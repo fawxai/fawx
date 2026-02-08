@@ -5,7 +5,13 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+default = []
+llama-cpp = []  # Enable llama.cpp integration (requires llama-cpp-sys)
+
 [dependencies]
 nv-core.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true

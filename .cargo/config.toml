@@ -17,7 +17,10 @@ opt-level = 0
 debug = true
 
 # Android cross-compilation target (for Horizon 1)
-# Commented out for pre-PoC; uncomment when building for Android
-# [target.aarch64-linux-android]
-# linker = "aarch64-linux-android-clang"
-# ar = "aarch64-linux-android-ar"
+[target.aarch64-linux-android]
+linker = "aarch64-linux-android-clang"
+ar = "aarch64-linux-android-ar"
+
+# iOS target (for future Horizon 2+)
+[target.aarch64-apple-ios]
+linker = "rust-lld"
