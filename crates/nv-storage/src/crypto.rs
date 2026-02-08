@@ -1,4 +1,7 @@
 //! Encryption layer using AES-256-GCM.
+//!
+//! This module provides authenticated encryption using AES-256-GCM from the `ring` crate.
+//! All encryption operations use randomly generated nonces to ensure semantic security.
 
 use nv_core::error::StorageError;
 use ring::aead::{
@@ -6,30 +9,99 @@ use ring::aead::{
 };
 use ring::error::Unspecified;
 use ring::rand::{SecureRandom, SystemRandom};
+use zeroize::Zeroize;
 
 type Result<T> = std::result::Result<T, StorageError>;
 
+/// Nonce length for AES-GCM (96 bits / 12 bytes as per NIST SP 800-38D)
 const NONCE_LEN: usize = 12;
 
-/// Encryption key for AES-256-GCM.
+/// Encryption key for AES-256-GCM authenticated encryption.
+///
+/// Wraps a 32-byte (256-bit) key used for AES-256-GCM operations.
+/// The key material is automatically zeroed when dropped to prevent
+/// leakage via memory dumps or swap.
+///
+/// # Security
+///
+/// Keys should be derived using [`crate::derive_key`] (HKDF) or
+/// [`crate::derive_key_from_password`] (PBKDF2) rather than
+/// constructed directly from arbitrary bytes.
+///
+/// # Example
+///
+/// ```no_run
+/// use nv_storage::{EncryptionKey, derive_key};
+///
+/// let master_key = b"secure_master_key_32_bytes_long!";
+/// let derived_key = derive_key(master_key, "context").expect("Key derivation failed");
+/// ```
 #[derive(Clone)]
 pub struct EncryptionKey {
+    /// The raw 32-byte AES-256 key material.
+    /// This is zeroed on drop to prevent key leakage.
     key_bytes: [u8; 32],
+}
+
+impl Drop for EncryptionKey {
+    fn drop(&mut self) {
+        self.key_bytes.zeroize();
+    }
 }
 
 impl EncryptionKey {
     /// Create an encryption key from a 32-byte array.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - A 32-byte array containing the key material
+    ///
+    /// # Security
+    ///
+    /// The key should be derived from a secure source using HKDF or PBKDF2.
+    /// **Do not use predictable or hardcoded values in production.**
+    ///
+    /// For production use, prefer [`crate::derive_key`] or
+    /// [`crate::derive_key_from_password`].
     pub fn from_bytes(key: &[u8; 32]) -> Self {
         Self { key_bytes: *key }
     }
 }
 
+impl std::fmt::Debug for EncryptionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncryptionKey")
+            .field("key_bytes", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Encrypt plaintext using AES-256-GCM with a random nonce.
-/// The nonce is prepended to the ciphertext.
+///
+/// Uses `ring::rand::SystemRandom` to generate a cryptographically secure
+/// random 96-bit nonce. The nonce is prepended to the ciphertext for use
+/// during decryption.
+///
+/// # Arguments
+///
+/// * `key` - The encryption key (must be 256 bits)
+/// * `plaintext` - The data to encrypt
+///
+/// # Returns
+///
+/// `[nonce (12 bytes) | ciphertext | auth_tag (16 bytes)]`
+///
+/// # Errors
+///
+/// Returns [`StorageError::Encryption`] if:
+/// - Random nonce generation fails
+/// - Encryption operation fails
 pub fn encrypt(key: &EncryptionKey, plaintext: &[u8]) -> Result<Vec<u8>> {
     let rng = SystemRandom::new();
 
-    // Generate random nonce
+    // Generate cryptographically secure random nonce (12 bytes for GCM).
+    // SystemRandom::fill() guarantees it fills the entire buffer or errors,
+    // so we don't need to verify the length.
     let mut nonce_bytes = [0u8; NONCE_LEN];
     rng.fill(&mut nonce_bytes)
         .map_err(|_| StorageError::Encryption("Failed to generate nonce".to_string()))?;
@@ -54,17 +126,48 @@ pub fn encrypt(key: &EncryptionKey, plaintext: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Decrypt ciphertext using AES-256-GCM.
-/// The nonce is expected to be prepended to the ciphertext.
+///
+/// Expects the nonce to be prepended to the ciphertext as produced by [`encrypt`].
+///
+/// # Arguments
+///
+/// * `key` - The encryption key (must match the key used for encryption)
+/// * `ciphertext` - The encrypted data: `[nonce (12 bytes) | ciphertext | auth_tag (16 bytes)]`
+///
+/// # Returns
+///
+/// The original plaintext if decryption and authentication succeed.
+///
+/// # Errors
+///
+/// Returns [`StorageError::Encryption`] if:
+/// - Ciphertext is too short (< 12 bytes for nonce)
+/// - Authentication tag verification fails (data was tampered with or wrong key)
+/// - Decryption operation fails
+///
+/// # Security
+///
+/// AES-GCM provides authenticated encryption. If the authentication tag doesn't
+/// match, the data was either:
+/// - Encrypted with a different key
+/// - Modified/tampered with after encryption
+/// - Corrupted during storage/transmission
 pub fn decrypt(key: &EncryptionKey, ciphertext: &[u8]) -> Result<Vec<u8>> {
     if ciphertext.len() < NONCE_LEN {
+        tracing::debug!(
+            "Ciphertext too short: {} bytes (need at least {})",
+            ciphertext.len(),
+            NONCE_LEN
+        );
         return Err(StorageError::Encryption("Ciphertext too short".to_string()));
     }
 
-    // Extract nonce
+    // Extract nonce from the first 12 bytes
     let (nonce_bytes, encrypted_data) = ciphertext.split_at(NONCE_LEN);
-    let nonce_array: [u8; NONCE_LEN] = nonce_bytes
-        .try_into()
-        .map_err(|_| StorageError::Encryption("Invalid nonce".to_string()))?;
+    let nonce_array: [u8; NONCE_LEN] = nonce_bytes.try_into().map_err(|e| {
+        tracing::debug!("Nonce conversion failed: {:?}", e);
+        StorageError::Encryption("Invalid nonce".to_string())
+    })?;
 
     // Create opening key
     let unbound_key = UnboundKey::new(&AES_256_GCM, &key.key_bytes)
@@ -81,10 +184,17 @@ pub fn decrypt(key: &EncryptionKey, ciphertext: &[u8]) -> Result<Vec<u8>> {
     Ok(decrypted.to_vec())
 }
 
-/// Single-use nonce sequence for AES-GCM.
+/// Single-use nonce sequence for AES-GCM operations.
+///
+/// This type ensures each nonce can only be used once, as required by
+/// the `ring::aead` API. Attempting to use the nonce a second time will
+/// return an error.
 struct SingleUseNonce(Option<Nonce>);
 
 impl NonceSequence for SingleUseNonce {
+    /// Advance to the next nonce (which doesn't exist for single-use).
+    ///
+    /// Returns the nonce on first call, then errors on subsequent calls.
     fn advance(&mut self) -> std::result::Result<Nonce, Unspecified> {
         self.0.take().ok_or(Unspecified)
     }

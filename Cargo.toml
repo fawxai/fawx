@@ -47,6 +47,7 @@ ring = "0.17"
 
 # Storage
 redb = "2.4"
+zeroize = "1.8"
 
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }

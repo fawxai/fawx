@@ -6,7 +6,11 @@ use serde::{Deserialize, Serialize};
 
 type Result<T> = std::result::Result<T, StorageError>;
 
-const CONVERSATIONS_TABLE: &str = "conversations";
+/// Table name for encrypted conversation history in the database.
+///
+/// This constant is public to allow external tools (debugging, backup, etc.)
+/// to inspect the database structure if needed.
+pub const CONVERSATIONS_TABLE: &str = "conversations";
 
 /// A message in a conversation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

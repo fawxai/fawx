@@ -5,7 +5,11 @@ use nv_core::error::StorageError;
 
 type Result<T> = std::result::Result<T, StorageError>;
 
-const CREDENTIALS_TABLE: &str = "credentials";
+/// Table name for encrypted credentials in the database.
+///
+/// This constant is public to allow external tools (debugging, backup, etc.)
+/// to inspect the database structure if needed.
+pub const CREDENTIALS_TABLE: &str = "credentials";
 
 /// Encrypted credential storage.
 pub struct CredentialStore {

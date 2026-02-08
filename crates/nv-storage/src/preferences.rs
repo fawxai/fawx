@@ -6,7 +6,11 @@ use serde::{Deserialize, Serialize};
 
 type Result<T> = std::result::Result<T, StorageError>;
 
-const PREFERENCES_TABLE: &str = "preferences";
+/// Table name for encrypted user preferences in the database.
+///
+/// This constant is public to allow external tools (debugging, backup, etc.)
+/// to inspect the database structure if needed.
+pub const PREFERENCES_TABLE: &str = "preferences";
 
 /// Encrypted preferences storage.
 pub struct Preferences {

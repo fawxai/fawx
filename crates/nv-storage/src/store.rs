@@ -8,6 +8,7 @@ use std::sync::Arc;
 type Result<T> = std::result::Result<T, StorageError>;
 
 /// Core storage backend using redb (embedded key-value database).
+#[derive(Clone)]
 pub struct Storage {
     db: Arc<Database>,
 }
