@@ -380,11 +380,11 @@ decision = "invalid"
         }
     }
 
-    #[test]
-    fn test_policy_engine_from_file_missing() {
+    #[tokio::test]
+    async fn test_policy_engine_from_file_missing() {
         use std::path::Path;
 
-        let result = PolicyEngine::from_file(Path::new("/nonexistent/path/policy.toml"));
+        let result = PolicyEngine::from_file(Path::new("/nonexistent/path/policy.toml")).await;
         assert!(result.is_err());
     }
 

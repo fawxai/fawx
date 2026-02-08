@@ -5,7 +5,6 @@ use super::types::{Condition, PolicyConfig, PolicyDecision, PolicyRule};
 use super::util::matches_action;
 use nv_core::error::SecurityError;
 use nv_core::types::{ActionPlan, ActionStep};
-use std::fs;
 use std::path::Path;
 
 /// Policy engine that evaluates actions against loaded policies.
@@ -36,8 +35,8 @@ impl PolicyEngine {
     ///
     /// # Returns
     /// PolicyEngine on success, SecurityError on I/O or parse failure
-    pub fn from_file(path: &Path) -> Result<Self, SecurityError> {
-        let content = fs::read_to_string(path).map_err(|e| {
+    pub async fn from_file(path: &Path) -> Result<Self, SecurityError> {
+        let content = tokio::fs::read_to_string(path).await.map_err(|e| {
             SecurityError::PolicyViolation(format!("Failed to read policy file: {}", e))
         })?;
 
@@ -62,18 +61,18 @@ impl PolicyEngine {
     /// let engine = PolicyEngine::from_signed_file(
     ///     Path::new("policy.toml"),
     ///     b"secret_key"
-    /// )?;
+    /// ).await?;
     /// ```
-    pub fn from_signed_file(path: &Path, key: &[u8]) -> Result<Self, SecurityError> {
+    pub async fn from_signed_file(path: &Path, key: &[u8]) -> Result<Self, SecurityError> {
         // Read policy file
-        let content = fs::read(path).map_err(|e| {
+        let content = tokio::fs::read(path).await.map_err(|e| {
             SecurityError::PolicyViolation(format!("Failed to read policy file: {}", e))
         })?;
 
         // Read signature file (.sig sidecar)
         let mut sig_path = path.to_path_buf();
         sig_path.as_mut_os_string().push(".sig");
-        let signature = fs::read(&sig_path).map_err(|e| {
+        let signature = tokio::fs::read(&sig_path).await.map_err(|e| {
             SecurityError::SignatureVerification(format!("Failed to read signature file: {}", e))
         })?;
 
@@ -950,8 +949,8 @@ decision = "deny"
 
     // Signed file tests
 
-    #[test]
-    fn test_from_signed_file_valid() {
+    #[tokio::test]
+    async fn test_from_signed_file_valid() {
         use crate::policy::signing::sign_policy;
         use std::io::Write;
         use tempfile::NamedTempFile;
@@ -978,12 +977,12 @@ decision = "deny"
         std::fs::write(&sig_path, &signature).unwrap();
 
         // Load from signed file
-        let engine = PolicyEngine::from_signed_file(policy_file.path(), key);
+        let engine = PolicyEngine::from_signed_file(policy_file.path(), key).await;
         assert!(engine.is_ok());
     }
 
-    #[test]
-    fn test_from_signed_file_invalid_signature() {
+    #[tokio::test]
+    async fn test_from_signed_file_invalid_signature() {
         use std::io::Write;
         use tempfile::NamedTempFile;
 
@@ -1005,7 +1004,7 @@ decision = "deny"
         std::fs::write(&sig_path, &wrong_signature).unwrap();
 
         // Should fail verification
-        let engine = PolicyEngine::from_signed_file(policy_file.path(), key);
+        let engine = PolicyEngine::from_signed_file(policy_file.path(), key).await;
         assert!(engine.is_err());
         match engine {
             Err(SecurityError::SignatureVerification(_)) => (),
@@ -1013,8 +1012,8 @@ decision = "deny"
         }
     }
 
-    #[test]
-    fn test_from_signed_file_missing_sig() {
+    #[tokio::test]
+    async fn test_from_signed_file_missing_sig() {
         use std::io::Write;
         use tempfile::NamedTempFile;
 
@@ -1030,7 +1029,7 @@ decision = "deny"
         policy_file.write_all(toml.as_bytes()).unwrap();
 
         // Should fail to read signature file
-        let engine = PolicyEngine::from_signed_file(policy_file.path(), key);
+        let engine = PolicyEngine::from_signed_file(policy_file.path(), key).await;
         assert!(engine.is_err());
         match engine {
             Err(SecurityError::SignatureVerification(_)) => (),
