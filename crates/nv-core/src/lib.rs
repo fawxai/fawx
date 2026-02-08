@@ -7,6 +7,9 @@
 //! - Event bus for asynchronous communication
 //! - Error taxonomy
 //! - Shared types (intents, action plans, etc.)
+//! - [`PhoneActions`](types::PhoneActions) trait — the critical abstraction between
+//!   the agent and phone hardware. All phone control goes through this trait,
+//!   enabling the same agent code to work with real Android devices.
 
 pub mod config;
 pub mod error;

@@ -46,15 +46,20 @@ impl EventBus {
 
     /// Publish an event to all subscribers.
     ///
+    /// Returns the number of receivers that received the message.
+    /// If no subscribers are active, returns `Ok(0)` — this is expected
+    /// during startup or when components haven't subscribed yet.
+    ///
     /// # Arguments
     /// * `message` - The message to publish
     ///
     /// # Returns
-    /// `Result<usize>` - Number of receivers that received the message, or error
+    /// `Ok(usize)` - Number of receivers that received the message
     pub fn publish(&self, message: InternalMessage) -> Result<usize> {
-        self.sender
-            .send(message)
-            .map_err(|e| CoreError::EventBus(format!("Failed to publish event: {}", e)))
+        match self.sender.send(message) {
+            Ok(count) => Ok(count),
+            Err(_) => Ok(0), // No active receivers — not an error
+        }
     }
 }
 

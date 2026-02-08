@@ -15,7 +15,7 @@ pub struct UserInput {
     /// Input source (voice, text, notification, etc.)
     pub source: InputSource,
 
-    /// Timestamp of input
+    /// Unix timestamp in milliseconds since epoch
     pub timestamp: u64,
 
     /// Optional context from previous conversation
@@ -227,6 +227,6 @@ pub struct Notification {
     /// Notification content
     pub content: String,
 
-    /// Timestamp
+    /// Unix timestamp in milliseconds since epoch
     pub timestamp: u64,
 }

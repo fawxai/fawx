@@ -14,11 +14,13 @@ pub trait LlmProvider {
 }
 
 /// Local LLM provider (llama.cpp).
+#[derive(Default)]
 pub struct LocalModel {
     // Placeholder - will be implemented in Epic 2
 }
 
 /// Cloud LLM provider (Claude API).
+#[derive(Default)]
 pub struct CloudModel {
     // Placeholder - will be implemented in Epic 3
 }

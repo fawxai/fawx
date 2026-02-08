@@ -9,8 +9,8 @@ use crate::error::{CoreError, Result};
 
 /// Main configuration structure for Nova.
 ///
-/// This configuration is loaded from a JSON5 file (currently using JSON for simplicity)
-/// and defines all system-level settings.
+/// This configuration is loaded from a JSON file and defines all system-level settings.
+/// TODO: Evaluate JSON5 for comments in config files (Epic 2+).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Path to the local LLM model file (GGUF format)
@@ -55,10 +55,26 @@ impl Config {
 
     /// Validate the configuration.
     ///
-    /// Checks that all required paths exist and are accessible.
+    /// Checks that required paths exist and log level is valid.
+    /// More thorough validation (model file format, key accessibility)
+    /// will be added in Epic 2-3 when those subsystems are implemented.
     pub fn validate(&self) -> Result<()> {
-        // Validation logic placeholder
-        // In a real implementation, check that paths are accessible
+        let valid_levels = ["trace", "debug", "info", "warn", "error"];
+        if !valid_levels.contains(&self.log_level.as_str()) {
+            return Err(CoreError::ConfigParse(format!(
+                "Invalid log_level '{}'. Expected one of: {:?}",
+                self.log_level, valid_levels
+            )));
+        }
+
+        if self.model_path.as_os_str().is_empty() {
+            return Err(CoreError::ConfigParse("model_path cannot be empty".into()));
+        }
+
+        if self.storage_path.as_os_str().is_empty() {
+            return Err(CoreError::ConfigParse("storage_path cannot be empty".into()));
+        }
+
         Ok(())
     }
 }

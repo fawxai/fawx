@@ -6,6 +6,7 @@
 /// Voice input handler.
 ///
 /// Manages wake word detection and speech-to-text conversion.
+#[derive(Default)]
 pub struct VoiceInput {
     // Placeholder - will be implemented in Horizon 1 Phase 2
 }
@@ -13,6 +14,7 @@ pub struct VoiceInput {
 /// Voice output handler.
 ///
 /// Manages text-to-speech conversion and audio playback.
+#[derive(Default)]
 pub struct VoiceOutput {
     // Placeholder - will be implemented in Horizon 1 Phase 2
 }

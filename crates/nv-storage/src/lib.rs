@@ -6,6 +6,7 @@
 /// Encrypted storage backend.
 ///
 /// Provides a key-value store with transparent encryption.
+#[derive(Default)]
 pub struct Storage {
     // Placeholder - will be implemented in Epic 6
 }
