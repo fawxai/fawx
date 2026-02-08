@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
 struct Config {
     #[serde(default)]
     agent: AgentConfig,
@@ -14,7 +14,7 @@ struct Config {
     llm: LlmConfig,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct AgentConfig {
     #[serde(default = "default_name")]
     name: String,
@@ -23,7 +23,7 @@ struct AgentConfig {
     workspace: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct SecurityConfig {
     #[serde(default = "default_bool_true")]
     require_confirmation: bool,
@@ -32,7 +32,7 @@ struct SecurityConfig {
     audit_enabled: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct LlmConfig {
     #[serde(default = "default_model")]
     model: String,
@@ -132,44 +132,6 @@ fn redact_sensitive(config: &Config) -> Config {
     }
 
     redacted
-}
-
-// Implement Clone manually since we need it for redaction
-impl Clone for Config {
-    fn clone(&self) -> Self {
-        Self {
-            agent: self.agent.clone(),
-            security: self.security.clone(),
-            llm: self.llm.clone(),
-        }
-    }
-}
-
-impl Clone for AgentConfig {
-    fn clone(&self) -> Self {
-        Self {
-            name: self.name.clone(),
-            workspace: self.workspace.clone(),
-        }
-    }
-}
-
-impl Clone for SecurityConfig {
-    fn clone(&self) -> Self {
-        Self {
-            require_confirmation: self.require_confirmation,
-            audit_enabled: self.audit_enabled,
-        }
-    }
-}
-
-impl Clone for LlmConfig {
-    fn clone(&self) -> Self {
-        Self {
-            model: self.model.clone(),
-            api_key: self.api_key.clone(),
-        }
-    }
 }
 
 #[cfg(test)]
