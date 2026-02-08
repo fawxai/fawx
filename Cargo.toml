@@ -60,3 +60,4 @@ futures = "0.3"
 # Shared crates
 nv-core = { path = "crates/nv-core" }
 nv-security = { path = "crates/nv-security" }
+nv-storage = { path = "crates/nv-storage" }

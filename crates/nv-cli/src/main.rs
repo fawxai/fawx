@@ -1,5 +1,6 @@
 //! Nova CLI - Management interface for the Nova agent.
 
+mod commands;
 mod confirmation;
 
 use clap::{Parser, Subcommand};
@@ -31,11 +32,30 @@ enum Commands {
     /// Show current configuration
     Config,
 
+    /// Manage audit logs
+    Audit {
+        #[command(subcommand)]
+        command: AuditCommands,
+    },
+
     /// Manage skills
     Skill {
         #[command(subcommand)]
         command: SkillCommands,
     },
+}
+
+#[derive(Subcommand)]
+enum AuditCommands {
+    /// Show recent audit entries
+    Show {
+        /// Maximum number of entries to display
+        #[arg(short, long)]
+        limit: Option<usize>,
+    },
+
+    /// Verify audit log integrity
+    Verify,
 }
 
 #[derive(Subcommand)]
@@ -63,43 +83,48 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    match cli.command {
+    let exit_code = match cli.command {
         Commands::Start => {
             println!("Starting Nova agent daemon...");
             println!("(Implementation pending - Epic 9)");
+            0
         }
         Commands::Stop => {
             println!("Stopping Nova agent daemon...");
             println!("(Implementation pending - Epic 9)");
+            0
         }
-        Commands::Chat => {
-            println!("Nova interactive chat");
-            println!("(Implementation pending - Epic 9)");
-        }
-        Commands::Doctor => {
-            println!("Running diagnostics...");
-            println!("✓ Workspace compiled successfully");
-            println!("(Full diagnostics pending - Epic 9)");
-        }
+        Commands::Chat => commands::chat::run().await?,
+        Commands::Doctor => commands::doctor::run().await?,
         Commands::Config => {
-            println!("Current configuration:");
-            println!("(Configuration display pending - Epic 9)");
+            commands::config::run().await?;
+            0
         }
+        Commands::Audit { command } => match command {
+            AuditCommands::Show { limit } => {
+                commands::audit::show(limit).await?;
+                0
+            }
+            AuditCommands::Verify => commands::audit::verify().await?,
+        },
         Commands::Skill { command } => match command {
             SkillCommands::List => {
                 println!("Installed skills:");
                 println!("(Skill management pending - Epic 8)");
+                0
             }
             SkillCommands::Install { path } => {
                 println!("Installing skill from: {}", path);
                 println!("(Skill installation pending - Epic 8)");
+                0
             }
             SkillCommands::Remove { name } => {
                 println!("Removing skill: {}", name);
                 println!("(Skill removal pending - Epic 8)");
+                0
             }
         },
-    }
+    };
 
-    Ok(())
+    std::process::exit(exit_code);
 }
