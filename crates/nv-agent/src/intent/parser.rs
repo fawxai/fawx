@@ -8,8 +8,13 @@ use tracing::warn;
 
 /// Maximum length for entity values (characters). Values exceeding this are truncated.
 const MAX_ENTITY_VALUE_LENGTH: usize = 1024;
+/// Marker appended to truncated entity values
+const TRUNCATION_MARKER: &str = "...";
 
 /// Raw JSON response from Claude for intent classification.
+///
+/// Note: Extra top-level fields are ignored by serde, but extra keys
+/// within the `entities` HashMap are preserved since it's a HashMap<String, String>.
 #[derive(Debug, Deserialize)]
 struct IntentResponse {
     category: String,
@@ -20,7 +25,8 @@ struct IntentResponse {
 
 /// Truncate entity value if it exceeds maximum length.
 ///
-/// Values longer than MAX_ENTITY_VALUE_LENGTH are truncated with "..." appended.
+/// Values longer than MAX_ENTITY_VALUE_LENGTH are truncated to exactly
+/// MAX_ENTITY_VALUE_LENGTH characters, with the truncation marker appended.
 /// This prevents malicious or accidental extremely long entity values from consuming
 /// excessive memory or causing downstream issues.
 ///
@@ -28,17 +34,17 @@ struct IntentResponse {
 /// * `value` - Entity value to truncate
 ///
 /// # Returns
-/// Truncated value if needed, otherwise original value
+/// Truncated value if needed (exactly MAX_ENTITY_VALUE_LENGTH chars), otherwise original value
 fn truncate_entity_value(value: String) -> String {
-    if value.chars().count() > MAX_ENTITY_VALUE_LENGTH {
-        let truncated: String = value.chars().take(MAX_ENTITY_VALUE_LENGTH).collect();
+    let char_count = value.chars().count();
+    if char_count > MAX_ENTITY_VALUE_LENGTH {
+        let max_chars = MAX_ENTITY_VALUE_LENGTH.saturating_sub(TRUNCATION_MARKER.len());
+        let truncated: String = value.chars().take(max_chars).collect();
         warn!(
             "Entity value exceeds {} chars, truncated from {} to {}",
-            MAX_ENTITY_VALUE_LENGTH,
-            value.chars().count(),
-            truncated.chars().count()
+            MAX_ENTITY_VALUE_LENGTH, char_count, MAX_ENTITY_VALUE_LENGTH
         );
-        format!("{}...", truncated)
+        format!("{}{}", truncated, TRUNCATION_MARKER)
     } else {
         value
     }

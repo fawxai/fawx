@@ -706,6 +706,20 @@ async fn test_json_extra_entities_field_format() {
 // ============================================================================
 
 #[tokio::test]
+async fn test_entity_value_empty_string() {
+    let mock = MockClassifier::with_response(
+        r#"{"category": "Message", "confidence": 0.9, "entities": {"message": ""}}"#.to_string(),
+    );
+    let classifier = IntentClassifier::new(ClassifierConfig::default(), mock);
+
+    let input = create_user_input("send message");
+    let intent = classifier.classify(&input).await.unwrap();
+
+    // Empty string should remain empty
+    assert_eq!(intent.entities.get("message").unwrap(), "");
+}
+
+#[tokio::test]
 async fn test_entity_value_within_limit() {
     let short_message = "This is a normal message";
     let mock = MockClassifier::with_response(format!(
@@ -755,9 +769,9 @@ async fn test_entity_value_exceeds_limit_truncated() {
 
     let truncated = intent.entities.get("message").unwrap();
 
-    // Should be truncated to 1024 chars + "..."
+    // Should be truncated to exactly 1024 chars total (including "...")
     assert!(truncated.ends_with("..."));
-    assert_eq!(truncated.len(), 1024 + 3); // 1024 chars + "..."
+    assert_eq!(truncated.len(), 1024); // Exactly 1024 chars total
 }
 
 #[tokio::test]
@@ -777,7 +791,7 @@ async fn test_entity_value_truncation_with_unicode() {
 
     // Should be truncated based on character count, not byte count
     assert!(truncated.ends_with("..."));
-    assert_eq!(truncated.chars().count(), 1024 + 3); // 1024 chars + "..."
+    assert_eq!(truncated.chars().count(), 1024); // Exactly 1024 chars total
 }
 
 #[tokio::test]
@@ -798,11 +812,11 @@ async fn test_multiple_entity_values_truncation() {
     let contact = intent.entities.get("contact").unwrap();
     let message = intent.entities.get("message").unwrap();
 
-    // Both should be truncated independently
+    // Both should be truncated independently to exactly 1024 chars
     assert!(contact.ends_with("..."));
     assert!(message.ends_with("..."));
-    assert_eq!(contact.len(), 1024 + 3);
-    assert_eq!(message.len(), 1024 + 3);
+    assert_eq!(contact.len(), 1024);
+    assert_eq!(message.len(), 1024);
 }
 
 #[tokio::test]
@@ -823,8 +837,8 @@ async fn test_entity_truncation_preserves_other_entities() {
     assert_eq!(intent.entities.get("contact").unwrap(), short_contact);
     assert!(!intent.entities.get("contact").unwrap().ends_with("..."));
 
-    // Long entity should be truncated
+    // Long entity should be truncated to exactly 1024 chars
     let message = intent.entities.get("message").unwrap();
     assert!(message.ends_with("..."));
-    assert_eq!(message.len(), 1024 + 3);
+    assert_eq!(message.len(), 1024);
 }
