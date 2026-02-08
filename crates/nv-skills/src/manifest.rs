@@ -1,6 +1,7 @@
 //! Skill manifest parsing and validation.
 
 use nv_core::error::SkillError;
+use semver::Version;
 use serde::{Deserialize, Serialize};
 
 /// Capability a skill can request.
@@ -17,6 +18,18 @@ pub enum Capability {
     Sensors,
     /// Control phone (high privilege)
     PhoneActions,
+}
+
+impl std::fmt::Display for Capability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Capability::Network => write!(f, "network"),
+            Capability::Storage => write!(f, "storage"),
+            Capability::Notifications => write!(f, "notifications"),
+            Capability::Sensors => write!(f, "sensors"),
+            Capability::PhoneActions => write!(f, "phone_actions"),
+        }
+    }
 }
 
 /// Skill manifest metadata.
@@ -63,6 +76,14 @@ pub fn validate_manifest(manifest: &SkillManifest) -> Result<(), SkillError> {
         return Err(SkillError::InvalidManifest(
             "version cannot be empty".to_string(),
         ));
+    }
+
+    // Validate version is valid semver
+    if Version::parse(&manifest.version).is_err() {
+        return Err(SkillError::InvalidManifest(format!(
+            "version '{}' is not a valid semantic version",
+            manifest.version
+        )));
     }
 
     if manifest.description.trim().is_empty() {
@@ -227,5 +248,86 @@ capabilities = ["network", "storage", "notifications", "sensors", "phone_actions
         };
 
         assert!(validate_manifest(&manifest).is_err());
+    }
+
+    #[test]
+    fn test_capability_display() {
+        assert_eq!(format!("{}", Capability::Network), "network");
+        assert_eq!(format!("{}", Capability::Storage), "storage");
+        assert_eq!(format!("{}", Capability::Notifications), "notifications");
+        assert_eq!(format!("{}", Capability::Sensors), "sensors");
+        assert_eq!(format!("{}", Capability::PhoneActions), "phone_actions");
+    }
+
+    #[test]
+    fn test_capability_display_in_error_message() {
+        let cap = Capability::Network;
+        let error_msg = format!("Capability denied: {}", cap);
+        assert_eq!(error_msg, "Capability denied: network");
+    }
+
+    #[test]
+    fn test_validate_valid_semver() {
+        let manifest = SkillManifest {
+            name: "test".to_string(),
+            version: "1.2.3".to_string(),
+            description: "Test".to_string(),
+            author: "Nova".to_string(),
+            api_version: "host_api_v1".to_string(),
+            capabilities: vec![],
+            entry_point: "run".to_string(),
+        };
+
+        assert!(validate_manifest(&manifest).is_ok());
+    }
+
+    #[test]
+    fn test_validate_semver_with_prerelease() {
+        let manifest = SkillManifest {
+            name: "test".to_string(),
+            version: "1.0.0-alpha.1".to_string(),
+            description: "Test".to_string(),
+            author: "Nova".to_string(),
+            api_version: "host_api_v1".to_string(),
+            capabilities: vec![],
+            entry_point: "run".to_string(),
+        };
+
+        assert!(validate_manifest(&manifest).is_ok());
+    }
+
+    #[test]
+    fn test_validate_invalid_semver() {
+        let manifest = SkillManifest {
+            name: "test".to_string(),
+            version: "not-a-version".to_string(),
+            description: "Test".to_string(),
+            author: "Nova".to_string(),
+            api_version: "host_api_v1".to_string(),
+            capabilities: vec![],
+            entry_point: "run".to_string(),
+        };
+
+        let result = validate_manifest(&manifest);
+        assert!(result.is_err());
+        if let Err(SkillError::InvalidManifest(msg)) = result {
+            assert!(msg.contains("not a valid semantic version"));
+        }
+    }
+
+    #[test]
+    fn test_validate_incomplete_semver() {
+        let manifest = SkillManifest {
+            name: "test".to_string(),
+            version: "1.0".to_string(),
+            description: "Test".to_string(),
+            author: "Nova".to_string(),
+            api_version: "host_api_v1".to_string(),
+            capabilities: vec![],
+            entry_point: "run".to_string(),
+        };
+
+        let result = validate_manifest(&manifest);
+        assert!(result.is_err());
     }
 }

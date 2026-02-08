@@ -24,7 +24,7 @@ impl CapabilityChecker {
             Ok(())
         } else {
             Err(SkillError::Execution(format!(
-                "Capability denied: {:?}",
+                "Capability denied: {}",
                 required
             )))
         }
