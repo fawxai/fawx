@@ -53,6 +53,8 @@ impl RoutingConfig {
     }
 }
 
+// Manual Default impl because we need to initialize with specific routing rules
+// rather than just default field values.
 impl Default for RoutingConfig {
     fn default() -> Self {
         Self::new_with_defaults()
@@ -159,6 +161,27 @@ impl RoutingContext {
 ///
 /// # Returns
 /// The selected routing strategy
+///
+/// # Examples
+/// ```
+/// use nv_llm::{RoutingConfig, RoutingContext, resolve_strategy, RoutingStrategy};
+///
+/// // Use default config with built-in rules
+/// let config = RoutingConfig::default();
+/// let context = RoutingContext::from_prompt("Hello, how are you?")
+///     .with_intent("Conversation")
+///     .with_confidence(0.9);
+///
+/// let strategy = resolve_strategy(&config, &context);
+/// assert_eq!(strategy, RoutingStrategy::LocalFirst); // Conversation → LocalFirst
+///
+/// // Low confidence triggers CloudFirst
+/// let context = RoutingContext::from_prompt("What is quantum entanglement?")
+///     .with_intent("Question")
+///     .with_confidence(0.5);
+/// let strategy = resolve_strategy(&config, &context);
+/// assert_eq!(strategy, RoutingStrategy::CloudFirst); // Low confidence → CloudFirst
+/// ```
 pub fn resolve_strategy(config: &RoutingConfig, context: &RoutingContext) -> RoutingStrategy {
     for rule in &config.rules {
         if rule.condition.matches(context) {

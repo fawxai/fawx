@@ -9,6 +9,15 @@ use crossterm::ExecutableCommand;
 use nv_security::PolicyDecision;
 use std::io::{self, BufRead, Write};
 
+/// Check if a user response indicates approval.
+///
+/// Accepts "y", "yes", or empty string (Enter) as approval.
+/// Everything else is treated as denial.
+fn is_approved(response: &str) -> bool {
+    let trimmed = response.trim().to_lowercase();
+    trimmed.is_empty() || trimmed == "y" || trimmed == "yes"
+}
+
 /// UI for prompting user confirmation of policy decisions.
 pub struct ConfirmationUi;
 
@@ -75,8 +84,7 @@ impl ConfirmationUi {
                     .read_line(&mut line)
                     .context("Failed to read user input")?;
 
-                let response = line.trim().to_lowercase();
-                let approved = response.is_empty() || response == "y" || response == "yes";
+                let approved = is_approved(&line);
 
                 if approved {
                     stdout
@@ -227,6 +235,29 @@ mod tests {
         // This test validates the logic without actually prompting
         let decision = PolicyDecision::Allow;
         assert!(matches!(decision, PolicyDecision::Allow));
+    }
+
+    #[test]
+    fn test_is_approved_yes_variants() {
+        assert!(is_approved("y"));
+        assert!(is_approved("Y"));
+        assert!(is_approved("yes"));
+        assert!(is_approved("YES"));
+        assert!(is_approved("Yes"));
+        assert!(is_approved(""));
+        assert!(is_approved("  "));
+        assert!(is_approved("\n"));
+    }
+
+    #[test]
+    fn test_is_approved_no_variants() {
+        assert!(!is_approved("n"));
+        assert!(!is_approved("N"));
+        assert!(!is_approved("no"));
+        assert!(!is_approved("NO"));
+        assert!(!is_approved("No"));
+        assert!(!is_approved("nope"));
+        assert!(!is_approved("anything else"));
     }
 
     #[test]

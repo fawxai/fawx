@@ -37,14 +37,24 @@ impl ProviderHealth {
     }
 
     /// Maximum consecutive failures before marking unhealthy.
+    ///
+    /// After 3 failures in a row, we assume the provider has a persistent
+    /// issue and stop trying it temporarily. This prevents cascading delays
+    /// from repeatedly attempting to use a broken provider. The counter resets
+    /// to zero on any successful generation.
     const MAX_FAILURES: u32 = 3;
 
-    /// Cooldown period in seconds before auto-recovery.
-    const COOLDOWN_SECONDS: u64 = 300; // 5 minutes
+    /// Cooldown period in seconds before auto-recovery (5 minutes).
+    ///
+    /// After marking a provider unhealthy, we wait this long before
+    /// automatically retrying. This gives transient issues (network blips,
+    /// API rate limits) time to resolve without requiring manual intervention.
+    /// After cooldown, the next request will attempt the provider again.
+    const COOLDOWN_SECONDS: u64 = 300;
 
     /// Record a failure and update health status.
     pub fn record_failure(&mut self) {
-        self.consecutive_failures += 1;
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         self.last_failure = Some(current_timestamp());
 
         if self.consecutive_failures >= Self::MAX_FAILURES {
@@ -153,9 +163,15 @@ impl FallbackRouter {
         max_tokens: u32,
         context: &RoutingContext,
     ) -> Result<FallbackResult, LlmError> {
-        // Check for auto-recovery
-        self.local_health.lock().unwrap().check_recovery();
-        self.cloud_health.lock().unwrap().check_recovery();
+        // Check for auto-recovery (ignore poison - health tracking is not critical)
+        self.local_health
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .check_recovery();
+        self.cloud_health
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .check_recovery();
 
         // Resolve strategy based on context
         let strategy = resolve_strategy(&self.config, context);
@@ -176,10 +192,19 @@ impl FallbackRouter {
         max_tokens: u32,
     ) -> Result<FallbackResult, LlmError> {
         // Check if local is healthy and available
-        if self.local.is_some() && self.local_health.lock().unwrap().is_healthy {
+        if self.local.is_some()
+            && self
+                .local_health
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_healthy
+        {
             match self.try_provider(&self.local, prompt, max_tokens).await {
                 Ok(text) => {
-                    self.local_health.lock().unwrap().record_success();
+                    self.local_health
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .record_success();
                     return Ok(FallbackResult {
                         text,
                         provider_used: "local".to_string(),
@@ -188,16 +213,28 @@ impl FallbackRouter {
                 }
                 Err(e) => {
                     warn!("Local provider failed: {}", e);
-                    self.local_health.lock().unwrap().record_failure();
+                    self.local_health
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .record_failure();
                 }
             }
         }
 
         // Fall back to cloud
-        if self.cloud.is_some() && self.cloud_health.lock().unwrap().is_healthy {
+        if self.cloud.is_some()
+            && self
+                .cloud_health
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_healthy
+        {
             match self.try_provider(&self.cloud, prompt, max_tokens).await {
                 Ok(text) => {
-                    self.cloud_health.lock().unwrap().record_success();
+                    self.cloud_health
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .record_success();
                     return Ok(FallbackResult {
                         text,
                         provider_used: "cloud".to_string(),
@@ -206,14 +243,17 @@ impl FallbackRouter {
                 }
                 Err(e) => {
                     warn!("Cloud provider failed: {}", e);
-                    self.cloud_health.lock().unwrap().record_failure();
+                    self.cloud_health
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .record_failure();
                     return Err(e);
                 }
             }
         }
 
         Err(LlmError::Inference(
-            "All providers failed or unavailable".to_string(),
+            "LocalFirst strategy failed: all providers unavailable".to_string(),
         ))
     }
 
@@ -224,10 +264,19 @@ impl FallbackRouter {
         max_tokens: u32,
     ) -> Result<FallbackResult, LlmError> {
         // Check if cloud is healthy and available
-        if self.cloud.is_some() && self.cloud_health.lock().unwrap().is_healthy {
+        if self.cloud.is_some()
+            && self
+                .cloud_health
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_healthy
+        {
             match self.try_provider(&self.cloud, prompt, max_tokens).await {
                 Ok(text) => {
-                    self.cloud_health.lock().unwrap().record_success();
+                    self.cloud_health
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .record_success();
                     return Ok(FallbackResult {
                         text,
                         provider_used: "cloud".to_string(),
@@ -236,16 +285,28 @@ impl FallbackRouter {
                 }
                 Err(e) => {
                     warn!("Cloud provider failed: {}", e);
-                    self.cloud_health.lock().unwrap().record_failure();
+                    self.cloud_health
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .record_failure();
                 }
             }
         }
 
         // Fall back to local
-        if self.local.is_some() && self.local_health.lock().unwrap().is_healthy {
+        if self.local.is_some()
+            && self
+                .local_health
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_healthy
+        {
             match self.try_provider(&self.local, prompt, max_tokens).await {
                 Ok(text) => {
-                    self.local_health.lock().unwrap().record_success();
+                    self.local_health
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .record_success();
                     return Ok(FallbackResult {
                         text,
                         provider_used: "local".to_string(),
@@ -254,14 +315,17 @@ impl FallbackRouter {
                 }
                 Err(e) => {
                     warn!("Local provider failed: {}", e);
-                    self.local_health.lock().unwrap().record_failure();
+                    self.local_health
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .record_failure();
                     return Err(e);
                 }
             }
         }
 
         Err(LlmError::Inference(
-            "All providers failed or unavailable".to_string(),
+            "CloudFirst strategy failed: all providers unavailable".to_string(),
         ))
     }
 
@@ -277,7 +341,10 @@ impl FallbackRouter {
 
         match self.try_provider(&self.local, prompt, max_tokens).await {
             Ok(text) => {
-                self.local_health.lock().unwrap().record_success();
+                self.local_health
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .record_success();
                 Ok(FallbackResult {
                     text,
                     provider_used: "local".to_string(),
@@ -285,7 +352,10 @@ impl FallbackRouter {
                 })
             }
             Err(e) => {
-                self.local_health.lock().unwrap().record_failure();
+                self.local_health
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .record_failure();
                 Err(e)
             }
         }
@@ -303,7 +373,10 @@ impl FallbackRouter {
 
         match self.try_provider(&self.cloud, prompt, max_tokens).await {
             Ok(text) => {
-                self.cloud_health.lock().unwrap().record_success();
+                self.cloud_health
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .record_success();
                 Ok(FallbackResult {
                     text,
                     provider_used: "cloud".to_string(),
@@ -311,7 +384,10 @@ impl FallbackRouter {
                 })
             }
             Err(e) => {
-                self.cloud_health.lock().unwrap().record_failure();
+                self.cloud_health
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .record_failure();
                 Err(e)
             }
         }
@@ -332,20 +408,29 @@ impl FallbackRouter {
 
     /// Get current health status of local provider.
     pub fn local_health(&self) -> ProviderHealth {
-        self.local_health.lock().unwrap().clone()
+        self.local_health
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Get current health status of cloud provider.
     pub fn cloud_health(&self) -> ProviderHealth {
-        self.cloud_health.lock().unwrap().clone()
+        self.cloud_health
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 
 /// Get current timestamp in seconds since UNIX epoch.
+///
+/// Returns 0 if system time is somehow before UNIX_EPOCH (should never happen
+/// on real systems, but handles the edge case gracefully without panicking).
 fn current_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("Time went backwards")
+        .unwrap_or_default()
         .as_secs()
 }
 
@@ -618,4 +703,10 @@ mod tests {
         assert!(health.last_failure.is_none());
         assert!(health.is_healthy);
     }
+
+    // Note: Auto-recovery based on cooldown timer is not tested here because it
+    // requires mocking system time. The check_recovery() logic is simple (compare
+    // timestamps) and is exercised in the integration flow via the generate() method.
+    // For production use, consider adding a test with a mock time provider if this
+    // becomes critical path code.
 }
