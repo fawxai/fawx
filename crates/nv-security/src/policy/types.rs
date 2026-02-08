@@ -1,8 +1,14 @@
 //! Policy types for action evaluation.
+//!
+//! This module defines the core types used by the policy engine to evaluate
+//! actions against security policies loaded from TOML configuration files.
 
 use serde::Deserialize;
 
 /// Decision made by the policy engine for an action.
+///
+/// This enum represents the security verdict for a proposed action.
+/// The policy engine evaluates rules and returns one of these decisions.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PolicyDecision {
     /// Action is allowed without confirmation
@@ -16,6 +22,10 @@ pub enum PolicyDecision {
 }
 
 /// A policy rule defining how to handle specific actions.
+///
+/// Rules match action patterns (with optional glob wildcards) and specify
+/// the security decision to apply. Rules are evaluated in order, with the
+/// first match winning.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PolicyRule {
     /// Action pattern (supports glob wildcards like "delete_*")
@@ -31,6 +41,10 @@ pub struct PolicyRule {
 }
 
 /// Conditions that must be met for a rule to apply.
+///
+/// **Note:** Conditions are currently parsed from TOML but not yet evaluated
+/// by the policy engine. They will be implemented in a future update.
+/// For now, rules match based on action patterns only.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
 pub enum Condition {
@@ -57,6 +71,9 @@ pub enum Condition {
 }
 
 /// Root policy configuration loaded from TOML.
+///
+/// This is the top-level structure deserialized from policy TOML files.
+/// It contains a default decision and a list of rules to evaluate.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PolicyConfig {
     /// Default policy when no rules match
@@ -67,6 +84,9 @@ pub struct PolicyConfig {
 }
 
 /// Default policy decision.
+///
+/// Specifies what decision to make when no rules match an action.
+/// Common values: "allow", "deny", "confirm".
 #[derive(Debug, Clone, Deserialize)]
 pub struct DefaultPolicy {
     /// Default decision type: "allow", "deny", or "confirm"

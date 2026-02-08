@@ -49,8 +49,21 @@ impl PolicyEngine {
     ///
     /// # Returns
     /// PolicyDecision for the action
+    ///
+    /// # Note
+    /// Currently only evaluates action patterns. The following ActionStep fields
+    /// are not yet used in evaluation:
+    /// - `target` - Future: could be used for condition matching
+    /// - `parameters` - Future: could be used for parameter validation
+    /// - `confirmation_required` - Future: could override policy decision
+    ///
+    /// TODO: Implement condition evaluation (PolicyRule.conditions) to check:
+    /// - Time of day constraints
+    /// - App target matching
+    /// - Contact target matching
     pub fn evaluate_action(&self, action: &ActionStep) -> PolicyDecision {
         // Find first matching rule
+        // TODO: Check rule.conditions here once condition evaluation is implemented
         for rule in &self.config.rules {
             if matches_pattern(&rule.action, &action.action) {
                 return rule_to_decision(rule);
@@ -76,14 +89,27 @@ impl PolicyEngine {
     }
 }
 
-/// Check if an action matches a pattern (supports glob wildcards).
+/// Check if an action matches a pattern (simple wildcard support).
 ///
 /// # Arguments
-/// * `pattern` - Pattern string (supports "*" wildcard at end)
+/// * `pattern` - Pattern string (supports "*" wildcard at end only)
 /// * `action` - Action name to match
 ///
 /// # Returns
 /// `true` if action matches pattern
+///
+/// # Limitations
+/// This is a simple pattern matcher that only supports:
+/// - Exact matches: "launch_app" matches "launch_app"
+/// - Trailing wildcards: "delete_*" matches "delete_file", "delete_contact"
+///
+/// NOT supported (may be added in future):
+/// - Leading wildcards: "*_file"
+/// - Mid-string wildcards: "delete_*_file"
+/// - Multiple wildcards: "delete_*_*"
+/// - Glob syntax: "delete_{file,contact}"
+///
+/// TODO: Consider using a full glob library (e.g., `globset`) for richer matching
 fn matches_pattern(pattern: &str, action: &str) -> bool {
     if let Some(prefix) = pattern.strip_suffix('*') {
         // Wildcard match: "delete_*" matches "delete_file", "delete_contact", etc.

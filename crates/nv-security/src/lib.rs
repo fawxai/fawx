@@ -5,5 +5,5 @@
 
 pub mod policy;
 
-// Re-export main policy types
-pub use policy::{PolicyDecision, PolicyEngine};
+// Re-export main policy types for convenience
+pub use policy::{sign_policy, verify_policy, PolicyDecision, PolicyEngine, RateLimiter};

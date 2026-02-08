@@ -335,6 +335,76 @@ decision = "invalid"
     }
 
     #[test]
+    fn test_rate_limiter_zero_max_count() {
+        let mut limiter = RateLimiter::new();
+        limiter.add_limit("action".to_string(), 0, 1000);
+
+        // With max_count=0, every check should be rate limited
+        match limiter.check("action") {
+            PolicyDecision::RateLimit { .. } => {}
+            _ => panic!("Expected RateLimit with max_count=0"),
+        }
+    }
+
+    #[test]
+    fn test_policy_engine_from_file_missing() {
+        use std::path::Path;
+
+        let result = PolicyEngine::from_file(Path::new("/nonexistent/path/policy.toml"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_mid_string_wildcard_not_supported() {
+        let toml = r#"[default]
+decision = "allow"
+
+[[rules]]
+action = "delete_*_file"
+decision = "deny"
+"#;
+
+        let engine = PolicyEngine::from_toml(toml).unwrap();
+
+        // Mid-string wildcards are not supported, so this should use default
+        let step = create_step("1", "delete_temp_file", "target");
+        assert!(matches!(
+            engine.evaluate_action(&step),
+            PolicyDecision::Allow
+        ));
+    }
+
+    #[test]
+    fn test_leading_wildcard_not_supported() {
+        let toml = r#"[default]
+decision = "allow"
+
+[[rules]]
+action = "*_file"
+decision = "deny"
+"#;
+
+        let engine = PolicyEngine::from_toml(toml).unwrap();
+
+        // Leading wildcards are not supported, so this should use default
+        let step = create_step("1", "delete_file", "target");
+        assert!(matches!(
+            engine.evaluate_action(&step),
+            PolicyDecision::Allow
+        ));
+    }
+
+    #[test]
+    fn test_rate_limiter_very_large_window() {
+        let mut limiter = RateLimiter::new();
+        // Very large window (1 year in ms)
+        limiter.add_limit("action".to_string(), 5, 31_536_000_000);
+
+        // Should not overflow or panic
+        assert!(matches!(limiter.check("action"), PolicyDecision::Allow));
+    }
+
+    #[test]
     fn test_complex_toml_structure() {
         let toml = r#"
             [default]

@@ -1,4 +1,35 @@
 //! Policy file signing and verification using HMAC-SHA256.
+//!
+//! This module provides cryptographic signing for policy files to detect
+//! tampering or unauthorized modifications.
+//!
+//! # Usage Example
+//!
+//! ```ignore
+//! use nv_security::policy::{PolicyEngine, sign_policy, verify_policy};
+//! use std::fs;
+//!
+//! // Sign a policy file
+//! let policy_content = fs::read("policy.toml")?;
+//! let key = b"my_secret_key";
+//! let signature = sign_policy(&policy_content, key);
+//! fs::write("policy.toml.sig", signature)?;
+//!
+//! // Verify and load policy
+//! let policy_content = fs::read("policy.toml")?;
+//! let signature = fs::read("policy.toml.sig")?;
+//! let key = b"my_secret_key";
+//!
+//! if verify_policy(&policy_content, &signature, key) {
+//!     let engine = PolicyEngine::from_toml(&String::from_utf8(policy_content)?)?;
+//!     // Use engine...
+//! } else {
+//!     eprintln!("Policy signature verification failed!");
+//! }
+//! ```
+//!
+//! **Note:** Signature verification is currently manual. `PolicyEngine::from_file`
+//! does NOT automatically verify signatures. Applications must verify before loading.
 
 use ring::hmac;
 

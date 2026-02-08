@@ -58,6 +58,8 @@ impl RateLimiter {
         // Check if we're over the limit
         if timestamps.len() >= max_count as usize {
             // Calculate how long to wait
+            // Note: For max_count=0, timestamps will be empty. Use 'now' as fallback.
+            // For max_count>0, timestamps is guaranteed non-empty by the check above.
             let oldest_in_window = timestamps.first().copied().unwrap_or(now);
             let wait_ms = (oldest_in_window + window_ms).saturating_sub(now);
             return PolicyDecision::RateLimit { wait_ms };
