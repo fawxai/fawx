@@ -19,6 +19,9 @@ hex = "0.4"
 
 [dev-dependencies]
 tempfile = "3.15"
+# E2E integration tests intentionally depend on multiple crates to test
+# cross-component interactions (agent, skills, storage). This coupling is
+# expected for integration tests and helps verify the full system works together.
 nv-agent = { workspace = true }
 nv-skills = { workspace = true }
 nv-storage = { workspace = true }

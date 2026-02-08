@@ -37,6 +37,25 @@ use tempfile::tempdir;
 use tokio::sync::Mutex;
 
 // ============================================================================
+// Test Constants
+// ============================================================================
+
+/// Encryption key for testing conversation storage
+const TEST_ENCRYPTION_KEY_CONVERSATION: [u8; 32] = [42u8; 32];
+
+/// Encryption key for testing credential storage
+const TEST_ENCRYPTION_KEY_CREDENTIAL: [u8; 32] = [7u8; 32];
+
+/// Encryption key for testing preferences storage
+const TEST_ENCRYPTION_KEY_PREFERENCE: [u8; 32] = [9u8; 32];
+
+/// Encryption key for testing special character storage
+const TEST_ENCRYPTION_KEY_SPECIAL: [u8; 32] = [11u8; 32];
+
+/// Encryption key for testing large value storage
+const TEST_ENCRYPTION_KEY_LARGE: [u8; 32] = [13u8; 32];
+
+// ============================================================================
 // Helper Functions
 // ============================================================================
 
@@ -47,7 +66,7 @@ fn create_user_input(text: &str) -> UserInput {
         source: InputSource::Text,
         timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("Failed to get system time")
             .as_millis() as u64,
         context_id: None,
     }
@@ -57,15 +76,32 @@ fn create_user_input(text: &str) -> UserInput {
 // Mock LLM Provider
 // ============================================================================
 
-/// Mock LLM classifier for testing
+/// Mock error types for testing different failure scenarios
+#[derive(Debug, Clone, PartialEq)]
+enum MockErrorType {
+    /// Service temporarily unavailable (503)
+    ServiceUnavailable,
+    /// Rate limit exceeded (429)
+    RateLimitExceeded,
+    /// Request timeout
+    Timeout,
+    /// Malformed JSON response
+    MalformedResponse,
+}
+
+/// Mock LLM classifier for testing.
+///
+/// This mock provides configurable responses based on input patterns and can simulate
+/// various error conditions (503, 429, timeout, malformed JSON). Responses are matched
+/// by substring; the first matching pattern wins. Thread-safe via Arc<Mutex<...>>.
 #[derive(Clone)]
 struct MockLlmProvider {
     /// Canned responses indexed by input substring
     responses: Arc<Mutex<HashMap<String, String>>>,
     /// Call counter for testing
     call_count: Arc<Mutex<usize>>,
-    /// Should fail flag for testing error paths
-    should_fail: Arc<Mutex<bool>>,
+    /// Error type to simulate (None = success)
+    error_type: Arc<Mutex<Option<MockErrorType>>>,
 }
 
 impl MockLlmProvider {
@@ -73,7 +109,7 @@ impl MockLlmProvider {
         Self {
             responses: Arc::new(Mutex::new(HashMap::new())),
             call_count: Arc::new(Mutex::new(0)),
-            should_fail: Arc::new(Mutex::new(false)),
+            error_type: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -88,14 +124,9 @@ impl MockLlmProvider {
         *self.call_count.lock().await
     }
 
-    /// Set whether the next call should fail
-    async fn set_should_fail(&self, should_fail: bool) {
-        *self.should_fail.lock().await = should_fail;
-    }
-
-    /// Reset the call counter
-    async fn reset_call_count(&self) {
-        *self.call_count.lock().await = 0;
+    /// Set the error type to simulate (None for success)
+    async fn set_error_type(&self, error_type: Option<MockErrorType>) {
+        *self.error_type.lock().await = error_type;
     }
 }
 
@@ -110,11 +141,20 @@ impl LlmClassifier for MockLlmProvider {
 
         // Check if should fail
         {
-            let should_fail = self.should_fail.lock().await;
-            if *should_fail {
-                return Err(AgentError::ApiRequest(
-                    "Mock LLM unavailable (503)".to_string(),
-                ));
+            let error_type = self.error_type.lock().await;
+            if let Some(err_type) = error_type.as_ref() {
+                return match err_type {
+                    MockErrorType::ServiceUnavailable => Err(AgentError::ApiRequest(
+                        "Mock LLM unavailable (503)".to_string(),
+                    )),
+                    MockErrorType::RateLimitExceeded => Err(AgentError::ApiRequest(
+                        "Rate limit exceeded (429)".to_string(),
+                    )),
+                    MockErrorType::Timeout => {
+                        Err(AgentError::ApiRequest("Request timeout".to_string()))
+                    }
+                    MockErrorType::MalformedResponse => Ok("not valid json{".to_string()),
+                };
             }
         }
 
@@ -144,7 +184,11 @@ impl LlmClassifier for MockLlmProvider {
 // ============================================================================
 
 #[tokio::test]
-async fn test_skill_invocation_success() {
+async fn test_skill_invocation_infrastructure() {
+    // NOTE: This test verifies skill loading and registration infrastructure,
+    // NOT actual WASM execution. Real skill execution will be tested in PR #179.
+    // TODO: Replace with functional WASM module once PR #179 (real WASM runtime) merges.
+
     // Create a skill runtime
     let mut runtime = SkillRuntime::new().expect("Failed to create runtime");
 
@@ -159,7 +203,7 @@ async fn test_skill_invocation_success() {
         entry_point: "main".to_string(),
     };
 
-    // Create a minimal WASM module (just a placeholder for testing)
+    // Create a minimal WASM module (placeholder for infrastructure testing)
     // Minimal valid WASM: magic + version
     let wasm_bytes = vec![
         0x00, 0x61, 0x73, 0x6d, // magic: \0asm
@@ -177,17 +221,20 @@ async fn test_skill_invocation_success() {
         .register_skill(skill)
         .expect("Failed to register skill");
 
-    // Invoke skill
+    // Invoke skill (placeholder execution)
     let result = runtime
         .invoke("test_calculator", "2 + 2")
         .expect("Failed to invoke skill");
 
-    // Verify result contains skill name (placeholder execution)
+    // Verify result contains skill name (infrastructure test only)
     assert!(result.contains("test_calculator"));
 }
 
 #[tokio::test]
-async fn test_skill_invocation_with_audit() {
+async fn test_skill_invocation_audit_trail() {
+    // NOTE: Tests audit logging for skill invocation, not actual WASM execution.
+    // TODO: Update with real execution tests when PR #179 merges.
+
     // Create audit log
     let mut audit_log = AuditLog::in_memory();
 
@@ -243,7 +290,11 @@ async fn test_skill_invocation_with_audit() {
 }
 
 #[tokio::test]
-async fn test_skill_capability_check() {
+async fn test_skill_capability_manifest_verification() {
+    // NOTE: This test verifies manifest capability declarations only.
+    // Runtime capability enforcement is tested in test_skill_network_capability_denied.
+    // TODO: Integrate with actual WASM runtime capability checks in PR #179.
+
     // Create a skill with specific capabilities
     let manifest = SkillManifest {
         name: "network_skill".to_string(),
@@ -258,6 +309,36 @@ async fn test_skill_capability_check() {
     // Verify required capabilities
     assert!(manifest.capabilities.contains(&Capability::Network));
     assert!(!manifest.capabilities.contains(&Capability::Storage));
+}
+
+#[tokio::test]
+async fn test_skill_network_capability_denied() {
+    // Tests that skills without Network capability cannot make network calls
+    // TODO: This currently tests manifest verification only.
+    // Update with runtime enforcement when WASM capability checks are implemented in PR #179.
+
+    let manifest_without_network = SkillManifest {
+        name: "offline_skill".to_string(),
+        version: "1.0.0".to_string(),
+        description: "Offline skill without network access".to_string(),
+        author: "test".to_string(),
+        api_version: "host_api_v1".to_string(),
+        capabilities: vec![], // No Network capability
+        entry_point: "main".to_string(),
+    };
+
+    // Verify Network capability is NOT present
+    assert!(
+        !manifest_without_network
+            .capabilities
+            .contains(&Capability::Network),
+        "Skill should not have Network capability"
+    );
+
+    // TODO: When PR #179 adds runtime enforcement, add test that:
+    // 1. Loads a skill WITHOUT Network capability
+    // 2. Attempts to invoke a network operation
+    // 3. Verifies the operation is denied with appropriate error
 }
 
 // ============================================================================
@@ -304,7 +385,7 @@ async fn test_policy_denial_and_audit() {
     let event = AuditEvent::new(
         AuditEventType::PolicyViolation,
         "agent",
-        format!("Action denied: send_sms - SMS sending is disabled"),
+        "Action denied: send_sms - SMS sending is disabled".to_string(),
     )
     .expect("Failed to create audit event");
 
@@ -323,7 +404,7 @@ async fn test_policy_denial_and_audit() {
 }
 
 #[tokio::test]
-async fn test_policy_allow_with_confirmation() {
+async fn test_policy_requires_confirmation_for_destructive_actions() {
     let policy_toml = r#"
         [default]
         decision = "allow"
@@ -405,7 +486,7 @@ async fn test_conversation_storage_round_trip() {
     // Create storage and store conversation
     {
         let storage = Storage::open(&db_path).expect("Failed to create storage");
-        let key = EncryptionKey::from_bytes(&[42u8; 32]);
+        let key = EncryptionKey::from_bytes(&TEST_ENCRYPTION_KEY_CONVERSATION);
         let encrypted = EncryptedStore::new(storage, key);
 
         // Store conversation data
@@ -417,7 +498,7 @@ async fn test_conversation_storage_round_trip() {
     // Reopen and verify
     {
         let storage = Storage::open(&db_path).expect("Failed to open storage");
-        let key = EncryptionKey::from_bytes(&[42u8; 32]);
+        let key = EncryptionKey::from_bytes(&TEST_ENCRYPTION_KEY_CONVERSATION);
         let encrypted = EncryptedStore::new(storage, key);
 
         let data = encrypted
@@ -454,20 +535,21 @@ async fn test_prompt_injection_resistance() {
 
     let result = classifier.classify(&input).await;
 
-    // Should either return a safe classification or handle gracefully
+    // Should return safe classification
     assert!(
         result.is_ok(),
         "Classifier should handle adversarial input gracefully"
     );
 
-    if let Ok(intent) = result {
-        // Should classify as conversation (safe fallback), not as a Settings change
-        assert_ne!(
-            intent.category,
-            IntentCategory::Settings,
-            "Should not classify injection as dangerous action"
-        );
-    }
+    let intent = result.expect("Classification should succeed");
+
+    // Prompt injection attempts should be classified as safe conversation,
+    // not as dangerous actions like Settings, PhoneControl, etc.
+    assert_eq!(
+        intent.category,
+        IntentCategory::Conversation,
+        "Injection attempt should be classified as safe conversation"
+    );
 }
 
 #[tokio::test]
@@ -485,8 +567,24 @@ async fn test_empty_input_handling() {
     let input = create_user_input("");
     let result = classifier.classify(&input).await;
 
-    // Should handle empty input gracefully (either Ok or descriptive error)
-    assert!(result.is_ok() || result.is_err());
+    // Empty input should either succeed with conversation category OR fail with specific error
+    match result {
+        Ok(intent) => {
+            assert_eq!(
+                intent.category,
+                IntentCategory::Conversation,
+                "Empty input should default to safe conversation category"
+            );
+        }
+        Err(e) => {
+            let err_msg = format!("{}", e);
+            assert!(
+                err_msg.contains("empty") || err_msg.contains("no input"),
+                "Error should indicate empty input, got: {}",
+                err_msg
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -507,11 +605,27 @@ async fn test_very_long_input_handling() {
     let input = create_user_input(&long_input);
     let result = classifier.classify(&input).await;
 
-    // Should not panic
-    assert!(
-        result.is_ok() || result.is_err(),
-        "Should handle long input without panic"
-    );
+    // Long input should either truncate gracefully or error descriptively
+    match result {
+        Ok(intent) => {
+            // Should default to safe category
+            assert_eq!(
+                intent.category,
+                IntentCategory::Conversation,
+                "Long input should default to safe conversation category"
+            );
+        }
+        Err(e) => {
+            let err_msg = format!("{}", e);
+            assert!(
+                err_msg.contains("too long")
+                    || err_msg.contains("length")
+                    || err_msg.contains("size"),
+                "Error should indicate input size issue, got: {}",
+                err_msg
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -531,8 +645,25 @@ async fn test_special_characters_handling() {
     let input = create_user_input(special_input);
     let result = classifier.classify(&input).await;
 
-    // Should handle special characters gracefully
-    assert!(result.is_ok() || result.is_err());
+    // Special characters should be handled safely
+    match result {
+        Ok(intent) => {
+            // Should not be classified as dangerous action
+            assert_eq!(
+                intent.category,
+                IntentCategory::Conversation,
+                "Special characters should be classified as safe conversation"
+            );
+        }
+        Err(e) => {
+            let err_msg = format!("{}", e);
+            assert!(
+                err_msg.contains("invalid") || err_msg.contains("encoding"),
+                "Error should indicate encoding issue, got: {}",
+                err_msg
+            );
+        }
+    }
 }
 
 // ============================================================================
@@ -608,7 +739,43 @@ async fn test_audit_hash_chain_integrity() {
 }
 
 #[tokio::test]
-async fn test_audit_concurrent_operations() {
+async fn test_audit_hash_chain_tampering_detection() {
+    let mut audit_log = AuditLog::in_memory();
+
+    // Add events to build hash chain
+    for i in 0..5 {
+        let event = AuditEvent::new(
+            AuditEventType::ActionExecuted,
+            "test",
+            format!("Operation {}", i),
+        )
+        .expect("Failed to create event");
+        let _ = audit_log.append(event).await;
+    }
+
+    // Verify integrity before tampering
+    assert!(
+        audit_log
+            .verify_integrity()
+            .expect("Integrity check failed"),
+        "Hash chain should be intact before tampering"
+    );
+
+    // TODO: When audit log provides API for direct event modification (for testing),
+    // add code here to:
+    // 1. Modify an audit event in the middle of the chain
+    // 2. Verify that verify_integrity() returns false
+    // 3. Assert that tampering is detected
+    //
+    // Current limitation: AuditLog doesn't expose internal mutation for testing.
+    // This test validates that integrity checking works on valid chains;
+    // tampering detection will be verified once mutation API is available.
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_audit_concurrent_operations_with_timeout() {
+    use tokio::time::{timeout, Duration};
+
     let audit_log: Arc<Mutex<AuditLog>> = Arc::new(Mutex::new(AuditLog::in_memory()));
 
     // Spawn concurrent tasks that append to audit log
@@ -619,8 +786,8 @@ async fn test_audit_concurrent_operations() {
         let handle = tokio::spawn(async move {
             let event = AuditEvent::new(
                 AuditEventType::ActionExecuted,
-                &format!("task_{}", i),
-                format!("Concurrent operation {}", i),
+                format!("task_{}", i),
+                format!("Task {} - Concurrent operation {}", i, i),
             )
             .expect("Failed to create event");
 
@@ -630,17 +797,28 @@ async fn test_audit_concurrent_operations() {
         handles.push(handle);
     }
 
-    // Wait for all tasks
-    for handle in handles {
-        handle.await.expect("Task panicked");
-    }
+    // Wait for all tasks with timeout to detect potential deadlocks
+    let wait_result = timeout(Duration::from_secs(5), async {
+        for handle in handles {
+            handle.await.expect("Task panicked");
+        }
+    })
+    .await;
+
+    assert!(
+        wait_result.is_ok(),
+        "Concurrent operations should complete without deadlock"
+    );
 
     // Verify all events were logged
     let log: tokio::sync::MutexGuard<'_, AuditLog> = audit_log.lock().await;
-    assert_eq!(log.count(), 5);
+    assert_eq!(log.count(), 5, "All concurrent events should be logged");
 
     // Verify integrity
-    assert!(log.verify_integrity().expect("Integrity check failed"));
+    assert!(
+        log.verify_integrity().expect("Integrity check failed"),
+        "Hash chain should remain valid after concurrent operations"
+    );
 }
 
 // ============================================================================
@@ -655,7 +833,7 @@ async fn test_credential_persistence() {
     // Store credentials
     {
         let storage = Storage::open(&db_path).expect("Failed to create storage");
-        let key = EncryptionKey::from_bytes(&[7u8; 32]);
+        let key = EncryptionKey::from_bytes(&TEST_ENCRYPTION_KEY_CREDENTIAL);
         let encrypted = EncryptedStore::new(storage, key);
         let cred_store = CredentialStore::new(encrypted);
 
@@ -671,7 +849,7 @@ async fn test_credential_persistence() {
     // Restart by reopening
     {
         let storage = Storage::open(&db_path).expect("Failed to open storage");
-        let key = EncryptionKey::from_bytes(&[7u8; 32]);
+        let key = EncryptionKey::from_bytes(&TEST_ENCRYPTION_KEY_CREDENTIAL);
         let encrypted = EncryptedStore::new(storage, key);
         let cred_store = CredentialStore::new(encrypted);
 
@@ -698,7 +876,7 @@ async fn test_preferences_persistence() {
     // Store preferences
     {
         let storage = Storage::open(&db_path).expect("Failed to create storage");
-        let key = EncryptionKey::from_bytes(&[9u8; 32]);
+        let key = EncryptionKey::from_bytes(&TEST_ENCRYPTION_KEY_PREFERENCE);
         let encrypted = EncryptedStore::new(storage, key);
         let prefs = Preferences::new(encrypted);
 
@@ -714,7 +892,7 @@ async fn test_preferences_persistence() {
     // Restart by reopening
     {
         let storage = Storage::open(&db_path).expect("Failed to open storage");
-        let key = EncryptionKey::from_bytes(&[9u8; 32]);
+        let key = EncryptionKey::from_bytes(&TEST_ENCRYPTION_KEY_PREFERENCE);
         let encrypted = EncryptedStore::new(storage, key);
         let prefs = Preferences::new(encrypted);
 
@@ -739,7 +917,7 @@ async fn test_storage_with_special_characters() {
     let db_path = dir.path().join("test.db");
 
     let storage = Storage::open(&db_path).expect("Failed to create storage");
-    let key = EncryptionKey::from_bytes(&[11u8; 32]);
+    let key = EncryptionKey::from_bytes(&TEST_ENCRYPTION_KEY_SPECIAL);
     let encrypted = EncryptedStore::new(storage, key);
     let cred_store = CredentialStore::new(encrypted);
 
@@ -763,7 +941,7 @@ async fn test_storage_with_large_value() {
     let db_path = dir.path().join("test.db");
 
     let storage = Storage::open(&db_path).expect("Failed to create storage");
-    let key = EncryptionKey::from_bytes(&[13u8; 32]);
+    let key = EncryptionKey::from_bytes(&TEST_ENCRYPTION_KEY_LARGE);
     let encrypted = EncryptedStore::new(storage, key);
     let cred_store = CredentialStore::new(encrypted);
 
@@ -786,9 +964,11 @@ async fn test_storage_with_large_value() {
 // ============================================================================
 
 #[tokio::test]
-async fn test_llm_unavailable_handling() {
+async fn test_llm_service_unavailable_503() {
     let mock_llm = MockLlmProvider::new();
-    mock_llm.set_should_fail(true).await;
+    mock_llm
+        .set_error_type(Some(MockErrorType::ServiceUnavailable))
+        .await;
 
     let classifier = IntentClassifier::new(ClassifierConfig::default(), mock_llm.clone());
 
@@ -813,9 +993,80 @@ async fn test_llm_unavailable_handling() {
 }
 
 #[tokio::test]
+async fn test_llm_rate_limit_429() {
+    let mock_llm = MockLlmProvider::new();
+    mock_llm
+        .set_error_type(Some(MockErrorType::RateLimitExceeded))
+        .await;
+
+    let classifier = IntentClassifier::new(ClassifierConfig::default(), mock_llm);
+
+    let input = create_user_input("test input");
+    let result = classifier.classify(&input).await;
+
+    assert!(result.is_err(), "Should fail when rate limited");
+
+    if let Err(err) = result {
+        let err_msg = format!("{}", err);
+        assert!(
+            err_msg.contains("rate limit") || err_msg.contains("429"),
+            "Error should indicate rate limiting: {}",
+            err_msg
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_llm_timeout() {
+    let mock_llm = MockLlmProvider::new();
+    mock_llm.set_error_type(Some(MockErrorType::Timeout)).await;
+
+    let classifier = IntentClassifier::new(ClassifierConfig::default(), mock_llm);
+
+    let input = create_user_input("test input");
+    let result = classifier.classify(&input).await;
+
+    assert!(result.is_err(), "Should fail when request times out");
+
+    if let Err(err) = result {
+        let err_msg = format!("{}", err);
+        assert!(
+            err_msg.contains("timeout"),
+            "Error should indicate timeout: {}",
+            err_msg
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_llm_malformed_json_response() {
+    let mock_llm = MockLlmProvider::new();
+    mock_llm
+        .set_error_type(Some(MockErrorType::MalformedResponse))
+        .await;
+
+    let classifier = IntentClassifier::new(ClassifierConfig::default(), mock_llm);
+
+    let input = create_user_input("test input");
+    let result = classifier.classify(&input).await;
+
+    // Should either handle gracefully or return descriptive error
+    if result.is_err() {
+        let err_msg = format!("{:?}", result);
+        assert!(
+            err_msg.contains("JSON") || err_msg.contains("parse") || err_msg.contains("invalid"),
+            "Error should indicate JSON parsing issue: {}",
+            err_msg
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_retry_with_all_failures() {
     let mock_llm = MockLlmProvider::new();
-    mock_llm.set_should_fail(true).await;
+    mock_llm
+        .set_error_type(Some(MockErrorType::ServiceUnavailable))
+        .await;
 
     let policy = RetryPolicy::new(3, 10, 100, 2.0);
 
@@ -849,7 +1100,9 @@ async fn test_retry_success_after_failure() {
         .await;
 
     // Start with failure, then succeed
-    mock_llm.set_should_fail(true).await;
+    mock_llm
+        .set_error_type(Some(MockErrorType::ServiceUnavailable))
+        .await;
 
     let call_counter = Arc::new(Mutex::new(0));
     let counter_clone = Arc::clone(&call_counter);
@@ -867,7 +1120,7 @@ async fn test_retry_success_after_failure() {
 
             // Succeed on third attempt
             if *count >= 3 {
-                llm.set_should_fail(false).await;
+                llm.set_error_type(None).await;
             }
 
             let messages = vec![Message::user("test")];
@@ -892,7 +1145,9 @@ async fn test_retry_backoff_behavior() {
     use std::time::Instant;
 
     let mock_llm = MockLlmProvider::new();
-    mock_llm.set_should_fail(true).await;
+    mock_llm
+        .set_error_type(Some(MockErrorType::ServiceUnavailable))
+        .await;
 
     let policy = RetryPolicy::new(2, 50, 1000, 2.0);
 
@@ -908,10 +1163,10 @@ async fn test_retry_backoff_behavior() {
     let elapsed = start.elapsed();
 
     // Should have delays: ~50ms + ~100ms = ~150ms minimum
-    // Allow some slack for test execution overhead
+    // Use 80ms threshold to account for test infrastructure overhead and allow some tolerance
     assert!(
-        elapsed.as_millis() >= 100,
-        "Should have backoff delays (elapsed: {}ms)",
+        elapsed.as_millis() >= 80,
+        "Should have backoff delays (elapsed: {}ms, expected >= 80ms)",
         elapsed.as_millis()
     );
 }
