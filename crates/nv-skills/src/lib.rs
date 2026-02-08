@@ -1,28 +1,30 @@
 //! WASM skill runtime with capability enforcement.
 //!
 //! Loads and executes signed WASM skills with enforced security boundaries.
+//!
+//! # Architecture
+//!
+//! - **Manifest**: Skill metadata, capabilities, and API version contract
+//! - **HostApi**: Host functions exposed to WASM skills (host_api_v1)
+//! - **Capabilities**: Runtime enforcement of declared permissions
+//! - **Storage**: Isolated key-value storage with quota enforcement
+//! - **Signing**: Ed25519 signature generation and verification
+//! - **Loader**: Skill loading with signature verification
+//! - **Runtime**: Skill registration and invocation
 
-/// WASM skill runtime.
-///
-/// Manages loading, verification, and execution of WASM skills.
-pub struct SkillRuntime {
-    // Placeholder - will be implemented in Epic 8
-}
+pub mod capabilities;
+pub mod host_api;
+pub mod loader;
+pub mod manifest;
+pub mod runtime;
+pub mod signing;
+pub mod storage;
 
-impl SkillRuntime {
-    /// Create a new skill runtime.
-    pub fn new() -> Self {
-        Self {}
-    }
-}
-
-impl Default for SkillRuntime {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// A loaded WASM skill.
-pub struct LoadedSkill {
-    // Placeholder
-}
+// Re-export commonly used types
+pub use capabilities::CapabilityChecker;
+pub use host_api::{HostApi, MockHostApi};
+pub use loader::{LoadedSkill, SkillLoader};
+pub use manifest::{parse_manifest, validate_manifest, Capability, SkillManifest};
+pub use runtime::SkillRuntime;
+pub use signing::{generate_keypair, sign_skill, verify_skill};
+pub use storage::SkillStorage;
