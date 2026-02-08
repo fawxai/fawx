@@ -355,7 +355,7 @@ decision = "invalid"
     }
 
     #[test]
-    fn test_mid_string_wildcard_not_supported() {
+    fn test_mid_string_wildcard_supported() {
         let toml = r#"[default]
 decision = "allow"
 
@@ -366,16 +366,16 @@ decision = "deny"
 
         let engine = PolicyEngine::from_toml(toml).unwrap();
 
-        // Mid-string wildcards are not supported, so this should use default
+        // Mid-string wildcards are now supported!
         let step = create_step("1", "delete_temp_file", "target");
         assert!(matches!(
             engine.evaluate_action(&step),
-            PolicyDecision::Allow
+            PolicyDecision::Deny { .. }
         ));
     }
 
     #[test]
-    fn test_leading_wildcard_not_supported() {
+    fn test_leading_wildcard_supported() {
         let toml = r#"[default]
 decision = "allow"
 
@@ -386,11 +386,11 @@ decision = "deny"
 
         let engine = PolicyEngine::from_toml(toml).unwrap();
 
-        // Leading wildcards are not supported, so this should use default
+        // Leading wildcards are now supported!
         let step = create_step("1", "delete_file", "target");
         assert!(matches!(
             engine.evaluate_action(&step),
-            PolicyDecision::Allow
+            PolicyDecision::Deny { .. }
         ));
     }
 

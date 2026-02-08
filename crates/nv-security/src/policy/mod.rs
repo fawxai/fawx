@@ -25,6 +25,7 @@ pub mod engine;
 pub mod rate_limit;
 pub mod signing;
 pub mod types;
+pub mod util;
 
 #[cfg(test)]
 mod tests;
@@ -34,3 +35,4 @@ pub use engine::PolicyEngine;
 pub use rate_limit::RateLimiter;
 pub use signing::{sign_policy, verify_policy};
 pub use types::{Condition, DefaultPolicy, PolicyConfig, PolicyDecision, PolicyRule};
+pub use util::matches_action;
