@@ -11,12 +11,11 @@
 
 1. [Vision](#1-vision)
 2. [Strategic Roadmap](#2-strategic-roadmap)
-3. [Phase 0.5: Mac Mini Pre-PoC](#3-phase-05-mac-mini-pre-poc)
-4. [Horizon 1: Android Proof of Concept](#4-horizon-1-android-proof-of-concept)
-5. [Horizon 2: AI-Native Operating System](#5-horizon-2-ai-native-operating-system)
-6. [Horizon 3: Purpose-Built Hardware](#6-horizon-3-purpose-built-hardware)
-7. [Cross-Cutting Concerns](#7-cross-cutting-concerns)
-8. [Decision Log](#8-decision-log)
+3. [Horizon 1: Android Proof of Concept](#3-horizon-1-android-proof-of-concept)
+4. [Horizon 2: AI-Native Operating System](#4-horizon-2-ai-native-operating-system)
+5. [Horizon 3: Purpose-Built Hardware](#5-horizon-3-purpose-built-hardware)
+6. [Cross-Cutting Concerns](#6-cross-cutting-concerns)
+7. [Decision Log](#7-decision-log)
 
 ---
 
@@ -61,133 +60,38 @@ OpenClaw demonstrated that people desperately want an AI agent that *does things
 ## 2. Strategic Roadmap
 
 ```
-Phase 0.5               Horizon 1                    Horizon 2                    Horizon 3
-Mac Mini Pre-PoC         Android PoC                  AI-Native OS                 Purpose-Built Hardware
-(Weeks 1-8)              (Months 3-12)                (Months 12-28)               (Months 28-48)
+Horizon 1                    Horizon 2                    Horizon 3
+Android PoC                  AI-Native OS                 Purpose-Built Hardware
+(Months 1-12)                (Months 12-28)               (Months 28-48)
 
-Validate the agent       Rust agent daemon on         Replace Android userspace    ODM partnership or
-brain without a phone.   rooted Pixel 8a.             with agent-native runtime.   custom board design.
-All cognition, policy,   Puppets Android UI.          Linux kernel + custom        Hardware trust button,
-skills, storage tested   Proves the value.            compositor + service layer.  NPU-first SoC selection,
-on Mac Mini.             Builds community.            WASM services replace apps.  optimized form factor.
+Rust agent daemon on         Replace Android userspace    ODM partnership or
+rooted Pixel 10 Pro.         with agent-native runtime.   custom board design.
+Puppets Android UI.          Linux kernel + custom        Hardware trust button,
+Proves the value.            compositor + service layer.  NPU-first SoC selection,
+Builds community.            WASM services replace apps.  optimized form factor.
 
-├── Local LLM (llama.cpp)├── Voice control            ├── Custom compositor        ├── Hardware spec
-├── Cloud LLM (Claude)   ├── Touch injection          ├── Telephony (oFono)        ├── ODM selection
-├── Intent classification├── Local LLM inference      ├── Service ecosystem        ├── FCC certification
-├── Agent reasoning loop ├── Cloud escalation         ├── App compat (Waydroid)    ├── Trust button design
-├── Action policy engine ├── WASM skill system        ├── Bluetooth/NFC/USB        ├── NPU optimization
-├── Encrypted storage    ├── Encrypted storage        ├── OTA updates              ├── Form factor R&D
-├── WASM skill runtime   ├── Action policy engine     ├── Multi-device sync        ├── Manufacturing
-├── Phone simulator      └── Private skill hub        └── Developer SDK            └── Distribution
-└── CLI REPL
-                         85% of Pre-PoC code          85% of PoC code              OS unchanged;
-                         carries forward.             carries forward.             hardware adapts.
+├── Voice control            ├── Custom compositor        ├── Hardware spec
+├── Touch injection          ├── Telephony (oFono)        ├── ODM selection
+├── Local LLM inference      ├── Service ecosystem        ├── FCC certification
+├── Cloud escalation         ├── App compat (Waydroid)    ├── Trust button design
+├── WASM skill system        ├── Bluetooth/NFC/USB        ├── NPU optimization
+├── Encrypted storage        ├── OTA updates              ├── Form factor R&D
+├── Action policy engine     ├── Multi-device sync        ├── Manufacturing
+└── Private skill hub        └── Developer SDK            └── Distribution
+
+                             85% of PoC code              OS unchanged;
+                             carries forward.             hardware adapts.
 ```
 
 ---
 
-## 3. Phase 0.5: Mac Mini Pre-PoC
+## 3. Horizon 1: Android Proof of Concept
 
-### 3.1 Overview
-
-Before purchasing a phone or touching Android, validate the entire cognitive pipeline on the Mac Mini. The Mac Mini runs ~80% of the final codebase natively — all the "brain" crates (nv-core, nv-agent, nv-llm, nv-storage, nv-security, nv-skills, nv-cli) compile for `aarch64-apple-darwin` with no Android dependencies. llama.cpp and whisper.cpp run faster on Apple Silicon than they will on the Pixel 8a, giving a better development experience.
-
-The pre-PoC answers one question: **Does the agent architecture work?** Can it classify intents, route between local/cloud LLMs, generate multi-step action plans, enforce security policies, execute WASM skills, and maintain conversational context — all before spending $200 on a phone?
-
-### 3.2 What It Is (and Isn't)
-
-- Text-only CLI interaction (`nova chat` REPL). No voice, no phone UI.
-- Real LLM inference: Gemma 3n (local via llama.cpp) + Claude (cloud).
-- Real policy engine, real encryption, real WASM skills, real audit logging.
-- A **phone simulator** (`nv-phone-sim`) provides a mock phone environment the agent plans against. The agent doesn't know it's simulated — it uses the same `PhoneActions` trait the real phone will implement.
-- This is NOT a throwaway prototype. Every line of code carries forward to Horizon 1.
-
-### 3.3 Architecture
-
-```
-┌──────────────────────────────────────────────────────────┐
-│  Mac Mini (aarch64-apple-darwin)                         │
-│                                                          │
-│  nv-cli (REPL) → nv-agent (orchestrator)                 │
-│                     │                                    │
-│       ┌─────────────┼─────────────┐                      │
-│       ▼             ▼             ▼                      │
-│   nv-llm        nv-security   nv-skills                  │
-│   local+cloud   policy engine WASM runtime               │
-│       │             │             │                      │
-│       └─────────────┼─────────────┘                      │
-│                     ▼                                    │
-│              nv-phone-sim                                │
-│              (mock phone with fake apps,                 │
-│               contacts, calendar, notifications)         │
-│                     │                                    │
-│              nv-storage (encrypted KV)                   │
-│              nv-core (audit log)                         │
-└──────────────────────────────────────────────────────────┘
-```
-
-The `PhoneActions` trait is the critical abstraction. Both `SimulatedPhone` and the eventual real `AndroidPhone` implement it. The agent code is identical in both environments.
-
-### 3.4 Duration & Milestones
-
-8 weeks part-time, 4 weeks full-time. Six sprints with detailed epics and tasks defined in the companion **PRE-POC-PRD.md** document.
-
-| Sprint | Weeks | Milestone |
-|---|---|---|
-| Sprint 1 | 1-2 | Cargo workspace compiles, local LLM produces output |
-| Sprint 2 | 3-4 | Intent classification + Claude routing work end-to-end |
-| Sprint 3 | 5 | Policy engine validates plans, encrypted storage works |
-| Sprint 4 | 6 | Agent executes plans against simulated phone |
-| Sprint 5 | 7 | WASM skills load, execute, and enforce capabilities |
-| Sprint 6 | 8 | Full REPL, integration tests, documentation, benchmarks |
-
-### 3.5 Done Criteria
-
-The pre-PoC is complete when:
-- `nova chat` runs interactively with local + cloud LLM routing
-- Action plans are generated, policy-checked, and executed against the simulator
-- At least 2 WASM skills (weather, calculator) are installed and invocable
-- All data at rest is encrypted, audit log verifies integrity
-- Integration test suite passes, performance benchmarks recorded
-- A new developer can clone and run within 15 minutes
-
-**When this checklist is complete, purchase the Pixel 8a and begin Horizon 1.**
-
-### 3.6 Hurdles & Blind Spots
-
-- **llama.cpp on macOS ≠ llama.cpp on Android.** Mac uses Metal GPU; Android uses Vulkan/CPU. Output quality and speed differ at the same quantization level. Don't over-tune prompts to Mac behavior — test with CPU-only mode periodically.
-
-- **The simulator is too easy.** Real apps crash, show interstitial ads, have login screens, change layout across updates. The simulator has none of this. Simulator success validates the reasoning pipeline, not the execution layer. Don't mistake one for the other.
-
-- **Intent classification at 1.7B is marginal.** At ~85% accuracy, 1 in 7 commands misroutes. May need to iterate on prompts or evaluate multiple small models (Qwen3, Phi-4-mini, Gemma 3n) to find the best classifier at the size constraint.
-
-- **`PhoneActions` trait design is load-bearing.** Both the simulator and real phone implement it. Getting the interface wrong now means rewriting every executor and action plan later. Over-design slightly — include methods for the real phone even if the simulator doesn't use them.
-
-- **WASM host API is a permanent contract.** Skills built against `host_api_v1` must keep working forever. Version it from day one. Study WASI conventions before finalizing.
-
-- **Encryption key derivation is permanent.** The KDF parameters (HKDF-SHA256 salt, info string) encrypt all stored data. Changing them later makes existing data unreadable. Define once, document exactly, don't change.
-
-### 3.7 Transition to Horizon 1
-
-After pre-PoC validation:
-1. Add `aarch64-linux-android` cross-compilation target
-2. Swap llama-cpp-sys build from Metal to Android NDK (CPU-only initially)
-3. Implement real `nv-phone` crate behind the `PhoneActions` trait
-4. Build Android companion app (Kotlin)
-5. Add `nv-voice` with whisper.cpp STT and Porcupine wake word
-6. Deploy to Pixel 8a
-
-Estimated transition: 2-3 weeks to first voice command on phone, because the hard problems (reasoning, routing, policy, skills) are already solved.
-
----
-
-## 4. Horizon 1: Android Proof of Concept
-
-### 4.1 What We're Building
+### 3.1 What We're Building
 
 A Rust daemon that runs on a rooted Android phone (Pixel 8a), controlled by voice and a thin overlay UI. It perceives the phone's state (screen content, notifications, sensors), thinks about what to do (local LLM for simple tasks, Claude API for complex reasoning), and acts by directly injecting touch events and controlling apps. All communication with the cloud is outbound-only over a Tailscale mesh.
 
-### 4.2 Target Hardware
+### 3.2 Target Hardware
 
 **Google Pixel 8a** — selected for:
 - Tensor G3 SoC with Edge TPU (optimized for Gemma models)
@@ -197,7 +101,7 @@ A Rust daemon that runs on a rooted Android phone (Pixel 8a), controlled by voic
 - Stock Android with minimal OEM modifications (no Samsung/Xiaomi battery killers)
 - ~$200-250 used, dedicated device (not daily driver)
 
-### 4.3 Architecture
+### 3.3 Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -256,13 +160,13 @@ A Rust daemon that runs on a rooted Android phone (Pixel 8a), controlled by voic
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 4.4 Crate Architecture
+### 3.4 Crate Architecture
 
 ```
 nova/
 ├── Cargo.toml                      # Workspace root
 ├── crates/
-│   ├── nv-core/                    # [Reuse: 100%] Types, config, event bus, errors
+│   ├── nv-core/                    # Types, config, event bus, errors
 │   │   ├── src/
 │   │   │   ├── lib.rs
 │   │   │   ├── config.rs           # JSON5 config, serde validation
@@ -272,7 +176,7 @@ nova/
 │   │   │   └── types.rs            # Shared types (ActionPlan, Intent, etc.)
 │   │   └── Cargo.toml
 │   │
-│   ├── nv-agent/                   # [Reuse: 100%] Agent reasoning loop
+│   ├── nv-agent/                   # Agent reasoning loop
 │   │   ├── src/
 │   │   │   ├── lib.rs
 │   │   │   ├── orchestrator.rs     # Main perception→cognition→action loop
@@ -283,7 +187,7 @@ nova/
 │   │   │   └── feedback.rs         # User feedback protocol (audio/visual)
 │   │   └── Cargo.toml
 │   │
-│   ├── nv-llm/                     # [Reuse: 100%] LLM provider abstraction
+│   ├── nv-llm/                     # LLM provider abstraction
 │   │   ├── src/
 │   │   │   ├── lib.rs
 │   │   │   ├── traits.rs           # Provider trait definition
@@ -296,7 +200,7 @@ nova/
 │   │   │       └── conversation.txt
 │   │   └── Cargo.toml
 │   │
-│   ├── nv-phone/                   # [Reuse: 0% — PoC only] Android puppeting
+│   ├── nv-phone/                   # [Reuse: 0% — Horizon 1 only] Android puppeting
 │   │   ├── src/
 │   │   │   ├── lib.rs
 │   │   │   ├── input.rs            # /dev/input touch injection
@@ -307,7 +211,7 @@ nova/
 │   │   │   └── android_ipc.rs      # Unix socket IPC with companion app
 │   │   └── Cargo.toml
 │   │
-│   ├── nv-voice/                   # [Reuse: 95%] Voice I/O
+│   ├── nv-voice/                   # Voice I/O
 │   │   ├── src/
 │   │   │   ├── lib.rs
 │   │   │   ├── wake_word.rs        # Porcupine integration
@@ -316,7 +220,7 @@ nova/
 │   │   │   └── audio.rs            # Audio capture/playback (CPAL / Android)
 │   │   └── Cargo.toml
 │   │
-│   ├── nv-security/                # [Reuse: 90%] Security subsystem
+│   ├── nv-security/                # Security subsystem
 │   │   ├── src/
 │   │   │   ├── lib.rs
 │   │   │   ├── capabilities.rs     # Linux cap drop, privilege management
@@ -328,7 +232,7 @@ nova/
 │   │   │   └── verify.rs           # Skill signature verification
 │   │   └── Cargo.toml
 │   │
-│   ├── nv-skills/                  # [Reuse: 100%] WASM skill runtime
+│   ├── nv-skills/                  # WASM skill runtime
 │   │   ├── src/
 │   │   │   ├── lib.rs
 │   │   │   ├── runtime.rs          # wasmtime host, instance management
@@ -338,7 +242,7 @@ nova/
 │   │   │   └── manifest.rs         # Skill manifest format
 │   │   └── Cargo.toml
 │   │
-│   ├── nv-sync/                    # [Reuse: 100%] Cloud sync client
+│   ├── nv-sync/                    # Cloud sync client
 │   │   ├── src/
 │   │   │   ├── lib.rs
 │   │   │   ├── client.rs           # Outbound HTTPS to cloud instance
@@ -347,7 +251,7 @@ nova/
 │   │   │   └── skill_updates.rs    # OTA skill update checks
 │   │   └── Cargo.toml
 │   │
-│   ├── nv-storage/                 # [Reuse: 100%] Persistent encrypted storage
+│   ├── nv-storage/                 # Persistent encrypted storage
 │   │   ├── src/
 │   │   │   ├── lib.rs
 │   │   │   ├── kv.rs               # redb key-value store
@@ -356,7 +260,7 @@ nova/
 │   │   │   └── preferences.rs      # User preferences and patterns
 │   │   └── Cargo.toml
 │   │
-│   ├── nv-sensors/                 # [Reuse: 80%] Device state monitoring
+│   ├── nv-sensors/                 # Device state monitoring
 │   │   ├── src/
 │   │   │   ├── lib.rs
 │   │   │   ├── notifications.rs    # Notification watcher
@@ -366,7 +270,7 @@ nova/
 │   │   │   └── triggers.rs         # Event-based trigger engine
 │   │   └── Cargo.toml
 │   │
-│   └── nv-cli/                     # [Reuse: 100%] CLI for management
+│   └── nv-cli/                     # CLI for management
 │       ├── src/
 │       │   ├── main.rs             # Entry point (clap)
 │       │   ├── daemon.rs           # Start/stop daemon
@@ -408,9 +312,9 @@ nova/
         └── Cargo.toml
 ```
 
-### 4.5 Key Design Details
+### 3.5 Key Design Details
 
-#### 4.5.1 The Companion App Is Not Optional
+#### 3.5.1 The Companion App Is Not Optional
 
 On Android, several critical capabilities require a Java/Kotlin process:
 
@@ -422,7 +326,7 @@ On Android, several critical capabilities require a Java/Kotlin process:
 
 The Kotlin companion app hosts all of these and pipes data to the Rust daemon over a local Unix domain socket. The Rust daemon does all the thinking and acting. The Kotlin app is a sensor array and display adapter — deliberately thin.
 
-#### 4.5.2 Process Architecture on Android
+#### 3.5.2 Process Architecture on Android
 
 ```
 init (PID 1)
@@ -441,7 +345,7 @@ init (PID 1)
 
 The Rust daemon starts at boot via a Magisk init.d script. It opens privileged file descriptors (/dev/input for touch, etc.), then drops to an unprivileged user. The companion app starts as a regular Android app and connects to the daemon's Unix socket.
 
-#### 4.5.3 Action Policy Engine
+#### 3.5.3 Action Policy Engine
 
 The policy engine is the hard security boundary between the LLM's output and the phone's execution layer. The LLM's action plans are treated as **untrusted input**.
 
@@ -483,7 +387,7 @@ Category: RATE-LIMITED
 
 The policy engine runs in the same process as the daemon but is architecturally separated — the agent module cannot modify or bypass the policy module. Policy rules are loaded from a signed config file. Changing the policy requires re-signing the config with the user's key.
 
-#### 4.5.4 WASM Skill System
+#### 3.5.4 WASM Skill System
 
 Each skill is a compiled WASM binary with a capability manifest.
 
@@ -508,7 +412,7 @@ schedule = "0 7 * * *"    # Run at 7am daily (proactive morning briefing)
 
 The WASM runtime enforces these capabilities at the boundary. A skill declaring `network = ["api.weather.gov"]` that attempts to make a request to any other domain gets an immediate error. A skill with no `phone_actions` capability cannot call the touch injection API even if it tries. This is enforced at the wasmtime host function level, not by trust.
 
-#### 4.5.5 Communication Model
+#### 3.5.5 Communication Model
 
 ```
 ┌─────────┐              ┌─────────┐
@@ -538,7 +442,7 @@ Push notification alternative (for low-latency remote commands):
   (phone-initiated) with heartbeat.
 ```
 
-#### 4.5.6 Graceful Degradation
+#### 3.5.6 Graceful Degradation
 
 The system must handle failure at every level:
 
@@ -554,7 +458,7 @@ The system must handle failure at every level:
 | Battery below 15% | Suspend proactive behaviors, local-only, no wake word |
 | Storage encryption key unavailable | Refuse to start, require PIN entry |
 
-### 4.6 Build Phases
+### 3.6 Build Phases
 
 #### Phase 0: Foundation (Weeks 1-3)
 
@@ -673,9 +577,9 @@ The system must handle failure at every level:
 
 ---
 
-## 5. Horizon 2: AI-Native Operating System
+## 4. Horizon 2: AI-Native Operating System
 
-### 5.1 What Changes
+### 4.1 What Changes
 
 The PoC runs on top of Android, puppeting its UI. The OS *replaces* Android's userspace while keeping the Linux kernel and hardware abstraction layer.
 
@@ -696,7 +600,7 @@ Android stack:                    NovaOS stack:
 └──────────────┘                 └──────────────┘
 ```
 
-### 5.2 What Transfers from PoC
+### 4.2 What Transfers from PoC
 
 | PoC Crate | OS Role | Changes Needed |
 |---|---|---|
@@ -712,7 +616,7 @@ Android stack:                    NovaOS stack:
 | nv-sensors | System sensors | Direct sysfs/HAL access instead of Android APIs |
 | Android app | **Deleted** | Replaced by native compositor |
 
-### 5.3 New Components Needed
+### 4.3 New Components Needed
 
 | Component | Purpose | Estimated Effort | Build or Adopt |
 |---|---|---|---|
@@ -728,7 +632,7 @@ Android stack:                    NovaOS stack:
 | **Android compat** | Run Android apps (optional) | 3-6 months | Adopt Waydroid (Android in LXC container) |
 | **Init system** | Boot, service management | 2-4 weeks | Adopt s6 or write minimal custom |
 
-### 5.4 The Service Model
+### 4.4 The Service Model
 
 In the OS, WASM skills become full "services" — the equivalent of apps.
 
@@ -765,7 +669,7 @@ Each service declares:
 - **Triggers** it can respond to (new message received, event upcoming, etc.)
 - **UI fragments** it can optionally render (for complex interactions)
 
-### 5.5 Hurdles & Blind Spots for Horizon 2
+### 4.5 Hurdles & Blind Spots for Horizon 2
 
 - **Telephony is the hardest problem.** Cellular baseband communication on Android goes through the Radio Interface Layer (RIL), which is partially proprietary per-modem. oFono supports some modems, but coverage is inconsistent. Qualcomm modems (used in most Android phones) have the best Linux support via QMI protocol, but Samsung Exynos and Google Tensor modems are less documented. On the Pixel 8a, the Tensor modem (Samsung-derived) may require reverse-engineering or using Android's RIL as a compatibility layer. Without telephony, the device can't make calls or send SMS — which makes it a WiFi-only tablet, not a phone. *This is the single biggest risk for Horizon 2.*
 
@@ -781,9 +685,9 @@ Each service declares:
 
 ---
 
-## 6. Horizon 3: Purpose-Built Hardware
+## 5. Horizon 3: Purpose-Built Hardware
 
-### 6.1 When to Engage
+### 5.1 When to Engage
 
 Hardware becomes relevant when:
 - [ ] The PoC is stable and has daily users (even if that's just you)
@@ -792,7 +696,7 @@ Hardware becomes relevant when:
 - [ ] You've identified specific hardware limitations that custom hardware would solve
 - [ ] There's funding or revenue to support a $500K-1.5M minimum hardware investment
 
-### 6.2 Hardware Priorities
+### 5.2 Hardware Priorities
 
 | Priority | What | Why | Available today? |
 |---|---|---|---|
@@ -804,7 +708,7 @@ Hardware becomes relevant when:
 | 6 | Large battery | 6000+ mAh for sustained inference | Yes (some gaming phones) |
 | 7 | Microphone array | Far-field voice pickup, noise cancellation | Partial (most phones have 2-3 mics) |
 
-### 6.3 The Trust Button
+### 5.3 The Trust Button
 
 The one genuinely novel hardware idea. A dedicated physical button (or capacitive sensor) that:
 - Is wired directly to a hardware interrupt, not software-controllable
@@ -817,7 +721,7 @@ This creates a physical air gap between the AI's intentions and irreversible rea
 
 **PoC prototype**: Remap the Pixel 8a's power button or a volume button to serve as the trust button. The remap happens at the kernel level — the agent daemon cannot intercept or simulate it. This validates the UX without custom hardware.
 
-### 6.4 Hardware Paths
+### 5.4 Hardware Paths
 
 | Path | Cost | Timeline | MOQ | Pros | Cons |
 |---|---|---|---|---|---|
@@ -826,7 +730,7 @@ This creates a physical air gap between the AI's intentions and irreversible rea
 | **Reference design modification** | $200K-500K | 8-12 months | 1,000-3,000 | Lower cost, faster, uses proven platform | Less customization, still needs certification |
 | **Full custom** (board + enclosure) | $2M+ | 24-36 months | 10,000+ | Total control, novel form factor | Massive capital and team requirement |
 
-### 6.5 Hurdles & Blind Spots for Horizon 3
+### 5.5 Hurdles & Blind Spots for Horizon 3
 
 - **FCC/CE certification.** Any device with a cellular radio or WiFi transmitter sold in the US requires FCC certification ($50-100K, 3-6 months). If using an existing phone's radio module, the existing certification may apply. If designing a new board, full certification is required. *Mitigation*: Use certified radio modules (Qualcomm/MediaTek reference designs include pre-certified radio modules).
 
@@ -840,9 +744,9 @@ This creates a physical air gap between the AI's intentions and irreversible rea
 
 ---
 
-## 7. Cross-Cutting Concerns
+## 6. Cross-Cutting Concerns
 
-### 7.1 Privacy
+### 6.1 Privacy
 
 The agent sees everything on the phone: messages, photos, location, browsing history, health data. This is inherently more invasive than any existing assistant. The privacy model must be:
 
@@ -853,14 +757,14 @@ The agent sees everything on the phone: messages, photos, location, browsing his
 - **Selective screen blindness**: Apps on the privacy list are not read by the agent.
 - **On-device training never happens**: The local model is static — user data does not train or fine-tune the model.
 
-### 7.2 Legal
+### 6.2 Legal
 
 - **Root voids warranty**: Users must understand this. The setup wizard should include a clear disclosure.
 - **Liability for agent actions**: If the agent sends an embarrassing message or deletes important data, who is responsible? This needs terms of use that clearly state the software is provided as-is and the user bears responsibility for the agent's actions. The confirmation mechanism for sensitive actions is a product feature, not a legal shield.
 - **GDPR/CCPA**: If any user data reaches the cloud instance, data protection regulations apply. The user owns the cloud instance, so they're technically both data controller and data processor. Keep it self-hosted to avoid regulatory complexity.
 - **Wiretapping laws**: In some jurisdictions, recording audio (even locally for STT) may have legal implications. The always-on wake word listener technically processes ambient audio continuously. *Mitigation*: The wake word detector uses a fixed-function model that discards non-wake-word audio immediately. Whisper transcription only runs after wake word detection. Document this clearly.
 
-### 7.3 Testing Strategy
+### 6.3 Testing Strategy
 
 | Level | What | How |
 |---|---|---|
@@ -873,7 +777,7 @@ The agent sees everything on the phone: messages, photos, location, browsing his
 | Battery | Power consumption profiling | Extended battery tests in each power mode |
 | Stress | Memory pressure, model paging | Run inference while opening heavy Android apps |
 
-### 7.4 Metrics to Track
+### 6.4 Metrics to Track
 
 | Metric | Target (PoC) | Target (OS) |
 |---|---|---|
@@ -892,7 +796,7 @@ The agent sees everything on the phone: messages, photos, location, browsing his
 
 ---
 
-## 8. Decision Log
+## 7. Decision Log
 
 Decisions that have been made, with rationale, to avoid revisiting them.
 
