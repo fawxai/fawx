@@ -1,7 +1,7 @@
 # CLAUDE.md - Nova Project
 
 ## Project Overview
-AI-native phone agent. Rust daemon that perceives, thinks, and acts on behalf of the user. Phone-first development: Rust agent daemon + Android NDK cross-compilation + direct device control on rooted Pixel 10 Pro.
+AI-native phone agent. Rust daemon running on a rooted Android phone (Pixel 10 Pro) that perceives, thinks, and acts on behalf of the user. Phone-first development approach: Rust agent daemon + Android NDK cross-compilation + direct device control.
 
 ## Tech Stack
 - Rust (2021 edition)
