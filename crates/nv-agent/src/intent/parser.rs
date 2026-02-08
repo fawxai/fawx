@@ -6,6 +6,9 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use tracing::warn;
 
+/// Maximum length for entity values (characters). Values exceeding this are truncated.
+const MAX_ENTITY_VALUE_LENGTH: usize = 1024;
+
 /// Raw JSON response from Claude for intent classification.
 #[derive(Debug, Deserialize)]
 struct IntentResponse {
@@ -13,6 +16,32 @@ struct IntentResponse {
     confidence: f32,
     #[serde(default)]
     entities: HashMap<String, String>,
+}
+
+/// Truncate entity value if it exceeds maximum length.
+///
+/// Values longer than MAX_ENTITY_VALUE_LENGTH are truncated with "..." appended.
+/// This prevents malicious or accidental extremely long entity values from consuming
+/// excessive memory or causing downstream issues.
+///
+/// # Arguments
+/// * `value` - Entity value to truncate
+///
+/// # Returns
+/// Truncated value if needed, otherwise original value
+fn truncate_entity_value(value: String) -> String {
+    if value.chars().count() > MAX_ENTITY_VALUE_LENGTH {
+        let truncated: String = value.chars().take(MAX_ENTITY_VALUE_LENGTH).collect();
+        warn!(
+            "Entity value exceeds {} chars, truncated from {} to {}",
+            MAX_ENTITY_VALUE_LENGTH,
+            value.chars().count(),
+            truncated.chars().count()
+        );
+        format!("{}...", truncated)
+    } else {
+        value
+    }
 }
 
 /// Parse Claude's JSON response into an Intent.
@@ -65,10 +94,17 @@ pub fn parse_intent_response(raw: &str, original_input: &str) -> Result<Intent, 
     // Map category string to enum
     let category = category_from_str(&response.category);
 
+    // Truncate entity values that exceed maximum length
+    let entities = response
+        .entities
+        .into_iter()
+        .map(|(key, value)| (key, truncate_entity_value(value)))
+        .collect();
+
     Ok(Intent {
         category,
         confidence,
-        entities: response.entities,
+        entities,
         raw_input: original_input.to_string(),
     })
 }
