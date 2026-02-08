@@ -97,7 +97,7 @@ pub fn run() -> anyhow::Result<()> {
 }
 
 fn load_config() -> anyhow::Result<Config> {
-    let config_path = get_config_path();
+    let config_path = get_config_path()?;
 
     if config_path.exists() {
         let content = std::fs::read_to_string(&config_path)?;
@@ -109,11 +109,10 @@ fn load_config() -> anyhow::Result<Config> {
     }
 }
 
-fn get_config_path() -> std::path::PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".nova")
-        .join("config.toml")
+fn get_config_path() -> anyhow::Result<std::path::PathBuf> {
+    let home = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
+    Ok(home.join(".nova").join("config.toml"))
 }
 
 fn redact_sensitive(config: &Config) -> Config {

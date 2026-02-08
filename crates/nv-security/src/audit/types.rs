@@ -75,18 +75,26 @@ pub enum AuditEventType {
 
 impl AuditEvent {
     /// Create a new audit event with a generated UUID and current timestamp
+    /// Get current timestamp in milliseconds since Unix epoch.
+    fn current_timestamp_ms() -> Result<u64, nv_core::error::SecurityError> {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| {
+                nv_core::error::SecurityError::AuditLog(format!("Invalid system time: {}", e))
+            })?
+            .as_millis()
+            .try_into()
+            .map_err(|_| {
+                nv_core::error::SecurityError::AuditLog("Timestamp overflow".to_string())
+            })
+    }
+
     pub fn new(
         event_type: AuditEventType,
         actor: impl Into<String>,
         description: impl Into<String>,
     ) -> Result<Self, nv_core::error::SecurityError> {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| {
-                nv_core::error::SecurityError::AuditLog(format!("Invalid system time: {}", e))
-            })?
-            // Safe until year 2262 (u64::MAX ms from Unix epoch)
-            .as_millis() as u64;
+        let timestamp = Self::current_timestamp_ms()?;
 
         Ok(Self {
             id: uuid::Uuid::new_v4().to_string(),
@@ -105,13 +113,7 @@ impl AuditEvent {
         description: impl Into<String>,
         metadata: BTreeMap<String, String>,
     ) -> Result<Self, nv_core::error::SecurityError> {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| {
-                nv_core::error::SecurityError::AuditLog(format!("Invalid system time: {}", e))
-            })?
-            // Safe until year 2262 (u64::MAX ms from Unix epoch)
-            .as_millis() as u64;
+        let timestamp = Self::current_timestamp_ms()?;
 
         Ok(Self {
             id: uuid::Uuid::new_v4().to_string(),

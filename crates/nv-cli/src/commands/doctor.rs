@@ -58,11 +58,11 @@ pub async fn run() -> anyhow::Result<i32> {
 }
 
 fn check_workspace() -> bool {
-    get_workspace_dir().exists()
+    get_workspace_dir().map(|p| p.exists()).unwrap_or(false)
 }
 
 fn check_config() -> bool {
-    get_config_path().exists()
+    get_config_path().map(|p| p.exists()).unwrap_or(false)
 }
 
 fn check_model() -> bool {
@@ -72,10 +72,13 @@ fn check_model() -> bool {
 }
 
 fn check_storage() -> bool {
-    let storage_dir = get_storage_dir();
+    let storage_dir = match get_storage_dir() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
 
-    // Create directory if it doesn't exist
-    if !storage_dir.exists() && std::fs::create_dir_all(&storage_dir).is_err() {
+    // Create directory if it doesn't exist (create_dir_all is idempotent)
+    if std::fs::create_dir_all(&storage_dir).is_err() {
         return false;
     }
 
@@ -91,7 +94,10 @@ fn check_storage() -> bool {
 }
 
 fn check_audit_log() -> bool {
-    let log_path = get_audit_log_path();
+    let log_path = match get_audit_log_path() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
 
     if !log_path.exists() {
         // No log file yet is fine
@@ -111,22 +117,22 @@ fn check_audit_log() -> bool {
     }
 }
 
-fn get_workspace_dir() -> std::path::PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".nova")
+fn get_workspace_dir() -> anyhow::Result<std::path::PathBuf> {
+    let home = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
+    Ok(home.join(".nova"))
 }
 
-fn get_config_path() -> std::path::PathBuf {
-    get_workspace_dir().join("config.toml")
+fn get_config_path() -> anyhow::Result<std::path::PathBuf> {
+    Ok(get_workspace_dir()?.join("config.toml"))
 }
 
-fn get_storage_dir() -> std::path::PathBuf {
-    get_workspace_dir().join("storage")
+fn get_storage_dir() -> anyhow::Result<std::path::PathBuf> {
+    Ok(get_workspace_dir()?.join("storage"))
 }
 
-fn get_audit_log_path() -> std::path::PathBuf {
-    get_workspace_dir().join("audit.log")
+fn get_audit_log_path() -> anyhow::Result<std::path::PathBuf> {
+    Ok(get_workspace_dir()?.join("audit.log"))
 }
 
 #[cfg(test)]

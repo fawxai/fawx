@@ -107,10 +107,18 @@ impl AuditLog {
             let file = File::open(path)
                 .map_err(|e| SecurityError::AuditLog(format!("Failed to open log: {}", e)))?;
 
+            const MAX_LINE_LENGTH: usize = 1_048_576; // 1MB per entry
             let reader = BufReader::new(file);
             for line in reader.lines() {
                 let line = line
                     .map_err(|e| SecurityError::AuditLog(format!("Failed to read line: {}", e)))?;
+
+                if line.len() > MAX_LINE_LENGTH {
+                    return Err(SecurityError::AuditLog(format!(
+                        "Audit log entry exceeds maximum length ({} bytes)",
+                        line.len()
+                    )));
+                }
 
                 let entry: AuditEntry = serde_json::from_str(&line).map_err(|e| {
                     SecurityError::AuditLog(format!("Failed to parse entry: {}", e))

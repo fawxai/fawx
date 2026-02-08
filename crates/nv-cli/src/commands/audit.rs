@@ -7,7 +7,7 @@ const CROSS_MARK: &str = "\x1b[31m✗\x1b[0m"; // Red X
 
 /// Show recent audit entries
 pub fn show(limit: Option<usize>) -> anyhow::Result<()> {
-    let log_path = get_audit_log_path();
+    let log_path = get_audit_log_path()?;
 
     if !log_path.exists() {
         println!("No audit log found. The log will be created when events are recorded.");
@@ -42,7 +42,7 @@ pub fn show(limit: Option<usize>) -> anyhow::Result<()> {
 
 /// Verify audit log integrity
 pub fn verify() -> anyhow::Result<i32> {
-    let log_path = get_audit_log_path();
+    let log_path = get_audit_log_path()?;
 
     if !log_path.exists() {
         println!("No audit log found.");
@@ -98,11 +98,10 @@ fn format_timestamp(millis: u64) -> String {
     }
 }
 
-fn get_audit_log_path() -> std::path::PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".nova")
-        .join("audit.log")
+fn get_audit_log_path() -> anyhow::Result<std::path::PathBuf> {
+    let home = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
+    Ok(home.join(".nova").join("audit.log"))
 }
 
 #[cfg(test)]
