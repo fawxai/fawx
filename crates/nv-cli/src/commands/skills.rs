@@ -229,6 +229,11 @@ pub async fn list() -> Result<()> {
 
 /// Remove an installed skill.
 pub async fn remove(name: &str) -> Result<()> {
+    // Validate name to prevent path traversal attacks
+    if name.contains("..") || name.contains('/') || name.contains('\\') {
+        anyhow::bail!("Invalid skill name: must not contain path separators or '..'");
+    }
+
     let skills_dir = get_skills_dir()?;
     let skill_dir = skills_dir.join(name);
 

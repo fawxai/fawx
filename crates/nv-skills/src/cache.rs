@@ -85,7 +85,10 @@ pub fn load_cached_module(
 
     // Deserialize module
     // Safety: We've verified the SHA-256 hash of the serialized bytes matches
-    // what we originally wrote. This prevents loading tampered modules.
+    // the stored hash. This detects accidental corruption (bitrot, incomplete writes)
+    // but does NOT prevent malicious tampering, as both files can be modified by
+    // an attacker with write access to the cache directory.
+    // For defense-in-depth, the cache directory should have restricted permissions.
     let module = unsafe { Module::deserialize(engine, &cached_bytes) }.map_err(|e| {
         // If deserialization fails, remove the corrupt cache file
         let _ = fs::remove_file(&cache_path);

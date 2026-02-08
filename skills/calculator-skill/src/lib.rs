@@ -81,25 +81,11 @@ fn evaluate(expr: &str) -> Result<f64, String> {
         return Ok(num);
     }
 
-    // Try to find operators (order of operations: * / + -)
-    // Multiplication
-    if let Some(pos) = expr.rfind('*') {
-        let left = evaluate(&expr[..pos])?;
-        let right = evaluate(&expr[pos + 1..])?;
-        return Ok(left * right);
-    }
+    // Recursive descent: search for lowest-precedence operators first.
+    // Using rfind means the rightmost operator becomes the split point,
+    // giving correct left-to-right associativity.
 
-    // Division
-    if let Some(pos) = expr.rfind('/') {
-        let left = evaluate(&expr[..pos])?;
-        let right = evaluate(&expr[pos + 1..])?;
-        if right == 0.0 {
-            return Err("Division by zero".to_string());
-        }
-        return Ok(left / right);
-    }
-
-    // Addition
+    // Addition (lowest precedence — search first)
     if let Some(pos) = expr.rfind('+') {
         let left = evaluate(&expr[..pos])?;
         let right = evaluate(&expr[pos + 1..])?;
@@ -112,6 +98,23 @@ fn evaluate(expr: &str) -> Result<f64, String> {
         let left = evaluate(&expr[..pos])?;
         let right = evaluate(&expr[pos + 1..])?;
         return Ok(left - right);
+    }
+
+    // Multiplication (higher precedence)
+    if let Some(pos) = expr.rfind('*') {
+        let left = evaluate(&expr[..pos])?;
+        let right = evaluate(&expr[pos + 1..])?;
+        return Ok(left * right);
+    }
+
+    // Division (highest precedence — search last)
+    if let Some(pos) = expr.rfind('/') {
+        let left = evaluate(&expr[..pos])?;
+        let right = evaluate(&expr[pos + 1..])?;
+        if right == 0.0 {
+            return Err("Division by zero".to_string());
+        }
+        return Ok(left / right);
     }
 
     Err(format!("Invalid expression: {}", expr))
