@@ -65,6 +65,7 @@ impl ClaudeClient {
             input_tokens: 0,
             output_tokens: 0,
         };
+        let mut stop_reason = StopReason::EndTurn;
 
         while let Some(chunk) = stream.next().await {
             let chunk =
@@ -84,6 +85,12 @@ impl ClaudeClient {
 
                     match event.event_type.as_str() {
                         "content_block_start" => {
+                            // Handle ToolUse content blocks
+                            if let Some(block) = event.content_block {
+                                if matches!(block, ContentBlock::ToolUse { .. }) {
+                                    content_blocks.push(block);
+                                }
+                            }
                             callback(StreamEvent::ContentBlockStart);
                         }
                         "content_block_delta" => {
@@ -107,6 +114,9 @@ impl ClaudeClient {
                             if let Some(msg_usage) = event.usage {
                                 usage.output_tokens = msg_usage.output_tokens;
                             }
+                            if let Some(reason) = event.stop_reason {
+                                stop_reason = reason;
+                            }
                         }
                         "message_start" => {
                             if let Some(message) = event.message {
@@ -126,7 +136,7 @@ impl ClaudeClient {
 
         Ok(CompletionResponse {
             content: content_blocks,
-            stop_reason: StopReason::EndTurn,
+            stop_reason,
             usage,
         })
     }
@@ -165,7 +175,11 @@ impl ClaudeClient {
             HeaderValue::from_str(&self.config.api_key)
                 .map_err(|e| AgentError::Config(format!("Invalid API key: {}", e)))?,
         );
-        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        headers.insert(
+            "anthropic-version",
+            HeaderValue::from_str(&self.config.api_version)
+                .map_err(|e| AgentError::Config(format!("Invalid API version: {}", e)))?,
+        );
 
         let response = self
             .client
@@ -211,7 +225,7 @@ impl ClaudeClient {
         let body = response
             .text()
             .await
-            .unwrap_or_else(|_| String::from("Failed to read error body"));
+            .unwrap_or_else(|e| format!("Failed to read error body: {}", e));
 
         match status_code {
             401 => AgentError::Auth(format!("Authentication failed: {}", body)),
@@ -244,6 +258,10 @@ struct StreamEventData {
     usage: Option<Usage>,
     #[serde(default)]
     message: Option<StreamMessage>,
+    #[serde(default)]
+    stop_reason: Option<StopReason>,
+    #[serde(default)]
+    content_block: Option<ContentBlock>,
 }
 
 #[derive(Debug, Deserialize)]

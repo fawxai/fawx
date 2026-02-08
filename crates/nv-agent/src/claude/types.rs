@@ -39,6 +39,10 @@ impl Message {
 }
 
 /// Role of a message sender.
+///
+/// Note: In Claude's API, `System` messages are typically passed via the `system`
+/// parameter rather than in the messages array. This variant is included for
+/// completeness and potential future use cases.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -47,6 +51,7 @@ pub enum Role {
     /// Assistant (Claude) message.
     Assistant,
     /// System message (instructions).
+    /// Note: Typically passed separately via the `system` parameter in Claude API.
     System,
 }
 

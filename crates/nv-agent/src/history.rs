@@ -1,6 +1,7 @@
 //! Conversation history management.
 
 use crate::claude::types::Message;
+use std::collections::VecDeque;
 
 /// Manages conversation history with automatic truncation.
 #[derive(Debug, Clone)]
@@ -8,7 +9,7 @@ pub struct ConversationHistory {
     /// Maximum number of messages to keep.
     max_messages: usize,
     /// Message history (oldest to newest).
-    messages: Vec<Message>,
+    messages: VecDeque<Message>,
 }
 
 impl ConversationHistory {
@@ -16,7 +17,7 @@ impl ConversationHistory {
     pub fn new(max_messages: usize) -> Self {
         Self {
             max_messages,
-            messages: Vec::with_capacity(max_messages),
+            messages: VecDeque::with_capacity(max_messages),
         }
     }
 
@@ -37,15 +38,19 @@ impl ConversationHistory {
     }
 
     /// Get all messages in the history.
-    pub fn messages(&self) -> &[Message] {
-        &self.messages
+    ///
+    /// Returns a slice of all messages. Note: VecDeque::make_contiguous() is called
+    /// to ensure the messages are contiguous in memory for efficient slice access.
+    pub fn messages(&mut self) -> &[Message] {
+        self.messages.make_contiguous()
     }
 
     /// Truncate history to a specific number of messages.
+    ///
+    /// Keeps only the most recent `max_messages` by removing from the front.
     pub fn truncate_to(&mut self, max_messages: usize) {
-        if self.messages.len() > max_messages {
-            // Keep only the most recent max_messages
-            self.messages = self.messages.split_off(self.messages.len() - max_messages);
+        while self.messages.len() > max_messages {
+            self.messages.pop_front();
         }
         self.max_messages = max_messages;
     }
@@ -66,11 +71,13 @@ impl ConversationHistory {
     }
 
     /// Add a message and enforce max_messages limit.
+    ///
+    /// Removes the oldest message if at capacity before adding the new one.
     fn add_message(&mut self, message: Message) {
         if self.messages.len() >= self.max_messages {
-            self.messages.remove(0);
+            self.messages.pop_front();
         }
-        self.messages.push(message);
+        self.messages.push_back(message);
     }
 }
 

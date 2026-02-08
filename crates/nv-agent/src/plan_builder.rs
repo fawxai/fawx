@@ -26,7 +26,7 @@ impl PlanBuilder {
         let description = Self::generate_description(&steps);
 
         Ok(ActionPlan {
-            id: uuid::v4().to_string(),
+            id: plan_id::generate().to_string(),
             steps,
             description,
             requires_confirmation: false,
@@ -142,27 +142,30 @@ impl PlanBuilder {
 }
 
 // Simple UUID generation for plan IDs
-mod uuid {
+// Note: Uses timestamp-based IDs (nanoseconds since UNIX epoch as hex).
+// This is sufficient for plan identification in a single-agent context.
+// For distributed systems, consider using a proper UUID library.
+mod plan_id {
     use std::fmt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    pub fn v4() -> Uuid {
-        Uuid::new()
+    pub fn generate() -> PlanId {
+        PlanId::new()
     }
 
-    pub struct Uuid(String);
+    pub struct PlanId(String);
 
-    impl Uuid {
+    impl PlanId {
         fn new() -> Self {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_else(|_| std::time::Duration::from_secs(0))
                 .as_nanos();
             Self(format!("{:032x}", now))
         }
     }
 
-    impl fmt::Display for Uuid {
+    impl fmt::Display for PlanId {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             write!(f, "{}", self.0)
         }
