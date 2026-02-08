@@ -303,19 +303,27 @@ impl AuditLog {
     ///
     /// Generates a fresh random HMAC key for each instance to ensure test isolation
     /// and prevent key reuse across test runs.
-    pub fn in_memory() -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns `SecurityError::AuditLog` if random key generation fails.
+    pub fn in_memory() -> Result<Self, SecurityError> {
         // Generate a fresh random key for each in-memory instance
         let key_bytes: [u8; 32] = ring::rand::generate(&ring::rand::SystemRandom::new())
-            .expect("Failed to generate random key for in-memory log")
+            .map_err(|_| {
+                SecurityError::AuditLog(
+                    "Failed to generate random key for in-memory log".to_string(),
+                )
+            })?
             .expose();
 
         let key = hmac::Key::new(hmac::HMAC_SHA256, &key_bytes);
-        Self {
+        Ok(Self {
             path: None,
             key,
             entries: Vec::new(),
             last_hash: "GENESIS".to_string(),
-        }
+        })
     }
 
     /// Create an in-memory audit log with a specific HMAC key (for testing)
@@ -491,14 +499,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_empty_log() {
-        let log = AuditLog::in_memory();
+        let log = AuditLog::in_memory().unwrap();
         assert_eq!(log.count(), 0);
         assert!(log.verify_integrity().unwrap());
     }
 
     #[tokio::test]
     async fn test_append_and_count() {
-        let mut log = AuditLog::in_memory();
+        let mut log = AuditLog::in_memory().unwrap();
         let event =
             AuditEvent::new(AuditEventType::ActionExecuted, "agent", "Test action").unwrap();
 
@@ -508,7 +516,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_hash_chain_integrity() {
-        let mut log = AuditLog::in_memory();
+        let mut log = AuditLog::in_memory().unwrap();
 
         for i in 0..5 {
             let event = AuditEvent::new(
@@ -526,7 +534,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tamper_detection() {
-        let mut log = AuditLog::in_memory();
+        let mut log = AuditLog::in_memory().unwrap();
 
         let event1 = AuditEvent::new(AuditEventType::ActionExecuted, "agent", "Original").unwrap();
         let event2 = AuditEvent::new(AuditEventType::ActionExecuted, "agent", "Second").unwrap();
@@ -542,7 +550,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_query_by_event_type() {
-        let mut log = AuditLog::in_memory();
+        let mut log = AuditLog::in_memory().unwrap();
 
         let event1 = AuditEvent::new(AuditEventType::ActionExecuted, "agent", "Action").unwrap();
         let event2 =
@@ -563,7 +571,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_query_by_actor() {
-        let mut log = AuditLog::in_memory();
+        let mut log = AuditLog::in_memory().unwrap();
 
         let event1 = AuditEvent::new(AuditEventType::ActionExecuted, "agent", "A").unwrap();
         let event2 = AuditEvent::new(AuditEventType::ActionExecuted, "user", "B").unwrap();
@@ -583,7 +591,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_query_by_time_range() {
-        let mut log = AuditLog::in_memory();
+        let mut log = AuditLog::in_memory().unwrap();
 
         // Create events with known timestamps
         let mut event1 = AuditEvent::new(AuditEventType::ActionExecuted, "agent", "Early").unwrap();
@@ -612,7 +620,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_query_with_limit() {
-        let mut log = AuditLog::in_memory();
+        let mut log = AuditLog::in_memory().unwrap();
 
         for i in 0..10 {
             let event = AuditEvent::new(
@@ -636,7 +644,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_query_combined_filters() {
-        let mut log = AuditLog::in_memory();
+        let mut log = AuditLog::in_memory().unwrap();
 
         let event1 =
             AuditEvent::new(AuditEventType::ActionExecuted, "agent", "No match type").unwrap();
@@ -661,7 +669,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_query_no_matches() {
-        let mut log = AuditLog::in_memory();
+        let mut log = AuditLog::in_memory().unwrap();
 
         let event = AuditEvent::new(AuditEventType::ActionExecuted, "agent", "Test").unwrap();
         log.append(event).await.unwrap();
@@ -677,7 +685,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_query_all_event_types() {
-        let mut log = AuditLog::in_memory();
+        let mut log = AuditLog::in_memory().unwrap();
 
         let types: Vec<AuditEventType> = vec![
             AuditEventType::ActionExecuted,
@@ -706,7 +714,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_combined_filter_with_time_range() {
-        let mut log = AuditLog::in_memory();
+        let mut log = AuditLog::in_memory().unwrap();
 
         let mut event1 = AuditEvent::new(AuditEventType::ActionExecuted, "agent", "Early").unwrap();
         event1.timestamp = 500;
@@ -1047,7 +1055,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_very_large_number_of_entries() {
-        let mut log = AuditLog::in_memory();
+        let mut log = AuditLog::in_memory().unwrap();
 
         // Append 1000+ events
         for i in 0..1500 {
@@ -1081,7 +1089,7 @@ mod tests {
         use std::sync::Arc;
         use tokio::sync::Mutex;
 
-        let log = Arc::new(Mutex::new(AuditLog::in_memory()));
+        let log = Arc::new(Mutex::new(AuditLog::in_memory().unwrap()));
         let mut handles = vec![];
 
         // Spawn 10 tasks, each appending 10 events
