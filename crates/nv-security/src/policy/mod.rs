@@ -30,9 +30,12 @@ pub mod util;
 #[cfg(test)]
 mod tests;
 
-// Re-export main types for convenience
+// Re-export main types for public API
 pub use engine::PolicyEngine;
 pub use rate_limit::RateLimiter;
 pub use signing::{sign_policy, verify_policy};
-pub use types::{Condition, DefaultPolicy, PolicyConfig, PolicyDecision, PolicyRule};
-pub use util::matches_action;
+pub use types::PolicyDecision;
+
+// Note: Internal types (Condition, DefaultPolicy, PolicyConfig, PolicyRule from types::*)
+// and utility functions (matches_action from util::*) are NOT re-exported, keeping the
+// public API surface minimal. They remain accessible within this module via their submodules.

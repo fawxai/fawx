@@ -2,6 +2,11 @@
 //!
 //! This module defines the core types used by the policy engine to evaluate
 //! actions against security policies loaded from TOML configuration files.
+//!
+//! ## Timezone Note
+//!
+//! Time-based conditions (`Condition::TimeOfDay`) are evaluated using UTC.
+//! This ensures consistent behavior across different deployments and timezones.
 
 use serde::Deserialize;
 
@@ -26,7 +31,7 @@ pub enum PolicyDecision {
 /// Rules match action patterns (with optional glob wildcards) and specify
 /// the security decision to apply. Rules are evaluated in order, with the
 /// first match winning.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct PolicyRule {
     /// Action pattern (supports glob wildcards like "delete_*")
     pub action: String,
@@ -52,15 +57,22 @@ pub struct PolicyRule {
 /// - **AppTarget**: Matches if `ActionStep.target` equals the specified app name.
 /// - **ContactTarget**: Matches if `ActionStep.parameters["contact"]` equals the
 ///   specified contact name.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "type")]
 pub enum Condition {
-    /// Time of day constraint
+    /// Time of day constraint (24-hour format, evaluated in UTC)
+    ///
+    /// **Important:** Times are evaluated in UTC, not local time.
+    /// For example, `after: "09:00"` means 09:00 UTC (which is 1:00 AM PST
+    /// or 5:00 AM EDT). If you want to restrict actions to local business
+    /// hours, you must convert your local time to UTC.
+    ///
+    /// Supports midnight crossing (e.g., `after: "22:00", before: "06:00"`).
     #[serde(rename = "time_of_day")]
     TimeOfDay {
-        /// Start time (e.g., "09:00")
+        /// Start time in 24-hour format (e.g., "09:00")
         after: String,
-        /// End time (e.g., "17:00")
+        /// End time in 24-hour format (e.g., "17:00")
         before: String,
     },
     /// Application target constraint
@@ -81,7 +93,7 @@ pub enum Condition {
 ///
 /// This is the top-level structure deserialized from policy TOML files.
 /// It contains a default decision and a list of rules to evaluate.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct PolicyConfig {
     /// Default policy when no rules match
     pub default: DefaultPolicy,
@@ -94,7 +106,7 @@ pub struct PolicyConfig {
 ///
 /// Specifies what decision to make when no rules match an action.
 /// Common values: "allow", "deny", "confirm".
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct DefaultPolicy {
     /// Default decision type: "allow", "deny", or "confirm"
     pub decision: String,
