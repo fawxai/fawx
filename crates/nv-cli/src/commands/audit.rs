@@ -99,8 +99,8 @@ fn format_timestamp(millis: u64) -> String {
 }
 
 fn get_audit_log_path() -> anyhow::Result<std::path::PathBuf> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
     Ok(home.join(".nova").join("audit.log"))
 }
 

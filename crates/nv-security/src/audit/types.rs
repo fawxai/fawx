@@ -84,9 +84,7 @@ impl AuditEvent {
             })?
             .as_millis()
             .try_into()
-            .map_err(|_| {
-                nv_core::error::SecurityError::AuditLog("Timestamp overflow".to_string())
-            })
+            .map_err(|_| nv_core::error::SecurityError::AuditLog("Timestamp overflow".to_string()))
     }
 
     pub fn new(
