@@ -1,11 +1,12 @@
 //! Intent classification using LLM.
 
+use super::metrics::IntentMetrics;
 use super::parser::parse_intent_response;
 use super::prompts::INTENT_SYSTEM_PROMPT;
 use crate::claude::{AgentError, ClaudeClient, Message, Result};
 use async_trait::async_trait;
 use nv_core::types::{Intent, IntentCategory, UserInput};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
@@ -13,6 +14,9 @@ use tracing::{debug, info, warn};
 use std::sync::Arc;
 #[cfg(test)]
 use tokio::sync::Mutex;
+
+/// Fallback confidence score used when classification fails or times out.
+const FALLBACK_CONFIDENCE: f32 = 0.3;
 
 /// Configuration for the intent classifier.
 ///
@@ -82,6 +86,7 @@ impl LlmClassifier for ClaudeClient {
 pub struct IntentClassifier<C: LlmClassifier> {
     config: ClassifierConfig,
     llm: C,
+    metrics: IntentMetrics,
 }
 
 impl<C: LlmClassifier> IntentClassifier<C> {
@@ -91,7 +96,19 @@ impl<C: LlmClassifier> IntentClassifier<C> {
     /// * `config` - Classifier configuration
     /// * `llm` - LLM client implementing LlmClassifier trait
     pub fn new(config: ClassifierConfig, llm: C) -> Self {
-        Self { config, llm }
+        Self {
+            config,
+            llm,
+            metrics: IntentMetrics::new(),
+        }
+    }
+
+    /// Get a reference to the metrics for this classifier.
+    ///
+    /// Returns a clone of the metrics handle, which can be used to
+    /// query metrics from other threads or components.
+    pub fn metrics(&self) -> IntentMetrics {
+        self.metrics.clone()
     }
 
     /// Classify user input into an intent.
@@ -154,6 +171,8 @@ impl<C: LlmClassifier> IntentClassifier<C> {
         input: &UserInput,
         timeout_duration: Duration,
     ) -> Result<Intent> {
+        let start_time = Instant::now();
+
         match timeout(timeout_duration, self.classify(input)).await {
             Ok(result) => result,
             Err(_) => {
@@ -161,9 +180,15 @@ impl<C: LlmClassifier> IntentClassifier<C> {
                     "Classification timed out after {:?}, falling back to Conversation",
                     timeout_duration
                 );
+
+                // Record timeout fallback
+                let latency = start_time.elapsed();
+                self.metrics
+                    .record_classification(FALLBACK_CONFIDENCE, latency, true);
+
                 Ok(Intent {
                     category: IntentCategory::Conversation,
-                    confidence: 0.3,
+                    confidence: FALLBACK_CONFIDENCE,
                     entities: Default::default(),
                     raw_input: input.text.clone(),
                 })
@@ -173,6 +198,8 @@ impl<C: LlmClassifier> IntentClassifier<C> {
 
     /// Internal method to classify messages and apply threshold logic.
     async fn classify_messages(&self, messages: &[Message], raw_input: &str) -> Result<Intent> {
+        let start_time = Instant::now();
+
         // Call LLM
         let raw_response = self.llm.classify_raw(messages).await?;
 
@@ -185,15 +212,23 @@ impl<C: LlmClassifier> IntentClassifier<C> {
         );
 
         // Apply confidence threshold
-        if intent.confidence < self.config.confidence_threshold {
+        let was_fallback = if intent.confidence < self.config.confidence_threshold {
             warn!(
                 "Confidence {} below threshold {}, overriding to Conversation",
                 intent.confidence, self.config.confidence_threshold
             );
             intent.category = IntentCategory::Conversation;
-        }
+            true
+        } else {
+            false
+        };
 
         info!("Final classification: {:?}", intent.category);
+
+        // Record metrics
+        let latency = start_time.elapsed();
+        self.metrics
+            .record_classification(intent.confidence, latency, was_fallback);
 
         Ok(intent)
     }
@@ -428,5 +463,143 @@ mod tests {
 
         assert_eq!(intent.category, IntentCategory::Message);
         assert_eq!(intent.confidence, 0.85);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_tracking_basic() {
+        let mock = MockClassifier::with_response(
+            r#"{"category": "LaunchApp", "confidence": 0.95, "entities": {"app_name": "spotify"}}"#
+                .to_string(),
+        );
+        let classifier = IntentClassifier::new(ClassifierConfig::default(), mock);
+
+        let input = create_user_input("open spotify");
+        let _intent = classifier.classify(&input).await.unwrap();
+
+        let snapshot = classifier.metrics().get_snapshot();
+        assert_eq!(snapshot.total_classifications, 1);
+        assert!((snapshot.average_confidence - 0.95).abs() < 0.01);
+        assert_eq!(snapshot.fallback_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_tracking_fallback() {
+        let mock = MockClassifier::with_response(
+            r#"{"category": "Question", "confidence": 0.6, "entities": {}}"#.to_string(),
+        );
+
+        let config = ClassifierConfig {
+            confidence_threshold: 0.7,
+        };
+        let classifier = IntentClassifier::new(config, mock);
+
+        let input = create_user_input("maybe a question?");
+        let _intent = classifier.classify(&input).await.unwrap();
+
+        let snapshot = classifier.metrics().get_snapshot();
+        assert_eq!(snapshot.total_classifications, 1);
+        assert!((snapshot.average_confidence - 0.6).abs() < 0.01);
+        assert_eq!(snapshot.fallback_count, 1); // Below threshold
+    }
+
+    #[tokio::test]
+    async fn test_metrics_tracking_multiple() {
+        let mock = MockClassifier::new(vec![
+            r#"{"category": "LaunchApp", "confidence": 0.9, "entities": {}}"#.to_string(),
+            r#"{"category": "Message", "confidence": 0.8, "entities": {}}"#.to_string(),
+            r#"{"category": "Search", "confidence": 0.6, "entities": {}}"#.to_string(),
+        ]);
+
+        let config = ClassifierConfig {
+            confidence_threshold: 0.7,
+        };
+        let classifier = IntentClassifier::new(config, mock);
+
+        let _intent1 = classifier
+            .classify(&create_user_input("test1"))
+            .await
+            .unwrap();
+        let _intent2 = classifier
+            .classify(&create_user_input("test2"))
+            .await
+            .unwrap();
+        let _intent3 = classifier
+            .classify(&create_user_input("test3"))
+            .await
+            .unwrap();
+
+        let snapshot = classifier.metrics().get_snapshot();
+        assert_eq!(snapshot.total_classifications, 3);
+
+        // Average: (0.9 + 0.8 + 0.6) / 3 = 0.766...
+        assert!((snapshot.average_confidence - 0.7666).abs() < 0.01);
+
+        // Only the third one (0.6) should be a fallback
+        assert_eq!(snapshot.fallback_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_tracking_timeout() {
+        struct SlowMockClassifier;
+
+        #[async_trait]
+        impl LlmClassifier for SlowMockClassifier {
+            async fn classify_raw(&self, _messages: &[Message]) -> Result<String> {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                Ok(r#"{"category": "Search", "confidence": 0.9, "entities": {}}"#.to_string())
+            }
+        }
+
+        let classifier = IntentClassifier::new(ClassifierConfig::default(), SlowMockClassifier);
+
+        let input = create_user_input("search something");
+        let _intent = classifier
+            .classify_with_timeout(&input, Duration::from_millis(50))
+            .await
+            .unwrap();
+
+        let snapshot = classifier.metrics().get_snapshot();
+        assert_eq!(snapshot.total_classifications, 1);
+        assert!((snapshot.average_confidence - 0.3).abs() < 0.01); // Timeout fallback
+        assert_eq!(snapshot.fallback_count, 1); // Timeout counts as fallback
+    }
+
+    #[tokio::test]
+    async fn test_metrics_latency_tracking() {
+        let mock = MockClassifier::with_response(
+            r#"{"category": "LaunchApp", "confidence": 0.9, "entities": {}}"#.to_string(),
+        );
+        let classifier = IntentClassifier::new(ClassifierConfig::default(), mock);
+
+        let input = create_user_input("open app");
+        let _intent = classifier.classify(&input).await.unwrap();
+
+        let snapshot = classifier.metrics().get_snapshot();
+        assert_eq!(snapshot.total_classifications, 1);
+
+        // Latency should be very small for mock classifier (< 10ms)
+        assert!(snapshot.average_latency < Duration::from_millis(10));
+    }
+
+    #[tokio::test]
+    async fn test_metrics_can_be_cloned() {
+        let mock = MockClassifier::with_response(
+            r#"{"category": "LaunchApp", "confidence": 0.9, "entities": {}}"#.to_string(),
+        );
+        let classifier = IntentClassifier::new(ClassifierConfig::default(), mock);
+
+        let metrics1 = classifier.metrics();
+        let metrics2 = classifier.metrics();
+
+        let input = create_user_input("test");
+        let _intent = classifier.classify(&input).await.unwrap();
+
+        // Both clones should see the same metrics
+        let snapshot1 = metrics1.get_snapshot();
+        let snapshot2 = metrics2.get_snapshot();
+
+        assert_eq!(snapshot1.total_classifications, 1);
+        assert_eq!(snapshot2.total_classifications, 1);
+        assert_eq!(snapshot1.average_confidence, snapshot2.average_confidence);
     }
 }
