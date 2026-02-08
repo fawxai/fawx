@@ -44,14 +44,23 @@ pub fn parse_intent_response(raw: &str, original_input: &str) -> Result<Intent, 
         }
     };
 
-    // Validate confidence is in valid range
-    let confidence = response.confidence.clamp(0.0, 1.0);
-    if confidence != response.confidence {
+    // Validate confidence is finite and in valid range
+    let confidence = if response.confidence.is_finite() {
+        let clamped = response.confidence.clamp(0.0, 1.0);
+        if clamped != response.confidence {
+            warn!(
+                "Confidence {} out of range, clamped to {}",
+                response.confidence, clamped
+            );
+        }
+        clamped
+    } else {
         warn!(
-            "Confidence {} out of range, clamped to {}",
-            response.confidence, confidence
+            "Invalid confidence {} (NaN or infinity), defaulting to 0.3",
+            response.confidence
         );
-    }
+        0.3
+    };
 
     // Map category string to enum
     let category = category_from_str(&response.category);
@@ -66,15 +75,33 @@ pub fn parse_intent_response(raw: &str, original_input: &str) -> Result<Intent, 
 
 /// Convert category string to IntentCategory enum.
 ///
-/// Case-insensitive matching. Unknown categories default to Conversation.
+/// Case-insensitive matching with normalization (removes spaces, underscores, hyphens).
+/// Unknown categories default to Conversation.
 ///
 /// # Arguments
 /// * `s` - Category string from JSON response
 ///
 /// # Returns
 /// Corresponding IntentCategory enum variant
+///
+/// # Examples
+/// ```
+/// # use nv_agent::category_from_str;
+/// # use nv_core::types::IntentCategory;
+/// assert_eq!(category_from_str("LaunchApp"), IntentCategory::LaunchApp);
+/// assert_eq!(category_from_str("launch_app"), IntentCategory::LaunchApp);
+/// assert_eq!(category_from_str("launch-app"), IntentCategory::LaunchApp);
+/// assert_eq!(category_from_str("launch app"), IntentCategory::LaunchApp);
+/// ```
 pub fn category_from_str(s: &str) -> IntentCategory {
-    match s.to_lowercase().as_str() {
+    // Normalize: lowercase + remove delimiters (spaces, underscores, hyphens)
+    let normalized = s
+        .to_lowercase()
+        .chars()
+        .filter(|c| !matches!(c, ' ' | '_' | '-'))
+        .collect::<String>();
+
+    match normalized.as_str() {
         "launchapp" => IntentCategory::LaunchApp,
         "search" => IntentCategory::Search,
         "navigate" => IntentCategory::Navigate,
@@ -190,5 +217,50 @@ mod tests {
         );
         assert_eq!(category_from_str(""), IntentCategory::Conversation);
         assert_eq!(category_from_str("xyz"), IntentCategory::Conversation);
+    }
+
+    #[test]
+    fn test_category_from_str_with_delimiters() {
+        // Underscores
+        assert_eq!(category_from_str("launch_app"), IntentCategory::LaunchApp);
+        assert_eq!(
+            category_from_str("complex_task"),
+            IntentCategory::ComplexTask
+        );
+
+        // Hyphens
+        assert_eq!(category_from_str("launch-app"), IntentCategory::LaunchApp);
+        assert_eq!(
+            category_from_str("complex-task"),
+            IntentCategory::ComplexTask
+        );
+
+        // Spaces
+        assert_eq!(category_from_str("launch app"), IntentCategory::LaunchApp);
+        assert_eq!(
+            category_from_str("complex task"),
+            IntentCategory::ComplexTask
+        );
+
+        // Mixed
+        assert_eq!(category_from_str("launch_App"), IntentCategory::LaunchApp);
+        assert_eq!(
+            category_from_str("Complex-Task"),
+            IntentCategory::ComplexTask
+        );
+    }
+
+    #[test]
+    fn test_confidence_nan_handling() {
+        let raw = r#"{
+            "category": "Question",
+            "confidence": null
+        }"#;
+
+        // This will fail to parse confidence as f32, so serde will error
+        // The malformed JSON fallback will catch it
+        let intent = parse_intent_response(raw, "test").unwrap();
+        assert_eq!(intent.category, IntentCategory::Conversation);
+        assert_eq!(intent.confidence, 0.3);
     }
 }

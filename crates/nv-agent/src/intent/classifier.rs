@@ -13,25 +13,20 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 /// Configuration for the intent classifier.
+///
+/// Note: Token limits and model selection are controlled by the ClaudeClient configuration,
+/// not by this classifier config.
 #[derive(Debug, Clone)]
 pub struct ClassifierConfig {
-    /// Model to use for classification (default: "claude-sonnet-4-5")
-    pub model: String,
-
     /// Confidence threshold for accepting classifications (default: 0.7)
-    /// If confidence < threshold, override to Conversation category
+    /// Values >= threshold are accepted; values < threshold fall back to Conversation
     pub confidence_threshold: f32,
-
-    /// Maximum tokens in classification response (default: 256)
-    pub max_tokens: u32,
 }
 
 impl Default for ClassifierConfig {
     fn default() -> Self {
         Self {
-            model: "claude-sonnet-4-5".to_string(),
             confidence_threshold: 0.7,
-            max_tokens: 256,
         }
     }
 }
@@ -216,8 +211,6 @@ impl LlmClassifier for MockClassifier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
 
     fn create_user_input(text: &str) -> UserInput {
         UserInput {
@@ -268,7 +261,6 @@ mod tests {
 
         let config = ClassifierConfig {
             confidence_threshold: 0.7,
-            ..Default::default()
         };
         let classifier = IntentClassifier::new(config, mock);
 
@@ -288,7 +280,6 @@ mod tests {
 
         let config = ClassifierConfig {
             confidence_threshold: 0.7,
-            ..Default::default()
         };
         let classifier = IntentClassifier::new(config, mock);
 
@@ -336,8 +327,6 @@ mod tests {
     #[tokio::test]
     async fn test_config_defaults() {
         let config = ClassifierConfig::default();
-        assert_eq!(config.model, "claude-sonnet-4-5");
         assert_eq!(config.confidence_threshold, 0.7);
-        assert_eq!(config.max_tokens, 256);
     }
 }

@@ -57,8 +57,7 @@ Extract relevant entities based on category:
 - Conversation: {} (usually empty)
 
 **Response Format:**
-Respond ONLY with valid JSON in this exact format:
-```json
+Respond ONLY with raw JSON (no markdown, no code fences, just the JSON object):
 {
   "category": "LaunchApp",
   "confidence": 0.95,
@@ -66,12 +65,11 @@ Respond ONLY with valid JSON in this exact format:
     "app_name": "spotify"
   }
 }
-```
 
 **Examples:**
 
 Input: "open spotify"
-```json
+Response:
 {
   "category": "LaunchApp",
   "confidence": 0.95,
@@ -79,10 +77,9 @@ Input: "open spotify"
     "app_name": "spotify"
   }
 }
-```
 
 Input: "text mom happy birthday"
-```json
+Response:
 {
   "category": "Message",
   "confidence": 0.9,
@@ -92,10 +89,9 @@ Input: "text mom happy birthday"
     "channel": "text"
   }
 }
-```
 
 Input: "what's the weather"
-```json
+Response:
 {
   "category": "Question",
   "confidence": 0.95,
@@ -103,19 +99,17 @@ Input: "what's the weather"
     "query": "weather"
   }
 }
-```
 
 Input: "hey"
-```json
+Response:
 {
   "category": "Conversation",
   "confidence": 0.85,
   "entities": {}
 }
-```
 
 Input: "book a flight and hotel for next week"
-```json
+Response:
 {
   "category": "ComplexTask",
   "confidence": 0.9,
@@ -124,7 +118,6 @@ Input: "book a flight and hotel for next week"
     "timeframe": "next week"
   }
 }
-```
 
 **Important:**
 - Always respond with valid JSON

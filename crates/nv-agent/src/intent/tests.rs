@@ -186,7 +186,6 @@ async fn test_confidence_exactly_at_threshold() {
 
     let config = ClassifierConfig {
         confidence_threshold: 0.7,
-        ..Default::default()
     };
     let classifier = IntentClassifier::new(config, mock);
 
@@ -206,7 +205,6 @@ async fn test_confidence_just_below_threshold() {
 
     let config = ClassifierConfig {
         confidence_threshold: 0.7,
-        ..Default::default()
     };
     let classifier = IntentClassifier::new(config, mock);
 
@@ -226,7 +224,6 @@ async fn test_custom_confidence_threshold() {
 
     let config = ClassifierConfig {
         confidence_threshold: 0.8, // Higher threshold
-        ..Default::default()
     };
     let classifier = IntentClassifier::new(config, mock);
 
@@ -435,21 +432,15 @@ fn test_system_prompt_has_json_format() {
 #[test]
 fn test_classifier_config_defaults() {
     let config = ClassifierConfig::default();
-    assert_eq!(config.model, "claude-sonnet-4-5");
     assert_eq!(config.confidence_threshold, 0.7);
-    assert_eq!(config.max_tokens, 256);
 }
 
 #[test]
 fn test_classifier_config_custom() {
     let config = ClassifierConfig {
-        model: "claude-opus-4".to_string(),
         confidence_threshold: 0.8,
-        max_tokens: 512,
     };
-    assert_eq!(config.model, "claude-opus-4");
     assert_eq!(config.confidence_threshold, 0.8);
-    assert_eq!(config.max_tokens, 512);
 }
 
 // ============================================================================
