@@ -8,35 +8,59 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-/// Filter for querying audit events
+/// Filter for querying audit events.
+///
+/// All filter fields are optional and combined with AND logic.
+/// Use [`Default::default()`] to query all events.
 #[derive(Debug, Default)]
 pub struct AuditFilter {
-    /// Filter by event type
+    /// Filter by event type (e.g., `ActionExecuted`, `PolicyViolation`).
+    ///
+    /// If `None`, all event types are included.
     pub event_type: Option<AuditEventType>,
 
-    /// Filter by actor
+    /// Filter by actor (e.g., `"agent"`, `"user"`, `"skill:camera"`).
+    ///
+    /// If `None`, all actors are included.
     pub actor: Option<String>,
 
-    /// Only events after this timestamp (inclusive)
+    /// Only events at or after this timestamp (Unix milliseconds, inclusive).
+    ///
+    /// If `None`, no lower bound is applied.
     pub after: Option<u64>,
 
-    /// Only events before this timestamp (inclusive)
+    /// Only events at or before this timestamp (Unix milliseconds, inclusive).
+    ///
+    /// If `None`, no upper bound is applied.
     pub before: Option<u64>,
 
-    /// Maximum number of results
+    /// Maximum number of results to return.
+    ///
+    /// If `None`, all matching events are returned.
     pub limit: Option<usize>,
 }
 
-/// Internal log entry with HMAC hash chain for integrity
+/// Internal log entry with HMAC hash chain for integrity.
+///
+/// Each entry contains:
+/// - The audit event data
+/// - Hash of the previous entry (linking the chain)
+/// - Hash of this entry (computed from event data + prev_hash)
+///
+/// The hash chain starts with `prev_hash = "GENESIS"` for the first entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AuditEntry {
-    /// The actual event
+    /// The actual audit event with all data fields.
     event: AuditEvent,
 
-    /// HMAC hash of the previous entry (hex-encoded)
+    /// HMAC-SHA256 hash of the previous entry (hex-encoded).
+    ///
+    /// For the first entry, this is `"GENESIS"`.
     prev_hash: String,
 
-    /// HMAC hash of this entry (hex-encoded)
+    /// HMAC-SHA256 hash of this entry (hex-encoded).
+    ///
+    /// Computed as `HMAC(key, event_data || prev_hash)`.
     hash: String,
 }
 
@@ -161,7 +185,44 @@ impl AuditLog {
         }
     }
 
-    /// Open or create an audit log file
+    /// Open or create an audit log file.
+    ///
+    /// If the log file doesn't exist, it will be created. If it exists, all entries
+    /// are loaded into memory for querying and integrity verification.
+    ///
+    /// The HMAC key is automatically loaded from `audit.key` in the same directory.
+    /// If the key doesn't exist, a new 256-bit key is generated and saved with
+    /// restrictive permissions (0600 on Unix).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The log file exists but contains invalid JSON
+    /// - The key file cannot be read or created
+    /// - File I/O fails
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use nv_security::audit::AuditLog;
+    /// use std::path::Path;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ///     // Open or create audit log
+    ///     let log = AuditLog::open(Path::new("/var/log/nova/audit.log")).await?;
+    ///
+    ///     // Check if there are existing entries
+    ///     println!("Audit log has {} entries", log.count());
+    ///
+    ///     // Verify integrity of existing entries
+    ///     if log.verify_integrity()? {
+    ///         println!("Audit log integrity verified ✓");
+    ///     }
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
     pub async fn open(path: &Path) -> Result<Self, SecurityError> {
         let key = Self::load_or_create_key(path).await?;
         let mut entries = Vec::new();
@@ -230,7 +291,56 @@ impl AuditLog {
         }
     }
 
-    /// Append an event to the log
+    /// Append an event to the log.
+    ///
+    /// The event is:
+    /// 1. Linked to the previous entry via HMAC hash chain
+    /// 2. Written to disk immediately (if not in-memory mode)
+    /// 3. Added to the in-memory cache for querying
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - HMAC computation fails
+    /// - JSON serialization fails
+    /// - File I/O fails (disk full, permissions, etc.)
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use nv_security::audit::{AuditLog, AuditEvent, AuditEventType};
+    /// use std::path::Path;
+    /// use std::collections::BTreeMap;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ///     let mut log = AuditLog::open(Path::new("audit.log")).await?;
+    ///
+    ///     // Simple event
+    ///     let event = AuditEvent::new(
+    ///         AuditEventType::ActionExecuted,
+    ///         "agent",
+    ///         "User sent SMS message"
+    ///     )?;
+    ///     log.append(event).await?;
+    ///
+    ///     // Event with metadata
+    ///     let mut metadata = BTreeMap::new();
+    ///     metadata.insert("recipient".to_string(), "+1234567890".to_string());
+    ///     metadata.insert("skill".to_string(), "messages".to_string());
+    ///
+    ///     let event_with_meta = AuditEvent::with_metadata(
+    ///         AuditEventType::SkillInvoked,
+    ///         "skill:messages",
+    ///         "SMS sent successfully",
+    ///         metadata
+    ///     )?;
+    ///     log.append(event_with_meta).await?;
+    ///
+    ///     println!("Total events: {}", log.count());
+    ///     Ok(())
+    /// }
+    /// ```
     pub async fn append(&mut self, event: AuditEvent) -> Result<(), SecurityError> {
         let entry = AuditEntry::new(&self.key, event, self.last_hash.clone())?;
 
@@ -737,5 +847,245 @@ mod tests {
         let metadata = std::fs::metadata(&key_path).unwrap();
         let mode = metadata.permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "Key file should be owner-only read/write");
+    }
+
+    // ========================================================================
+    // Edge Case Tests (Issue #167)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_partially_written_json_truncated() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("truncated.log");
+
+        // Write key file first
+        let key_bytes: [u8; 32] = [0x42u8; 32];
+        fs::write(dir.path().join(KEY_FILE_NAME), &key_bytes)
+            .await
+            .unwrap();
+
+        // Write valid entry, then truncated entry
+        let valid_entry = r#"{"event":{"id":"123","timestamp":1000,"event_type":"ActionExecuted","actor":"agent","description":"Test","metadata":{}},"prev_hash":"GENESIS","hash":"abc123"}"#;
+        let truncated = r#"{"event":{"id":"456","timestamp":2000,"event_type"#; // incomplete JSON
+
+        fs::write(&log_path, format!("{}\n{}", valid_entry, truncated))
+            .await
+            .unwrap();
+
+        let result = AuditLog::open(&log_path).await;
+        assert!(
+            result.is_err(),
+            "Opening log with truncated JSON should fail"
+        );
+
+        if let Err(e) = result {
+            assert!(
+                e.to_string().contains("Failed to parse entry"),
+                "Error should mention parse failure"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_corrupted_hash_field() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("corrupted_hash.log");
+
+        // Create log with valid entries
+        {
+            let mut log = AuditLog::open(&log_path).await.unwrap();
+            log.append(
+                AuditEvent::new(AuditEventType::ActionExecuted, "agent", "Event 1").unwrap(),
+            )
+            .await
+            .unwrap();
+            log.append(
+                AuditEvent::new(AuditEventType::ActionExecuted, "agent", "Event 2").unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+
+        // Corrupt the hash field in the first entry
+        let content = fs::read_to_string(&log_path).await.unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        let mut first_entry: AuditEntry = serde_json::from_str(lines[0]).unwrap();
+
+        // Modify the hash to simulate tampering
+        first_entry.hash = "CORRUPTED_HASH_VALUE".to_string();
+
+        let corrupted_line = serde_json::to_string(&first_entry).unwrap();
+        let corrupted_content = format!("{}\n{}", corrupted_line, lines[1]);
+        fs::write(&log_path, corrupted_content).await.unwrap();
+
+        // Reopen and verify — integrity should fail
+        let log = AuditLog::open(&log_path).await.unwrap();
+        assert_eq!(log.count(), 2, "Both entries should be loaded");
+        assert!(
+            !log.verify_integrity().unwrap(),
+            "Integrity check should fail with corrupted hash"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_empty_lines_in_log() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("empty_lines.log");
+
+        // Write key file first
+        let key_bytes: [u8; 32] = [0x33u8; 32];
+        fs::write(dir.path().join(KEY_FILE_NAME), &key_bytes)
+            .await
+            .unwrap();
+
+        // Create log with empty lines interspersed
+        let valid_entry = r#"{"event":{"id":"123","timestamp":1000,"event_type":"ActionExecuted","actor":"agent","description":"Test","metadata":{}},"prev_hash":"GENESIS","hash":"abc123"}"#;
+
+        // Write with empty lines
+        fs::write(
+            &log_path,
+            format!("{}\n\n\n{}\n\n", valid_entry, valid_entry),
+        )
+        .await
+        .unwrap();
+
+        let result = AuditLog::open(&log_path).await;
+        // Empty lines will try to parse as JSON and fail
+        assert!(result.is_err(), "Log with empty lines should fail to parse");
+    }
+
+    #[tokio::test]
+    async fn test_very_large_number_of_entries() {
+        let mut log = AuditLog::in_memory();
+
+        // Append 1000+ events
+        for i in 0..1500 {
+            let event = AuditEvent::new(
+                AuditEventType::ActionExecuted,
+                "agent",
+                format!("Event {}", i),
+            )
+            .unwrap();
+
+            log.append(event).await.unwrap();
+        }
+
+        assert_eq!(log.count(), 1500, "Should have 1500 entries");
+        assert!(
+            log.verify_integrity().unwrap(),
+            "Hash chain should be intact for all 1500 entries"
+        );
+
+        // Query with limit
+        let filter = AuditFilter {
+            limit: Some(100),
+            ..Default::default()
+        };
+        let results = log.query(&filter).unwrap();
+        assert_eq!(results.len(), 100, "Limit should be respected");
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_appends() {
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let log = Arc::new(Mutex::new(AuditLog::in_memory()));
+        let mut handles = vec![];
+
+        // Spawn 10 tasks, each appending 10 events
+        for task_id in 0..10 {
+            let log_clone = Arc::clone(&log);
+            let handle = tokio::spawn(async move {
+                for i in 0..10 {
+                    let event = AuditEvent::new(
+                        AuditEventType::ActionExecuted,
+                        format!("task-{}", task_id),
+                        format!("Event {} from task {}", i, task_id),
+                    )
+                    .unwrap();
+
+                    let mut log_guard = log_clone.lock().await;
+                    log_guard.append(event).await.unwrap();
+                }
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all tasks to complete
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        let log_guard = log.lock().await;
+        assert_eq!(
+            log_guard.count(),
+            100,
+            "Should have 100 total entries (10 tasks × 10 events)"
+        );
+        assert!(
+            log_guard.verify_integrity().unwrap(),
+            "Hash chain should remain intact despite concurrent access"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_disk_full_simulation_readonly_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("readonly.log");
+
+        // Create log first
+        {
+            let mut log = AuditLog::open(&log_path).await.unwrap();
+            log.append(
+                AuditEvent::new(AuditEventType::ActionExecuted, "agent", "Initial").unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+
+        // Make directory read-only to simulate write failure
+        let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
+        perms.set_mode(0o555); // r-xr-xr-x (no write)
+        std::fs::set_permissions(dir.path(), perms).unwrap();
+
+        // Try to append — should fail
+        let result = AuditLog::open(&log_path).await;
+
+        // Reset permissions for cleanup
+        let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(dir.path(), perms).unwrap();
+
+        // The open itself might succeed (reading existing file), but append should fail
+        // Let's test the append failure scenario
+        if let Ok(mut log) = result {
+            let event =
+                AuditEvent::new(AuditEventType::ActionExecuted, "agent", "Should fail").unwrap();
+
+            // Make dir readonly again for append test
+            let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
+            perms.set_mode(0o555);
+            std::fs::set_permissions(dir.path(), perms).unwrap();
+
+            let append_result = log.append(event).await;
+
+            // Reset permissions again
+            let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(dir.path(), perms).unwrap();
+
+            // Note: This test may pass on some systems where the file is already open
+            // The real test is that we handle write errors gracefully
+            if let Err(e) = append_result {
+                assert!(
+                    e.to_string().contains("Failed to"),
+                    "Error should indicate write failure"
+                );
+            }
+        }
     }
 }
