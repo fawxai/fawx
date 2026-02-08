@@ -1,7 +1,7 @@
 # CLAUDE.md - Nova Project
 
 ## Project Overview
-AI-native phone agent. Rust daemon that perceives, thinks, and acts on behalf of the user. Phase 0.5: Mac Mini pre-PoC validating the cognitive pipeline without a phone.
+AI-native phone agent. Rust daemon that perceives, thinks, and acts on behalf of the user. Phone-first development: Rust agent daemon + Android NDK cross-compilation + direct device control on rooted Pixel 10 Pro.
 
 ## Tech Stack
 - Rust (2021 edition)
@@ -70,3 +70,21 @@ Every feature needs tests. Every bug fix needs a failing regression test first.
 4. ✅ New tests for new features
 5. ✅ Documentation updated if needed
 6. ✅ `@claude review this PR` comment posted
+
+## Parallel Agent Swarm Rules
+
+When running multiple sub-agents in parallel on the same repo:
+
+1. **ALWAYS use separate git clones** — never share a working directory
+   ```bash
+   git clone nova nova-agent1
+   git clone nova nova-agent2
+   cd nova-agent1 && git remote set-url origin https://github.com/abbudjoe/nova.git
+   ```
+2. **Each agent gets its own directory** — e.g., `nova-agent1/`, `nova-agent2/`, `nova-agent3/`
+3. **Each agent works on a separate branch** in its own clone
+4. **Agents must NEVER cd into another agent's directory**
+5. **Destroy clones after PRs merge** — run `rm -rf nova-agent1 nova-agent2 nova-agent3` once work is merged to main
+6. **The primary `nova/` directory stays on `main`** — only clone directories have feature branches
+
+**Why:** Parallel agents sharing one `.git` directory will switch branches on each other, causing total work loss. This was learned the hard way on 2026-02-08.
