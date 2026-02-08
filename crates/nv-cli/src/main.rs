@@ -1,6 +1,10 @@
 //! Nova CLI - Management interface for the Nova agent.
 
+mod confirmation;
+
 use clap::{Parser, Subcommand};
+
+pub use confirmation::ConfirmationUi;
 
 #[derive(Parser)]
 #[command(name = "nova")]
