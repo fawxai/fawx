@@ -82,10 +82,7 @@ impl CapabilityChecker {
             );
 
             let description = if allowed {
-                format!(
-                    "Skill '{}' used capability: {}",
-                    self.skill_name, required
-                )
+                format!("Skill '{}' used capability: {}", self.skill_name, required)
             } else {
                 format!(
                     "Skill '{}' denied capability: {}",
@@ -221,10 +218,8 @@ mod tests {
 
     #[test]
     fn test_check_allowed_capability() {
-        let checker = CapabilityChecker::new(
-            vec![Capability::Network, Capability::Storage],
-            "test_skill",
-        );
+        let checker =
+            CapabilityChecker::new(vec![Capability::Network, Capability::Storage], "test_skill");
 
         assert!(checker.check(&Capability::Network).is_ok());
         assert!(checker.check(&Capability::Storage).is_ok());
@@ -305,7 +300,10 @@ mod tests {
             events[0].metadata.get("capability"),
             Some(&"network".to_string())
         );
-        assert_eq!(events[0].metadata.get("result"), Some(&"allowed".to_string()));
+        assert_eq!(
+            events[0].metadata.get("result"),
+            Some(&"allowed".to_string())
+        );
     }
 
     #[cfg(feature = "audit")]
@@ -330,7 +328,10 @@ mod tests {
             events[0].metadata.get("capability"),
             Some(&"phone_actions".to_string())
         );
-        assert_eq!(events[0].metadata.get("result"), Some(&"denied".to_string()));
+        assert_eq!(
+            events[0].metadata.get("result"),
+            Some(&"denied".to_string())
+        );
     }
 
     #[cfg(feature = "audit")]
@@ -385,7 +386,13 @@ mod tests {
         assert_eq!(log.count(), 2);
 
         let events = log.query(&Default::default()).unwrap();
-        assert_eq!(events[0].metadata.get("result"), Some(&"allowed".to_string()));
-        assert_eq!(events[1].metadata.get("result"), Some(&"denied".to_string()));
+        assert_eq!(
+            events[0].metadata.get("result"),
+            Some(&"allowed".to_string())
+        );
+        assert_eq!(
+            events[1].metadata.get("result"),
+            Some(&"denied".to_string())
+        );
     }
 }

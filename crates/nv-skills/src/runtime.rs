@@ -307,7 +307,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_invoke_skill_async_nonexistent() {
-        let mut runtime = SkillRuntime::new().expect("Should create runtime");
+        let runtime = SkillRuntime::new().expect("Should create runtime");
 
         let result = runtime.invoke_skill_async("nonexistent", "input").await;
         assert!(result.is_err());
