@@ -32,7 +32,7 @@ pub async fn run() -> anyhow::Result<i32> {
     }
 
     // Check storage directory
-    if check_storage() {
+    if check_storage().await {
         println!("{} Storage directory is writable", CHECK_MARK);
     } else {
         println!("{} Storage directory not writable", CROSS_MARK);
@@ -40,7 +40,7 @@ pub async fn run() -> anyhow::Result<i32> {
     }
 
     // Check audit log
-    if check_audit_log() {
+    if check_audit_log().await {
         println!("{} Audit log is intact", CHECK_MARK);
     } else {
         println!("{} Audit log verification failed", CROSS_MARK);
@@ -71,29 +71,29 @@ fn check_model() -> bool {
     true
 }
 
-fn check_storage() -> bool {
+async fn check_storage() -> bool {
     let storage_dir = match get_storage_dir() {
         Ok(p) => p,
         Err(_) => return false,
     };
 
     // Create directory if it doesn't exist (create_dir_all is idempotent)
-    if std::fs::create_dir_all(&storage_dir).is_err() {
+    if tokio::fs::create_dir_all(&storage_dir).await.is_err() {
         return false;
     }
 
     // Test writability by creating a temp file
     let test_file = storage_dir.join(".writetest");
-    match std::fs::write(&test_file, b"test") {
+    match tokio::fs::write(&test_file, b"test").await {
         Ok(_) => {
-            let _ = std::fs::remove_file(&test_file);
+            let _ = tokio::fs::remove_file(&test_file).await;
             true
         }
         Err(_) => false,
     }
 }
 
-fn check_audit_log() -> bool {
+async fn check_audit_log() -> bool {
     let log_path = match get_audit_log_path() {
         Ok(p) => p,
         Err(_) => return false,
@@ -105,7 +105,7 @@ fn check_audit_log() -> bool {
     }
 
     // Try to open and verify the log
-    match nv_security::AuditLog::open(&log_path) {
+    match nv_security::AuditLog::open(&log_path).await {
         Ok(log) => match log.verify_integrity() {
             Ok(valid) => valid,
             Err(e) => {
@@ -138,27 +138,18 @@ fn get_audit_log_path() -> anyhow::Result<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
 
     #[test]
-    fn test_check_functions_return_bool() {
+    fn test_sync_check_functions_return_bool() {
         // These should return bool values without panicking
         let _ = check_workspace();
         let _ = check_config();
         let _ = check_model();
-        let _ = check_storage();
-        let _ = check_audit_log();
     }
 
-    #[test]
-    fn test_storage_check_creates_dir() {
-        let dir = tempdir().unwrap();
-        let storage_path = dir.path().join("storage");
-
-        assert!(!storage_path.exists());
-
-        // This would normally be tested via check_storage,
-        // but we can't easily inject the path without refactoring
-        // The test verifies that the directory doesn't exist initially
+    #[tokio::test]
+    async fn test_async_check_functions_return_bool() {
+        let _ = check_storage().await;
+        let _ = check_audit_log().await;
     }
 }

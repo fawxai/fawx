@@ -97,15 +97,15 @@ async fn main() -> anyhow::Result<()> {
         Commands::Chat => commands::chat::run().await?,
         Commands::Doctor => commands::doctor::run().await?,
         Commands::Config => {
-            commands::config::run()?;
+            commands::config::run().await?;
             0
         }
         Commands::Audit { command } => match command {
             AuditCommands::Show { limit } => {
-                commands::audit::show(limit)?;
+                commands::audit::show(limit).await?;
                 0
             }
-            AuditCommands::Verify => commands::audit::verify()?,
+            AuditCommands::Verify => commands::audit::verify().await?,
         },
         Commands::Skill { command } => match command {
             SkillCommands::List => {

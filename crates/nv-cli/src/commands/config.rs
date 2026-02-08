@@ -85,8 +85,8 @@ impl Default for LlmConfig {
 }
 
 /// Show current configuration
-pub fn run() -> anyhow::Result<()> {
-    let config = load_config()?;
+pub async fn run() -> anyhow::Result<()> {
+    let config = load_config().await?;
     let redacted_config = redact_sensitive(&config);
 
     let toml_str = toml::to_string_pretty(&redacted_config)?;
@@ -96,11 +96,11 @@ pub fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn load_config() -> anyhow::Result<Config> {
+async fn load_config() -> anyhow::Result<Config> {
     let config_path = get_config_path()?;
 
     if config_path.exists() {
-        let content = std::fs::read_to_string(&config_path)?;
+        let content = tokio::fs::read_to_string(&config_path).await?;
         let config: Config = toml::from_str(&content)?;
         Ok(config)
     } else {

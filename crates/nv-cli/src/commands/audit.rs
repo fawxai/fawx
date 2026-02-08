@@ -6,7 +6,7 @@ const CHECK_MARK: &str = "\x1b[32m✓\x1b[0m"; // Green checkmark
 const CROSS_MARK: &str = "\x1b[31m✗\x1b[0m"; // Red X
 
 /// Show recent audit entries
-pub fn show(limit: Option<usize>) -> anyhow::Result<()> {
+pub async fn show(limit: Option<usize>) -> anyhow::Result<()> {
     let log_path = get_audit_log_path()?;
 
     if !log_path.exists() {
@@ -14,7 +14,7 @@ pub fn show(limit: Option<usize>) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let log = AuditLog::open(&log_path)?;
+    let log = AuditLog::open(&log_path).await?;
 
     let filter = AuditFilter {
         limit,
@@ -41,7 +41,7 @@ pub fn show(limit: Option<usize>) -> anyhow::Result<()> {
 }
 
 /// Verify audit log integrity
-pub fn verify() -> anyhow::Result<i32> {
+pub async fn verify() -> anyhow::Result<i32> {
     let log_path = get_audit_log_path()?;
 
     if !log_path.exists() {
@@ -51,7 +51,7 @@ pub fn verify() -> anyhow::Result<i32> {
 
     println!("Verifying audit log integrity...\n");
 
-    let log = AuditLog::open(&log_path)?;
+    let log = AuditLog::open(&log_path).await?;
 
     match log.verify_integrity()? {
         true => {
