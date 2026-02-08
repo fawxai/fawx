@@ -75,10 +75,17 @@ impl AuditEntry {
         prev_hash: &str,
     ) -> Result<String, SecurityError> {
         let event_type_json = serde_json::to_string(&event.event_type).map_err(|e| {
-            SecurityError::AuditLog(format!("Failed to serialize event type: {}", e))
+            SecurityError::AuditLog(format!(
+                "Internal error: failed to serialize event type for HMAC computation: {}",
+                e
+            ))
         })?;
-        let metadata_json = serde_json::to_string(&event.metadata)
-            .map_err(|e| SecurityError::AuditLog(format!("Failed to serialize metadata: {}", e)))?;
+        let metadata_json = serde_json::to_string(&event.metadata).map_err(|e| {
+            SecurityError::AuditLog(format!(
+                "Internal error: failed to serialize metadata for HMAC computation: {}",
+                e
+            ))
+        })?;
 
         let data = format!(
             "{}:{}:{}:{}:{}:{}:{}",
@@ -129,6 +136,12 @@ pub struct AuditLog {
 
 /// Default key file name stored alongside the audit log
 const KEY_FILE_NAME: &str = "audit.key";
+
+/// Maximum size of a single audit log entry (1 MB).
+///
+/// This limit protects against memory exhaustion and extremely large entries.
+/// Entries exceeding this size will be rejected during log loading.
+const MAX_ENTRY_SIZE: usize = 1_048_576;
 
 impl AuditLog {
     /// Generate or load an HMAC key for the audit log.
@@ -194,10 +207,16 @@ impl AuditLog {
     /// If the key doesn't exist, a new 256-bit key is generated and saved with
     /// restrictive permissions (0600 on Unix).
     ///
+    /// # Limits
+    ///
+    /// - Maximum entry size: 1 MB (see [`MAX_ENTRY_SIZE`])
+    /// - Empty lines in the log file are silently skipped
+    ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The log file exists but contains invalid JSON
+    /// - An entry exceeds the maximum size limit
     /// - The key file cannot be read or created
     /// - File I/O fails
     ///
@@ -234,7 +253,6 @@ impl AuditLog {
                 .await
                 .map_err(|e| SecurityError::AuditLog(format!("Failed to open log: {}", e)))?;
 
-            const MAX_LINE_LENGTH: usize = 1_048_576; // 1MB per entry
             let reader = BufReader::new(file);
             let mut lines = reader.lines();
 
@@ -243,9 +261,14 @@ impl AuditLog {
                 .await
                 .map_err(|e| SecurityError::AuditLog(format!("Failed to read line: {}", e)))?
             {
-                if line.len() > MAX_LINE_LENGTH {
+                // Skip empty lines gracefully
+                if line.trim().is_empty() {
+                    continue;
+                }
+
+                if line.len() > MAX_ENTRY_SIZE {
                     return Err(SecurityError::AuditLog(format!(
-                        "Audit log entry exceeds maximum length ({} bytes)",
+                        "Audit log entry exceeds maximum size ({} bytes)",
                         line.len()
                     )));
                 }
@@ -267,10 +290,17 @@ impl AuditLog {
         })
     }
 
-    /// Create an in-memory audit log (for testing)
+    /// Create an in-memory audit log (for testing).
+    ///
+    /// Generates a fresh random HMAC key for each instance to ensure test isolation
+    /// and prevent key reuse across test runs.
     pub fn in_memory() -> Self {
-        // Use a fixed test key for in-memory mode
-        let key = hmac::Key::new(hmac::HMAC_SHA256, b"nova-audit-test-key-do-not-use!");
+        // Generate a fresh random key for each in-memory instance
+        let key_bytes: [u8; 32] = ring::rand::generate(&ring::rand::SystemRandom::new())
+            .expect("Failed to generate random key for in-memory log")
+            .expose();
+
+        let key = hmac::Key::new(hmac::HMAC_SHA256, &key_bytes);
         Self {
             path: None,
             key,
@@ -928,30 +958,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_broken_hash_chain_link() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("broken_chain.log");
+
+        // Create log with valid entries
+        {
+            let mut log = AuditLog::open(&log_path).await.unwrap();
+            log.append(
+                AuditEvent::new(AuditEventType::ActionExecuted, "agent", "Event 1").unwrap(),
+            )
+            .await
+            .unwrap();
+            log.append(
+                AuditEvent::new(AuditEventType::ActionExecuted, "agent", "Event 2").unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+
+        // Break the chain by modifying second entry's prev_hash
+        let content = fs::read_to_string(&log_path).await.unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        let mut second_entry: AuditEntry = serde_json::from_str(lines[1]).unwrap();
+
+        // Change prev_hash to something invalid
+        second_entry.prev_hash = "INVALID_LINK".to_string();
+
+        let corrupted_line = serde_json::to_string(&second_entry).unwrap();
+        let corrupted_content = format!("{}\n{}", lines[0], corrupted_line);
+        fs::write(&log_path, corrupted_content).await.unwrap();
+
+        // Reopen and verify
+        let log = AuditLog::open(&log_path).await.unwrap();
+        assert!(
+            !log.verify_integrity().unwrap(),
+            "Should detect broken chain link"
+        );
+    }
+
+    #[tokio::test]
     async fn test_empty_lines_in_log() {
         let dir = tempdir().unwrap();
         let log_path = dir.path().join("empty_lines.log");
 
-        // Write key file first
-        let key_bytes: [u8; 32] = [0x33u8; 32];
-        fs::write(dir.path().join(KEY_FILE_NAME), &key_bytes)
+        // Create a valid log with 2 entries first
+        {
+            let mut log = AuditLog::open(&log_path).await.unwrap();
+            log.append(
+                AuditEvent::new(AuditEventType::ActionExecuted, "agent", "Event 1").unwrap(),
+            )
             .await
             .unwrap();
+            log.append(
+                AuditEvent::new(AuditEventType::ActionExecuted, "agent", "Event 2").unwrap(),
+            )
+            .await
+            .unwrap();
+        }
 
-        // Create log with empty lines interspersed
-        let valid_entry = r#"{"event":{"id":"123","timestamp":1000,"event_type":"ActionExecuted","actor":"agent","description":"Test","metadata":{}},"prev_hash":"GENESIS","hash":"abc123"}"#;
+        // Manually add empty lines to the log file
+        let content = fs::read_to_string(&log_path).await.unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        let with_empty_lines = format!("{}\n\n\n{}\n\n", lines[0], lines[1]);
+        fs::write(&log_path, with_empty_lines).await.unwrap();
 
-        // Write with empty lines
-        fs::write(
-            &log_path,
-            format!("{}\n\n\n{}\n\n", valid_entry, valid_entry),
-        )
-        .await
-        .unwrap();
-
-        let result = AuditLog::open(&log_path).await;
-        // Empty lines will try to parse as JSON and fail
-        assert!(result.is_err(), "Log with empty lines should fail to parse");
+        // Reopen — should gracefully skip empty lines
+        let log = AuditLog::open(&log_path).await.unwrap();
+        assert_eq!(
+            log.count(),
+            2,
+            "Should load 2 entries, skipping empty lines"
+        );
+        assert!(
+            log.verify_integrity().unwrap(),
+            "Integrity should still be valid"
+        );
     }
 
     #[tokio::test]
@@ -1029,63 +1111,54 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
-    async fn test_disk_full_simulation_readonly_dir() {
-        use std::os::unix::fs::PermissionsExt;
-
+    async fn test_append_propagates_write_errors() {
+        // Create log in a valid directory first
         let dir = tempdir().unwrap();
-        let log_path = dir.path().join("readonly.log");
+        let log_path = dir.path().join("test.log");
 
-        // Create log first
+        let mut log = AuditLog::open(&log_path).await.unwrap();
+
+        // Write one event successfully
+        log.append(
+            AuditEvent::new(AuditEventType::ActionExecuted, "agent", "Initial event").unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // Now make the log file read-only to simulate write failure on append
+        #[cfg(unix)]
         {
-            let mut log = AuditLog::open(&log_path).await.unwrap();
-            log.append(
-                AuditEvent::new(AuditEventType::ActionExecuted, "agent", "Initial").unwrap(),
-            )
-            .await
-            .unwrap();
-        }
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&log_path).unwrap().permissions();
+            perms.set_mode(0o444); // read-only
+            std::fs::set_permissions(&log_path, perms).unwrap();
 
-        // Make directory read-only to simulate write failure
-        let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
-        perms.set_mode(0o555); // r-xr-xr-x (no write)
-        std::fs::set_permissions(dir.path(), perms).unwrap();
-
-        // Try to append — should fail
-        let result = AuditLog::open(&log_path).await;
-
-        // Reset permissions for cleanup
-        let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(dir.path(), perms).unwrap();
-
-        // The open itself might succeed (reading existing file), but append should fail
-        // Let's test the append failure scenario
-        if let Ok(mut log) = result {
             let event =
                 AuditEvent::new(AuditEventType::ActionExecuted, "agent", "Should fail").unwrap();
+            let result = log.append(event).await;
 
-            // Make dir readonly again for append test
-            let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
-            perms.set_mode(0o555);
-            std::fs::set_permissions(dir.path(), perms).unwrap();
+            // Reset permissions for cleanup
+            let mut perms = std::fs::metadata(&log_path).unwrap().permissions();
+            perms.set_mode(0o644);
+            std::fs::set_permissions(&log_path, perms).unwrap();
 
-            let append_result = log.append(event).await;
-
-            // Reset permissions again
-            let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(dir.path(), perms).unwrap();
-
-            // Note: This test may pass on some systems where the file is already open
-            // The real test is that we handle write errors gracefully
-            if let Err(e) = append_result {
+            // Verify that write failure was detected
+            assert!(result.is_err(), "Should fail when log file is read-only");
+            if let Err(e) = result {
+                let error_msg = e.to_string();
                 assert!(
-                    e.to_string().contains("Failed to"),
-                    "Error should indicate write failure"
+                    error_msg.contains("Failed to") || error_msg.contains("failed to"),
+                    "Error should indicate write failure, got: {}",
+                    error_msg
                 );
             }
+        }
+
+        // On non-Unix platforms, this test is a no-op
+        #[cfg(not(unix))]
+        {
+            // Test passes automatically on non-Unix platforms
         }
     }
 }

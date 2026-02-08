@@ -62,6 +62,38 @@
 //! - **Skills** — `SkillInvoked`, `SkillInstalled`, `SkillRemoved`
 //! - **Security** — `AuthAttempt`, `CredentialAccess`
 //! - **System** — `SystemStartup`, `SystemShutdown`, `ConfigChanged`
+//!
+//! # Concurrency
+//!
+//! `AuditLog` is **not** `Sync` and requires external synchronization for concurrent access.
+//! Use `Arc<Mutex<AuditLog>>` when multiple tasks need to append events:
+//!
+//! ```rust,no_run
+//! use nv_security::audit::{AuditLog, AuditEvent, AuditEventType};
+//! use std::path::Path;
+//! use std::sync::Arc;
+//! use tokio::sync::Mutex;
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), nv_core::error::SecurityError> {
+//!     let log = Arc::new(Mutex::new(AuditLog::open(Path::new("audit.log")).await?));
+//!
+//!     let log_clone = Arc::clone(&log);
+//!     let handle = tokio::spawn(async move {
+//!         let event = AuditEvent::new(
+//!             AuditEventType::ActionExecuted,
+//!             "task-1",
+//!             "Concurrent event"
+//!         )?;
+//!         let mut guard = log_clone.lock().await;
+//!         guard.append(event).await?;
+//!         Ok::<(), nv_core::error::SecurityError>(())
+//!     });
+//!
+//!     handle.await.unwrap()?;
+//!     Ok(())
+//! }
+//! ```
 
 mod log;
 mod types;
