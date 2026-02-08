@@ -16,16 +16,30 @@
 //! - Thread safety is maintained (llama.cpp is not thread-safe by default)
 
 #![allow(non_camel_case_types)]
-#![allow(dead_code)]
 
 use std::os::raw::{c_char, c_float, c_int};
 
 // Opaque types (llama.cpp internal structures)
+
+/// Opaque handle to a llama.cpp model.
+///
+/// # Safety
+/// This type must only be created and destroyed by llama.cpp via
+/// `llama_model_load` and `llama_free_model`. Rust code should only
+/// pass pointers to this type, never dereference or construct directly.
+/// The `[u8; 0]` pattern ensures zero size while preventing construction.
 #[repr(C)]
 pub struct llama_model {
     _private: [u8; 0],
 }
 
+/// Opaque handle to a llama.cpp inference context.
+///
+/// # Safety
+/// This type must only be created and destroyed by llama.cpp via
+/// `llama_new_context` and `llama_free`. Rust code should only pass
+/// pointers to this type, never dereference or construct directly.
+/// The context is NOT thread-safe; synchronize access externally.
 #[repr(C)]
 pub struct llama_context {
     _private: [u8; 0],
@@ -207,6 +221,13 @@ pub mod stub {
     /// This is a no-op stub. Safe to call but does nothing.
     pub unsafe fn llama_free_model(_model: *mut llama_model) {}
 }
+
+// Re-export FFI functions for explicit import path
+#[cfg(feature = "llama-cpp")]
+pub use self::{
+    llama_decode, llama_free, llama_free_model, llama_model_load, llama_new_context,
+    llama_token_to_str, llama_tokenize,
+};
 
 // Re-export stubs when feature is disabled
 #[cfg(not(feature = "llama-cpp"))]

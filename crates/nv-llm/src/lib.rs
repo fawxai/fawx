@@ -19,7 +19,7 @@ pub use router::{LlmRouter, RoutingStrategy};
 ///
 /// Abstraction over local and cloud LLM providers.
 #[async_trait]
-pub trait LlmProvider: Send + Sync {
+pub trait LlmProvider: Send + Sync + std::fmt::Debug {
     /// Generate a completion for the given prompt.
     ///
     /// # Arguments
@@ -61,6 +61,7 @@ mod tests {
     use super::*;
 
     /// Mock provider for testing
+    #[derive(Debug)]
     struct MockProvider {
         name: String,
         response: String,

@@ -194,4 +194,32 @@ mod tests {
         // Cleanup
         std::fs::remove_file(&model_path).ok();
     }
+
+    #[tokio::test]
+    async fn test_streaming_callback_signature() {
+        // This test verifies the streaming API signature works correctly
+        // without requiring actual model inference
+
+        let temp_dir = std::env::temp_dir();
+        let model_path = temp_dir.join("test-model-streaming.gguf");
+        std::fs::write(&model_path, b"fake model").unwrap();
+
+        let config = LocalModelConfig::new(model_path.clone(), 2048, 0.7, 0.95, 512).unwrap();
+        let model = LocalModel::new(config).unwrap();
+
+        // Verify callback accepts owned String (not &str)
+        let callback = Box::new(|chunk: String| {
+            // In real use, this would send chunk to a channel/stream
+            assert!(!chunk.is_empty() || chunk.is_empty()); // Always true, just to use chunk
+        });
+
+        let result = model.generate_streaming("test", 10, callback).await;
+
+        // Without llama-cpp feature, generate() fails, so streaming also fails
+        #[cfg(not(feature = "llama-cpp"))]
+        assert!(result.is_err());
+
+        // Cleanup
+        std::fs::remove_file(&model_path).ok();
+    }
 }

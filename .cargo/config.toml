@@ -17,10 +17,11 @@ opt-level = 0
 debug = true
 
 # Android cross-compilation target (for Horizon 1)
+# API Level 33 = Android 13 (minimum supported version)
 [target.aarch64-linux-android]
-linker = "aarch64-linux-android-clang"
-ar = "aarch64-linux-android-ar"
+linker = "aarch64-linux-android33-clang"
+ar = "llvm-ar"
 
 # iOS target (for future Horizon 2+)
-[target.aarch64-apple-ios]
-linker = "rust-lld"
+# Cargo uses correct linker by default; no override needed
+# [target.aarch64-apple-ios]

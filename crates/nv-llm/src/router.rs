@@ -23,31 +23,40 @@ pub enum RoutingStrategy {
 
 /// Routes LLM requests to appropriate providers based on strategy.
 ///
-/// The router maintains a collection of providers and selects one
-/// based on the routing strategy.
+/// The router maintains typed references to local and cloud providers,
+/// ensuring type-safe routing strategies.
+#[derive(Debug)]
 pub struct LlmRouter {
-    providers: Vec<Box<dyn LlmProvider>>,
+    local: Option<Box<dyn LlmProvider>>,
+    cloud: Option<Box<dyn LlmProvider>>,
 }
 
 impl LlmRouter {
-    /// Create a new router with the given providers.
+    /// Create a new router with optional local and cloud providers.
     ///
     /// # Arguments
-    /// * `providers` - Vector of LLM providers to route between
+    /// * `local` - Optional local LLM provider
+    /// * `cloud` - Optional cloud LLM provider
     ///
-    /// # Panics
-    /// Panics if providers list is empty (use a type-level guarantee in production)
-    pub fn new(providers: Vec<Box<dyn LlmProvider>>) -> Self {
-        if providers.is_empty() {
-            panic!("LlmRouter requires at least one provider");
+    /// # Errors
+    /// Returns `LlmError::Model` if both providers are None
+    pub fn new(
+        local: Option<Box<dyn LlmProvider>>,
+        cloud: Option<Box<dyn LlmProvider>>,
+    ) -> Result<Self, LlmError> {
+        if local.is_none() && cloud.is_none() {
+            return Err(LlmError::Model(
+                "LlmRouter requires at least one provider".to_string(),
+            ));
         }
-        Self { providers }
+        Ok(Self { local, cloud })
     }
 
     /// Generate completion using the specified routing strategy.
     ///
     /// # Arguments
     /// * `prompt` - Input text
+    /// * `max_tokens` - Maximum number of tokens to generate
     /// * `routing` - Strategy for selecting provider
     ///
     /// # Returns
@@ -55,34 +64,33 @@ impl LlmRouter {
     pub async fn generate(
         &self,
         prompt: &str,
+        max_tokens: u32,
         routing: RoutingStrategy,
     ) -> Result<String, LlmError> {
         match routing {
-            RoutingStrategy::LocalFirst => self.try_local_then_cloud(prompt, 512).await,
-            RoutingStrategy::CloudFirst => self.try_cloud_then_local(prompt, 512).await,
-            RoutingStrategy::LocalOnly => self.try_local_only(prompt, 512).await,
-            RoutingStrategy::CloudOnly => self.try_cloud_only(prompt, 512).await,
+            RoutingStrategy::LocalFirst => self.try_local_then_cloud(prompt, max_tokens).await,
+            RoutingStrategy::CloudFirst => self.try_cloud_then_local(prompt, max_tokens).await,
+            RoutingStrategy::LocalOnly => self.try_local_only(prompt, max_tokens).await,
+            RoutingStrategy::CloudOnly => self.try_cloud_only(prompt, max_tokens).await,
         }
     }
 
-    /// Try local providers first, fall back to cloud.
+    /// Try local provider first, fall back to cloud.
     async fn try_local_then_cloud(
         &self,
         prompt: &str,
         max_tokens: u32,
     ) -> Result<String, LlmError> {
-        // For now, just try first provider (will be enhanced with provider type detection)
-        if let Some(provider) = self.providers.first() {
-            match provider.generate(prompt, max_tokens).await {
+        if let Some(ref local) = self.local {
+            match local.generate(prompt, max_tokens).await {
                 Ok(result) => {
                     debug!("Local generation succeeded");
                     Ok(result)
                 }
                 Err(e) => {
                     warn!("Local generation failed: {}, trying cloud fallback", e);
-                    // Try cloud providers if available
-                    if self.providers.len() > 1 {
-                        self.providers[1].generate(prompt, max_tokens).await
+                    if let Some(ref cloud) = self.cloud {
+                        cloud.generate(prompt, max_tokens).await
                     } else {
                         Err(LlmError::Inference(
                             "Local failed and no cloud fallback available".to_string(),
@@ -90,49 +98,58 @@ impl LlmRouter {
                     }
                 }
             }
+        } else if let Some(ref cloud) = self.cloud {
+            // No local provider, use cloud
+            cloud.generate(prompt, max_tokens).await
         } else {
             Err(LlmError::Model("No providers available".to_string()))
         }
     }
 
-    /// Try cloud providers first, fall back to local.
+    /// Try cloud provider first, fall back to local.
     async fn try_cloud_then_local(
         &self,
         prompt: &str,
         max_tokens: u32,
     ) -> Result<String, LlmError> {
-        // Similar to local-first but reversed
-        if self.providers.len() > 1 {
-            match self.providers[1].generate(prompt, max_tokens).await {
+        if let Some(ref cloud) = self.cloud {
+            match cloud.generate(prompt, max_tokens).await {
                 Ok(result) => {
                     debug!("Cloud generation succeeded");
                     Ok(result)
                 }
                 Err(e) => {
                     warn!("Cloud generation failed: {}, trying local fallback", e);
-                    self.providers[0].generate(prompt, max_tokens).await
+                    if let Some(ref local) = self.local {
+                        local.generate(prompt, max_tokens).await
+                    } else {
+                        Err(LlmError::Inference(
+                            "Cloud failed and no local fallback available".to_string(),
+                        ))
+                    }
                 }
             }
-        } else if let Some(provider) = self.providers.first() {
-            provider.generate(prompt, max_tokens).await
+        } else if let Some(ref local) = self.local {
+            // No cloud provider, use local
+            local.generate(prompt, max_tokens).await
         } else {
             Err(LlmError::Model("No providers available".to_string()))
         }
     }
 
-    /// Only use local providers.
+    /// Only use local provider.
     async fn try_local_only(&self, prompt: &str, max_tokens: u32) -> Result<String, LlmError> {
-        if let Some(provider) = self.providers.first() {
-            provider.generate(prompt, max_tokens).await
+        if let Some(ref local) = self.local {
+            local.generate(prompt, max_tokens).await
         } else {
             Err(LlmError::Model("No local provider available".to_string()))
         }
     }
 
-    /// Only use cloud providers.
+    /// Only use cloud provider.
     async fn try_cloud_only(&self, prompt: &str, max_tokens: u32) -> Result<String, LlmError> {
-        if self.providers.len() > 1 {
-            self.providers[1].generate(prompt, max_tokens).await
+        if let Some(ref cloud) = self.cloud {
+            cloud.generate(prompt, max_tokens).await
         } else {
             Err(LlmError::Model("No cloud provider available".to_string()))
         }
@@ -140,7 +157,14 @@ impl LlmRouter {
 
     /// Get number of registered providers.
     pub fn provider_count(&self) -> usize {
-        self.providers.len()
+        let mut count = 0;
+        if self.local.is_some() {
+            count += 1;
+        }
+        if self.cloud.is_some() {
+            count += 1;
+        }
+        count
     }
 }
 
@@ -151,6 +175,7 @@ mod tests {
     use std::sync::Mutex;
 
     /// Mock provider that tracks call count
+    #[derive(Debug)]
     struct MockProvider {
         name: String,
         should_succeed: bool,
@@ -208,8 +233,10 @@ mod tests {
         let local = Box::new(MockProvider::new_success("local", "local response"));
         let cloud = Box::new(MockProvider::new_success("cloud", "cloud response"));
 
-        let router = LlmRouter::new(vec![local, cloud]);
-        let result = router.generate("test", RoutingStrategy::LocalFirst).await;
+        let router = LlmRouter::new(Some(local), Some(cloud)).unwrap();
+        let result = router
+            .generate("test", 512, RoutingStrategy::LocalFirst)
+            .await;
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "local response");
@@ -220,8 +247,10 @@ mod tests {
         let local = Box::new(MockProvider::new_failure("local", "local failed"));
         let cloud = Box::new(MockProvider::new_success("cloud", "cloud response"));
 
-        let router = LlmRouter::new(vec![local, cloud]);
-        let result = router.generate("test", RoutingStrategy::LocalFirst).await;
+        let router = LlmRouter::new(Some(local), Some(cloud)).unwrap();
+        let result = router
+            .generate("test", 512, RoutingStrategy::LocalFirst)
+            .await;
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "cloud response");
@@ -232,8 +261,10 @@ mod tests {
         let local = Box::new(MockProvider::new_success("local", "local response"));
         let cloud = Box::new(MockProvider::new_success("cloud", "cloud response"));
 
-        let router = LlmRouter::new(vec![local, cloud]);
-        let result = router.generate("test", RoutingStrategy::CloudOnly).await;
+        let router = LlmRouter::new(Some(local), Some(cloud)).unwrap();
+        let result = router
+            .generate("test", 512, RoutingStrategy::CloudOnly)
+            .await;
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "cloud response");
@@ -244,8 +275,10 @@ mod tests {
         let local = Box::new(MockProvider::new_success("local", "local response"));
         let cloud = Box::new(MockProvider::new_success("cloud", "cloud response"));
 
-        let router = LlmRouter::new(vec![local, cloud]);
-        let result = router.generate("test", RoutingStrategy::LocalOnly).await;
+        let router = LlmRouter::new(Some(local), Some(cloud)).unwrap();
+        let result = router
+            .generate("test", 512, RoutingStrategy::LocalOnly)
+            .await;
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "local response");
@@ -255,11 +288,13 @@ mod tests {
     async fn test_local_only_fails_when_no_local() {
         let cloud = Box::new(MockProvider::new_success("cloud", "cloud response"));
 
-        let router = LlmRouter::new(vec![cloud]);
-        let result = router.generate("test", RoutingStrategy::LocalOnly).await;
+        let router = LlmRouter::new(None, Some(cloud)).unwrap();
+        let result = router
+            .generate("test", 512, RoutingStrategy::LocalOnly)
+            .await;
 
-        // With only one provider, local-only still uses it
-        assert!(result.is_ok());
+        // LocalOnly with no local provider should fail
+        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -267,13 +302,22 @@ mod tests {
         let local = Box::new(MockProvider::new_success("local", "ok"));
         let cloud = Box::new(MockProvider::new_success("cloud", "ok"));
 
-        let router = LlmRouter::new(vec![local, cloud]);
+        let router = LlmRouter::new(Some(local), Some(cloud)).unwrap();
         assert_eq!(router.provider_count(), 2);
     }
 
+    #[tokio::test]
+    async fn test_provider_count_single() {
+        let local = Box::new(MockProvider::new_success("local", "ok"));
+
+        let router = LlmRouter::new(Some(local), None).unwrap();
+        assert_eq!(router.provider_count(), 1);
+    }
+
     #[test]
-    #[should_panic(expected = "LlmRouter requires at least one provider")]
-    fn test_empty_providers_panics() {
-        LlmRouter::new(vec![]);
+    fn test_empty_providers_returns_error() {
+        let result = LlmRouter::new(None, None);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), LlmError::Model(_)));
     }
 }

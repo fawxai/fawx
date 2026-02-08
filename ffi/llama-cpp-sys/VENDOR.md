@@ -4,11 +4,11 @@ This document describes how to vendor llama.cpp source code for compilation.
 
 ## Pinned Version
 
-**Target commit:** `b1696` (llama.cpp upstream, stable release)  
+**Target release:** `b1696` (llama.cpp stable release, Feb 2024)  
 **Repository:** https://github.com/ggerganov/llama.cpp  
-**Release:** v0.0.1696 (February 2024)
+**Commit SHA:** _To be filled when vendoring_ (tag `b1696` resolves to specific commit)
 
-> **Why b1696?** This is a stable commit with proven Android compatibility and GGUF format support.
+> **Why b1696?** This is a stable release with proven Android compatibility and GGUF format support.
 
 ## Vendoring Instructions
 
