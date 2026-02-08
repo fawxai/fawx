@@ -79,9 +79,39 @@ pub async fn install(path: &str) -> Result<()> {
     // Validate manifest
     nv_skills::manifest::validate_manifest(&manifest).context("Manifest validation failed")?;
 
+    // Validate manifest fields
+    const MAX_NAME_LEN: usize = 64;
+    const MAX_DESCRIPTION_LEN: usize = 1024;
+    const MAX_WASM_SIZE: usize = 10 * 1024 * 1024; // 10 MB
+    const MAX_CAPABILITIES: usize = 10;
+
+    if manifest.name.len() > MAX_NAME_LEN {
+        anyhow::bail!("Skill name too long (max {} chars)", MAX_NAME_LEN);
+    }
+    if manifest.name.contains("..") || manifest.name.contains('/') || manifest.name.contains('\\') {
+        anyhow::bail!("Invalid skill name: must not contain path separators or '..'");
+    }
+    if manifest.description.len() > MAX_DESCRIPTION_LEN {
+        anyhow::bail!(
+            "Skill description too long (max {} chars)",
+            MAX_DESCRIPTION_LEN
+        );
+    }
+    if manifest.capabilities.len() > MAX_CAPABILITIES {
+        anyhow::bail!("Too many capabilities (max {})", MAX_CAPABILITIES);
+    }
+
     // Load WASM bytes
     let wasm_bytes = fs::read(&wasm_path)
         .with_context(|| format!("Failed to read WASM file: {:?}", wasm_path))?;
+
+    if wasm_bytes.len() > MAX_WASM_SIZE {
+        anyhow::bail!(
+            "WASM file too large: {} bytes (max {} MB)",
+            wasm_bytes.len(),
+            MAX_WASM_SIZE / (1024 * 1024)
+        );
+    }
 
     // Validate WASM by trying to compile it
     let loader = nv_skills::loader::SkillLoader::new(vec![]);

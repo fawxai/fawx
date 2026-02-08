@@ -22,10 +22,7 @@ pub fn skill_tools() -> Vec<Tool> {
         }
     };
 
-    manifests
-        .iter()
-        .map(skill_to_tool)
-        .collect()
+    manifests.iter().map(skill_to_tool).collect()
 }
 
 /// Convert a skill manifest into a Claude Tool definition.

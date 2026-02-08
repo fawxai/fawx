@@ -51,17 +51,26 @@ impl MockHostApi {
 
     /// Get the output that was set by the skill.
     pub fn get_output(&self) -> String {
-        self.output.lock().expect("Lock poisoned").clone()
+        self.output
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Get all logged messages.
     pub fn get_logs(&self) -> Vec<(u32, String)> {
-        self.logs.lock().expect("Lock poisoned").clone()
+        self.logs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Get the current storage state.
     pub fn get_storage(&self) -> HashMap<String, String> {
-        self.storage.lock().expect("Lock poisoned").clone()
+        self.storage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 }
 
@@ -69,7 +78,7 @@ impl HostApi for MockHostApi {
     fn log(&self, level: u32, message: &str) {
         self.logs
             .lock()
-            .expect("Lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push((level, message.to_string()));
 
         match level {
@@ -85,7 +94,7 @@ impl HostApi for MockHostApi {
     fn kv_get(&self, key: &str) -> Option<String> {
         self.storage
             .lock()
-            .expect("Lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(key)
             .cloned()
     }
@@ -93,7 +102,7 @@ impl HostApi for MockHostApi {
     fn kv_set(&mut self, key: &str, value: &str) -> Result<(), SkillError> {
         self.storage
             .lock()
-            .expect("Lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(key.to_string(), value.to_string());
         Ok(())
     }
@@ -103,7 +112,10 @@ impl HostApi for MockHostApi {
     }
 
     fn set_output(&mut self, text: &str) {
-        *self.output.lock().expect("Lock poisoned") = text.to_string();
+        *self
+            .output
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = text.to_string();
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

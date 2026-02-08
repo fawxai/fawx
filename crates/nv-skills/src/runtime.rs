@@ -2,26 +2,49 @@
 
 use crate::host_api::{HostApi, MockHostApi};
 use crate::loader::LoadedSkill;
-use crate::manifest::SkillManifest;
+use crate::manifest::{Capability, SkillManifest};
 use nv_core::error::SkillError;
 use std::collections::HashMap;
 use wasmtime::{Caller, Engine, Linker, Memory, Store};
+
+/// Starting offset for string allocations in WASM linear memory.
+const WASM_STRING_BUFFER_START: u32 = 1024;
 
 /// Host state that holds the HostApi implementation and linear memory.
 struct HostState {
     api: Box<dyn HostApi>,
     memory: Option<Memory>,
+    /// Capabilities granted to the current skill.
+    capabilities: Vec<Capability>,
+    /// Next free offset for string allocation in WASM memory.
+    alloc_offset: u32,
 }
 
 impl HostState {
-    /// Create a new host state with the given API implementation.
-    fn new(api: Box<dyn HostApi>) -> Self {
-        Self { api, memory: None }
+    /// Create a new host state with the given API implementation and capabilities.
+    fn new(api: Box<dyn HostApi>, capabilities: Vec<Capability>) -> Self {
+        Self {
+            api,
+            memory: None,
+            capabilities,
+            alloc_offset: WASM_STRING_BUFFER_START,
+        }
     }
 
     /// Set the linear memory reference.
     fn set_memory(&mut self, memory: Memory) {
         self.memory = Some(memory);
+    }
+
+    /// Check if the skill has a required capability.
+    fn has_capability(&self, cap: &Capability) -> bool {
+        self.capabilities.contains(cap)
+    }
+
+    /// Reset allocation offset (e.g., between host function calls).
+    #[allow(dead_code)]
+    fn reset_alloc(&mut self) {
+        self.alloc_offset = WASM_STRING_BUFFER_START;
     }
 
     /// Read a string from WASM memory.
@@ -45,30 +68,38 @@ impl HostState {
             .map_err(|e| SkillError::Execution(format!("Invalid UTF-8: {}", e)))
     }
 
-    /// Write a string to WASM memory.
+    /// Write a string to WASM memory using bump allocation.
     /// Returns the pointer to the written string.
+    /// Appends a null terminator after the string for guest-side reading.
     ///
-    /// Note: This is a standalone method that takes memory explicitly
+    /// Note: This is a standalone method that takes memory + offset explicitly
     /// to avoid double-mutable-borrow issues with wasmtime's `Caller`.
     fn write_to_memory(
         memory: Memory,
         store: &mut impl wasmtime::AsContextMut,
         s: &str,
+        alloc_offset: &mut u32,
     ) -> Result<u32, SkillError> {
-        // For simplicity, we'll write to a fixed location in memory
-        // TODO(#165): production implementation should use proper memory allocation
-        let ptr = 1024u32; // Start at 1KB offset
+        let ptr = *alloc_offset;
         let bytes = s.as_bytes();
+        // +1 for null terminator
+        let total_len = bytes.len() + 1;
 
         let mem_data = memory.data_mut(store);
-        if ptr as usize + bytes.len() > mem_data.len() {
+        if ptr as usize + total_len > mem_data.len() {
             return Err(SkillError::Execution(format!(
-                "String too large for WASM memory: {} bytes",
-                bytes.len()
+                "String too large for WASM memory: {} bytes (offset {})",
+                bytes.len(),
+                ptr
             )));
         }
         let dest = &mut mem_data[ptr as usize..ptr as usize + bytes.len()];
         dest.copy_from_slice(bytes);
+        // Null terminator
+        mem_data[ptr as usize + bytes.len()] = 0;
+
+        // Bump the allocation offset (align to 8 bytes)
+        *alloc_offset = ptr + ((total_len as u32 + 7) & !7);
 
         Ok(ptr)
     }
@@ -131,6 +162,12 @@ impl SkillRuntime {
                 "host_api_v1",
                 "kv_get",
                 |mut caller: Caller<'_, HostState>, key_ptr: u32, key_len: u32| -> u32 {
+                    // Check capability
+                    if !caller.data().has_capability(&Capability::Storage) {
+                        tracing::warn!("kv_get denied: skill lacks Storage capability");
+                        return 0;
+                    }
+
                     // Read key
                     let key_result = caller.data().read_string(&caller, key_ptr, key_len);
                     let key = match key_result {
@@ -148,7 +185,7 @@ impl SkillRuntime {
                         None => return 0,
                     };
 
-                    // Write value — get memory before mutable borrow
+                    // Write value — get memory and alloc_offset before mutable borrow
                     let memory = match caller.data().memory {
                         Some(m) => m,
                         None => {
@@ -156,8 +193,13 @@ impl SkillRuntime {
                             return 0;
                         }
                     };
-                    match HostState::write_to_memory(memory, &mut caller, &value) {
-                        Ok(ptr) => ptr,
+                    let mut alloc_offset = caller.data().alloc_offset;
+                    match HostState::write_to_memory(memory, &mut caller, &value, &mut alloc_offset)
+                    {
+                        Ok(ptr) => {
+                            caller.data_mut().alloc_offset = alloc_offset;
+                            ptr
+                        }
                         Err(e) => {
                             tracing::error!("Failed to write kv_get value: {}", e);
                             0
@@ -177,6 +219,12 @@ impl SkillRuntime {
                  key_len: u32,
                  val_ptr: u32,
                  val_len: u32| {
+                    // Check capability
+                    if !caller.data().has_capability(&Capability::Storage) {
+                        tracing::warn!("kv_set denied: skill lacks Storage capability");
+                        return;
+                    }
+
                     let key_result = caller.data().read_string(&caller, key_ptr, key_len);
                     let val_result = caller.data().read_string(&caller, val_ptr, val_len);
 
@@ -203,7 +251,7 @@ impl SkillRuntime {
                     // Get input
                     let input = caller.data().api.get_input();
 
-                    // Write to memory — get memory before mutable borrow
+                    // Write to memory — get memory and alloc_offset before mutable borrow
                     let memory = match caller.data().memory {
                         Some(m) => m,
                         None => {
@@ -211,8 +259,13 @@ impl SkillRuntime {
                             return 0;
                         }
                     };
-                    match HostState::write_to_memory(memory, &mut caller, &input) {
-                        Ok(ptr) => ptr,
+                    let mut alloc_offset = caller.data().alloc_offset;
+                    match HostState::write_to_memory(memory, &mut caller, &input, &mut alloc_offset)
+                    {
+                        Ok(ptr) => {
+                            caller.data_mut().alloc_offset = alloc_offset;
+                            ptr
+                        }
                         Err(e) => {
                             tracing::error!("Failed to write input: {}", e);
                             0
@@ -251,9 +304,10 @@ impl SkillRuntime {
             .get(skill_name)
             .ok_or_else(|| SkillError::Execution(format!("Skill '{}' not found", skill_name)))?;
 
-        // Create host API state
+        // Create host API state with skill's declared capabilities
+        let capabilities = skill.capabilities().to_vec();
         let host_api = Box::new(MockHostApi::new(input));
-        let mut store = Store::new(&self.engine, HostState::new(host_api));
+        let mut store = Store::new(&self.engine, HostState::new(host_api, capabilities));
 
         // Create linker and link host functions
         let mut linker = Linker::new(&self.engine);
@@ -304,17 +358,15 @@ impl SkillRuntime {
     /// Runs the WASM execution in a blocking thread pool via `tokio::task::spawn_blocking`,
     /// allowing multiple skills to execute concurrently.
     ///
+    /// # Note
+    /// This is currently a placeholder implementation that returns a mock result.
+    /// Full WASM execution requires cloning the compiled `Module` into the blocking
+    /// task, which will be implemented when concurrent skill execution is needed
+    /// (tracked in issue backlog).
+    ///
     /// # Arguments
     /// * `skill_name` - Name of the skill to invoke
     /// * `input` - JSON input string for the skill
-    ///
-    /// # Example
-    /// ```ignore
-    /// let (r1, r2) = tokio::join!(
-    ///     runtime.invoke_skill_async("skill1", "input1"),
-    ///     runtime.invoke_skill_async("skill2", "input2")
-    /// );
-    /// ```
     pub async fn invoke_skill_async(
         &self,
         skill_name: &str,
@@ -331,9 +383,8 @@ impl SkillRuntime {
 
         let manifest_name = skill.manifest().name.clone();
 
-        // Execute WASM in a blocking thread pool
-        // In a real implementation, this would clone the compiled module
-        // and create a new Store/Instance for concurrent execution
+        // TODO(#165): Clone compiled Module into spawn_blocking for real WASM execution.
+        // Current implementation returns placeholder output for API compatibility.
         tokio::task::spawn_blocking(move || {
             let mut host_api = MockHostApi::new(&input);
             let output = format!("Skill '{}' invoked (placeholder execution)", manifest_name);
@@ -369,7 +420,11 @@ impl SkillRuntime {
 
 impl Default for SkillRuntime {
     fn default() -> Self {
-        Self::new().expect("Failed to create default SkillRuntime")
+        Self::new().unwrap_or_else(|e| {
+            // SkillRuntime::new() only fails if Engine::default() fails,
+            // which should not happen under normal circumstances.
+            panic!("Failed to create default SkillRuntime: {}", e)
+        })
     }
 }
 

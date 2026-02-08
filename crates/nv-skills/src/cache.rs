@@ -32,15 +32,23 @@ fn get_cache_path(hash: &str) -> Result<PathBuf, SkillError> {
     Ok(cache_dir.join(format!("{}.module", hash)))
 }
 
+/// Get the integrity hash file path for a cached module.
+fn get_integrity_path(hash: &str) -> Result<PathBuf, SkillError> {
+    let cache_dir = get_cache_dir()?;
+    Ok(cache_dir.join(format!("{}.sha256", hash)))
+}
+
 /// Try to load a cached module.
 ///
-/// Returns `Some(Module)` if cache hit, `None` if cache miss.
+/// Returns `Some(Module)` if cache hit with valid integrity, `None` if cache miss.
+/// Removes cached files if integrity verification fails.
 pub fn load_cached_module(
     engine: &Engine,
     wasm_bytes: &[u8],
 ) -> Result<Option<Module>, SkillError> {
     let hash = hash_bytes(wasm_bytes);
     let cache_path = get_cache_path(&hash)?;
+    let integrity_path = get_integrity_path(&hash)?;
 
     if !cache_path.exists() {
         tracing::debug!("Cache miss for hash {}", hash);
@@ -51,34 +59,71 @@ pub fn load_cached_module(
     let cached_bytes = fs::read(&cache_path)
         .map_err(|e| SkillError::Load(format!("Failed to read cached module: {}", e)))?;
 
+    // Verify integrity hash
+    let expected_hash = match fs::read_to_string(&integrity_path) {
+        Ok(h) => h,
+        Err(_) => {
+            // No integrity file — treat as corrupted, remove cache
+            tracing::warn!("Cache integrity file missing for hash {}, removing", hash);
+            let _ = fs::remove_file(&cache_path);
+            return Ok(None);
+        }
+    };
+
+    let actual_hash = hash_bytes(&cached_bytes);
+    if actual_hash != expected_hash.trim() {
+        tracing::warn!(
+            "Cache integrity mismatch for hash {} (expected {}, got {})",
+            hash,
+            expected_hash.trim(),
+            actual_hash
+        );
+        let _ = fs::remove_file(&cache_path);
+        let _ = fs::remove_file(&integrity_path);
+        return Ok(None);
+    }
+
     // Deserialize module
-    // Safety: We're trusting the cache. In a production system, you might want
-    // additional validation (e.g., checking a signature file).
+    // Safety: We've verified the SHA-256 hash of the serialized bytes matches
+    // what we originally wrote. This prevents loading tampered modules.
     let module = unsafe { Module::deserialize(engine, &cached_bytes) }.map_err(|e| {
         // If deserialization fails, remove the corrupt cache file
         let _ = fs::remove_file(&cache_path);
+        let _ = fs::remove_file(&integrity_path);
         SkillError::Load(format!("Failed to deserialize cached module: {}", e))
     })?;
 
-    tracing::debug!("Cache hit for hash {}", hash);
+    tracing::debug!("Cache hit for hash {} (integrity verified)", hash);
     Ok(Some(module))
 }
 
-/// Cache a compiled module.
+/// Cache a compiled module with integrity verification.
 pub fn cache_module(wasm_bytes: &[u8], module: &Module) -> Result<(), SkillError> {
     let hash = hash_bytes(wasm_bytes);
     let cache_path = get_cache_path(&hash)?;
+    let integrity_path = get_integrity_path(&hash)?;
 
     // Serialize module
     let serialized = module
         .serialize()
         .map_err(|e| SkillError::Load(format!("Failed to serialize module: {}", e)))?;
 
-    // Write to cache
-    fs::write(&cache_path, serialized)
+    // Compute integrity hash of serialized bytes
+    let integrity_hash = hash_bytes(&serialized);
+
+    // Write serialized module
+    fs::write(&cache_path, &serialized)
         .map_err(|e| SkillError::Load(format!("Failed to write cache: {}", e)))?;
 
-    tracing::debug!("Cached module with hash {}", hash);
+    // Write integrity hash
+    fs::write(&integrity_path, &integrity_hash)
+        .map_err(|e| SkillError::Load(format!("Failed to write integrity file: {}", e)))?;
+
+    tracing::debug!(
+        "Cached module with hash {} (integrity: {})",
+        hash,
+        integrity_hash
+    );
     Ok(())
 }
 
@@ -90,7 +135,7 @@ pub fn clear_cache() -> Result<(), SkillError> {
         return Ok(());
     }
 
-    // Remove all .module files
+    // Remove all .module and .sha256 files
     for entry in fs::read_dir(&cache_dir)
         .map_err(|e| SkillError::Load(format!("Failed to read cache directory: {}", e)))?
     {
@@ -98,7 +143,8 @@ pub fn clear_cache() -> Result<(), SkillError> {
             entry.map_err(|e| SkillError::Load(format!("Failed to read cache entry: {}", e)))?;
 
         let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) == Some("module") {
+        let ext = path.extension().and_then(|s| s.to_str());
+        if ext == Some("module") || ext == Some("sha256") {
             fs::remove_file(&path)
                 .map_err(|e| SkillError::Load(format!("Failed to remove cache file: {}", e)))?;
         }

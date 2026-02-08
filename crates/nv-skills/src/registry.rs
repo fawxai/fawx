@@ -167,7 +167,7 @@ impl SkillRegistry {
 
 impl Default for SkillRegistry {
     fn default() -> Self {
-        Self::new().expect("Failed to create default SkillRegistry")
+        Self::new().unwrap_or_else(|e| panic!("Failed to create default SkillRegistry: {}", e))
     }
 }
 

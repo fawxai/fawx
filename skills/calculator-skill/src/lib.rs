@@ -22,19 +22,26 @@ extern "C" {
     fn host_api_v1_set_output(text_ptr: *const u8, text_len: u32);
 }
 
-/// Read a string from a pointer in host memory
+/// Maximum string length to read from host memory.
+const MAX_HOST_STRING_LEN: usize = 4096;
+
+/// Read a null-terminated string from a pointer in WASM linear memory.
+///
+/// The host writes null-terminated strings via `write_to_memory`.
+/// This function reads up to `MAX_HOST_STRING_LEN` bytes or until a null byte.
+///
+/// # Safety
+/// The caller must ensure `ptr` points to valid WASM linear memory.
 unsafe fn read_host_string(ptr: u32) -> String {
     if ptr == 0 {
         return String::new();
     }
 
-    // The host writes strings starting at the given pointer
-    // For simplicity, we read up to 4KB
-    let slice = core::slice::from_raw_parts(ptr as *const u8, 4096);
-    
-    // Find null terminator or use entire buffer
-    let len = slice.iter().position(|&b| b == 0).unwrap_or(4096);
-    
+    let slice = core::slice::from_raw_parts(ptr as *const u8, MAX_HOST_STRING_LEN);
+
+    // Find null terminator
+    let len = slice.iter().position(|&b| b == 0).unwrap_or(MAX_HOST_STRING_LEN);
+
     String::from_utf8_lossy(&slice[..len]).to_string()
 }
 
