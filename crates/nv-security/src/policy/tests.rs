@@ -2,7 +2,8 @@
 
 #[cfg(test)]
 mod integration_tests {
-    use crate::policy::*;
+    use crate::policy::types::{Condition, DefaultPolicy, PolicyConfig, PolicyRule};
+    use crate::policy::{sign_policy, verify_policy, PolicyDecision, PolicyEngine, RateLimiter};
     use nv_core::types::{ActionPlan, ActionStep};
     use std::collections::HashMap;
 
@@ -443,5 +444,195 @@ decision = "deny"
             engine.evaluate_action(&step3),
             PolicyDecision::Allow
         ));
+    }
+
+    // PartialEq tests (Issue #136)
+
+    #[test]
+    fn test_condition_partial_eq() {
+        let cond1 = Condition::TimeOfDay {
+            after: "09:00".to_string(),
+            before: "17:00".to_string(),
+        };
+        let cond2 = Condition::TimeOfDay {
+            after: "09:00".to_string(),
+            before: "17:00".to_string(),
+        };
+        let cond3 = Condition::TimeOfDay {
+            after: "10:00".to_string(),
+            before: "18:00".to_string(),
+        };
+
+        assert_eq!(cond1, cond2);
+        assert_ne!(cond1, cond3);
+    }
+
+    #[test]
+    fn test_condition_app_target_partial_eq() {
+        let cond1 = Condition::AppTarget {
+            app: "telegram".to_string(),
+        };
+        let cond2 = Condition::AppTarget {
+            app: "telegram".to_string(),
+        };
+        let cond3 = Condition::AppTarget {
+            app: "whatsapp".to_string(),
+        };
+
+        assert_eq!(cond1, cond2);
+        assert_ne!(cond1, cond3);
+    }
+
+    #[test]
+    fn test_condition_contact_target_partial_eq() {
+        let cond1 = Condition::ContactTarget {
+            contact: "joe".to_string(),
+        };
+        let cond2 = Condition::ContactTarget {
+            contact: "joe".to_string(),
+        };
+        let cond3 = Condition::ContactTarget {
+            contact: "alice".to_string(),
+        };
+
+        assert_eq!(cond1, cond2);
+        assert_ne!(cond1, cond3);
+    }
+
+    #[test]
+    fn test_policy_rule_partial_eq_basic() {
+        let rule1 = PolicyRule {
+            action: "send_*".to_string(),
+            decision: "allow".to_string(),
+            reason: None,
+            prompt: None,
+            conditions: None,
+        };
+        let rule2 = PolicyRule {
+            action: "send_*".to_string(),
+            decision: "allow".to_string(),
+            reason: None,
+            prompt: None,
+            conditions: None,
+        };
+        let rule3 = PolicyRule {
+            action: "delete_*".to_string(),
+            decision: "deny".to_string(),
+            reason: Some("Not allowed".to_string()),
+            prompt: None,
+            conditions: None,
+        };
+
+        assert_eq!(rule1, rule2);
+        assert_ne!(rule1, rule3);
+    }
+
+    #[test]
+    fn test_policy_rule_partial_eq_with_conditions() {
+        let cond = Condition::TimeOfDay {
+            after: "09:00".to_string(),
+            before: "17:00".to_string(),
+        };
+
+        let rule1 = PolicyRule {
+            action: "send_*".to_string(),
+            decision: "allow".to_string(),
+            reason: None,
+            prompt: None,
+            conditions: Some(vec![cond.clone()]),
+        };
+        let rule2 = PolicyRule {
+            action: "send_*".to_string(),
+            decision: "allow".to_string(),
+            reason: None,
+            prompt: None,
+            conditions: Some(vec![cond.clone()]),
+        };
+        let rule3 = PolicyRule {
+            action: "send_*".to_string(),
+            decision: "allow".to_string(),
+            reason: None,
+            prompt: None,
+            conditions: None,
+        };
+
+        assert_eq!(rule1, rule2);
+        assert_ne!(rule1, rule3);
+    }
+
+    #[test]
+    fn test_default_policy_partial_eq() {
+        let default1 = DefaultPolicy {
+            decision: "allow".to_string(),
+        };
+        let default2 = DefaultPolicy {
+            decision: "allow".to_string(),
+        };
+        let default3 = DefaultPolicy {
+            decision: "deny".to_string(),
+        };
+
+        assert_eq!(default1, default2);
+        assert_ne!(default1, default3);
+    }
+
+    #[test]
+    fn test_policy_config_partial_eq() {
+        let rule = PolicyRule {
+            action: "test".to_string(),
+            decision: "allow".to_string(),
+            reason: None,
+            prompt: None,
+            conditions: None,
+        };
+
+        let config1 = PolicyConfig {
+            default: DefaultPolicy {
+                decision: "deny".to_string(),
+            },
+            rules: vec![rule.clone()],
+        };
+        let config2 = PolicyConfig {
+            default: DefaultPolicy {
+                decision: "deny".to_string(),
+            },
+            rules: vec![rule.clone()],
+        };
+        let config3 = PolicyConfig {
+            default: DefaultPolicy {
+                decision: "allow".to_string(),
+            },
+            rules: vec![rule.clone()],
+        };
+
+        assert_eq!(config1, config2);
+        assert_ne!(config1, config3);
+    }
+
+    #[test]
+    fn test_policy_rule_comparison_in_test_helper() {
+        // Demonstrate using == in a test helper function
+        fn assert_rules_match(expected: &PolicyRule, actual: &PolicyRule) {
+            assert_eq!(expected, actual, "PolicyRules should match");
+        }
+
+        let rule = PolicyRule {
+            action: "launch_*".to_string(),
+            decision: "confirm".to_string(),
+            reason: None,
+            prompt: Some("Launch this app?".to_string()),
+            conditions: None,
+        };
+
+        let same_rule = PolicyRule {
+            action: "launch_*".to_string(),
+            decision: "confirm".to_string(),
+            reason: None,
+            prompt: Some("Launch this app?".to_string()),
+            conditions: None,
+        };
+
+        // Use the helper function with == comparison
+        assert_rules_match(&rule, &same_rule);
     }
 }
