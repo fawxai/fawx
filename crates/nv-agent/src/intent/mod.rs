@@ -51,6 +51,7 @@
 //! ```
 
 pub mod classifier;
+pub mod metrics;
 pub mod parser;
 pub mod prompts;
 
@@ -59,6 +60,7 @@ mod tests;
 
 // Re-export key types
 pub use classifier::{ClassifierConfig, IntentClassifier, LlmClassifier};
+pub use metrics::{IntentMetrics, MetricsSnapshot};
 pub use parser::{category_from_str, parse_intent_response};
 pub use prompts::INTENT_SYSTEM_PROMPT;
 
