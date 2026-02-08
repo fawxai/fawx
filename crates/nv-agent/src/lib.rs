@@ -5,6 +5,7 @@
 
 pub mod claude;
 pub mod history;
+pub mod intent;
 pub mod plan_builder;
 pub mod retry;
 pub mod tools;
@@ -16,6 +17,10 @@ pub use claude::{
     Role, StopReason, StreamEvent, Tool, ToolResult, ToolUse, Usage,
 };
 pub use history::ConversationHistory;
+pub use intent::{
+    category_from_str, parse_intent_response, ClassifierConfig, IntentClassifier, LlmClassifier,
+    INTENT_SYSTEM_PROMPT,
+};
 pub use plan_builder::PlanBuilder;
 pub use retry::{calculate_delay, should_retry, with_retry, RetryPolicy};
 pub use tools::nova_action_tools;
