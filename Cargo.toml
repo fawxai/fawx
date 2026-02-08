@@ -36,6 +36,7 @@ async-trait = "0.1"
 
 # CLI
 clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.27"
 
 # Logging
 tracing = "0.1"
@@ -55,3 +56,4 @@ futures = "0.3"
 
 # Shared crates
 nv-core = { path = "crates/nv-core" }
+nv-security = { path = "crates/nv-security" }

@@ -8,12 +8,16 @@ use nv_core::error::LlmError;
 use std::sync::Arc;
 
 mod config;
+mod fallback;
 mod local;
 mod router;
+mod routing;
 
 pub use config::LocalModelConfig;
+pub use fallback::{FallbackResult, FallbackRouter, ProviderHealth};
 pub use local::LocalModel;
 pub use router::{LlmRouter, RoutingStrategy};
+pub use routing::{resolve_strategy, RoutingCondition, RoutingConfig, RoutingContext, RoutingRule};
 
 /// LLM provider trait.
 ///
