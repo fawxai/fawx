@@ -5,6 +5,8 @@ use super::prompts::INTENT_SYSTEM_PROMPT;
 use crate::claude::{AgentError, ClaudeClient, Message, Result};
 use async_trait::async_trait;
 use nv_core::types::{Intent, IntentCategory, UserInput};
+use std::time::Duration;
+use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 #[cfg(test)]
@@ -134,6 +136,39 @@ impl<C: LlmClassifier> IntentClassifier<C> {
         messages.push(Message::user(&input.text));
 
         self.classify_messages(&messages, &input.text).await
+    }
+
+    /// Classify user input with a timeout for production robustness.
+    ///
+    /// Enforces a maximum time for classification to prevent hanging on slow LLM responses.
+    /// On timeout, returns a Conversation intent with low confidence.
+    ///
+    /// # Arguments
+    /// * `input` - User input to classify
+    /// * `timeout_duration` - Maximum time to wait for classification
+    ///
+    /// # Returns
+    /// Classified Intent, or a fallback Conversation intent on timeout
+    pub async fn classify_with_timeout(
+        &self,
+        input: &UserInput,
+        timeout_duration: Duration,
+    ) -> Result<Intent> {
+        match timeout(timeout_duration, self.classify(input)).await {
+            Ok(result) => result,
+            Err(_) => {
+                warn!(
+                    "Classification timed out after {:?}, falling back to Conversation",
+                    timeout_duration
+                );
+                Ok(Intent {
+                    category: IntentCategory::Conversation,
+                    confidence: 0.3,
+                    entities: Default::default(),
+                    raw_input: input.text.clone(),
+                })
+            }
+        }
     }
 
     /// Internal method to classify messages and apply threshold logic.
@@ -328,5 +363,70 @@ mod tests {
     async fn test_config_defaults() {
         let config = ClassifierConfig::default();
         assert_eq!(config.confidence_threshold, 0.7);
+    }
+
+    #[tokio::test]
+    async fn test_classify_with_timeout_success() {
+        let mock = MockClassifier::with_response(
+            r#"{"category": "LaunchApp", "confidence": 0.95, "entities": {"app_name": "spotify"}}"#
+                .to_string(),
+        );
+        let classifier = IntentClassifier::new(ClassifierConfig::default(), mock);
+
+        let input = create_user_input("open spotify");
+        let intent = classifier
+            .classify_with_timeout(&input, Duration::from_secs(30))
+            .await
+            .unwrap();
+
+        assert_eq!(intent.category, IntentCategory::LaunchApp);
+        assert_eq!(intent.confidence, 0.95);
+    }
+
+    #[tokio::test]
+    async fn test_classify_with_timeout_expires() {
+        // Create a mock that will simulate a slow response
+        struct SlowMockClassifier;
+
+        #[async_trait]
+        impl LlmClassifier for SlowMockClassifier {
+            async fn classify_raw(&self, _messages: &[Message]) -> Result<String> {
+                // Sleep longer than the timeout
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                Ok(r#"{"category": "Search", "confidence": 0.9, "entities": {}}"#.to_string())
+            }
+        }
+
+        let classifier = IntentClassifier::new(ClassifierConfig::default(), SlowMockClassifier);
+
+        let input = create_user_input("search something");
+        let intent = classifier
+            .classify_with_timeout(&input, Duration::from_millis(50))
+            .await
+            .unwrap();
+
+        // Should fallback to Conversation with low confidence on timeout
+        assert_eq!(intent.category, IntentCategory::Conversation);
+        assert_eq!(intent.confidence, 0.3);
+        assert_eq!(intent.raw_input, "search something");
+    }
+
+    #[tokio::test]
+    async fn test_classify_with_timeout_different_durations() {
+        let mock = MockClassifier::with_response(
+            r#"{"category": "Message", "confidence": 0.85, "entities": {}}"#.to_string(),
+        );
+        let classifier = IntentClassifier::new(ClassifierConfig::default(), mock);
+
+        let input = create_user_input("text someone");
+
+        // Test with very long timeout (should succeed)
+        let intent = classifier
+            .classify_with_timeout(&input, Duration::from_secs(60))
+            .await
+            .unwrap();
+
+        assert_eq!(intent.category, IntentCategory::Message);
+        assert_eq!(intent.confidence, 0.85);
     }
 }
