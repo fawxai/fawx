@@ -2,7 +2,13 @@
 //!
 //! Provides encrypted key-value storage for credentials, conversation history,
 //! preferences, and other persistent data.
+//!
+//! This crate provides both synchronous and asynchronous interfaces:
+//! - Sync: `Storage`, `EncryptedStore`
+//! - Async: `AsyncStorage`, `AsyncEncryptedStore` (using `tokio::task::spawn_blocking`)
 
+pub mod async_encrypted;
+pub mod async_store;
 pub mod conversation;
 pub mod credentials;
 pub mod crypto;
@@ -12,6 +18,8 @@ pub mod preferences;
 pub mod store;
 
 // Re-export key types for convenience
+pub use async_encrypted::AsyncEncryptedStore;
+pub use async_store::AsyncStorage;
 pub use conversation::{Message, StoredConversationHistory};
 pub use credentials::CredentialStore;
 pub use crypto::EncryptionKey;

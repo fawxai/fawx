@@ -1,6 +1,8 @@
 //! Policy engine for evaluating actions against security policies.
 
-use super::types::{PolicyConfig, PolicyDecision, PolicyRule};
+use super::signing::verify_policy;
+use super::types::{Condition, PolicyConfig, PolicyDecision, PolicyRule};
+use super::util::matches_action;
 use nv_core::error::SecurityError;
 use nv_core::types::{ActionPlan, ActionStep};
 use std::fs;
@@ -42,6 +44,54 @@ impl PolicyEngine {
         Self::from_toml(&content)
     }
 
+    /// Load policy from a signed TOML file with verification.
+    ///
+    /// Reads the policy file and its `.sig` sidecar file, verifies the HMAC
+    /// signature, then loads the policy.
+    ///
+    /// # Arguments
+    /// * `path` - Path to TOML policy file (signature file should be at `path.sig`)
+    /// * `key` - Secret key for signature verification
+    ///
+    /// # Returns
+    /// PolicyEngine on success, SecurityError if signature verification fails
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let engine = PolicyEngine::from_signed_file(
+    ///     Path::new("policy.toml"),
+    ///     b"secret_key"
+    /// )?;
+    /// ```
+    pub fn from_signed_file(path: &Path, key: &[u8]) -> Result<Self, SecurityError> {
+        // Read policy file
+        let content = fs::read(path).map_err(|e| {
+            SecurityError::PolicyViolation(format!("Failed to read policy file: {}", e))
+        })?;
+
+        // Read signature file (.sig sidecar)
+        let mut sig_path = path.to_path_buf();
+        sig_path.as_mut_os_string().push(".sig");
+        let signature = fs::read(&sig_path).map_err(|e| {
+            SecurityError::SignatureVerification(format!("Failed to read signature file: {}", e))
+        })?;
+
+        // Verify signature
+        if !verify_policy(&content, &signature, key) {
+            return Err(SecurityError::SignatureVerification(
+                "Policy signature verification failed".to_string(),
+            ));
+        }
+
+        // Load the policy
+        let content_str = String::from_utf8(content).map_err(|e| {
+            SecurityError::PolicyViolation(format!("Policy file is not valid UTF-8: {}", e))
+        })?;
+
+        Self::from_toml(&content_str)
+    }
+
     /// Evaluate a single action step against the policy.
     ///
     /// # Arguments
@@ -51,27 +101,60 @@ impl PolicyEngine {
     /// PolicyDecision for the action
     ///
     /// # Note
-    /// Currently only evaluates action patterns. The following ActionStep fields
-    /// are not yet used in evaluation:
-    /// - `target` - Future: could be used for condition matching
-    /// - `parameters` - Future: could be used for parameter validation
-    /// - `confirmation_required` - Future: could override policy decision
-    ///
-    /// TODO: Implement condition evaluation (PolicyRule.conditions) to check:
-    /// - Time of day constraints
-    /// - App target matching
-    /// - Contact target matching
+    /// This method does NOT consider `ActionStep.confirmation_required`.
+    /// Use `evaluate_action_with_step` if you need that behavior.
     pub fn evaluate_action(&self, action: &ActionStep) -> PolicyDecision {
+        self.evaluate_action_internal(action, None)
+    }
+
+    /// Evaluate an action step with full integration.
+    ///
+    /// This method considers both the policy rules AND the ActionStep's
+    /// `confirmation_required` flag:
+    /// - If policy says Allow and `confirmation_required` is true → upgrade to Confirm
+    /// - If policy says Confirm or Deny → keep the stricter decision
+    ///
+    /// # Arguments
+    /// * `action` - Action step to evaluate
+    /// * `current_time` - Optional current time in "HH:MM" format (for time-based conditions).
+    ///   If `None`, time-based conditions will fail to match (evaluated with empty string).
+    ///
+    /// # Returns
+    /// PolicyDecision for the action
+    pub fn evaluate_action_with_step(
+        &self,
+        action: &ActionStep,
+        current_time: Option<&str>,
+    ) -> PolicyDecision {
+        self.evaluate_action_internal(action, current_time)
+    }
+
+    /// Internal evaluation logic.
+    fn evaluate_action_internal(
+        &self,
+        action: &ActionStep,
+        current_time: Option<&str>,
+    ) -> PolicyDecision {
         // Find first matching rule
-        // TODO: Check rule.conditions here once condition evaluation is implemented
         for rule in &self.config.rules {
-            if matches_pattern(&rule.action, &action.action) {
-                return rule_to_decision(rule);
+            if matches_action(&rule.action, &action.action) {
+                // Check conditions if present
+                if let Some(conditions) = &rule.conditions {
+                    if !evaluate_conditions(conditions, action, current_time.unwrap_or("")) {
+                        continue; // Conditions don't match, try next rule
+                    }
+                }
+
+                let decision = rule_to_decision(rule);
+
+                // Apply confirmation_required upgrade
+                return apply_confirmation_required(decision, action.confirmation_required);
             }
         }
 
         // No rule matched, use default
-        default_to_decision(&self.config.default.decision)
+        let decision = default_to_decision(&self.config.default.decision);
+        apply_confirmation_required(decision, action.confirmation_required)
     }
 
     /// Evaluate an entire action plan against the policy.
@@ -89,34 +172,118 @@ impl PolicyEngine {
     }
 }
 
-/// Check if an action matches a pattern (simple wildcard support).
+/// Evaluate a list of conditions against an action step.
+///
+/// All conditions must match for the function to return true (AND logic).
 ///
 /// # Arguments
-/// * `pattern` - Pattern string (supports "*" wildcard at end only)
-/// * `action` - Action name to match
+/// * `conditions` - List of conditions to check
+/// * `action` - Action step being evaluated
+/// * `current_time` - Current time in "HH:MM" format
 ///
 /// # Returns
-/// `true` if action matches pattern
+/// `true` if all conditions match, `false` otherwise
+fn evaluate_conditions(conditions: &[Condition], action: &ActionStep, current_time: &str) -> bool {
+    conditions.iter().all(|condition| match condition {
+        Condition::TimeOfDay { after, before } => check_time_of_day(current_time, after, before),
+        Condition::AppTarget { app } => action.target == *app,
+        Condition::ContactTarget { contact } => action
+            .parameters
+            .get("contact")
+            .map(|c| c == contact)
+            .unwrap_or(false),
+    })
+}
+
+/// Check if current time falls within a time range.
 ///
-/// # Limitations
-/// This is a simple pattern matcher that only supports:
-/// - Exact matches: "launch_app" matches "launch_app"
-/// - Trailing wildcards: "delete_*" matches "delete_file", "delete_contact"
+/// Handles midnight crossing (e.g., after="22:00", before="06:00" means
+/// 22:00-23:59 and 00:00-06:00).
 ///
-/// NOT supported (may be added in future):
-/// - Leading wildcards: "*_file"
-/// - Mid-string wildcards: "delete_*_file"
-/// - Multiple wildcards: "delete_*_*"
-/// - Glob syntax: "delete_{file,contact}"
+/// # Arguments
+/// * `current` - Current time in "HH:MM" format
+/// * `after` - Start time in "HH:MM" format
+/// * `before` - End time in "HH:MM" format
 ///
-/// TODO: Consider using a full glob library (e.g., `globset`) for richer matching
-fn matches_pattern(pattern: &str, action: &str) -> bool {
-    if let Some(prefix) = pattern.strip_suffix('*') {
-        // Wildcard match: "delete_*" matches "delete_file", "delete_contact", etc.
-        action.starts_with(prefix)
+/// # Returns
+/// `true` if current time is within the range, `false` if time parsing fails
+/// or time is outside range
+///
+/// # Note
+/// Invalid time formats (e.g., "25:00", "12:70") will log a warning and return false.
+fn check_time_of_day(current: &str, after: &str, before: &str) -> bool {
+    // Parse time strings as minutes since midnight
+    let parse_time = |s: &str| -> Option<u32> {
+        let parts: Vec<&str> = s.split(':').collect();
+        if parts.len() != 2 {
+            return None;
+        }
+        let hours: u32 = parts[0].parse().ok()?;
+        let minutes: u32 = parts[1].parse().ok()?;
+        // Validate time ranges
+        if hours > 23 || minutes > 59 {
+            return None;
+        }
+        Some(hours * 60 + minutes)
+    };
+
+    let current_mins = match parse_time(current) {
+        Some(m) => m,
+        None => {
+            tracing::warn!("Invalid current time format: '{}'", current);
+            return false;
+        }
+    };
+    let after_mins = match parse_time(after) {
+        Some(m) => m,
+        None => {
+            tracing::warn!("Invalid 'after' time format in policy: '{}'", after);
+            return false;
+        }
+    };
+    let before_mins = match parse_time(before) {
+        Some(m) => m,
+        None => {
+            tracing::warn!("Invalid 'before' time format in policy: '{}'", before);
+            return false;
+        }
+    };
+
+    if after_mins <= before_mins {
+        // Normal range (e.g., 09:00-17:00)
+        current_mins >= after_mins && current_mins < before_mins
     } else {
-        // Exact match
-        pattern == action
+        // Midnight crossing (e.g., 22:00-06:00)
+        current_mins >= after_mins || current_mins < before_mins
+    }
+}
+
+/// Apply confirmation_required upgrade to a policy decision.
+///
+/// # Logic
+/// - If decision is Allow and confirmation_required is true → upgrade to Confirm
+/// - If decision is already Confirm or Deny → keep it (stricter wins)
+///
+/// # Arguments
+/// * `decision` - Original policy decision
+/// * `confirmation_required` - Whether the action step requires confirmation
+///
+/// # Returns
+/// Final policy decision
+fn apply_confirmation_required(
+    decision: PolicyDecision,
+    confirmation_required: bool,
+) -> PolicyDecision {
+    if confirmation_required {
+        match decision {
+            PolicyDecision::Allow => PolicyDecision::Confirm {
+                prompt: "This action requires confirmation".to_string(),
+            },
+            // Keep stricter decisions unchanged
+            other => other,
+        }
+    } else {
+        decision
     }
 }
 
@@ -418,15 +585,456 @@ decision = "deny"
 
     #[test]
     fn test_matches_pattern_exact() {
-        assert!(matches_pattern("launch_app", "launch_app"));
-        assert!(!matches_pattern("launch_app", "launch_app2"));
+        assert!(matches_action("launch_app", "launch_app"));
+        assert!(!matches_action("launch_app", "launch_app2"));
     }
 
     #[test]
     fn test_matches_pattern_wildcard() {
-        assert!(matches_pattern("delete_*", "delete_file"));
-        assert!(matches_pattern("delete_*", "delete_contact"));
-        assert!(matches_pattern("delete_*", "delete_"));
-        assert!(!matches_pattern("delete_*", "send_message"));
+        assert!(matches_action("delete_*", "delete_file"));
+        assert!(matches_action("delete_*", "delete_contact"));
+        assert!(matches_action("delete_*", "delete_"));
+        assert!(!matches_action("delete_*", "send_message"));
+    }
+
+    // Condition evaluation tests
+
+    #[test]
+    fn test_time_of_day_within_range() {
+        let toml = r#"
+            [default]
+            decision = "deny"
+
+            [[rules]]
+            action = "browse_web"
+            decision = "allow"
+            
+            [[rules.conditions]]
+            type = "time_of_day"
+            after = "09:00"
+            before = "17:00"
+        "#;
+
+        let engine = PolicyEngine::from_toml(toml).unwrap();
+        let step = create_test_step("browse_web");
+
+        // Test with time inside range (14:00)
+        let decision = engine.evaluate_action_internal(&step, Some("14:00"));
+        assert!(matches!(decision, PolicyDecision::Allow));
+    }
+
+    #[test]
+    fn test_time_of_day_outside_range() {
+        let toml = r#"
+            [default]
+            decision = "allow"
+
+            [[rules]]
+            action = "browse_web"
+            decision = "deny"
+            
+            [[rules.conditions]]
+            type = "time_of_day"
+            after = "09:00"
+            before = "17:00"
+        "#;
+
+        let engine = PolicyEngine::from_toml(toml).unwrap();
+        let step = create_test_step("browse_web");
+
+        // Test with time outside range (20:00)
+        let decision = engine.evaluate_action_internal(&step, Some("20:00"));
+        assert!(matches!(decision, PolicyDecision::Allow)); // Falls through to default
+    }
+
+    #[test]
+    fn test_time_of_day_midnight_crossing_inside() {
+        let toml = r#"
+            [default]
+            decision = "deny"
+
+            [[rules]]
+            action = "security_patrol"
+            decision = "allow"
+            
+            [[rules.conditions]]
+            type = "time_of_day"
+            after = "22:00"
+            before = "06:00"
+        "#;
+
+        let engine = PolicyEngine::from_toml(toml).unwrap();
+        let step = create_test_step("security_patrol");
+
+        // Test with time inside midnight-crossing range (02:00)
+        let decision = engine.evaluate_action_internal(&step, Some("02:00"));
+        assert!(matches!(decision, PolicyDecision::Allow));
+    }
+
+    #[test]
+    fn test_time_of_day_midnight_crossing_outside() {
+        let toml = r#"
+            [default]
+            decision = "allow"
+
+            [[rules]]
+            action = "security_patrol"
+            decision = "deny"
+            
+            [[rules.conditions]]
+            type = "time_of_day"
+            after = "22:00"
+            before = "06:00"
+        "#;
+
+        let engine = PolicyEngine::from_toml(toml).unwrap();
+        let step = create_test_step("security_patrol");
+
+        // Test with time outside midnight-crossing range (12:00)
+        let decision = engine.evaluate_action_internal(&step, Some("12:00"));
+        assert!(matches!(decision, PolicyDecision::Allow)); // Falls through to default
+    }
+
+    #[test]
+    fn test_app_target_matching() {
+        let toml = r#"
+            [default]
+            decision = "deny"
+
+            [[rules]]
+            action = "launch_app"
+            decision = "allow"
+            
+            [[rules.conditions]]
+            type = "app_target"
+            app = "spotify"
+        "#;
+
+        let engine = PolicyEngine::from_toml(toml).unwrap();
+
+        let mut step = create_test_step("launch_app");
+        step.target = "spotify".to_string();
+
+        let decision = engine.evaluate_action(&step);
+        assert!(matches!(decision, PolicyDecision::Allow));
+    }
+
+    #[test]
+    fn test_app_target_not_matching() {
+        let toml = r#"
+            [default]
+            decision = "allow"
+
+            [[rules]]
+            action = "launch_app"
+            decision = "deny"
+            
+            [[rules.conditions]]
+            type = "app_target"
+            app = "spotify"
+        "#;
+
+        let engine = PolicyEngine::from_toml(toml).unwrap();
+
+        let mut step = create_test_step("launch_app");
+        step.target = "chrome".to_string();
+
+        let decision = engine.evaluate_action(&step);
+        assert!(matches!(decision, PolicyDecision::Allow)); // Falls through to default
+    }
+
+    #[test]
+    fn test_contact_target_matching() {
+        let toml = r#"
+            [default]
+            decision = "deny"
+
+            [[rules]]
+            action = "send_message"
+            decision = "allow"
+            
+            [[rules.conditions]]
+            type = "contact_target"
+            contact = "alice"
+        "#;
+
+        let engine = PolicyEngine::from_toml(toml).unwrap();
+
+        let mut step = create_test_step("send_message");
+        step.parameters
+            .insert("contact".to_string(), "alice".to_string());
+
+        let decision = engine.evaluate_action(&step);
+        assert!(matches!(decision, PolicyDecision::Allow));
+    }
+
+    #[test]
+    fn test_contact_target_missing_param() {
+        let toml = r#"
+            [default]
+            decision = "allow"
+
+            [[rules]]
+            action = "send_message"
+            decision = "deny"
+            
+            [[rules.conditions]]
+            type = "contact_target"
+            contact = "alice"
+        "#;
+
+        let engine = PolicyEngine::from_toml(toml).unwrap();
+
+        let step = create_test_step("send_message");
+        // No contact parameter
+
+        let decision = engine.evaluate_action(&step);
+        assert!(matches!(decision, PolicyDecision::Allow)); // Falls through to default
+    }
+
+    #[test]
+    fn test_multiple_conditions_all_match() {
+        let toml = r#"
+            [default]
+            decision = "deny"
+
+            [[rules]]
+            action = "send_message"
+            decision = "allow"
+            
+            [[rules.conditions]]
+            type = "time_of_day"
+            after = "09:00"
+            before = "17:00"
+            
+            [[rules.conditions]]
+            type = "contact_target"
+            contact = "alice"
+        "#;
+
+        let engine = PolicyEngine::from_toml(toml).unwrap();
+
+        let mut step = create_test_step("send_message");
+        step.parameters
+            .insert("contact".to_string(), "alice".to_string());
+
+        // Both conditions match
+        let decision = engine.evaluate_action_internal(&step, Some("14:00"));
+        assert!(matches!(decision, PolicyDecision::Allow));
+    }
+
+    #[test]
+    fn test_multiple_conditions_one_fails() {
+        let toml = r#"
+            [default]
+            decision = "allow"
+
+            [[rules]]
+            action = "send_message"
+            decision = "deny"
+            
+            [[rules.conditions]]
+            type = "time_of_day"
+            after = "09:00"
+            before = "17:00"
+            
+            [[rules.conditions]]
+            type = "contact_target"
+            contact = "alice"
+        "#;
+
+        let engine = PolicyEngine::from_toml(toml).unwrap();
+
+        let mut step = create_test_step("send_message");
+        step.parameters
+            .insert("contact".to_string(), "bob".to_string()); // Wrong contact
+
+        // One condition fails (contact doesn't match)
+        let decision = engine.evaluate_action_internal(&step, Some("14:00"));
+        assert!(matches!(decision, PolicyDecision::Allow)); // Falls through to default
+    }
+
+    // ActionStep.confirmation_required integration tests
+
+    #[test]
+    fn test_confirmation_required_upgrades_allow() {
+        let toml = r#"
+            [default]
+            decision = "allow"
+
+            [[rules]]
+            action = "send_payment"
+            decision = "allow"
+        "#;
+
+        let engine = PolicyEngine::from_toml(toml).unwrap();
+
+        let mut step = create_test_step("send_payment");
+        step.confirmation_required = true;
+
+        let decision = engine.evaluate_action_with_step(&step, None);
+        assert!(matches!(decision, PolicyDecision::Confirm { .. }));
+    }
+
+    #[test]
+    fn test_confirmation_required_keeps_confirm() {
+        let toml = r#"
+            [default]
+            decision = "allow"
+
+            [[rules]]
+            action = "send_payment"
+            decision = "confirm"
+            prompt = "Custom prompt"
+        "#;
+
+        let engine = PolicyEngine::from_toml(toml).unwrap();
+
+        let mut step = create_test_step("send_payment");
+        step.confirmation_required = true;
+
+        let decision = engine.evaluate_action_with_step(&step, None);
+        match decision {
+            PolicyDecision::Confirm { prompt } => {
+                assert_eq!(prompt, "Custom prompt");
+            }
+            _ => panic!("Expected Confirm decision"),
+        }
+    }
+
+    #[test]
+    fn test_confirmation_required_keeps_deny() {
+        let toml = r#"
+            [default]
+            decision = "allow"
+
+            [[rules]]
+            action = "delete_system"
+            decision = "deny"
+            reason = "Not allowed"
+        "#;
+
+        let engine = PolicyEngine::from_toml(toml).unwrap();
+
+        let mut step = create_test_step("delete_system");
+        step.confirmation_required = true;
+
+        let decision = engine.evaluate_action_with_step(&step, None);
+        match decision {
+            PolicyDecision::Deny { reason } => {
+                assert_eq!(reason, "Not allowed");
+            }
+            _ => panic!("Expected Deny decision"),
+        }
+    }
+
+    #[test]
+    fn test_confirmation_required_false_no_upgrade() {
+        let toml = r#"
+            [default]
+            decision = "allow"
+
+            [[rules]]
+            action = "browse_web"
+            decision = "allow"
+        "#;
+
+        let engine = PolicyEngine::from_toml(toml).unwrap();
+
+        let mut step = create_test_step("browse_web");
+        step.confirmation_required = false;
+
+        let decision = engine.evaluate_action_with_step(&step, None);
+        assert!(matches!(decision, PolicyDecision::Allow));
+    }
+
+    // Signed file tests
+
+    #[test]
+    fn test_from_signed_file_valid() {
+        use crate::policy::signing::sign_policy;
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let toml = r#"
+            [default]
+            decision = "allow"
+
+            [[rules]]
+            action = "launch_app"
+            decision = "allow"
+        "#;
+
+        let key = b"test_secret_key";
+        let signature = sign_policy(toml.as_bytes(), key);
+
+        // Create temporary files
+        let mut policy_file = NamedTempFile::new().unwrap();
+        policy_file.write_all(toml.as_bytes()).unwrap();
+
+        // Create sig file with .sig extension appended
+        let mut sig_path = policy_file.path().to_path_buf();
+        sig_path.as_mut_os_string().push(".sig");
+        std::fs::write(&sig_path, &signature).unwrap();
+
+        // Load from signed file
+        let engine = PolicyEngine::from_signed_file(policy_file.path(), key);
+        assert!(engine.is_ok());
+    }
+
+    #[test]
+    fn test_from_signed_file_invalid_signature() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let toml = r#"
+            [default]
+            decision = "allow"
+        "#;
+
+        let key = b"test_secret_key";
+        let wrong_signature = vec![0u8; 32];
+
+        // Create temporary files
+        let mut policy_file = NamedTempFile::new().unwrap();
+        policy_file.write_all(toml.as_bytes()).unwrap();
+
+        // Create sig file with .sig extension appended (matching implementation)
+        let mut sig_path = policy_file.path().to_path_buf();
+        sig_path.as_mut_os_string().push(".sig");
+        std::fs::write(&sig_path, &wrong_signature).unwrap();
+
+        // Should fail verification
+        let engine = PolicyEngine::from_signed_file(policy_file.path(), key);
+        assert!(engine.is_err());
+        match engine {
+            Err(SecurityError::SignatureVerification(_)) => (),
+            _ => panic!("Expected SignatureVerification error"),
+        }
+    }
+
+    #[test]
+    fn test_from_signed_file_missing_sig() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let toml = r#"
+            [default]
+            decision = "allow"
+        "#;
+
+        let key = b"test_secret_key";
+
+        // Create temporary file (no .sig file)
+        let mut policy_file = NamedTempFile::new().unwrap();
+        policy_file.write_all(toml.as_bytes()).unwrap();
+
+        // Should fail to read signature file
+        let engine = PolicyEngine::from_signed_file(policy_file.path(), key);
+        assert!(engine.is_err());
+        match engine {
+            Err(SecurityError::SignatureVerification(_)) => (),
+            _ => panic!("Expected SignatureVerification error"),
+        }
     }
 }

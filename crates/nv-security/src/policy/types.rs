@@ -42,9 +42,16 @@ pub struct PolicyRule {
 
 /// Conditions that must be met for a rule to apply.
 ///
-/// **Note:** Conditions are currently parsed from TOML but not yet evaluated
-/// by the policy engine. They will be implemented in a future update.
-/// For now, rules match based on action patterns only.
+/// Conditions are evaluated when `PolicyEngine::evaluate_action()` is called.
+/// All conditions in a rule must match for the rule to apply (AND logic).
+///
+/// # Supported Conditions
+///
+/// - **TimeOfDay**: Matches if current time falls within the specified range.
+///   Supports midnight crossing (e.g., "22:00" to "06:00").
+/// - **AppTarget**: Matches if `ActionStep.target` equals the specified app name.
+/// - **ContactTarget**: Matches if `ActionStep.parameters["contact"]` equals the
+///   specified contact name.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
 pub enum Condition {
