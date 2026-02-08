@@ -41,36 +41,46 @@ struct AuditEntry {
 }
 
 impl AuditEntry {
-    /// Compute hash for this entry
-    fn compute_hash(event: &AuditEvent, prev_hash: &str) -> String {
+    /// Compute hash for this entry, including all fields for tamper detection.
+    ///
+    /// Returns `Err` if event fields cannot be serialized, rather than silently
+    /// corrupting the hash chain.
+    fn compute_hash(event: &AuditEvent, prev_hash: &str) -> Result<String, SecurityError> {
+        let event_type_json = serde_json::to_string(&event.event_type).map_err(|e| {
+            SecurityError::AuditLog(format!("Failed to serialize event type: {}", e))
+        })?;
+        let metadata_json = serde_json::to_string(&event.metadata)
+            .map_err(|e| SecurityError::AuditLog(format!("Failed to serialize metadata: {}", e)))?;
+
         let data = format!(
-            "{}:{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}:{}",
             event.id,
             event.timestamp,
-            serde_json::to_string(&event.event_type).unwrap_or_default(),
+            event_type_json,
             event.actor,
             event.description,
+            metadata_json,
             prev_hash
         );
 
         let hash = digest(&SHA256, data.as_bytes());
-        hex::encode(hash.as_ref())
+        Ok(hex::encode(hash.as_ref()))
     }
 
     /// Create a new entry with hash chain
-    fn new(event: AuditEvent, prev_hash: String) -> Self {
-        let hash = Self::compute_hash(&event, &prev_hash);
-        Self {
+    fn new(event: AuditEvent, prev_hash: String) -> Result<Self, SecurityError> {
+        let hash = Self::compute_hash(&event, &prev_hash)?;
+        Ok(Self {
             event,
             prev_hash,
             hash,
-        }
+        })
     }
 
     /// Verify this entry's hash is correct
-    fn verify(&self) -> bool {
-        let expected_hash = Self::compute_hash(&self.event, &self.prev_hash);
-        self.hash == expected_hash
+    fn verify(&self) -> Result<bool, SecurityError> {
+        let expected_hash = Self::compute_hash(&self.event, &self.prev_hash)?;
+        Ok(self.hash == expected_hash)
     }
 }
 
@@ -129,7 +139,7 @@ impl AuditLog {
 
     /// Append an event to the log
     pub fn append(&mut self, event: AuditEvent) -> Result<(), SecurityError> {
-        let entry = AuditEntry::new(event, self.last_hash.clone());
+        let entry = AuditEntry::new(event, self.last_hash.clone())?;
 
         // Write to file if not in-memory
         if let Some(ref path) = self.path {
@@ -215,7 +225,7 @@ impl AuditLog {
             }
 
             // Verify the entry's hash
-            if !entry.verify() {
+            if !entry.verify()? {
                 return Ok(false);
             }
 
