@@ -24,7 +24,7 @@ pub fn skill_tools() -> Vec<Tool> {
 
     manifests
         .iter()
-        .map(|manifest| skill_to_tool(manifest))
+        .map(skill_to_tool)
         .collect()
 }
 
@@ -54,7 +54,7 @@ fn skill_to_tool(manifest: &SkillManifest) -> Tool {
         "required": ["input"]
     });
 
-    Tool::new(&format!("skill_{}", manifest.name), &description, schema)
+    Tool::new(format!("skill_{}", manifest.name), &description, schema)
 }
 
 /// Format skill description for planning context.
