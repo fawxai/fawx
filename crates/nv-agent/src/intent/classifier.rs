@@ -15,6 +15,9 @@ use std::sync::Arc;
 #[cfg(test)]
 use tokio::sync::Mutex;
 
+/// Fallback confidence score used when classification fails or times out.
+const FALLBACK_CONFIDENCE: f32 = 0.3;
+
 /// Configuration for the intent classifier.
 ///
 /// Note: Token limits and model selection are controlled by the ClaudeClient configuration,
@@ -180,11 +183,12 @@ impl<C: LlmClassifier> IntentClassifier<C> {
 
                 // Record timeout fallback
                 let latency = start_time.elapsed();
-                self.metrics.record_classification(0.3, latency, true);
+                self.metrics
+                    .record_classification(FALLBACK_CONFIDENCE, latency, true);
 
                 Ok(Intent {
                     category: IntentCategory::Conversation,
-                    confidence: 0.3,
+                    confidence: FALLBACK_CONFIDENCE,
                     entities: Default::default(),
                     raw_input: input.text.clone(),
                 })

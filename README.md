@@ -1,6 +1,6 @@
 # Nova: AI-Native Phone Agent
 
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen)]()
+[![Build Status](https://github.com/abbudjoe/nova/actions/workflows/ci.yml/badge.svg)](https://github.com/abbudjoe/nova/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.83%2B-orange.svg)](https://www.rust-lang.org/)
 

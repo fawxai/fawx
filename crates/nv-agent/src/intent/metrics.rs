@@ -57,6 +57,13 @@ impl IntentMetrics {
     /// * `confidence` - Classification confidence score (0.0-1.0)
     /// * `latency` - Time taken for classification
     /// * `was_fallback` - Whether this was a fallback classification (low confidence or timeout)
+    ///
+    /// # Memory Ordering
+    /// Uses `Ordering::Relaxed` for all atomic operations because:
+    /// - Metrics are aggregate statistics, not control flow data
+    /// - No inter-thread synchronization is required
+    /// - Eventual consistency is acceptable for metrics
+    /// - Provides maximum performance (no memory barriers)
     pub fn record_classification(&self, confidence: f32, latency: Duration, was_fallback: bool) {
         // Increment total count
         self.inner
