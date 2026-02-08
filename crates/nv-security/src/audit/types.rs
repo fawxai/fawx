@@ -79,18 +79,22 @@ impl AuditEvent {
         event_type: AuditEventType,
         actor: impl Into<String>,
         description: impl Into<String>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, nv_core::error::SecurityError> {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| {
+                nv_core::error::SecurityError::AuditLog(format!("Invalid system time: {}", e))
+            })?
+            .as_millis() as u64;
+
+        Ok(Self {
             id: uuid::Uuid::new_v4().to_string(),
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("System time before Unix epoch")
-                .as_millis() as u64,
+            timestamp,
             event_type,
             actor: actor.into(),
             description: description.into(),
             metadata: HashMap::new(),
-        }
+        })
     }
 
     /// Create an event with metadata
@@ -99,18 +103,22 @@ impl AuditEvent {
         actor: impl Into<String>,
         description: impl Into<String>,
         metadata: HashMap<String, String>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, nv_core::error::SecurityError> {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| {
+                nv_core::error::SecurityError::AuditLog(format!("Invalid system time: {}", e))
+            })?
+            .as_millis() as u64;
+
+        Ok(Self {
             id: uuid::Uuid::new_v4().to_string(),
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("System time before Unix epoch")
-                .as_millis() as u64,
+            timestamp,
             event_type,
             actor: actor.into(),
             description: description.into(),
             metadata,
-        }
+        })
     }
 }
 
@@ -120,7 +128,8 @@ mod tests {
 
     #[test]
     fn test_audit_event_creation() {
-        let event = AuditEvent::new(AuditEventType::ActionExecuted, "agent", "Sent SMS message");
+        let event =
+            AuditEvent::new(AuditEventType::ActionExecuted, "agent", "Sent SMS message").unwrap();
 
         assert_eq!(event.event_type, AuditEventType::ActionExecuted);
         assert_eq!(event.actor, "agent");
@@ -141,7 +150,8 @@ mod tests {
             "agent",
             "Sent SMS message",
             metadata.clone(),
-        );
+        )
+        .unwrap();
 
         assert_eq!(event.metadata.len(), 2);
         assert_eq!(
@@ -183,7 +193,8 @@ mod tests {
             AuditEventType::SkillInvoked,
             "skill:camera",
             "Captured photo",
-        );
+        )
+        .unwrap();
 
         let json = serde_json::to_string(&event).expect("Failed to serialize");
         let deserialized: AuditEvent = serde_json::from_str(&json).expect("Failed to deserialize");

@@ -113,7 +113,8 @@ mod tests {
 
     #[test]
     fn test_format_event_produces_readable_output() {
-        let event = AuditEvent::new(AuditEventType::ActionExecuted, "agent", "Test action");
+        let event =
+            AuditEvent::new(AuditEventType::ActionExecuted, "agent", "Test action").unwrap();
 
         let formatted = format_event(&event);
 
@@ -137,7 +138,8 @@ mod tests {
             "agent",
             "Test action",
             metadata,
-        );
+        )
+        .unwrap();
 
         let formatted = format_event(&event);
 

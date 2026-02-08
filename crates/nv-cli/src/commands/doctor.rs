@@ -100,7 +100,13 @@ fn check_audit_log() -> bool {
 
     // Try to open and verify the log
     match nv_security::AuditLog::open(&log_path) {
-        Ok(log) => log.verify_integrity().unwrap_or_default(),
+        Ok(log) => match log.verify_integrity() {
+            Ok(valid) => valid,
+            Err(e) => {
+                tracing::warn!("Audit log verification error: {}", e);
+                false
+            }
+        },
         Err(_) => false,
     }
 }

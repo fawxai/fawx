@@ -234,7 +234,8 @@ mod tests {
     #[test]
     fn test_create_and_append_event() {
         let mut log = AuditLog::in_memory();
-        let event = AuditEvent::new(AuditEventType::ActionExecuted, "agent", "Test action");
+        let event =
+            AuditEvent::new(AuditEventType::ActionExecuted, "agent", "Test action").unwrap();
 
         assert!(log.append(event).is_ok());
         assert_eq!(log.count(), 1);
@@ -249,7 +250,8 @@ mod tests {
                 AuditEventType::ActionExecuted,
                 "agent",
                 format!("Action {}", i),
-            );
+            )
+            .unwrap();
             assert!(log.append(event).is_ok());
         }
 
@@ -260,26 +262,14 @@ mod tests {
     fn test_query_by_event_type() {
         let mut log = AuditLog::in_memory();
 
-        log.append(AuditEvent::new(
-            AuditEventType::ActionExecuted,
-            "agent",
-            "Action 1",
-        ))
-        .unwrap();
+        log.append(AuditEvent::new(AuditEventType::ActionExecuted, "agent", "Action 1").unwrap())
+            .unwrap();
 
-        log.append(AuditEvent::new(
-            AuditEventType::ActionDenied,
-            "agent",
-            "Action 2",
-        ))
-        .unwrap();
+        log.append(AuditEvent::new(AuditEventType::ActionDenied, "agent", "Action 2").unwrap())
+            .unwrap();
 
-        log.append(AuditEvent::new(
-            AuditEventType::ActionExecuted,
-            "agent",
-            "Action 3",
-        ))
-        .unwrap();
+        log.append(AuditEvent::new(AuditEventType::ActionExecuted, "agent", "Action 3").unwrap())
+            .unwrap();
 
         let filter = AuditFilter {
             event_type: Some(AuditEventType::ActionExecuted),
@@ -296,26 +286,14 @@ mod tests {
     fn test_query_by_actor() {
         let mut log = AuditLog::in_memory();
 
-        log.append(AuditEvent::new(
-            AuditEventType::ActionExecuted,
-            "agent",
-            "Action 1",
-        ))
-        .unwrap();
+        log.append(AuditEvent::new(AuditEventType::ActionExecuted, "agent", "Action 1").unwrap())
+            .unwrap();
 
-        log.append(AuditEvent::new(
-            AuditEventType::ActionExecuted,
-            "user",
-            "Action 2",
-        ))
-        .unwrap();
+        log.append(AuditEvent::new(AuditEventType::ActionExecuted, "user", "Action 2").unwrap())
+            .unwrap();
 
-        log.append(AuditEvent::new(
-            AuditEventType::ActionExecuted,
-            "agent",
-            "Action 3",
-        ))
-        .unwrap();
+        log.append(AuditEvent::new(AuditEventType::ActionExecuted, "agent", "Action 3").unwrap())
+            .unwrap();
 
         let filter = AuditFilter {
             actor: Some("agent".to_string()),
@@ -377,11 +355,14 @@ mod tests {
         let mut log = AuditLog::in_memory();
 
         for i in 0..10 {
-            log.append(AuditEvent::new(
-                AuditEventType::ActionExecuted,
-                "agent",
-                format!("Action {}", i),
-            ))
+            log.append(
+                AuditEvent::new(
+                    AuditEventType::ActionExecuted,
+                    "agent",
+                    format!("Action {}", i),
+                )
+                .unwrap(),
+            )
             .unwrap();
         }
 
@@ -399,21 +380,13 @@ mod tests {
         let mut log = AuditLog::in_memory();
         assert_eq!(log.count(), 0);
 
-        log.append(AuditEvent::new(
-            AuditEventType::ActionExecuted,
-            "agent",
-            "Test",
-        ))
-        .unwrap();
+        log.append(AuditEvent::new(AuditEventType::ActionExecuted, "agent", "Test").unwrap())
+            .unwrap();
 
         assert_eq!(log.count(), 1);
 
-        log.append(AuditEvent::new(
-            AuditEventType::ActionExecuted,
-            "agent",
-            "Test 2",
-        ))
-        .unwrap();
+        log.append(AuditEvent::new(AuditEventType::ActionExecuted, "agent", "Test 2").unwrap())
+            .unwrap();
 
         assert_eq!(log.count(), 2);
     }
@@ -423,11 +396,14 @@ mod tests {
         let mut log = AuditLog::in_memory();
 
         for i in 0..5 {
-            log.append(AuditEvent::new(
-                AuditEventType::ActionExecuted,
-                "agent",
-                format!("Action {}", i),
-            ))
+            log.append(
+                AuditEvent::new(
+                    AuditEventType::ActionExecuted,
+                    "agent",
+                    format!("Action {}", i),
+                )
+                .unwrap(),
+            )
             .unwrap();
         }
 
@@ -439,11 +415,14 @@ mod tests {
         let mut log = AuditLog::in_memory();
 
         for i in 0..5 {
-            log.append(AuditEvent::new(
-                AuditEventType::ActionExecuted,
-                "agent",
-                format!("Action {}", i),
-            ))
+            log.append(
+                AuditEvent::new(
+                    AuditEventType::ActionExecuted,
+                    "agent",
+                    format!("Action {}", i),
+                )
+                .unwrap(),
+            )
             .unwrap();
         }
 
@@ -471,12 +450,8 @@ mod tests {
     fn test_no_match_query() {
         let mut log = AuditLog::in_memory();
 
-        log.append(AuditEvent::new(
-            AuditEventType::ActionExecuted,
-            "agent",
-            "Test",
-        ))
-        .unwrap();
+        log.append(AuditEvent::new(AuditEventType::ActionExecuted, "agent", "Test").unwrap())
+            .unwrap();
 
         let filter = AuditFilter {
             event_type: Some(AuditEventType::PolicyViolation),
@@ -542,19 +517,11 @@ mod tests {
         // Create log and write events
         {
             let mut log = AuditLog::open(&log_path).unwrap();
-            log.append(AuditEvent::new(
-                AuditEventType::ActionExecuted,
-                "agent",
-                "Test 1",
-            ))
-            .unwrap();
+            log.append(AuditEvent::new(AuditEventType::ActionExecuted, "agent", "Test 1").unwrap())
+                .unwrap();
 
-            log.append(AuditEvent::new(
-                AuditEventType::ActionExecuted,
-                "agent",
-                "Test 2",
-            ))
-            .unwrap();
+            log.append(AuditEvent::new(AuditEventType::ActionExecuted, "agent", "Test 2").unwrap())
+                .unwrap();
         }
 
         // Reopen and verify
