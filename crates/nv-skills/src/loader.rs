@@ -46,6 +46,17 @@ impl SkillLoader {
         }
     }
 
+    /// Create a skill loader that shares an engine with a SkillRuntime.
+    ///
+    /// Wasmtime requires modules and stores to use the same Engine instance.
+    /// Use this when loading skills that will be executed by a specific runtime.
+    pub fn with_engine(engine: Engine, trusted_keys: Vec<Vec<u8>>) -> Self {
+        Self {
+            engine,
+            trusted_keys,
+        }
+    }
+
     /// Load a skill from WASM bytes, manifest, and optional signature.
     ///
     /// If a signature is provided, it must verify against one of the trusted keys.
