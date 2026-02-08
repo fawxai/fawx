@@ -5,9 +5,10 @@ use nv_core::error::SkillError;
 use std::collections::HashSet;
 
 #[cfg(feature = "audit")]
-use nv_security::{AuditEvent, AuditEventType, AuditLog};
-#[cfg(feature = "audit")]
-use std::collections::BTreeMap;
+use {
+    nv_security::{AuditEvent, AuditEventType, AuditLog},
+    std::collections::BTreeMap,
+};
 
 /// Capability checker for runtime enforcement.
 #[derive(Debug, Clone)]
@@ -45,6 +46,13 @@ impl CapabilityChecker {
     ///
     /// This async version logs capability checks to the audit system if provided.
     ///
+    /// # Audit Semantics
+    /// - Audit events are logged **after** the capability check is performed
+    /// - If audit logging fails, a warning is logged but the capability check
+    ///   result is still returned (audit failures don't block operations)
+    /// - If `audit_log` is `None`, no logging occurs (valid for testing/development)
+    /// - Both allowed and denied capability checks are logged
+    ///
     /// # Arguments
     /// * `required` - The capability to check
     /// * `audit_log` - Optional audit log for recording the check
@@ -52,6 +60,10 @@ impl CapabilityChecker {
     /// # Returns
     /// * `Ok(())` - If capability is allowed
     /// * `Err(SkillError)` - If capability is denied
+    ///
+    /// # Note
+    /// In production, `audit_log` should always be `Some` for security monitoring.
+    /// Passing `None` is intended for testing and development scenarios only.
     #[cfg(feature = "audit")]
     pub async fn check_with_audit(
         &self,
@@ -81,19 +93,36 @@ impl CapabilityChecker {
                 )
             };
 
-            let event = AuditEvent::with_metadata(
+            // Attempt to create and log the audit event
+            // If audit logging fails, log a warning but don't fail the capability check
+            match AuditEvent::with_metadata(
                 AuditEventType::SkillInvoked,
                 format!("skill:{}", self.skill_name),
                 description,
                 metadata,
-            )
-            .map_err(|e| SkillError::Execution(format!("Failed to create audit event: {}", e)))?;
-
-            log.append(event)
-                .await
-                .map_err(|e| SkillError::Execution(format!("Failed to write audit log: {}", e)))?;
+            ) {
+                Ok(event) => {
+                    if let Err(e) = log.append(event).await {
+                        tracing::warn!(
+                            skill = %self.skill_name,
+                            capability = %required,
+                            error = %e,
+                            "Failed to write capability check to audit log"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        skill = %self.skill_name,
+                        capability = %required,
+                        error = %e,
+                        "Failed to create audit event for capability check"
+                    );
+                }
+            }
         }
 
+        // Return the capability check result (independent of audit logging)
         if allowed {
             Ok(())
         } else {
@@ -118,6 +147,21 @@ impl CapabilityChecker {
     ///
     /// Logs each capability check to the audit system if provided.
     ///
+    /// # Audit Ordering
+    /// Capability checks are performed sequentially, and each is logged
+    /// immediately after its check completes. This ensures audit log entries
+    /// appear in check order, which is important for security analysis.
+    ///
+    /// If a capability is denied, the method returns immediately with an error,
+    /// but any previous capability checks will still have been logged.
+    ///
+    /// # Performance Note
+    /// Each capability check awaits individually, which means audit log writes
+    /// happen sequentially. For skills with many capabilities (rare), this could
+    /// add latency. This is intentional to maintain audit log ordering and
+    /// simplify error handling. Consider this a tradeoff for correctness over
+    /// raw performance.
+    ///
     /// # Arguments
     /// * `required` - List of capabilities to check
     /// * `audit_log` - Optional audit log for recording checks
@@ -125,6 +169,29 @@ impl CapabilityChecker {
     /// # Returns
     /// * `Ok(())` - If all capabilities are allowed
     /// * `Err(SkillError)` - On first denied capability
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use nv_skills::CapabilityChecker;
+    /// # use nv_skills::manifest::Capability;
+    /// # #[cfg(feature = "audit")]
+    /// # use nv_security::AuditLog;
+    /// # async fn example() {
+    /// # #[cfg(feature = "audit")]
+    /// # let mut audit_log = AuditLog::in_memory();
+    /// let checker = CapabilityChecker::new(
+    ///     vec![Capability::Network, Capability::Storage],
+    ///     "my_skill"
+    /// );
+    ///
+    /// # #[cfg(feature = "audit")]
+    /// let result = checker.check_all_with_audit(
+    ///     &[Capability::Network, Capability::Storage],
+    ///     Some(&mut audit_log)
+    /// ).await;
+    /// // Both checks logged, result is Ok(())
+    /// # }
+    /// ```
     #[cfg(feature = "audit")]
     pub async fn check_all_with_audit(
         &self,
