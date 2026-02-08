@@ -236,7 +236,7 @@ async fn test_skill_invocation_audit_trail() {
     // TODO: Update with real execution tests when PR #179 merges.
 
     // Create audit log
-    let mut audit_log = AuditLog::in_memory();
+    let mut audit_log = AuditLog::in_memory().unwrap();
 
     // Create skill runtime
     let mut runtime = SkillRuntime::new().expect("Failed to create runtime");
@@ -380,7 +380,7 @@ async fn test_policy_denial_and_audit() {
     assert!(matches!(decision, PolicyDecision::Deny { .. }));
 
     // Create audit log and record denial
-    let mut audit_log = AuditLog::in_memory();
+    let mut audit_log = AuditLog::in_memory().unwrap();
 
     let event = AuditEvent::new(
         AuditEventType::PolicyViolation,
@@ -672,7 +672,7 @@ async fn test_special_characters_handling() {
 
 #[tokio::test]
 async fn test_audit_trail_sequence() {
-    let mut audit_log = AuditLog::in_memory();
+    let mut audit_log = AuditLog::in_memory().unwrap();
 
     // Perform a sequence of operations
     // 1. Policy check
@@ -716,7 +716,7 @@ async fn test_audit_trail_sequence() {
 
 #[tokio::test]
 async fn test_audit_hash_chain_integrity() {
-    let mut audit_log = AuditLog::in_memory();
+    let mut audit_log = AuditLog::in_memory().unwrap();
 
     // Add multiple events
     for i in 0..10 {
@@ -740,7 +740,7 @@ async fn test_audit_hash_chain_integrity() {
 
 #[tokio::test]
 async fn test_audit_hash_chain_tampering_detection() {
-    let mut audit_log = AuditLog::in_memory();
+    let mut audit_log = AuditLog::in_memory().unwrap();
 
     // Add events to build hash chain
     for i in 0..5 {
@@ -776,7 +776,7 @@ async fn test_audit_hash_chain_tampering_detection() {
 async fn test_audit_concurrent_operations_with_timeout() {
     use tokio::time::{timeout, Duration};
 
-    let audit_log: Arc<Mutex<AuditLog>> = Arc::new(Mutex::new(AuditLog::in_memory()));
+    let audit_log: Arc<Mutex<AuditLog>> = Arc::new(Mutex::new(AuditLog::in_memory().unwrap()));
 
     // Spawn concurrent tasks that append to audit log
     let mut handles = vec![];
