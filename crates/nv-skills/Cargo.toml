@@ -7,6 +7,8 @@ license.workspace = true
 
 [dependencies]
 nv-core.workspace = true
+nv-security = { workspace = true, optional = true }
+tokio.workspace = true
 tracing.workspace = true
 wasmtime.workspace = true
 ring.workspace = true
@@ -15,3 +17,10 @@ serde_json.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 semver.workspace = true
+
+[features]
+default = []
+audit = ["nv-security"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
