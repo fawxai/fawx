@@ -47,8 +47,8 @@ impl AsyncStorage {
     /// Store a key-value pair in the specified table.
     pub async fn put(&self, table: &str, key: &str, value: &[u8]) -> Result<()> {
         let storage = Arc::clone(&self.storage);
-        let table_name = table.to_string();
-        let key_name = key.to_string();
+        let err_table = table.to_string();
+        let err_key = key.to_string();
         let table = table.to_string();
         let key = key.to_string();
         let value = value.to_vec();
@@ -58,7 +58,7 @@ impl AsyncStorage {
             .map_err(move |e| {
                 StorageError::Database(format!(
                     "Task join error in AsyncStorage::put(table='{}', key='{}'): {}",
-                    table_name, key_name, e
+                    err_table, err_key, e
                 ))
             })?
     }
@@ -66,8 +66,8 @@ impl AsyncStorage {
     /// Retrieve a value by key from the specified table.
     pub async fn get(&self, table: &str, key: &str) -> Result<Option<Vec<u8>>> {
         let storage = Arc::clone(&self.storage);
-        let table_name = table.to_string();
-        let key_name = key.to_string();
+        let err_table = table.to_string();
+        let err_key = key.to_string();
         let table = table.to_string();
         let key = key.to_string();
 
@@ -76,7 +76,7 @@ impl AsyncStorage {
             .map_err(move |e| {
                 StorageError::Database(format!(
                     "Task join error in AsyncStorage::get(table='{}', key='{}'): {}",
-                    table_name, key_name, e
+                    err_table, err_key, e
                 ))
             })?
     }
@@ -84,8 +84,8 @@ impl AsyncStorage {
     /// Delete a key from the specified table. Returns true if the key existed.
     pub async fn delete(&self, table: &str, key: &str) -> Result<bool> {
         let storage = Arc::clone(&self.storage);
-        let table_name = table.to_string();
-        let key_name = key.to_string();
+        let err_table = table.to_string();
+        let err_key = key.to_string();
         let table = table.to_string();
         let key = key.to_string();
 
@@ -94,7 +94,7 @@ impl AsyncStorage {
             .map_err(move |e| {
                 StorageError::Database(format!(
                     "Task join error in AsyncStorage::delete(table='{}', key='{}'): {}",
-                    table_name, key_name, e
+                    err_table, err_key, e
                 ))
             })?
     }
@@ -102,7 +102,7 @@ impl AsyncStorage {
     /// List all keys in the specified table.
     pub async fn list_keys(&self, table: &str) -> Result<Vec<String>> {
         let storage = Arc::clone(&self.storage);
-        let table_name = table.to_string();
+        let err_table = table.to_string();
         let table = table.to_string();
 
         tokio::task::spawn_blocking(move || storage.list_keys(&table))
@@ -110,7 +110,7 @@ impl AsyncStorage {
             .map_err(move |e| {
                 StorageError::Database(format!(
                     "Task join error in AsyncStorage::list_keys(table='{}'): {}",
-                    table_name, e
+                    err_table, e
                 ))
             })?
     }
