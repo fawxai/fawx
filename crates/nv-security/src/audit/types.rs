@@ -85,6 +85,7 @@ impl AuditEvent {
             .map_err(|e| {
                 nv_core::error::SecurityError::AuditLog(format!("Invalid system time: {}", e))
             })?
+            // Safe until year 2262 (u64::MAX ms from Unix epoch)
             .as_millis() as u64;
 
         Ok(Self {
@@ -109,6 +110,7 @@ impl AuditEvent {
             .map_err(|e| {
                 nv_core::error::SecurityError::AuditLog(format!("Invalid system time: {}", e))
             })?
+            // Safe until year 2262 (u64::MAX ms from Unix epoch)
             .as_millis() as u64;
 
         Ok(Self {

@@ -540,5 +540,15 @@ mod tests {
             assert_eq!(log.count(), 2);
             assert!(log.verify_integrity().unwrap());
         }
+
+        #[test]
+        fn test_open_with_malformed_json() {
+            let dir = tempdir().unwrap();
+            let log_path = dir.path().join("corrupt.log");
+            std::fs::write(&log_path, "not valid json\n").unwrap();
+
+            let result = AuditLog::open(&log_path);
+            assert!(result.is_err());
+        }
     }
 }
