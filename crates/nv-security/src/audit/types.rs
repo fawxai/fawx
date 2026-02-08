@@ -21,7 +21,11 @@ pub struct AuditEvent {
     /// Human-readable description
     pub description: String,
 
-    /// Additional context as key-value pairs
+    /// Additional context as key-value pairs.
+    ///
+    /// Uses `BTreeMap` to ensure deterministic serialization order for HMAC computation.
+    /// **DO NOT** change to `HashMap` as this would break integrity verification across
+    /// different audit log instances.
     pub metadata: BTreeMap<String, String>,
 }
 
