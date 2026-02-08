@@ -6,13 +6,48 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use tracing::warn;
 
+/// Maximum length for entity values (characters). Values exceeding this are truncated.
+const MAX_ENTITY_VALUE_LENGTH: usize = 1024;
+/// Marker appended to truncated entity values
+const TRUNCATION_MARKER: &str = "...";
+
 /// Raw JSON response from Claude for intent classification.
+///
+/// Note: Extra top-level fields are ignored by serde, but extra keys
+/// within the `entities` HashMap are preserved since it's a HashMap<String, String>.
 #[derive(Debug, Deserialize)]
 struct IntentResponse {
     category: String,
     confidence: f32,
     #[serde(default)]
     entities: HashMap<String, String>,
+}
+
+/// Truncate entity value if it exceeds maximum length.
+///
+/// Values longer than MAX_ENTITY_VALUE_LENGTH are truncated to exactly
+/// MAX_ENTITY_VALUE_LENGTH characters, with the truncation marker appended.
+/// This prevents malicious or accidental extremely long entity values from consuming
+/// excessive memory or causing downstream issues.
+///
+/// # Arguments
+/// * `value` - Entity value to truncate
+///
+/// # Returns
+/// Truncated value if needed (exactly MAX_ENTITY_VALUE_LENGTH chars), otherwise original value
+fn truncate_entity_value(value: String) -> String {
+    let char_count = value.chars().count();
+    if char_count > MAX_ENTITY_VALUE_LENGTH {
+        let max_chars = MAX_ENTITY_VALUE_LENGTH.saturating_sub(TRUNCATION_MARKER.len());
+        let truncated: String = value.chars().take(max_chars).collect();
+        warn!(
+            "Entity value exceeds {} chars, truncated from {} to {}",
+            MAX_ENTITY_VALUE_LENGTH, char_count, MAX_ENTITY_VALUE_LENGTH
+        );
+        format!("{}{}", truncated, TRUNCATION_MARKER)
+    } else {
+        value
+    }
 }
 
 /// Parse Claude's JSON response into an Intent.
@@ -65,10 +100,17 @@ pub fn parse_intent_response(raw: &str, original_input: &str) -> Result<Intent, 
     // Map category string to enum
     let category = category_from_str(&response.category);
 
+    // Truncate entity values that exceed maximum length
+    let entities = response
+        .entities
+        .into_iter()
+        .map(|(key, value)| (key, truncate_entity_value(value)))
+        .collect();
+
     Ok(Intent {
         category,
         confidence,
-        entities: response.entities,
+        entities,
         raw_input: original_input.to_string(),
     })
 }
