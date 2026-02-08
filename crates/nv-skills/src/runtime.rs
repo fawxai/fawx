@@ -5,7 +5,70 @@ use crate::loader::LoadedSkill;
 use crate::manifest::SkillManifest;
 use nv_core::error::SkillError;
 use std::collections::HashMap;
-use wasmtime::Engine;
+use wasmtime::{Caller, Engine, Linker, Memory, Store};
+
+/// Host state that holds the HostApi implementation and linear memory.
+struct HostState {
+    api: Box<dyn HostApi>,
+    memory: Option<Memory>,
+}
+
+impl HostState {
+    /// Create a new host state with the given API implementation.
+    fn new(api: Box<dyn HostApi>) -> Self {
+        Self { api, memory: None }
+    }
+
+    /// Set the linear memory reference.
+    fn set_memory(&mut self, memory: Memory) {
+        self.memory = Some(memory);
+    }
+
+    /// Read a string from WASM memory.
+    fn read_string(
+        &self,
+        store: &impl wasmtime::AsContext,
+        ptr: u32,
+        len: u32,
+    ) -> Result<String, SkillError> {
+        let memory = self
+            .memory
+            .as_ref()
+            .ok_or_else(|| SkillError::Execution("Memory not initialized".to_string()))?;
+
+        let data = memory
+            .data(store)
+            .get(ptr as usize..(ptr + len) as usize)
+            .ok_or_else(|| SkillError::Execution("Invalid memory access".to_string()))?;
+
+        String::from_utf8(data.to_vec())
+            .map_err(|e| SkillError::Execution(format!("Invalid UTF-8: {}", e)))
+    }
+
+    /// Write a string to WASM memory.
+    /// Returns the pointer to the written string.
+    fn write_string(
+        &mut self,
+        store: &mut impl wasmtime::AsContextMut,
+        s: &str,
+    ) -> Result<u32, SkillError> {
+        let memory = self
+            .memory
+            .as_ref()
+            .ok_or_else(|| SkillError::Execution("Memory not initialized".to_string()))?;
+
+        // For simplicity, we'll write to a fixed location in memory
+        // A production implementation would use proper memory allocation
+        let ptr = 1024u32; // Start at 1KB offset
+        let bytes = s.as_bytes();
+
+        let mem_data = memory.data_mut(store);
+        let dest = &mut mem_data[ptr as usize..ptr as usize + bytes.len()];
+        dest.copy_from_slice(bytes);
+
+        Ok(ptr)
+    }
+}
 
 /// WASM skill runtime manager.
 pub struct SkillRuntime {
@@ -38,10 +101,132 @@ impl SkillRuntime {
         Ok(())
     }
 
+    /// Link host API functions to the WASM linker.
+    fn link_host_functions(linker: &mut Linker<HostState>) -> Result<(), SkillError> {
+        // host_api_v1::log(level: u32, msg_ptr: u32, msg_len: u32)
+        linker
+            .func_wrap(
+                "host_api_v1",
+                "log",
+                |mut caller: Caller<'_, HostState>, level: u32, msg_ptr: u32, msg_len: u32| {
+                    match caller.data().read_string(&caller, msg_ptr, msg_len) {
+                        Ok(message) => {
+                            caller.data_mut().api.log(level, &message);
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to read log message: {}", e);
+                        }
+                    }
+                },
+            )
+            .map_err(|e| SkillError::Execution(format!("Failed to link log: {}", e)))?;
+
+        // host_api_v1::kv_get(key_ptr: u32, key_len: u32) -> u32 (0 = not found, ptr otherwise)
+        linker
+            .func_wrap(
+                "host_api_v1",
+                "kv_get",
+                |mut caller: Caller<'_, HostState>, key_ptr: u32, key_len: u32| -> u32 {
+                    // Read key
+                    let key_result = caller.data().read_string(&caller, key_ptr, key_len);
+                    let key = match key_result {
+                        Ok(k) => k,
+                        Err(e) => {
+                            tracing::error!("Failed to read kv_get key: {}", e);
+                            return 0;
+                        }
+                    };
+
+                    // Get value
+                    let value_opt = caller.data().api.kv_get(&key);
+                    let value = match value_opt {
+                        Some(v) => v,
+                        None => return 0,
+                    };
+
+                    // Write value
+                    match caller.data_mut().write_string(&mut caller, &value) {
+                        Ok(ptr) => ptr,
+                        Err(e) => {
+                            tracing::error!("Failed to write kv_get value: {}", e);
+                            0
+                        }
+                    }
+                },
+            )
+            .map_err(|e| SkillError::Execution(format!("Failed to link kv_get: {}", e)))?;
+
+        // host_api_v1::kv_set(key_ptr: u32, key_len: u32, val_ptr: u32, val_len: u32)
+        linker
+            .func_wrap(
+                "host_api_v1",
+                "kv_set",
+                |mut caller: Caller<'_, HostState>,
+                 key_ptr: u32,
+                 key_len: u32,
+                 val_ptr: u32,
+                 val_len: u32| {
+                    let key_result = caller.data().read_string(&caller, key_ptr, key_len);
+                    let val_result = caller.data().read_string(&caller, val_ptr, val_len);
+
+                    match (key_result, val_result) {
+                        (Ok(key), Ok(value)) => {
+                            if let Err(e) = caller.data_mut().api.kv_set(&key, &value) {
+                                tracing::error!("kv_set failed: {}", e);
+                            }
+                        }
+                        (Err(e), _) | (_, Err(e)) => {
+                            tracing::error!("Failed to read kv_set parameters: {}", e);
+                        }
+                    }
+                },
+            )
+            .map_err(|e| SkillError::Execution(format!("Failed to link kv_set: {}", e)))?;
+
+        // host_api_v1::get_input() -> u32 (ptr to input string in memory)
+        linker
+            .func_wrap(
+                "host_api_v1",
+                "get_input",
+                |mut caller: Caller<'_, HostState>| -> u32 {
+                    // Get input
+                    let input = caller.data().api.get_input();
+
+                    // Write to memory
+                    match caller.data_mut().write_string(&mut caller, &input) {
+                        Ok(ptr) => ptr,
+                        Err(e) => {
+                            tracing::error!("Failed to write input: {}", e);
+                            0
+                        }
+                    }
+                },
+            )
+            .map_err(|e| SkillError::Execution(format!("Failed to link get_input: {}", e)))?;
+
+        // host_api_v1::set_output(text_ptr: u32, text_len: u32)
+        linker
+            .func_wrap(
+                "host_api_v1",
+                "set_output",
+                |mut caller: Caller<'_, HostState>, text_ptr: u32, text_len: u32| match caller
+                    .data()
+                    .read_string(&caller, text_ptr, text_len)
+                {
+                    Ok(text) => {
+                        caller.data_mut().api.set_output(&text);
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to read output text: {}", e);
+                    }
+                },
+            )
+            .map_err(|e| SkillError::Execution(format!("Failed to link set_output: {}", e)))?;
+
+        Ok(())
+    }
+
     /// Invoke a skill by name with input.
-    ///
-    /// Note: This is a simplified implementation. Full WASM execution
-    /// requires proper host function linking and calling conventions.
     pub fn invoke(&mut self, skill_name: &str, input: &str) -> Result<String, SkillError> {
         let skill = self
             .skills
@@ -49,24 +234,51 @@ impl SkillRuntime {
             .ok_or_else(|| SkillError::Execution(format!("Skill '{}' not found", skill_name)))?;
 
         // Create host API state
-        let mut host_api = MockHostApi::new(input);
+        let host_api = Box::new(MockHostApi::new(input));
+        let mut store = Store::new(&self.engine, HostState::new(host_api));
 
-        // For now, we use a simplified execution model
-        // In a real implementation, this would:
-        // 1. Create a Store with HostState
-        // 2. Create a Linker and link host functions
-        // 3. Instantiate the module
-        // 4. Call the entry point function
-        // 5. Return the output
+        // Create linker and link host functions
+        let mut linker = Linker::new(&self.engine);
+        Self::link_host_functions(&mut linker)?;
 
-        // Simplified: just return a placeholder showing the skill was called
-        let output = format!(
-            "Skill '{}' invoked (placeholder execution)",
-            skill.manifest().name
-        );
-        host_api.set_output(&output);
+        // Instantiate the module
+        let instance = linker
+            .instantiate(&mut store, skill.module())
+            .map_err(|e| SkillError::Execution(format!("Failed to instantiate module: {}", e)))?;
 
-        Ok(host_api.get_output())
+        // Get the memory export and store it in the host state
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .ok_or_else(|| SkillError::Execution("Module does not export 'memory'".to_string()))?;
+
+        store.data_mut().set_memory(memory);
+
+        // Get the entry point function
+        let entry_point = skill.manifest().entry_point.as_str();
+        let run_func = instance
+            .get_typed_func::<(), ()>(&mut store, entry_point)
+            .map_err(|e| {
+                SkillError::Execution(format!(
+                    "Failed to get entry point '{}': {}",
+                    entry_point, e
+                ))
+            })?;
+
+        // Call the entry point
+        run_func
+            .call(&mut store, ())
+            .map_err(|e| SkillError::Execution(format!("Skill execution failed: {}", e)))?;
+
+        // Extract the output
+        let api_ref = &store.data().api;
+        // We need to downcast to get the output
+        // This is safe because we created a MockHostApi above
+        let mock_api = api_ref
+            .as_any()
+            .downcast_ref::<MockHostApi>()
+            .ok_or_else(|| SkillError::Execution("Failed to access host API".to_string()))?;
+
+        Ok(mock_api.get_output())
     }
 
     /// List all registered skills.

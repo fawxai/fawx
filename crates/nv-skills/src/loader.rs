@@ -49,6 +49,7 @@ impl SkillLoader {
     /// Load a skill from WASM bytes, manifest, and optional signature.
     ///
     /// If a signature is provided, it must verify against one of the trusted keys.
+    /// Uses module caching to speed up repeated loads of the same WASM bytes.
     pub fn load(
         &self,
         wasm_bytes: &[u8],
@@ -76,9 +77,25 @@ impl SkillLoader {
             }
         }
 
-        // Compile the WASM module
-        let module = Module::new(&self.engine, wasm_bytes)
-            .map_err(|e| SkillError::Load(format!("Failed to compile WASM module: {}", e)))?;
+        // Try to load from cache first
+        let module = if let Some(cached) =
+            crate::cache::load_cached_module(&self.engine, wasm_bytes)?
+        {
+            tracing::debug!("Loaded skill '{}' from cache", manifest.name);
+            cached
+        } else {
+            // Compile the WASM module
+            let module = Module::new(&self.engine, wasm_bytes)
+                .map_err(|e| SkillError::Load(format!("Failed to compile WASM module: {}", e)))?;
+
+            // Cache the compiled module
+            if let Err(e) = crate::cache::cache_module(wasm_bytes, &module) {
+                tracing::warn!("Failed to cache module: {}", e);
+            }
+
+            tracing::debug!("Compiled and cached skill '{}'", manifest.name);
+            module
+        };
 
         Ok(LoadedSkill {
             module,

@@ -24,6 +24,9 @@ pub trait HostApi: Send + Sync {
 
     /// Set the skill's response output.
     fn set_output(&mut self, text: &str);
+
+    /// Downcast to concrete type for accessing implementation-specific methods.
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 /// Mock implementation of HostApi for testing.
@@ -101,6 +104,10 @@ impl HostApi for MockHostApi {
 
     fn set_output(&mut self, text: &str) {
         *self.output.lock().expect("Lock poisoned") = text.to_string();
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 

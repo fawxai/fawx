@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 nv-core.workspace = true
 nv-security.workspace = true
+nv-skills = { path = "../nv-skills" }
 nv-storage.workspace = true
 clap.workspace = true
 tokio.workspace = true

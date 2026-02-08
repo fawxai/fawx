@@ -109,18 +109,15 @@ async fn main() -> anyhow::Result<()> {
         },
         Commands::Skill { command } => match command {
             SkillCommands::List => {
-                println!("Installed skills:");
-                println!("(Skill management pending - Epic 8)");
+                commands::skills::list().await?;
                 0
             }
             SkillCommands::Install { path } => {
-                println!("Installing skill from: {}", path);
-                println!("(Skill installation pending - Epic 8)");
+                commands::skills::install(&path).await?;
                 0
             }
             SkillCommands::Remove { name } => {
-                println!("Removing skill: {}", name);
-                println!("(Skill removal pending - Epic 8)");
+                commands::skills::remove(&name).await?;
                 0
             }
         },
