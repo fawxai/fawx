@@ -72,7 +72,9 @@ impl Config {
         }
 
         if self.storage_path.as_os_str().is_empty() {
-            return Err(CoreError::ConfigParse("storage_path cannot be empty".into()));
+            return Err(CoreError::ConfigParse(
+                "storage_path cannot be empty".into(),
+            ));
         }
 
         Ok(())

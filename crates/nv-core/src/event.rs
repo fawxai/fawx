@@ -2,7 +2,7 @@
 //!
 //! Uses `tokio::sync::broadcast` for multi-producer, multi-consumer event distribution.
 
-use crate::error::{CoreError, Result};
+use crate::error::Result;
 use crate::message::InternalMessage;
 use tokio::sync::broadcast;
 
