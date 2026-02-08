@@ -109,7 +109,7 @@ fn get_audit_log_path() -> std::path::PathBuf {
 mod tests {
     use super::*;
     use nv_security::{AuditEvent, AuditEventType};
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     #[test]
     fn test_format_event_produces_readable_output() {
@@ -129,7 +129,7 @@ mod tests {
 
     #[test]
     fn test_format_event_with_metadata() {
-        let mut metadata = HashMap::new();
+        let mut metadata = BTreeMap::new();
         metadata.insert("key1".to_string(), "value1".to_string());
         metadata.insert("key2".to_string(), "value2".to_string());
 

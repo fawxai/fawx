@@ -1,7 +1,7 @@
 //! Audit event types for security and compliance tracking.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 /// An audit event recording a security-relevant action
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,7 +22,7 @@ pub struct AuditEvent {
     pub description: String,
 
     /// Additional context as key-value pairs
-    pub metadata: HashMap<String, String>,
+    pub metadata: BTreeMap<String, String>,
 }
 
 /// Categories of auditable events
@@ -94,7 +94,7 @@ impl AuditEvent {
             event_type,
             actor: actor.into(),
             description: description.into(),
-            metadata: HashMap::new(),
+            metadata: BTreeMap::new(),
         })
     }
 
@@ -103,7 +103,7 @@ impl AuditEvent {
         event_type: AuditEventType,
         actor: impl Into<String>,
         description: impl Into<String>,
-        metadata: HashMap<String, String>,
+        metadata: BTreeMap<String, String>,
     ) -> Result<Self, nv_core::error::SecurityError> {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -143,7 +143,7 @@ mod tests {
 
     #[test]
     fn test_audit_event_with_metadata() {
-        let mut metadata = HashMap::new();
+        let mut metadata = BTreeMap::new();
         metadata.insert("recipient".to_string(), "+1234567890".to_string());
         metadata.insert("app".to_string(), "messages".to_string());
 

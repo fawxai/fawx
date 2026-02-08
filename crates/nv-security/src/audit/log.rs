@@ -551,4 +551,42 @@ mod tests {
         let result = AuditLog::open(&log_path);
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_metadata_hash_determinism() {
+        use std::collections::BTreeMap;
+
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("metadata.log");
+
+        // Create event with multiple metadata keys
+        let mut metadata = BTreeMap::new();
+        metadata.insert("app".to_string(), "messages".to_string());
+        metadata.insert("recipient".to_string(), "+1234567890".to_string());
+        metadata.insert("action".to_string(), "send_sms".to_string());
+
+        let event = AuditEvent::with_metadata(
+            AuditEventType::ActionExecuted,
+            "agent",
+            "Sent SMS",
+            metadata,
+        )
+        .unwrap();
+
+        // Write event
+        {
+            let mut log = AuditLog::open(&log_path).unwrap();
+            log.append(event).unwrap();
+        }
+
+        // Reopen and verify — BTreeMap ensures deterministic ordering
+        {
+            let log = AuditLog::open(&log_path).unwrap();
+            assert_eq!(log.count(), 1);
+            assert!(
+                log.verify_integrity().unwrap(),
+                "Hash verification must succeed with metadata across open/close"
+            );
+        }
+    }
 }
