@@ -3,7 +3,22 @@
 //! This crate implements the core agent logic: perception → cognition → action.
 //! It orchestrates intent classification, action planning, and execution.
 
+pub mod claude;
+pub mod history;
+pub mod plan_builder;
+pub mod retry;
+pub mod tools;
+
 use nv_core::types::{ActionPlan, UserInput};
+
+pub use claude::{
+    AgentError, ClaudeClient, ClaudeConfig, CompletionResponse, ContentBlock, Message, Result,
+    Role, StopReason, StreamEvent, Tool, ToolResult, ToolUse, Usage,
+};
+pub use history::ConversationHistory;
+pub use plan_builder::PlanBuilder;
+pub use retry::{calculate_delay, should_retry, with_retry, RetryPolicy};
+pub use tools::nova_action_tools;
 
 /// Main agent orchestrator.
 ///
