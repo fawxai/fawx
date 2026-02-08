@@ -1,0 +1,11 @@
+[package]
+name = "nv-llm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+nv-core.workspace = true
+tokio.workspace = true
+tracing.workspace = true

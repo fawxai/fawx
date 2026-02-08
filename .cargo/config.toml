@@ -1,0 +1,23 @@
+# Cargo configuration for Nova
+
+[build]
+# Default to native target
+# target = "x86_64-unknown-linux-gnu"  # Uncomment for explicit target
+
+[profile.release]
+# Optimize for size and performance
+lto = true              # Link-time optimization
+strip = true            # Strip symbols
+codegen-units = 1       # Better optimization
+opt-level = 3           # Maximum optimization
+
+[profile.dev]
+# Faster incremental builds in development
+opt-level = 0
+debug = true
+
+# Android cross-compilation target (for Horizon 1)
+# Commented out for pre-PoC; uncomment when building for Android
+# [target.aarch64-linux-android]
+# linker = "aarch64-linux-android-clang"
+# ar = "aarch64-linux-android-ar"
