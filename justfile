@@ -52,7 +52,10 @@ doctor:
 watch:
     cargo watch -x "check --workspace"
 
-# Cross-compile for Android (Horizon 1)
-cross-android:
-    @echo "Android cross-compilation will be configured in Horizon 1"
-    @echo "Target: aarch64-linux-android"
+# Check Android cross-compilation (no binary output)
+check-android:
+    cargo check --target aarch64-linux-android
+
+# Build for Android (Horizon 1)
+build-android:
+    cargo build --target aarch64-linux-android --release
