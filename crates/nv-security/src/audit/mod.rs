@@ -14,8 +14,10 @@
 //!
 //! # Security
 //!
-//! - Each audit log has a unique 256-bit HMAC key stored in `audit.key` (created automatically)
-//! - Key file has restrictive permissions (0600 on Unix)
+//! - Each audit log has a unique 256-bit HMAC key stored alongside the log file (created automatically)
+//! - Key filename is derived from log filename: `audit.log` → `audit.key`, `audit-2024.log` → `audit-2024.key`
+//! - This ensures cryptographic independence between different log files in the same directory
+//! - Key files have restrictive permissions (0600 on Unix)
 //! - Entries are hashed with `HMAC-SHA256(key, event_data || prev_hash)`
 //! - Verification checks the entire chain from genesis to the latest entry
 //!

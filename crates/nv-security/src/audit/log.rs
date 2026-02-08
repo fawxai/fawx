@@ -134,9 +134,6 @@ pub struct AuditLog {
     last_hash: String,
 }
 
-/// Default key file name stored alongside the audit log
-const KEY_FILE_NAME: &str = "audit.key";
-
 /// Maximum size of a single audit log entry (1 MB).
 ///
 /// This limit protects against memory exhaustion and extremely large entries.
@@ -146,13 +143,25 @@ const MAX_ENTRY_SIZE: usize = 1_048_576;
 impl AuditLog {
     /// Generate or load an HMAC key for the audit log.
     ///
-    /// The key is stored in a file next to the audit log. If the key file
-    /// doesn't exist, a new 256-bit key is generated and saved.
+    /// Each audit log has its own key file derived from the log filename.
+    /// For example, `audit.log` uses `audit.key`, `audit-2024.log` uses `audit-2024.key`.
+    /// This ensures cryptographic independence between different log files in the same directory.
+    ///
+    /// If the key file doesn't exist, a new 256-bit key is generated and saved.
     async fn load_or_create_key(log_path: &Path) -> Result<hmac::Key, SecurityError> {
+        // Derive key filename from log filename
+        let key_filename = format!(
+            "{}.key",
+            log_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| SecurityError::AuditLog("Invalid log path".to_string()))?
+        );
+
         let key_path = log_path
             .parent()
             .unwrap_or(Path::new("."))
-            .join(KEY_FILE_NAME);
+            .join(key_filename);
 
         if key_path.exists() {
             let key_bytes = fs::read(&key_path)
@@ -758,7 +767,7 @@ mod tests {
 
         // Write key file first so open doesn't fail on missing key
         let key_bytes: [u8; 32] = [0u8; 32];
-        fs::write(dir.path().join(KEY_FILE_NAME), &key_bytes)
+        fs::write(dir.path().join("corrupt.key"), &key_bytes)
             .await
             .unwrap();
 
@@ -810,7 +819,7 @@ mod tests {
     async fn test_hmac_key_persistence() {
         let dir = tempdir().unwrap();
         let log_path = dir.path().join("audit.log");
-        let key_path = dir.path().join(KEY_FILE_NAME);
+        let key_path = dir.path().join("audit.key");
 
         // First open creates key
         {
@@ -839,7 +848,7 @@ mod tests {
     async fn test_wrong_key_fails_verification() {
         let dir = tempdir().unwrap();
         let log_path = dir.path().join("audit.log");
-        let key_path = dir.path().join(KEY_FILE_NAME);
+        let key_path = dir.path().join("audit.key");
 
         // Create log with one key
         {
@@ -870,7 +879,7 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let log_path = dir.path().join("audit.log");
-        let key_path = dir.path().join(KEY_FILE_NAME);
+        let key_path = dir.path().join("audit.key");
 
         let _log = AuditLog::open(&log_path).await.unwrap();
 
@@ -890,7 +899,7 @@ mod tests {
 
         // Write key file first
         let key_bytes: [u8; 32] = [0x42u8; 32];
-        fs::write(dir.path().join(KEY_FILE_NAME), &key_bytes)
+        fs::write(dir.path().join("truncated.key"), &key_bytes)
             .await
             .unwrap();
 
