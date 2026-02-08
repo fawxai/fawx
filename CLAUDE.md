@@ -61,6 +61,7 @@ Every feature needs tests. Every bug fix needs a failing regression test first.
 - ✅ **Address EVERY comment** — partial fixes are not acceptable
 - ✅ **ALL review items must be resolved** — including suggestions, observations, and "nice to have" items. Every single one. No exceptions.
 - ✅ **"Optional enhancements for future consideration"** → Create backlog GitHub issues (don't lose them)
+- 🔄 **If Joe requests changes after `@abbudjoe ready for merge`** → Full review cycle restarts (push fixes → `@claude review this PR` → address all → repeat until clean → ping Joe again)
 
 ## Checklist Before PR
 
