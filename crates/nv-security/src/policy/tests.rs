@@ -34,6 +34,39 @@ mod integration_tests {
     }
 
     #[test]
+    fn test_policy_decision_partial_eq() {
+        let allow1 = PolicyDecision::Allow;
+        let allow2 = PolicyDecision::Allow;
+        assert_eq!(allow1, allow2);
+
+        let deny1 = PolicyDecision::Deny {
+            reason: "test".to_string(),
+        };
+        let deny2 = PolicyDecision::Deny {
+            reason: "test".to_string(),
+        };
+        let deny3 = PolicyDecision::Deny {
+            reason: "other".to_string(),
+        };
+        assert_eq!(deny1, deny2);
+        assert_ne!(deny1, deny3);
+
+        let confirm1 = PolicyDecision::Confirm {
+            prompt: "test?".to_string(),
+        };
+        let confirm2 = PolicyDecision::Confirm {
+            prompt: "test?".to_string(),
+        };
+        assert_eq!(confirm1, confirm2);
+
+        let rate1 = PolicyDecision::RateLimit { wait_ms: 100 };
+        let rate2 = PolicyDecision::RateLimit { wait_ms: 100 };
+        let rate3 = PolicyDecision::RateLimit { wait_ms: 200 };
+        assert_eq!(rate1, rate2);
+        assert_ne!(rate1, rate3);
+    }
+
+    #[test]
     fn test_conditions_time_of_day() {
         let toml = r#"
             [default]

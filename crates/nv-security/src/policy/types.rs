@@ -63,7 +63,9 @@ pub enum Condition {
     /// Time of day constraint (24-hour format, evaluated in UTC)
     ///
     /// **Important:** Times are evaluated in UTC, not local time.
-    /// For example, `after: "09:00"` means 09:00 UTC.
+    /// For example, `after: "09:00"` means 09:00 UTC (which is 1:00 AM PST
+    /// or 5:00 AM EDT). If you want to restrict actions to local business
+    /// hours, you must convert your local time to UTC.
     ///
     /// Supports midnight crossing (e.g., `after: "22:00", before: "06:00"`).
     #[serde(rename = "time_of_day")]

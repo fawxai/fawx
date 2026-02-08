@@ -36,6 +36,6 @@ pub use rate_limit::RateLimiter;
 pub use signing::{sign_policy, verify_policy};
 pub use types::PolicyDecision;
 
-// Note: Internal types (Condition, DefaultPolicy, PolicyConfig, PolicyRule, matches_action)
-// are NOT re-exported, keeping the public API surface minimal.
-// They remain accessible within this module via their submodules (types::*, util::*).
+// Note: Internal types (Condition, DefaultPolicy, PolicyConfig, PolicyRule from types::*)
+// and utility functions (matches_action from util::*) are NOT re-exported, keeping the
+// public API surface minimal. They remain accessible within this module via their submodules.
