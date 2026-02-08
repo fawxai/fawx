@@ -211,7 +211,7 @@ async fn test_skill_invocation_infrastructure() {
     ];
 
     // Load skill using SkillLoader
-    let loader = SkillLoader::new(vec![]);
+    let loader = SkillLoader::with_engine(runtime.engine().clone(), vec![]);
     let skill = loader
         .load(&wasm_bytes, &manifest, None)
         .expect("Failed to load skill");
@@ -256,7 +256,7 @@ async fn test_skill_invocation_audit_trail() {
         0x00, 0x61, 0x73, 0x6d, // magic
         0x01, 0x00, 0x00, 0x00, // version
     ];
-    let loader = SkillLoader::new(vec![]);
+    let loader = SkillLoader::with_engine(runtime.engine().clone(), vec![]);
     let skill = loader
         .load(&wasm_bytes, &manifest, None)
         .expect("Failed to load skill");

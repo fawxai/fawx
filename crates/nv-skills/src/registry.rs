@@ -176,10 +176,11 @@ mod tests {
     use super::*;
     use crate::manifest::Capability;
     use std::fs;
+    use std::path::Path;
     use tempfile::TempDir;
 
     fn create_test_skill_dir(
-        skills_dir: &PathBuf,
+        skills_dir: &Path,
         name: &str,
         manifest: &SkillManifest,
     ) -> Result<(), std::io::Error> {
