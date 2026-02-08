@@ -19,3 +19,9 @@ hex = "0.4"
 
 [dev-dependencies]
 tempfile = "3.15"
+nv-agent = { workspace = true }
+nv-skills = { workspace = true }
+nv-storage = { workspace = true }
+async-trait = { workspace = true }
+semver = { workspace = true }
+reqwest = { workspace = true }
