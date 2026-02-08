@@ -89,17 +89,17 @@ Builds community.            WASM services replace apps.  optimized form factor.
 
 ### 3.1 What We're Building
 
-A Rust daemon that runs on a rooted Android phone (Pixel 8a), controlled by voice and a thin overlay UI. It perceives the phone's state (screen content, notifications, sensors), thinks about what to do (local LLM for simple tasks, Claude API for complex reasoning), and acts by directly injecting touch events and controlling apps. All communication with the cloud is outbound-only over a Tailscale mesh.
+A Rust daemon that runs on a rooted Android phone (Pixel 10 Pro), controlled by voice and a thin overlay UI. It perceives the phone's state (screen content, notifications, sensors), thinks about what to do (local LLM for simple tasks, Claude API for complex reasoning), and acts by directly injecting touch events and controlling apps. All communication with the cloud is outbound-only over a Tailscale mesh.
 
 ### 3.2 Target Hardware
 
-**Google Pixel 8a** — selected for:
-- Tensor G3 SoC with Edge TPU (optimized for Gemma models)
-- 8GB RAM (tight but workable with mmap model loading)
+**Google Pixel 10 Pro** — selected for:
+- Tensor G5 SoC with next-gen TPU (optimized for Gemma models)
+- 16GB RAM (comfortable headroom for model loading + app state)
 - Easy bootloader unlock, well-documented root process via Magisk
 - Best-in-class mainline Linux kernel support (critical for Horizon 2)
 - Stock Android with minimal OEM modifications (no Samsung/Xiaomi battery killers)
-- ~$200-250 used, dedicated device (not daily driver)
+- Dedicated development device (not daily driver)
 
 ### 3.3 Architecture
 
@@ -200,7 +200,7 @@ nova/
 │   │   │       └── conversation.txt
 │   │   └── Cargo.toml
 │   │
-│   ├── nv-phone/                   # [Reuse: 0% — Horizon 1 only] Android puppeting
+│   ├── nv-phone/                   # Android puppeting (Horizon 1 only)
 │   │   ├── src/
 │   │   │   ├── lib.rs
 │   │   │   ├── input.rs            # /dev/input touch injection
@@ -571,7 +571,7 @@ The system must handle failure at every level:
 
 - **Memory and preference learning is a cold start problem.** The agent doesn't know the user's patterns for weeks. During that time, its proactive suggestions are generic or wrong, which trains the user to ignore them. *Mitigation*: Explicit preference collection during onboarding. "What time do you usually wake up? What's your commute? Do you want morning briefings?" Give the agent a head start. Then refine based on observed behavior.
 
-- **Battery life under sustained use.** Wake word listening + periodic notification processing + model inference = significant power draw. Target: < 2% battery per hour idle, < 5% per hour during active use. Unknown until measured on actual hardware. *Mitigation*: Implement power profiles early. "Sleeping" mode: wake word only, screen off, no proactive processing, < 0.5% per hour. "Alert" mode: wake word + notification processing, < 2% per hour. "Active" mode: full inference, screen capture, action execution, < 5% per hour. Measure actual drain on Pixel 8a and adjust.
+- **Battery life under sustained use.** Wake word listening + periodic notification processing + model inference = significant power draw. Target: < 2% battery per hour idle, < 5% per hour during active use. Unknown until measured on actual hardware. *Mitigation*: Implement power profiles early. "Sleeping" mode: wake word only, screen off, no proactive processing, < 0.5% per hour. "Alert" mode: wake word + notification processing, < 2% per hour. "Active" mode: full inference, screen capture, action execution, < 5% per hour. Measure actual drain on Pixel 10 Pro and adjust.
 
 - **The agent develops "habits" that the user didn't intend.** If the agent learns that the user always opens Instagram at 9pm and starts proactively opening it, it's reinforcing a habit the user might want to break. The agent optimizing for observed behavior isn't the same as optimizing for the user's wellbeing. *Mitigation*: The agent should offer observations, not automatic actions, for learned patterns. "You usually check Instagram around this time. Want me to open it?" rather than just opening it. The user can say "stop suggesting that" and the agent learns the exclusion.
 
@@ -671,7 +671,7 @@ Each service declares:
 
 ### 4.5 Hurdles & Blind Spots for Horizon 2
 
-- **Telephony is the hardest problem.** Cellular baseband communication on Android goes through the Radio Interface Layer (RIL), which is partially proprietary per-modem. oFono supports some modems, but coverage is inconsistent. Qualcomm modems (used in most Android phones) have the best Linux support via QMI protocol, but Samsung Exynos and Google Tensor modems are less documented. On the Pixel 8a, the Tensor modem (Samsung-derived) may require reverse-engineering or using Android's RIL as a compatibility layer. Without telephony, the device can't make calls or send SMS — which makes it a WiFi-only tablet, not a phone. *This is the single biggest risk for Horizon 2.*
+- **Telephony is the hardest problem.** Cellular baseband communication on Android goes through the Radio Interface Layer (RIL), which is partially proprietary per-modem. oFono supports some modems, but coverage is inconsistent. Qualcomm modems (used in most Android phones) have the best Linux support via QMI protocol, but Samsung Exynos and Google Tensor modems are less documented. On the Pixel 10 Pro, the Tensor modem (Samsung-derived) may require reverse-engineering or using Android's RIL as a compatibility layer. Without telephony, the device can't make calls or send SMS — which makes it a WiFi-only tablet, not a phone. *This is the single biggest risk for Horizon 2.*
 
 - **Power management on Linux phones is immature.** Android has spent 15 years optimizing suspend/resume, wake locks, doze mode, and app standby. Linux phone projects (postmarketOS, Mobian) typically get 4-8 hours of battery life versus 24+ hours on Android. The issue isn't the kernel (it supports suspend fine) but the userspace: every component needs to be suspend-aware, and background tasks need to be carefully managed. *Mitigation*: Study how postmarketOS/Phosh handle power management. Budget significant time for profiling and optimization. Accept that v1 of the OS will have worse battery life than Android and improve iteratively.
 
@@ -679,7 +679,7 @@ Each service declares:
 
 - **Security model changes fundamentally.** On Android, the agent runs as a rooted user in a permissive security environment. On the OS, the agent *is* the system — it has legitimate access to everything. The security concern shifts from "protect the OS from the agent" to "protect the user from the agent making mistakes." The action policy engine becomes even more critical because there's no Android permission system as a backup.
 
-- **Hardware support is device-specific.** A compositor, telephony stack, and power management all need to work with specific hardware. The Pixel 8a is one device. Supporting even five devices requires significant kernel and HAL work. *Mitigation*: Pick one device and make it work perfectly before expanding. The Pixel 8a's mainline Linux support is the best of any Android phone, which is why it's the right starting point.
+- **Hardware support is device-specific.** A compositor, telephony stack, and power management all need to work with specific hardware. The Pixel 10 Pro is one device. Supporting even five devices requires significant kernel and HAL work. *Mitigation*: Pick one device and make it work perfectly before expanding. The Pixel 10 Pro's mainline Linux support is the best of any Android phone, which is why it's the right starting point.
 
 - **Developer ecosystem chicken-and-egg.** The OS needs services (apps) to be useful. Services need users to justify development. Neither exists at launch. *Mitigation*: The 10-15 built-in services from the PoC provide a functional baseline. Web apps (via embedded browser) fill most remaining gaps. The service format is simple enough (WASM + manifest) that the same person (you) can build new services as needed. Community development comes later, after the platform proves itself.
 
@@ -691,7 +691,7 @@ Each service declares:
 
 Hardware becomes relevant when:
 - [ ] The PoC is stable and has daily users (even if that's just you)
-- [ ] The OS boots on a Pixel 8a with telephony, Bluetooth, and acceptable battery life
+- [ ] The OS boots on a Pixel 10 Pro with telephony, Bluetooth, and acceptable battery life
 - [ ] There's a small community (50+ people) running the OS
 - [ ] You've identified specific hardware limitations that custom hardware would solve
 - [ ] There's funding or revenue to support a $500K-1.5M minimum hardware investment
@@ -719,7 +719,7 @@ The one genuinely novel hardware idea. A dedicated physical button (or capacitiv
 
 This creates a physical air gap between the AI's intentions and irreversible real-world actions. No software bug, prompt injection, or model hallucination can bypass a button the human hasn't pressed.
 
-**PoC prototype**: Remap the Pixel 8a's power button or a volume button to serve as the trust button. The remap happens at the kernel level — the agent daemon cannot intercept or simulate it. This validates the UX without custom hardware.
+**PoC prototype**: Remap the Pixel 10 Pro's power button or a volume button to serve as the trust button. The remap happens at the kernel level — the agent daemon cannot intercept or simulate it. This validates the UX without custom hardware.
 
 ### 5.4 Hardware Paths
 
@@ -770,7 +770,7 @@ The agent sees everything on the phone: messages, photos, location, browsing his
 |---|---|---|
 | Unit | Individual crate functions | `cargo test` with mocked dependencies |
 | Integration | Crate interactions (agent → LLM → phone) | Test harness with mock LLM responses and simulated UI tree |
-| Device | Full pipeline on Pixel 8a | ADB-driven test suite that issues commands and verifies results |
+| Device | Full pipeline on Pixel 10 Pro | ADB-driven test suite that issues commands and verifies results |
 | Policy | Action policy correctness | Exhaustive test of every action type against every policy category |
 | Security | Capability dropping, encryption, audit | Targeted security tests (try to escalate, try to bypass policy) |
 | Adversarial | Prompt injection resistance | Library of known injection attacks applied as notification text, screen content, voice input |
@@ -805,7 +805,7 @@ Decisions that have been made, with rationale, to avoid revisiting them.
 | 1 | Rust for the core runtime | Memory safety without GC, direct hardware access, cross-compilation, single binary. The agent runs as root — memory safety is not optional. | A Rust alternative emerges with better Android/embedded support |
 | 2 | Phone-native, not server-first | Eliminates gateway attack surface, reduces latency, leverages phone sensors and context | Server-hosted agents become clearly superior (unlikely given physics) |
 | 3 | Outbound-only networking | Zero inbound attack surface. The phone initiates all connections. | Use case demands inbound connections (none identified) |
-| 4 | Pixel 8a as PoC device | Best root support, decent NPU, best mainline Linux kernel support, cheap | A clearly better device emerges with better Linux/NPU support |
+| 4 | Pixel 10 Pro as PoC device | Best root support, Tensor G5 TPU, 16GB RAM, best mainline Linux kernel support | A clearly better device emerges with better Linux/NPU support |
 | 5 | WASM for skills/services | Sandboxed, portable, language-agnostic, becomes the app model in the OS | WASM performance is insufficient for critical-path skills |
 | 6 | Private skill hub, not public registry | Security: signed skills only, capability auditing, no npm-style supply chain risk | Community is large enough to justify a vetted public registry |
 | 7 | Tailscale for cloud connectivity | WireGuard-based, zero-config mesh, works across NATs, trusted | Tailscale Inc. changes terms or pricing, or a better alternative emerges |
