@@ -62,6 +62,7 @@ Every feature needs tests. Every bug fix needs a failing regression test first.
 - ✅ **ALL review items must be resolved** — including suggestions, observations, and "nice to have" items. Every single one. No exceptions.
 - ✅ **"Optional enhancements for future consideration"** → Create backlog GitHub issues (don't lose them)
 - 🔄 **If Joe requests changes after `@abbudjoe ready for merge`** → Full review cycle restarts (push fixes → `@claude review this PR` → address all → repeat until clean → ping Joe again)
+- ✅ **ALL CI checks must pass** before commenting `@abbudjoe ready for merge` — verify Format, Clippy, Check, Test are green on GitHub Actions
 
 ## Checklist Before PR
 
