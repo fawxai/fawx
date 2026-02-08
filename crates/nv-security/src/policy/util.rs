@@ -33,6 +33,12 @@ pub fn matches_action(pattern: &str, action: &str) -> bool {
 }
 
 /// Internal glob matcher supporting * and ?.
+///
+/// # Performance Note
+/// This implementation uses recursion and creates new strings on each recursive call.
+/// For patterns with multiple `*` wildcards, this could be less efficient than
+/// specialized glob libraries. However, for typical policy patterns (e.g., "delete_*",
+/// "*.txt"), the performance is acceptable.
 fn matches_glob(pattern: &str, text: &str) -> bool {
     let mut pattern_chars = pattern.chars().peekable();
     let mut text_chars = text.chars().peekable();

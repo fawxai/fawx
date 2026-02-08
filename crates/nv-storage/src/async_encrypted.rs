@@ -29,35 +29,56 @@ impl AsyncEncryptedStore {
     /// Store an encrypted value.
     pub async fn put(&self, table: &str, key: &str, value: &[u8]) -> Result<()> {
         let store = Arc::clone(&self.store);
+        let table_name = table.to_string();
+        let key_name = key.to_string();
         let table = table.to_string();
         let key = key.to_string();
         let value = value.to_vec();
 
         tokio::task::spawn_blocking(move || store.put(&table, &key, &value))
             .await
-            .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+            .map_err(move |e| {
+                StorageError::Database(format!(
+                    "Task join error in AsyncEncryptedStore::put(table='{}', key='{}'): {}",
+                    table_name, key_name, e
+                ))
+            })?
     }
 
     /// Retrieve and decrypt a value.
     pub async fn get(&self, table: &str, key: &str) -> Result<Option<Vec<u8>>> {
         let store = Arc::clone(&self.store);
+        let table_name = table.to_string();
+        let key_name = key.to_string();
         let table = table.to_string();
         let key = key.to_string();
 
         tokio::task::spawn_blocking(move || store.get(&table, &key))
             .await
-            .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+            .map_err(move |e| {
+                StorageError::Database(format!(
+                    "Task join error in AsyncEncryptedStore::get(table='{}', key='{}'): {}",
+                    table_name, key_name, e
+                ))
+            })?
     }
 
     /// Delete a key.
     pub async fn delete(&self, table: &str, key: &str) -> Result<bool> {
         let store = Arc::clone(&self.store);
+        let table_name = table.to_string();
+        let key_name = key.to_string();
         let table = table.to_string();
         let key = key.to_string();
 
         tokio::task::spawn_blocking(move || store.delete(&table, &key))
             .await
-            .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+            .map_err(move |e| {
+                StorageError::Database(format!(
+                    "Task join error in AsyncEncryptedStore::delete(table='{}', key='{}'): {}",
+                    table_name, key_name, e
+                ))
+            })?
     }
 
     /// Store a JSON-serializable value.
@@ -68,6 +89,8 @@ impl AsyncEncryptedStore {
         value: &T,
     ) -> Result<()> {
         let store = Arc::clone(&self.store);
+        let table_name = table.to_string();
+        let key_name = key.to_string();
         let table = table.to_string();
         let key = key.to_string();
         let json = serde_json::to_vec(value)
@@ -75,7 +98,12 @@ impl AsyncEncryptedStore {
 
         tokio::task::spawn_blocking(move || store.put(&table, &key, &json))
             .await
-            .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+            .map_err(move |e| {
+                StorageError::Database(format!(
+                    "Task join error in AsyncEncryptedStore::put_json(table='{}', key='{}'): {}",
+                    table_name, key_name, e
+                ))
+            })?
     }
 
     /// Retrieve and deserialize a JSON value.
@@ -85,22 +113,35 @@ impl AsyncEncryptedStore {
         key: &str,
     ) -> Result<Option<T>> {
         let store = Arc::clone(&self.store);
+        let table_name = table.to_string();
+        let key_name = key.to_string();
         let table = table.to_string();
         let key = key.to_string();
 
         tokio::task::spawn_blocking(move || store.get_json::<T>(&table, &key))
             .await
-            .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+            .map_err(move |e| {
+                StorageError::Database(format!(
+                    "Task join error in AsyncEncryptedStore::get_json(table='{}', key='{}'): {}",
+                    table_name, key_name, e
+                ))
+            })?
     }
 
     /// List all keys in a table.
     pub async fn list_keys(&self, table: &str) -> Result<Vec<String>> {
         let store = Arc::clone(&self.store);
+        let table_name = table.to_string();
         let table = table.to_string();
 
         tokio::task::spawn_blocking(move || store.list_keys(&table))
             .await
-            .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+            .map_err(move |e| {
+                StorageError::Database(format!(
+                    "Task join error in AsyncEncryptedStore::list_keys(table='{}'): {}",
+                    table_name, e
+                ))
+            })?
     }
 }
 

@@ -22,7 +22,9 @@ impl AsyncStorage {
         let path = path.to_path_buf();
         let storage = tokio::task::spawn_blocking(move || Storage::open(&path))
             .await
-            .map_err(|e| StorageError::Database(format!("Task join error: {e}")))??;
+            .map_err(|e| {
+                StorageError::Database(format!("Task join error in AsyncStorage::open: {e}"))
+            })??;
         Ok(Self {
             storage: Arc::new(storage),
         })
@@ -32,7 +34,11 @@ impl AsyncStorage {
     pub async fn open_in_memory() -> Result<Self> {
         let storage = tokio::task::spawn_blocking(Storage::open_in_memory)
             .await
-            .map_err(|e| StorageError::Database(format!("Task join error: {e}")))??;
+            .map_err(|e| {
+                StorageError::Database(format!(
+                    "Task join error in AsyncStorage::open_in_memory: {e}"
+                ))
+            })??;
         Ok(Self {
             storage: Arc::new(storage),
         })
@@ -41,45 +47,72 @@ impl AsyncStorage {
     /// Store a key-value pair in the specified table.
     pub async fn put(&self, table: &str, key: &str, value: &[u8]) -> Result<()> {
         let storage = Arc::clone(&self.storage);
+        let table_name = table.to_string();
+        let key_name = key.to_string();
         let table = table.to_string();
         let key = key.to_string();
         let value = value.to_vec();
 
         tokio::task::spawn_blocking(move || storage.put(&table, &key, &value))
             .await
-            .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+            .map_err(move |e| {
+                StorageError::Database(format!(
+                    "Task join error in AsyncStorage::put(table='{}', key='{}'): {}",
+                    table_name, key_name, e
+                ))
+            })?
     }
 
     /// Retrieve a value by key from the specified table.
     pub async fn get(&self, table: &str, key: &str) -> Result<Option<Vec<u8>>> {
         let storage = Arc::clone(&self.storage);
+        let table_name = table.to_string();
+        let key_name = key.to_string();
         let table = table.to_string();
         let key = key.to_string();
 
         tokio::task::spawn_blocking(move || storage.get(&table, &key))
             .await
-            .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+            .map_err(move |e| {
+                StorageError::Database(format!(
+                    "Task join error in AsyncStorage::get(table='{}', key='{}'): {}",
+                    table_name, key_name, e
+                ))
+            })?
     }
 
     /// Delete a key from the specified table. Returns true if the key existed.
     pub async fn delete(&self, table: &str, key: &str) -> Result<bool> {
         let storage = Arc::clone(&self.storage);
+        let table_name = table.to_string();
+        let key_name = key.to_string();
         let table = table.to_string();
         let key = key.to_string();
 
         tokio::task::spawn_blocking(move || storage.delete(&table, &key))
             .await
-            .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+            .map_err(move |e| {
+                StorageError::Database(format!(
+                    "Task join error in AsyncStorage::delete(table='{}', key='{}'): {}",
+                    table_name, key_name, e
+                ))
+            })?
     }
 
     /// List all keys in the specified table.
     pub async fn list_keys(&self, table: &str) -> Result<Vec<String>> {
         let storage = Arc::clone(&self.storage);
+        let table_name = table.to_string();
         let table = table.to_string();
 
         tokio::task::spawn_blocking(move || storage.list_keys(&table))
             .await
-            .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+            .map_err(move |e| {
+                StorageError::Database(format!(
+                    "Task join error in AsyncStorage::list_keys(table='{}'): {}",
+                    table_name, e
+                ))
+            })?
     }
 }
 

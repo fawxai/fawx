@@ -116,7 +116,8 @@ impl PolicyEngine {
     ///
     /// # Arguments
     /// * `action` - Action step to evaluate
-    /// * `current_time` - Optional current time in "HH:MM" format (for time-based conditions)
+    /// * `current_time` - Optional current time in "HH:MM" format (for time-based conditions).
+    ///   If `None`, time-based conditions will fail to match (evaluated with empty string).
     ///
     /// # Returns
     /// PolicyDecision for the action
@@ -205,7 +206,11 @@ fn evaluate_conditions(conditions: &[Condition], action: &ActionStep, current_ti
 /// * `before` - End time in "HH:MM" format
 ///
 /// # Returns
-/// `true` if current time is within the range
+/// `true` if current time is within the range, `false` if time parsing fails
+/// or time is outside range
+///
+/// # Note
+/// Invalid time formats (e.g., "25:00", "12:70") will log a warning and return false.
 fn check_time_of_day(current: &str, after: &str, before: &str) -> bool {
     // Parse time strings as minutes since midnight
     let parse_time = |s: &str| -> Option<u32> {
@@ -215,20 +220,33 @@ fn check_time_of_day(current: &str, after: &str, before: &str) -> bool {
         }
         let hours: u32 = parts[0].parse().ok()?;
         let minutes: u32 = parts[1].parse().ok()?;
+        // Validate time ranges
+        if hours > 23 || minutes > 59 {
+            return None;
+        }
         Some(hours * 60 + minutes)
     };
 
     let current_mins = match parse_time(current) {
         Some(m) => m,
-        None => return false,
+        None => {
+            tracing::warn!("Invalid current time format: '{}'", current);
+            return false;
+        }
     };
     let after_mins = match parse_time(after) {
         Some(m) => m,
-        None => return false,
+        None => {
+            tracing::warn!("Invalid 'after' time format in policy: '{}'", after);
+            return false;
+        }
     };
     let before_mins = match parse_time(before) {
         Some(m) => m,
-        None => return false,
+        None => {
+            tracing::warn!("Invalid 'before' time format in policy: '{}'", before);
+            return false;
+        }
     };
 
     if after_mins <= before_mins {
@@ -981,7 +999,9 @@ decision = "deny"
         let mut policy_file = NamedTempFile::new().unwrap();
         policy_file.write_all(toml.as_bytes()).unwrap();
 
-        let sig_path = policy_file.path().with_extension("toml.sig");
+        // Create sig file with .sig extension appended (matching implementation)
+        let mut sig_path = policy_file.path().to_path_buf();
+        sig_path.as_mut_os_string().push(".sig");
         std::fs::write(&sig_path, &wrong_signature).unwrap();
 
         // Should fail verification
