@@ -8,3 +8,10 @@ license.workspace = true
 [dependencies]
 nv-core.workspace = true
 tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+ring.workspace = true
+redb.workspace = true
+zeroize.workspace = true
+tokio.workspace = true
