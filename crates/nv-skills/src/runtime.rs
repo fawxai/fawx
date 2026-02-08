@@ -38,7 +38,7 @@ impl SkillRuntime {
         Ok(())
     }
 
-    /// Invoke a skill by name with input.
+    /// Invoke a skill by name with input (synchronous).
     ///
     /// Note: This is a simplified implementation. Full WASM execution
     /// requires proper host function linking and calling conventions.
@@ -67,6 +67,52 @@ impl SkillRuntime {
         host_api.set_output(&output);
 
         Ok(host_api.get_output())
+    }
+
+    /// Invoke a skill by name with input (asynchronous).
+    ///
+    /// This is an async wrapper around the synchronous `invoke()` method.
+    /// WASM execution is moved to a blocking thread pool to avoid blocking
+    /// the async runtime.
+    ///
+    /// # Arguments
+    /// * `skill_name` - Name of the skill to invoke
+    /// * `input` - Input string for the skill
+    ///
+    /// # Returns
+    /// * `Ok(String)` - Output from the skill
+    /// * `Err(SkillError)` - If skill not found or execution fails
+    pub async fn invoke_skill_async(
+        &mut self,
+        skill_name: &str,
+        input: &str,
+    ) -> Result<String, SkillError> {
+        // Clone the necessary data to move into the blocking task
+        let skill_name = skill_name.to_string();
+        let input = input.to_string();
+
+        // We need to check if the skill exists first (before moving into blocking)
+        if !self.skills.contains_key(&skill_name) {
+            return Err(SkillError::Execution(format!(
+                "Skill '{}' not found",
+                skill_name
+            )));
+        }
+
+        // Get the skill manifest name for output
+        let manifest_name = self.skills.get(&skill_name).unwrap().manifest().name.clone();
+
+        // Execute WASM in a blocking thread pool
+        // In a real implementation, this would perform actual WASM execution
+        tokio::task::spawn_blocking(move || {
+            // Simulate WASM execution
+            let mut host_api = MockHostApi::new(&input);
+            let output = format!("Skill '{}' invoked (placeholder execution)", manifest_name);
+            host_api.set_output(&output);
+            Ok(host_api.get_output())
+        })
+        .await
+        .map_err(|e| SkillError::Execution(format!("Async task panicked: {}", e)))?
     }
 
     /// List all registered skills.
@@ -222,5 +268,91 @@ mod tests {
 
         assert!(runtime.get_skill("test").is_some());
         assert!(runtime.get_skill("nonexistent").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_invoke_skill_async() {
+        let mut runtime = SkillRuntime::new().expect("Should create runtime");
+        let loader = SkillLoader::new(vec![]);
+
+        let manifest = create_test_manifest("async_test");
+        let wasm = create_minimal_wasm();
+
+        let skill = loader.load(&wasm, &manifest, None).expect("Should load");
+        runtime.register_skill(skill).expect("Should register");
+
+        let output = runtime
+            .invoke_skill_async("async_test", "async input")
+            .await
+            .expect("Should invoke async");
+
+        assert!(output.contains("async_test"));
+    }
+
+    #[tokio::test]
+    async fn test_invoke_skill_async_nonexistent() {
+        let mut runtime = SkillRuntime::new().expect("Should create runtime");
+
+        let result = runtime.invoke_skill_async("nonexistent", "input").await;
+        assert!(result.is_err());
+        assert!(matches!(result, Err(SkillError::Execution(_))));
+    }
+
+    #[tokio::test]
+    async fn test_invoke_skill_async_multiple_concurrent() {
+        let mut runtime = SkillRuntime::new().expect("Should create runtime");
+        let loader = SkillLoader::new(vec![]);
+
+        let manifest1 = create_test_manifest("skill1");
+        let manifest2 = create_test_manifest("skill2");
+        let wasm = create_minimal_wasm();
+
+        let skill1 = loader.load(&wasm, &manifest1, None).expect("Should load");
+        let skill2 = loader.load(&wasm, &manifest2, None).expect("Should load");
+
+        runtime.register_skill(skill1).expect("Should register");
+        runtime.register_skill(skill2).expect("Should register");
+
+        // Note: Since we have &mut self, we can't actually run these concurrently
+        // This test verifies that async invocation works for multiple skills sequentially
+        let output1 = runtime
+            .invoke_skill_async("skill1", "input1")
+            .await
+            .expect("Should invoke skill1");
+
+        let output2 = runtime
+            .invoke_skill_async("skill2", "input2")
+            .await
+            .expect("Should invoke skill2");
+
+        assert!(output1.contains("skill1"));
+        assert!(output2.contains("skill2"));
+    }
+
+    #[tokio::test]
+    async fn test_invoke_sync_and_async_compatibility() {
+        let mut runtime = SkillRuntime::new().expect("Should create runtime");
+        let loader = SkillLoader::new(vec![]);
+
+        let manifest = create_test_manifest("compat_test");
+        let wasm = create_minimal_wasm();
+
+        let skill = loader.load(&wasm, &manifest, None).expect("Should load");
+        runtime.register_skill(skill).expect("Should register");
+
+        // Test sync path
+        let sync_output = runtime
+            .invoke("compat_test", "sync input")
+            .expect("Should invoke sync");
+
+        // Test async path
+        let async_output = runtime
+            .invoke_skill_async("compat_test", "async input")
+            .await
+            .expect("Should invoke async");
+
+        // Both should work
+        assert!(sync_output.contains("compat_test"));
+        assert!(async_output.contains("compat_test"));
     }
 }
