@@ -217,17 +217,17 @@ mod tests {
     fn test_different_wasm_not_cached() {
         let engine = Engine::default();
         let wasm1 = create_minimal_wasm();
-        let mut wasm2 = wasm1.clone();
-        wasm2.push(0x00); // Different hash
+
+        // Different bytes produce a different hash
+        let wasm2 = b"different content that won't compile but has a different hash";
 
         // Clear cache first
         clear_cache().ok();
 
-        compile_module(&engine, &wasm1).expect("Should compile");
+        compile_module(&engine, &wasm1).expect("Should compile wasm1");
 
-        // Different WASM should not be cached
-        let (_, was_cached) = compile_module(&engine, &wasm2).expect("Should compile");
-        assert!(!was_cached);
+        // Different bytes should not show as cached
+        assert!(!has_cached_module(wasm2).expect("Should check"));
     }
 
     #[test]
