@@ -943,6 +943,46 @@ Decisions that have been made, with rationale, to avoid revisiting them.
 
 ---
 
+## 8. Future Capability Integrations (Nice-to-Have)
+
+These are capabilities the agent could offer users as opt-in integrations. Each would be gated by the policy engine — users explicitly grant or deny access.
+
+### 8.1 User-Controlled Permissions Model
+
+Users must be able to decide exactly what the agent can and cannot access. Beyond the action policy categories (§3.5.3), this extends to:
+
+- **Per-app access controls:** "Agent can read notifications from Signal but not WhatsApp"
+- **Data category controls:** "Agent can see my calendar but not my photos"
+- **Time-based controls:** "Agent can only act proactively between 9am-10pm"
+- **Integration-specific grants:** Each integration below requires explicit user opt-in
+
+### 8.2 AgentMail Integration
+
+An email identity for the agent — allows it to send/receive emails on the user's behalf or as its own identity.
+
+- **Use cases:** Drafting and sending emails, managing subscriptions, automated replies, scheduling via email
+- **Policy:** Falls under CONFIRM category (user approves before sending)
+- **Privacy:** Email credentials managed via Key Agent (§3.5.6), never in LLM context
+
+### 8.3 x402 Wallet (Agent Payments)
+
+HTTP 402-based micropayment capability — lets the agent make small payments for API calls, services, or content.
+
+- **Use cases:** Paying for premium API access, purchasing digital goods, tipping content creators, paying for agent-to-agent services
+- **Policy:** Financial transactions start in DENY (v1). Unlock in v2 with biometric gate + spending limits
+- **Implementation:** x402 protocol integration, user-set spending caps (daily/monthly), transaction audit trail, biometric confirmation for amounts over threshold
+- **Security:** Wallet keys in Key Agent, spending limits enforced by policy engine (not LLM), full transaction log in audit trail
+
+### 8.4 Agent-to-Agent Communication
+
+Allow the agent to communicate with other AI agents or services.
+
+- **Use cases:** Delegating tasks to specialized agents, querying external knowledge bases, collaborative problem-solving
+- **Policy:** Outbound data sharing requires CONFIRM; inbound data treated as untrusted input
+- **Protocol:** Standard HTTP/WebSocket, potentially Agent Protocol (agentprotocol.ai)
+
+---
+
 ## Appendix A: Estimated Dependency Map
 
 ### Core (all platforms)
