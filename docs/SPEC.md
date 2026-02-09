@@ -442,15 +442,82 @@ Push notification alternative (for low-latency remote commands):
   (phone-initiated) with heartbeat.
 ```
 
-#### 3.5.6 Graceful Degradation
+#### 3.5.6 Key Agent (Credential Broker)
+
+API keys are the most sensitive data Nova handles. The Key Agent isolates them from the main daemon using the same pattern as `ssh-agent`:
+
+```
+┌─────────────────────┐     ┌──────────────────────┐
+│   Nova Daemon        │     │   Key Agent           │
+│                      │     │   (separate process)  │
+│  LLM routing         │     │                       │
+│  Prompt building ──────────→ "send this prompt     │
+│  Skill execution     │ IPC │  to Claude for me"    │
+│  Policy engine       │     │                       │
+│  Phone automation    │     │  Decrypts API key     │
+│                      │     │  Injects auth header  │
+│  ❌ No plaintext     │     │  Makes HTTPS call     │
+│     keys in memory   │     │  Returns response     │
+└─────────────────────┘     └──────────────────────┘
+         │                           │
+    Unix domain socket          HTTPS to providers
+    (capability-limited)        (Claude/OpenAI/etc)
+```
+
+**Security properties:**
+- Process isolation is OS-enforced. Memory corruption or WASM escape in the daemon cannot read keys from another process's address space.
+- The Key Agent is ~500 lines of auditable Rust. The daemon is complex (LLM, skills, phone automation). Keys live in the simple component, not the complex one.
+- SELinux contexts can further restrict cross-process access even for root.
+- All API calls flow through one choke point — rate limiting, spend tracking, and anomaly detection in one place.
+- IPC overhead is ~0.1ms over Unix socket, negligible vs. network RTT.
+
+**Implementation plan:** Design the IPC interface (request/response types, Unix socket protocol) from day one. Build as a same-process module first (`KeyStore` behind an async trait). Split into a separate process when the Android deployment pipeline is mature. The trait interface is identical either way — swap function call for socket send.
+
+#### 3.5.7 LLM Provider Architecture
+
+Nova defines its own LLM interface. Providers adapt to Nova, not the other way around.
+
+```
+                    ┌─────────────────┐
+                    │  Nova LLM Trait  │
+                    │                  │
+                    │  generate()      │
+                    │  stream()        │
+                    │  capabilities()  │
+                    └────────┬────────┘
+                             │
+            ┌────────────────┼────────────────┐
+            │                │                 │
+    ┌───────┴──────┐ ┌──────┴───────┐ ┌──────┴───────┐
+    │ Claude       │ │ OpenAI/      │ │ Local        │
+    │ Adapter      │ │ OpenRouter   │ │ llama.cpp    │
+    │              │ │ Adapter      │ │ Adapter      │
+    │ text ✓       │ │ text ✓       │ │ text ✓       │
+    │ vision ✓     │ │ vision ✓     │ │ vision ✗     │
+    │ voice ✗      │ │ voice ✓      │ │ voice ✗      │
+    │ tools ✓      │ │ tools ✓      │ │ tools ✗      │
+    │ 200k ctx     │ │ 128k ctx     │ │ 8k ctx       │
+    └──────────────┘ └──────────────┘ └──────────────┘
+```
+
+**Key properties:**
+- **User selects primary provider** at setup: OpenRouter (access to all models), Claude, ChatGPT, or local-only.
+- **BYOK (Bring Your Own Key):** User enters their API key, encrypted on-device via Key Agent. Managed proxy option for users who prefer not to manage keys.
+- **Capability-based routing:** Provider declares supported modalities (text, vision, voice, audio) and features (streaming, tool use, max context). Routing layer picks provider per request type.
+- **Mix-and-match:** User can set Claude for text reasoning, OpenAI for voice/TTS, local for intent classification. Or use one provider for everything.
+- **Graceful fallback:** If primary provider fails, route to next capable provider. Local model is always-available fallback for basic tasks.
+- **Adding a provider** means writing one adapter file. Zero changes to Nova core.
+
+#### 3.5.8 Graceful Degradation
 
 The system must handle failure at every level:
 
 | Failure | Behavior |
 |---|---|
-| Local LLM too slow (memory pressure) | Fall back to cloud-only mode, unload model |
-| Cloud unreachable | Local-only mode, queue cloud requests for later |
-| Both LLMs unavailable | Voice: "I can't think right now, try again in a moment" |
+| Local LLM too slow (memory pressure) | Fall back to cloud provider, unload local model |
+| Primary cloud provider unreachable | Route to next capable provider. If all cloud fails, local-only mode, queue requests |
+| All providers unavailable | Voice: "I can't think right now, try again in a moment" |
+| Key Agent process dies | Daemon detects disconnect, restarts key agent, queues requests during recovery |
 | Companion app killed by Android | Daemon continues running, loses UI tree + notifications, taps still work via /dev/input |
 | Daemon killed by OOM | Companion app detects disconnect, restarts daemon via init.d |
 | Screen capture fails | Fall back to UI tree text-only (no visual analysis) |
@@ -480,6 +547,56 @@ The system must handle failure at every level:
 - **Bionic libc vs glibc.** Android uses Bionic, not glibc. Most Rust crates work fine, but anything touching DNS resolution, locale, or advanced threading may behave differently. The `nix` crate (for Linux syscalls) works on Bionic but some functions are stubs. *Mitigation*: Test early and often on a real device, not just in cross-compilation.
 
 - **SELinux.** Even on a rooted phone, SELinux is enforcing by default. Our daemon can't just open /dev/input — SELinux policies block it even for root. Magisk typically sets SELinux to permissive, but some operations may need custom SELinux policy modules or context labels. *Mitigation*: Document the exact SELinux config required. Test with `setenforce 0` initially, then write proper policy modules.
+
+#### Current Implementation Baseline (as of 2026-02-09)
+
+The following is a snapshot of what exists versus what is planned, to set realistic expectations for each phase.
+
+**Implemented (Epics 1-8):**
+- Cargo workspace with 12 crates, CI pipeline (format, clippy, check, test)
+- nv-core: config loading, event bus, internal types, error hierarchy
+- nv-llm: local model stub (llama.cpp integration not yet functional), Claude API client with streaming/tool use, confidence-based routing with fallback
+- nv-security: encrypted KV store (redb + AES-256-GCM), audit log with HMAC-SHA256 hash chain, intent classification (regex + LLM hybrid), policy engine with rules/capabilities/rate limiting
+- nv-skills: WASM runtime (wasmtime), capability enforcement at host boundary, module compilation + caching, skill loader/registry/installer with signature verification, async skill execution
+- nv-cli: `nova doctor`, `nova config show`, `nova audit` commands
+- 400+ tests across all crates
+
+**Not yet functional (stubs/placeholders):**
+- `Agent::process` (nv-agent) — core orchestrator loop is `todo!()`
+- `PhoneActions` trait (nv-phone) — all methods are `todo!()`
+- `LocalModel::generate` (nv-llm) — returns error, llama.cpp FFI build is stub
+- `invoke_skill_async` (nv-skills) — returns placeholder output
+- CLI `start`/`stop`/chat commands — placeholder
+- nv-voice, nv-sensors, nv-sync — not started
+
+**Security gaps requiring hardening before production paths:**
+- Skill signature verification exists but is not mandatory — callers can pass `signature: None`
+- `PolicyEngine::from_file()` loads unsigned policies alongside signed `from_signed_file()`
+- `evaluate_action()` does not pass time context, so time-based policy rules never match
+- Audit log verification requires explicit caller action, not enforced on open/query
+
+---
+
+#### Phase 0.5: Hardening (Week 3-4)
+
+**Rationale:** Epics 1-8 built the security primitives. Before wiring them into production paths (Phase 1+), we need to close the enforcement gaps so that every subsequent phase inherits strict-by-default security.
+
+**Deliverables:**
+- Mandatory signature enforcement mode: `--strict` flag / `security.strict_mode: true` config. When enabled, `load()` rejects unsigned skills, `PolicyEngine::from_file()` requires signature, CLI install refuses unsigned packages
+- Time context wired into policy evaluation: `evaluate_action()` accepts `SystemTime`, time-based rules actually fire
+- Fail-closed audit: `AuditLog::open()` verifies chain integrity by default, query methods return error on corrupted chain rather than silently returning data
+- Remove panic-based `Default` impls from runtime constructors (use builder pattern or `Result`-returning constructors)
+- Config schema consolidation: single canonical format (JSON5), CLI reads both TOML and JSON5 with canonical conversion
+
+**Exit criteria:**
+- `cargo test` passes with `--strict` enabled in all integration tests
+- No `todo!()` in any security-critical path (loader, policy eval, audit open/query)
+- Time-based policy rules have integration tests proving they fire correctly
+- `nova doctor` reports signature enforcement status
+
+**Milestone**: `nova doctor --strict` passes all security checks. Unsigned skill install is rejected. Unsigned policy load fails. Audit chain corruption is detected on open.
+
+---
 
 #### Phase 1: The Agent Can Think (Weeks 4-8)
 
@@ -816,6 +933,13 @@ Decisions that have been made, with rationale, to avoid revisiting them.
 | 12 | Dual STT: Android SpeechRecognizer + optional Whisper | Pragmatic. Google's on-device STT is 10x faster. Whisper is more private. Let user choose. | On-device Whisper performance improves to < 1s for typical utterances |
 | 13 | Three-horizon roadmap | PoC → OS → Hardware. Each stage validates the next. Hardware comes last because the value is in the software. | A compelling hardware partnership appears early |
 | 14 | Trust button as physical hardware interlock | No software vulnerability can bypass a physical button. Essential for an agent with root access. Prototype with remapped Pixel button. | We find a software-only confirmation mechanism that's equally secure (unlikely) |
+| 15 | Hardening phase before production paths | Security primitives exist (Epics 1-8) but aren't mandatory. Adding features on top of optional security creates tech debt. Harden first, then build. | All enforcement gaps are closed and we're confident in the defaults |
+| 16 | Dual-tier distribution: non-root (standard) + root (pro) | Non-root covers 90% of capability via Accessibility Service. Root unlocks /dev/input, screen capture, SELinux mods. Sideload SaaS, no Play Store dependency — avoids policy risk and 30% cut. | Play Store policy becomes favorable, or root becomes mainstream |
+| 17 | User-selected cloud LLM as primary driver | Users BYOK (OpenRouter/Claude/ChatGPT). Local model is fallback/offline/intent classification. Cloud models are dramatically more capable — don't handicap the product by forcing local-only. Managed proxy option for users who don't want API keys. | Local models become good enough for complex reasoning (years away) |
+| 18 | Unified LLM provider trait with multimodal capabilities | Nova defines its own interface; adapters translate per-provider. Each provider declares capabilities by modality (text/vision/voice). No LocalModel vs CloudModel split — local is just another provider. Future-proofs for any new provider or modality. | A provider requires fundamentally different interaction patterns that can't be adapted |
+| 19 | API keys encrypted on-device, never in LLM context | Keys decrypted only in HTTP adapter layer, injected as auth headers. LLM prompt/context never contains keys. Separate code paths for credentials and inference. Marketable security guarantee. | Hardware secure enclave becomes accessible from Rust (then move keys there) |
+| 20 | Key Agent process design (ssh-agent pattern) | Design IPC interface now for a separate credential broker process. Daemon proxies API calls through key agent, never holds plaintext keys. Process isolation is OS-enforced — even memory exploits in the daemon can't reach keys. Build same-process module first, split to separate process when ready. | Performance profiling shows IPC overhead is unacceptable (unlikely — ~0.1ms vs network RTT) |
+| 21 | Provider capability matrix for routing | Each provider declares: streaming, tool use, vision, voice, max context, etc. Routing layer picks best provider per modality. Users can mix-and-match (Claude for text, OpenAI for voice, local for classification). | All providers converge to identical capabilities (unlikely) |
 
 ---
 
