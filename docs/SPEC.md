@@ -442,15 +442,82 @@ Push notification alternative (for low-latency remote commands):
   (phone-initiated) with heartbeat.
 ```
 
-#### 3.5.6 Graceful Degradation
+#### 3.5.6 Key Agent (Credential Broker)
+
+API keys are the most sensitive data Nova handles. The Key Agent isolates them from the main daemon using the same pattern as `ssh-agent`:
+
+```
+┌─────────────────────┐     ┌──────────────────────┐
+│   Nova Daemon        │     │   Key Agent           │
+│                      │     │   (separate process)  │
+│  LLM routing         │     │                       │
+│  Prompt building ──────────→ "send this prompt     │
+│  Skill execution     │ IPC │  to Claude for me"    │
+│  Policy engine       │     │                       │
+│  Phone automation    │     │  Decrypts API key     │
+│                      │     │  Injects auth header  │
+│  ❌ No plaintext     │     │  Makes HTTPS call     │
+│     keys in memory   │     │  Returns response     │
+└─────────────────────┘     └──────────────────────┘
+         │                           │
+    Unix domain socket          HTTPS to providers
+    (capability-limited)        (Claude/OpenAI/etc)
+```
+
+**Security properties:**
+- Process isolation is OS-enforced. Memory corruption or WASM escape in the daemon cannot read keys from another process's address space.
+- The Key Agent is ~500 lines of auditable Rust. The daemon is complex (LLM, skills, phone automation). Keys live in the simple component, not the complex one.
+- SELinux contexts can further restrict cross-process access even for root.
+- All API calls flow through one choke point — rate limiting, spend tracking, and anomaly detection in one place.
+- IPC overhead is ~0.1ms over Unix socket, negligible vs. network RTT.
+
+**Implementation plan:** Design the IPC interface (request/response types, Unix socket protocol) from day one. Build as a same-process module first (`KeyStore` behind an async trait). Split into a separate process when the Android deployment pipeline is mature. The trait interface is identical either way — swap function call for socket send.
+
+#### 3.5.7 LLM Provider Architecture
+
+Nova defines its own LLM interface. Providers adapt to Nova, not the other way around.
+
+```
+                    ┌─────────────────┐
+                    │  Nova LLM Trait  │
+                    │                  │
+                    │  generate()      │
+                    │  stream()        │
+                    │  capabilities()  │
+                    └────────┬────────┘
+                             │
+            ┌────────────────┼────────────────┐
+            │                │                 │
+    ┌───────┴──────┐ ┌──────┴───────┐ ┌──────┴───────┐
+    │ Claude       │ │ OpenAI/      │ │ Local        │
+    │ Adapter      │ │ OpenRouter   │ │ llama.cpp    │
+    │              │ │ Adapter      │ │ Adapter      │
+    │ text ✓       │ │ text ✓       │ │ text ✓       │
+    │ vision ✓     │ │ vision ✓     │ │ vision ✗     │
+    │ voice ✗      │ │ voice ✓      │ │ voice ✗      │
+    │ tools ✓      │ │ tools ✓      │ │ tools ✗      │
+    │ 200k ctx     │ │ 128k ctx     │ │ 8k ctx       │
+    └──────────────┘ └──────────────┘ └──────────────┘
+```
+
+**Key properties:**
+- **User selects primary provider** at setup: OpenRouter (access to all models), Claude, ChatGPT, or local-only.
+- **BYOK (Bring Your Own Key):** User enters their API key, encrypted on-device via Key Agent. Managed proxy option for users who prefer not to manage keys.
+- **Capability-based routing:** Provider declares supported modalities (text, vision, voice, audio) and features (streaming, tool use, max context). Routing layer picks provider per request type.
+- **Mix-and-match:** User can set Claude for text reasoning, OpenAI for voice/TTS, local for intent classification. Or use one provider for everything.
+- **Graceful fallback:** If primary provider fails, route to next capable provider. Local model is always-available fallback for basic tasks.
+- **Adding a provider** means writing one adapter file. Zero changes to Nova core.
+
+#### 3.5.8 Graceful Degradation
 
 The system must handle failure at every level:
 
 | Failure | Behavior |
 |---|---|
-| Local LLM too slow (memory pressure) | Fall back to cloud-only mode, unload model |
-| Cloud unreachable | Local-only mode, queue cloud requests for later |
-| Both LLMs unavailable | Voice: "I can't think right now, try again in a moment" |
+| Local LLM too slow (memory pressure) | Fall back to cloud provider, unload local model |
+| Primary cloud provider unreachable | Route to next capable provider. If all cloud fails, local-only mode, queue requests |
+| All providers unavailable | Voice: "I can't think right now, try again in a moment" |
+| Key Agent process dies | Daemon detects disconnect, restarts key agent, queues requests during recovery |
 | Companion app killed by Android | Daemon continues running, loses UI tree + notifications, taps still work via /dev/input |
 | Daemon killed by OOM | Companion app detects disconnect, restarts daemon via init.d |
 | Screen capture fails | Fall back to UI tree text-only (no visual analysis) |
@@ -867,6 +934,12 @@ Decisions that have been made, with rationale, to avoid revisiting them.
 | 13 | Three-horizon roadmap | PoC → OS → Hardware. Each stage validates the next. Hardware comes last because the value is in the software. | A compelling hardware partnership appears early |
 | 14 | Trust button as physical hardware interlock | No software vulnerability can bypass a physical button. Essential for an agent with root access. Prototype with remapped Pixel button. | We find a software-only confirmation mechanism that's equally secure (unlikely) |
 | 15 | Hardening phase before production paths | Security primitives exist (Epics 1-8) but aren't mandatory. Adding features on top of optional security creates tech debt. Harden first, then build. | All enforcement gaps are closed and we're confident in the defaults |
+| 16 | Dual-tier distribution: non-root (standard) + root (pro) | Non-root covers 90% of capability via Accessibility Service. Root unlocks /dev/input, screen capture, SELinux mods. Sideload SaaS, no Play Store dependency — avoids policy risk and 30% cut. | Play Store policy becomes favorable, or root becomes mainstream |
+| 17 | User-selected cloud LLM as primary driver | Users BYOK (OpenRouter/Claude/ChatGPT). Local model is fallback/offline/intent classification. Cloud models are dramatically more capable — don't handicap the product by forcing local-only. Managed proxy option for users who don't want API keys. | Local models become good enough for complex reasoning (years away) |
+| 18 | Unified LLM provider trait with multimodal capabilities | Nova defines its own interface; adapters translate per-provider. Each provider declares capabilities by modality (text/vision/voice). No LocalModel vs CloudModel split — local is just another provider. Future-proofs for any new provider or modality. | A provider requires fundamentally different interaction patterns that can't be adapted |
+| 19 | API keys encrypted on-device, never in LLM context | Keys decrypted only in HTTP adapter layer, injected as auth headers. LLM prompt/context never contains keys. Separate code paths for credentials and inference. Marketable security guarantee. | Hardware secure enclave becomes accessible from Rust (then move keys there) |
+| 20 | Key Agent process design (ssh-agent pattern) | Design IPC interface now for a separate credential broker process. Daemon proxies API calls through key agent, never holds plaintext keys. Process isolation is OS-enforced — even memory exploits in the daemon can't reach keys. Build same-process module first, split to separate process when ready. | Performance profiling shows IPC overhead is unacceptable (unlikely — ~0.1ms vs network RTT) |
+| 21 | Provider capability matrix for routing | Each provider declares: streaming, tool use, vision, voice, max context, etc. Routing layer picks best provider per modality. Users can mix-and-match (Claude for text, OpenAI for voice, local for classification). | All providers converge to identical capabilities (unlikely) |
 
 ---
 
