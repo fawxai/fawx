@@ -14,10 +14,26 @@ pub struct SkillRegistry {
 }
 
 impl SkillRegistry {
-    /// Create a new skill registry.
+    /// Create a new skill registry with a default engine.
     ///
     /// Uses `~/.nova/skills/` as the default skills directory.
     pub fn new() -> Result<Self, SkillError> {
+        let loader = SkillLoader::new(vec![]);
+        Self::with_loader(loader)
+    }
+
+    /// Create a skill registry sharing an existing wasmtime Engine.
+    ///
+    /// This ensures skills loaded from this registry can be executed
+    /// by a `SkillRuntime` using the same Engine (wasmtime requires
+    /// Module and Store to share an Engine).
+    pub fn with_engine(engine: wasmtime::Engine) -> Result<Self, SkillError> {
+        let loader = SkillLoader::with_engine(engine, vec![]);
+        Self::with_loader(loader)
+    }
+
+    /// Internal: create registry with a specific loader.
+    fn with_loader(loader: SkillLoader) -> Result<Self, SkillError> {
         let home = dirs::home_dir()
             .ok_or_else(|| SkillError::Load("Failed to get home directory".to_string()))?;
 
@@ -26,8 +42,6 @@ impl SkillRegistry {
         // Create directory if it doesn't exist
         fs::create_dir_all(&skills_dir)
             .map_err(|e| SkillError::Load(format!("Failed to create skills directory: {}", e)))?;
-
-        let loader = SkillLoader::new(vec![]);
 
         Ok(Self { loader, skills_dir })
     }

@@ -59,9 +59,13 @@ impl HostState {
             .as_ref()
             .ok_or_else(|| SkillError::Execution("Memory not initialized".to_string()))?;
 
+        let end = ptr.checked_add(len).ok_or_else(|| {
+            SkillError::Execution("Integer overflow in memory access".to_string())
+        })?;
+
         let data = memory
             .data(store)
-            .get(ptr as usize..(ptr + len) as usize)
+            .get(ptr as usize..end as usize)
             .ok_or_else(|| SkillError::Execution("Invalid memory access".to_string()))?;
 
         String::from_utf8(data.to_vec())

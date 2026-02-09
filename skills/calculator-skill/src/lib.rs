@@ -15,11 +15,15 @@ struct CalculatorResponse {
     expression: String,
 }
 
-/// Host API imports
+/// Host API imports — linked to the "host_api_v1" WASM import module.
+#[link(wasm_import_module = "host_api_v1")]
 extern "C" {
-    fn host_api_v1_log(level: u32, msg_ptr: *const u8, msg_len: u32);
-    fn host_api_v1_get_input() -> u32;
-    fn host_api_v1_set_output(text_ptr: *const u8, text_len: u32);
+    #[link_name = "log"]
+    fn host_log(level: u32, msg_ptr: *const u8, msg_len: u32);
+    #[link_name = "get_input"]
+    fn host_get_input() -> u32;
+    #[link_name = "set_output"]
+    fn host_set_output(text_ptr: *const u8, text_len: u32);
 }
 
 /// Maximum string length to read from host memory.
@@ -48,14 +52,14 @@ unsafe fn read_host_string(ptr: u32) -> String {
 /// Log a message
 fn log(level: u32, message: &str) {
     unsafe {
-        host_api_v1_log(level, message.as_ptr(), message.len() as u32);
+        host_log(level, message.as_ptr(), message.len() as u32);
     }
 }
 
 /// Get input from host
 fn get_input() -> String {
     unsafe {
-        let ptr = host_api_v1_get_input();
+        let ptr = host_get_input();
         read_host_string(ptr)
     }
 }
@@ -63,7 +67,7 @@ fn get_input() -> String {
 /// Set output to host
 fn set_output(text: &str) {
     unsafe {
-        host_api_v1_set_output(text.as_ptr(), text.len() as u32);
+        host_set_output(text.as_ptr(), text.len() as u32);
     }
 }
 

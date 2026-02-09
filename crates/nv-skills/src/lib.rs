@@ -24,7 +24,7 @@ pub mod signing;
 pub mod storage;
 
 // Re-export commonly used types
-pub use cache::{cache_module, cache_stats, clear_cache, load_cached_module, CacheStats};
+pub use cache::{cache_stats, clear_cache, compile_module, has_cached_module, CacheStats};
 pub use capabilities::CapabilityChecker;
 pub use host_api::{HostApi, MockHostApi};
 pub use loader::{LoadedSkill, SkillLoader};

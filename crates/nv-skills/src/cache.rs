@@ -1,4 +1,13 @@
 //! Module caching for faster skill loading.
+//!
+//! Uses safe `Module::new()` compilation only. We intentionally avoid
+//! `Module::deserialize()` (unsafe) because it loads pre-compiled native
+//! code directly into executable memory — an attacker who can modify
+//! cached files could achieve arbitrary code execution.
+//!
+//! The cache tracks which WASM bytes have been seen (via SHA-256 hash)
+//! for statistics and cache management. Actual compilation always goes
+//! through the safe `Module::new()` path.
 
 use nv_core::error::SkillError;
 use ring::digest::{digest, SHA256};
@@ -26,108 +35,43 @@ fn hash_bytes(data: &[u8]) -> String {
     hex::encode(hash.as_ref())
 }
 
-/// Get the cache file path for a given WASM hash.
+/// Get the cache marker file path for a given WASM hash.
 fn get_cache_path(hash: &str) -> Result<PathBuf, SkillError> {
     let cache_dir = get_cache_dir()?;
     Ok(cache_dir.join(format!("{}.module", hash)))
 }
 
-/// Get the integrity hash file path for a cached module.
-fn get_integrity_path(hash: &str) -> Result<PathBuf, SkillError> {
-    let cache_dir = get_cache_dir()?;
-    Ok(cache_dir.join(format!("{}.sha256", hash)))
-}
-
-/// Try to load a cached module.
+/// Safely compile a WASM module, using the cache for deduplication tracking.
 ///
-/// Returns `Some(Module)` if cache hit with valid integrity, `None` if cache miss.
-/// Removes cached files if integrity verification fails.
-pub fn load_cached_module(
-    engine: &Engine,
-    wasm_bytes: &[u8],
-) -> Result<Option<Module>, SkillError> {
+/// Always compiles from source WASM bytes via `Module::new()` (safe).
+/// Records the WASM hash in the cache directory for statistics.
+///
+/// Returns `(Module, bool)` where the bool indicates if this WASM was seen before.
+pub fn compile_module(engine: &Engine, wasm_bytes: &[u8]) -> Result<(Module, bool), SkillError> {
     let hash = hash_bytes(wasm_bytes);
     let cache_path = get_cache_path(&hash)?;
-    let integrity_path = get_integrity_path(&hash)?;
+    let was_cached = cache_path.exists();
 
-    if !cache_path.exists() {
-        tracing::debug!("Cache miss for hash {}", hash);
-        return Ok(None);
+    // Always compile safely from source
+    let module = Module::new(engine, wasm_bytes)
+        .map_err(|e| SkillError::Load(format!("Failed to compile WASM module: {}", e)))?;
+
+    // Write cache marker (just the hash, not native code)
+    if !was_cached {
+        let _ = fs::write(&cache_path, hash.as_bytes());
+        tracing::debug!("Compiled and cached new module with hash {}", hash);
+    } else {
+        tracing::debug!("Recompiled known module with hash {}", hash);
     }
 
-    // Read cached bytes
-    let cached_bytes = fs::read(&cache_path)
-        .map_err(|e| SkillError::Load(format!("Failed to read cached module: {}", e)))?;
-
-    // Verify integrity hash
-    let expected_hash = match fs::read_to_string(&integrity_path) {
-        Ok(h) => h,
-        Err(_) => {
-            // No integrity file — treat as corrupted, remove cache
-            tracing::warn!("Cache integrity file missing for hash {}, removing", hash);
-            let _ = fs::remove_file(&cache_path);
-            return Ok(None);
-        }
-    };
-
-    let actual_hash = hash_bytes(&cached_bytes);
-    if actual_hash != expected_hash.trim() {
-        tracing::warn!(
-            "Cache integrity mismatch for hash {} (expected {}, got {})",
-            hash,
-            expected_hash.trim(),
-            actual_hash
-        );
-        let _ = fs::remove_file(&cache_path);
-        let _ = fs::remove_file(&integrity_path);
-        return Ok(None);
-    }
-
-    // Deserialize module
-    // Safety: We've verified the SHA-256 hash of the serialized bytes matches
-    // the stored hash. This detects accidental corruption (bitrot, incomplete writes)
-    // but does NOT prevent malicious tampering, as both files can be modified by
-    // an attacker with write access to the cache directory.
-    // For defense-in-depth, the cache directory should have restricted permissions.
-    let module = unsafe { Module::deserialize(engine, &cached_bytes) }.map_err(|e| {
-        // If deserialization fails, remove the corrupt cache file
-        let _ = fs::remove_file(&cache_path);
-        let _ = fs::remove_file(&integrity_path);
-        SkillError::Load(format!("Failed to deserialize cached module: {}", e))
-    })?;
-
-    tracing::debug!("Cache hit for hash {} (integrity verified)", hash);
-    Ok(Some(module))
+    Ok((module, was_cached))
 }
 
-/// Cache a compiled module with integrity verification.
-pub fn cache_module(wasm_bytes: &[u8], module: &Module) -> Result<(), SkillError> {
+/// Check if WASM bytes have been compiled before.
+pub fn has_cached_module(wasm_bytes: &[u8]) -> Result<bool, SkillError> {
     let hash = hash_bytes(wasm_bytes);
     let cache_path = get_cache_path(&hash)?;
-    let integrity_path = get_integrity_path(&hash)?;
-
-    // Serialize module
-    let serialized = module
-        .serialize()
-        .map_err(|e| SkillError::Load(format!("Failed to serialize module: {}", e)))?;
-
-    // Compute integrity hash of serialized bytes
-    let integrity_hash = hash_bytes(&serialized);
-
-    // Write serialized module
-    fs::write(&cache_path, &serialized)
-        .map_err(|e| SkillError::Load(format!("Failed to write cache: {}", e)))?;
-
-    // Write integrity hash
-    fs::write(&integrity_path, &integrity_hash)
-        .map_err(|e| SkillError::Load(format!("Failed to write integrity file: {}", e)))?;
-
-    tracing::debug!(
-        "Cached module with hash {} (integrity: {})",
-        hash,
-        integrity_hash
-    );
-    Ok(())
+    Ok(cache_path.exists())
 }
 
 /// Clear the entire module cache.
@@ -138,7 +82,7 @@ pub fn clear_cache() -> Result<(), SkillError> {
         return Ok(());
     }
 
-    // Remove all .module and .sha256 files
+    // Remove all .module files
     for entry in fs::read_dir(&cache_dir)
         .map_err(|e| SkillError::Load(format!("Failed to read cache directory: {}", e)))?
     {
@@ -146,8 +90,7 @@ pub fn clear_cache() -> Result<(), SkillError> {
             entry.map_err(|e| SkillError::Load(format!("Failed to read cache entry: {}", e)))?;
 
         let path = entry.path();
-        let ext = path.extension().and_then(|s| s.to_str());
-        if ext == Some("module") || ext == Some("sha256") {
+        if path.extension().and_then(|s| s.to_str()) == Some("module") {
             fs::remove_file(&path)
                 .map_err(|e| SkillError::Load(format!("Failed to remove cache file: {}", e)))?;
         }
@@ -226,55 +169,65 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_miss() {
+    fn test_compile_new_module() {
         let engine = Engine::default();
         let wasm = create_minimal_wasm();
 
         // Clear cache first
         clear_cache().ok();
 
-        let result = load_cached_module(&engine, &wasm).expect("Should not error");
-        assert!(result.is_none());
+        let (module, was_cached) = compile_module(&engine, &wasm).expect("Should compile");
+        assert!(!was_cached);
+        assert_eq!(module.exports().count(), 0); // Minimal WASM has no exports
     }
 
     #[test]
-    fn test_cache_hit() {
+    fn test_compile_cached_module() {
         let engine = Engine::default();
         let wasm = create_minimal_wasm();
 
         // Clear cache first
         clear_cache().ok();
 
-        // Compile and cache
-        let module = Module::new(&engine, &wasm).expect("Should compile");
-        cache_module(&wasm, &module).expect("Should cache");
+        // First compile
+        let (_module1, was_cached1) = compile_module(&engine, &wasm).expect("Should compile");
+        assert!(!was_cached1);
 
-        // Load from cache
-        let cached = load_cached_module(&engine, &wasm)
-            .expect("Should not error")
-            .expect("Should be cached");
-
-        // Both modules should work
-        assert!(module.exports().count() == cached.exports().count());
+        // Second compile — should report as previously seen
+        let (_module2, was_cached2) = compile_module(&engine, &wasm).expect("Should compile");
+        assert!(was_cached2);
     }
 
     #[test]
-    fn test_cache_invalidation() {
+    fn test_has_cached_module() {
+        let wasm = create_minimal_wasm();
+        let engine = Engine::default();
+
+        // Clear cache first
+        clear_cache().ok();
+
+        assert!(!has_cached_module(&wasm).expect("Should check"));
+
+        compile_module(&engine, &wasm).expect("Should compile");
+
+        assert!(has_cached_module(&wasm).expect("Should check"));
+    }
+
+    #[test]
+    fn test_different_wasm_not_cached() {
         let engine = Engine::default();
         let wasm1 = create_minimal_wasm();
         let mut wasm2 = wasm1.clone();
-        wasm2.push(0x00); // Modify to get different hash
+        wasm2.push(0x00); // Different hash
 
         // Clear cache first
         clear_cache().ok();
 
-        // Cache first module
-        let module1 = Module::new(&engine, &wasm1).expect("Should compile");
-        cache_module(&wasm1, &module1).expect("Should cache");
+        compile_module(&engine, &wasm1).expect("Should compile");
 
-        // Second module should not hit cache
-        let result = load_cached_module(&engine, &wasm2).expect("Should not error");
-        assert!(result.is_none());
+        // Different WASM should not be cached
+        let (_, was_cached) = compile_module(&engine, &wasm2).expect("Should compile");
+        assert!(!was_cached);
     }
 
     #[test]
@@ -288,13 +241,10 @@ mod tests {
         let stats_before = cache_stats().expect("Should get stats");
         assert_eq!(stats_before.num_entries, 0);
 
-        // Add a cached module
-        let module = Module::new(&engine, &wasm).expect("Should compile");
-        cache_module(&wasm, &module).expect("Should cache");
+        compile_module(&engine, &wasm).expect("Should compile");
 
         let stats_after = cache_stats().expect("Should get stats");
         assert_eq!(stats_after.num_entries, 1);
-        assert!(stats_after.total_size > 0);
     }
 
     #[test]
@@ -302,18 +252,13 @@ mod tests {
         let engine = Engine::default();
         let wasm = create_minimal_wasm();
 
-        // Add a cached module
-        let module = Module::new(&engine, &wasm).expect("Should compile");
-        cache_module(&wasm, &module).expect("Should cache");
+        compile_module(&engine, &wasm).expect("Should compile");
 
-        // Verify it's there
         let stats = cache_stats().expect("Should get stats");
         assert!(stats.num_entries > 0);
 
-        // Clear cache
         clear_cache().expect("Should clear");
 
-        // Verify it's gone
         let stats = cache_stats().expect("Should get stats");
         assert_eq!(stats.num_entries, 0);
     }

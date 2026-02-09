@@ -72,6 +72,13 @@ pub fn validate_manifest(manifest: &SkillManifest) -> Result<(), SkillError> {
         ));
     }
 
+    // Prevent path traversal via skill names
+    if manifest.name.contains("..") || manifest.name.contains('/') || manifest.name.contains('\\') {
+        return Err(SkillError::InvalidManifest(
+            "name must not contain path separators or '..'".to_string(),
+        ));
+    }
+
     if manifest.version.trim().is_empty() {
         return Err(SkillError::InvalidManifest(
             "version cannot be empty".to_string(),
