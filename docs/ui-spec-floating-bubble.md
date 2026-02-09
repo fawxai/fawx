@@ -28,6 +28,8 @@ determined through an interview during the user's first-run onboarding
 flow. The user shapes Nova's personality before they've used it —
 building a relationship from the first interaction.
 
+**Onboarding is mandatory — it cannot be skipped.**
+
 ### 1.3 Design Principles
 
 - **Ambient, not intrusive** — Nova should feel like a presence, not
@@ -57,6 +59,12 @@ The default, resting state. Nova is available but not active.
 | Position | User-defined — draggable to any screen edge/area, persists across sessions |
 | Presence | Out of the way, not distracting |
 
+**Variant — Pending Action:**
+When Nova timed out waiting for confirmation (see §2.5) or has an
+undelivered notification, the idle orb displays a **faint colored
+ring** in the user's colorway. This signals "I have something for
+you" without being intrusive.
+
 **Interaction:**
 - **Tap-hold** (default) or **3D press** (on supported devices) to
   wake Nova → transitions to Listening state
@@ -83,6 +91,14 @@ Nova has been woken and is ready to receive input.
    as the idle orb but larger — provides a text input field for users
    who prefer typing over speaking
 4. Text bubble inherits the user's colorway for accent elements
+
+**Audio feedback (personality-dependent cascade):**
+- **Screen off:** Nova speaks an acknowledgment phrase, AI-generated
+  based on personality (e.g., "Listening", "What's up?", "Hit me",
+  "How can I help?")
+- **Screen on, verbose setting:** Nova speaks
+- **Screen on, moderate setting:** Ambient vibrating flux sound
+- **Screen on, minimal setting / volume off:** Haptic feedback only
 
 **Interaction:**
 - User speaks (voice input) or types in the text bubble
@@ -130,7 +146,7 @@ Nova needs the user's approval before proceeding. This is the
 | Property | Value |
 |----------|-------|
 | Shape | Orb/star |
-| Color | User's colorway |
+| Color | Risk-level dependent (see §4 Permission System) |
 | Animation | **Slow brightness oscillation** — high-to-low-to-high, spending more time at peak and trough brightness than in transition. Higher peak and lower trough than other animated states. |
 | Haptics | Single tap every **2 seconds** — persistent, attention-seeking |
 
@@ -143,10 +159,22 @@ Nova needs the user's approval before proceeding. This is the
 - The overall effect: a slow, deep "breathing" that says
   "I need you"
 
-**Haptic pattern:**
-- Single distinct tap every 2 seconds
-- Persistent until user responds
-- Encourages engagement without being aggressive
+**Confirmation UI:**
+- A **swipe slider at the bottom of the screen** to confirm
+- Swipe gesture is intentional — harder to accidentally approve
+  than a tap
+- Slider color matches risk level (green/yellow/red)
+
+**Timeout behavior:**
+- After **60 seconds** with no response, Nova returns to idle
+- The pending action is saved in the text prompt window with a note:
+  *"Do you still want me to..."*
+- Idle orb shows **faint colored ring** indicating pending action
+  (see §2.1 Variant)
+
+**Batch confirmations:**
+- Both **one-by-one** and **approve all** options available
+- "Approve all" shown when Nova has multiple related actions queued
 
 ### 2.6 Error State
 
@@ -244,9 +272,110 @@ Users can change defaults in:
 
 ---
 
-## 4. Interaction Model
+## 4. Permission System
 
-### 4.1 Waking Nova
+### 4.1 Permission Tiers
+
+Four tiers, selected by the user during mandatory onboarding.
+Editable anytime in settings.
+
+| Tier | Name | Nova asks before... |
+|------|------|---------------------|
+| 1 | **Full control** | Everything — every action requires approval |
+| 2 | **External + destructive** (recommended default) | Sending messages/emails/tweets, deleting files/data |
+| 3 | **Financial + destructive only** | Purchases, accessing finances, deleting files |
+| 4 | **Autonomous** | Nothing — Nova acts freely (expert mode) |
+
+The default tier is determined during onboarding based on the user's
+comfort level.
+
+### 4.2 Risk-Level Color Coding
+
+Confirmation UI color reflects the stakes:
+
+| Risk Level | Color | Examples |
+|------------|-------|----------|
+| Low | **Green** | Open an app, search something, read info |
+| Medium | **Yellow** | Send a message, post on social media, edit a file |
+| High | **Red** | Delete files, make a purchase, access financial accounts |
+
+The confirmation slider, bubble glow, and any overlay elements all
+reflect the risk color during the confirmation state.
+
+### 4.3 Confirmation Interaction
+
+1. Nova enters Confirmation state (slow brightness oscillation +
+   haptic taps)
+2. Confirmation card appears showing:
+   - What Nova wants to do (action description)
+   - Risk level indicator (color coded)
+3. User **swipes the slider at the bottom of the screen** to approve
+4. Or taps "Cancel" / waits 60 seconds for auto-dismiss
+
+---
+
+## 5. Sound & Audio Design
+
+### 5.1 Personality-Dependent Cascade
+
+All audio follows a three-tier cascade based on user settings
+from onboarding:
+
+| Priority | Condition | Output |
+|----------|-----------|--------|
+| 1 | Verbose personality + volume on | **AI-generated speech** (contextual, personality-matched) |
+| 2 | Moderate personality + volume on | **Ambient tone/sound** |
+| 3 | Minimal personality OR volume off | **Haptic feedback only** |
+
+Screen-off interactions bump up one tier (e.g., moderate → speaks)
+to compensate for no visual feedback.
+
+### 5.2 Sound Events
+
+| Event | Verbose | Moderate | Minimal |
+|-------|---------|----------|---------|
+| Wake acknowledgment | AI-generated phrase ("What's up?", "Listening", etc.) | Vibrating ambient flux sound | Haptic only |
+| Task complete | AI-generated ("Done!", "All set", etc.) | Subtle chime | Haptic only |
+| Error | AI-generated ("That didn't work", etc.) | Alert tone | Haptic only |
+| Confirmation needed | AI-generated ("Need your OK", etc.) | Attention chime | Haptic only |
+| Background task done | AI-generated notification | Ambient chime | Haptic only |
+
+### 5.3 AI-Generated Speech
+
+Spoken responses are **generated in real-time by Nova's LLM**, not
+pre-recorded or from a fixed set. This means:
+- Phrases match the user's chosen personality and verbosity
+- Responses are contextually appropriate (not the same thing every time)
+- Voice character (warm, professional, playful, etc.) is set during
+  onboarding
+
+---
+
+## 6. Text & Visual Communication
+
+### 6.1 Text Rendering
+
+| Property | Value |
+|----------|-------|
+| Text appearance | **Streams in** (typing/ChatGPT effect) |
+| Typography | **Clean and minimal** |
+| Overlay background | **Translucent bubble** behind text |
+| Theme | **Follows system theme** (dark/light) |
+
+### 6.2 Text Bubble Design
+
+- Translucent background with slight blur (frosted glass effect)
+- User's colorway as accent (borders, highlights, cursor)
+- Clean sans-serif typeface
+- Text streams in character-by-character or word-by-word for
+  conversational feel
+- Static text (labels, buttons) appears immediately
+
+---
+
+## 7. Interaction Model
+
+### 7.1 Waking Nova
 
 | Gesture | Behavior |
 |---------|----------|
@@ -255,7 +384,7 @@ Users can change defaults in:
 | Simple tap on idle orb | Haptic acknowledgment only — does NOT wake (prevents accidental activation) |
 | Wake word (voice) | Wake → Listening state (no touch required) |
 
-### 4.2 Dismissing / Minimizing Nova
+### 7.2 Dismissing / Minimizing Nova
 
 | Gesture | Behavior |
 |---------|----------|
@@ -264,7 +393,7 @@ Users can change defaults in:
 The dismiss gesture mirrors Android's chat head pattern — familiar
 to users.
 
-### 4.3 Interrupting Nova Mid-Action
+### 7.3 Interrupting Nova Mid-Action
 
 | Gesture | Behavior |
 |---------|----------|
@@ -276,7 +405,7 @@ to users.
 - After interrupt, Nova enters a "paused" state where user can
   choose to resume, cancel, or give new instructions
 
-### 4.4 Moving the Bubble
+### 7.4 Moving the Bubble
 
 | Gesture | Behavior |
 |---------|----------|
@@ -285,7 +414,7 @@ to users.
 
 ---
 
-## 5. State Transition Map
+## 8. State Transition Map
 
 ```
                     tap-hold / 3D press / wake word
@@ -296,7 +425,7 @@ to users.
          └──────┘                           └───────────┘
             ▲                                      │
             │ dismiss / error viewed         user submits input
-            │                                      │
+            │ / 60s timeout                        │
             │                                      ▼
          ┌──────┐     needs approval      ┌───────────┐
          │ERROR │◄────────────────────────│ THINKING   │
@@ -318,28 +447,30 @@ to users.
                                        ┌──────┐
                                        │ IDLE │
                                        └──────┘
+
+Note: CONFIRMING → IDLE after 60s timeout (saves pending action)
+      IDLE with faint ring = has pending action or notification
 ```
 
 ---
 
-## 6. Color & Theming
+## 9. Color & Theming
 
 | Element | Color Source |
 |---------|-------------|
 | Idle orb | Pitch black with subtle shine |
-| Active states (listening, thinking, acting, confirming) | User's chosen colorway |
+| Idle orb (pending) | Pitch black + faint colored ring (user colorway) |
+| Active states (listening, thinking, acting) | User's chosen colorway |
+| Confirming state | Risk-level color (green/yellow/red) |
 | Error state | Red (overrides colorway) |
-| Text interface bubble | Dark background, colorway accents |
+| Text interface bubble | Translucent + colorway accents, follows system theme |
 | Highlighted touch ripples | Colorway with transparency |
-| PiP preview | Dark background, colorway accents |
-
-The user selects their colorway during onboarding from a curated
-palette. This color is applied consistently across all non-error
-states.
+| PiP preview | Translucent + colorway accents, follows system theme |
+| Confirmation slider | Risk-level color |
 
 ---
 
-## 7. Haptic Language
+## 10. Haptic Language
 
 | Event | Haptic Pattern |
 |-------|---------------|
@@ -354,7 +485,7 @@ states.
 
 ---
 
-## 8. Responsive Sizing
+## 11. Responsive Sizing
 
 | State | Approximate Size |
 |-------|-----------------|
@@ -362,16 +493,31 @@ states.
 | Listening | ~64-72dp (slightly larger, plus text bubble) |
 | Thinking | ~64-72dp |
 | Acting | ~64-72dp (plus action visualization overlay) |
-| Confirming | ~64-72dp (plus confirmation UI) |
+| Confirming | ~64-72dp (plus confirmation slider at bottom) |
 | Error | ~64-72dp |
 
 The orb itself doesn't dramatically resize — state is communicated
 through color, animation, and supplementary UI elements (text bubble,
-PiP, overlays).
+PiP, overlays, confirmation slider).
 
 ---
 
-## 9. Accessibility Considerations
+## 12. Onboarding Flow (UI-Relevant Decisions)
+
+The following are decided during the mandatory onboarding interview
+and affect all UI behavior:
+
+| Decision | Affects |
+|----------|---------|
+| **Color selection** | All colorway elements across every state |
+| **Personality interview** | Voice character, spoken phrase style |
+| **Verbosity level** | Sound cascade tier (verbose/moderate/minimal) |
+| **Permission tier** | Which actions require confirmation |
+| **Action visualization preference** | Override defaults for action modes |
+
+---
+
+## 13. Accessibility Considerations
 
 - All states must be distinguishable without color alone (animation
   patterns differ per state)
@@ -381,23 +527,21 @@ PiP, overlays).
 - Screen reader compatibility for all interactive elements
 - Confirmation state must be perceivable through multiple channels
   (visual + haptic + optional sound)
+- System theme support ensures readability in both light and dark modes
 
 ---
 
-## 10. Open Questions for Future Topics
+## 14. Open Questions
 
-These will be defined in subsequent specs:
+### Topic 6: Horizon 2 — NovaOS Modes
+*Deferred — Joe wants to think more before committing to full-screen
+modes (ambient/active/immersive/review). Will revisit when design
+direction crystallizes.*
 
-- **Topic 3:** Confirmation UX — what information shows in the
-  confirmation dialog, swipe vs tap, risk level visualization
-- **Topic 4:** Sound design — wake acknowledgment, completion,
-  error tones
-- **Topic 5:** Text & visual communication — typography, overlay
-  backgrounds, streaming text
-- **Topic 6:** Horizon 2 NovaOS modes — ambient/active/immersive/review
-- **Topic 7:** Marketing mocks — hero shots, video demo style
+### Topic 7: Marketing Mocks
+*Not yet discussed — hero shots, video demo style, device branding.*
 
 ---
 
-*Spec version: 1.0 — 2026-02-09*
-*Based on UX interview with Joe (Topics 1-2)*
+*Spec version: 2.0 — 2026-02-09*
+*Based on UX interview with Joe (Topics 1-5, Topic 6 deferred)*

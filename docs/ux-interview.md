@@ -72,55 +72,81 @@ In all cases, user can opt in or out of specific settings.
 
 ---
 
-## Topic 3: Confirmation UX (Trust Model) — NOT YET ASKED
+## Topic 3: Confirmation UX (Trust Model) ✅ ANSWERED
 
-The policy engine is the most important safety feature. The user-facing side — how you approve or reject an action — needs to be a beautifully designed moment.
+### Permission Tiers
+Four tiers, selected during mandatory onboarding, editable in settings:
+1. **Full control** — Nova asks before everything
+2. **External + destructive** — asks before sending messages/emails/tweets, deleting (recommended default)
+3. **Financial + destructive only** — asks before purchases, finances, file deletion
+4. **Autonomous** — Nova never asks (expert mode)
 
-### Questions to ask:
-- What information should a confirmation show? (action description, consequences, undo option?)
-- Full-screen takeover or inline in the bubble?
-- Swipe to confirm (like Apple Pay) or tap?
-- How does Nova communicate risk level? (routine vs high-stakes visual distinction)
-- Timeout behavior — if user doesn't respond, does Nova wait forever or cancel?
-- Batch confirmations — "I want to do 5 things, approve all?" or one-by-one?
+Default tier decided during onboarding.
 
----
+### Confirmation UI
+- Color coded by risk: **green** (low), **yellow** (medium), **red** (high)
+- **Swipe slider at bottom of screen** to confirm (intentional gesture)
+- Both one-by-one AND approve-all for batch actions
 
-## Topic 4: Sound Design — NOT YET ASKED
+### Timeout
+- 60 seconds → Nova goes idle
+- Pending action saved in prompt window with "Do you still want me to..."
+- Idle orb shows faint colored ring indicating pending action
 
-For a voice-first device, sound is critical.
-
-### Questions to ask:
-- Wake word acknowledgment sound (the "I heard you" moment)
-- Completion sound (task done)
-- Error tone
-- Confirmation request sound (attention needed)
-- Ambient awareness audio (subtle chime for background task completion?)
-- Should sounds have the same personality customization as the voice?
+### Design output
+→ Full spec: `docs/ui-spec-floating-bubble.md` §4
 
 ---
 
-## Topic 5: Text & Visual Communication — NOT YET ASKED
+## Topic 4: Sound Design ✅ ANSWERED
 
-### Questions to ask:
-- When Nova shows text on the overlay, how does it appear? All at once, streaming/typing, animated?
-- Typography personality — clean and minimal? Warm and rounded? Technical and monospaced?
-- Does the overlay have a background or is it transparent floating text?
-- Dark mode only, light mode only, or follows system?
+### Core principle
+Sound follows a **personality-dependent cascade** based on onboarding:
+
+| Priority | Condition | Output |
+|----------|-----------|--------|
+| 1 | Verbose + volume on | AI-generated speech |
+| 2 | Moderate + volume on | Ambient tone/sound |
+| 3 | Minimal OR volume off | Haptic only |
+
+Screen-off bumps up one tier (moderate → speaks).
+
+### Key decisions
+- Spoken phrases are **AI-generated in real-time** (not pre-recorded)
+- Personality and context determine what Nova says
+- Same cascade applies to all sound events (wake, complete, error, confirm)
+- Specific tones/sounds to be decided later
+
+### Design output
+→ Full spec: `docs/ui-spec-floating-bubble.md` §5
 
 ---
 
-## Topic 6: Horizon 2 — NovaOS Modes — NOT YET ASKED
+## Topic 5: Text & Visual Communication ✅ ANSWERED
 
-The spec mentions "ambient/active/immersive/review modes" but never defines them.
+- **Text appearance:** Streams in (typing/ChatGPT effect)
+- **Typography:** Clean and minimal
+- **Overlay background:** Translucent bubble (frosted glass)
+- **Theme:** Follows system theme (dark/light)
 
-### Questions to ask:
-- **Ambient mode**: What does the screen show when you're not actively using it? Clock + context? Visualization of agent state? Minimal text?
-- **Active mode**: What triggers the transition from ambient? How does it look/feel different?
+### Design output
+→ Full spec: `docs/ui-spec-floating-bubble.md` §6
+
+---
+
+## Topic 6: Horizon 2 — NovaOS Modes — DEFERRED
+
+*Joe wants to think more before committing. "I'm tempted to keep it
+the same for horizon 2 as we have it in 1, but it should have a
+different vibe. I'm not sure I'm ready to make these choices yet."*
+
+### Questions for when ready:
+- **Ambient mode**: What does the screen show when you're not actively using it?
+- **Active mode**: What triggers the transition from ambient?
 - **Immersive mode**: Full agent interaction — what's the layout?
-- **Review mode**: Looking at what Nova did while you were away — timeline? Cards? Conversation log?
-- Transitions between modes — what are the gestures? The animations?
-- The "awareness surface" concept — screen as something you glance at rather than interact with. What does that actually look like?
+- **Review mode**: Looking at what Nova did while you were away
+- Transitions between modes — gestures, animations
+- The "awareness surface" concept
 
 ---
 
