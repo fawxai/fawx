@@ -32,32 +32,43 @@ These will feed into UI mocks for marketing and actual implementation.
 
 ---
 
-## Topic 2: The Floating Bubble (Horizon 1) — PENDING
-
-*Joe is thinking on this. Questions below for when he returns.*
-
-The bubble is the primary UI surface in Horizon 1 — always present on Android, always communicating state.
+## Topic 2: The Floating Bubble (Horizon 1) ✅ ANSWERED
 
 ### Q1: Bubble states
-The supernova icon needs to communicate what Nova is doing:
-- **Idle** — floating, available. Subtle glow? Dim? Slowly pulsing?
-- **Listening** — wake word triggered. Bright flare? Expanding rings? Color shift?
-- **Thinking** — processing request. Spinning? Swirling nebula animation? Inner glow?
-- **Acting** — executing on the phone. Progress trail? Step-by-step overlay?
-- **Waiting for confirmation** — needs approval (the trust moment). Distinct from other states?
-- **Error/failed** — something went wrong. Red shift? Shake? Collapse animation?
+
+- **Idle** — Small orb, pitch black, slight shine (obsidian-like). Out of the way, not distracting. Haptic feedback on tap.
+- **Listening** — Black orb transforms into small glowing star, shifts into user's chosen colorway. Text interface bubble appears on screen for typing.
+- **Thinking** — Swirling, spinning. Inner glow pulsating.
+- **Acting** — Context-dependent visualization (see Q3). Haptic feedback on a rhythm to indicate Nova is actively working.
+- **Waiting for confirmation** — Slow brightness oscillation (high/low), spending more time at peak and trough, with higher/lower magnitude brightness. Haptic tap every 2 seconds.
+- **Error** — Shaking in all directions (not spinning). Red. Tap to see error text. If voice mode on, tapping plays answer aloud.
 
 ### Q2: Bubble size and position
-- Small and out of the way (like a chat head), or larger and more present?
-- Does it resize based on state (expand when active, shrink when idle)?
 
-### Q3: When Nova is acting on your phone
-"Watching it tap itself like a ghost is unsettling" — what should the user see instead?
-- **Narrated overlay** — Nova describes what it's doing in real-time ("Opening Messages → Finding Sarah → Typing...")
-- **Picture-in-picture preview** — small window showing plan summary being executed
-- **Highlighted touches** — visual ripples where Nova "taps," making it feel intentional
-- **Hands-off mode** — screen goes to a Nova "working" animation and comes back when done
-- A combination?
+- Small and out of the way when idle
+- User can move orb anywhere on screen, persists
+- Wake by **tap-hold** (default) or **3D press** (supported devices)
+- Dismiss by **tap-hold-drag to corner/margin**
+- Simple tap = haptic acknowledgment only, does NOT wake
+
+### Q3: When Nova acts on your phone
+
+Three modes, context-dependent. Nova auto-selects defaults, user can change in onboarding and settings:
+
+1. **Narrated overlay** — opt-in, off by default. Real-time text describing actions.
+2. **PiP preview** — for background tasks or API calls. Small window showing plan summary.
+3. **Highlighted touches** — for on-screen app interactions. Nova hovers over tap targets, visual ripples at touch points, haptic feedback at each "tap" or as letters/words are entered.
+
+In all cases, user can opt in or out of specific settings.
+
+### Q4: Follow-up answers
+
+- **Text interface bubble** appears at same location as idle orb but larger
+- **Interruption** — touch and hold anywhere on screen for 2 seconds → Nova stops
+- Tap-hold is primary wake gesture; 3D press is bonus on supported devices
+
+### Design output
+→ Full spec: `docs/ui-spec-floating-bubble.md`
 
 ---
 
