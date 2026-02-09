@@ -8,6 +8,7 @@ pub mod history;
 pub mod intent;
 pub mod plan_builder;
 pub mod retry;
+pub mod skill_tools;
 pub mod tools;
 
 use nv_core::types::{ActionPlan, UserInput};
@@ -23,6 +24,7 @@ pub use intent::{
 };
 pub use plan_builder::PlanBuilder;
 pub use retry::{calculate_delay, should_retry, with_retry, RetryPolicy};
+pub use skill_tools::{format_skills_context, skill_tools};
 pub use tools::nova_action_tools;
 
 /// Main agent orchestrator.

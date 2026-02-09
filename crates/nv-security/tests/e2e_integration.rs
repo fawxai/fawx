@@ -185,9 +185,7 @@ impl LlmClassifier for MockLlmProvider {
 
 #[tokio::test]
 async fn test_skill_invocation_infrastructure() {
-    // NOTE: This test verifies skill loading and registration infrastructure,
-    // NOT actual WASM execution. Real skill execution will be tested in PR #179.
-    // TODO: Replace with functional WASM module once PR #179 (real WASM runtime) merges.
+    // Tests skill loading, registration, and real WASM execution.
 
     // Create a skill runtime
     let mut runtime = SkillRuntime::new().expect("Failed to create runtime");
@@ -200,18 +198,32 @@ async fn test_skill_invocation_infrastructure() {
         author: "test".to_string(),
         api_version: "host_api_v1".to_string(),
         capabilities: vec![],
-        entry_point: "main".to_string(),
+        entry_point: "run".to_string(),
     };
 
-    // Create a minimal WASM module (placeholder for infrastructure testing)
-    // Minimal valid WASM: magic + version
-    let wasm_bytes = vec![
-        0x00, 0x61, 0x73, 0x6d, // magic: \0asm
-        0x01, 0x00, 0x00, 0x00, // version: 1
-    ];
+    // Create a functional WASM module using WAT
+    // This module imports host_api_v1 functions, writes "ok" to memory, and calls set_output
+    let wat = r#"
+        (module
+            (import "host_api_v1" "log" (func $log (param i32 i32 i32)))
+            (import "host_api_v1" "kv_get" (func $kv_get (param i32 i32) (result i32)))
+            (import "host_api_v1" "kv_set" (func $kv_set (param i32 i32 i32 i32)))
+            (import "host_api_v1" "get_input" (func $get_input (result i32)))
+            (import "host_api_v1" "set_output" (func $set_output (param i32 i32)))
+            (memory (export "memory") 1)
+            (func (export "run")
+                ;; Write "ok" to memory at offset 0
+                (i32.store8 (i32.const 0) (i32.const 111)) ;; 'o'
+                (i32.store8 (i32.const 1) (i32.const 107)) ;; 'k'
+                ;; Call set_output(ptr=0, len=2)
+                (call $set_output (i32.const 0) (i32.const 2))
+            )
+        )
+    "#;
+    let wasm_bytes = wat.as_bytes().to_vec();
 
-    // Load skill using SkillLoader
-    let loader = SkillLoader::new(vec![]);
+    // Load skill using SkillLoader with runtime's engine
+    let loader = SkillLoader::with_engine(runtime.engine().clone(), vec![]);
     let skill = loader
         .load(&wasm_bytes, &manifest, None)
         .expect("Failed to load skill");
@@ -221,19 +233,18 @@ async fn test_skill_invocation_infrastructure() {
         .register_skill(skill)
         .expect("Failed to register skill");
 
-    // Invoke skill (placeholder execution)
+    // Invoke skill with real WASM execution
     let result = runtime
         .invoke("test_calculator", "2 + 2")
         .expect("Failed to invoke skill");
 
-    // Verify result contains skill name (infrastructure test only)
-    assert!(result.contains("test_calculator"));
+    // Verify the WASM module executed and set output to "ok"
+    assert_eq!(result, "ok");
 }
 
 #[tokio::test]
 async fn test_skill_invocation_audit_trail() {
-    // NOTE: Tests audit logging for skill invocation, not actual WASM execution.
-    // TODO: Update with real execution tests when PR #179 merges.
+    // Tests audit logging for skill invocation with real WASM execution.
 
     // Create audit log
     let mut audit_log = AuditLog::in_memory().unwrap();
@@ -241,7 +252,7 @@ async fn test_skill_invocation_audit_trail() {
     // Create skill runtime
     let mut runtime = SkillRuntime::new().expect("Failed to create runtime");
 
-    // Create and register test skill
+    // Create and register test skill with functional WASM
     let manifest = SkillManifest {
         name: "test_skill".to_string(),
         version: "1.0.0".to_string(),
@@ -249,14 +260,26 @@ async fn test_skill_invocation_audit_trail() {
         author: "test".to_string(),
         api_version: "host_api_v1".to_string(),
         capabilities: vec![],
-        entry_point: "main".to_string(),
+        entry_point: "run".to_string(),
     };
 
-    let wasm_bytes = vec![
-        0x00, 0x61, 0x73, 0x6d, // magic
-        0x01, 0x00, 0x00, 0x00, // version
-    ];
-    let loader = SkillLoader::new(vec![]);
+    let wat = r#"
+        (module
+            (import "host_api_v1" "log" (func $log (param i32 i32 i32)))
+            (import "host_api_v1" "kv_get" (func $kv_get (param i32 i32) (result i32)))
+            (import "host_api_v1" "kv_set" (func $kv_set (param i32 i32 i32 i32)))
+            (import "host_api_v1" "get_input" (func $get_input (result i32)))
+            (import "host_api_v1" "set_output" (func $set_output (param i32 i32)))
+            (memory (export "memory") 1)
+            (func (export "run")
+                (i32.store8 (i32.const 0) (i32.const 111))
+                (i32.store8 (i32.const 1) (i32.const 107))
+                (call $set_output (i32.const 0) (i32.const 2))
+            )
+        )
+    "#;
+    let wasm_bytes = wat.as_bytes().to_vec();
+    let loader = SkillLoader::with_engine(runtime.engine().clone(), vec![]);
     let skill = loader
         .load(&wasm_bytes, &manifest, None)
         .expect("Failed to load skill");

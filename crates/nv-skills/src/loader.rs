@@ -46,9 +46,21 @@ impl SkillLoader {
         }
     }
 
+    /// Create a skill loader that shares an engine with a SkillRuntime.
+    ///
+    /// Wasmtime requires modules and stores to use the same Engine instance.
+    /// Use this when loading skills that will be executed by a specific runtime.
+    pub fn with_engine(engine: Engine, trusted_keys: Vec<Vec<u8>>) -> Self {
+        Self {
+            engine,
+            trusted_keys,
+        }
+    }
+
     /// Load a skill from WASM bytes, manifest, and optional signature.
     ///
     /// If a signature is provided, it must verify against one of the trusted keys.
+    /// Uses module caching to speed up repeated loads of the same WASM bytes.
     pub fn load(
         &self,
         wasm_bytes: &[u8],
@@ -76,9 +88,13 @@ impl SkillLoader {
             }
         }
 
-        // Compile the WASM module
-        let module = Module::new(&self.engine, wasm_bytes)
-            .map_err(|e| SkillError::Load(format!("Failed to compile WASM module: {}", e)))?;
+        // Compile the WASM module safely (always from source, no unsafe deserialize)
+        let (module, was_cached) = crate::cache::compile_module(&self.engine, wasm_bytes)?;
+        if was_cached {
+            tracing::debug!("Recompiled known skill '{}'", manifest.name);
+        } else {
+            tracing::debug!("Compiled new skill '{}'", manifest.name);
+        }
 
         Ok(LoadedSkill {
             module,
