@@ -481,6 +481,56 @@ The system must handle failure at every level:
 
 - **SELinux.** Even on a rooted phone, SELinux is enforcing by default. Our daemon can't just open /dev/input — SELinux policies block it even for root. Magisk typically sets SELinux to permissive, but some operations may need custom SELinux policy modules or context labels. *Mitigation*: Document the exact SELinux config required. Test with `setenforce 0` initially, then write proper policy modules.
 
+#### Current Implementation Baseline (as of 2026-02-09)
+
+The following is a snapshot of what exists versus what is planned, to set realistic expectations for each phase.
+
+**Implemented (Epics 1-8):**
+- Cargo workspace with 12 crates, CI pipeline (format, clippy, check, test)
+- nv-core: config loading, event bus, internal types, error hierarchy
+- nv-llm: local model stub (llama.cpp integration not yet functional), Claude API client with streaming/tool use, confidence-based routing with fallback
+- nv-security: encrypted KV store (redb + AES-256-GCM), audit log with HMAC-SHA256 hash chain, intent classification (regex + LLM hybrid), policy engine with rules/capabilities/rate limiting
+- nv-skills: WASM runtime (wasmtime), capability enforcement at host boundary, module compilation + caching, skill loader/registry/installer with signature verification, async skill execution
+- nv-cli: `nova doctor`, `nova config show`, `nova audit` commands
+- 400+ tests across all crates
+
+**Not yet functional (stubs/placeholders):**
+- `Agent::process` (nv-agent) — core orchestrator loop is `todo!()`
+- `PhoneActions` trait (nv-phone) — all methods are `todo!()`
+- `LocalModel::generate` (nv-llm) — returns error, llama.cpp FFI build is stub
+- `invoke_skill_async` (nv-skills) — returns placeholder output
+- CLI `start`/`stop`/chat commands — placeholder
+- nv-voice, nv-sensors, nv-sync — not started
+
+**Security gaps requiring hardening before production paths:**
+- Skill signature verification exists but is not mandatory — callers can pass `signature: None`
+- `PolicyEngine::from_file()` loads unsigned policies alongside signed `from_signed_file()`
+- `evaluate_action()` does not pass time context, so time-based policy rules never match
+- Audit log verification requires explicit caller action, not enforced on open/query
+
+---
+
+#### Phase 0.5: Hardening (Week 3-4)
+
+**Rationale:** Epics 1-8 built the security primitives. Before wiring them into production paths (Phase 1+), we need to close the enforcement gaps so that every subsequent phase inherits strict-by-default security.
+
+**Deliverables:**
+- Mandatory signature enforcement mode: `--strict` flag / `security.strict_mode: true` config. When enabled, `load()` rejects unsigned skills, `PolicyEngine::from_file()` requires signature, CLI install refuses unsigned packages
+- Time context wired into policy evaluation: `evaluate_action()` accepts `SystemTime`, time-based rules actually fire
+- Fail-closed audit: `AuditLog::open()` verifies chain integrity by default, query methods return error on corrupted chain rather than silently returning data
+- Remove panic-based `Default` impls from runtime constructors (use builder pattern or `Result`-returning constructors)
+- Config schema consolidation: single canonical format (JSON5), CLI reads both TOML and JSON5 with canonical conversion
+
+**Exit criteria:**
+- `cargo test` passes with `--strict` enabled in all integration tests
+- No `todo!()` in any security-critical path (loader, policy eval, audit open/query)
+- Time-based policy rules have integration tests proving they fire correctly
+- `nova doctor` reports signature enforcement status
+
+**Milestone**: `nova doctor --strict` passes all security checks. Unsigned skill install is rejected. Unsigned policy load fails. Audit chain corruption is detected on open.
+
+---
+
 #### Phase 1: The Agent Can Think (Weeks 4-8)
 
 **Deliverables:**
@@ -816,6 +866,7 @@ Decisions that have been made, with rationale, to avoid revisiting them.
 | 12 | Dual STT: Android SpeechRecognizer + optional Whisper | Pragmatic. Google's on-device STT is 10x faster. Whisper is more private. Let user choose. | On-device Whisper performance improves to < 1s for typical utterances |
 | 13 | Three-horizon roadmap | PoC → OS → Hardware. Each stage validates the next. Hardware comes last because the value is in the software. | A compelling hardware partnership appears early |
 | 14 | Trust button as physical hardware interlock | No software vulnerability can bypass a physical button. Essential for an agent with root access. Prototype with remapped Pixel button. | We find a software-only confirmation mechanism that's equally secure (unlikely) |
+| 15 | Hardening phase before production paths | Security primitives exist (Epics 1-8) but aren't mandatory. Adding features on top of optional security creates tech debt. Harden first, then build. | All enforcement gaps are closed and we're confident in the defaults |
 
 ---
 
