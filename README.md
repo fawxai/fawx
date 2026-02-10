@@ -1,12 +1,12 @@
-# Nova: AI-Native Phone Agent
+# Citros: AI-Native Phone Agent
 
-[![Build Status](https://github.com/abbudjoe/nova/actions/workflows/ci.yml/badge.svg)](https://github.com/abbudjoe/nova/actions/workflows/ci.yml)
+[![Build Status](https://github.com/abbudjoe/citros/actions/workflows/ci.yml/badge.svg)](https://github.com/abbudjoe/citros/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.83%2B-orange.svg)](https://www.rust-lang.org/)
 
-**Nova** is an AI-native phone agent designed to run locally on Android devices. Unlike cloud-based assistants, Nova lives on your phone, using local LLMs for fast inference and only escalating to cloud LLMs for complex reasoning. It's the foundation for a future where the agent *is* the interface, not just a feature bolted onto an app-centric OS.
+**Citros** is an AI-native phone agent designed to run locally on Android devices. Unlike cloud-based assistants, Citros lives on your phone, using local LLMs for fast inference and only escalating to cloud LLMs for complex reasoning. It's the foundation for a future where the agent *is* the interface, not just a feature bolted onto an app-centric OS.
 
-**⚠️ Status: Early Development** — Nova is under active development. Core infrastructure (Epics 1-6) is complete, with 225+ tests and a clean Rust codebase. See [Project Status](#project-status) below for details.
+**⚠️ Status: Early Development** — Citros is under active development. Core infrastructure (Epics 1-6) is complete, with 225+ tests and a clean Rust codebase. See [Project Status](#project-status) below for details.
 
 ---
 
@@ -31,7 +31,7 @@
 Smartphones haven't fundamentally changed since 2007. Users navigate grids of siloed apps, manually orchestrating multi-step tasks across different UIs. AI assistants (Siri, Google Assistant) failed to fix this because they're constrained by OS limitations and predefined app "intents."
 
 ### The Solution
-**Nova puts the agent on the phone, not in the cloud.** It perceives (voice, screen, sensors), thinks (local LLM for speed, cloud for complexity), and acts (direct device control). The phone becomes an *awareness surface* where you glance to see what the agent is doing, not an *input surface* where you tap 47 times to book a flight.
+**Citros puts the agent on the phone, not in the cloud.** It perceives (voice, screen, sensors), thinks (local LLM for speed, cloud for complexity), and acts (direct device control). The phone becomes an *awareness surface* where you glance to see what the agent is doing, not an *input surface* where you tap 47 times to book a flight.
 
 ### Design Principles
 1. **Phone-native, not server-first** — No gateway, no open ports, no inbound connections
@@ -71,23 +71,23 @@ For the full vision and three-horizon roadmap, see [`docs/SPEC.md`](docs/SPEC.md
 
 ## Architecture
 
-Nova is a Rust workspace with 12 crates, designed for modularity and testability:
+Citros is a Rust workspace with 12 crates, designed for modularity and testability:
 
 ```
-nova/
+citros/
 ├── crates/
-│   ├── nv-core/           # Core types, traits, and utilities
-│   ├── nv-agent/          # Agent orchestration, intent classification, Claude API
-│   ├── nv-llm/            # Local LLM inference via llama.cpp
-│   ├── nv-security/       # Policy engine, capability management, action validation
-│   ├── nv-storage/        # Encrypted key-value store, audit log persistence
-│   ├── nv-skills/         # WASM skill runtime, host API, module loading
-│   ├── nv-phone/          # Phone-specific actions (UI automation, app control)
-│   ├── nv-voice/          # Voice interface (STT, TTS, wake word)
-│   ├── nv-sensors/        # Sensor access (camera, microphone, location, etc.)
-│   ├── nv-sync/           # Multi-device encrypted sync protocol
-│   ├── nv-cli/            # Interactive CLI for development and testing
-│   └── nv-audit/          # Audit log (CLI commands, verification, querying)
+│   ├── ct-core/           # Core types, traits, and utilities
+│   ├── ct-agent/          # Agent orchestration, intent classification, Claude API
+│   ├── ct-llm/            # Local LLM inference via llama.cpp
+│   ├── ct-security/       # Policy engine, capability management, action validation
+│   ├── ct-storage/        # Encrypted key-value store, audit log persistence
+│   ├── ct-skills/         # WASM skill runtime, host API, module loading
+│   ├── ct-phone/          # Phone-specific actions (UI automation, app control)
+│   ├── ct-voice/          # Voice interface (STT, TTS, wake word)
+│   ├── ct-sensors/        # Sensor access (camera, microphone, location, etc.)
+│   ├── ct-sync/           # Multi-device encrypted sync protocol
+│   ├── ct-cli/            # Interactive CLI for development and testing
+│   └── ct-audit/          # Audit log (CLI commands, verification, querying)
 └── ffi/
     └── llama-cpp-sys/     # Rust FFI bindings to llama.cpp
 
@@ -159,8 +159,8 @@ Device (Android UI, Apps, Sensors)
 ### Clone and Build
 ```bash
 # Clone the repository
-git clone https://github.com/abbudjoe/nova.git
-cd nova
+git clone https://github.com/abbudjoe/citros.git
+cd citros
 
 # Build all crates
 cargo build --workspace
@@ -175,10 +175,10 @@ cargo build --workspace --release
 ### Quick Test: Intent Classification
 ```bash
 # Run the intent classification tests
-cargo test -p nv-agent --test tests -- intent
+cargo test -p ct-agent --test tests -- intent
 
 # Run with output to see classification results
-cargo test -p nv-agent --test tests -- intent --nocapture
+cargo test -p ct-agent --test tests -- intent --nocapture
 ```
 
 ### Environment Setup
@@ -191,16 +191,16 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 
 ## Testing
 
-Nova has extensive test coverage across all crates:
+Citros has extensive test coverage across all crates:
 
 ```bash
 # Run all tests
 cargo test --workspace
 
 # Run tests for a specific crate
-cargo test -p nv-agent
-cargo test -p nv-security
-cargo test -p nv-storage
+cargo test -p ct-agent
+cargo test -p ct-security
+cargo test -p ct-storage
 
 # Run with coverage report (requires cargo-tarpaulin)
 cargo tarpaulin --workspace --out Html
@@ -222,7 +222,7 @@ cargo fmt --check
 
 ## Security
 
-Nova takes security seriously. The agent runs with elevated privileges on the phone, so the security model must be proportionally rigorous.
+Citros takes security seriously. The agent runs with elevated privileges on the phone, so the security model must be proportionally rigorous.
 
 ### Threat Model
 1. **Malicious WASM skills** — Sandboxed with restricted host API, policy validation
@@ -245,7 +245,7 @@ Please **do not** open public GitHub issues for security vulnerabilities. Contac
 
 ## Contributing
 
-Nova is in early development and not yet accepting external contributions. Once the core architecture stabilizes (post-Epic 9), we'll publish contribution guidelines and open the project to community involvement.
+Citros is in early development and not yet accepting external contributions. Once the core architecture stabilizes (post-Epic 9), we'll publish contribution guidelines and open the project to community involvement.
 
 ### For Now
 - **Star the repo** if you're interested in the project
@@ -299,7 +299,7 @@ ODM partnership or custom board design. Hardware trust button, NPU-optimized SoC
 ## Project Structure
 
 ```
-nova/
+citros/
 ├── crates/              # Rust workspace crates
 ├── docs/                # Design docs, specs, architecture diagrams
 ├── ffi/                 # FFI bindings (llama.cpp)

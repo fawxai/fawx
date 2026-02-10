@@ -1,0 +1,10 @@
+[package]
+name = "ct-voice"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+ct-core.workspace = true
+tracing.workspace = true

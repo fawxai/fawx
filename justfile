@@ -1,4 +1,4 @@
-# Justfile for Nova - Common development commands
+# Justfile for Citros - Common development commands
 
 # Default recipe (run with just `just`)
 default:
@@ -42,11 +42,11 @@ clean:
 
 # Run the CLI
 run *ARGS:
-    cargo run -p nv-cli -- {{ARGS}}
+    cargo run -p ct-cli -- {{ARGS}}
 
 # Run doctor command
 doctor:
-    cargo run -p nv-cli -- doctor
+    cargo run -p ct-cli -- doctor
 
 # Watch and rebuild on file changes (requires cargo-watch)
 watch:

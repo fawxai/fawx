@@ -1,8 +1,8 @@
-# Nova Architecture
+# Citros Architecture
 
 ## Overview
 
-Nova is an AI-native phone agent designed across three horizons:
+Citros is an AI-native phone agent designed across three horizons:
 - **Phase 0.5**: Mac Mini pre-PoC (validate cognitive pipeline)
 - **Horizon 1**: Android PoC (Rust daemon on rooted Pixel 8a)
 - **Horizon 2**: AI-Native OS (custom Linux-based operating system)
@@ -12,30 +12,30 @@ This document describes the crate architecture for Phase 0.5 and Horizon 1. For 
 
 ## Workspace Structure
 
-Nova is organized as a Cargo workspace with 12 crates:
+Citros is organized as a Cargo workspace with 12 crates:
 
 ```
-nova/
+citros/
 ├── Cargo.toml                 # Workspace root
 ├── crates/
-│   ├── nv-core/              # [100% reuse] Core types, config, event bus, errors
-│   ├── nv-agent/             # [100% reuse] Agent reasoning loop, orchestrator
-│   ├── nv-llm/               # [100% reuse] LLM provider abstraction (local+cloud)
-│   ├── nv-phone/             # [0% reuse]  Android UI puppeting (PoC only)
-│   ├── nv-phone-sim/         # [Pre-PoC]   Mock phone for testing without hardware
-│   ├── nv-voice/             # [95% reuse]  Voice I/O, STT, TTS, wake word
-│   ├── nv-security/          # [90% reuse]  Capabilities, crypto, policy, audit
-│   ├── nv-skills/            # [100% reuse] WASM skill runtime
-│   ├── nv-sync/              # [100% reuse] Cloud sync client (outbound-only)
-│   ├── nv-storage/           # [100% reuse] Encrypted key-value store
-│   ├── nv-sensors/           # [80% reuse]  Device state monitoring
-│   └── nv-cli/               # [100% reuse] CLI management interface
+│   ├── ct-core/              # [100% reuse] Core types, config, event bus, errors
+│   ├── ct-agent/             # [100% reuse] Agent reasoning loop, orchestrator
+│   ├── ct-llm/               # [100% reuse] LLM provider abstraction (local+cloud)
+│   ├── ct-phone/             # [0% reuse]  Android UI puppeting (PoC only)
+│   ├── ct-phone-sim/         # [Pre-PoC]   Mock phone for testing without hardware
+│   ├── ct-voice/             # [95% reuse]  Voice I/O, STT, TTS, wake word
+│   ├── ct-security/          # [90% reuse]  Capabilities, crypto, policy, audit
+│   ├── ct-skills/            # [100% reuse] WASM skill runtime
+│   ├── ct-sync/              # [100% reuse] Cloud sync client (outbound-only)
+│   ├── ct-storage/           # [100% reuse] Encrypted key-value store
+│   ├── ct-sensors/           # [80% reuse]  Device state monitoring
+│   └── ct-cli/               # [100% reuse] CLI management interface
 └── ffi/                       # (Future) FFI bindings for llama.cpp, whisper.cpp
 ```
 
 ## Crate Responsibilities
 
-### nv-core (100% reuse)
+### ct-core (100% reuse)
 
 **Purpose**: Foundation crate providing types, configuration, and utilities used by all other crates.
 
@@ -47,19 +47,19 @@ nova/
 - `error.rs` - Error taxonomy: `CoreError`, `LlmError`, `StorageError`, `SecurityError`, `SkillError`, `PhoneError`
 
 **Key Traits**:
-- `PhoneActions` - Abstraction for phone control (implemented by `nv-phone` and `nv-phone-sim`)
+- `PhoneActions` - Abstraction for phone control (implemented by `ct-phone` and `ct-phone-sim`)
 
 **Dependencies**: `serde`, `serde_json`, `thiserror`, `tokio`, `tracing`
 
 ---
 
-### nv-agent (100% reuse)
+### ct-agent (100% reuse)
 
 **Purpose**: Core agent logic - orchestrates the perception → cognition → action loop.
 
 **Responsibilities**:
 - Receive user input (voice, text, notification, scheduled)
-- Classify intent (via `nv-llm`)
+- Classify intent (via `ct-llm`)
 - Route to local or cloud LLM based on complexity
 - Generate action plans
 - Execute plans against `PhoneActions` trait
@@ -72,11 +72,11 @@ nova/
 - `executor.rs` - Plan execution with verification
 - `memory.rs` - Conversation history and context management
 
-**Dependencies**: `nv-core`, `tokio`, `tracing`
+**Dependencies**: `ct-core`, `tokio`, `tracing`
 
 ---
 
-### nv-llm (100% reuse)
+### ct-llm (100% reuse)
 
 **Purpose**: LLM provider abstraction for both local (llama.cpp) and cloud (Claude) inference.
 
@@ -87,7 +87,7 @@ nova/
 - `router.rs` - Confidence-based routing between local and cloud
 - `prompts/` - System prompts for intent classification, planning, conversation
 
-**Dependencies**: `nv-core`, `tokio`, `tracing` (+ `reqwest` for cloud, FFI for local)
+**Dependencies**: `ct-core`, `tokio`, `tracing` (+ `reqwest` for cloud, FFI for local)
 
 **Routing Logic**:
 - Simple commands (launch app, settings) → local model (fast, private)
@@ -97,7 +97,7 @@ nova/
 
 ---
 
-### nv-phone (0% reuse - PoC only)
+### ct-phone (0% reuse - PoC only)
 
 **Purpose**: Android-specific phone control via touch injection, screen capture, and accessibility services.
 
@@ -110,11 +110,11 @@ nova/
 - `apps.rs` - App management via `am`/`pm`
 - `gestures.rs` - High-level gestures (tap, swipe, pinch)
 
-**Implements**: `PhoneActions` trait from `nv-core`
+**Implements**: `PhoneActions` trait from `ct-core`
 
 ---
 
-### nv-phone-sim (Pre-PoC only)
+### ct-phone-sim (Pre-PoC only)
 
 **Purpose**: Simulated phone environment for testing the agent without hardware.
 
@@ -125,11 +125,11 @@ nova/
 **Modules**:
 - `lib.rs` - `SimulatedPhone` struct with `PhoneActions` implementation
 
-**Status**: Fully functional for Phase 0.5. Replaced by `nv-phone` in Horizon 1.
+**Status**: Fully functional for Phase 0.5. Replaced by `ct-phone` in Horizon 1.
 
 ---
 
-### nv-voice (95% reuse)
+### ct-voice (95% reuse)
 
 **Purpose**: Voice input (STT, wake word) and output (TTS).
 
@@ -143,7 +143,7 @@ nova/
 
 ---
 
-### nv-security (90% reuse)
+### ct-security (90% reuse)
 
 **Purpose**: Security boundary between agent plans and device execution.
 
@@ -165,7 +165,7 @@ nova/
 
 ---
 
-### nv-skills (100% reuse)
+### ct-skills (100% reuse)
 
 **Purpose**: WASM skill runtime with capability enforcement.
 
@@ -187,7 +187,7 @@ nova/
 
 ---
 
-### nv-sync (100% reuse)
+### ct-sync (100% reuse)
 
 **Purpose**: Cloud sync client for encrypted backups, state sync, and remote command polling.
 
@@ -201,7 +201,7 @@ nova/
 
 ---
 
-### nv-storage (100% reuse)
+### ct-storage (100% reuse)
 
 **Purpose**: Encrypted persistent storage for credentials, conversation history, preferences.
 
@@ -215,7 +215,7 @@ nova/
 
 ---
 
-### nv-sensors (80% reuse)
+### ct-sensors (80% reuse)
 
 **Purpose**: Device state monitoring (notifications, location, connectivity, battery).
 
@@ -230,20 +230,20 @@ nova/
 
 ---
 
-### nv-cli (100% reuse)
+### ct-cli (100% reuse)
 
 **Purpose**: Command-line management interface.
 
 **Commands**:
-- `nova start` / `nova stop` - Daemon control
-- `nova chat` - Interactive REPL
-- `nova doctor` - Diagnostics
-- `nova config show` - Display config
-- `nova skill install/remove/list` - Skill management
-- `nova audit show/verify` - Audit log access
-- `nova sim status/reset` - Simulator control (pre-PoC)
+- `citros start` / `citros stop` - Daemon control
+- `citros chat` - Interactive REPL
+- `citros doctor` - Diagnostics
+- `citros config show` - Display config
+- `citros skill install/remove/list` - Skill management
+- `citros audit show/verify` - Audit log access
+- `citros sim status/reset` - Simulator control (pre-PoC)
 
-**Dependencies**: `nv-core`, `clap`, `tokio`, `tracing`
+**Dependencies**: `ct-core`, `clap`, `tokio`, `tracing`
 
 ---
 
@@ -252,41 +252,41 @@ nova/
 ```
 User Input (voice/text)
    ↓
-nv-agent (orchestrator)
+ct-agent (orchestrator)
    ↓
-nv-llm (intent classification - local or cloud)
+ct-llm (intent classification - local or cloud)
    ↓
-nv-agent (action planning)
+ct-agent (action planning)
    ↓
-nv-security (policy evaluation)
+ct-security (policy evaluation)
    ↓
-nv-agent (execution)
+ct-agent (execution)
    ↓
-nv-phone / nv-phone-sim (PhoneActions trait)
+ct-phone / ct-phone-sim (PhoneActions trait)
    ↓
-Action Result → nv-agent → AgentResponse → User
+Action Result → ct-agent → AgentResponse → User
 ```
 
-All stages publish events to `nv-core::EventBus` for monitoring, logging, and coordination.
+All stages publish events to `ct-core::EventBus` for monitoring, logging, and coordination.
 
 ## Phase 0.5 vs Horizon 1 vs Horizon 2
 
 | Crate | Phase 0.5 (Mac Mini) | Horizon 1 (Android) | Horizon 2 (OS) |
 |-------|---------------------|---------------------|----------------|
-| nv-core | ✓ Full implementation | ✓ Unchanged | ✓ Unchanged |
-| nv-agent | ✓ Full implementation | ✓ Unchanged | ✓ Unchanged |
-| nv-llm | ✓ Full implementation | ✓ Unchanged | ✓ Unchanged |
-| nv-phone | ✗ Not used | ✓ Android-specific | ✗ Replaced by OS APIs |
-| nv-phone-sim | ✓ Used for testing | ✗ Not needed | ✗ Not needed |
-| nv-voice | ✗ Text-only | ✓ Voice I/O | ✓ Minor API updates |
-| nv-security | ✓ Full implementation | ✓ + keystore integration | ✓ + HSM integration |
-| nv-skills | ✓ Full implementation | ✓ Unchanged | ✓ Unchanged |
-| nv-sync | ✓ Full implementation | ✓ Unchanged | ✓ Unchanged |
-| nv-storage | ✓ Full implementation | ✓ Unchanged | ✓ Unchanged |
-| nv-sensors | ✗ Minimal | ✓ Full Android sensors | ✓ OS-native sensors |
-| nv-cli | ✓ Full implementation | ✓ Unchanged | ✓ Unchanged |
+| ct-core | ✓ Full implementation | ✓ Unchanged | ✓ Unchanged |
+| ct-agent | ✓ Full implementation | ✓ Unchanged | ✓ Unchanged |
+| ct-llm | ✓ Full implementation | ✓ Unchanged | ✓ Unchanged |
+| ct-phone | ✗ Not used | ✓ Android-specific | ✗ Replaced by OS APIs |
+| ct-phone-sim | ✓ Used for testing | ✗ Not needed | ✗ Not needed |
+| ct-voice | ✗ Text-only | ✓ Voice I/O | ✓ Minor API updates |
+| ct-security | ✓ Full implementation | ✓ + keystore integration | ✓ + HSM integration |
+| ct-skills | ✓ Full implementation | ✓ Unchanged | ✓ Unchanged |
+| ct-sync | ✓ Full implementation | ✓ Unchanged | ✓ Unchanged |
+| ct-storage | ✓ Full implementation | ✓ Unchanged | ✓ Unchanged |
+| ct-sensors | ✗ Minimal | ✓ Full Android sensors | ✓ OS-native sensors |
+| ct-cli | ✓ Full implementation | ✓ Unchanged | ✓ Unchanged |
 
-**Key Insight**: 85% of the codebase written in Phase 0.5 carries forward to Horizon 1 unchanged. 85% of Horizon 1 carries forward to Horizon 2. Only the phone abstraction layer (`nv-phone`) is disposable.
+**Key Insight**: 85% of the codebase written in Phase 0.5 carries forward to Horizon 1 unchanged. 85% of Horizon 1 carries forward to Horizon 2. Only the phone abstraction layer (`ct-phone`) is disposable.
 
 ## Design Principles
 
@@ -294,7 +294,7 @@ All stages publish events to `nv-core::EventBus` for monitoring, logging, and co
 
 2. **100% reuse crates are architecture-neutral.** They work on macOS, Android, and the future OS without modification.
 
-3. **Security as architecture.** The policy engine (`nv-security`) is a hard boundary that the agent cannot bypass.
+3. **Security as architecture.** The policy engine (`ct-security`) is a hard boundary that the agent cannot bypass.
 
 4. **Local-first intelligence.** Simple tasks run entirely on-device. Cloud is for complex reasoning and backup only.
 

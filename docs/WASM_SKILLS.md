@@ -1,6 +1,6 @@
 # WASM Skills System
 
-Nova's WASM skills system provides a secure, sandboxed environment for extending agent capabilities through WebAssembly modules.
+Citros's WASM skills system provides a secure, sandboxed environment for extending agent capabilities through WebAssembly modules.
 
 ## Architecture
 
@@ -31,12 +31,12 @@ Nova's WASM skills system provides a secure, sandboxed environment for extending
    - Manages execution lifecycle
 
 5. **Registry**
-   - Discovers installed skills from `~/.nova/skills/`
+   - Discovers installed skills from `~/.citros/skills/`
    - Loads skills on demand
    - Provides metadata for agent planning
 
 6. **Cache**
-   - Caches compiled modules at `~/.nova/cache/skills/`
+   - Caches compiled modules at `~/.citros/cache/skills/`
    - Invalidates on WASM file hash change
    - Speeds up repeated skill loads
 
@@ -65,22 +65,22 @@ Capabilities are enforced at runtime. Skills cannot access resources they haven'
 ### Installation
 
 ```bash
-nova skill install path/to/skill-directory
+citros skill install path/to/skill-directory
 # or
-nova skill install path/to/skill.wasm
+citros skill install path/to/skill.wasm
 ```
 
 Installation:
 - Validates manifest
 - Verifies WASM module compiles
-- Copies to `~/.nova/skills/{skill-name}/`
+- Copies to `~/.citros/skills/{skill-name}/`
 - Optionally verifies signature
 
 ### Discovery
 
 The agent automatically discovers installed skills at startup:
 
-1. Registry scans `~/.nova/skills/`
+1. Registry scans `~/.citros/skills/`
 2. Loads all manifests
 3. Converts skills to Claude tool definitions
 4. Includes in planning context
@@ -105,7 +105,7 @@ When the agent invokes a skill:
 name = "calculator"
 version = "1.0.0"
 description = "Evaluates mathematical expressions"
-author = "Nova Team"
+author = "Citros Team"
 api_version = "host_api_v1"
 capabilities = []
 entry_point = "run"
@@ -173,7 +173,7 @@ cargo build --target wasm32-wasi --release
 ### Install
 
 ```bash
-nova skill install target/wasm32-wasi/release/calculator_skill.wasm
+citros skill install target/wasm32-wasi/release/calculator_skill.wasm
 ```
 
 ### Use
@@ -272,7 +272,7 @@ When the agent decides to use a skill:
 ### List Skills
 
 ```bash
-nova skill list
+citros skill list
 ```
 
 Output:
@@ -290,21 +290,21 @@ Installed skills:
 ### Install Skill
 
 ```bash
-nova skill install skills/calculator-skill
-nova skill install skills/calculator-skill/calculator.wasm
+citros skill install skills/calculator-skill
+citros skill install skills/calculator-skill/calculator.wasm
 ```
 
 ### Remove Skill
 
 ```bash
-nova skill remove calculator
+citros skill remove calculator
 ```
 
 ## Performance
 
 ### Module Caching
 
-- Compiled modules cached at `~/.nova/cache/skills/`
+- Compiled modules cached at `~/.citros/cache/skills/`
 - Cache keyed by WASM file SHA-256 hash
 - First load: ~100ms compile time
 - Cached load: ~1ms deserialize time
@@ -335,7 +335,7 @@ nova skill remove calculator
 
 ### Performance Issues
 
-- Clear cache: `rm -rf ~/.nova/cache/skills/`
+- Clear cache: `rm -rf ~/.citros/cache/skills/`
 - Check skill doesn't have infinite loops
 - Profile skill execution time
 - Consider optimizing WASM binary size

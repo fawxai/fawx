@@ -1,6 +1,6 @@
-# Nova Skills
+# Citros Skills
 
-Example WASM skills for the Nova AI agent.
+Example WASM skills for the Citros AI agent.
 
 ## Available Skills
 
@@ -70,11 +70,11 @@ The compiled WASM binary will be at `target/wasm32-wasi/release/weather_skill.wa
 
 ## Installing Skills
 
-Use the Nova CLI to install skills:
+Use the Citros CLI to install skills:
 
 ```bash
-nova skill install skills/weather-skill/weather.wasm
-nova skill install skills/calculator-skill/calculator.wasm
+citros skill install skills/weather-skill/weather.wasm
+citros skill install skills/calculator-skill/calculator.wasm
 ```
 
 ## Manifest Format
@@ -158,8 +158,8 @@ See format above.
 ### 7. Install and test
 
 ```bash
-nova skill install target/wasm32-wasi/release/my_skill.wasm
-nova skill list
+citros skill install target/wasm32-wasi/release/my_skill.wasm
+citros skill list
 ```
 
 ## Host API Reference

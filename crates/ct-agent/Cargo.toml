@@ -1,0 +1,18 @@
+[package]
+name = "ct-agent"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+ct-core.workspace = true
+ct-skills = { path = "../ct-skills" }
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+reqwest.workspace = true
+async-trait.workspace = true
+futures.workspace = true
