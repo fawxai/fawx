@@ -147,7 +147,11 @@ pub struct CacheStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use wasmtime::Engine;
+
+    // Serialize cache tests to prevent races on the shared cache directory
+    static CACHE_LOCK: Mutex<()> = Mutex::new(());
 
     fn create_minimal_wasm() -> Vec<u8> {
         vec![
@@ -170,6 +174,7 @@ mod tests {
 
     #[test]
     fn test_compile_new_module() {
+        let _lock = CACHE_LOCK.lock().unwrap();
         let engine = Engine::default();
         let wasm = create_minimal_wasm();
 
@@ -183,6 +188,7 @@ mod tests {
 
     #[test]
     fn test_compile_cached_module() {
+        let _lock = CACHE_LOCK.lock().unwrap();
         let engine = Engine::default();
         let wasm = create_minimal_wasm();
 
@@ -200,6 +206,7 @@ mod tests {
 
     #[test]
     fn test_has_cached_module() {
+        let _lock = CACHE_LOCK.lock().unwrap();
         let wasm = create_minimal_wasm();
         let engine = Engine::default();
 
@@ -215,6 +222,7 @@ mod tests {
 
     #[test]
     fn test_different_wasm_not_cached() {
+        let _lock = CACHE_LOCK.lock().unwrap();
         let engine = Engine::default();
         let wasm1 = create_minimal_wasm();
 
@@ -232,6 +240,7 @@ mod tests {
 
     #[test]
     fn test_cache_stats() {
+        let _lock = CACHE_LOCK.lock().unwrap();
         let engine = Engine::default();
         let wasm = create_minimal_wasm();
 
@@ -249,6 +258,7 @@ mod tests {
 
     #[test]
     fn test_clear_cache() {
+        let _lock = CACHE_LOCK.lock().unwrap();
         let engine = Engine::default();
         let wasm = create_minimal_wasm();
 
