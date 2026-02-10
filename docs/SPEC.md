@@ -1,4 +1,4 @@
-# Nova: AI-Native Phone Agent
+# Citros: AI-Native Phone Agent
 ## Three-Horizon Product & Technical Specification
 
 **Version**: 0.1 — February 7, 2026
@@ -126,21 +126,21 @@ A Rust daemon that runs on a rooted Android phone (Pixel 10 Pro), controlled by 
 │  │  Perception ──→ Cognition ──→ Action                 │   │
 │  │                                                      │   │
 │  │  ┌────────────┐ ┌────────────┐ ┌──────────────────┐  │   │
-│  │  │ nv-voice   │ │ nv-agent   │ │ nv-phone         │  │   │
+│  │  │ ct-voice   │ │ ct-agent   │ │ ct-phone         │  │   │
 │  │  │ whisper STT│ │ intent     │ │ /dev/input tap   │  │   │
 │  │  │ wake word  │ │ planning   │ │ screencap        │  │   │
 │  │  │ TTS output │ │ memory     │ │ app management   │  │   │
 │  │  └────────────┘ │ skills     │ │ UI tree (a11y)   │  │   │
 │  │                 └────────────┘ └──────────────────┘  │   │
 │  │  ┌────────────┐ ┌────────────┐ ┌──────────────────┐  │   │
-│  │  │ nv-llm     │ │ nv-skills  │ │ nv-security      │  │   │
+│  │  │ ct-llm     │ │ ct-skills  │ │ ct-security      │  │   │
 │  │  │ local:     │ │ WASM       │ │ cap drop         │  │   │
 │  │  │  llama.cpp │ │ runtime    │ │ crypto (ring)    │  │   │
 │  │  │ cloud:     │ │ capability │ │ action policy    │  │   │
 │  │  │  Claude API│ │ enforce    │ │ audit log        │  │   │
 │  │  └────────────┘ └────────────┘ └──────────────────┘  │   │
 │  │  ┌────────────┐ ┌────────────┐ ┌──────────────────┐  │   │
-│  │  │ nv-sync    │ │ nv-storage │ │ nv-sensors       │  │   │
+│  │  │ ct-sync    │ │ ct-storage │ │ ct-sensors       │  │   │
 │  │  │ cloud sync │ │ encrypted  │ │ notif watcher    │  │   │
 │  │  │ backup     │ │ KV store   │ │ location         │  │   │
 │  │  │ outbound   │ │ history    │ │ connectivity     │  │   │
@@ -163,10 +163,10 @@ A Rust daemon that runs on a rooted Android phone (Pixel 10 Pro), controlled by 
 ### 3.4 Crate Architecture
 
 ```
-nova/
+citros/
 ├── Cargo.toml                      # Workspace root
 ├── crates/
-│   ├── nv-core/                    # Types, config, event bus, errors
+│   ├── ct-core/                    # Types, config, event bus, errors
 │   │   ├── src/
 │   │   │   ├── lib.rs
 │   │   │   ├── config.rs           # JSON5 config, serde validation
@@ -176,7 +176,7 @@ nova/
 │   │   │   └── types.rs            # Shared types (ActionPlan, Intent, etc.)
 │   │   └── Cargo.toml
 │   │
-│   ├── nv-agent/                   # Agent reasoning loop
+│   ├── ct-agent/                   # Agent reasoning loop
 │   │   ├── src/
 │   │   │   ├── lib.rs
 │   │   │   ├── orchestrator.rs     # Main perception→cognition→action loop
@@ -187,7 +187,7 @@ nova/
 │   │   │   └── feedback.rs         # User feedback protocol (audio/visual)
 │   │   └── Cargo.toml
 │   │
-│   ├── nv-llm/                     # LLM provider abstraction
+│   ├── ct-llm/                     # LLM provider abstraction
 │   │   ├── src/
 │   │   │   ├── lib.rs
 │   │   │   ├── traits.rs           # Provider trait definition
@@ -200,7 +200,7 @@ nova/
 │   │   │       └── conversation.txt
 │   │   └── Cargo.toml
 │   │
-│   ├── nv-phone/                   # Android puppeting (Horizon 1 only)
+│   ├── ct-phone/                   # Android puppeting (Horizon 1 only)
 │   │   ├── src/
 │   │   │   ├── lib.rs
 │   │   │   ├── input.rs            # /dev/input touch injection
@@ -211,7 +211,7 @@ nova/
 │   │   │   └── android_ipc.rs      # Unix socket IPC with companion app
 │   │   └── Cargo.toml
 │   │
-│   ├── nv-voice/                   # Voice I/O
+│   ├── ct-voice/                   # Voice I/O
 │   │   ├── src/
 │   │   │   ├── lib.rs
 │   │   │   ├── wake_word.rs        # Porcupine integration
@@ -220,7 +220,7 @@ nova/
 │   │   │   └── audio.rs            # Audio capture/playback (CPAL / Android)
 │   │   └── Cargo.toml
 │   │
-│   ├── nv-security/                # Security subsystem
+│   ├── ct-security/                # Security subsystem
 │   │   ├── src/
 │   │   │   ├── lib.rs
 │   │   │   ├── capabilities.rs     # Linux cap drop, privilege management
@@ -232,7 +232,7 @@ nova/
 │   │   │   └── verify.rs           # Skill signature verification
 │   │   └── Cargo.toml
 │   │
-│   ├── nv-skills/                  # WASM skill runtime
+│   ├── ct-skills/                  # WASM skill runtime
 │   │   ├── src/
 │   │   │   ├── lib.rs
 │   │   │   ├── runtime.rs          # wasmtime host, instance management
@@ -242,7 +242,7 @@ nova/
 │   │   │   └── manifest.rs         # Skill manifest format
 │   │   └── Cargo.toml
 │   │
-│   ├── nv-sync/                    # Cloud sync client
+│   ├── ct-sync/                    # Cloud sync client
 │   │   ├── src/
 │   │   │   ├── lib.rs
 │   │   │   ├── client.rs           # Outbound HTTPS to cloud instance
@@ -251,7 +251,7 @@ nova/
 │   │   │   └── skill_updates.rs    # OTA skill update checks
 │   │   └── Cargo.toml
 │   │
-│   ├── nv-storage/                 # Persistent encrypted storage
+│   ├── ct-storage/                 # Persistent encrypted storage
 │   │   ├── src/
 │   │   │   ├── lib.rs
 │   │   │   ├── kv.rs               # redb key-value store
@@ -260,7 +260,7 @@ nova/
 │   │   │   └── preferences.rs      # User preferences and patterns
 │   │   └── Cargo.toml
 │   │
-│   ├── nv-sensors/                 # Device state monitoring
+│   ├── ct-sensors/                 # Device state monitoring
 │   │   ├── src/
 │   │   │   ├── lib.rs
 │   │   │   ├── notifications.rs    # Notification watcher
@@ -270,7 +270,7 @@ nova/
 │   │   │   └── triggers.rs         # Event-based trigger engine
 │   │   └── Cargo.toml
 │   │
-│   └── nv-cli/                     # CLI for management
+│   └── ct-cli/                     # CLI for management
 │       ├── src/
 │       │   ├── main.rs             # Entry point (clap)
 │       │   ├── daemon.rs           # Start/stop daemon
@@ -288,7 +288,7 @@ nova/
 │   └── android/                    # Companion app (Kotlin/Compose)
 │       ├── app/src/main/
 │       │   ├── AndroidManifest.xml
-│       │   └── java/com/nova/
+│       │   └── java/ai/citros/
 │       │       ├── MainActivity.kt
 │       │       ├── service/
 │       │       │   ├── DaemonHostService.kt    # Foreground service, wake lock
@@ -331,12 +331,12 @@ The Kotlin companion app hosts all of these and pipes data to the Rust daemon ov
 ```
 init (PID 1)
 ├── zygote → Android framework
-│   └── com.nova.app (companion app)
+│   └── ai.citros.app (companion app)
 │       ├── DaemonHostService (foreground service, holds wake lock)
 │       ├── AgentAccessibility (accessibility service)
 │       └── NotificationListener
 │
-└── nova-daemon (Rust binary, launched by init.d or Magisk service)
+└── citros-daemon (Rust binary, launched by init.d or Magisk service)
     ├── Agent thread (tokio runtime, main logic)
     ├── LLM inference thread (CPU-bound, separate from async runtime)
     ├── Voice listener thread (audio capture → wake word → STT)
@@ -444,11 +444,11 @@ Push notification alternative (for low-latency remote commands):
 
 #### 3.5.6 Key Agent (Credential Broker)
 
-API keys are the most sensitive data Nova handles. The Key Agent isolates them from the main daemon using the same pattern as `ssh-agent`:
+API keys are the most sensitive data Citros handles. The Key Agent isolates them from the main daemon using the same pattern as `ssh-agent`:
 
 ```
 ┌─────────────────────┐     ┌──────────────────────┐
-│   Nova Daemon        │     │   Key Agent           │
+│   Citros Daemon        │     │   Key Agent           │
 │                      │     │   (separate process)  │
 │  LLM routing         │     │                       │
 │  Prompt building ──────────→ "send this prompt     │
@@ -475,11 +475,11 @@ API keys are the most sensitive data Nova handles. The Key Agent isolates them f
 
 #### 3.5.7 LLM Provider Architecture
 
-Nova defines its own LLM interface. Providers adapt to Nova, not the other way around.
+Citros defines its own LLM interface. Providers adapt to Citros, not the other way around.
 
 ```
                     ┌─────────────────┐
-                    │  Nova LLM Trait  │
+                    │  Citros LLM Trait  │
                     │                  │
                     │  generate()      │
                     │  stream()        │
@@ -506,7 +506,7 @@ Nova defines its own LLM interface. Providers adapt to Nova, not the other way a
 - **Capability-based routing:** Provider declares supported modalities (text, vision, voice, audio) and features (streaming, tool use, max context). Routing layer picks provider per request type.
 - **Mix-and-match:** User can set Claude for text reasoning, OpenAI for voice/TTS, local for intent classification. Or use one provider for everything.
 - **Graceful fallback:** If primary provider fails, route to next capable provider. Local model is always-available fallback for basic tasks.
-- **Adding a provider** means writing one adapter file. Zero changes to Nova core.
+- **Adding a provider** means writing one adapter file. Zero changes to Citros core.
 
 #### 3.5.8 Graceful Degradation
 
@@ -531,14 +531,14 @@ The system must handle failure at every level:
 
 **Deliverables:**
 - Cargo workspace with all 11 crates stubbed
-- nv-core: config loading (JSON5), internal message types, event bus, error types
-- nv-cli: `nova start`, `nova config show`, `nova doctor`
+- ct-core: config loading (JSON5), internal message types, event bus, error types
+- ct-cli: `citros start`, `citros config show`, `citros doctor`
 - ffi/llama-cpp-sys: builds and links against vendored llama.cpp for aarch64-android
 - ffi/whisper-cpp-sys: builds and links for aarch64-android
 - CI pipeline: cross-compilation for x86_64-unknown-linux-gnu and aarch64-linux-android
 - Binary deploys to phone via ADB and runs in shell
 
-**Milestone**: `adb push nova /data/local/tmp/ && adb shell /data/local/tmp/nova doctor` prints system info.
+**Milestone**: `adb push citros /data/local/tmp/ && adb shell /data/local/tmp/citros doctor` prints system info.
 
 **Hurdles & Blind Spots:**
 
@@ -554,20 +554,20 @@ The following is a snapshot of what exists versus what is planned, to set realis
 
 **Implemented (Epics 1-8):**
 - Cargo workspace with 12 crates, CI pipeline (format, clippy, check, test)
-- nv-core: config loading, event bus, internal types, error hierarchy
-- nv-llm: local model stub (llama.cpp integration not yet functional), Claude API client with streaming/tool use, confidence-based routing with fallback
-- nv-security: encrypted KV store (redb + AES-256-GCM), audit log with HMAC-SHA256 hash chain, intent classification (regex + LLM hybrid), policy engine with rules/capabilities/rate limiting
-- nv-skills: WASM runtime (wasmtime), capability enforcement at host boundary, module compilation + caching, skill loader/registry/installer with signature verification, async skill execution
-- nv-cli: `nova doctor`, `nova config show`, `nova audit` commands
+- ct-core: config loading, event bus, internal types, error hierarchy
+- ct-llm: local model stub (llama.cpp integration not yet functional), Claude API client with streaming/tool use, confidence-based routing with fallback
+- ct-security: encrypted KV store (redb + AES-256-GCM), audit log with HMAC-SHA256 hash chain, intent classification (regex + LLM hybrid), policy engine with rules/capabilities/rate limiting
+- ct-skills: WASM runtime (wasmtime), capability enforcement at host boundary, module compilation + caching, skill loader/registry/installer with signature verification, async skill execution
+- ct-cli: `citros doctor`, `citros config show`, `citros audit` commands
 - 400+ tests across all crates
 
 **Not yet functional (stubs/placeholders):**
-- `Agent::process` (nv-agent) — core orchestrator loop is `todo!()`
-- `PhoneActions` trait (nv-phone) — all methods are `todo!()`
-- `LocalModel::generate` (nv-llm) — returns error, llama.cpp FFI build is stub
-- `invoke_skill_async` (nv-skills) — returns placeholder output
+- `Agent::process` (ct-agent) — core orchestrator loop is `todo!()`
+- `PhoneActions` trait (ct-phone) — all methods are `todo!()`
+- `LocalModel::generate` (ct-llm) — returns error, llama.cpp FFI build is stub
+- `invoke_skill_async` (ct-skills) — returns placeholder output
 - CLI `start`/`stop`/chat commands — placeholder
-- nv-voice, nv-sensors, nv-sync — not started
+- ct-voice, ct-sensors, ct-sync — not started
 
 **Security gaps requiring hardening before production paths:**
 - Skill signature verification exists but is not mandatory — callers can pass `signature: None`
@@ -592,28 +592,28 @@ The following is a snapshot of what exists versus what is planned, to set realis
 - `cargo test` passes with `--strict` enabled in all integration tests
 - No `todo!()` in any security-critical path (loader, policy eval, audit open/query)
 - Time-based policy rules have integration tests proving they fire correctly
-- `nova doctor` reports signature enforcement status
+- `citros doctor` reports signature enforcement status
 
-**Milestone**: `nova doctor --strict` passes all security checks. Unsigned skill install is rejected. Unsigned policy load fails. Audit chain corruption is detected on open.
+**Milestone**: `citros doctor --strict` passes all security checks. Unsigned skill install is rejected. Unsigned policy load fails. Audit chain corruption is detected on open.
 
 ---
 
 #### Phase 1: The Agent Can Think (Weeks 4-8)
 
 **Deliverables:**
-- nv-llm (local): llama.cpp integration, load Gemma 3n (1.7B), intent classification
-- nv-llm (cloud): Claude API client with streaming and tool use
-- nv-llm (router): confidence-based routing — local for simple, cloud for complex
-- nv-agent: core orchestrator loop (receive → classify → route → plan → respond)
-- nv-storage: encrypted KV store (redb + ring AES-256-GCM)
-- nv-security: capability dropping after init, basic audit log
-- nv-cli: `nova chat` — interactive text chat via CLI over ADB
+- ct-llm (local): llama.cpp integration, load Gemma 3n (1.7B), intent classification
+- ct-llm (cloud): Claude API client with streaming and tool use
+- ct-llm (router): confidence-based routing — local for simple, cloud for complex
+- ct-agent: core orchestrator loop (receive → classify → route → plan → respond)
+- ct-storage: encrypted KV store (redb + ring AES-256-GCM)
+- ct-security: capability dropping after init, basic audit log
+- ct-cli: `citros chat` — interactive text chat via CLI over ADB
 
 **Milestone**: ADB shell, type "what time is it in Tokyo," get a response from local LLM. Type "plan a three-day trip to Kyoto," get a response from Claude.
 
 **Hurdles & Blind Spots:**
 
-- **Model loading time.** First-time mmap of a 1.5GB model file on eMMC/UFS storage takes 2-5 seconds. Subsequent loads from page cache are near-instant, but after a phone restart or memory pressure event, the cache is cold. The user says "hey nova" and waits 5 seconds before anything happens. *Mitigation*: Keep a tiny model (< 200MB) always resident for instant intent classification. Load the larger model on-demand and in the background after wake word detection. Provide immediate audio feedback ("I'm thinking...") before the model is ready.
+- **Model loading time.** First-time mmap of a 1.5GB model file on eMMC/UFS storage takes 2-5 seconds. Subsequent loads from page cache are near-instant, but after a phone restart or memory pressure event, the cache is cold. The user says "hey citros" and waits 5 seconds before anything happens. *Mitigation*: Keep a tiny model (< 200MB) always resident for instant intent classification. Load the larger model on-demand and in the background after wake word detection. Provide immediate audio feedback ("I'm thinking...") before the model is ready.
 
 - **Quantization quality.** Q4_K_M quantization at 1.7B parameters loses meaningful capability versus the full-precision model. Intent classification accuracy may drop from 95% to 85%, causing more misroutes. *Mitigation*: Build a test suite of 200+ intent classification examples. Benchmark accuracy at different quantization levels. If Q4 isn't good enough, try Q5 or Q6 (larger but more accurate) or use a different architecture (Qwen3-1.7B may classify better than Gemma 3n at the same size).
 
@@ -624,10 +624,10 @@ The following is a snapshot of what exists versus what is planned, to set realis
 #### Phase 2: The Agent Can Act (Weeks 9-14)
 
 **Deliverables:**
-- nv-phone: touch injection via /dev/input, screen capture, UI tree reading
-- nv-voice: whisper.cpp STT (+ Android SpeechRecognizer fallback), Porcupine wake word, TTS
-- nv-agent: action execution loop with screenshot verification
-- nv-security: full action policy engine with confirm/deny/allow rules
+- ct-phone: touch injection via /dev/input, screen capture, UI tree reading
+- ct-voice: whisper.cpp STT (+ Android SpeechRecognizer fallback), Porcupine wake word, TTS
+- ct-agent: action execution loop with screenshot verification
+- ct-security: full action policy engine with confirm/deny/allow rules
 - Android companion app: foreground service, accessibility service, overlay bubble, notification listener
 - Integration: voice command → STT → intent → plan → execute → TTS response
 
@@ -650,10 +650,10 @@ The following is a snapshot of what exists versus what is planned, to set realis
 #### Phase 3: The Agent Can Learn (Weeks 15-20)
 
 **Deliverables:**
-- nv-skills: WASM runtime (wasmtime), full capability enforcement
+- ct-skills: WASM runtime (wasmtime), full capability enforcement
 - Hub server: private skill registry, signature verification, static analysis
 - Built-in skills: weather, reminders, contacts, calendar, web search, file management, calculator, unit conversion, timer
-- nv-sync: encrypted cloud backup, state sync, OTA skill pulls, remote command queue
+- ct-sync: encrypted cloud backup, state sync, OTA skill pulls, remote command queue
 - Skill authoring toolchain: cargo template, capability manifest, build-and-sign script
 
 **Milestone**: Install a signed third-party skill (from your hub), agent uses it autonomously based on context. Conversation history syncs to cloud encrypted. Remote command from SSH is picked up and executed by phone.
@@ -662,9 +662,9 @@ The following is a snapshot of what exists versus what is planned, to set realis
 
 - **wasmtime binary size.** wasmtime adds ~10-15MB to the final binary. On a phone with 128GB+ storage this isn't a problem, but it's worth knowing. There are lighter alternatives (wasmi, wasm3) that are smaller but slower and lack some features (WASI support, async host functions). *Mitigation*: Start with wasmtime. If size is a concern, evaluate wasmi for skills that don't need high performance.
 
-- **Skill debugging is painful.** When a WASM skill fails, the error is typically an opaque trap with a memory address. Mapping that back to source code requires DWARF debug info in the WASM, which not all languages emit cleanly. Skill authors need a good development experience or nobody will write skills. *Mitigation*: Ship a `nova skill dev` command that runs skills locally on the Mac/PC with full debugging, logging, and capability simulation. The phone runtime is production; the dev loop happens on a desktop.
+- **Skill debugging is painful.** When a WASM skill fails, the error is typically an opaque trap with a memory address. Mapping that back to source code requires DWARF debug info in the WASM, which not all languages emit cleanly. Skill authors need a good development experience or nobody will write skills. *Mitigation*: Ship a `citros skill dev` command that runs skills locally on the Mac/PC with full debugging, logging, and capability simulation. The phone runtime is production; the dev loop happens on a desktop.
 
-- **Signed skill bootstrapping.** You need a key management story. Who generates keys? Where are public keys stored? How does the phone know which keys to trust? If you lose your signing key, can you still update skills? *Mitigation*: Ed25519 key pair generated during `nova setup`. Public key embedded in the daemon's config (signed config file). Private key stored in the cloud instance's encrypted storage. Skill signing happens on the cloud instance or on a trusted development machine. Device trusts keys in its config. Adding a new trusted key requires re-signing the config with an existing trusted key. Emergency recovery: if all keys lost, factory reset + re-setup (the nuclear option, but honest about the tradeoff).
+- **Signed skill bootstrapping.** You need a key management story. Who generates keys? Where are public keys stored? How does the phone know which keys to trust? If you lose your signing key, can you still update skills? *Mitigation*: Ed25519 key pair generated during `citros setup`. Public key embedded in the daemon's config (signed config file). Private key stored in the cloud instance's encrypted storage. Skill signing happens on the cloud instance or on a trusted development machine. Device trusts keys in its config. Adding a new trusted key requires re-signing the config with an existing trusted key. Emergency recovery: if all keys lost, factory reset + re-setup (the nuclear option, but honest about the tradeoff).
 
 - **Built-in skills need to interact with Android apps.** The "contacts" skill needs to read the phone's contacts database. On Android, this is a content provider (content://com.android.contacts). Accessing it from a Rust daemon requires either: (a) calling Android framework APIs via JNI, (b) reading the SQLite database directly (possible with root, but fragile across Android versions), or (c) having the companion app serve as a bridge (query content provider, pipe results to daemon). *Mitigation*: Option (c) for the PoC. The companion app exposes a local API that the daemon can call for Android-specific data (contacts, calendar, media store). This is PoC-specific scaffolding that goes away in Horizon 2 where services access data directly.
 
@@ -673,7 +673,7 @@ The following is a snapshot of what exists versus what is planned, to set realis
 #### Phase 4: The Agent Is Autonomous (Weeks 21-26)
 
 **Deliverables:**
-- nv-sensors: full notification watcher with intent analysis, trigger engine for scheduled + event-based actions
+- ct-sensors: full notification watcher with intent analysis, trigger engine for scheduled + event-based actions
 - Proactive behaviors: calendar awareness, commute timing, message summaries, daily briefing
 - Multi-step execution with verification loops (act → screenshot → analyze → adjust)
 - Memory system: long-term preferences, learned patterns, behavioral adaptation
@@ -701,7 +701,7 @@ The following is a snapshot of what exists versus what is planned, to set realis
 The PoC runs on top of Android, puppeting its UI. The OS *replaces* Android's userspace while keeping the Linux kernel and hardware abstraction layer.
 
 ```
-Android stack:                    NovaOS stack:
+Android stack:                    CitrosOS stack:
 ┌──────────────┐                 ┌──────────────┐
 │ Apps (APKs)  │                 │ WASM Services│  ← Skills become services
 ├──────────────┤                 ├──────────────┤
@@ -721,16 +721,16 @@ Android stack:                    NovaOS stack:
 
 | PoC Crate | OS Role | Changes Needed |
 |---|---|---|
-| nv-core | System core types | None — OS-agnostic |
-| nv-agent | System agent | Swap "phone puppeting" for "service orchestration" |
-| nv-llm | System LLM engine | Swap Android audio path for ALSA/PipeWire |
-| nv-security | System security | Direct HSM access instead of JNI bridge |
-| nv-skills | Service runtime | Promoted from "plugins" to "the app model" |
-| nv-storage | System storage | Direct filesystem instead of Android storage |
-| nv-sync | System sync | Unchanged |
-| nv-voice | System voice | Swap Android audio for ALSA/PipeWire |
-| nv-phone | **Deleted** | No more UI puppeting — agent calls services directly |
-| nv-sensors | System sensors | Direct sysfs/HAL access instead of Android APIs |
+| ct-core | System core types | None — OS-agnostic |
+| ct-agent | System agent | Swap "phone puppeting" for "service orchestration" |
+| ct-llm | System LLM engine | Swap Android audio path for ALSA/PipeWire |
+| ct-security | System security | Direct HSM access instead of JNI bridge |
+| ct-skills | Service runtime | Promoted from "plugins" to "the app model" |
+| ct-storage | System storage | Direct filesystem instead of Android storage |
+| ct-sync | System sync | Unchanged |
+| ct-voice | System voice | Swap Android audio for ALSA/PipeWire |
+| ct-phone | **Deleted** | No more UI puppeting — agent calls services directly |
+| ct-sensors | System sensors | Direct sysfs/HAL access instead of Android APIs |
 | Android app | **Deleted** | Replaced by native compositor |
 
 ### 4.3 New Components Needed
@@ -936,7 +936,7 @@ Decisions that have been made, with rationale, to avoid revisiting them.
 | 15 | Hardening phase before production paths | Security primitives exist (Epics 1-8) but aren't mandatory. Adding features on top of optional security creates tech debt. Harden first, then build. | All enforcement gaps are closed and we're confident in the defaults |
 | 16 | Dual-tier distribution: non-root (standard) + root (pro) | Non-root covers 90% of capability via Accessibility Service. Root unlocks /dev/input, screen capture, SELinux mods. Sideload SaaS, no Play Store dependency — avoids policy risk and 30% cut. | Play Store policy becomes favorable, or root becomes mainstream |
 | 17 | User-selected cloud LLM as primary driver | Users BYOK (OpenRouter/Claude/ChatGPT). Local model is fallback/offline/intent classification. Cloud models are dramatically more capable — don't handicap the product by forcing local-only. Managed proxy option for users who don't want API keys. | Local models become good enough for complex reasoning (years away) |
-| 18 | Unified LLM provider trait with multimodal capabilities | Nova defines its own interface; adapters translate per-provider. Each provider declares capabilities by modality (text/vision/voice). No LocalModel vs CloudModel split — local is just another provider. Future-proofs for any new provider or modality. | A provider requires fundamentally different interaction patterns that can't be adapted |
+| 18 | Unified LLM provider trait with multimodal capabilities | Citros defines its own interface; adapters translate per-provider. Each provider declares capabilities by modality (text/vision/voice). No LocalModel vs CloudModel split — local is just another provider. Future-proofs for any new provider or modality. | A provider requires fundamentally different interaction patterns that can't be adapted |
 | 19 | API keys encrypted on-device, never in LLM context | Keys decrypted only in HTTP adapter layer, injected as auth headers. LLM prompt/context never contains keys. Separate code paths for credentials and inference. Marketable security guarantee. | Hardware secure enclave becomes accessible from Rust (then move keys there) |
 | 20 | Key Agent process design (ssh-agent pattern) | Design IPC interface now for a separate credential broker process. Daemon proxies API calls through key agent, never holds plaintext keys. Process isolation is OS-enforced — even memory exploits in the daemon can't reach keys. Build same-process module first, split to separate process when ready. | Performance profiling shows IPC overhead is unacceptable (unlikely — ~0.1ms vs network RTT) |
 | 21 | Provider capability matrix for routing | Each provider declares: streaming, tool use, vision, voice, max context, etc. Routing layer picks best provider per modality. Users can mix-and-match (Claude for text, OpenAI for voice, local for classification). | All providers converge to identical capabilities (unlikely) |

@@ -1,7 +1,7 @@
 name = "calculator"
 version = "1.0.0"
 description = "Evaluates simple mathematical expressions (supports +, -, *, /)"
-author = "Nova Team"
+author = "Citros Team"
 api_version = "host_api_v1"
 capabilities = []
 entry_point = "run"

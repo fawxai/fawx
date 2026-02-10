@@ -1,16 +1,16 @@
 [workspace]
 members = [
-    "crates/nv-core",
-    "crates/nv-agent",
-    "crates/nv-llm",
-    "crates/nv-phone",
-    "crates/nv-voice",
-    "crates/nv-security",
-    "crates/nv-skills",
-    "crates/nv-sync",
-    "crates/nv-storage",
-    "crates/nv-sensors",
-    "crates/nv-cli",
+    "crates/ct-core",
+    "crates/ct-agent",
+    "crates/ct-llm",
+    "crates/ct-phone",
+    "crates/ct-voice",
+    "crates/ct-security",
+    "crates/ct-skills",
+    "crates/ct-sync",
+    "crates/ct-storage",
+    "crates/ct-sensors",
+    "crates/ct-cli",
     "ffi/llama-cpp-sys",
 ]
 resolver = "2"
@@ -61,8 +61,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 futures = "0.3"
 
 # Shared crates
-nv-core = { path = "crates/nv-core" }
-nv-agent = { path = "crates/nv-agent" }
-nv-security = { path = "crates/nv-security" }
-nv-skills = { path = "crates/nv-skills" }
-nv-storage = { path = "crates/nv-storage" }
+ct-core = { path = "crates/ct-core" }
+ct-agent = { path = "crates/ct-agent" }
+ct-security = { path = "crates/ct-security" }
+ct-skills = { path = "crates/ct-skills" }
+ct-storage = { path = "crates/ct-storage" }

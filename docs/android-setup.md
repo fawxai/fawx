@@ -101,7 +101,7 @@ cargo test --target aarch64-linux-android
 - May need to set `BINDGEN_EXTRA_CLANG_ARGS` for bindgen crates
 
 ### API Level Mismatch
-- Nova targets API 33 (Android 13) minimum
+- Citros targets API 33 (Android 13) minimum
 - Adjust `CC_aarch64_linux_android` to match your NDK version:
   - NDK r26 → `aarch64-linux-android33-clang`
   - NDK r25 → `aarch64-linux-android32-clang`

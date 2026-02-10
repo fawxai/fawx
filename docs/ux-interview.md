@@ -1,4 +1,4 @@
-# Nova UX Interview — In Progress
+# Citros UX Interview — In Progress
 
 *Started 2026-02-08. Joe is defining the UX vision through structured Q&A.*
 
@@ -10,25 +10,25 @@ The spec treats UI as infrastructure — "overlay bubble," "quick settings tile,
 
 For a product whose entire thesis is reinventing how humans interact with phones, the interaction design needs its own specs:
 - `horizon1-UX-spec.md` — Android PoC experience design
-- `horizon2-UX-spec.md` — NovaOS experience design
+- `horizon2-UX-spec.md` — CitrosOS experience design
 
 These will feed into UI mocks for marketing and actual implementation.
 
 ---
 
-## Topic 1: Nova's Personality ✅ ANSWERED
+## Topic 1: Citros's Personality ✅ ANSWERED
 
 **Q1-Q3: Voice, vibe, verbosity**
-> **Joe's decision:** These are NOT pre-set. They are decided through an **interview during the user onboarding flow**. The user shapes Nova's personality in their first interaction — building a relationship before they've even used the product.
+> **Joe's decision:** These are NOT pre-set. They are decided through an **interview during the user onboarding flow**. The user shapes Citros's personality in their first interaction — building a relationship before they've even used the product.
 
 **Q4: Visual identity**
-> **Joe's decision:** Nova's icon is based on a **supernova** image (reference: `docs/assets/supernova-reference.jpg`). During onboarding, the user selects from a set of colors, and their choice determines the color tint of the supernova icon. This makes Nova visually personal from the start.
+> **Joe's decision:** Citros's icon is based on a **PLACEHOLDER_SUPERCITROS** image (reference: `docs/assets/PLACEHOLDER_SUPERCITROS-reference.jpg`). During onboarding, the user selects from a set of colors, and their choice determines the color tint of the PLACEHOLDER_SUPERCITROS icon. This makes Citros visually personal from the start.
 
 ### Design implications:
 - Onboarding flow must include personality interview (voice character, verbosity level, vibe)
-- Onboarding must include color picker that tints the supernova icon
+- Onboarding must include color picker that tints the PLACEHOLDER_SUPERCITROS icon
 - All UI elements (bubble, overlay, confirmation dialogs) inherit the user's chosen color
-- The supernova icon is the universal symbol for Nova across all states
+- The PLACEHOLDER_SUPERCITROS icon is the universal symbol for Citros across all states
 
 ---
 
@@ -39,7 +39,7 @@ These will feed into UI mocks for marketing and actual implementation.
 - **Idle** — Small orb, pitch black, slight shine (obsidian-like). Out of the way, not distracting. Haptic feedback on tap.
 - **Listening** — Black orb transforms into small glowing star, shifts into user's chosen colorway. Text interface bubble appears on screen for typing.
 - **Thinking** — Swirling, spinning. Inner glow pulsating.
-- **Acting** — Context-dependent visualization (see Q3). Haptic feedback on a rhythm to indicate Nova is actively working.
+- **Acting** — Context-dependent visualization (see Q3). Haptic feedback on a rhythm to indicate Citros is actively working.
 - **Waiting for confirmation** — Slow brightness oscillation (high/low), spending more time at peak and trough, with higher/lower magnitude brightness. Haptic tap every 2 seconds.
 - **Error** — Shaking in all directions (not spinning). Red. Tap to see error text. If voice mode on, tapping plays answer aloud.
 
@@ -51,20 +51,20 @@ These will feed into UI mocks for marketing and actual implementation.
 - Dismiss by **tap-hold-drag to corner/margin**
 - Simple tap = haptic acknowledgment only, does NOT wake
 
-### Q3: When Nova acts on your phone
+### Q3: When Citros acts on your phone
 
-Three modes, context-dependent. Nova auto-selects defaults, user can change in onboarding and settings:
+Three modes, context-dependent. Citros auto-selects defaults, user can change in onboarding and settings:
 
 1. **Narrated overlay** — opt-in, off by default. Real-time text describing actions.
 2. **PiP preview** — for background tasks or API calls. Small window showing plan summary.
-3. **Highlighted touches** — for on-screen app interactions. Nova hovers over tap targets, visual ripples at touch points, haptic feedback at each "tap" or as letters/words are entered.
+3. **Highlighted touches** — for on-screen app interactions. Citros hovers over tap targets, visual ripples at touch points, haptic feedback at each "tap" or as letters/words are entered.
 
 In all cases, user can opt in or out of specific settings.
 
 ### Q4: Follow-up answers
 
 - **Text interface bubble** appears at same location as idle orb but larger
-- **Interruption** — touch and hold anywhere on screen for 2 seconds → Nova stops
+- **Interruption** — touch and hold anywhere on screen for 2 seconds → Citros stops
 - Tap-hold is primary wake gesture; 3D press is bonus on supported devices
 
 ### Design output
@@ -76,10 +76,10 @@ In all cases, user can opt in or out of specific settings.
 
 ### Permission Tiers
 Four tiers, selected during mandatory onboarding, editable in settings:
-1. **Full control** — Nova asks before everything
+1. **Full control** — Citros asks before everything
 2. **External + destructive** — asks before sending messages/emails/tweets, deleting (recommended default)
 3. **Financial + destructive only** — asks before purchases, finances, file deletion
-4. **Autonomous** — Nova never asks (expert mode)
+4. **Autonomous** — Citros never asks (expert mode)
 
 Default tier decided during onboarding.
 
@@ -89,7 +89,7 @@ Default tier decided during onboarding.
 - Both one-by-one AND approve-all for batch actions
 
 ### Timeout
-- 60 seconds → Nova goes idle
+- 60 seconds → Citros goes idle
 - Pending action saved in prompt window with "Do you still want me to..."
 - Idle orb shows faint colored ring indicating pending action
 
@@ -113,7 +113,7 @@ Screen-off bumps up one tier (moderate → speaks).
 
 ### Key decisions
 - Spoken phrases are **AI-generated in real-time** (not pre-recorded)
-- Personality and context determine what Nova says
+- Personality and context determine what Citros says
 - Same cascade applies to all sound events (wake, complete, error, confirm)
 - Specific tones/sounds to be decided later
 
@@ -134,7 +134,7 @@ Screen-off bumps up one tier (moderate → speaks).
 
 ---
 
-## Topic 6: Horizon 2 — NovaOS Modes — DEFERRED
+## Topic 6: Horizon 2 — CitrosOS Modes — DEFERRED
 
 *Joe wants to think more before committing. "I'm tempted to keep it
 the same for horizon 2 as we have it in 1, but it should have a
@@ -144,7 +144,7 @@ different vibe. I'm not sure I'm ready to make these choices yet."*
 - **Ambient mode**: What does the screen show when you're not actively using it?
 - **Active mode**: What triggers the transition from ambient?
 - **Immersive mode**: Full agent interaction — what's the layout?
-- **Review mode**: Looking at what Nova did while you were away
+- **Review mode**: Looking at what Citros did while you were away
 - Transitions between modes — gestures, animations
 - The "awareness surface" concept
 
@@ -156,4 +156,4 @@ different vibe. I'm not sure I'm ready to make these choices yet."*
 - Which states/moments are most compelling for marketing visuals?
 - Do we need a "hero shot" of the bubble on a real phone screen?
 - Video demo: real device footage or animated mockup?
-- What's the one screenshot that sells Nova?
+- What's the one screenshot that sells Citros?
