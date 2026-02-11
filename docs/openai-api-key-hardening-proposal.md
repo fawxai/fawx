@@ -1,7 +1,7 @@
 # OpenAI API Key Hardening and Reliability Proposal (Android)
 
-Status: Proposal  
-Owner: Citros Android  
+Status: Proposal
+Owner: Citros Android
 Last updated: 2026-02-11
 
 ## 1. Context
@@ -34,14 +34,19 @@ Given current platform constraints, the most reliable path for production usage 
 
 Implement encrypted local credential storage for OpenAI keys/tokens.
 
-- Add `CredentialVault` abstraction in Android app layer.
-- Generate per-install AES key via Android Keystore (`KeyGenParameterSpec`, AES/GCM, `PURPOSE_ENCRYPT|DECRYPT`).
+- Add `CredentialVault` abstraction in Android app layer (Kotlin `:chat` or `:core` module, using Android Keystore APIs — not Rust daemon; credentials stay in the Android security sandbox).
+- Generate per-install AES key via Android Keystore (`KeyGenParameterSpec`, AES/GCM/NoPadding, 256-bit key, 128-bit authentication tag, `PURPOSE_ENCRYPT|DECRYPT`).
 - Store encrypted blob + IV + metadata in SharedPreferences (or DataStore).
 - Keep plaintext key only in memory for active session, never logged.
 - Add migration:
   - Read legacy `cloud_token` plaintext once.
   - Encrypt into vault format.
   - Delete plaintext key from prefs after successful write.
+- Key rotation / invalidation handling:
+  - Detect Keystore key invalidation via `KeyPermanentlyInvalidatedException` (e.g., after factory reset recovery, lockscreen removal on some OEMs)
+  - On invalidation: prompt user to re-enter credential
+  - Generate new AES key and re-encrypt
+  - Log invalidation event for diagnostics
 - Fallback behavior:
   - If hardware-backed unavailable, still use Keystore-managed software key.
 
@@ -68,7 +73,7 @@ Add explicit guidance in-app and docs for API key best practices.
 
 Deliverables:
 
-- New doc: `docs/openai-api-key-setup.md`
+- New doc: `docs/openai-api-key-setup.md` (verify placement against existing `docs/` structure; may also live in `android/docs/` if a per-module doc convention is established)
 - Updated strings in `ChatActivity` auth UI
 
 ### Track C: OAuth failure UX mapping
@@ -77,11 +82,14 @@ Strengthen error mapping for common OpenAI auth failures in UI.
 
 - Keep raw provider error internally, but surface user-focused messages.
 - Canonical mapped cases:
-  - Missing `model.request` scope
-  - Invalid/expired credential
-  - Project/org permission mismatch
-  - Network timeout/offline
-- Include “What to do next” per case.
+  - Missing `model.request` scope → "Your token doesn't have API access. Use an API key instead."
+  - Invalid/expired credential → "Your API key is invalid or expired. Generate a new one."
+  - Project/org permission mismatch → "Your key doesn't have access to this model. Check project permissions."
+  - Network timeout/offline → "Can't reach OpenAI. Check your internet connection."
+  - `429` rate limit → "Too many requests. Try again in X seconds." (parse `retry-after` header)
+  - `402` / quota exceeded → "API quota exceeded. Check your OpenAI billing at platform.openai.com."
+  - Model not found / deprecated → "Model unavailable. It may have been deprecated. Try switching models."
+- Include "What to do next" per case.
 
 Deliverables:
 
@@ -110,6 +118,11 @@ Suggested endpoint strategy:
 
 - Use lightweight model metadata check (`GET /v1/models/{id}`) for configured model IDs.
 - Avoid billable generation call for health preflight.
+- **Limitation**: Model metadata endpoint may succeed even if `model.request` scope is missing for OAuth credentials. For full validation, consider an optional minimal completion check:
+  ```
+  POST /v1/chat/completions { model: "gpt-4o-mini", messages: [...], max_tokens: 1 }
+  ```
+  This adds ~$0.0001 cost but validates actual API access. Document this trade-off in health check UI.
 
 Deliverables:
 
@@ -171,15 +184,24 @@ Phase 3: Health check feature
 
 ## 7. Testing Strategy
 
+0. TDD workflow (MANDATORY per CLAUDE.md)
+- Write failing test FIRST for each component
+- Minimal implementation to pass
+- Refactor while green
+- No production code without corresponding tests
+
 1. Unit tests
 - Vault encryption/decryption
+- Vault key rotation/invalidation recovery (see Track A)
 - Migration from legacy plaintext
-- Error mapping classification
+- Migration idempotency: runs twice without data loss (first run migrates plaintext → encrypted; second run detects encrypted format, no-ops safely)
+- Error mapping classification (including 429, 402, model deprecation)
 - Health checker response handling
 
 2. Integration tests
 - `MockWebServer` for OpenAI error/status variants
 - Model permission denied vs auth denied vs timeout
+- Health check with mock offline/network-down scenarios
 
 3. Manual/device validation
 - Fresh install key setup
@@ -201,7 +223,13 @@ Phase 3: Health check feature
 - Mitigation: robust fallback + explicit recovery path
 
 2. Migration failures causing forced re-login
-- Mitigation: transactional migration and safe rollback behavior
+- Mitigation: atomic migration with explicit rollback:
+  1. Read plaintext credential from legacy storage
+  2. Encrypt and write to vault
+  3. Verify decryption matches original plaintext
+  4. Only then delete plaintext from legacy storage
+  5. On failure at any step: keep plaintext, log error, allow retry on next startup
+  - Migration must be idempotent — safe to run twice if interrupted
 
 3. Endpoint behavior differences for model checks
 - Mitigation: classify unknown responses conservatively and show raw support code in diagnostics
@@ -210,7 +238,9 @@ Phase 3: Health check feature
 
 1. Should health check run automatically on every app start, or only on demand?
 2. Should we gate chat send if health check fails hard, or allow best-effort send?
-3. Do we want optional biometric gate before decrypting stored credential?
+   - Proposed: allow sends when offline (queue/retry per existing handling), but block on hard auth failures (invalid key / missing scope).
+3. ~~Do we want optional biometric gate before decrypting stored credential?~~
+   **Scoped out for this phase.** Biometric authentication adds significant testing surface and UX complexity. Defer to a future phase if user demand warrants it. Effort estimate unchanged.
 4. Should we migrate from SharedPreferences to Encrypted DataStore in a later iteration?
 
 ## 11. Effort Estimate
