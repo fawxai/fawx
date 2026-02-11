@@ -113,6 +113,11 @@ Add a preflight check accessible from auth/setup.
   - `Missing model permission`
   - `Network error`
   - `Unknown provider error`
+- Health check gating behavior:
+  - **On first credential entry**: Health check runs automatically (non-blocking)
+  - **If offline during first check**: Show "Network unreachable" warning but allow sends (queue/retry per existing handling)
+  - **If hard auth failure (401/403)**: Block sends until credential is fixed or health check passes
+  - **Manual "Test OpenAI Connection"**: Always runs on-demand, does not block sends
 
 Suggested endpoint strategy:
 
@@ -129,6 +134,21 @@ Deliverables:
 - `OpenAiHealthChecker` service
 - UI panel/dialog in auth flow
 - Unit tests with `MockWebServer`
+
+## 4.5. Credential Storage Architecture Decision
+
+The credential vault is implemented in the **Android app layer (Kotlin)**, not the Rust daemon, for these reasons:
+
+1. **Android Keystore APIs are Java/Kotlin-only** — no stable FFI/JNI bindings for Rust
+2. **Credentials remain in Android security sandbox** — no cross-boundary exposure to root processes
+3. **Rust daemon receives credentials via IPC** — Android app passes the decrypted key over the Unix socket (#229) at session start
+4. **Rust daemon never persists credentials** — receives them per-session from the Android app, holds only in memory
+
+This means:
+- Vault code lives in `android/core/.../security/CredentialVault.kt`
+- Rust daemon remains credential-agnostic (receives API key via IPC per-session)
+- Android app manages full credential lifecycle (store/load/rotate/clear)
+- If the Rust daemon crashes, no credentials are on disk — Android app re-sends on reconnect
 
 ## 5. Architecture and Data Changes
 
@@ -193,8 +213,12 @@ Phase 3: Health check feature
 1. Unit tests
 - Vault encryption/decryption
 - Vault key rotation/invalidation recovery (see Track A)
+- Keystore unavailability fallback (simulate `KeyStore.getInstance()` failure or missing provider → verify software key fallback)
 - Migration from legacy plaintext
-- Migration idempotency: runs twice without data loss (first run migrates plaintext → encrypted; second run detects encrypted format, no-ops safely)
+- Migration idempotency scenarios:
+  - App crashes after vault write but before plaintext deletion → next startup completes migration safely
+  - Migration logic called twice in same session → second call no-ops (doesn't double-encrypt or corrupt)
+  - Both encrypted and plaintext exist → encrypted takes precedence, plaintext deleted
 - Error mapping classification (including 429, 402, model deprecation)
 - Health checker response handling
 
