@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.83%2B-orange.svg)](https://www.rust-lang.org/)
 
-**Citros** is an AI-native phone agent designed to run locally on Android devices. Unlike cloud-based assistants, Citros lives on your phone, using local LLMs for fast inference and only escalating to cloud LLMs for complex reasoning. It's the foundation for a future where the agent *is* the interface, not just a feature bolted onto an app-centric OS.
+**Citros** is an AI-native phone agent designed to run locally on Android devices. Unlike cloud-based assistants, Citros lives on your phone, escalating to cloud LLMs for complex reasoning. It's the foundation for a future where the agent *is* the interface, not just a feature bolted onto an app-centric OS.
 
 **⚠️ Status: Early Development** — Citros is under active development. Core infrastructure (Epics 1-6) is complete, with 225+ tests and a clean Rust codebase. See [Project Status](#project-status) below for details.
 
