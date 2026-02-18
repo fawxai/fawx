@@ -3,6 +3,7 @@
 //! This crate implements the core agent logic: perception → cognition → action.
 //! It orchestrates intent classification, action planning, and execution.
 
+pub mod auth;
 pub mod claude;
 pub mod history;
 pub mod intent;
@@ -13,6 +14,7 @@ pub mod tools;
 
 use ct_core::types::{ActionPlan, UserInput};
 
+pub use auth::{AuthBackend, AuthCredentials, AuthRouter, AuthStrategy};
 pub use claude::{
     AgentError, ClaudeClient, ClaudeConfig, CompletionResponse, ContentBlock, Message, Result,
     Role, StopReason, StreamEvent, Tool, ToolResult, ToolUse, Usage,

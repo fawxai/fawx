@@ -39,6 +39,15 @@ struct LlmConfig {
 
     #[serde(default)]
     api_key: Option<String>,
+
+    #[serde(default)]
+    claude_setup_token: Option<String>,
+
+    #[serde(default)]
+    claude_sdk_url: Option<String>,
+
+    #[serde(default)]
+    openai_oauth_token: Option<String>,
 }
 
 fn default_name() -> String {
@@ -80,6 +89,9 @@ impl Default for LlmConfig {
         Self {
             model: default_model(),
             api_key: None,
+            claude_setup_token: None,
+            claude_sdk_url: None,
+            openai_oauth_token: None,
         }
     }
 }
@@ -118,19 +130,27 @@ fn get_config_path() -> anyhow::Result<std::path::PathBuf> {
 fn redact_sensitive(config: &Config) -> Config {
     let mut redacted = config.clone();
 
-    if let Some(ref key) = redacted.llm.api_key {
-        if !key.is_empty() {
-            // Redact API keys: show first few chars and "...REDACTED"
-            let prefix = if key.len() > 6 {
-                &key[..6]
-            } else {
-                &key[..key.len().min(2)]
-            };
-            redacted.llm.api_key = Some(format!("{}...REDACTED", prefix));
-        }
-    }
+    redacted.llm.api_key = redact_secret(redacted.llm.api_key.as_deref());
+    redacted.llm.claude_setup_token = redact_secret(redacted.llm.claude_setup_token.as_deref());
+    redacted.llm.openai_oauth_token = redact_secret(redacted.llm.openai_oauth_token.as_deref());
+    redacted.llm.claude_sdk_url = redact_secret(redacted.llm.claude_sdk_url.as_deref());
 
     redacted
+}
+
+fn redact_secret(value: Option<&str>) -> Option<String> {
+    let value = value?;
+    if value.is_empty() {
+        return Some(String::new());
+    }
+
+    // Redact tokens/keys while preserving a tiny prefix for debugging.
+    let prefix = if value.len() > 6 {
+        &value[..6]
+    } else {
+        &value[..value.len().min(2)]
+    };
+    Some(format!("{}...REDACTED", prefix))
 }
 
 #[cfg(test)]
@@ -149,6 +169,8 @@ mod tests {
     fn test_redact_hides_api_keys() {
         let mut config = Config::default();
         config.llm.api_key = Some("sk-1234567890abcdef".to_string());
+        config.llm.claude_setup_token = Some("claude-sub-token-abc123".to_string());
+        config.llm.openai_oauth_token = Some("openai-oauth-token-xyz999".to_string());
 
         let redacted = redact_sensitive(&config);
 
@@ -156,6 +178,14 @@ mod tests {
         let redacted_key = redacted.llm.api_key.unwrap();
         assert!(redacted_key.contains("REDACTED"));
         assert!(!redacted_key.contains("1234567890abcdef"));
+
+        let redacted_claude_token = redacted.llm.claude_setup_token.unwrap();
+        assert!(redacted_claude_token.contains("REDACTED"));
+        assert!(!redacted_claude_token.contains("abc123"));
+
+        let redacted_openai_token = redacted.llm.openai_oauth_token.unwrap();
+        assert!(redacted_openai_token.contains("REDACTED"));
+        assert!(!redacted_openai_token.contains("xyz999"));
     }
 
     #[test]
@@ -164,12 +194,24 @@ mod tests {
         config.agent.name = "TestAgent".to_string();
         config.llm.model = "test-model".to_string();
         config.llm.api_key = Some("sk-secret".to_string());
+        config.llm.claude_setup_token = Some("claude-secret".to_string());
+        config.llm.openai_oauth_token = Some("openai-secret".to_string());
 
         let redacted = redact_sensitive(&config);
 
         assert_eq!(redacted.agent.name, "TestAgent");
         assert_eq!(redacted.llm.model, "test-model");
         assert!(redacted.llm.api_key.unwrap().contains("REDACTED"));
+        assert!(redacted
+            .llm
+            .claude_setup_token
+            .unwrap()
+            .contains("REDACTED"));
+        assert!(redacted
+            .llm
+            .openai_oauth_token
+            .unwrap()
+            .contains("REDACTED"));
     }
 
     #[test]
@@ -179,6 +221,8 @@ mod tests {
 
         let redacted = redact_sensitive(&config);
         assert_eq!(redacted.llm.api_key, Some("".to_string()));
+        assert_eq!(redacted.llm.claude_setup_token, None);
+        assert_eq!(redacted.llm.openai_oauth_token, None);
     }
 
     #[test]
@@ -186,6 +230,8 @@ mod tests {
         let config = Config::default();
         let redacted = redact_sensitive(&config);
         assert!(redacted.llm.api_key.is_none());
+        assert!(redacted.llm.claude_setup_token.is_none());
+        assert!(redacted.llm.openai_oauth_token.is_none());
     }
 
     #[test]
@@ -196,5 +242,11 @@ mod tests {
         let redacted = redact_sensitive(&config);
         let redacted_key = redacted.llm.api_key.unwrap();
         assert!(redacted_key.contains("REDACTED"));
+    }
+
+    #[test]
+    fn test_redact_secret_empty_and_none() {
+        assert_eq!(redact_secret(None), None);
+        assert_eq!(redact_secret(Some("")), Some("".to_string()));
     }
 }

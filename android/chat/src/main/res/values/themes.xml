@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        Uses legacy android:Theme.Material.NoActionBar (not AppCompat/Material3) because
+        all UI is rendered via Jetpack Compose with MaterialTheme. The XML theme only
+        applies to the Activity window chrome (status/nav bar colors). No XML-rendered
+        Material widgets exist in the app.
+    -->
+    <style name="Theme.Citros" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
+</resources>

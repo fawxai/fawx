@@ -72,7 +72,7 @@ rustup target list --installed | grep android
 
 ```bash
 just check-android   # Check compilation without building
-just build-android   # Full build (to be added)
+just build-android   # Full release build
 ```
 
 ### Manual Cargo Commands
@@ -108,8 +108,9 @@ cargo test --target aarch64-linux-android
 
 ## Next Steps
 
+- **Rooted device prep:** Follow `docs/android-root-magisk-setup.md` for Magisk/root provisioning
+- **ADB workflow:** Use `docs/android-adb-workflow.md` for app/binary deploy + debugging loop
 - **Horizon 1:** Enable on-device LLM inference via `llama-cpp-sys`
-- **Testing:** Deploy to Android device via `adb` or termux
 - **CI/CD:** Automate Android builds in GitHub Actions
 
 ## References

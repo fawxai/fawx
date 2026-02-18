@@ -1,0 +1,396 @@
+package ai.citros.chat
+
+import ai.citros.core.OverlayLine
+import ai.citros.core.OverlayLineType
+import ai.citros.core.OverlayRunState
+import ai.citros.core.OverlayState
+import ai.citros.core.OverlayStep
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.joinAll
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
+import kotlinx.coroutines.test.runTest
+import org.junit.After
+import org.junit.Before
+import org.junit.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertNull
+import kotlin.test.assertTrue
+
+@OptIn(ExperimentalCoroutinesApi::class)
+class OverlayControllerTest {
+
+    @Before
+    fun setUp() {
+        OverlayController.reset()
+    }
+
+    @After
+    fun tearDown() {
+        OverlayController.reset()
+    }
+
+    @Test
+    fun `initial state is inactive with FULL_APP mode`() {
+        assertFalse(OverlayController.isOverlayActive.value)
+        assertEquals(OverlaySurfaceMode.FULL_APP, OverlayController.surfaceMode.value)
+        assertEquals(OverlayState.EMPTY, OverlayController.overlayState.value)
+        assertNull(OverlayController.queuedMessage.value)
+        assertEquals(0, OverlayController.unreadCount.value)
+    }
+
+    @Test
+    fun `activateOverlay sets active and switches to MINI_CHAT`() {
+        OverlayController.activateOverlay()
+
+        assertTrue(OverlayController.isOverlayActive.value)
+        assertEquals(OverlaySurfaceMode.MINI_CHAT, OverlayController.surfaceMode.value)
+    }
+
+    @Test
+    fun `activateOverlay preserves non-FULL_APP mode`() {
+        OverlayController.updateSurfaceMode(OverlaySurfaceMode.BUBBLE)
+        OverlayController.activateOverlay()
+
+        assertTrue(OverlayController.isOverlayActive.value)
+        assertEquals(OverlaySurfaceMode.BUBBLE, OverlayController.surfaceMode.value)
+    }
+
+    @Test
+    fun `deactivateOverlay resets to FULL_APP and inactive`() {
+        OverlayController.activateOverlay()
+        OverlayController.deactivateOverlay()
+
+        assertFalse(OverlayController.isOverlayActive.value)
+        assertEquals(OverlaySurfaceMode.FULL_APP, OverlayController.surfaceMode.value)
+    }
+
+    @Test
+    fun `updateSurfaceMode to FULL_APP deactivates overlay`() {
+        OverlayController.activateOverlay()
+        assertTrue(OverlayController.isOverlayActive.value)
+
+        OverlayController.updateSurfaceMode(OverlaySurfaceMode.FULL_APP)
+
+        assertFalse(OverlayController.isOverlayActive.value)
+        assertEquals(OverlaySurfaceMode.FULL_APP, OverlayController.surfaceMode.value)
+    }
+
+    @Test
+    fun `updateSurfaceMode to BUBBLE keeps overlay active`() {
+        OverlayController.activateOverlay()
+        OverlayController.updateSurfaceMode(OverlaySurfaceMode.BUBBLE)
+
+        assertTrue(OverlayController.isOverlayActive.value)
+        assertEquals(OverlaySurfaceMode.BUBBLE, OverlayController.surfaceMode.value)
+    }
+
+    @Test
+    fun `updateSurfaceMode to MINI_CHAT keeps overlay active`() {
+        OverlayController.activateOverlay()
+        OverlayController.updateSurfaceMode(OverlaySurfaceMode.BUBBLE)
+        OverlayController.updateSurfaceMode(OverlaySurfaceMode.MINI_CHAT)
+
+        assertTrue(OverlayController.isOverlayActive.value)
+        assertEquals(OverlaySurfaceMode.MINI_CHAT, OverlayController.surfaceMode.value)
+    }
+
+    @Test
+    fun `updateOverlayState propagates state`() {
+        val state = OverlayState(
+            runState = OverlayRunState.EXECUTING,
+            steps = listOf(OverlayStep(step = 1, total = 3, label = "Opening app")),
+            lines = listOf(OverlayLine(id = 1, type = OverlayLineType.USER, text = "Do something")),
+            currentStepIndex = 0,
+            totalSteps = 3
+        )
+
+        OverlayController.updateOverlayState(state)
+
+        assertEquals(state, OverlayController.overlayState.value)
+        assertEquals(OverlayRunState.EXECUTING, OverlayController.overlayState.value.runState)
+    }
+
+    @Test
+    fun `updateQueuedMessage stores non-blank text`() {
+        OverlayController.updateQueuedMessage("check bluetooth too")
+        assertEquals("check bluetooth too", OverlayController.queuedMessage.value)
+    }
+
+    @Test
+    fun `updateQueuedMessage clears blank text`() {
+        OverlayController.updateQueuedMessage("something")
+        OverlayController.updateQueuedMessage("   ")
+        assertNull(OverlayController.queuedMessage.value)
+    }
+
+    @Test
+    fun `updateQueuedMessage clears null text`() {
+        OverlayController.updateQueuedMessage("something")
+        OverlayController.updateQueuedMessage(null)
+        assertNull(OverlayController.queuedMessage.value)
+    }
+
+    @Test
+    fun `updateUnreadCount updates count`() {
+        OverlayController.updateUnreadCount(5)
+        assertEquals(5, OverlayController.unreadCount.value)
+    }
+
+    @Test
+    fun `updateUnreadCount coerces negative to zero`() {
+        OverlayController.updateUnreadCount(-3)
+        assertEquals(0, OverlayController.unreadCount.value)
+    }
+
+    @Test
+    fun `resetUnreadCount sets count to zero`() {
+        OverlayController.updateUnreadCount(5)
+        OverlayController.resetUnreadCount()
+        assertEquals(0, OverlayController.unreadCount.value)
+    }
+
+    // --- Queued message tests (#445) ---
+
+    @Test
+    fun `queued message survives overlay state updates`() {
+        OverlayController.updateQueuedMessage("user typed this")
+
+        OverlayController.updateOverlayState(
+            OverlayState(
+                runState = OverlayRunState.EXECUTING,
+                steps = listOf(OverlayStep(step = 2, total = 5, label = "Tapping")),
+                lines = emptyList(),
+                currentStepIndex = 0,
+                totalSteps = 5
+            )
+        )
+
+        assertEquals("user typed this", OverlayController.queuedMessage.value)
+    }
+
+    // --- Action dispatch tests (#463) ---
+    //
+    // SharedFlow + runTest gotcha (#466): dispatch() uses tryEmit() which buffers
+    // values synchronously. Collectors must use UnconfinedTestDispatcher so they
+    // eagerly process buffered emissions. StandardTestDispatcher (the default)
+    // requires explicit advanceUntilIdle() and still races with SharedFlow's
+    // internal notification mechanism. backgroundScope prevents the collector
+    // from blocking runTest completion.
+
+    @Test
+    fun `dispatch emits QueueMessage action`() = runTest {
+        val received = mutableListOf<OverlayAction>()
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+            OverlayController.actions.collect { received.add(it) }
+        }
+
+        OverlayController.dispatch(OverlayAction.QueueMessage("hello"))
+
+        assertEquals(1, received.size)
+        assertEquals(OverlayAction.QueueMessage("hello"), received[0])
+    }
+
+    @Test
+    fun `dispatch emits SetSurfaceMode action`() = runTest {
+        val received = mutableListOf<OverlayAction>()
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+            OverlayController.actions.collect { received.add(it) }
+        }
+
+        OverlayController.dispatch(OverlayAction.SetSurfaceMode(OverlaySurfaceMode.BUBBLE))
+
+        assertEquals(1, received.size)
+        assertEquals(OverlayAction.SetSurfaceMode(OverlaySurfaceMode.BUBBLE), received[0])
+    }
+
+    @Test
+    fun `dispatch emits Deactivate action`() = runTest {
+        val received = mutableListOf<OverlayAction>()
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+            OverlayController.actions.collect { received.add(it) }
+        }
+
+        OverlayController.dispatch(OverlayAction.Deactivate)
+
+        assertEquals(1, received.size)
+        assertEquals(OverlayAction.Deactivate, received[0])
+    }
+
+    @Test
+    fun `dispatch emits StopExecution action`() = runTest {
+        val received = mutableListOf<OverlayAction>()
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+            OverlayController.actions.collect { received.add(it) }
+        }
+
+        OverlayController.dispatch(OverlayAction.StopExecution)
+
+        assertEquals(1, received.size)
+        assertEquals(OverlayAction.StopExecution, received[0])
+    }
+
+    @Test
+    fun `dispatch emits ExpandFromBubble action`() = runTest {
+        val received = mutableListOf<OverlayAction>()
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+            OverlayController.actions.collect { received.add(it) }
+        }
+
+        OverlayController.dispatch(OverlayAction.ExpandFromBubble)
+
+        assertEquals(1, received.size)
+        assertEquals(OverlayAction.ExpandFromBubble, received[0])
+    }
+
+    @Test
+    fun `dispatch preserves FIFO ordering`() = runTest {
+        val received = mutableListOf<OverlayAction>()
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+            OverlayController.actions.collect { received.add(it) }
+        }
+
+        OverlayController.dispatch(OverlayAction.QueueMessage("first"))
+        OverlayController.dispatch(OverlayAction.StopExecution)
+        OverlayController.dispatch(OverlayAction.SetSurfaceMode(OverlaySurfaceMode.BUBBLE))
+
+        assertEquals(3, received.size)
+        assertEquals(OverlayAction.QueueMessage("first"), received[0])
+        assertEquals(OverlayAction.StopExecution, received[1])
+        assertEquals(OverlayAction.SetSurfaceMode(OverlaySurfaceMode.BUBBLE), received[2])
+    }
+
+    @Test
+    fun `dispatch without collector drops overflow gracefully`() {
+        // Dispatch more actions than buffer capacity (16) without a collector.
+        // tryEmit() returns false for overflow items — logged, not thrown.
+        repeat(20) { i ->
+            OverlayController.dispatch(OverlayAction.QueueMessage("msg_$i"))
+        }
+        // No crash = pass. Buffer overflow is logged via Log.e, not thrown.
+    }
+
+    @Test
+    fun `dispatch with active collector handles burst beyond buffer capacity`() = runTest {
+        // With an eager collector, all dispatches are processed (collector frees
+        // buffer space immediately), so even bursts beyond buffer size succeed.
+        val received = mutableListOf<OverlayAction>()
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+            OverlayController.actions.collect { received.add(it) }
+        }
+
+        repeat(20) { i ->
+            OverlayController.dispatch(OverlayAction.QueueMessage("msg_$i"))
+        }
+
+        assertEquals(20, received.size)
+        assertEquals("msg_0", (received.first() as OverlayAction.QueueMessage).text)
+        assertEquals("msg_19", (received.last() as OverlayAction.QueueMessage).text)
+    }
+
+    @Test
+    fun `concurrent rapid dispatches do not crash`() = runTest {
+        val received = mutableListOf<OverlayAction>()
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+            OverlayController.actions.collect { received.add(it) }
+        }
+
+        // Simulate rapid user taps
+        OverlayController.dispatch(OverlayAction.StopExecution)
+        OverlayController.dispatch(OverlayAction.QueueMessage("quick"))
+        OverlayController.dispatch(OverlayAction.ExpandFromBubble)
+        OverlayController.dispatch(OverlayAction.Deactivate)
+
+        // All actions should be received (well within buffer capacity)
+        assertEquals(4, received.size)
+    }
+
+    // --- Debounce guard for activateOverlay (#437) ---
+
+    @Test
+    fun `activateOverlay debounces rapid calls`() {
+        OverlayController.activateOverlay()
+        assertTrue(OverlayController.isOverlayActive.value)
+
+        // Deactivate and immediately re-activate within debounce window
+        OverlayController.deactivateOverlay()
+        assertFalse(OverlayController.isOverlayActive.value)
+
+        // Second call within debounce window should be skipped
+        val result = OverlayController.activateOverlay()
+        assertFalse(result, "Second activateOverlay within debounce window should be skipped")
+        assertFalse(OverlayController.isOverlayActive.value)
+    }
+
+    @Test
+    fun `activateOverlay succeeds after debounce window`() {
+        OverlayController.activateOverlay()
+        assertTrue(OverlayController.isOverlayActive.value)
+
+        // reset() clears the debounce timestamp, simulating window expiry
+        OverlayController.reset()
+        val result = OverlayController.activateOverlay()
+        assertTrue(result, "activateOverlay after debounce window should succeed")
+        assertTrue(OverlayController.isOverlayActive.value)
+    }
+
+    @Test
+    fun `activateOverlay is thread-safe under concurrent calls`() = runBlocking {
+        OverlayController.reset()
+        val results = java.util.concurrent.ConcurrentLinkedQueue<Boolean>()
+        val jobs = (1..10).map {
+            launch(Dispatchers.Default) {
+                results.add(OverlayController.activateOverlay())
+            }
+        }
+        jobs.joinAll()
+        // Exactly one call should win the CAS race within the debounce window
+        assertEquals(1, results.count { it }, "Only one concurrent activateOverlay should succeed")
+        assertTrue(OverlayController.isOverlayActive.value)
+    }
+
+    @Test
+    fun `reset clears all state`() {
+        OverlayController.activateOverlay()
+        OverlayController.updateQueuedMessage("pending")
+        OverlayController.updateUnreadCount(3)
+        OverlayController.updateOverlayState(
+            OverlayState(
+                runState = OverlayRunState.EXECUTING,
+                steps = emptyList(),
+                lines = emptyList(),
+                currentStepIndex = 0,
+                totalSteps = 0
+            )
+        )
+
+        OverlayController.reset()
+
+        assertFalse(OverlayController.isOverlayActive.value)
+        assertEquals(OverlaySurfaceMode.FULL_APP, OverlayController.surfaceMode.value)
+        assertEquals(OverlayState.EMPTY, OverlayController.overlayState.value)
+        assertNull(OverlayController.queuedMessage.value)
+        assertEquals(0, OverlayController.unreadCount.value)
+    }
+
+    @Test
+    fun `mode transition flow - FULL_APP to MINI_CHAT to BUBBLE to FULL_APP`() {
+        assertEquals(OverlaySurfaceMode.FULL_APP, OverlayController.surfaceMode.value)
+        assertFalse(OverlayController.isOverlayActive.value)
+
+        OverlayController.activateOverlay()
+        assertEquals(OverlaySurfaceMode.MINI_CHAT, OverlayController.surfaceMode.value)
+        assertTrue(OverlayController.isOverlayActive.value)
+
+        OverlayController.updateSurfaceMode(OverlaySurfaceMode.BUBBLE)
+        assertEquals(OverlaySurfaceMode.BUBBLE, OverlayController.surfaceMode.value)
+        assertTrue(OverlayController.isOverlayActive.value)
+
+        OverlayController.updateSurfaceMode(OverlaySurfaceMode.FULL_APP)
+        assertEquals(OverlaySurfaceMode.FULL_APP, OverlayController.surfaceMode.value)
+        assertFalse(OverlayController.isOverlayActive.value)
+    }
+}

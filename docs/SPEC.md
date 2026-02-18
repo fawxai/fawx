@@ -548,17 +548,31 @@ The system must handle failure at every level:
 
 - **SELinux.** Even on a rooted phone, SELinux is enforcing by default. Our daemon can't just open /dev/input — SELinux policies block it even for root. Magisk typically sets SELinux to permissive, but some operations may need custom SELinux policy modules or context labels. *Mitigation*: Document the exact SELinux config required. Test with `setenforce 0` initially, then write proper policy modules.
 
-#### Current Implementation Baseline (as of 2026-02-09)
+#### Current Implementation Baseline (as of 2026-02-11)
 
 The following is a snapshot of what exists versus what is planned, to set realistic expectations for each phase.
 
-**Implemented (Epics 1-8):**
+**Kotlin MVP (`:chat` module) — SHIPPED & WORKING:**
+- Jetpack Compose chat UI with phone control via Accessibility Service
+- 3 cloud LLM providers: Anthropic (`sk-ant-*`), OpenAI (`sk-*`), OpenRouter (`sk-or-*`)
+- Auto-detection from key prefix, per-provider client architecture (`BaseProviderClient` → `AnthropicClient`, `OpenAiClientImpl`, `OpenRouterClientImpl`)
+- Structured tool use: 10 phone control tools (tap, type, scroll, swipe, back, home, open_app, wait, read_screen, screenshot) via native tool calling
+- Dual-model: Sonnet 4.5 for chat, Haiku 4.5 for action loop
+- Retry logic with 429 exponential backoff, context trimming (maxMessages=20)
+- Device Code Flow for OpenAI OAuth (works but token lacks `model.request` scope)
+- Embedded OAuth bridge (NanoHTTPD, PKCE, CSRF protection)
+- 235+ tests across 9+ test suites
+- Sideload distribution via gofile.io (debug APKs)
+- Running on Pixel 10 Pro — phone control demonstrated (YouTube, app navigation)
+
+**Rust Crates (Epics 1-8) — FOUNDATION BUILT:**
 - Cargo workspace with 12 crates, CI pipeline (format, clippy, check, test)
 - ct-core: config loading, event bus, internal types, error hierarchy
 - ct-llm: local model stub (llama.cpp integration not yet functional), Claude API client with streaming/tool use, confidence-based routing with fallback
 - ct-security: encrypted KV store (redb + AES-256-GCM), audit log with HMAC-SHA256 hash chain, intent classification (regex + LLM hybrid), policy engine with rules/capabilities/rate limiting
 - ct-skills: WASM runtime (wasmtime), capability enforcement at host boundary, module compilation + caching, skill loader/registry/installer with signature verification, async skill execution
 - ct-cli: `citros doctor`, `citros config show`, `citros audit` commands
+- ct-security/oauth: OAuth bridge with PKCE, CSRF, constant-time state comparison, redirect URI validation (20 tests)
 - 400+ tests across all crates
 
 **Not yet functional (stubs/placeholders):**
@@ -568,6 +582,21 @@ The following is a snapshot of what exists versus what is planned, to set realis
 - `invoke_skill_async` (ct-skills) — returns placeholder output
 - CLI `start`/`stop`/chat commands — placeholder
 - ct-voice, ct-sensors, ct-sync — not started
+- **Unix socket IPC** between Kotlin app and Rust daemon — not started
+- **DaemonBridge.kt** — not started
+
+**Next Phase: Rust Daemon Integration**
+
+The immediate next milestone is deploying the Rust daemon on the rooted Pixel 10 Pro and connecting it to the existing Kotlin app via Unix socket IPC. This follows a two-phase bridge approach:
+
+- **Phase A (Unix Socket Daemon):** Rust binary runs as root service (Magisk init.d), Kotlin app connects via Unix domain socket. JSON-RPC protocol for commands. Clean process separation — crash in Rust doesn't kill the app. Easy to develop and debug independently.
+- **Phase B (JNI, future):** Same Rust code compiled as `.so`, loaded into app process via JNI. Sub-microsecond call overhead. The IPC API contract from Phase A becomes the JNI interface — no throwaway work.
+
+**Onboarding & Monetization (spec'd, not built):**
+- Three tiers: BYO (paste key), Citros Base (OpenRouter, usage-capped), Citros Super (higher cap)
+- All tiers access all models — tiers differ by usage cap, not model restrictions
+- Key wallet: store multiple API keys, switch providers/models instantly
+- See `docs/onboarding-spec.md` for full spec
 
 **Security gaps requiring hardening before production paths:**
 - Skill signature verification exists but is not mandatory — callers can pass `signature: None`

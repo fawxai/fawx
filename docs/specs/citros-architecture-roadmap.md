@@ -1,0 +1,365 @@
+# Citros Architecture Roadmap
+
+*From "demo that sometimes works" to "phone agent that just works."*
+*Synthesized from OpenClaw architecture deep dive + gap analysis + MVP sprint spec.*
+
+---
+
+## Where We Are
+
+Citros can see the screen, dispatch gestures, and talk to frontier models. The hard plumbing works:
+- Accessibility service reads screen → `ScreenContent`
+- Window-aware filtering skips self-overlay (PR #434, #446)
+- Overlay hides during screenshots (PR #439) and tool loops (PR #458, in review)
+- Structured logging (PR #435) across 4 tags
+- 27 tools defined in `PhoneTools.ALL`
+- 3 providers: Anthropic, OpenAI, OpenRouter
+- 532+ tests passing
+
+What's broken is the **agent brain** and the **loop architecture**:
+- Monolithic system prompt doesn't teach strategy
+- Tool loop is a `while` loop in `ChatViewModel` with no boundaries, hooks, or injection points
+- No stuck detection, no message queuing, no context management
+- Agent regularly burns 15+ steps on tasks that should take 3-5
+
+## Where We Need To Be
+
+A phone agent that reliably completes everyday tasks on the first try:
+- Open app, do thing, report back — in under 10 steps
+- Recovers from getting stuck instead of burning context
+- User can redirect mid-task ("no, I meant the other app")
+- Context stays clean across multi-step tasks
+- Architecture supports future features without rewriting the loop
+
+---
+
+## The Plan: 4 Horizons
+
+### Horizon 0: Ship MVP (3 PRs — this week)
+
+The immediate deliverables. Zero architecture changes — just prompt engineering and safety nets that work within the current monolithic loop.
+
+#### PR 1: System Prompt Overhaul (#449)
+**Branch:** `feat/system-prompt-449` | **Files:** `PhoneAgentPrompts.kt` only
+
+Replace the generic tool-listing prompt with a structured, strategy-focused prompt assembled from sections:
+
+| Section | Purpose | Conditional? |
+|---------|---------|-------------|
+| Identity | "You are Citros, an AI agent that controls this Android phone" | No |
+| Tools | Organized by category (navigation, interaction, observation, memory) | Yes — skip phone tools when accessibility detached |
+| Strategy | The "always do this" pattern: open app → read screen → act → verify from results | No |
+| Recovery | What to do when tap fails, when stuck, when "No target app visible" | No |
+| Disambiguation | "Open settings" = Android Settings, not Citros settings | No |
+| Rules | type_text doesn't submit, element IDs are ephemeral, be concise | No |
+| Runtime | Model name, screen reader status, current time | Yes — assembled at call time |
+
+**Why first:** Highest leverage. Changes zero code but teaches the agent *strategy* instead of just listing tools. The recovery section ("if screen hasn't changed after 2 actions, you're stuck") is the prompt-side of stuck detection — belt AND suspenders with PR 2.
+
+**Informed by OpenClaw:** Their system prompt is assembled from ~10 modular sections with runtime injection. We adopt the same pattern in Kotlin: a `buildSystemPrompt()` function that concatenates sections, with a runtime block that includes model name and accessibility status.
+
+#### PR 2: Stuck Detection & Loop Guards (#451)
+**Branch:** `fix/stuck-detection-451` | **Files:** `ChatViewModel.kt`, `PhoneAgentApi.kt`
+
+Client-side safety net for when the prompt instructions aren't enough:
+
+1. **MAX_TOOL_STEPS: 20 → 12** — successful tasks take 3-7 steps; 12 is generous
+2. **Screen content hash tracking** — rolling window of last 3 hashes
+3. **Self-steer on stuck** — when 3 consecutive screen hashes are identical, inject `⚠️ STUCK: The screen has not changed in 3 actions. Try a different approach or tell the user what's blocking you.` into the tool result
+4. **Consecutive wait detection** — after 2+ waits with no screen change, inject `⚠️ Waiting more won't help. Take a different action.`
+5. **Progress logging** — `loopMetrics: step=N, uniqueScreens=M, consecutiveWaits=W`
+
+**The key insight from OpenClaw:** This is a "self-steer" pattern. OpenClaw's `steer` queue mode injects user messages into running tool loops at tool boundaries. We're doing the same thing — injecting a system-generated message into the context at the boundary between tool steps. The agent sees the ⚠️ message as part of the tool result and adjusts its behavior. No new architecture needed.
+
+#### PR 3: Overlay Auto-Hide (#457)
+**Branch:** `fix/overlay-blocks-touch-457` | **PR #458** in Claude review
+
+Already implemented. Hides overlay for entire tool loop duration, not just screenshots. Hook pattern bridges `:core` ↔ `:chat` module boundary. Double-hide guard in OverlayService makes nested calls safe.
+
+#### MVP Success Criteria
+After all 3 PRs, these work on first try with Opus or Sonnet:
+- ✅ "What's on my calendar tomorrow?" — < 8 steps
+- ✅ "Send a test email to joe@citros.ai" — < 10 steps  
+- ✅ "Open Settings" — 1 step
+- ✅ "Set a timer for 5 minutes" — < 6 steps
+- ✅ "Hey, how are you?" — text response, 0 tools
+
+---
+
+### Horizon 1: Loop Architecture (next 2-4 weeks)
+
+Refactor the tool loop from a monolithic `while` in `ChatViewModel` to a proper agent executor with boundaries, hooks, and message injection. This is the prerequisite for everything in Horizons 2-3.
+
+#### 1.1 Extract AgentExecutor
+
+Pull the tool loop out of `ChatViewModel.sendMessage()` into its own class:
+
+```
+ChatViewModel (orchestrator — UI state, message dispatch)
+  └── AgentExecutor (loop lifecycle)
+       ├── PromptBuilder (context assembly — sections, runtime injection)
+       ├── ToolRunner (execution + pre/post hooks)
+       ├── ScreenManager (read, refresh, hash tracking)
+       └── ContextManager (trimming, pruning, token estimation)
+```
+
+**Why:** Currently, stuck detection, overlay hooks, logging, tool execution, API calls, and UI state updates are all interleaved in one function. Every new feature means editing that function. The AgentExecutor separates *what* the loop does (execute tools) from *how* it's presented (ChatViewModel UI state).
+
+**Informed by OpenClaw:** Their agent loop has explicit lifecycle phases (intake → context assembly → inference → tool execution → streaming → persistence) with hook points at each boundary. We adopt the boundaries without the full plugin system.
+
+#### 1.2 Tool Boundary Checkpoints
+
+At each boundary between tool execution steps, the AgentExecutor runs a checkpoint:
+
+```kotlin
+interface ToolBoundaryCheck {
+    /** Return null to continue, or a string to inject into context */
+    fun check(state: LoopState): String?
+}
+
+data class LoopState(
+    val step: Int,
+    val maxSteps: Int,
+    val screenHashes: List<Int>,
+    val consecutiveWaits: Int,
+    val lastToolName: String?,
+    val pendingUserMessages: List<String>,  // for steer
+    val tokenEstimate: Int
+)
+```
+
+Built-in checks:
+- `StuckDetectionCheck` — screen hash repetition, consecutive waits (from Horizon 0 PR 2, now extracted)
+- `SteerCheck` — if user sent a message during the loop, inject it as context
+- `ContextPressureCheck` — if token estimate is high, trigger pruning
+- `CancellationCheck` — if user cancelled, exit loop
+
+**Informed by OpenClaw:** Their `steer` mode cancels pending tool calls at the next tool boundary. Our checkpoints are simpler (inject, don't cancel) but architecturally equivalent.
+
+#### 1.3 Message Queuing
+
+When a tool loop is active, buffer inbound messages and process them at loop boundaries:
+
+- **Steer mode** (default): At the next tool boundary, inject "The user says: {message}" into the tool result. The agent adjusts behavior.
+- **Queue mode**: Hold messages until the loop finishes, then dispatch as a single followup turn (coalescing — OpenClaw's `collect` pattern).
+
+This fixes #445 (queue button) and enables the "I said Calendar, not Settings" redirect.
+
+**Informed by OpenClaw:** Their 5 queue modes (`steer`, `followup`, `collect`, `steer-backlog`, `interrupt`) are overkill for a single-user phone agent. We need exactly 2: steer (redirect mid-loop) and collect (hold for after).
+
+#### 1.4 Smart Context Trimming
+
+Replace the hard `maxMessages=20` trim with intelligent pruning:
+
+**Priority order for context budget:**
+1. System prompt (never trimmed)
+2. Last user message + current tool loop (never trimmed)
+3. Recent user/assistant conversation turns (keep last 5-8)
+4. Recent tool results (keep last 2-3 full, summarize older ones)
+5. Old tool results → replace with one-line summary: "Step 3: Opened Gmail inbox (12 elements)"
+6. Screenshot descriptions → keep text, drop any base64 references
+
+**Informed by OpenClaw:** They have separate mechanisms — pruning (trim old tool results in-memory) and compaction (summarize older conversation to disk). We only need pruning for now. Their insight about tool results being the biggest context consumer is dead-on — a single `read_screen` with 60+ elements produces ~2K tokens.
+
+---
+
+### Horizon 2: Intelligence Layer (1-2 months out)
+
+Features that make the agent *smarter*, not just *more reliable*.
+
+#### 2.1 On-Device Memory
+
+Store facts and user preferences that survive conversation resets:
+
+- **Storage:** SQLite (Room) on-device — fits zero-infrastructure principle
+- **Write:** `remember(content)` tool already exists — wire it to actual persistence
+- **Read:** `recall(query)` tool — simple keyword + recency search (no vector needed at first)
+- **Inject:** On conversation start, inject "Here's what you know about this user: ..." from recent memories
+
+**Informed by OpenClaw:** Their memory is plain Markdown files + optional vector search. Phone equivalent: SQLite rows with timestamp + content + optional tags. Keep it simple — vector search is a nice-to-have, not a must-have.
+
+#### 2.2 Conversation Lifecycle
+
+- **Idle timeout:** After 4 hours of inactivity, start a fresh conversation context (but keep chat history visible in UI)
+- **Daily reset:** Optional setting — new context each day
+- **Context summary on reset:** When resetting, generate a 2-3 sentence summary of the old conversation and inject it as "Previous conversation context"
+
+**Informed by OpenClaw:** Their session lifecycle (daily reset at 4 AM + idle timeout + manual `/new`) is well-designed. We adapt: phone users expect persistent chat UI but fresh context. Show all messages in scroll history, but only send recent ones to the model.
+
+#### 2.3 Tool Grouping
+
+Divide the 27 tools into categories and only send relevant ones:
+
+| Group | Tools | When to include |
+|-------|-------|-----------------|
+| Core | open_app, tap, tap_text, type_text, scroll, swipe, press_back, press_home, read_screen | Always (when accessibility attached) |
+| Extended | long_press, screenshot, paste, wait | Always |
+| Notifications | read_notifications, tap_notification, dismiss_notification, reply_notification | Always |
+| Timer/Alarm | set_timer, set_alarm | When user mentions time-related task |
+| Files | read_file, write_file, list_files | When user mentions files/notes |
+| Memory | remember, recall | Always |
+| Clipboard | clipboard_copy, clipboard_read | When user mentions copy/paste |
+
+**Why it matters:** 27 tool schemas is ~3-4K tokens. Dropping to 15 core tools saves ~1.5K tokens per turn — that's meaningful context budget, especially on Haiku.
+
+**Informed by OpenClaw:** Their skills system is lazy-loaded metadata (~97 chars per skill in prompt, full SKILL.md read on demand). Full lazy loading is overkill for us, but grouping achieves 80% of the benefit with 20% of the complexity.
+
+#### 2.4 Model-Aware Prompt Tuning
+
+Different prompts for different model tiers:
+
+- **Opus/GPT-5:** Full prompt with strategy section — model is smart enough to follow complex instructions
+- **Sonnet/GPT-4o:** Concise prompt — strip examples, rely on tool schemas more
+- **Haiku/GPT-4o-mini:** Minimal prompt — core rules only, fewer tools, tighter step limits
+
+**Informed by OpenClaw:** They have prompt modes (full/minimal/none) for main agents vs sub-agents. Same principle: less capable models need simpler instructions, not more.
+
+#### 2.5 Progressive Status Updates
+
+Stream tool execution status to the UI during loops:
+
+```
+Opening Gmail...          (step 1)
+Reading inbox...          (step 2, auto)
+Tapping Compose...        (step 3)
+Typing recipient...       (step 4)
+```
+
+This replaces the current "Thinking..." with real-time progress. Doesn't require API streaming — just surface the tool name being executed.
+
+**Informed by OpenClaw:** Their block streaming and typing indicators give users instant feedback. We don't need streaming from the API — tool execution names are available synchronously.
+
+---
+
+### Horizon 3: Ecosystem (3+ months out)
+
+#### 3.1 Model Failover Chain
+When Key Wallet supports multiple keys/providers: auth rotation with cooldowns, model fallback chain, session-sticky auth. Direct port of OpenClaw's failover system.
+
+#### 3.2 Multi-Step Task Planning
+For complex tasks ("send an email about tomorrow's calendar"), plan ahead:
+1. Agent generates a task plan (open Calendar → read events → open Gmail → compose)
+2. Execute plan step by step with checkpoints
+3. If a step fails, re-plan from current state
+
+This is NOT OpenClaw's sub-agent system (we don't need isolated sessions). It's a planning layer on top of the tool loop.
+
+#### 3.3 Learned Navigation Patterns
+Store successful navigation paths ("to compose an email: open Gmail → wait → tap Compose FAB") in memory. On similar tasks, suggest the known path to the agent. Reduces steps and improves reliability.
+
+#### 3.4 Gateway Integration (Optional)
+For power users who want to control their phone from a VPS:
+- Phone as an OpenClaw node
+- Gateway sends commands, phone executes
+- Screen content relayed back
+
+This is the horizon 2-3 escape hatch mentioned in the product principle. NOT the core product.
+
+---
+
+## Architecture Diagram: Current vs Target
+
+### Current (Horizon 0)
+```
+User Message
+  → ChatViewModel.sendMessage()           ← everything lives here
+      → Build system prompt (monolithic)
+      → API call
+      → while (hasToolCalls && step < 20)
+          → Execute tool
+          → Refresh screen
+          → API call
+      → Display result
+```
+
+### Target (Horizon 1)
+```
+User Message
+  → ChatViewModel                          ← UI state only
+      → MessageQueue.enqueue()
+      → AgentExecutor.run()
+          → PromptBuilder.build(state)     ← modular, conditional
+          → API call
+          → for each tool boundary:
+              → ToolRunner.execute(call)
+              → ScreenManager.refresh()
+              → BoundaryCheckpoint.run()   ← stuck, steer, cancel, context
+              → ContextManager.trim()      ← prune old results
+              → API call
+      → Display result
+      → MessageQueue.drain()               ← queued messages → next turn
+```
+
+---
+
+## What NOT To Build (Now)
+
+Things OpenClaw does that Citros doesn't need in the same form:
+
+1. **Multi-agent routing** — one user, one phone, one agent. No bindings/routing rules.
+2. **Cron/webhook infrastructure** — phone agent is reactive to user input, not scheduled.
+3. **Channel abstraction** — one UI surface (the chat + overlay), not 15 messaging platforms.
+4. **Block streaming to external channels** — no external channels to stream to.
+
+### Deferred, Not Descoped
+
+These were initially descoped but belong in the roadmap:
+
+5. **WASM skill system** — already spec'd and partially implemented in Rust crates. Bridges to Kotlin MVP when Rust daemon ships. (See Open Question #6)
+6. **Session key hierarchies** — there are valid use cases (work/personal, per-app). Deferred to Horizon 2+. (See Open Question #7)
+7. **Persona files (AGENTS.md/SOUL.md)** — core feature for agent personality. Should be in Horizon 2. (See Open Question #8)
+
+---
+
+## Execution Timeline
+
+| Horizon | Scope | Timeline | Key Metric |
+|---------|-------|----------|------------|
+| **H0: MVP** | 3 PRs (prompt, stuck, overlay) | This week | Calendar + Gmail tasks work < 10 steps |
+| **H1: Loop** | AgentExecutor, boundaries, queuing, trimming | 2-4 weeks | User can redirect mid-task; context stays clean |
+| **H2: Intelligence** | Memory, lifecycle, tool groups, model-aware prompts, progress UI | 1-2 months | Agent remembers preferences; works well on Haiku |
+| **H3: Ecosystem** | Failover, planning, learned paths, gateway | 3+ months | Multi-step tasks, multi-provider resilience |
+
+---
+
+## Open Questions
+
+1. **AgentExecutor threading model** — should it be a coroutine with structured concurrency, or a simple sequential executor? Coroutines give us cancellation for free but add complexity.
+
+2. **Context token estimation** — how do we estimate token count on-device without a tokenizer? Options: char count / 4 (rough), tiktoken-lite, or just count messages and cap at N.
+
+3. **Steer vs cancel UX** — RESOLVED. Build all three — the UI primitives already exist:
+   - **Send button** → steer (inject "The user says: {message}" into current loop at next tool boundary)
+   - **Queue button** → hold message, deliver as followup turn after loop ends (fix #445)
+   - **Stop button** → cancel loop, queued messages drain as next turn (already works)
+   User picks the right action in the moment. No heuristic needed.
+
+4. **Tool result pruning** — RESOLVED. Same as OpenClaw: full conversation persisted to storage, pruned view sent to the model. Pruning is transient per API request — never rewrites history. Full tool results always recoverable from the persistent layer. This also means the UI can show complete conversation history even when the model only sees a trimmed context.
+
+5. **Memory scope & cloud sync** — RESOLVED. Full-scope sync for backup and device migration (scoped knowledge, conversation history, persona files, guardrails, settings, learned patterns). Multi-device sharing deferred — not a near-term priority. Local SQLite is the always-available layer; cloud is an optional sync target. Backend-swappable storage interface from day 1.
+   - **BYO tier**: bring your own cloud DB (Supabase, Turso, etc.). User configures connection. Free.
+   - **Base tier**: can add managed cloud storage for an additional fee.
+   - **Super tier**: managed cloud storage included.
+   This aligns with `ct-sync` and `ct-storage` from SPEC.md. The Kotlin MVP should define a `StorageBackend` interface that SQLite implements locally, with cloud sync adapters added later.
+
+6. **WASM skill/plugin system** — RESOLVED. Already fully spec'd in `docs/SPEC.md` §3.5.4 and Decision #5/#6. WASM binaries with capability manifests (network domain allowlists, storage caps, phone action grants, sensor access). Ed25519 signed, verified on load. wasmtime host-level capability enforcement. `ct-skills` crate already has working implementation (wasmtime runtime, capability enforcement, module compilation/caching, loader/registry/installer with signature verification). Distribution: private skill hub first (Decision #6), vetted public registry when community grows. The Kotlin MVP doesn't have this yet — it's in the Rust crate stack. Bridge plan: expose `ct-skills` via the Unix socket IPC to the Kotlin app, or port the capability manifest + WASM runtime to Android via JNI when the Rust daemon ships.
+
+7. **Scoped agent knowledge (replaces session key hierarchies)** — RESOLVED. Instead of user-managed named sessions, Citros builds an **automatic knowledge base indexed by scope**. Three scope types:
+   - `app:<package_name>` — learned navigation patterns, UI quirks, user preferences per Android app. Built automatically from tool interactions (ScreenContent.packageName tags every interaction). Gets injected into system prompt when agent is about to interact with that app.
+   - `api:<provider>` — API-specific knowledge (rate limits, model quirks, pricing notes). Built from API interaction history.
+   - `mcp:<server>` — MCP server capabilities, tool behavior, user workflow preferences. Built from MCP tool invocations.
+   
+   Knowledge accumulates implicitly (agent learns from successful interactions) and is managed explicitly through conversation ("In Gmail, always use my work account" / "Forget what you know about Chrome" / "What do you know about my apps?"). User never sees the storage layer — they just talk to the agent. This is the foundation for Horizon 3 "learned navigation patterns" and naturally solves the session hierarchy question with a phone-native approach.
+
+8. **Persona files (AGENTS.md/SOUL.md equivalent)** — RESOLVED. Copy OpenClaw's model directly: markdown files in app-internal storage (SOUL.md, USER.md, optionally AGENTS.md). Injected into system prompt at conversation start. Editable by user as free text. Onboarding seeds USER.md with name + conversation style. Three concerns are strictly separated:
+   - **Persona** (SOUL.md/USER.md) = who the agent is, who the user is, tone, personality
+   - **Flavors** = visual theme ONLY (Lime=green, Tangerine=orange). No agent behavior impact.
+   - **Guardrails** = constraint rules ("ask before sending emails"). Already have infrastructure. Injected as a separate "Constraints" section in system prompt. Does NOT touch persona files.
+
+9. **Cloud-first vs local-first storage architecture** — RESOLVED. Local-first, cloud-optional. SQLite on-device is always available. Cloud sync is additive (BYO or managed). Full scope — one `StorageBackend` interface covers everything (memory, conversations, persona, guardrails, settings, patterns). Design once, implement SQLite first, add cloud adapters when tiers ship.
+
+---
+
+*Last updated: 2026-02-14*
+*Sources: OpenClaw docs (17 files), Citros codebase, real-world Pixel testing*
+*Supersedes: `docs/specs/openclaw-architecture-lessons.md` and `docs/specs/mvp-sprint-spec.md`*

@@ -187,6 +187,55 @@ To use cloud LLM features (Claude API), set your API key:
 export ANTHROPIC_API_KEY="sk-ant-..."
 ```
 
+Subscription-first auth routing can also use:
+```bash
+# Claude Code subscription token from `claude setup-token`
+# Accepts any of: CLAUDE_SETUP_TOKEN, CLAUDE_CODE_SETUP_TOKEN, or ANTHROPIC_SUBSCRIPTION_TOKEN
+export CLAUDE_SETUP_TOKEN="..."
+
+# Optional OpenAI subscription OAuth token fallback
+export OPENAI_OAUTH_TOKEN="..."
+
+# Optional Claude CLI stream bridge URL (experimental)
+export CLAUDE_SDK_URL="ws://127.0.0.1:4242"
+```
+
+### Android OAuth Setup
+
+To enable browser-based OpenAI login in the Android app:
+
+1. Start an OAuth bridge service (see `docs/codex-oauth-bridge-api.md` for implementation spec)
+2. In Citros Android app, select **"🧪 Codex OAuth (Browser Redirect)"**
+3. Enter bridge URL (default: `http://127.0.0.1:4318`)
+4. Complete sign-in in browser, app will auto-detect the redirect and exchange the code
+
+**API contract:** `docs/codex-oauth-bridge-api.md`
+
+To run a local OAuth bridge server for Android Codex sign-in:
+```bash
+export CITROS_OPENAI_AUTH_URL="https://<provider-authorize-endpoint>"
+export CITROS_OPENAI_TOKEN_URL="https://<provider-token-endpoint>"
+export CITROS_OPENAI_CLIENT_ID="<oauth-client-id>"
+# Optional for confidential clients:
+export CITROS_OPENAI_CLIENT_SECRET="<oauth-client-secret>"
+export CITROS_OPENAI_SCOPE="openid profile email offline_access"
+
+# Start bridge (default listen: 127.0.0.1:4318)
+cargo run -p ct-cli -- oauth-bridge
+```
+
+For Android emulator use `http://10.0.2.2:4318`. For physical devices use:
+```bash
+adb reverse tcp:4318 tcp:4318
+```
+
+### Android Developer Bring-up Docs
+
+- NDK cross-compilation baseline: [`docs/android-setup.md`](docs/android-setup.md)
+- **NDK cross-compilation + hello-world on rooted Pixel 10 (arm64)** — [`docs/android-ndk-cross-compilation.md`](docs/android-ndk-cross-compilation.md)
+- Root/Magisk setup (dedicated dev devices): [`docs/android-root-magisk-setup.md`](docs/android-root-magisk-setup.md)
+- ADB workflow (build/install/push/debug): [`docs/android-adb-workflow.md`](docs/android-adb-workflow.md)
+
 ---
 
 ## Testing

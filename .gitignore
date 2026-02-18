@@ -46,3 +46,18 @@ Cargo.lock
 
 # Logs
 *.log
+
+# Android
+*.apk
+*.aab
+android/.gradle/
+android/build/
+android/*/build/
+android/local.properties
+android/.idea/
+
+# ML model files (downloaded by the downloadSherpaModels Gradle task)
+android/app/src/main/assets/models/*.onnx
+android/app/src/main/assets/models/*.txt
+
+models-cache/

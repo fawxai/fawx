@@ -43,6 +43,33 @@ enum Commands {
         #[command(subcommand)]
         command: SkillCommands,
     },
+
+    /// Run OAuth bridge server for Android Codex sign-in
+    OauthBridge {
+        /// Listen address for the bridge HTTP server
+        #[arg(long, default_value = "127.0.0.1:4318")]
+        listen: String,
+
+        /// OAuth authorize endpoint URL
+        #[arg(long)]
+        auth_url: Option<String>,
+
+        /// OAuth token endpoint URL
+        #[arg(long)]
+        token_url: Option<String>,
+
+        /// OAuth client ID
+        #[arg(long)]
+        client_id: Option<String>,
+
+        /// OAuth client secret (optional for PKCE public clients)
+        #[arg(long)]
+        client_secret: Option<String>,
+
+        /// OAuth scope string
+        #[arg(long)]
+        scope: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -121,6 +148,24 @@ async fn main() -> anyhow::Result<()> {
                 0
             }
         },
+        Commands::OauthBridge {
+            listen,
+            auth_url,
+            token_url,
+            client_id,
+            client_secret,
+            scope,
+        } => {
+            let options = commands::oauth_bridge::Options {
+                listen,
+                auth_url,
+                token_url,
+                client_id,
+                client_secret,
+                scope,
+            };
+            commands::oauth_bridge::run(options).await?
+        }
     };
 
     std::process::exit(exit_code);

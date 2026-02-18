@@ -35,36 +35,33 @@ Every feature needs tests. Every bug fix needs a failing regression test first.
 **All changes must follow this flow. No exceptions.**
 
 1. Create feature branch from main
-2. Make changes, commit
+2. Write code + tests (TDD: RED → GREEN → REFACTOR)
 3. Push branch, open PR
-4. **Post PR comment: `@claude review this PR`** ← REQUIRED, DO NOT SKIP
+4. **Comment on PR: `@claude review this PR`** ← REQUIRED, DO NOT SKIP
    ⚠️ **Note:** This is a comment on the PR (not the commit message)
-5. **Post PR comment: `@codex review this PR`** ← REQUIRED, DO NOT SKIP
-6. **Wait 2 minutes, then check PR for review comments from both reviewers**
-7. **Address ALL comments from both reviews** (every single item)
-8. Commit fixes, **push**
-9. **Post PR comment: `@claude review this PR`** ← REQUIRED AFTER EVERY PUSH
-10. **Post PR comment: `@codex review this PR`** ← REQUIRED AFTER EVERY PUSH
-11. **Wait 2 minutes, check for new review comments**
-12. Issues remaining? → Go to step 7 (address all comments again)
-13. When clean: Comment `@abbudjoe ready for merge`
-12. Joe reviews and merges
+5. Wait ~5 minutes, check PR for review comments
+6. **Address ALL review items** (every single one)
+7. Push fixes
+8. **Comment on PR: `@claude review this PR`** ← REQUIRED AFTER EVERY PUSH
+9. Repeat STEPS 5-8 until all issues are resolved
+10. **Verify ALL CI checks pass** (all green on GitHub Actions)
+11. If CI fails → fix, push, go to step 4
+12. Comment `@abbudjoe ready for merge`
 
 **CRITICAL:**
 - ❌ No direct commits to main (except hotfixes approved by Joe)
 - ❌ No merges without Claude Code review
 - ❌ No skipping the `@claude review this PR` comment (required after EVERY push)
-- ❌ No skipping the `@codex review this PR` comment (required after EVERY push)
 - ❌ Do NOT put review trigger comments in commit messages
 - ❌ Do NOT rely on automatic GitHub Action triggers
 - ❌ Do NOT skip review items marked "low priority", "nice to have", or "suggestion"
 - ✅ The comment must be **standalone** on the PR (not combined with other text)
-- ✅ Comment after **every push** to trigger re-review
+- ✅ Comment `@claude review this PR` after **every push** to trigger re-review
 - ✅ **Check back after 2 minutes** to view and address all review comments
 - ✅ **Address EVERY comment** — partial fixes are not acceptable
 - ✅ **ALL review items must be resolved** — including suggestions, observations, and "nice to have" items. Every single one. No exceptions.
 - ✅ **"Optional enhancements for future consideration"** → Create backlog GitHub issues (don't lose them)
-- 🔄 **If Joe requests changes after `@abbudjoe ready for merge`** → Full review cycle restarts (push fixes → `@claude review this PR` + `@codex review this PR` → address all → repeat until clean → ping Joe again)
+- 🔄 **If Joe requests changes after `@abbudjoe ready for merge`** → Full review cycle restarts (push fixes → `@claude review this PR` → address all → repeat until clean → ping Joe again)
 - ✅ **ALL CI checks must pass** before commenting `@abbudjoe ready for merge` — verify Format, Clippy, Check, Test are green on GitHub Actions
 
 ## Checklist Before PR
