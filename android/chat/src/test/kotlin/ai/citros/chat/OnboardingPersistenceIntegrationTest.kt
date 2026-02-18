@@ -98,20 +98,21 @@ class OnboardingPersistenceIntegrationTest {
             screenContent = null // Screen context is irrelevant for identity prompt assertions.
         )
 
-        assertTrue(persistedSoul.contains(profile.agentName))
-        assertTrue(persistedUser.contains(profile.userName))
-        assertTrue(startupPrompt.contains("## SOUL.md"))
-        assertTrue(startupPrompt.contains("## USER.md"))
-        assertTrue(startupPrompt.contains(profile.agentName))
-        assertTrue(startupPrompt.contains(profile.userName))
+        // Agent name is in IDENTITY.md, not SOUL.md; SOUL has personality/vibe
+        assertTrue(persistedSoul.contains(profile.agentVibe), "SOUL should contain agent vibe")
+        val persistedIdentity = reloadedManager.readFile(AgentFileManager.IDENTITY_FILE)
+        assertTrue(persistedIdentity.contains(profile.agentName), "IDENTITY should contain agent name")
+        assertTrue(persistedUser.contains(profile.userName), "USER should contain user name")
+        assertTrue(startupPrompt.contains(profile.agentName), "Startup prompt should contain agent name")
+        assertTrue(startupPrompt.contains(profile.userName), "Startup prompt should contain user name")
+        assertTrue(startupPrompt.contains("## Strategy"), "Startup prompt should contain strategy section")
 
         assertEquals(1, client.chatWithToolsCallCount)
         val sentPrompt = client.lastSystemPrompt
         assertNotNull(sentPrompt)
-        assertTrue(sentPrompt.contains("## SOUL.md"))
-        assertTrue(sentPrompt.contains("## USER.md"))
-        assertTrue(sentPrompt.contains(profile.agentName))
-        assertTrue(sentPrompt.contains(profile.userName))
+        assertTrue(sentPrompt.contains(profile.agentName), "Sent prompt should contain agent name")
+        assertTrue(sentPrompt.contains(profile.userName), "Sent prompt should contain user name")
+        assertTrue(sentPrompt.contains("## Strategy"), "Sent prompt should contain strategy section")
 
         assertEquals("Done", response.text)
         assertEquals("end_turn", response.stopReason)
@@ -129,8 +130,8 @@ class OnboardingPersistenceIntegrationTest {
         val reloadedManager = AgentFileManager.fromContext(context)
         val prompt = OnboardingPersistence.systemPromptForStartup(reloadedManager)
 
-        // Falls back to default built system prompt
-        assertTrue(prompt.contains("You are Citros"), "Should fall back to default system prompt")
+        // With user file missing, composed prompt still has identity from IDENTITY.md
+        assertTrue(prompt.contains(profile.agentName), "Should contain agent name from IDENTITY.md")
         assertTrue(prompt.contains("## Strategy"), "Should contain strategy section")
     }
 
@@ -146,13 +147,13 @@ class OnboardingPersistenceIntegrationTest {
         val reloadedManager = AgentFileManager.fromContext(context)
         val prompt = OnboardingPersistence.systemPromptForStartup(reloadedManager)
 
-        // Falls back to default built system prompt
-        assertTrue(prompt.contains("You are Citros"), "Should fall back to default system prompt")
+        // With soul file missing, composed prompt still has identity from IDENTITY.md
+        assertTrue(prompt.contains(profile.agentName), "Should contain agent name from IDENTITY.md")
         assertTrue(prompt.contains("## Strategy"), "Should contain strategy section")
     }
 
     private class CapturingProviderClient(
-        override val provider: Provider = Provider.OPENAI
+        override val provider: Provider = Provider.ANTHROPIC // Stub; not used in prompt assertions
     ) : ProviderClient {
         var lastSystemPrompt: String? = null
             private set

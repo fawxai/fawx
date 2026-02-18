@@ -26,12 +26,16 @@ class OnboardingPersistenceTest {
         val soul = manager.readFile(AgentFileManager.SOUL_FILE)
         val user = manager.readFile(AgentFileManager.USER_FILE)
 
-        assertTrue(soul.contains("# SOUL"))
-        assertTrue(soul.contains("- Name: Zest"))
-        assertTrue(soul.contains("- Nature: citrus spirit"))
-        assertTrue(soul.contains("- Vibe: chill but sharp"))
-        assertTrue(soul.contains("- Emoji: 🍋"))
-        assertTrue(soul.contains("- Style: casual and direct"))
+        assertTrue(soul.contains("# SOUL"), "Should have SOUL header")
+        assertTrue(soul.contains("chill but sharp"), "Should contain agent vibe")
+        assertTrue(soul.contains("casual and direct"), "Should contain relationship style")
+        assertTrue(soul.contains("Be genuinely helpful"), "Should contain personality guidance")
+
+        // IDENTITY.md should also be written
+        val identity = manager.readFile(AgentFileManager.IDENTITY_FILE)
+        assertTrue(identity.contains("Zest"), "Identity should contain agent name")
+        assertTrue(identity.contains("citrus spirit"), "Identity should contain agent nature")
+        assertTrue(identity.contains("🍋"), "Identity should contain emoji")
 
         assertTrue(user.contains("# USER"))
         assertTrue(user.contains("- Name: Joe"))
@@ -48,10 +52,9 @@ class OnboardingPersistenceTest {
 
         val prompt = OnboardingPersistence.systemPromptForStartup(manager)
 
-        assertTrue(prompt.contains("## SOUL.md"))
-        assertTrue(prompt.contains("## USER.md"))
-        assertTrue(prompt.contains("Zest"))
-        assertTrue(prompt.contains("Joe"))
+        assertTrue(prompt.contains("Zest"), "Prompt should contain agent name")
+        assertTrue(prompt.contains("Joe"), "Prompt should contain user name")
+        assertTrue(prompt.contains("## Strategy"), "Prompt should contain phone agent strategy")
     }
 
     @Test
@@ -60,8 +63,8 @@ class OnboardingPersistenceTest {
 
         val prompt = OnboardingPersistence.systemPromptForStartup(manager)
 
-        // Falls back to the default built system prompt (contains identity + strategy)
-        assertTrue(prompt.contains("You are Citros"), "Should fall back to default system prompt")
+        // Always uses composed prompt; with no identity files, falls back to hardcoded SECTION_IDENTITY
+        assertTrue(prompt.contains("You are Citros"), "Should contain default identity")
         assertTrue(prompt.contains("## Strategy"), "Should contain strategy section")
     }
 
@@ -72,21 +75,14 @@ class OnboardingPersistenceTest {
 
         // Starts with H1 heading
         assertTrue(md.startsWith("# SOUL"), "Should start with H1 heading")
-        // Contains H2 sections
-        assertTrue(md.contains("## Identity"), "Should have Identity section")
-        assertTrue(md.contains("## Relationship"), "Should have Relationship section")
-        // All list items are valid markdown bullets
-        val bulletLines = md.lines().filter { it.trimStart().startsWith("- ") }
-        assertTrue(bulletLines.size >= 5, "Should have at least 5 bullet items, got ${bulletLines.size}")
-        bulletLines.forEach { line ->
-            assertTrue(line.matches(Regex("^- .+: .+$")),
-                "Bullet should be '- Key: Value' format, got: '$line'")
-        }
-        // No blank value fields
-        bulletLines.forEach { line ->
-            val value = line.substringAfter(": ")
-            assertTrue(value.isNotBlank(), "Value should not be blank in: '$line'")
-        }
+        // Contains key personality sections
+        assertTrue(md.contains("## Personality"), "Should have Personality section")
+        assertTrue(md.contains("## Core Truths"), "Should have Core Truths section")
+        assertTrue(md.contains("## Boundaries"), "Should have Boundaries section")
+        // Contains the agent vibe
+        assertTrue(md.contains("chill but sharp"), "Should contain the agent vibe")
+        // Contains personality guidance
+        assertTrue(md.contains("Be genuinely helpful"), "Should contain personality guidance")
     }
 
     @Test

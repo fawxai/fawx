@@ -124,4 +124,52 @@ class AgentFileManagerTest {
         manager.writeFile("maxsize.md", content)
         assertEquals(content, manager.readFile("maxsize.md"))
     }
+
+    // -- onPromptFileChanged callback tests --
+
+    @Test
+    fun `writeFile triggers onPromptFileChanged for SOUL_MD`() {
+        val manager = AgentFileManager.fromDirectory(tempRoot)
+        val triggered = mutableListOf<String>()
+        manager.onPromptFileChanged = { triggered.add(it) }
+
+        manager.writeFile("SOUL.md", "# My soul")
+
+        assertEquals(listOf("SOUL.md"), triggered)
+    }
+
+    @Test
+    fun `writeFile triggers onPromptFileChanged for IDENTITY_MD`() {
+        val manager = AgentFileManager.fromDirectory(tempRoot)
+        val triggered = mutableListOf<String>()
+        manager.onPromptFileChanged = { triggered.add(it) }
+
+        manager.writeFile("IDENTITY.md", "# Identity")
+
+        assertEquals(listOf("IDENTITY.md"), triggered)
+    }
+
+    @Test
+    fun `writeFile triggers onPromptFileChanged for USER_MD`() {
+        val manager = AgentFileManager.fromDirectory(tempRoot)
+        val triggered = mutableListOf<String>()
+        manager.onPromptFileChanged = { triggered.add(it) }
+
+        manager.writeFile("USER.md", "# User info")
+
+        assertEquals(listOf("USER.md"), triggered)
+    }
+
+    @Test
+    fun `writeFile does NOT trigger onPromptFileChanged for non-prompt files`() {
+        val manager = AgentFileManager.fromDirectory(tempRoot)
+        val triggered = mutableListOf<String>()
+        manager.onPromptFileChanged = { triggered.add(it) }
+
+        manager.writeFile("AGENTS.md", "# Agents")
+        manager.writeFile("notes.md", "some notes")
+        manager.writeFile("memory/2026-01-01.md", "daily log")
+
+        assertTrue(triggered.isEmpty(), "Non-prompt files should not trigger callback")
+    }
 }

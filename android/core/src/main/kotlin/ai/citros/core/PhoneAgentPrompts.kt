@@ -8,18 +8,23 @@ import java.time.format.DateTimeFormatter
  * Modular system prompt builder for Citros phone agent.
  *
  * Assembles the system prompt from discrete sections, with runtime injection
- * for model name and accessibility status. Inspired by OpenClaw's modular
- * prompt assembly pattern.
+ * for model name and accessibility status. Identity files from the agent
+ * directory SUPPLEMENT these sections — they never replace the phone-specific
+ * tool docs, strategy, or recovery patterns.
  *
  * Sections:
- * 1. Identity — who Citros is
+ * 1. Identity — from SOUL.md/IDENTITY.md (or hardcoded fallback)
  * 2. Tools — grouped by category (conditional on phone control)
  * 3. Strategy — how to approach tasks vs. direct commands
  * 4. Recovery — specific failure patterns and fixes
- * 4b. Communication Policy — what to tell/hide from user (conditional on phone control)
- * 5. Disambiguation — "open settings" = Android Settings, not Citros
- * 6. Rules — conciseness, completion, conversational detection
- * 7. Runtime — model name, screen reader status, timestamp
+ * 5. Communication Policy — what to tell/hide from user (conditional on phone control)
+ * 6. Disambiguation
+ * 7. Agent directives — from AGENTS.md (optional)
+ * 8. Security rules — from SECURITY.md (optional)
+ * 9. Rules
+ * 10. User context — from USER.md (recency zone)
+ * 11. Memory context — from MEMORY.md truncated (recency zone)
+ * 12. Runtime — model name, screen reader status, timestamp
  */
 object PhoneAgentPrompts {
 
@@ -93,11 +98,11 @@ One tool call. No observation needed.
 
 ### Research — Search Before Navigating
 When the user asks a factual question, try web_search first. Only open a browser app if the user specifically asks to browse.
-"What’s the weather?" → web_search("weather in [city]"). Return the answer.
+"What's the weather?" → web_search("weather in [city]"). Return the answer.
 "Look up the score" → web_search("[team] score today"). Return the answer.
 "Open Google" → open_app("Google"). Direct command to launch the app.
 "Google the weather" → web_search("weather"). Search task, not an app launch.
-Don’t open Chrome just to Google something — use web_search directly.
+Don't open Chrome just to Google something — use web_search directly.
 
 ### Tasks — Open, Read, Act, Check
 1. Open the target app
@@ -129,7 +134,7 @@ Don’t open Chrome just to Google something — use web_search directly.
 
 **Keyboard blocking elements:** Scroll down or dismiss the keyboard (press back) to reveal hidden buttons."""
 
-    // ── Section 4b: Communication Policy ────────────────────────────────
+    // ── Section 5: Communication Policy ────────────────────────────────
 
     internal const val SECTION_COMMUNICATION = """## Communication Policy
 
@@ -159,7 +164,7 @@ When executing tools, follow these guidelines for what to communicate to the use
 - Your internal debate about which approach to take
 - The word "error" for routine exploration failures"""
 
-    // ── Section 5: Disambiguation ───────────────────────────────────────
+    // ── Section 6: Disambiguation ───────────────────────────────────────
 
     internal const val SECTION_DISAMBIGUATION = """## Disambiguation
 - "Open settings" → the Android Settings app. Use open_app("Settings").
@@ -168,7 +173,7 @@ When executing tools, follow these guidelines for what to communicate to the use
 - Only navigate Citros UI if the user explicitly says "Citros settings" or "your settings."
 - You control the PHONE. Your tools interact with Android apps, not with yourself."""
 
-    // ── Section 6: Rules ────────────────────────────────────────────────
+    // ── Section 9: Rules ────────────────────────────────────────────────
 
     internal const val SECTION_RULES = """## Rules
 - When the task is complete, stop calling tools and respond with a brief summary of what you did.
@@ -179,7 +184,7 @@ When executing tools, follow these guidelines for what to communicate to the use
 - After open_app, type the user's actual query — not the app name you just opened. E.g. open_app("Google") then type_text("weather in Denver"), NOT type_text("Google").
 - One action per step. You'll see the updated screen before your next move."""
 
-    // ── Section 7: Runtime (built dynamically) ──────────────────────────
+    // ── Section 12: Runtime (built dynamically) ──────────────────────────
 
     /**
      * Build the runtime section with current model, accessibility status, and time.
@@ -211,32 +216,78 @@ When executing tools, follow these guidelines for what to communicate to the use
     /**
      * Build the full system prompt from modular sections.
      *
-     * When [phoneControlAvailable] is false, the tools section is omitted and
-     * the runtime section includes a warning about accessibility being disabled.
+     * Identity files from the agent directory SUPPLEMENT the phone prompt.
+     * They replace the generic identity section but never displace tools,
+     * strategy, recovery, communication, or rules.
      *
      * @param phoneControlAvailable Whether the accessibility service is attached
      * @param modelName The current model name (e.g. "claude-opus-4-6"), shown in runtime section
+     * @param identityContent Content from SOUL.md + IDENTITY.md, replaces [SECTION_IDENTITY] if non-null
+     * @param userContent Content from USER.md, injected as a user context section
+     * @param agentsContent Content from AGENTS.md, injected as agent directives section
+     * @param memoryContent Truncated content from MEMORY.md, injected as memory context
+     * @param securityContent Content from SECURITY.md, injected as Security Rules section before Rules
      * @return The assembled system prompt
      */
     fun buildSystemPrompt(
         phoneControlAvailable: Boolean = true,
-        modelName: String? = null
+        modelName: String? = null,
+        identityContent: String? = null,
+        userContent: String? = null,
+        agentsContent: String? = null,
+        memoryContent: String? = null,
+        securityContent: String? = null
     ): String {
         val sections = mutableListOf<String>()
 
-        sections.add(SECTION_IDENTITY)
+        // Section 1: Identity — use file content if available, else hardcoded fallback
+        if (!identityContent.isNullOrBlank()) {
+            sections.add(identityContent)
+        } else {
+            sections.add(SECTION_IDENTITY)
+        }
 
+        // Section 2: Phone tools (never replaced by files)
         if (phoneControlAvailable) {
             sections.add(SECTION_TOOLS)
         }
 
+        // Section 3-4: Strategy + Recovery (never replaced)
         sections.add(SECTION_STRATEGY)
         sections.add(SECTION_RECOVERY)
+
+        // Section 5: Communication (conditional on phone control)
         if (phoneControlAvailable) {
             sections.add(SECTION_COMMUNICATION)
         }
+
+        // Section 6: Disambiguation
         sections.add(SECTION_DISAMBIGUATION)
+
+        // Section 7: Agent directives from AGENTS.md
+        if (!agentsContent.isNullOrBlank()) {
+            sections.add("## Agent Directives\n\n$agentsContent")
+        }
+
+        // Section 8: Security rules from SECURITY.md
+        if (!securityContent.isNullOrBlank()) {
+            sections.add("## Security Rules\n\n$securityContent")
+        }
+
+        // Section 9: Rules (never replaced)
         sections.add(SECTION_RULES)
+
+        // Section 10: User context from USER.md (recency zone)
+        if (!userContent.isNullOrBlank()) {
+            sections.add("## About Your User\n\n$userContent")
+        }
+
+        // Section 11: Memory context from MEMORY.md (recency zone)
+        if (!memoryContent.isNullOrBlank()) {
+            sections.add("## Memory Context\n\n$memoryContent")
+        }
+
+        // Section 12: Runtime
         sections.add(buildRuntimeSection(phoneControlAvailable, modelName))
 
         return sections.joinToString("\n\n")
@@ -248,7 +299,7 @@ When executing tools, follow these guidelines for what to communicate to the use
      * Shorter than the full prompt — the model already has context from the first turn.
      * Focuses on key reminders that prevent common mistakes.
      */
-    fun buildActionPrompt(phoneControlAvailable: Boolean = true, modelName: String? = null): String {
+    fun buildActionPrompt(phoneControlAvailable: Boolean = true, modelName: String? = null, securityContent: String? = null): String {
         val parts = mutableListOf<String>()
 
         parts.add("""Continue executing the task.
@@ -260,6 +311,11 @@ Reminders:
 - After open_app, type the user's actual query — not the app name you just opened.
 - If the screen hasn't changed after 2 actions, you're stuck — try a different approach.
 - When the task is complete, respond with text only — no more tool calls.${if (phoneControlAvailable) "\n- Stay silent about tap/swipe failures — just try a different approach. Only alert the user if you're stuck after 3 attempts or something needs their action." else ""}""")
+
+        // Include security rules in action loop (they must always be present)
+        if (!securityContent.isNullOrBlank()) {
+            parts.add("## Security Rules\n\n$securityContent")
+        }
 
         if (modelName != null) {
             parts.add("Model: $modelName")

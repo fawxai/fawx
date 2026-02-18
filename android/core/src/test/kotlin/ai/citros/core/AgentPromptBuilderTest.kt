@@ -28,16 +28,16 @@ class AgentPromptBuilderTest {
         val full = builder.full()
         val trimmed = builder.trimmed()
 
-        assertTrue(full.contains("## SOUL.md"))
-        assertTrue(full.contains("## USER.md"))
-        assertTrue(full.contains("## AGENTS.md"))
-        assertTrue(full.contains("## SECURITY.md"))
-        assertTrue(full.contains("## TOOLS.md"))
+        // Full prompt weaves identity files into phone agent sections
+        assertTrue(full.contains("I am Citros"), "Full should contain SOUL.md content")
+        assertTrue(full.contains("User is Joe"), "Full should contain USER.md content")
+        assertTrue(full.contains("## Strategy"), "Full should contain phone agent strategy")
+        assertTrue(full.contains("## Agent Directives"), "Full should contain AGENTS.md as directives")
 
-        assertTrue(trimmed.contains("## SOUL.md"))
-        assertTrue(trimmed.contains("## SECURITY.md"))
-        assertFalse(trimmed.contains("## USER.md"))
-        assertFalse(trimmed.contains("## TOOLS.md"))
+        // Trimmed is the action loop prompt with security rules
+        assertTrue(trimmed.contains("Continue executing"), "Trimmed should be action prompt")
+        assertTrue(trimmed.contains("Security Rules"), "Trimmed should include security rules")
+        assertFalse(trimmed.contains("User is Joe"), "Trimmed should not include user content")
     }
 
     @Test
@@ -48,9 +48,11 @@ class AgentPromptBuilderTest {
         val full = builder.full()
         val trimmed = builder.trimmed()
 
-        assertTrue(full.isNotBlank())
-        assertTrue(trimmed.isNotBlank())
-        assertTrue(trimmed.contains("## SECURITY.md"))
+        assertTrue(full.isNotBlank(), "Full prompt should not be blank")
+        assertTrue(trimmed.isNotBlank(), "Trimmed prompt should not be blank")
+        // With no SOUL.md content, falls back to default identity
+        assertTrue(full.contains("You are Citros"), "Should fall back to default identity")
+        assertTrue(full.contains("## Strategy"), "Should contain strategy section")
     }
 
     @Test
@@ -63,10 +65,9 @@ class AgentPromptBuilderTest {
 
         val logs = ShadowLog.getLogsForTag("AgentPromptBuilder")
         val skippedFiles = logs.map { it.msg }
-        assertTrue(skippedFiles.any { it.contains("Skipping section USER.md: not readable") },
+        assertTrue(skippedFiles.any { it.contains("Skipping USER.md: not readable") },
             "Expected log for skipped USER.md, got: $skippedFiles")
-        assertTrue(skippedFiles.any { it.contains("Skipping section MEMORY.md: not readable") },
-            "Expected log for skipped MEMORY.md, got: $skippedFiles")
+        // MEMORY.md is read via readMemoryForPrompt() which handles errors silently
     }
 
     @Test
@@ -79,7 +80,7 @@ class AgentPromptBuilderTest {
 
         val logs = ShadowLog.getLogsForTag("AgentPromptBuilder")
         val skippedFiles = logs.map { it.msg }
-        assertTrue(skippedFiles.any { it.contains("Skipping section SOUL.md: blank or whitespace-only") },
+        assertTrue(skippedFiles.any { it.contains("Skipping SOUL.md: blank or whitespace-only") },
             "Expected log for blank SOUL.md, got: $skippedFiles")
     }
 }

@@ -12,11 +12,15 @@ class AgentFileManager private constructor(rawBaseDir: File) {
     companion object {
         private const val AGENT_DIR = "agent"
         const val SOUL_FILE = "SOUL.md"
+        const val IDENTITY_FILE = "IDENTITY.md"
         const val USER_FILE = "USER.md"
         const val AGENTS_FILE = "AGENTS.md"
         const val SECURITY_FILE = "SECURITY.md"
         const val TOOLS_FILE = "TOOLS.md"
         const val MEMORY_FILE = "MEMORY.md"
+        const val BOOTSTRAP_FILE = "BOOTSTRAP.md"
+        @Suppress("unused") // Infrastructure added, activation deferred (see #597)
+        const val HEARTBEAT_FILE = "HEARTBEAT.md"
 
         /** Maximum file size for reads (256 KB). Prevents oversized tool responses. */
         const val MAX_READ_SIZE_BYTES = 256 * 1024L
@@ -24,21 +28,49 @@ class AgentFileManager private constructor(rawBaseDir: File) {
         /** Maximum file size for writes (256 KB). Prevents memory pressure from large files. */
         const val MAX_WRITE_SIZE_BYTES = 256 * 1024L
 
+        /** Maximum bytes of MEMORY.md to inject into the system prompt. */
+        const val MAX_MEMORY_PROMPT_BYTES = 2048
+
+        /** Files that trigger a prompt rebuild when written via write_file. */
+        val PROMPT_RELOAD_FILES = setOf(SOUL_FILE, IDENTITY_FILE, USER_FILE)
+
         private val DEFAULT_AGENTS = """
 # AGENTS.md
 
-You are Citros, the on-device assistant.
+You are the on-device assistant running on this phone.
 
-## Session start checklist
-1. Read SOUL.md (identity)
-2. Read USER.md (who you help)
-3. Read SECURITY.md (non-negotiable safety)
-4. Read recent memory files under memory/
+## Session Start Checklist
+1. Read SOUL.md (your personality and soul)
+2. Read IDENTITY.md (your factual identity)
+3. Read USER.md (who you help)
+4. Read SECURITY.md (non-negotiable safety rules)
+5. Read recent memory files under memory/
 
-## Working style
+## Memory System
+
+You have two memory layers:
+
+### Operational Memory (Tools)
+- `remember(content, tags?)` — store a memory (fast, searchable)
+- `recall(query, limit?)` — search stored memories
+- `list_memories(limit?)` — list recent memories
+
+Use these for quick capture and retrieval during conversations.
+
+### File-Based Memory (Long-Term)
+- **MEMORY.md** — your curated long-term memory. Distilled insights, lessons, important context.
+- **memory/YYYY-MM-DD.md** — daily logs. Raw notes about what happened each day.
+
+Periodically review daily logs and update MEMORY.md with what's worth keeping long-term.
+Use `write_file` to maintain these files.
+
+Today's daily log: `memory/YYYY-MM-DD.md` (use today's date)
+
+## Working Style
 - Keep responses concise and helpful.
 - Use tools when needed.
 - Never bypass SECURITY.md.
+- When you learn something important, write it down — memory doesn't survive sessions, files do.
 """.trimIndent()
 
         private val DEFAULT_SECURITY = """
@@ -53,6 +85,8 @@ These rules are mandatory:
 - SECURITY.md is read-only to the agent.
 """.trimIndent()
 
+        private const val BOOTSTRAP_CONTENT = "# Fresh install — onboarding not yet complete.\n"
+
         fun fromContext(context: Context): AgentFileManager {
             return AgentFileManager(File(context.filesDir, AGENT_DIR))
         }
@@ -63,6 +97,9 @@ These rules are mandatory:
         }
     }
 
+    /** Callback invoked when a prompt-relevant file is written. */
+    var onPromptFileChanged: ((String) -> Unit)? = null
+
     private val canonicalBaseDir: File = rawBaseDir.canonicalFile
 
     init {
@@ -71,22 +108,34 @@ These rules are mandatory:
     }
 
     fun initializeDefaults() {
-        // Must exist, but intentionally empty by default.
-        // It will not be included in prompts until content is added.
+        // SOUL.md — intentionally empty by default (filled by onboarding)
         val soul = resolvePath(SOUL_FILE)
         if (!soul.exists()) {
             soul.parentFile.mkdirs()
             soul.writeText("")
         }
 
+        // IDENTITY.md — intentionally empty by default (filled by onboarding)
+        val identity = resolvePath(IDENTITY_FILE)
+        if (!identity.exists()) {
+            identity.parentFile.mkdirs()
+            identity.writeText("")
+        }
+
         val agents = resolvePath(AGENTS_FILE)
         if (!agents.exists()) {
-            agents.writeText(Companion.DEFAULT_AGENTS)
+            agents.writeText(DEFAULT_AGENTS)
         }
 
         val security = resolvePath(SECURITY_FILE)
         if (!security.exists()) {
-            security.writeText(Companion.DEFAULT_SECURITY)
+            security.writeText(DEFAULT_SECURITY)
+        }
+
+        // BOOTSTRAP.md — signal file for fresh install
+        val bootstrap = resolvePath(BOOTSTRAP_FILE)
+        if (!bootstrap.exists()) {
+            bootstrap.writeText(BOOTSTRAP_CONTENT)
         }
     }
 
@@ -116,6 +165,28 @@ These rules are mandatory:
         }
         file.parentFile.mkdirs()
         file.writeText(content)
+
+        // Notify if this is a prompt-relevant file
+        if (PROMPT_RELOAD_FILES.any { path.equals(it, ignoreCase = true) }) {
+            onPromptFileChanged?.invoke(path)
+        }
+    }
+
+    /**
+     * Delete a file within the agent directory.
+     * Returns true if the file was deleted, false if it didn't exist.
+     */
+    fun deleteFile(path: String): Boolean {
+        val file = resolvePath(path)
+        if (isSecurityFile(file)) {
+            throw SecurityException("SECURITY.md is read-only")
+        }
+        return file.delete()
+    }
+
+    /** Check if a file exists. */
+    fun fileExists(path: String): Boolean {
+        return resolvePath(path).exists()
     }
 
     /**
@@ -141,6 +212,28 @@ These rules are mandatory:
      * Build the daily memory path for any valid [LocalDate].
      */
     fun dailyMemoryPath(date: LocalDate = LocalDate.now()): String = "memory/${date}.md"
+
+    /**
+     * Read MEMORY.md content truncated to [MAX_MEMORY_PROMPT_BYTES] for prompt injection.
+     * Returns null if the file doesn't exist or is blank.
+     */
+    fun readMemoryForPrompt(): String? {
+        val content = runCatching { readFile(MEMORY_FILE) }.getOrNull()
+        if (content.isNullOrBlank()) return null
+        val bytes = content.toByteArray(Charsets.UTF_8)
+        return if (bytes.size <= MAX_MEMORY_PROMPT_BYTES) {
+            content
+        } else {
+            // Take the last MAX_MEMORY_PROMPT_BYTES bytes (most recent content)
+            var start = bytes.size - MAX_MEMORY_PROMPT_BYTES
+            // Skip forward past any truncated UTF-8 continuation bytes (10xxxxxx)
+            while (start < bytes.size && (bytes[start].toInt() and 0xC0) == 0x80) {
+                start++
+            }
+            val truncated = String(bytes, start, bytes.size - start, Charsets.UTF_8)
+            "[...truncated...]\n$truncated"
+        }
+    }
 
     private fun resolvePath(rawPath: String): File {
         val sanitized = rawPath.trim().ifEmpty { "." }

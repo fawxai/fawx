@@ -232,10 +232,10 @@ open class PhoneAgentApi(
         val client = if (isActionLoop) actionClient else chatClient
         val modelName = client.modelId
         val systemPrompt = if (isActionLoop) {
-            promptBuilder?.trimmed()
+            promptBuilder?.trimmed(phoneControlAvailable = phoneControlAvailable, modelName = modelName)
                 ?: PhoneAgentPrompts.buildActionPrompt(phoneControlAvailable = phoneControlAvailable, modelName = modelName)
         } else {
-            promptBuilder?.full() ?: PhoneAgentPrompts.buildSystemPrompt(phoneControlAvailable = phoneControlAvailable, modelName = modelName)
+            promptBuilder?.full(phoneControlAvailable = phoneControlAvailable, modelName = modelName) ?: PhoneAgentPrompts.buildSystemPrompt(phoneControlAvailable = phoneControlAvailable, modelName = modelName)
         }
         
         // Use compacted messages for action loop to manage context window.
@@ -289,7 +289,7 @@ open class PhoneAgentApi(
      */
     open suspend fun continueAfterTools(): ChatResponse {
         val phoneControlAvailable = phoneControlOverride ?: ScreenReader.isAttached()
-        val systemPrompt = promptBuilder?.trimmed()
+        val systemPrompt = promptBuilder?.trimmed(phoneControlAvailable = phoneControlAvailable, modelName = actionClient.modelId)
             ?: PhoneAgentPrompts.buildActionPrompt(
                 phoneControlAvailable = phoneControlAvailable,
                 modelName = actionClient.modelId
