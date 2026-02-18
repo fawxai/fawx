@@ -175,6 +175,7 @@ class ContextCompactor(
             firstLine.startsWith("pressed back") || firstLine.startsWith("went back") -> "press_back"
             firstLine.startsWith("results for") -> "web_search"
             firstLine.startsWith("content from") || firstLine.startsWith("fetched") -> "web_fetch"
+            firstLine.startsWith("web automation") -> "web_browse"
             firstLine.startsWith("thought:") -> "think"
             firstLine.startsWith("screenshot") -> "screenshot"
             else -> "unknown"

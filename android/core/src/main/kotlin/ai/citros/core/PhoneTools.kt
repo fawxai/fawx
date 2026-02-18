@@ -545,13 +545,42 @@ object PhoneTools {
     )
 
     /**
+     * Execute a browser automation task on a website using TinyFish Web Agent.
+     * Navigates pages, fills forms, clicks buttons, extracts data.
+     * Use for tasks requiring interaction with live websites.
+     */
+    val WEB_BROWSE = Tool(
+        name = "web_browse",
+        description = "Execute a browser automation task on a live website. Navigates pages, fills forms, clicks buttons, and extracts data using a cloud browser. Use for price comparison, data extraction, booking, form submission, or any task requiring real website interaction. More powerful than web_fetch — handles JavaScript, dynamic content, and multi-step flows.",
+        inputSchema = mapOf(
+            "type" to "object",
+            "properties" to mapOf(
+                "url" to mapOf(
+                    "type" to "string",
+                    "description" to "Target website URL (e.g., https://amazon.com)"
+                ),
+                "goal" to mapOf(
+                    "type" to "string",
+                    "description" to "Natural language description of what to accomplish (e.g., 'Find the price of AirPods Pro 3 and compare with AirPods Max')"
+                ),
+                "stealth" to mapOf(
+                    "type" to "boolean",
+                    "description" to "Use anti-detection browser for bot-protected sites (default: false)"
+                )
+            ),
+            "required" to listOf("url", "goal")
+        )
+    )
+
+    /**
      * API tools that require network access.
      * Only available to models at STANDARD tier or above.
      * Conditionally included via PhoneAgentApi.getToolsForModel().
      */
     val API_TOOLS: List<Tool> = listOf(
         WEB_SEARCH,
-        WEB_FETCH
+        WEB_FETCH,
+        WEB_BROWSE
     )
 
     val ALL: List<Tool> = listOf(

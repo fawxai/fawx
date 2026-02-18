@@ -139,6 +139,7 @@ object OutputClassifier {
         // Research — always shown
         "web_search" to ToolCategory.RESEARCH,
         "web_fetch" to ToolCategory.RESEARCH,
+        "web_browse" to ToolCategory.RESEARCH,
 
         // Reasoning — shown dimmed
         "think" to ToolCategory.REASONING

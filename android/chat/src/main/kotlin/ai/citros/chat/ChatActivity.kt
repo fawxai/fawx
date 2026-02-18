@@ -540,6 +540,7 @@ private const val PREF_LAST_CONVERSATION_DATE = "last_conversation_date"
 internal const val PREF_DEFAULT_OVERLAY_MODE = "default_overlay_mode"
 internal const val PREF_SEARCH_BASE_URL = "search_base_url"
 internal const val PREF_BRAVE_API_KEY = "brave_api_key"
+internal const val PREF_TINYFISH_API_KEY = "tinyfish_api_key"
 
 private const val TOKEN_PREVIEW_LIMIT = 80
 
@@ -1110,7 +1111,8 @@ fun ChatScreen(
         val searchPrefs = context.getSharedPreferences(CITROS_PREFS, android.content.Context.MODE_PRIVATE)
         viewModel.setSearchConfig(
             searxngUrl = searchPrefs.getString(PREF_SEARCH_BASE_URL, null),
-            braveKey = searchPrefs.getString(PREF_BRAVE_API_KEY, null)
+            braveKey = searchPrefs.getString(PREF_BRAVE_API_KEY, null),
+            tinyFishKey = searchPrefs.getString(PREF_TINYFISH_API_KEY, null)
         )
 
         // Try wallet first

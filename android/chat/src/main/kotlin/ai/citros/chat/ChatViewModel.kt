@@ -73,6 +73,7 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
                 ToolCategory.RESEARCH -> when (toolName) {
                     "web_search" -> "Searching the web..."
                     "web_fetch" -> "Fetching page..."
+                    "web_browse" -> "Browsing the web..."
                     else -> "Researching..."
                 }
                 ToolCategory.REASONING -> "Thinking..."
@@ -162,15 +163,19 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
     /** Brave Search API key for fallback search. Set via [setSearchConfig]. */
     private var braveApiKey: String? = null
 
+    /** TinyFish Web Agent API key for browser automation. Set via [setSearchConfig]. */
+    private var tinyFishApiKey: String? = null
+
     /**
      * Update search provider configuration.
      *
      * Call from Activity after reading SharedPreferences. These values are used
      * when [configureWithWallet] builds the [PhoneAgentApi] backend.
      */
-    fun setSearchConfig(searxngUrl: String? = null, braveKey: String? = null) {
+    fun setSearchConfig(searxngUrl: String? = null, braveKey: String? = null, tinyFishKey: String? = null) {
         searchBaseUrl = searxngUrl
         braveApiKey = braveKey
+        tinyFishApiKey = tinyFishKey
     }
 
     private enum class Mode { API, LOCAL }
@@ -499,7 +504,8 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
                 actionModelId = actionModelId,
                 memoryProvider = memoryProvider,
                 searchBaseUrl = searchBaseUrl,
-                braveApiKey = braveApiKey
+                braveApiKey = braveApiKey,
+                tinyFishApiKey = tinyFishApiKey
             )
         )
     }
@@ -519,6 +525,8 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
         activeApiBackendIndex = index
         cloudApiClient = backend.chatClient
         phoneAgentApi = backend.agent
+        // Wire real-time progress updates for long-running tools (e.g., web_browse)
+        backend.agent.onToolProgress = { status -> currentToolStatus.value = status }
     }
 
     @VisibleForTesting

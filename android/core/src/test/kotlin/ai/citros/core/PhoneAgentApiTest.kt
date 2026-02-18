@@ -1467,4 +1467,89 @@ class PhoneAgentApiTest {
         assertFalse("web_fetch" in toolNames, "web_fetch should be excluded for SMALL tier models")
     }
 
+
+
+    // ========== TinyFish Web Browse Tests ==========
+
+    @Test
+    fun `web_browse returns error when tinyFishApiKey is null`() = kotlinx.coroutines.runBlocking {
+        val agent = createAgent()
+        val result = agent.executeToolCall(
+            ToolCall("t1", "web_browse", mapOf("url" to "https://example.com", "goal" to "Find price")),
+            null
+        )
+        assertTrue(result.isError)
+        assertTrue(result.text.contains("not configured") || result.text.contains("not available"))
+    }
+
+    @Test
+    fun `getToolsForModel excludes web_browse when tinyFishApiKey is null`() {
+        val agent = createAgent()
+        val tools = agent.getToolsForModel()
+        val toolNames = tools.map { it.name }
+        assertFalse("web_browse" in toolNames, "web_browse should be excluded when API key is null")
+    }
+
+    @Test
+    fun `getToolsForModel includes web_browse when tinyFishApiKey is set`() {
+        val defaultClient = ClaudeClient(
+            apiKey = "sk-ant-api03-test",
+            systemPrompt = PhoneAgentPrompts.SYSTEM_PROMPT,
+            baseUrl = server.url("/v1/messages").toString()
+        )
+        val agent = PhoneAgentApi(
+            chatClient = defaultClient,
+            actionClient = defaultClient,
+            tinyFishApiKey = "test-tinyfish-key"
+        ).also {
+            it.phoneControlOverride = true
+        }
+        val tools = agent.getToolsForModel()
+        val toolNames = tools.map { it.name }
+        assertTrue("web_browse" in toolNames, "web_browse should be included when API key is set")
+    }
+
+    @Test
+    fun `executeToolCall web_browse dispatches to TinyFishClient when key is configured`() = kotlinx.coroutines.runBlocking {
+        // Serve a mock TinyFish SSE response
+        val sseBody = listOf(
+            """data: {"type":"STARTED","runId":"run_1","timestamp":"2026-01-01T00:00:00Z"}""",
+            """data: {"type":"PROGRESS","runId":"run_1","purpose":"Navigating to page","timestamp":"2026-01-01T00:00:01Z"}""",
+            """data: {"type":"COMPLETE","runId":"run_1","status":"COMPLETED","resultJson":{"answer":"42"},"timestamp":"2026-01-01T00:00:05Z"}"""
+        ).joinToString("\n")
+        server.enqueue(MockResponse()
+            .setBody(sseBody)
+            .setResponseCode(200)
+            .addHeader("Content-Type", "text/event-stream"))
+
+        val tinyFishEndpoint = server.url("/v1/automation/run-sse").toString()
+        val defaultClient = ClaudeClient(
+            apiKey = "sk-ant-api03-test",
+            systemPrompt = PhoneAgentPrompts.SYSTEM_PROMPT,
+            baseUrl = server.url("/v1/messages").toString()
+        )
+        val agent = PhoneAgentApi(
+            chatClient = defaultClient,
+            actionClient = defaultClient,
+            tinyFishApiKey = "test-tinyfish-key",
+            tinyFishEndpoint = tinyFishEndpoint
+        ).also {
+            it.phoneControlOverride = true
+        }
+
+        val result = agent.executeToolCall(
+            ToolCall("t1", "web_browse", mapOf("url" to "https://example.com", "goal" to "Find the answer")),
+            null
+        )
+
+        assertFalse(result.isError, "Expected success but got error: " + result.text)
+        assertTrue(result.text.contains("42"), "Result should contain automation result")
+        // Verify the request actually reached MockWebServer (TinyFish endpoint)
+        val request = server.takeRequest()
+        assertEquals("/v1/automation/run-sse", request.path)
+        val body = request.body.readUtf8()
+        assertTrue(body.contains("example.com"), "Request body should contain URL")
+        assertTrue(body.contains("Find the answer"), "Request body should contain goal")
+    }
+
 }

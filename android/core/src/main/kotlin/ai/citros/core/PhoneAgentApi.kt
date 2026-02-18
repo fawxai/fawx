@@ -27,7 +27,11 @@ open class PhoneAgentApi(
     /** Base URL for SearXNG search instance (e.g., "http://100.93.251.101:8888"). Null to disable. */
     private val searchBaseUrl: String? = null,
     /** Brave Search API key for fallback search. Null to disable Brave. */
-    private val braveApiKey: String? = null
+    private val braveApiKey: String? = null,
+    /** TinyFish Web Agent API key for browser automation. Null to disable. */
+    private val tinyFishApiKey: String? = null,
+    /** TinyFish endpoint override for testing. Null uses production default. */
+    private val tinyFishEndpoint: String? = null
 ) {
     /** Shared search client — reuses OkHttpClient connection pools across calls. */
     private val searchClient by lazy {
@@ -36,6 +40,11 @@ open class PhoneAgentApi(
 
     /** Shared fetch client — reuses OkHttpClient connection pool across calls. */
     private val fetchClient by lazy { WebFetchClient() }
+
+    /** Shared TinyFish client for web browser automation. Only initialized when API key is set. */
+    private val tinyFishClient by lazy {
+        tinyFishApiKey?.let { TinyFishClient(apiKey = it, endpoint = tinyFishEndpoint ?: TinyFishClient.DEFAULT_ENDPOINT) }
+    }
 
     init {
         // Validate that the action model meets the minimum capability floor.
@@ -63,7 +72,13 @@ open class PhoneAgentApi(
 
         return if (tier != ModelTier.SMALL) {
             // web_search always available (DuckDuckGo fallback needs no config)
-            PhoneTools.ALL + PhoneTools.API_TOOLS
+            // web_browse requires TinyFish API key
+            val apiTools = if (tinyFishApiKey != null) {
+                PhoneTools.API_TOOLS
+            } else {
+                PhoneTools.API_TOOLS.filter { it.name != "web_browse" }
+            }
+            PhoneTools.ALL + apiTools
         } else {
             PhoneTools.ALL
         }
@@ -76,6 +91,13 @@ open class PhoneAgentApi(
      * Override for phone control availability check. When null, uses [ScreenReader.isAttached()].
      * Set to `true` in tests to simulate phone control being available.
      */
+    /**
+     * Optional callback for real-time tool progress updates.
+     * Called from IO dispatcher during long-running tool operations (e.g., web_browse).
+     * Set by ChatViewModel to update UI status text.
+     */
+    var onToolProgress: ((String) -> Unit)? = null
+
     @androidx.annotation.VisibleForTesting
     @Volatile
     var phoneControlOverride: Boolean? = null
@@ -121,7 +143,7 @@ open class PhoneAgentApi(
             Regex("""<tool_call>.*?</tool_call>""", RegexOption.DOT_MATCHES_ALL),
             Regex("""<function_call>.*?</function_call>""", RegexOption.DOT_MATCHES_ALL),
             // JSON tool objects with known tool names (handles one level of nesting)
-            Regex("""\{\s*"name"\s*:\s*"(tap|type_text|swipe|open_app|press_back|press_home|read_screen|screenshot|scroll|long_press|tap_text|open_notifications|wait|think)"[^{}]*(\{[^{}]*\}[^{}]*)?\}""")
+            Regex("""\{\s*"name"\s*:\s*"(tap|type_text|swipe|open_app|press_back|press_home|read_screen|screenshot|scroll|long_press|tap_text|open_notifications|wait|think|web_browse|web_search|web_fetch)"[^{}]*(\{[^{}]*\}[^{}]*)?\}""")
         )
 
         /**
@@ -727,6 +749,17 @@ open class PhoneAgentApi(
                         ?: return ToolResult("Missing required parameter: url", isError = true)
                     val maxChars = (toolCall.input["max_chars"] as? Number)?.toInt() ?: 5000
                     fetchClient.fetch(url, maxChars)
+                }
+
+                "web_browse" -> {
+                    val client = tinyFishClient
+                        ?: return ToolResult("Web browse not available: TinyFish API key not configured", isError = true)
+                    val url = toolCall.input["url"]?.toString()
+                        ?: return ToolResult("Missing required parameter: url", isError = true)
+                    val goal = toolCall.input["goal"]?.toString()
+                        ?: return ToolResult("Missing required parameter: goal", isError = true)
+                    val stealth = toolCall.input["stealth"] as? Boolean ?: false
+                    client.browse(url = url, goal = goal, stealth = stealth, onProgress = onToolProgress)
                 }
 
                 else -> {

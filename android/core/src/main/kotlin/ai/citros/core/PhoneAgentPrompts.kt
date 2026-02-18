@@ -82,6 +82,7 @@ When they're just chatting, respond naturally without using tools."""
 ### Research
 - web_search(query, count?) — search the web (returns titles, URLs, snippets)
 - web_fetch(url, max_chars?) — fetch and extract readable text from a URL
+- web_browse(url, goal, stealth?) — automate a live website: navigate, fill forms, click buttons, extract data. Use for complex web tasks (price comparison, booking, multi-step flows)
 
 ### Planning
 - think(thought) — reason about the situation without taking action (not shown to user)"""
