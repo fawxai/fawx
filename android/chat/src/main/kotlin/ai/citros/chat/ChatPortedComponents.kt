@@ -378,11 +378,19 @@ internal fun PortedMessageBubble(
                 modifier = Modifier.widthIn(max = 320.dp),
                 contentPadding = androidx.compose.foundation.layout.PaddingValues(12.dp)
             ) {
-                Text(
-                    text = message.content,
-                    color = if (isUser) userText else MaterialTheme.colorScheme.onSurface,
-                    style = MaterialTheme.typography.bodyMedium
-                )
+                if (isUser) {
+                    Text(
+                        text = message.content,
+                        color = userText,
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                } else {
+                    MarkdownText(
+                        text = message.content,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                }
             }
             if (isSteer) {
                 Text(

@@ -366,7 +366,11 @@ private fun ChatNavHost(walletDependencies: WalletDependencies) {
         OverlayController.updateQueuedMessage(sharedChatViewModel.queuedMessage.value)
         OverlayController.updateToolStatus(sharedChatViewModel.currentToolStatus.value)
 
+        // Only auto-activate overlay when a tool is actively executing (currentToolStatus != null),
+        // not just during loading/thinking. This prevents the overlay from popping up
+        // in full-screen chat when the agent is generating a text response.
         val isToolExecutionActive = overlayState.runState == OverlayRunState.EXECUTING
+            && sharedChatViewModel.currentToolStatus.value != null
         if (isToolExecutionActive && OverlayPermission.canDrawOverlays(context)) {
             OverlayController.updateSurfaceMode(getPreferredOverlayMode(context))
             OverlayController.activateOverlay()
@@ -2717,7 +2721,7 @@ internal fun MessageInput(
                         text = event.text
                         isListening = false
                         if (voiceManager?.autoSendAfterVoice?.value == true && event.text.isNotBlank()) {
-                            onSend(event.text)
+                            if (isLoading) onSteer(event.text) else onSend(event.text)
                             text = ""
                         }
                     }
@@ -2813,7 +2817,40 @@ internal fun MessageInput(
             Spacer(modifier = Modifier.width(8.dp))
 
             if (isLoading && text.isBlank()) {
-                // Stop button when loading with no text
+                // Voice-steer: mic button to redirect via voice while agent is running
+                if (isListening) {
+                    MessageInputGlassIconButton(
+                        onClick = {
+                            listeningJob?.cancel()
+                            listeningJob = null
+                            voiceManager?.activeStt?.value?.stopListening()
+                            isListening = false
+                        },
+                        enabled = true,
+                        borderColor = MaterialTheme.colorScheme.error.copy(alpha = 0.58f),
+                        highlightColor = MaterialTheme.colorScheme.error,
+                        iconTint = MaterialTheme.colorScheme.error
+                    ) {
+                        Icon(Icons.Filled.Stop, contentDescription = "Stop listening")
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                } else if (voiceReady) {
+                    MessageInputGlassIconButton(
+                        onClick = { startListening() },
+                        enabled = true,
+                        borderColor = flavor.primary.copy(alpha = 0.30f),
+                        highlightColor = flavor.primary,
+                        iconTint = lerp(flavor.primary, Color.White, 0.36f)
+                    ) {
+                        Icon(
+                            Icons.Default.KeyboardVoice,
+                            contentDescription = "Voice steer"
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                }
+
+                // Stop button
                 MessageInputGlassIconButton(
                     onClick = onCancel,
                     enabled = true,

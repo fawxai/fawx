@@ -35,6 +35,8 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -63,6 +65,8 @@ import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Shadow
@@ -806,6 +810,7 @@ internal fun OnboardingFlow(
                             )
 
                             var apiKeyText by rememberSaveable { mutableStateOf("") }
+                            var apiKeyVisible by rememberSaveable { mutableStateOf(false) }
                             var apiKeyLabel by rememberSaveable { mutableStateOf("") }
                             var selectedApiProvider by rememberSaveable { mutableStateOf(Provider.ANTHROPIC) }
                             var connectionStatus by rememberSaveable { mutableStateOf<String?>(null) }
@@ -900,6 +905,16 @@ internal fun OnboardingFlow(
                                         },
                                         label = { Text("API Key") },
                                         placeholder = { Text(ProviderUi.keyPlaceholder(selectedApiProvider)) },
+                                        visualTransformation = if (apiKeyVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                                        trailingIcon = {
+                                            IconButton(onClick = { apiKeyVisible = !apiKeyVisible }) {
+                                                Icon(
+                                                    imageVector = if (apiKeyVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                                    contentDescription = if (apiKeyVisible) "Hide key" else "Show key",
+                                                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                                )
+                                            }
+                                        },
                                         singleLine = true,
                                         shape = RoundedCornerShape(16.dp),
                                         colors = inputColors,
