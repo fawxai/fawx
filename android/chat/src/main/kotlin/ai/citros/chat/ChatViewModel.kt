@@ -273,6 +273,14 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
     @VisibleForTesting
     internal var pendingTaskMessage: String? = null
 
+    /**
+     * Tracks the last abnormal tool loop exit reason (#603).
+     * Consumed on the next [sendMessage] call to prepend context.
+     * Matches OpenClaw's abortedLastRun reactive-hint pattern.
+     */
+    @VisibleForTesting
+    internal var lastExitReason: ToolLoopExit? = null
+
     /** Queue for mid-loop steer messages from the user. Thread-safe. */
     @VisibleForTesting
     internal val steerQueue = ConcurrentLinkedQueue<String>()
@@ -716,6 +724,10 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
         error.value = null
         isLoading.value = true
 
+        // Prepend context if last tool loop exited abnormally (#603)
+        // Consumed on main thread before coroutine launch; written from main-dispatched coroutine. No race.
+        val exitHint = consumeExitReasonHint()
+
         viewModelScope.launch {
             var toolSteps = 0
             try {
@@ -730,10 +742,11 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
                 // When accessibility is ON and a pending task exists, prepend it as context.
                 val accessibilityAvailable = ScreenReader.isAttached()
                 setPendingTaskIfAccessibilityUnavailable(content, accessibilityAvailable)
+                val baseContent = if (exitHint != null) "$exitHint\n\n$content" else content
                 val effectiveContent = if (accessibilityAvailable) {
-                    consumePendingTaskContext(content)
+                    consumePendingTaskContext(baseContent)
                 } else {
-                    content
+                    baseContent
                 }
 
                 // Initial user message uses chat model (Sonnet)
@@ -828,9 +841,24 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
                             if (finalText != null) {
                                 messages.add(Message(role = "assistant", content = finalText))
                                 speakIfEnabled(finalText)
-                            } else if (result.exitReason == "max_steps") {
-                                messages.add(Message(role = "assistant", content = "Hit step limit ($MAX_TOOL_STEPS). What next?"))
                             }
+
+                            // Determine exit type and handle post-loop behavior (#603)
+                            val exit = when {
+                                toolLoopCancelled.get() -> ToolLoopExit.CANCELLED
+                                result.exitReason == "max_steps" -> ToolLoopExit.MAX_STEPS
+                                result.exitReason == "accessibility_lost" -> ToolLoopExit.ACCESSIBILITY_LOST
+                                else -> ToolLoopExit.END_TURN
+                            }
+                            // Final API call for exits that need model explanation
+                            exit.systemPrompt?.let { prompt ->
+                                requestFinalExplanation(prompt)
+                            }
+                            // Reactive flag for cancelled — hint prepended on next user message
+                            if (exit == ToolLoopExit.CANCELLED) {
+                                lastExitReason = ToolLoopExit.CANCELLED
+                            }
+
                             result.steps
                         }
                         is LoopResult.Error -> {
@@ -926,9 +954,25 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
         if (finalText != null) {
             messages.add(Message(role = "assistant", content = finalText))
             speakIfEnabled(finalText)
-        } else if (toolSteps >= MAX_TOOL_STEPS) {
-            messages.add(Message(role = "assistant", content = "Hit step limit ($MAX_TOOL_STEPS). What next?"))
         }
+
+        // Post-loop exit handling for local mode (#603)
+        val localExit = when {
+            toolLoopCancelled.get() -> ToolLoopExit.CANCELLED
+            // If the model produced final text on the last step, it wrapped up naturally —
+            // treat as END_TURN (no need for requestFinalExplanation). Asymmetric with
+            // API mode where AgentExecutor reports max_steps regardless of final text,
+            // but intentional: local mode can detect natural completion.
+            toolSteps >= MAX_TOOL_STEPS && finalText == null -> ToolLoopExit.MAX_STEPS
+            else -> ToolLoopExit.END_TURN
+        }
+        localExit.systemPrompt?.let { prompt ->
+            requestFinalExplanation(prompt)
+        }
+        if (localExit == ToolLoopExit.CANCELLED) {
+            lastExitReason = ToolLoopExit.CANCELLED
+        }
+
         return toolSteps
     }
 
@@ -1133,6 +1177,69 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
     }
 
     /**
+     * Why the tool loop ended. Determines post-loop behavior (#603).
+     */
+    @VisibleForTesting
+    internal enum class ToolLoopExit(val systemPrompt: String?) {
+        /** Model chose end_turn. Already has final text. No extra action. */
+        END_TURN(null),
+        /** User cancelled. Handled reactively via [lastExitReason] flag. */
+        CANCELLED(null),
+        /** Hit step limit. Model should summarize partial progress. */
+        MAX_STEPS(
+            "[System: You hit the step limit and couldn't finish the task. " +
+                "Summarize what you accomplished so far and ask the user how they'd like to proceed.]"
+        ),
+        /** Lost accessibility service. Model should explain. */
+        ACCESSIBILITY_LOST(
+            "[System: You lost connection to the phone's accessibility service during the task. " +
+                "Let the user know what happened and ask if they'd like to retry or do something else.]"
+        )
+    }
+
+    /**
+     * Give the model one final API call to explain an abnormal exit in its own voice (#603).
+     * Replaces hardcoded "Hit step limit" strings with natural model responses.
+     */
+    private suspend fun requestFinalExplanation(systemPrompt: String) {
+        try {
+            // Use sendEphemeral for API mode to avoid polluting conversation history
+            // with the system prompt. Only the assistant's reply is persisted.
+            val text = when (mode) {
+                Mode.API -> phoneAgentApi?.sendEphemeral(systemPrompt)
+                Mode.LOCAL -> {
+                    val response = sendMessageWithAgent(
+                        message = systemPrompt,
+                        screenContent = null,
+                        isActionLoop = false
+                    )
+                    response?.text
+                }
+            }
+            text?.let {
+                messages.add(Message(role = "assistant", content = it))
+                speakIfEnabled(it)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "requestFinalExplanation failed: ${e.message}")
+        }
+    }
+
+    /**
+     * Consume the [lastExitReason] flag and return a hint to prepend, or null (#603).
+     * Called once per [sendMessage]; the flag is cleared after consumption.
+     */
+    @VisibleForTesting
+    internal fun consumeExitReasonHint(): String? {
+        val reason = lastExitReason ?: return null
+        lastExitReason = null
+        return when (reason) {
+            ToolLoopExit.CANCELLED -> "Note: The previous task was stopped by the user. Resume carefully or ask for clarification."
+            else -> null
+        }
+    }
+
+    /**
      * Queue a steer message for mid-loop injection.
      * If the tool loop is not running, falls back to a normal [sendMessage].
      *
@@ -1281,6 +1388,7 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
         error.value = null
         lastUserMessage = null
         pendingTaskMessage = null
+        lastExitReason = null
         lastActivityTimestamp = 0L
         apiBackends.forEach { it.agent.clearConversation() }
         phoneAgentLocal?.clearConversation()

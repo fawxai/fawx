@@ -328,7 +328,9 @@ private fun ChatNavHost(walletDependencies: WalletDependencies) {
         OverlayController.actions.collect { action ->
             when (action) {
                 is OverlayAction.QueueMessage -> {
-                    sharedChatViewModel.setQueuedMessage(action.text)
+                    // Route through steerMessage which checks isLoading internally
+                    // and falls back to sendMessage when idle (#603).
+                    sharedChatViewModel.steerMessage(action.text)
                 }
                 is OverlayAction.StopExecution -> {
                     sharedChatViewModel.cancelToolExecution()

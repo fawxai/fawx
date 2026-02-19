@@ -192,7 +192,7 @@ class ChatViewModelTest {
         advanceUntilIdle()
 
         assertFalse(viewModel.isLoading.value)
-        assertTrue(viewModel.messages.last().content.contains("Hit step limit (25). What next?"))
+        // #603: hardcoded "Hit step limit" replaced by requestFinalExplanation
     }
 
     @Test
@@ -223,9 +223,8 @@ class ChatViewModelTest {
         advanceUntilIdle()
 
         assertFalse(viewModel.isLoading.value)
-        // AgentExecutor Stop boundary returns text=null at max steps;
-        // ViewModel then shows the step limit message.
-        assertTrue(viewModel.messages.last().content.contains("Hit step limit"))
+        // #603: At max steps boundary, requestFinalExplanation fires.
+        // Scripted responses exhausted so final explanation fails silently.
     }
 
     @Test
@@ -513,7 +512,7 @@ class ChatViewModelTest {
         val toolMessages = viewModel.messages.filter { it.content.startsWith("🤖") || it.content.startsWith("⚙️") }
         assertEquals(25, toolMessages.size)
         assertTrue(toolMessages.all { it.content.contains("Failed") || it.content.contains("Unknown") })
-        assertTrue(viewModel.messages.last().content.contains("Hit step limit"))
+        // #603: hardcoded "Hit step limit" replaced by requestFinalExplanation
     }
 
     // ========== Edge-Case Tests: Exception During Tool Execution (#281) ==========
@@ -950,7 +949,9 @@ class ChatViewModelTest {
         advanceUntilIdle()
 
         assertFalse(viewModel.isLoading.value)
-        assertTrue(viewModel.messages.last().content.contains("Hit step limit (25)"))
+        // #603: hardcoded "Hit step limit" replaced by requestFinalExplanation.
+        // In local mode, sendMessageWithAgent returns null (no API backend),
+        // so final explanation fails silently. Verify loop stopped.
     }
 
     @Test
@@ -1012,6 +1013,45 @@ class ChatViewModelTest {
         viewModel.clearConversation()
 
         assertEquals(0, viewModel.messages.size)
+    }
+
+
+    @Test
+    fun `requestFinalExplanation fires and adds message after max_steps`() = runTest {
+        // 25 tool responses to hit the limit; the final explanation consumes the text response
+        val responses = ArrayDeque(
+            (1..25).map { index ->
+                ChatResponse(
+                    text = null,
+                    toolCalls = listOf(ToolCall("tool_$index", "press_back", emptyMap())),
+                    stopReason = "tool_use"
+                )
+            } + ChatResponse(
+                text = "I hit the step limit. Here's what I did so far.",
+                toolCalls = emptyList(),
+                stopReason = "end_turn"
+            )
+        )
+        val scripted = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            scripted = responses
+        )
+        setApiModeWithBackends(
+            viewModel,
+            listOf(viewModel.createTestBackend(Provider.ANTHROPIC, scripted, scripted))
+        )
+
+        viewModel.sendMessage("press back repeatedly")
+        advanceUntilIdle()
+
+        assertFalse(viewModel.isLoading.value)
+        // The final explanation message should have been added
+        val lastAssistant = viewModel.messages.lastOrNull { it.role == "assistant" }
+        assertNotNull(lastAssistant)
+        assertTrue(
+            lastAssistant!!.content.contains("step limit"),
+            "Expected final explanation message but got: ${lastAssistant.content}"
+        )
     }
 
     // ========== Helper Methods ==========
@@ -2112,6 +2152,103 @@ class ChatViewModelTest {
         advanceUntilIdle()
         val userMsg = viewModel.messages.firstOrNull { it.role == "user" && it.content == "hello" }
         assertNotNull(userMsg, "User message should appear in messages")
+    }
+
+
+    // =========================================================================
+    // Post-action behavior tests (#603)
+    // =========================================================================
+
+    @Test
+    fun `lastExitReason is null by default`() {
+        assertNull(viewModel.lastExitReason)
+    }
+
+    @Test
+    fun `consumeExitReasonHint returns null when no exit reason`() {
+        assertNull(viewModel.consumeExitReasonHint())
+    }
+
+    @Test
+    fun `consumeExitReasonHint returns hint for cancelled and clears flag`() {
+        viewModel.lastExitReason = ChatViewModel.ToolLoopExit.CANCELLED
+        val hint = viewModel.consumeExitReasonHint()
+        assertNotNull(hint)
+        assertTrue(hint!!.contains("stopped by the user"))
+        // Flag should be consumed
+        assertNull(viewModel.lastExitReason)
+        // Second call returns null
+        assertNull(viewModel.consumeExitReasonHint())
+    }
+
+    @Test
+    fun `consumeExitReasonHint returns null for unknown reason and clears flag`() {
+        viewModel.lastExitReason = ChatViewModel.ToolLoopExit.MAX_STEPS  // used as a non-CANCELLED value
+        val hint = viewModel.consumeExitReasonHint()
+        assertNull(hint)
+        assertNull(viewModel.lastExitReason)
+    }
+
+    @Test
+    fun `clearConversation clears lastExitReason`() {
+        viewModel.lastExitReason = ChatViewModel.ToolLoopExit.CANCELLED
+        viewModel.clearConversation()
+        assertNull(viewModel.lastExitReason)
+    }
+
+    @Test
+    fun `ToolLoopExit END_TURN has no system prompt`() {
+        assertNull(ChatViewModel.ToolLoopExit.END_TURN.systemPrompt)
+    }
+
+    @Test
+    fun `ToolLoopExit CANCELLED has no system prompt`() {
+        assertNull(ChatViewModel.ToolLoopExit.CANCELLED.systemPrompt)
+    }
+
+    @Test
+    fun `ToolLoopExit MAX_STEPS has system prompt`() {
+        val prompt = ChatViewModel.ToolLoopExit.MAX_STEPS.systemPrompt
+        assertNotNull(prompt)
+        assertTrue(prompt!!.contains("step limit"))
+    }
+
+    @Test
+    fun `ToolLoopExit ACCESSIBILITY_LOST has system prompt`() {
+        val prompt = ChatViewModel.ToolLoopExit.ACCESSIBILITY_LOST.systemPrompt
+        assertNotNull(prompt)
+        assertTrue(prompt!!.contains("accessibility service"))
+    }
+
+    @Test
+    fun `lastExitReason hint is prepended to next sendMessage`() = runTest {
+        // Simulate the state after a cancelled tool loop
+        viewModel.lastExitReason = ChatViewModel.ToolLoopExit.CANCELLED
+
+        val scripted = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            scripted = ArrayDeque(listOf(
+                ChatResponse(
+                    text = "Sure, I'll do that instead.",
+                    toolCalls = emptyList(),
+                    stopReason = "end_turn"
+                )
+            ))
+        )
+        setApiModeWithBackends(
+            viewModel,
+            listOf(viewModel.createTestBackend(Provider.ANTHROPIC, scripted, scripted))
+        )
+
+        viewModel.sendMessage("do something else")
+        advanceUntilIdle()
+
+        // Flag should be consumed
+        assertNull(viewModel.lastExitReason)
+        // Agent should have responded
+        val assistantMsg = viewModel.messages.lastOrNull { it.role == "assistant" }
+        assertNotNull(assistantMsg)
+        assertTrue(assistantMsg!!.content.contains("do that instead"))
     }
 
 }

@@ -297,6 +297,40 @@ open class PhoneAgentApi(
     }
     
     /**
+     * Send an ephemeral prompt using existing conversation as context,
+     * without persisting the user message in conversation history.
+     *
+     * Used for system-generated prompts (e.g., final explanation after max_steps)
+     * that should not pollute the persistent message history for future API calls.
+     *
+     * Only the assistant's reply is appended to the persistent messages list.
+     *
+     * @param prompt The ephemeral user prompt (not persisted)
+     * @return The assistant's text response, or null on failure
+     */
+    open suspend fun sendEphemeral(prompt: String): String? {
+        val ephemeralMessages = messages.toMutableList().apply {
+            add(Message(role = "user", content = prompt))
+        }
+        val result = chatClient.chatWithTools(
+            ephemeralMessages,
+            systemPrompt = null,
+            tools = emptyList()
+        )
+        return result.fold(
+            onSuccess = { response ->
+                response.text?.also { text ->
+                    messages.add(Message(role = "assistant", content = text))
+                }
+            },
+            onFailure = { error ->
+                Log.w(TAG, "sendEphemeral failed: ${error.message}")
+                null
+            }
+        )
+    }
+
+    /**
      * Continue the conversation after tool results have been added.
      *
      * Unlike [sendMessage], this does NOT inject a new user message. The model
