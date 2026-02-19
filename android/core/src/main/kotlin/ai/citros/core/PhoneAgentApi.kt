@@ -554,9 +554,11 @@ open class PhoneAgentApi(
                     val (screenW, screenH) = ScreenReader.getDisplaySize()
                     val centerX = screenW / 2
                     val centerY = screenH / 2
+                    // "scroll down" = see content below = swipe UP (finger moves up)
+                    // "scroll up" = see content above = swipe DOWN (finger moves down)
                     val (startX, startY, endX, endY) = when (direction) {
-                        "up" -> listOf(centerX, screenH * 3 / 4, centerX, screenH / 4)
-                        "down" -> listOf(centerX, screenH / 4, centerX, screenH * 3 / 4)
+                        "down" -> listOf(centerX, screenH * 3 / 4, centerX, screenH / 4)
+                        "up" -> listOf(centerX, screenH / 4, centerX, screenH * 3 / 4)
                         "left" -> listOf(screenW * 4 / 5, centerY, screenW / 5, centerY)
                         "right" -> listOf(screenW / 5, centerY, screenW * 4 / 5, centerY)
                         else -> throw IllegalArgumentException("Invalid direction \"$direction\" - use up/down/left/right")
@@ -578,9 +580,11 @@ open class PhoneAgentApi(
                     // for scrolling within specific scrollable containers.
                     val (screenW, screenH) = ScreenReader.getDisplaySize()
                     val centerX = screenW / 2
+                    // "scroll down" = see content below = swipe UP (finger moves up)
+                    // "scroll up" = see content above = swipe DOWN (finger moves down)
                     val (startX, startY, endX, endY) = when (direction) {
-                        "up" -> listOf(centerX, screenH * 3 / 4, centerX, screenH / 4)
-                        "down" -> listOf(centerX, screenH / 4, centerX, screenH * 3 / 4)
+                        "down" -> listOf(centerX, screenH * 3 / 4, centerX, screenH / 4)
+                        "up" -> listOf(centerX, screenH / 4, centerX, screenH * 3 / 4)
                         else -> throw IllegalArgumentException("Invalid direction \"$direction\" - use up/down")
                     }
                     

@@ -480,38 +480,117 @@ object ScreenReader {
     
     /**
      * Type text into the focused field.
+     *
+     * Uses a multi-strategy approach to find the right input field:
+     * 1. Window-aware root (findAppWindowRoot) — targets the actual app, not our overlay
+     * 2. findFocus(FOCUS_INPUT) — asks the framework directly for the input-focused node
+     * 3. Tree walk for isEditable && isFocused — traditional approach
+     * 4. Tree walk for isEditable only — relaxed, for apps that don't report focus
+     * 5. Fallback to rootInActiveWindow — last resort
      */
     fun typeText(text: String): Boolean {
         val svc = service ?: return false
-        val root = svc.rootInActiveWindow ?: return false
-        
-        val focused = findFocusedEditText(root)
-        if (focused != null) {
-            val args = Bundle().apply {
-                putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
-            }
-            val result = focused.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
-            focused.recycle()
-            root.recycle()
-            return result
+
+        val args = Bundle().apply {
+            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
         }
-        
-        root.recycle()
+
+        // Strategy 1: Use window-aware root (same as getScreenContent)
+        val appRoot = findAppWindowRoot(svc)
+        if (appRoot != null) {
+            // Strategy 2: Ask framework for input-focused node within app window
+            val inputFocused = appRoot.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+            if (inputFocused != null) {
+                Log.d(TAG, "typeText: found via FOCUS_INPUT in app window (editable=${inputFocused.isEditable})")
+                val result = inputFocused.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+                inputFocused.recycle()
+                appRoot.recycle()
+                return result
+            }
+            inputFocused?.recycle()
+
+            // Strategy 3: Walk tree for focused editable
+            val focused = findFocusedEditText(appRoot)
+            if (focused != null) {
+                Log.d(TAG, "typeText: found via tree walk (focused+editable) in app window")
+                val result = focused.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+                focused.recycle()
+                appRoot.recycle()
+                return result
+            }
+
+            // Strategy 4: Relaxed — any editable node (drop isFocused requirement)
+            // NOTE: On multi-input screens (login forms), this grabs the first
+            // editable node depth-first, which may not be the intended field.
+            // Future improvement: prefer the node nearest lastTappedCoordinates.
+            val editable = findEditableNode(appRoot)
+            if (editable != null) {
+                Log.d(TAG, "typeText: found via relaxed tree walk (editable only) in app window")
+                val focusResult = editable.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+                if (!focusResult) {
+                    Log.w(TAG, "typeText: ACTION_FOCUS failed on editable node, attempting SET_TEXT anyway")
+                }
+                val result = editable.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+                editable.recycle()
+                appRoot.recycle()
+                return result
+            }
+
+            appRoot.recycle()
+        }
+
+        // Strategy 5: Fallback to rootInActiveWindow (original behavior)
+        // Intentionally does NOT try relaxed search here — rootInActiveWindow
+        // may return our own overlay root, and blindly targeting the first
+        // editable node in our own UI would be wrong.
+        val root = svc.rootInActiveWindow
+        if (root != null) {
+            val focused = findFocusedEditText(root)
+            if (focused != null) {
+                Log.d(TAG, "typeText: found via rootInActiveWindow fallback")
+                val result = focused.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+                focused.recycle()
+                root.recycle()
+                return result
+            }
+            root.recycle()
+        }
+
+        Log.w(TAG, "typeText: no editable field found in any window")
         return false
     }
-    
+
     private fun findFocusedEditText(node: AccessibilityNodeInfo): AccessibilityNodeInfo? {
         if (node.isEditable && node.isFocused) {
             return AccessibilityNodeInfo.obtain(node)
         }
-        
+
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
             val result = findFocusedEditText(child)
             child.recycle()
             if (result != null) return result
         }
-        
+
+        return null
+    }
+
+    /**
+     * Find any editable node in the tree (relaxed — ignores focus state).
+     * Returns the first editable node found via depth-first traversal.
+     */
+    private fun findEditableNode(node: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        if (node.isEditable) {
+            return AccessibilityNodeInfo.obtain(node)
+        }
+
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            val result = findEditableNode(child)
+            child.recycle()
+            if (result != null) return result
+        }
+
         return null
     }
     
