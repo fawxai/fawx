@@ -70,10 +70,9 @@ class OverlayServiceTest {
     }
 
     @Test
-    fun `notification IDs do not conflict between services`() {
-        // OverlayService uses 2001, CitrosBubbleService (in :app) uses 1001
-        assertTrue(OverlayService.NOTIFICATION_ID != 1001,
-            "OverlayService notification ID should not conflict with CitrosBubbleService")
+    fun `notification ID is non-zero`() {
+        assertTrue(OverlayService.NOTIFICATION_ID > 0,
+            "OverlayService notification ID must be positive")
     }
 
     @Test

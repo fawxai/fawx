@@ -24,6 +24,5 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "Citros"
-// include(":app")  // Stubbed out - :chat is the primary APK
 include(":chat")
 include(":core")
