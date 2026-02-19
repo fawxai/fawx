@@ -158,6 +158,12 @@ internal fun OverlayPreviewScreen(
     var queuedMessageDraft by rememberSaveable { mutableStateOf("") }
     var isDismissingOverlay by rememberSaveable { mutableStateOf(false) }
     var fullAppMessageDraft by rememberSaveable { mutableStateOf("") }
+    val isDarkTheme = LocalCitrosIsDark.current
+    val previewBackground = if (isDarkTheme) {
+        OverlayColors.PreviewBackground
+    } else {
+        MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.44f)
+    }
     val unreadCount = viewModel?.unreadCount?.intValue ?: 2
     val coroutineScope = rememberCoroutineScope()
 
@@ -355,7 +361,7 @@ internal fun OverlayPreviewScreen(
                     .weight(1f)
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(OverlayUiConstants.PreviewCornerRadius))
-                    .background(OverlayColors.PreviewBackground)
+                    .background(previewBackground)
                     .border(
                         width = 1.dp,
                         color = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f),
@@ -501,7 +507,7 @@ private fun OverlayModeChip(
             text = label,
             modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
             style = MaterialTheme.typography.labelMedium,
-            color = if (selected) Color.White else MaterialTheme.colorScheme.onSurfaceVariant
+            color = if (selected) contrastOn(accent) else MaterialTheme.colorScheme.onSurfaceVariant
         )
     }
 }
@@ -569,6 +575,12 @@ internal fun FullAppOverlayContent(
     onStopAction: () -> Unit
 ) {
     val fullScrollState = rememberScrollState()
+    val isDarkTheme = LocalCitrosIsDark.current
+    val appChromeColor = if (isDarkTheme) {
+        OverlayColors.AppChrome
+    } else {
+        MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.84f)
+    }
 
     // Auto-scroll to bottom when lines change or last line content updates.
     val fullLastLineText = lines.lastOrNull()?.text
@@ -587,14 +599,14 @@ internal fun FullAppOverlayContent(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .background(OverlayColors.AppChrome)
+                .background(appChromeColor)
                 .padding(horizontal = 14.dp, vertical = 10.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
                 "Citros",
                 style = MaterialTheme.typography.titleMedium,
-                color = Color.White,
+                color = contrastOn(appChromeColor),
                 fontWeight = FontWeight.SemiBold,
                 modifier = Modifier.weight(1f)
             )
@@ -643,7 +655,7 @@ internal fun FullAppOverlayContent(
                     contentPadding = OverlayUiConstants.ActionChipPadding,
                     modifier = Modifier.semantics { contentDescription = "Return to overlay" }
                 ) {
-                    Text("Return", style = MaterialTheme.typography.labelSmall, color = Color.White)
+                    Text("Return", style = MaterialTheme.typography.labelSmall, color = contrastOn(flavor.primary))
                 }
                 OutlinedButton(
                     onClick = onStopAction,
@@ -729,22 +741,32 @@ internal fun FullAppOverlayContent(
 
 @Composable
 private fun FakeUnderlyingPhoneSurface() {
+    val isDarkTheme = LocalCitrosIsDark.current
+    val baseColor = if (isDarkTheme) OverlayColors.FakePhoneBase else MaterialTheme.colorScheme.surface
+    val barColor = if (isDarkTheme) OverlayColors.FakePhoneBar else MaterialTheme.colorScheme.surfaceVariant
+    val surfaceColor = if (isDarkTheme) OverlayColors.FakePhoneSurface else MaterialTheme.colorScheme.background
+    val borderColor = if (isDarkTheme) OverlayColors.FakePhoneBorder else MaterialTheme.colorScheme.outline.copy(alpha = 0.24f)
+    val mutedTextColor = if (isDarkTheme) OverlayColors.FakePhoneTextMuted else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.58f)
+    val brightTextColor = if (isDarkTheme) OverlayColors.FakePhoneTextBright else MaterialTheme.colorScheme.onSurface
+    val dimTextColor = if (isDarkTheme) OverlayColors.FakePhoneTextDim else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.74f)
+    val accentColor = if (isDarkTheme) OverlayColors.FakePhoneAccent else MaterialTheme.colorScheme.primary
+    val chevronColor = if (isDarkTheme) OverlayColors.FakePhoneChevron else MaterialTheme.colorScheme.onSurfaceVariant
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .background(OverlayColors.FakePhoneBase)
+            .background(baseColor)
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .background(OverlayColors.FakePhoneBar)
+                .background(barColor)
                 .padding(horizontal = 12.dp, vertical = 6.dp),
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            Text("9:41", style = MaterialTheme.typography.labelSmall, color = OverlayColors.FakePhoneTextMuted)
+            Text("9:41", style = MaterialTheme.typography.labelSmall, color = mutedTextColor)
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text("NET", style = MaterialTheme.typography.labelSmall, color = OverlayColors.FakePhoneTextMuted)
-                Text("BAT", style = MaterialTheme.typography.labelSmall, color = OverlayColors.FakePhoneTextMuted)
+                Text("NET", style = MaterialTheme.typography.labelSmall, color = mutedTextColor)
+                Text("BAT", style = MaterialTheme.typography.labelSmall, color = mutedTextColor)
             }
         }
 
@@ -752,17 +774,17 @@ private fun FakeUnderlyingPhoneSurface() {
             text = "Settings",
             modifier = Modifier
                 .fillMaxWidth()
-                .background(OverlayColors.FakePhoneBar)
+                .background(barColor)
                 .padding(horizontal = 16.dp, vertical = 12.dp),
             style = MaterialTheme.typography.titleMedium,
-            color = OverlayColors.FakePhoneTextBright,
+            color = brightTextColor,
             fontWeight = FontWeight.Medium
         )
 
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .background(OverlayColors.FakePhoneSurface)
+                .background(surfaceColor)
                 .padding(horizontal = 16.dp, vertical = 8.dp)
         ) {
             listOf(
@@ -779,7 +801,7 @@ private fun FakeUnderlyingPhoneSurface() {
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(vertical = 9.dp)
-                        .border(width = 0.5.dp, color = OverlayColors.FakePhoneBorder, shape = RoundedCornerShape(OverlayUiConstants.PhoneItemCornerRadius))
+                        .border(width = 0.5.dp, color = borderColor, shape = RoundedCornerShape(OverlayUiConstants.PhoneItemCornerRadius))
                         .padding(horizontal = 8.dp, vertical = 8.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
@@ -787,9 +809,9 @@ private fun FakeUnderlyingPhoneSurface() {
                     Text(
                         text = item,
                         style = MaterialTheme.typography.bodySmall,
-                        color = if (index == 0) OverlayColors.FakePhoneAccent else OverlayColors.FakePhoneTextDim
+                        color = if (index == 0) accentColor else dimTextColor
                     )
-                    Text(">", style = MaterialTheme.typography.bodySmall, color = OverlayColors.FakePhoneChevron)
+                    Text(">", style = MaterialTheme.typography.bodySmall, color = chevronColor)
                 }
             }
         }
@@ -1037,7 +1059,7 @@ internal fun MiniChatOverlayCard(
                         colors = ButtonDefaults.buttonColors(containerColor = OverlayColors.Error),
                         contentPadding = OverlayUiConstants.PrimaryActionPadding
                     ) {
-                        Text("Stop", style = MaterialTheme.typography.labelSmall, color = Color.White)
+                        Text("Stop", style = MaterialTheme.typography.labelSmall, color = contrastOn(OverlayColors.Error))
                     }
                 }
             }
@@ -1138,16 +1160,17 @@ private fun BubbleOverlay(
             }
 
             if (runState == OverlayRunState.COMPLETED || runState == OverlayRunState.FAILED || unreadCount > 0) {
+                val badgeColor = when {
+                    runState == OverlayRunState.COMPLETED -> OverlayColors.Success
+                    runState == OverlayRunState.FAILED -> OverlayColors.Error
+                    else -> flavor.primary
+                }
                 Surface(
                     modifier = Modifier
                         .align(Alignment.TopEnd)
                         .size(OverlayUiConstants.BubbleBadgeSize),
                     shape = CircleShape,
-                    color = when {
-                        runState == OverlayRunState.COMPLETED -> OverlayColors.Success
-                        runState == OverlayRunState.FAILED -> OverlayColors.Error
-                        else -> flavor.primary
-                    }
+                    color = badgeColor
                 ) {
                     Box(contentAlignment = Alignment.Center) {
                         Text(
@@ -1157,7 +1180,7 @@ private fun BubbleOverlay(
                                 else -> unreadCount.toString()
                             },
                             style = MaterialTheme.typography.labelSmall,
-                            color = Color.White
+                            color = contrastOn(badgeColor)
                         )
                     }
                 }

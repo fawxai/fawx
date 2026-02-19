@@ -109,7 +109,7 @@ internal const val PREF_WAITLIST_EMAIL = "waitlist_email"
 internal const val PREF_WAITLIST_TIER = "waitlist_tier"
 internal const val PREF_PAYWALL_SEEN = "paywall_seen"
 internal const val PREF_THEME_MODE = "theme_mode"
-internal const val THEME_MODE_DEFAULT = "dark"
+internal const val THEME_MODE_DEFAULT = "system"
 internal const val PREF_ONBOARDING_CHAT_SEEN = "onboarding_chat_seen"
 internal const val PREF_ONBOARDING_CHAT_COMPLETE = "onboarding_chat_complete"
 internal const val PREF_ONBOARDING_CHAT_SKIPPED = "onboarding_chat_skipped"
@@ -333,7 +333,10 @@ internal fun OnboardingFlow(
             CitrosFlavor.fromStorage(prefs.getString(PREF_SELECTED_FLAVOR, CitrosFlavor.TANGERINE.storageValue))
         )
     }
-    val splashVisuals = remember(selectedFlavor) { citrosSplashVisualTokens(selectedFlavor) }
+    val isDarkTheme = LocalCitrosIsDark.current
+    val splashVisuals = remember(selectedFlavor, isDarkTheme) {
+        citrosSplashVisualTokens(selectedFlavor, isDark = isDarkTheme)
+    }
     var tone by rememberSaveable { mutableStateOf("Balanced") }
     var explanation by rememberSaveable { mutableStateOf("Balanced") }
     var trust by rememberSaveable { mutableStateOf("Ask for risky stuff") }
@@ -487,6 +490,7 @@ internal fun OnboardingFlow(
                     ) {
                         CitrosHeroShaderSphere(
                             flavor = selectedFlavor,
+                            isDark = isDarkTheme,
                             modifier = Modifier.fillMaxSize()
                         )
                         Column(
@@ -1215,6 +1219,7 @@ internal fun OnboardingFlow(
                     ) {
                         CitrosHeroShaderSphere(
                             flavor = selectedFlavor,
+                            isDark = isDarkTheme,
                             modifier = Modifier.fillMaxSize()
                         )
 
@@ -1273,7 +1278,11 @@ internal fun OnboardingFlow(
                 CitrosLiquidGlassSurface(
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(28.dp),
-                    baseColor = Color(0xE6070709),
+                    baseColor = if (isDarkTheme) {
+                        Color(0xE6070709)
+                    } else {
+                        MaterialTheme.colorScheme.surface.copy(alpha = 0.92f)
+                    },
                     borderColor = selectedFlavor.primary.copy(alpha = 0.44f),
                     borderWidth = 1.dp,
                     highlightColor = selectedFlavor.primary,
@@ -1358,7 +1367,10 @@ private fun OnboardingChatHeader(
     onBack: () -> Unit,
     onSkip: () -> Unit
 ) {
-    val heroDeep = remember(flavor) { citrosSplashVisualTokens(flavor).hero.deep }
+    val isDarkTheme = LocalCitrosIsDark.current
+    val heroDeep = remember(flavor, isDarkTheme) {
+        citrosSplashVisualTokens(flavor, isDark = isDarkTheme).hero.deep
+    }
 
     Column(
         modifier = Modifier

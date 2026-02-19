@@ -770,9 +770,10 @@ internal fun CitrosChatTheme(
     content: @Composable () -> Unit
 ) {
     val useDark = when (themeMode) {
+        "dark" -> true
         "light" -> false
         "system" -> isSystemInDarkTheme()
-        else -> true // THEME_MODE_DEFAULT or fallback
+        else -> false // THEME_MODE_DEFAULT or fallback
     }
     val colorScheme = if (useDark) {
         darkColorScheme(
@@ -813,7 +814,7 @@ internal fun CitrosChatTheme(
     MaterialTheme(
         colorScheme = colorScheme,
     ) {
-        ProvideCitrosSplashVisualTokens(flavor = flavor) {
+        ProvideCitrosSplashVisualTokens(flavor = flavor, isDark = useDark) {
             content()
         }
     }
@@ -1597,7 +1598,7 @@ private fun FlavorToolbarIconButton(
     enabled: Boolean = true
 ) {
     val iconColor = if (enabled) {
-        lerp(flavor.primary, Color.White, 0.34f)
+        lerp(flavor.primary, MaterialTheme.colorScheme.onSurface, 0.34f)
     } else {
         flavor.primary.copy(alpha = 0.34f)
     }
@@ -1677,7 +1678,10 @@ private fun NoKeyPrompt(
     flavor: CitrosFlavor = CitrosFlavor.TANGERINE,
     onOpenSettings: () -> Unit
 ) {
-    val visualTokens = remember(flavor) { citrosSplashVisualTokens(flavor) }
+    val isDarkTheme = LocalCitrosIsDark.current
+    val visualTokens = remember(flavor, isDarkTheme) {
+        citrosSplashVisualTokens(flavor, isDark = isDarkTheme)
+    }
 
     Box(
         modifier = Modifier
@@ -2864,7 +2868,7 @@ internal fun MessageInput(
                         enabled = true,
                         borderColor = flavor.primary.copy(alpha = 0.30f),
                         highlightColor = flavor.primary,
-                        iconTint = lerp(flavor.primary, Color.White, 0.36f)
+                        iconTint = lerp(flavor.primary, MaterialTheme.colorScheme.onSurface, 0.36f)
                     ) {
                         Icon(
                             Icons.Default.KeyboardVoice,
@@ -2910,7 +2914,7 @@ internal fun MessageInput(
                         borderColor = flavor.primary.copy(alpha = 0.30f),
                         highlightColor = if (!isLoading && voiceReady) flavor.primary else null,
                         iconTint = if (voiceReady) {
-                            lerp(flavor.primary, Color.White, 0.36f)
+                            lerp(flavor.primary, MaterialTheme.colorScheme.onSurface, 0.36f)
                         } else {
                             flavor.primary.copy(alpha = 0.34f)
                         }
@@ -2938,7 +2942,7 @@ internal fun MessageInput(
                         flavor.primary.copy(alpha = 0.72f)
                     },
                     highlightColor = flavor.primary,
-                    iconTint = lerp(flavor.primary, Color.White, 0.32f)
+                    iconTint = lerp(flavor.primary, MaterialTheme.colorScheme.onSurface, 0.32f)
                 ) {
                     Icon(
                         if (isLoading) Icons.Filled.NorthEast else Icons.AutoMirrored.Filled.Send,

@@ -75,16 +75,8 @@ class CitrosChatThemeTest {
     }
 
     @Test
-    fun `default theme mode is dark`() {
-        var background = Color.Unspecified
-
-        composeRule.setContent {
-            CitrosChatTheme {
-                background = MaterialTheme.colorScheme.background
-            }
-        }
-
-        assertEquals(Color(0xFF050505), background)
+    fun `default theme mode is system`() {
+        assertEquals("system", THEME_MODE_DEFAULT)
     }
 
     @Test

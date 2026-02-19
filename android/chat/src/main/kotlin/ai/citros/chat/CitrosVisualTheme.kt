@@ -30,18 +30,61 @@ internal data class CitrosSplashVisualTokens(
     val brandTitleColor: Color
 )
 
-internal fun citrosSplashVisualTokens(flavor: CitrosFlavor): CitrosSplashVisualTokens {
-    val heroDeep = lerp(Color(0xFF1A0A00), flavor.tint, 0.20f)
-    val heroPrimary = lerp(Color(0xFFF59E0B), flavor.primary, 0.15f)
-    val heroWarm = lerp(Color(0xFFFF6B2B), flavor.primary, 0.18f)
-    val heroWire = lerp(Color(0xFF4A2D13), heroDeep, 0.28f)
-    val heroRing = lerp(heroPrimary, heroWarm, 0.36f)
-    val heroParticle = lerp(Color(0xFFFFCC53), heroPrimary, 0.22f)
+internal fun citrosSplashVisualTokens(
+    flavor: CitrosFlavor,
+    isDark: Boolean
+): CitrosSplashVisualTokens {
+    val heroDeep = if (isDark) {
+        lerp(Color(0xFF1A0A00), flavor.tint, 0.20f)
+    } else {
+        lerp(Color(0xFFF7EEE3), flavor.glow, 0.22f)
+    }
+    val heroPrimary = if (isDark) {
+        lerp(Color(0xFFF59E0B), flavor.primary, 0.15f)
+    } else {
+        lerp(Color(0xFFFFC463), flavor.primary, 0.20f)
+    }
+    val heroWarm = if (isDark) {
+        lerp(Color(0xFFFF6B2B), flavor.primary, 0.18f)
+    } else {
+        lerp(Color(0xFFFFAA57), flavor.primary, 0.22f)
+    }
+    val heroWire = if (isDark) {
+        lerp(Color(0xFF4A2D13), heroDeep, 0.28f)
+    } else {
+        lerp(Color(0xFFD6BCA2), heroDeep, 0.26f)
+    }
+    val heroRing = if (isDark) {
+        lerp(heroPrimary, heroWarm, 0.36f)
+    } else {
+        lerp(heroPrimary, heroWarm, 0.28f)
+    }
+    val heroParticle = if (isDark) {
+        lerp(Color(0xFFFFCC53), heroPrimary, 0.22f)
+    } else {
+        lerp(Color(0xFFFFE4A3), heroPrimary, 0.24f)
+    }
 
-    val buttonDeep = lerp(Color(0xFF1A0A00), flavor.tint, 0.22f)
-    val buttonAmber = lerp(Color(0xFFF59E0B), flavor.primary, 0.20f)
-    val buttonWarm = lerp(Color(0xFFFF6B2B), flavor.primary, 0.18f)
-    val brandTitle = lerp(Color(0xFFFFA625), flavor.primary, 0.10f)
+    val buttonDeep = if (isDark) {
+        lerp(Color(0xFF1A0A00), flavor.tint, 0.22f)
+    } else {
+        lerp(Color(0xFFFFF4E7), flavor.glow, 0.22f)
+    }
+    val buttonAmber = if (isDark) {
+        lerp(Color(0xFFF59E0B), flavor.primary, 0.20f)
+    } else {
+        lerp(Color(0xFFFFC463), flavor.primary, 0.24f)
+    }
+    val buttonWarm = if (isDark) {
+        lerp(Color(0xFFFF6B2B), flavor.primary, 0.18f)
+    } else {
+        lerp(Color(0xFFFF9D4D), flavor.primary, 0.24f)
+    }
+    val brandTitle = if (isDark) {
+        lerp(Color(0xFFFFA625), flavor.primary, 0.10f)
+    } else {
+        lerp(Color(0xFF9A4A08), flavor.primary, 0.26f)
+    }
 
     return CitrosSplashVisualTokens(
         hero = CitrosHeroShaderTokens(
@@ -56,24 +99,29 @@ internal fun citrosSplashVisualTokens(flavor: CitrosFlavor): CitrosSplashVisualT
             deep = buttonDeep,
             amber = buttonAmber,
             warm = buttonWarm,
-            textEnabled = Color(0xFFFFCF7A),
-            textDisabled = Color(0x99FFCF7A)
+            textEnabled = if (isDark) Color(0xFFFFCF7A) else Color(0xFF2B1A08),
+            textDisabled = if (isDark) Color(0x99FFCF7A) else Color(0x992B1A08)
         ),
         brandTitleColor = brandTitle
     )
 }
 
 internal val LocalCitrosSplashVisualTokens = staticCompositionLocalOf {
-    citrosSplashVisualTokens(CitrosFlavor.TANGERINE)
+    citrosSplashVisualTokens(CitrosFlavor.TANGERINE, isDark = false)
 }
+internal val LocalCitrosIsDark = staticCompositionLocalOf { false }
 
 @Composable
 internal fun ProvideCitrosSplashVisualTokens(
     flavor: CitrosFlavor,
+    isDark: Boolean,
     content: @Composable () -> Unit
 ) {
-    val tokens = remember(flavor) { citrosSplashVisualTokens(flavor) }
-    CompositionLocalProvider(LocalCitrosSplashVisualTokens provides tokens) {
+    val tokens = remember(flavor, isDark) { citrosSplashVisualTokens(flavor, isDark) }
+    CompositionLocalProvider(
+        LocalCitrosIsDark provides isDark,
+        LocalCitrosSplashVisualTokens provides tokens
+    ) {
         content()
     }
 }

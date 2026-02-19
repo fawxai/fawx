@@ -323,7 +323,7 @@ internal fun OverlayMiniChatContent(
                             colors = ButtonDefaults.buttonColors(containerColor = ErrorColor),
                             contentPadding = OverlayUiConstants.PrimaryActionPadding
                         ) {
-                            Text("Stop", style = MaterialTheme.typography.labelSmall, color = Color.White)
+                            Text("Stop", style = MaterialTheme.typography.labelSmall, color = contrastOn(ErrorColor))
                         }
                     }
                 }
@@ -446,16 +446,17 @@ internal fun OverlayBubbleContent(
 
             // Badge
             if (runState == OverlayRunState.COMPLETED || runState == OverlayRunState.FAILED || unreadCount > 0) {
+                val badgeColor = when {
+                    runState == OverlayRunState.COMPLETED -> SuccessColor
+                    runState == OverlayRunState.FAILED -> ErrorColor
+                    else -> flavor.primary
+                }
                 Surface(
                     modifier = Modifier
                         .align(Alignment.TopEnd)
                         .size(OverlayUiConstants.BubbleBadgeSize),
                     shape = CircleShape,
-                    color = when {
-                        runState == OverlayRunState.COMPLETED -> SuccessColor
-                        runState == OverlayRunState.FAILED -> ErrorColor
-                        else -> flavor.primary
-                    }
+                    color = badgeColor
                 ) {
                     Box(contentAlignment = Alignment.Center) {
                         Text(
@@ -465,7 +466,7 @@ internal fun OverlayBubbleContent(
                                 else -> unreadCount.toString()
                             },
                             style = MaterialTheme.typography.labelSmall,
-                            color = Color.White
+                            color = contrastOn(badgeColor)
                         )
                     }
                 }

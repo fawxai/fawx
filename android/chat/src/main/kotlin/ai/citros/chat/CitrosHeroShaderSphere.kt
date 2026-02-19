@@ -29,20 +29,24 @@ internal fun CitrosHeroShaderSphere(
     flavor: CitrosFlavor,
     modifier: Modifier = Modifier,
     particleSizeScale: Float = 1f,
+    isDark: Boolean? = null,
     clipCircle: Boolean = false
 ) {
+    val resolvedIsDark = isDark ?: LocalCitrosIsDark.current
     AndroidView(
         modifier = modifier,
         factory = { context ->
             CitrosHeroGLSurfaceView(context).apply {
                 setFlavor(flavor)
                 setParticleSizeScale(particleSizeScale)
+                setThemeIsDark(resolvedIsDark)
                 setClipCircle(clipCircle)
             }
         },
         update = { view ->
             view.setFlavor(flavor)
             view.setParticleSizeScale(particleSizeScale)
+            view.setThemeIsDark(resolvedIsDark)
             view.setClipCircle(clipCircle)
         }
     )
@@ -84,6 +88,12 @@ private class CitrosHeroGLSurfaceView(context: Context) : GLSurfaceView(context)
     fun setParticleSizeScale(scale: Float) {
         queueEvent {
             heroRenderer.setParticleSizeScale(scale)
+        }
+    }
+
+    fun setThemeIsDark(isDark: Boolean) {
+        queueEvent {
+            heroRenderer.setThemeIsDark(isDark)
         }
     }
 
@@ -131,7 +141,16 @@ private class CitrosHeroRenderer : GLSurfaceView.Renderer {
     private var ringMesh: RingMesh? = null
 
     @Volatile
-    private var palette: HeroPalette = HeroPalette.fromFlavor(CitrosFlavor.TANGERINE)
+    private var currentFlavor: CitrosFlavor = CitrosFlavor.TANGERINE
+
+    @Volatile
+    private var isDarkTheme: Boolean = false
+
+    @Volatile
+    private var palette: HeroPalette = HeroPalette.fromFlavor(
+        flavor = currentFlavor,
+        isDark = isDarkTheme
+    )
 
     @Volatile
     private var particleSizeScale: Float = 1f
@@ -150,7 +169,13 @@ private class CitrosHeroRenderer : GLSurfaceView.Renderer {
     private val cameraPosition = floatArrayOf(0f, 0f, 5f)
 
     fun setFlavor(flavor: CitrosFlavor) {
-        palette = HeroPalette.fromFlavor(flavor)
+        currentFlavor = flavor
+        palette = HeroPalette.fromFlavor(flavor = currentFlavor, isDark = isDarkTheme)
+    }
+
+    fun setThemeIsDark(isDark: Boolean) {
+        isDarkTheme = isDark
+        palette = HeroPalette.fromFlavor(flavor = currentFlavor, isDark = isDarkTheme)
     }
 
     fun setParticleSizeScale(scale: Float) {
@@ -206,6 +231,12 @@ private class CitrosHeroRenderer : GLSurfaceView.Renderer {
 
         val elapsedSeconds = ((SystemClock.elapsedRealtimeNanos() - startNanos) / 1_000_000_000.0f)
         val palette = palette
+        val renderLightBackground = !isDarkTheme && !clipCircle
+        if (renderLightBackground) {
+            GLES20.glClearColor(1f, 1f, 1f, 1f)
+        } else {
+            GLES20.glClearColor(0f, 0f, 0f, 0f)
+        }
 
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
 
@@ -510,13 +541,37 @@ private data class HeroPalette(
     val particleColor: FloatArray
 ) {
     companion object {
-        fun fromFlavor(flavor: CitrosFlavor): HeroPalette {
-            val deep = lerp(Color(0xFF060607), flavor.tint, 0.78f)
-            val primary = lerp(flavor.primary, flavor.glow, 0.08f)
-            val warm = lerp(flavor.primary, Color.White, 0.18f)
-            val wire = lerp(flavor.tint, flavor.primary, 0.30f)
-            val ring = lerp(flavor.primary, flavor.glow, 0.34f)
-            val particle = lerp(flavor.primary, flavor.glow, 0.56f)
+        fun fromFlavor(flavor: CitrosFlavor, isDark: Boolean): HeroPalette {
+            val deep = if (isDark) {
+                lerp(Color(0xFF060607), flavor.tint, 0.78f)
+            } else {
+                lerp(Color(0xFFF8EFE5), flavor.glow, 0.30f)
+            }
+            val primary = if (isDark) {
+                lerp(flavor.primary, flavor.glow, 0.08f)
+            } else {
+                lerp(flavor.primary, flavor.glow, 0.20f)
+            }
+            val warm = if (isDark) {
+                lerp(flavor.primary, Color.White, 0.18f)
+            } else {
+                lerp(flavor.primary, Color(0xFFFCE9D2), 0.22f)
+            }
+            val wire = if (isDark) {
+                lerp(flavor.tint, flavor.primary, 0.30f)
+            } else {
+                lerp(Color(0xFFC6A98D), flavor.primary, 0.24f)
+            }
+            val ring = if (isDark) {
+                lerp(flavor.primary, flavor.glow, 0.34f)
+            } else {
+                lerp(flavor.primary, flavor.glow, 0.46f)
+            }
+            val particle = if (isDark) {
+                lerp(flavor.primary, flavor.glow, 0.56f)
+            } else {
+                lerp(flavor.primary, flavor.glow, 0.62f)
+            }
             return HeroPalette(
                 color1 = deep.toRgbArray(),
                 color2 = primary.toRgbArray(),

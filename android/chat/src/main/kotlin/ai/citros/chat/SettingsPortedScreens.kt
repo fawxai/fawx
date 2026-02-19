@@ -80,7 +80,15 @@ private fun SettingsSubPageScaffold(
     scrollable: Boolean = true,
     content: @Composable androidx.compose.foundation.layout.ColumnScope.() -> Unit
 ) {
-    val visuals = remember(flavor) { citrosSplashVisualTokens(flavor) }
+    val isDarkTheme = LocalCitrosIsDark.current
+    val visuals = remember(flavor, isDarkTheme) {
+        citrosSplashVisualTokens(flavor, isDark = isDarkTheme)
+    }
+    val backdropScrim = if (isDarkTheme) {
+        Color.Black.copy(alpha = 0.44f)
+    } else {
+        MaterialTheme.colorScheme.surface.copy(alpha = 0.58f)
+    }
     Scaffold(containerColor = Color.Transparent) { padding ->
         Box(
             modifier = Modifier
@@ -94,7 +102,7 @@ private fun SettingsSubPageScaffold(
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(Color.Black.copy(alpha = 0.44f))
+                    .background(backdropScrim)
             )
 
             Column(
@@ -206,7 +214,15 @@ internal fun SettingsHubScreen(
     val walletState = remember { walletManager.loadOrDefault() }
     val activeKey = walletState.keys.find { it.id == walletState.activeKeyId }
     val flavor = remember { readSelectedFlavor(context) }
-    val visuals = remember(flavor) { citrosSplashVisualTokens(flavor) }
+    val isDarkTheme = LocalCitrosIsDark.current
+    val visuals = remember(flavor, isDarkTheme) {
+        citrosSplashVisualTokens(flavor, isDark = isDarkTheme)
+    }
+    val backdropScrim = if (isDarkTheme) {
+        Color.Black.copy(alpha = 0.42f)
+    } else {
+        MaterialTheme.colorScheme.surface.copy(alpha = 0.56f)
+    }
 
     Scaffold(
         containerColor = Color.Transparent
@@ -223,7 +239,7 @@ internal fun SettingsHubScreen(
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(Color.Black.copy(alpha = 0.42f))
+                    .background(backdropScrim)
             )
 
             Column(

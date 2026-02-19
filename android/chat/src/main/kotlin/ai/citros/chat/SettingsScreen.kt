@@ -128,7 +128,15 @@ fun SettingsScreen(
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     val flavor = remember { readSelectedFlavor(context) }
-    val visuals = remember(flavor) { citrosSplashVisualTokens(flavor) }
+    val isDarkTheme = LocalCitrosIsDark.current
+    val visuals = remember(flavor, isDarkTheme) {
+        citrosSplashVisualTokens(flavor, isDark = isDarkTheme)
+    }
+    val backdropScrim = if (isDarkTheme) {
+        Color.Black.copy(alpha = 0.44f)
+    } else {
+        MaterialTheme.colorScheme.surface.copy(alpha = 0.58f)
+    }
 
     fun refreshAndReconfigure() {
         walletState = walletManager.loadOrDefault()
@@ -177,7 +185,7 @@ fun SettingsScreen(
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(Color.Black.copy(alpha = 0.44f))
+                    .background(backdropScrim)
             )
 
             Column(
@@ -373,7 +381,11 @@ fun SettingsScreen(
     keyToDelete?.let { doomed ->
         AlertDialog(
             onDismissRequest = { keyToDelete = null },
-            containerColor = Color(0xE6070709),
+            containerColor = if (isDarkTheme) {
+                Color(0xE6070709)
+            } else {
+                MaterialTheme.colorScheme.surface.copy(alpha = 0.96f)
+            },
             titleContentColor = flavor.primary.copy(alpha = 0.95f),
             textContentColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.86f),
             confirmButton = {
@@ -584,6 +596,7 @@ private fun AddKeyBottomSheet(
 
     val selectedAccent = lerp(providerAccent(selectedProvider), flavor.primary, 0.46f)
     val context = LocalContext.current
+    val isDarkTheme = LocalCitrosIsDark.current
     val providerUrl = when (selectedProvider) {
         Provider.ANTHROPIC -> "console.anthropic.com/settings/keys"
         Provider.OPENAI -> "platform.openai.com/api-keys"
@@ -611,7 +624,11 @@ private fun AddKeyBottomSheet(
             CitrosLiquidGlassSurface(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(26.dp),
-                baseColor = Color(0xE6070709),
+                baseColor = if (isDarkTheme) {
+                    Color(0xE6070709)
+                } else {
+                    MaterialTheme.colorScheme.surface.copy(alpha = 0.92f)
+                },
                 borderColor = selectedAccent.copy(alpha = 0.48f),
                 borderWidth = 1.dp,
                 highlightColor = selectedAccent,
@@ -642,7 +659,11 @@ private fun AddKeyBottomSheet(
                                 },
                                 label = { Text(ProviderUi.displayName(provider)) },
                                 colors = FilterChipDefaults.filterChipColors(
-                                    containerColor = Color.Black.copy(alpha = 0.20f),
+                                    containerColor = if (isDarkTheme) {
+                                        Color.Black.copy(alpha = 0.20f)
+                                    } else {
+                                        MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.72f)
+                                    },
                                     labelColor = chipAccent.copy(alpha = 0.84f),
                                     selectedContainerColor = chipAccent.copy(alpha = 0.20f),
                                     selectedLabelColor = chipAccent.copy(alpha = 0.98f)

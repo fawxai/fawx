@@ -369,6 +369,7 @@ internal fun CitrosFloatingAppIconGraphic(
     val frameShape = RoundedCornerShape(cornerRadius)
     val iconShape = if (orbOnly) CircleShape else frameShape
     val iconFrameSize = if (showBackground) size * 0.72f else size * 0.92f
+    val isDarkTheme = LocalCitrosIsDark.current
 
     Box(
         modifier = modifier
@@ -399,7 +400,11 @@ internal fun CitrosFloatingAppIconGraphic(
                             Brush.radialGradient(
                                 colors = listOf(
                                     Color.Transparent,
-                                    Color.Black.copy(alpha = 0.38f * backgroundAlpha)
+                                    if (isDarkTheme) {
+                                        Color.Black.copy(alpha = 0.38f * backgroundAlpha)
+                                    } else {
+                                        MaterialTheme.colorScheme.onSurface.copy(alpha = 0.16f * backgroundAlpha)
+                                    }
                                 ),
                                 radius = Float.POSITIVE_INFINITY
                             )
@@ -410,7 +415,11 @@ internal fun CitrosFloatingAppIconGraphic(
             CitrosLiquidGlassSurface(
                 modifier = Modifier.size(iconFrameSize),
                 shape = RoundedCornerShape(cornerRadius),
-                baseColor = Color.Black.copy(alpha = 0.24f * backgroundAlpha),
+                baseColor = if (isDarkTheme) {
+                    Color.Black.copy(alpha = 0.24f * backgroundAlpha)
+                } else {
+                    MaterialTheme.colorScheme.surface.copy(alpha = 0.82f * backgroundAlpha)
+                },
                 borderColor = flavor.primary.copy(alpha = 0.34f * backgroundAlpha),
                 borderWidth = 1.dp,
                 highlightColor = flavor.primary,
@@ -953,17 +962,24 @@ internal fun CitrusLiquidGlassButton(
     val tintedAmber = tintColor?.let { lerp(visuals.amber, it, 0.82f) } ?: visuals.amber
     val tintedWarm = tintColor?.let { lerp(visuals.warm, it, 0.88f) } ?: visuals.warm
     val tintedDeep = tintColor?.let { lerp(visuals.deep, it, 0.42f) } ?: visuals.deep
+    val isDarkTheme = LocalCitrosIsDark.current
+    val glossColor = if (isDarkTheme) Color.White else MaterialTheme.colorScheme.onSurface
+    val backingColor = if (isDarkTheme) {
+        Color(0x22000000)
+    } else {
+        MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.58f)
+    }
     val resolvedTextColor = textColor
         ?: tintColor?.let {
             val lift = if (enabled) 0.50f else 0.34f
-            lerp(it, Color.White, lift)
+            lerp(it, MaterialTheme.colorScheme.onSurface, lift)
         }
         ?: if (enabled) visuals.textEnabled else visuals.textDisabled
 
     Box(
         modifier = modifier
             .clip(shape)
-            .background(Color(0x22000000))
+            .background(backingColor)
             .drawBehind {
                 val width = size.width
                 val height = size.height
@@ -972,9 +988,13 @@ internal fun CitrusLiquidGlassButton(
                 drawRoundRect(
                     brush = Brush.verticalGradient(
                         colors = listOf(
-                            Color.White.copy(alpha = if (enabled) 0.20f else 0.08f),
+                            glossColor.copy(alpha = if (enabled) 0.20f else 0.08f),
                             tintedAmber.copy(alpha = if (enabled) 0.20f else 0.10f),
-                            tintedDeep.copy(alpha = if (enabled) 0.42f else 0.24f)
+                            tintedDeep.copy(alpha = if (enabled) {
+                                if (isDarkTheme) 0.42f else 0.28f
+                            } else {
+                                if (isDarkTheme) 0.24f else 0.16f
+                            })
                         )
                     ),
                     cornerRadius = radius
@@ -982,7 +1002,11 @@ internal fun CitrusLiquidGlassButton(
                 drawRoundRect(
                     brush = Brush.radialGradient(
                         colors = listOf(
-                            tintedWarm.copy(alpha = if (enabled) 0.42f else 0.18f),
+                            tintedWarm.copy(alpha = if (enabled) {
+                                if (isDarkTheme) 0.42f else 0.22f
+                            } else {
+                                if (isDarkTheme) 0.18f else 0.10f
+                            }),
                             Color.Transparent
                         ),
                         center = Offset(width * 0.5f, height * 0.05f),
@@ -993,7 +1017,11 @@ internal fun CitrusLiquidGlassButton(
                 drawRoundRect(
                     brush = Brush.verticalGradient(
                         colors = listOf(
-                            Color.White.copy(alpha = if (enabled) 0.18f else 0.08f),
+                            glossColor.copy(alpha = if (enabled) {
+                                if (isDarkTheme) 0.18f else 0.10f
+                            } else {
+                                if (isDarkTheme) 0.08f else 0.05f
+                            }),
                             Color.Transparent
                         ),
                         startY = 0f,
@@ -1023,8 +1051,8 @@ internal fun CitrosLiquidGlassSurface(
     shape: Shape = RoundedCornerShape(16.dp),
     onClick: (() -> Unit)? = null,
     enabled: Boolean = true,
-    baseColor: Color = Color(0x14000000),
-    borderColor: Color = Color.White.copy(alpha = 0.14f),
+    baseColor: Color = Color.Unspecified,
+    borderColor: Color = Color.Unspecified,
     borderWidth: Dp = 1.dp,
     highlightColor: Color? = null,
     warmth: Float = 1f,
@@ -1032,9 +1060,29 @@ internal fun CitrosLiquidGlassSurface(
     content: @Composable BoxScope.() -> Unit
 ) {
     val visuals = LocalCitrosSplashVisualTokens.current.glassButton
+    val isDarkTheme = LocalCitrosIsDark.current
     val warmScale = warmth.coerceIn(0.45f, 1.8f)
     val amber = highlightColor?.let { lerp(visuals.amber, it, 0.45f) } ?: visuals.amber
     val warm = highlightColor ?: visuals.warm
+    val glossColor = if (isDarkTheme) Color.White else MaterialTheme.colorScheme.onSurface
+    val resolvedBaseColor = if (baseColor == Color.Unspecified) {
+        if (isDarkTheme) {
+            Color(0x14000000)
+        } else {
+            MaterialTheme.colorScheme.surface.copy(alpha = 0.78f)
+        }
+    } else {
+        baseColor
+    }
+    val resolvedBorderColor = if (borderColor == Color.Unspecified) {
+        if (isDarkTheme) {
+            Color.White.copy(alpha = 0.14f)
+        } else {
+            MaterialTheme.colorScheme.outline.copy(alpha = 0.28f)
+        }
+    } else {
+        borderColor
+    }
     val interactionModifier = if (onClick != null) {
         Modifier.clickable(enabled = enabled, onClick = onClick)
     } else {
@@ -1045,10 +1093,10 @@ internal fun CitrosLiquidGlassSurface(
         modifier = modifier
             .then(interactionModifier)
             .clip(shape)
-            .background(baseColor, shape)
+            .background(resolvedBaseColor, shape)
             .let { base ->
                 if (borderWidth > 0.dp) {
-                    base.border(BorderStroke(borderWidth, borderColor), shape)
+                    base.border(BorderStroke(borderWidth, resolvedBorderColor), shape)
                 } else {
                     base
                 }
@@ -1060,16 +1108,16 @@ internal fun CitrosLiquidGlassSurface(
                 drawRect(
                     brush = Brush.verticalGradient(
                         colors = listOf(
-                            Color.White.copy(alpha = 0.10f * warmScale),
+                            glossColor.copy(alpha = 0.10f * warmScale),
                             amber.copy(alpha = 0.10f * warmScale),
-                            visuals.deep.copy(alpha = 0.36f)
+                            visuals.deep.copy(alpha = if (isDarkTheme) 0.36f else 0.18f)
                         )
                     )
                 )
                 drawRect(
                     brush = Brush.radialGradient(
                         colors = listOf(
-                            warm.copy(alpha = 0.22f * warmScale),
+                            warm.copy(alpha = (if (isDarkTheme) 0.22f else 0.14f) * warmScale),
                             Color.Transparent
                         ),
                         center = Offset(width * 0.5f, height * 0.05f),
@@ -1079,7 +1127,7 @@ internal fun CitrosLiquidGlassSurface(
                 drawRect(
                     brush = Brush.verticalGradient(
                         colors = listOf(
-                            Color.White.copy(alpha = 0.12f),
+                            glossColor.copy(alpha = if (isDarkTheme) 0.12f else 0.08f),
                             Color.Transparent
                         ),
                         startY = 0f,
@@ -1140,7 +1188,7 @@ internal fun PersonalityOptionChip(
         flavor.primary.copy(alpha = 0.34f)
     }
     val textColor = if (selected) {
-        lerp(flavor.primary, Color.White, 0.44f)
+        lerp(flavor.primary, MaterialTheme.colorScheme.onSurface, 0.44f)
     } else {
         flavor.primary.copy(alpha = 0.86f)
     }

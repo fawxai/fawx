@@ -87,10 +87,15 @@ internal fun QuickSwitcherSheet(
 ) {
     val activeKey = walletState.keys.find { it.id == walletState.activeKeyId }
     val provider = activeKey?.provider
+    val isDarkTheme = LocalCitrosIsDark.current
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
-        containerColor = Color(0xF4060606),
+        containerColor = if (isDarkTheme) {
+            Color(0xF4060606)
+        } else {
+            MaterialTheme.colorScheme.surface.copy(alpha = 0.96f)
+        },
         contentColor = MaterialTheme.colorScheme.onSurface,
         dragHandle = {
             Box(
@@ -180,7 +185,7 @@ internal fun QuickSwitcherSheet(
                                     containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.52f),
                                     labelColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.84f),
                                     selectedContainerColor = flavor.primary.copy(alpha = 0.20f),
-                                    selectedLabelColor = lerp(flavor.primary, Color.White, 0.42f)
+                                    selectedLabelColor = lerp(flavor.primary, MaterialTheme.colorScheme.onSurface, 0.42f)
                                 )
                             )
                         }
@@ -204,7 +209,7 @@ internal fun QuickSwitcherSheet(
                                     containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.52f),
                                     labelColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.84f),
                                     selectedContainerColor = flavor.primary.copy(alpha = 0.20f),
-                                    selectedLabelColor = lerp(flavor.primary, Color.White, 0.42f)
+                                    selectedLabelColor = lerp(flavor.primary, MaterialTheme.colorScheme.onSurface, 0.42f)
                                 )
                             )
                         }
@@ -318,7 +323,7 @@ internal fun ChatEmptyState(
                     Text(
                         suggestion,
                         style = MaterialTheme.typography.labelLarge,
-                        color = lerp(flavor.primary, Color.White, 0.42f),
+                        color = lerp(flavor.primary, MaterialTheme.colorScheme.onSurface, 0.42f),
                         textAlign = TextAlign.Center
                     )
                 }
@@ -346,7 +351,7 @@ internal fun PortedMessageBubble(
             message.content.contains("[Tools:")
         )
 
-    val userText = lerp(flavor.primary, Color.White, 0.40f)
+    val userText = lerp(flavor.primary, MaterialTheme.colorScheme.onSurface, 0.40f)
 
     Row(
         modifier = Modifier.fillMaxWidth(),
