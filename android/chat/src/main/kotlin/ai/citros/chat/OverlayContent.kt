@@ -283,6 +283,7 @@ internal fun OverlayMiniChatContent(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
+                    val isExecuting = runState == OverlayRunState.EXECUTING
                     val queueKeyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
                         imeAction = androidx.compose.ui.text.input.ImeAction.Send
                     )
@@ -295,7 +296,12 @@ internal fun OverlayMiniChatContent(
                         modifier = Modifier
                             .weight(1f),
                         singleLine = true,
-                        placeholder = { Text("Queue a follow-up...") },
+                        placeholder = {
+                            Text(
+                                if (isExecuting) "Queue a follow-up..."
+                                else "Ask anything..."
+                            )
+                        },
                         keyboardOptions = queueKeyboardOptions,
                         keyboardActions = queueKeyboardActions,
                         colors = TextFieldDefaults.colors(
@@ -311,10 +317,14 @@ internal fun OverlayMiniChatContent(
                         contentPadding = OverlayUiConstants.CompactActionPadding,
                         colors = ButtonDefaults.outlinedButtonColors(contentColor = flavor.primary)
                     ) {
-                        Text("Queue", style = MaterialTheme.typography.labelSmall, color = flavor.primary)
+                        Text(
+                            if (isExecuting) "Queue" else "Send",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = flavor.primary
+                        )
                     }
 
-                    if (runState == OverlayRunState.EXECUTING) {
+                    if (isExecuting) {
                         Button(
                             onClick = {
                                 onStopAction()
