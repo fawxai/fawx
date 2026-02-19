@@ -160,22 +160,33 @@ class PhoneAgentPromptsTest {
         assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "confidently resolve")
         assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "Low stakes")
         assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "High stakes")
+        // Clarifies that "use context" means existing info, not exploring
+        assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "existing context")
+        assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "Do NOT open apps")
+        // Messaging-specific contact verification rule
+        assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "Messaging rule")
+        assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "confident you have the right person")
+        assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "don't search and pick one")
     }
 
     @Test
     fun `rules reinforce think-then-ask for uncertain situations`() {
         assertContains(
             PhoneAgentPrompts.SECTION_RULES,
-            "unsure what the user wants, use think()"
+            "unsure what the user wants, use your think() tool"
         )
         assertContains(PhoneAgentPrompts.SECTION_RULES, "high-stakes")
+        assertContains(PhoneAgentPrompts.SECTION_RULES, "Never open apps")
     }
 
     @Test
     fun `action prompt includes mid-task disambiguation reminder`() {
         val prompt = PhoneAgentPrompts.buildActionPrompt(phoneControlAvailable = true)
         assertContains(prompt, "ambiguity mid-task")
-        assertContains(prompt, "think()")
+        assertContains(prompt, "stop and ask the user")
+        // Intentional: action prompt tells agent to ask directly, without think() nudge.
+        // think() is still taught in SECTION_STRATEGY (system prompt) — no need to repeat here.
+        assertNotContains(prompt, "think()")
     }
 
     @Test
