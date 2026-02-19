@@ -637,7 +637,8 @@ private fun readCodexBridgeMode(prefs: android.content.SharedPreferences): Codex
 }
 
 private fun readEmbeddedCodexConfig(
-    prefs: android.content.SharedPreferences
+    prefs: android.content.SharedPreferences,
+    clientSecret: String?
 ): EmbeddedCodexOauthBridgeServer.Config {
     return EmbeddedCodexOauthBridgeServer.Config(
         authorizeUrl = prefs.getString(
@@ -649,7 +650,7 @@ private fun readEmbeddedCodexConfig(
             EmbeddedCodexOauthBridgeServer.DEFAULT_TOKEN_URL
         ) ?: EmbeddedCodexOauthBridgeServer.DEFAULT_TOKEN_URL,
         clientId = prefs.getString(PREF_CODEX_OAUTH_CLIENT_ID, "") ?: "",
-        clientSecret = prefs.getString(PREF_CODEX_OAUTH_CLIENT_SECRET, null),
+        clientSecret = clientSecret,
         scope = prefs.getString(
             PREF_CODEX_OAUTH_SCOPE,
             EmbeddedCodexOauthBridgeServer.DEFAULT_SCOPE
@@ -863,6 +864,20 @@ fun ChatScreen(
         embeddedBridge = null
     }
 
+    fun readSecureBackedValue(key: String): String? {
+        val secureValue = secureStore.getString(key)
+        if (!secureValue.isNullOrBlank()) {
+            return secureValue
+        }
+        val legacyValue = prefs.getString(key, null)?.takeIf { it.isNotBlank() } ?: return null
+        secureStore.putString(key, legacyValue)
+        prefs.edit().remove(key).apply()
+        return legacyValue
+    }
+
+    fun writeSecureBackedValue(key: String, value: String?) =
+        writeSecureBacked(secureStore, prefs, key, value)
+
     suspend fun ensureEmbeddedBridgeRunning(
         config: EmbeddedCodexOauthBridgeServer.Config
     ): Result<String> {
@@ -888,6 +903,8 @@ fun ChatScreen(
     }
 
     val clearPendingOauthState = {
+        secureStore.remove(PREF_CODEX_OAUTH_LOGIN_ID)
+        secureStore.remove(PREF_CODEX_OAUTH_CODE_VERIFIER)
         prefs.edit()
             .remove(PREF_CODEX_OAUTH_STATE)
             .remove(PREF_CODEX_OAUTH_STATE_TIMESTAMP)
@@ -985,7 +1002,10 @@ fun ChatScreen(
             PREF_CODEX_OAUTH_BRIDGE,
             CodexOauthBridgeClient.DEFAULT_BRIDGE_BASE_URL
         ) ?: CodexOauthBridgeClient.DEFAULT_BRIDGE_BASE_URL
-        val embeddedConfig = readEmbeddedCodexConfig(prefs)
+        val embeddedConfig = readEmbeddedCodexConfig(
+            prefs = prefs,
+            clientSecret = readSecureBackedValue(PREF_CODEX_OAUTH_CLIENT_SECRET)
+        )
         return when (mode) {
             CodexOauthBridgeMode.EXTERNAL -> CodexOauthStartRequest(
                 mode = CodexOauthBridgeMode.EXTERNAL,
@@ -1007,7 +1027,10 @@ fun ChatScreen(
 
         clearPendingOauthState()
         val state = generateOauthState()
-        val embeddedConfig = request.embeddedConfig ?: readEmbeddedCodexConfig(prefs)
+        val embeddedConfig = request.embeddedConfig ?: readEmbeddedCodexConfig(
+            prefs = prefs,
+            clientSecret = readSecureBackedValue(PREF_CODEX_OAUTH_CLIENT_SECRET)
+        )
         val normalizedBridge = when (request.mode) {
             CodexOauthBridgeMode.EXTERNAL -> {
                 request.externalBridgeUrl
@@ -1049,24 +1072,10 @@ fun ChatScreen(
                 .putString(PREF_CODEX_OAUTH_TOKEN_URL, embeddedConfig.tokenUrl)
                 .putString(PREF_CODEX_OAUTH_CLIENT_ID, embeddedConfig.clientId)
                 .putString(PREF_CODEX_OAUTH_SCOPE, embeddedConfig.scope)
-                .apply {
-                    if (embeddedConfig.clientSecret.isNullOrBlank()) {
-                        remove(PREF_CODEX_OAUTH_CLIENT_SECRET)
-                    } else {
-                        putString(PREF_CODEX_OAUTH_CLIENT_SECRET, embeddedConfig.clientSecret)
-                    }
-                    if (start.loginId != null) {
-                        putString(PREF_CODEX_OAUTH_LOGIN_ID, start.loginId)
-                    } else {
-                        remove(PREF_CODEX_OAUTH_LOGIN_ID)
-                    }
-                    if (start.codeVerifier != null) {
-                        putString(PREF_CODEX_OAUTH_CODE_VERIFIER, start.codeVerifier)
-                    } else {
-                        remove(PREF_CODEX_OAUTH_CODE_VERIFIER)
-                    }
-                }
                 .apply()
+            writeSecureBackedValue(PREF_CODEX_OAUTH_CLIENT_SECRET, embeddedConfig.clientSecret)
+            writeSecureBackedValue(PREF_CODEX_OAUTH_LOGIN_ID, start.loginId)
+            writeSecureBackedValue(PREF_CODEX_OAUTH_CODE_VERIFIER, start.codeVerifier)
 
             val launchResult = runCatching {
                 context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(start.authUrl)))
@@ -1115,6 +1124,16 @@ fun ChatScreen(
     
     // Load saved credentials on first launch
     LaunchedEffect(Unit) {
+        // Migrate legacy plaintext sensitive OAuth/device-code fields into encrypted storage.
+        listOf(
+            PREF_CODEX_OAUTH_CLIENT_SECRET,
+            PREF_CODEX_OAUTH_LOGIN_ID,
+            PREF_CODEX_OAUTH_CODE_VERIFIER,
+            PREF_DEVICE_CODE_REFRESH_TOKEN
+        ).forEach { key ->
+            readSecureBackedValue(key)
+        }
+
         // Initialize on-device memory provider for remember/recall/list_memories tools.
         // Store DB reference on the hosting Activity for cleanup in onDestroy().
         val activity = context as? ChatActivity
@@ -1259,7 +1278,10 @@ fun ChatScreen(
             val resolvedBridgeBaseUrl = when (readCodexBridgeMode(prefs)) {
                 CodexOauthBridgeMode.EXTERNAL -> bridgeBaseUrl
                 CodexOauthBridgeMode.EMBEDDED -> {
-                    val embeddedConfig = readEmbeddedCodexConfig(prefs)
+                    val embeddedConfig = readEmbeddedCodexConfig(
+                        prefs = prefs,
+                        clientSecret = readSecureBackedValue(PREF_CODEX_OAUTH_CLIENT_SECRET)
+                    )
                     ensureEmbeddedBridgeRunning(embeddedConfig)
                         .onFailure { error ->
                             codexOauthBusy = false
@@ -1274,8 +1296,8 @@ fun ChatScreen(
                 bridgeBaseUrl = resolvedBridgeBaseUrl,
                 code = code,
                 state = callbackState ?: pendingState,
-                loginId = prefs.getString(PREF_CODEX_OAUTH_LOGIN_ID, null),
-                codeVerifier = prefs.getString(PREF_CODEX_OAUTH_CODE_VERIFIER, null),
+                loginId = readSecureBackedValue(PREF_CODEX_OAUTH_LOGIN_ID),
+                codeVerifier = readSecureBackedValue(PREF_CODEX_OAUTH_CODE_VERIFIER),
                 redirectUri = ChatActivity.OAUTH_CALLBACK_URI
             ).onSuccess { exchange ->
                 applyCodexOauthToken(exchange.accessToken)
@@ -2332,6 +2354,9 @@ fun SignInPrompt(
                 val prefs = remember(context) {
                     context.getSharedPreferences(CITROS_PREFS, android.content.Context.MODE_PRIVATE)
                 }
+                val secureStore = remember(context) { SecureCredentialStore(context) }
+                fun writeSecureBackedValue(key: String, value: String?) =
+                    writeSecureBacked(secureStore, prefs, key, value)
                 val coroutineScope = rememberCoroutineScope()
                 val deviceCodeClient = remember { ai.citros.core.DeviceCodeAuthClient() }
 
@@ -2393,9 +2418,7 @@ fun SignInPrompt(
                                     ).onSuccess { tokens ->
                                         // Store refresh token separately if present
                                         if (tokens.refreshToken != null) {
-                                            prefs.edit()
-                                                .putString(PREF_DEVICE_CODE_REFRESH_TOKEN, tokens.refreshToken)
-                                                .apply()
+                                            writeSecureBackedValue(PREF_DEVICE_CODE_REFRESH_TOKEN, tokens.refreshToken)
                                         }
                                         
                                         // onToken callback handles main token persistence

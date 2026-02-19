@@ -1,6 +1,9 @@
 package ai.citros.core
 
+import android.Manifest
+import android.annotation.SuppressLint
 import android.content.Context
+import android.content.pm.PackageManager
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
@@ -88,9 +91,11 @@ class SherpaOnnxSpeechToText(
 
     private var recognizer: OfflineRecognizer? = null
     private var vad: Vad? = null
+    private var appContext: Context? = null
     private val isListening = AtomicBoolean(false)
 
     override suspend fun initialize(context: Context) {
+        appContext = context.applicationContext
         if (!isAvailable) {
             throw IllegalStateException("Model files not found at $modelDir")
         }
@@ -129,6 +134,18 @@ class SherpaOnnxSpeechToText(
     }
 
     override fun startListening(): Flow<SpeechEvent> = callbackFlow {
+        val context = appContext
+        if (context == null) {
+            trySend(SpeechEvent.Error(SpeechError.Unavailable("Provider not initialized. Call initialize() first.")))
+            close()
+            return@callbackFlow
+        }
+        if (context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            trySend(SpeechEvent.Error(SpeechError.PermissionDenied("Microphone permission denied")))
+            close()
+            return@callbackFlow
+        }
+
         val currentVad = vad
         val currentRecognizer = recognizer
         if (currentVad == null || currentRecognizer == null) {
@@ -153,13 +170,7 @@ class SherpaOnnxSpeechToText(
                     return@launch
                 }
 
-                audioRecord = AudioRecord(
-                    MediaRecorder.AudioSource.MIC,
-                    SAMPLE_RATE,
-                    AudioFormat.CHANNEL_IN_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT,
-                    bufferSize,
-                )
+                audioRecord = createAudioRecord(bufferSize)
 
                 if (audioRecord.state != AudioRecord.STATE_INITIALIZED) {
                     trySend(SpeechEvent.Error(SpeechError.EngineError("Failed to initialize AudioRecord")))
@@ -269,6 +280,18 @@ class SherpaOnnxSpeechToText(
         recognizer = null
         vad?.release()
         vad = null
+        appContext = null
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun createAudioRecord(bufferSize: Int): AudioRecord {
+        return AudioRecord(
+            MediaRecorder.AudioSource.MIC,
+            SAMPLE_RATE,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT,
+            bufferSize,
+        )
     }
 
     internal companion object {

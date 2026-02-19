@@ -142,7 +142,7 @@ class AgentExecutorErrorTest {
         mockDelegate.onExecute = { _, _ ->
             ToolResult("element not found", isError = true)
         }
-        val executor = AgentExecutor(mockDelegate, mockListener, maxToolSteps = 1)
+        val executor = AgentExecutor(mockDelegate, mockListener, maxToolSteps = 2)
         // Batch with two different tools
         val toolResponse = ChatResponse(
             text = null,
@@ -153,7 +153,9 @@ class AgentExecutorErrorTest {
             stopReason = "tool_use"
         )
 
-        executor.run(toolResponse, null, { false }) { toolResponse }
+        executor.run(toolResponse, null, { false }) {
+            ChatResponse(text = "done", toolCalls = emptyList(), stopReason = "end_turn")
+        }
 
         // Both errors should be EXPLORATORY (count=1 each, independent counters)
         assertEquals(2, mockListener.toolErrors.size)

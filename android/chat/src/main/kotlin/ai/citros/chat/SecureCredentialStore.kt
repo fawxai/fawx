@@ -56,3 +56,22 @@ class SecureCredentialStore(context: Context) : CredentialStore {
         prefs.edit().remove(key).apply()
     }
 }
+
+/**
+ * Write a value to secure storage and remove any legacy plaintext copy.
+ *
+ * Null or blank values remove the key from both stores.
+ */
+fun writeSecureBacked(
+    secureStore: CredentialStore,
+    legacyPrefs: SharedPreferences,
+    key: String,
+    value: String?
+) {
+    if (value.isNullOrBlank()) {
+        secureStore.remove(key)
+    } else {
+        secureStore.putString(key, value)
+    }
+    legacyPrefs.edit().remove(key).apply()
+}
