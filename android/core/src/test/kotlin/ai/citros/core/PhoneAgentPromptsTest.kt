@@ -322,4 +322,27 @@ class PhoneAgentPromptsTest {
             text.contains(substring)
         )
     }
+
+    // --- Execution rule tests (#613) ---
+
+    @Test
+    fun `system prompt contains act-dont-announce rule`() {
+        val prompt = PhoneAgentPrompts.buildSystemPrompt(phoneControlAvailable = true)
+        assertContains(prompt, "Never announce an action without doing it")
+        assertContains(prompt, "Text without tools = conversation, not action")
+    }
+
+    @Test
+    fun `execution rule is in system prompt only, not action prompt`() {
+        val actionPrompt = PhoneAgentPrompts.buildActionPrompt(phoneControlAvailable = true)
+        // Action prompt is trimmed for mid-loop use — execution rule is not needed there
+        // because the model is already in a tool loop (it IS acting).
+        assert(!actionPrompt.contains("Act, Don't Announce")) {
+            "Action prompt should not contain the execution rule (it's for initial turns only)"
+        }
+
+        // Verify it IS in the system prompt
+        val systemPrompt = PhoneAgentPrompts.buildSystemPrompt(phoneControlAvailable = true)
+        assertContains(systemPrompt, "Act, Don't Announce")
+    }
 }

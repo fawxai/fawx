@@ -156,6 +156,7 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
     private var phoneAgentLocal: PhoneAgentLocal? = null
     private var lastWalletProvider: Provider? = null
     private var lastWalletChatModelId: String? = null
+    private var lastWalletActionModelId: String? = null
 
     /** Base URL for SearXNG or other search provider. Set via [setSearchConfig]. */
     private var searchBaseUrl: String? = null
@@ -361,6 +362,7 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
 
         lastWalletProvider = config.provider
         lastWalletChatModelId = config.chatModelId
+        lastWalletActionModelId = config.actionModelId
 
         mode = Mode.API
         isConfigured.value = true
@@ -382,19 +384,30 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
             return
         }
 
+        // Check both chat AND action model IDs (#609)
         val modelsUnchanged =
             lastWalletProvider == config.provider &&
-                lastWalletChatModelId == config.chatModelId
+                lastWalletChatModelId == config.chatModelId &&
+                lastWalletActionModelId == config.actionModelId
         if (modelsUnchanged) {
             return
         }
 
+        // Preserve conversation history across model switch.
+        // buildWalletBackend creates a new PhoneAgentApi with empty messages.
+        // Transfer the old agent's messages to the new one so the model
+        // retains conversation context after switching (#609, #612).
+        val oldMessages = activeBackend.agent.getMessages()
         val updatedBackend = buildWalletBackend(config)
+        if (oldMessages.isNotEmpty()) {
+            updatedBackend.agent.setMessages(oldMessages)
+        }
         apiBackends[activeIndex] = updatedBackend
         activateApiBackend(activeIndex)
 
         lastWalletProvider = config.provider
         lastWalletChatModelId = config.chatModelId
+        lastWalletActionModelId = config.actionModelId
 
         mode = Mode.API
         isConfigured.value = true
@@ -442,6 +455,7 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
 
         lastWalletProvider = null
         lastWalletChatModelId = null
+        lastWalletActionModelId = null
 
         mode = Mode.API
         isConfigured.value = true
@@ -466,6 +480,7 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
         activeApiBackendIndex = -1
         lastWalletProvider = null
         lastWalletChatModelId = null
+        lastWalletActionModelId = null
         mode = Mode.LOCAL
         isConfigured.value = true
         needsAuth.value = false
@@ -496,6 +511,9 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
         // Action model must meet the security floor (Sonnet-tier minimum) because
         // the action loop processes untrusted screen content. Always uses the
         // provider's default action model regardless of chat model selection.
+        // Note: config.actionModelId from the wallet is intentionally ignored here.
+        // lastWalletActionModelId tracking in updateModelsFromWallet() is
+        // forward-compatible for when user-selectable action models are enabled.
         val actionModelId = ModelConfig.defaultActionModel(config.provider)
         val actionConfig = config.copy(chatModelId = actionModelId)
 
@@ -590,6 +608,7 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
 
         lastWalletProvider = null
         lastWalletChatModelId = null
+        lastWalletActionModelId = null
 
         mode = Mode.API
         isConfigured.value = true
@@ -606,6 +625,7 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
         activeApiBackendIndex = -1
         lastWalletProvider = null
         lastWalletChatModelId = null
+        lastWalletActionModelId = null
 
         mode = Mode.LOCAL
         isConfigured.value = true
@@ -1411,6 +1431,7 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
         activeApiBackendIndex = -1
         lastWalletProvider = null
         lastWalletChatModelId = null
+        lastWalletActionModelId = null
         isConfigured.value = false
         needsAuth.value = false
         isLoading.value = false
