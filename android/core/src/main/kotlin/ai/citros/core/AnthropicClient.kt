@@ -105,8 +105,6 @@ class AnthropicClient : BaseProviderClient {
         tools: List<Tool>,
         tokenLimit: Int?
     ): Result<ChatResponse> {
-        require(tools.isNotEmpty()) { "chatWithTools requires at least one tool" }
-
         val effectiveSystemPrompt = systemPrompt ?: this.systemPrompt
         val effectiveTokenLimit = tokenLimit ?: this.maxTokens
 
@@ -172,8 +170,8 @@ class AnthropicClient : BaseProviderClient {
                 }
             }
 
-            // Add tools array
-            putJsonArray("tools") {
+            // Add tools array (omitted for tool-free calls like sendEphemeral)
+            if (tools.isNotEmpty()) putJsonArray("tools") {
                 tools.forEachIndexed { index, tool ->
                     addJsonObject {
                         put("name", tool.name)

@@ -71,8 +71,6 @@ internal class OpenAiCompatibleClientImpl(
         tools: List<Tool>,
         tokenLimit: Int?
     ): Result<ChatResponse> {
-        require(tools.isNotEmpty()) { "chatWithTools requires at least one tool" }
-
         val effectiveSystemPrompt = systemPrompt ?: this.systemPrompt
         val effectiveTokenLimit = tokenLimit ?: this.maxTokens
 
@@ -118,7 +116,7 @@ internal class OpenAiCompatibleClientImpl(
             put("model", config.chatModelId)
             put("max_tokens", maxTokens)
 
-            putJsonArray("tools") {
+            if (tools.isNotEmpty()) putJsonArray("tools") {
                 tools.forEach { tool ->
                     addJsonObject {
                         put("type", "function")
