@@ -1552,4 +1552,87 @@ class PhoneAgentApiTest {
         assertTrue(body.contains("Find the answer"), "Request body should contain goal")
     }
 
+    // --- Conversation history seeding tests (#612) ---
+
+    @Test
+    fun `seedConversationHistory populates empty messages from UI`() = runTest {
+        val agent = createAgent()
+        assertEquals(0, agent.messageCount)
+
+        val uiMessages = listOf(
+            Message(role = "user", content = "what's the weather?"),
+            Message(role = "assistant", content = "It's 38F and partly cloudy in Denver."),
+            Message(role = "user", content = "should I bring a jacket?")
+        )
+
+        agent.seedConversationHistory(uiMessages)
+        assertEquals(3, agent.messageCount)
+    }
+
+    @Test
+    fun `seedConversationHistory is no-op when messages already exist`() = runTest {
+        val agent = createAgent()
+
+        agent.seedConversationHistory(listOf(
+            Message(role = "user", content = "first turn"),
+            Message(role = "assistant", content = "first response")
+        ))
+        assertEquals(2, agent.messageCount)
+
+        // Second seed should be a no-op
+        agent.seedConversationHistory(listOf(
+            Message(role = "user", content = "should NOT appear"),
+            Message(role = "assistant", content = "neither should this")
+        ))
+        assertEquals(2, agent.messageCount)  // unchanged
+    }
+
+    @Test
+    fun `seedConversationHistory skips tool and blank messages`() = runTest {
+        val agent = createAgent()
+        val uiMessages = listOf(
+            Message(role = "user", content = "do something"),
+            Message(role = "tool", content = "tool result here"),
+            Message(role = "assistant", content = "Done!"),
+            Message(role = "assistant", content = "  ")  // blank, should be skipped
+        )
+
+        agent.seedConversationHistory(uiMessages)
+        assertEquals(2, agent.messageCount)  // user + "Done!", tool and blank skipped
+    }
+
+    @Test
+    fun `seedConversationHistory strips tool metadata from assistant messages`() = runTest {
+        val agent = createAgent()
+        val uiMessages = listOf(
+            Message(role = "user", content = "open settings"),
+            Message(role = "assistant", content = "Opened Settings [Tools: open_app, tap]")
+        )
+
+        agent.seedConversationHistory(uiMessages)
+        assertEquals(2, agent.messageCount)
+    }
+
+    @Test
+    fun `seedConversationHistory with empty UI messages is no-op`() = runTest {
+        val agent = createAgent()
+        agent.seedConversationHistory(emptyList())
+        assertEquals(0, agent.messageCount)
+    }
+
+    @Test
+    fun `seedConversationHistory deduplicates consecutive same-role messages`() = runTest {
+        val agent = createAgent()
+        // After stripping tool messages, two user messages end up adjacent
+        val uiMessages = listOf(
+            Message(role = "user", content = "do something"),
+            Message(role = "tool", content = "tool result"),  // stripped
+            Message(role = "user", content = "also do this"),  // steer, now adjacent to first user
+            Message(role = "assistant", content = "Done!")
+        )
+
+        agent.seedConversationHistory(uiMessages)
+        // user + user -> only first kept (consecutive dedup), then assistant = 2
+        assertEquals(2, agent.messageCount)
+    }
 }

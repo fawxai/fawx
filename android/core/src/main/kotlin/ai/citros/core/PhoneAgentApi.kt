@@ -85,12 +85,66 @@ open class PhoneAgentApi(
     }
 
     private val messages = mutableListOf<Message>()
+
+    /** Expose message count for testing. */
+    @get:androidx.annotation.VisibleForTesting
+    internal val messageCount: Int get() = messages.size
+
     /** Current tool step counter, used for context compaction. Set by ChatViewModel. */
     var currentToolStep: Int = 0
+
     /**
-     * Override for phone control availability check. When null, uses [ScreenReader.isAttached()].
-     * Set to `true` in tests to simulate phone control being available.
+     * Seed the API conversation history from UI messages when the agent's
+     * in-memory history is empty (e.g. after process recreation).
+     *
+     * Android may kill the process while the user is in another app (during a
+     * tool loop). When they return, [ChatViewModel.messages] persists (UI state)
+     * but [PhoneAgentApi.messages] is empty. Without seeding, the model loses
+     * all context from prior turns (#612).
+     *
+     * Only text content is preserved — tool_use/tool_result blocks are lost.
+     * This is intentional: the Anthropic API requires matching tool_use/tool_result
+     * pairs, and reconstructing those from UI messages is not reliable. Text-only
+     * history is sufficient for conversational continuity.
      */
+    fun seedConversationHistory(uiMessages: List<Message>) {
+        if (messages.isNotEmpty()) return  // Already has history, skip
+        if (uiMessages.isEmpty()) return
+
+        // Convert UI messages to simple text-only messages for API context.
+        // Drop tool/system messages, keep user and assistant text.
+        val seeded = uiMessages.mapNotNull { msg ->
+            when {
+                msg.role == Message.ROLE_USER -> Message(role = "user", content = msg.content)
+                msg.role == Message.ROLE_ASSISTANT && msg.content.isNotBlank() -> {
+                    // Strip tool metadata suffix (e.g. "[Tools: tap, type]")
+                    val textOnly = msg.content
+                        .replace(Regex("""\s*\[Tools:.*?]"""), "")
+                        .trim()
+                    if (textOnly.isNotEmpty()) Message(role = "assistant", content = textOnly) else null
+                }
+                else -> null
+            }
+        }
+
+        // Deduplicate consecutive same-role messages that can arise when
+        // steer messages (mid-loop user turns) are adjacent to regular user turns
+        // after tool-role messages are stripped. The Anthropic API rejects
+        // consecutive same-role messages.
+        val deduped = mutableListOf<Message>()
+        for (msg in seeded) {
+            if (deduped.isEmpty() || deduped.last().role != msg.role) {
+                deduped.add(msg)
+            }
+            // else: skip consecutive same-role message
+        }
+
+        if (deduped.isNotEmpty()) {
+            messages.addAll(deduped)
+            Log.d(TAG, "seedConversationHistory: seeded ${'$'}{deduped.size} messages from UI (${'$'}{seeded.size - deduped.size} consecutive dupes removed)")
+        }
+    }
+
     /**
      * Optional callback for real-time tool progress updates.
      * Called from IO dispatcher during long-running tool operations (e.g., web_browse).
@@ -98,6 +152,10 @@ open class PhoneAgentApi(
      */
     var onToolProgress: ((String) -> Unit)? = null
 
+    /**
+     * Override for phone control availability check. When null, uses [ScreenReader.isAttached()].
+     * Set to `true` in tests to simulate phone control being available.
+     */
     @androidx.annotation.VisibleForTesting
     @Volatile
     var phoneControlOverride: Boolean? = null

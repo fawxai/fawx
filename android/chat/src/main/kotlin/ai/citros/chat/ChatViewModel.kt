@@ -755,6 +755,10 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
                     if (ScreenReader.isAttached()) ScreenReader.getScreenContent() else null
                 } catch (_: Exception) { null }
 
+                // Seed API conversation history from UI messages if agent's
+                // in-memory history was lost (process recreation) (#612).
+                phoneAgentApi?.seedConversationHistory(messages.dropLast(1))
+
                 Log.d(TAG, "sendMessage: mode=$mode, content='${content.take(60)}', screenAttached=${ScreenReader.isAttached()}, package=${screenContent?.packageName}")
 
                 // #447: Stash/replay task context across accessibility enable prompt.
