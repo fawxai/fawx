@@ -142,6 +142,12 @@ object OutputClassifier {
         "web_browse" to ToolCategory.RESEARCH,
 
         // Reasoning — shown dimmed
+        // Status
+        "wait" to ToolCategory.MECHANICAL,
+        "read_screen" to ToolCategory.MECHANICAL,
+        "read_notifications" to ToolCategory.PROMINENT,
+        "paste" to ToolCategory.OTHER,
+        "clipboard" to ToolCategory.OTHER,
         "think" to ToolCategory.REASONING
     )
 
@@ -448,8 +454,23 @@ object OutputClassifier {
      * 4. Truncate at [DISPLAY_MAX_CHARS] on a word boundary
      */
     internal fun summarize(result: String): String {
+        // Handle "Screenshot description:\n..." — extract the actual description
+        if (result.startsWith("Screenshot description:")) {
+            val desc = result.removePrefix("Screenshot description:").trim()
+            return if (desc.isNotEmpty()) {
+                truncateAtWord(desc.lineSequence().first { it.isNotBlank() })
+            } else {
+                "Analyzed screen"
+            }
+        }
+
+        // Strip "Waited Xs. Screen:\n..." down to just "Waited Xs"
+        val withoutWaitDump = result.replace(
+            Regex("""(Waited \d+(?:\.\d+)?(?:s|ms))\.\s*Screen:\n[\s\S]*"""), "$1"
+        ).trim()
+
         // Strip SCREEN: blocks — everything from "SCREEN:" onward
-        val withoutScreen = result.replace(Regex("""(^|\n+)SCREEN:\n[\s\S]*"""), "").trim()
+        val withoutScreen = withoutWaitDump.replace(Regex("""(^|\n+)SCREEN:\n[\s\S]*"""), "").trim()
 
         // Strip verification suffixes (newline-prefixed; inline suffixes like
         // "Tapped Send [Verified: ok]" are kept as they're part of the action text)
@@ -467,11 +488,17 @@ object OutputClassifier {
                 withoutVerification.take(DISPLAY_MAX_CHARS) + "…"
             }
 
-        // Truncate at word boundary
-        return if (firstLine.length <= DISPLAY_MAX_CHARS) {
-            firstLine
+        return truncateAtWord(firstLine)
+    }
+
+    /**
+     * Truncate a string at a word boundary within [DISPLAY_MAX_CHARS].
+     */
+    private fun truncateAtWord(text: String): String {
+        return if (text.length <= DISPLAY_MAX_CHARS) {
+            text
         } else {
-            val truncated = firstLine.substring(0, DISPLAY_MAX_CHARS)
+            val truncated = text.substring(0, DISPLAY_MAX_CHARS)
             val lastSpace = truncated.lastIndexOf(' ')
             if (lastSpace > DISPLAY_MAX_CHARS / 2) {
                 truncated.substring(0, lastSpace) + "…"
@@ -481,4 +508,3 @@ object OutputClassifier {
         }
     }
 }
-

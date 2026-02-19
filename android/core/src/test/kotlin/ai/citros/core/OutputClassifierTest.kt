@@ -27,10 +27,12 @@ class OutputClassifierTest {
     @Test
     fun `TOOL_CATEGORIES contains all expected tools`() {
         val expectedMechanical = listOf("tap", "tap_text", "long_press", "swipe", "scroll",
-            "press_back", "press_home", "type_text")
-        val expectedProminent = listOf("open_app", "open_notifications", "screenshot", "subtask")
+            "press_back", "press_home", "type_text", "wait", "read_screen")
+        val expectedProminent = listOf("open_app", "open_notifications", "read_notifications",
+            "screenshot", "subtask")
         val expectedResearch = listOf("web_search", "web_fetch")
         val expectedReasoning = listOf("think")
+        val expectedOther = listOf("paste", "clipboard")
 
         for (tool in expectedMechanical) {
             assertEquals(ToolCategory.MECHANICAL, OutputClassifier.TOOL_CATEGORIES[tool], "$tool")
@@ -44,6 +46,9 @@ class OutputClassifierTest {
         for (tool in expectedReasoning) {
             assertEquals(ToolCategory.REASONING, OutputClassifier.TOOL_CATEGORIES[tool], "$tool")
         }
+        for (tool in expectedOther) {
+            assertEquals(ToolCategory.OTHER, OutputClassifier.TOOL_CATEGORIES[tool], "$tool")
+        }
     }
 
     // ========== classify() ==========
@@ -51,7 +56,7 @@ class OutputClassifierTest {
     @Test
     fun `mechanical actions are hidden`() {
         val mechanical = listOf("tap", "tap_text", "long_press", "swipe", "scroll",
-            "press_back", "press_home", "type_text")
+            "press_back", "press_home", "type_text", "wait", "read_screen")
         for (tool in mechanical) {
             assertEquals(
                 OutputVisibility.HIDE,
@@ -86,10 +91,18 @@ class OutputClassifierTest {
     }
 
     @Test
-    fun `screenshot is show`() {
+    fun `screenshot is show (prominent)`() {
         assertEquals(
             OutputVisibility.SHOW,
             OutputClassifier.classify("screenshot", "Screenshot description: inbox with 3 emails")
+        )
+    }
+
+    @Test
+    fun `read_notifications is show (prominent)`() {
+        assertEquals(
+            OutputVisibility.SHOW,
+            OutputClassifier.classify("read_notifications", "4 notifications found")
         )
     }
 
@@ -154,24 +167,24 @@ class OutputClassifierTest {
     }
 
     @Test
-    fun `wait is show dimmed`() {
+    fun `wait is hidden (mechanical)`() {
         assertEquals(
-            OutputVisibility.SHOW_DIMMED,
+            OutputVisibility.HIDE,
             OutputClassifier.classify("wait", "Waited 2s")
         )
     }
 
     @Test
-    fun `read_screen is show dimmed`() {
+    fun `read_screen is hidden (mechanical)`() {
         assertEquals(
-            OutputVisibility.SHOW_DIMMED,
+            OutputVisibility.HIDE,
             OutputClassifier.classify("read_screen", "Screen refreshed")
         )
     }
 
     @Test
     fun `notification tools are show dimmed`() {
-        val notifTools = listOf("read_notifications", "tap_notification",
+        val notifTools = listOf("tap_notification",
             "dismiss_notification", "reply_notification")
         for (tool in notifTools) {
             assertEquals(
@@ -749,5 +762,60 @@ class OutputClassifierTest {
         val longWhitespace = "   ".repeat(100)  // only whitespace lines
         val result = OutputClassifier.summarize(longWhitespace)
         assertTrue(result.length <= OutputClassifier.DISPLAY_MAX_CHARS + 1)
+    }
+
+
+    // --- Screenshot and wait summarize tests (#625) ---
+
+    @Test
+    fun `summarize extracts screenshot description`() {
+        val result = "Screenshot description:\nThe screen shows a weather app with 72F"
+        assertEquals(
+            "The screen shows a weather app with 72F",
+            OutputClassifier.summarize(result)
+        )
+    }
+
+    @Test
+    fun `summarize handles empty screenshot description`() {
+        assertEquals(
+            "Analyzed screen",
+            OutputClassifier.summarize("Screenshot description:")
+        )
+    }
+
+    @Test
+    fun `summarize strips wait screen dump`() {
+        val result = "Waited 2s. Screen:\nApp: com.android.settings\n[0] Search Settings"
+        assertEquals(
+            "Waited 2s",
+            OutputClassifier.summarize(result)
+        )
+    }
+
+    @Test
+    fun `summarize keeps plain wait`() {
+        assertEquals(
+            "Waited 2s",
+            OutputClassifier.summarize("Waited 2s")
+        )
+    }
+
+    @Test
+    fun `summarize strips wait screen dump with decimal duration`() {
+        val result = "Waited 2.5s. Screen:\nApp: com.android.settings\n[0] Search"
+        assertEquals(
+            "Waited 2.5s",
+            OutputClassifier.summarize(result)
+        )
+    }
+
+    @Test
+    fun `summarize strips wait screen dump with ms duration`() {
+        val result = "Waited 200ms. Screen:\nApp: com.android.clock\n[0] Alarm"
+        assertEquals(
+            "Waited 200ms",
+            OutputClassifier.summarize(result)
+        )
     }
 }
