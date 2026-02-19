@@ -1,5 +1,20 @@
 package ai.citros.chat
 
+/**
+ * LIVE OVERLAY composables rendered inside [OverlayService]'s ComposeView.
+ *
+ * These composables are what the user actually sees floating over other apps.
+ * [OverlayServiceContent] in OverlayService.kt switches between them based on
+ * [OverlaySurfaceMode]:
+ *   - [OverlayMiniChatContent] — bottom-anchored floating panel (~40% height)
+ *   - [OverlayBubbleContent] — circular floating indicator (~56dp)
+ *
+ * ⚠️  NOT the same as OverlayPortedScreen.kt, which contains FULL-SCREEN copies
+ * of these composables embedded inside ChatActivity (for preview and in-app use).
+ * Changes to overlay behavior/rendering must be made HERE to affect the actual
+ * floating overlay. Update OverlayPortedScreen.kt separately if parity is needed.
+ */
+
 import ai.citros.core.OverlayLine
 import ai.citros.core.OverlayLineType
 import ai.citros.core.OverlayRunState
@@ -35,6 +50,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -78,6 +94,20 @@ internal fun OverlayMiniChatContent(
     modifier: Modifier = Modifier
 ) {
     var isUndoStopVisible by rememberSaveable { mutableStateOf(false) }
+    val scrollState = rememberScrollState()
+
+    // Auto-scroll to bottom when lines change or last line content updates.
+    val lastLineText = lines.lastOrNull()?.text
+    LaunchedEffect(lines.size, lastLineText) {
+        kotlinx.coroutines.yield()
+        kotlinx.coroutines.delay(100)
+        scrollState.animateScrollTo(scrollState.maxValue)
+        // Second pass: content may still be measuring (e.g. markdown rendering).
+        kotlinx.coroutines.delay(300)
+        if (scrollState.maxValue > scrollState.value) {
+            scrollState.animateScrollTo(scrollState.maxValue)
+        }
+    }
 
     Surface(
         modifier = modifier,
@@ -146,7 +176,7 @@ internal fun OverlayMiniChatContent(
                 modifier = Modifier
                     .weight(1f)
                     .padding(horizontal = 10.dp)
-                    .verticalScroll(rememberScrollState()),
+                    .verticalScroll(scrollState),
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 lines.forEach { line ->
@@ -179,7 +209,7 @@ internal fun OverlayMiniChatContent(
                                 }
                             }
                         }
-                        Text(
+                        MarkdownText(
                             text = line.text,
                             style = MaterialTheme.typography.bodySmall,
                             color = if (line.type == OverlayLineType.QUEUED) {

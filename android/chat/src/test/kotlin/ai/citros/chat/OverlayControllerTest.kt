@@ -393,4 +393,90 @@ class OverlayControllerTest {
         assertEquals(OverlaySurfaceMode.FULL_APP, OverlayController.surfaceMode.value)
         assertFalse(OverlayController.isOverlayActive.value)
     }
+
+
+    // --- Toggle button tests (#608/PR #614) ---
+
+    @Test
+    fun `toggle deactivates overlay when active`() {
+        OverlayController.activateOverlay()
+        assertTrue(OverlayController.isOverlayActive.value)
+
+        // Simulate toggle onClick: if active -> deactivate
+        val isActive = OverlayController.isOverlayActive.value
+        if (isActive) {
+            OverlayController.deactivateOverlay()
+        } else {
+            OverlayController.activateOverlay()
+        }
+
+        assertFalse(OverlayController.isOverlayActive.value)
+        assertEquals(OverlaySurfaceMode.FULL_APP, OverlayController.surfaceMode.value)
+    }
+
+    @Test
+    fun `toggle activates overlay when inactive`() {
+        assertFalse(OverlayController.isOverlayActive.value)
+
+        // Simulate toggle onClick: if inactive -> activate
+        val isActive = OverlayController.isOverlayActive.value
+        if (isActive) {
+            OverlayController.deactivateOverlay()
+        } else {
+            OverlayController.updateSurfaceMode(OverlaySurfaceMode.MINI_CHAT)
+            OverlayController.activateOverlay()
+        }
+
+        assertTrue(OverlayController.isOverlayActive.value)
+        assertEquals(OverlaySurfaceMode.MINI_CHAT, OverlayController.surfaceMode.value)
+    }
+
+    // --- Restore hook tests (#608/PR #614) ---
+
+    @Test
+    fun `restore hook activates overlay from inactive state`() {
+        // Simulate: overlay was never activated (race condition scenario)
+        assertFalse(OverlayController.isOverlayActive.value)
+
+        // Restore hook logic: activate only if not already active
+        if (!OverlayController.isOverlayActive.value) {
+            OverlayController.updateSurfaceMode(OverlaySurfaceMode.MINI_CHAT)
+            OverlayController.activateOverlay()
+        }
+
+        assertTrue(OverlayController.isOverlayActive.value)
+        assertEquals(OverlaySurfaceMode.MINI_CHAT, OverlayController.surfaceMode.value)
+    }
+
+    @Test
+    fun `restore hook skips activation when already active`() {
+        // Overlay already running (normal case)
+        OverlayController.activateOverlay()
+        assertTrue(OverlayController.isOverlayActive.value)
+        OverlayController.updateSurfaceMode(OverlaySurfaceMode.BUBBLE)
+
+        // Restore hook: should not re-activate (already active)
+        if (!OverlayController.isOverlayActive.value) {
+            OverlayController.updateSurfaceMode(OverlaySurfaceMode.MINI_CHAT)
+            OverlayController.activateOverlay()
+        }
+
+        // Mode should remain BUBBLE (not overridden to MINI_CHAT)
+        assertTrue(OverlayController.isOverlayActive.value)
+        assertEquals(OverlaySurfaceMode.BUBBLE, OverlayController.surfaceMode.value)
+    }
+
+    @Test
+    fun `restore hook with BUBBLE preferred mode activates as BUBBLE`() {
+        assertFalse(OverlayController.isOverlayActive.value)
+
+        // Simulate restore with BUBBLE preference
+        if (!OverlayController.isOverlayActive.value) {
+            OverlayController.updateSurfaceMode(OverlaySurfaceMode.BUBBLE)
+            OverlayController.activateOverlay()
+        }
+
+        assertTrue(OverlayController.isOverlayActive.value)
+        assertEquals(OverlaySurfaceMode.BUBBLE, OverlayController.surfaceMode.value)
+    }
 }

@@ -1,7 +1,13 @@
 package ai.citros.chat
 
 /**
- * Overlay UI for phone control task execution.
+ * FULL-SCREEN (ported) overlay UI embedded inside ChatActivity.
+ *
+ * These are IN-APP copies of the overlay composables — NOT the actual floating overlay.
+ * The real floating overlay is in OverlayContent.kt (rendered by OverlayService).
+ *
+ * ⚠️  If you need to change how the floating overlay looks or behaves, edit
+ * OverlayContent.kt instead. This file is for the full-screen/in-app experience only.
  *
  * Supports two modes:
  * - **Live mode**: pass a [ChatViewModel] to display real-time tool execution state
@@ -564,10 +570,17 @@ internal fun FullAppOverlayContent(
 ) {
     val fullScrollState = rememberScrollState()
 
-    // Auto-scroll to bottom when lines change
-    LaunchedEffect(lines.size) {
+    // Auto-scroll to bottom when lines change or last line content updates.
+    val fullLastLineText = lines.lastOrNull()?.text
+    LaunchedEffect(lines.size, fullLastLineText) {
         kotlinx.coroutines.yield()
+        kotlinx.coroutines.delay(100)
         fullScrollState.animateScrollTo(fullScrollState.maxValue)
+        // Second pass: content may still be measuring (e.g. markdown rendering).
+        kotlinx.coroutines.delay(300)
+        if (fullScrollState.maxValue > fullScrollState.value) {
+            fullScrollState.animateScrollTo(fullScrollState.maxValue)
+        }
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
@@ -666,7 +679,7 @@ internal fun FullAppOverlayContent(
                     color = MaterialTheme.colorScheme.surface.copy(alpha = 0.92f),
                     border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.3f))
                 ) {
-                    Text(
+                    MarkdownText(
                         text = line.text,
                         modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
                         style = MaterialTheme.typography.bodySmall,
@@ -801,11 +814,19 @@ internal fun MiniChatOverlayCard(
 ) {
     val scrollState = rememberScrollState()
 
-    // Auto-scroll to bottom when lines change
-    LaunchedEffect(lines.size) {
-        // Brief yield to let Compose lay out the new content before scrolling
+    // Auto-scroll to bottom when lines change or last line content updates.
+    // The delay ensures Compose has laid out new content (especially after
+    // overlay activation, when the view may not have measured yet).
+    val lastLineText = lines.lastOrNull()?.text
+    LaunchedEffect(lines.size, lastLineText) {
         kotlinx.coroutines.yield()
+        kotlinx.coroutines.delay(100)
         scrollState.animateScrollTo(scrollState.maxValue)
+        // Second pass: content may still be measuring (e.g. markdown rendering).
+        kotlinx.coroutines.delay(300)
+        if (scrollState.maxValue > scrollState.value) {
+            scrollState.animateScrollTo(scrollState.maxValue)
+        }
     }
 
     Surface(
@@ -898,7 +919,7 @@ internal fun MiniChatOverlayCard(
                                 }
                             }
                         }
-                        Text(
+                        MarkdownText(
                             text = line.text,
                             style = MaterialTheme.typography.bodySmall,
                             color = if (line.type == OverlayLineType.QUEUED) {

@@ -176,6 +176,22 @@ class ChatActivity : ComponentActivity() {
         }
         ScreenReader.toolLoopOverlayRestoreHook = {
             withContext(Dispatchers.Main) {
+                // Ensure overlay is active before restoring visibility (#608).
+                // When the user starts from full-screen chat, the overlay service
+                // may not be running yet (race with startForegroundService).
+                // Only activate if not already active — avoids the 500ms debounce
+                // in activateOverlay() which could swallow a sub-500ms restore.
+                // Note: if preferredMode is FULL_APP, updateSurfaceMode sets
+                // isOverlayActive=false, then activateOverlay re-sets it to true
+                // and overrides to MINI_CHAT. This is intentional — FULL_APP means
+                // "use ChatActivity", so the restore hook should fall through to
+                // MINI_CHAT for the floating overlay.
+                if (OverlayPermission.canDrawOverlays(this@ChatActivity) &&
+                    !OverlayController.isOverlayActive.value
+                ) {
+                    OverlayController.updateSurfaceMode(getPreferredOverlayMode(this@ChatActivity))
+                    OverlayController.activateOverlay()
+                }
                 OverlayService.instance?.restoreOverlayVisibility()
             }
         }
@@ -1361,19 +1377,25 @@ fun ChatScreen(
                                 onClick = onOpenSettings
                             )
                             val hasOverlayPermission = OverlayPermission.canDrawOverlays(context)
+                            val isOverlayCurrentlyActive = OverlayController.isOverlayActive.collectAsState().value
                             FlavorToolbarIconButton(
                                 icon = Icons.Default.Layers,
-                                contentDescription = if (hasOverlayPermission) {
-                                    "Switch to overlay"
-                                } else {
-                                    "Switch to overlay (permission required)"
+                                contentDescription = when {
+                                    !hasOverlayPermission -> "Switch to overlay (permission required)"
+                                    isOverlayCurrentlyActive -> "Deactivate overlay"
+                                    else -> "Switch to overlay"
                                 },
                                 flavor = selectedFlavor,
                                 enabled = hasOverlayPermission,
                                 onClick = {
                                     if (hasOverlayPermission) {
-                                        OverlayController.updateSurfaceMode(getPreferredOverlayMode(context))
-                                        OverlayController.activateOverlay()
+                                        val isActive = isOverlayCurrentlyActive
+                                        if (isActive) {
+                                            OverlayController.deactivateOverlay()
+                                        } else {
+                                            OverlayController.updateSurfaceMode(getPreferredOverlayMode(context))
+                                            OverlayController.activateOverlay()
+                                        }
                                     } else {
                                         Toast.makeText(
                                             context,
