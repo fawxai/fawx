@@ -109,6 +109,7 @@ class ChatActivity : ComponentActivity() {
     internal var memoryDb: android.database.sqlite.SQLiteDatabase? = null
 
     override fun onDestroy() {
+        OverlayController.setChatInForeground(false)
         // Clear hooks to avoid leaking this Activity (#436, #457)
         ScreenReader.toolLoopOverlayHideHook = null
         ScreenReader.toolLoopOverlayRestoreHook = null
@@ -119,8 +120,18 @@ class ChatActivity : ComponentActivity() {
         super.onDestroy()
     }
 
+    // Using onPause/onResume rather than onStop/onStart for overlay suppression (#627):
+    // onPause fires faster when the user switches away, providing snappier overlay restore.
+    // Trade-off: in multi-window or transparent-activity scenarios, onPause fires while
+    // ChatActivity is still partially visible — acceptable since those are rare edge cases.
+    override fun onPause() {
+        super.onPause()
+        OverlayController.setChatInForeground(false)
+    }
+
     override fun onResume() {
         super.onResume()
+        OverlayController.setChatInForeground(true)
         val prefs = getSharedPreferences(CITROS_PREFS, MODE_PRIVATE)
         val timeoutMs = prefs.getLong(PREF_IDLE_TIMEOUT_MS, ConversationLifecycle.DEFAULT_TIMEOUT_MS)
         val lastDate = prefs.getString(PREF_LAST_CONVERSATION_DATE, null)

@@ -466,6 +466,25 @@ class OverlayControllerTest {
         assertEquals(OverlaySurfaceMode.BUBBLE, OverlayController.surfaceMode.value)
     }
 
+    // --- Chat foreground state tests (#627) ---
+
+    @Test
+    fun `setChatInForeground updates isChatInForeground and reset clears it`() {
+        assertFalse(OverlayController.isChatInForeground.value)
+
+        OverlayController.setChatInForeground(true)
+        assertTrue(OverlayController.isChatInForeground.value)
+
+        OverlayController.setChatInForeground(false)
+        assertFalse(OverlayController.isChatInForeground.value)
+
+        OverlayController.setChatInForeground(true)
+        assertTrue(OverlayController.isChatInForeground.value)
+
+        OverlayController.reset()
+        assertFalse(OverlayController.isChatInForeground.value)
+    }
+
     @Test
     fun `restore hook with BUBBLE preferred mode activates as BUBBLE`() {
         assertFalse(OverlayController.isOverlayActive.value)

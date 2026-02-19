@@ -2,6 +2,7 @@ package ai.citros.chat
 
 import ai.citros.core.OverlayRunState
 import ai.citros.core.OverlayState
+import androidx.annotation.MainThread
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -80,6 +81,14 @@ object OverlayController {
     private val _isOverlayActive = MutableStateFlow(false)
     /** Whether the overlay service should be running. */
     val isOverlayActive: StateFlow<Boolean> = _isOverlayActive.asStateFlow()
+
+    private val _isChatInForeground = MutableStateFlow(false)
+    /**
+     * Whether [ChatActivity] is currently in the foreground.
+     * When true, [OverlayService] suppresses overlay visibility to avoid
+     * redundantly showing the overlay on top of the full-screen chat (#627).
+     */
+    val isChatInForeground: StateFlow<Boolean> = _isChatInForeground.asStateFlow()
 
     private val _queuedMessage = MutableStateFlow<String?>(null)
     /** Queued follow-up message text. */
@@ -194,6 +203,16 @@ object OverlayController {
         _currentToolStatus.value = status
     }
 
+    /**
+     * Update whether ChatActivity is in the foreground.
+     * Called from ChatActivity.onResume() (true) and onPause() (false).
+     * OverlayService observes this to suppress overlay visibility (#627).
+     */
+    @MainThread
+    internal fun setChatInForeground(inForeground: Boolean) {
+        _isChatInForeground.value = inForeground
+    }
+
     /** Reset unread count to zero. Called by ChatActivity mediator. */
     internal fun resetUnreadCount() {
         _unreadCount.value = 0
@@ -208,6 +227,7 @@ object OverlayController {
         _surfaceMode.value = OverlaySurfaceMode.FULL_APP
         _isOverlayActive.value = false
         _queuedMessage.value = null
+        _isChatInForeground.value = false
         _unreadCount.value = 0
         lastActivateTimestampMs.set(0L)
     }

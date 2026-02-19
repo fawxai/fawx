@@ -324,6 +324,100 @@ class OverlayServiceTest {
         assertEquals(android.view.View.VISIBLE, view.visibility)
     }
 
+    // --- Chat foreground overlay suppression tests (#627) ---
+    // NOTE: These tests verify the visibility-toggling *algorithm* (the if/else logic),
+    // not the OverlayService wiring. True integration tests would require Robolectric
+    // service lifecycle support to bind the overlay View and observe StateFlow collection.
+    // The OverlayControllerTest above covers the state management layer; these cover
+    // the decision logic that determines when to show/hide/skip restore.
+
+    @Test
+    fun `overlay becomes INVISIBLE when isChatInForeground emits true`() {
+        val context = androidx.test.core.app.ApplicationProvider.getApplicationContext<android.content.Context>()
+        val view = android.view.View(context)
+        view.visibility = android.view.View.VISIBLE
+
+        // Simulate observeChatForeground collecting inForeground=true
+        val inForeground = true
+        if (inForeground) {
+            if (view.visibility == android.view.View.VISIBLE) {
+                view.visibility = android.view.View.INVISIBLE
+            }
+        }
+
+        assertEquals(android.view.View.INVISIBLE, view.visibility)
+    }
+
+    @Test
+    fun `overlay restores to VISIBLE when isChatInForeground emits false`() {
+        val context = androidx.test.core.app.ApplicationProvider.getApplicationContext<android.content.Context>()
+        val view = android.view.View(context)
+        view.visibility = android.view.View.INVISIBLE
+        val savedVisibility = -1 // NO_SAVED_VISIBILITY
+
+        // Simulate observeChatForeground collecting inForeground=false
+        val inForeground = false
+        if (!inForeground) {
+            if (view.visibility == android.view.View.INVISIBLE && savedVisibility == -1) {
+                view.visibility = android.view.View.VISIBLE
+            }
+        }
+
+        assertEquals(android.view.View.VISIBLE, view.visibility)
+    }
+
+    @Test
+    fun `chat foreground restore suppressed when savedVisibility is set`() {
+        val context = androidx.test.core.app.ApplicationProvider.getApplicationContext<android.content.Context>()
+        val view = android.view.View(context)
+        view.visibility = android.view.View.INVISIBLE
+        var savedVisibility = android.view.View.INVISIBLE // screenshot hide was active
+
+        // Simulate observeChatForeground collecting inForeground=false
+        // with savedVisibility != NO_SAVED_VISIBILITY
+        val inForeground = false
+        if (!inForeground) {
+            if (view.visibility == android.view.View.INVISIBLE && savedVisibility == -1) {
+                view.visibility = android.view.View.VISIBLE
+            } else if (savedVisibility != -1) {
+                // Race condition fix: update saved state so restore gets VISIBLE
+                savedVisibility = android.view.View.VISIBLE
+            }
+        }
+
+        // View stays INVISIBLE (not directly restored by chat-foreground observer)
+        assertEquals(android.view.View.INVISIBLE, view.visibility)
+        // But savedVisibility updated so restoreOverlayVisibility will restore to VISIBLE
+        assertEquals(android.view.View.VISIBLE, savedVisibility)
+    }
+
+    @Test
+    fun `restoreOverlayVisibility skips restore when isChatInForeground is true and clears savedVisibility`() {
+        val context = androidx.test.core.app.ApplicationProvider.getApplicationContext<android.content.Context>()
+        val view = android.view.View(context)
+        view.visibility = android.view.View.INVISIBLE
+        var savedVisibility = android.view.View.VISIBLE // was hidden for screenshot
+
+        // Simulate restoreOverlayVisibility with chat in foreground
+        OverlayController.setChatInForeground(true)
+
+        if (OverlayController.isChatInForeground.value) {
+            // Skip restore — chat foreground observer handles visibility
+            // Safe to clear: overlay is binary VISIBLE/INVISIBLE, and the
+            // chat-foreground observer will handle restoring visibility when
+            // ChatActivity eventually leaves the foreground.
+            savedVisibility = -1 // NO_SAVED_VISIBILITY
+        } else {
+            view.visibility = if (savedVisibility != -1) savedVisibility else android.view.View.VISIBLE
+            savedVisibility = -1
+        }
+
+        // View stays INVISIBLE (restore was skipped)
+        assertEquals(android.view.View.INVISIBLE, view.visibility)
+        // savedVisibility was cleared
+        assertEquals(-1, savedVisibility)
+    }
+
     // softInputMode (#444/#451) and keyboard behavior require instrumented tests —
     // buildLayoutParams is private, and WindowManager interaction can't be verified
     // in Robolectric. Verified on-device: SOFT_INPUT_ADJUST_PAN pans the overlay

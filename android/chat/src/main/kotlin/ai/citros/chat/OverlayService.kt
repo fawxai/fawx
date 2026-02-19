@@ -130,6 +130,7 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
     private var currentMode: OverlaySurfaceMode = OverlaySurfaceMode.BUBBLE
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var modeObserverJob: Job? = null
+    private var foregroundObserverJob: Job? = null
     private var selectedFlavor by mutableStateOf(CitrosFlavor.TANGERINE)
     private var selectedThemeMode by mutableStateOf(THEME_MODE_DEFAULT)
     private var onboardingPrefs: SharedPreferences? = null
@@ -178,6 +179,7 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
         lifecycleRegistry.currentState = Lifecycle.State.STARTED
         showOverlay()
         observeModeChanges()
+        observeChatForeground()
         Log.d(TAG, "OverlayService created")
     }
 
@@ -223,6 +225,7 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
         lifecycleRegistry.currentState = Lifecycle.State.DESTROYED
 
         modeObserverJob?.cancel()
+        foregroundObserverJob?.cancel()
         serviceScope.cancel()
         unregisterOnboardingPrefsListener()
         removeOverlay()
@@ -286,6 +289,42 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
                         updateNotification(mode)
                     }
                 }
+        }
+    }
+
+    /**
+     * Observe [OverlayController.isChatInForeground] and suppress overlay visibility
+     * when ChatActivity is in the foreground (#627). The overlay is redundant when the
+     * user is already viewing the full-screen chat. When the user leaves ChatActivity
+     * (e.g. switches to another app), the overlay is restored.
+     *
+     * Uses [View.INVISIBLE] (not GONE) to preserve WindowManager layout position,
+     * consistent with [hideOverlayForScreenshot].
+     *
+     * **Known limitation:** In split-screen or PiP mode, [onPause] fires even though
+     * ChatActivity is partially visible, causing the overlay to restore prematurely.
+     * Acceptable trade-off for single-window (99% of usage).
+     */
+    private fun observeChatForeground() {
+        foregroundObserverJob = serviceScope.launch {
+            OverlayController.isChatInForeground.collect { inForeground ->
+                val view = overlayView ?: return@collect
+                if (inForeground) {
+                    if (view.visibility == View.VISIBLE) {
+                        view.visibility = View.INVISIBLE
+                        Log.d(TAG, "Overlay suppressed: ChatActivity is in foreground (#627)")
+                    }
+                } else {
+                    if (view.visibility == View.INVISIBLE && savedVisibility == NO_SAVED_VISIBILITY) {
+                        view.visibility = View.VISIBLE
+                        Log.d(TAG, "Overlay restored: ChatActivity left foreground (#627)")
+                    } else if (savedVisibility != NO_SAVED_VISIBILITY) {
+                        // Screenshot hide was active during chat foreground — update saved state
+                        // so restoreOverlayVisibility() restores to VISIBLE, not INVISIBLE
+                        savedVisibility = View.VISIBLE
+                    }
+                }
+            }
         }
     }
 
@@ -396,6 +435,15 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
     @android.annotation.SuppressLint("WrongConstant")
     fun restoreOverlayVisibility() {
         overlayView?.let {
+            // Re-check: don't restore if ChatActivity is still in foreground (#627 race fix)
+            if (OverlayController.isChatInForeground.value) {
+                Log.d(TAG, "restoreOverlayVisibility: skipped — ChatActivity still in foreground")
+                // Safe to clear: overlay is binary VISIBLE/INVISIBLE, and the
+                // chat-foreground observer will handle restoring visibility when
+                // ChatActivity eventually leaves the foreground.
+                savedVisibility = NO_SAVED_VISIBILITY
+                return
+            }
             it.visibility = if (savedVisibility != NO_SAVED_VISIBILITY) savedVisibility else View.VISIBLE
             savedVisibility = NO_SAVED_VISIBILITY
         }
