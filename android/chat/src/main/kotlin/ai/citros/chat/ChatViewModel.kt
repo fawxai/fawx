@@ -393,15 +393,12 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
             return
         }
 
-        // Preserve conversation history across model switch.
-        // buildWalletBackend creates a new PhoneAgentApi with empty messages.
-        // Transfer the old agent's messages to the new one so the model
-        // retains conversation context after switching (#609, #612).
-        val oldMessages = activeBackend.agent.getMessages()
+        // Model switch creates a new PhoneAgentApi with empty messages.
+        // Don't transfer raw history — it may contain provider-specific tool
+        // formats or blow the new model's context window. Instead, rely on
+        // seedConversationHistory() called in ChatViewModel.sendMessage() which re-seeds text-only
+        // conversational context from UI messages on the next turn (#609).
         val updatedBackend = buildWalletBackend(config)
-        if (oldMessages.isNotEmpty()) {
-            updatedBackend.agent.setMessages(oldMessages)
-        }
         apiBackends[activeIndex] = updatedBackend
         activateApiBackend(activeIndex)
 

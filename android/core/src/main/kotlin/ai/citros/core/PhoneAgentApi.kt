@@ -1054,23 +1054,6 @@ open class PhoneAgentApi(
     open fun addSteerMessage(text: String) {
         messages.add(Message(role = Message.ROLE_USER, content = text))
     }
-    
-    /**
-     * Get a snapshot of the current conversation messages.
-     * Used to transfer history when rebuilding the agent (e.g. model switch).
-     */
-    fun getMessages(): List<Message> = messages.toList()
-
-    /**
-     * Replace the conversation history with the given messages.
-     * Used to transfer history from an old agent instance to a new one
-     * during model switches (#609).
-     */
-    fun setMessages(newMessages: List<Message>) {
-        messages.clear()
-        messages.addAll(newMessages)
-        Log.d(TAG, "setMessages: loaded ${newMessages.size} messages")
-    }
 
     /**
      * Clear the conversation history.
