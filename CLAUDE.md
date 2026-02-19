@@ -37,41 +37,46 @@ Every feature needs tests. Every bug fix needs a failing regression test first.
 1. Create feature branch from main
 2. Write code + tests (TDD: RED → GREEN → REFACTOR)
 3. Push branch, open PR
-4. **Comment on PR: `@claude review this PR`** ← REQUIRED, DO NOT SKIP
-   ⚠️ **Note:** This is a comment on the PR (not the commit message)
-5. Wait ~5 minutes, check PR for review comments
-6. **Address ALL review items** (every single one)
-7. Push fixes
-8. **Comment on PR: `@claude review this PR`** ← REQUIRED AFTER EVERY PUSH
-9. Repeat STEPS 5-8 until all issues are resolved
-10. **Verify ALL CI checks pass** (all green on GitHub Actions)
-11. If CI fails → fix, push, go to step 4
-12. Comment `@abbudjoe ready for merge`
+4. **Spawn an opus subagent to review the PR** ← REQUIRED (see Opus Review Process below)
+   ⚠️ **Note:** The `@claude review this PR` GitHub Action is currently broken upstream ([anthropics/claude-code-action#947](https://github.com/anthropics/claude-code-action/issues/947)). When it's fixed, revert to using it instead of opus subagents.
+5. **Address ALL review items** (every single one)
+6. Push fixes
+7. **Spawn another opus review after every push** ← REQUIRED
+8. Repeat STEPS 5-7 until all issues are resolved
+9. **Verify ALL CI checks pass** (all green on GitHub Actions)
+10. If CI fails → fix, push, go to step 4
+11. Comment `@abbudjoe ready for merge`
+
+### Opus Review Process (NON-NEGOTIABLE)
+
+Every opus reviewer subagent MUST be spawned with ALL of the following:
+
+1. **The full review standards from this file** — TDD mandatory, every feature needs tests, every bug fix needs a regression test, address ALL items including "nice to have"
+2. **Explicit test quality checks** — Do tests actually test production code, or do they duplicate logic inline? Do they use the correct APIs and patterns from the existing test suite?
+3. **Correct API context** — Include relevant interface signatures, test patterns (e.g. `ScriptedProviderClient`, `setApiModeWithBackends`), and architectural notes so the reviewer can catch stale API usage in tests
+4. **Anti-rubber-stamp directive** — "Do NOT rubber-stamp. Missing tests = BLOCKING. If something looks wrong, say so."
+5. **Full checklist** — correctness, test coverage, test quality, thread safety, memory management, architecture, edge cases, documentation
+
+The reviewer enforces the SAME standards the `@claude` GitHub Action would have applied. A review that misses missing tests or uses the wrong verdict is a failed review.
 
 **CRITICAL:**
 - ❌ No direct commits to main (except hotfixes approved by Joe)
-- ❌ No merges without Claude Code review
-- ❌ No skipping the `@claude review this PR` comment (required after EVERY push)
-- ❌ Do NOT put review trigger comments in commit messages
-- ❌ Do NOT rely on automatic GitHub Action triggers
+- ❌ No merges without opus code review
+- ❌ No skipping review after ANY push
 - ❌ Do NOT skip review items marked "low priority", "nice to have", or "suggestion"
-- ✅ The comment must be **standalone** on the PR (not combined with other text)
-- ✅ Comment `@claude review this PR` after **every push** to trigger re-review
-- ✅ **Check back after 2 minutes** to view and address all review comments
+- ✅ Review must be posted as a PR comment via `gh pr comment`
 - ✅ **Address EVERY comment** — partial fixes are not acceptable
 - ✅ **ALL review items must be resolved** — including suggestions, observations, and "nice to have" items. Every single one. No exceptions.
 - ✅ **"Optional enhancements for future consideration"** → Create backlog GitHub issues (don't lose them)
-- 🔄 **If Joe requests changes after `@abbudjoe ready for merge`** → Full review cycle restarts (push fixes → `@claude review this PR` → address all → repeat until clean → ping Joe again)
-- ✅ **ALL CI checks must pass** before commenting `@abbudjoe ready for merge` — verify Format, Clippy, Check, Test are green on GitHub Actions
+- 🔄 **If Joe requests changes after `@abbudjoe ready for merge`** → Full review cycle restarts (push fixes → opus review → address all → repeat until clean → ping Joe again)
+- ✅ **ALL CI checks must pass** before commenting `@abbudjoe ready for merge` — verify all checks are green on GitHub Actions
 
 ## Checklist Before PR
 
-1. ✅ All tests pass (`cargo test`)
-2. ✅ No clippy warnings (`cargo clippy -- -D warnings`)
-3. ✅ Code formatted (`cargo fmt --check`)
-4. ✅ New tests for new features
-5. ✅ Documentation updated if needed
-6. ✅ `@claude review this PR` comment posted
+1. ✅ All tests pass (Android: `./gradlew :chat:testDebugUnitTest :core:testDebugUnitTest`)
+2. ✅ New tests for new features / regression tests for bug fixes
+3. ✅ Documentation updated if needed
+4. ✅ Opus review spawned with full CLAUDE.md standards (see Opus Review Process above)
 
 ## Parallel Agent Swarm Rules
 
