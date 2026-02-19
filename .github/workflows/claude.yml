@@ -32,7 +32,7 @@ jobs:
 
       - name: Run Claude Code
         id: claude
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@v1.0.51  # Pinned: v1.0.52+ has AJV schema crash (anthropics/claude-code-action#947)
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 
