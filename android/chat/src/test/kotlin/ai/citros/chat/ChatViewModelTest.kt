@@ -2251,4 +2251,99 @@ class ChatViewModelTest {
         assertTrue(assistantMsg!!.content.contains("do that instead"))
     }
 
+    // --- streamingContentVersion tests (#618 / #640) ---
+    //
+    // Testing limitation: The streaming increment (`streamingContentVersion.intValue++`)
+    // happens inside `mainHandler.post { }` in the `onDelta` callback. Without Robolectric
+    // and its Looper shadow, `mainHandler.post` is a no-op in pure JUnit tests — posted
+    // runnables never execute. This means we CANNOT observe mid-stream increments here.
+    //
+    // What we CAN test:
+    //   - Counter initial state and reset paths (clearConversation, sendMessage completion)
+    //   - That sendMessage flows reset the counter at the end (via ScriptedProviderClient)
+    //
+    // What we CANNOT test without Robolectric:
+    //   - Counter incrementing during streaming (onDelta → mainHandler.post)
+    //   - Auto-scroll behavior in ChatActivity's LaunchedEffect(streamingVersion)
+    //
+    // See #643 for adding Robolectric-based streaming integration tests.
+
+    @Test
+    fun `streamingContentVersion starts at zero`() {
+        assertEquals(0, viewModel.streamingContentVersion.intValue)
+    }
+
+    @Test
+    fun `clearConversation resets streamingContentVersion`() {
+        // Manually bump to simulate mid-stream state
+        viewModel.streamingContentVersion.intValue = 5
+        assertEquals(5, viewModel.streamingContentVersion.intValue)
+
+        viewModel.clearConversation()
+
+        assertEquals(0, viewModel.streamingContentVersion.intValue)
+    }
+
+    @Test
+    fun `streamingContentVersion resets after successful sendMessage`() = runTest {
+        // Pre-set to non-zero to simulate a value accumulated during streaming.
+        // The production code resets to 0 in the finally/completion block (line ~912).
+        viewModel.streamingContentVersion.intValue = 10
+
+        val scripted = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            scripted = ArrayDeque(listOf(
+                ChatResponse(
+                    text = "Done.",
+                    toolCalls = emptyList(),
+                    stopReason = "end_turn"
+                )
+            ))
+        )
+        setApiModeWithBackends(
+            viewModel,
+            listOf(viewModel.createTestBackend(Provider.ANTHROPIC, scripted, scripted))
+        )
+
+        viewModel.sendMessage("test streaming reset")
+        advanceUntilIdle()
+
+        // Exercises the completion path reset (isLoading.value = false block)
+        assertEquals(0, viewModel.streamingContentVersion.intValue)
+    }
+
+    @Test
+    fun `streamingContentVersion resets when not configured`() = runTest {
+        // Exercises the early-return error path (line ~810): no backend → "Not configured"
+        viewModel.streamingContentVersion.intValue = 7
+
+        viewModel.sendMessage("test error reset")
+        advanceUntilIdle()
+
+        assertEquals(0, viewModel.streamingContentVersion.intValue)
+    }
+
+    @Test
+    fun `streamingContentVersion resets after provider error`() = runTest {
+        // Exercises the exception path via ThrowingProviderClient
+        viewModel.streamingContentVersion.intValue = 3
+
+        val throwing = ThrowingProviderClient(
+            provider = Provider.ANTHROPIC,
+            error = RuntimeException("connection failed")
+        )
+        setApiModeWithBackends(
+            viewModel,
+            listOf(viewModel.createTestBackend(Provider.ANTHROPIC, throwing, throwing))
+        )
+
+        viewModel.sendMessage("test provider error reset")
+        advanceUntilIdle()
+
+        assertEquals(0, viewModel.streamingContentVersion.intValue)
+    }
+    //
+    // The ViewModel-level tests above verify the version counter lifecycle,
+    // which is the prerequisite for the scroll behavior.
+
 }

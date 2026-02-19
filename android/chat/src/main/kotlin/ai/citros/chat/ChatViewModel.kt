@@ -197,6 +197,14 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
     val isLoading = mutableStateOf(false)
     val error = mutableStateOf<String?>(null)
 
+    /**
+     * Monotonically increasing counter bumped each time a streaming message's
+     * content is updated in-place. Compose observers can key on this to
+     * auto-scroll during streaming even though [messages].size stays constant.
+     * @see #618
+     */
+    val streamingContentVersion = mutableIntStateOf(0)
+
     /** User-facing status text updated as tools execute (e.g. "Opening Gmail...", "Searching the web..."). */
     val currentToolStatus = mutableStateOf<String?>(null)
     val isConfigured = mutableStateOf(false)
@@ -789,6 +797,9 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
                             role = "assistant",
                             content = streamingText.toString()
                         )
+                        // Runs on Dispatchers.Main via mainHandler.post — safe for
+                        // Compose mutableIntStateOf writes without additional wrapping.
+                        streamingContentVersion.intValue++
                     }
                 }
 
@@ -799,6 +810,7 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
                     messages.removeAt(streamingMsgIndex)
                     messages.add(Message(role = "assistant", content = "Not configured"))
                     isLoading.value = false
+                    streamingContentVersion.intValue = 0
                     return@launch
                 }
 
@@ -900,6 +912,7 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
                     Log.w(TAG, "toolLoop: overlay restore hook failed: ${e.message}")
                 }
                 isLoading.value = false
+                streamingContentVersion.intValue = 0
                 currentToolStatus.value = null
                 // Increment unread once per completed execution run (not per tool result)
                 if (toolSteps > 0) {
@@ -1401,6 +1414,7 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
         messages.clear()
         queuedMessage.value = null
         unreadCount.intValue = 0
+        streamingContentVersion.intValue = 0
         toolLoopCancelled.set(false)
         steerQueue.clear()
         hasQueuedSteer.value = false

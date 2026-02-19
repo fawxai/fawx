@@ -546,6 +546,9 @@ data class CodexOauthStartRequest(
 )
 
 internal const val CITROS_PREFS = "citros"
+/** Number of items from the end of the list to consider "near bottom" for auto-scroll. */
+private const val NEAR_BOTTOM_THRESHOLD = 3
+
 private const val PREF_CLOUD_TOKEN = "cloud_token"
 private const val PREF_CLOUD_PROVIDER = "cloud_provider"
 private const val PREF_CLOUD_AUTH_KIND = "cloud_auth_kind"
@@ -1344,6 +1347,29 @@ fun ChatScreen(
     LaunchedEffect(viewModel.messages.size) {
         if (viewModel.messages.isNotEmpty()) {
             listState.animateScrollToItem((listState.layoutInfo.totalItemsCount - 1).coerceAtLeast(0))
+        }
+    }
+
+    // Auto-scroll during streaming responses (#618).
+    // When the assistant message content updates in-place (size unchanged),
+    // scroll to bottom only if the user is already near the bottom.
+    // This prevents hijacking scroll when the user has scrolled up to read history.
+    val streamingVersion = viewModel.streamingContentVersion.intValue
+    LaunchedEffect(streamingVersion) {
+        if (streamingVersion == 0) return@LaunchedEffect
+        val layoutInfo = listState.layoutInfo
+        val lastVisibleItem = layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
+        val totalItems = layoutInfo.totalItemsCount
+        // "Near bottom" = the last visible item is among the final NEAR_BOTTOM_THRESHOLD items.
+        // For totalItems=10 (indices 0-9), this triggers when lastVisibleItem >= 7 (items 7, 8, 9).
+        // When totalItems == 0 (initial load / empty layout), treat as near-bottom — the
+        // subsequent messages.isNotEmpty() check prevents scrolling to an invalid index.
+        val isNearBottom = totalItems == 0 || lastVisibleItem >= totalItems - NEAR_BOTTOM_THRESHOLD
+        if (isNearBottom && viewModel.messages.isNotEmpty()) {
+            // Use scrollToItem (instant jump) instead of animateScrollToItem because
+            // streaming deltas arrive rapidly — animated scrolls get cancelled mid-flight
+            // by the next recomposition, causing jittery behavior.
+            listState.scrollToItem((totalItems - 1).coerceAtLeast(0))
         }
     }
 
