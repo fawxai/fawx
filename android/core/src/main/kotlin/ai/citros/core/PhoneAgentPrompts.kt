@@ -117,7 +117,21 @@ Don't open Chrome just to Google something — use web_search directly.
 - One action per step. You see the result before deciding the next move.
 - Prefer tap(element_id) over tap_text — IDs are unambiguous, text can match wrong elements.
 - Scroll before giving up. The element might be below the fold.
-- Don't screenshot to verify simple actions. Trust the tool result."""
+- Don't screenshot to verify simple actions. Trust the tool result.
+
+### When Uncertain — Think, Then Ask or Act
+If a request is ambiguous, don't blindly guess and don't blindly ask — reason first.
+
+1. **Use context** — conversation history, what's on screen, recency, the user's wording.
+   Use your think() tool to work through it before acting.
+2. **If you can confidently resolve it** — act.
+   "Reply to Chris about the project" + recent chat with Chris M. about Q3 project → message Chris M.
+3. **If you can't** — ask. A question costs one turn; a wrong guess costs many.
+   "Text Chris" + two contacts named Chris + no context clues → ask which Chris.
+
+Calibrate by stakes:
+- **Low stakes** (which app to search in, which tab to open) → lean toward figuring it out.
+- **High stakes** (who to message, what to delete, payments) → lean toward asking."""
 
     // ── Section 4: Recovery ─────────────────────────────────────────────
 
@@ -183,7 +197,8 @@ When executing tools, follow these guidelines for what to communicate to the use
 - Element IDs are ephemeral — they change after every action. Always use IDs from the latest screen.
 - type_text only enters text. It does NOT submit. Tap the send/submit/search button separately.
 - After open_app, type the user's actual query — not the app name you just opened. E.g. open_app("Google") then type_text("weather in Denver"), NOT type_text("Google").
-- One action per step. You'll see the updated screen before your next move."""
+- One action per step. You'll see the updated screen before your next move.
+- If you're unsure what the user wants, use your think() tool to reason through it. Act if confident; ask if not — especially for high-stakes actions like messaging or deleting."""
 
     // ── Section 12: Runtime (built dynamically) ──────────────────────────
 
@@ -311,7 +326,13 @@ Reminders:
 - type_text does NOT submit — tap the send/submit button separately.
 - After open_app, type the user's actual query — not the app name you just opened.
 - If the screen hasn't changed after 2 actions, you're stuck — try a different approach.
-- When the task is complete, respond with text only — no more tool calls.${if (phoneControlAvailable) "\n- Stay silent about tap/swipe failures — just try a different approach. Only alert the user if you're stuck after 3 attempts or something needs their action." else ""}""")
+- When the task is complete, respond with text only — no more tool calls.""")
+
+        // Phone-control-only reminders: silence policy + mid-task disambiguation
+        if (phoneControlAvailable) {
+            parts.add("""- Stay silent about tap/swipe failures — just try a different approach. Only alert the user if you're stuck after 3 attempts or something needs their action.
+- If you discover ambiguity mid-task (e.g. two matching contacts), use your think() tool to reason through it. Ask the user if you can't resolve it confidently.""")
+        }
 
         // Include security rules in action loop (they must always be present)
         if (!securityContent.isNullOrBlank()) {

@@ -153,6 +153,37 @@ class PhoneAgentPromptsTest {
         assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "One tool call. No observation needed.")
     }
 
+    @Test
+    fun `strategy section teaches confidence-gated disambiguation`() {
+        assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "When Uncertain")
+        assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "think()")
+        assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "confidently resolve")
+        assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "Low stakes")
+        assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "High stakes")
+    }
+
+    @Test
+    fun `rules reinforce think-then-ask for uncertain situations`() {
+        assertContains(
+            PhoneAgentPrompts.SECTION_RULES,
+            "unsure what the user wants, use think()"
+        )
+        assertContains(PhoneAgentPrompts.SECTION_RULES, "high-stakes")
+    }
+
+    @Test
+    fun `action prompt includes mid-task disambiguation reminder`() {
+        val prompt = PhoneAgentPrompts.buildActionPrompt(phoneControlAvailable = true)
+        assertContains(prompt, "ambiguity mid-task")
+        assertContains(prompt, "think()")
+    }
+
+    @Test
+    fun `action prompt omits disambiguation reminder when phone control disabled`() {
+        val prompt = PhoneAgentPrompts.buildActionPrompt(phoneControlAvailable = false)
+        assertNotContains(prompt, "ambiguity mid-task")
+    }
+
     // ── Recovery teaches failure patterns ────────────────────────────────
 
     @Test
