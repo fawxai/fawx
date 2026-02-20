@@ -12,6 +12,7 @@ package ai.citros.core
  * @param actionClient Client for action loop follow-ups (e.g., Haiku for speed)
  */
 import android.util.Log
+import java.util.concurrent.CopyOnWriteArrayList
 
 open class PhoneAgentApi(
     private val chatClient: ProviderClient,
@@ -84,13 +85,14 @@ open class PhoneAgentApi(
         }
     }
 
-    private val messages = mutableListOf<Message>()
+    private val messages: MutableList<Message> = CopyOnWriteArrayList()
 
     /** Expose message count for testing. */
     @get:androidx.annotation.VisibleForTesting
     internal val messageCount: Int get() = messages.size
 
     /** Current tool step counter, used for context compaction. Set by ChatViewModel. */
+    @Volatile
     var currentToolStep: Int = 0
 
     /**
@@ -107,6 +109,7 @@ open class PhoneAgentApi(
      * pairs, and reconstructing those from UI messages is not reliable. Text-only
      * history is sufficient for conversational continuity.
      */
+    @Synchronized
     fun seedConversationHistory(uiMessages: List<Message>) {
         if (messages.isNotEmpty()) return  // Already has history, skip
         if (uiMessages.isEmpty()) return
@@ -1061,7 +1064,12 @@ open class PhoneAgentApi(
 
     /**
      * Clear the conversation history.
+     *
+     * Thread-safe: synchronized to prevent races with [seedConversationHistory].
+     * Note: if an API call is in-flight, it already has a snapshot of messages
+     * (via `toList()` / `toMutableList()`), so clearing won't corrupt it.
      */
+    @Synchronized
     fun clearConversation() {
         messages.clear()
         currentToolStep = 0

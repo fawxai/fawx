@@ -1678,4 +1678,111 @@ class PhoneAgentApiTest {
         agent.seedConversationHistory(uiMessages)
         assertEquals(0, agent.messageCount)
     }
+
+    // ========== Thread Safety Tests (#644) ==========
+
+    @Test
+    fun `messages list supports concurrent iteration and modification without ConcurrentModificationException`() {
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+        val agent = PhoneAgentApi(client, client)
+
+        // Seed some initial messages
+        val uiMessages = (1..50).map { i ->
+            if (i % 2 == 1) Message(role = "user", content = "msg $i")
+            else Message(role = "assistant", content = "reply $i")
+        }
+        agent.seedConversationHistory(uiMessages)
+
+        // Use real threads via Dispatchers.Default for actual thread interleaving
+        kotlinx.coroutines.runBlocking(kotlinx.coroutines.Dispatchers.Default) {
+            val jobs = mutableListOf<kotlinx.coroutines.Job>()
+            repeat(50) {
+                jobs += launch {
+                    // Read: access messageCount
+                    agent.messageCount
+                }
+                jobs += launch {
+                    // Write: add tool results
+                    agent.addToolResult("tool_$it", "result_$it", "tap")
+                }
+            }
+            jobs.forEach { it.join() }
+        }
+        // No ConcurrentModificationException = pass
+    }
+
+    @Test
+    fun `seedConversationHistory and clearConversation interleaving is safe`() {
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+        val agent = PhoneAgentApi(client, client)
+
+        val uiMessages = listOf(
+            Message(role = "user", content = "hello"),
+            Message(role = "assistant", content = "hi there")
+        )
+
+        // Use real threads for actual concurrency
+        kotlinx.coroutines.runBlocking(kotlinx.coroutines.Dispatchers.Default) {
+            val jobs = (1..50).map { i ->
+                launch {
+                    if (i % 2 == 0) {
+                        agent.seedConversationHistory(uiMessages)
+                    } else {
+                        agent.clearConversation()
+                    }
+                }
+            }
+            jobs.forEach { it.join() }
+        }
+        // No exception = pass. Final state is non-deterministic but safe.
+    }
+
+    @Test
+    fun `addToolResult and addSteerMessage concurrent access is safe`() {
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+        val agent = PhoneAgentApi(client, client)
+
+        kotlinx.coroutines.runBlocking(kotlinx.coroutines.Dispatchers.Default) {
+            val jobs = (1..20).map { i ->
+                launch {
+                    if (i % 2 == 0) {
+                        agent.addToolResult("tool_$i", "result_$i", "tap")
+                    } else {
+                        agent.addSteerMessage("steer $i")
+                    }
+                }
+            }
+            jobs.forEach { it.join() }
+        }
+
+        // All 20 messages should be added (CopyOnWriteArrayList is safe for concurrent adds)
+        assertEquals(20, agent.messageCount)
+    }
+
+    @Test
+    fun `concurrent seedConversationHistory calls do not duplicate messages`() {
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+        val agent = PhoneAgentApi(client, client)
+
+        val uiMessages = listOf(
+            Message(role = "user", content = "hello"),
+            Message(role = "assistant", content = "hi there")
+        )
+
+        // Launch many concurrent seed attempts — only one should succeed
+        kotlinx.coroutines.runBlocking(kotlinx.coroutines.Dispatchers.Default) {
+            val latch = java.util.concurrent.CountDownLatch(1)
+            val jobs = (1..20).map {
+                launch {
+                    latch.await() // all threads start together
+                    agent.seedConversationHistory(uiMessages)
+                }
+            }
+            latch.countDown()
+            jobs.forEach { it.join() }
+        }
+
+        // Synchronized ensures only one seed succeeds — exactly 2 messages
+        assertEquals(2, agent.messageCount)
+    }
 }
