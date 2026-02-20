@@ -51,6 +51,21 @@ class KeyDeliveryClientTest {
     }
 
     @Test
+    fun `fetchKeys returns null on 401 unauthorized`() = runTest {
+        server.enqueue(MockResponse()
+            .setBody("""{"error": "Unauthorized"}""")
+            .setResponseCode(401))
+
+        val client = KeyDeliveryClient(
+            endpoint = server.url("/api/keys").toString(),
+            appToken = "wrong-token"
+        )
+        val keys = client.fetchKeys()
+
+        assertNull(keys, "Should return null on 401")
+    }
+
+    @Test
     fun `fetchKeys sends POST with correct headers`() = runTest {
         server.enqueue(MockResponse()
             .setBody("""{"keys": {}}""")
@@ -102,5 +117,57 @@ class KeyDeliveryClientTest {
         val keys = client.fetchKeys()
 
         assertNull(keys)
+    }
+
+    @Test
+    fun `fetchKeys sends Bearer auth header when appToken is provided`() = runTest {
+        server.enqueue(MockResponse()
+            .setBody("""{"keys": {"tinyfish": "tf-key"}}""")
+            .setResponseCode(200))
+
+        val client = KeyDeliveryClient(
+            endpoint = server.url("/api/keys").toString(),
+            appToken = "test-app-token-xyz"
+        )
+        client.fetchKeys()
+
+        val request = server.takeRequest()
+        assertEquals("Bearer test-app-token-xyz", request.getHeader("Authorization"))
+    }
+
+    @Test
+    fun `fetchKeys omits Bearer auth header when appToken is null`() = runTest {
+        server.enqueue(MockResponse()
+            .setBody("""{"keys": {}}""")
+            .setResponseCode(200))
+
+        val client = KeyDeliveryClient(
+            endpoint = server.url("/api/keys").toString(),
+            appToken = null
+        )
+        client.fetchKeys()
+
+        val request = server.takeRequest()
+        assertNull(request.getHeader("Authorization"))
+    }
+
+    @Test
+    fun `fetchKeys no longer returns appToken in response`() = runTest {
+        // Even if server returns appToken (legacy), client should still parse fine
+        // but callers should use BuildConfig.CITROS_APP_TOKEN instead.
+        server.enqueue(MockResponse()
+            .setBody("""{"keys": {"tinyfish": "tf-key", "appToken": "should-ignore"}}""")
+            .setResponseCode(200))
+
+        val client = KeyDeliveryClient(
+            endpoint = server.url("/api/keys").toString(),
+            appToken = "compiled-token"
+        )
+        val keys = client.fetchKeys()
+
+        assertNotNull(keys)
+        assertEquals("tf-key", keys.tinyfish)
+        // appToken field still parsed (backward compat) but callers shouldn't use it
+        assertEquals("should-ignore", keys.appToken)
     }
 }

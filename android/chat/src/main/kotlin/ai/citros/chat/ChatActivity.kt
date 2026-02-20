@@ -1176,17 +1176,25 @@ fun ChatScreen(
             tinyFishKey = userTinyFishKey
         )
 
-        // Fetch server-delivered keys (TinyFish, app token) asynchronously.
-        // Race condition: a search triggered before keys arrive will have no app token,
-        // causing the Citros proxy to return 401. This is intentional — the fallback chain
-        // (DDG → SearXNG → Brave) handles it gracefully. Once keys arrive, subsequent
-        // searches use the authenticated proxy.
+        // App token is compiled into the APK at build time (scripts/release.sh).
+        // Empty string = no token (dev build without -PcitrosAppToken).
+        val compiledAppToken = BuildConfig.CITROS_APP_TOKEN.takeIf { it.isNotBlank() }
+        if (compiledAppToken != null) {
+            viewModel.updateCitrosKeys(appToken = compiledAppToken)
+        }
+
+        // Fetch server-delivered keys (TinyFish) asynchronously.
+        // When compiled app token is present, sends Bearer auth.
+        // When absent (dev builds), still attempts unauthenticated fetch —
+        // server may return 401 (gracefully handled) or partial response.
         if (activity != null) {
             activity.lifecycleScope.launch {
-                val delivered = ai.citros.core.KeyDeliveryClient().fetchKeys()
+                val delivered = ai.citros.core.KeyDeliveryClient(
+                    appToken = compiledAppToken
+                ).fetchKeys()
                 if (delivered != null) {
                     viewModel.updateCitrosKeys(
-                        appToken = delivered.appToken,
+                        appToken = if (compiledAppToken == null) delivered.appToken else null,
                         tinyFishKey = if (userTinyFishKey == null) delivered.tinyfish else null
                     )
                 }

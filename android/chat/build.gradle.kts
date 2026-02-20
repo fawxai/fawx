@@ -17,6 +17,15 @@ android {
         versionName = "0.1.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
+        // Citros app token for authenticating to citros.ai API endpoints.
+        // Gradle property -PcitrosAppToken or from gradle.properties / local.properties.
+        // scripts/release.sh writes to local.properties automatically.
+        // Empty string = no token = dev build (key fetch still attempted without auth).
+        buildConfigField(
+            "String",
+            "CITROS_APP_TOKEN",
+            "\"${project.findProperty("citrosAppToken")?.toString() ?: ""}\""
+        )
     }
 
     buildTypes {

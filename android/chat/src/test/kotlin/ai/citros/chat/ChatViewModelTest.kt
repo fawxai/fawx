@@ -903,6 +903,72 @@ class ChatViewModelTest {
     }
 
     @Test
+    fun `compiled app token applied immediately via updateCitrosKeys`() {
+        val keyStore = InMemoryKeyStore()
+        val storage = InMemoryWalletStorage()
+        val walletManager = ai.citros.core.WalletManager(storage, keyStore)
+
+        walletManager.addKey(Provider.OPENAI, "OpenAI Key", "sk-test-openai-key")
+        walletManager.setActiveKey(walletManager.loadOrDefault().keys.first().id)
+
+        // Simulate ChatActivity flow: set compiled token BEFORE configureWithWallet
+        viewModel.updateCitrosKeys(appToken = "compiled-token-abc")
+        viewModel.configureWithWallet(walletManager)
+
+        val backends = getPrivateField<List<Any>>("apiBackends")!!
+        val activeIndex = getPrivateField<Int>("activeApiBackendIndex")!!
+        val backend = backends[activeIndex]
+        val agentField = backend::class.java.getDeclaredField("agent")
+        agentField.isAccessible = true
+        val agent = agentField.get(backend)
+
+        val tokenField = agent::class.java.getDeclaredField("citrosAppToken")
+        tokenField.isAccessible = true
+        assertEquals("compiled-token-abc", tokenField.get(agent),
+            "Compiled app token should be passed through to PhoneAgentApi")
+    }
+
+    @Test
+    fun `blank compiled token does not set appToken on ViewModel`() {
+        // Simulate dev build: BuildConfig.CITROS_APP_TOKEN = ""
+        // ChatActivity does: .takeIf { it.isNotBlank() } → null → skip updateCitrosKeys
+        val tokenBefore = getPrivateField<String>("citrosAppToken")
+        assertNull(tokenBefore, "citrosAppToken should be null by default")
+
+        // Calling with null appToken should be a no-op
+        viewModel.updateCitrosKeys(appToken = null, tinyFishKey = "tf-key")
+
+        val tokenAfter = getPrivateField<String>("citrosAppToken")
+        assertNull(tokenAfter, "citrosAppToken should remain null when no compiled token")
+
+        // But tinyFishKey should be set (dev build still gets TinyFish from server)
+        val tfKey = getPrivateField<String>("tinyFishApiKey")
+        assertEquals("tf-key", tfKey, "TinyFish key should be set even without compiled app token")
+    }
+
+    @Test
+    fun `updateCitrosKeys preserves compiled token when only tinyFishKey delivered`() {
+        val keyStore = InMemoryKeyStore()
+        val storage = InMemoryWalletStorage()
+        val walletManager = ai.citros.core.WalletManager(storage, keyStore)
+
+        walletManager.addKey(Provider.OPENAI, "OpenAI Key", "sk-test-openai-key")
+        walletManager.setActiveKey(walletManager.loadOrDefault().keys.first().id)
+
+        // Step 1: compiled token set
+        viewModel.updateCitrosKeys(appToken = "compiled-token")
+        viewModel.configureWithWallet(walletManager)
+
+        // Step 2: key delivery returns only tinyfish (appToken=null)
+        viewModel.updateCitrosKeys(tinyFishKey = "delivered-tf-key")
+
+        // Compiled token should still be there
+        val token = getPrivateField<String>("citrosAppToken")
+        assertEquals("compiled-token", token,
+            "Compiled app token should not be overwritten by null appToken from key delivery")
+    }
+
+    @Test
     fun `setAgentFileManager wires file manager into built backends`() {
         val tempDir = java.io.File.createTempFile("agent-test", "").also { it.delete(); it.mkdirs() }
         try {

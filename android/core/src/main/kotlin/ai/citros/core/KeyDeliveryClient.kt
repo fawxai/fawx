@@ -17,10 +17,17 @@ import java.util.concurrent.TimeUnit
  * startup. This avoids embedding third-party API keys in the APK while
  * keeping direct connections (e.g., TinyFish SSE streaming) fast.
  *
- * @param endpoint Key delivery URL (default: production citros.ai)
+ * The endpoint requires Bearer auth with the compiled app token. This
+ * prevents unauthenticated access to server-side keys.
+ *
+ * @param endpoint Key delivery URL (default: production citros.ai).
+ *   Note: if overridden (e.g., for testing), the [appToken] is still sent
+ *   as a Bearer header. Use `appToken = null` for non-citros endpoints.
+ * @param appToken Bearer token for authentication (compiled into APK)
  */
 class KeyDeliveryClient(
-    private val endpoint: String = DEFAULT_ENDPOINT
+    private val endpoint: String = DEFAULT_ENDPOINT,
+    private val appToken: String? = null
 ) {
     companion object {
         private const val TAG = "KeyDeliveryClient"
@@ -56,6 +63,10 @@ class KeyDeliveryClient(
                     .post("{}".toRequestBody("application/json".toMediaType()))
                     .header("Accept", "application/json")
                     .header("X-Citros-Client", "android/${android.os.Build.VERSION.SDK_INT}")
+
+                if (appToken != null) {
+                    requestBuilder.header("Authorization", "Bearer $appToken")
+                }
 
                 sharedHttpClient.newCall(requestBuilder.build()).execute().use { response ->
                     if (!response.isSuccessful) {
