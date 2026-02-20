@@ -7,25 +7,33 @@ import kotlinx.serialization.json.*
 import okhttp3.FormBody
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.CertificatePinner
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import java.util.concurrent.TimeUnit
 
 /**
  * Web search client with pluggable provider support.
  *
- * Supports three providers (tried in order):
- * 1. **DuckDuckGo Lite** (default): No API key needed. Scrapes DDG Lite HTML.
- *    Works best from mobile IPs. Free, private, zero config.
- * 2. **SearXNG** (optional): Self-hosted meta-search, no API key needed.
+ * Supports four providers (tried in order):
+ * 1. **Citros Search** (default): Proxied Brave Search via citros.ai edge function.
+ *    No API key needed on device — key lives server-side. Zero config.
+ * 2. **DuckDuckGo Lite** (fallback): Scrapes DDG Lite HTML. No API key needed.
+ *    Works best from mobile IPs. May be rate-limited.
+ * 3. **SearXNG** (optional): Self-hosted meta-search, no API key needed.
  *    Set searxngBaseUrl to enable.
- * 3. **Brave** (optional): Brave Search API, requires API key.
+ * 4. **Brave** (optional): Direct Brave Search API, requires user's own API key.
  *    Free tier: 2,000 queries/month. Set braveApiKey to enable.
  *
+ * @param citrosSearchEndpoint Citros search proxy URL (null to skip)
+ * @param citrosAppToken Bearer token for Citros API auth (null to skip auth)
  * @param searxngBaseUrl Base URL for SearXNG instance (e.g., "http://localhost:8888")
- * @param braveApiKey Optional Brave Search API key for fallback
+ * @param braveApiKey Optional Brave Search API key for direct Brave access
  */
 class WebSearchClient(
+    private val citrosSearchEndpoint: String? = CITROS_SEARCH_ENDPOINT,
+    private val citrosAppToken: String? = null,
     private val searxngBaseUrl: String? = null,
     private val braveApiKey: String? = null,
     /** Brave Search API endpoint. Override for testing. */
@@ -35,6 +43,7 @@ class WebSearchClient(
 ) {
     companion object {
         private const val TAG = "WebSearchClient"
+        private const val CITROS_SEARCH_ENDPOINT = "https://citros.ai/api/search"
         private const val BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
         private const val DDG_LITE_URL = "https://lite.duckduckgo.com/lite/"
         private const val DDG_USER_AGENT = "Mozilla/5.0 (Linux; Android 16; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
@@ -44,21 +53,23 @@ class WebSearchClient(
     }
 
     /**
-     * Certificate pinner for Brave Search API.
+     * Certificate pinner for Let's Encrypt services (Brave + Citros).
      * Pins ISRG Root X1 (expires 2035) -- stable root CA used by Let's Encrypt.
-     * SearXNG and DuckDuckGo requests are not pinned.
+     * Both citros.ai (Vercel) and api.search.brave.com use LE certificates.
      */
-    private val braveCertPinner = CertificatePinner.Builder()
+    private val letsEncryptCertPinner = CertificatePinner.Builder()
         .add("api.search.brave.com", "sha256/C5+lpZ7tcVwmwQIMcRtPbsQtWLABXhQzejna0wHFr8M=")
+        .add("citros.ai", "sha256/C5+lpZ7tcVwmwQIMcRtPbsQtWLABXhQzejna0wHFr8M=")
         .build()
 
+    /** HTTP client with cert pinning for Brave and Citros endpoints. */
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(TIMEOUT_SECONDS, TimeUnit.SECONDS)
         .readTimeout(TIMEOUT_SECONDS, TimeUnit.SECONDS)
-        .certificatePinner(braveCertPinner)
+        .certificatePinner(letsEncryptCertPinner)
         .build()
 
-    /** Separate client without cert pinning for non-Brave providers. */
+    /** Separate client without cert pinning for third-party providers (SearXNG, DDG). */
     private val plainHttpClient = OkHttpClient.Builder()
         .connectTimeout(TIMEOUT_SECONDS, TimeUnit.SECONDS)
         .readTimeout(TIMEOUT_SECONDS, TimeUnit.SECONDS)
@@ -69,7 +80,7 @@ class WebSearchClient(
     /**
      * Search the web and return formatted results.
      *
-     * Tries DuckDuckGo first (no config needed), then SearXNG, then Brave.
+     * Provider chain: Citros proxy → DuckDuckGo → SearXNG → Brave (direct).
      *
      * @param query Search query string
      * @param count Number of results to return (1-5, default 3)
@@ -81,20 +92,27 @@ class WebSearchClient(
         }
         val clampedCount = count.coerceIn(1, MAX_COUNT)
 
-        // 1. Try DuckDuckGo Lite (always available, no config needed)
+        // 1. Try Citros search proxy (zero config, most reliable)
+        if (citrosSearchEndpoint != null) {
+            val result = searchCitros(query, clampedCount)
+            if (!result.isError) return result
+            Log.w(TAG, "Citros search failed: ${result.text}")
+        }
+
+        // 2. Try DuckDuckGo Lite (no config needed, may be rate-limited)
         if (ddgEndpoint == null) Log.d(TAG, "DuckDuckGo disabled")
         val ddgResult = if (ddgEndpoint != null) searchDuckDuckGo(query, clampedCount) else null
         if (ddgResult != null && !ddgResult.isError) return ddgResult
         if (ddgResult != null) Log.w(TAG, "DuckDuckGo search failed: ${ddgResult.text}")
 
-        // 2. Try SearXNG if configured
+        // 3. Try SearXNG if configured
         if (searxngBaseUrl != null) {
             val result = searchSearXNG(query, clampedCount)
             if (!result.isError) return result
             Log.w(TAG, "SearXNG search failed: ${result.text}")
         }
 
-        // 3. Try Brave if API key provided
+        // 4. Try Brave if user provided their own API key
         if (braveApiKey != null) {
             return searchBrave(query, clampedCount)
         }
@@ -104,6 +122,54 @@ class WebSearchClient(
             "Web search temporarily unavailable. Tell the user the search could not be completed and suggest they try again later. Do NOT open Chrome or any browser app to search manually.",
             isError = true
         )
+    }
+
+    /**
+     * Search via Citros proxy (Brave Search behind a Vercel edge function).
+     * POSTs JSON `{query, count}`, receives Brave API JSON response.
+     * No API key needed on device — key is server-side.
+     */
+    private suspend fun searchCitros(query: String, count: Int): ToolResult {
+        return withContext(Dispatchers.IO) {
+            try {
+                val jsonBody = buildJsonObject {
+                    put("query", query)
+                    put("count", count)
+                }.toString()
+
+                val requestBuilder = Request.Builder()
+                    .url(citrosSearchEndpoint!!)
+                    .post(jsonBody.toRequestBody("application/json; charset=utf-8".toMediaType()))
+                    .header("Accept", "application/json")
+
+                if (citrosAppToken != null) {
+                    requestBuilder.header("Authorization", "Bearer $citrosAppToken")
+                }
+
+                val request = requestBuilder.build()
+
+                httpClient.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) {
+                        return@withContext ToolResult(
+                            "Citros search failed (${response.code})",
+                            isError = true
+                        )
+                    }
+
+                    val body = response.body?.string() ?: return@withContext ToolResult(
+                        "Citros search returned empty response",
+                        isError = true
+                    )
+
+                    // Citros proxy returns Brave API JSON format
+                    val results = parseBraveResults(body, count)
+                    ToolResult(formatResults(query, results))
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Citros search error: ${e.message}")
+                ToolResult("Citros search failed: ${e.message?.take(100)}", isError = true)
+            }
+        }
     }
 
     private suspend fun searchDuckDuckGo(query: String, count: Int): ToolResult {

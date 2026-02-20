@@ -213,6 +213,19 @@ class PhoneAgentPromptsTest {
         assertContains(PhoneAgentPrompts.SECTION_RECOVERY, "Do NOT open Chrome")
     }
 
+    @Test
+    fun `recovery section covers web browse failure`() {
+        assertContains(PhoneAgentPrompts.SECTION_RECOVERY, "Web browse failed")
+    }
+
+    @Test
+    fun `strategy section teaches web tool selection`() {
+        assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "Search vs Browse vs Chrome")
+        assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "Need information")
+        assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "Need web interaction")
+        assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "Never open Chrome just to search")
+    }
+
     // ── buildActionPrompt ───────────────────────────────────────────────
 
     @Test

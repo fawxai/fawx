@@ -72,6 +72,7 @@ import androidx.annotation.VisibleForTesting
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -1165,13 +1166,31 @@ fun ChatScreen(
 
         viewModel.setSystemPrompt(OnboardingPersistence.systemPromptForStartup(agentFileManager))
 
-        // Optional SearXNG/Brave override from prefs (DuckDuckGo is the zero-config default)
+        // Search config: user Settings override server-delivered keys
         val searchPrefs = context.getSharedPreferences(CITROS_PREFS, android.content.Context.MODE_PRIVATE)
+        val userTinyFishKey = searchPrefs.getString(PREF_TINYFISH_API_KEY, null)
         viewModel.setSearchConfig(
             searxngUrl = searchPrefs.getString(PREF_SEARCH_BASE_URL, null),
             braveKey = searchPrefs.getString(PREF_BRAVE_API_KEY, null),
-            tinyFishKey = searchPrefs.getString(PREF_TINYFISH_API_KEY, null)
+            tinyFishKey = userTinyFishKey
         )
+
+        // Fetch server-delivered keys (TinyFish, app token) asynchronously.
+        // Race condition: a search triggered before keys arrive will have no app token,
+        // causing the Citros proxy to return 401. This is intentional — the fallback chain
+        // (DDG → SearXNG → Brave) handles it gracefully. Once keys arrive, subsequent
+        // searches use the authenticated proxy.
+        if (activity != null) {
+            activity.lifecycleScope.launch {
+                val delivered = ai.citros.core.KeyDeliveryClient().fetchKeys()
+                if (delivered != null) {
+                    viewModel.updateCitrosKeys(
+                        appToken = delivered.appToken,
+                        tinyFishKey = if (userTinyFishKey == null) delivered.tinyfish else null
+                    )
+                }
+            }
+        }
 
         // Try wallet first
         walletStateFlow.value = walletManager.loadOrDefault()

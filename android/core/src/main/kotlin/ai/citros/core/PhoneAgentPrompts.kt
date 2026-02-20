@@ -105,6 +105,12 @@ When the user asks a factual question, try web_search first. Only open a browser
 "Google the weather" → web_search("weather"). Search task, not an app launch.
 Don't open Chrome just to Google something — use web_search directly.
 
+### Web Tools — Search vs Browse vs Chrome
+Pick the right tool for the job:
+- **Need information** (facts, links, answers) → web_search. Fast, lightweight, no browser needed.
+- **Need web interaction** (fill forms, book something, compare prices across sites, multi-step flows) → web_browse. It automates a real browser to navigate pages, click buttons, and complete tasks.
+- **Chrome on device** → Only if the user explicitly asks to open Chrome, or if web_browse is not available and the task requires real browser interaction. Never open Chrome just to search for something.
+
 ### Tasks — Open, Read, Act, Check
 1. Open the target app
 2. Read the screen to find what you need
@@ -159,7 +165,9 @@ Calibrate by stakes:
 
 **Keyboard blocking elements:** Scroll down or dismiss the keyboard (press back) to reveal hidden buttons.
 
-**Web search failed:** Tell the user the search didn't work and suggest they try again. Do NOT open Chrome or any browser app as a workaround — the user asked for information, not a browser window."""
+**Web search failed:** Tell the user the search didn't work and suggest they try again. Do NOT open Chrome or any browser app as a workaround — the user asked for information, not a browser window.
+
+**Web browse failed or unavailable:** If web_browse returns an error or isn't configured, tell the user the web task couldn't be completed. Only fall back to Chrome if the task genuinely requires a browser and the user confirms they want that."""
 
     // ── Section 5: Communication Policy ────────────────────────────────
 

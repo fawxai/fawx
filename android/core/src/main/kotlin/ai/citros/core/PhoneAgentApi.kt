@@ -32,11 +32,13 @@ open class PhoneAgentApi(
     /** TinyFish Web Agent API key for browser automation. Null to disable. */
     private val tinyFishApiKey: String? = null,
     /** TinyFish endpoint override for testing. Null uses production default. */
-    private val tinyFishEndpoint: String? = null
+    private val tinyFishEndpoint: String? = null,
+    /** Citros app token for authenticating to Citros API endpoints. */
+    private val citrosAppToken: String? = null
 ) {
     /** Shared search client — reuses OkHttpClient connection pools across calls. */
     private val searchClient by lazy {
-        WebSearchClient(searxngBaseUrl = searchBaseUrl, braveApiKey = braveApiKey)
+        WebSearchClient(citrosAppToken = citrosAppToken, searxngBaseUrl = searchBaseUrl, braveApiKey = braveApiKey)
     }
 
     /** Shared fetch client — reuses OkHttpClient connection pool across calls. */

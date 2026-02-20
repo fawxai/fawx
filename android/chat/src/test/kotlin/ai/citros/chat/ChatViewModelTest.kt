@@ -836,6 +836,72 @@ class ChatViewModelTest {
     }
 
     @Test
+    fun `updateCitrosKeys rebuilds backend and applies delivered keys`() {
+        val keyStore = InMemoryKeyStore()
+        val storage = InMemoryWalletStorage()
+        val walletManager = ai.citros.core.WalletManager(storage, keyStore)
+
+        walletManager.addKey(Provider.OPENAI, "OpenAI Key", "sk-test-openai-key")
+        walletManager.setActiveKey(walletManager.loadOrDefault().keys.first().id)
+        viewModel.configureWithWallet(walletManager)
+
+        val backendsBefore = getPrivateField<List<Any>>("apiBackends")!!
+        val activeIndex = getPrivateField<Int>("activeApiBackendIndex")!!
+        val backendBefore = backendsBefore[activeIndex]
+
+        viewModel.updateCitrosKeys(appToken = "app-token-1", tinyFishKey = "tinyfish-1")
+
+        val backendsAfter = getPrivateField<List<Any>>("apiBackends")!!
+        val backendAfter = backendsAfter[activeIndex]
+        assertNotEquals(
+            System.identityHashCode(backendBefore),
+            System.identityHashCode(backendAfter),
+            "Active backend should be rebuilt when delivered keys arrive"
+        )
+
+        val agentField = backendAfter::class.java.getDeclaredField("agent")
+        agentField.isAccessible = true
+        val agent = agentField.get(backendAfter)
+
+        val appTokenField = agent::class.java.getDeclaredField("citrosAppToken")
+        appTokenField.isAccessible = true
+        assertEquals("app-token-1", appTokenField.get(agent))
+
+        val tinyFishField = agent::class.java.getDeclaredField("tinyFishApiKey")
+        tinyFishField.isAccessible = true
+        assertEquals("tinyfish-1", tinyFishField.get(agent))
+    }
+
+    @Test
+    fun `updateCitrosKeys skips rebuild when delivered keys are unchanged`() {
+        val keyStore = InMemoryKeyStore()
+        val storage = InMemoryWalletStorage()
+        val walletManager = ai.citros.core.WalletManager(storage, keyStore)
+
+        walletManager.addKey(Provider.OPENAI, "OpenAI Key", "sk-test-openai-key")
+        walletManager.setActiveKey(walletManager.loadOrDefault().keys.first().id)
+        viewModel.configureWithWallet(walletManager)
+
+        // First update applies keys and rebuilds once.
+        viewModel.updateCitrosKeys(appToken = "app-token-1", tinyFishKey = "tinyfish-1")
+
+        val backendsBefore = getPrivateField<List<Any>>("apiBackends")!!
+        val activeIndex = getPrivateField<Int>("activeApiBackendIndex")!!
+        val backendBefore = backendsBefore[activeIndex]
+
+        // Same values should be a no-op.
+        viewModel.updateCitrosKeys(appToken = "app-token-1", tinyFishKey = "tinyfish-1")
+
+        val backendsAfter = getPrivateField<List<Any>>("apiBackends")!!
+        val backendAfter = backendsAfter[activeIndex]
+        assertEquals(
+            System.identityHashCode(backendBefore),
+            System.identityHashCode(backendAfter),
+            "Active backend should NOT be rebuilt when delivered keys are unchanged"
+        )
+    }
+
+    @Test
     fun `updateModelsFromWallet refreshes tracked chat and action models`() {
         val keyStore = InMemoryKeyStore()
         val storage = InMemoryWalletStorage()

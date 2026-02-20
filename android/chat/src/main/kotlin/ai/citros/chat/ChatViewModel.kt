@@ -167,6 +167,9 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
     /** TinyFish Web Agent API key for browser automation. Set via [setSearchConfig]. */
     private var tinyFishApiKey: String? = null
 
+    /** Citros app token for authenticating to Citros API endpoints. Set via [setSearchConfig]. */
+    private var citrosAppToken: String? = null
+
     /**
      * Update search provider configuration.
      *
@@ -177,6 +180,24 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
         searchBaseUrl = searxngUrl
         braveApiKey = braveKey
         tinyFishApiKey = tinyFishKey
+    }
+
+    /**
+     * Update keys delivered from the Citros key delivery endpoint.
+     * Only updates non-null values — does not overwrite user-provided Settings.
+     *
+     * If API backends are already configured, rebuild them so runtime key updates
+     * (app token / TinyFish key) are applied to active PhoneAgentApi instances.
+     */
+    fun updateCitrosKeys(appToken: String? = null, tinyFishKey: String? = null) {
+        val appTokenChanged = appToken != null && appToken != citrosAppToken
+        val tinyFishKeyChanged = tinyFishKey != null && tinyFishKey != tinyFishApiKey
+        if (!appTokenChanged && !tinyFishKeyChanged) return
+
+        if (appTokenChanged) citrosAppToken = appToken
+        if (tinyFishKeyChanged) tinyFishApiKey = tinyFishKey
+
+        rebuildApiBackendsForRuntimeKeyUpdate()
     }
 
     private enum class Mode { API, LOCAL }
@@ -536,7 +557,8 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
                 memoryProvider = memoryProvider,
                 searchBaseUrl = searchBaseUrl,
                 braveApiKey = braveApiKey,
-                tinyFishApiKey = tinyFishApiKey
+                tinyFishApiKey = tinyFishApiKey,
+                citrosAppToken = citrosAppToken
             )
         )
     }
@@ -558,6 +580,32 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
         phoneAgentApi = backend.agent
         // Wire real-time progress updates for long-running tools (e.g., web_browse)
         backend.agent.onToolProgress = { status -> currentToolStatus.value = status }
+    }
+
+    /**
+     * Rebuild configured API backends so runtime-delivered keys take effect.
+     *
+     * This handles startup races where key delivery completes after wallet
+     * configuration has already built PhoneAgentApi instances (#656).
+     */
+    private fun rebuildApiBackendsForRuntimeKeyUpdate() {
+        if (mode != Mode.API) return
+        if (apiBackends.isEmpty() || apiBackendConfigs.isEmpty()) return
+        if (apiBackendConfigs.size != apiBackends.size) {
+            Log.w(
+                TAG,
+                "Skipping runtime key rebind: backend/config count mismatch (${apiBackends.size}/${apiBackendConfigs.size})"
+            )
+            return
+        }
+
+        // Rebuild from stored provider configs; keys are now read from updated
+        // ViewModel fields when PhoneAgentApi/WebSearchClient are constructed.
+        val rebuiltBackends = apiBackendConfigs.map { buildWalletBackend(it) }
+        apiBackends.clear()
+        apiBackends.addAll(rebuiltBackends)
+
+        activateApiBackend(activeApiBackendIndex.coerceIn(0, apiBackends.lastIndex))
     }
 
     @VisibleForTesting

@@ -8,6 +8,7 @@ import org.junit.Before
 import org.junit.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class WebSearchClientTest {
@@ -25,6 +26,114 @@ class WebSearchClientTest {
         server.shutdown()
     }
 
+    // ========== Citros proxy tests ==========
+
+    @Test
+    fun `search tries Citros proxy first`() = runTest {
+        val braveJson = """
+        {
+            "web": {
+                "results": [
+                    {"title": "Citros Result", "url": "https://citros.ai", "description": "From proxy"}
+                ]
+            }
+        }
+        """.trimIndent()
+        server.enqueue(MockResponse().setBody(braveJson).setResponseCode(200))
+
+        val client = WebSearchClient(
+            citrosSearchEndpoint = server.url("/api/search").toString(),
+            ddgEndpoint = null
+        )
+        val result = client.search("test")
+
+        assertFalse(result.isError, "Should succeed via Citros proxy: ${result.text}")
+        assertTrue(result.text.contains("Citros Result"))
+
+        // Verify POST with JSON body
+        val request = server.takeRequest()
+        assertEquals("POST", request.method)
+        val body = request.body.readUtf8()
+        assertTrue(body.contains("\"query\""), "Should send JSON body: $body")
+        assertTrue(body.contains("test"), "Should include query: $body")
+    }
+
+    @Test
+    fun `search falls back to DDG when Citros proxy fails`() = runTest {
+        // Citros proxy returns error
+        server.enqueue(MockResponse().setResponseCode(503))
+
+        // DDG returns results (using a second server to avoid confusion)
+        val ddgServer = MockWebServer()
+        ddgServer.start()
+        try {
+            val ddgHtml = """
+                <a rel="nofollow" href="https://fallback.com" class='result-link'>DDG Fallback</a>
+                <td class='result-snippet'>Fell back to DuckDuckGo</td>
+            """.trimIndent()
+            ddgServer.enqueue(MockResponse().setBody(ddgHtml).setResponseCode(200))
+
+            val client = WebSearchClient(
+                citrosSearchEndpoint = server.url("/api/search").toString(),
+                ddgEndpoint = ddgServer.url("/").toString()
+            )
+            val result = client.search("test")
+
+            assertFalse(result.isError, "Should succeed via DDG fallback: ${result.text}")
+            assertTrue(result.text.contains("DDG Fallback"))
+        } finally {
+            ddgServer.shutdown()
+        }
+    }
+
+    @Test
+    fun `search sends Bearer auth header when citrosAppToken is set`() = runTest {
+        val braveJson = """{"web": {"results": [{"title": "R", "url": "https://r.com", "description": "D"}]}}"""
+        server.enqueue(MockResponse().setBody(braveJson).setResponseCode(200))
+
+        val client = WebSearchClient(
+            citrosSearchEndpoint = server.url("/api/search").toString(),
+            citrosAppToken = "test-app-token-123",
+            ddgEndpoint = null
+        )
+        client.search("test")
+
+        val request = server.takeRequest()
+        assertEquals("Bearer test-app-token-123", request.getHeader("Authorization"))
+    }
+
+    @Test
+    fun `search omits auth header when citrosAppToken is null`() = runTest {
+        val braveJson = """{"web": {"results": [{"title": "R", "url": "https://r.com", "description": "D"}]}}"""
+        server.enqueue(MockResponse().setBody(braveJson).setResponseCode(200))
+
+        val client = WebSearchClient(
+            citrosSearchEndpoint = server.url("/api/search").toString(),
+            citrosAppToken = null,
+            ddgEndpoint = null
+        )
+        client.search("test")
+
+        val request = server.takeRequest()
+        assertNull(request.getHeader("Authorization"))
+    }
+
+    @Test
+    fun `search skips Citros proxy when endpoint is null`() = runTest {
+        val searxJson = """{"results": [{"title": "SearX Result", "url": "https://searx.com", "content": "Direct"}]}"""
+        server.enqueue(MockResponse().setBody(searxJson).setResponseCode(200))
+
+        val client = WebSearchClient(
+            citrosSearchEndpoint = null,
+            searxngBaseUrl = server.url("/").toString(),
+            ddgEndpoint = null
+        )
+        val result = client.search("test")
+
+        assertFalse(result.isError)
+        assertTrue(result.text.contains("SearX Result"))
+    }
+
     // ========== SearXNG tests ==========
 
     @Test
@@ -40,7 +149,7 @@ class WebSearchClientTest {
         """.trimIndent()
         server.enqueue(MockResponse().setBody(json).setResponseCode(200))
 
-        val client = WebSearchClient(searxngBaseUrl = server.url("/").toString(), ddgEndpoint = null)
+        val client = WebSearchClient(citrosSearchEndpoint = null, searxngBaseUrl = server.url("/").toString(), ddgEndpoint = null)
         val result = client.search("kotlin", count = 3)
 
         assertFalse(result.isError)
@@ -54,7 +163,7 @@ class WebSearchClientTest {
         val json = """{"results": [{"title": "Result", "url": "https://example.com", "content": "desc"}]}"""
         server.enqueue(MockResponse().setBody(json).setResponseCode(200))
 
-        val client = WebSearchClient(searxngBaseUrl = server.url("/").toString(), ddgEndpoint = null)
+        val client = WebSearchClient(citrosSearchEndpoint = null, searxngBaseUrl = server.url("/").toString(), ddgEndpoint = null)
         client.search("test", count = 100)
 
         val request = server.takeRequest()
@@ -64,7 +173,7 @@ class WebSearchClientTest {
 
     @Test
     fun `search returns error on empty query`() = runTest {
-        val client = WebSearchClient(searxngBaseUrl = "http://localhost:1234", ddgEndpoint = null)
+        val client = WebSearchClient(citrosSearchEndpoint = null, searxngBaseUrl = "http://localhost:1234", ddgEndpoint = null)
         val result = client.search("")
         assertTrue(result.isError)
         assertTrue(result.text.contains("empty"))
@@ -74,7 +183,7 @@ class WebSearchClientTest {
     fun `search returns error when SearXNG returns HTTP error`() = runTest {
         server.enqueue(MockResponse().setResponseCode(500).setBody("Internal Server Error"))
 
-        val client = WebSearchClient(searxngBaseUrl = server.url("/").toString(), ddgEndpoint = null)
+        val client = WebSearchClient(citrosSearchEndpoint = null, searxngBaseUrl = server.url("/").toString(), ddgEndpoint = null)
         val result = client.search("test")
 
         assertTrue(result.isError)
@@ -86,7 +195,7 @@ class WebSearchClientTest {
     fun `search returns no results message when empty`() = runTest {
         server.enqueue(MockResponse().setBody("""{"results": []}""").setResponseCode(200))
 
-        val client = WebSearchClient(searxngBaseUrl = server.url("/").toString(), ddgEndpoint = null)
+        val client = WebSearchClient(citrosSearchEndpoint = null, searxngBaseUrl = server.url("/").toString(), ddgEndpoint = null)
         val result = client.search("xyznonexistent")
 
         assertFalse(result.isError)
@@ -97,7 +206,7 @@ class WebSearchClientTest {
 
     @Test
     fun `search returns error when all providers fail`() = runTest {
-        val client = WebSearchClient(ddgEndpoint = null)
+        val client = WebSearchClient(citrosSearchEndpoint = null, ddgEndpoint = null)
         val result = client.search("test")
         assertTrue(result.isError, "Should fail when all providers are unavailable")
         assertTrue(result.text.contains("Do NOT open Chrome"),
@@ -128,6 +237,7 @@ class WebSearchClientTest {
             braveServer.enqueue(MockResponse().setBody(braveJson).setResponseCode(200))
 
             val client = WebSearchClient(
+                citrosSearchEndpoint = null,
                 searxngBaseUrl = searxngServer.url("/").toString(),
                 braveApiKey = "test-key",
                 braveEndpoint = braveServer.url("/").toString(),
@@ -147,7 +257,7 @@ class WebSearchClientTest {
     fun `search returns error when SearXNG fails and no Brave key`() = runTest {
         server.enqueue(MockResponse().setResponseCode(503))
 
-        val client = WebSearchClient(searxngBaseUrl = server.url("/").toString(), ddgEndpoint = null)
+        val client = WebSearchClient(citrosSearchEndpoint = null, searxngBaseUrl = server.url("/").toString(), ddgEndpoint = null)
         val result = client.search("test")
 
         assertTrue(result.isError)
