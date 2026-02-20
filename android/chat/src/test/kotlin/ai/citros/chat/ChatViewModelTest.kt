@@ -25,6 +25,7 @@ import org.junit.Before
 import org.junit.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -889,6 +890,109 @@ class ChatViewModelTest {
         assertTrue(viewModel.needsAuth.value)
     }
 
+
+    // ========== PR #620: actionModelId tracking in updateModelsFromWallet ==========
+
+    @Test
+    fun `updateModelsFromWallet detects action model change and rebuilds`() {
+        val keyStore = InMemoryKeyStore()
+        val storage = InMemoryWalletStorage()
+        val walletManager = ai.citros.core.WalletManager(storage, keyStore)
+
+        walletManager.addKey(Provider.OPENAI, "OpenAI Key", "sk-test-openai-key")
+        walletManager.setActiveKey(walletManager.loadOrDefault().keys.first().id)
+        viewModel.configureWithWallet(walletManager)
+
+        // Capture active backend instance identity before change
+        val backends = getPrivateField<List<Any>>("apiBackends")!!
+        val activeIdx = getPrivateField<Int>("activeApiBackendIndex")!!
+        val backendBefore = backends[activeIdx]
+
+        // Change only the action model
+        walletManager.setActionModel("gpt-4o-2024-08-06")
+        viewModel.updateModelsFromWallet(walletManager)
+
+        // Active backend should be a DIFFERENT instance (rebuild happened)
+        // The list is mutated in-place (apiBackends[activeIndex] = updatedBackend),
+        // so we check the element identity, not the list identity.
+        val backendsAfter = getPrivateField<List<Any>>("apiBackends")!!
+        val backendAfter = backendsAfter[activeIdx]
+        assertNotEquals(
+            System.identityHashCode(backendBefore),
+            System.identityHashCode(backendAfter),
+            "Active backend should be rebuilt when action model changes"
+        )
+        // Action model ID should be updated
+        assertEquals("gpt-4o-2024-08-06", getPrivateField<String>("lastWalletActionModelId"))
+        assertTrue(viewModel.isConfigured.value)
+    }
+
+    @Test
+    fun `updateModelsFromWallet skips rebuild when all models unchanged`() {
+        val keyStore = InMemoryKeyStore()
+        val storage = InMemoryWalletStorage()
+        val walletManager = ai.citros.core.WalletManager(storage, keyStore)
+
+        walletManager.addKey(Provider.OPENAI, "OpenAI Key", "sk-test-openai-key")
+        walletManager.setActiveKey(walletManager.loadOrDefault().keys.first().id)
+        viewModel.configureWithWallet(walletManager)
+
+        // Capture active backend instance identity before no-op call
+        val backends = getPrivateField<List<Any>>("apiBackends")!!
+        val activeIdx = getPrivateField<Int>("activeApiBackendIndex")!!
+        val backendBefore = backends[activeIdx]
+
+        // Call again with same models — should be a no-op
+        viewModel.updateModelsFromWallet(walletManager)
+
+        // Active backend should be the SAME instance (no rebuild)
+        val backendsAfter = getPrivateField<List<Any>>("apiBackends")!!
+        val backendAfter = backendsAfter[activeIdx]
+        assertEquals(
+            System.identityHashCode(backendBefore),
+            System.identityHashCode(backendAfter),
+            "Active backend should NOT be rebuilt when models are unchanged"
+        )
+        assertTrue(viewModel.isConfigured.value)
+    }
+
+    // ========== PR #622: model switch text-only seed ==========
+
+    @Test
+    fun `updateModelsFromWallet does not transfer raw messages to new backend`() = runTest {
+        val keyStore = InMemoryKeyStore()
+        val storage = InMemoryWalletStorage()
+        val walletManager = ai.citros.core.WalletManager(storage, keyStore)
+
+        walletManager.addKey(Provider.OPENAI, "OpenAI Key", "sk-test-openai-key")
+        walletManager.setActiveKey(walletManager.loadOrDefault().keys.first().id)
+        viewModel.configureWithWallet(walletManager)
+
+        // Add some UI messages to simulate prior conversation
+        viewModel.messages.add(Message(role = "user", content = "hello"))
+        viewModel.messages.add(Message(role = "assistant", content = "hi there"))
+
+        // Switch models
+        walletManager.setChatModel("gpt-4o-mini")
+        viewModel.updateModelsFromWallet(walletManager)
+
+        // The new backend's PhoneAgentApi should start with zero messages
+        // (history is not transferred; it will be seeded on next sendMessage)
+        val apiBackends = getPrivateField<List<Any>>("apiBackends")
+        assertNotNull(apiBackends)
+        assertTrue(apiBackends!!.isNotEmpty())
+
+        val activeIndex = getPrivateField<Int>("activeApiBackendIndex")!!
+        val activeBackend = apiBackends[activeIndex]
+        val agentField = activeBackend::class.java.getDeclaredField("agent")
+        agentField.isAccessible = true
+        val agent = agentField.get(activeBackend) as ai.citros.core.PhoneAgentApi
+        // messageCount is internal to :core — access messages list via reflection from :chat test
+        val messagesField = agent::class.java.getDeclaredField("messages")
+        messagesField.isAccessible = true
+        val messages = messagesField.get(agent) as List<*>
+        assertEquals(0, messages.size, "New backend should start with zero messages (no raw transfer)")
+    }
 
     // ========== Local LLM Mode Tests (#255) ==========
 

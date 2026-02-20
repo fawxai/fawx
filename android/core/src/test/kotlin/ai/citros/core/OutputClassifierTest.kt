@@ -818,4 +818,35 @@ class OutputClassifierTest {
             OutputClassifier.summarize(result)
         )
     }
+
+    // --- PR #630: edge cases ---
+
+    @Test
+    fun `summarize screenshot description with very long first line truncates at DISPLAY_MAX_CHARS`() {
+        val longDescription = "A".repeat(500)
+        val result = "Screenshot description:\n$longDescription"
+        val summarized = OutputClassifier.summarize(result)
+        assertTrue(
+            summarized.length <= OutputClassifier.DISPLAY_MAX_CHARS + 1,
+            "Expected truncated to at most ${OutputClassifier.DISPLAY_MAX_CHARS + 1} chars but got ${summarized.length}"
+        )
+        assertTrue(summarized.endsWith("…"), "Expected ellipsis at end")
+    }
+
+    @Test
+    fun `TOOL_CATEGORIES covers all known tool names from PhoneTools`() {
+        // Every tool in PhoneTools.ALL should have an EXPLICIT entry in TOOL_CATEGORIES.
+        // categoryOf() falls back to OTHER for unmapped tools, so assertNotNull is useless —
+        // we must check the map directly to catch tools that were added without categorization.
+        val allToolNames = PhoneTools.ALL.map { it.name }
+        val categorized = OutputClassifier.TOOL_CATEGORIES.keys
+
+        for (toolName in allToolNames) {
+            assertTrue(
+                categorized.contains(toolName),
+                "Tool '$toolName' from PhoneTools.ALL is not explicitly mapped in TOOL_CATEGORIES — " +
+                    "it will silently fall back to OTHER. Add an entry."
+            )
+        }
+    }
 }

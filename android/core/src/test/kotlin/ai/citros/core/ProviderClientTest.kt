@@ -288,18 +288,134 @@ class ProviderClientTest {
 
     // ========== Error Handling Tests ==========
 
+    // ========== Empty Tools List Tests (PR #629) ==========
+
     @Test
-    fun `chatWithTools rejects empty tools list`() = runTest {
+    fun `Anthropic chatWithTools with empty tools list does not throw`() = runTest {
+        server.enqueue(
+            MockResponse()
+                .setBody("""{"content":[{"type":"text","text":"No tools needed"}],"role":"assistant","stop_reason":"end_turn"}""")
+                .setResponseCode(200)
+                .addHeader("Content-Type", "application/json")
+        )
+
         val client = AnthropicClient(
             apiKey = "sk-ant-api03-test-key",
             baseUrl = server.url("/v1/messages").toString()
         )
 
         val messages = listOf(Message(role = "user", content = "test"))
+        val result = client.chatWithTools(messages, tools = emptyList())
 
-        assertFailsWith<IllegalArgumentException> {
-            client.chatWithTools(messages, tools = emptyList())
-        }
+        assertTrue(result.isSuccess)
+    }
+
+    @Test
+    fun `Anthropic chatWithTools with empty tools list omits tools from request body`() = runTest {
+        server.enqueue(
+            MockResponse()
+                .setBody("""{"content":[{"type":"text","text":"ok"}],"role":"assistant","stop_reason":"end_turn"}""")
+                .setResponseCode(200)
+                .addHeader("Content-Type", "application/json")
+        )
+
+        val client = AnthropicClient(
+            apiKey = "sk-ant-api03-test-key",
+            baseUrl = server.url("/v1/messages").toString()
+        )
+
+        val messages = listOf(Message(role = "user", content = "test"))
+        client.chatWithTools(messages, tools = emptyList())
+
+        val request = server.takeRequest()
+        val body = request.body.readUtf8()
+        assertFalse(body.contains("\"tools\""), "Empty tools list should omit 'tools' key from request body, got: $body")
+    }
+
+    @Test
+    fun `Anthropic chatWithTools with non-empty tools still includes tools array`() = runTest {
+        server.enqueue(
+            MockResponse()
+                .setBody("""{"content":[{"type":"text","text":"Using tools"}],"role":"assistant","stop_reason":"end_turn"}""")
+                .setResponseCode(200)
+                .addHeader("Content-Type", "application/json")
+        )
+
+        val client = AnthropicClient(
+            apiKey = "sk-ant-api03-test-key",
+            baseUrl = server.url("/v1/messages").toString()
+        )
+
+        val messages = listOf(Message(role = "user", content = "test"))
+        client.chatWithTools(messages, tools = PhoneTools.ALL)
+
+        val request = server.takeRequest()
+        val body = request.body.readUtf8()
+        assertTrue(body.contains("\"tools\""), "Non-empty tools list should include 'tools' key in request body")
+    }
+
+    @Test
+    fun `OpenAI chatWithTools with empty tools list does not throw`() = runTest {
+        server.enqueue(
+            MockResponse()
+                .setBody("""{"choices":[{"message":{"role":"assistant","content":"No tools"},"finish_reason":"stop"}]}""")
+                .setResponseCode(200)
+                .addHeader("Content-Type", "application/json")
+        )
+
+        val config = ProviderConfig.openAi("test-key").copy(
+            baseUrl = server.url("/v1/chat/completions").toString()
+        )
+        val client = OpenAiClient(config = config)
+
+        val messages = listOf(Message(role = "user", content = "test"))
+        val result = client.chatWithTools(messages, tools = emptyList())
+
+        assertTrue(result.isSuccess)
+    }
+
+    @Test
+    fun `OpenAI chatWithTools with empty tools list omits tools from request body`() = runTest {
+        server.enqueue(
+            MockResponse()
+                .setBody("""{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}""")
+                .setResponseCode(200)
+                .addHeader("Content-Type", "application/json")
+        )
+
+        val config = ProviderConfig.openAi("test-key").copy(
+            baseUrl = server.url("/v1/chat/completions").toString()
+        )
+        val client = OpenAiClient(config = config)
+
+        val messages = listOf(Message(role = "user", content = "test"))
+        client.chatWithTools(messages, tools = emptyList())
+
+        val request = server.takeRequest()
+        val body = request.body.readUtf8()
+        assertFalse(body.contains("\"tools\""), "Empty tools list should omit 'tools' key from request body, got: $body")
+    }
+
+    @Test
+    fun `OpenAI chatWithTools with non-empty tools still includes tools array`() = runTest {
+        server.enqueue(
+            MockResponse()
+                .setBody("""{"choices":[{"message":{"role":"assistant","content":"Using tools"},"finish_reason":"stop"}]}""")
+                .setResponseCode(200)
+                .addHeader("Content-Type", "application/json")
+        )
+
+        val config = ProviderConfig.openAi("test-key").copy(
+            baseUrl = server.url("/v1/chat/completions").toString()
+        )
+        val client = OpenAiClient(config = config)
+
+        val messages = listOf(Message(role = "user", content = "test"))
+        client.chatWithTools(messages, tools = PhoneTools.ALL)
+
+        val request = server.takeRequest()
+        val body = request.body.readUtf8()
+        assertTrue(body.contains("\"tools\""), "Non-empty tools list should include 'tools' key in request body")
     }
 
     @Test

@@ -1635,4 +1635,47 @@ class PhoneAgentApiTest {
         // user + user -> only first kept (consecutive dedup), then assistant = 2
         assertEquals(2, agent.messageCount)
     }
+
+    // --- PR #619: seed conversation history content assertions ---
+
+    @Suppress("UNCHECKED_CAST")
+    private fun getMessages(agent: PhoneAgentApi): List<Message> {
+        val field = PhoneAgentApi::class.java.getDeclaredField("messages")
+        field.isAccessible = true
+        return (field.get(agent) as List<Message>)
+    }
+
+    @Test
+    fun `seedConversationHistory preserves message content and order`() = runTest {
+        val agent = createAgent()
+        val uiMessages = listOf(
+            Message(role = "user", content = "what's the weather?"),
+            Message(role = "assistant", content = "It's 38F and partly cloudy in Denver."),
+            Message(role = "user", content = "should I bring a jacket?")
+        )
+
+        agent.seedConversationHistory(uiMessages)
+
+        val seeded = getMessages(agent)
+        assertEquals(3, seeded.size)
+        assertEquals("user", seeded[0].role)
+        assertEquals("what's the weather?", seeded[0].content)
+        assertEquals("assistant", seeded[1].role)
+        assertEquals("It's 38F and partly cloudy in Denver.", seeded[1].content)
+        assertEquals("user", seeded[2].role)
+        assertEquals("should I bring a jacket?", seeded[2].content)
+    }
+
+    @Test
+    fun `seedConversationHistory with only tool messages results in empty seed`() = runTest {
+        val agent = createAgent()
+        val uiMessages = listOf(
+            Message(role = "tool", content = "tool result 1"),
+            Message(role = "tool", content = "tool result 2"),
+            Message(role = "tool", content = "tool result 3")
+        )
+
+        agent.seedConversationHistory(uiMessages)
+        assertEquals(0, agent.messageCount)
+    }
 }
