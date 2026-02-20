@@ -182,7 +182,7 @@ class ChatActivity : ComponentActivity() {
         // All hooks run on Main dispatcher since they touch View visibility.
         ScreenReader.toolLoopOverlayHideHook = {
             withContext(Dispatchers.Main) {
-                OverlayService.instance?.hideOverlayForScreenshot()
+                OverlayService.instance?.hideForToolLoop()
             }
         }
         ScreenReader.toolLoopOverlayRestoreHook = {
@@ -203,7 +203,7 @@ class ChatActivity : ComponentActivity() {
                     OverlayController.updateSurfaceMode(getPreferredOverlayMode(this@ChatActivity))
                     OverlayController.activateOverlay()
                 }
-                OverlayService.instance?.restoreOverlayVisibility()
+                OverlayService.instance?.restoreAfterToolLoop()
             }
         }
         ScreenReader.screenshotOverlayHook = {

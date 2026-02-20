@@ -455,4 +455,136 @@ class OverlayServiceTest {
     // Note: Full integration tests for moveOverlayToTop/moveOverlayToBottom with a real
     // WindowManager require instrumented tests on device. The gravity flip and
     // updateViewLayout call chain are verified during E2E testing.
+
+
+    // ========== Tool loop hide/restore tests (#626, #646) ==========
+    //
+    // These tests use reflection to inject a real View and LayoutParams into
+    // a Robolectric-built OverlayService, then call the actual production methods
+    // and assert on the real object state (view.visibility, params.flags).
+
+    /**
+     * Inject test doubles into a Robolectric-built OverlayService so that
+     * hideForToolLoop/restoreAfterToolLoop/hideOverlayForScreenshot/restoreOverlayVisibility
+     * operate on real objects instead of hitting null guards.
+     */
+    private fun buildServiceWithOverlay(): Triple<OverlayService, android.view.View, android.view.WindowManager.LayoutParams> {
+        val context = androidx.test.core.app.ApplicationProvider.getApplicationContext<android.content.Context>()
+        val service = Robolectric.buildService(OverlayService::class.java).get()
+        val view = android.view.View(context)
+        view.visibility = android.view.View.VISIBLE
+        val params = android.view.WindowManager.LayoutParams(
+            android.view.WindowManager.LayoutParams.MATCH_PARENT,
+            400,
+            android.view.WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+            android.graphics.PixelFormat.TRANSLUCENT
+        )
+
+        // Inject via reflection
+        fun setField(name: String, value: Any?) {
+            val field = OverlayService::class.java.getDeclaredField(name)
+            field.isAccessible = true
+            field.set(service, value)
+        }
+        setField("overlayView", view)
+        setField("overlayParams", params)
+        // WindowManager is needed for makeWindowNotTouchable — use Robolectric's
+        setField("windowManager", context.getSystemService(android.content.Context.WINDOW_SERVICE))
+
+        return Triple(service, view, params)
+    }
+
+    @Test
+    fun `hideForToolLoop is no-op when service not fully initialized`() {
+        val service = Robolectric.buildService(OverlayService::class.java).get()
+        // No crash when overlayView is null
+        service.hideForToolLoop()
+        service.restoreAfterToolLoop()
+    }
+
+    @Test
+    fun `hideForToolLoop sets INVISIBLE and FLAG_NOT_TOUCHABLE`() {
+        val (service, view, params) = buildServiceWithOverlay()
+
+        service.hideForToolLoop()
+
+        assertEquals(android.view.View.INVISIBLE, view.visibility)
+        assertTrue(params.flags and android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE != 0,
+            "FLAG_NOT_TOUCHABLE should be set after hideForToolLoop")
+    }
+
+    @Test
+    fun `restoreAfterToolLoop restores VISIBLE and clears FLAG_NOT_TOUCHABLE`() {
+        val (service, view, params) = buildServiceWithOverlay()
+        OverlayController.setChatInForeground(false)
+
+        service.hideForToolLoop()
+        service.restoreAfterToolLoop()
+
+        assertEquals(android.view.View.VISIBLE, view.visibility)
+        assertEquals(0, params.flags and android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+            "FLAG_NOT_TOUCHABLE should be cleared after restoreAfterToolLoop")
+    }
+
+    @Test
+    fun `hideOverlayForScreenshot is no-op during active tool loop`() {
+        val (service, view, params) = buildServiceWithOverlay()
+
+        service.hideForToolLoop()
+        assertEquals(android.view.View.INVISIBLE, view.visibility)
+
+        // Screenshot hide should be a no-op
+        service.hideOverlayForScreenshot()
+        // Screenshot restore should also be a no-op — view stays INVISIBLE
+        service.restoreOverlayVisibility()
+        assertEquals(android.view.View.INVISIBLE, view.visibility,
+            "View must stay INVISIBLE — tool loop owns visibility")
+        assertTrue(params.flags and android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE != 0,
+            "FLAG_NOT_TOUCHABLE must stay set during tool loop")
+    }
+
+    @Test
+    fun `restoreAfterToolLoop is no-op without prior hideForToolLoop`() {
+        val (service, view, params) = buildServiceWithOverlay()
+
+        service.restoreAfterToolLoop()
+
+        assertEquals(android.view.View.VISIBLE, view.visibility,
+            "View should remain VISIBLE — no tool loop was active")
+        assertEquals(0, params.flags and android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+            "FLAG_NOT_TOUCHABLE should not be set")
+    }
+
+    @Test
+    fun `double hideForToolLoop preserves original savedVisibility`() {
+        val (service, view, params) = buildServiceWithOverlay()
+        OverlayController.setChatInForeground(false)
+
+        service.hideForToolLoop()
+        service.hideForToolLoop() // second call — should be no-op
+
+        // Restore should still go back to VISIBLE (original state)
+        service.restoreAfterToolLoop()
+        assertEquals(android.view.View.VISIBLE, view.visibility)
+    }
+
+    @Test
+    fun `restoreAfterToolLoop skips visibility restore when chat is in foreground`() {
+        val (service, view, params) = buildServiceWithOverlay()
+
+        service.hideForToolLoop()
+        OverlayController.setChatInForeground(true)
+
+        service.restoreAfterToolLoop()
+
+        // View stays INVISIBLE because ChatActivity is in foreground
+        assertEquals(android.view.View.INVISIBLE, view.visibility,
+            "View must stay INVISIBLE when ChatActivity is in foreground")
+        // FLAG_NOT_TOUCHABLE is cleared — safe because ChatActivity covers the overlay.
+        // The foreground observer will restore visibility when ChatActivity leaves.
+        assertEquals(0, params.flags and android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+            "FLAG_NOT_TOUCHABLE cleared — ChatActivity covers overlay")
+    }
+
 }

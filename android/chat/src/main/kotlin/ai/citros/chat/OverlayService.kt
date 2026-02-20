@@ -20,6 +20,7 @@ import android.view.WindowInsets
 import android.view.WindowInsetsAnimation
 import android.view.WindowManager
 import android.view.animation.DecelerateInterpolator
+import androidx.annotation.MainThread
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -412,15 +413,84 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
     private var savedVisibility: Int = NO_SAVED_VISIBILITY
 
     /**
+     * When true, the overlay is hidden for the entire tool loop duration.
+     * [restoreOverlayVisibility] becomes a no-op while this is set,
+     * preventing per-screenshot restore from re-showing the overlay mid-loop.
+     */
+    private var toolLoopHideActive = false
+
+    /**
+     * Hide the overlay for the duration of a tool loop (#626, #646).
+     *
+     * Sets the view to [View.INVISIBLE] and adds
+     * [FLAG_NOT_TOUCHABLE][WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE] so the
+     * InputDispatcher skips this window entirely. Without FLAG_NOT_TOUCHABLE, an
+     * INVISIBLE overlay window still consumes [dispatchGesture][android.accessibilityservice.AccessibilityService.dispatchGesture]
+     * taps -- preventing the agent from tapping elements in the app underneath
+     * (bottom nav tabs, list items, etc.).
+     *
+     * Per-screenshot hide/restore calls ([hideOverlayForScreenshot] /
+     * [restoreOverlayVisibility]) become no-ops while the tool loop hide is active,
+     * ensuring the overlay stays hidden and non-touchable for the full loop duration.
+     *
+     * Call [restoreAfterToolLoop] to undo.
+     */
+    @MainThread
+    fun hideForToolLoop() {
+        if (toolLoopHideActive) return
+        toolLoopHideActive = true
+        // If overlayView is null (service not fully initialized), the flag is still
+        // set so that hideOverlayForScreenshot/restoreOverlayVisibility become no-ops.
+        // restoreAfterToolLoop will clear the flag harmlessly.
+        overlayView?.let { view ->
+            if (savedVisibility == NO_SAVED_VISIBILITY) {
+                savedVisibility = view.visibility
+            }
+            view.visibility = View.INVISIBLE
+            makeWindowNotTouchable(true)
+        }
+    }
+
+    /**
+     * Restore overlay after a tool loop completes.
+     * Counterpart to [hideForToolLoop].
+     */
+    @MainThread
+    @android.annotation.SuppressLint("WrongConstant")
+    fun restoreAfterToolLoop() {
+        if (!toolLoopHideActive) return
+        toolLoopHideActive = false
+        overlayView?.let { view ->
+            if (OverlayController.isChatInForeground.value) {
+                Log.d(TAG, "restoreAfterToolLoop: skipped -- ChatActivity still in foreground")
+                savedVisibility = NO_SAVED_VISIBILITY
+                // Clear FLAG_NOT_TOUCHABLE even though view stays INVISIBLE.
+                // Safe: ChatActivity is the full-screen foreground window, so
+                // it covers the overlay -- no touches reach this window anyway.
+                // When ChatActivity leaves, observeChatForeground restores visibility.
+                makeWindowNotTouchable(false)
+                return
+            }
+            view.visibility = if (savedVisibility != NO_SAVED_VISIBILITY) savedVisibility else View.VISIBLE
+            savedVisibility = NO_SAVED_VISIBILITY
+            makeWindowNotTouchable(false)
+        }
+    }
+
+    /**
      * Temporarily hide the overlay view so it doesn't appear in screenshots.
      * Uses [View.INVISIBLE] (not GONE) to preserve the view's layout position
      * in the window manager, avoiding re-layout on restore.
      * Call [restoreOverlayVisibility] to restore the previous state.
      *
+     * No-op while [hideForToolLoop] is active -- the overlay is already hidden
+     * and must stay that way until the tool loop ends.
+     *
      * Guarded against double-hide: if already hidden (savedVisibility is set),
      * subsequent calls are no-ops to preserve the original visibility state.
      */
     fun hideOverlayForScreenshot() {
+        if (toolLoopHideActive) return
         overlayView?.let {
             if (savedVisibility == NO_SAVED_VISIBILITY) {
                 savedVisibility = it.visibility
@@ -431,9 +501,13 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
 
     /**
      * Restore overlay visibility to the state before [hideOverlayForScreenshot].
+     *
+     * No-op while [hideForToolLoop] is active -- the tool loop owns the
+     * visibility state until [restoreAfterToolLoop] is called.
      */
     @android.annotation.SuppressLint("WrongConstant")
     fun restoreOverlayVisibility() {
+        if (toolLoopHideActive) return
         overlayView?.let {
             // Re-check: don't restore if ChatActivity is still in foreground (#627 race fix)
             if (OverlayController.isChatInForeground.value) {
@@ -446,6 +520,27 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
             }
             it.visibility = if (savedVisibility != NO_SAVED_VISIBILITY) savedVisibility else View.VISIBLE
             savedVisibility = NO_SAVED_VISIBILITY
+        }
+    }
+
+    /**
+     * Toggle [FLAG_NOT_TOUCHABLE][WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE] on
+     * the overlay window. When [notTouchable] is true the InputDispatcher will skip
+     * this window entirely, allowing gestures to fall through to windows behind it.
+     */
+    private fun makeWindowNotTouchable(notTouchable: Boolean) {
+        val wm = windowManager ?: return
+        val view = overlayView ?: return
+        val params = overlayParams ?: return
+        if (notTouchable) {
+            params.flags = params.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        } else {
+            params.flags = params.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+        }
+        try {
+            wm.updateViewLayout(view, params)
+        } catch (e: Exception) {
+            Log.w(TAG, "makeWindowNotTouchable($notTouchable) failed: ${e.message}")
         }
     }
 
