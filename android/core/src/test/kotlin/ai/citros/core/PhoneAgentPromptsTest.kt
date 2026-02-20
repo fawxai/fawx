@@ -364,4 +364,10 @@ class PhoneAgentPromptsTest {
         val systemPrompt = PhoneAgentPrompts.buildSystemPrompt(phoneControlAvailable = true)
         assertContains(systemPrompt, "Act, Don't Announce")
     }
+
+    @Test
+    fun `strategy section includes learning guidance`() {
+        assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "Learning — Record What Works")
+        assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "learn()")
+    }
 }

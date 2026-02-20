@@ -7,6 +7,9 @@ import java.nio.file.Files
 import java.time.LocalDate
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class AgentFileManagerTest {
@@ -171,5 +174,108 @@ class AgentFileManagerTest {
         manager.writeFile("memory/2026-01-01.md", "daily log")
 
         assertTrue(triggered.isEmpty(), "Non-prompt files should not trigger callback")
+    }
+
+    // ── Knowledge tests ──
+
+    @Test
+    fun `knowledgePathForPackage returns correct path`() {
+        val manager = AgentFileManager.fromDirectory(tempRoot)
+        assertEquals(
+            "knowledge/app-com.google.android.apps.messaging.md",
+            manager.knowledgePathForPackage("com.google.android.apps.messaging")
+        )
+    }
+
+    @Test
+    fun `knowledgePathForPackage sanitizes special characters`() {
+        val manager = AgentFileManager.fromDirectory(tempRoot)
+        val path = manager.knowledgePathForPackage("com.evil/../escape")
+        assertFalse(path.contains(".."), "Should sanitize path traversal: $path")
+    }
+
+    @Test
+    fun `knowledgePathForPackage rejects package names that sanitize to empty`() {
+        val manager = AgentFileManager.fromDirectory(tempRoot)
+        assertFailsWith<IllegalArgumentException> {
+            manager.knowledgePathForPackage("!!!")
+        }
+    }
+
+    @Test
+    fun `readKnowledge returns null when no file exists`() {
+        val manager = AgentFileManager.fromDirectory(tempRoot)
+        assertNull(manager.readKnowledge("com.nonexistent.app"))
+    }
+
+    @Test
+    fun `writeKnowledge creates new file with header and entry`() {
+        val manager = AgentFileManager.fromDirectory(tempRoot)
+        val result = manager.writeKnowledge("com.test.app", "Tap by text works better", "navigation")
+
+        assertTrue(result.contains("# com.test.app"))
+        assertTrue(result.contains("## Navigation"))
+        assertTrue(result.contains("[confirmed:1] Tap by text works better"))
+        assertTrue(result.contains("Last Updated:"))
+
+        // Verify persisted
+        val read = manager.readKnowledge("com.test.app")
+        assertNotNull(read)
+        assertTrue(read!!.contains("[confirmed:1] Tap by text works better"))
+    }
+
+    @Test
+    fun `writeKnowledge appends to existing category`() {
+        val manager = AgentFileManager.fromDirectory(tempRoot)
+        manager.writeKnowledge("com.test.app", "First pattern", "navigation")
+        manager.writeKnowledge("com.test.app", "Second pattern", "navigation")
+
+        val content = manager.readKnowledge("com.test.app")!!
+        assertTrue(content.contains("[confirmed:1] First pattern"))
+        assertTrue(content.contains("[confirmed:1] Second pattern"))
+        // Only one Navigation header
+        assertEquals(1, content.lines().count { it.trim() == "## Navigation" })
+    }
+
+    @Test
+    fun `writeKnowledge creates separate category sections`() {
+        val manager = AgentFileManager.fromDirectory(tempRoot)
+        manager.writeKnowledge("com.test.app", "Nav pattern", "navigation")
+        manager.writeKnowledge("com.test.app", "Fail pattern", "failure")
+
+        val content = manager.readKnowledge("com.test.app")!!
+        assertTrue(content.contains("## Navigation"))
+        assertTrue(content.contains("## Failure"))
+        assertTrue(content.contains("[confirmed:1] Nav pattern"))
+        assertTrue(content.contains("[confirmed:1] Fail pattern"))
+    }
+
+    @Test
+    fun `writeKnowledge throws when file would exceed size limit`() {
+        val manager = AgentFileManager.fromDirectory(tempRoot)
+        // Fill with a large pattern to approach the limit
+        val bigPattern = "x".repeat(1800)
+        manager.writeKnowledge("com.test.app", bigPattern, "navigation")
+
+        // Second write should exceed 2KB
+        assertFailsWith<IllegalArgumentException> {
+            manager.writeKnowledge("com.test.app", bigPattern, "failure")
+        }
+    }
+
+    @Test
+    fun `listKnowledgePackages returns empty when no knowledge exists`() {
+        val manager = AgentFileManager.fromDirectory(tempRoot)
+        assertTrue(manager.listKnowledgePackages().isEmpty())
+    }
+
+    @Test
+    fun `listKnowledgePackages returns packages with knowledge files`() {
+        val manager = AgentFileManager.fromDirectory(tempRoot)
+        manager.writeKnowledge("com.app.one", "Pattern 1")
+        manager.writeKnowledge("com.app.two", "Pattern 2")
+
+        val packages = manager.listKnowledgePackages()
+        assertEquals(listOf("com.app.one", "com.app.two"), packages)
     }
 }

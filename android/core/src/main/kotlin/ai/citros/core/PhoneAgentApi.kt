@@ -200,6 +200,10 @@ open class PhoneAgentApi(
             "message", "photo", "camera", "wifi", "bluetooth", "brightness"
         )
 
+        /** Strict Android package-name validation for learn tool input. */
+        private val ANDROID_PACKAGE_PATTERN =
+            Regex("^[a-zA-Z][a-zA-Z0-9_]*(\\.[a-zA-Z][a-zA-Z0-9_]*)+$")
+
         /** Regex patterns for tool-like artifacts that should be stripped from chat responses. */
         private val TOOL_ARTIFACT_PATTERNS = listOf(
             Regex("""<tool_use>.*?</tool_use>""", RegexOption.DOT_MATCHES_ALL),
@@ -803,6 +807,29 @@ open class PhoneAgentApi(
                     val path = toolCall.input["path"] as? String
                     val files = manager.listFiles(path)
                     fileToolSuccess(toolName = "list_files", path = path ?: ".", files = files)
+                }
+
+                "learn" -> fileToolResult("learn") {
+                    val manager = agentFileManager ?: throw IllegalStateException("Agent file manager not configured")
+                    val appPackage = (toolCall.input["app_package"] as? String)?.trim()?.takeIf { it.isNotBlank() }
+                        ?: throw IllegalArgumentException("learn requires app_package (string)")
+                    if (!ANDROID_PACKAGE_PATTERN.matches(appPackage)) {
+                        throw IllegalArgumentException(
+                            "app_package must be a valid Android package name (e.g., com.example.app)"
+                        )
+                    }
+                    val pattern = (toolCall.input["pattern"] as? String)?.takeIf { it.isNotBlank() }
+                        ?: throw IllegalArgumentException("learn requires pattern (string)")
+                    val category = (toolCall.input["category"] as? String)
+                        ?.trim()
+                        ?.lowercase()
+                        ?.takeIf { it.isNotBlank() }
+                        ?: "navigation"
+                    if (category !in listOf("navigation", "failure", "strategy")) {
+                        throw IllegalArgumentException("category must be navigation, failure, or strategy")
+                    }
+                    manager.writeKnowledge(appPackage, pattern, category)
+                    "Learned pattern for $appPackage [$category]: $pattern"
                 }
 
                 // Memory tools use runBlocking because executeToolCall() is synchronous

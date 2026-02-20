@@ -34,6 +34,14 @@ class AgentFileManager private constructor(rawBaseDir: File) {
         /** Files that trigger a prompt rebuild when written via write_file. */
         val PROMPT_RELOAD_FILES = setOf(SOUL_FILE, IDENTITY_FILE, USER_FILE)
 
+        // ── Knowledge constants ──
+        /** Directory for per-app knowledge files. */
+        const val KNOWLEDGE_DIR = "knowledge"
+        /** Max bytes per knowledge file. Prevents unbounded growth. */
+        const val MAX_KNOWLEDGE_FILE_BYTES = 2048L
+        private const val KNOWLEDGE_FILE_PREFIX = "app-"
+        private const val KNOWLEDGE_FILE_EXT = ".md"
+
         private val DEFAULT_AGENTS = """
 # AGENTS.md
 
@@ -233,6 +241,106 @@ These rules are mandatory:
             val truncated = String(bytes, start, bytes.size - start, Charsets.UTF_8)
             "[...truncated...]\n$truncated"
         }
+    }
+
+    // ── Knowledge (Scoped Agent Learning) ────────────────────────────
+
+    /**
+     * Get the knowledge file path for an app package.
+     * e.g., "com.google.android.apps.messaging" → "knowledge/app-com.google.android.apps.messaging.md"
+     */
+    fun knowledgePathForPackage(packageName: String): String {
+        val sanitized = packageName
+            .trim()
+            .replace(Regex("[^a-zA-Z0-9._-]"), "")
+            .replace(Regex("\\.{2,}"), ".")
+            .trim('.', '-', '_')
+
+        require(sanitized.isNotBlank()) { "Invalid package name: $packageName" }
+
+        return "$KNOWLEDGE_DIR/$KNOWLEDGE_FILE_PREFIX$sanitized$KNOWLEDGE_FILE_EXT"
+    }
+
+    /**
+     * Read knowledge for an app. Returns null if no knowledge file exists.
+     */
+    fun readKnowledge(packageName: String): String? {
+        val path = knowledgePathForPackage(packageName)
+        return runCatching { readFile(path) }.getOrNull()?.takeIf { it.isNotBlank() }
+    }
+
+    /**
+     * Append a learned pattern to an app's knowledge file.
+     *
+     * @param packageName Android package name
+     * @param pattern What was learned
+     * @param category One of: navigation, failure, strategy
+     * @return The updated knowledge content
+     * @throws IllegalArgumentException if the file would exceed MAX_KNOWLEDGE_FILE_BYTES
+     */
+    fun writeKnowledge(packageName: String, pattern: String, category: String = "navigation"): String {
+        val path = knowledgePathForPackage(packageName)
+        val existing = runCatching { readFile(path) }.getOrNull() ?: ""
+        val categoryHeader = "## ${category.replaceFirstChar { it.uppercase() }}"
+        val entry = "- [confirmed:1] $pattern"
+        val timestamp = "Last Updated: ${java.time.Instant.now()}"
+
+        val newContent = if (existing.isBlank()) {
+            // New file
+            "# $packageName\n\n$categoryHeader\n$entry\n\n$timestamp\n"
+        } else {
+            // Append to existing category or create new category section
+            val lines = existing.lines().toMutableList()
+
+            // Remove old timestamp
+            lines.removeAll { it.startsWith("Last Updated:") }
+            // Remove trailing blank lines
+            while (lines.isNotEmpty() && lines.last().isBlank()) lines.removeAt(lines.lastIndex)
+
+            val categoryIndex = lines.indexOfFirst { it.trim().equals(categoryHeader, ignoreCase = true) }
+            if (categoryIndex >= 0) {
+                // Find the end of this category section (next ## or end of file)
+                var insertAt = categoryIndex + 1
+                while (insertAt < lines.size && !lines[insertAt].startsWith("## ")) {
+                    insertAt++
+                }
+                // Insert before the next section (or at end)
+                lines.add(insertAt, entry)
+            } else {
+                // New category — append at end
+                lines.add("")
+                lines.add(categoryHeader)
+                lines.add(entry)
+            }
+
+            lines.add("")
+            lines.add(timestamp)
+            lines.joinToString("\n") + "\n"
+        }
+
+        val contentSize = newContent.toByteArray(Charsets.UTF_8).size.toLong()
+        if (contentSize > MAX_KNOWLEDGE_FILE_BYTES) {
+            throw IllegalArgumentException(
+                "Knowledge file for $packageName would exceed ${MAX_KNOWLEDGE_FILE_BYTES} bytes ($contentSize). " +
+                "Remove old patterns before adding new ones."
+            )
+        }
+
+        writeFile(path, newContent)
+        return newContent
+    }
+
+    /**
+     * List all packages that have knowledge files.
+     */
+    fun listKnowledgePackages(): List<String> {
+        val dir = resolvePath(KNOWLEDGE_DIR)
+        if (!dir.exists() || !dir.isDirectory) return emptyList()
+        return dir.listFiles()
+            ?.filter { it.name.startsWith(KNOWLEDGE_FILE_PREFIX) && it.name.endsWith(KNOWLEDGE_FILE_EXT) }
+            ?.map { it.name.removePrefix(KNOWLEDGE_FILE_PREFIX).removeSuffix(KNOWLEDGE_FILE_EXT) }
+            ?.sorted()
+            ?: emptyList()
     }
 
     private fun resolvePath(rawPath: String): File {

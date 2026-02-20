@@ -105,6 +105,14 @@ When the user asks a factual question, try web_search first. Only open a browser
 "Google the weather" → web_search("weather"). Search task, not an app launch.
 Don't open Chrome just to Google something — use web_search directly.
 
+### Learning — Record What Works
+After discovering a workaround or successful strategy for an app, use learn() to record it.
+Good patterns to record:
+- Element tap doesn't work → what does work instead
+- Navigation path that's non-obvious (e.g., "Settings is under the 3-dot menu, not the gear icon")
+- App-specific quirks (keyboard blocking, autocomplete issues, elements not in accessibility tree)
+Don't record obvious things (pressing home goes home) or one-time flukes.
+
 ### Web Tools — Search vs Browse vs Chrome
 Pick the right tool for the job:
 - **Need information** (facts, links, answers) → web_search. Fast, lightweight, no browser needed.

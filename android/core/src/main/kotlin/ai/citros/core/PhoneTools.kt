@@ -494,6 +494,30 @@ object PhoneTools {
         )
     )
 
+    val LEARN = Tool(
+        name = "learn",
+        description = "Record a learned pattern about an app. Use after discovering what works or doesn't work for a specific app. Patterns are saved per-app for future retrieval and reuse.",
+        inputSchema = mapOf(
+            "type" to "object",
+            "properties" to mapOf(
+                "app_package" to mapOf(
+                    "type" to "string",
+                    "description" to "Android package name (e.g., com.google.android.apps.messaging)"
+                ),
+                "pattern" to mapOf(
+                    "type" to "string",
+                    "description" to "What you learned — what works, what doesn't, and why"
+                ),
+                "category" to mapOf(
+                    "type" to "string",
+                    "enum" to listOf("navigation", "failure", "strategy"),
+                    "description" to "Category of the pattern (default: navigation)"
+                )
+            ),
+            "required" to listOf("app_package", "pattern")
+        )
+    )
+
     /**
      * All available phone control tools.
      * Use this list when calling chatWithTools().
@@ -608,6 +632,7 @@ object PhoneTools {
         REMEMBER,
         RECALL,
         LIST_MEMORIES,
+        LEARN,
         THINK,
         WAIT,
         LONG_PRESS

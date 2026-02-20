@@ -1810,4 +1810,160 @@ class PhoneAgentApiTest {
         assertNotNull(client.lastSystemPrompt, "sendEphemeral must pass a non-null system prompt (#606)")
         assertTrue(client.lastSystemPrompt!!.isNotBlank(), "system prompt must not be blank")
     }
+
+    // ── Learn tool tests ──
+
+    @Test
+    fun `learn tool records pattern to knowledge file`() = runTest {
+        val tempDir = java.io.File.createTempFile("agent-test", "").also { it.delete(); it.mkdirs() }
+        try {
+            val fileManager = AgentFileManager.fromDirectory(tempDir)
+            val agent = createAgent(fileManager = fileManager)
+
+            val result = agent.executeToolCall(
+                ToolCall("l1", "learn", mapOf(
+                    "app_package" to "com.test.app",
+                    "pattern" to "Tap by text works better than element ID",
+                    "category" to "navigation"
+                )),
+                null
+            )
+
+            assertFalse(result.isError, "learn should succeed: ${result.text}")
+            assertTrue(result.text.contains("Learned pattern"))
+            assertTrue(result.text.contains("com.test.app"))
+
+            // Verify persisted
+            val knowledge = fileManager.readKnowledge("com.test.app")
+            assertNotNull(knowledge, "Knowledge file should exist")
+            assertTrue(knowledge!!.contains("Tap by text works better"))
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `learn tool fails without file manager`() = runTest {
+        val agent = createAgent(fileManager = null)
+        val result = agent.executeToolCall(
+            ToolCall("l1", "learn", mapOf(
+                "app_package" to "com.test.app",
+                "pattern" to "Test pattern"
+            )),
+            null
+        )
+        assertTrue(result.isError, "learn should fail without file manager")
+    }
+
+    @Test
+    fun `learn tool fails with empty app_package`() = runTest {
+        val tempDir = java.io.File.createTempFile("agent-test", "").also { it.delete(); it.mkdirs() }
+        try {
+            val fileManager = AgentFileManager.fromDirectory(tempDir)
+            val agent = createAgent(fileManager = fileManager)
+
+            val result = agent.executeToolCall(
+                ToolCall("l1", "learn", mapOf(
+                    "app_package" to "",
+                    "pattern" to "Test pattern"
+                )),
+                null
+            )
+            assertTrue(result.isError, "learn should fail with empty app_package")
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `learn tool fails with malformed app_package`() = runTest {
+        val tempDir = java.io.File.createTempFile("agent-test", "").also { it.delete(); it.mkdirs() }
+        try {
+            val fileManager = AgentFileManager.fromDirectory(tempDir)
+            val agent = createAgent(fileManager = fileManager)
+
+            val result = agent.executeToolCall(
+                ToolCall("l1", "learn", mapOf(
+                    "app_package" to "../",
+                    "pattern" to "Bad package should be rejected"
+                )),
+                null
+            )
+
+            assertTrue(result.isError, "learn should fail with malformed app_package")
+            assertTrue(result.text.contains("valid Android package name"), "Expected validation message, got: ${result.text}")
+            assertTrue(fileManager.listKnowledgePackages().isEmpty(), "No knowledge file should be created")
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `learn tool fails with invalid category`() = runTest {
+        val tempDir = java.io.File.createTempFile("agent-test", "").also { it.delete(); it.mkdirs() }
+        try {
+            val fileManager = AgentFileManager.fromDirectory(tempDir)
+            val agent = createAgent(fileManager = fileManager)
+
+            val result = agent.executeToolCall(
+                ToolCall("l1", "learn", mapOf(
+                    "app_package" to "com.test.app",
+                    "pattern" to "Test",
+                    "category" to "bogus"
+                )),
+                null
+            )
+            assertTrue(result.isError, "learn should fail with invalid category")
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `learn tool normalizes category case and whitespace`() = runTest {
+        val tempDir = java.io.File.createTempFile("agent-test", "").also { it.delete(); it.mkdirs() }
+        try {
+            val fileManager = AgentFileManager.fromDirectory(tempDir)
+            val agent = createAgent(fileManager = fileManager)
+
+            val result = agent.executeToolCall(
+                ToolCall("l1", "learn", mapOf(
+                    "app_package" to "com.test.app",
+                    "pattern" to "Mixed-case category test",
+                    "category" to "  Navigation  "
+                )),
+                null
+            )
+
+            assertFalse(result.isError, "learn should accept normalized category: ${result.text}")
+            val knowledge = fileManager.readKnowledge("com.test.app")!!
+            assertTrue(knowledge.contains("## Navigation"), "Category header should be normalized")
+            assertTrue(result.text.contains("[navigation]"), "Response should use normalized category")
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `learn tool defaults category to navigation`() = runTest {
+        val tempDir = java.io.File.createTempFile("agent-test", "").also { it.delete(); it.mkdirs() }
+        try {
+            val fileManager = AgentFileManager.fromDirectory(tempDir)
+            val agent = createAgent(fileManager = fileManager)
+
+            val result = agent.executeToolCall(
+                ToolCall("l1", "learn", mapOf(
+                    "app_package" to "com.test.app",
+                    "pattern" to "Default category test"
+                )),
+                null
+            )
+
+            assertFalse(result.isError)
+            val knowledge = fileManager.readKnowledge("com.test.app")!!
+            assertTrue(knowledge.contains("## Navigation"), "Should default to navigation category")
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
 }
