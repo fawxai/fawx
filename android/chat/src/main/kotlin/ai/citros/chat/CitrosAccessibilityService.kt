@@ -14,12 +14,12 @@ class CitrosAccessibilityService : AccessibilityService() {
         super.onServiceConnected()
         
         serviceInfo = AccessibilityServiceInfo().apply {
-            eventTypes = AccessibilityEvent.TYPES_ALL_MASK
+            eventTypes = 0 // No event listening — all screen reading is on-demand
             feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
             flags = AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS or
                     AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
                     AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
-            notificationTimeout = 100
+            notificationTimeout = 250
         }
         
         ScreenReader.attach(this)
@@ -27,7 +27,7 @@ class CitrosAccessibilityService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        // We primarily use on-demand screen reading, not event listening
+        // No-op: we use on-demand screen reading only (eventTypes = 0)
     }
 
     override fun onInterrupt() {
