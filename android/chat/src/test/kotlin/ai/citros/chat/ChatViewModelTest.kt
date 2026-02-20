@@ -1,5 +1,6 @@
 package ai.citros.chat
 
+import ai.citros.core.AgentFileManager
 import ai.citros.core.ChatResponse
 import ai.citros.core.MemoryFilter
 import ai.citros.core.MemoryMetadata
@@ -899,6 +900,39 @@ class ChatViewModelTest {
             System.identityHashCode(backendAfter),
             "Active backend should NOT be rebuilt when delivered keys are unchanged"
         )
+    }
+
+    @Test
+    fun `setAgentFileManager wires file manager into built backends`() {
+        val tempDir = java.io.File.createTempFile("agent-test", "").also { it.delete(); it.mkdirs() }
+        try {
+            val fileManager = AgentFileManager.fromDirectory(tempDir)
+            viewModel.setAgentFileManager(fileManager)
+
+            val keyStore = InMemoryKeyStore()
+            val storage = InMemoryWalletStorage()
+            val walletManager = ai.citros.core.WalletManager(storage, keyStore)
+
+            walletManager.addKey(Provider.OPENAI, "OpenAI Key", "sk-test-openai-key")
+            walletManager.setActiveKey(walletManager.loadOrDefault().keys.first().id)
+            viewModel.configureWithWallet(walletManager)
+
+            val backends = getPrivateField<List<Any>>("apiBackends")!!
+            val activeIndex = getPrivateField<Int>("activeApiBackendIndex")!!
+            val backend = backends[activeIndex]
+
+            val agentField = backend::class.java.getDeclaredField("agent")
+            agentField.isAccessible = true
+            val agent = agentField.get(backend)
+
+            val fmField = agent::class.java.getDeclaredField("agentFileManager")
+            fmField.isAccessible = true
+            val wiredManager = fmField.get(agent)
+
+            assertNotNull(wiredManager, "AgentFileManager should be wired into PhoneAgentApi")
+        } finally {
+            tempDir.deleteRecursively()
+        }
     }
 
     @Test

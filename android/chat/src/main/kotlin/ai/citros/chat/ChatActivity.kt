@@ -1164,6 +1164,7 @@ fun ChatScreen(
             android.util.Log.w("ChatActivity", "Context is not ChatActivity — memory provider not initialized")
         }
 
+        viewModel.setAgentFileManager(agentFileManager)
         viewModel.setSystemPrompt(OnboardingPersistence.systemPromptForStartup(agentFileManager))
 
         // Search config: user Settings override server-delivered keys

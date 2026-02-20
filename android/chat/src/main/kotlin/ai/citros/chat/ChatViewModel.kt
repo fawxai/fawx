@@ -170,6 +170,9 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
     /** Citros app token for authenticating to Citros API endpoints. Set via [setSearchConfig]. */
     private var citrosAppToken: String? = null
 
+    /** Agent file manager for knowledge file tools (learn, read_file, etc.). */
+    private var agentFileManager: AgentFileManager? = null
+
     /**
      * Update search provider configuration.
      *
@@ -180,6 +183,16 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
         searchBaseUrl = searxngUrl
         braveApiKey = braveKey
         tinyFishApiKey = tinyFishKey
+    }
+
+    /**
+     * Set the agent file manager for knowledge tools (learn, read_file, write_file, list_files).
+     *
+     * Call from Activity after creating [AgentFileManager.fromContext]. Must be set
+     * before [configureWithWallet] so backends are built with file tool support.
+     */
+    fun setAgentFileManager(manager: AgentFileManager) {
+        agentFileManager = manager
     }
 
     /**
@@ -555,6 +568,7 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
                 actionClient = actionClient,
                 actionModelId = actionModelId,
                 memoryProvider = memoryProvider,
+                agentFileManager = agentFileManager,
                 searchBaseUrl = searchBaseUrl,
                 braveApiKey = braveApiKey,
                 tinyFishApiKey = tinyFishApiKey,
@@ -1197,6 +1211,7 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
 
     /** Request cancellation of the active tool execution loop. Thread-safe. */
     fun cancelToolExecution() {
+        Log.d(TAG, "cancelToolExecution: setting toolLoopCancelled=true (was=${toolLoopCancelled.get()}, isLoading=${isLoading.value})")
         toolLoopCancelled.set(true)
     }
 

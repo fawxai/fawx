@@ -110,7 +110,11 @@ interface BoundaryCheck {
  */
 class CancellationCheck : BoundaryCheck {
     override suspend fun check(state: LoopState): CheckResult {
-        return if (state.isCancelled) CheckResult.Stop("cancelled") else CheckResult.Continue
+        if (state.isCancelled) {
+            android.util.Log.d("CitrosLoop", "CancellationCheck: isCancelled=true at step=${state.step}, stopping")
+            return CheckResult.Stop("cancelled")
+        }
+        return CheckResult.Continue
     }
 }
 
