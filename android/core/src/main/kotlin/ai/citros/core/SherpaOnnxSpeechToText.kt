@@ -33,9 +33,11 @@ import java.util.concurrent.atomic.AtomicBoolean
  * 3. When speech ends, accumulated audio segment sent to [OfflineRecognizer]
  * 4. Transcription result emitted as [SpeechEvent.Final]
  *
- * The session ends after the first non-empty [SpeechEvent.Final] is emitted.
- * Empty transcription results (e.g. from background noise that passes VAD) are
- * silently discarded and the session continues listening.
+ * Each non-empty transcription result is emitted as a [SpeechEvent.Final].
+ * The session continues listening until stopped via [stopListening], cancelled,
+ * or timed out. Callers should accumulate Finals to build the complete
+ * transcription. Empty transcription results (e.g. from background noise that
+ * passes VAD) are silently discarded and the session continues listening.
  *
  * Model files must be pre-downloaded to [modelDir] before use. Required files:
  * - `silero_vad.onnx` (VAD model)
@@ -206,7 +208,6 @@ class SherpaOnnxSpeechToText(
                     }
 
                     // Drain all completed speech segments from VAD queue
-                    var gotFinal = false
                     while (!currentVad.empty()) {
                         val segment = currentVad.front()
                         currentVad.pop()
@@ -224,16 +225,12 @@ class SherpaOnnxSpeechToText(
 
                         if (text.isNotEmpty()) {
                             trySend(SpeechEvent.Final(text))
-                            gotFinal = true
-                            break // Stop after first successful transcription
                         }
-                        // Empty results (noise, brief sounds) are silently discarded;
-                        // the session continues listening for real speech.
+                        // Reset so next speech detection triggers a fresh Partial.
+                        // Empty results (noise, brief sounds) are silently discarded.
+                        speechDetected = false
                     }
 
-                    if (gotFinal) {
-                        isListening.set(false)
-                    }
                 }
             } catch (e: SecurityException) {
                 trySend(SpeechEvent.Error(SpeechError.PermissionDenied("Microphone permission denied: ${e.message}")))
@@ -301,7 +298,7 @@ class SherpaOnnxSpeechToText(
         const val DEFAULT_TIMEOUT_MS = 30_000L
         const val DEFAULT_MODEL_TYPE = "nemo_transducer"
         const val VAD_THRESHOLD = 0.5f
-        const val VAD_MIN_SILENCE_DURATION = 0.5f
+        const val VAD_MIN_SILENCE_DURATION = 1.5f
         const val VAD_MIN_SPEECH_DURATION = 0.25f
         const val VAD_WINDOW_SIZE = 512
 

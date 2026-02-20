@@ -160,7 +160,44 @@ class SherpaOnnxSpeechToTextTest {
         assertEquals(16000, SherpaOnnxSpeechToText.SAMPLE_RATE)
         assertEquals(30_000L, SherpaOnnxSpeechToText.DEFAULT_TIMEOUT_MS)
         assertEquals(512, SherpaOnnxSpeechToText.VAD_WINDOW_SIZE)
+    }
+
+    @Test
+    fun `VAD silence duration is at least 1 second for natural speech pauses`() {
+        // Regression test for #637: 0.5s silence duration caused premature
+        // recording cutoff during natural speech pauses.
+        assertTrue(
+            "VAD_MIN_SILENCE_DURATION must be >= 1.0s to tolerate natural speech pauses (#637)",
+            SherpaOnnxSpeechToText.VAD_MIN_SILENCE_DURATION >= 1.0f
+        )
         assertEquals("nemo_transducer", SherpaOnnxSpeechToText.DEFAULT_MODEL_TYPE)
+    }
+
+    @Test
+    fun `stopListening is idempotent when called multiple times`() {
+        val provider = SherpaOnnxSpeechToText(modelDir = "/nonexistent")
+        // Multiple calls should not throw — important because beginListening
+        // calls stopListening() on the previous provider before starting new session (#637).
+        provider.stopListening()
+        provider.stopListening()
+        provider.stopListening()
+    }
+
+    @Test
+    fun `cancel is idempotent when called multiple times`() {
+        val provider = SherpaOnnxSpeechToText(modelDir = "/nonexistent")
+        provider.cancel()
+        provider.cancel()
+        provider.cancel()
+    }
+
+    @Test
+    fun `stopListening followed by release is safe sequence`() {
+        // Verifies the re-tap cleanup sequence: stopListening() to signal
+        // the capture loop, then release() to free native resources.
+        val provider = SherpaOnnxSpeechToText(modelDir = "/nonexistent")
+        provider.stopListening()
+        provider.release()
     }
 
     @Test

@@ -14,7 +14,9 @@ import ai.citros.core.VoiceManager
 import ai.citros.core.SpeechEvent
 import ai.citros.core.SpeechToTextProvider
 import ai.citros.core.SpeechError
+import ai.citros.core.VoiceAccumulator
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -2800,19 +2802,20 @@ internal fun MessageInput(
     val context = LocalContext.current
 
     fun beginListening(stt: SpeechToTextProvider) {
+        // Cancel any previous listening session to avoid two AudioRecord
+        // instances fighting over the microphone (#637).
+        val previousJob = listeningJob
+        stt.stopListening()
+        val prefix = text  // Preserve existing text in the input field (#637)
         isListening = true
         listeningJob = coroutineScope.launch {
+            // Wait for old AudioRecord cleanup to complete before creating
+            // a new one. cancel() is async — the old job's finally block
+            // (which calls audioRecord.stop()/release()) may not have run yet.
+            previousJob?.cancelAndJoin()
+            val accumulator = VoiceAccumulator(prefix)
             stt.startListening().collect { event ->
                 when (event) {
-                    is SpeechEvent.Partial -> text = event.text
-                    is SpeechEvent.Final -> {
-                        text = event.text
-                        isListening = false
-                        if (voiceManager?.autoSendAfterVoice?.value == true && event.text.isNotBlank()) {
-                            if (isLoading) onSteer(event.text) else onSend(event.text)
-                            text = ""
-                        }
-                    }
                     is SpeechEvent.Error -> {
                         isListening = false
                         val err = event.error
@@ -2825,7 +2828,23 @@ internal fun MessageInput(
                         }
                         Toast.makeText(context, errorMsg, Toast.LENGTH_SHORT).show()
                     }
+                    else -> {
+                        accumulator.onEvent(event)?.let { display -> text = display }
+                    }
                 }
+            }
+            // Flow completed naturally (timeout or provider stopped).
+            // Auto-send the complete accumulated transcription if enabled.
+            isListening = false
+            val result = accumulator.finish(
+                autoSend = voiceManager?.autoSendAfterVoice?.value == true
+            )
+            val sendText = result.autoSendText
+            if (sendText != null) {
+                if (isLoading) onSteer(sendText) else onSend(sendText)
+                text = ""
+            } else {
+                text = result.displayText
             }
         }
     }
