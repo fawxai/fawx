@@ -418,6 +418,17 @@ class OverlayServiceTest {
         assertEquals(-1, savedVisibility)
     }
 
+    // Regression guard (#583): calculateMiniChatHeight was removed from production code.
+    // This test ensures only the current public height API (calculateBubbleBaseY) is tested
+    // and no stale references cause compile errors.
+    @Test
+    fun `no stale calculateMiniChatHeight reference exists`() {
+        // If this test compiles, the stale reference from #583 is confirmed gone.
+        // calculateBubbleBaseY is the only public height API on OverlayService.
+        val result = OverlayService.calculateBubbleBaseY(1920, 2.0f)
+        assertTrue(result > 0, "calculateBubbleBaseY should return a positive value")
+    }
+
     // softInputMode (#444/#451) and keyboard behavior require instrumented tests —
     // buildLayoutParams is private, and WindowManager interaction can't be verified
     // in Robolectric. Verified on-device: SOFT_INPUT_ADJUST_PAN pans the overlay

@@ -1405,6 +1405,53 @@ class ChatViewModelTest {
     }
 
     @Test
+    fun `queued message is cleared before dispatch to prevent duplicates`() = runTest {
+        // Regression test for #561: queuedMessage must be consumed (cleared) before
+        // sendMessage is called, not after. Otherwise re-entrant reads could dispatch
+        // the same message twice.
+        val scripted = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            scripted = ArrayDeque(
+                listOf(
+                    // Response to initial message (tool loop)
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(ToolCall("t1", "press_back", emptyMap())),
+                        stopReason = "tool_use"
+                    ),
+                    ChatResponse(
+                        text = "First done",
+                        toolCalls = emptyList(),
+                        stopReason = "end_turn"
+                    ),
+                    // Response to queued message
+                    ChatResponse(
+                        text = "Queued done",
+                        toolCalls = emptyList(),
+                        stopReason = "end_turn"
+                    )
+                )
+            )
+        )
+        setApiModeWithBackends(
+            viewModel,
+            listOf(viewModel.createTestBackend(Provider.ANTHROPIC, scripted, scripted))
+        )
+
+        // "open" triggers action mode (matches isLikelyConversationalMessage action hints),
+        // ensuring the message routes through chatWithTools (tracked by scripted.calls)
+        viewModel.setQueuedMessage("open the settings")
+        viewModel.sendMessage("open something")
+        advanceUntilIdle()
+
+        // queuedMessage must be null after dispatch
+        assertNull(viewModel.queuedMessage.value, "Queued message must be cleared before dispatch (#561)")
+        // Verify no duplicate dispatch: initial chatWithTools + tool loop continue + queued = 3
+        // If queuedMessage wasn't cleared before dispatch, we'd see 4+ calls
+        assertEquals(3, scripted.calls, "Queued message should be dispatched exactly once, not duplicated")
+    }
+
+    @Test
     fun `checkStuck returns null when screens are changing`() {
         val state = ChatViewModel.StuckDetectionState()
 

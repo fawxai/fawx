@@ -373,9 +373,13 @@ open class PhoneAgentApi(
         val ephemeralMessages = messages.toMutableList().apply {
             add(Message(role = "user", content = prompt))
         }
+        val phoneControlAvailable = phoneControlOverride ?: ScreenReader.isAttached()
+        val modelName = chatClient.modelId
+        val systemPrompt = promptBuilder?.full(phoneControlAvailable = phoneControlAvailable, modelName = modelName)
+            ?: PhoneAgentPrompts.buildSystemPrompt(phoneControlAvailable = phoneControlAvailable, modelName = modelName)
         val result = chatClient.chatWithTools(
             ephemeralMessages,
-            systemPrompt = null,
+            systemPrompt = systemPrompt,
             tools = emptyList()
         )
         return result.fold(

@@ -924,11 +924,14 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
                 if (!toolLoopCancelled.get()) {
                     pendingTaskMessage = null
                 }
-                // Dispatch queued message only if loop was not cancelled
+                // Dispatch queued message only if loop was not cancelled.
+                // Clear before sending to prevent duplicate dispatch (#561):
+                // if sendMessage re-enters before the clear, the same message
+                // could be dispatched twice.
                 if (!toolLoopCancelled.get()) {
                     val pending = queuedMessage.value?.takeIf { it.isNotBlank() }
+                    queuedMessage.value = null
                     if (pending != null) {
-                        queuedMessage.value = null
                         sendMessage(pending)
                     }
                 }

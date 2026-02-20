@@ -1375,6 +1375,8 @@ class PhoneAgentApiTest {
         var describeImageCalls = 0
         /** Last messages list passed to chatWithTools, for verifying conversation flow. */
         var lastMessages: List<Message>? = null
+        /** Last system prompt passed to chatWithTools. */
+        var lastSystemPrompt: String? = null
 
         override suspend fun chat(conversation: Conversation): Result<String> {
             chatCalls++
@@ -1389,6 +1391,7 @@ class PhoneAgentApiTest {
         ): Result<ChatResponse> {
             chatWithToolsCalls++
             lastMessages = messages.toList()
+            lastSystemPrompt = systemPrompt
             return Result.success(toolResponses.removeFirst())
         }
 
@@ -1784,5 +1787,26 @@ class PhoneAgentApiTest {
 
         // Synchronized ensures only one seed succeeds — exactly 2 messages
         assertEquals(2, agent.messageCount)
+    }
+
+    // ========== sendEphemeral system prompt regression (#606) ==========
+
+    @Test
+    fun `sendEphemeral passes non-null system prompt`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(listOf(
+                ChatResponse(text = "Summary of progress", toolCalls = emptyList(), stopReason = "end_turn")
+            ))
+        )
+        val agent = PhoneAgentApi(chatClient = client, actionClient = client).also {
+            it.phoneControlOverride = true
+        }
+
+        val result = agent.sendEphemeral("[System: Summarize progress]")
+
+        assertEquals("Summary of progress", result)
+        assertNotNull(client.lastSystemPrompt, "sendEphemeral must pass a non-null system prompt (#606)")
+        assertTrue(client.lastSystemPrompt!!.isNotBlank(), "system prompt must not be blank")
     }
 }
