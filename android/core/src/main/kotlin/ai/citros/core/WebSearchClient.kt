@@ -99,9 +99,9 @@ class WebSearchClient(
             return searchBrave(query, clampedCount)
         }
 
-        // All providers failed
+        // All providers failed — directive prevents model from opening a browser app as workaround
         return ToolResult(
-            "Web search failed. DuckDuckGo returned no results and no fallback provider is configured.",
+            "Web search temporarily unavailable. Tell the user the search could not be completed and suggest they try again later. Do NOT open Chrome or any browser app to search manually.",
             isError = true
         )
     }
@@ -135,8 +135,9 @@ class WebSearchClient(
 
                     val results = parseDuckDuckGoResults(body, count)
                     if (results.isEmpty()) {
+                        Log.w(TAG, "DuckDuckGo returned no organic results (body=${body.length} chars, may be rate-limited)")
                         return@withContext ToolResult(
-                            "DuckDuckGo returned no results (may be rate-limited)",
+                            "DuckDuckGo returned no results (may be rate-limited). Do NOT open a browser app to search manually.",
                             isError = true
                         )
                     }
@@ -208,13 +209,13 @@ class WebSearchClient(
                 httpClient.newCall(request).execute().use { response ->
                     if (!response.isSuccessful) {
                         return@withContext ToolResult(
-                            "Brave search failed (${response.code}): ${response.message}",
+                            "Brave search failed (${response.code}): ${response.message}. Do NOT open a browser app to search manually.",
                             isError = true
                         )
                     }
 
                     val body = response.body?.string() ?: return@withContext ToolResult(
-                        "Brave search returned empty response",
+                        "Brave search returned empty response. Do NOT open a browser app to search manually.",
                         isError = true
                     )
 
@@ -334,7 +335,7 @@ class WebSearchClient(
 
     internal fun formatResults(query: String, results: List<SearchResult>): String {
         if (results.isEmpty()) {
-            return "No results found for: $query"
+            return "No results found for: $query. Tell the user no results were found. Do NOT open a browser app to search manually."
         }
         return buildString {
             appendLine("Search results for: $query")

@@ -91,6 +91,8 @@ class WebSearchClientTest {
 
         assertFalse(result.isError)
         assertTrue(result.text.contains("No results found"))
+        assertTrue(result.text.contains("Do NOT open a browser"),
+            "Empty results should include anti-browser directive: ${result.text}")
     }
 
     @Test
@@ -98,6 +100,8 @@ class WebSearchClientTest {
         val client = WebSearchClient(ddgEndpoint = null)
         val result = client.search("test")
         assertTrue(result.isError, "Should fail when all providers are unavailable")
+        assertTrue(result.text.contains("Do NOT open Chrome"),
+            "Error should include anti-browser directive: ${result.text}")
     }
 
     // ========== Brave fallback tests ==========
@@ -147,8 +151,18 @@ class WebSearchClientTest {
         val result = client.search("test")
 
         assertTrue(result.isError)
-        assertTrue(result.text.contains("failed"),
-            "Should mention failure: ${result.text}")
+        // Falls through to all-providers-failed which has the anti-browser directive
+        assertTrue(result.text.contains("Do NOT open Chrome"),
+            "Should include anti-browser directive: ${result.text}")
+    }
+
+    @Test
+    fun `formatResults empty results include anti-browser directive`() {
+        val client = WebSearchClient()
+        val formatted = client.formatResults("test", emptyList())
+        assertTrue(formatted.contains("No results found"))
+        assertTrue(formatted.contains("Do NOT open a browser"),
+            "Empty results should warn against browser fallback: $formatted")
     }
 
     // ========== Parsing tests ==========

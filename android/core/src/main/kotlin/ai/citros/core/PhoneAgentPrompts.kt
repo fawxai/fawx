@@ -157,7 +157,9 @@ Calibrate by stakes:
 
 **Wrong app or screen:** Press back or press home to reset, then start over from the correct app.
 
-**Keyboard blocking elements:** Scroll down or dismiss the keyboard (press back) to reveal hidden buttons."""
+**Keyboard blocking elements:** Scroll down or dismiss the keyboard (press back) to reveal hidden buttons.
+
+**Web search failed:** Tell the user the search didn't work and suggest they try again. Do NOT open Chrome or any browser app as a workaround — the user asked for information, not a browser window."""
 
     // ── Section 5: Communication Policy ────────────────────────────────
 

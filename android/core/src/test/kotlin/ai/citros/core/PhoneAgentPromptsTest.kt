@@ -207,6 +207,12 @@ class PhoneAgentPromptsTest {
         assertContains(PhoneAgentPrompts.SECTION_RECOVERY, "Keyboard blocking")
     }
 
+    @Test
+    fun `recovery section covers web search failure with anti-browser directive`() {
+        assertContains(PhoneAgentPrompts.SECTION_RECOVERY, "Web search failed")
+        assertContains(PhoneAgentPrompts.SECTION_RECOVERY, "Do NOT open Chrome")
+    }
+
     // ── buildActionPrompt ───────────────────────────────────────────────
 
     @Test
