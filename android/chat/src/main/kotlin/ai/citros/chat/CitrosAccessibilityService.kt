@@ -14,7 +14,9 @@ class CitrosAccessibilityService : AccessibilityService() {
         super.onServiceConnected()
         
         serviceInfo = AccessibilityServiceInfo().apply {
-            eventTypes = 0 // No event listening — all screen reading is on-demand
+            // Start with no event listening. InterruptionDetector dynamically
+            // toggles TYPE_WINDOW_STATE_CHANGED when monitoring is active.
+            eventTypes = 0
             feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
             flags = AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS or
                     AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
@@ -23,11 +25,14 @@ class CitrosAccessibilityService : AccessibilityService() {
         }
         
         ScreenReader.attach(this)
+        InterruptionDetector.attach(this)
         ClipboardHelper.attach(this)
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        // No-op: we use on-demand screen reading only (eventTypes = 0)
+        // Forward to InterruptionDetector for classification.
+        // Only fires when monitoring is active (eventTypes dynamically toggled).
+        event?.let { InterruptionDetector.onAccessibilityEvent(it) }
     }
 
     override fun onInterrupt() {
@@ -36,6 +41,7 @@ class CitrosAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         ClipboardHelper.detach()
+        InterruptionDetector.detach()
         ScreenReader.detach()
         super.onDestroy()
     }

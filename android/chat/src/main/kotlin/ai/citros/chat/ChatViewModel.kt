@@ -921,8 +921,10 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
                         delegate = this@ChatViewModel,
                         progressListener = this@ChatViewModel,
                         maxToolSteps = MAX_TOOL_STEPS,
-                        steerMessageSource = { drainSteerQueue() }
+                        steerMessageSource = { drainSteerQueue() },
+                        interruptionSource = { InterruptionDetector.drain() }
                     )
+                    InterruptionDetector.startMonitoring(screenContent?.packageName)
                     val result = executor.run(
                         initialResponse = response,
                         initialScreenContent = screenContent,
@@ -967,6 +969,8 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
             } catch (e: Exception) {
                 messages.add(Message(role = "assistant", content = "💥 Crashed: ${e.message?.take(120)}"))
             } finally {
+                // Stop interruption monitoring
+                InterruptionDetector.stopMonitoring()
                 // Restore overlay visibility after tool loop ends (#457)
                 try {
                     ScreenReader.toolLoopOverlayRestoreHook?.invoke()
@@ -1078,9 +1082,15 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
     // ========== ToolExecutionDelegate implementation ==========
 
     override suspend fun executeToolCall(toolCall: ToolCall, screenContent: ScreenContent?): ToolResult {
-        return phoneAgentApi?.executeToolCall(toolCall, screenContent)
-            ?: phoneAgentLocal?.executeToolCall(toolCall, screenContent)
-            ?: ToolResult("Not configured", isError = true)
+        val isUiMutating = isUiMutatingTool(toolCall.name)
+        if (isUiMutating) InterruptionDetector.markAgentAction()
+        try {
+            return phoneAgentApi?.executeToolCall(toolCall, screenContent)
+                ?: phoneAgentLocal?.executeToolCall(toolCall, screenContent)
+                ?: ToolResult("Not configured", isError = true)
+        } finally {
+            if (isUiMutating) InterruptionDetector.clearAgentAction()
+        }
     }
 
     override suspend fun refreshScreen(): ScreenContent? {
@@ -1091,12 +1101,15 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
 
     override suspend fun refreshScreenAfterTool(toolName: String, actionResult: String): ScreenContent? {
         val usesSmartPoll = toolName == "open_app" || toolName == "press_home"
-        return if (usesSmartPoll && !actionResult.startsWith("Failed")) {
+        val screen = if (usesSmartPoll && !actionResult.startsWith("Failed")) {
             val selfPackage = BuildConfig.APPLICATION_ID
             pollForPackageChangeImpl(selfPackage)
         } else {
             refreshScreen()
         }
+        // Update expected package so InterruptionDetector knows where the agent is
+        screen?.packageName?.let { InterruptionDetector.setExpectedPackage(it) }
+        return screen
     }
 
     override suspend fun settleDelay(toolName: String, actionResult: String) {

@@ -222,4 +222,44 @@ class UserInterruptionTest {
         // Steer message should have been delivered
         assertTrue(delegate.steerMessages.any { it.contains("switched from com.gmail to com.calendar") })
     }
+
+    @Test
+    fun `AgentExecutor pauses loop on external interruption`() = runTest {
+        val delegate = FakeToolExecutionDelegate()
+        val listener = FakeLoopProgressListener()
+        var eventFired = false
+        val interruptionSource: () -> InterruptionEvent? = {
+            if (!eventFired) {
+                eventFired = true
+                InterruptionEvent.ExternalInterrupt("Incoming phone call detected")
+            } else null
+        }
+
+        val executor = AgentExecutor(
+            delegate = delegate,
+            progressListener = listener,
+            boundaryChecks = listOf(
+                CancellationCheck(),
+                StepLimitCheck(),
+                StuckDetectionCheck.withDefaults(),
+                ActionVerificationCheck(),
+                UserInterruptionCheck(),
+                SteerCheck()
+            ),
+            interruptionSource = interruptionSource
+        )
+        val response = ChatResponse(
+            text = null,
+            toolCalls = listOf(ToolCall("t1", "tap", mapOf("element_id" to 1))),
+            stopReason = "tool_use"
+        )
+
+        val result = executor.run(response, null, { false }) {
+            ChatResponse(text = "OK, pausing for call", toolCalls = emptyList(), stopReason = "end_turn")
+        }
+
+        assertIs<LoopResult.Completed>(result)
+        assertEquals("end_turn", result.exitReason)
+        assertTrue(delegate.steerMessages.any { it.contains("Incoming phone call detected") })
+    }
 }
