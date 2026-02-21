@@ -124,6 +124,39 @@ class OrphanedToolResultTest {
         assertEquals("user", orphanConverted!!.role)
     }
 
+    @Test
+    fun `sanitizeMessages truncates converted orphaned tool_result content to 200 chars`() {
+        val longContent = "x".repeat(260)
+        val messages = listOf(
+            Message(role = "user", content = "hello"),
+            Message(role = "assistant", content = "Done"),
+            Message.toolResult("orphan_id", longContent)
+        )
+
+        val result = client.sanitizeMessages(messages)
+        val converted = result.last()
+        assertEquals("user", converted.role)
+        assertTrue(converted.content.startsWith("[tool result] "))
+        val preserved = converted.content.removePrefix("[tool result] ")
+        assertEquals(200, preserved.length)
+        assertEquals("x".repeat(200), preserved)
+    }
+
+    @Test
+    fun `sanitizeMessages converts tool message with null toolCallId to text`() {
+        val messages = listOf(
+            Message(role = "user", content = "hello"),
+            Message.assistantWithTools("tapping", listOf(ToolCall("t1", "tap", mapOf("element_id" to 1)))),
+            Message(role = Message.ROLE_TOOL, content = "Result missing tool id")
+        )
+
+        val result = client.sanitizeMessages(messages)
+        val converted = result.last()
+        assertEquals(Message.ROLE_USER, converted.role)
+        assertTrue(converted.content.contains("Result missing tool id"))
+        assertNull(converted.contentBlocks)
+    }
+
     // ==================== Long tool loop + follow-up ====================
 
     @Test

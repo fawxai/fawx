@@ -151,9 +151,6 @@ class AnthropicClient : BaseProviderClient {
     }
 
     /**
-     * Build request body for Anthropic Messages API with tool support.
-     */
-    /**
      * Sanitize messages before sending to the API.
      *
      * Validates that every tool_result block references a tool_use in the
@@ -232,12 +229,6 @@ class AnthropicClient : BaseProviderClient {
         maxTokens: Int
     ): JsonObject {
         val sanitizedMessages = sanitizeMessages(messages)
-        // Diagnostic logging: log first/last few message roles for debugging
-        if (sanitizedMessages.size > 4) {
-            val first3 = sanitizedMessages.take(3).map { "${it.role}(blocks=${it.contentBlocks != null})" }
-            val last3 = sanitizedMessages.takeLast(3).map { "${it.role}(blocks=${it.contentBlocks != null})" }
-            Log.d("CitrosAPI", "buildToolRequest: ${sanitizedMessages.size} msgs, first=$first3, last=$last3")
-        }
         return buildJsonObject {
             put("model", config.chatModelId)
             put("max_tokens", maxTokens)
