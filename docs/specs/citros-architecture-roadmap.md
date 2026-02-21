@@ -33,24 +33,24 @@ Horizons 0 and 1 are **COMPLETE**. Horizon 2 is **~60% complete** (7/12 items sh
 | §3 Clean Loop | continueAfterTools, no synthetic messages | H1.1 | ✅ Shipped |
 | §4 Model Floor | Sonnet-minimum for action loop security | H1 (PR #496) | ✅ Shipped |
 | §5 Implicit Observation | Screen content in UI-mutating tool results | H1.1 | ✅ Shipped |
-| §6 Subtask Decomposition | `subtask` tool, isolated context, depth limits | H3.2 | 🔲 Not started |
-| §7 Output Classification | SHOW/SHOW_DIMMED/HIDE, TTS routing | H2.5 (PR #670) | ✅ Shipped |
+| §6 Subtask Decomposition | `subtask` tool, isolated context, depth limits | H3.1 | 🔲 Not started |
+| §7 Output Classification | SHOW/SHOW_DIMMED/HIDE, TTS routing | H2.3 (PR #670) | ✅ Shipped |
 | §8 Metacognitive Layer | Three-timescale reflection, self-improvement | H3.3 | 🔲 Not started |
 | §9 Tool Gating | Gate tools on accessibility state | H1 (PR #496) | ✅ Shipped |
 | §12.1 Action Policy Engine | Per-tool ALLOW/CONFIRM/DENY | H2.7 | 🔲 Not started |
 | §12.2 Voice I/O | STT/TTS integration | H2 Voice | ✅ Shipped |
 | §12.3 Local LLM Routing | Security evaluation for local models | Deferred | 🔲 Blocked (security) |
-| §12.4 Proactive Behavior | Agent-initiated loops (briefings, reminders) | H3.7 | 🔲 Not started |
-| §12.5 Sensor Context | Battery/location/time in prompt | H2.9 | 🔲 Not started |
-| §12.6 Privacy-Sensitive Apps | Selective screen blindness | H2.11 | 🔲 Not started |
+| §12.4 Proactive Behavior | Agent-initiated loops (briefings, reminders) | H3.4 | 🔲 Not started |
+| §12.5 Sensor Context | Battery/location/time in prompt | H2.8 | 🔲 Not started |
+| §12.6 Privacy-Sensitive Apps | Selective screen blindness | H2.6 | 🔲 Not started |
 | §12.7 Web Search | web_search/web_fetch tools | H2 (PR #497) | ✅ Shipped |
-| §12.8 Cost Tracking | Token tracking + budget limits | H2.10 | ⚠️ Partial (#531) |
-| §12.9 User Interruption | Detect user touch/app switch, pause | H2.8 | 🔲 Not started |
+| §12.8 Cost Tracking | Token tracking + budget limits | H2.11 | ⚠️ Partial (#531) |
+| §12.9 User Interruption | Detect user touch/app switch, pause | H2.5 | 🔲 Not started |
 | §12.10 Rust Migration | Kotlin → Rust daemon transition | H3.8 | 🔲 Not started |
 
 **v2 Implementation Phases:**
 - Phase 1 (Clean Loop Foundation): ✅ COMPLETE
-- Phase 2 (Subtask Decomposition): 🔲 Not started → H3.2
+- Phase 2 (Subtask Decomposition): 🔲 Not started → H3.1
 - Phase 3 (Metacognitive Layer): 🔲 Not started → H3.3
 - Phase 4 (Refinement & Long Tail): 🔲 Not started → H3+
 
@@ -217,35 +217,7 @@ Store facts and user preferences that survive conversation resets:
 
 **Informed by OpenClaw:** Their session lifecycle (daily reset at 4 AM + idle timeout + manual `/new`) is well-designed. We adapt: phone users expect persistent chat UI but fresh context. Show all messages in scroll history, but only send recent ones to the model.
 
-#### 2.3 Tool Grouping 🔲 (#557)
-
-Divide the 27 tools into categories and only send relevant ones:
-
-| Group | Tools | When to include |
-|-------|-------|-----------------|
-| Core | open_app, tap, tap_text, type_text, scroll, swipe, press_back, press_home, read_screen | Always (when accessibility attached) |
-| Extended | long_press, screenshot, paste, wait | Always |
-| Notifications | read_notifications, tap_notification, dismiss_notification, reply_notification | Always |
-| Timer/Alarm | set_timer, set_alarm | When user mentions time-related task |
-| Files | read_file, write_file, list_files | When user mentions files/notes |
-| Memory | remember, recall | Always |
-| Clipboard | clipboard_copy, clipboard_read | When user mentions copy/paste |
-
-**Why it matters:** 27 tool schemas is ~3-4K tokens. Dropping to 15 core tools saves ~1.5K tokens per turn — that's meaningful context budget, especially on Haiku.
-
-**Informed by OpenClaw:** Their skills system is lazy-loaded metadata (~97 chars per skill in prompt, full SKILL.md read on demand). Full lazy loading is overkill for us, but grouping achieves 80% of the benefit with 20% of the complexity.
-
-#### 2.4 Model-Aware Prompt Tuning 🔲 (#558)
-
-Different prompts for different model tiers:
-
-- **Opus/GPT-5:** Full prompt with strategy section — model is smart enough to follow complex instructions
-- **Sonnet/GPT-4o:** Concise prompt — strip examples, rely on tool schemas more
-- **Haiku/GPT-4o-mini:** Minimal prompt — core rules only, fewer tools, tighter step limits
-
-**Informed by OpenClaw:** They have prompt modes (full/minimal/none) for main agents vs sub-agents. Same principle: less capable models need simpler instructions, not more.
-
-#### 2.5 Progressive Status Updates ✅ (PR #670)
+#### 2.3 Progressive Status Updates ✅ (PR #670)
 
 Stream tool execution status to the UI during loops:
 
@@ -260,7 +232,7 @@ This replaces the current "Thinking..." with real-time progress. Doesn't require
 
 **Informed by OpenClaw:** Their block streaming and typing indicators give users instant feedback. We don't need streaming from the API — tool execution names are available synchronously.
 
-#### 2.6 Per-Action Verification ✅ (PR #671)
+#### 2.4 Per-Action Verification ✅ (PR #671)
 
 Upgrade from passive stuck detection (screen hash repetition) to **active verification after every action**:
 
@@ -304,6 +276,35 @@ This is the single highest-leverage reliability improvement. Stuck detection cat
 | #668 | Notes app navigation fix |
 | #670 | Tool output verbosity (OutputClassifier.formatStatus) |
 | Voice I/O MVP | SherpaOnnx STT + Android TTS + mic in ChatActivity (#556 closed) |
+#### 2.5 User Interruption Detection 🔲
+
+*Source: agentic-loop-v2.md §12.9*
+
+Detect when the user takes control mid-task and handle gracefully:
+
+1. **Screen change detection** — foreground app changes without agent action → user switched apps. Pause loop.
+2. **User touch detection** — accessibility service distinguishes agent-injected events from user touches. Any user touch during execution → pause.
+3. **Interruption protocol** — agent pauses and asks: "I was working on [task]. Want me to continue or cancel?"
+4. **State preservation** — conversation history and step progress preserved for resume.
+
+Builds on existing steer infrastructure (boundary checkpoints). The difference: steer is explicit (user types a message), interruption is implicit (user touches screen).
+
+#### 2.6 Privacy-Sensitive App Handling 🔲
+
+*Source: agentic-loop-v2.md §12.6, SPEC.md §6.1*
+
+Selective screen blindness for apps on a user-configured privacy list (banking, health, etc.):
+
+- When a privacy-listed app is in the foreground, screen content is **not** appended to tool results
+- Agent receives: `"SCREEN: [Privacy mode — screen content hidden for this app. Ask the user for guidance if needed.]"`
+- Agent can still execute blind actions (press_back, press_home) but cannot observe results
+- Privacy list managed in Settings
+
+This is a security/trust feature — users need to feel safe that their banking app screens aren't being sent to cloud LLMs.
+
+
+---
+
 #### 2.7 Action Policy Engine 🔲
 
 *Source: [agentic-loop-v2.md §12.1](../agentic-loop-v2.md#121-action-policy-engine-spec-353), SPEC.md §3.5.3*
@@ -324,20 +325,7 @@ Per-tool security gates that intercept tool calls before execution. The policy e
 
 **Phase 1:** Lightweight check in AgentExecutor. **Full engine:** Signed config, capability grants, comes with Rust daemon.
 
-#### 2.8 User Interruption Detection 🔲
-
-*Source: agentic-loop-v2.md §12.9*
-
-Detect when the user takes control mid-task and handle gracefully:
-
-1. **Screen change detection** — foreground app changes without agent action → user switched apps. Pause loop.
-2. **User touch detection** — accessibility service distinguishes agent-injected events from user touches. Any user touch during execution → pause.
-3. **Interruption protocol** — agent pauses and asks: "I was working on [task]. Want me to continue or cancel?"
-4. **State preservation** — conversation history and step progress preserved for resume.
-
-Builds on existing steer infrastructure (boundary checkpoints). The difference: steer is explicit (user types a message), interruption is implicit (user touches screen).
-
-#### 2.9 Sensor Context 🔲
+#### 2.8 Sensor Context 🔲
 
 *Source: agentic-loop-v2.md §12.5. Related: #344 (status bar awareness)*
 
@@ -355,7 +343,35 @@ Informs agent decisions:
 
 Lightweight — reads Android system APIs, no extra permissions beyond what's already granted.
 
-#### 2.10 Cost Tracking & Budgets ⚠️ Partial
+#### 2.9 Tool Grouping 🔲 (#557)
+
+Divide the 27 tools into categories and only send relevant ones:
+
+| Group | Tools | When to include |
+|-------|-------|-----------------|
+| Core | open_app, tap, tap_text, type_text, scroll, swipe, press_back, press_home, read_screen | Always (when accessibility attached) |
+| Extended | long_press, screenshot, paste, wait | Always |
+| Notifications | read_notifications, tap_notification, dismiss_notification, reply_notification | Always |
+| Timer/Alarm | set_timer, set_alarm | When user mentions time-related task |
+| Files | read_file, write_file, list_files | When user mentions files/notes |
+| Memory | remember, recall | Always |
+| Clipboard | clipboard_copy, clipboard_read | When user mentions copy/paste |
+
+**Why it matters:** 27 tool schemas is ~3-4K tokens. Dropping to 15 core tools saves ~1.5K tokens per turn — that's meaningful context budget, especially on Haiku.
+
+**Informed by OpenClaw:** Their skills system is lazy-loaded metadata (~97 chars per skill in prompt, full SKILL.md read on demand). Full lazy loading is overkill for us, but grouping achieves 80% of the benefit with 20% of the complexity.
+
+#### 2.10 Model-Aware Prompt Tuning 🔲 (#558)
+
+Different prompts for different model tiers:
+
+- **Opus/GPT-5:** Full prompt with strategy section — model is smart enough to follow complex instructions
+- **Sonnet/GPT-4o:** Concise prompt — strip examples, rely on tool schemas more
+- **Haiku/GPT-4o-mini:** Minimal prompt — core rules only, fewer tools, tighter step limits
+
+**Informed by OpenClaw:** They have prompt modes (full/minimal/none) for main agents vs sub-agents. Same principle: less capable models need simpler instructions, not more.
+
+#### 2.11 Cost Tracking & Budgets ⚠️ Partial
 
 *Source: agentic-loop-v2.md §12.8. Token tracking shipped: PR #531*
 
@@ -365,28 +381,12 @@ Lightweight — reads Android system APIs, no extra permissions beyond what's al
 - 🔲 **Reflection cost control** — skip post-task reflection when budget is low
 - 🔲 **Subtask cost inheritance** — subtask tokens count toward parent task total
 
-#### 2.11 Privacy-Sensitive App Handling 🔲
-
-*Source: agentic-loop-v2.md §12.6, SPEC.md §6.1*
-
-Selective screen blindness for apps on a user-configured privacy list (banking, health, etc.):
-
-- When a privacy-listed app is in the foreground, screen content is **not** appended to tool results
-- Agent receives: `"SCREEN: [Privacy mode — screen content hidden for this app. Ask the user for guidance if needed.]"`
-- Agent can still execute blind actions (press_back, press_home) but cannot observe results
-- Privacy list managed in Settings
-
-This is a security/trust feature — users need to feel safe that their banking app screens aren't being sent to cloud LLMs.
-
 
 ---
 
 ### Horizon 3: Ecosystem (3+ months out)
 
-#### 3.1 Model Failover Chain
-When Key Wallet supports multiple keys/providers: auth rotation with cooldowns, model fallback chain, session-sticky auth. Direct port of OpenClaw's failover system.
-
-#### 3.2 Subtask Decomposition & Multi-Step Planning 🔲
+#### 3.1 Subtask Decomposition & Multi-Step Planning 🔲
 
 *Source: agentic-loop-v2.md §6 (v2 Phase 2). Full API design + execution model: [agentic-loop-v2.md §6](../agentic-loop-v2.md#6-subtask-decomposition)*
 
@@ -420,6 +420,9 @@ val SUBTASK = Tool(
 
 This is NOT OpenClaw's sub-agent system (we don't need isolated sessions). It's a planning layer on top of the tool loop.
 
+#### 3.2 Model Failover Chain
+When Key Wallet supports multiple keys/providers: auth rotation with cooldowns, model fallback chain, session-sticky auth. Direct port of OpenClaw's failover system.
+
 #### 3.3 Metacognitive Layer & Learned Patterns 🔲
 
 *Source: agentic-loop-v2.md §8 (v2 Phase 3). Full reflection design + storage: [agentic-loop-v2.md §8](../agentic-loop-v2.md#8-metacognitive-layer--self-awareness-and-self-improvement). Related: #349 (app nav maps), #350 (telemetry), #650 (scoped knowledge)*
@@ -451,13 +454,26 @@ The agent reflects, learns, and improves over time. Three timescales:
 
 **Learned Navigation Patterns** (original H3.3): Store successful paths ("compose email: open Gmail → tap Compose FAB") in scoped knowledge. Inject into system prompt when agent interacts with that app. Connects to Open Question #7 (scoped agent knowledge).
 
-#### 3.4 Gateway Integration (Optional)
-For power users who want to control their phone from a VPS:
-- Phone as an OpenClaw node
-- Gateway sends commands, phone executes
-- Screen content relayed back
+#### 3.4 Proactive Agent Behavior 🔲
 
-This is the horizon 2-3 escape hatch mentioned in the product principle. NOT the core product.
+*Source: [agentic-loop-v2.md §12.4](../agentic-loop-v2.md#124-proactive-agent-behavior), SPEC.md §3.4 Phase 4. Issue: #597*
+
+Agent-initiated loops — the agent starts tasks without user prompting:
+
+```kotlin
+sealed class LoopTrigger {
+    data class UserMessage(val text: String) : LoopTrigger()
+    data class Notification(val content: NotificationContent) : LoopTrigger()
+    data class Schedule(val trigger: ScheduledTrigger) : LoopTrigger()
+    data class ContextChange(val event: ContextEvent) : LoopTrigger()
+}
+```
+
+Examples: morning briefing (calendar + weather + unread messages), calendar event reminders, notification summaries, low battery warnings.
+
+Proactive loops run the same orchestration path but with different entry context. The model receives "A calendar event is in 30 minutes" instead of a user message.
+
+**Off by default.** Each proactive behavior is individually opt-in in Settings. Quiet hours suppression based on sensor context (H2.8).
 
 #### 3.5 External Browser Automation API (TinyFish) ✅ (PR #599 — basic integration)
 
@@ -474,7 +490,15 @@ Chrome's accessibility layer is fundamentally broken for text input — fields r
 
 **Status (2026-02-21):** In contact with TinyFish (Gargi, Dev Marketing). Demo of on-device accessibility layer requested as proof of working foundation. TinyFish key delivery planned via `/api/keys` endpoint.
 
-#### 3.6 Shared Intelligence — Community Knowledge Pool
+#### 3.6 Gateway Integration (Optional)
+For power users who want to control their phone from a VPS:
+- Phone as an OpenClaw node
+- Gateway sends commands, phone executes
+- Screen content relayed back
+
+This is the horizon 2-3 escape hatch mentioned in the product principle. NOT the core product.
+
+#### 3.7 Shared Intelligence — Community Knowledge Pool
 
 The scaling flywheel: every user's agent improves every other user's agent.
 
@@ -511,6 +535,22 @@ User B's agent encounters same app → pull relevant patterns → inject into pr
 
 ---
 
+#### 3.8 Rust Daemon Migration Path 🔲
+
+*Source: [agentic-loop-v2.md §12.10](../agentic-loop-v2.md#1210-rust-daemon-migration-path), SPEC.md §3.4*
+
+When the Rust daemon (ct-agent) takes over orchestration:
+
+- `PhoneAgentApi.continueAfterTools()` → `orchestrator::continue_loop()`
+- Tool execution routes through Unix socket IPC to Kotlin companion (accessibility) or `/dev/input` (root)
+- Metacognitive layer translates directly — reflection is LLM-agnostic
+- Policy engine in Rust (ct-security) replaces Kotlin lightweight check
+- WASM skill system (ct-skills) exposed via Unix socket IPC or JNI
+
+Design Kotlin interfaces so Rust equivalents are obvious. Same method signatures, same data flow, same contracts.
+
+---
+
 ## Architecture Diagram: Current vs Target
 
 ### Current (Horizon 0)
@@ -544,40 +584,6 @@ User Message
       → MessageQueue.drain()               ← queued messages → next turn
 ```
 
-#### 3.7 Proactive Agent Behavior 🔲
-
-*Source: [agentic-loop-v2.md §12.4](../agentic-loop-v2.md#124-proactive-agent-behavior), SPEC.md §3.4 Phase 4. Issue: #597*
-
-Agent-initiated loops — the agent starts tasks without user prompting:
-
-```kotlin
-sealed class LoopTrigger {
-    data class UserMessage(val text: String) : LoopTrigger()
-    data class Notification(val content: NotificationContent) : LoopTrigger()
-    data class Schedule(val trigger: ScheduledTrigger) : LoopTrigger()
-    data class ContextChange(val event: ContextEvent) : LoopTrigger()
-}
-```
-
-Examples: morning briefing (calendar + weather + unread messages), calendar event reminders, notification summaries, low battery warnings.
-
-Proactive loops run the same orchestration path but with different entry context. The model receives "A calendar event is in 30 minutes" instead of a user message.
-
-**Off by default.** Each proactive behavior is individually opt-in in Settings. Quiet hours suppression based on sensor context (H2.9).
-
-#### 3.8 Rust Daemon Migration Path 🔲
-
-*Source: [agentic-loop-v2.md §12.10](../agentic-loop-v2.md#1210-rust-daemon-migration-path), SPEC.md §3.4*
-
-When the Rust daemon (ct-agent) takes over orchestration:
-
-- `PhoneAgentApi.continueAfterTools()` → `orchestrator::continue_loop()`
-- Tool execution routes through Unix socket IPC to Kotlin companion (accessibility) or `/dev/input` (root)
-- Metacognitive layer translates directly — reflection is LLM-agnostic
-- Policy engine in Rust (ct-security) replaces Kotlin lightweight check
-- WASM skill system (ct-skills) exposed via Unix socket IPC or JNI
-
-Design Kotlin interfaces so Rust equivalents are obvious. Same method signatures, same data flow, same contracts.
 
 ---
 
