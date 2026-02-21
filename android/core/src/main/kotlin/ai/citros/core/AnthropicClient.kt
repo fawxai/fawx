@@ -153,12 +153,91 @@ class AnthropicClient : BaseProviderClient {
     /**
      * Build request body for Anthropic Messages API with tool support.
      */
+    /**
+     * Sanitize messages before sending to the API.
+     *
+     * Validates that every tool_result block references a tool_use in the
+     * immediately preceding assistant message. Orphaned tool_results are
+     * converted to plain text messages to prevent API rejection.
+     *
+     * Also ensures the first message is role="user" (not a tool message).
+     *
+     * @param messages Raw message list
+     * @return Sanitized message list safe for the Anthropic Messages API
+     */
+    internal fun sanitizeMessages(messages: List<Message>): List<Message> {
+        if (messages.isEmpty()) return messages
+
+        val result = mutableListOf<Message>()
+
+        // Drop leading tool messages (they have no preceding assistant)
+        var startIdx = 0
+        while (startIdx < messages.size && messages[startIdx].role == Message.ROLE_TOOL) {
+            Log.w("CitrosAPI", "sanitizeMessages: dropping leading tool message at index $startIdx (toolCallId=${messages[startIdx].toolCallId})")
+            // Convert to plain user text so context isn't lost
+            result.add(Message(role = Message.ROLE_USER, content = "[tool result] ${messages[startIdx].content.take(200)}"))
+            startIdx++
+        }
+
+        // Process remaining messages, checking tool_result/tool_use pairing
+        var lastAssistantToolIds: Set<String> = emptySet()
+        for (i in startIdx until messages.size) {
+            val msg = messages[i]
+            when (msg.role) {
+                Message.ROLE_ASSISTANT -> {
+                    // Extract tool_use IDs from this assistant message
+                    lastAssistantToolIds = msg.contentBlocks
+                        ?.filter { it["type"] == "tool_use" }
+                        ?.mapNotNull { it["id"] as? String }
+                        ?.toSet()
+                        ?: emptySet()
+                    result.add(msg)
+                }
+                Message.ROLE_TOOL -> {
+                    val toolCallId = msg.toolCallId
+                    if (toolCallId != null && toolCallId in lastAssistantToolIds) {
+                        result.add(msg)
+                    } else {
+                        // Orphaned tool_result: convert to plain text
+                        Log.w("CitrosAPI", "sanitizeMessages: orphaned tool_result at index $i " +
+                            "(toolCallId=$toolCallId, expected one of $lastAssistantToolIds). Converting to text.")
+                        result.add(Message(role = Message.ROLE_USER, content = "[tool result] ${msg.content.take(200)}"))
+                    }
+                }
+                else -> {
+                    lastAssistantToolIds = emptySet()
+                    result.add(msg)
+                }
+            }
+        }
+
+        // Merge consecutive same-role user messages that may have been created
+        val merged = mutableListOf<Message>()
+        for (msg in result) {
+            if (merged.isNotEmpty() && merged.last().role == msg.role && msg.role == Message.ROLE_USER && msg.contentBlocks == null && merged.last().contentBlocks == null) {
+                val prev = merged.removeAt(merged.lastIndex)
+                merged.add(Message(role = Message.ROLE_USER, content = prev.content + "\n" + msg.content))
+            } else {
+                merged.add(msg)
+            }
+        }
+
+        return merged
+    }
+
     internal override fun buildToolRequest(
         messages: List<Message>,
         systemPrompt: String,
         tools: List<Tool>,
         maxTokens: Int
     ): JsonObject {
+        val sanitizedMessages = sanitizeMessages(messages)
+        // Diagnostic logging: log first/last few message roles for debugging
+        if (sanitizedMessages.size > 4) {
+            val first3 = sanitizedMessages.take(3).map { "${it.role}(blocks=${it.contentBlocks != null})" }
+            val last3 = sanitizedMessages.takeLast(3).map { "${it.role}(blocks=${it.contentBlocks != null})" }
+            Log.d("CitrosAPI", "buildToolRequest: ${sanitizedMessages.size} msgs, first=$first3, last=$last3")
+        }
         return buildJsonObject {
             put("model", config.chatModelId)
             put("max_tokens", maxTokens)
@@ -200,8 +279,8 @@ class AnthropicClient : BaseProviderClient {
             // always have contentBlocks=null and fall through to the text branch.
             putJsonArray("messages") {
                 var i = 0
-                while (i < messages.size) {
-                    val msg = messages[i]
+                while (i < sanitizedMessages.size) {
+                    val msg = sanitizedMessages[i]
                     val blocks = msg.contentBlocks
                     when {
                         // Tool result message(s): merge consecutive tool messages
@@ -219,9 +298,9 @@ class AnthropicClient : BaseProviderClient {
                                         }
                                     }
                                     // Merge any immediately following tool messages
-                                    while (i + 1 < messages.size && messages[i + 1].role == "tool") {
+                                    while (i + 1 < sanitizedMessages.size && sanitizedMessages[i + 1].role == "tool") {
                                         i++
-                                        messages[i].contentBlocks?.forEach { block ->
+                                        sanitizedMessages[i].contentBlocks?.forEach { block ->
                                             addJsonObject {
                                                 block.forEach { (key, value) ->
                                                     put(key, anyToJsonElement(value))

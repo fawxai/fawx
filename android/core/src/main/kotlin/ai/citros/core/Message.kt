@@ -96,6 +96,30 @@ data class Message(
         }
     }
     
+    /**
+     * Create a copy with new text content, discarding cached contentBlocks.
+     *
+     * Unlike [copy], this forces contentBlocks to be reconstructed from the
+     * persisted fields (toolCallId, toolCallsJson) and the NEW content string.
+     * Use this when compacting/trimming message content to ensure the structured
+     * blocks reflect the updated text rather than the original.
+     *
+     * Without this, [copy(content = ...)] preserves the @Transient _contentBlocks
+     * field, causing stale tool_result blocks to survive compaction and potentially
+     * orphaning them from their matching tool_use blocks. (#665)
+     */
+    fun withContent(newContent: String): Message = Message(
+        role = role,
+        content = newContent,
+        timestamp = timestamp,
+        toolCallId = toolCallId,
+        toolCallsJson = toolCallsJson,
+        isError = isError,
+        toolName = toolName,
+        isSteer = isSteer,
+        _contentBlocks = null  // Force reconstruction from persisted fields
+    )
+
     companion object {
         /** Standard message roles for API compatibility. */
         const val ROLE_USER = "user"

@@ -113,13 +113,13 @@ class ContextManager(
         // Compact screen content in user messages
         if (message.role == "user" && content.contains("CURRENT SCREEN:")) {
             val compacted = compactScreenContent(content)
-            return message.copy(content = compacted)
+            return message.withContent(compacted)
         }
 
         // Compact tool results
         if (message.role == "tool") {
             val compacted = compactToolResult(content)
-            return message.copy(content = compacted)
+            return message.withContent(compacted)
         }
 
         return message

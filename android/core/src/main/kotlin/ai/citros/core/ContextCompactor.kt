@@ -217,7 +217,7 @@ class ContextCompactor(
             }
         }
 
-        return msg.copy(content = trimmed)
+        return msg.withContent(trimmed)
     }
 
     /**
@@ -227,7 +227,7 @@ class ContextCompactor(
     fun stripScreenSection(message: Message): Message {
         val delimiterIndex = message.content.indexOf(SCREEN_DELIMITER)
         return if (delimiterIndex >= 0) {
-            message.copy(content = message.content.substring(0, delimiterIndex))
+            message.withContent(message.content.substring(0, delimiterIndex))
         } else {
             message
         }
