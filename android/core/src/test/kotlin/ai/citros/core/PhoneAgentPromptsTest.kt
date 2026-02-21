@@ -21,6 +21,14 @@ class PhoneAgentPromptsTest {
     }
 
     @Test
+    fun `SECTION_TOOLS_SMALL excludes research tool category`() {
+        assertNotContains(PhoneAgentPrompts.SECTION_TOOLS_SMALL, "web_search")
+        assertNotContains(PhoneAgentPrompts.SECTION_TOOLS_SMALL, "web_fetch")
+        assertNotContains(PhoneAgentPrompts.SECTION_TOOLS_SMALL, "web_browse")
+        assertNotContains(PhoneAgentPrompts.SECTION_TOOLS_SMALL, "Research")
+    }
+
+    @Test
     fun `buildSystemPrompt without phone control omits tools section`() {
         val prompt = PhoneAgentPrompts.buildSystemPrompt(phoneControlAvailable = false)
         assertNotContains(prompt, "## Your Tools")
@@ -33,13 +41,13 @@ class PhoneAgentPromptsTest {
         val prompt = PhoneAgentPrompts.buildSystemPrompt(phoneControlAvailable = false)
         assertContains(prompt, "Accessibility service is NOT attached")
         assertContains(prompt, "Phone control unavailable")
-        assertContains(prompt, "Accessibility: disabled")
+        assertContains(prompt, "accessibility=disabled")
     }
 
     @Test
     fun `buildSystemPrompt with phone control shows attached status`() {
         val prompt = PhoneAgentPrompts.buildSystemPrompt(phoneControlAvailable = true)
-        assertContains(prompt, "Accessibility: enabled")
+        assertContains(prompt, "accessibility=enabled")
         assertNotContains(prompt, "Accessibility service is NOT attached")
     }
 
@@ -49,7 +57,7 @@ class PhoneAgentPromptsTest {
             phoneControlAvailable = true,
             modelName = "claude-opus-4-6"
         )
-        assertContains(prompt, "Model: claude-opus-4-6")
+        assertContains(prompt, "Runtime: model=claude-opus-4-6")
     }
 
     @Test
@@ -58,7 +66,7 @@ class PhoneAgentPromptsTest {
             phoneControlAvailable = true,
             modelName = null
         )
-        assertNotContains(prompt, "Model:")
+        assertContains(prompt, "Runtime: model=unknown")
     }
 
     // ── Core sections always present ────────────────────────────────────
@@ -104,8 +112,8 @@ class PhoneAgentPromptsTest {
     @Test
     fun `buildSystemPrompt always includes runtime section`() {
         val prompt = PhoneAgentPrompts.buildSystemPrompt(phoneControlAvailable = true)
-        assertContains(prompt, "## Runtime")
-        assertContains(prompt, "Time:")
+        assertContains(prompt, "Runtime: model=")
+        assertContains(prompt, " | time=")
     }
 
     // ── Strategy teaches key behaviors ──────────────────────────────────
@@ -251,13 +259,13 @@ class PhoneAgentPromptsTest {
     @Test
     fun `buildActionPrompt includes model name when provided`() {
         val prompt = PhoneAgentPrompts.buildActionPrompt(modelName = "gpt-4o")
-        assertContains(prompt, "Model: gpt-4o")
+        assertContains(prompt, "Runtime: model=gpt-4o")
     }
 
     @Test
     fun `buildActionPrompt omits model line when null`() {
         val prompt = PhoneAgentPrompts.buildActionPrompt(modelName = null)
-        assertNotContains(prompt, "Model:")
+        assertContains(prompt, "Runtime: model=unknown")
     }
 
     // ── Communication Policy ────────────────────────────────────────────
@@ -317,13 +325,13 @@ class PhoneAgentPromptsTest {
         val lazy = PhoneAgentPrompts.SYSTEM_PROMPT
         assertContains(lazy, "You are Citros")
         assertContains(lazy, "## Strategy")
-        assertContains(lazy, "## Runtime")
+        assertContains(lazy, "Runtime: model=")
     }
 
     @Test
     fun `ACTION_PROMPT lazy val matches buildActionPrompt default`() {
         val lazy = PhoneAgentPrompts.ACTION_PROMPT
-        assertContains(lazy, "Continue executing the task")
+        assertContains(lazy, "## Key Reminders")
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────
