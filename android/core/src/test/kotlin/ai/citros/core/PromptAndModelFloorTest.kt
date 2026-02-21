@@ -217,25 +217,34 @@ class PromptAndModelFloorTest {
 
     @Test
     fun `compaction strips SCREEN from old tool results`() {
+        // Need 8+ messages to trigger compaction (minMessagesBeforeTrim=8)
         val messages = listOf(
             Message(role = "user", content = "Open Settings"),
+            Message(role = "assistant", content = "Opening Settings."),
             Message(role = "tool", content = "Tapped element 5\n\nSCREEN:\n[1] 'Settings'\n[2] 'About'", toolCallId = "tc1"),
+            Message(role = "assistant", content = "Navigating."),
             Message(role = "tool", content = "Tapped element 3\n\nSCREEN:\n[1] 'Wi-Fi'\n[2] 'Bluetooth'", toolCallId = "tc2"),
+            Message(role = "assistant", content = "Found Wi-Fi."),
             Message(role = "tool", content = "Tapped element 1\n\nSCREEN:\n[1] 'Connected'\n[2] 'Disconnect'", toolCallId = "tc3"),
+            Message(role = "assistant", content = "Connected."),
             Message(role = "tool", content = "Tapped element 2\n\nSCREEN:\n[1] 'Network'\n[2] 'Data'", toolCallId = "tc4")
         )
         // Force compaction by using a very low threshold
         val result = ContextCompactor.compact(messages, maxTokenEstimate = 1)
 
-        // Last 2 tool results should be preserved
-        assertTrue(result[3].content.contains("SCREEN:"), "Third-to-last tool result should keep SCREEN")
-        assertTrue(result[4].content.contains("SCREEN:"), "Last tool result should keep SCREEN")
-
-        // Older tool results should have SCREEN stripped
-        assertFalse(result[1].content.contains("SCREEN:"), "Old tool result should have SCREEN stripped")
-        assertEquals("Tapped element 5", result[1].content)
-        assertFalse(result[2].content.contains("SCREEN:"), "Old tool result should have SCREEN stripped")
-        assertEquals("Tapped element 3", result[2].content)
+        // Last 2 tool results should be preserved (indices 6 and 8 in expanded list)
+        val toolResults = result.filter { it.role == "tool" }
+        assertEquals(4, toolResults.size)
+        // Last 2 kept
+        assertFalse(toolResults[2].content.contains(ContextCompactor.TRIM_MARKER), "Third tool result should be kept")
+        assertFalse(toolResults[3].content.contains(ContextCompactor.TRIM_MARKER), "Last tool result should be kept")
+        assertTrue(toolResults[2].content.contains("SCREEN:"), "Third tool result should keep SCREEN")
+        assertTrue(toolResults[3].content.contains("SCREEN:"), "Last tool result should keep SCREEN")
+        // First 2 trimmed
+        assertTrue(toolResults[0].content.contains(ContextCompactor.TRIM_MARKER), "First tool result should be trimmed")
+        assertFalse(toolResults[0].content.contains("SCREEN:"), "First tool result should have SCREEN stripped")
+        assertTrue(toolResults[1].content.contains(ContextCompactor.TRIM_MARKER), "Second tool result should be trimmed")
+        assertFalse(toolResults[1].content.contains("SCREEN:"), "Second tool result should have SCREEN stripped")
     }
 
     @Test

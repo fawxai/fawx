@@ -136,7 +136,7 @@ class SettingsScreenTest {
     }
 
     @Test
-    fun `add key bottom sheet save enabled only when key entered`() {
+    fun `add key bottom sheet validate enabled only when key entered`() {
         composeRule.setContent {
             SettingsScreen(
                 walletManager = testWalletManager,
@@ -146,9 +146,12 @@ class SettingsScreenTest {
         }
 
         composeRule.onNodeWithContentDescription("Add Key").performClick()
-        composeRule.onNodeWithText("Save").assertIsNotEnabled()
-        composeRule.onNodeWithText("API key").performTextInput("sk-test-12345678901234567890")
-        composeRule.onNodeWithText("Save").assertIsEnabled()
+        composeRule.onNodeWithText("Validate Key").assertIsNotEnabled()
+
+        // Field placeholder is provider-specific (Anthropic default in this test setup)
+        composeRule.onNodeWithText("sk-ant-...").performTextInput("sk-test-12345678901234567890")
+
+        composeRule.onNodeWithText("Validate Key").assertIsEnabled()
     }
 
     @Test

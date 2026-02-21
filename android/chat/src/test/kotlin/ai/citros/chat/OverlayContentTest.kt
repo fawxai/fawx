@@ -6,6 +6,12 @@ import ai.citros.core.OverlayRunState
 import ai.citros.core.OverlayStep
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onNodeWithContentDescription
+import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.assert
+import androidx.compose.ui.test.hasAnyDescendant
+import androidx.compose.ui.test.hasTestTag
+import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.onNodeWithText
 import org.junit.Rule
 import org.junit.Test
@@ -46,15 +52,15 @@ class OverlayContentTest {
                 onStopAction = {},
                 onResumeOrRetry = {},
                 onOpenFull = {},
-                onOpenBubble = {}
+                onOpenIsland = {}
             )
         }
 
-        composeRule.onNodeWithText("Send").assertIsDisplayed()
+        composeRule.onNodeWithContentDescription("Send").assertIsDisplayed()
     }
 
     @Test
-    fun `mini chat shows Queue button when executing`() {
+    fun `mini chat shows Stop button when executing with empty draft`() {
         composeRule.setContent {
             OverlayMiniChatContent(
                 flavor = CitrosFlavor.LIME,
@@ -67,11 +73,12 @@ class OverlayContentTest {
                 onStopAction = {},
                 onResumeOrRetry = {},
                 onOpenFull = {},
-                onOpenBubble = {}
+                onOpenIsland = {}
             )
         }
 
-        composeRule.onNodeWithText("Queue").assertIsDisplayed()
+        // Empty draft + executing = stop button
+        composeRule.onNodeWithContentDescription("Stop").assertIsDisplayed()
     }
 
     @Test
@@ -88,11 +95,11 @@ class OverlayContentTest {
                 onStopAction = {},
                 onResumeOrRetry = {},
                 onOpenFull = {},
-                onOpenBubble = {}
+                onOpenIsland = {}
             )
         }
 
-        composeRule.onNodeWithText("Send").assertIsDisplayed()
+        composeRule.onNodeWithContentDescription("Send").assertIsDisplayed()
     }
 
     @Test
@@ -109,11 +116,11 @@ class OverlayContentTest {
                 onStopAction = {},
                 onResumeOrRetry = {},
                 onOpenFull = {},
-                onOpenBubble = {}
+                onOpenIsland = {}
             )
         }
 
-        composeRule.onNodeWithText("Send").assertIsDisplayed()
+        composeRule.onNodeWithContentDescription("Send").assertIsDisplayed()
     }
 
     @Test
@@ -130,11 +137,11 @@ class OverlayContentTest {
                 onStopAction = {},
                 onResumeOrRetry = {},
                 onOpenFull = {},
-                onOpenBubble = {}
+                onOpenIsland = {}
             )
         }
 
-        composeRule.onNodeWithText("Send").assertIsDisplayed()
+        composeRule.onNodeWithContentDescription("Send").assertIsDisplayed()
     }
 
     // ========== PR #624: Placeholder text ==========
@@ -153,11 +160,11 @@ class OverlayContentTest {
                 onStopAction = {},
                 onResumeOrRetry = {},
                 onOpenFull = {},
-                onOpenBubble = {}
+                onOpenIsland = {}
             )
         }
 
-        composeRule.onNodeWithText("Ask anything...", useUnmergedTree = true).assertExists()
+        composeRule.onNodeWithText("Message", useUnmergedTree = true).assertExists()
     }
 
     @Test
@@ -174,11 +181,11 @@ class OverlayContentTest {
                 onStopAction = {},
                 onResumeOrRetry = {},
                 onOpenFull = {},
-                onOpenBubble = {}
+                onOpenIsland = {}
             )
         }
 
-        composeRule.onNodeWithText("Queue a follow-up...", useUnmergedTree = true).assertExists()
+        composeRule.onNodeWithText("Steer or queue...", useUnmergedTree = true).assertExists()
     }
 
     // ========== PR #614: Header status text ==========
@@ -197,7 +204,7 @@ class OverlayContentTest {
                 onStopAction = {},
                 onResumeOrRetry = {},
                 onOpenFull = {},
-                onOpenBubble = {}
+                onOpenIsland = {}
             )
         }
 
@@ -218,7 +225,7 @@ class OverlayContentTest {
                 onStopAction = {},
                 onResumeOrRetry = {},
                 onOpenFull = {},
-                onOpenBubble = {}
+                onOpenIsland = {}
             )
         }
 
@@ -239,7 +246,7 @@ class OverlayContentTest {
                 onStopAction = {},
                 onResumeOrRetry = {},
                 onOpenFull = {},
-                onOpenBubble = {}
+                onOpenIsland = {}
             )
         }
 
@@ -267,7 +274,7 @@ class OverlayContentTest {
                 onStopAction = {},
                 onResumeOrRetry = {},
                 onOpenFull = {},
-                onOpenBubble = {}
+                onOpenIsland = {}
             )
         }
 
@@ -294,12 +301,15 @@ class OverlayContentTest {
                 onStopAction = {},
                 onResumeOrRetry = {},
                 onOpenFull = {},
-                onOpenBubble = {}
+                onOpenIsland = {}
             )
         }
 
-        composeRule.onNodeWithText("Queued").assertExists()
-        composeRule.onNodeWithText("Check bluetooth too", substring = true).assertExists()
+        // QUEUED lines are style-only now; assert via stable semantic tag + text
+        composeRule.onNodeWithTag(TEST_TAG_OVERLAY_QUEUED_LINE).assertExists()
+        composeRule.onNode(
+            hasTestTag(TEST_TAG_OVERLAY_QUEUED_LINE) and hasAnyDescendant(hasText("Check bluetooth too", substring = true))
+        ).assertExists()
     }
 
     // ========== PR #614: Stop button visibility ==========
@@ -318,11 +328,11 @@ class OverlayContentTest {
                 onStopAction = {},
                 onResumeOrRetry = {},
                 onOpenFull = {},
-                onOpenBubble = {}
+                onOpenIsland = {}
             )
         }
 
-        composeRule.onNodeWithText("Stop").assertIsDisplayed()
+        composeRule.onNodeWithContentDescription("Stop").assertIsDisplayed()
     }
 
     @Test
@@ -339,17 +349,17 @@ class OverlayContentTest {
                 onStopAction = {},
                 onResumeOrRetry = {},
                 onOpenFull = {},
-                onOpenBubble = {}
+                onOpenIsland = {}
             )
         }
 
-        composeRule.onNodeWithText("Stop").assertDoesNotExist()
+        composeRule.onNodeWithContentDescription("Stop").assertDoesNotExist()
     }
 
     // ========== PR #614: Mode control buttons ==========
 
     @Test
-    fun `mini chat has Full and Bubble mode buttons`() {
+    fun `mini chat has Full and Island mode buttons`() {
         composeRule.setContent {
             OverlayMiniChatContent(
                 flavor = CitrosFlavor.LIME,
@@ -362,12 +372,12 @@ class OverlayContentTest {
                 onStopAction = {},
                 onResumeOrRetry = {},
                 onOpenFull = {},
-                onOpenBubble = {}
+                onOpenIsland = {}
             )
         }
 
         composeRule.onNodeWithText("Full").assertIsDisplayed()
-        composeRule.onNodeWithText("Bubble").assertIsDisplayed()
+        composeRule.onNodeWithText("Island").assertIsDisplayed()
     }
 
     // ========== PR #614: Auto-scroll ==========

@@ -41,6 +41,7 @@ import ai.citros.core.Provider
 import ai.citros.core.WalletState
 import android.content.Context
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 @Composable
 internal fun ProviderModelChip(
     walletState: WalletState,
@@ -188,6 +189,7 @@ internal fun QuickSwitcherSheet(
                 .padding(top = 96.dp, start = 16.dp, end = 16.dp)
                 .fillMaxWidth()
                 .widthIn(max = 428.dp)
+                .testTag(TEST_TAG_QUICK_SWITCHER_SHEET)
                 .clip(RoundedCornerShape(20.dp))
                 .background(
                     if (isDarkTheme) {

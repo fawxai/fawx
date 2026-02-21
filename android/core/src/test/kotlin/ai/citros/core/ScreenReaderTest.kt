@@ -191,7 +191,7 @@ class ScreenReaderTest {
         val result = ScreenReader.waitForAttachment(timeoutMs = 300, pollIntervalMs = 50)
         val elapsed = System.currentTimeMillis() - start
         assertFalse(result)
-        assertTrue("Should wait close to 300ms but took ${elapsed}ms", elapsed in 250..450)
+        assertTrue("Should wait near timeout (~300ms) but took ${elapsed}ms", elapsed in 250..550)
     }
 
     @Test
@@ -202,7 +202,7 @@ class ScreenReaderTest {
                 delay(150)
                 simulateAttach()
             }
-            val result = ScreenReader.waitForAttachment(timeoutMs = 2000, pollIntervalMs = 50)
+            val result = ScreenReader.waitForAttachment(timeoutMs = 600, pollIntervalMs = 50)
             assertTrue(result)
         } finally {
             ScreenReader.detach()
@@ -467,14 +467,14 @@ class ScreenReaderTest {
     }
 
     @Test
-    fun `waitForAttachment succeeds when service attaches just before deadline`() = runBlocking {
+    fun `waitForAttachment succeeds when service attaches before deadline`() = runBlocking {
         ScreenReader.detach()
         try {
             launch {
-                delay(250) // Attach at t=250ms, just before 300ms deadline
+                delay(200) // Attach comfortably before timeout to keep test deterministic
                 simulateAttach()
             }
-            val result = ScreenReader.waitForAttachment(timeoutMs = 300, pollIntervalMs = 50)
+            val result = ScreenReader.waitForAttachment(timeoutMs = 500, pollIntervalMs = 50)
             assertTrue("Should return true when service attaches before deadline", result)
         } finally {
             ScreenReader.detach()

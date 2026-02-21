@@ -43,20 +43,21 @@ class OverlayControllerTest {
     }
 
     @Test
-    fun `activateOverlay sets active and switches to SEARCH_BAR`() {
+    fun `activateOverlay sets active and switches to DYNAMIC_ISLAND`() {
         OverlayController.activateOverlay()
 
         assertTrue(OverlayController.isOverlayActive.value)
-        assertEquals(OverlaySurfaceMode.SEARCH_BAR, OverlayController.surfaceMode.value)
+        assertEquals(OverlaySurfaceMode.DYNAMIC_ISLAND, OverlayController.surfaceMode.value)
     }
 
     @Test
-    fun `activateOverlay preserves non-FULL_APP mode`() {
+    fun `activateOverlay reconciles to preferred idle mode even if pre-set`() {
         OverlayController.updateSurfaceMode(OverlaySurfaceMode.SEARCH_BAR)
         OverlayController.activateOverlay()
 
         assertTrue(OverlayController.isOverlayActive.value)
-        assertEquals(OverlaySurfaceMode.SEARCH_BAR, OverlayController.surfaceMode.value)
+        // reconcileSurfaceMode(force=true) overrides to preferredIdleSurfaceMode() = DYNAMIC_ISLAND
+        assertEquals(OverlaySurfaceMode.DYNAMIC_ISLAND, OverlayController.surfaceMode.value)
     }
 
     @Test
@@ -382,7 +383,7 @@ class OverlayControllerTest {
     @Test
     fun `interaction demand forces panel while active`() {
         OverlayController.activateOverlay()
-        assertEquals(OverlaySurfaceMode.SEARCH_BAR, OverlayController.surfaceMode.value)
+        assertEquals(OverlaySurfaceMode.DYNAMIC_ISLAND, OverlayController.surfaceMode.value)
 
         OverlayController.updateInteractionDemand(OverlayInteractionDemand.INPUT_REQUIRED)
 
@@ -390,14 +391,14 @@ class OverlayControllerTest {
     }
 
     @Test
-    fun `clearing interaction demand returns to search bar when panel not pinned`() {
+    fun `clearing interaction demand returns to preferred idle mode when panel not pinned`() {
         OverlayController.activateOverlay()
         OverlayController.updateInteractionDemand(OverlayInteractionDemand.INPUT_REQUIRED)
         assertEquals(OverlaySurfaceMode.PANEL, OverlayController.surfaceMode.value)
 
         OverlayController.updateInteractionDemand(OverlayInteractionDemand.NONE)
 
-        assertEquals(OverlaySurfaceMode.SEARCH_BAR, OverlayController.surfaceMode.value)
+        assertEquals(OverlaySurfaceMode.DYNAMIC_ISLAND, OverlayController.surfaceMode.value)
     }
 
     @Test
@@ -410,7 +411,7 @@ class OverlayControllerTest {
         assertEquals(OverlaySurfaceMode.PANEL, OverlayController.surfaceMode.value)
 
         OverlayController.setUserPanelPinned(false)
-        assertEquals(OverlaySurfaceMode.SEARCH_BAR, OverlayController.surfaceMode.value)
+        assertEquals(OverlaySurfaceMode.DYNAMIC_ISLAND, OverlayController.surfaceMode.value)
     }
 
     @Test
@@ -419,7 +420,7 @@ class OverlayControllerTest {
         assertFalse(OverlayController.isOverlayActive.value)
 
         OverlayController.activateOverlay()
-        assertEquals(OverlaySurfaceMode.SEARCH_BAR, OverlayController.surfaceMode.value)
+        assertEquals(OverlaySurfaceMode.DYNAMIC_ISLAND, OverlayController.surfaceMode.value)
         assertTrue(OverlayController.isOverlayActive.value)
 
         OverlayController.updateSurfaceMode(OverlaySurfaceMode.PANEL)
@@ -464,7 +465,7 @@ class OverlayControllerTest {
         }
 
         assertTrue(OverlayController.isOverlayActive.value)
-        assertEquals(OverlaySurfaceMode.SEARCH_BAR, OverlayController.surfaceMode.value)
+        assertEquals(OverlaySurfaceMode.DYNAMIC_ISLAND, OverlayController.surfaceMode.value)
     }
 
     // --- Restore hook tests (#608/PR #614) ---
@@ -474,14 +475,16 @@ class OverlayControllerTest {
         // Simulate: overlay was never activated (race condition scenario)
         assertFalse(OverlayController.isOverlayActive.value)
 
-        // Restore hook logic: activate only if not already active
+        // Restore hook logic: activate only if not already active.
+        // Note: activateOverlay() reconciles to preferredIdleSurfaceMode()
+        // which is DYNAMIC_ISLAND by default (useIslandWhenIdle=true).
         if (!OverlayController.isOverlayActive.value) {
             OverlayController.updateSurfaceMode(OverlaySurfaceMode.SEARCH_BAR)
             OverlayController.activateOverlay()
         }
 
         assertTrue(OverlayController.isOverlayActive.value)
-        assertEquals(OverlaySurfaceMode.SEARCH_BAR, OverlayController.surfaceMode.value)
+        assertEquals(OverlaySurfaceMode.DYNAMIC_ISLAND, OverlayController.surfaceMode.value)
     }
 
     @Test
@@ -522,16 +525,17 @@ class OverlayControllerTest {
     }
 
     @Test
-    fun `restore hook with SEARCH_BAR preferred mode activates as SEARCH_BAR`() {
+    fun `restore hook with SEARCH_BAR preferred mode activates as DYNAMIC_ISLAND`() {
         assertFalse(OverlayController.isOverlayActive.value)
 
-        // Simulate restore with SEARCH_BAR preference
+        // Simulate restore with SEARCH_BAR preference.
+        // activateOverlay() reconciles to preferredIdleSurfaceMode() = DYNAMIC_ISLAND.
         if (!OverlayController.isOverlayActive.value) {
             OverlayController.updateSurfaceMode(OverlaySurfaceMode.SEARCH_BAR)
             OverlayController.activateOverlay()
         }
 
         assertTrue(OverlayController.isOverlayActive.value)
-        assertEquals(OverlaySurfaceMode.SEARCH_BAR, OverlayController.surfaceMode.value)
+        assertEquals(OverlaySurfaceMode.DYNAMIC_ISLAND, OverlayController.surfaceMode.value)
     }
 }

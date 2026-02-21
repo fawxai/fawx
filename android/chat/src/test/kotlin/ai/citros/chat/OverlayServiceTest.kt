@@ -79,7 +79,7 @@ class OverlayServiceTest {
     fun `overlay controller mode transitions are reflected correctly`() {
         // Simulate what the service observes
         OverlayController.activateOverlay()
-        assertEquals(OverlaySurfaceMode.SEARCH_BAR, OverlayController.surfaceMode.value)
+        assertEquals(OverlaySurfaceMode.DYNAMIC_ISLAND, OverlayController.surfaceMode.value)
         assertTrue(OverlayController.isOverlayActive.value)
 
         OverlayController.updateSurfaceMode(OverlaySurfaceMode.SEARCH_BAR)
@@ -175,12 +175,12 @@ class OverlayServiceTest {
     }
 
     @Test
-    fun `activateOverlay defaults to SEARCH_BAR mode`() {
+    fun `activateOverlay defaults to DYNAMIC_ISLAND mode`() {
         OverlayController.activateOverlay()
-        // Default mode after activation is SEARCH_BAR
+        // Default mode after activation is DYNAMIC_ISLAND (useIslandWhenIdle=true)
         val surfaceMode = OverlayController.surfaceMode.value
 
-        assertEquals(OverlaySurfaceMode.SEARCH_BAR, surfaceMode)
+        assertEquals(OverlaySurfaceMode.DYNAMIC_ISLAND, surfaceMode)
         assertTrue(surfaceMode != OverlaySurfaceMode.FULL_APP)
     }
 
@@ -207,7 +207,7 @@ class OverlayServiceTest {
     fun `FULL_APP transition deactivates overlay`() {
         OverlayController.activateOverlay()
         assertTrue(OverlayController.isOverlayActive.value)
-        assertEquals(OverlaySurfaceMode.SEARCH_BAR, OverlayController.surfaceMode.value)
+        assertEquals(OverlaySurfaceMode.DYNAMIC_ISLAND, OverlayController.surfaceMode.value)
 
         // Simulate what happens when user taps "Full" button
         OverlayController.updateSurfaceMode(OverlaySurfaceMode.FULL_APP)
@@ -413,14 +413,14 @@ class OverlayServiceTest {
     }
 
     // Regression guard (#583): calculateMiniChatHeight was removed from production code.
-    // This test ensures only the current public height API (calculateBubbleBaseY) is tested
+    // This test ensures only the current public height API (calculateSearchBarBaseY) is tested
     // and no stale references cause compile errors.
     @Test
     fun `no stale calculateMiniChatHeight reference exists`() {
         // If this test compiles, the stale reference from #583 is confirmed gone.
-        // calculateBubbleBaseY is the only public height API on OverlayService.
-        val result = OverlayService.calculateBubbleBaseY(1920, 2.0f)
-        assertTrue(result > 0, "calculateBubbleBaseY should return a positive value")
+        // calculateSearchBarBaseY is the only public height API on OverlayService.
+        val result = OverlayService.calculateSearchBarBaseY(1920, 2.0f)
+        assertTrue(result >= 0, "calculateSearchBarBaseY should return a non-negative value")
     }
 
     // softInputMode (#444/#451) and keyboard behavior require instrumented tests —

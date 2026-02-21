@@ -62,6 +62,7 @@ import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
@@ -281,6 +282,7 @@ internal fun OverlayMiniChatContent(
                     }
 
                     Surface(
+                        modifier = if (line.type == OverlayLineType.QUEUED) Modifier.testTag(TEST_TAG_OVERLAY_QUEUED_LINE) else Modifier,
                         shape = RoundedCornerShape(
                             topStart = 14.dp,
                             topEnd = 14.dp,
@@ -483,6 +485,10 @@ internal fun OverlayMiniChatContent(
                         showStopButton -> surfaces.labelPrimary
                         hasInputText -> activeSendIconTint
                         else -> inactiveSendIconTint
+                    },
+                    contentDescription = when {
+                        showStopButton -> "Stop"
+                        else -> "Send"
                     }
                 ) { resolvedIconTint ->
                     if (showStopButton) {

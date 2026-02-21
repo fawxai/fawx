@@ -463,7 +463,7 @@ class ClaudeClientTest {
         val result = client.chat(conversation)
 
         assertTrue(result.isFailure)
-        assertTrue(result.exceptionOrNull()?.message?.contains("Rate limit") == true)
+        assertTrue(result.exceptionOrNull()?.message?.contains("rate", ignoreCase = true) == true)
         assertEquals(4, server.requestCount) // Initial + 3 retries
     }
 

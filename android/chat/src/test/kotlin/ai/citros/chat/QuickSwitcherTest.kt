@@ -136,7 +136,8 @@ class QuickSwitcherTest {
 
         composeRule.onNodeWithTag("quick_switcher_chip").performClick()
 
-        composeRule.onNodeWithText("Quick Switcher").assertIsDisplayed()
+        // Verify the sheet opened via a stable test tag (not copy text)
+        composeRule.onNodeWithTag(TEST_TAG_QUICK_SWITCHER_SHEET).assertIsDisplayed()
     }
 
     @Test

@@ -199,8 +199,8 @@ class SettingsHubScreensTest {
         }
 
         composeRule.onNodeWithText("Appearance", useUnmergedTree = true).assertExists()
-        composeRule.onNodeWithText("Flavor", useUnmergedTree = true).assertExists()
-        composeRule.onNodeWithText("Theme", useUnmergedTree = true).assertExists()
+        composeRule.onNodeWithText("FLAVOR", useUnmergedTree = true).assertExists()
+        composeRule.onNodeWithText("THEME", useUnmergedTree = true).assertExists()
         composeRule.onNodeWithText("Dark", useUnmergedTree = true).assertExists()
         composeRule.onNodeWithText("Light", useUnmergedTree = true).assertExists()
         composeRule.onNodeWithText("System", useUnmergedTree = true).assertExists()

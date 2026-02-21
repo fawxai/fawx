@@ -3154,6 +3154,7 @@ internal fun MessageInputGlassIconButton(
     enabled: Boolean,
     backgroundColor: Color,
     iconTint: Color,
+    contentDescription: String? = null,
     content: @Composable (Color) -> Unit
 ) {
     val resolvedIconTint = if (enabled) iconTint else iconTint.copy(alpha = 0.55f)
@@ -3162,7 +3163,10 @@ internal fun MessageInputGlassIconButton(
             .size(40.dp)
             .clip(CircleShape)
             .background(backgroundColor)
-            .clickable(enabled = enabled, onClick = onClick),
+            .clickable(enabled = enabled, onClick = onClick)
+            .semantics {
+                contentDescription?.let { this.contentDescription = it }
+            },
         contentAlignment = Alignment.Center
     ) {
         content(resolvedIconTint)

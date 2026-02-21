@@ -373,15 +373,15 @@ class ContextCompactorTest {
             defaultKeepFull = 1,
             trimMode = TrimMode.ACTION_SUMMARY
         ))
-        // "wait" is in OTHER category
+        // "learn" is in OTHER category ("wait" moved to MECHANICAL)
         val msgs = conversation(
-            toolResult("Waited 2 seconds\n\nSCREEN:\nApp: com.test\n[0] \"X\"", "wait"),
-            toolResult("Waited 3 seconds\n\nSCREEN:\nApp: com.test\n[0] \"Y\"", "wait")
+            toolResult("Learned fact: cats purr\n\nSCREEN:\nApp: com.test\n[0] \"X\"", "learn"),
+            toolResult("Learned fact: dogs bark\n\nSCREEN:\nApp: com.test\n[0] \"Y\"", "learn")
         )
         val result = compactor.compact(msgs)
         val toolResults = result.filter { it.role == "tool" }
 
-        // First wait trimmed, second kept
+        // First learn trimmed, second kept
         assertTrue(toolResults[0].content.contains(ContextCompactor.TRIM_MARKER))
         assertFalse(toolResults[1].content.contains(ContextCompactor.TRIM_MARKER))
     }
@@ -439,7 +439,7 @@ class ContextCompactorTest {
         assertNotNull(metrics)
         val inputChars = msgs.sumOf { it.content.length }
         val outputChars = result.sumOf { it.content.length }
-        assertEquals((inputChars - outputChars) / 3, metrics!!.tokensSaved)
+        assertEquals(maxOf(0, inputChars / 3 - outputChars / 3), metrics!!.tokensSaved)
     }
 
     // -- Int.MAX_VALUE keepFull edge case --
@@ -451,9 +451,9 @@ class ContextCompactorTest {
             maxTokenEstimate = 0,
             keepFullByCategory = mapOf(ToolCategory.OTHER to Int.MAX_VALUE)
         ))
-        // Create many OTHER-category tool results
+        // Create many OTHER-category tool results ("learn" is OTHER category)
         val msgs = conversation(
-            *Array(50) { i -> toolResult("Result $i\n\nSCREEN:\nApp: com.test\n[0] \"X\"", "wait") }
+            *Array(50) { i -> toolResult("Result $i\n\nSCREEN:\nApp: com.test\n[0] \"X\"", "learn") }
         )
         val result = compactor.compact(msgs)
         val toolResults = result.filter { it.role == "tool" }

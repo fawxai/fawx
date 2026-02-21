@@ -85,19 +85,21 @@ class ModelManagerTest {
 
     @Test
     fun `ensureExtracted cleans up directory on extraction failure`() = runTest {
-        // Note: Robolectric's AssetManager does not serve bundled model files,
-        // so this test verifies that ensureExtracted() attempts extraction
-        // (throws because the asset doesn't exist in the test APK) and cleans
-        // up the partial state on failure.
+        // Deterministic failure setup: create a file where the extraction directory should be.
+        // Writing the version marker to <file>/.version throws, and extractAssetDir must clean up.
+        val blockingFile = File(manager.modelDir)
+        blockingFile.parentFile?.mkdirs()
+        blockingFile.writeText("not-a-directory")
+
         try {
             manager.ensureExtracted()
-            fail("Expected exception — test APK has no bundled model assets")
+            fail("Expected extraction failure when modelDir path is occupied by a file")
         } catch (_: Exception) {
-            // Expected: asset open fails because models aren't in test resources
+            // Expected
         }
-        // Verify cleanup: directory should be removed on failure
+
         assertFalse(
-            "Partial extraction should be cleaned up on failure",
+            "Partial extraction state should be cleaned up on failure",
             File(manager.modelDir).exists()
         )
     }
@@ -110,16 +112,15 @@ class ModelManagerTest {
         File(dir, ".version").writeText("old-version")
 
         // Version mismatch means isExtracted is false, so ensureExtracted will
-        // attempt extraction. It will fail (no assets in test APK) and clean up.
-        try {
-            manager.ensureExtracted()
-            fail("Expected exception — test APK has no bundled model assets")
-        } catch (_: Exception) {
-            // Expected
-        }
-        // Old files should be cleaned up
-        assertFalse(
-            "Stale files should be cleaned up on failed re-extraction",
+        // attempt re-extraction. Robolectric's AssetManager returns empty list,
+        // so it succeeds with 0 extracted files + new .version.
+        // NOTE: This tests the re-extraction trigger, but not failure cleanup.
+        // See `ensureExtracted cleans up directory on extraction failure` for that.
+        val result = manager.ensureExtracted()
+        assertTrue("Should re-extract on version mismatch", result)
+        // Stale files should be replaced — directory recreated
+        assertTrue(
+            "Model directory should exist after re-extraction",
             File(manager.modelDir).exists()
         )
     }

@@ -47,6 +47,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.semantics.contentDescription
@@ -958,6 +959,7 @@ internal fun MiniChatOverlayCard(
                         else -> surfaces.separatorLight
                     }
                     Surface(
+                        modifier = if (line.type == OverlayLineType.QUEUED) Modifier.testTag(TEST_TAG_OVERLAY_QUEUED_LINE) else Modifier,
                         shape = RoundedCornerShape(
                             topStart = 14.dp,
                             topEnd = 14.dp,
@@ -1159,6 +1161,10 @@ internal fun MiniChatOverlayCard(
                         showStopButton -> surfaces.labelPrimary
                         hasInputText -> activeSendIconTint
                         else -> inactiveSendIconTint
+                    },
+                    contentDescription = when {
+                        showStopButton -> "Stop"
+                        else -> "Send"
                     }
                 ) { resolvedIconTint ->
                     if (showStopButton) {

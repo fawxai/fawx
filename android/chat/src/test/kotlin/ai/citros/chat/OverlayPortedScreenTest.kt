@@ -81,7 +81,7 @@ class OverlayPortedScreenTest {
             )
         }
 
-        composeRule.onNodeWithText("Message...", useUnmergedTree = true).assertExists()
+        composeRule.onNodeWithText("Message", useUnmergedTree = true).assertExists()
     }
 
     @Test
@@ -103,11 +103,11 @@ class OverlayPortedScreenTest {
             )
         }
 
-        composeRule.onNodeWithText("Message...", useUnmergedTree = true).assertExists()
+        composeRule.onNodeWithText("Message", useUnmergedTree = true).assertExists()
     }
 
     @Test
-    fun `mini chat send button disabled when draft is blank`() {
+    fun `mini chat shows stop button when executing with blank draft`() {
         composeRule.setContent {
             MiniChatOverlayCard(
                 flavor = CitrosFlavor.LIME,
@@ -125,7 +125,8 @@ class OverlayPortedScreenTest {
             )
         }
 
-        composeRule.onNodeWithText("Send").assertIsNotEnabled()
+        // EXECUTING + empty draft = stop button (enabled), not send button
+        composeRule.onNodeWithContentDescription("Stop").assertIsEnabled()
     }
 
     @Test
@@ -147,11 +148,11 @@ class OverlayPortedScreenTest {
             )
         }
 
-        composeRule.onNodeWithText("Send").assertIsEnabled()
+        composeRule.onNodeWithContentDescription("Send").assertIsEnabled()
     }
 
     @Test
-    fun `mini chat send button disabled for whitespace-only draft`() {
+    fun `mini chat shows stop button when executing with whitespace-only draft`() {
         composeRule.setContent {
             MiniChatOverlayCard(
                 flavor = CitrosFlavor.LIME,
@@ -169,7 +170,8 @@ class OverlayPortedScreenTest {
             )
         }
 
-        composeRule.onNodeWithText("Send").assertIsNotEnabled()
+        // Whitespace-only draft is not "input" — still shows stop button
+        composeRule.onNodeWithContentDescription("Stop").assertIsEnabled()
     }
 
     @Test
@@ -218,7 +220,7 @@ class OverlayPortedScreenTest {
         composeRule.onNodeWithText("Resume").assertExists()
         // Input is still visible (never hidden)
         composeRule.onNodeWithContentDescription("Message input").assertExists()
-        composeRule.onNodeWithText("Message...", useUnmergedTree = true).assertExists()
+        composeRule.onNodeWithText("Message", useUnmergedTree = true).assertExists()
     }
 
     @Test
@@ -296,7 +298,7 @@ class OverlayPortedScreenTest {
         composeRule.onNodeWithText("Resume").assertExists()
 
         // Send a message
-        composeRule.onNodeWithText("Send").performClick()
+        composeRule.onNodeWithContentDescription("Send").performClick()
         composeRule.waitForIdle()
 
         // Banner should be gone
@@ -331,7 +333,7 @@ class OverlayPortedScreenTest {
             )
         }
 
-        composeRule.onNodeWithText("Send").performClick()
+        composeRule.onNodeWithContentDescription("Send").performClick()
         assertTrue(submitted, "onSubmitQueuedMessage should fire on Send click")
     }
 
@@ -615,12 +617,13 @@ class OverlayPortedScreenTest {
             )
         }
 
-        composeRule.onNodeWithText("Send").performClick()
+        composeRule.onNodeWithContentDescription("Send").performClick()
         composeRule.waitForIdle()
 
         assertEquals("follow-up message", sentMessage)
         assertEquals("", currentDraft)
-        composeRule.onNodeWithText("Send").assertIsNotEnabled()
+        // After send clears draft, button switches to Stop (EXECUTING + empty draft)
+        composeRule.onNodeWithContentDescription("Stop").assertIsEnabled()
     }
 
     // ========== Whitespace Trimming ==========
@@ -651,7 +654,7 @@ class OverlayPortedScreenTest {
     }
 
     @Test
-    fun `mini chat whitespace-only draft keeps send disabled`() {
+    fun `mini chat whitespace-only draft shows stop button when executing`() {
         var sendCalled = false
 
         composeRule.setContent {
@@ -671,7 +674,8 @@ class OverlayPortedScreenTest {
             )
         }
 
-        composeRule.onNodeWithText("Send").assertIsNotEnabled()
+        // Whitespace-only draft in EXECUTING state = stop button (not send)
+        composeRule.onNodeWithContentDescription("Stop").assertIsEnabled()
         assertEquals(false, sendCalled)
     }
 
