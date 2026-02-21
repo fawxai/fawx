@@ -1,5 +1,4 @@
 package ai.citros.chat
-
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -14,14 +13,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FilterChip
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
-import androidx.compose.material3.RadioButton
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -34,23 +26,18 @@ import ai.citros.core.ModelConfig
 import ai.citros.core.Provider
 import ai.citros.core.WalletKey
 import ai.citros.core.WalletState
-
 private val QuickSpacingXs = 8.dp
 private val QuickSpacingSm = 12.dp
 private val QuickSpacingMd = 16.dp
-
 // Row content in the key list is designed around a 56.dp tap target.
 private val QuickSwitcherKeyRowHeight = 56.dp
 private val QuickSwitcherMaxVisibleKeyRows = 4
 private val QuickSwitcherMaxSheetHeight = 560.dp
-
 internal fun abbreviatedModelName(modelId: String): String {
     val normalized = modelId
         .removeSuffix("-latest")
         .substringAfterLast('/')
-
     val normalizedVersion = normalized.replace('.', '-')
-
     return when {
         normalizedVersion.contains("claude-sonnet-4-5") -> "Sonnet 4.5"
         normalizedVersion.contains("claude-haiku-4-5") -> "Haiku 4.5"
@@ -59,7 +46,6 @@ internal fun abbreviatedModelName(modelId: String): String {
         else -> normalized.replace("-", " ").replaceFirstChar { it.uppercase() }
     }
 }
-
 @Composable
 internal fun QuickSwitcherToolbarChip(
     provider: Provider,
@@ -67,11 +53,10 @@ internal fun QuickSwitcherToolbarChip(
     onClick: () -> Unit
 ) {
     val modelLabel = abbreviatedModelName(chatModelId)
-
     Surface(
         onClick = onClick,
-        shape = MaterialTheme.shapes.large,
-        color = MaterialTheme.colorScheme.surfaceVariant,
+        shape = RoundedCornerShape(999.dp),
+        color = CitrosColorScheme.surfaceVariant,
         tonalElevation = 2.dp,
         modifier = Modifier.semantics {
             contentDescription = "Quick switcher. Provider ${provider.name}. Chat model $modelLabel"
@@ -85,16 +70,14 @@ internal fun QuickSwitcherToolbarChip(
             Spacer(Modifier.width(6.dp))
             Text(
                 modelLabel,
-                style = MaterialTheme.typography.labelLarge,
+                style = CitrosTypography.labelLarge,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )
         }
     }
 }
-
 @Composable
-@OptIn(ExperimentalMaterial3Api::class)
 internal fun QuickSwitcherBottomSheet(
     walletState: WalletState,
     onDismiss: () -> Unit,
@@ -105,7 +88,6 @@ internal fun QuickSwitcherBottomSheet(
 ) {
     val activeKey = walletState.keys.find { it.id == walletState.activeKeyId }
     val provider = activeKey?.provider
-
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(
             modifier = Modifier
@@ -115,11 +97,10 @@ internal fun QuickSwitcherBottomSheet(
                 .padding(horizontal = QuickSpacingMd)
                 .padding(bottom = QuickSpacingMd)
         ) {
-            Text("Quick Switcher", style = MaterialTheme.typography.titleLarge)
+            Text("Quick Switcher", style = CitrosTypography.titleLarge)
             Spacer(Modifier.height(QuickSpacingSm))
-            Text("API Keys", style = MaterialTheme.typography.titleMedium)
+            Text("API Keys", style = CitrosTypography.titleMedium)
             Spacer(Modifier.height(QuickSpacingXs))
-
             LazyColumn(
                 verticalArrangement = Arrangement.spacedBy(QuickSpacingXs),
                 modifier = Modifier.height(
@@ -147,16 +128,15 @@ internal fun QuickSwitcherBottomSheet(
                         Text(key.label, modifier = Modifier.weight(1f))
                         Text(
                             if (key.id == walletState.activeKeyId) "Active" else "Available",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                            style = CitrosTypography.labelSmall,
+                            color = CitrosColorScheme.onSurfaceVariant
                         )
                     }
                 }
             }
-
             if (provider != null) {
                 Spacer(Modifier.height(QuickSpacingSm))
-                Text("Chat Model", style = MaterialTheme.typography.titleSmall)
+                Text("Chat Model", style = CitrosTypography.titleSmall)
                 Spacer(Modifier.height(QuickSpacingXs))
                 Row(horizontalArrangement = Arrangement.spacedBy(QuickSpacingXs)) {
                     ModelConfig.chatModelsForProvider(provider).forEach { model ->
@@ -168,9 +148,8 @@ internal fun QuickSwitcherBottomSheet(
                         )
                     }
                 }
-
                 Spacer(Modifier.height(QuickSpacingSm))
-                Text("Action Model", style = MaterialTheme.typography.titleSmall)
+                Text("Action Model", style = CitrosTypography.titleSmall)
                 Spacer(Modifier.height(QuickSpacingXs))
                 Row(horizontalArrangement = Arrangement.spacedBy(QuickSpacingXs)) {
                     ModelConfig.actionModelsForProvider(provider).forEach { model ->
@@ -183,7 +162,6 @@ internal fun QuickSwitcherBottomSheet(
                     }
                 }
             }
-
             Spacer(Modifier.height(QuickSpacingSm))
             TextButton(
                 onClick = onManageKeys,

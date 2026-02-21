@@ -19,9 +19,10 @@ import android.view.View
 import android.view.WindowInsets
 import android.view.WindowInsetsAnimation
 import android.view.WindowManager
-import android.view.animation.DecelerateInterpolator
 import androidx.annotation.MainThread
 import androidx.compose.runtime.Composable
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.padding
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -49,8 +50,9 @@ import kotlinx.coroutines.launch
  * using [WindowManager] with [WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY].
  *
  * Supports two visual modes:
- * - **MINI_CHAT**: Bottom-anchored floating panel (~40% screen height, draggable).
- * - **BUBBLE**: Small circular indicator (~56dp, draggable, tap to expand).
+ * - **PANEL**: Bottom-anchored floating panel (~40% screen height).
+ * - **SEARCH_BAR**: Docked bottom search bar in the Pixel search slot.
+ * - **DYNAMIC_ISLAND**: Compact top-centered status island.
  *
  * The service observes [OverlayController] flows for state updates and mode changes.
  * A [ComposeView] renders the overlay UI using the same composables from
@@ -78,10 +80,9 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
         const val ACTION_EXPAND = "ai.citros.chat.ACTION_EXPAND_OVERLAY"
         private const val EXTRA_FLAVOR = "extra_flavor"
 
-        private const val MINI_CHAT_HEIGHT_FRACTION = 0.4f
-        /** Max fraction of available space above keyboard for mini chat. */
-        private const val BUBBLE_SIZE_DP = 56
-        private const val BUBBLE_MARGIN_BOTTOM_DP = 100
+        private const val PANEL_HEIGHT_FRACTION = 0.4f
+        private const val SEARCH_BAR_BOTTOM_MARGIN_DP = 0
+        private const val DYNAMIC_ISLAND_TOP_MARGIN_DP = 12
 
         /** Sentinel value indicating no visibility has been saved yet. */
         private const val NO_SAVED_VISIBILITY = -1
@@ -106,11 +107,12 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
                 action = ACTION_STOP
             }
 
-        /** Calculate bubble Y position. Exposed for testing. */
-        internal fun calculateBubbleBaseY(screenHeight: Int, density: Float): Int {
-            val sizePx = (BUBBLE_SIZE_DP * density).toInt()
-            return screenHeight - sizePx - (BUBBLE_MARGIN_BOTTOM_DP * density).toInt()
-        }
+        /**
+         * Search bar Y offset from the bottom edge.
+         * Currently 0 (flush to bottom). If SEARCH_BAR_BOTTOM_MARGIN_DP
+         * is ever non-zero, restore the density calculation.
+         */
+        internal fun calculateSearchBarBaseY(screenHeight: Int, density: Float): Int = 0
 
 
     }
@@ -128,7 +130,7 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
     private var overlayParams: WindowManager.LayoutParams? = null
     /** Tracks IME visibility to avoid redundant layout updates. */
     private var lastImeVisible = false
-    private var currentMode: OverlaySurfaceMode = OverlaySurfaceMode.BUBBLE
+    private var currentMode: OverlaySurfaceMode = OverlaySurfaceMode.DYNAMIC_ISLAND
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var modeObserverJob: Job? = null
     private var foregroundObserverJob: Job? = null
@@ -136,9 +138,6 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
     private var selectedThemeMode by mutableStateOf(THEME_MODE_DEFAULT)
     private var onboardingPrefs: SharedPreferences? = null
     private var onboardingPrefsListener: SharedPreferences.OnSharedPreferenceChangeListener? = null
-
-    // Drag state
-    private var animationJob: Job? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -195,7 +194,7 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
                 return START_NOT_STICKY
             }
             ACTION_EXPAND -> {
-                OverlayController.updateSurfaceMode(OverlaySurfaceMode.MINI_CHAT)
+                OverlayController.updateSurfaceMode(OverlaySurfaceMode.PANEL, fromUser = true)
                 return START_STICKY
             }
         }
@@ -240,10 +239,9 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
         if (onboardingPrefsListener != null) return
         onboardingPrefsListener = SharedPreferences.OnSharedPreferenceChangeListener { sharedPrefs, key ->
             when (key) {
-                PREF_SELECTED_FLAVOR -> {
-                    val nextFlavor = CitrosFlavor.fromStorage(
-                        sharedPrefs.getString(PREF_SELECTED_FLAVOR, CitrosFlavor.TANGERINE.storageValue)
-                    )
+                PREF_SELECTED_FLAVOR,
+                PREF_SELECTED_FLAVOR_OPTION -> {
+                    val nextFlavor = readSelectedFlavor(this)
                     serviceScope.launch {
                         selectedFlavor = nextFlavor
                     }
@@ -342,7 +340,7 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
      * Note: [startActivity] dispatches the intent to the system synchronously;
      * the activity will launch even if [stopSelf] is called immediately after.
      *
-     * Called when the user taps "Full" on the overlay mini-chat.
+     * Called when the user taps "Full" on the overlay panel.
      */
     private fun launchChatActivity() {
         val intent = Intent(this, ChatActivity::class.java).apply {
@@ -393,10 +391,10 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
             addView(composeView)
             overlayParams = params
             callback = createDragCallback()
-            // Only enable drag interception in bubble mode. In mini-chat mode,
-            // Compose scroll (LazyColumn) conflicts with frame-level drag via
-            // requestDisallowInterceptTouchEvent.
-            dragEnabled = mode == OverlaySurfaceMode.BUBBLE
+            // Keep drag interception disabled for directive-C overlays.
+            // Search bar and dynamic island are fixed-position surfaces; panel
+            // interaction relies on inner scroll/input gestures.
+            dragEnabled = false
         }
         overlayView = dragFrame
 
@@ -545,7 +543,7 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
     }
 
     /**
-     * Move the mini-chat overlay to the top of the screen.
+     * Move the panel overlay to the top of the screen.
      * Called when the queue input TextField gains focus (#451) or
      * after a drag-to-top / swipe-up gesture (#408).
      * Resets x/y offsets so gravity-based positioning takes over.
@@ -572,7 +570,7 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
     }
 
     /**
-     * Move the mini-chat overlay back to the bottom of the screen.
+     * Move the panel overlay back to the bottom of the screen.
      * Called when the queue input TextField loses focus (#451) or
      * after a drag/snap gesture (#408).
      * Resets x/y offsets so gravity-based positioning takes over.
@@ -640,51 +638,25 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
     private fun handleDragEnd(velocityY: Float, rawX: Float, rawY: Float) {
         val view = overlayView ?: return
         val dm = resources.displayMetrics
-        val density = dm.density
 
         when (currentMode) {
-            OverlaySurfaceMode.MINI_CHAT -> {
-                val action = OverlayGestureHelper.classifyMiniChatGesture(velocityY, rawX, dm.heightPixels)
+            OverlaySurfaceMode.PANEL -> {
+                val action = OverlayGestureHelper.classifyPanelGesture(velocityY, rawY, dm.heightPixels)
                 when (action) {
-                    MiniChatGestureAction.SNAP_TO_TOP -> moveOverlayToTop()
-                    MiniChatGestureAction.SNAP_TO_BOTTOM -> moveOverlayToBottom()
-                    MiniChatGestureAction.MINIMIZE_TO_BUBBLE -> {
-                        OverlayController.updateSurfaceMode(OverlaySurfaceMode.BUBBLE)
+                    PanelGestureAction.SNAP_TO_TOP -> moveOverlayToTop()
+                    PanelGestureAction.SNAP_TO_BOTTOM -> moveOverlayToBottom()
+                    PanelGestureAction.MINIMIZE_TO_SEARCH_BAR -> {
+                        OverlayController.updateSurfaceMode(OverlaySurfaceMode.SEARCH_BAR, fromUser = true)
                     }
                 }
-                if (action != MiniChatGestureAction.SNAP_TO_BOTTOM) {
+                if (action != PanelGestureAction.SNAP_TO_BOTTOM) {
                     view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
                 }
                 announceGesture(view, action)
             }
-            OverlaySurfaceMode.BUBBLE -> {
-                val action = OverlayGestureHelper.classifyBubbleGesture(velocityY)
-                when (action) {
-                    BubbleGestureAction.EXPAND_TO_MINI_CHAT -> {
-                        OverlayController.updateSurfaceMode(OverlaySurfaceMode.MINI_CHAT)
-                        OverlayController.resetUnreadCount()
-                    }
-                    BubbleGestureAction.SNAP_TO_CORNER -> {
-                        val bubbleSizePx = (BUBBLE_SIZE_DP * density).toInt()
-                        val marginPx = (16 * density).toInt()
-                        val bottomMarginPx = (BUBBLE_MARGIN_BOTTOM_DP * density).toInt()
-                        val params = overlayParams ?: return
-                        val (targetX, targetY) = OverlayGestureHelper.snapBubbleToCorner(
-                            releaseX = params.x,
-                            releaseY = params.y,
-                            screenWidth = dm.widthPixels,
-                            screenHeight = dm.heightPixels,
-                            bubbleSizePx = bubbleSizePx,
-                            marginPx = marginPx,
-                            bottomMarginPx = bottomMarginPx
-                        )
-                        animateToPosition(view, params, targetX, targetY)
-                    }
-                }
-                view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
-                announceGesture(view, action)
-            }
-            else -> {}
+            OverlaySurfaceMode.SEARCH_BAR,
+            OverlaySurfaceMode.DYNAMIC_ISLAND,
+            OverlaySurfaceMode.FULL_APP -> Unit
         }
     }
 
@@ -693,8 +665,8 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
         val density = dm.density
 
         return when (mode) {
-            OverlaySurfaceMode.MINI_CHAT -> {
-                val height = (dm.heightPixels * MINI_CHAT_HEIGHT_FRACTION).toInt()
+            OverlaySurfaceMode.PANEL -> {
+                val height = (dm.heightPixels * PANEL_HEIGHT_FRACTION).toInt()
                 WindowManager.LayoutParams(
                     WindowManager.LayoutParams.MATCH_PARENT,
                     height,
@@ -705,35 +677,46 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
                     PixelFormat.TRANSLUCENT
                 ).apply {
                     gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-                    // Pan the overlay so the focused TextField stays visible above
-                    // the keyboard. ADJUST_RESIZE caused flickering on Pixel 10 Pro
-                    // (see #401); ADJUST_PAN lets the system shift the view without
-                    // re-layout, which avoids that issue.
+                    // Pan the overlay so the focused TextField stays visible above the keyboard.
                     softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING
                     x = 0
                     y = 0
                 }
             }
-            OverlaySurfaceMode.BUBBLE -> {
-                val sizePx = (BUBBLE_SIZE_DP * density).toInt()
-                val marginPx = (16 * density).toInt()
+            OverlaySurfaceMode.SEARCH_BAR -> {
                 WindowManager.LayoutParams(
-                    sizePx,
-                    sizePx,
+                    WindowManager.LayoutParams.MATCH_PARENT,
+                    WindowManager.LayoutParams.WRAP_CONTENT,
                     WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                     WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
                         WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
                     PixelFormat.TRANSLUCENT
                 ).apply {
-                    gravity = Gravity.TOP or Gravity.START
-                    x = dm.widthPixels - sizePx - marginPx
-                    y = calculateBubbleBaseY(dm)
+                    gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+                    x = 0
+                    y = calculateSearchBarBaseY(dm.heightPixels, density)
+                }
+            }
+            OverlaySurfaceMode.DYNAMIC_ISLAND -> {
+                WindowManager.LayoutParams(
+                    WindowManager.LayoutParams.WRAP_CONTENT,
+                    WindowManager.LayoutParams.WRAP_CONTENT,
+                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                        WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
+                    PixelFormat.TRANSLUCENT
+                ).apply {
+                    gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                    x = 0
+                    y = (DYNAMIC_ISLAND_TOP_MARGIN_DP * density).toInt()
                 }
             }
             OverlaySurfaceMode.FULL_APP -> {
                 // Should not reach here — FULL_APP stops the service
-                buildLayoutParams(OverlaySurfaceMode.MINI_CHAT)
+                buildLayoutParams(OverlaySurfaceMode.PANEL)
             }
         }
     }
@@ -746,10 +729,10 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
         overlayParams = newParams
         try {
             wm.updateViewLayout(view, newParams)
-            // Update DraggableOverlayFrame's params reference and drag state for the new mode
+            // Update DraggableOverlayFrame's params reference.
             (view as? DraggableOverlayFrame)?.apply {
                 overlayParams = newParams
-                dragEnabled = mode == OverlaySurfaceMode.BUBBLE
+                dragEnabled = false
             }
         } catch (e: Exception) {
             Log.w(TAG, "Failed to update overlay layout", e)
@@ -758,60 +741,6 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
             showOverlay()
         }
     }
-
-    /**
-     * Calculate the default bottom-right Y position for the bubble overlay.
-     */
-    private fun calculateBubbleBaseY(dm: android.util.DisplayMetrics): Int =
-        calculateBubbleBaseY(dm.heightPixels, dm.density)
-
-    // Animation constants sourced from OverlayGestureHelper for consistency.
-
-    /**
-     * Animate the overlay view from its current position to (targetX, targetY)
-     * using a decelerate interpolator for a natural spring-like feel (#408).
-     */
-    private fun animateToPosition(
-        view: View,
-        params: WindowManager.LayoutParams,
-        targetX: Int,
-        targetY: Int
-    ) {
-        val wm = windowManager ?: return
-        val startX = params.x
-        val startY = params.y
-        val interpolator = DecelerateInterpolator(OverlayGestureHelper.DECELERATE_FACTOR)
-        val startTime = System.currentTimeMillis()
-
-        animationJob?.cancel() // Cancel any in-flight animation to prevent conflicts
-        animationJob = serviceScope.launch {
-            var elapsed = 0L
-            while (elapsed < OverlayGestureHelper.SNAP_ANIMATION_DURATION_MS) {
-                elapsed = System.currentTimeMillis() - startTime
-                val fraction = interpolator.getInterpolation(
-                    (elapsed.toFloat() / OverlayGestureHelper.SNAP_ANIMATION_DURATION_MS).coerceIn(0f, 1f)
-                )
-                params.x = startX + ((targetX - startX) * fraction).toInt()
-                params.y = startY + ((targetY - startY) * fraction).toInt()
-                try {
-                    wm.updateViewLayout(view, params)
-                } catch (e: Exception) {
-                    Log.w(TAG, "animateToPosition: layout update failed", e)
-                    return@launch
-                }
-                kotlinx.coroutines.delay(OverlayGestureHelper.ANIMATION_FRAME_INTERVAL_MS)
-            }
-            // Ensure final position is exact
-            params.x = targetX
-            params.y = targetY
-            try {
-                wm.updateViewLayout(view, params)
-            } catch (e: Exception) {
-                Log.w(TAG, "animateToPosition: final layout update failed", e)
-            }
-        }
-    }
-
 
     /**
      * Detect keyboard (IME) show/hide via WindowInsetsAnimation.Callback (API 30+).
@@ -836,7 +765,7 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
                         Log.d(TAG, "IME animation ended: imeVisible=$imeVisible, lastImeVisible=$lastImeVisible, mode=$currentMode")
                         if (imeVisible != lastImeVisible) {
                             lastImeVisible = imeVisible
-                            if (currentMode == OverlaySurfaceMode.MINI_CHAT) {
+                            if (currentMode == OverlaySurfaceMode.PANEL) {
                                 if (imeVisible) moveOverlayToTop() else moveOverlayToBottom()
                             }
                         }
@@ -850,20 +779,11 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
     }
 
     /** Announce gesture result to TalkBack users (#408). */
-    private fun announceGesture(view: View, action: MiniChatGestureAction) {
+    private fun announceGesture(view: View, action: PanelGestureAction) {
         val text = when (action) {
-            MiniChatGestureAction.SNAP_TO_TOP -> "Docked to top"
-            MiniChatGestureAction.SNAP_TO_BOTTOM -> return // No announcement for default position
-            MiniChatGestureAction.MINIMIZE_TO_BUBBLE -> "Minimized to bubble"
-        }
-        view.announceForAccessibility(text)
-    }
-
-    /** Announce gesture result to TalkBack users (#408). */
-    private fun announceGesture(view: View, action: BubbleGestureAction) {
-        val text = when (action) {
-            BubbleGestureAction.SNAP_TO_CORNER -> "Snapped to corner"
-            BubbleGestureAction.EXPAND_TO_MINI_CHAT -> "Expanded to mini chat"
+            PanelGestureAction.SNAP_TO_TOP -> "Docked to top"
+            PanelGestureAction.SNAP_TO_BOTTOM -> return // No announcement for default position
+            PanelGestureAction.MINIMIZE_TO_SEARCH_BAR -> "Minimized to search bar"
         }
         view.announceForAccessibility(text)
     }
@@ -915,8 +835,9 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
 
     private fun updateNotification(mode: OverlaySurfaceMode) {
         val statusText = when (mode) {
-            OverlaySurfaceMode.MINI_CHAT -> "Executing phone actions — mini-chat active"
-            OverlaySurfaceMode.BUBBLE -> "Executing phone actions — tap bubble to expand"
+            OverlaySurfaceMode.PANEL -> "Executing phone actions — panel active"
+            OverlaySurfaceMode.SEARCH_BAR -> "Executing phone actions — search bar active"
+            OverlaySurfaceMode.DYNAMIC_ISLAND -> "Executing phone actions — dynamic island active"
             OverlaySurfaceMode.FULL_APP -> "Citros is running"
         }
         val notification = buildNotification(statusText)
@@ -982,6 +903,19 @@ private fun OverlayServiceContent(flavor: CitrosFlavor) {
             )
         }
     }
+    val latestSystemLine = lines.lastOrNull { it.type == ai.citros.core.OverlayLineType.SYSTEM }
+        ?.text
+        ?.removePrefix("💥")
+        ?.removePrefix("Error:")
+        ?.trim()
+        .orEmpty()
+    val searchBarStatusText = when (overlayState.runState) {
+        ai.citros.core.OverlayRunState.EXECUTING -> currentStep.label
+        ai.citros.core.OverlayRunState.COMPLETED,
+        ai.citros.core.OverlayRunState.FAILED,
+        ai.citros.core.OverlayRunState.STOPPED -> latestSystemLine.ifBlank { currentStep.label }
+        ai.citros.core.OverlayRunState.IDLE -> ""
+    }
 
     var queuedDraft by androidx.compose.runtime.remember { mutableStateOf(queuedMessage.orEmpty()) }
 
@@ -991,7 +925,7 @@ private fun OverlayServiceContent(flavor: CitrosFlavor) {
     }
 
     when (surfaceMode) {
-        OverlaySurfaceMode.MINI_CHAT -> {
+        OverlaySurfaceMode.PANEL -> {
             OverlayMiniChatContent(
                 flavor = flavor,
                 runState = overlayState.runState,
@@ -1016,20 +950,42 @@ private fun OverlayServiceContent(flavor: CitrosFlavor) {
                     OverlayController.dispatch(OverlayAction.ResumeExecution)
                 },
                 onOpenFull = {
-                    OverlayController.updateSurfaceMode(OverlaySurfaceMode.FULL_APP)
+                    OverlayController.updateSurfaceMode(OverlaySurfaceMode.FULL_APP, fromUser = true)
                 },
-                onOpenBubble = {
-                    OverlayController.updateSurfaceMode(OverlaySurfaceMode.BUBBLE)
+                onOpenIsland = {
+                    OverlayController.updateSurfaceMode(OverlaySurfaceMode.DYNAMIC_ISLAND, fromUser = true)
+                },
+                onMinimize = {
+                    OverlayController.updateSurfaceMode(OverlaySurfaceMode.SEARCH_BAR, fromUser = true)
                 }
             )
         }
-        OverlaySurfaceMode.BUBBLE -> {
-            OverlayBubbleContent(
+        OverlaySurfaceMode.SEARCH_BAR -> {
+            OverlaySearchBarContent(
                 flavor = flavor,
                 runState = overlayState.runState,
+                statusLabel = searchBarStatusText,
                 unreadCount = unreadCount,
                 onExpand = {
-                    OverlayController.updateSurfaceMode(OverlaySurfaceMode.MINI_CHAT)
+                    OverlayController.updateSurfaceMode(OverlaySurfaceMode.PANEL, fromUser = true)
+                    OverlayController.resetUnreadCount()
+                },
+                onStopAction = {
+                    OverlayController.dispatch(OverlayAction.StopExecution)
+                },
+                modifier = androidx.compose.ui.Modifier
+                    .padding(horizontal = cg(5), vertical = cg(2))
+                    .navigationBarsPadding()
+            )
+        }
+        OverlaySurfaceMode.DYNAMIC_ISLAND -> {
+            OverlayDynamicIslandContent(
+                flavor = flavor,
+                runState = overlayState.runState,
+                currentStepLabel = currentStep.label,
+                unreadCount = unreadCount,
+                onExpand = {
+                    OverlayController.updateSurfaceMode(OverlaySurfaceMode.PANEL, fromUser = true)
                     OverlayController.resetUnreadCount()
                 },
                 onStopAction = {

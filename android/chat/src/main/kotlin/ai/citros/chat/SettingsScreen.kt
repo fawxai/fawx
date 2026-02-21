@@ -1,7 +1,9 @@
 package ai.citros.chat
 
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -25,8 +27,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.Visibility
-import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.DropdownMenu
@@ -37,12 +37,12 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.SwipeToDismissBox
 import androidx.compose.material3.SwipeToDismissBoxValue
 import androidx.compose.material3.Text
@@ -61,15 +61,22 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shadow
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.annotation.StringRes
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.OffsetMapping
+import androidx.compose.ui.text.input.TransformedText
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import ai.citros.core.KeyHealth
@@ -112,6 +119,20 @@ private data class ConnectionTestResult(
     val health: KeyHealth,
     @StringRes val messageRes: Int
 )
+
+private class PrefixMaskVisualTransformation(
+    private val visiblePrefix: Int = 8,
+    private val maskChar: Char = '•'
+) : VisualTransformation {
+    override fun filter(text: AnnotatedString): TransformedText {
+        val raw = text.text
+        if (raw.isEmpty() || raw.length <= visiblePrefix) {
+            return TransformedText(AnnotatedString(raw), OffsetMapping.Identity)
+        }
+        val masked = raw.take(visiblePrefix) + maskChar.toString().repeat(raw.length - visiblePrefix)
+        return TransformedText(AnnotatedString(masked), OffsetMapping.Identity)
+    }
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -573,7 +594,7 @@ internal fun ModelSelectionSection(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun AddKeyBottomSheet(
+internal fun AddKeyBottomSheet(
     flavor: CitrosFlavor = CitrosFlavor.TANGERINE,
     onDismiss: () -> Unit,
     onSave: (Provider, String, String) -> Unit,
@@ -586,6 +607,9 @@ private fun AddKeyBottomSheet(
     var testStatus by remember { mutableStateOf<ConnectionTestResult?>(null) }
     var testing by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
+    val providerTabs = remember {
+        listOf(Provider.ANTHROPIC, Provider.OPENROUTER, Provider.OPENAI)
+    }
 
     LaunchedEffect(apiKey) {
         ProviderConfig.detectProvider(apiKey)?.let {
@@ -597,129 +621,302 @@ private fun AddKeyBottomSheet(
     val selectedAccent = lerp(providerAccent(selectedProvider), flavor.primary, 0.46f)
     val context = LocalContext.current
     val isDarkTheme = LocalCitrosIsDark.current
+    val surfaces = remember(isDarkTheme) { citrosDirectiveSurfaces(isDarkTheme) }
     val providerUrl = when (selectedProvider) {
         Provider.ANTHROPIC -> "console.anthropic.com/settings/keys"
         Provider.OPENAI -> "platform.openai.com/api-keys"
         Provider.OPENROUTER -> "openrouter.ai/keys"
     }
+    val hasApiKey = apiKey.trim().isNotBlank()
+    val health = testStatus?.health
+    val showInvalidState = health == KeyHealth.INVALID || health == KeyHealth.EXPIRED
+    val invalidMessage = when (health) {
+        KeyHealth.INVALID, KeyHealth.EXPIRED -> "Invalid API key. Check it and try again."
+        else -> null
+    }
     val fieldColors = OutlinedTextFieldDefaults.colors(
-        focusedBorderColor = selectedAccent.copy(alpha = 0.95f),
-        unfocusedBorderColor = selectedAccent.copy(alpha = 0.46f),
-        focusedLabelColor = selectedAccent.copy(alpha = 0.94f),
-        unfocusedLabelColor = selectedAccent.copy(alpha = 0.74f),
-        cursorColor = selectedAccent
+        focusedBorderColor = Color.Transparent,
+        unfocusedBorderColor = Color.Transparent,
+        focusedLabelColor = surfaces.labelSecondary,
+        unfocusedLabelColor = surfaces.labelSecondary,
+        cursorColor = selectedAccent,
+        focusedTextColor = surfaces.labelPrimary,
+        unfocusedTextColor = surfaces.labelPrimary,
+        focusedContainerColor = surfaces.surface1,
+        unfocusedContainerColor = surfaces.surface1,
+        disabledContainerColor = surfaces.surface1
     )
+    val disabledButtonColor = if (isDarkTheme) surfaces.surface2 else surfaces.surface3.copy(alpha = 0.92f)
+    val disabledButtonTextColor = surfaces.labelSecondary
+    val isValidated = health == KeyHealth.VALID
+    val canValidate = hasApiKey && !testing && !isValidated
+    val canSave = isValidated && !testing
+    val validateButtonBg = if (isDarkTheme) Color.White else Color.Black
+    val saveButtonBg = if (isDarkTheme) Color.White else Color.Black
+    val buttonBg = when {
+        canSave -> saveButtonBg
+        canValidate -> validateButtonBg
+        else -> disabledButtonColor
+    }
+    val buttonTextColor = if (canValidate || canSave) {
+        if (buttonBg.luminance() >= 0.52f) Color.Black else Color.White
+    } else {
+        disabledButtonTextColor
+    }
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
-        containerColor = Color.Transparent,
-        scrimColor = flavor.primary.copy(alpha = 0.22f),
-        dragHandle = null
+        containerColor = if (isDarkTheme) {
+            Color(0xF51C1C1E)
+        } else {
+            Color(0xF5F2F2F7)
+        },
+        contentColor = surfaces.labelPrimary,
+        scrimColor = Color.Black.copy(alpha = if (isDarkTheme) 0.50f else 0.26f),
+        dragHandle = {
+            Box(
+                modifier = Modifier
+                    .padding(top = 12.dp, bottom = 6.dp)
+                    .size(width = 44.dp, height = 5.dp)
+                    .background(surfaces.labelTertiary.copy(alpha = 0.42f), RoundedCornerShape(999.dp))
+            )
+        }
     ) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 14.dp, vertical = 8.dp)
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 16.dp, vertical = 6.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
-            CitrosLiquidGlassSurface(
+            Row(
                 modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(26.dp),
-                baseColor = if (isDarkTheme) {
-                    Color(0xE6070709)
-                } else {
-                    MaterialTheme.colorScheme.surface.copy(alpha = 0.92f)
-                },
-                borderColor = selectedAccent.copy(alpha = 0.48f),
-                borderWidth = 1.dp,
-                highlightColor = selectedAccent,
-                warmth = 0.88f,
-                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 16.dp)
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Column(
+                Text(
+                    text = "Add Provider",
+                    style = CitrosTypography.titleLarge,
+                    fontWeight = FontWeight.SemiBold,
+                    color = surfaces.labelPrimary,
+                    modifier = Modifier.weight(1f)
+                )
+                Surface(
+                    modifier = Modifier
+                        .size(28.dp)
+                        .clickable(onClick = onDismiss),
+                    shape = CircleShape,
+                    color = surfaces.surface3
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Text(
+                            text = "×",
+                            style = CitrosTypography.titleMedium,
+                            color = surfaces.labelSecondary
+                        )
+                    }
+                }
+            }
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+                color = if (isDarkTheme) surfaces.surface1 else surfaces.surface2,
+                border = BorderStroke(1.dp, surfaces.separatorLight)
+            ) {
+                Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .verticalScroll(rememberScrollState()),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                        .padding(4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    Text(
-                        stringResource(R.string.wallet_add_api_key),
-                        style = MaterialTheme.typography.titleLarge,
-                        color = selectedAccent,
-                        fontWeight = FontWeight.SemiBold
-                    )
-
-                    Row(horizontalArrangement = Arrangement.spacedBy(SpacingXs)) {
-                        listOf(Provider.ANTHROPIC, Provider.OPENAI, Provider.OPENROUTER).forEach { provider ->
-                            val chipAccent = lerp(providerAccent(provider), flavor.primary, 0.42f)
-                            FilterChip(
-                                selected = selectedProvider == provider,
-                                onClick = {
-                                    selectedProvider = provider
-                                    if (label.isBlank() || label.endsWith(" Key")) label = defaultLabelFor(provider)
-                                },
-                                label = { Text(ProviderUi.displayName(provider)) },
-                                colors = FilterChipDefaults.filterChipColors(
-                                    containerColor = if (isDarkTheme) {
-                                        Color.Black.copy(alpha = 0.20f)
+                    providerTabs.forEach { provider ->
+                        val selected = selectedProvider == provider
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .background(
+                                    if (selected) {
+                                        if (isDarkTheme) surfaces.surface2 else surfaces.background
                                     } else {
-                                        MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.72f)
+                                        Color.Transparent
                                     },
-                                    labelColor = chipAccent.copy(alpha = 0.84f),
-                                    selectedContainerColor = chipAccent.copy(alpha = 0.20f),
-                                    selectedLabelColor = chipAccent.copy(alpha = 0.98f)
+                                    RoundedCornerShape(10.dp)
                                 )
+                                .border(
+                                    width = if (selected) 1.dp else 0.dp,
+                                    color = if (selected) surfaces.separator else Color.Transparent,
+                                    shape = RoundedCornerShape(10.dp)
+                                )
+                                .clickable {
+                                    selectedProvider = provider
+                                    testStatus = null
+                                    if (label.isBlank() || label.endsWith(" Key")) {
+                                        label = defaultLabelFor(provider)
+                                    }
+                                }
+                                .padding(horizontal = 8.dp, vertical = 10.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = ProviderUi.displayName(provider),
+                                style = CitrosTypography.bodyMedium,
+                                color = if (selected) surfaces.labelPrimary else surfaces.labelTertiary,
+                                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal
                             )
                         }
                     }
+                }
+            }
 
-                    Text(
-                        text = "Get a key at $providerUrl",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = selectedAccent.copy(alpha = 0.92f),
+            Text(
+                text = "Get a key at $providerUrl",
+                style = CitrosTypography.bodyMedium,
+                color = selectedAccent.copy(alpha = 0.92f),
+                modifier = Modifier
+                    .clickable {
+                        context.startActivity(
+                            android.content.Intent(
+                                android.content.Intent.ACTION_VIEW,
+                                android.net.Uri.parse("https://$providerUrl")
+                            )
+                        )
+                    }
+            )
+
+            Text(
+                text = "API KEY",
+                style = CitrosTypography.labelMedium,
+                color = surfaces.labelSecondary.copy(alpha = 0.90f)
+            )
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(surfaces.surface1, RoundedCornerShape(12.dp))
+                    .border(
+                        width = if (showInvalidState) 1.5.dp else 0.dp,
+                        color = if (showInvalidState) surfaces.red else Color.Transparent,
+                        shape = RoundedCornerShape(12.dp)
+                    )
+            ) {
+                OutlinedTextField(
+                    value = apiKey,
+                    onValueChange = {
+                        apiKey = it
+                        testStatus = null
+                    },
+                    placeholder = {
+                        Text(
+                            ProviderUi.keyPlaceholder(selectedProvider),
+                            color = surfaces.labelTertiary,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    },
+                    visualTransformation = if (showSecret) {
+                        VisualTransformation.None
+                    } else {
+                        PrefixMaskVisualTransformation(visiblePrefix = 8)
+                    },
+                    textStyle = CitrosTypography.bodyLarge.copy(fontFamily = FontFamily.Monospace),
+                    trailingIcon = {
+                        CitrosIconButton(onClick = { showSecret = !showSecret }) {
+                            CitrosIcon(
+                                imageVector = if (showSecret) CitrosIcons.VisibilityOff else CitrosIcons.Visibility,
+                                contentDescription = if (showSecret) "Hide key" else "Show key",
+                                tint = surfaces.labelTertiary
+                            )
+                        }
+                    },
+                    colors = fieldColors,
+                    singleLine = true,
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+
+            invalidMessage?.let {
+                Text(
+                    text = it,
+                    style = CitrosTypography.bodyMedium,
+                    color = surfaces.red
+                )
+            }
+
+            Text(
+                text = "LABEL (optional)",
+                style = CitrosTypography.labelMedium,
+                color = surfaces.labelSecondary.copy(alpha = 0.90f)
+            )
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(surfaces.surface1, RoundedCornerShape(12.dp))
+            ) {
+                OutlinedTextField(
+                    value = label,
+                    onValueChange = { label = it },
+                    placeholder = {
+                        Text(
+                            "e.g. Personal key",
+                            color = surfaces.labelTertiary
+                        )
+                    },
+                    colors = fieldColors,
+                    singleLine = true,
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+
+            if (isValidated) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.Center
+                ) {
+                    Box(
                         modifier = Modifier
-                            .clickable {
-                                context.startActivity(
-                                    android.content.Intent(
-                                        android.content.Intent.ACTION_VIEW,
-                                        android.net.Uri.parse("https://$providerUrl")
-                                    )
-                                )
-                            }
-                            .padding(vertical = 4.dp)
+                            .size(20.dp)
+                            .background(surfaces.surface3, CircleShape),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Canvas(modifier = Modifier.size(11.dp)) {
+                            drawLine(
+                                color = surfaces.labelPrimary,
+                                start = Offset(x = size.width * 0.18f, y = size.height * 0.56f),
+                                end = Offset(x = size.width * 0.42f, y = size.height * 0.80f),
+                                strokeWidth = size.minDimension * 0.16f,
+                                cap = StrokeCap.Round
+                            )
+                            drawLine(
+                                color = surfaces.labelPrimary,
+                                start = Offset(x = size.width * 0.40f, y = size.height * 0.80f),
+                                end = Offset(x = size.width * 0.84f, y = size.height * 0.24f),
+                                strokeWidth = size.minDimension * 0.16f,
+                                cap = StrokeCap.Round
+                            )
+                        }
+                    }
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = "Key verified",
+                        style = CitrosTypography.bodyMedium,
+                        color = surfaces.green
                     )
+                }
+            }
 
-                    OutlinedTextField(
-                        value = apiKey,
-                        onValueChange = {
-                            apiKey = it
-                            testStatus = null
-                        },
-                        label = { Text(stringResource(R.string.wallet_api_key)) },
-                        visualTransformation = if (showSecret) VisualTransformation.None else PasswordVisualTransformation(),
-                        trailingIcon = {
-                            IconButton(onClick = { showSecret = !showSecret }) {
-                                Icon(
-                                    if (showSecret) Icons.Default.VisibilityOff else Icons.Default.Visibility,
-                                    contentDescription = stringResource(R.string.wallet_toggle_visibility),
-                                    tint = selectedAccent.copy(alpha = 0.9f)
-                                )
-                            }
-                        },
-                        colors = fieldColors,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-
-                    OutlinedTextField(
-                        value = label,
-                        onValueChange = { label = it },
-                        label = { Text(stringResource(R.string.common_label)) },
-                        colors = fieldColors,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-
-                    CitrusLiquidGlassButton(
-                        text = if (testing) stringResource(R.string.wallet_testing) else stringResource(R.string.wallet_test_connection),
-                        onClick = {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(52.dp)
+                    .background(buttonBg, RoundedCornerShape(12.dp))
+                    .clickable(enabled = (canValidate || canSave)) {
+                        if (canSave) {
+                            onSave(
+                                selectedProvider,
+                                label.ifBlank { defaultLabelFor(selectedProvider) },
+                                apiKey.trim()
+                            )
+                        } else if (canValidate) {
                             testing = true
                             scope.launch {
                                 val result = testConnection(selectedProvider, apiKey.trim())
@@ -727,79 +924,62 @@ private fun AddKeyBottomSheet(
                                 onTested(result.health, selectedProvider, apiKey.trim())
                                 testing = false
                             }
-                        },
-                        enabled = apiKey.isNotBlank() && !testing,
-                        tintColor = selectedAccent,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-
-                    testStatus?.let {
-                        val statusColor = when (it.health) {
-                            KeyHealth.VALID -> Color(0xFF88F5B4)
-                            KeyHealth.INVALID, KeyHealth.EXPIRED -> Color(0xFFFF8A8A)
-                            KeyHealth.UNKNOWN, KeyHealth.UNCHECKED -> Color(0xFFFFE089)
                         }
-                        Text(
-                            text = stringResource(it.messageRes),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = statusColor
-                        )
-                    }
-
-                    CitrusLiquidGlassButton(
-                        text = stringResource(R.string.common_save),
-                        onClick = {
-                            onSave(
-                                selectedProvider,
-                                label.ifBlank { defaultLabelFor(selectedProvider) },
-                                apiKey.trim()
-                            )
-                        },
-                        enabled = apiKey.isNotBlank(),
-                        tintColor = selectedAccent,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                }
+                    },
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = when {
+                        canSave -> "Save Provider"
+                        testing -> "Validating..."
+                        else -> "Validate Key"
+                    },
+                    style = CitrosTypography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = buttonTextColor
+                )
             }
+            Spacer(Modifier.height(10.dp))
         }
     }
 }
 
 private suspend fun testConnection(provider: Provider, apiKey: String): ConnectionTestResult {
     if (apiKey.isBlank()) return ConnectionTestResult(KeyHealth.INVALID, R.string.wallet_key_required)
+    if (provider == Provider.OPENROUTER) {
+        return validateOpenRouterKey(apiKey.trim())
+    }
+    return when (validateApiCredential(apiKey.trim(), provider)) {
+        ApiKeyValidationStatus.VALID -> ConnectionTestResult(KeyHealth.VALID, R.string.wallet_connection_connected)
+        ApiKeyValidationStatus.INVALID -> ConnectionTestResult(KeyHealth.INVALID, R.string.wallet_connection_invalid_key)
+        ApiKeyValidationStatus.EXPIRED -> ConnectionTestResult(KeyHealth.INVALID, R.string.wallet_connection_invalid_key)
+        ApiKeyValidationStatus.UNKNOWN -> ConnectionTestResult(KeyHealth.UNKNOWN, R.string.wallet_connection_could_not_verify)
+    }
+}
 
-    return withContext(Dispatchers.IO) {
-        try {
-            val endpoint = when (provider) {
-                Provider.ANTHROPIC -> "https://api.anthropic.com/v1/models"
-                Provider.OPENAI -> "https://api.openai.com/v1/models"
-                Provider.OPENROUTER -> "https://openrouter.ai/api/v1/models"
-            }
-            val conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
-                requestMethod = "GET"
-                connectTimeout = CONNECT_TIMEOUT_MS
-                readTimeout = READ_TIMEOUT_MS
-                when (provider) {
-                    Provider.ANTHROPIC -> {
-                        setRequestProperty("x-api-key", apiKey)
-                        setRequestProperty("anthropic-version", ProviderConfig.ANTHROPIC_API_VERSION)
-                    }
-                    Provider.OPENAI, Provider.OPENROUTER -> setRequestProperty("Authorization", "Bearer $apiKey")
-                }
-            }
-            conn.connect()
-            when (conn.responseCode) {
-                in 200..299 -> ConnectionTestResult(KeyHealth.VALID, R.string.wallet_connection_connected)
-                401, 403 -> ConnectionTestResult(KeyHealth.INVALID, R.string.wallet_connection_invalid_key)
-                in 500..599 -> ConnectionTestResult(KeyHealth.UNKNOWN, R.string.wallet_connection_provider_unavailable)
-                else -> ConnectionTestResult(KeyHealth.UNKNOWN, R.string.wallet_connection_could_not_verify)
-            }
-        } catch (_: SocketTimeoutException) {
-            ConnectionTestResult(KeyHealth.UNKNOWN, R.string.wallet_connection_timed_out)
-        } catch (_: UnknownHostException) {
-            ConnectionTestResult(KeyHealth.UNKNOWN, R.string.wallet_connection_no_network)
-        } catch (_: Throwable) {
-            ConnectionTestResult(KeyHealth.UNKNOWN, R.string.wallet_connection_error)
+private suspend fun validateOpenRouterKey(apiKey: String): ConnectionTestResult = withContext(Dispatchers.IO) {
+    try {
+        val conn = (URL("https://openrouter.ai/api/v1/auth/key").openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = CONNECT_TIMEOUT_MS
+            readTimeout = READ_TIMEOUT_MS
+            setRequestProperty("Authorization", "Bearer $apiKey")
+            setRequestProperty("Accept", "application/json")
+            setRequestProperty("HTTP-Referer", "https://citros.ai")
+            setRequestProperty("X-Title", "Citros")
         }
+        conn.connect()
+        when (conn.responseCode) {
+            in 200..299 -> ConnectionTestResult(KeyHealth.VALID, R.string.wallet_connection_connected)
+            401, 403 -> ConnectionTestResult(KeyHealth.INVALID, R.string.wallet_connection_invalid_key)
+            in 500..599 -> ConnectionTestResult(KeyHealth.UNKNOWN, R.string.wallet_connection_provider_unavailable)
+            else -> ConnectionTestResult(KeyHealth.UNKNOWN, R.string.wallet_connection_could_not_verify)
+        }
+    } catch (_: SocketTimeoutException) {
+        ConnectionTestResult(KeyHealth.UNKNOWN, R.string.wallet_connection_timed_out)
+    } catch (_: UnknownHostException) {
+        ConnectionTestResult(KeyHealth.UNKNOWN, R.string.wallet_connection_no_network)
+    } catch (_: Throwable) {
+        ConnectionTestResult(KeyHealth.UNKNOWN, R.string.wallet_connection_error)
     }
 }

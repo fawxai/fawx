@@ -7,9 +7,11 @@ internal object OverlayUiConstants {
     const val STEP_TICKER_DELAY_MS = 1400L
     const val DISMISS_ANIMATION_DELAY_MS = 200L
 
-    val BubbleSize = 58.dp
-    val BubbleProgressSize = 48.dp
-    val BubbleBadgeSize = 18.dp
+    val SearchBarHorizontalMargin = 20.dp
+    val SearchBarHeight = 52.dp
+    val SearchBarCornerRadius = 28.dp
+    val SearchBarOrbSize = 36.dp
+    val SearchBarMicButtonSize = 36.dp
     val HeaderStatusDotSize = 8.dp
 
     val StandardChipPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
@@ -23,8 +25,6 @@ internal object OverlayUiConstants {
     val MiniChatCornerRadius = 22.dp
     val StandardCardCornerRadius = 14.dp
     val MiniChatMaxHeight = 340.dp
-    val BubbleQuickActionsWidth = 150.dp
-
     val PillCornerRadius = 999.dp
     val ModeChipCornerRadius = 10.dp
     val PhoneItemCornerRadius = 6.dp

@@ -50,7 +50,7 @@ class LauncherIconManagerTest {
 
         val componentCaptor = argumentCaptor<ComponentName>()
         val stateCaptor = argumentCaptor<Int>()
-        verify(packageManager, times(5)).setComponentEnabledSetting(
+        verify(packageManager, times(6)).setComponentEnabledSetting(
             componentCaptor.capture(),
             stateCaptor.capture(),
             eq(PackageManager.DONT_KILL_APP)
@@ -63,6 +63,7 @@ class LauncherIconManagerTest {
 
         assertEquals(
             setOf(
+                "$packageName.LauncherNone",
                 "$packageName.LauncherLemon",
                 "$packageName.LauncherTangerine",
                 "$packageName.LauncherLime",

@@ -16,7 +16,7 @@ import kotlin.test.assertTrue
 
 /**
  * Unit tests for OverlayService intents, OverlayController state,
- * bubble positioning, and overlay visibility management.
+ * search bar positioning, and overlay visibility management.
  *
  * Requires Robolectric for Android framework APIs (Intent construction)
  * that aren't available in standard JVM unit tests.
@@ -79,11 +79,11 @@ class OverlayServiceTest {
     fun `overlay controller mode transitions are reflected correctly`() {
         // Simulate what the service observes
         OverlayController.activateOverlay()
-        assertEquals(OverlaySurfaceMode.MINI_CHAT, OverlayController.surfaceMode.value)
+        assertEquals(OverlaySurfaceMode.SEARCH_BAR, OverlayController.surfaceMode.value)
         assertTrue(OverlayController.isOverlayActive.value)
 
-        OverlayController.updateSurfaceMode(OverlaySurfaceMode.BUBBLE)
-        assertEquals(OverlaySurfaceMode.BUBBLE, OverlayController.surfaceMode.value)
+        OverlayController.updateSurfaceMode(OverlaySurfaceMode.SEARCH_BAR)
+        assertEquals(OverlaySurfaceMode.SEARCH_BAR, OverlayController.surfaceMode.value)
         assertTrue(OverlayController.isOverlayActive.value)
 
         // FULL_APP should signal the service to stop
@@ -113,25 +113,19 @@ class OverlayServiceTest {
     }
 
     @Test
-    fun `calculateBubbleBaseY positions bubble near bottom of screen`() {
+    fun `calculateSearchBarBaseY returns docked bottom offset`() {
         val screenHeight = 2400
         val density = 2.5f
-        val baseY = OverlayService.calculateBubbleBaseY(screenHeight, density)
-        // sizePx = (56 * 2.5) = 140, marginPx = (100 * 2.5) = 250
-        // baseY = 2400 - 140 - 250 = 2010
-        assertEquals(2010, baseY)
+        val baseY = OverlayService.calculateSearchBarBaseY(screenHeight, density)
+        assertEquals(0, baseY)
     }
 
     @Test
-    fun `bubble base Y adjusts above keyboard when offset by IME height`() {
+    fun `calculateSearchBarBaseY stays stable across densities`() {
         val screenHeight = 2400
-        val density = 2.5f
-        val baseY = OverlayService.calculateBubbleBaseY(screenHeight, density)
-        val imeHeight = 800
-        // In setupKeyboardPolling (currently disabled): params.y = if (imeHeight > 0) baseY - imeHeight else baseY
-        val adjustedY = baseY - imeHeight
-        assertEquals(1210, adjustedY)
-        assertTrue(adjustedY > 0, "Bubble should still be visible above keyboard")
+        assertEquals(0, OverlayService.calculateSearchBarBaseY(screenHeight, 1f))
+        assertEquals(0, OverlayService.calculateSearchBarBaseY(screenHeight, 2.5f))
+        assertEquals(0, OverlayService.calculateSearchBarBaseY(screenHeight, 3f))
     }
 
     @Test
@@ -146,7 +140,7 @@ class OverlayServiceTest {
     // whether to stop the overlay service when the Activity is destroyed.
 
     @Test
-    fun `service should be preserved when executing in MINI_CHAT mode`() {
+    fun `service should be preserved when executing in SEARCH_BAR mode`() {
         OverlayController.activateOverlay()
         OverlayController.updateOverlayState(
             ai.citros.core.OverlayState(
@@ -167,26 +161,26 @@ class OverlayServiceTest {
     }
 
     @Test
-    fun `service should be preserved in BUBBLE mode even when idle`() {
+    fun `service should be preserved in SEARCH_BAR mode even when idle`() {
         OverlayController.activateOverlay()
-        OverlayController.updateSurfaceMode(OverlaySurfaceMode.BUBBLE)
+        OverlayController.updateSurfaceMode(OverlaySurfaceMode.SEARCH_BAR)
 
         val isExecuting = OverlayController.overlayState.value.runState == ai.citros.core.OverlayRunState.EXECUTING
         val surfaceMode = OverlayController.surfaceMode.value
 
-        // Not executing, but in BUBBLE mode — should preserve
+        // Not executing, but in SEARCH_BAR mode — should preserve
         assertTrue(!isExecuting)
-        assertEquals(OverlaySurfaceMode.BUBBLE, surfaceMode)
+        assertEquals(OverlaySurfaceMode.SEARCH_BAR, surfaceMode)
         assertTrue(surfaceMode != OverlaySurfaceMode.FULL_APP)
     }
 
     @Test
-    fun `service should be preserved in MINI_CHAT mode even when idle`() {
+    fun `activateOverlay defaults to SEARCH_BAR mode`() {
         OverlayController.activateOverlay()
-        // Default mode after activation is MINI_CHAT
+        // Default mode after activation is SEARCH_BAR
         val surfaceMode = OverlayController.surfaceMode.value
 
-        assertEquals(OverlaySurfaceMode.MINI_CHAT, surfaceMode)
+        assertEquals(OverlaySurfaceMode.SEARCH_BAR, surfaceMode)
         assertTrue(surfaceMode != OverlaySurfaceMode.FULL_APP)
     }
 
@@ -213,7 +207,7 @@ class OverlayServiceTest {
     fun `FULL_APP transition deactivates overlay`() {
         OverlayController.activateOverlay()
         assertTrue(OverlayController.isOverlayActive.value)
-        assertEquals(OverlaySurfaceMode.MINI_CHAT, OverlayController.surfaceMode.value)
+        assertEquals(OverlaySurfaceMode.SEARCH_BAR, OverlayController.surfaceMode.value)
 
         // Simulate what happens when user taps "Full" button
         OverlayController.updateSurfaceMode(OverlaySurfaceMode.FULL_APP)
@@ -247,9 +241,9 @@ class OverlayServiceTest {
     }
 
     @Test
-    fun `FULL_APP mode from BUBBLE also deactivates overlay`() {
+    fun `FULL_APP mode from SEARCH_BAR also deactivates overlay`() {
         OverlayController.activateOverlay()
-        OverlayController.updateSurfaceMode(OverlaySurfaceMode.BUBBLE)
+        OverlayController.updateSurfaceMode(OverlaySurfaceMode.SEARCH_BAR)
         assertTrue(OverlayController.isOverlayActive.value)
 
         OverlayController.updateSurfaceMode(OverlaySurfaceMode.FULL_APP)

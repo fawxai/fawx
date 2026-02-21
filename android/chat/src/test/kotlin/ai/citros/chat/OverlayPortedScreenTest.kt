@@ -54,7 +54,7 @@ class OverlayPortedScreenTest {
                 onResumeOrRetry = {},
                 onStopAction = {},
                 onOpenFull = {},
-                onOpenBubble = {}
+                onOpenIsland = {}
             )
         }
 
@@ -77,7 +77,7 @@ class OverlayPortedScreenTest {
                 onResumeOrRetry = {},
                 onStopAction = {},
                 onOpenFull = {},
-                onOpenBubble = {}
+                onOpenIsland = {}
             )
         }
 
@@ -99,7 +99,7 @@ class OverlayPortedScreenTest {
                 onResumeOrRetry = {},
                 onStopAction = {},
                 onOpenFull = {},
-                onOpenBubble = {}
+                onOpenIsland = {}
             )
         }
 
@@ -121,7 +121,7 @@ class OverlayPortedScreenTest {
                 onResumeOrRetry = {},
                 onStopAction = {},
                 onOpenFull = {},
-                onOpenBubble = {}
+                onOpenIsland = {}
             )
         }
 
@@ -143,7 +143,7 @@ class OverlayPortedScreenTest {
                 onResumeOrRetry = {},
                 onStopAction = {},
                 onOpenFull = {},
-                onOpenBubble = {}
+                onOpenIsland = {}
             )
         }
 
@@ -165,7 +165,7 @@ class OverlayPortedScreenTest {
                 onResumeOrRetry = {},
                 onStopAction = {},
                 onOpenFull = {},
-                onOpenBubble = {}
+                onOpenIsland = {}
             )
         }
 
@@ -187,7 +187,7 @@ class OverlayPortedScreenTest {
                 onResumeOrRetry = {},
                 onStopAction = {},
                 onOpenFull = {},
-                onOpenBubble = {}
+                onOpenIsland = {}
             )
         }
 
@@ -209,7 +209,7 @@ class OverlayPortedScreenTest {
                 onResumeOrRetry = {},
                 onStopAction = {},
                 onOpenFull = {},
-                onOpenBubble = {}
+                onOpenIsland = {}
             )
         }
 
@@ -236,7 +236,7 @@ class OverlayPortedScreenTest {
                 onResumeOrRetry = {},
                 onStopAction = {},
                 onOpenFull = {},
-                onOpenBubble = {}
+                onOpenIsland = {}
             )
         }
 
@@ -262,7 +262,7 @@ class OverlayPortedScreenTest {
                 onResumeOrRetry = { resumed = true },
                 onStopAction = {},
                 onOpenFull = {},
-                onOpenBubble = {}
+                onOpenIsland = {}
             )
         }
 
@@ -287,7 +287,7 @@ class OverlayPortedScreenTest {
                 onResumeOrRetry = {},
                 onStopAction = {},
                 onOpenFull = {},
-                onOpenBubble = {}
+                onOpenIsland = {}
             )
         }
 
@@ -327,7 +327,7 @@ class OverlayPortedScreenTest {
                 onResumeOrRetry = {},
                 onStopAction = {},
                 onOpenFull = {},
-                onOpenBubble = {}
+                onOpenIsland = {}
             )
         }
 
@@ -352,7 +352,7 @@ class OverlayPortedScreenTest {
                 onResumeOrRetry = {},
                 onStopAction = {},
                 onOpenFull = {},
-                onOpenBubble = {}
+                onOpenIsland = {}
             )
         }
 
@@ -547,7 +547,7 @@ class OverlayPortedScreenTest {
                 onResumeOrRetry = {},
                 onStopAction = {},
                 onOpenFull = {},
-                onOpenBubble = {}
+                onOpenIsland = {}
             )
         }
 
@@ -611,7 +611,7 @@ class OverlayPortedScreenTest {
                 onResumeOrRetry = {},
                 onStopAction = {},
                 onOpenFull = {},
-                onOpenBubble = {}
+                onOpenIsland = {}
             )
         }
 
@@ -667,7 +667,7 @@ class OverlayPortedScreenTest {
                 onResumeOrRetry = {},
                 onStopAction = {},
                 onOpenFull = {},
-                onOpenBubble = {}
+                onOpenIsland = {}
             )
         }
 

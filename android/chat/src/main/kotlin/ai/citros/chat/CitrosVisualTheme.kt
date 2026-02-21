@@ -34,6 +34,27 @@ internal fun citrosSplashVisualTokens(
     flavor: CitrosFlavor,
     isDark: Boolean
 ): CitrosSplashVisualTokens {
+    if (flavor == CitrosFlavor.NONE) {
+        return CitrosSplashVisualTokens(
+            hero = CitrosHeroShaderTokens(
+                deep = if (isDark) Color(0xFFCACDD6) else Color(0xFF09090B),
+                primary = if (isDark) Color(0xFFFFFFFF) else Color(0xFF000000),
+                warm = if (isDark) Color(0xFFE6E8EE) else Color(0xFF262830),
+                wire = if (isDark) Color(0xFFAAAEBB) else Color(0xFF41444E),
+                ring = if (isDark) Color(0xFFD6D9E3) else Color(0xFF373A44),
+                particle = if (isDark) Color(0xFFBEC2CE) else Color(0xFF525664)
+            ),
+            glassButton = CitrosLiquidGlassButtonTokens(
+                deep = if (isDark) Color(0xFF22242B) else Color(0xFFE7E8ED),
+                amber = if (isDark) Color(0xFF323540) else Color(0xFFD6D8DF),
+                warm = if (isDark) Color(0xFF4A4E5D) else Color(0xFFBFC3CE),
+                textEnabled = if (isDark) Color.White else Color.Black,
+                textDisabled = if (isDark) Color(0x99FFFFFF) else Color(0x99000000)
+            ),
+            brandTitleColor = if (isDark) Color.White else Color.Black
+        )
+    }
+
     val heroDeep = if (isDark) {
         lerp(Color(0xFF1A0A00), flavor.tint, 0.20f)
     } else {
@@ -110,6 +131,7 @@ internal val LocalCitrosSplashVisualTokens = staticCompositionLocalOf {
     citrosSplashVisualTokens(CitrosFlavor.TANGERINE, isDark = false)
 }
 internal val LocalCitrosIsDark = staticCompositionLocalOf { false }
+internal val LocalCitrosFlavor = staticCompositionLocalOf { CitrosFlavor.TANGERINE }
 
 @Composable
 internal fun ProvideCitrosSplashVisualTokens(
@@ -119,6 +141,7 @@ internal fun ProvideCitrosSplashVisualTokens(
 ) {
     val tokens = remember(flavor, isDark) { citrosSplashVisualTokens(flavor, isDark) }
     CompositionLocalProvider(
+        LocalCitrosFlavor provides flavor,
         LocalCitrosIsDark provides isDark,
         LocalCitrosSplashVisualTokens provides tokens
     ) {

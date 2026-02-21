@@ -51,7 +51,13 @@ class CitrosNotificationListener : NotificationListenerService() {
                 context.contentResolver,
                 "enabled_notification_listeners"
             ) ?: return false
-            return flat.contains(componentName.flattenToString())
+            return flat
+                .split(':')
+                .mapNotNull { entry -> ComponentName.unflattenFromString(entry.trim()) }
+                .any { enabled ->
+                    enabled.packageName == componentName.packageName &&
+                        enabled.className == componentName.className
+                }
         }
 
         /**

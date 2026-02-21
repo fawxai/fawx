@@ -1,5 +1,4 @@
 package ai.citros.chat
-
 import android.Manifest
 import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -28,6 +27,10 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.background
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -41,21 +44,14 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.Send
-import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.Layers
-import androidx.compose.material.icons.automirrored.filled.ExitToApp
-import androidx.compose.material.icons.filled.KeyboardVoice
-import androidx.compose.material.icons.filled.NorthEast
-import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.filled.Stop
-import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shadow
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.geometry.Offset
@@ -64,10 +60,15 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.annotation.VisibleForTesting
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -94,23 +95,26 @@ import ai.citros.core.ModelConfig
 import ai.citros.core.Conversation
 import ai.citros.core.OpenAiClient
 import ai.citros.core.OpenRouterClient
+import ai.citros.core.OverlayLineType
 import ai.citros.core.OverlayRunState
+import ai.citros.core.OverlayState
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import androidx.compose.runtime.collectAsState
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import java.util.UUID
-
+import kotlin.math.cos
+import kotlin.math.sin
 class ChatActivity : ComponentActivity() {
     private val walletDependencies by lazy { provideWalletDependencies(this) }
     internal var memoryDb: android.database.sqlite.SQLiteDatabase? = null
-
     override fun onDestroy() {
         OverlayController.setChatInForeground(false)
         // Clear hooks to avoid leaking this Activity (#436, #457)
@@ -122,7 +126,6 @@ class ChatActivity : ComponentActivity() {
         memoryDb = null
         super.onDestroy()
     }
-
     // Using onPause/onResume rather than onStop/onStart for overlay suppression (#627):
     // onPause fires faster when the user switches away, providing snappier overlay restore.
     // Trade-off: in multi-window or transparent-activity scenarios, onPause fires while
@@ -131,35 +134,29 @@ class ChatActivity : ComponentActivity() {
         super.onPause()
         OverlayController.setChatInForeground(false)
     }
-
     override fun onResume() {
         super.onResume()
         OverlayController.setChatInForeground(true)
         val prefs = getSharedPreferences(CITROS_PREFS, MODE_PRIVATE)
         val timeoutMs = prefs.getLong(PREF_IDLE_TIMEOUT_MS, ConversationLifecycle.DEFAULT_TIMEOUT_MS)
         val lastDate = prefs.getString(PREF_LAST_CONVERSATION_DATE, null)
-
         val chatViewModel = androidx.lifecycle.ViewModelProvider(this)[ChatViewModel::class.java]
         val reason = chatViewModel.checkLifecycleAndClear(
             timeoutMs = timeoutMs,
             lastConversationDate = lastDate
         )
-
         // Update stored date on any resume so daily reset works next time
         val today = ConversationLifecycle.todayDateString()
         prefs.edit().putString(PREF_LAST_CONVERSATION_DATE, today).apply()
-
         if (reason != null) {
             android.util.Log.d("CitrosLifecycle", "Conversation cleared: $reason")
         }
     }
-
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
         handleOauthCallbackIntent(intent)
     }
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         handleOauthCallbackIntent(intent)
@@ -169,44 +166,66 @@ class ChatActivity : ComponentActivity() {
         }.onFailure { error ->
             Log.w("ChatActivity", "Failed to sync launcher icon", error)
         }
-
         // Wire overlay hooks so the overlay doesn't interfere with agent actions:
         //
-        // - Tool loop hooks (#457): hide overlay during entire tool execution so
-        //   it doesn't block touch gestures on the target app (e.g. FABs).
+        // - Tool loop hooks (#457): collapse panel/search bar to Dynamic Island
+        //   during tool execution so status stays visible while large overlays
+        //   are out of the way of target-app gestures.
         //
         // - Screenshot hooks (#436): hide overlay during capture so it doesn't
         //   appear in screenshots.
         //
-        // These are separate because screenshot hide/restore happens within the
-        // already-hidden tool loop — the double-hide guard in OverlayService
-        // (savedVisibility sentinel) makes nested calls safe.
+        // These are separate because screenshot hide/restore can run during the
+        // tool loop — the double-hide guard in OverlayService (savedVisibility
+        // sentinel) makes nested calls safe.
         //
         // All hooks run on Main dispatcher since they touch View visibility.
+        var toolLoopRestoreMode: OverlaySurfaceMode? = null
+        var toolLoopRestorePinned: Boolean? = null
         ScreenReader.toolLoopOverlayHideHook = {
             withContext(Dispatchers.Main) {
-                OverlayService.instance?.hideForToolLoop()
+                if (!OverlayPermission.canDrawOverlays(this@ChatActivity)) {
+                    return@withContext
+                }
+                val wasActive = OverlayController.isOverlayActive.value
+                val currentMode = OverlayController.surfaceMode.value
+                if (wasActive && currentMode != OverlaySurfaceMode.FULL_APP) {
+                    if (currentMode != OverlaySurfaceMode.DYNAMIC_ISLAND) {
+                        toolLoopRestoreMode = currentMode
+                        toolLoopRestorePinned = OverlayController.userPanelPinned.value
+                        OverlayController.updateSurfaceMode(OverlaySurfaceMode.DYNAMIC_ISLAND)
+                    }
+                } else {
+                    // Ensure execution status stays visible even when bar/panel are hidden.
+                    toolLoopRestoreMode = OverlayController.preferredIdleSurfaceMode()
+                    toolLoopRestorePinned = false
+                    OverlayController.updateSurfaceMode(OverlaySurfaceMode.DYNAMIC_ISLAND)
+                    OverlayController.activateOverlay()
+                }
             }
         }
         ScreenReader.toolLoopOverlayRestoreHook = {
             withContext(Dispatchers.Main) {
-                // Ensure overlay is active before restoring visibility (#608).
-                // When the user starts from full-screen chat, the overlay service
-                // may not be running yet (race with startForegroundService).
-                // Only activate if not already active — avoids the 500ms debounce
-                // in activateOverlay() which could swallow a sub-500ms restore.
-                // Note: if preferredMode is FULL_APP, updateSurfaceMode sets
-                // isOverlayActive=false, then activateOverlay re-sets it to true
-                // and overrides to MINI_CHAT. This is intentional — FULL_APP means
-                // "use ChatActivity", so the restore hook should fall through to
-                // MINI_CHAT for the floating overlay.
                 if (OverlayPermission.canDrawOverlays(this@ChatActivity) &&
                     !OverlayController.isOverlayActive.value
                 ) {
-                    OverlayController.updateSurfaceMode(getPreferredOverlayMode(this@ChatActivity))
+                    OverlayController.updateSurfaceMode(OverlayController.preferredIdleSurfaceMode())
                     OverlayController.activateOverlay()
                 }
-                OverlayService.instance?.restoreAfterToolLoop()
+                val restoreMode = toolLoopRestoreMode
+                val restorePinned = toolLoopRestorePinned
+                if (restoreMode != null && OverlayController.isOverlayActive.value) {
+                    OverlayController.updateSurfaceMode(
+                        restoreMode,
+                        fromUser = restoreMode == OverlaySurfaceMode.PANEL && restorePinned == true
+                    )
+                    if (restoreMode == OverlaySurfaceMode.PANEL && restorePinned == true) {
+                        OverlayController.setUserPanelPinned(true)
+                    }
+                }
+                toolLoopRestoreMode = null
+                toolLoopRestorePinned = null
+                OverlayService.instance?.restoreOverlayVisibility()
             }
         }
         ScreenReader.screenshotOverlayHook = {
@@ -223,6 +242,9 @@ class ChatActivity : ComponentActivity() {
             val onboardingPrefs = remember {
                 getSharedPreferences(ONBOARDING_PREFS, MODE_PRIVATE)
             }
+            val chatPrefs = remember {
+                getSharedPreferences(CITROS_PREFS, MODE_PRIVATE)
+            }
             var themeMode by remember {
                 mutableStateOf(
                     onboardingPrefs.getString(PREF_THEME_MODE, THEME_MODE_DEFAULT) ?: THEME_MODE_DEFAULT
@@ -234,7 +256,6 @@ class ChatActivity : ComponentActivity() {
                         .getOrDefault(CitrosFlavor.TANGERINE)
                 )
             }
-
             DisposableEffect(onboardingPrefs) {
                 val listener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { prefs, key ->
                     when (key) {
@@ -253,6 +274,41 @@ class ChatActivity : ComponentActivity() {
                     onboardingPrefs.unregisterOnSharedPreferenceChangeListener(listener)
                 }
             }
+            DisposableEffect(chatPrefs) {
+                OverlayController.updateIdleSurfacePreference(
+                    chatPrefs.getBoolean(
+                        PREF_OVERLAY_USE_ISLAND_WHEN_IDLE,
+                        PREF_OVERLAY_USE_ISLAND_WHEN_IDLE_DEFAULT
+                    )
+                )
+                OverlayController.updateSearchBarIdlePreference(
+                    chatPrefs.getBoolean(
+                        PREF_OVERLAY_SHOW_SEARCH_BAR_WHEN_IDLE,
+                        PREF_OVERLAY_SHOW_SEARCH_BAR_WHEN_IDLE_DEFAULT
+                    )
+                )
+                val listener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { prefs, key ->
+                    if (key == PREF_OVERLAY_USE_ISLAND_WHEN_IDLE) {
+                        OverlayController.updateIdleSurfacePreference(
+                            prefs.getBoolean(
+                                PREF_OVERLAY_USE_ISLAND_WHEN_IDLE,
+                                PREF_OVERLAY_USE_ISLAND_WHEN_IDLE_DEFAULT
+                            )
+                        )
+                    } else if (key == PREF_OVERLAY_SHOW_SEARCH_BAR_WHEN_IDLE) {
+                        OverlayController.updateSearchBarIdlePreference(
+                            prefs.getBoolean(
+                                PREF_OVERLAY_SHOW_SEARCH_BAR_WHEN_IDLE,
+                                PREF_OVERLAY_SHOW_SEARCH_BAR_WHEN_IDLE_DEFAULT
+                            )
+                        )
+                    }
+                }
+                chatPrefs.registerOnSharedPreferenceChangeListener(listener)
+                onDispose {
+                    chatPrefs.unregisterOnSharedPreferenceChangeListener(listener)
+                }
+            }
             CitrosChatTheme(themeMode = themeMode, flavor = selectedFlavor) {
                 CompositionLocalProvider(LocalWalletDependencies provides walletDependencies) {
                     ChatNavHost(walletDependencies = walletDependencies)
@@ -260,7 +316,6 @@ class ChatActivity : ComponentActivity() {
             }
         }
     }
-
     private fun handleOauthCallbackIntent(intent: Intent?) {
         val uri = intent?.data ?: return
         if (
@@ -271,30 +326,41 @@ class ChatActivity : ComponentActivity() {
             oauthCallbackState.value = uri
         }
     }
-
     companion object {
         const val OAUTH_CALLBACK_SCHEME = "citros"
         const val OAUTH_CALLBACK_HOST = "oauth"
         const val OAUTH_CALLBACK_PATH = "/callback"
         const val OAUTH_CALLBACK_URI = "$OAUTH_CALLBACK_SCHEME://$OAUTH_CALLBACK_HOST$OAUTH_CALLBACK_PATH"
-
         private val oauthCallbackState = MutableStateFlow<Uri?>(null)
-
         fun oauthCallbackFlow() = oauthCallbackState.asStateFlow()
-
         fun clearOauthCallback() {
             oauthCallbackState.value = null
         }
     }
 }
-
 @Composable
 private fun ChatNavHost(walletDependencies: WalletDependencies) {
     val navController = rememberNavController()
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     val sharedChatViewModel: ChatViewModel = viewModel()
     val startDestination = remember {
         if (shouldShowOnboarding(context)) "onboarding" else "chat"
+    }
+    var isAppForeground by remember { mutableStateOf(true) }
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_RESUME -> isAppForeground = true
+                Lifecycle.Event.ON_PAUSE,
+                Lifecycle.Event.ON_STOP -> isAppForeground = false
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
     }
     // ── Voice I/O initialization ──
     // Extract models in background, then create VoiceManager.
@@ -307,19 +373,14 @@ private fun ChatNavHost(walletDependencies: WalletDependencies) {
                 val modelManager = ModelManager(appContext)
                 modelManager.ensureExtracted()
                 modelManager.ensureTtsExtracted()
-
                 val sherpaProvider = SherpaOnnxSpeechToText(modelManager.modelDir)
                 sherpaProvider.initialize(appContext)
-
                 val androidStt = AndroidSpeechToText()
                 androidStt.initialize(appContext)
-
                 val sherpaTts = SherpaOnnxTextToSpeech(modelManager.ttsModelDir)
                 sherpaTts.initialize(appContext)
-
                 val androidTts = AndroidTextToSpeech()
                 androidTts.initialize(appContext)
-
                 val voiceManager = VoiceManager(
                     context = appContext,
                     sttProviders = listOf(sherpaProvider, androidStt),
@@ -334,10 +395,8 @@ private fun ChatNavHost(walletDependencies: WalletDependencies) {
                 try {
                     val androidStt = AndroidSpeechToText()
                     androidStt.initialize(appContext)
-
                     val androidTts = AndroidTextToSpeech()
                     androidTts.initialize(appContext)
-
                     val voiceManager = VoiceManager(
                         context = appContext,
                         sttProviders = listOf(androidStt),
@@ -352,7 +411,6 @@ private fun ChatNavHost(walletDependencies: WalletDependencies) {
             }
         }
     }
-
     // Overlay action mediator stays active across all destinations (chat/settings/overlay).
     LaunchedEffect(Unit) {
         OverlayController.actions.collect { action ->
@@ -369,25 +427,25 @@ private fun ChatNavHost(walletDependencies: WalletDependencies) {
                     sharedChatViewModel.resumeExecution()
                 }
                 is OverlayAction.SetSurfaceMode -> {
-                    OverlayController.updateSurfaceMode(action.mode)
+                    OverlayController.updateSurfaceMode(action.mode, fromUser = true)
                 }
                 is OverlayAction.Deactivate -> {
                     OverlayController.deactivateOverlay()
                 }
-                is OverlayAction.ExpandFromBubble -> {
-                    OverlayController.updateSurfaceMode(OverlaySurfaceMode.MINI_CHAT)
+                is OverlayAction.ExpandFromSearchBar -> {
+                    OverlayController.updateSurfaceMode(OverlaySurfaceMode.PANEL, fromUser = true)
                     sharedChatViewModel.resetUnreadCount()
                 }
             }
         }
     }
-
     // Keep overlay state synced from ViewModel even when not on chat route.
     LaunchedEffect(
         sharedChatViewModel.isLoading.value,
         sharedChatViewModel.messages.size,
         sharedChatViewModel.currentToolStatus.value,
-        sharedChatViewModel.queuedMessage.value
+        sharedChatViewModel.queuedMessage.value,
+        isAppForeground
     ) {
         val overlayState = OverlayStateMapper.mapToOverlayState(
             messages = sharedChatViewModel.messages.toList(),
@@ -397,34 +455,52 @@ private fun ChatNavHost(walletDependencies: WalletDependencies) {
         OverlayController.updateUnreadCount(sharedChatViewModel.unreadCount.intValue)
         OverlayController.updateQueuedMessage(sharedChatViewModel.queuedMessage.value)
         OverlayController.updateToolStatus(sharedChatViewModel.currentToolStatus.value)
-
-        // Only auto-activate overlay when a tool is actively executing (currentToolStatus != null),
-        // not just during loading/thinking. This prevents the overlay from popping up
-        // in full-screen chat when the agent is generating a text response.
+        OverlayController.updateInteractionDemand(
+            deriveOverlayInteractionDemand(
+                overlayState = overlayState,
+                toolStatus = sharedChatViewModel.currentToolStatus.value
+            )
+        )
         val isToolExecutionActive = overlayState.runState == OverlayRunState.EXECUTING
             && sharedChatViewModel.currentToolStatus.value != null
-        if (isToolExecutionActive && OverlayPermission.canDrawOverlays(context)) {
-            OverlayController.updateSurfaceMode(getPreferredOverlayMode(context))
+        val idleSurfaceMode = OverlayController.preferredIdleSurfaceMode()
+        val backgroundSurfaceMode = if (isToolExecutionActive) {
+            OverlaySurfaceMode.DYNAMIC_ISLAND
+        } else {
+            idleSurfaceMode
+        }
+        val shouldShowOverlayInBackground = backgroundSurfaceMode != OverlaySurfaceMode.FULL_APP
+        if (!isAppForeground && OverlayPermission.canDrawOverlays(context) && shouldShowOverlayInBackground) {
+            val currentMode = OverlayController.surfaceMode.value
+            if (!OverlayController.isOverlayActive.value || currentMode == OverlaySurfaceMode.FULL_APP) {
+                OverlayController.updateSurfaceMode(backgroundSurfaceMode)
+            } else if (isToolExecutionActive && currentMode != OverlaySurfaceMode.DYNAMIC_ISLAND) {
+                OverlayController.updateSurfaceMode(OverlaySurfaceMode.DYNAMIC_ISLAND)
+            }
             OverlayController.activateOverlay()
+        } else if (!isAppForeground &&
+            !shouldShowOverlayInBackground &&
+            OverlayController.isOverlayActive.value &&
+            !isToolExecutionActive
+        ) {
+            OverlayController.deactivateOverlay()
         }
     }
-
     // Overlay service lifecycle should not depend on which screen is visible.
     val appContext = context.applicationContext
     val isOverlayActive by OverlayController.isOverlayActive.collectAsState()
     var serviceStarted by remember { mutableStateOf(false) }
-    LaunchedEffect(isOverlayActive) {
-        if (isOverlayActive && OverlayPermission.canDrawOverlays(context) && !serviceStarted) {
+    LaunchedEffect(isOverlayActive, isAppForeground) {
+        if (!isAppForeground && isOverlayActive && OverlayPermission.canDrawOverlays(context) && !serviceStarted) {
             appContext.startForegroundService(
                 OverlayService.startIntent(appContext)
             )
             serviceStarted = true
-        } else if (!isOverlayActive && serviceStarted) {
+        } else {
             appContext.stopService(OverlayService.stopIntent(appContext))
             serviceStarted = false
         }
     }
-
     DisposableEffect(Unit) {
         onDispose {
             val isExecuting = OverlayController.overlayState.value.runState == OverlayRunState.EXECUTING
@@ -437,7 +513,6 @@ private fun ChatNavHost(walletDependencies: WalletDependencies) {
             }
         }
     }
-
     NavHost(navController = navController, startDestination = startDestination) {
         composable("onboarding") {
             OnboardingFlow(
@@ -486,7 +561,7 @@ private fun ChatNavHost(walletDependencies: WalletDependencies) {
             )
         }
         composable("settings_wallet") {
-            SettingsScreen(
+            ApiKeysSettingsScreen(
                 walletManager = walletDependencies.walletManager,
                 keyStore = walletDependencies.keyStore,
                 onBack = { navController.popBackStack() }
@@ -527,8 +602,6 @@ private fun ChatNavHost(walletDependencies: WalletDependencies) {
         }
     }
 }
-
-
 enum class CloudAuthKind {
     ANTHROPIC_CREDENTIAL,
     OPENAI_API_KEY,
@@ -536,18 +609,15 @@ enum class CloudAuthKind {
     OPENAI_DEVICE_CODE,
     OPENROUTER_API_KEY
 }
-
 enum class CodexOauthBridgeMode {
     EMBEDDED,
     EXTERNAL
 }
-
 data class CodexOauthStartRequest(
     val mode: CodexOauthBridgeMode,
     val externalBridgeUrl: String? = null,
     val embeddedConfig: EmbeddedCodexOauthBridgeServer.Config? = null
 )
-
 internal const val CITROS_PREFS = "citros"
 /** Number of items from the end of the list to consider "near bottom" for auto-scroll. */
 private const val NEAR_BOTTOM_THRESHOLD = 3
@@ -576,27 +646,68 @@ private const val PREF_CODEX_OAUTH_CLIENT_SECRET = "codex_oauth_client_secret"
 private const val PREF_CODEX_OAUTH_SCOPE = "codex_oauth_scope"
 private const val PREF_IDLE_TIMEOUT_MS = "idle_timeout_ms"
 private const val PREF_LAST_CONVERSATION_DATE = "last_conversation_date"
-internal const val PREF_DEFAULT_OVERLAY_MODE = "default_overlay_mode"
 internal const val PREF_SEARCH_BASE_URL = "search_base_url"
 internal const val PREF_BRAVE_API_KEY = "brave_api_key"
 internal const val PREF_TINYFISH_API_KEY = "tinyfish_api_key"
-
+internal const val PREF_OVERLAY_USE_ISLAND_WHEN_IDLE = "overlay_use_island_when_idle"
+internal const val PREF_OVERLAY_USE_ISLAND_WHEN_IDLE_DEFAULT = true
+internal const val PREF_OVERLAY_SHOW_SEARCH_BAR_WHEN_IDLE = "overlay_show_search_bar_when_idle"
+internal const val PREF_OVERLAY_SHOW_SEARCH_BAR_WHEN_IDLE_DEFAULT = true
 private const val TOKEN_PREVIEW_LIMIT = 80
-
-/** Read the user's preferred overlay mode from SharedPreferences. Defaults to [OverlaySurfaceMode.MINI_CHAT]. */
-private fun getPreferredOverlayMode(context: android.content.Context): OverlaySurfaceMode {
-    val pref = runCatching {
-        context.getSharedPreferences(CITROS_PREFS, android.content.Context.MODE_PRIVATE)
-            .getString(PREF_DEFAULT_OVERLAY_MODE, null)
-    }.getOrNull()
-    return OverlaySurfaceMode.fromPrefValue(pref)
-}
 private const val DIAGNOSTIC_PREVIEW_LIMIT = 60
 private const val OAUTH_STATE_EXPIRY_MS = 600_000L // 10 minutes
 private const val API_VALIDATION_TIMEOUT_MS = 10_000L
 
-private fun generateOauthState(): String = UUID.randomUUID().toString()
+private val OverlayPermissionKeywords = listOf(
+    "permission",
+    "grant access",
+    "grant permission",
+    "allow access",
+    "enable accessibility",
+    "overlay permission",
+    "notification access"
+)
 
+private val OverlayInputKeywords = listOf(
+    "should i",
+    "would you like",
+    "which option",
+    "choose",
+    "pick one",
+    "confirm",
+    "need your input",
+    "tap to continue"
+)
+
+private fun deriveOverlayInteractionDemand(
+    overlayState: OverlayState,
+    toolStatus: String?
+): OverlayInteractionDemand {
+    if (overlayState.runState == OverlayRunState.FAILED) {
+        return OverlayInteractionDemand.ERROR_ACTION_REQUIRED
+    }
+    val latestSystem = overlayState.lines
+        .lastOrNull { it.type == OverlayLineType.SYSTEM }
+        ?.text
+        ?.lowercase()
+        .orEmpty()
+    val normalized = buildString {
+        append(toolStatus?.lowercase().orEmpty())
+        append(' ')
+        append(latestSystem)
+    }.trim()
+    if (normalized.isBlank()) return OverlayInteractionDemand.NONE
+    if (OverlayPermissionKeywords.any { normalized.contains(it) }) {
+        return OverlayInteractionDemand.PERMISSION_REQUIRED
+    }
+    val endsWithQuestion = latestSystem.trimEnd().endsWith("?")
+    if (endsWithQuestion || OverlayInputKeywords.any { normalized.contains(it) }) {
+        return OverlayInteractionDemand.INPUT_REQUIRED
+    }
+    return OverlayInteractionDemand.NONE
+}
+
+private fun generateOauthState(): String = UUID.randomUUID().toString()
 private fun openInCustomTab(context: Context, url: String): Result<Unit> {
     return runCatching {
         val customTabsIntent = CustomTabsIntent.Builder().setShowTitle(true).build()
@@ -608,13 +719,11 @@ private fun openInCustomTab(context: Context, url: String): Result<Unit> {
         Log.e("ChatActivity", "Failed to open URL", fallbackError)
     }.map { Unit }
 }
-
 private fun Uri.getOauthParameter(name: String): String? {
     val queryValue = getQueryParameter(name)?.trim()
     if (!queryValue.isNullOrBlank()) {
         return queryValue
     }
-
     val fragment = fragment ?: return null
     val pairs = fragment.split("&")
     for (pair in pairs) {
@@ -626,10 +735,8 @@ private fun Uri.getOauthParameter(name: String): String? {
             return value
         }
     }
-
     return null
 }
-
 private fun Uri.extractOauthTokenFromCallback(): String? {
     val keys = listOf(
         "token",
@@ -646,13 +753,11 @@ private fun Uri.extractOauthTokenFromCallback(): String? {
     }
     return null
 }
-
 private fun readCodexBridgeMode(prefs: android.content.SharedPreferences): CodexOauthBridgeMode {
     val raw = prefs.getString(PREF_CODEX_OAUTH_BRIDGE_MODE, CodexOauthBridgeMode.EMBEDDED.name)
     return runCatching { CodexOauthBridgeMode.valueOf(raw ?: CodexOauthBridgeMode.EMBEDDED.name) }
         .getOrDefault(CodexOauthBridgeMode.EMBEDDED)
 }
-
 private fun readEmbeddedCodexConfig(
     prefs: android.content.SharedPreferences,
     clientSecret: String?
@@ -674,14 +779,12 @@ private fun readEmbeddedCodexConfig(
         ) ?: EmbeddedCodexOauthBridgeServer.DEFAULT_SCOPE
     )
 }
-
 private fun isRecoverableOauthSessionError(message: String?): Boolean {
     val normalized = message?.lowercase() ?: return false
     return normalized.contains("missing login_id") ||
         normalized.contains("unknown or expired login_id") ||
         normalized.contains("unknown login_id")
 }
-
 @VisibleForTesting
 internal fun mapDeviceCodePollError(errorCode: String, description: String?): String {
     return when (errorCode) {
@@ -691,7 +794,6 @@ internal fun mapDeviceCodePollError(errorCode: String, description: String?): St
         else -> "Sign-in failed: ${description?.take(TOKEN_PREVIEW_LIMIT) ?: errorCode}. Check your internet connection or try API key instead."
     }
 }
-
 @VisibleForTesting
 internal fun formatDeviceCodeDiagnostics(
     diagnostics: ai.citros.core.DeviceCodeAuthClient.PollDiagnostics?
@@ -708,7 +810,6 @@ internal fun formatDeviceCodeDiagnostics(
         "pending403=${diagnostics.pending403Count}, pending404=${diagnostics.pending404Count}, " +
         "networkErrors=${diagnostics.networkErrorCount}, lastStatus=$lastStatus, preview=$preview"
 }
-
 @VisibleForTesting
 internal fun formatDeviceCodeSessionInfo(
     response: ai.citros.core.DeviceCodeAuthClient.DeviceCodeResponse
@@ -716,7 +817,6 @@ internal fun formatDeviceCodeSessionInfo(
     val authIdSuffix = response.deviceAuthId.takeLast(8)
     return "Session=$authIdSuffix, pollInterval=${response.interval}s"
 }
-
 @VisibleForTesting
 internal suspend fun validateApiCredential(
     token: String,
@@ -729,13 +829,11 @@ internal suspend fun validateApiCredential(
                 Provider.OPENAI -> ProviderConfig.openAi(token)
                 Provider.OPENROUTER -> ProviderConfig.openRouter(token)
             }
-
             val client: ProviderClient = when (provider) {
                 Provider.ANTHROPIC -> AnthropicClient(config = config, systemPrompt = PhoneAgentPrompts.buildSystemPrompt())
                 Provider.OPENAI -> OpenAiClient(config = config, systemPrompt = PhoneAgentPrompts.buildSystemPrompt())
                 Provider.OPENROUTER -> OpenRouterClient(config = config, systemPrompt = PhoneAgentPrompts.buildSystemPrompt())
             }
-
             val conversation = Conversation().apply { addUser("ping") }
             val result = client.chat(conversation)
             if (result.isSuccess) {
@@ -750,15 +848,12 @@ internal suspend fun validateApiCredential(
         ApiKeyValidationStatus.UNKNOWN
     }
 }
-
-
 @VisibleForTesting
 internal data class ResolvedWalletScope(
     val keyStore: ai.citros.core.KeyStore,
     val walletStorage: ai.citros.core.WalletStorage,
     val walletManager: WalletManager
 )
-
 @VisibleForTesting
 internal fun resolveWalletScope(
     scopedWalletDependencies: WalletDependencies?,
@@ -777,10 +872,8 @@ internal fun resolveWalletScope(
     } else {
         WalletManager(walletStorage, walletKeyStore)
     }
-
     return ResolvedWalletScope(walletKeyStore, walletStorage, walletManager)
 }
-
 @Composable
 internal fun CitrosChatTheme(
     themeMode: String = THEME_MODE_DEFAULT,
@@ -793,52 +886,10 @@ internal fun CitrosChatTheme(
         "system" -> isSystemInDarkTheme()
         else -> false // THEME_MODE_DEFAULT or fallback
     }
-    val colorScheme = if (useDark) {
-        darkColorScheme(
-            primary = Color(0xFFF59E0B),      // Amber (matches citros.ai)
-            secondary = Color(0xFFFF6B2B),    // Warm orange (matches citros.ai)
-            tertiary = Color(0xFFFFD600),     // Lemon accent
-            background = Color(0xFF050505),   // Near-black (matches citros.ai --bg)
-            surface = Color(0xFF0C0C0C),      // Slightly elevated (--bg-elevated)
-            surfaceVariant = Color(0xFF111111), // Card background (--bg-card)
-            onPrimary = Color.Black,
-            onSecondary = Color.Black,
-            onBackground = Color.White,
-            onSurface = Color.White,
-            onSurfaceVariant = Color.White.copy(alpha = 0.65f),
-            outline = Color.White.copy(alpha = 0.08f),  // Subtle borders (--border)
-            outlineVariant = Color.White.copy(alpha = 0.04f),
-            error = Color(0xFFEF4444),        // --danger
-        )
-    } else {
-        // Only core colors defined; Material3 defaults handle error/outline/etc.
-        lightColorScheme(
-            primary = Color(0xFFF59E0B),      // Amber (matches citros.ai)
-            secondary = Color(0xFFFF6B2B),    // Warm orange
-            tertiary = Color(0xFFFFD600),     // Lemon accent
-            background = Color(0xFFFFFBFE),
-            surface = Color(0xFFF5F5F5),
-            surfaceVariant = Color(0xFFEEEEEE),
-            onPrimary = Color.Black,
-            onSecondary = Color.Black,
-            onBackground = Color(0xFF1C1B1F),
-            onSurface = Color(0xFF1C1B1F),
-            onSurfaceVariant = Color(0xFF1C1B1F).copy(alpha = 0.65f),
-            outline = Color(0xFF1C1B1F).copy(alpha = 0.12f),
-            outlineVariant = Color(0xFF1C1B1F).copy(alpha = 0.06f),
-            error = Color(0xFFEF4444),
-        )
-    }
-    MaterialTheme(
-        colorScheme = colorScheme,
-    ) {
-        ProvideCitrosSplashVisualTokens(flavor = flavor, isDark = useDark) {
-            content()
-        }
+    ProvideCitrosSplashVisualTokens(flavor = flavor, isDark = useDark) {
+        content()
     }
 }
-
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatScreen(
     viewModel: ChatViewModel = viewModel(),
@@ -869,18 +920,17 @@ fun ChatScreen(
     var embeddedBridge by remember { mutableStateOf<EmbeddedCodexOauthBridgeServer?>(null) }
     var showQuickSwitcher by remember { mutableStateOf(false) }
     var selectedFlavor by remember { mutableStateOf(readSelectedFlavor(context)) }
-
+    val isDarkTheme = LocalCitrosIsDark.current
+    val directiveSurfaces = remember(isDarkTheme) { citrosDirectiveSurfaces(isDarkTheme) }
     var codexOauthStatus by remember { mutableStateOf<String?>(null) }
     var codexOauthBusy by remember { mutableStateOf(false) }
     val walletStateFlow = remember { MutableStateFlow(walletManager.loadOrDefault()) }
     val walletMutationMutex = remember { Mutex() }
     val walletState by walletStateFlow.collectAsState()
-
     val stopEmbeddedBridge = {
         embeddedBridge?.stop()
         embeddedBridge = null
     }
-
     fun readSecureBackedValue(key: String): String? {
         val secureValue = secureStore.getString(key)
         if (!secureValue.isNullOrBlank()) {
@@ -891,10 +941,8 @@ fun ChatScreen(
         prefs.edit().remove(key).apply()
         return legacyValue
     }
-
     fun writeSecureBackedValue(key: String, value: String?) =
         writeSecureBacked(secureStore, prefs, key, value)
-
     suspend fun ensureEmbeddedBridgeRunning(
         config: EmbeddedCodexOauthBridgeServer.Config
     ): Result<String> {
@@ -903,12 +951,10 @@ fun ChatScreen(
                 IllegalArgumentException("OAuth client ID is required for on-device bridge mode")
             )
         }
-
         val existing = embeddedBridge
         if (existing != null && existing.isRunning()) {
             return existing.start().map { it.baseUrl }
         }
-
         stopEmbeddedBridge()
         val candidate = EmbeddedCodexOauthBridgeServer(config)
         return candidate.start().mapCatching { running ->
@@ -918,7 +964,6 @@ fun ChatScreen(
             candidate.stop()
         }
     }
-
     val clearPendingOauthState = {
         secureStore.remove(PREF_CODEX_OAUTH_LOGIN_ID)
         secureStore.remove(PREF_CODEX_OAUTH_CODE_VERIFIER)
@@ -930,11 +975,9 @@ fun ChatScreen(
             .remove(PREF_CODEX_OAUTH_CODE_VERIFIER)
             .apply()
     }
-
     val refreshWalletState = {
         walletStateFlow.value = walletManager.loadOrDefault()
     }
-
     suspend fun mutateWalletAndRefresh(
         reconfigure: Boolean = false,
         modelOnlyUpdate: Boolean = false,
@@ -954,7 +997,6 @@ fun ChatScreen(
             }
         }
     }
-
     val persistCloudCredential = { token: String, provider: Provider?, authKind: CloudAuthKind? ->
         // Secure storage
         secureStore.putString(PREF_CLOUD_TOKEN, token)
@@ -976,16 +1018,13 @@ fun ChatScreen(
             .remove(PREF_LEGACY_ANTHROPIC_TOKEN)
             .remove(PREF_LOCAL_URL)
             .apply()
-        
         // Also add to wallet (check for duplicates first)
         val detectedProvider = provider ?: ProviderConfig.detectProvider(token) ?: Provider.OPENAI
         val currentState = walletManager.loadOrDefault()
-        
         // Find existing key with matching token
         val existingKey = currentState.keys.find { key ->
             key.provider == detectedProvider && walletKeyStore.get(key.id) == token
         }
-        
         if (existingKey != null) {
             // Token already exists - just set it active
             walletManager.setActiveKey(existingKey.id)
@@ -995,13 +1034,11 @@ fun ChatScreen(
             walletManager.addKey(detectedProvider, label, token)
             walletManager.setActiveKey(walletManager.loadOrDefault().keys.last().id)
         }
-        
         // Always update model configuration for the provider
         walletManager.setChatModel(ModelConfig.defaultChatModel(detectedProvider))
         walletManager.setActionModel(ModelConfig.defaultActionModel(detectedProvider))
         refreshWalletState()
     }
-
     val applyCodexOauthToken = { token: String ->
         clearPendingOauthState()
         stopEmbeddedBridge()
@@ -1012,7 +1049,6 @@ fun ChatScreen(
             mutateWalletAndRefresh(reconfigure = true) { }
         }
     }
-
     fun buildCodexOauthStartRequestFromPrefs(): CodexOauthStartRequest {
         val mode = readCodexBridgeMode(prefs)
         val externalBridgeUrl = prefs.getString(
@@ -1034,14 +1070,12 @@ fun ChatScreen(
             )
         }
     }
-
     suspend fun beginCodexOauthSignIn(
         request: CodexOauthStartRequest,
         startingStatus: String = "Starting OpenAI sign-in..."
     ) {
         codexOauthBusy = true
         codexOauthStatus = startingStatus
-
         clearPendingOauthState()
         val state = generateOauthState()
         val embeddedConfig = request.embeddedConfig ?: readEmbeddedCodexConfig(
@@ -1067,14 +1101,12 @@ fun ChatScreen(
                     .getOrElse { return }
             }
         }
-
         // Validate bridge URL starts with http:// or https://
         if (!normalizedBridge.startsWith("http://") && !normalizedBridge.startsWith("https://")) {
             codexOauthBusy = false
             codexOauthStatus = "Invalid bridge URL. Must start with http:// or https://"
             return
         }
-
         oauthBridgeClient.startLogin(
             bridgeBaseUrl = normalizedBridge,
             redirectUri = ChatActivity.OAUTH_CALLBACK_URI,
@@ -1093,11 +1125,9 @@ fun ChatScreen(
             writeSecureBackedValue(PREF_CODEX_OAUTH_CLIENT_SECRET, embeddedConfig.clientSecret)
             writeSecureBackedValue(PREF_CODEX_OAUTH_LOGIN_ID, start.loginId)
             writeSecureBackedValue(PREF_CODEX_OAUTH_CODE_VERIFIER, start.codeVerifier)
-
             val launchResult = runCatching {
                 context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(start.authUrl)))
             }
-
             if (launchResult.isSuccess) {
                 codexOauthStatus = "Browser opened. Complete OpenAI sign-in, then return to Citros."
             } else {
@@ -1119,7 +1149,6 @@ fun ChatScreen(
             }
         }
     }
-
     // Check accessibility status on resume and refresh wallet state from the source of truth.
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
@@ -1138,7 +1167,6 @@ fun ChatScreen(
             lifecycleOwner.lifecycle.removeObserver(observer)
         }
     }
-    
     // Load saved credentials on first launch
     LaunchedEffect(Unit) {
         // Migrate legacy plaintext sensitive OAuth/device-code fields into encrypted storage.
@@ -1150,7 +1178,6 @@ fun ChatScreen(
         ).forEach { key ->
             readSecureBackedValue(key)
         }
-
         // Initialize on-device memory provider for remember/recall/list_memories tools.
         // Store DB reference on the hosting Activity for cleanup in onDestroy().
         val activity = context as? ChatActivity
@@ -1163,10 +1190,8 @@ fun ChatScreen(
         } else {
             android.util.Log.w("ChatActivity", "Context is not ChatActivity — memory provider not initialized")
         }
-
         viewModel.setAgentFileManager(agentFileManager)
         viewModel.setSystemPrompt(OnboardingPersistence.systemPromptForStartup(agentFileManager))
-
         // Search config: user Settings override server-delivered keys
         val searchPrefs = context.getSharedPreferences(CITROS_PREFS, android.content.Context.MODE_PRIVATE)
         val userTinyFishKey = searchPrefs.getString(PREF_TINYFISH_API_KEY, null)
@@ -1175,7 +1200,6 @@ fun ChatScreen(
             braveKey = searchPrefs.getString(PREF_BRAVE_API_KEY, null),
             tinyFishKey = userTinyFishKey
         )
-
         // App token is compiled into the APK at build time (scripts/release.sh).
         // Empty string = no token (dev build without -PcitrosAppToken).
         val compiledAppToken = BuildConfig.CITROS_APP_TOKEN.takeIf { it.isNotBlank() }
@@ -1200,10 +1224,9 @@ fun ChatScreen(
                 }
             }
         }
-
         // Try wallet first
         walletStateFlow.value = walletManager.loadOrDefault()
-        if (walletState.keys.isNotEmpty() && 
+        if (walletState.keys.isNotEmpty() &&
             walletState.activeKeyId != null &&
             walletState.keys.any { it.id == walletState.activeKeyId }) {
             viewModel.configureWithWallet(walletManager)
@@ -1212,14 +1235,12 @@ fun ChatScreen(
             val secureToken = secureStore.getString(PREF_CLOUD_TOKEN)
             val plainToken = prefs.getString(PREF_CLOUD_TOKEN, null)
             val legacyToken = prefs.getString(PREF_LEGACY_ANTHROPIC_TOKEN, null)
-
             val token = when {
                 !secureToken.isNullOrBlank() -> secureToken
                 !plainToken.isNullOrBlank() -> plainToken
                 !legacyToken.isNullOrBlank() -> legacyToken
                 else -> null
             }
-
             // Migrate plaintext/legacy tokens to secure store
             if (!token.isNullOrBlank() && secureToken.isNullOrBlank()) {
                 secureStore.putString(PREF_CLOUD_TOKEN, token)
@@ -1228,7 +1249,6 @@ fun ChatScreen(
                     .remove(PREF_LEGACY_ANTHROPIC_TOKEN)
                     .apply()
             }
-
             val savedProvider = prefs.getString(PREF_CLOUD_PROVIDER, null)?.let { raw ->
                 runCatching { Provider.valueOf(raw) }.getOrNull()
             }
@@ -1237,7 +1257,6 @@ fun ChatScreen(
             }
             val localUrl = prefs.getString(PREF_LOCAL_URL, null)
             val localModel = prefs.getString(PREF_LOCAL_MODEL, "qwen2.5:3b")
-            
             when {
                 localUrl != null -> viewModel.configureWithLocalLLM(localUrl, localModel!!)
                 token != null -> {
@@ -1248,21 +1267,17 @@ fun ChatScreen(
                 }
             }
         }
-        
         viewModel.updateAccessibilityStatus(
             CitrosAccessibilityService.isEnabled(context)
         )
     }
-
     LaunchedEffect(Unit) {
         ChatActivity.oauthCallbackFlow().collect { uri ->
             val callbackUri = uri ?: return@collect
             ChatActivity.clearOauthCallback()
-
             val pendingState = prefs.getString(PREF_CODEX_OAUTH_STATE, null)
             val stateTimestamp = prefs.getLong(PREF_CODEX_OAUTH_STATE_TIMESTAMP, 0)
             val stateAge = System.currentTimeMillis() - stateTimestamp
-
             if (pendingState.isNullOrBlank() || stateAge > OAUTH_STATE_EXPIRY_MS) {
                 clearPendingOauthState()
                 codexOauthBusy = false
@@ -1273,7 +1288,6 @@ fun ChatScreen(
                 }
                 return@collect
             }
-
             val callbackState = callbackUri.getOauthParameter("state")
             if (!callbackState.isNullOrBlank() && callbackState != pendingState) {
                 codexOauthBusy = false
@@ -1281,7 +1295,6 @@ fun ChatScreen(
                 clearPendingOauthState()
                 return@collect
             }
-
             val oauthError = callbackUri.getOauthParameter("error")
             if (!oauthError.isNullOrBlank()) {
                 codexOauthBusy = false
@@ -1298,12 +1311,10 @@ fun ChatScreen(
                 clearPendingOauthState()
                 return@collect
             }
-
             callbackUri.extractOauthTokenFromCallback()?.let { token ->
                 applyCodexOauthToken(token)
                 return@collect
             }
-
             val code = callbackUri.getOauthParameter("code")
             if (code.isNullOrBlank()) {
                 codexOauthBusy = false
@@ -1311,14 +1322,11 @@ fun ChatScreen(
                 clearPendingOauthState()
                 return@collect
             }
-
             codexOauthStatus = "Completing OpenAI sign-in..."
-
             val bridgeBaseUrl = prefs.getString(
                 PREF_CODEX_OAUTH_BRIDGE,
                 CodexOauthBridgeClient.DEFAULT_BRIDGE_BASE_URL
             ) ?: CodexOauthBridgeClient.DEFAULT_BRIDGE_BASE_URL
-
             val resolvedBridgeBaseUrl = when (readCodexBridgeMode(prefs)) {
                 CodexOauthBridgeMode.EXTERNAL -> bridgeBaseUrl
                 CodexOauthBridgeMode.EMBEDDED -> {
@@ -1335,7 +1343,6 @@ fun ChatScreen(
                         .getOrElse { return@collect }
                 }
             }
-
             oauthBridgeClient.exchangeCode(
                 bridgeBaseUrl = resolvedBridgeBaseUrl,
                 code = code,
@@ -1364,13 +1371,11 @@ fun ChatScreen(
             }
         }
     }
-
     DisposableEffect(Unit) {
         onDispose {
             stopEmbeddedBridge()
         }
     }
-    
     // Auto-scroll when new messages arrive
     // #552: scroll to end-spacer item (size, not size-1) to ensure last message
     // is fully visible including bottom content padding
@@ -1379,7 +1384,6 @@ fun ChatScreen(
             listState.animateScrollToItem((listState.layoutInfo.totalItemsCount - 1).coerceAtLeast(0))
         }
     }
-
     // Auto-scroll during streaming responses (#618).
     // When the assistant message content updates in-place (size unchanged),
     // scroll to bottom only if the user is already near the bottom.
@@ -1402,7 +1406,6 @@ fun ChatScreen(
             listState.scrollToItem((totalItems - 1).coerceAtLeast(0))
         }
     }
-
     // Auto-scroll when keyboard appears (#450, #552) — only on hidden→visible transition
     val imeBottom = WindowInsets.ime.getBottom(LocalDensity.current)
     val wasKeyboardHidden = remember { mutableStateOf(imeBottom == 0) }
@@ -1412,120 +1415,122 @@ fun ChatScreen(
         }
         wasKeyboardHidden.value = imeBottom == 0
     }
-
-
     val isConfigured = viewModel.isConfigured.value
-
     Scaffold(
         containerColor = Color.Transparent,
         topBar = {
             if (isConfigured) {
-                val topBarHeight = TopAppBarDefaults.TopAppBarExpandedHeight +
-                    WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
-                Box(
+                val statusBarTopPadding = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
+                val chatSubtitle = if (walletState.activeKeyId != null) {
+                    shortModelName(walletState.chatModelId)
+                } else {
+                    "No provider connected"
+                }
+                Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(topBarHeight)
+                        .background(directiveSurfaces.background)
                 ) {
-                    CitrosFloatingSpriteBackdrop(
-                        flavor = selectedFlavor,
-                        modifier = Modifier.fillMaxSize(),
-                        density = 0.95f,
-                        alpha = 0.72f
-                    )
-                    CenterAlignedTopAppBar(
-                        title = {
-                            CitrosFloatingAppIconGraphic(
-                                flavor = selectedFlavor,
-                                size = 56.dp,
-                                cornerRadius = 14.dp,
-                                showBackground = false,
-                                orbOnly = true
-                            )
-                        },
-                        navigationIcon = {
-                            if (walletState.activeKeyId != null) {
-                                ProviderModelChip(
-                                    walletState = walletState,
-                                    flavor = selectedFlavor,
-                                    onClick = { showQuickSwitcher = true },
-                                    modifier = Modifier
-                                        .padding(start = 6.dp)
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(
+                                top = statusBarTopPadding + 10.dp,
+                                bottom = 10.dp,
+                                start = 14.dp,
+                                end = 14.dp
+                            ),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        CitrosDirectiveOrb(
+                            flavor = selectedFlavor,
+                            size = 32.dp,
+                            modifier = Modifier.let { base ->
+                                if (walletState.activeKeyId != null) {
+                                    base
                                         .testTag("quick_switcher_chip")
-                                )
+                                        .clickable { showQuickSwitcher = true }
+                                } else {
+                                    base
+                                }
                             }
-                        },
-                        colors = TopAppBarDefaults.topAppBarColors(
-                            containerColor = Color.Transparent,
-                            scrolledContainerColor = Color.Transparent
-                        ),
-                        actions = {
-                            FlavorToolbarIconButton(
-                                icon = Icons.Default.Settings,
-                                contentDescription = "Settings",
-                                flavor = selectedFlavor,
-                                onClick = onOpenSettings
-                            )
-                            val hasOverlayPermission = OverlayPermission.canDrawOverlays(context)
-                            val isOverlayCurrentlyActive = OverlayController.isOverlayActive.collectAsState().value
-                            FlavorToolbarIconButton(
-                                icon = Icons.Default.Layers,
-                                contentDescription = when {
-                                    !hasOverlayPermission -> "Switch to overlay (permission required)"
-                                    isOverlayCurrentlyActive -> "Deactivate overlay"
-                                    else -> "Switch to overlay"
-                                },
-                                flavor = selectedFlavor,
-                                enabled = hasOverlayPermission,
-                                onClick = {
-                                    if (hasOverlayPermission) {
-                                        val isActive = isOverlayCurrentlyActive
-                                        if (isActive) {
-                                            OverlayController.deactivateOverlay()
-                                        } else {
-                                            OverlayController.updateSurfaceMode(getPreferredOverlayMode(context))
-                                            OverlayController.activateOverlay()
-                                        }
+                        )
+                        Spacer(Modifier.width(10.dp))
+                        Column(
+                            modifier = Modifier
+                                .weight(1f)
+                                .padding(end = 4.dp)
+                                .let { base ->
+                                    if (walletState.activeKeyId != null) {
+                                        base.clickable { showQuickSwitcher = true }
                                     } else {
-                                        Toast.makeText(
-                                            context,
-                                            "Overlay permission required — enable in Settings → Phone Control",
-                                            Toast.LENGTH_SHORT
-                                        ).show()
+                                        base
                                     }
                                 }
+                        ) {
+                            Text(
+                                text = "Citros",
+                                style = CitrosTypography.titleMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                color = directiveSurfaces.labelPrimary
                             )
-                            FlavorToolbarIconButton(
-                                icon = Icons.Default.Delete,
-                                contentDescription = "Clear",
-                                flavor = selectedFlavor,
-                                onClick = { viewModel.clearConversation() }
-                            )
-                            FlavorToolbarIconButton(
-                                icon = Icons.AutoMirrored.Filled.ExitToApp,
-                                contentDescription = "Sign out",
-                                flavor = selectedFlavor,
-                                onClick = {
-                                    // Clear secure store
-                                    secureStore.remove(PREF_CLOUD_TOKEN)
-                                    // Clear legacy prefs
-                                    prefs.edit().clear().apply()
-                                    
-                                    // Clear wallet (both keystore and metadata)
-                                    walletManager.loadOrDefault().keys.forEach { key ->
-                                        walletManager.removeKey(key.id)
-                                    }
-                                    walletStorage.saveState(WalletState(
-                                        keys = emptyList(),
-                                        activeKeyId = null,
-                                        chatModelId = ModelConfig.CHAT_MODEL,
-                                        actionModelId = ModelConfig.ACTION_MODEL
-                                    ))
-                                    refreshWalletState()
-                                    showQuickSwitcher = false
-                                    viewModel.signOut()
-                                })
+                            if (walletState.activeKeyId != null) {
+                                Row(
+                                    modifier = Modifier
+                                        .padding(top = 1.dp)
+                                        .wrapContentWidth(),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(2.dp)
+                                ) {
+                                    Text(
+                                        text = chatSubtitle,
+                                        style = CitrosTypography.bodySmall,
+                                        color = directiveSurfaces.labelSecondary,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.widthIn(max = 190.dp)
+                                    )
+                                    Text(
+                                        text = "▾",
+                                        fontSize = 22.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = directiveSurfaces.labelPrimary,
+                                        modifier = Modifier.padding(bottom = 1.dp)
+                                    )
+                                }
+                            } else {
+                                Text(
+                                    text = chatSubtitle,
+                                    style = CitrosTypography.bodySmall,
+                                    color = directiveSurfaces.labelTertiary,
+                                    maxLines = 1
+                                )
+                            }
                         }
+                        CitrosLiquidGlassSurface(
+                            modifier = Modifier
+                                .size(36.dp)
+                                .semantics { contentDescription = "Settings" },
+                            shape = CircleShape,
+                            onClick = onOpenSettings,
+                            baseColor = directiveSurfaces.surface1,
+                            borderColor = directiveSurfaces.separatorLight,
+                            borderWidth = 1.dp
+                        ) {
+                            Box(
+                                modifier = Modifier.fillMaxSize(),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                SettingsGlyph(
+                                    tint = directiveSurfaces.labelPrimary,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
+                        }
+                    }
+                    HorizontalDivider(
+                        color = directiveSurfaces.separator,
+                        thickness = 0.5.dp
                     )
                 }
             }
@@ -1536,7 +1541,7 @@ fun ChatScreen(
                 .fillMaxSize()
                 .padding(padding)
                 .imePadding()
-                .background(MaterialTheme.colorScheme.background)
+                .background(directiveSurfaces.background)
         ) {
             if (!isConfigured) {
                 // #554: Show themed prompt instead of legacy SignInPrompt
@@ -1552,9 +1557,7 @@ fun ChatScreen(
                         onEnable = { CitrosAccessibilityService.openSettings(context) }
                     )
                 }
-
                 val showCenteredEmptyState = viewModel.messages.isEmpty() && !viewModel.isLoading.value
-
                 if (showCenteredEmptyState) {
                     Box(
                         modifier = Modifier
@@ -1564,8 +1567,7 @@ fun ChatScreen(
                         contentAlignment = Alignment.Center
                     ) {
                         ChatEmptyState(
-                            flavor = selectedFlavor,
-                            onSuggestion = { viewModel.sendMessage(it) }
+                            flavor = selectedFlavor
                         )
                     }
                 } else {
@@ -1585,7 +1587,6 @@ fun ChatScreen(
                                 flavor = selectedFlavor,
                             )
                         }
-
                         if (viewModel.isLoading.value) {
                             item {
                                 LoadingIndicator(
@@ -1598,13 +1599,11 @@ fun ChatScreen(
                                 )
                             }
                         }
-
                         // #552: End spacer — scroll target to ensure last message is fully visible.
                         // animateScrollToItem(messages.size) lands here, pushing content up.
                         item { Spacer(Modifier.height(4.dp)) }
                     }
                 }
-                
                 // Error snackbar
                 viewModel.error.value?.let { error ->
                     Snackbar(
@@ -1618,35 +1617,36 @@ fun ChatScreen(
                         Text(error)
                     }
                 }
-                
                 // Input field
                 val voiceReadyState by viewModel.voiceReady.collectAsState()
                 val voiceManagerState by viewModel.voiceManager.collectAsState()
+                HorizontalDivider(
+                    color = directiveSurfaces.separator,
+                    thickness = 0.5.dp
+                )
                 MessageInput(
                     onSend = { viewModel.sendMessage(it) },
                     onSteer = { viewModel.steerMessage(it) },
+                    onQueue = { viewModel.setQueuedMessage(it) },
+                    queuedMessage = viewModel.queuedMessage.value,
+                    onSteerQueuedMessage = {
+                        viewModel.setQueuedMessage("")
+                        viewModel.steerMessage(it)
+                    },
                     onCancel = { viewModel.cancelToolExecution() },
                     isLoading = viewModel.isLoading.value,
                     flavor = selectedFlavor,
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
-                    placeholder = if (viewModel.isLoading.value) {
-                        "Send a new instruction..."
-                    } else if (viewModel.accessibilityEnabled.value) {
-                        "Ask me to do something..."
-                    } else {
-                        "Message Citros..."
-                    },
+                    modifier = Modifier.padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 24.dp),
+                    placeholder = "Message",
                     voiceReady = voiceReadyState,
                     voiceManager = voiceManagerState
                 )
             }
         }
     }
-
     if (showQuickSwitcher) {
         QuickSwitcherSheet(
             walletState = walletState,
-            keyStore = walletKeyStore,
             flavor = selectedFlavor,
             onDismiss = { showQuickSwitcher = false },
             onSelectKey = { keyId ->
@@ -1679,6 +1679,48 @@ fun ChatScreen(
 }
 
 @Composable
+private fun SettingsGlyph(
+    tint: Color,
+    modifier: Modifier = Modifier
+) {
+    Canvas(modifier = modifier) {
+        val center = Offset(size.width / 2f, size.height / 2f)
+        val radius = size.minDimension / 2f
+        val strokeWidth = radius * 0.22f
+        val outerGearRadius = radius * 0.78f
+        val spokeInnerRadius = radius * 0.58f
+
+        drawCircle(
+            color = tint,
+            radius = radius * 0.48f,
+            style = Stroke(width = strokeWidth)
+        )
+        drawCircle(
+            color = tint,
+            radius = radius * 0.13f
+        )
+
+        repeat(8) { index ->
+            val angle = Math.toRadians((index * 45.0) - 90.0)
+            val start = Offset(
+                x = center.x + cos(angle).toFloat() * spokeInnerRadius,
+                y = center.y + sin(angle).toFloat() * spokeInnerRadius
+            )
+            val end = Offset(
+                x = center.x + cos(angle).toFloat() * outerGearRadius,
+                y = center.y + sin(angle).toFloat() * outerGearRadius
+            )
+            drawLine(
+                color = tint,
+                start = start,
+                end = end,
+                strokeWidth = strokeWidth,
+                cap = StrokeCap.Round
+            )
+        }
+    }
+}
+@Composable
 private fun FlavorToolbarIconButton(
     icon: ImageVector,
     contentDescription: String,
@@ -1687,7 +1729,7 @@ private fun FlavorToolbarIconButton(
     enabled: Boolean = true
 ) {
     val iconColor = if (enabled) {
-        lerp(flavor.primary, MaterialTheme.colorScheme.onSurface, 0.34f)
+        lerp(flavor.primary, CitrosColorScheme.onSurface, 0.34f)
     } else {
         flavor.primary.copy(alpha = 0.34f)
     }
@@ -1708,7 +1750,7 @@ private fun FlavorToolbarIconButton(
         warmth = if (enabled) 0.96f else 0.62f
     ) {
         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            Icon(
+            CitrosIcon(
                 imageVector = icon,
                 contentDescription = contentDescription,
                 tint = iconColor
@@ -1716,7 +1758,6 @@ private fun FlavorToolbarIconButton(
         }
     }
 }
-
 @Composable
 internal fun AccessibilityBanner(
     onEnable: () -> Unit,
@@ -1740,24 +1781,23 @@ internal fun AccessibilityBanner(
             Column(modifier = Modifier.weight(1f)) {
                 Text(
                     "Enable phone control",
-                    style = MaterialTheme.typography.titleSmall,
+                    style = CitrosTypography.titleSmall,
                     color = flavor.primary
                 )
                 Text(
                     "Let Citros see and control your screen",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.78f)
+                    style = CitrosTypography.bodySmall,
+                    color = CitrosColorScheme.onSurface.copy(alpha = 0.78f)
                 )
             }
             TextButton(onClick = onEnable) {
-                Icon(Icons.Default.Settings, contentDescription = null, tint = flavor.primary)
+                CitrosIcon(CitrosIcons.Settings, contentDescription = null, tint = flavor.primary)
                 Spacer(Modifier.width(4.dp))
                 Text("Enable", color = flavor.primary)
             }
         }
     }
 }
-
 /**
  * Minimal themed prompt shown when user completed onboarding but has no API key.
  * Replaces the legacy SignInPrompt (#554). Directs user to Settings > Wallet.
@@ -1771,7 +1811,6 @@ private fun NoKeyPrompt(
     val visualTokens = remember(flavor, isDarkTheme) {
         citrosSplashVisualTokens(flavor, isDark = isDarkTheme)
     }
-
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -1782,7 +1821,6 @@ private fun NoKeyPrompt(
             flavor = flavor,
             modifier = Modifier.fillMaxSize()
         )
-
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -1792,8 +1830,8 @@ private fun NoKeyPrompt(
         ) {
             Text(
                 text = "Add an API Key",
-                style = MaterialTheme.typography.displaySmall.copy(
-                    fontSize = MaterialTheme.typography.displaySmall.fontSize * 1.08f,
+                style = CitrosTypography.displaySmall.copy(
+                    fontSize = CitrosTypography.displaySmall.fontSize * 1.08f,
                     shadow = Shadow(
                         color = visualTokens.hero.deep.copy(alpha = 0.78f),
                         offset = Offset(0f, 2f),
@@ -1803,17 +1841,14 @@ private fun NoKeyPrompt(
                 color = flavor.primary,
                 fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold
             )
-
             Spacer(modifier = Modifier.height(12.dp))
-
             Text(
                 text = "Connect an Anthropic, OpenAI, or OpenRouter key to start chatting.",
-                style = MaterialTheme.typography.bodyLarge,
-                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.80f),
+                style = CitrosTypography.bodyLarge,
+                color = CitrosColorScheme.onSurface.copy(alpha = 0.80f),
                 textAlign = androidx.compose.ui.text.style.TextAlign.Center
             )
         }
-
         CitrusLiquidGlassButton(
             text = "Open Settings",
             onClick = onOpenSettings,
@@ -1825,7 +1860,6 @@ private fun NoKeyPrompt(
         )
     }
 }
-
 @Composable
 fun SignInPrompt(
     onToken: (String, Provider?, CloudAuthKind?) -> Unit,
@@ -1867,7 +1901,6 @@ fun SignInPrompt(
     var apiKeyValidationStatus by remember { mutableStateOf(ApiKeyValidationStatus.UNKNOWN) }
     var validatingApiKey by remember { mutableStateOf(false) }
     val coroutineScope = rememberCoroutineScope()
-    
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -1879,26 +1912,20 @@ fun SignInPrompt(
     ) {
         Text(
             "🍊",
-            style = MaterialTheme.typography.displayLarge
+            style = CitrosTypography.displayLarge
         )
-        
         Spacer(modifier = Modifier.height(16.dp))
-        
         Text(
             "Welcome to Citros",
-            style = MaterialTheme.typography.headlineMedium
+            style = CitrosTypography.headlineMedium
         )
-        
         Spacer(modifier = Modifier.height(8.dp))
-        
         Text(
             "AI phone control with cloud and local models",
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.7f)
+            style = CitrosTypography.bodyMedium,
+            color = CitrosColorScheme.onBackground.copy(alpha = 0.7f)
         )
-        
         Spacer(modifier = Modifier.height(32.dp))
-        
         when (mode) {
             "main" -> {
                 // PROMINENT: Device Code Flow - simplest for users
@@ -1912,17 +1939,13 @@ fun SignInPrompt(
                 ) {
                     Text("🔑 Sign in with OpenAI")
                 }
-                
                 Spacer(modifier = Modifier.height(8.dp))
-                
                 Text(
                     "No API key needed — sign in with your ChatGPT account",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.5f)
+                    style = CitrosTypography.bodySmall,
+                    color = CitrosColorScheme.onBackground.copy(alpha = 0.5f)
                 )
-                
                 Spacer(modifier = Modifier.height(20.dp))
-                
                 OutlinedButton(
                     onClick = {
                         selectedProvider = Provider.ANTHROPIC
@@ -1933,17 +1956,13 @@ fun SignInPrompt(
                 ) {
                     Text("🔐 Anthropic Key / Setup Token")
                 }
-                
                 Spacer(modifier = Modifier.height(8.dp))
-                
                 Text(
                     "From console.anthropic.com",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.5f)
+                    style = CitrosTypography.bodySmall,
+                    color = CitrosColorScheme.onBackground.copy(alpha = 0.5f)
                 )
-                
                 Spacer(modifier = Modifier.height(20.dp))
-                
                 OutlinedButton(
                     onClick = {
                         selectedProvider = Provider.OPENAI
@@ -1954,17 +1973,13 @@ fun SignInPrompt(
                 ) {
                     Text("🤖 OpenAI API Key")
                 }
-                
                 Spacer(modifier = Modifier.height(8.dp))
-                
                 Text(
                     "From platform.openai.com/api-keys",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.5f)
+                    style = CitrosTypography.bodySmall,
+                    color = CitrosColorScheme.onBackground.copy(alpha = 0.5f)
                 )
-                
                 Spacer(modifier = Modifier.height(20.dp))
-                
                 OutlinedButton(
                     onClick = {
                         selectedProvider = Provider.OPENROUTER
@@ -1975,17 +1990,13 @@ fun SignInPrompt(
                 ) {
                     Text("🌐 OpenRouter API Key")
                 }
-                
                 Spacer(modifier = Modifier.height(8.dp))
-                
                 Text(
                     "From openrouter.ai/keys",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.5f)
+                    style = CitrosTypography.bodySmall,
+                    color = CitrosColorScheme.onBackground.copy(alpha = 0.5f)
                 )
-                
                 Spacer(modifier = Modifier.height(20.dp))
-                
                 OutlinedButton(
                     onClick = {
                         selectedProvider = null
@@ -1996,13 +2007,11 @@ fun SignInPrompt(
                 ) {
                     Text("⚡ Local LLM")
                 }
-                
                 Spacer(modifier = Modifier.height(8.dp))
-                
                 Text(
                     "llama.cpp or Ollama in Termux",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.5f)
+                    style = CitrosTypography.bodySmall,
+                    color = CitrosColorScheme.onBackground.copy(alpha = 0.5f)
                 )
             }
             "token" -> {
@@ -2025,7 +2034,6 @@ fun SignInPrompt(
                 val isTokenFormatValid = resolvedProvider?.let { provider ->
                     isValidKeyFormat(trimmedToken, provider)
                 } ?: false
-
                 val providerLabel = when (selectedAuthKind) {
                     CloudAuthKind.ANTHROPIC_CREDENTIAL -> "Anthropic credential selected"
                     CloudAuthKind.OPENAI_API_KEY -> "OpenAI API key selected"
@@ -2039,7 +2047,6 @@ fun SignInPrompt(
                         null -> "Auto-detect mode"
                     }
                 }
-
                 val hint = when {
                     inputValue.isBlank() -> "$providerLabel. Paste credential to continue."
                     codexOauthSelected && !looksLikeOauth ->
@@ -2055,33 +2062,28 @@ fun SignInPrompt(
                     tokenType == ClaudeClient.TokenType.API_KEY -> "✅ Anthropic API key detected"
                     else -> "⚠️ Unrecognized format for selected provider"
                 }
-
                 Text(
                     hint,
-                    style = MaterialTheme.typography.bodySmall,
+                    style = CitrosTypography.bodySmall,
                     color = when {
                         codexOauthSelected && inputValue.isNotBlank() && !looksLikeOauth ->
-                            MaterialTheme.colorScheme.error
+                            CitrosColorScheme.error
                         resolvedProvider != null ->
-                            MaterialTheme.colorScheme.secondary
-                        inputValue.isNotBlank() -> MaterialTheme.colorScheme.error
+                            CitrosColorScheme.secondary
+                        inputValue.isNotBlank() -> CitrosColorScheme.error
                         else ->
-                            MaterialTheme.colorScheme.onBackground.copy(alpha = 0.7f)
+                            CitrosColorScheme.onBackground.copy(alpha = 0.7f)
                     }
                 )
-                
                 Spacer(modifier = Modifier.height(8.dp))
-
                 if (hasToken && resolvedProvider != null && !isTokenFormatValid) {
                     Text(
                         "Credential format does not match the selected provider.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.error
+                        style = CitrosTypography.bodySmall,
+                        color = CitrosColorScheme.error
                     )
                 }
-
                 Spacer(modifier = Modifier.height(12.dp))
-
                 resolvedProvider?.let { provider ->
                     OutlinedButton(
                         onClick = { onOpenApiKeySetup(provider) },
@@ -2089,19 +2091,15 @@ fun SignInPrompt(
                     ) {
                         Text("Set up API Key")
                     }
-
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
                         "This opens your provider dashboard in Chrome Custom Tabs. Create/copy the key, then return and paste.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.65f)
+                        style = CitrosTypography.bodySmall,
+                        color = CitrosColorScheme.onBackground.copy(alpha = 0.65f)
                     )
                 }
-
                 Spacer(modifier = Modifier.height(16.dp))
-
                 var tokenVisible by remember { mutableStateOf(false) }
-                
                 OutlinedTextField(
                     value = inputValue,
                     onValueChange = {
@@ -2139,14 +2137,11 @@ fun SignInPrompt(
                         }
                     }
                 )
-                
                 Spacer(modifier = Modifier.height(16.dp))
-
                 OutlinedButton(
                     onClick = {
                         val provider = resolvedProvider ?: return@OutlinedButton
                         if (!isTokenFormatValid) return@OutlinedButton
-
                         validatingApiKey = true
                         coroutineScope.launch {
                             apiKeyValidationStatus = validateApiCredential(trimmedToken, provider)
@@ -2158,7 +2153,6 @@ fun SignInPrompt(
                 ) {
                     Text(if (validatingApiKey) "Testing..." else "Test Connection")
                 }
-
                 if (apiKeyValidationStatus != ApiKeyValidationStatus.UNKNOWN) {
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
@@ -2168,18 +2162,16 @@ fun SignInPrompt(
                             ApiKeyValidationStatus.EXPIRED -> stringResource(R.string.api_key_status_expired)
                             ApiKeyValidationStatus.UNKNOWN -> stringResource(R.string.api_key_status_unknown)
                         },
-                        style = MaterialTheme.typography.bodySmall,
+                        style = CitrosTypography.bodySmall,
                         color = when (apiKeyValidationStatus) {
-                            ApiKeyValidationStatus.VALID -> MaterialTheme.colorScheme.secondary
-                            ApiKeyValidationStatus.INVALID -> MaterialTheme.colorScheme.error
-                            ApiKeyValidationStatus.EXPIRED -> MaterialTheme.colorScheme.error
-                            ApiKeyValidationStatus.UNKNOWN -> MaterialTheme.colorScheme.onBackground.copy(alpha = 0.7f)
+                            ApiKeyValidationStatus.VALID -> CitrosColorScheme.secondary
+                            ApiKeyValidationStatus.INVALID -> CitrosColorScheme.error
+                            ApiKeyValidationStatus.EXPIRED -> CitrosColorScheme.error
+                            ApiKeyValidationStatus.UNKNOWN -> CitrosColorScheme.onBackground.copy(alpha = 0.7f)
                         }
                     )
                 }
-
                 Spacer(modifier = Modifier.height(12.dp))
-
                 Button(
                     onClick = {
                         val provider = resolvedProvider ?: return@Button
@@ -2191,9 +2183,7 @@ fun SignInPrompt(
                 ) {
                     Text("Connect")
                 }
-                
                 Spacer(modifier = Modifier.height(8.dp))
-                
                 TextButton(onClick = {
                     mode = "main"
                     inputValue = ""
@@ -2206,20 +2196,16 @@ fun SignInPrompt(
             "codex_oauth" -> {
                 Text(
                     "Connect your OpenAI subscription with browser sign-in.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.7f)
+                    style = CitrosTypography.bodySmall,
+                    color = CitrosColorScheme.onBackground.copy(alpha = 0.7f)
                 )
-
                 Spacer(modifier = Modifier.height(16.dp))
-
                 Text(
                     "Bridge Mode",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.7f)
+                    style = CitrosTypography.labelMedium,
+                    color = CitrosColorScheme.onBackground.copy(alpha = 0.7f)
                 )
-
                 Spacer(modifier = Modifier.height(8.dp))
-
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -2237,9 +2223,7 @@ fun SignInPrompt(
                         enabled = !codexOauthInProgress
                     )
                 }
-
                 Spacer(modifier = Modifier.height(12.dp))
-
                 if (codexBridgeMode == CodexOauthBridgeMode.EMBEDDED) {
                     OutlinedTextField(
                         value = codexAuthUrl,
@@ -2249,9 +2233,7 @@ fun SignInPrompt(
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
-
                     Spacer(modifier = Modifier.height(8.dp))
-
                     OutlinedTextField(
                         value = codexTokenUrl,
                         onValueChange = { codexTokenUrl = it },
@@ -2260,9 +2242,7 @@ fun SignInPrompt(
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
-
                     Spacer(modifier = Modifier.height(8.dp))
-
                     OutlinedTextField(
                         value = codexClientId,
                         onValueChange = { codexClientId = it },
@@ -2270,9 +2250,7 @@ fun SignInPrompt(
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
-
                     Spacer(modifier = Modifier.height(8.dp))
-
                     OutlinedTextField(
                         value = codexClientSecret,
                         onValueChange = { codexClientSecret = it },
@@ -2281,9 +2259,7 @@ fun SignInPrompt(
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
-
                     Spacer(modifier = Modifier.height(8.dp))
-
                     OutlinedTextField(
                         value = codexScope,
                         onValueChange = { codexScope = it },
@@ -2292,13 +2268,11 @@ fun SignInPrompt(
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
-
                     Spacer(modifier = Modifier.height(8.dp))
-
                     Text(
                         "Starts a local bridge inside the app and exchanges callback code for token.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f)
+                        style = CitrosTypography.bodySmall,
+                        color = CitrosColorScheme.onBackground.copy(alpha = 0.6f)
                     )
                 } else {
                     OutlinedTextField(
@@ -2309,35 +2283,30 @@ fun SignInPrompt(
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
-
                     Spacer(modifier = Modifier.height(8.dp))
-
                     Text(
                         "External bridge starts login and exchanges callback code for token.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f)
+                        style = CitrosTypography.bodySmall,
+                        color = CitrosColorScheme.onBackground.copy(alpha = 0.6f)
                     )
                 }
-
                 if (!codexOauthStatus.isNullOrBlank()) {
                     Spacer(modifier = Modifier.height(12.dp))
                     Text(
                         codexOauthStatus,
-                        style = MaterialTheme.typography.bodySmall,
+                        style = CitrosTypography.bodySmall,
                         color = when {
                             codexOauthStatus.contains("failed", ignoreCase = true) ||
                                 codexOauthStatus.contains("could not", ignoreCase = true) ||
                                 codexOauthStatus.contains("missing", ignoreCase = true) ||
                                 codexOauthStatus.contains("mismatch", ignoreCase = true) ||
                                 codexOauthStatus.contains("no active", ignoreCase = true) ->
-                                    MaterialTheme.colorScheme.error
-                            else -> MaterialTheme.colorScheme.secondary
+                                    CitrosColorScheme.error
+                            else -> CitrosColorScheme.secondary
                         }
                     )
                 }
-
                 Spacer(modifier = Modifier.height(16.dp))
-
                 val codexStartRequest = when (codexBridgeMode) {
                     CodexOauthBridgeMode.EXTERNAL -> {
                         CodexOauthStartRequest(
@@ -2366,7 +2335,6 @@ fun SignInPrompt(
                         )
                     }
                 }
-
                 Button(
                     onClick = { onStartCodexOauth(codexStartRequest) },
                     enabled = !codexOauthInProgress,
@@ -2383,9 +2351,7 @@ fun SignInPrompt(
                         Text("Sign in with OpenAI")
                     }
                 }
-
                 Spacer(modifier = Modifier.height(8.dp))
-
                 OutlinedButton(
                     onClick = {
                         selectedProvider = Provider.OPENAI
@@ -2397,9 +2363,7 @@ fun SignInPrompt(
                 ) {
                     Text("Paste Token Manually")
                 }
-
                 Spacer(modifier = Modifier.height(8.dp))
-
                 TextButton(onClick = {
                     mode = "main"
                     selectedProvider = null
@@ -2426,19 +2390,16 @@ fun SignInPrompt(
                     writeSecureBacked(secureStore, prefs, key, value)
                 val coroutineScope = rememberCoroutineScope()
                 val deviceCodeClient = remember { ai.citros.core.DeviceCodeAuthClient() }
-
                 // Cleanup on disposal - cancel any running polling
                 DisposableEffect(Unit) {
                     onDispose {
                         pollingJob?.cancel()
                     }
                 }
-
                 LaunchedEffect(retryTrigger) {
                     // Prevent duplicate requests on recomposition
                     if (hasInitialized) return@LaunchedEffect
                     hasInitialized = true
-                    
                     deviceCodeStatus = "Requesting authorization code..."
                     deviceCodeError = null
                     deviceCodeDiagnostics = null
@@ -2459,7 +2420,6 @@ fun SignInPrompt(
                             .putString(PREF_DEVICE_CODE_LAST_DIAGNOSTICS, deviceCodeDiagnostics)
                             .remove(PREF_DEVICE_CODE_LAST_ERROR)
                             .apply()
-                        
                         // Auto-start polling in background, storing Job for cleanup
                         isPolling = true
                         pollingJob = coroutineScope.launch {
@@ -2487,7 +2447,6 @@ fun SignInPrompt(
                                         if (tokens.refreshToken != null) {
                                             writeSecureBackedValue(PREF_DEVICE_CODE_REFRESH_TOKEN, tokens.refreshToken)
                                         }
-                                        
                                         // onToken callback handles main token persistence
                                         onToken(tokens.accessToken, Provider.OPENAI, CloudAuthKind.OPENAI_DEVICE_CODE)
                                         prefs.edit()
@@ -2531,25 +2490,20 @@ fun SignInPrompt(
                             .apply()
                     }
                 }
-
                 Text(
                     "Sign in with your OpenAI account",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.7f)
+                    style = CitrosTypography.bodyMedium,
+                    color = CitrosColorScheme.onBackground.copy(alpha = 0.7f)
                 )
-
                 Spacer(modifier = Modifier.height(24.dp))
-
                 if (deviceCodeResponse != null) {
                     // Step 1: Open the link
                     Text(
                         "1. Open the link below",
-                        style = MaterialTheme.typography.labelLarge,
-                        color = MaterialTheme.colorScheme.primary
+                        style = CitrosTypography.labelLarge,
+                        color = CitrosColorScheme.primary
                     )
-
                     Spacer(modifier = Modifier.height(12.dp))
-
                     Button(
                         onClick = {
                             val uri = Uri.parse(
@@ -2559,37 +2513,31 @@ fun SignInPrompt(
                         },
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Icon(Icons.AutoMirrored.Filled.ExitToApp, contentDescription = null)
+                        CitrosIcon(CitrosIcons.ExitToApp, contentDescription = null)
                         Spacer(Modifier.width(8.dp))
                         Text("Open Browser")
                     }
-
                     Spacer(modifier = Modifier.height(24.dp))
-
                     // Step 2: Enter the code
                     Text(
                         "2. Enter this code",
-                        style = MaterialTheme.typography.labelLarge,
-                        color = MaterialTheme.colorScheme.primary
+                        style = CitrosTypography.labelLarge,
+                        color = CitrosColorScheme.primary
                     )
-
                     Spacer(modifier = Modifier.height(12.dp))
-
                     Surface(
                         shape = RoundedCornerShape(12.dp),
-                        color = MaterialTheme.colorScheme.primaryContainer,
+                        color = CitrosColorScheme.primaryContainer,
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Text(
                             deviceCodeResponse?.userCode ?: "",
-                            style = MaterialTheme.typography.displayMedium,
-                            color = MaterialTheme.colorScheme.onPrimaryContainer,
+                            style = CitrosTypography.displayMedium,
+                            color = CitrosColorScheme.onPrimaryContainer,
                             modifier = Modifier.padding(24.dp)
                         )
                     }
-
                     Spacer(modifier = Modifier.height(8.dp))
-
                     OutlinedButton(
                         onClick = {
                             val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
@@ -2601,26 +2549,20 @@ fun SignInPrompt(
                     ) {
                         Text("📋 Copy Code")
                     }
-
                     Spacer(modifier = Modifier.height(24.dp))
-
                     // Step 3: Approve access
                     Text(
                         "3. Approve access",
-                        style = MaterialTheme.typography.labelLarge,
-                        color = MaterialTheme.colorScheme.primary
+                        style = CitrosTypography.labelLarge,
+                        color = CitrosColorScheme.primary
                     )
-
                     Spacer(modifier = Modifier.height(8.dp))
-
                     Text(
                         "Then return to Citros",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f)
+                        style = CitrosTypography.bodySmall,
+                        color = CitrosColorScheme.onBackground.copy(alpha = 0.6f)
                     )
-
                     Spacer(modifier = Modifier.height(24.dp))
-
                     // Polling status
                     if (isPolling && deviceCodeStatus != null) {
                         Row(
@@ -2635,8 +2577,8 @@ fun SignInPrompt(
                             Spacer(modifier = Modifier.width(12.dp))
                             Text(
                                 deviceCodeStatus ?: "",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.secondary
+                                style = CitrosTypography.bodyMedium,
+                                color = CitrosColorScheme.secondary
                             )
                         }
                     }
@@ -2654,45 +2596,40 @@ fun SignInPrompt(
                         Spacer(modifier = Modifier.width(12.dp))
                         Text(
                             deviceCodeStatus ?: "",
-                            style = MaterialTheme.typography.bodyMedium
+                            style = CitrosTypography.bodyMedium
                         )
                     }
                 }
-
                 if (deviceCodeDiagnostics != null) {
                     Spacer(modifier = Modifier.height(12.dp))
                     Surface(
                         shape = RoundedCornerShape(8.dp),
-                        color = MaterialTheme.colorScheme.surfaceVariant,
+                        color = CitrosColorScheme.surfaceVariant,
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Text(
                             "Diagnostics: ${deviceCodeDiagnostics ?: ""}",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = CitrosTypography.bodySmall,
+                            color = CitrosColorScheme.onSurfaceVariant,
                             modifier = Modifier.padding(12.dp)
                         )
                     }
                 }
-
                 // Error display
                 if (deviceCodeError != null) {
                     Spacer(modifier = Modifier.height(16.dp))
-                    
                     Surface(
                         shape = RoundedCornerShape(8.dp),
-                        color = MaterialTheme.colorScheme.errorContainer,
+                        color = CitrosColorScheme.errorContainer,
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Column(modifier = Modifier.padding(16.dp)) {
                             Text(
                                 deviceCodeError ?: "",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onErrorContainer
+                                style = CitrosTypography.bodyMedium,
+                                color = CitrosColorScheme.onErrorContainer
                             )
-                            
                             Spacer(modifier = Modifier.height(12.dp))
-                            
                             Button(
                                 onClick = {
                                     // Retry by canceling current poll and resetting state
@@ -2718,9 +2655,7 @@ fun SignInPrompt(
                         }
                     }
                 }
-
                 Spacer(modifier = Modifier.height(16.dp))
-
                 TextButton(
                     onClick = {
                         // Cancel any running polling before navigating away
@@ -2746,12 +2681,10 @@ fun SignInPrompt(
             "local" -> {
                 Text(
                     "Connect to llama.cpp or Ollama in Termux",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.7f)
+                    style = CitrosTypography.bodySmall,
+                    color = CitrosColorScheme.onBackground.copy(alpha = 0.7f)
                 )
-                
                 Spacer(modifier = Modifier.height(16.dp))
-                
                 OutlinedTextField(
                     value = inputValue.ifBlank { "http://localhost:8080" },
                     onValueChange = { inputValue = it },
@@ -2759,9 +2692,7 @@ fun SignInPrompt(
                     modifier = Modifier.fillMaxWidth(),
                     singleLine = true
                 )
-                
                 Spacer(modifier = Modifier.height(8.dp))
-                
                 OutlinedTextField(
                     value = modelName,
                     onValueChange = { modelName = it },
@@ -2769,9 +2700,7 @@ fun SignInPrompt(
                     modifier = Modifier.fillMaxWidth(),
                     singleLine = true
                 )
-                
                 Spacer(modifier = Modifier.height(16.dp))
-                
                 Button(
                     onClick = {
                         val url = inputValue.ifBlank { "http://localhost:8080" }
@@ -2781,9 +2710,7 @@ fun SignInPrompt(
                 ) {
                     Text("⚡ Connect")
                 }
-                
                 Spacer(modifier = Modifier.height(8.dp))
-                
                 TextButton(onClick = {
                     mode = "main"
                     inputValue = ""
@@ -2796,7 +2723,6 @@ fun SignInPrompt(
         }
     }
 }
-
 @Composable
 internal fun MessageBubble(
     message: Message,
@@ -2804,16 +2730,17 @@ internal fun MessageBubble(
 ) {
     PortedMessageBubble(message = message, flavor = flavor)
 }
-
 @Composable
 internal fun LoadingIndicator(flavor: CitrosFlavor = CitrosFlavor.TANGERINE, label: String = "Thinking") {
     PortedLoadingIndicator(flavor = flavor, label = label)
 }
-
 @Composable
 internal fun MessageInput(
     onSend: (String) -> Unit,
     onSteer: (String) -> Unit = onSend,
+    onQueue: (String) -> Unit = onSteer,
+    queuedMessage: String? = null,
+    onSteerQueuedMessage: (String) -> Unit = onSteer,
     onCancel: () -> Unit = {},
     isLoading: Boolean = false,
     flavor: CitrosFlavor = CitrosFlavor.TANGERINE,
@@ -2824,11 +2751,23 @@ internal fun MessageInput(
     onVoiceText: ((String) -> Unit)? = null
 ) {
     var text by remember { mutableStateOf("") }
+    var pendingStopVisual by remember { mutableStateOf(false) }
     var isListening by remember { mutableStateOf(false) }
     var listeningJob by remember { mutableStateOf<Job?>(null) }
     val coroutineScope = rememberCoroutineScope()
     val context = LocalContext.current
-
+    LaunchedEffect(pendingStopVisual, isLoading) {
+        if (pendingStopVisual && isLoading) {
+            pendingStopVisual = false
+            return@LaunchedEffect
+        }
+        if (pendingStopVisual && !isLoading) {
+            delay(180)
+            if (!isLoading) {
+                pendingStopVisual = false
+            }
+        }
+    }
     fun beginListening(stt: SpeechToTextProvider) {
         // Cancel any previous listening session to avoid two AudioRecord
         // instances fighting over the microphone (#637).
@@ -2869,14 +2808,14 @@ internal fun MessageInput(
             )
             val sendText = result.autoSendText
             if (sendText != null) {
-                if (isLoading) onSteer(sendText) else onSend(sendText)
+                if (isLoading) onQueue(sendText) else onSend(sendText)
                 text = ""
+                pendingStopVisual = true
             } else {
                 text = result.displayText
             }
         }
     }
-
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
@@ -2887,7 +2826,6 @@ internal fun MessageInput(
             Toast.makeText(context, "Microphone permission is required for voice input", Toast.LENGTH_SHORT).show()
         }
     }
-
     val startListening = {
         val stt = voiceManager?.activeStt?.value
         if (stt != null) {
@@ -2901,192 +2839,332 @@ internal fun MessageInput(
             }
         }
     }
-    val containerShape = RoundedCornerShape(22.dp)
+    val isDarkTheme = LocalCitrosIsDark.current
+    val surfaces = remember(isDarkTheme) { citrosDirectiveSurfaces(isDarkTheme) }
+    val queuedText = queuedMessage?.trim()?.takeIf { it.isNotBlank() }
+    val hasInputText = text.isNotBlank()
+    val activeSendButtonColor = if (flavor == CitrosFlavor.NONE) {
+        if (isDarkTheme) Color.White else Color.Black
+    } else {
+        flavor.primary
+    }
+    val activeSendIconTint = contrastOn(activeSendButtonColor)
+    val inactiveSendButtonColor = if (isDarkTheme) surfaces.surface3 else surfaces.surface2
+    val inactiveSendIconTint = surfaces.labelQuaternary
     val textFieldColors = OutlinedTextFieldDefaults.colors(
-        focusedBorderColor = flavor.primary.copy(alpha = 0.75f),
-        unfocusedBorderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.28f),
-        focusedContainerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.26f),
-        unfocusedContainerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.18f),
+        focusedBorderColor = Color.Transparent,
+        unfocusedBorderColor = Color.Transparent,
+        focusedContainerColor = Color.Transparent,
+        unfocusedContainerColor = Color.Transparent,
         cursorColor = flavor.primary,
-        focusedTextColor = MaterialTheme.colorScheme.onSurface,
-        unfocusedTextColor = MaterialTheme.colorScheme.onSurface,
-        focusedPlaceholderColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.78f),
-        unfocusedPlaceholderColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.62f)
+        focusedTextColor = surfaces.labelPrimary,
+        unfocusedTextColor = surfaces.labelPrimary,
+        focusedPlaceholderColor = surfaces.labelTertiary,
+        unfocusedPlaceholderColor = surfaces.labelTertiary
     )
-
-    CitrosLiquidGlassSurface(
+    Column(
         modifier = modifier.fillMaxWidth(),
-        shape = containerShape,
-        borderColor = flavor.primary.copy(alpha = 0.34f),
-        borderWidth = 1.dp,
-        highlightColor = flavor.primary,
-        warmth = 0.98f,
-        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp)
+        verticalArrangement = Arrangement.spacedBy(6.dp)
     ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            OutlinedTextField(
-                value = text,
-                onValueChange = { text = it },
-                modifier = Modifier.weight(1f),
-                placeholder = { Text(placeholder) },
-                enabled = true,
-                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
-                keyboardActions = KeyboardActions(
-                    onSend = {
-                        if (text.isNotBlank()) {
-                            if (isLoading) onSteer(text) else onSend(text)
-                            text = ""
-                        }
-                    }
-                ),
-                singleLine = false,
-                maxLines = 4,
-                shape = RoundedCornerShape(18.dp),
-                colors = textFieldColors
-            )
-
-            Spacer(modifier = Modifier.width(8.dp))
-
-            if (isLoading && text.isBlank()) {
-                // Voice-steer: mic button to redirect via voice while agent is running
-                if (isListening) {
-                    MessageInputGlassIconButton(
-                        onClick = {
-                            listeningJob?.cancel()
-                            listeningJob = null
-                            voiceManager?.activeStt?.value?.stopListening()
-                            isListening = false
-                        },
-                        enabled = true,
-                        borderColor = MaterialTheme.colorScheme.error.copy(alpha = 0.58f),
-                        highlightColor = MaterialTheme.colorScheme.error,
-                        iconTint = MaterialTheme.colorScheme.error
-                    ) {
-                        Icon(Icons.Filled.Stop, contentDescription = "Stop listening")
-                    }
-                    Spacer(modifier = Modifier.width(8.dp))
-                } else if (voiceReady) {
-                    MessageInputGlassIconButton(
-                        onClick = { startListening() },
-                        enabled = true,
-                        borderColor = flavor.primary.copy(alpha = 0.30f),
-                        highlightColor = flavor.primary,
-                        iconTint = lerp(flavor.primary, MaterialTheme.colorScheme.onSurface, 0.36f)
-                    ) {
-                        Icon(
-                            Icons.Default.KeyboardVoice,
-                            contentDescription = "Voice steer"
-                        )
-                    }
-                    Spacer(modifier = Modifier.width(8.dp))
-                }
-
-                // Stop button
-                MessageInputGlassIconButton(
-                    onClick = onCancel,
-                    enabled = true,
-                    borderColor = MaterialTheme.colorScheme.error.copy(alpha = 0.58f),
-                    highlightColor = MaterialTheme.colorScheme.error,
-                    iconTint = MaterialTheme.colorScheme.error
+        if (queuedText != null) {
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+                color = surfaces.surface2,
+                border = BorderStroke(1.dp, surfaces.separatorLight)
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 10.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Icon(
-                        Icons.Filled.Stop,
-                        contentDescription = "Stop"
+                    Text(
+                        text = queuedText,
+                        style = CitrosTypography.bodySmall,
+                        color = surfaces.labelSecondary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Text(
+                        text = "Steer",
+                        style = CitrosTypography.labelSmall,
+                        color = flavor.primary,
+                        modifier = Modifier.clickable {
+                            onSteerQueuedMessage(queuedText)
+                        }
                     )
                 }
-            } else {
-                if (isListening) {
-                    MessageInputGlassIconButton(
-                        onClick = {
-                            listeningJob?.cancel()
-                            listeningJob = null
-                            voiceManager?.activeStt?.value?.stopListening()
-                            isListening = false
+            }
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Surface(
+                modifier = Modifier.weight(1f),
+                shape = RoundedCornerShape(22.dp),
+                color = surfaces.surface2
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(start = 2.dp, end = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedTextField(
+                        value = text,
+                        onValueChange = { text = it },
+                        modifier = Modifier
+                            .weight(1f)
+                            .heightIn(max = 132.dp),
+                        placeholder = {
+                            Text(
+                                text = placeholder,
+                                style = CitrosTypography.bodyLarge
+                            )
                         },
                         enabled = true,
-                        borderColor = MaterialTheme.colorScheme.error.copy(alpha = 0.58f),
-                        highlightColor = MaterialTheme.colorScheme.error,
-                        iconTint = MaterialTheme.colorScheme.error
+                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Default),
+                        keyboardActions = KeyboardActions(
+                            onSend = {
+                                if (text.isNotBlank()) {
+                                    if (isLoading) onQueue(text) else onSend(text)
+                                    text = ""
+                                    pendingStopVisual = true
+                                }
+                            }
+                        ),
+                        singleLine = false,
+                        maxLines = 6,
+                        centerSingleLineContentWhenMultiline = true,
+                        textStyle = CitrosTypography.bodyLarge,
+                        shape = RoundedCornerShape(18.dp),
+                        colors = textFieldColors
+                    )
+                    Box(
+                        modifier = Modifier
+                            .size(32.dp)
+                            .clip(CircleShape)
+                            .background(
+                                when {
+                                    hasInputText -> surfaces.surface3
+                                    isListening -> surfaces.red.copy(alpha = 0.18f)
+                                    else -> Color.Transparent
+                                }
+                            )
+                            .clickable(
+                                enabled = hasInputText || isListening || (!isLoading && voiceReady),
+                                onClick = {
+                                    when {
+                                        hasInputText -> {
+                                            text = ""
+                                        }
+                                        isListening -> {
+                                            listeningJob?.cancel()
+                                            listeningJob = null
+                                            voiceManager?.activeStt?.value?.stopListening()
+                                            isListening = false
+                                        }
+                                        else -> {
+                                            startListening()
+                                        }
+                                    }
+                                }
+                            ),
+                        contentAlignment = Alignment.Center
                     ) {
-                        Icon(Icons.Filled.Stop, contentDescription = "Stop listening")
-                    }
-                } else {
-                    MessageInputGlassIconButton(
-                        onClick = { startListening() },
-                        enabled = !isLoading && voiceReady,
-                        borderColor = flavor.primary.copy(alpha = 0.30f),
-                        highlightColor = if (!isLoading && voiceReady) flavor.primary else null,
-                        iconTint = if (voiceReady) {
-                            lerp(flavor.primary, MaterialTheme.colorScheme.onSurface, 0.36f)
-                        } else {
-                            flavor.primary.copy(alpha = 0.34f)
+                        val micTint = when {
+                            isListening -> surfaces.red
+                            !hasInputText && !isLoading && voiceReady -> surfaces.labelSecondary.copy(alpha = 0.92f)
+                            else -> surfaces.labelSecondary.copy(alpha = 0.90f)
                         }
-                    ) {
-                        Icon(
-                            Icons.Default.KeyboardVoice,
-                            contentDescription = "Voice input"
-                        )
+                        if (hasInputText) {
+                            MessageInputClearGlyph(
+                                tint = surfaces.labelSecondary.copy(alpha = 0.92f),
+                                modifier = Modifier.size(13.dp)
+                            )
+                        } else if (isListening) {
+                            Box(
+                                modifier = Modifier
+                                    .size(10.dp)
+                                    .clip(RoundedCornerShape(3.dp))
+                                    .background(micTint)
+                            )
+                        } else {
+                            MessageInputMicGlyph(
+                                tint = micTint,
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
                     }
                 }
-
-                Spacer(modifier = Modifier.width(8.dp))
-
-                MessageInputGlassIconButton(
-                    onClick = {
-                        if (text.isNotBlank()) {
-                            if (isLoading) onSteer(text) else onSend(text)
-                            text = ""
+            }
+            val showStopButton = (isLoading || pendingStopVisual) && !hasInputText && !isListening
+            val sendEnabled = hasInputText || showStopButton
+            MessageInputGlassIconButton(
+                onClick = {
+                    when {
+                        showStopButton -> {
+                            pendingStopVisual = false
+                            onCancel()
                         }
-                    },
-                    enabled = text.isNotBlank(),
-                    borderColor = if (isLoading) {
-                        flavor.primary.copy(alpha = 0.58f)
-                    } else {
-                        flavor.primary.copy(alpha = 0.72f)
-                    },
-                    highlightColor = flavor.primary,
-                    iconTint = lerp(flavor.primary, MaterialTheme.colorScheme.onSurface, 0.32f)
-                ) {
-                    Icon(
-                        if (isLoading) Icons.Filled.NorthEast else Icons.AutoMirrored.Filled.Send,
-                        contentDescription = if (isLoading) "Redirect" else "Send"
+                        text.isNotBlank() -> {
+                            if (isLoading) onQueue(text) else onSend(text)
+                            text = ""
+                            pendingStopVisual = true
+                        }
+                    }
+                },
+                enabled = sendEnabled,
+                backgroundColor = if (hasInputText) activeSendButtonColor else inactiveSendButtonColor,
+                iconTint = when {
+                    showStopButton -> surfaces.labelPrimary
+                    hasInputText -> activeSendIconTint
+                    else -> inactiveSendIconTint
+                }
+            ) { resolvedIconTint ->
+                if (showStopButton) {
+                    Box(
+                        modifier = Modifier
+                            .size(12.dp)
+                            .clip(RoundedCornerShape(3.dp))
+                            .background(resolvedIconTint)
+                    )
+                } else {
+                    MessageInputArrowGlyph(
+                        tint = resolvedIconTint,
+                        modifier = Modifier.size(16.dp)
                     )
                 }
             }
         }
     }
 }
+@Composable
+internal fun MessageInputMicGlyph(
+    tint: Color,
+    modifier: Modifier = Modifier
+) {
+    Canvas(modifier = modifier) {
+        val w = size.width
+        val h = size.height
+        val stroke = size.minDimension * 0.11f
+        val bodyWidth = w * 0.36f
+        val bodyHeight = h * 0.48f
+        val bodyLeft = (w - bodyWidth) / 2f
+        val bodyTop = h * 0.15f
+        val bodyRadius = bodyWidth * 0.38f
+
+        drawRoundRect(
+            color = tint,
+            topLeft = Offset(bodyLeft, bodyTop),
+            size = androidx.compose.ui.geometry.Size(bodyWidth, bodyHeight),
+            cornerRadius = androidx.compose.ui.geometry.CornerRadius(bodyRadius, bodyRadius),
+            style = Stroke(width = stroke)
+        )
+        drawLine(
+            color = tint,
+            start = Offset(w * 0.26f, h * 0.58f),
+            end = Offset(w * 0.74f, h * 0.58f),
+            strokeWidth = stroke,
+            cap = StrokeCap.Round
+        )
+        drawLine(
+            color = tint,
+            start = Offset(w * 0.50f, h * 0.63f),
+            end = Offset(w * 0.50f, h * 0.84f),
+            strokeWidth = stroke,
+            cap = StrokeCap.Round
+        )
+        drawLine(
+            color = tint,
+            start = Offset(w * 0.34f, h * 0.84f),
+            end = Offset(w * 0.66f, h * 0.84f),
+            strokeWidth = stroke,
+            cap = StrokeCap.Round
+        )
+    }
+}
+@Composable
+internal fun MessageInputArrowGlyph(
+    tint: Color,
+    modifier: Modifier = Modifier
+) {
+    Canvas(modifier = modifier) {
+        val w = size.width
+        val h = size.height
+        val stroke = size.minDimension * 0.12f
+        val tip = Offset(w * 0.50f, h * 0.18f)
+        val left = Offset(w * 0.30f, h * 0.40f)
+        val right = Offset(w * 0.70f, h * 0.40f)
+        drawLine(
+            color = tint,
+            start = Offset(w * 0.50f, h * 0.82f),
+            end = tip,
+            strokeWidth = stroke,
+            cap = StrokeCap.Round
+        )
+        drawLine(
+            color = tint,
+            start = tip,
+            end = left,
+            strokeWidth = stroke,
+            cap = StrokeCap.Round
+        )
+        drawLine(
+            color = tint,
+            start = tip,
+            end = right,
+            strokeWidth = stroke,
+            cap = StrokeCap.Round
+        )
+    }
+}
 
 @Composable
-private fun MessageInputGlassIconButton(
+internal fun MessageInputClearGlyph(
+    tint: Color,
+    modifier: Modifier = Modifier
+) {
+    Canvas(modifier = modifier) {
+        val stroke = size.minDimension * 0.20f
+        drawLine(
+            color = tint,
+            start = Offset(size.width * 0.24f, size.height * 0.24f),
+            end = Offset(size.width * 0.76f, size.height * 0.76f),
+            strokeWidth = stroke,
+            cap = StrokeCap.Round
+        )
+        drawLine(
+            color = tint,
+            start = Offset(size.width * 0.76f, size.height * 0.24f),
+            end = Offset(size.width * 0.24f, size.height * 0.76f),
+            strokeWidth = stroke,
+            cap = StrokeCap.Round
+        )
+    }
+}
+@Composable
+internal fun MessageInputGlassIconButton(
     onClick: () -> Unit,
     enabled: Boolean,
-    borderColor: Color,
-    highlightColor: Color?,
+    backgroundColor: Color,
     iconTint: Color,
-    content: @Composable () -> Unit
+    content: @Composable (Color) -> Unit
 ) {
-    CitrosLiquidGlassSurface(
-        modifier = Modifier.size(40.dp),
-        shape = CircleShape,
-        onClick = onClick,
-        enabled = enabled,
-        borderColor = borderColor,
-        borderWidth = 1.dp,
-        highlightColor = highlightColor,
-        warmth = if (enabled) 1.02f else 0.60f
+    val resolvedIconTint = if (enabled) iconTint else iconTint.copy(alpha = 0.55f)
+    Box(
+        modifier = Modifier
+            .size(40.dp)
+            .clip(CircleShape)
+            .background(backgroundColor)
+            .clickable(enabled = enabled, onClick = onClick),
+        contentAlignment = Alignment.Center
     ) {
-        CompositionLocalProvider(
-            LocalContentColor provides iconTint,
-            LocalTextStyle provides MaterialTheme.typography.titleMedium
-        ) {
-            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                content()
-            }
-        }
+        content(resolvedIconTint)
     }
 }

@@ -27,12 +27,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
@@ -73,6 +67,13 @@ internal enum class CitrosFlavor(
     val glow: Color,
     val tint: Color
 ) {
+    NONE(
+        storageValue = "none",
+        displayName = "None",
+        primary = Color(0xFF8E8E93),
+        glow = Color(0xFFD1D1D6),
+        tint = Color(0xFF2C2C2E)
+    ),
     LEMON(
         storageValue = "lemon",
         displayName = "Lemon",
@@ -127,53 +128,64 @@ internal data class CitrosPlanSpec(
     val comingSoon: Boolean = false
 )
 
+internal enum class CitrosStepProgressStyle {
+    BARS,
+    DOTS
+}
+
 @Composable
 internal fun CitrosStepHeader(
-    title: String,
+    title: String? = null,
     stepIndex: Int,
     totalSteps: Int,
     onBack: (() -> Unit)? = null,
-    titleColor: Color = MaterialTheme.colorScheme.onBackground,
-    backLabelColor: Color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.75f),
-    stepCounterColor: Color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.65f),
-    activeProgressColor: Color = MaterialTheme.colorScheme.primary,
-    inactiveProgressColor: Color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.16f),
+    titleColor: Color = CitrosColorScheme.onBackground,
+    backLabelColor: Color = CitrosColorScheme.onBackground.copy(alpha = 0.75f),
+    stepCounterColor: Color = CitrosColorScheme.onBackground.copy(alpha = 0.65f),
+    activeProgressColor: Color = CitrosColorScheme.primary,
+    inactiveProgressColor: Color = CitrosColorScheme.onBackground.copy(alpha = 0.16f),
     titleShadow: Shadow? = null,
     centerTitle: Boolean = false,
+    showStepCounter: Boolean = true,
+    progressStyle: CitrosStepProgressStyle = CitrosStepProgressStyle.BARS,
     modifier: Modifier = Modifier
 ) {
     Column(modifier = modifier.fillMaxWidth()) {
-        if (centerTitle) {
-            Box(
-                modifier = Modifier.fillMaxWidth(),
-                contentAlignment = Alignment.Center
-            ) {
+        val hasTitle = !title.isNullOrBlank()
+        val showTopRow = onBack != null || hasTitle || showStepCounter
+
+        if (showTopRow && centerTitle) {
+            Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
                 if (onBack != null) {
                     Text(
                         text = "Back",
-                        style = MaterialTheme.typography.labelLarge,
+                        style = CitrosTypography.labelLarge,
                         color = backLabelColor,
                         modifier = Modifier
                             .align(Alignment.CenterStart)
                             .clickable(onClick = onBack)
                     )
                 }
-                Text(
-                    text = title,
-                    style = MaterialTheme.typography.headlineSmall.copy(
-                        shadow = titleShadow
-                    ),
-                    fontWeight = FontWeight.SemiBold,
-                    color = titleColor
-                )
-                Text(
-                    text = "$stepIndex/$totalSteps",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = stepCounterColor,
-                    modifier = Modifier.align(Alignment.CenterEnd)
-                )
+                if (hasTitle) {
+                    Text(
+                        text = title ?: "",
+                        style = CitrosTypography.headlineSmall.copy(
+                            shadow = titleShadow
+                        ),
+                        fontWeight = FontWeight.SemiBold,
+                        color = titleColor
+                    )
+                }
+                if (showStepCounter) {
+                    Text(
+                        text = "$stepIndex/$totalSteps",
+                        style = CitrosTypography.labelMedium,
+                        color = stepCounterColor,
+                        modifier = Modifier.align(Alignment.CenterEnd)
+                    )
+                }
             }
-        } else {
+        } else if (showTopRow) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically
@@ -181,48 +193,85 @@ internal fun CitrosStepHeader(
                 if (onBack != null) {
                     Text(
                         text = "Back",
-                        style = MaterialTheme.typography.labelLarge,
+                        style = CitrosTypography.labelLarge,
                         color = backLabelColor,
                         modifier = Modifier.clickable(onClick = onBack)
                     )
-                    Spacer(Modifier.width(12.dp))
+                    if (hasTitle) {
+                        Spacer(Modifier.width(12.dp))
+                    }
                 }
-                Text(
-                    text = title,
-                    style = MaterialTheme.typography.headlineSmall.copy(
-                        shadow = titleShadow
-                    ),
-                    fontWeight = FontWeight.SemiBold,
-                    color = titleColor
-                )
+                if (hasTitle) {
+                    Text(
+                        text = title ?: "",
+                        style = CitrosTypography.headlineSmall.copy(
+                            shadow = titleShadow
+                        ),
+                        fontWeight = FontWeight.SemiBold,
+                        color = titleColor
+                    )
+                }
                 Spacer(Modifier.weight(1f))
-                Text(
-                    text = "$stepIndex/$totalSteps",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = stepCounterColor
-                )
+                if (showStepCounter) {
+                    Text(
+                        text = "$stepIndex/$totalSteps",
+                        style = CitrosTypography.labelMedium,
+                        color = stepCounterColor
+                    )
+                }
             }
         }
-        Spacer(Modifier.height(12.dp))
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
-            repeat(totalSteps) { index ->
-                val active = index < stepIndex
-                Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .height(4.dp)
-                        .clip(CircleShape)
-                        .background(
-                            if (active) {
-                                activeProgressColor
-                            } else {
-                                inactiveProgressColor
-                            }
+
+        Spacer(Modifier.height(if (showTopRow) 12.dp else 4.dp))
+
+        when (progressStyle) {
+            CitrosStepProgressStyle.BARS -> {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    repeat(totalSteps) { index ->
+                        val active = index < stepIndex
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(4.dp)
+                                .clip(CircleShape)
+                                .background(
+                                    if (active) {
+                                        activeProgressColor
+                                    } else {
+                                        inactiveProgressColor
+                                    }
+                                )
                         )
-                )
+                    }
+                }
+            }
+            CitrosStepProgressStyle.DOTS -> {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.Center
+                ) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        repeat(totalSteps) { index ->
+                            val active = index == (stepIndex - 1).coerceAtLeast(0)
+                            Box(
+                                modifier = Modifier
+                                    .width(if (active) 20.dp else 8.dp)
+                                    .height(8.dp)
+                                    .clip(CircleShape)
+                                    .background(
+                                        if (active) {
+                                            activeProgressColor
+                                        } else {
+                                            inactiveProgressColor
+                                        }
+                                    )
+                            )
+                        }
+                    }
+                }
             }
         }
     }
@@ -233,13 +282,23 @@ internal fun CitrusHeroBadge(
     flavor: CitrosFlavor,
     size: Int = 68
 ) {
+    val isDarkTheme = LocalCitrosIsDark.current
+    val orbColors = if (flavor == CitrosFlavor.NONE) {
+        if (isDarkTheme) {
+            listOf(Color(0xFFE7E9F0), Color(0xFFFFFFFF), Color(0xFFC8CCD6))
+        } else {
+            listOf(Color(0xFF2B2C31), Color(0xFF000000), Color(0xFF09090B))
+        }
+    } else {
+        listOf(flavor.glow, flavor.primary, flavor.tint)
+    }
     Box(
         modifier = Modifier
             .size(size.dp)
             .clip(CircleShape)
             .background(
                 brush = Brush.radialGradient(
-                    colors = listOf(flavor.glow, flavor.primary, flavor.tint)
+                    colors = orbColors
                 )
             )
     )
@@ -403,7 +462,7 @@ internal fun CitrosFloatingAppIconGraphic(
                                     if (isDarkTheme) {
                                         Color.Black.copy(alpha = 0.38f * backgroundAlpha)
                                     } else {
-                                        MaterialTheme.colorScheme.onSurface.copy(alpha = 0.16f * backgroundAlpha)
+                                        CitrosColorScheme.onSurface.copy(alpha = 0.16f * backgroundAlpha)
                                     }
                                 ),
                                 radius = Float.POSITIVE_INFINITY
@@ -418,7 +477,7 @@ internal fun CitrosFloatingAppIconGraphic(
                 baseColor = if (isDarkTheme) {
                     Color.Black.copy(alpha = 0.24f * backgroundAlpha)
                 } else {
-                    MaterialTheme.colorScheme.surface.copy(alpha = 0.82f * backgroundAlpha)
+                    CitrosColorScheme.surface.copy(alpha = 0.82f * backgroundAlpha)
                 },
                 borderColor = flavor.primary.copy(alpha = 0.34f * backgroundAlpha),
                 borderWidth = 1.dp,
@@ -957,87 +1016,40 @@ internal fun CitrusLiquidGlassButton(
     tintColor: Color? = null,
     textColor: Color? = null
 ) {
-    val shape = RoundedCornerShape(999.dp)
-    val visuals = LocalCitrosSplashVisualTokens.current.glassButton
-    val tintedAmber = tintColor?.let { lerp(visuals.amber, it, 0.82f) } ?: visuals.amber
-    val tintedWarm = tintColor?.let { lerp(visuals.warm, it, 0.88f) } ?: visuals.warm
-    val tintedDeep = tintColor?.let { lerp(visuals.deep, it, 0.42f) } ?: visuals.deep
     val isDarkTheme = LocalCitrosIsDark.current
-    val glossColor = if (isDarkTheme) Color.White else MaterialTheme.colorScheme.onSurface
-    val backingColor = if (isDarkTheme) {
-        Color(0x22000000)
+    val surfaces = remember(isDarkTheme) { citrosDirectiveSurfaces(isDarkTheme) }
+    val shape = RoundedCornerShape(999.dp)
+    val baseColor = tintColor ?: surfaces.surface2
+    val resolvedContainerColor = if (enabled) {
+        baseColor
     } else {
-        MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.58f)
+        baseColor.copy(alpha = 0.46f)
     }
     val resolvedTextColor = textColor
-        ?: tintColor?.let {
-            val lift = if (enabled) 0.50f else 0.34f
-            lerp(it, MaterialTheme.colorScheme.onSurface, lift)
+        ?: if (tintColor != null) {
+            contrastOn(baseColor).copy(alpha = if (enabled) 0.96f else 0.68f)
+        } else {
+            surfaces.labelPrimary.copy(alpha = if (enabled) 0.94f else 0.66f)
         }
-        ?: if (enabled) visuals.textEnabled else visuals.textDisabled
+    val resolvedBorderColor = if (tintColor != null) {
+        tintColor.copy(alpha = if (enabled) 0.44f else 0.24f)
+    } else {
+        surfaces.separatorLight.copy(alpha = if (enabled) 1f else 0.6f)
+    }
 
     Box(
         modifier = modifier
             .clip(shape)
-            .background(backingColor)
-            .drawBehind {
-                val width = size.width
-                val height = size.height
-                val radius = CornerRadius(height / 2f, height / 2f)
-
-                drawRoundRect(
-                    brush = Brush.verticalGradient(
-                        colors = listOf(
-                            glossColor.copy(alpha = if (enabled) 0.20f else 0.08f),
-                            tintedAmber.copy(alpha = if (enabled) 0.20f else 0.10f),
-                            tintedDeep.copy(alpha = if (enabled) {
-                                if (isDarkTheme) 0.42f else 0.28f
-                            } else {
-                                if (isDarkTheme) 0.24f else 0.16f
-                            })
-                        )
-                    ),
-                    cornerRadius = radius
-                )
-                drawRoundRect(
-                    brush = Brush.radialGradient(
-                        colors = listOf(
-                            tintedWarm.copy(alpha = if (enabled) {
-                                if (isDarkTheme) 0.42f else 0.22f
-                            } else {
-                                if (isDarkTheme) 0.18f else 0.10f
-                            }),
-                            Color.Transparent
-                        ),
-                        center = Offset(width * 0.5f, height * 0.05f),
-                        radius = width * 0.85f
-                    ),
-                    cornerRadius = radius
-                )
-                drawRoundRect(
-                    brush = Brush.verticalGradient(
-                        colors = listOf(
-                            glossColor.copy(alpha = if (enabled) {
-                                if (isDarkTheme) 0.18f else 0.10f
-                            } else {
-                                if (isDarkTheme) 0.08f else 0.05f
-                            }),
-                            Color.Transparent
-                        ),
-                        startY = 0f,
-                        endY = height * 0.62f
-                    ),
-                    cornerRadius = radius
-                )
-            }
+            .background(resolvedContainerColor, shape)
+            .border(BorderStroke(1.dp, resolvedBorderColor), shape)
             .clickable(enabled = enabled, onClick = onClick)
             .padding(horizontal = 20.dp, vertical = 14.dp),
         contentAlignment = Alignment.Center
     ) {
         Text(
             text = text,
-            style = MaterialTheme.typography.titleLarge.copy(
-                fontSize = MaterialTheme.typography.titleLarge.fontSize * 1.25f
+            style = CitrosTypography.titleLarge.copy(
+                fontSize = CitrosTypography.titleLarge.fontSize * 0.92f
             ),
             fontWeight = FontWeight.SemiBold,
             color = resolvedTextColor
@@ -1059,27 +1071,16 @@ internal fun CitrosLiquidGlassSurface(
     contentPadding: PaddingValues = PaddingValues(0.dp),
     content: @Composable BoxScope.() -> Unit
 ) {
-    val visuals = LocalCitrosSplashVisualTokens.current.glassButton
     val isDarkTheme = LocalCitrosIsDark.current
-    val warmScale = warmth.coerceIn(0.45f, 1.8f)
-    val amber = highlightColor?.let { lerp(visuals.amber, it, 0.45f) } ?: visuals.amber
-    val warm = highlightColor ?: visuals.warm
-    val glossColor = if (isDarkTheme) Color.White else MaterialTheme.colorScheme.onSurface
+    val surfaces = remember(isDarkTheme) { citrosDirectiveSurfaces(isDarkTheme) }
+    val highlightBlend = if (warmth >= 1f) 0.10f else 0.05f
     val resolvedBaseColor = if (baseColor == Color.Unspecified) {
-        if (isDarkTheme) {
-            Color(0x14000000)
-        } else {
-            MaterialTheme.colorScheme.surface.copy(alpha = 0.78f)
-        }
+        highlightColor?.let { lerp(surfaces.surface1, it, highlightBlend) } ?: surfaces.surface1
     } else {
         baseColor
     }
     val resolvedBorderColor = if (borderColor == Color.Unspecified) {
-        if (isDarkTheme) {
-            Color.White.copy(alpha = 0.14f)
-        } else {
-            MaterialTheme.colorScheme.outline.copy(alpha = 0.28f)
-        }
+        highlightColor?.copy(alpha = if (isDarkTheme) 0.40f else 0.26f) ?: surfaces.separatorLight
     } else {
         borderColor
     }
@@ -1100,40 +1101,6 @@ internal fun CitrosLiquidGlassSurface(
                 } else {
                     base
                 }
-            }
-            .drawBehind {
-                val width = size.width
-                val height = size.height
-
-                drawRect(
-                    brush = Brush.verticalGradient(
-                        colors = listOf(
-                            glossColor.copy(alpha = 0.10f * warmScale),
-                            amber.copy(alpha = 0.10f * warmScale),
-                            visuals.deep.copy(alpha = if (isDarkTheme) 0.36f else 0.18f)
-                        )
-                    )
-                )
-                drawRect(
-                    brush = Brush.radialGradient(
-                        colors = listOf(
-                            warm.copy(alpha = (if (isDarkTheme) 0.22f else 0.14f) * warmScale),
-                            Color.Transparent
-                        ),
-                        center = Offset(width * 0.5f, height * 0.05f),
-                        radius = width * 0.95f
-                    )
-                )
-                drawRect(
-                    brush = Brush.verticalGradient(
-                        colors = listOf(
-                            glossColor.copy(alpha = if (isDarkTheme) 0.12f else 0.08f),
-                            Color.Transparent
-                        ),
-                        startY = 0f,
-                        endY = height * 0.64f
-                    )
-                )
             }
     ) {
         Box(modifier = Modifier.padding(contentPadding), content = content)
@@ -1162,14 +1129,76 @@ internal fun FlavorOptionCard(
     flavor: CitrosFlavor,
     selected: Boolean,
     onClick: () -> Unit,
+    accentColor: Color = Color.Unspecified,
     modifier: Modifier = Modifier
 ) {
-    CitrusLiquidGlassButton(
-        text = if (selected) "✓ ${flavor.displayName}" else flavor.displayName,
-        onClick = onClick,
-        modifier = modifier.fillMaxWidth(),
-        tintColor = flavor.primary
-    )
+    val isDarkTheme = LocalCitrosIsDark.current
+    val surfaces = remember(isDarkTheme) { citrosDirectiveSurfaces(isDarkTheme) }
+    val flavorTokens = remember(flavor, surfaces) {
+        citrosDirectiveFlavorTokens(flavor, surfaces)
+    }
+    val selectionAccent = if (accentColor != Color.Unspecified) {
+        accentColor
+    } else {
+        if (flavor == CitrosFlavor.NONE) flavorTokens.orbColor else flavor.primary
+    }
+    val containerColor = if (selected) {
+        lerp(surfaces.surface1, selectionAccent, if (isDarkTheme) 0.20f else 0.12f)
+    } else {
+        surfaces.surface1
+    }
+
+    Surface(
+        modifier = modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick),
+        shape = RoundedCornerShape(14.dp),
+        color = containerColor,
+        border = BorderStroke(
+            1.dp,
+            if (selected) selectionAccent.copy(alpha = 0.58f) else surfaces.separatorLight
+        )
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(28.dp)
+                    .background(flavorTokens.orbColor, CircleShape),
+                contentAlignment = Alignment.Center
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(10.dp)
+                        .background(flavorTokens.orbInner, CircleShape)
+                )
+            }
+            Spacer(Modifier.width(10.dp))
+            Text(
+                text = flavor.displayName,
+                style = CitrosTypography.bodyLarge,
+                color = surfaces.labelPrimary,
+                modifier = Modifier.weight(1f)
+            )
+            if (selected) {
+                Surface(
+                    shape = RoundedCornerShape(999.dp),
+                    color = selectionAccent.copy(alpha = if (isDarkTheme) 0.22f else 0.16f)
+                ) {
+                    Text(
+                        text = "Selected",
+                        style = CitrosTypography.labelSmall,
+                        color = selectionAccent.copy(alpha = 0.96f),
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                    )
+                }
+            }
+        }
+    }
 }
 
 @Composable
@@ -1181,41 +1210,47 @@ internal fun PersonalityOptionChip(
     onClick: () -> Unit
 ) {
     val clampedScale = scale.coerceIn(1f, 1.22f)
+    val isDarkTheme = LocalCitrosIsDark.current
+    val surfaces = remember(isDarkTheme) { citrosDirectiveSurfaces(isDarkTheme) }
     val shape = RoundedCornerShape(999.dp)
-    val borderColor = if (selected) {
-        flavor.primary.copy(alpha = 0.86f)
+    val containerColor = if (selected) {
+        lerp(surfaces.surface1, flavor.primary, if (isDarkTheme) 0.20f else 0.12f)
     } else {
-        flavor.primary.copy(alpha = 0.34f)
+        surfaces.surface1
+    }
+    val borderColor = if (selected) {
+        flavor.primary.copy(alpha = 0.70f)
+    } else {
+        surfaces.separatorLight
     }
     val textColor = if (selected) {
-        lerp(flavor.primary, MaterialTheme.colorScheme.onSurface, 0.44f)
+        surfaces.labelPrimary
     } else {
-        flavor.primary.copy(alpha = 0.86f)
+        surfaces.labelSecondary
     }
 
-    CitrosLiquidGlassSurface(
+    Surface(
         modifier = Modifier.widthIn(max = 260.dp),
         shape = shape,
-        onClick = onClick,
-        borderColor = borderColor,
-        borderWidth = if (selected) 2.dp else 1.dp,
-        highlightColor = if (selected) flavor.primary else null,
-        warmth = if (selected) 1.10f else 0.78f,
-        contentPadding = PaddingValues(
-            horizontal = 12.dp * clampedScale,
-            vertical = 8.dp * clampedScale
-        )
+        color = containerColor,
+        border = BorderStroke(if (selected) 1.6.dp else 1.dp, borderColor)
     ) {
-        Text(
-            text = text,
-            style = MaterialTheme.typography.labelLarge.copy(
-                fontSize = MaterialTheme.typography.labelLarge.fontSize * clampedScale
-            ),
-            color = textColor,
-            textAlign = TextAlign.Center,
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis
-        )
+        Box(
+            modifier = Modifier
+                .clickable(onClick = onClick)
+                .padding(horizontal = 12.dp * clampedScale, vertical = 8.dp * clampedScale)
+        ) {
+            Text(
+                text = text,
+                style = CitrosTypography.labelLarge.copy(
+                    fontSize = CitrosTypography.labelLarge.fontSize * clampedScale
+                ),
+                color = textColor,
+                textAlign = TextAlign.Center,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
     }
 }
 
@@ -1226,68 +1261,95 @@ internal fun PlanCard(
     modifier: Modifier = Modifier,
     testTag: String? = null
 ) {
-    val shape = RoundedCornerShape(18.dp)
-    val borderColor = MaterialTheme.colorScheme.outline
-    val stroke = 1.dp
+    val isDarkTheme = LocalCitrosIsDark.current
+    val surfaces = remember(isDarkTheme) { citrosDirectiveSurfaces(isDarkTheme) }
+    val shape = RoundedCornerShape(16.dp)
     val cardModifier = (if (testTag != null) modifier.testTag(testTag) else modifier)
         .fillMaxWidth()
-    val accent = if (plan.recommended) plan.accent else null
+    val containerColor = if (plan.recommended) {
+        lerp(surfaces.surface1, plan.accent, if (isDarkTheme) 0.16f else 0.10f)
+    } else {
+        surfaces.surface1
+    }
 
-    CitrosLiquidGlassSurface(
+    Surface(
         modifier = cardModifier,
         shape = shape,
-        onClick = onSelect,
-        borderColor = borderColor.copy(alpha = 0.35f),
-        borderWidth = stroke,
-        highlightColor = accent,
-        warmth = if (plan.recommended) 1.22f else 0.84f,
-        contentPadding = PaddingValues(16.dp)
+        color = containerColor,
+        border = BorderStroke(
+            1.dp,
+            if (plan.recommended) plan.accent.copy(alpha = 0.54f) else surfaces.separatorLight
+        )
     ) {
         Column(
             modifier = Modifier
-                .fillMaxWidth(),
+                .fillMaxWidth()
+                .clickable(onClick = onSelect)
+                .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     text = plan.title,
-                    style = MaterialTheme.typography.titleMedium,
-                    color = plan.accent.copy(alpha = 0.96f),
+                    style = CitrosTypography.titleMedium,
+                    color = surfaces.labelPrimary,
                     modifier = Modifier.weight(1f)
                 )
                 if (plan.recommended) {
-                    Text(
-                        text = "Recommended",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = plan.accent
-                    )
+                    Surface(
+                        shape = RoundedCornerShape(999.dp),
+                        color = plan.accent.copy(alpha = 0.18f)
+                    ) {
+                        Text(
+                            text = "Recommended",
+                            style = CitrosTypography.labelSmall,
+                            color = plan.accent,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                        )
+                    }
                 }
             }
             Text(
                 text = plan.subtitle,
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.88f)
+                style = CitrosTypography.bodyMedium,
+                color = surfaces.labelSecondary
             )
             Text(
                 text = plan.details,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.72f)
+                style = CitrosTypography.bodySmall,
+                color = surfaces.labelTertiary
             )
 
             if (plan.comingSoon) {
                 Text(
                     text = "Coming Soon",
-                    style = MaterialTheme.typography.labelMedium,
+                    style = CitrosTypography.labelMedium,
                     color = plan.accent
                 )
             }
 
-            CitrusLiquidGlassButton(
-                text = plan.cta,
-                onClick = onSelect,
-                modifier = Modifier.fillMaxWidth(),
-                tintColor = plan.accent
-            )
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(onClick = onSelect),
+                shape = RoundedCornerShape(14.dp),
+                color = plan.accent,
+                border = BorderStroke(1.dp, plan.accent.copy(alpha = 0.62f))
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 11.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = plan.cta,
+                        style = CitrosTypography.titleSmall,
+                        color = contrastOn(plan.accent),
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+            }
         }
     }
 }

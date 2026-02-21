@@ -2,6 +2,7 @@ package ai.citros.chat
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
+import android.content.ComponentName
 import android.content.Intent
 import android.provider.Settings
 import android.view.accessibility.AccessibilityEvent
@@ -48,12 +49,18 @@ class CitrosAccessibilityService : AccessibilityService() {
 
     companion object {
         fun isEnabled(context: android.content.Context): Boolean {
-            val serviceName = "${context.packageName}/${CitrosAccessibilityService::class.java.canonicalName}"
+            val expectedComponent = ComponentName(context, CitrosAccessibilityService::class.java)
             val enabledServices = Settings.Secure.getString(
                 context.contentResolver,
                 Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
             ) ?: return false
-            return enabledServices.contains(serviceName)
+            return enabledServices
+                .split(':')
+                .mapNotNull { entry -> ComponentName.unflattenFromString(entry.trim()) }
+                .any { enabled ->
+                    enabled.packageName == expectedComponent.packageName &&
+                        enabled.className == expectedComponent.className
+                }
         }
 
         fun openSettings(context: android.content.Context) {

@@ -1,13 +1,16 @@
 package ai.citros.chat
-
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
-import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -16,21 +19,19 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FilterChip
-import androidx.compose.material3.FilterChipDefaults
-import androidx.compose.material3.Icon
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
-import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -38,7 +39,8 @@ import ai.citros.core.ModelConfig
 import ai.citros.core.Message
 import ai.citros.core.Provider
 import ai.citros.core.WalletState
-
+import android.content.Context
+import androidx.compose.ui.platform.LocalContext
 @Composable
 internal fun ProviderModelChip(
     walletState: WalletState,
@@ -47,37 +49,74 @@ internal fun ProviderModelChip(
     modifier: Modifier = Modifier
 ) {
     val activeKey = walletState.keys.find { it.id == walletState.activeKeyId } ?: return
+    val isDarkTheme = LocalCitrosIsDark.current
+    val surfaces = remember(isDarkTheme) { citrosDirectiveSurfaces(isDarkTheme) }
     val accent = lerp(ProviderUi.brandColor(activeKey.provider), flavor.primary, 0.45f)
-    CitrosLiquidGlassSurface(
-        modifier = modifier,
-        shape = RoundedCornerShape(999.dp),
-        onClick = onClick,
-        borderColor = accent.copy(alpha = 0.46f),
-        borderWidth = 1.dp,
-        highlightColor = accent,
-        warmth = 1.02f,
-        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 10.dp, vertical = 7.dp)
+    Row(
+        modifier = modifier
+            .clip(RoundedCornerShape(999.dp))
+            .background(surfaces.surface2)
+            .border(1.dp, accent.copy(alpha = 0.40f), RoundedCornerShape(999.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 10.dp, vertical = 7.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp)
     ) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        Text(
+            ProviderUi.icon(activeKey.provider),
+            style = CitrosTypography.labelMedium
+        )
+        Text(
+            text = shortModelName(walletState.chatModelId),
+            style = CitrosTypography.labelMedium,
+            fontWeight = FontWeight.SemiBold,
+            color = accent
+        )
+        Text(
+            text = "▾",
+            style = CitrosTypography.titleLarge,
+            fontWeight = FontWeight.Bold,
+            color = surfaces.labelPrimary
+        )
+    }
+}
+@Composable
+internal fun ChatEmptyState(
+    flavor: CitrosFlavor
+) {
+    val isDarkTheme = LocalCitrosIsDark.current
+    val surfaces = remember(isDarkTheme) { citrosDirectiveSurfaces(isDarkTheme) }
+    val flavorTokens = remember(flavor, surfaces) {
+        citrosDirectiveFlavorTokens(flavor, surfaces)
+    }
+    CitrosDirectiveWashBox(
+        modifier = Modifier.fillMaxWidth(),
+        washColor = flavorTokens.washColor,
+        centerXFraction = 0.5f,
+        centerYFraction = 0.40f,
+        radiusFraction = 0.78f
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
-            Text(ProviderUi.icon(activeKey.provider), style = MaterialTheme.typography.labelMedium)
+            CitrosDirectiveOrb(
+                flavor = flavor,
+                size = 60.dp
+            )
             Text(
-                text = shortModelName(walletState.chatModelId),
-                style = MaterialTheme.typography.labelMedium,
+                "How can I help?",
+                style = CitrosTypography.headlineSmall,
                 fontWeight = FontWeight.SemiBold,
-                color = accent
+                color = surfaces.labelPrimary
             )
         }
     }
 }
-
-@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 internal fun QuickSwitcherSheet(
     walletState: WalletState,
-    keyStore: ai.citros.core.KeyStore,
     flavor: CitrosFlavor = CitrosFlavor.TANGERINE,
     onDismiss: () -> Unit,
     onSelectKey: (String) -> Unit,
@@ -87,373 +126,442 @@ internal fun QuickSwitcherSheet(
 ) {
     val activeKey = walletState.keys.find { it.id == walletState.activeKeyId }
     val provider = activeKey?.provider
+    val context = LocalContext.current
     val isDarkTheme = LocalCitrosIsDark.current
-
-    ModalBottomSheet(
-        onDismissRequest = onDismiss,
-        containerColor = if (isDarkTheme) {
-            Color(0xF4060606)
-        } else {
-            MaterialTheme.colorScheme.surface.copy(alpha = 0.96f)
-        },
-        contentColor = MaterialTheme.colorScheme.onSurface,
-        dragHandle = {
-            Box(
-                modifier = Modifier
-                    .padding(top = 12.dp, bottom = 4.dp)
-                    .size(width = 44.dp, height = 5.dp)
-                    .background(flavor.primary.copy(alpha = 0.42f), RoundedCornerShape(999.dp))
+    val surfaces = remember(isDarkTheme) { citrosDirectiveSurfaces(isDarkTheme) }
+    val prefs = remember(context) { context.getSharedPreferences(CITROS_PREFS, Context.MODE_PRIVATE) }
+    var useLocalOffline by remember {
+        mutableStateOf(prefs.getBoolean("models_use_local_offline", true))
+    }
+    val localModelId = remember(prefs) {
+        prefs.getString("local_model", "qwen2.5:3b") ?: "qwen2.5:3b"
+    }
+    val cloudModels = remember(provider) {
+        provider?.let { ModelConfig.chatModelsForProvider(it) } ?: emptyList()
+    }
+    val modelRows = remember(cloudModels, localModelId) {
+        buildList {
+            add(
+                QuickSwitcherModelRow(
+                    modelId = localModelId,
+                    title = "llama.cpp",
+                    subtitle = "On-device · Fastest",
+                    badgeLabel = "Local",
+                    badgeColor = null,
+                    tier = QuickSwitcherModelTier.FAST
+                )
             )
+            cloudModels.forEach { modelId ->
+                add(
+                    QuickSwitcherModelRow(
+                        modelId = modelId,
+                        title = quickSwitcherModelTitle(modelId),
+                        subtitle = quickSwitcherModelSubtitle(modelId),
+                        badgeLabel = "Cloud",
+                        badgeColor = surfaces.blue,
+                        tier = quickSwitcherModelTier(modelId)
+                    )
+                )
+            }
         }
-    ) {
+    }
+    val selectedAccent = if (flavor == CitrosFlavor.NONE) {
+        surfaces.labelSecondary
+    } else {
+        flavor.primary
+    }
+
+    Box(modifier = Modifier.fillMaxSize()) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black.copy(alpha = if (isDarkTheme) 0.34f else 0.15f))
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                    onClick = onDismiss
+                )
+        )
         Column(
             modifier = Modifier
+                .align(Alignment.TopCenter)
+                .padding(top = 96.dp, start = 16.dp, end = 16.dp)
                 .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+                .widthIn(max = 428.dp)
+                .clip(RoundedCornerShape(20.dp))
+                .background(
+                    if (isDarkTheme) {
+                        Color(0xF51C1C1E)
+                    } else {
+                        Color(0xF5FFFFFF)
+                    }
+                )
+                .border(
+                    width = if (isDarkTheme) 0.dp else 1.dp,
+                    color = if (isDarkTheme) Color.Transparent else surfaces.separator,
+                    shape = RoundedCornerShape(20.dp)
+                )
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                    onClick = {}
+                )
         ) {
-            Text(
-                "Quick Switcher",
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.SemiBold,
-                color = flavor.primary
-            )
-
-            if (walletState.keys.isEmpty()) {
-                Text(
-                    "No keys available. Add one in Settings.",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.72f)
-                )
-            } else {
-                Text(
-                    "Active Key",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = flavor.primary.copy(alpha = 0.78f)
-                )
-                activeKey?.let { key ->
-                    KeySwitchRow(
-                        label = key.label,
-                        provider = key.provider,
-                        flavor = flavor,
-                        maskedKey = maskApiKey(keyStore.get(key.id)),
-                        selected = true,
-                        onClick = { onSelectKey(key.id) }
-                    )
-                }
-
-                val otherKeys = walletState.keys.filter { it.id != walletState.activeKeyId }
-                if (otherKeys.isNotEmpty()) {
-                    Text(
-                        "Other Keys",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = flavor.primary.copy(alpha = 0.78f)
-                    )
-                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        otherKeys.forEach { key ->
-                            KeySwitchRow(
-                                label = key.label,
-                                provider = key.provider,
-                                flavor = flavor,
-                                maskedKey = maskApiKey(keyStore.get(key.id)),
-                                selected = false,
-                                onClick = { onSelectKey(key.id) }
-                            )
-                        }
-                    }
-                }
-
-                provider?.let {
-                    val chatModels = ModelConfig.chatModelsForProvider(it)
-                    val actionModels = ModelConfig.actionModelsForProvider(it)
-
-                    Text(
-                        "Chat Model",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = flavor.primary.copy(alpha = 0.78f)
-                    )
-                    FlowRow(
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        chatModels.forEach { modelId ->
-                            FilterChip(
-                                selected = modelId == walletState.chatModelId,
-                                onClick = { onSelectChatModel(modelId) },
-                                label = { Text(shortModelName(modelId)) },
-                                colors = FilterChipDefaults.filterChipColors(
-                                    containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.52f),
-                                    labelColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.84f),
-                                    selectedContainerColor = flavor.primary.copy(alpha = 0.20f),
-                                    selectedLabelColor = lerp(flavor.primary, MaterialTheme.colorScheme.onSurface, 0.42f)
-                                )
-                            )
-                        }
-                    }
-
-                    Text(
-                        "Action Model",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = flavor.primary.copy(alpha = 0.78f)
-                    )
-                    FlowRow(
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        actionModels.forEach { modelId ->
-                            FilterChip(
-                                selected = modelId == walletState.actionModelId,
-                                onClick = { onSelectActionModel(modelId) },
-                                label = { Text(shortModelName(modelId)) },
-                                colors = FilterChipDefaults.filterChipColors(
-                                    containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.52f),
-                                    labelColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.84f),
-                                    selectedContainerColor = flavor.primary.copy(alpha = 0.20f),
-                                    selectedLabelColor = lerp(flavor.primary, MaterialTheme.colorScheme.onSurface, 0.42f)
-                                )
-                            )
-                        }
-                    }
-                }
-            }
-
-            TextButton(
-                onClick = onManageKeys,
-                modifier = Modifier.align(Alignment.End)
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 14.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Icon(Icons.Default.Settings, contentDescription = null, tint = flavor.primary)
-                Spacer(Modifier.width(6.dp))
-                Text("Manage Keys", color = flavor.primary)
-            }
-
-            Spacer(Modifier.height(8.dp))
-        }
-    }
-}
-
-@Composable
-private fun KeySwitchRow(
-    label: String,
-    provider: Provider,
-    flavor: CitrosFlavor,
-    maskedKey: String,
-    selected: Boolean,
-    onClick: () -> Unit
-) {
-    val accent = lerp(ProviderUi.brandColor(provider), flavor.primary, 0.42f)
-    CitrosLiquidGlassSurface(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(14.dp),
-        onClick = onClick,
-        borderColor = if (selected) accent.copy(alpha = 0.62f) else MaterialTheme.colorScheme.outline.copy(alpha = 0.34f),
-        borderWidth = if (selected) 1.3.dp else 1.dp,
-        highlightColor = if (selected) accent else flavor.primary,
-        warmth = if (selected) 1.10f else 0.76f,
-        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 10.dp)
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-            Text(ProviderUi.icon(provider))
-            Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    label,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = if (selected) accent else MaterialTheme.colorScheme.onSurface
+                    text = "MODEL",
+                    style = CitrosTypography.labelLarge,
+                    color = surfaces.labelSecondary
                 )
-                Text(
-                    maskedKey,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
-                )
-            }
-            if (selected) {
-                Box(
-                    modifier = Modifier
-                        .size(9.dp)
-                        .background(accent, CircleShape)
-                )
-            }
-        }
-    }
-}
-
-@OptIn(ExperimentalLayoutApi::class)
-@Composable
-internal fun ChatEmptyState(
-    flavor: CitrosFlavor,
-    onSuggestion: (String) -> Unit
-) {
-    val suggestions = listOf(
-        "Set a timer for 10 minutes",
-        "Open my email",
-        "What's on my calendar?",
-        "Take a screenshot"
-    )
-
-    Column(
-        modifier = Modifier
-            .fillMaxWidth(),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
-        Text(
-            "Hey there! What can I help you with?",
-            style = MaterialTheme.typography.titleMedium,
-            fontWeight = FontWeight.SemiBold,
-            color = flavor.primary
-        )
-        FlowRow(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
-            verticalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            suggestions.forEach { suggestion ->
-                CitrosLiquidGlassSurface(
-                    onClick = { onSuggestion(suggestion) },
-                    shape = RoundedCornerShape(999.dp),
-                    borderColor = flavor.primary.copy(alpha = 0.32f),
-                    borderWidth = 1.dp,
-                    highlightColor = flavor.primary,
-                    warmth = 0.86f,
-                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 8.dp)
+                Spacer(Modifier.weight(1f))
+                Row(
+                    modifier = Modifier.clickable { onManageKeys() },
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
+                    CitrosIcon(
+                        imageVector = CitrosIcons.Settings,
+                        contentDescription = null,
+                        tint = surfaces.labelTertiary,
+                        modifier = Modifier.size(14.dp)
+                    )
                     Text(
-                        suggestion,
-                        style = MaterialTheme.typography.labelLarge,
-                        color = lerp(flavor.primary, MaterialTheme.colorScheme.onSurface, 0.42f),
-                        textAlign = TextAlign.Center
+                        text = "Manage",
+                        style = CitrosTypography.bodySmall,
+                        color = surfaces.labelTertiary
                     )
                 }
             }
+
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                verticalArrangement = Arrangement.spacedBy(2.dp)
+            ) {
+                modelRows.forEach { row ->
+                    val selected = row.modelId == walletState.chatModelId
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(16.dp))
+                            .background(if (selected) surfaces.surface2 else Color.Transparent)
+                            .clickable {
+                                if (activeKey != null) {
+                                    onSelectKey(activeKey.id)
+                                }
+                                onSelectChatModel(row.modelId)
+                            }
+                            .padding(horizontal = 10.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(36.dp)
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(if (selected) surfaces.surface3 else surfaces.surface1),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            QuickSwitcherTierIcon(
+                                tier = row.tier,
+                                tint = if (selected) selectedAccent else surfaces.labelSecondary
+                            )
+                        }
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = row.title,
+                                style = CitrosTypography.titleLarge,
+                                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                                color = surfaces.labelPrimary
+                            )
+                            Text(
+                                text = row.subtitle,
+                                style = CitrosTypography.bodyMedium,
+                                color = surfaces.labelTertiary
+                            )
+                        }
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(8.dp))
+                                .background((row.badgeColor ?: surfaces.green).copy(alpha = 0.17f))
+                                .padding(horizontal = 10.dp, vertical = 3.dp)
+                        ) {
+                            Text(
+                                text = row.badgeLabel,
+                                style = CitrosTypography.labelLarge,
+                                color = row.badgeColor ?: surfaces.green
+                            )
+                        }
+                    }
+                }
+            }
+
+            HorizontalDivider(color = surfaces.separatorLight, thickness = 0.6.dp)
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "Use local when offline",
+                    style = CitrosTypography.headlineSmall,
+                    color = surfaces.labelPrimary,
+                    modifier = Modifier.weight(1f)
+                )
+                Switch(
+                    checked = useLocalOffline,
+                    onCheckedChange = {
+                        useLocalOffline = it
+                        prefs.edit().putBoolean("models_use_local_offline", it).apply()
+                    },
+                    colors = SwitchDefaults.colors(
+                        checkedTrackColor = surfaces.green,
+                        checkedThumbColor = Color.White,
+                        uncheckedTrackColor = surfaces.surface3,
+                        uncheckedThumbColor = Color.White
+                    )
+                )
+            }
         }
     }
 }
 
-/** Alpha for normal user message bubble background. */
-private const val USER_MESSAGE_ALPHA = 0.45f
+private data class QuickSwitcherModelRow(
+    val modelId: String,
+    val title: String,
+    val subtitle: String,
+    val badgeLabel: String,
+    val badgeColor: Color?,
+    val tier: QuickSwitcherModelTier
+)
+
+private enum class QuickSwitcherModelTier {
+    FAST,
+    BALANCED,
+    CAPABLE
+}
+
+private fun quickSwitcherModelTitle(modelId: String): String {
+    val label = shortModelName(modelId)
+    return when {
+        label.startsWith("Sonnet") -> "Claude $label"
+        label.startsWith("Haiku") -> "Claude $label"
+        label.startsWith("Opus") -> "Claude $label"
+        else -> label
+    }
+}
+
+private fun quickSwitcherModelSubtitle(modelId: String): String {
+    val lowered = modelId.lowercase()
+    return when {
+        lowered.contains("opus") -> "Cloud · Most capable"
+        lowered.contains("gpt") -> "Cloud · Fast multi-modal"
+        else -> "Cloud · Balanced"
+    }
+}
+
+private fun quickSwitcherModelTier(modelId: String): QuickSwitcherModelTier {
+    val lowered = modelId.lowercase()
+    return when {
+        lowered.contains("opus") -> QuickSwitcherModelTier.CAPABLE
+        else -> QuickSwitcherModelTier.BALANCED
+    }
+}
+
+@Composable
+private fun QuickSwitcherTierIcon(
+    tier: QuickSwitcherModelTier,
+    tint: Color
+) {
+    when (tier) {
+        QuickSwitcherModelTier.FAST -> {
+            Canvas(modifier = Modifier.size(14.dp)) {
+                val bolt = Path().apply {
+                    moveTo(size.width * 0.62f, size.height * 0.05f)
+                    lineTo(size.width * 0.26f, size.height * 0.58f)
+                    lineTo(size.width * 0.52f, size.height * 0.58f)
+                    lineTo(size.width * 0.40f, size.height * 0.96f)
+                    lineTo(size.width * 0.78f, size.height * 0.44f)
+                    lineTo(size.width * 0.52f, size.height * 0.44f)
+                    close()
+                }
+                drawPath(
+                    path = bolt,
+                    color = tint,
+                    style = Stroke(width = 1.6.dp.toPx())
+                )
+            }
+        }
+        QuickSwitcherModelTier.BALANCED -> {
+            Canvas(modifier = Modifier.size(14.dp)) {
+                drawCircle(
+                    color = tint,
+                    radius = size.minDimension * 0.36f,
+                    style = Stroke(width = 1.5.dp.toPx())
+                )
+                drawCircle(
+                    color = tint,
+                    radius = size.minDimension * 0.11f
+                )
+            }
+        }
+        QuickSwitcherModelTier.CAPABLE -> {
+            Text(
+                text = "★",
+                style = CitrosTypography.bodyLarge,
+                color = tint
+            )
+        }
+    }
+}
 /** Alpha for steer (mid-loop redirect) message bubble background. */
 private const val STEER_MESSAGE_ALPHA = 0.22f
-
 @Composable
 internal fun PortedMessageBubble(
     message: Message,
     flavor: CitrosFlavor
 ) {
+    val isDarkTheme = LocalCitrosIsDark.current
+    val surfaces = remember(isDarkTheme) { citrosDirectiveSurfaces(isDarkTheme) }
+    val flavorTokens = remember(flavor, surfaces) {
+        citrosDirectiveFlavorTokens(flavor, surfaces)
+    }
     val isUser = message.role == "user"
     val isSteer = isUser && message.isSteer
     val isAction = !isUser && (
         message.content.startsWith("🤖") ||
             message.content.startsWith("📱") ||
             message.content.startsWith("👁") ||
+            message.content.startsWith("📅") ||
             message.content.contains("[Tools:")
         )
-
-    val userText = lerp(flavor.primary, MaterialTheme.colorScheme.onSurface, 0.40f)
-
+    val userText = flavorTokens.userBubbleText
+    val assistantBubbleColor = if (isDarkTheme) Color(0xFF2C2D33) else Color(0xFFD9DAE1)
+    val actionText = message.content
+        .removePrefix("🤖")
+        .removePrefix("📱")
+        .removePrefix("👁")
+        .removePrefix("📅")
+        .trim()
+    if (isAction) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.Start,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = "🗓",
+                style = CitrosTypography.bodySmall,
+                color = surfaces.labelTertiary
+            )
+            Spacer(Modifier.width(6.dp))
+            Text(
+                text = actionText,
+                style = CitrosTypography.bodySmall,
+                color = surfaces.labelSecondary
+            )
+            Spacer(Modifier.width(6.dp))
+            Text(
+                text = "✓",
+                style = CitrosTypography.labelSmall,
+                color = surfaces.green
+            )
+        }
+        return
+    }
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start
     ) {
         Column(horizontalAlignment = if (isUser) Alignment.End else Alignment.Start) {
-            val bubbleShape = RoundedCornerShape(
-                topStart = 16.dp,
-                topEnd = 16.dp,
-                bottomStart = if (isUser) 16.dp else 4.dp,
-                bottomEnd = if (isUser) 4.dp else 16.dp
-            )
-            CitrosLiquidGlassSurface(
+            val bubbleShape = RoundedCornerShape(18.dp)
+            Surface(
+                modifier = Modifier.widthIn(max = 348.dp),
                 shape = bubbleShape,
-                baseColor = when {
-                    isSteer -> flavor.tint.copy(alpha = STEER_MESSAGE_ALPHA)
-                    isUser -> flavor.tint.copy(alpha = USER_MESSAGE_ALPHA)
-                    isAction -> MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.50f)
-                    else -> MaterialTheme.colorScheme.surface.copy(alpha = 0.42f)
+                color = when {
+                    isSteer -> flavor.primary.copy(alpha = STEER_MESSAGE_ALPHA)
+                    isUser -> flavor.primary
+                    else -> assistantBubbleColor
                 },
-                borderColor = when {
-                    isUser -> flavor.primary.copy(alpha = if (isSteer) 0.56f else 0.42f)
-                    isAction -> flavor.primary.copy(alpha = 0.34f)
-                    else -> MaterialTheme.colorScheme.outline.copy(alpha = 0.32f)
-                },
-                borderWidth = 1.dp,
-                highlightColor = if (isUser || isAction) flavor.primary else null,
-                warmth = if (isUser) 1.06f else 0.80f,
-                modifier = Modifier.widthIn(max = 320.dp),
-                contentPadding = androidx.compose.foundation.layout.PaddingValues(12.dp)
+                border = if (isUser) {
+                    null
+                } else {
+                    null
+                }
             ) {
                 if (isUser) {
                     Text(
                         text = message.content,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
                         color = userText,
-                        style = MaterialTheme.typography.bodyMedium
+                        style = CitrosTypography.bodyMedium
                     )
                 } else {
                     MarkdownText(
                         text = message.content,
-                        color = MaterialTheme.colorScheme.onSurface,
-                        style = MaterialTheme.typography.bodyMedium
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                        color = surfaces.labelPrimary,
+                        style = CitrosTypography.bodyMedium
                     )
                 }
             }
             if (isSteer) {
                 Text(
                     text = "↗ redirected",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+                    style = CitrosTypography.labelSmall,
+                    color = surfaces.labelTertiary,
                     modifier = Modifier.padding(top = 2.dp, end = 4.dp)
                 )
             }
         }
     }
 }
-
 @Composable
 internal fun PortedLoadingIndicator(flavor: CitrosFlavor = CitrosFlavor.TANGERINE, label: String = "Thinking") {
+    val isDarkTheme = LocalCitrosIsDark.current
+    val surfaces = remember(isDarkTheme) { citrosDirectiveSurfaces(isDarkTheme) }
+    val flavorTokens = remember(flavor, surfaces) {
+        citrosDirectiveFlavorTokens(flavor, surfaces)
+    }
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.Start
     ) {
-        CitrosLiquidGlassSurface(
-            shape = RoundedCornerShape(16.dp),
-            baseColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.42f),
-            borderColor = flavor.primary.copy(alpha = 0.34f),
-            borderWidth = 1.dp,
-            highlightColor = flavor.primary,
-            warmth = 0.82f,
-            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 14.dp, vertical = 10.dp)
+        Surface(
+            shape = RoundedCornerShape(18.dp),
+            color = surfaces.surface2,
+            border = BorderStroke(1.dp, surfaces.separatorLight),
+            modifier = Modifier
+                .widthIn(max = 260.dp)
+                .padding(vertical = 1.dp)
         ) {
             Row(
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                repeat(3) { index ->
-                    val alpha = when (index) {
-                        0 -> 0.45f
-                        1 -> 0.7f
-                        else -> 1f
-                    }
-                    Box(
-                        modifier = Modifier
-                            .size(6.dp)
-                            .background(
-                                flavor.primary.copy(alpha = alpha),
-                                CircleShape
-                            )
-                    )
-                }
-                Spacer(Modifier.width(4.dp))
+                Box(
+                    modifier = Modifier
+                        .size(6.dp)
+                        .background(flavorTokens.orbColor.copy(alpha = 0.64f), CircleShape)
+                )
                 Text(
-                    label,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = flavor.primary.copy(alpha = 0.92f)
+                    text = "$label...",
+                    style = CitrosTypography.bodySmall.copy(fontStyle = FontStyle.Italic),
+                    color = surfaces.labelSecondary
                 )
             }
         }
     }
 }
-
 internal fun shortModelName(modelId: String): String {
     val raw = modelId.substringAfterLast('/').removeSuffix("-latest")
     // Map known model IDs to clean display names
@@ -477,15 +585,12 @@ internal fun shortModelName(modelId: String): String {
     // Try exact match first, then prefix match for dated variants
     knownModels[raw]?.let { return it }
     knownModels.entries.find { raw.startsWith(it.key) }?.let { return it.value }
-    
     // Fallback: clean up unknown models
     val cleaned = raw.replace(Regex("-\\d{8}$"), "") // strip date suffixes like -20250514
-    
     // Special handling for GPT models: normalize prefix to uppercase
     if (cleaned.startsWith("gpt-")) {
         return cleaned.replace("gpt-", "GPT-")
     }
-    
     // For other models: strip claude- prefix, convert dashes to spaces, capitalize
     return cleaned
         .replace("claude-", "")

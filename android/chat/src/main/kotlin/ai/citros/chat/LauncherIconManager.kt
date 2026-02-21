@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.util.Log
 
 private val FLAVOR_LAUNCHER_ALIAS_SUFFIX = mapOf(
+    CitrosFlavor.NONE to ".LauncherNone",
     CitrosFlavor.LEMON to ".LauncherLemon",
     CitrosFlavor.TANGERINE to ".LauncherTangerine",
     CitrosFlavor.LIME to ".LauncherLime",
@@ -18,11 +19,12 @@ private val FLAVOR_LAUNCHER_ALIAS_SUFFIX = mapOf(
  * Home-screen launcher icons are still switched via activity-alias components.
  */
 internal fun launcherIconForegroundResForFlavor(flavor: CitrosFlavor): Int = when (flavor) {
-    CitrosFlavor.TANGERINE -> R.drawable.ic_launcher_fg3d_tangerine
-    CitrosFlavor.LEMON -> R.drawable.ic_launcher_fg3d_lemon
-    CitrosFlavor.LIME -> R.drawable.ic_launcher_fg3d_lime
-    CitrosFlavor.BLOOD_ORANGE -> R.drawable.ic_launcher_fg3d_blood_orange
-    CitrosFlavor.GRAPEFRUIT -> R.drawable.ic_launcher_fg3d_grapefruit
+    CitrosFlavor.NONE -> R.drawable.ic_launcher_fg_orb_none
+    CitrosFlavor.TANGERINE -> R.drawable.ic_launcher_fg_orb_tangerine
+    CitrosFlavor.LEMON -> R.drawable.ic_launcher_fg_orb_lemon
+    CitrosFlavor.LIME -> R.drawable.ic_launcher_fg_orb_lime
+    CitrosFlavor.BLOOD_ORANGE -> R.drawable.ic_launcher_fg_orb_blood_orange
+    CitrosFlavor.GRAPEFRUIT -> R.drawable.ic_launcher_fg_orb_grapefruit
 }
 
 internal fun syncLauncherIconWithPreferences(context: Context) {

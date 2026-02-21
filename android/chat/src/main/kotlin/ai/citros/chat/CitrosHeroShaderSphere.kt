@@ -542,6 +542,27 @@ private data class HeroPalette(
 ) {
     companion object {
         fun fromFlavor(flavor: CitrosFlavor, isDark: Boolean): HeroPalette {
+            if (flavor == CitrosFlavor.NONE) {
+                return if (isDark) {
+                    HeroPalette(
+                        color1 = Color(0xFFCBCED7).toRgbArray(),
+                        color2 = Color(0xFFFFFFFF).toRgbArray(),
+                        color3 = Color(0xFFE5E8EF).toRgbArray(),
+                        wireColor = Color(0xFFA9AEBC).toRgbArray(),
+                        ringColor = Color(0xFFD4D8E2).toRgbArray(),
+                        particleColor = Color(0xFFBFC4D0).toRgbArray()
+                    )
+                } else {
+                    HeroPalette(
+                        color1 = Color(0xFF0A0A0C).toRgbArray(),
+                        color2 = Color(0xFF000000).toRgbArray(),
+                        color3 = Color(0xFF262830).toRgbArray(),
+                        wireColor = Color(0xFF42454E).toRgbArray(),
+                        ringColor = Color(0xFF363A44).toRgbArray(),
+                        particleColor = Color(0xFF525665).toRgbArray()
+                    )
+                }
+            }
             val deep = if (isDark) {
                 lerp(Color(0xFF060607), flavor.tint, 0.78f)
             } else {

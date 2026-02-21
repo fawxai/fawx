@@ -8,13 +8,13 @@ class OverlaySurfaceModeTest {
     // ========== toPrefValue ==========
 
     @Test
-    fun `MINI_CHAT serializes to mini_chat`() {
-        assertEquals("mini_chat", OverlaySurfaceMode.MINI_CHAT.toPrefValue())
+    fun `PANEL serializes to panel`() {
+        assertEquals("panel", OverlaySurfaceMode.PANEL.toPrefValue())
     }
 
     @Test
-    fun `BUBBLE serializes to bubble`() {
-        assertEquals("bubble", OverlaySurfaceMode.BUBBLE.toPrefValue())
+    fun `SEARCH_BAR serializes to search_bar`() {
+        assertEquals("search_bar", OverlaySurfaceMode.SEARCH_BAR.toPrefValue())
     }
 
     @Test
@@ -25,13 +25,23 @@ class OverlaySurfaceModeTest {
     // ========== fromPrefValue ==========
 
     @Test
-    fun `fromPrefValue parses mini_chat`() {
-        assertEquals(OverlaySurfaceMode.MINI_CHAT, OverlaySurfaceMode.fromPrefValue("mini_chat"))
+    fun `fromPrefValue parses panel`() {
+        assertEquals(OverlaySurfaceMode.PANEL, OverlaySurfaceMode.fromPrefValue("panel"))
     }
 
     @Test
-    fun `fromPrefValue parses bubble`() {
-        assertEquals(OverlaySurfaceMode.BUBBLE, OverlaySurfaceMode.fromPrefValue("bubble"))
+    fun `fromPrefValue parses search_bar`() {
+        assertEquals(OverlaySurfaceMode.SEARCH_BAR, OverlaySurfaceMode.fromPrefValue("search_bar"))
+    }
+
+    @Test
+    fun `fromPrefValue parses legacy mini_chat`() {
+        assertEquals(OverlaySurfaceMode.PANEL, OverlaySurfaceMode.fromPrefValue("mini_chat"))
+    }
+
+    @Test
+    fun `fromPrefValue parses legacy bubble`() {
+        assertEquals(OverlaySurfaceMode.SEARCH_BAR, OverlaySurfaceMode.fromPrefValue("bubble"))
     }
 
     @Test
@@ -40,13 +50,18 @@ class OverlaySurfaceModeTest {
     }
 
     @Test
-    fun `fromPrefValue defaults to MINI_CHAT for null`() {
-        assertEquals(OverlaySurfaceMode.MINI_CHAT, OverlaySurfaceMode.fromPrefValue(null))
+    fun `fromPrefValue parses dynamic_island`() {
+        assertEquals(OverlaySurfaceMode.DYNAMIC_ISLAND, OverlaySurfaceMode.fromPrefValue("dynamic_island"))
     }
 
     @Test
-    fun `fromPrefValue defaults to MINI_CHAT for unknown string`() {
-        assertEquals(OverlaySurfaceMode.MINI_CHAT, OverlaySurfaceMode.fromPrefValue("unknown"))
+    fun `fromPrefValue defaults to SEARCH_BAR for null`() {
+        assertEquals(OverlaySurfaceMode.SEARCH_BAR, OverlaySurfaceMode.fromPrefValue(null))
+    }
+
+    @Test
+    fun `fromPrefValue defaults to SEARCH_BAR for unknown string`() {
+        assertEquals(OverlaySurfaceMode.SEARCH_BAR, OverlaySurfaceMode.fromPrefValue("unknown"))
     }
 
     // ========== Round-trip ==========

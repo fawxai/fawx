@@ -1,9 +1,11 @@
 package ai.citros.chat
-
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.provider.Settings
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -12,31 +14,21 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.automirrored.filled.VolumeUp
-import androidx.compose.material.icons.filled.Brush
-import androidx.compose.material.icons.filled.Info
-import androidx.compose.material.icons.filled.Key
-import androidx.compose.material.icons.filled.PhoneAndroid
-import androidx.compose.material.icons.filled.Security
-import androidx.compose.material.icons.filled.Tune
-import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.Icon
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Switch
-import androidx.compose.material3.SwitchDefaults
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -47,21 +39,27 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Shadow
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import ai.citros.core.WalletManager
+import ai.citros.core.Provider
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.view.accessibility.AccessibilityManager
-import androidx.compose.foundation.Image
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.res.painterResource
-
 /**
  * Helper function to check if accessibility service is enabled for the app
  */
@@ -71,103 +69,160 @@ private fun isAccessibilityServiceEnabled(context: Context): Boolean {
     val packageName = context.packageName
     return enabledServices.any { it.resolveInfo.serviceInfo.packageName == packageName }
 }
-
 @Composable
 private fun SettingsSubPageScaffold(
     flavor: CitrosFlavor,
     title: String,
     onBack: () -> Unit,
+    accentColor: Color? = null,
     scrollable: Boolean = true,
     content: @Composable androidx.compose.foundation.layout.ColumnScope.() -> Unit
 ) {
     val isDarkTheme = LocalCitrosIsDark.current
-    val visuals = remember(flavor, isDarkTheme) {
-        citrosSplashVisualTokens(flavor, isDark = isDarkTheme)
-    }
-    val backdropScrim = if (isDarkTheme) {
-        Color.Black.copy(alpha = 0.44f)
-    } else {
-        MaterialTheme.colorScheme.surface.copy(alpha = 0.58f)
-    }
-    Scaffold(containerColor = Color.Transparent) { padding ->
-        Box(
+    val surfaces = remember(isDarkTheme) { citrosDirectiveSurfaces(isDarkTheme) }
+    val resolvedAccent = accentColor ?: flavor.primary.copy(alpha = 0.92f)
+    val statusBarTopPadding = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
+    Scaffold(containerColor = surfaces.background) { padding ->
+        Column(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
         ) {
-            CitrosHeroShaderSphere(
-                flavor = flavor,
-                modifier = Modifier.fillMaxSize()
-            )
             Box(
                 modifier = Modifier
-                    .fillMaxSize()
-                    .background(backdropScrim)
-            )
-
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(horizontal = 16.dp)
+                    .fillMaxWidth()
+                    .padding(top = statusBarTopPadding + 4.dp, start = 12.dp, end = 12.dp, bottom = 8.dp)
             ) {
                 Row(
                     modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(top = 6.dp),
+                        .align(Alignment.CenterStart)
+                        .height(44.dp)
+                        .clickable(onClick = onBack),
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    CitrosLiquidGlassSurface(
-                        modifier = Modifier.size(40.dp),
-                        shape = RoundedCornerShape(999.dp),
-                        onClick = onBack,
-                        borderColor = flavor.primary.copy(alpha = 0.44f),
-                        borderWidth = 1.dp,
-                        highlightColor = flavor.primary,
-                        warmth = 1.02f
-                    ) {
-                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                            Icon(
-                                imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                                contentDescription = "Back",
-                                tint = flavor.primary.copy(alpha = 0.96f)
-                            )
-                        }
-                    }
+                    SettingsBackChevron(
+                        tint = resolvedAccent,
+                        modifier = Modifier.size(width = 10.dp, height = 16.dp)
+                    )
                     Text(
-                        title,
-                        style = MaterialTheme.typography.headlineSmall.copy(
-                            shadow = Shadow(
-                                color = visuals.hero.deep.copy(alpha = 0.70f),
-                                offset = Offset(0f, 2f),
-                                blurRadius = 14f
-                            )
-                        ),
-                        fontWeight = FontWeight.SemiBold,
-                        color = flavor.primary
-                    )
-                    Spacer(modifier = Modifier.size(40.dp))
-                }
-
-                val bodyModifier = Modifier
-                    .fillMaxSize()
-                    .padding(top = 10.dp)
-
-                if (scrollable) {
-                    Column(
-                        modifier = bodyModifier.verticalScroll(rememberScrollState()),
-                        verticalArrangement = Arrangement.spacedBy(12.dp),
-                        content = content
-                    )
-                } else {
-                    Column(
-                        modifier = bodyModifier,
-                        verticalArrangement = Arrangement.spacedBy(12.dp),
-                        content = content
+                        text = "Settings",
+                        style = CitrosTypography.bodyLarge,
+                        color = resolvedAccent
                     )
                 }
+                Text(
+                    text = title,
+                    style = CitrosTypography.titleMedium,
+                    color = surfaces.labelPrimary,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.align(Alignment.Center)
+                )
+            }
+            HorizontalDivider(
+                color = surfaces.separator,
+                thickness = 0.5.dp
+            )
+            val bodyModifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 16.dp, vertical = 14.dp)
+            if (scrollable) {
+                Column(
+                    modifier = bodyModifier.verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(14.dp),
+                    content = content
+                )
+            } else {
+                Column(
+                    modifier = bodyModifier,
+                    verticalArrangement = Arrangement.spacedBy(14.dp),
+                    content = content
+                )
             }
         }
+    }
+}
+
+@Composable
+private fun SettingsBackChevron(
+    tint: Color,
+    modifier: Modifier = Modifier
+) {
+    Canvas(modifier = modifier) {
+        val stroke = size.minDimension * 0.22f
+        drawLine(
+            color = tint,
+            start = Offset(size.width * 0.88f, size.height * 0.10f),
+            end = Offset(size.width * 0.12f, size.height * 0.50f),
+            strokeWidth = stroke,
+            cap = StrokeCap.Round
+        )
+        drawLine(
+            color = tint,
+            start = Offset(size.width * 0.12f, size.height * 0.50f),
+            end = Offset(size.width * 0.88f, size.height * 0.90f),
+            strokeWidth = stroke,
+            cap = StrokeCap.Round
+        )
+    }
+}
+
+@Composable
+private fun SettingsTrashIcon(
+    tint: Color,
+    modifier: Modifier = Modifier
+) {
+    Canvas(modifier = modifier) {
+        val stroke = size.minDimension * 0.12f
+        drawLine(
+            color = tint,
+            start = Offset(size.width * 0.30f, size.height * 0.28f),
+            end = Offset(size.width * 0.70f, size.height * 0.28f),
+            strokeWidth = stroke,
+            cap = StrokeCap.Round
+        )
+        drawLine(
+            color = tint,
+            start = Offset(size.width * 0.40f, size.height * 0.20f),
+            end = Offset(size.width * 0.60f, size.height * 0.20f),
+            strokeWidth = stroke,
+            cap = StrokeCap.Round
+        )
+        drawLine(
+            color = tint,
+            start = Offset(size.width * 0.35f, size.height * 0.28f),
+            end = Offset(size.width * 0.38f, size.height * 0.78f),
+            strokeWidth = stroke,
+            cap = StrokeCap.Round
+        )
+        drawLine(
+            color = tint,
+            start = Offset(size.width * 0.65f, size.height * 0.28f),
+            end = Offset(size.width * 0.62f, size.height * 0.78f),
+            strokeWidth = stroke,
+            cap = StrokeCap.Round
+        )
+        drawLine(
+            color = tint,
+            start = Offset(size.width * 0.38f, size.height * 0.78f),
+            end = Offset(size.width * 0.62f, size.height * 0.78f),
+            strokeWidth = stroke,
+            cap = StrokeCap.Round
+        )
+        drawLine(
+            color = tint,
+            start = Offset(size.width * 0.46f, size.height * 0.38f),
+            end = Offset(size.width * 0.46f, size.height * 0.68f),
+            strokeWidth = stroke * 0.9f,
+            cap = StrokeCap.Round
+        )
+        drawLine(
+            color = tint,
+            start = Offset(size.width * 0.54f, size.height * 0.38f),
+            end = Offset(size.width * 0.54f, size.height * 0.68f),
+            strokeWidth = stroke * 0.9f,
+            cap = StrokeCap.Round
+        )
     }
 }
 
@@ -178,26 +233,150 @@ private fun SettingsGlassPillButton(
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    CitrosLiquidGlassSurface(
+    Surface(
         modifier = modifier,
         shape = RoundedCornerShape(999.dp),
-        onClick = onClick,
-        borderColor = tint.copy(alpha = 0.42f),
-        borderWidth = 1.dp,
-        highlightColor = tint,
-        warmth = 1.04f,
-        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
+        color = tint.copy(alpha = 0.14f),
+        border = androidx.compose.foundation.BorderStroke(1.dp, tint.copy(alpha = 0.42f))
+    ) {
+        Box(
+            modifier = Modifier
+                .clickable(onClick = onClick)
+                .padding(horizontal = 14.dp, vertical = 8.dp)
+        ) {
+            Text(
+                text,
+                style = CitrosTypography.labelLarge,
+                fontWeight = FontWeight.SemiBold,
+                color = tint.copy(alpha = 0.95f)
+            )
+        }
+    }
+}
+
+@Composable
+private fun SettingsSelectedBadge(
+    accent: Color,
+    text: String = "Selected"
+) {
+    Surface(
+        shape = RoundedCornerShape(999.dp),
+        color = accent.copy(alpha = 0.16f)
     ) {
         Text(
-            text,
-            style = MaterialTheme.typography.labelLarge,
-            fontWeight = FontWeight.SemiBold,
-            color = tint.copy(alpha = 0.95f)
+            text = text,
+            style = CitrosTypography.labelSmall,
+            color = accent.copy(alpha = 0.96f),
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
         )
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SettingsSelectionCheck(
+    modifier: Modifier = Modifier
+) {
+    val isDarkTheme = LocalCitrosIsDark.current
+    val surfaces = remember(isDarkTheme) { citrosDirectiveSurfaces(isDarkTheme) }
+    Box(
+        modifier = modifier
+            .size(20.dp)
+            .background(surfaces.surface3, CircleShape),
+        contentAlignment = Alignment.Center
+    ) {
+        Canvas(modifier = Modifier.size(11.dp)) {
+            drawLine(
+                color = surfaces.labelPrimary,
+                start = Offset(x = size.width * 0.18f, y = size.height * 0.56f),
+                end = Offset(x = size.width * 0.42f, y = size.height * 0.80f),
+                strokeWidth = size.minDimension * 0.16f,
+                cap = StrokeCap.Round
+            )
+            drawLine(
+                color = surfaces.labelPrimary,
+                start = Offset(x = size.width * 0.40f, y = size.height * 0.80f),
+                end = Offset(x = size.width * 0.84f, y = size.height * 0.24f),
+                strokeWidth = size.minDimension * 0.16f,
+                cap = StrokeCap.Round
+            )
+        }
+    }
+}
+
+@Composable
+private fun SettingsSectionHeader(
+    text: String
+) {
+    val isDarkTheme = LocalCitrosIsDark.current
+    val surfaces = remember(isDarkTheme) { citrosDirectiveSurfaces(isDarkTheme) }
+    Text(
+        text = text.uppercase(),
+        style = CitrosTypography.labelSmall,
+        color = surfaces.labelSecondary
+    )
+}
+@Composable
+private fun SettingsGroupedSurface(
+    modifier: Modifier = Modifier,
+    content: @Composable androidx.compose.foundation.layout.ColumnScope.() -> Unit
+) {
+    val isDarkTheme = LocalCitrosIsDark.current
+    val surfaces = remember(isDarkTheme) { citrosDirectiveSurfaces(isDarkTheme) }
+    Surface(
+        modifier = modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(14.dp),
+        color = surfaces.surface1,
+        border = BorderStroke(1.dp, surfaces.separatorLight)
+    ) {
+        Column(modifier = Modifier.fillMaxWidth(), content = content)
+    }
+}
+@Composable
+private fun SettingsListRow(
+    title: String,
+    subtitle: String? = null,
+    onClick: (() -> Unit)? = null,
+    showDivider: Boolean = true,
+    trailing: @Composable (() -> Unit)? = null
+) {
+    val isDarkTheme = LocalCitrosIsDark.current
+    val surfaces = remember(isDarkTheme) { citrosDirectiveSurfaces(isDarkTheme) }
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .semantics(mergeDescendants = true) {}
+            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
+            .padding(horizontal = 14.dp, vertical = 12.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = title,
+                    style = CitrosTypography.bodyLarge,
+                    color = surfaces.labelPrimary
+                )
+                if (!subtitle.isNullOrBlank()) {
+                    Text(
+                        text = subtitle,
+                        style = CitrosTypography.bodySmall,
+                        color = surfaces.labelSecondary
+                    )
+                }
+            }
+            trailing?.invoke()
+        }
+        if (showDivider) {
+            Spacer(Modifier.height(12.dp))
+            HorizontalDivider(
+                color = surfaces.separatorLight,
+                thickness = 0.5.dp
+            )
+        }
+    }
+}
 @Composable
 internal fun SettingsHubScreen(
     context: Context,
@@ -215,193 +394,157 @@ internal fun SettingsHubScreen(
     val activeKey = walletState.keys.find { it.id == walletState.activeKeyId }
     val flavor = remember { readSelectedFlavor(context) }
     val isDarkTheme = LocalCitrosIsDark.current
-    val visuals = remember(flavor, isDarkTheme) {
-        citrosSplashVisualTokens(flavor, isDark = isDarkTheme)
+    val surfaces = remember(isDarkTheme) { citrosDirectiveSurfaces(isDarkTheme) }
+    val flavorTokens = remember(flavor, surfaces) {
+        citrosDirectiveFlavorTokens(flavor, surfaces)
     }
-    val backdropScrim = if (isDarkTheme) {
-        Color.Black.copy(alpha = 0.42f)
-    } else {
-        MaterialTheme.colorScheme.surface.copy(alpha = 0.56f)
-    }
-
+    val statusBarTopPadding = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
     Scaffold(
-        containerColor = Color.Transparent
+        containerColor = surfaces.background
     ) { padding ->
-        Box(
+        Column(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
         ) {
-            CitrosHeroShaderSphere(
-                flavor = flavor,
-                modifier = Modifier.fillMaxSize()
-            )
-            Box(
+            Row(
                 modifier = Modifier
-                    .fillMaxSize()
-                    .background(backdropScrim)
+                    .fillMaxWidth()
+                    .padding(top = statusBarTopPadding + 4.dp, start = 12.dp, end = 12.dp, bottom = 8.dp)
+                    .height(44.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "Settings",
+                    style = CitrosTypography.headlineLarge,
+                    fontWeight = FontWeight.SemiBold,
+                    color = surfaces.labelPrimary
+                )
+                Spacer(Modifier.weight(1f))
+                Text(
+                    text = "Back",
+                    modifier = Modifier.clickable(onClick = onBack),
+                    style = CitrosTypography.bodyLarge,
+                    color = flavor.primary.copy(alpha = 0.92f)
+                )
+            }
+            HorizontalDivider(
+                color = surfaces.separator,
+                thickness = 0.5.dp
             )
-
             Column(
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(horizontal = 16.dp)
-                    .verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
             ) {
-                Row(
+                CitrosDirectiveWashBox(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(top = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    CitrosLiquidGlassSurface(
-                        modifier = Modifier
-                            .width(40.dp)
-                            .height(40.dp),
-                        shape = androidx.compose.foundation.shape.RoundedCornerShape(999.dp),
-                        onClick = onBack,
-                        borderColor = flavor.primary.copy(alpha = 0.44f),
-                        borderWidth = 1.dp,
-                        highlightColor = flavor.primary,
-                        warmth = 1.02f
-                    ) {
-                        Box(
-                            modifier = Modifier.fillMaxSize(),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(
-                                imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                                contentDescription = "Back",
-                                tint = flavor.primary.copy(alpha = 0.96f)
-                            )
-                        }
-                    }
-                    Text(
-                        "Settings",
-                        style = MaterialTheme.typography.headlineSmall.copy(
-                            shadow = Shadow(
-                                color = visuals.hero.deep.copy(alpha = 0.70f),
-                                offset = Offset(0f, 2f),
-                                blurRadius = 14f
-                            )
-                        ),
-                        fontWeight = FontWeight.SemiBold,
-                        color = flavor.primary
-                    )
-                    Spacer(modifier = Modifier.width(40.dp))
-                }
-
-                CitrosLiquidGlassSurface(
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = androidx.compose.foundation.shape.RoundedCornerShape(20.dp),
-                    borderColor = flavor.primary.copy(alpha = 0.38f),
-                    borderWidth = 1.dp,
-                    highlightColor = flavor.primary,
-                    warmth = 1.06f,
-                    contentPadding = androidx.compose.foundation.layout.PaddingValues(
-                        horizontal = 14.dp,
-                        vertical = 14.dp
-                    )
+                        .padding(vertical = 2.dp),
+                    washColor = flavorTokens.washColor,
+                    centerXFraction = 0.18f,
+                    centerYFraction = 0.5f,
+                    radiusFraction = 0.66f,
+                    contentAlignment = Alignment.CenterStart
                 ) {
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 4.dp, vertical = 8.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
-                        CitrosLiquidGlassSurface(
-                            modifier = Modifier
-                                .width(42.dp)
-                                .height(42.dp),
-                            shape = RoundedCornerShape(10.dp),
-                            borderColor = flavor.primary.copy(alpha = 0.34f),
-                            borderWidth = 1.dp,
-                            highlightColor = flavor.primary,
-                            warmth = 0.90f
-                        ) {
-                            Image(
-                                painter = painterResource(id = launcherIconForegroundResForFlavor(flavor)),
-                                contentDescription = "Citros app icon",
-                                modifier = Modifier
-                                    .fillMaxSize()
-                                    .clip(RoundedCornerShape(10.dp)),
-                                contentScale = ContentScale.Crop
-                            )
-                        }
+                        CitrosDirectiveOrb(
+                            flavor = flavor,
+                            size = 56.dp
+                        )
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
                                 "Citros",
-                                style = MaterialTheme.typography.titleMedium,
+                                style = CitrosTypography.headlineSmall,
                                 fontWeight = FontWeight.SemiBold,
-                                color = flavor.primary.copy(alpha = 0.96f)
+                                color = surfaces.labelPrimary
                             )
                             Text(
-                                activeKey?.let { "${it.label} · ${walletState.chatModelId}" } ?: "No active API key",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.78f)
+                                activeKey?.let { "${it.label} · ${shortModelName(walletState.chatModelId)}" }
+                                    ?: "No active API key",
+                                style = CitrosTypography.bodyMedium,
+                                color = surfaces.labelSecondary
                             )
                         }
                     }
                 }
-
-                SettingsNavCard(
-                    icon = Icons.Default.Key,
-                    title = "API Keys",
-                    subtitle = "Manage your provider keys",
-                    flavor = flavor,
-                    onClick = onOpenWallet
+                Text(
+                    text = "General",
+                    style = CitrosTypography.labelMedium,
+                    color = surfaces.labelSecondary
                 )
                 SettingsNavCard(
-                    icon = Icons.Default.Tune,
-                    title = "Models",
-                    subtitle = "Chat & action model selection",
-                    flavor = flavor,
-                    onClick = onOpenModels
-                )
-                SettingsNavCard(
-                    icon = Icons.AutoMirrored.Filled.VolumeUp,
-                    title = "Sound & Haptics",
-                    subtitle = "Voice, sounds, haptic feedback",
-                    flavor = flavor,
-                    onClick = onOpenSound
-                )
-                SettingsNavCard(
-                    icon = Icons.Default.Security,
-                    title = "Trust Level",
-                    subtitle = "Permission tier settings",
-                    flavor = flavor,
-                    onClick = onOpenTrust
-                )
-                SettingsNavCard(
-                    icon = Icons.Default.PhoneAndroid,
-                    title = "Phone Control",
-                    subtitle = "Accessibility & overlay",
-                    flavor = flavor,
-                    onClick = onOpenPhoneControl
-                )
-                SettingsNavCard(
-                    icon = Icons.Default.Brush,
+                    icon = CitrosIcons.Brush,
                     title = "Appearance",
                     subtitle = "Theme & flavor settings",
                     flavor = flavor,
                     onClick = onOpenAppearance
                 )
                 SettingsNavCard(
-                    icon = Icons.Default.Info,
+                    icon = CitrosIcons.Tune,
+                    title = "Models",
+                    subtitle = "Chat & action model selection",
+                    flavor = flavor,
+                    onClick = onOpenModels
+                )
+                SettingsNavCard(
+                    icon = CitrosIcons.Volume,
+                    title = "Sound & Haptics",
+                    subtitle = "Voice, sounds, haptic feedback",
+                    flavor = flavor,
+                    onClick = onOpenSound
+                )
+                Text(
+                    text = "Account",
+                    style = CitrosTypography.labelMedium,
+                    color = surfaces.labelSecondary
+                )
+                SettingsNavCard(
+                    icon = CitrosIcons.Key,
+                    title = "API Keys",
+                    subtitle = "Manage your provider keys",
+                    flavor = flavor,
+                    onClick = onOpenWallet
+                )
+                SettingsNavCard(
+                    icon = CitrosIcons.Info,
                     title = "About",
                     subtitle = "Version, licenses",
                     flavor = flavor,
                     onClick = onOpenAbout
                 )
-
-                Spacer(Modifier.height(20.dp))
+                Text(
+                    text = "Privacy & Control",
+                    style = CitrosTypography.labelMedium,
+                    color = surfaces.labelSecondary
+                )
+                SettingsNavCard(
+                    icon = CitrosIcons.Security,
+                    title = "Trust Level",
+                    subtitle = "Permission tier settings",
+                    flavor = flavor,
+                    onClick = onOpenTrust
+                )
+                SettingsNavCard(
+                    icon = CitrosIcons.Phone,
+                    title = "Phone Control",
+                    subtitle = "Accessibility & overlay",
+                    flavor = flavor,
+                    onClick = onOpenPhoneControl
+                )
+                Spacer(Modifier.height(16.dp))
             }
         }
     }
 }
-
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun TrustSettingsScreen(
     context: Context,
@@ -412,260 +555,393 @@ internal fun TrustSettingsScreen(
     var selected by rememberSaveable {
         mutableStateOf(prefs.getString(PREF_PERSONALITY_TRUST, "Ask for risky stuff") ?: "Ask for risky stuff")
     }
-
     val options = listOf(
         "Ask before everything",
         "Ask for risky stuff",
         "Full autonomy"
     )
-
     SettingsSubPageScaffold(
         flavor = flavor,
         title = "Trust Level",
         onBack = onBack
     ) {
-        Text(
-            "Choose how much autonomy Citros should have while controlling your phone.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.78f)
-        )
-        options.forEach { option ->
-            val isSelected = selected == option
-            CitrosLiquidGlassSurface(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(16.dp),
-                onClick = {
-                    selected = option
-                    prefs.edit().putString(PREF_PERSONALITY_TRUST, option).apply()
-                },
-                borderColor = if (isSelected) flavor.primary.copy(alpha = 0.66f) else flavor.primary.copy(alpha = 0.30f),
-                borderWidth = if (isSelected) 1.6.dp else 1.dp,
-                highlightColor = if (isSelected) flavor.primary else null,
-                warmth = if (isSelected) 1.08f else 0.84f,
-                contentPadding = PaddingValues(14.dp)
-            ) {
-                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text(
-                        option,
-                        style = MaterialTheme.typography.titleMedium,
-                        color = if (isSelected) flavor.primary.copy(alpha = 0.96f)
-                        else MaterialTheme.colorScheme.onSurface
-                    )
-                    Text(
-                        when (option) {
-                            "Ask before everything" -> "Citros asks before every phone action."
-                            "Ask for risky stuff" -> "Citros asks before sensitive actions like send/delete/purchase."
-                            else -> "Citros executes without confirmation dialogs."
-                        },
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.76f)
-                    )
-                }
+        val isDarkTheme = LocalCitrosIsDark.current
+        val surfaces = remember(isDarkTheme) { citrosDirectiveSurfaces(isDarkTheme) }
+        SettingsSectionHeader("Autonomy level")
+        SettingsGroupedSurface {
+            options.forEachIndexed { index, option ->
+                val isSelected = selected == option
+                SettingsListRow(
+                    title = option,
+                    subtitle = when (option) {
+                        "Ask before everything" -> "Confirm every action before Citros acts."
+                        "Ask for risky stuff" -> "Auto-run safe actions, confirm sensitive actions."
+                        else -> "Citros acts independently."
+                    },
+                    onClick = {
+                        selected = option
+                        prefs.edit().putString(PREF_PERSONALITY_TRUST, option).apply()
+                    },
+                    showDivider = index < options.lastIndex,
+                    trailing = {
+                        if (isSelected) {
+                            SettingsSelectionCheck()
+                        }
+                    }
+                )
             }
         }
+        Text(
+            "Trust level controls how much confirmation Citros requires before taking actions on your phone.",
+            style = CitrosTypography.bodySmall,
+            color = surfaces.labelTertiary
+        )
         Spacer(Modifier.height(6.dp))
     }
 }
-
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun AppearanceSettingsScreen(
     context: Context,
     onBack: () -> Unit
 ) {
     val prefs = remember(context) { context.getSharedPreferences(ONBOARDING_PREFS, Context.MODE_PRIVATE) }
+    val chatPrefs = remember(context) { context.getSharedPreferences(CITROS_PREFS, Context.MODE_PRIVATE) }
     var selectedFlavor by rememberSaveable {
         mutableStateOf(readSelectedFlavor(context))
     }
+    val isDarkTheme = LocalCitrosIsDark.current
+    val surfaces = remember(isDarkTheme) { citrosDirectiveSurfaces(isDarkTheme) }
     var themeMode by rememberSaveable {
         mutableStateOf(prefs.getString(PREF_THEME_MODE, THEME_MODE_DEFAULT) ?: THEME_MODE_DEFAULT)
     }
-
+    val autoClearOptions = remember {
+        listOf(
+            "Never" to ConversationLifecycle.TIMEOUT_NEVER,
+            "After 1 hour" to 60L * 60 * 1000,
+            "After 1 day" to 24L * 60 * 60 * 1000,
+            "After 1 week" to 7L * 24 * 60 * 60 * 1000
+        )
+    }
+    var selectedTimeout by rememberSaveable {
+        mutableStateOf(
+            chatPrefs
+                .getLong("idle_timeout_ms", ConversationLifecycle.DEFAULT_TIMEOUT_MS)
+                .let { stored ->
+                    if (autoClearOptions.any { it.second == stored }) stored
+                    else ConversationLifecycle.TIMEOUT_NEVER
+                }
+        )
+    }
     SettingsSubPageScaffold(
         flavor = selectedFlavor,
         title = "Appearance",
         onBack = onBack
     ) {
-        Text(
-            "Flavor",
-            style = MaterialTheme.typography.titleSmall,
-            fontWeight = FontWeight.SemiBold,
-            color = selectedFlavor.primary.copy(alpha = 0.94f)
-        )
-        CitrosFlavor.entries.forEach { flavor ->
-            FlavorOptionCard(
-                flavor = flavor,
-                selected = selectedFlavor == flavor,
-                onClick = {
-                    selectedFlavor = flavor
-                    prefs.edit().putString(PREF_SELECTED_FLAVOR, flavor.storageValue).apply()
-                    OverlayService.instance?.refreshAppearanceFromPrefs()
-                    // Avoid alias flips while overlay is active; they can destabilize
-                    // the running task and close the current screen on some devices.
-                    if (!OverlayController.isOverlayActive.value) {
-                        runCatching {
-                            syncLauncherIconWithPreferences(context)
-                        }.onFailure { error ->
-                            android.util.Log.w("AppearanceSettings", "Failed to sync launcher icon", error)
-                        }
-                    }
-                }
-            )
-        }
-
-        Spacer(Modifier.height(6.dp))
-        Text(
-            "Auto-clear",
-            style = MaterialTheme.typography.titleSmall,
-            fontWeight = FontWeight.SemiBold,
-            color = selectedFlavor.primary.copy(alpha = 0.94f)
-        )
-        Text(
-            "Automatically clear conversation history after inactivity",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.72f)
-        )
-        run {
-            val chatPrefs = remember(context) {
-                context.getSharedPreferences(CITROS_PREFS, Context.MODE_PRIVATE)
-            }
-            var selectedTimeout by rememberSaveable {
-                mutableStateOf(
-                    chatPrefs.getLong("idle_timeout_ms", ConversationLifecycle.DEFAULT_TIMEOUT_MS)
-                )
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                ConversationLifecycle.TIMEOUT_OPTIONS.forEach { (label, timeoutMs) ->
-                    val selected = selectedTimeout == timeoutMs
-                    CitrosLiquidGlassSurface(
-                        modifier = Modifier.weight(1f),
-                        shape = RoundedCornerShape(999.dp),
-                        onClick = {
-                            selectedTimeout = timeoutMs
-                            chatPrefs
-                                .edit()
-                                .putLong("idle_timeout_ms", timeoutMs)
-                                .apply()
-                        },
-                        borderColor = if (selected) {
-                            selectedFlavor.primary.copy(alpha = 0.62f)
-                        } else {
-                            selectedFlavor.primary.copy(alpha = 0.28f)
-                        },
-                        borderWidth = if (selected) 1.6.dp else 1.dp,
-                        highlightColor = if (selected) selectedFlavor.primary else null,
-                        warmth = if (selected) 1.10f else 0.80f,
-                        contentPadding = PaddingValues(vertical = 10.dp)
-                    ) {
-                        Box(
-                            modifier = Modifier.fillMaxWidth(),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Text(
-                                label,
-                                style = MaterialTheme.typography.labelSmall,
-                                color = if (selected) selectedFlavor.primary.copy(alpha = 0.96f)
-                                else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.84f),
-                                maxLines = 1
-                            )
-                        }
-                    }
-                }
-            }
-        }
-
-        Spacer(Modifier.height(6.dp))
-        Text(
-            "Theme",
-            style = MaterialTheme.typography.titleSmall,
-            fontWeight = FontWeight.SemiBold,
-            color = selectedFlavor.primary.copy(alpha = 0.94f)
-        )
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            listOf("dark", "light", "system").forEach { mode ->
-                val selected = themeMode == mode
-                CitrosLiquidGlassSurface(
-                    modifier = Modifier.weight(1f),
-                    shape = RoundedCornerShape(999.dp),
-                    onClick = {
-                        themeMode = mode
-                        prefs.edit().putString(PREF_THEME_MODE, mode).apply()
-                        OverlayService.instance?.refreshAppearanceFromPrefs()
-                    },
-                    borderColor = if (selected) {
-                        selectedFlavor.primary.copy(alpha = 0.62f)
-                    } else {
-                        selectedFlavor.primary.copy(alpha = 0.28f)
-                    },
-                    borderWidth = if (selected) 1.6.dp else 1.dp,
-                    highlightColor = if (selected) selectedFlavor.primary else null,
-                    warmth = if (selected) 1.10f else 0.80f,
-                    contentPadding = PaddingValues(vertical = 10.dp)
-                ) {
-                    Box(
+        SettingsSectionHeader("Flavor")
+        SettingsGroupedSurface {
+            val flavorsPerRow = 3
+            val flavorRows = CitrosFlavor.entries.chunked(flavorsPerRow)
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 10.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                flavorRows.forEach { flavorRow ->
+                    Row(
                         modifier = Modifier.fillMaxWidth(),
-                        contentAlignment = Alignment.Center
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalAlignment = Alignment.Top
                     ) {
+                        flavorRow.forEach { flavor ->
+                            val selected = selectedFlavor == flavor
+                            val flavorTokens = citrosDirectiveFlavorTokens(flavor, surfaces)
+                            Column(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .clickable {
+                                        selectedFlavor = flavor
+                                        prefs.edit()
+                                            .putString(PREF_SELECTED_FLAVOR, flavor.storageValue)
+                                            .putString(PREF_SELECTED_FLAVOR_OPTION, flavor.storageValue)
+                                            .apply()
+                                        OverlayService.instance?.refreshAppearanceFromPrefs()
+                                        if (!OverlayController.isOverlayActive.value) {
+                                            runCatching {
+                                                syncLauncherIconWithPreferences(context)
+                                            }.onFailure { error ->
+                                                android.util.Log.w("AppearanceSettings", "Failed to sync launcher icon", error)
+                                            }
+                                        }
+                                    },
+                                horizontalAlignment = Alignment.CenterHorizontally
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(44.dp)
+                                        .background(
+                                            color = if (selected) surfaces.labelPrimary else surfaces.separator,
+                                            shape = CircleShape
+                                        )
+                                        .padding(if (selected) 2.dp else 1.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .background(flavorTokens.orbColor, CircleShape),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(14.dp)
+                                                .background(flavorTokens.orbInner, CircleShape)
+                                        )
+                                    }
+                                }
+                                Spacer(Modifier.height(6.dp))
+                                Text(
+                                    text = flavor.displayName,
+                                    style = CitrosTypography.bodySmall,
+                                    color = if (selected) surfaces.labelPrimary else surfaces.labelSecondary,
+                                    textAlign = TextAlign.Center,
+                                    maxLines = 2
+                                )
+                            }
+                        }
+                        repeat(flavorsPerRow - flavorRow.size) {
+                            Spacer(modifier = Modifier.weight(1f))
+                        }
+                    }
+                }
+            }
+        }
+
+        SettingsSectionHeader("Theme")
+        SettingsGroupedSurface {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 10.dp, vertical = 10.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                listOf("dark", "light", "system").forEach { mode ->
+                    val selected = themeMode == mode
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .clickable {
+                                themeMode = mode
+                                prefs.edit().putString(PREF_THEME_MODE, mode).apply()
+                                OverlayService.instance?.refreshAppearanceFromPrefs()
+                            },
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Surface(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(64.dp),
+                            shape = RoundedCornerShape(10.dp),
+                            color = surfaces.surface2,
+                            border = BorderStroke(
+                                width = if (selected) 2.dp else 1.dp,
+                                color = if (selected) surfaces.labelPrimary else surfaces.separator
+                            )
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .padding(4.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                when (mode) {
+                                    "dark" -> Box(
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .background(Color(0xFF1C1C1E), RoundedCornerShape(8.dp))
+                                    )
+                                    "light" -> Box(
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .background(Color(0xFFF2F2F7), RoundedCornerShape(8.dp))
+                                    )
+                                    else -> Canvas(modifier = Modifier.fillMaxSize()) {
+                                        drawRoundRect(
+                                            color = Color(0xFF1C1C1E),
+                                            cornerRadius = androidx.compose.ui.geometry.CornerRadius(16f, 16f)
+                                        )
+                                        val path = Path().apply {
+                                            moveTo(size.width, 0f)
+                                            lineTo(size.width, size.height)
+                                            lineTo(0f, size.height)
+                                            close()
+                                        }
+                                        drawPath(path = path, color = Color(0xFFF2F2F7))
+                                    }
+                                }
+                            }
+                        }
+                        Spacer(Modifier.height(6.dp))
                         Text(
-                            mode.replaceFirstChar { it.uppercase() },
-                            color = if (selected) selectedFlavor.primary.copy(alpha = 0.96f)
-                            else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.84f)
+                            text = mode.replaceFirstChar { it.uppercase() },
+                            style = CitrosTypography.bodyMedium,
+                            color = if (selected) surfaces.labelPrimary else surfaces.labelSecondary
                         )
                     }
                 }
             }
         }
-        Spacer(Modifier.height(6.dp))
+
+        SettingsSectionHeader("Auto-clear chat")
+        SettingsGroupedSurface {
+            val resolvedSelectedTimeout = autoClearOptions
+                .firstOrNull { it.second == selectedTimeout }
+                ?.second
+                ?: ConversationLifecycle.TIMEOUT_NEVER
+            autoClearOptions.forEachIndexed { index, (label, timeoutMs) ->
+                val selected = resolvedSelectedTimeout == timeoutMs
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable {
+                            selectedTimeout = timeoutMs
+                            chatPrefs.edit().putLong("idle_timeout_ms", timeoutMs).apply()
+                        }
+                        .padding(horizontal = 14.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = label,
+                        style = CitrosTypography.bodyLarge,
+                        color = surfaces.labelPrimary,
+                        modifier = Modifier.weight(1f)
+                    )
+                    if (selected) {
+                        SettingsSelectionCheck()
+                    }
+                }
+                if (index < autoClearOptions.lastIndex) {
+                    HorizontalDivider(
+                        color = surfaces.separatorLight,
+                        thickness = 0.5.dp
+                    )
+                }
+            }
+        }
     }
 }
-
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun AboutSettingsScreen(onBack: () -> Unit) {
     val context = LocalContext.current
     val flavor = remember { readSelectedFlavor(context) }
+    val isDarkTheme = LocalCitrosIsDark.current
+    val surfaces = remember(isDarkTheme) { citrosDirectiveSurfaces(isDarkTheme) }
+    val packageInfo = remember(context) {
+        runCatching {
+            @Suppress("DEPRECATION")
+            context.packageManager.getPackageInfo(context.packageName, 0)
+        }.getOrNull()
+    }
+    val versionName = packageInfo?.versionName ?: "0.1.0"
+    @Suppress("DEPRECATION")
+    val buildNumber = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+        packageInfo?.longVersionCode?.toString() ?: "1"
+    } else {
+        packageInfo?.versionCode?.toString() ?: "1"
+    }
+    fun openUrl(url: String) {
+        runCatching {
+            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+        }
+    }
     SettingsSubPageScaffold(
         flavor = flavor,
         title = "About",
         onBack = onBack
     ) {
+        SettingsSectionHeader("Citros")
         Text(
             "Citros",
-            style = MaterialTheme.typography.headlineMedium,
+            style = CitrosTypography.headlineMedium,
             fontWeight = FontWeight.SemiBold,
-            color = flavor.primary.copy(alpha = 0.96f)
+            color = surfaces.labelPrimary
         )
         Text(
             "AI phone agent for Android",
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.78f)
+            style = CitrosTypography.bodyMedium,
+            color = surfaces.labelSecondary
         )
-        CitrosLiquidGlassSurface(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(16.dp),
-            borderColor = flavor.primary.copy(alpha = 0.34f),
-            borderWidth = 1.dp,
-            highlightColor = flavor.primary,
-            warmth = 0.92f,
-            contentPadding = PaddingValues(14.dp)
-        ) {
-            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text("Version 0.1.0", color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.9f))
-                Text("Runtime: Rust + Kotlin", color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.86f))
-                Text("UI: Jetpack Compose", color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.86f))
-                Text("Min SDK: 28", color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.86f))
-            }
+        SettingsGroupedSurface {
+            SettingsListRow(
+                title = "Version",
+                showDivider = true,
+                trailing = {
+                    Text(
+                        text = versionName,
+                        style = CitrosTypography.bodyMedium,
+                        color = surfaces.labelTertiary
+                    )
+                }
+            )
+            SettingsListRow(
+                title = "Build",
+                showDivider = true
+                ,
+                trailing = {
+                    Text(
+                        text = buildNumber,
+                        style = CitrosTypography.bodyMedium,
+                        color = surfaces.labelTertiary
+                    )
+                }
+            )
+            SettingsListRow(
+                title = "Device",
+                showDivider = false,
+                trailing = {
+                    Text(
+                        text = Build.MODEL ?: "Android device",
+                        style = CitrosTypography.bodyMedium,
+                        color = surfaces.labelTertiary
+                    )
+                }
+            )
+        }
+        SettingsSectionHeader("Links")
+        SettingsGroupedSurface {
+            SettingsListRow(
+                title = "Licenses",
+                onClick = { },
+                showDivider = true,
+                trailing = {
+                    Text("›", color = surfaces.labelTertiary)
+                }
+            )
+            SettingsListRow(
+                title = "Privacy Policy",
+                onClick = { openUrl("https://citros.ai/privacy") },
+                showDivider = true,
+                trailing = {
+                    Text("›", color = surfaces.labelTertiary)
+                }
+            )
+            SettingsListRow(
+                title = "Source Code",
+                onClick = { openUrl("https://github.com/citros-ai/citros") },
+                showDivider = false,
+                trailing = {
+                    Text("›", color = surfaces.labelTertiary)
+                }
+            )
         }
         Text(
             "Made with citrus intent.",
-            style = MaterialTheme.typography.bodySmall,
-            color = flavor.primary.copy(alpha = 0.74f)
+            style = CitrosTypography.bodySmall,
+            color = surfaces.labelTertiary
         )
         Spacer(Modifier.height(6.dp))
     }
 }
-
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun SoundSettingsScreen(
     voiceManager: ai.citros.core.VoiceManager?,
@@ -673,269 +949,271 @@ internal fun SoundSettingsScreen(
 ) {
     val context = LocalContext.current
     val flavor = remember { readSelectedFlavor(context) }
+    val isDarkTheme = LocalCitrosIsDark.current
+    val surfaces = remember(isDarkTheme) { citrosDirectiveSurfaces(isDarkTheme) }
     val autoSpeak = voiceManager?.autoSpeakResponses?.collectAsState()?.value ?: false
     val autoSend = voiceManager?.autoSendAfterVoice?.collectAsState()?.value ?: false
+    val chatPrefs = remember(context) {
+        context.getSharedPreferences(CITROS_PREFS, Context.MODE_PRIVATE)
+    }
+    var hapticsEnabled by rememberSaveable {
+        mutableStateOf(chatPrefs.getBoolean("feedback_haptics_enabled", true))
+    }
+    var soundEffectsEnabled by rememberSaveable {
+        mutableStateOf(chatPrefs.getBoolean("feedback_sound_enabled", false))
+    }
     SettingsSubPageScaffold(
         flavor = flavor,
         title = "Sound & Haptics",
         onBack = onBack,
         scrollable = true
     ) {
-        Spacer(Modifier.height(12.dp))
-        // Voice Output section
-        CitrosLiquidGlassSurface(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(20.dp),
-            borderColor = flavor.primary.copy(alpha = 0.36f),
-            borderWidth = 1.dp,
-            highlightColor = flavor.primary,
-            warmth = 0.92f,
-            contentPadding = PaddingValues(horizontal = 18.dp, vertical = 16.dp)
-        ) {
-            Column(modifier = Modifier.fillMaxWidth()) {
-                Text(
-                    "Voice Output",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold,
-                    color = flavor.primary.copy(alpha = 0.96f)
-                )
-                Spacer(Modifier.height(16.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            "Read responses aloud",
-                            style = MaterialTheme.typography.bodyLarge,
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
-                        Text(
-                            "Speak AI responses using on-device TTS",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+        SettingsSectionHeader("Voice")
+        SettingsGroupedSurface {
+            SettingsListRow(
+                title = "Read responses aloud",
+                subtitle = "Speak AI responses using on-device TTS",
+                showDivider = true,
+                trailing = {
+                    Box(modifier = Modifier.padding(start = 12.dp)) {
+                        Switch(
+                            checked = autoSpeak,
+                            onCheckedChange = { voiceManager?.setAutoSpeakResponses(it) },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = Color.White,
+                                checkedTrackColor = surfaces.green,
+                                uncheckedThumbColor = surfaces.surface4,
+                                uncheckedTrackColor = surfaces.surface3
+                            )
                         )
                     }
-                    Switch(
-                        checked = autoSpeak,
-                        onCheckedChange = { voiceManager?.setAutoSpeakResponses(it) },
-                        colors = SwitchDefaults.colors(
-                            checkedThumbColor = flavor.primary,
-                            checkedTrackColor = flavor.primary.copy(alpha = 0.3f)
-                        )
-                    )
                 }
-                Spacer(Modifier.height(12.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            "Auto-send voice input",
-                            style = MaterialTheme.typography.bodyLarge,
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
-                        Text(
-                            "Send message immediately after voice recognition",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+            )
+            SettingsListRow(
+                title = "Auto-send voice input",
+                subtitle = "Send message immediately after voice recognition",
+                showDivider = false,
+                trailing = {
+                    Box(modifier = Modifier.padding(start = 12.dp)) {
+                        Switch(
+                            checked = autoSend,
+                            onCheckedChange = { voiceManager?.setAutoSendAfterVoice(it) },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = Color.White,
+                                checkedTrackColor = surfaces.green,
+                                uncheckedThumbColor = surfaces.surface4,
+                                uncheckedTrackColor = surfaces.surface3
+                            )
                         )
                     }
-                    Switch(
-                        checked = autoSend,
-                        onCheckedChange = { voiceManager?.setAutoSendAfterVoice(it) },
-                        colors = SwitchDefaults.colors(
-                            checkedThumbColor = flavor.primary,
-                            checkedTrackColor = flavor.primary.copy(alpha = 0.3f)
-                        )
-                    )
                 }
-            }
+            )
+        }
+        SettingsSectionHeader("Feedback")
+        SettingsGroupedSurface {
+            SettingsListRow(
+                title = "Haptic feedback",
+                subtitle = "Vibrate for key actions",
+                showDivider = true,
+                trailing = {
+                    Box(modifier = Modifier.padding(start = 12.dp)) {
+                        Switch(
+                            checked = hapticsEnabled,
+                            onCheckedChange = {
+                                hapticsEnabled = it
+                                chatPrefs.edit().putBoolean("feedback_haptics_enabled", it).apply()
+                            },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = Color.White,
+                                checkedTrackColor = surfaces.green,
+                                uncheckedThumbColor = surfaces.surface4,
+                                uncheckedTrackColor = surfaces.surface3
+                            )
+                        )
+                    }
+                }
+            )
+            SettingsListRow(
+                title = "Sound effects",
+                subtitle = "Play subtle interface sounds",
+                showDivider = false,
+                trailing = {
+                    Box(modifier = Modifier.padding(start = 12.dp)) {
+                        Switch(
+                            checked = soundEffectsEnabled,
+                            onCheckedChange = {
+                                soundEffectsEnabled = it
+                                chatPrefs.edit().putBoolean("feedback_sound_enabled", it).apply()
+                            },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = Color.White,
+                                checkedTrackColor = surfaces.green,
+                                uncheckedThumbColor = surfaces.surface4,
+                                uncheckedTrackColor = surfaces.surface3
+                            )
+                        )
+                    }
+                }
+            )
         }
     }
 }
-
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun PhoneControlSettingsScreen(
     context: Context,
     onBack: () -> Unit
 ) {
-    val overlayPermissionGranted = Settings.canDrawOverlays(context)
-    val accessibilityEnabled = isAccessibilityServiceEnabled(context)
+    val chatPrefs = remember(context) {
+        context.getSharedPreferences(CITROS_PREFS, Context.MODE_PRIVATE)
+    }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var overlayPermissionGranted by remember { mutableStateOf(Settings.canDrawOverlays(context)) }
+    var accessibilityEnabled by remember { mutableStateOf(isAccessibilityServiceEnabled(context)) }
     val flavor = remember { readSelectedFlavor(context) }
+    val isDarkTheme = LocalCitrosIsDark.current
+    val surfaces = remember(isDarkTheme) { citrosDirectiveSurfaces(isDarkTheme) }
+    var useIslandWhenIdle by rememberSaveable {
+        mutableStateOf(
+            chatPrefs.getBoolean(
+                PREF_OVERLAY_USE_ISLAND_WHEN_IDLE,
+                PREF_OVERLAY_USE_ISLAND_WHEN_IDLE_DEFAULT
+            )
+        )
+    }
+    var showSearchBarWhenIdle by rememberSaveable {
+        mutableStateOf(
+            chatPrefs.getBoolean(
+                PREF_OVERLAY_SHOW_SEARCH_BAR_WHEN_IDLE,
+                PREF_OVERLAY_SHOW_SEARCH_BAR_WHEN_IDLE_DEFAULT
+            )
+        )
+    }
     val okColor = Color(0xFF88F5B4)
     val warningColor = Color(0xFFFF8A8A)
-
+    fun refreshPermissionStatus() {
+        overlayPermissionGranted = Settings.canDrawOverlays(context)
+        accessibilityEnabled = isAccessibilityServiceEnabled(context)
+    }
+    LaunchedEffect(Unit) {
+        refreshPermissionStatus()
+    }
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                refreshPermissionStatus()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
     SettingsSubPageScaffold(
         flavor = flavor,
         title = "Phone Control",
         onBack = onBack
     ) {
-        Text(
-            "Citros needs these permissions to control your phone:",
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.78f)
-        )
-
-        CitrosLiquidGlassSurface(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(16.dp),
-            borderColor = if (accessibilityEnabled) okColor.copy(alpha = 0.44f) else flavor.primary.copy(alpha = 0.34f),
-            borderWidth = 1.dp,
-            highlightColor = if (accessibilityEnabled) okColor else flavor.primary,
-            warmth = 0.92f,
-            contentPadding = PaddingValues(16.dp)
-        ) {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text("Accessibility Service", style = MaterialTheme.typography.titleMedium)
-                    Text(
-                        if (accessibilityEnabled) "✓ Granted" else "⚠ Not granted",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = if (accessibilityEnabled) okColor else warningColor
-                    )
-                }
-                Text(
-                    "Required for automated actions like tapping, scrolling, and reading screen content",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.76f)
-                )
-                SettingsGlassPillButton(
-                    text = "Open Settings",
-                    tint = if (accessibilityEnabled) okColor else flavor.primary,
-                    onClick = {
-                        context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-                    }
-                )
-            }
-        }
-
-        CitrosLiquidGlassSurface(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(16.dp),
-            borderColor = if (overlayPermissionGranted) okColor.copy(alpha = 0.44f) else flavor.primary.copy(alpha = 0.34f),
-            borderWidth = 1.dp,
-            highlightColor = if (overlayPermissionGranted) okColor else flavor.primary,
-            warmth = 0.92f,
-            contentPadding = PaddingValues(16.dp)
-        ) {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text("Display over other apps", style = MaterialTheme.typography.titleMedium)
-                    Text(
-                        if (overlayPermissionGranted) "✓ Granted" else "⚠ Not granted",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = if (overlayPermissionGranted) okColor else warningColor
-                    )
-                }
-                Text(
-                    "Allows Citros to show confirmation dialogs and status indicators",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.76f)
-                )
-                SettingsGlassPillButton(
-                    text = "Open Settings",
-                    tint = if (overlayPermissionGranted) okColor else flavor.primary,
-                    onClick = {
-                        val intent = Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION)
-                        intent.data = Uri.parse("package:${context.packageName}")
-                        context.startActivity(intent)
-                    }
-                )
-            }
-        }
-
-        CitrosLiquidGlassSurface(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(16.dp),
-            borderColor = flavor.primary.copy(alpha = 0.34f),
-            borderWidth = 1.dp,
-            highlightColor = flavor.primary,
-            warmth = 0.90f,
-            contentPadding = PaddingValues(16.dp)
-        ) {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text(
-                    "Default Overlay Mode",
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.SemiBold,
-                    color = flavor.primary.copy(alpha = 0.94f)
-                )
-                Text(
-                    "How the overlay appears when the agent starts working",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.72f)
-                )
-                run {
-                    val chatPrefs = remember(context) {
-                        context.getSharedPreferences(CITROS_PREFS, Context.MODE_PRIVATE)
-                    }
-                    var selectedMode by rememberSaveable {
-                        mutableStateOf(
-                            chatPrefs.getString(PREF_DEFAULT_OVERLAY_MODE, OverlaySurfaceMode.MINI_CHAT.toPrefValue())
-                                ?: OverlaySurfaceMode.MINI_CHAT.toPrefValue()
+        SettingsSectionHeader("Permissions")
+        SettingsGroupedSurface {
+            SettingsListRow(
+                title = "Accessibility Service",
+                subtitle = "Read and interact with screen content",
+                onClick = { context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) },
+                showDivider = true,
+                trailing = {
+                    Surface(
+                        shape = RoundedCornerShape(999.dp),
+                        color = (if (accessibilityEnabled) okColor else warningColor).copy(alpha = 0.16f)
+                    ) {
+                        Text(
+                            text = if (accessibilityEnabled) "Granted" else "Not granted",
+                            style = CitrosTypography.labelSmall,
+                            color = if (accessibilityEnabled) okColor else warningColor,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
                         )
                     }
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        listOf(
-                            OverlaySurfaceMode.MINI_CHAT to "Mini Chat",
-                            OverlaySurfaceMode.BUBBLE to "Bubble"
-                        ).forEach { (mode, label) ->
-                            val value = mode.toPrefValue()
-                            val selected = selectedMode == value
-                            CitrosLiquidGlassSurface(
-                                modifier = Modifier.weight(1f),
-                                shape = RoundedCornerShape(999.dp),
-                                onClick = {
-                                    selectedMode = value
-                                    chatPrefs
-                                        .edit()
-                                        .putString(PREF_DEFAULT_OVERLAY_MODE, value)
-                                        .apply()
-                                },
-                                borderColor = if (selected) {
-                                    flavor.primary.copy(alpha = 0.62f)
-                                } else {
-                                    flavor.primary.copy(alpha = 0.28f)
-                                },
-                                borderWidth = if (selected) 1.6.dp else 1.dp,
-                                highlightColor = if (selected) flavor.primary else null,
-                                warmth = if (selected) 1.10f else 0.80f,
-                                contentPadding = PaddingValues(vertical = 10.dp)
-                            ) {
-                                Box(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Text(
-                                        label,
-                                        color = if (selected) flavor.primary.copy(alpha = 0.96f)
-                                        else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.84f)
-                                    )
-                                }
-                            }
-                        }
+                }
+            )
+            SettingsListRow(
+                title = "Overlay Permission",
+                subtitle = "Display Citros over other apps",
+                onClick = {
+                    val intent = Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION)
+                    intent.data = Uri.parse("package:${context.packageName}")
+                    context.startActivity(intent)
+                },
+                showDivider = false,
+                trailing = {
+                    Surface(
+                        shape = RoundedCornerShape(999.dp),
+                        color = (if (overlayPermissionGranted) okColor else warningColor).copy(alpha = 0.16f)
+                    ) {
+                        Text(
+                            text = if (overlayPermissionGranted) "Granted" else "Not granted",
+                            style = CitrosTypography.labelSmall,
+                            color = if (overlayPermissionGranted) okColor else warningColor,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                        )
                     }
                 }
-            }
+            )
         }
-        Spacer(Modifier.height(6.dp))
+        SettingsSectionHeader("Overlay Behavior")
+        SettingsGroupedSurface {
+            SettingsListRow(
+                title = "Automatic mode switching",
+                subtitle = "Citros switches between surfaces based on what it's doing.",
+                showDivider = true
+            )
+            SettingsListRow(
+                title = "Use island instead of search bar when idle",
+                subtitle = "Default behavior for idle overlay mode outside the app.",
+                showDivider = true,
+                trailing = {
+                    Box(modifier = Modifier.padding(start = 12.dp)) {
+                        Switch(
+                            checked = useIslandWhenIdle,
+                            onCheckedChange = {
+                                useIslandWhenIdle = it
+                                chatPrefs.edit().putBoolean(PREF_OVERLAY_USE_ISLAND_WHEN_IDLE, it).apply()
+                                OverlayController.updateIdleSurfacePreference(it)
+                            },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = Color.White,
+                                checkedTrackColor = surfaces.green,
+                                uncheckedThumbColor = surfaces.surface4,
+                                uncheckedTrackColor = surfaces.surface3
+                            )
+                        )
+                    }
+                }
+            )
+            SettingsListRow(
+                title = "Show search bar when idle",
+                subtitle = "Turn off to hide idle overlay when island idle mode is disabled.",
+                showDivider = false,
+                trailing = {
+                    Box(modifier = Modifier.padding(start = 12.dp)) {
+                        Switch(
+                            checked = showSearchBarWhenIdle,
+                            onCheckedChange = {
+                                showSearchBarWhenIdle = it
+                                chatPrefs.edit().putBoolean(PREF_OVERLAY_SHOW_SEARCH_BAR_WHEN_IDLE, it).apply()
+                                OverlayController.updateSearchBarIdlePreference(it)
+                            },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = Color.White,
+                                checkedTrackColor = surfaces.green,
+                                uncheckedThumbColor = surfaces.surface4,
+                                uncheckedTrackColor = surfaces.surface3
+                            )
+                        )
+                    }
+                }
+            )
+        }
     }
 }
-
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun ModelsSettingsScreen(
     walletManager: WalletManager,
@@ -943,60 +1221,122 @@ internal fun ModelsSettingsScreen(
 ) {
     val context = LocalContext.current
     val flavor = remember { readSelectedFlavor(context) }
+    val isDarkTheme = LocalCitrosIsDark.current
+    val surfaces = remember(isDarkTheme) { citrosDirectiveSurfaces(isDarkTheme) }
     var walletState by remember { mutableStateOf(walletManager.loadOrDefault()) }
     val activeProvider = walletState.keys.find { it.id == walletState.activeKeyId }?.provider
-
+    val chatPrefs = remember(context) {
+        context.getSharedPreferences(CITROS_PREFS, Context.MODE_PRIVATE)
+    }
+    var useLocalFallback by rememberSaveable {
+        mutableStateOf(chatPrefs.getBoolean("models_use_local_offline", true))
+    }
+    fun modelSubtitle(modelId: String): String = when {
+        modelId.contains("llama", ignoreCase = true) -> "On-device fallback model"
+        modelId.contains("sonnet", ignoreCase = true) -> "Balanced speed and capability"
+        modelId.contains("opus", ignoreCase = true) -> "Most capable cloud model"
+        modelId.contains("haiku", ignoreCase = true) -> "Fastest cloud response"
+        else -> modelId
+    }
     SettingsSubPageScaffold(
         flavor = flavor,
         title = "Models",
         onBack = onBack
     ) {
         if (activeProvider != null) {
-            ModelSelectionSection(
-                activeProvider = activeProvider,
-                chatModelId = walletState.chatModelId,
-                actionModelId = walletState.actionModelId,
-                flavor = flavor,
-                onChatChange = { modelId ->
-                    walletManager.setChatModel(modelId)
-                    walletState = walletManager.loadOrDefault()
-                },
-                onActionChange = { modelId ->
-                    walletManager.setActionModel(modelId)
-                    walletState = walletManager.loadOrDefault()
+            val chatModels = ai.citros.core.ModelConfig.chatModelsForProvider(activeProvider)
+            val actionModels = ai.citros.core.ModelConfig.actionModelsForProvider(activeProvider)
+            SettingsSectionHeader("Chat Model")
+            SettingsGroupedSurface {
+                chatModels.forEachIndexed { index, modelId ->
+                    val selected = modelId == walletState.chatModelId
+                    SettingsListRow(
+                        title = shortModelName(modelId),
+                        subtitle = modelSubtitle(modelId),
+                        onClick = {
+                            walletManager.setChatModel(modelId)
+                            walletState = walletManager.loadOrDefault()
+                        },
+                        showDivider = index < chatModels.lastIndex,
+                        trailing = {
+                            if (selected) {
+                                SettingsSelectionCheck()
+                            }
+                        }
+                    )
                 }
-            )
+            }
+            SettingsSectionHeader("Action Model")
+            SettingsGroupedSurface {
+                actionModels.forEachIndexed { index, modelId ->
+                    val selected = modelId == walletState.actionModelId
+                    SettingsListRow(
+                        title = shortModelName(modelId),
+                        subtitle = modelSubtitle(modelId),
+                        onClick = {
+                            walletManager.setActionModel(modelId)
+                            walletState = walletManager.loadOrDefault()
+                        },
+                        showDivider = index < actionModels.lastIndex,
+                        trailing = {
+                            if (selected) {
+                                SettingsSelectionCheck()
+                            }
+                        }
+                    )
+                }
+            }
+            SettingsSectionHeader("Fallback")
+            SettingsGroupedSurface {
+                SettingsListRow(
+                    title = "Use local model when offline",
+                    subtitle = "Automatically switch to an on-device fallback when provider calls fail",
+                    showDivider = false,
+                    trailing = {
+                        Box(modifier = Modifier.padding(start = 12.dp)) {
+                            Switch(
+                                checked = useLocalFallback,
+                                onCheckedChange = {
+                                    useLocalFallback = it
+                                    chatPrefs.edit().putBoolean("models_use_local_offline", it).apply()
+                                },
+                                colors = SwitchDefaults.colors(
+                                    checkedThumbColor = Color.White,
+                                    checkedTrackColor = surfaces.green,
+                                    uncheckedThumbColor = surfaces.surface4,
+                                    uncheckedTrackColor = surfaces.surface3
+                                )
+                            )
+                        }
+                    }
+                )
+            }
         } else {
-            CitrosLiquidGlassSurface(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(18.dp),
-                borderColor = flavor.primary.copy(alpha = 0.34f),
-                borderWidth = 1.dp,
-                highlightColor = flavor.primary,
-                warmth = 0.92f,
-                contentPadding = PaddingValues(16.dp)
-            ) {
+            SettingsSectionHeader("Models")
+            SettingsGroupedSurface {
                 Column(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 14.dp, vertical = 16.dp),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    Icon(
-                        imageVector = Icons.Filled.Key,
+                    CitrosIcon(
+                        imageVector = CitrosIcons.Key,
                         contentDescription = "No API Key",
-                        tint = flavor.primary.copy(alpha = 0.95f),
+                        tint = surfaces.labelTertiary,
                         modifier = Modifier.padding(12.dp)
                     )
                     Text(
                         "No API Key Active",
-                        style = MaterialTheme.typography.titleLarge,
+                        style = CitrosTypography.titleMedium,
                         fontWeight = FontWeight.SemiBold,
-                        color = flavor.primary.copy(alpha = 0.96f)
+                        color = surfaces.labelPrimary
                     )
                     Spacer(Modifier.height(8.dp))
                     Text(
                         "Add an API key in Settings → API Keys to configure model preferences",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.76f)
+                        style = CitrosTypography.bodySmall,
+                        color = surfaces.labelSecondary
                     )
                 }
             }
@@ -1004,7 +1344,192 @@ internal fun ModelsSettingsScreen(
         Spacer(Modifier.height(6.dp))
     }
 }
-
+@Composable
+internal fun ApiKeysSettingsScreen(
+    walletManager: WalletManager,
+    keyStore: ai.citros.core.KeyStore,
+    onBack: () -> Unit
+) {
+    val context = LocalContext.current
+    val flavor = remember { readSelectedFlavor(context) }
+    val isDarkTheme = LocalCitrosIsDark.current
+    val surfaces = remember(isDarkTheme) { citrosDirectiveSurfaces(isDarkTheme) }
+    var walletState by remember { mutableStateOf(walletManager.loadOrDefault()) }
+    var showAddSheet by remember { mutableStateOf(false) }
+    fun refreshWalletState() {
+        walletState = walletManager.loadOrDefault()
+    }
+    SettingsSubPageScaffold(
+        flavor = flavor,
+        title = "API Keys",
+        onBack = onBack
+    ) {
+        Text(
+            "CONNECTED PROVIDERS",
+            style = CitrosTypography.labelSmall,
+            color = surfaces.labelSecondary
+        )
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(14.dp),
+            color = surfaces.surface1,
+            border = androidx.compose.foundation.BorderStroke(1.dp, surfaces.separatorLight)
+        ) {
+            if (walletState.keys.isEmpty()) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 14.dp, vertical = 16.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Text(
+                        "No API keys connected",
+                        style = CitrosTypography.titleSmall,
+                        color = surfaces.labelPrimary
+                    )
+                    Text(
+                        "Add a provider key to enable cloud models.",
+                        style = CitrosTypography.bodySmall,
+                        color = surfaces.labelSecondary
+                    )
+                }
+            } else {
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    walletState.keys.forEachIndexed { index, key ->
+                        val isActive = walletState.activeKeyId == key.id
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    walletManager.setActiveKey(key.id)
+                                    refreshWalletState()
+                                }
+                                .padding(horizontal = 14.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = ProviderUi.icon(key.provider),
+                                style = CitrosTypography.titleMedium
+                            )
+                            Spacer(Modifier.width(10.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    key.label,
+                                    style = CitrosTypography.bodyLarge,
+                                    color = surfaces.labelPrimary
+                                )
+                                Text(
+                                    maskApiKey(keyStore.get(key.id)),
+                                    style = CitrosTypography.bodySmall,
+                                    color = surfaces.labelTertiary
+                                )
+                            }
+                            Row(
+                                modifier = Modifier.fillMaxHeight(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                if (isActive) {
+                                    Surface(
+                                        modifier = Modifier.height(26.dp),
+                                        shape = RoundedCornerShape(999.dp),
+                                        color = surfaces.green.copy(alpha = 0.18f)
+                                    ) {
+                                        Box(
+                                            modifier = Modifier
+                                                .fillMaxHeight()
+                                                .padding(horizontal = 8.dp),
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            Text(
+                                                "Active",
+                                                style = CitrosTypography.labelSmall,
+                                                color = surfaces.green
+                                            )
+                                        }
+                                    }
+                                }
+                                Surface(
+                                    modifier = Modifier
+                                        .size(26.dp)
+                                        .clickable {
+                                            walletManager.removeKey(key.id)
+                                            refreshWalletState()
+                                        },
+                                    shape = CircleShape,
+                                    color = Color.Transparent,
+                                    border = BorderStroke(1.dp, surfaces.separatorLight)
+                                ) {
+                                    Box(
+                                        modifier = Modifier.fillMaxSize(),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        SettingsTrashIcon(
+                                            tint = surfaces.labelPrimary,
+                                            modifier = Modifier.size(15.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                        if (index < walletState.keys.lastIndex) {
+                            HorizontalDivider(
+                                color = surfaces.separatorLight,
+                                thickness = 0.5.dp
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { showAddSheet = true },
+            shape = RoundedCornerShape(14.dp),
+            color = surfaces.surface1,
+            border = androidx.compose.foundation.BorderStroke(1.dp, surfaces.separatorLight)
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 14.dp, vertical = 14.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "Add provider",
+                    style = CitrosTypography.bodyLarge,
+                    color = surfaces.labelPrimary,
+                    modifier = Modifier.weight(1f)
+                )
+                Text(
+                    text = "+",
+                    style = CitrosTypography.headlineSmall,
+                    color = surfaces.labelTertiary
+                )
+            }
+        }
+        Text(
+            "Active key defaults are used for chat and action models.",
+            style = CitrosTypography.bodySmall,
+            color = surfaces.labelTertiary
+        )
+        Spacer(Modifier.height(6.dp))
+    }
+    if (showAddSheet) {
+        AddKeyBottomSheet(
+            flavor = flavor,
+            onDismiss = { showAddSheet = false },
+            onSave = { provider, label, apiKey ->
+                val created = walletManager.addKey(provider, label, apiKey)
+                walletManager.setActiveKey(created.id)
+                refreshWalletState()
+                showAddSheet = false
+            },
+            onTested = { _, _, _ -> }
+        )
+    }
+}
 @Composable
 private fun SettingsNavCard(
     icon: ImageVector,
@@ -1013,50 +1538,51 @@ private fun SettingsNavCard(
     flavor: CitrosFlavor,
     onClick: () -> Unit
 ) {
-    CitrosLiquidGlassSurface(
+    val isDarkTheme = LocalCitrosIsDark.current
+    val surfaces = remember(isDarkTheme) { citrosDirectiveSurfaces(isDarkTheme) }
+    Surface(
         modifier = Modifier
-            .fillMaxWidth(),
-        shape = androidx.compose.foundation.shape.RoundedCornerShape(16.dp),
-        onClick = onClick,
-        borderColor = flavor.primary.copy(alpha = 0.34f),
-        borderWidth = 1.dp,
-        highlightColor = flavor.primary,
-        warmth = 0.92f,
-        contentPadding = androidx.compose.foundation.layout.PaddingValues(14.dp)
+            .fillMaxWidth()
+            .semantics(mergeDescendants = true) {
+                contentDescription = "Settings card: $title"
+            }
+            .clickable(onClick = onClick),
+        shape = RoundedCornerShape(14.dp),
+        color = surfaces.surface1,
+        border = androidx.compose.foundation.BorderStroke(1.dp, surfaces.separatorLight)
     ) {
         Row(
             modifier = Modifier
-                .fillMaxWidth(),
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp, vertical = 12.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            CitrosLiquidGlassSurface(
-                shape = androidx.compose.foundation.shape.RoundedCornerShape(10.dp),
-                borderColor = flavor.primary.copy(alpha = 0.30f),
-                borderWidth = 1.dp,
-                highlightColor = flavor.primary,
-                warmth = 1.08f,
-                contentPadding = androidx.compose.foundation.layout.PaddingValues(8.dp)
+            Surface(
+                shape = RoundedCornerShape(10.dp),
+                color = surfaces.surface2
             ) {
-                Icon(
+                CitrosIcon(
                     imageVector = icon,
                     contentDescription = null,
-                    tint = flavor.primary.copy(alpha = 0.96f)
+                    tint = flavor.primary.copy(alpha = 0.88f),
+                    modifier = Modifier.padding(8.dp)
                 )
             }
             Column(modifier = Modifier.weight(1f)) {
                 Text(
                     title,
-                    style = MaterialTheme.typography.titleMedium,
-                    color = flavor.primary.copy(alpha = 0.94f)
+                    style = CitrosTypography.titleMedium,
+                    color = surfaces.labelPrimary,
+                    modifier = Modifier.clickable(onClick = onClick)
                 )
                 Text(
                     subtitle,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.78f)
+                    style = CitrosTypography.bodySmall,
+                    color = surfaces.labelSecondary
                 )
             }
-            Text("›", color = flavor.primary.copy(alpha = 0.72f))
+            Text("›", color = surfaces.labelTertiary)
         }
     }
 }

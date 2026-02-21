@@ -1,5 +1,4 @@
 package ai.citros.chat
-
 /**
  * FULL-SCREEN (ported) overlay UI embedded inside ChatActivity.
  *
@@ -14,14 +13,12 @@ package ai.citros.chat
  *   via [OverlayStateMapper], with working stop/resume, queued messages, and unread badges.
  * - **Preview mode**: omit the viewModel to use simulated sample data for UI iteration.
  */
-
 import android.content.Context
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -38,25 +35,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.automirrored.filled.Send
-import androidx.compose.material3.AssistChip
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
-import androidx.compose.material3.TextField
-import androidx.compose.material3.TextFieldDefaults
-import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -64,7 +42,6 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -84,9 +61,7 @@ import ai.citros.core.*
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-
 // Uses OverlaySurfaceMode from OverlayController.kt
-
 private object OverlayColors {
     val AppChrome = Color(0xFF101423)
     val PreviewBackground = Color(0xFF121727)
@@ -99,11 +74,9 @@ private object OverlayColors {
     val FakePhoneTextDim = Color(0xFFBBBBBB)
     val FakePhoneAccent = Color(0xFFFFD600)
     val FakePhoneChevron = Color(0xFF6B7280)
-
     val Success = Color(0xFF22C55E)
     val Error = Color(0xFFEF4444)
 }
-
 // Preview-only demo strings/data. These stay local for fast UI iteration and are not production i18n resources.
 private val overlaySteps = listOf(
     OverlayStep(step = 1, total = 5, label = "Opening Settings"),
@@ -112,7 +85,6 @@ private val overlaySteps = listOf(
     OverlayStep(step = 4, total = 5, label = "Connecting to network"),
     OverlayStep(step = 5, total = 5, label = "Verifying connection")
 )
-
 private val overlayLines = listOf(
     OverlayLine(id = 1, type = OverlayLineType.USER, text = "Turn on Wi-Fi and connect to home network"),
     OverlayLine(id = 2, type = OverlayLineType.SYSTEM, text = "Opening Settings app..."),
@@ -121,8 +93,7 @@ private val overlayLines = listOf(
     OverlayLine(id = 5, type = OverlayLineType.SYSTEM, text = "Enabling Wi-Fi toggle"),
     OverlayLine(id = 6, type = OverlayLineType.QUEUED, text = "also check bluetooth")
 )
-
-@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 internal fun OverlayPreviewScreen(
     context: Context,
@@ -150,23 +121,19 @@ internal fun OverlayPreviewScreen(
             onboardingPrefs.unregisterOnSharedPreferenceChangeListener(listener)
         }
     }
-    var surfaceMode by rememberSaveable { mutableStateOf(OverlaySurfaceMode.MINI_CHAT) }
+    var surfaceMode by rememberSaveable { mutableStateOf(OverlaySurfaceMode.DYNAMIC_ISLAND) }
     var runState by rememberSaveable { mutableStateOf(OverlayRunState.EXECUTING) }
     var stepIndex by rememberSaveable { mutableIntStateOf(0) }
-    var showBubbleQuickActions by rememberSaveable { mutableStateOf(false) }
     var isUndoStopVisible by rememberSaveable { mutableStateOf(false) }
     var queuedMessageDraft by rememberSaveable { mutableStateOf("") }
-    var isDismissingOverlay by rememberSaveable { mutableStateOf(false) }
     var fullAppMessageDraft by rememberSaveable { mutableStateOf("") }
     val isDarkTheme = LocalCitrosIsDark.current
     val previewBackground = if (isDarkTheme) {
         OverlayColors.PreviewBackground
     } else {
-        MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.44f)
+        CitrosColorScheme.surfaceVariant.copy(alpha = 0.44f)
     }
     val unreadCount = viewModel?.unreadCount?.intValue ?: 2
-    val coroutineScope = rememberCoroutineScope()
-
     // Derive overlay state from ChatViewModel if provided, otherwise use demo data
     val liveOverlayState = if (viewModel != null) {
         remember {
@@ -178,7 +145,6 @@ internal fun OverlayPreviewScreen(
             }
         }.value
     } else null
-    
     // Use live state if available, otherwise use demo state
     val activeSteps = liveOverlayState?.steps ?: overlaySteps
     val activeLines = if (liveOverlayState != null) {
@@ -194,15 +160,13 @@ internal fun OverlayPreviewScreen(
     }
     val activeRunState = liveOverlayState?.runState ?: runState
     val activeStepIndex = liveOverlayState?.currentStepIndex ?: stepIndex
-
     val currentStep = if (activeSteps.isEmpty()) {
         overlaySteps.first()
     } else {
-        activeSteps.getOrElse(activeStepIndex.coerceIn(0, activeSteps.lastIndex)) { 
-            overlaySteps.first() 
+        activeSteps.getOrElse(activeStepIndex.coerceIn(0, activeSteps.lastIndex)) {
+            overlaySteps.first()
         }
     }
-
     // Step ticker for demo mode only (not used when viewModel is provided)
     LaunchedEffect(runState) {
         if (viewModel == null && runState == OverlayRunState.EXECUTING) {
@@ -212,22 +176,17 @@ internal fun OverlayPreviewScreen(
             }
         }
     }
-
     // No auto-hide timer for undo banner — stays until user sends a message or taps Resume (#473)
-
-
     LaunchedEffect(viewModel?.queuedMessage?.value) {
         if (viewModel != null) {
             queuedMessageDraft = viewModel.queuedMessage.value.orEmpty()
         }
     }
-
     LaunchedEffect(surfaceMode, viewModel) {
-        if (viewModel != null && surfaceMode == OverlaySurfaceMode.MINI_CHAT) {
+        if (viewModel != null && surfaceMode == OverlaySurfaceMode.PANEL) {
             viewModel.resetUnreadCount()
         }
     }
-
     val stopAction = {
         if (viewModel != null) {
             viewModel.cancelToolExecution()
@@ -236,14 +195,13 @@ internal fun OverlayPreviewScreen(
         }
         isUndoStopVisible = true
     }
-
     Scaffold(
         topBar = {
             TopAppBar(
                 title = { Text("Phone Control Overlay") },
                 navigationIcon = {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                    CitrosIconButton(onClick = onBack) {
+                        CitrosIcon(CitrosIcons.ArrowBack, contentDescription = "Back")
                     }
                 }
             )
@@ -259,8 +217,8 @@ internal fun OverlayPreviewScreen(
             Surface(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(OverlayUiConstants.ControlPanelCornerRadius),
-                color = MaterialTheme.colorScheme.surface,
-                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.35f))
+                color = CitrosColorScheme.surface,
+                border = BorderStroke(1.dp, CitrosColorScheme.outline.copy(alpha = 0.35f))
             ) {
                 Column(
                     modifier = Modifier
@@ -270,21 +228,27 @@ internal fun OverlayPreviewScreen(
                 ) {
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         OverlayModeChip(
-                            label = "Mini-Chat",
-                            selected = surfaceMode == OverlaySurfaceMode.MINI_CHAT,
+                            label = "Search Bar",
+                            selected = surfaceMode == OverlaySurfaceMode.SEARCH_BAR,
                             accent = flavor.primary,
                             onClick = {
-                                surfaceMode = OverlaySurfaceMode.MINI_CHAT
-                                showBubbleQuickActions = false
+                                surfaceMode = OverlaySurfaceMode.SEARCH_BAR
                             }
                         )
                         OverlayModeChip(
-                            label = "Bubble",
-                            selected = surfaceMode == OverlaySurfaceMode.BUBBLE,
+                            label = "Panel",
+                            selected = surfaceMode == OverlaySurfaceMode.PANEL,
                             accent = flavor.primary,
                             onClick = {
-                                surfaceMode = OverlaySurfaceMode.BUBBLE
-                                showBubbleQuickActions = false
+                                surfaceMode = OverlaySurfaceMode.PANEL
+                            }
+                        )
+                        OverlayModeChip(
+                            label = "Dynamic Island",
+                            selected = surfaceMode == OverlaySurfaceMode.DYNAMIC_ISLAND,
+                            accent = flavor.primary,
+                            onClick = {
+                                surfaceMode = OverlaySurfaceMode.DYNAMIC_ISLAND
                             }
                         )
                         OverlayModeChip(
@@ -292,7 +256,6 @@ internal fun OverlayPreviewScreen(
                             selected = surfaceMode == OverlaySurfaceMode.FULL_APP,
                             accent = flavor.primary,
                             onClick = {
-                                showBubbleQuickActions = false
                                 if (viewModel != null) {
                                     onNavigateToChat?.invoke()
                                 } else {
@@ -355,7 +318,6 @@ internal fun OverlayPreviewScreen(
                     }
                 }
             }
-
             Box(
                 modifier = Modifier
                     .weight(1f)
@@ -364,7 +326,7 @@ internal fun OverlayPreviewScreen(
                     .background(previewBackground)
                     .border(
                         width = 1.dp,
-                        color = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f),
+                        color = CitrosColorScheme.outline.copy(alpha = 0.35f),
                         shape = RoundedCornerShape(OverlayUiConstants.PreviewCornerRadius)
                     )
             ) {
@@ -385,17 +347,16 @@ internal fun OverlayPreviewScreen(
                                 }
                             },
                             onReturnToOverlay = {
-                                if (viewModel != null) onNavigateToChat?.invoke() else surfaceMode = OverlaySurfaceMode.MINI_CHAT
+                                if (viewModel != null) onNavigateToChat?.invoke() else surfaceMode = OverlaySurfaceMode.PANEL
                             },
                             onStopAction = stopAction
                         )
                     }
-
-                    OverlaySurfaceMode.MINI_CHAT,
-                    OverlaySurfaceMode.BUBBLE -> {
+                    OverlaySurfaceMode.PANEL,
+                    OverlaySurfaceMode.SEARCH_BAR,
+                    OverlaySurfaceMode.DYNAMIC_ISLAND -> {
                         FakeUnderlyingPhoneSurface()
-
-                        if (surfaceMode == OverlaySurfaceMode.MINI_CHAT) {
+                        if (surfaceMode == OverlaySurfaceMode.PANEL) {
                             MiniChatOverlayCard(
                                 modifier = Modifier
                                     .align(Alignment.BottomCenter)
@@ -439,44 +400,58 @@ internal fun OverlayPreviewScreen(
                                 },
                                 onStopAction = stopAction,
                                 onOpenFull = { if (viewModel != null) onNavigateToChat?.invoke() else surfaceMode = OverlaySurfaceMode.FULL_APP },
-                                onOpenBubble = { surfaceMode = OverlaySurfaceMode.BUBBLE }
+                                onOpenIsland = { surfaceMode = OverlaySurfaceMode.DYNAMIC_ISLAND },
+                                onMinimize = { surfaceMode = OverlaySurfaceMode.SEARCH_BAR }
                             )
                         }
-
-                        if (surfaceMode == OverlaySurfaceMode.BUBBLE) {
-                            BubbleOverlay(
+                        if (surfaceMode == OverlaySurfaceMode.SEARCH_BAR) {
+                            val latestSystemLine = activeLines.lastOrNull { it.type == OverlayLineType.SYSTEM }
+                                ?.text
+                                ?.removePrefix("💥")
+                                ?.removePrefix("Error:")
+                                ?.trim()
+                                .orEmpty()
+                            val statusText = when (activeRunState) {
+                                OverlayRunState.EXECUTING -> currentStep.label
+                                OverlayRunState.COMPLETED,
+                                OverlayRunState.FAILED,
+                                OverlayRunState.STOPPED -> latestSystemLine.ifBlank { currentStep.label }
+                                OverlayRunState.IDLE -> ""
+                            }
+                            OverlaySearchBarContent(
                                 modifier = Modifier
-                                    .align(Alignment.BottomEnd)
-                                    .padding(end = 12.dp, bottom = 14.dp),
+                                    .align(Alignment.BottomCenter)
+                                    .padding(horizontal = OverlayUiConstants.SearchBarHorizontalMargin, vertical = 12.dp),
                                 flavor = flavor,
                                 runState = activeRunState,
+                                statusLabel = statusText,
                                 unreadCount = unreadCount,
-                                isQuickActionsOpen = showBubbleQuickActions,
-                                onToggleQuickActions = { showBubbleQuickActions = !showBubbleQuickActions },
                                 onExpand = {
-                                    surfaceMode = OverlaySurfaceMode.MINI_CHAT
-                                    showBubbleQuickActions = false
+                                    surfaceMode = OverlaySurfaceMode.PANEL
                                 },
                                 onStopAction = {
                                     stopAction()
-                                    showBubbleQuickActions = false
-                                },
-                                onDismissQuickActions = { showBubbleQuickActions = false },
-                                onDismissOverlay = {
-                                    if (isDismissingOverlay) return@BubbleOverlay
-                                    showBubbleQuickActions = false
+                                }
+                            )
+                        }
+                        if (surfaceMode == OverlaySurfaceMode.DYNAMIC_ISLAND) {
+                            OverlayDynamicIslandContent(
+                                flavor = flavor,
+                                runState = activeRunState,
+                                currentStepLabel = currentStep.label,
+                                unreadCount = unreadCount,
+                                onExpand = { surfaceMode = OverlaySurfaceMode.PANEL },
+                                onStopAction = stopAction,
+                                onDismiss = {
                                     if (viewModel != null) {
                                         onOverlayMinimized?.invoke()
                                     } else {
-                                        isDismissingOverlay = true
-                                        coroutineScope.launch {
-                                            runState = OverlayRunState.COMPLETED
-                                            delay(OverlayUiConstants.DISMISS_ANIMATION_DELAY_MS)
-                                            surfaceMode = OverlaySurfaceMode.FULL_APP
-                                            isDismissingOverlay = false
-                                        }
+                                        surfaceMode = OverlaySurfaceMode.FULL_APP
                                     }
-                                }
+                                },
+                                modifier = Modifier
+                                    .align(Alignment.TopCenter)
+                                    .padding(top = 12.dp)
                             )
                         }
                     }
@@ -485,7 +460,6 @@ internal fun OverlayPreviewScreen(
         }
     }
 }
-
 @Composable
 private fun OverlayModeChip(
     label: String,
@@ -495,7 +469,7 @@ private fun OverlayModeChip(
 ) {
     Surface(
         shape = RoundedCornerShape(OverlayUiConstants.PillCornerRadius),
-        color = if (selected) accent else MaterialTheme.colorScheme.surfaceVariant,
+        color = if (selected) accent else CitrosColorScheme.surfaceVariant,
         modifier = Modifier
             .clip(RoundedCornerShape(OverlayUiConstants.PillCornerRadius))
             .semantics {
@@ -506,12 +480,11 @@ private fun OverlayModeChip(
         Text(
             text = label,
             modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
-            style = MaterialTheme.typography.labelMedium,
-            color = if (selected) contrastOn(accent) else MaterialTheme.colorScheme.onSurfaceVariant
+            style = CitrosTypography.labelMedium,
+            color = if (selected) contrastOn(accent) else CitrosColorScheme.onSurfaceVariant
         )
     }
 }
-
 @Composable
 private fun OverlayStateChip(
     label: String,
@@ -528,8 +501,8 @@ private fun OverlayStateChip(
             }
             .clickable(onClick = onClick),
         shape = RoundedCornerShape(OverlayUiConstants.ModeChipCornerRadius),
-        color = if (selected) tint.copy(alpha = 0.2f) else MaterialTheme.colorScheme.surface,
-        border = BorderStroke(1.dp, if (selected) tint.copy(alpha = 0.65f) else MaterialTheme.colorScheme.outline.copy(alpha = 0.4f))
+        color = if (selected) tint.copy(alpha = 0.2f) else CitrosColorScheme.surface,
+        border = BorderStroke(1.dp, if (selected) tint.copy(alpha = 0.65f) else CitrosColorScheme.outline.copy(alpha = 0.4f))
     ) {
         Box(
             modifier = Modifier
@@ -539,19 +512,17 @@ private fun OverlayStateChip(
         ) {
             Text(
                 text = label,
-                style = MaterialTheme.typography.labelSmall,
-                color = if (selected) tint else MaterialTheme.colorScheme.onSurfaceVariant
+                style = CitrosTypography.labelSmall,
+                color = if (selected) tint else CitrosColorScheme.onSurfaceVariant
             )
         }
     }
 }
-
 private fun overlayRunStateColor(runState: OverlayRunState): Color = when (runState) {
     OverlayRunState.IDLE -> Color.Unspecified
     OverlayRunState.EXECUTING, OverlayRunState.COMPLETED -> OverlayColors.Success
     OverlayRunState.FAILED, OverlayRunState.STOPPED -> OverlayColors.Error
 }
-
 @Composable
 private fun OverlayRunStateDot(runState: OverlayRunState) {
     Box(
@@ -561,7 +532,6 @@ private fun OverlayRunStateDot(runState: OverlayRunState) {
             .background(overlayRunStateColor(runState))
     )
 }
-
 @Composable
 internal fun FullAppOverlayContent(
     flavor: CitrosFlavor,
@@ -579,9 +549,8 @@ internal fun FullAppOverlayContent(
     val appChromeColor = if (isDarkTheme) {
         OverlayColors.AppChrome
     } else {
-        MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.84f)
+        CitrosColorScheme.surfaceVariant.copy(alpha = 0.84f)
     }
-
     // Auto-scroll to bottom when lines change or last line content updates.
     val fullLastLineText = lines.lastOrNull()?.text
     LaunchedEffect(lines.size, fullLastLineText) {
@@ -594,7 +563,6 @@ internal fun FullAppOverlayContent(
             fullScrollState.animateScrollTo(fullScrollState.maxValue)
         }
     }
-
     Column(modifier = Modifier.fillMaxSize()) {
         Row(
             modifier = Modifier
@@ -605,16 +573,15 @@ internal fun FullAppOverlayContent(
         ) {
             Text(
                 "Citros",
-                style = MaterialTheme.typography.titleMedium,
+                style = CitrosTypography.titleMedium,
                 color = contrastOn(appChromeColor),
                 fontWeight = FontWeight.SemiBold,
                 modifier = Modifier.weight(1f)
             )
             TextButton(onClick = onReturnToOverlay, contentPadding = OverlayUiConstants.StandardChipPadding) {
-                Text("Overlay", style = MaterialTheme.typography.labelMedium)
+                Text("Overlay", style = CitrosTypography.labelMedium)
             }
         }
-
         Surface(
             modifier = Modifier
                 .fillMaxWidth()
@@ -640,13 +607,13 @@ internal fun FullAppOverlayContent(
                             OverlayRunState.FAILED -> "Action failed"
                             OverlayRunState.STOPPED -> "Action stopped"
                         },
-                        style = MaterialTheme.typography.labelLarge,
-                        color = MaterialTheme.colorScheme.onSurface
+                        style = CitrosTypography.labelLarge,
+                        color = CitrosColorScheme.onSurface
                     )
                     Text(
                         text = "${currentStep.label} - Step ${currentStep.step}/${currentStep.total}",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.72f)
+                        style = CitrosTypography.bodySmall,
+                        color = CitrosColorScheme.onSurface.copy(alpha = 0.72f)
                     )
                 }
                 Button(
@@ -655,18 +622,17 @@ internal fun FullAppOverlayContent(
                     contentPadding = OverlayUiConstants.ActionChipPadding,
                     modifier = Modifier.semantics { contentDescription = "Return to overlay" }
                 ) {
-                    Text("Return", style = MaterialTheme.typography.labelSmall, color = contrastOn(flavor.primary))
+                    Text("Return", style = CitrosTypography.labelSmall, color = contrastOn(flavor.primary))
                 }
                 OutlinedButton(
                     onClick = onStopAction,
                     contentPadding = OverlayUiConstants.ActionChipPadding,
                     modifier = Modifier.semantics { contentDescription = "Stop current action" }
                 ) {
-                    Text("Stop", style = MaterialTheme.typography.labelSmall, color = OverlayColors.Error)
+                    Text("Stop", style = CitrosTypography.labelSmall, color = OverlayColors.Error)
                 }
             }
         }
-
         Column(
             modifier = Modifier
                 .weight(1f)
@@ -676,31 +642,30 @@ internal fun FullAppOverlayContent(
         ) {
             Surface(
                 shape = RoundedCornerShape(OverlayUiConstants.StandardCardCornerRadius),
-                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.96f),
-                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.3f))
+                color = CitrosColorScheme.surface.copy(alpha = 0.96f),
+                border = BorderStroke(1.dp, CitrosColorScheme.outline.copy(alpha = 0.3f))
             ) {
                 Text(
                     text = "On it. I will open Settings and turn on Wi-Fi for you.",
                     modifier = Modifier.padding(12.dp),
-                    style = MaterialTheme.typography.bodyMedium
+                    style = CitrosTypography.bodyMedium
                 )
             }
             lines.filter { it.type == OverlayLineType.SYSTEM }.take(3).forEach { line ->
                 Surface(
                     shape = RoundedCornerShape(OverlayUiConstants.StandardCardCornerRadius),
-                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.92f),
-                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.3f))
+                    color = CitrosColorScheme.surface.copy(alpha = 0.92f),
+                    border = BorderStroke(1.dp, CitrosColorScheme.outline.copy(alpha = 0.3f))
                 ) {
                     MarkdownText(
                         text = line.text,
                         modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f)
+                        style = CitrosTypography.bodySmall,
+                        color = CitrosColorScheme.onSurface.copy(alpha = 0.8f)
                     )
                 }
             }
         }
-
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -710,6 +675,7 @@ internal fun FullAppOverlayContent(
             TextField(
                 value = messageDraft,
                 onValueChange = onMessageDraftChange,
+                contentDescription = "Message input",
                 modifier = Modifier
                     .weight(1f)
                     .onFocusChanged { focusState ->
@@ -718,19 +684,18 @@ internal fun FullAppOverlayContent(
                         } else {
                             OverlayService.instance?.moveOverlayToBottom()
                         }
-                    }
-                    .semantics { contentDescription = "Message input" },
+                    },
                 placeholder = { Text("Message Citros...") },
                 singleLine = true,
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
                 keyboardActions = KeyboardActions(onSend = { onSendMessage() })
             )
-            IconButton(
+            CitrosIconButton(
                 onClick = onSendMessage,
                 enabled = messageDraft.trim().isNotBlank()
             ) {
-                Icon(
-                    imageVector = Icons.AutoMirrored.Filled.Send,
+                CitrosIcon(
+                    imageVector = CitrosIcons.Send,
                     contentDescription = "Send message",
                     tint = if (messageDraft.trim().isNotBlank()) flavor.primary else Color.Gray
                 )
@@ -738,19 +703,18 @@ internal fun FullAppOverlayContent(
         }
     }
 }
-
 @Composable
 private fun FakeUnderlyingPhoneSurface() {
     val isDarkTheme = LocalCitrosIsDark.current
-    val baseColor = if (isDarkTheme) OverlayColors.FakePhoneBase else MaterialTheme.colorScheme.surface
-    val barColor = if (isDarkTheme) OverlayColors.FakePhoneBar else MaterialTheme.colorScheme.surfaceVariant
-    val surfaceColor = if (isDarkTheme) OverlayColors.FakePhoneSurface else MaterialTheme.colorScheme.background
-    val borderColor = if (isDarkTheme) OverlayColors.FakePhoneBorder else MaterialTheme.colorScheme.outline.copy(alpha = 0.24f)
-    val mutedTextColor = if (isDarkTheme) OverlayColors.FakePhoneTextMuted else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.58f)
-    val brightTextColor = if (isDarkTheme) OverlayColors.FakePhoneTextBright else MaterialTheme.colorScheme.onSurface
-    val dimTextColor = if (isDarkTheme) OverlayColors.FakePhoneTextDim else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.74f)
-    val accentColor = if (isDarkTheme) OverlayColors.FakePhoneAccent else MaterialTheme.colorScheme.primary
-    val chevronColor = if (isDarkTheme) OverlayColors.FakePhoneChevron else MaterialTheme.colorScheme.onSurfaceVariant
+    val baseColor = if (isDarkTheme) OverlayColors.FakePhoneBase else CitrosColorScheme.surface
+    val barColor = if (isDarkTheme) OverlayColors.FakePhoneBar else CitrosColorScheme.surfaceVariant
+    val surfaceColor = if (isDarkTheme) OverlayColors.FakePhoneSurface else CitrosColorScheme.background
+    val borderColor = if (isDarkTheme) OverlayColors.FakePhoneBorder else CitrosColorScheme.outline.copy(alpha = 0.24f)
+    val mutedTextColor = if (isDarkTheme) OverlayColors.FakePhoneTextMuted else CitrosColorScheme.onSurface.copy(alpha = 0.58f)
+    val brightTextColor = if (isDarkTheme) OverlayColors.FakePhoneTextBright else CitrosColorScheme.onSurface
+    val dimTextColor = if (isDarkTheme) OverlayColors.FakePhoneTextDim else CitrosColorScheme.onSurface.copy(alpha = 0.74f)
+    val accentColor = if (isDarkTheme) OverlayColors.FakePhoneAccent else CitrosColorScheme.primary
+    val chevronColor = if (isDarkTheme) OverlayColors.FakePhoneChevron else CitrosColorScheme.onSurfaceVariant
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -763,24 +727,22 @@ private fun FakeUnderlyingPhoneSurface() {
                 .padding(horizontal = 12.dp, vertical = 6.dp),
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            Text("9:41", style = MaterialTheme.typography.labelSmall, color = mutedTextColor)
+            Text("9:41", style = CitrosTypography.labelSmall, color = mutedTextColor)
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text("NET", style = MaterialTheme.typography.labelSmall, color = mutedTextColor)
-                Text("BAT", style = MaterialTheme.typography.labelSmall, color = mutedTextColor)
+                Text("NET", style = CitrosTypography.labelSmall, color = mutedTextColor)
+                Text("BAT", style = CitrosTypography.labelSmall, color = mutedTextColor)
             }
         }
-
         Text(
             text = "Settings",
             modifier = Modifier
                 .fillMaxWidth()
                 .background(barColor)
                 .padding(horizontal = 16.dp, vertical = 12.dp),
-            style = MaterialTheme.typography.titleMedium,
+            style = CitrosTypography.titleMedium,
             color = brightTextColor,
             fontWeight = FontWeight.Medium
         )
-
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -808,16 +770,15 @@ private fun FakeUnderlyingPhoneSurface() {
                 ) {
                     Text(
                         text = item,
-                        style = MaterialTheme.typography.bodySmall,
+                        style = CitrosTypography.bodySmall,
                         color = if (index == 0) accentColor else dimTextColor
                     )
-                    Text(">", style = MaterialTheme.typography.bodySmall, color = chevronColor)
+                    Text(">", style = CitrosTypography.bodySmall, color = chevronColor)
                 }
             }
         }
     }
 }
-
 @Composable
 internal fun MiniChatOverlayCard(
     flavor: CitrosFlavor,
@@ -831,11 +792,30 @@ internal fun MiniChatOverlayCard(
     onResumeOrRetry: () -> Unit,
     onStopAction: () -> Unit,
     onOpenFull: () -> Unit,
-    onOpenBubble: () -> Unit,
+    onOpenIsland: () -> Unit,
+    onMinimize: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val scrollState = rememberScrollState()
-
+    val isDarkTheme = LocalCitrosIsDark.current
+    val surfaces = remember(isDarkTheme) { citrosDirectiveSurfaces(isDarkTheme) }
+    val panelColor = if (isDarkTheme) {
+        Color(0xEB1C1C1E)
+    } else {
+        Color(0xEBF2F2F7)
+    }
+    val statusColor = when (runState) {
+        OverlayRunState.EXECUTING, OverlayRunState.COMPLETED -> OverlayColors.Success
+        OverlayRunState.FAILED, OverlayRunState.STOPPED -> OverlayColors.Error
+        OverlayRunState.IDLE -> flavor.primary.copy(alpha = 0.78f)
+    }
+    val statusText = when (runState) {
+        OverlayRunState.IDLE -> "Ready"
+        OverlayRunState.EXECUTING -> currentStep.label
+        OverlayRunState.COMPLETED -> "Completed"
+        OverlayRunState.FAILED -> "Action failed"
+        OverlayRunState.STOPPED -> "Stopped"
+    }
     // Auto-scroll to bottom when lines change or last line content updates.
     // The delay ensures Compose has laid out new content (especially after
     // overlay activation, when the view may not have measured yet).
@@ -850,68 +830,116 @@ internal fun MiniChatOverlayCard(
             scrollState.animateScrollTo(scrollState.maxValue)
         }
     }
-
     Surface(
         modifier = modifier,
         shape = RoundedCornerShape(OverlayUiConstants.MiniChatCornerRadius),
-        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.96f),
-        border = BorderStroke(1.dp, flavor.primary.copy(alpha = 0.45f)),
-        tonalElevation = 6.dp
+        color = panelColor,
+        border = BorderStroke(1.dp, surfaces.separator),
+        tonalElevation = 8.dp
     ) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .heightIn(max = OverlayUiConstants.MiniChatMaxHeight),
-            verticalArrangement = Arrangement.spacedBy(0.dp)
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 8.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(width = 36.dp, height = 4.dp)
+                        .background(surfaces.labelTertiary.copy(alpha = 0.45f), RoundedCornerShape(999.dp))
+                )
+            }
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 10.dp, vertical = 9.dp),
+                    .padding(horizontal = 12.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                CitrosFloatingAppIconGraphic(
+                CitrosDirectiveOrb(
                     flavor = flavor,
-                    size = 22.dp,
-                    showBackground = false,
-                    orbOnly = true
+                    size = 24.dp
                 )
                 Text(
-                    text = when (runState) {
-                        OverlayRunState.IDLE -> "Ready"
-                        OverlayRunState.EXECUTING -> currentStep.label
-                        OverlayRunState.COMPLETED -> "Completed"
-                        OverlayRunState.FAILED -> "Action failed"
-                        OverlayRunState.STOPPED -> "Stopped"
-                    },
-                    style = MaterialTheme.typography.labelMedium,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
+                    text = "Citros",
+                    style = CitrosTypography.labelLarge,
+                    fontWeight = FontWeight.SemiBold,
                     modifier = Modifier.weight(1f),
-                    color = when (runState) {
-                        OverlayRunState.EXECUTING, OverlayRunState.IDLE -> MaterialTheme.colorScheme.onSurface
-                        else -> overlayRunStateColor(runState)
-                    }
+                    color = surfaces.labelPrimary
                 )
-                TextButton(
-                    onClick = onOpenFull,
-                    contentPadding = OverlayUiConstants.CompactChipPadding,
-                    colors = ButtonDefaults.textButtonColors(contentColor = flavor.primary),
-                    modifier = Modifier.semantics { contentDescription = "Open full app mode" }
+                Surface(
+                    shape = RoundedCornerShape(999.dp),
+                    color = surfaces.surface2,
+                    border = BorderStroke(1.dp, surfaces.separatorLight),
+                    modifier = Modifier
+                        .clickable(onClick = onOpenFull)
+                        .semantics { contentDescription = "Open full app mode" }
                 ) {
-                    Text("Full", style = MaterialTheme.typography.labelSmall, color = flavor.primary)
+                    Text(
+                        text = "Full",
+                        style = CitrosTypography.labelSmall,
+                        color = surfaces.labelSecondary,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                    )
                 }
-                TextButton(
-                    onClick = onOpenBubble,
-                    contentPadding = OverlayUiConstants.CompactChipPadding,
-                    colors = ButtonDefaults.textButtonColors(contentColor = flavor.primary),
-                    modifier = Modifier.semantics { contentDescription = "Open bubble mode" }
+                Surface(
+                    shape = RoundedCornerShape(999.dp),
+                    color = surfaces.surface2,
+                    border = BorderStroke(1.dp, surfaces.separatorLight),
+                    modifier = Modifier
+                        .clickable(onClick = onOpenIsland)
+                        .semantics { contentDescription = "Open dynamic island mode" }
                 ) {
-                    Text("Bubble", style = MaterialTheme.typography.labelSmall, color = flavor.primary)
+                    Text(
+                        text = "Island",
+                        style = CitrosTypography.labelSmall,
+                        color = surfaces.labelSecondary,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                    )
+                }
+                Surface(
+                    shape = RoundedCornerShape(999.dp),
+                    color = surfaces.surface2,
+                    border = BorderStroke(1.dp, surfaces.separatorLight),
+                    modifier = Modifier
+                        .clickable(onClick = onMinimize)
+                        .semantics { contentDescription = "Minimize to search bar" }
+                ) {
+                    Text(
+                        text = "↓",
+                        style = CitrosTypography.labelSmall,
+                        color = surfaces.labelSecondary,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                    )
                 }
             }
-
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(6.dp)
+                        .background(statusColor, CircleShape)
+                )
+                Text(
+                    text = statusText,
+                    style = CitrosTypography.bodySmall,
+                    color = surfaces.labelSecondary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
+                )
+            }
             Column(
                 modifier = Modifier
                     .weight(1f)
@@ -920,95 +948,120 @@ internal fun MiniChatOverlayCard(
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 lines.forEach { line ->
-                    Row(
-                        verticalAlignment = Alignment.Top,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    val bubbleColor = when (line.type) {
+                        OverlayLineType.SYSTEM -> surfaces.surface2
+                        OverlayLineType.USER -> surfaces.surface1
+                        OverlayLineType.QUEUED -> flavor.primary.copy(alpha = 0.14f)
+                    }
+                    val bubbleBorder = when (line.type) {
+                        OverlayLineType.QUEUED -> flavor.primary.copy(alpha = 0.34f)
+                        else -> surfaces.separatorLight
+                    }
+                    Surface(
+                        shape = RoundedCornerShape(
+                            topStart = 14.dp,
+                            topEnd = 14.dp,
+                            bottomStart = if (line.type == OverlayLineType.SYSTEM) 6.dp else 14.dp,
+                            bottomEnd = 14.dp
+                        ),
+                        color = bubbleColor,
+                        border = BorderStroke(1.dp, bubbleBorder)
                     ) {
-                        when (line.type) {
-                            OverlayLineType.USER -> Text(">", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            OverlayLineType.SYSTEM -> Text("-", style = MaterialTheme.typography.labelSmall, color = flavor.primary)
-                            OverlayLineType.QUEUED -> {
-                                Surface(
-                                    shape = RoundedCornerShape(OverlayUiConstants.PillCornerRadius),
-                                    color = flavor.primary.copy(alpha = 0.2f)
-                                ) {
-                                    Text(
-                                        "Queued",
-                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = flavor.primary
-                                    )
-                                }
-                            }
-                        }
                         MarkdownText(
                             text = line.text,
-                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                            style = CitrosTypography.bodySmall,
                             color = if (line.type == OverlayLineType.QUEUED) {
-                                MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
+                                surfaces.labelSecondary
                             } else {
-                                MaterialTheme.colorScheme.onSurface
+                                surfaces.labelPrimary
                             }
                         )
                     }
                 }
-
                 if (runState == OverlayRunState.EXECUTING) {
                     // Preview status chip (read-only in demo mode).
                     AssistChip(
                         onClick = {},
-                        label = { Text("Step ${currentStep.step} of ${currentStep.total}") }
+                        label = { Text("Step ${currentStep.step} of ${currentStep.total}") },
+                        colors = AssistChipDefaults.assistChipColors(
+                            containerColor = surfaces.surface2,
+                            labelColor = surfaces.labelSecondary
+                        )
                     )
                 }
-
                 // Inline error card removed — Failed state is handled by the
                 // contextual banner with a functional Retry button below (#473).
             }
-
             // Contextual banner: Stopped → Resume, Failed → Retry (#473)
             if (isUndoStopVisible) {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 10.dp, vertical = 6.dp),
+                        .padding(horizontal = 12.dp, vertical = 2.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
                         "Stopped",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.72f),
+                        style = CitrosTypography.bodySmall,
+                        color = surfaces.labelSecondary,
                         modifier = Modifier.weight(1f)
                     )
-                    OutlinedButton(
-                        onClick = onResumeOrRetry,
-                        contentPadding = OverlayUiConstants.CompactActionPadding
+                    Surface(
+                        shape = RoundedCornerShape(999.dp),
+                        color = surfaces.surface2,
+                        border = BorderStroke(1.dp, surfaces.separatorLight),
+                        modifier = Modifier.clickable(onClick = onResumeOrRetry)
                     ) {
-                        Text("Resume", style = MaterialTheme.typography.labelSmall, color = flavor.primary)
+                        Text(
+                            "Resume",
+                            style = CitrosTypography.labelSmall,
+                            color = flavor.primary,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                        )
                     }
                 }
             } else if (runState == OverlayRunState.FAILED) {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 10.dp, vertical = 6.dp),
+                        .padding(horizontal = 12.dp, vertical = 2.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
                         "Failed",
-                        style = MaterialTheme.typography.bodySmall,
+                        style = CitrosTypography.bodySmall,
                         color = OverlayColors.Error.copy(alpha = 0.72f),
                         modifier = Modifier.weight(1f)
                     )
-                    OutlinedButton(
-                        onClick = onResumeOrRetry,
-                        contentPadding = OverlayUiConstants.CompactActionPadding
+                    Surface(
+                        shape = RoundedCornerShape(999.dp),
+                        color = surfaces.surface2,
+                        border = BorderStroke(1.dp, surfaces.separatorLight),
+                        modifier = Modifier.clickable(onClick = onResumeOrRetry)
                     ) {
-                        Text("Retry", style = MaterialTheme.typography.labelSmall, color = OverlayColors.Error)
+                        Text(
+                            "Retry",
+                            style = CitrosTypography.labelSmall,
+                            color = OverlayColors.Error,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                        )
                     }
                 }
             }
-
             // Input row — always visible (#473)
+            val isExecuting = runState == OverlayRunState.EXECUTING
+            val hasInputText = queuedMessageDraft.isNotBlank()
+            val showStopButton = isExecuting && !hasInputText
+            val sendEnabled = hasInputText || showStopButton
+            val activeSendButtonColor = if (flavor == CitrosFlavor.NONE) {
+                if (isDarkTheme) Color.White else Color.Black
+            } else {
+                flavor.primary
+            }
+            val activeSendIconTint = contrastOn(activeSendButtonColor)
+            val inactiveSendButtonColor = if (isDarkTheme) surfaces.surface3 else surfaces.surface2
+            val inactiveSendIconTint = surfaces.labelQuaternary
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1016,171 +1069,109 @@ internal fun MiniChatOverlayCard(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                TextField(
-                    value = queuedMessageDraft,
-                    onValueChange = onQueuedDraftChange,
-                    modifier = Modifier
-                        .weight(1f)
-                        .onFocusChanged { focusState ->
-                            if (focusState.isFocused) {
-                                OverlayService.instance?.moveOverlayToTop()
-                            } else {
-                                OverlayService.instance?.moveOverlayToBottom()
-                            }
-                        }
-                        .semantics { contentDescription = "Message input" },
-                    singleLine = true,
-                    placeholder = {
-                        Text(
-                            if (runState == OverlayRunState.EXECUTING) "Steer or queue..."
-                            else "Message..."
-                        )
-                    },
-                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
-                    keyboardActions = KeyboardActions(onSend = { onSubmitQueuedMessage() }),
-                    colors = TextFieldDefaults.colors(
-                        focusedContainerColor = MaterialTheme.colorScheme.surface,
-                        unfocusedContainerColor = MaterialTheme.colorScheme.surface,
-                        focusedIndicatorColor = flavor.primary,
-                        unfocusedIndicatorColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f),
-                        cursorColor = flavor.primary
-                    )
-                )
-                OutlinedButton(
-                    onClick = onSubmitQueuedMessage,
-                    contentPadding = OverlayUiConstants.CompactActionPadding,
-                    colors = ButtonDefaults.outlinedButtonColors(contentColor = flavor.primary),
-                    enabled = queuedMessageDraft.trim().isNotBlank()
-                ) { Text("Send", style = MaterialTheme.typography.labelSmall, color = flavor.primary) }
-
-                if (runState == OverlayRunState.EXECUTING) {
-                    Button(
-                        onClick = onStopAction,
-                        colors = ButtonDefaults.buttonColors(containerColor = OverlayColors.Error),
-                        contentPadding = OverlayUiConstants.PrimaryActionPadding
-                    ) {
-                        Text("Stop", style = MaterialTheme.typography.labelSmall, color = contrastOn(OverlayColors.Error))
-                    }
-                }
-            }
-        }
-    }
-}
-
-@OptIn(ExperimentalFoundationApi::class)
-@Composable
-private fun BubbleOverlay(
-    flavor: CitrosFlavor,
-    runState: OverlayRunState,
-    unreadCount: Int,
-    isQuickActionsOpen: Boolean,
-    onToggleQuickActions: () -> Unit,
-    onExpand: () -> Unit,
-    onStopAction: () -> Unit,
-    onDismissQuickActions: () -> Unit,
-    onDismissOverlay: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    Box(modifier = modifier) {
-        if (isQuickActionsOpen) {
-            Surface(
-                modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .padding(bottom = 74.dp)
-                    .width(OverlayUiConstants.BubbleQuickActionsWidth),
-                shape = RoundedCornerShape(OverlayUiConstants.StandardCardCornerRadius),
-                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.98f),
-                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.35f))
-            ) {
-                Column(modifier = Modifier.padding(vertical = 6.dp)) {
-                    TextButton(
-                        onClick = onStopAction,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .semantics { contentDescription = "Stop action" }
-                    ) { Text("Stop Action") }
-                    TextButton(
-                        onClick = onExpand,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .semantics { contentDescription = "Expand overlay" }
-                    ) { Text("Expand") }
-                    TextButton(
-                        onClick = onDismissOverlay,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .semantics { contentDescription = "Dismiss overlay" }
-                    ) { Text("Dismiss Overlay") }
-                }
-            }
-        }
-
-        Box(modifier = Modifier.align(Alignment.BottomEnd)) {
-            Surface(
-                modifier = Modifier
-                    .size(OverlayUiConstants.BubbleSize)
-                    .semantics { contentDescription = "Overlay bubble" },
-                shape = CircleShape,
-                color = Color.Transparent,
-                border = null,
-                tonalElevation = 6.dp
-            ) {
-                Box(modifier = Modifier.fillMaxSize()) {
-                    Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
-                        CitrosFloatingAppIconGraphic(
-                            flavor = flavor,
-                            size = OverlayUiConstants.BubbleSize * 2.1f,
-                            showBackground = false,
-                            orbOnly = true
-                        )
-                        if (runState == OverlayRunState.EXECUTING) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(OverlayUiConstants.BubbleProgressSize),
-                                strokeWidth = 2.dp,
-                                color = flavor.primary,
-                                trackColor = Color.Transparent
-                            )
-                        }
-                    }
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .combinedClickable(
-                                onClick = {
-                                    if (isQuickActionsOpen) {
-                                        onDismissQuickActions()
-                                    } else {
-                                        onExpand()
-                                    }
-                                },
-                                onLongClick = onToggleQuickActions
-                            )
-                    )
-                }
-            }
-
-            if (runState == OverlayRunState.COMPLETED || runState == OverlayRunState.FAILED || unreadCount > 0) {
-                val badgeColor = when {
-                    runState == OverlayRunState.COMPLETED -> OverlayColors.Success
-                    runState == OverlayRunState.FAILED -> OverlayColors.Error
-                    else -> flavor.primary
-                }
                 Surface(
                     modifier = Modifier
-                        .align(Alignment.TopEnd)
-                        .size(OverlayUiConstants.BubbleBadgeSize),
-                    shape = CircleShape,
-                    color = badgeColor
+                        .weight(1f),
+                    shape = RoundedCornerShape(22.dp),
+                    color = surfaces.surface2,
+                    border = BorderStroke(1.dp, surfaces.separatorLight)
                 ) {
-                    Box(contentAlignment = Alignment.Center) {
-                        Text(
-                            text = when {
-                                runState == OverlayRunState.COMPLETED -> "C"
-                                runState == OverlayRunState.FAILED -> "!"
-                                else -> unreadCount.toString()
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(start = 2.dp, end = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        OutlinedTextField(
+                            value = queuedMessageDraft,
+                            onValueChange = onQueuedDraftChange,
+                            contentDescription = "Message input",
+                            modifier = Modifier
+                                .weight(1f)
+                                .heightIn(max = 132.dp)
+                                .onFocusChanged { focusState ->
+                                    if (focusState.isFocused) {
+                                        OverlayService.instance?.moveOverlayToTop()
+                                    } else {
+                                        OverlayService.instance?.moveOverlayToBottom()
+                                    }
+                                },
+                            placeholder = {
+                                Text(
+                                    text = if (runState == OverlayRunState.EXECUTING) "Steer or queue..." else "Message",
+                                    style = CitrosTypography.bodyLarge
+                                )
                             },
-                            style = MaterialTheme.typography.labelSmall,
-                            color = contrastOn(badgeColor)
+                            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                            keyboardActions = KeyboardActions(onSend = { onSubmitQueuedMessage() }),
+                            singleLine = false,
+                            maxLines = 6,
+                            centerSingleLineContentWhenMultiline = true,
+                            textStyle = CitrosTypography.bodyLarge,
+                            shape = RoundedCornerShape(18.dp),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = Color.Transparent,
+                                unfocusedBorderColor = Color.Transparent,
+                                focusedContainerColor = Color.Transparent,
+                                unfocusedContainerColor = Color.Transparent,
+                                cursorColor = flavor.primary,
+                                focusedTextColor = surfaces.labelPrimary,
+                                unfocusedTextColor = surfaces.labelPrimary,
+                                focusedPlaceholderColor = surfaces.labelTertiary,
+                                unfocusedPlaceholderColor = surfaces.labelTertiary
+                            )
+                        )
+                        Box(
+                            modifier = Modifier
+                                .size(32.dp)
+                                .clip(CircleShape)
+                                .background(if (hasInputText) surfaces.surface3 else Color.Transparent)
+                                .clickable(
+                                    enabled = hasInputText,
+                                    onClick = { onQueuedDraftChange("") }
+                                ),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            if (hasInputText) {
+                                MessageInputClearGlyph(
+                                    tint = surfaces.labelSecondary.copy(alpha = 0.92f),
+                                    modifier = Modifier.size(13.dp)
+                                )
+                            } else {
+                                MessageInputMicGlyph(
+                                    tint = surfaces.labelSecondary.copy(alpha = 0.72f),
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+                MessageInputGlassIconButton(
+                    onClick = {
+                        when {
+                            showStopButton -> onStopAction()
+                            hasInputText -> onSubmitQueuedMessage()
+                        }
+                    },
+                    enabled = sendEnabled,
+                    backgroundColor = if (hasInputText) activeSendButtonColor else inactiveSendButtonColor,
+                    iconTint = when {
+                        showStopButton -> surfaces.labelPrimary
+                        hasInputText -> activeSendIconTint
+                        else -> inactiveSendIconTint
+                    }
+                ) { resolvedIconTint ->
+                    if (showStopButton) {
+                        Box(
+                            modifier = Modifier
+                                .size(12.dp)
+                                .clip(RoundedCornerShape(3.dp))
+                                .background(resolvedIconTint)
+                        )
+                    } else {
+                        MessageInputArrowGlyph(
+                            tint = resolvedIconTint,
+                            modifier = Modifier.size(16.dp)
                         )
                     }
                 }

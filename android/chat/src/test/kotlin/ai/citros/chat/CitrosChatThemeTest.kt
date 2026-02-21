@@ -1,6 +1,5 @@
 package ai.citros.chat
 
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.test.junit4.createComposeRule
 import org.junit.Rule
@@ -25,12 +24,12 @@ class CitrosChatThemeTest {
 
         composeRule.setContent {
             CitrosChatTheme(themeMode = "dark") {
-                background = MaterialTheme.colorScheme.background
+                background = citrosDirectiveSurfaces(LocalCitrosIsDark.current).background
             }
         }
 
         // Dark background should be very dark (low luminance)
-        assertEquals(Color(0xFF050505), background)
+        assertEquals(Color(0xFF000000), background)
     }
 
     @Test
@@ -39,12 +38,12 @@ class CitrosChatThemeTest {
 
         composeRule.setContent {
             CitrosChatTheme(themeMode = "light") {
-                background = MaterialTheme.colorScheme.background
+                background = citrosDirectiveSurfaces(LocalCitrosIsDark.current).background
             }
         }
 
         // Light background should be very bright
-        assertEquals(Color(0xFFFFFBFE), background)
+        assertEquals(Color(0xFFFFFFFF), background)
     }
 
     @Test
@@ -53,12 +52,12 @@ class CitrosChatThemeTest {
 
         composeRule.setContent {
             CitrosChatTheme(themeMode = "light") {
-                onBackground = MaterialTheme.colorScheme.onBackground
+                onBackground = citrosDirectiveSurfaces(LocalCitrosIsDark.current).labelPrimary
             }
         }
 
         // onBackground should be dark in light mode
-        assertEquals(Color(0xFF1C1B1F), onBackground)
+        assertEquals(Color(0xFF000000), onBackground)
     }
 
     @Test
@@ -67,7 +66,7 @@ class CitrosChatThemeTest {
 
         composeRule.setContent {
             CitrosChatTheme(themeMode = "dark") {
-                onBackground = MaterialTheme.colorScheme.onBackground
+                onBackground = citrosDirectiveSurfaces(LocalCitrosIsDark.current).labelPrimary
             }
         }
 

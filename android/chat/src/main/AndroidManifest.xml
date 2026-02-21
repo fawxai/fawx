@@ -41,6 +41,20 @@
         </activity>
 
         <activity-alias
+            android:name=".LauncherNone"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher_none"
+            android:label="@string/app_name"
+            android:roundIcon="@mipmap/ic_launcher_none"
+            android:targetActivity=".ChatActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
             android:name=".LauncherTangerine"
             android:enabled="true"
             android:exported="true"

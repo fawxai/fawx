@@ -43,20 +43,20 @@ class OverlayControllerTest {
     }
 
     @Test
-    fun `activateOverlay sets active and switches to MINI_CHAT`() {
+    fun `activateOverlay sets active and switches to SEARCH_BAR`() {
         OverlayController.activateOverlay()
 
         assertTrue(OverlayController.isOverlayActive.value)
-        assertEquals(OverlaySurfaceMode.MINI_CHAT, OverlayController.surfaceMode.value)
+        assertEquals(OverlaySurfaceMode.SEARCH_BAR, OverlayController.surfaceMode.value)
     }
 
     @Test
     fun `activateOverlay preserves non-FULL_APP mode`() {
-        OverlayController.updateSurfaceMode(OverlaySurfaceMode.BUBBLE)
+        OverlayController.updateSurfaceMode(OverlaySurfaceMode.SEARCH_BAR)
         OverlayController.activateOverlay()
 
         assertTrue(OverlayController.isOverlayActive.value)
-        assertEquals(OverlaySurfaceMode.BUBBLE, OverlayController.surfaceMode.value)
+        assertEquals(OverlaySurfaceMode.SEARCH_BAR, OverlayController.surfaceMode.value)
     }
 
     @Test
@@ -80,22 +80,22 @@ class OverlayControllerTest {
     }
 
     @Test
-    fun `updateSurfaceMode to BUBBLE keeps overlay active`() {
+    fun `updateSurfaceMode to SEARCH_BAR keeps overlay active`() {
         OverlayController.activateOverlay()
-        OverlayController.updateSurfaceMode(OverlaySurfaceMode.BUBBLE)
+        OverlayController.updateSurfaceMode(OverlaySurfaceMode.SEARCH_BAR)
 
         assertTrue(OverlayController.isOverlayActive.value)
-        assertEquals(OverlaySurfaceMode.BUBBLE, OverlayController.surfaceMode.value)
+        assertEquals(OverlaySurfaceMode.SEARCH_BAR, OverlayController.surfaceMode.value)
     }
 
     @Test
-    fun `updateSurfaceMode to MINI_CHAT keeps overlay active`() {
+    fun `updateSurfaceMode to PANEL keeps overlay active`() {
         OverlayController.activateOverlay()
-        OverlayController.updateSurfaceMode(OverlaySurfaceMode.BUBBLE)
-        OverlayController.updateSurfaceMode(OverlaySurfaceMode.MINI_CHAT)
+        OverlayController.updateSurfaceMode(OverlaySurfaceMode.SEARCH_BAR)
+        OverlayController.updateSurfaceMode(OverlaySurfaceMode.PANEL)
 
         assertTrue(OverlayController.isOverlayActive.value)
-        assertEquals(OverlaySurfaceMode.MINI_CHAT, OverlayController.surfaceMode.value)
+        assertEquals(OverlaySurfaceMode.PANEL, OverlayController.surfaceMode.value)
     }
 
     @Test
@@ -201,10 +201,10 @@ class OverlayControllerTest {
             OverlayController.actions.collect { received.add(it) }
         }
 
-        OverlayController.dispatch(OverlayAction.SetSurfaceMode(OverlaySurfaceMode.BUBBLE))
+        OverlayController.dispatch(OverlayAction.SetSurfaceMode(OverlaySurfaceMode.SEARCH_BAR))
 
         assertEquals(1, received.size)
-        assertEquals(OverlayAction.SetSurfaceMode(OverlaySurfaceMode.BUBBLE), received[0])
+        assertEquals(OverlayAction.SetSurfaceMode(OverlaySurfaceMode.SEARCH_BAR), received[0])
     }
 
     @Test
@@ -234,16 +234,16 @@ class OverlayControllerTest {
     }
 
     @Test
-    fun `dispatch emits ExpandFromBubble action`() = runTest {
+    fun `dispatch emits ExpandFromSearchBar action`() = runTest {
         val received = mutableListOf<OverlayAction>()
         backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
             OverlayController.actions.collect { received.add(it) }
         }
 
-        OverlayController.dispatch(OverlayAction.ExpandFromBubble)
+        OverlayController.dispatch(OverlayAction.ExpandFromSearchBar)
 
         assertEquals(1, received.size)
-        assertEquals(OverlayAction.ExpandFromBubble, received[0])
+        assertEquals(OverlayAction.ExpandFromSearchBar, received[0])
     }
 
     @Test
@@ -255,12 +255,12 @@ class OverlayControllerTest {
 
         OverlayController.dispatch(OverlayAction.QueueMessage("first"))
         OverlayController.dispatch(OverlayAction.StopExecution)
-        OverlayController.dispatch(OverlayAction.SetSurfaceMode(OverlaySurfaceMode.BUBBLE))
+        OverlayController.dispatch(OverlayAction.SetSurfaceMode(OverlaySurfaceMode.SEARCH_BAR))
 
         assertEquals(3, received.size)
         assertEquals(OverlayAction.QueueMessage("first"), received[0])
         assertEquals(OverlayAction.StopExecution, received[1])
-        assertEquals(OverlayAction.SetSurfaceMode(OverlaySurfaceMode.BUBBLE), received[2])
+        assertEquals(OverlayAction.SetSurfaceMode(OverlaySurfaceMode.SEARCH_BAR), received[2])
     }
 
     @Test
@@ -301,7 +301,7 @@ class OverlayControllerTest {
         // Simulate rapid user taps
         OverlayController.dispatch(OverlayAction.StopExecution)
         OverlayController.dispatch(OverlayAction.QueueMessage("quick"))
-        OverlayController.dispatch(OverlayAction.ExpandFromBubble)
+        OverlayController.dispatch(OverlayAction.ExpandFromSearchBar)
         OverlayController.dispatch(OverlayAction.Deactivate)
 
         // All actions should be received (well within buffer capacity)
@@ -357,6 +357,7 @@ class OverlayControllerTest {
         OverlayController.activateOverlay()
         OverlayController.updateQueuedMessage("pending")
         OverlayController.updateUnreadCount(3)
+        OverlayController.updateInteractionDemand(OverlayInteractionDemand.INPUT_REQUIRED)
         OverlayController.updateOverlayState(
             OverlayState(
                 runState = OverlayRunState.EXECUTING,
@@ -374,19 +375,55 @@ class OverlayControllerTest {
         assertEquals(OverlayState.EMPTY, OverlayController.overlayState.value)
         assertNull(OverlayController.queuedMessage.value)
         assertEquals(0, OverlayController.unreadCount.value)
+        assertEquals(OverlayInteractionDemand.NONE, OverlayController.interactionDemand.value)
+        assertFalse(OverlayController.userPanelPinned.value)
     }
 
     @Test
-    fun `mode transition flow - FULL_APP to MINI_CHAT to BUBBLE to FULL_APP`() {
+    fun `interaction demand forces panel while active`() {
+        OverlayController.activateOverlay()
+        assertEquals(OverlaySurfaceMode.SEARCH_BAR, OverlayController.surfaceMode.value)
+
+        OverlayController.updateInteractionDemand(OverlayInteractionDemand.INPUT_REQUIRED)
+
+        assertEquals(OverlaySurfaceMode.PANEL, OverlayController.surfaceMode.value)
+    }
+
+    @Test
+    fun `clearing interaction demand returns to search bar when panel not pinned`() {
+        OverlayController.activateOverlay()
+        OverlayController.updateInteractionDemand(OverlayInteractionDemand.INPUT_REQUIRED)
+        assertEquals(OverlaySurfaceMode.PANEL, OverlayController.surfaceMode.value)
+
+        OverlayController.updateInteractionDemand(OverlayInteractionDemand.NONE)
+
+        assertEquals(OverlaySurfaceMode.SEARCH_BAR, OverlayController.surfaceMode.value)
+    }
+
+    @Test
+    fun `pinned panel stays open after interaction demand clears`() {
+        OverlayController.activateOverlay()
+        OverlayController.updateSurfaceMode(OverlaySurfaceMode.PANEL, fromUser = true)
+        OverlayController.updateInteractionDemand(OverlayInteractionDemand.INPUT_REQUIRED)
+
+        OverlayController.updateInteractionDemand(OverlayInteractionDemand.NONE)
+        assertEquals(OverlaySurfaceMode.PANEL, OverlayController.surfaceMode.value)
+
+        OverlayController.setUserPanelPinned(false)
+        assertEquals(OverlaySurfaceMode.SEARCH_BAR, OverlayController.surfaceMode.value)
+    }
+
+    @Test
+    fun `mode transition flow - FULL_APP to SEARCH_BAR to PANEL to FULL_APP`() {
         assertEquals(OverlaySurfaceMode.FULL_APP, OverlayController.surfaceMode.value)
         assertFalse(OverlayController.isOverlayActive.value)
 
         OverlayController.activateOverlay()
-        assertEquals(OverlaySurfaceMode.MINI_CHAT, OverlayController.surfaceMode.value)
+        assertEquals(OverlaySurfaceMode.SEARCH_BAR, OverlayController.surfaceMode.value)
         assertTrue(OverlayController.isOverlayActive.value)
 
-        OverlayController.updateSurfaceMode(OverlaySurfaceMode.BUBBLE)
-        assertEquals(OverlaySurfaceMode.BUBBLE, OverlayController.surfaceMode.value)
+        OverlayController.updateSurfaceMode(OverlaySurfaceMode.PANEL)
+        assertEquals(OverlaySurfaceMode.PANEL, OverlayController.surfaceMode.value)
         assertTrue(OverlayController.isOverlayActive.value)
 
         OverlayController.updateSurfaceMode(OverlaySurfaceMode.FULL_APP)
@@ -423,12 +460,11 @@ class OverlayControllerTest {
         if (isActive) {
             OverlayController.deactivateOverlay()
         } else {
-            OverlayController.updateSurfaceMode(OverlaySurfaceMode.MINI_CHAT)
             OverlayController.activateOverlay()
         }
 
         assertTrue(OverlayController.isOverlayActive.value)
-        assertEquals(OverlaySurfaceMode.MINI_CHAT, OverlayController.surfaceMode.value)
+        assertEquals(OverlaySurfaceMode.SEARCH_BAR, OverlayController.surfaceMode.value)
     }
 
     // --- Restore hook tests (#608/PR #614) ---
@@ -440,12 +476,12 @@ class OverlayControllerTest {
 
         // Restore hook logic: activate only if not already active
         if (!OverlayController.isOverlayActive.value) {
-            OverlayController.updateSurfaceMode(OverlaySurfaceMode.MINI_CHAT)
+            OverlayController.updateSurfaceMode(OverlaySurfaceMode.SEARCH_BAR)
             OverlayController.activateOverlay()
         }
 
         assertTrue(OverlayController.isOverlayActive.value)
-        assertEquals(OverlaySurfaceMode.MINI_CHAT, OverlayController.surfaceMode.value)
+        assertEquals(OverlaySurfaceMode.SEARCH_BAR, OverlayController.surfaceMode.value)
     }
 
     @Test
@@ -453,17 +489,17 @@ class OverlayControllerTest {
         // Overlay already running (normal case)
         OverlayController.activateOverlay()
         assertTrue(OverlayController.isOverlayActive.value)
-        OverlayController.updateSurfaceMode(OverlaySurfaceMode.BUBBLE)
+        OverlayController.updateSurfaceMode(OverlaySurfaceMode.SEARCH_BAR)
 
         // Restore hook: should not re-activate (already active)
         if (!OverlayController.isOverlayActive.value) {
-            OverlayController.updateSurfaceMode(OverlaySurfaceMode.MINI_CHAT)
+            OverlayController.updateSurfaceMode(OverlaySurfaceMode.SEARCH_BAR)
             OverlayController.activateOverlay()
         }
 
-        // Mode should remain BUBBLE (not overridden to MINI_CHAT)
+        // Mode should remain SEARCH_BAR (not overridden)
         assertTrue(OverlayController.isOverlayActive.value)
-        assertEquals(OverlaySurfaceMode.BUBBLE, OverlayController.surfaceMode.value)
+        assertEquals(OverlaySurfaceMode.SEARCH_BAR, OverlayController.surfaceMode.value)
     }
 
     // --- Chat foreground state tests (#627) ---
@@ -486,16 +522,16 @@ class OverlayControllerTest {
     }
 
     @Test
-    fun `restore hook with BUBBLE preferred mode activates as BUBBLE`() {
+    fun `restore hook with SEARCH_BAR preferred mode activates as SEARCH_BAR`() {
         assertFalse(OverlayController.isOverlayActive.value)
 
-        // Simulate restore with BUBBLE preference
+        // Simulate restore with SEARCH_BAR preference
         if (!OverlayController.isOverlayActive.value) {
-            OverlayController.updateSurfaceMode(OverlaySurfaceMode.BUBBLE)
+            OverlayController.updateSurfaceMode(OverlaySurfaceMode.SEARCH_BAR)
             OverlayController.activateOverlay()
         }
 
         assertTrue(OverlayController.isOverlayActive.value)
-        assertEquals(OverlaySurfaceMode.BUBBLE, OverlayController.surfaceMode.value)
+        assertEquals(OverlaySurfaceMode.SEARCH_BAR, OverlayController.surfaceMode.value)
     }
 }

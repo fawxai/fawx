@@ -21,12 +21,12 @@ sealed class OverlayAction {
     /** User tapped Undo/Resume in overlay after a stop. */
     data object ResumeExecution : OverlayAction()
 
-    /** User tapped Full/Bubble mode button to change overlay surface mode. */
+    /** User tapped overlay mode controls to change overlay surface mode. */
     data class SetSurfaceMode(val mode: OverlaySurfaceMode) : OverlayAction()
 
-    /** User dismissed overlay via bubble long-press or notification Stop button. */
+    /** User dismissed overlay via search bar controls or notification Stop button. */
     data object Deactivate : OverlayAction()
 
-    /** User tapped bubble to expand — switches to MINI_CHAT and resets unread count. */
-    data object ExpandFromBubble : OverlayAction()
+    /** User tapped search bar to expand — switches to PANEL and resets unread count. */
+    data object ExpandFromSearchBar : OverlayAction()
 }
