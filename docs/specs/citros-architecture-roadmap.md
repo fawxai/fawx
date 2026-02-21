@@ -306,7 +306,7 @@ This is the single highest-leverage reliability improvement. Stuck detection cat
 | Voice I/O MVP | SherpaOnnx STT + Android TTS + mic in ChatActivity (#556 closed) |
 #### 2.7 Action Policy Engine 🔲
 
-*Source: agentic-loop-v2.md §12.1, SPEC.md §3.5.3*
+*Source: [agentic-loop-v2.md §12.1](../agentic-loop-v2.md#121-action-policy-engine-spec-353), SPEC.md §3.5.3*
 
 Per-tool security gates that intercept tool calls before execution. The policy engine is the hard boundary between what the model wants and what actually happens.
 
@@ -388,7 +388,7 @@ When Key Wallet supports multiple keys/providers: auth rotation with cooldowns, 
 
 #### 3.2 Subtask Decomposition & Multi-Step Planning 🔲
 
-*Source: agentic-loop-v2.md §6 (v2 Phase 2)*
+*Source: agentic-loop-v2.md §6 (v2 Phase 2). Full API design + execution model: [agentic-loop-v2.md §6](../agentic-loop-v2.md#6-subtask-decomposition)*
 
 A `subtask` tool enables the model to decompose complex goals into isolated sub-loops:
 
@@ -422,7 +422,7 @@ This is NOT OpenClaw's sub-agent system (we don't need isolated sessions). It's 
 
 #### 3.3 Metacognitive Layer & Learned Patterns 🔲
 
-*Source: agentic-loop-v2.md §8 (v2 Phase 3). Related: #349 (app nav maps), #350 (telemetry), #650 (scoped knowledge)*
+*Source: agentic-loop-v2.md §8 (v2 Phase 3). Full reflection design + storage: [agentic-loop-v2.md §8](../agentic-loop-v2.md#8-metacognitive-layer--self-awareness-and-self-improvement). Related: #349 (app nav maps), #350 (telemetry), #650 (scoped knowledge)*
 
 The agent reflects, learns, and improves over time. Three timescales:
 
@@ -546,7 +546,7 @@ User Message
 
 #### 3.7 Proactive Agent Behavior 🔲
 
-*Source: agentic-loop-v2.md §12.4, SPEC.md §3.4 Phase 4. Issue: #597*
+*Source: [agentic-loop-v2.md §12.4](../agentic-loop-v2.md#124-proactive-agent-behavior), SPEC.md §3.4 Phase 4. Issue: #597*
 
 Agent-initiated loops — the agent starts tasks without user prompting:
 
@@ -567,7 +567,7 @@ Proactive loops run the same orchestration path but with different entry context
 
 #### 3.8 Rust Daemon Migration Path 🔲
 
-*Source: agentic-loop-v2.md §12.10, SPEC.md §3.4*
+*Source: [agentic-loop-v2.md §12.10](../agentic-loop-v2.md#1210-rust-daemon-migration-path), SPEC.md §3.4*
 
 When the Rust daemon (ct-agent) takes over orchestration:
 

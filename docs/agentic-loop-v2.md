@@ -1,9 +1,10 @@
 # Agentic Loop v2 — Architecture Specification
 
-> **Status:** Draft
+> **Status:** Phase 1 shipped (H0+H1 complete). Phases 2-4 are implementation blueprints for H3.
 > **Authors:** Joe, Clawdio
 > **Date:** 2026-02-13
-> **Supersedes:** `agentic-loop-audit.md` (Phase 1 implemented; this spec covers the full vision)
+> **Supersedes:** `agentic-loop-audit.md`
+> **Roadmap:** `docs/specs/citros-architecture-roadmap.md` (tracks status; this spec has implementation details)
 
 ---
 
@@ -619,23 +620,25 @@ bluetooth, brightness) in addition to action verbs.
 
 ## 10. Implementation Phases
 
-### Phase 1 — Clean Loop Foundation
+### Phase 1 — Clean Loop Foundation ✅ SHIPPED
 **Goal:** Fix the structural issues. Remove synthetic messages. Get the basic
 loop right.
 
+> **Shipped across H0+H1+H2:** PRs #459, #460, #458, #476, #477, #479, #481, #487, #489, #496, #504, #540, #670, #671. See `citros-architecture-roadmap.md` for full status.
+
 **Scope:**
-- [ ] `PhoneAgentApi.continueAfterTools()` — new method, no user message injection
-- [ ] `ChatViewModel.sendMessage()` — refactored loop using `continueAfterTools()`
-- [ ] Screen content in tool results for UI-mutating actions
-- [ ] Tool gating on accessibility state (#390)
-- [ ] `isLikelyConversationalMessage` fix (action hints before `?`)
-- [ ] Strip tool artifacts from chat-mode responses
-- [ ] Model floor enforcement — reject Haiku/mini in action loop
-- [ ] Context compaction — trim old screen dumps
-- [ ] Output classification — hide mechanical actions, show thinking
-- [ ] Updated system prompt with TASK COMPLETION and SELF-MONITORING sections
-- [ ] Updated action prompt with implicit observation guidance
-- [ ] Tests for all new behavior
+- [x] `PhoneAgentApi.continueAfterTools()` — new method, no user message injection
+- [x] `ChatViewModel.sendMessage()` — refactored loop using `continueAfterTools()`
+- [x] Screen content in tool results for UI-mutating actions
+- [x] Tool gating on accessibility state (#390)
+- [x] `isLikelyConversationalMessage` fix (action hints before `?`)
+- [x] Strip tool artifacts from chat-mode responses
+- [x] Model floor enforcement — reject Haiku/mini in action loop
+- [x] Context compaction — trim old screen dumps
+- [x] Output classification — hide mechanical actions, show thinking
+- [x] Updated system prompt with TASK COMPLETION and SELF-MONITORING sections
+- [x] Updated action prompt with implicit observation guidance
+- [x] Tests for all new behavior
 
 **Expected impact:** 70% → 85% task completion rate
 
@@ -684,7 +687,7 @@ loop right.
 
 ---
 
-## 11. File Impact (Phase 1)
+## 11. File Impact (Phase 1) — Completed
 
 | File | Changes |
 |---|---|
