@@ -7,7 +7,7 @@
 
 ## Where We Are (updated 2026-02-21)
 
-Horizons 0 and 1 are **COMPLETE**. Horizon 2 is **~80% complete**. The agent has a proper architecture:
+Horizons 0 and 1 are **COMPLETE**. Horizon 2 is **~60% complete** (7/12 items shipped, 5 new items added from v2 spec). The agent has a proper architecture:
 
 - **AgentExecutor** with boundary checkpoints (stuck detection, steer, cancellation, action verification)
 - **Modular system prompt** assembled from sections (identity, tools, strategy, recovery, disambiguation, rules, runtime)
@@ -22,7 +22,37 @@ Horizons 0 and 1 are **COMPLETE**. Horizon 2 is **~80% complete**. The agent has
 - **Progressive status updates** — human-readable tool output in chat/overlay
 - 3 providers: Anthropic, OpenAI, OpenRouter
 
-**Remaining H2 gaps:** Tool Grouping (#557) and Model-Aware Prompt Tuning (#558)
+**Remaining H2 gaps:** Tool Grouping (#557), Model-Aware Prompt Tuning (#558), plus 5 features from `agentic-loop-v2.md` not previously tracked (Action Policy Engine, User Interruption Detection, Sensor Context, Cost Budgets, Privacy-Sensitive Apps).
+
+## Agentic Loop v2 Spec Status
+
+`docs/agentic-loop-v2.md` is the detailed architectural spec for the agent brain. Cross-reference with roadmap:
+
+| v2 Section | Description | Roadmap | Status |
+|-----------|-------------|---------|--------|
+| §3 Clean Loop | continueAfterTools, no synthetic messages | H1.1 | ✅ Shipped |
+| §4 Model Floor | Sonnet-minimum for action loop security | H1 (PR #496) | ✅ Shipped |
+| §5 Implicit Observation | Screen content in UI-mutating tool results | H1.1 | ✅ Shipped |
+| §6 Subtask Decomposition | `subtask` tool, isolated context, depth limits | H3.2 | 🔲 Not started |
+| §7 Output Classification | SHOW/SHOW_DIMMED/HIDE, TTS routing | H2.5 (PR #670) | ✅ Shipped |
+| §8 Metacognitive Layer | Three-timescale reflection, self-improvement | H3.3 | 🔲 Not started |
+| §9 Tool Gating | Gate tools on accessibility state | H1 (PR #496) | ✅ Shipped |
+| §12.1 Action Policy Engine | Per-tool ALLOW/CONFIRM/DENY | H2.7 | 🔲 Not started |
+| §12.2 Voice I/O | STT/TTS integration | H2 Voice | ✅ Shipped |
+| §12.3 Local LLM Routing | Security evaluation for local models | Deferred | 🔲 Blocked (security) |
+| §12.4 Proactive Behavior | Agent-initiated loops (briefings, reminders) | H3.7 | 🔲 Not started |
+| §12.5 Sensor Context | Battery/location/time in prompt | H2.9 | 🔲 Not started |
+| §12.6 Privacy-Sensitive Apps | Selective screen blindness | H2.11 | 🔲 Not started |
+| §12.7 Web Search | web_search/web_fetch tools | H2 (PR #497) | ✅ Shipped |
+| §12.8 Cost Tracking | Token tracking + budget limits | H2.10 | ⚠️ Partial (#531) |
+| §12.9 User Interruption | Detect user touch/app switch, pause | H2.8 | 🔲 Not started |
+| §12.10 Rust Migration | Kotlin → Rust daemon transition | H3.8 | 🔲 Not started |
+
+**v2 Implementation Phases:**
+- Phase 1 (Clean Loop Foundation): ✅ COMPLETE
+- Phase 2 (Subtask Decomposition): 🔲 Not started → H3.2
+- Phase 3 (Metacognitive Layer): 🔲 Not started → H3.3
+- Phase 4 (Refinement & Long Tail): 🔲 Not started → H3+
 
 ## Where We Need To Be
 
@@ -164,7 +194,7 @@ Replace the hard `maxMessages=20` trim with intelligent pruning:
 
 ---
 
-### Horizon 2: Intelligence Layer (~80% complete)
+### Horizon 2: Intelligence Layer (~60% complete)
 
 Features that make the agent *smarter*, not just *more reliable*.
 
@@ -274,6 +304,80 @@ This is the single highest-leverage reliability improvement. Stuck detection cat
 | #668 | Notes app navigation fix |
 | #670 | Tool output verbosity (OutputClassifier.formatStatus) |
 | Voice I/O MVP | SherpaOnnx STT + Android TTS + mic in ChatActivity (#556 closed) |
+#### 2.7 Action Policy Engine 🔲
+
+*Source: agentic-loop-v2.md §12.1, SPEC.md §3.5.3*
+
+Per-tool security gates that intercept tool calls before execution. The policy engine is the hard boundary between what the model wants and what actually happens.
+
+| Tool Category | Default Policy | Notes |
+|--------------|----------------|-------|
+| UI navigation (tap, swipe, scroll, back, home) | ALLOW | Standard interaction |
+| Text entry (type_text) | ALLOW | Content reviewed by model |
+| App launch (open_app) | ALLOW | First-time app: CONFIRM |
+| Observation (read_screen, screenshot) | ALLOW | Read-only |
+| Internal (think, wait) | ALLOW | No side effects |
+| Messages/email (detected by screen context) | CONFIRM | High-stakes outbound |
+| Financial actions (detected by screen context) | DENY (v1) | Biometric gate in v2 |
+| Install/uninstall | CONFIRM | System modification |
+| Subtask | ALLOW | Inherits parent policy |
+
+**Phase 1:** Lightweight check in AgentExecutor. **Full engine:** Signed config, capability grants, comes with Rust daemon.
+
+#### 2.8 User Interruption Detection 🔲
+
+*Source: agentic-loop-v2.md §12.9*
+
+Detect when the user takes control mid-task and handle gracefully:
+
+1. **Screen change detection** — foreground app changes without agent action → user switched apps. Pause loop.
+2. **User touch detection** — accessibility service distinguishes agent-injected events from user touches. Any user touch during execution → pause.
+3. **Interruption protocol** — agent pauses and asks: "I was working on [task]. Want me to continue or cancel?"
+4. **State preservation** — conversation history and step progress preserved for resume.
+
+Builds on existing steer infrastructure (boundary checkpoints). The difference: steer is explicit (user types a message), interruption is implicit (user touches screen).
+
+#### 2.9 Sensor Context 🔲
+
+*Source: agentic-loop-v2.md §12.5. Related: #344 (status bar awareness)*
+
+Inject device state into system prompt as a lightweight prefix:
+
+```
+DEVICE STATE: Battery 72%, WiFi connected, Location: Denver CO, 4:15 PM MST
+```
+
+Informs agent decisions:
+- Don't start a 20-step task at 5% battery
+- Warn if cloud-dependent task requested while offline
+- Contextualize location-aware requests ("nearby restaurants")
+- Affect proactive behavior suppression (quiet hours)
+
+Lightweight — reads Android system APIs, no extra permissions beyond what's already granted.
+
+#### 2.10 Cost Tracking & Budgets ⚠️ Partial
+
+*Source: agentic-loop-v2.md §12.8. Token tracking shipped: PR #531*
+
+- ✅ **Per-task token tracking** — count input/output tokens across API calls (shipped #531)
+- 🔲 **Budget limits** — user-configurable daily/monthly spending cap. Loop refuses new tasks when exhausted.
+- 🔲 **Per-task cost display** — opt-in cost-per-task in chat UI (transparent reporting)
+- 🔲 **Reflection cost control** — skip post-task reflection when budget is low
+- 🔲 **Subtask cost inheritance** — subtask tokens count toward parent task total
+
+#### 2.11 Privacy-Sensitive App Handling 🔲
+
+*Source: agentic-loop-v2.md §12.6, SPEC.md §6.1*
+
+Selective screen blindness for apps on a user-configured privacy list (banking, health, etc.):
+
+- When a privacy-listed app is in the foreground, screen content is **not** appended to tool results
+- Agent receives: `"SCREEN: [Privacy mode — screen content hidden for this app. Ask the user for guidance if needed.]"`
+- Agent can still execute blind actions (press_back, press_home) but cannot observe results
+- Privacy list managed in Settings
+
+This is a security/trust feature — users need to feel safe that their banking app screens aren't being sent to cloud LLMs.
+
 
 ---
 
@@ -282,16 +386,70 @@ This is the single highest-leverage reliability improvement. Stuck detection cat
 #### 3.1 Model Failover Chain
 When Key Wallet supports multiple keys/providers: auth rotation with cooldowns, model fallback chain, session-sticky auth. Direct port of OpenClaw's failover system.
 
-#### 3.2 Multi-Step Task Planning
-For complex tasks ("send an email about tomorrow's calendar"), plan ahead:
-1. Agent generates a task plan (open Calendar → read events → open Gmail → compose)
-2. Execute plan step by step with checkpoints
-3. If a step fails, re-plan from current state
+#### 3.2 Subtask Decomposition & Multi-Step Planning 🔲
+
+*Source: agentic-loop-v2.md §6 (v2 Phase 2)*
+
+A `subtask` tool enables the model to decompose complex goals into isolated sub-loops:
+
+```kotlin
+val SUBTASK = Tool(
+    name = "subtask",
+    inputSchema = mapOf(
+        "goal" to "Clear description of what the sub-task should accomplish",
+        "success_criteria" to "How to determine if the sub-task succeeded",
+        "max_steps" to "Maximum tool steps (default: 10)"
+    )
+)
+```
+
+**Execution:**
+1. New `PhoneAgentApi` instance with fresh context (isolation)
+2. Sub-task goal as user message, success criteria in system prompt
+3. Same model config as parent, shared `ScreenReader`
+4. Returns structured result: `{status, result, steps_used, summary}`
+5. Orchestrator decides: retry, reformulate, proceed, or report
+
+**Constraints:**
+- Max recursion depth: 3 levels (orchestrator → subtask → sub-subtask)
+- Each level has its own step counter; parent increments by 1 per subtask call
+- Cancellation propagation via shared token
+- Wall-clock timeout: 60s default per subtask
+
+**The model decides** whether to decompose. Simple tasks use regular tools directly. The model's planning ability is the router, not a heuristic we build.
 
 This is NOT OpenClaw's sub-agent system (we don't need isolated sessions). It's a planning layer on top of the tool loop.
 
-#### 3.3 Learned Navigation Patterns
-Store successful navigation paths ("to compose an email: open Gmail → wait → tap Compose FAB") in memory. On similar tasks, suggest the known path to the agent. Reduces steps and improves reliability.
+#### 3.3 Metacognitive Layer & Learned Patterns 🔲
+
+*Source: agentic-loop-v2.md §8 (v2 Phase 3). Related: #349 (app nav maps), #350 (telemetry), #650 (scoped knowledge)*
+
+The agent reflects, learns, and improves over time. Three timescales:
+
+**In-Task (Real-Time Self-Monitoring):**
+- Loop detection: "I've attempted the same action 3 times — I'm stuck."
+- Efficiency awareness: "I've used 8 steps for what should be a 3-step task."
+- Strategy pivoting: "Scrolling isn't finding it. Let me try search."
+- Implemented via `think` tool + system prompt SELF-MONITORING framing
+
+**Post-Task (Structured Reflection):**
+- After every task: async self-evaluation (doesn't block response)
+- Records: outcome, steps_used, efficiency_rating, observations, learned patterns
+- Stored via memory system with tag taxonomy: `self-reflection`, `self-improvement`, `app-pattern:<app>`, `strategy:<category>`, `failure-analysis`
+
+**Cross-Task (Pattern Evolution):**
+- App-specific knowledge: "Gmail takes 2s to load. Settings is alphabetical."
+- Strategy preferences: "Search > scrolling for long lists."
+- Efficiency baselines: "Simple open-app: 1-2 steps. Compose-and-send: 5-8 steps."
+- Failure patterns: "Calendar widget doesn't respond to taps — open full app."
+
+**Self-Improvement Guardrails:**
+- Strategy changes: free (just using memory to inform decisions)
+- Prompt changes: stored as proposals, not auto-applied
+- Safety rules: immutable — self-improvement cannot relax model floor, confirmation gates, or audit
+- All insights visible/auditable by user
+
+**Learned Navigation Patterns** (original H3.3): Store successful paths ("compose email: open Gmail → tap Compose FAB") in scoped knowledge. Inject into system prompt when agent interacts with that app. Connects to Open Question #7 (scoped agent knowledge).
 
 #### 3.4 Gateway Integration (Optional)
 For power users who want to control their phone from a VPS:
@@ -386,6 +544,41 @@ User Message
       → MessageQueue.drain()               ← queued messages → next turn
 ```
 
+#### 3.7 Proactive Agent Behavior 🔲
+
+*Source: agentic-loop-v2.md §12.4, SPEC.md §3.4 Phase 4. Issue: #597*
+
+Agent-initiated loops — the agent starts tasks without user prompting:
+
+```kotlin
+sealed class LoopTrigger {
+    data class UserMessage(val text: String) : LoopTrigger()
+    data class Notification(val content: NotificationContent) : LoopTrigger()
+    data class Schedule(val trigger: ScheduledTrigger) : LoopTrigger()
+    data class ContextChange(val event: ContextEvent) : LoopTrigger()
+}
+```
+
+Examples: morning briefing (calendar + weather + unread messages), calendar event reminders, notification summaries, low battery warnings.
+
+Proactive loops run the same orchestration path but with different entry context. The model receives "A calendar event is in 30 minutes" instead of a user message.
+
+**Off by default.** Each proactive behavior is individually opt-in in Settings. Quiet hours suppression based on sensor context (H2.9).
+
+#### 3.8 Rust Daemon Migration Path 🔲
+
+*Source: agentic-loop-v2.md §12.10, SPEC.md §3.4*
+
+When the Rust daemon (ct-agent) takes over orchestration:
+
+- `PhoneAgentApi.continueAfterTools()` → `orchestrator::continue_loop()`
+- Tool execution routes through Unix socket IPC to Kotlin companion (accessibility) or `/dev/input` (root)
+- Metacognitive layer translates directly — reflection is LLM-agnostic
+- Policy engine in Rust (ct-security) replaces Kotlin lightweight check
+- WASM skill system (ct-skills) exposed via Unix socket IPC or JNI
+
+Design Kotlin interfaces so Rust equivalents are obvious. Same method signatures, same data flow, same contracts.
+
 ---
 
 ## What NOT To Build (Now)
@@ -399,12 +592,12 @@ Things OpenClaw does that Citros doesn't need in the same form:
 
 ### Deferred, Not Descoped
 
-These were initially descoped but belong in the roadmap:
+These were initially descoped but have since been addressed:
 
-5. **WASM skill system** — already spec'd and partially implemented in Rust crates. Bridges to Kotlin MVP when Rust daemon ships. (See Open Question #6)
-6. **Session key hierarchies** — there are valid use cases (work/personal, per-app). Deferred to Horizon 2+. (See Open Question #7)
-7. **Persona files (AGENTS.md/SOUL.md)** — core feature for agent personality. Should be in Horizon 2. (See Open Question #8)
-
+5. **WASM skill system** — already spec’d and partially implemented in Rust crates. Bridges to Kotlin MVP when Rust daemon ships. (See Open Question #6)
+6. **Scoped agent knowledge** (replaces session key hierarchies) — ✅ design resolved (Open Question #7), implementation tracked in #650
+7. **Persona files (AGENTS.md/SOUL.md)** — ✅ SHIPPED (PR #598, Agent Bones)
+8. **Local LLM routing** — deferred until local models demonstrate sufficient security against prompt injection (v2 §12.3). No local model in the action loop until dedicated security evaluation.
 ---
 
 ## Execution Timeline
@@ -413,9 +606,8 @@ These were initially descoped but belong in the roadmap:
 |---------|-------|--------|------------|
 | **H0: MVP** | 3 PRs (prompt, stuck, overlay) | ✅ COMPLETE | Calendar + Gmail tasks work < 10 steps |
 | **H1: Loop** | AgentExecutor, boundaries, queuing, trimming | ✅ COMPLETE | User can redirect mid-task; context stays clean |
-| **H2: Intelligence** | Memory, lifecycle, tool groups, model-aware prompts, progress UI, verification | ~80% COMPLETE | Agent remembers preferences; per-action verification catches failures |
-| **H3: Ecosystem** | Failover, planning, learned paths, browser API, shared intelligence, gateway | 🔲 NEXT (TinyFish started) | Multi-step tasks, community knowledge, multi-provider resilience |
-
+| **H2: Intelligence** | Memory, lifecycle, tool groups, prompts, verification, policy, privacy, sensors, budgets | ~60% COMPLETE (7/12) | Agent remembers; security gates on sensitive actions |
+| **H3: Ecosystem** | Subtasks, metacognition, failover, proactive, shared intelligence, Rust daemon | 🔲 NEXT (TinyFish started) | Self-improving agent, community knowledge, multi-provider resilience |
 ---
 
 ## Open Questions
@@ -452,10 +644,12 @@ These were initially descoped but belong in the roadmap:
    - **Flavors** = visual theme ONLY (Lime=green, Tangerine=orange). No agent behavior impact.
    - **Guardrails** = constraint rules ("ask before sending emails"). Already have infrastructure. Injected as a separate "Constraints" section in system prompt. Does NOT touch persona files.
 
+10. **v2 Phase 4 refinements** — Dangerous action confirmation gates (covered by H2.7), screen content sanitization (injection pattern stripping), parallel subtask execution, app-specific playbooks (covered by H3.3), user-in-the-loop for low-confidence actions, error recovery intelligence. These are refinements that depend on H3 foundations.
+
 9. **Cloud-first vs local-first storage architecture** — RESOLVED. Local-first, cloud-optional. SQLite on-device is always available. Cloud sync is additive (BYO or managed). Full scope — one `StorageBackend` interface covers everything (memory, conversations, persona, guardrails, settings, patterns). Design once, implement SQLite first, add cloud adapters when tiers ship.
 
 ---
 
-*Last updated: 2026-02-21 (comprehensive status audit)*
-*Sources: OpenClaw docs (17 files), Citros codebase, real-world Pixel testing*
+*Last updated: 2026-02-21 (v2 spec integration + gap closure)*
+*Sources: OpenClaw docs (17 files), Citros codebase, agentic-loop-v2.md, SPEC.md, real-world Pixel testing*
 *Supersedes: `docs/specs/openclaw-architecture-lessons.md` and `docs/specs/mvp-sprint-spec.md`*
