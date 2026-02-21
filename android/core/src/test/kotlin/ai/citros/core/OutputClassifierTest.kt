@@ -702,6 +702,42 @@ class OutputClassifierTest {
     }
 
     @Test
+    fun `formatStatus strips screen dumps and keeps concise action`() {
+        val status = "Waited 2s. Screen:\nApp: com.android.settings\n[0] Search"
+        assertEquals("Waited 2s", OutputClassifier.formatStatus(status))
+    }
+
+    @Test
+    fun `formatStatus collapses json payloads into generic working label`() {
+        val status = "{\"ok\":true,\"tool\":\"web_fetch\",\"result\":\"big payload\"}"
+        assertEquals("Working...", OutputClassifier.formatStatus(status))
+    }
+
+    @Test
+    fun `formatStatus returns generic label for blank status`() {
+        assertEquals("Working...", OutputClassifier.formatStatus("   "))
+    }
+
+    @Test
+    fun `formatStatus collapses array payloads into generic working label`() {
+        assertEquals("Working...", OutputClassifier.formatStatus("[1,2,3]"))
+    }
+
+    @Test
+    fun `formatStatus collapses post summarize json payloads`() {
+        val status = "Screenshot description:\n{\"raw\":\"payload\"}"
+        assertEquals("Working...", OutputClassifier.formatStatus(status))
+    }
+
+    @Test
+    fun `formatStatus truncates long statuses for overlay readability`() {
+        val longStatus = "Searching for " + "very ".repeat(40) + "specific information"
+        val formatted = OutputClassifier.formatStatus(longStatus)
+        assertTrue(formatted.length <= OutputClassifier.STATUS_MAX_CHARS + 1)
+        assertTrue(formatted.endsWith("…"))
+    }
+
+    @Test
     fun `summarize strips screen block with single newline prefix`() {
         val result = "Done\nSCREEN:\nSome content"
         assertEquals("Done", OutputClassifier.summarize(result))

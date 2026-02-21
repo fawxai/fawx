@@ -427,6 +427,28 @@ object OutputClassifier {
      * the user-facing message bubbles and overlay lines.
      */
     internal const val DISPLAY_MAX_CHARS = 200
+    internal const val STATUS_MAX_CHARS = 80
+
+    /**
+     * Format in-progress tool status for compact overlay/chat status lines.
+     *
+     * Reuses [summarize] to strip SCREEN dumps/verification noise, then collapses
+     * whitespace and bounds the output to [STATUS_MAX_CHARS]. If the remaining text
+     * still looks like a raw payload (e.g., JSON blob), returns a generic status.
+     */
+    fun formatStatus(status: String): String {
+        val raw = status.trim()
+        if (raw.startsWith("{") || raw.startsWith("[")) return "Working..."
+
+        val compact = summarize(status)
+            .replace(Regex("""\s+"""), " ")
+            .trim()
+
+        if (compact.isEmpty()) return "Working..."
+        if (compact.startsWith("{") || compact.startsWith("[")) return "Working..."
+
+        return truncateAtWord(compact, STATUS_MAX_CHARS)
+    }
 
     /**
      * Format a tool result for the user-facing chat UI.
@@ -579,13 +601,13 @@ object OutputClassifier {
     /**
      * Truncate a string at a word boundary within [DISPLAY_MAX_CHARS].
      */
-    private fun truncateAtWord(text: String): String {
-        return if (text.length <= DISPLAY_MAX_CHARS) {
+    private fun truncateAtWord(text: String, maxChars: Int = DISPLAY_MAX_CHARS): String {
+        return if (text.length <= maxChars) {
             text
         } else {
-            val truncated = text.substring(0, DISPLAY_MAX_CHARS)
+            val truncated = text.substring(0, maxChars)
             val lastSpace = truncated.lastIndexOf(' ')
-            if (lastSpace > DISPLAY_MAX_CHARS / 2) {
+            if (lastSpace > maxChars / 2) {
                 truncated.substring(0, lastSpace) + "…"
             } else {
                 truncated + "…"

@@ -2,6 +2,7 @@ package ai.citros.chat
 
 import ai.citros.core.AgentFileManager
 import ai.citros.core.ChatResponse
+import ai.citros.core.ErrorSeverity
 import ai.citros.core.MemoryFilter
 import ai.citros.core.MemoryMetadata
 import ai.citros.core.MemoryProvider
@@ -2217,6 +2218,34 @@ class ChatViewModelTest {
         val label = ChatViewModel.toolStatusLabel("some_new_tool")
         assertTrue(label.contains("some_new_tool"),
             "Unknown tool label should contain the tool name: $label")
+    }
+
+    @Test
+    fun `onToolError persistent status is compact and does not leak raw payload`() {
+        val vm = ChatViewModel()
+        vm.onToolError(
+            toolName = "web_fetch",
+            errorText = """{"ok":false,"error":"HTTP 500","debug":"${"x".repeat(300)}"}""",
+            severity = ErrorSeverity.PERSISTENT
+        )
+
+        assertEquals("⚠️ Working...", vm.currentToolStatus.value)
+    }
+
+    @Test
+    fun `onToolProgress status is compact and does not leak raw payload`() {
+        val scripted = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            scripted = ArrayDeque<ChatResponse>()
+        )
+        val backend = viewModel.createTestBackend(Provider.ANTHROPIC, scripted, scripted)
+        setApiModeWithBackends(viewModel, listOf(backend))
+
+        val progress = backend.agent.onToolProgress
+        assertNotNull(progress)
+        progress!!("""{"ok":true,"tool":"web_fetch","result":"${"x".repeat(300)}"}""")
+
+        assertEquals("Working...", viewModel.currentToolStatus.value)
     }
 
     // ========== Conversation Lifecycle ==========

@@ -593,7 +593,7 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
         cloudApiClient = backend.chatClient
         phoneAgentApi = backend.agent
         // Wire real-time progress updates for long-running tools (e.g., web_browse)
-        backend.agent.onToolProgress = { status -> currentToolStatus.value = status }
+        backend.agent.onToolProgress = { status -> currentToolStatus.value = OutputClassifier.formatStatus(status) }
     }
 
     /**
@@ -1192,7 +1192,7 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
             }
             ErrorSeverity.PERSISTENT -> {
                 // Sticky warning status
-                currentToolStatus.value = "⚠️ ${errorText.take(50)}"
+                currentToolStatus.value = "⚠️ ${OutputClassifier.formatStatus(errorText)}"
             }
             ErrorSeverity.EXPLORATORY,
             ErrorSeverity.INFORMATIONAL -> {
