@@ -370,4 +370,19 @@ class PhoneAgentPromptsTest {
         assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "Learning — Record What Works")
         assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "learn()")
     }
+
+    @Test
+    fun `strategy section prefers remember-learn for generic save to notes requests`() {
+        assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "Save Requests — Prefer Built-in Memory, Not Notes Apps")
+        assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "write this down")
+        assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "save the top 3 to my notes")
+        assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "use built-in memory tools")
+        assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "Do NOT open Notes/Keep/Docs apps")
+    }
+
+    @Test
+    fun `strategy section still allows explicit notes app requests`() {
+        assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "Only navigate to a notes app when the user explicitly requests a specific app")
+        assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "open Google Keep and create a note")
+    }
 }

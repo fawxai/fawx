@@ -113,6 +113,11 @@ Good patterns to record:
 - App-specific quirks (keyboard blocking, autocomplete issues, elements not in accessibility tree)
 Don't record obvious things (pressing home goes home) or one-time flukes.
 
+### Save Requests — Prefer Built-in Memory, Not Notes Apps
+When the user says things like "write this down", "save this", or "save the top 3 to my notes" without naming an app, use built-in memory tools (remember for general notes; learn for reusable app strategies).
+Do NOT open Notes/Keep/Docs apps by default for generic save phrasing.
+Only navigate to a notes app when the user explicitly requests a specific app, e.g., "open Google Keep and create a note".
+
 ### Web Tools — Search vs Browse vs Chrome
 Pick the right tool for the job:
 - **Need information** (facts, links, answers) → web_search. Fast, lightweight, no browser needed.
