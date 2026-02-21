@@ -140,12 +140,24 @@ object OutputClassifier {
         "web_search" to ToolCategory.RESEARCH,
         "web_fetch" to ToolCategory.RESEARCH,
         "web_browse" to ToolCategory.RESEARCH,
+        "recall" to ToolCategory.RESEARCH,
 
         // Reasoning — shown dimmed
         // Status
         "wait" to ToolCategory.MECHANICAL,
         "read_screen" to ToolCategory.MECHANICAL,
         "read_notifications" to ToolCategory.PROMINENT,
+        "learn" to ToolCategory.OTHER,
+        "remember" to ToolCategory.OTHER,
+        "list_files" to ToolCategory.OTHER,
+        "read_file" to ToolCategory.OTHER,
+        "write_file" to ToolCategory.OTHER,
+        "copy" to ToolCategory.OTHER,
+        "set_clipboard" to ToolCategory.OTHER,
+        "list_memories" to ToolCategory.OTHER,
+        "tap_notification" to ToolCategory.OTHER,
+        "dismiss_notification" to ToolCategory.OTHER,
+        "reply_notification" to ToolCategory.OTHER,
         "paste" to ToolCategory.OTHER,
         "clipboard" to ToolCategory.OTHER,
         "think" to ToolCategory.REASONING
@@ -454,6 +466,8 @@ object OutputClassifier {
      * 4. Truncate at [DISPLAY_MAX_CHARS] on a word boundary
      */
     internal fun summarize(result: String): String {
+        parseJsonSummary(result)?.let { return it }
+
         // Handle "Screenshot description:\n..." — extract the actual description
         if (result.startsWith("Screenshot description:")) {
             val desc = result.removePrefix("Screenshot description:").trim()
@@ -489,6 +503,77 @@ object OutputClassifier {
             }
 
         return truncateAtWord(firstLine)
+    }
+
+    /**
+     * Parses compact JSON tool results into a user-facing summary.
+     *
+     * Intentionally handles only known lightweight shapes emitted by tool wrappers,
+     * not arbitrary JSON parsing: `{ok, tool, ...}` with specialized handling for
+     * remember/learn/recall/list_files/read_file and a best-effort string fallback
+     * for unknown tools. If the payload is not recognized (missing required fields,
+     * malformed, or no extractable summary), returns null so summarize() falls back
+     * to the existing non-JSON line/regex pipeline.
+     */
+    private fun parseJsonSummary(result: String): String? {
+        val trimmed = result.trim()
+        if (!trimmed.startsWith("{") || !trimmed.contains("\"ok\"") || !trimmed.contains("\"tool\"")) {
+            return null
+        }
+
+        val tool = matchStringField(trimmed, "tool")
+        return when (tool) {
+            "remember", "learn" -> {
+                val content = matchStringField(trimmed, "content")
+                if (!content.isNullOrBlank()) "Saved: ${content.trim()}" else "Saved"
+            }
+            "recall" -> {
+                val recalled = Regex(""""results"\s*:\s*\[\s*\{[^}]*"content"\s*:\s*"([^"]+)"""")
+                    .find(trimmed)
+                    ?.groupValues
+                    ?.getOrNull(1)
+                    ?.trim()
+                if (!recalled.isNullOrEmpty()) "Recalled: $recalled" else "No results found"
+            }
+            "list_files" -> {
+                val block = Regex(""""files"\s*:\s*\[([^\]]*)]""")
+                    .find(trimmed)
+                    ?.groupValues
+                    ?.getOrNull(1)
+                    ?: return "Files: none"
+                val files = Regex(""""([^"]+)"""")
+                    .findAll(block)
+                    .map { it.groupValues[1] }
+                    .toList()
+                if (files.isEmpty()) {
+                    "Files: none"
+                } else {
+                    val shown = files.take(3).joinToString(", ")
+                    val suffix = if (files.size > 3) ", ..." else ""
+                    "Files: $shown$suffix"
+                }
+            }
+            "read_file" -> {
+                val path = matchStringField(trimmed, "path")
+                if (!path.isNullOrBlank()) "Read: ${path.trim()}" else "Read file"
+            }
+            else -> {
+                Regex(""":\s*"([^"]{2,})"""")
+                    .find(trimmed)
+                    ?.groupValues
+                    ?.getOrNull(1)
+            }
+        }
+    }
+
+    // Regex helper for flat string fields in compact tool JSON.
+    // Limitation: does not handle escaped quotes inside values (e.g. "), which is
+    // acceptable for current summaries and falls back safely when no match is found.
+    private fun matchStringField(json: String, key: String): String? {
+        return Regex(""""$key"\s*:\s*"([^"]*)"""")
+            .find(json)
+            ?.groupValues
+            ?.getOrNull(1)
     }
 
     /**

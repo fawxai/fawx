@@ -15,7 +15,12 @@ class OutputClassifierTest {
         assertEquals(ToolCategory.MECHANICAL, OutputClassifier.categoryOf("tap"))
         assertEquals(ToolCategory.PROMINENT, OutputClassifier.categoryOf("open_app"))
         assertEquals(ToolCategory.RESEARCH, OutputClassifier.categoryOf("web_search"))
+        assertEquals(ToolCategory.RESEARCH, OutputClassifier.categoryOf("recall"))
         assertEquals(ToolCategory.REASONING, OutputClassifier.categoryOf("think"))
+        assertEquals(ToolCategory.OTHER, OutputClassifier.categoryOf("learn"))
+        assertEquals(ToolCategory.OTHER, OutputClassifier.categoryOf("remember"))
+        assertEquals(ToolCategory.OTHER, OutputClassifier.categoryOf("list_files"))
+        assertEquals(ToolCategory.OTHER, OutputClassifier.categoryOf("read_file"))
     }
 
     @Test
@@ -30,9 +35,13 @@ class OutputClassifierTest {
             "press_back", "press_home", "type_text", "wait", "read_screen")
         val expectedProminent = listOf("open_app", "open_notifications", "read_notifications",
             "screenshot", "subtask")
-        val expectedResearch = listOf("web_search", "web_fetch")
+        val expectedResearch = listOf("web_search", "web_fetch", "recall")
         val expectedReasoning = listOf("think")
-        val expectedOther = listOf("paste", "clipboard")
+        val expectedOther = listOf(
+            "paste", "clipboard", "learn", "remember", "list_files", "read_file",
+            "write_file", "copy", "set_clipboard", "list_memories",
+            "tap_notification", "dismiss_notification", "reply_notification"
+        )
 
         for (tool in expectedMechanical) {
             assertEquals(ToolCategory.MECHANICAL, OutputClassifier.TOOL_CATEGORIES[tool], "$tool")
@@ -144,7 +153,7 @@ class OutputClassifierTest {
 
     @Test
     fun `memory tools are show dimmed`() {
-        val memoryTools = listOf("remember", "recall", "list_memories")
+        val memoryTools = listOf("remember", "list_memories")
         for (tool in memoryTools) {
             assertEquals(
                 OutputVisibility.SHOW_DIMMED,
@@ -817,6 +826,73 @@ class OutputClassifierTest {
             "Waited 200ms",
             OutputClassifier.summarize(result)
         )
+    }
+
+
+    @Test
+    fun `summarize remember json as saved content`() {
+        val result = """{"ok":true,"tool":"remember","content":"Favorite restaurant: Sushi Den on Pearl Street"}"""
+        assertEquals("Saved: Favorite restaurant: Sushi Den on Pearl Street", OutputClassifier.summarize(result))
+    }
+
+    @Test
+    fun `summarize learn json as saved content`() {
+        val result = """{"ok":true,"tool":"learn","content":"Use metric units"}"""
+        assertEquals("Saved: Use metric units", OutputClassifier.summarize(result))
+    }
+
+    @Test
+    fun `summarize recall json with results`() {
+        val result = """{"ok":true,"tool":"recall","results":[{"content":"Favorite restaurant: Sushi Den on Pearl Street"}]}"""
+        assertEquals("Recalled: Favorite restaurant: Sushi Den on Pearl Street", OutputClassifier.summarize(result))
+    }
+
+    @Test
+    fun `summarize recall json with empty results`() {
+        val result = """{"ok":true,"tool":"recall","results":[]}"""
+        assertEquals("No results found", OutputClassifier.summarize(result))
+    }
+
+    @Test
+    fun `summarize list_files json`() {
+        val result = """{"ok":true,"tool":"list_files","files":["file1.txt","file2.txt","file3.txt","file4.txt"]}"""
+        assertEquals("Files: file1.txt, file2.txt, file3.txt, ...", OutputClassifier.summarize(result))
+    }
+
+    @Test
+    fun `summarize list_files json empty array as none`() {
+        val result = """{"ok":true,"tool":"list_files","files":[]}"""
+        assertEquals("Files: none", OutputClassifier.summarize(result))
+    }
+
+    @Test
+    fun `summarize list_files json with three files has no ellipsis`() {
+        val result = """{"ok":true,"tool":"list_files","files":["a.txt","b.txt","c.txt"]}"""
+        assertEquals("Files: a.txt, b.txt, c.txt", OutputClassifier.summarize(result))
+    }
+
+    @Test
+    fun `summarize unknown json tool falls back to generic string extraction`() {
+        val result = """{"ok":true,"tool":"future_tool","note":"Did thing"}"""
+        assertEquals("future_tool", OutputClassifier.summarize(result))
+    }
+
+    @Test
+    fun `summarize read_file json`() {
+        val result = """{"ok":true,"tool":"read_file","path":"/tmp/note.txt","content":"top secret"}"""
+        assertEquals("Read: /tmp/note.txt", OutputClassifier.summarize(result))
+    }
+
+    @Test
+    fun `summarize malformed json falls through existing logic`() {
+        val result = "{" + "\"ok\":true,"
+        assertEquals(result, OutputClassifier.summarize(result))
+    }
+
+    @Test
+    fun `summarize non json behavior unchanged`() {
+        val result = "Opened Gmail\n\nSCREEN:\nInbox"
+        assertEquals("Opened Gmail", OutputClassifier.summarize(result))
     }
 
     // --- PR #630: edge cases ---
