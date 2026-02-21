@@ -5,37 +5,38 @@
 
 ---
 
-## Where We Are
+## Where We Are (updated 2026-02-21)
 
-Citros can see the screen, dispatch gestures, and talk to frontier models. The hard plumbing works:
-- Accessibility service reads screen → `ScreenContent`
-- Window-aware filtering skips self-overlay (PR #434, #446)
-- Overlay hides during screenshots (PR #439) and tool loops (PR #458, in review)
-- Structured logging (PR #435) across 4 tags
-- 27 tools defined in `PhoneTools.ALL`
+Horizons 0 and 1 are **COMPLETE**. Horizon 2 is **~80% complete**. The agent has a proper architecture:
+
+- **AgentExecutor** with boundary checkpoints (stuck detection, steer, cancellation, action verification)
+- **Modular system prompt** assembled from sections (identity, tools, strategy, recovery, disambiguation, rules, runtime)
+- **Voice I/O** working (SherpaOnnx on-device STT + Android TTS, VoiceAccumulator, mic in ChatActivity)
+- **On-device memory** (SQLite learn/recall), **conversation lifecycle** (idle timeout, daily reset)
+- **Context trimming** (category-aware ContextCompactor, transformContext hook)
+- **Steer UI** — user can redirect mid-task via message injection at tool boundaries
+- **Per-action verification** — catches failed UI actions on first attempt
+- **API tools** (web_search, web_fetch via Citros proxy + Brave), **TinyFish web_browse** for browser automation
+- **SSE streaming**, **wallet hardening**, **persona files** (SOUL.md/USER.md/IDENTITY.md in prompt)
+- **Confidence-gated disambiguation** — think before asking, calibrate by stakes
+- **Progressive status updates** — human-readable tool output in chat/overlay
 - 3 providers: Anthropic, OpenAI, OpenRouter
-- 532+ tests passing
 
-What's broken is the **agent brain** and the **loop architecture**:
-- Monolithic system prompt doesn't teach strategy
-- Tool loop is a `while` loop in `ChatViewModel` with no boundaries, hooks, or injection points
-- No stuck detection, no message queuing, no context management
-- Agent regularly burns 15+ steps on tasks that should take 3-5
+**Remaining H2 gaps:** Tool Grouping (#557) and Model-Aware Prompt Tuning (#558)
 
 ## Where We Need To Be
 
-A phone agent that reliably completes everyday tasks on the first try:
-- Open app, do thing, report back — in under 10 steps
-- Recovers from getting stuck instead of burning context
-- User can redirect mid-task ("no, I meant the other app")
-- Context stays clean across multi-step tasks
-- Architecture supports future features without rewriting the loop
+Finish H2 token optimization, then move to H3 ecosystem features:
+- Cheaper model tiers viable (Haiku/GPT-4o-mini) via tool grouping + prompt tuning
+- Model failover chains, multi-step task planning, learned navigation patterns
+- Community knowledge sharing (shared intelligence)
+- External browser API as primary web interaction path
 
 ---
 
 ## The Plan: 4 Horizons
 
-### Horizon 0: Ship MVP (3 PRs — this week)
+### Horizon 0: Ship MVP ✅ COMPLETE
 
 The immediate deliverables. Zero architecture changes — just prompt engineering and safety nets that work within the current monolithic loop.
 
@@ -86,7 +87,7 @@ After all 3 PRs, these work on first try with Opus or Sonnet:
 
 ---
 
-### Horizon 1: Loop Architecture (next 2-4 weeks)
+### Horizon 1: Loop Architecture ✅ COMPLETE
 
 Refactor the tool loop from a monolithic `while` in `ChatViewModel` to a proper agent executor with boundaries, hooks, and message injection. This is the prerequisite for everything in Horizons 2-3.
 
@@ -163,11 +164,11 @@ Replace the hard `maxMessages=20` trim with intelligent pruning:
 
 ---
 
-### Horizon 2: Intelligence Layer (1-2 months out)
+### Horizon 2: Intelligence Layer (~80% complete)
 
 Features that make the agent *smarter*, not just *more reliable*.
 
-#### 2.1 On-Device Memory
+#### 2.1 On-Device Memory ✅ (PR #504)
 
 Store facts and user preferences that survive conversation resets:
 
@@ -178,7 +179,7 @@ Store facts and user preferences that survive conversation resets:
 
 **Informed by OpenClaw:** Their memory is plain Markdown files + optional vector search. Phone equivalent: SQLite rows with timestamp + content + optional tags. Keep it simple — vector search is a nice-to-have, not a must-have.
 
-#### 2.2 Conversation Lifecycle
+#### 2.2 Conversation Lifecycle ✅ (Jarvis)
 
 - **Idle timeout:** After 4 hours of inactivity, start a fresh conversation context (but keep chat history visible in UI)
 - **Daily reset:** Optional setting — new context each day
@@ -186,7 +187,7 @@ Store facts and user preferences that survive conversation resets:
 
 **Informed by OpenClaw:** Their session lifecycle (daily reset at 4 AM + idle timeout + manual `/new`) is well-designed. We adapt: phone users expect persistent chat UI but fresh context. Show all messages in scroll history, but only send recent ones to the model.
 
-#### 2.3 Tool Grouping
+#### 2.3 Tool Grouping 🔲 (#557)
 
 Divide the 27 tools into categories and only send relevant ones:
 
@@ -204,7 +205,7 @@ Divide the 27 tools into categories and only send relevant ones:
 
 **Informed by OpenClaw:** Their skills system is lazy-loaded metadata (~97 chars per skill in prompt, full SKILL.md read on demand). Full lazy loading is overkill for us, but grouping achieves 80% of the benefit with 20% of the complexity.
 
-#### 2.4 Model-Aware Prompt Tuning
+#### 2.4 Model-Aware Prompt Tuning 🔲 (#558)
 
 Different prompts for different model tiers:
 
@@ -214,7 +215,7 @@ Different prompts for different model tiers:
 
 **Informed by OpenClaw:** They have prompt modes (full/minimal/none) for main agents vs sub-agents. Same principle: less capable models need simpler instructions, not more.
 
-#### 2.5 Progressive Status Updates
+#### 2.5 Progressive Status Updates ✅ (PR #670)
 
 Stream tool execution status to the UI during loops:
 
@@ -229,7 +230,7 @@ This replaces the current "Thinking..." with real-time progress. Doesn't require
 
 **Informed by OpenClaw:** Their block streaming and typing indicators give users instant feedback. We don't need streaming from the API — tool execution names are available synchronously.
 
-#### 2.6 Per-Action Verification Loop
+#### 2.6 Per-Action Verification ✅ (PR #671)
 
 Upgrade from passive stuck detection (screen hash repetition) to **active verification after every action**:
 
@@ -246,6 +247,33 @@ This is the single highest-leverage reliability improvement. Stuck detection cat
 **Implementation:** New `ActionVerifier` interface in AgentExecutor, called after every `ToolRunner.execute()`. Lightweight — just a screen hash comparison + optional element check. No extra API calls.
 
 **Informed by real-world testing (2026-02-21):** Flight booking flow on Google Flights showed the agent tapping elements that didn't respond, then continuing without noticing. Per-action verification would have caught this immediately and triggered a retry or alternative strategy.
+
+
+#### Additional H2-Era Features Shipped (not in original roadmap)
+
+| PR | Feature |
+|----|---------|
+| #497 | API Tools (web_search + web_fetch via Citros proxy) |
+| #501 | Client deduplication |
+| #503 | SSE streaming |
+| #514, #516 | Wallet hardening |
+| #521 | Batch tool results |
+| #524 | Prompt fix |
+| #530 | transformContext hook (H2 prerequisite) |
+| #531 | Token usage tracking (H2 prerequisite) |
+| #559 | Onboarding fixes |
+| #598 | Agent bones — persona files (SOUL.md/USER.md/IDENTITY.md) in prompt |
+| #599 | TinyFish web_browse integration |
+| #602 | UX polish batch (API key masking, markdown rendering, voice-steer) |
+| #607 | Confidence-gated disambiguation |
+| #654 | Voice silence threshold + VoiceAccumulator extraction |
+| #656 | Citros search proxy (zero-config web search) |
+| #662 | Ghost input fix (accessibility eventTypes) |
+| #666 | Orphaned tool_result fix (Message.copy() stale blocks) |
+| #667 | JSON tool display verbosity |
+| #668 | Notes app navigation fix |
+| #670 | Tool output verbosity (OutputClassifier.formatStatus) |
+| Voice I/O MVP | SherpaOnnx STT + Android TTS + mic in ChatActivity (#556 closed) |
 
 ---
 
@@ -273,7 +301,7 @@ For power users who want to control their phone from a VPS:
 
 This is the horizon 2-3 escape hatch mentioned in the product principle. NOT the core product.
 
-#### 3.5 External Browser Automation API (TinyFish)
+#### 3.5 External Browser Automation API (TinyFish) ✅ (PR #599 — basic integration)
 
 Chrome's accessibility layer is fundamentally broken for text input — fields report `active=false, focused=false`, making `type_text` unreliable in web views. Instead of fighting the accessibility layer, delegate web interaction to a purpose-built browser automation API.
 
@@ -381,12 +409,12 @@ These were initially descoped but belong in the roadmap:
 
 ## Execution Timeline
 
-| Horizon | Scope | Timeline | Key Metric |
-|---------|-------|----------|------------|
-| **H0: MVP** | 3 PRs (prompt, stuck, overlay) | This week | Calendar + Gmail tasks work < 10 steps |
-| **H1: Loop** | AgentExecutor, boundaries, queuing, trimming | 2-4 weeks | User can redirect mid-task; context stays clean |
-| **H2: Intelligence** | Memory, lifecycle, tool groups, model-aware prompts, progress UI | 1-2 months | Agent remembers preferences; works well on Haiku |
-| **H3: Ecosystem** | Failover, planning, learned paths, browser API, shared intelligence, gateway | 3+ months | Multi-step tasks, community knowledge, multi-provider resilience |
+| Horizon | Scope | Status | Key Metric |
+|---------|-------|--------|------------|
+| **H0: MVP** | 3 PRs (prompt, stuck, overlay) | ✅ COMPLETE | Calendar + Gmail tasks work < 10 steps |
+| **H1: Loop** | AgentExecutor, boundaries, queuing, trimming | ✅ COMPLETE | User can redirect mid-task; context stays clean |
+| **H2: Intelligence** | Memory, lifecycle, tool groups, model-aware prompts, progress UI, verification | ~80% COMPLETE | Agent remembers preferences; per-action verification catches failures |
+| **H3: Ecosystem** | Failover, planning, learned paths, browser API, shared intelligence, gateway | 🔲 NEXT (TinyFish started) | Multi-step tasks, community knowledge, multi-provider resilience |
 
 ---
 
@@ -428,6 +456,6 @@ These were initially descoped but belong in the roadmap:
 
 ---
 
-*Last updated: 2026-02-21*
+*Last updated: 2026-02-21 (comprehensive status audit)*
 *Sources: OpenClaw docs (17 files), Citros codebase, real-world Pixel testing*
 *Supersedes: `docs/specs/openclaw-architecture-lessons.md` and `docs/specs/mvp-sprint-spec.md`*
