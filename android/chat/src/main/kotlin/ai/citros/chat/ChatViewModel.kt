@@ -62,22 +62,22 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
          */
         internal fun toolStatusLabel(toolName: String): String {
             return when (OutputClassifier.categoryOf(toolName)) {
-                ToolCategory.MECHANICAL -> "Interacting..."
-                ToolCategory.PROMINENT -> when (toolName) {
+                OutputToolCategory.MECHANICAL -> "Interacting..."
+                OutputToolCategory.PROMINENT -> when (toolName) {
                     "open_app" -> "Opening app..."
                     "open_notifications" -> "Opening notifications..."
                     "screenshot" -> "Taking screenshot..."
                     "subtask" -> "Running subtask..."
                     else -> "Running $toolName..."
                 }
-                ToolCategory.RESEARCH -> when (toolName) {
+                OutputToolCategory.RESEARCH -> when (toolName) {
                     "web_search" -> "Searching the web..."
                     "web_fetch" -> "Fetching page..."
                     "web_browse" -> "Browsing the web..."
                     else -> "Researching..."
                 }
-                ToolCategory.REASONING -> "Thinking..."
-                ToolCategory.OTHER -> "Running $toolName..."
+                OutputToolCategory.REASONING -> "Thinking..."
+                OutputToolCategory.OTHER -> "Running $toolName..."
             }
         }
     }

@@ -519,6 +519,38 @@ object PhoneTools {
     )
 
     /**
+     * Meta-tool for requesting additional tool categories when needed.
+     * This is a hint mechanism; execution returns descriptions for categories.
+     */
+    val REQUEST_TOOLS = Tool(
+        name = "request_tools",
+        description = "Request additional tool categories to be loaded. Categories: navigation, interaction, observation, notification, clipboard, memory, research, planning.",
+        inputSchema = mapOf(
+            "type" to "object",
+            "properties" to mapOf(
+                "categories" to mapOf(
+                    "type" to "array",
+                    "description" to "List of category names to request",
+                    "items" to mapOf(
+                        "type" to "string",
+                        "enum" to listOf(
+                            "navigation",
+                            "interaction",
+                            "observation",
+                            "notification",
+                            "clipboard",
+                            "memory",
+                            "research",
+                            "planning"
+                        )
+                    )
+                )
+            ),
+            "required" to listOf("categories")
+        )
+    )
+
+    /**
      * All available phone control tools.
      * Use this list when calling chatWithTools().
      */
@@ -607,6 +639,86 @@ object PhoneTools {
         WEB_BROWSE
     )
 
+    private val ALL_TOOLS: List<Tool> by lazy { (ALL + API_TOOLS).distinctBy { it.name } }
+
+    /**
+     * Minimum viable tool set that is always available for any interaction.
+     *
+     * Tools in this set may also belong to a specific [ToolCategory] (for example
+     * `tap` is INTERACTION and core). This overlap is intentional:
+     * - `getToolsForCategories(emptySet())` returns only these core tools.
+     * - Category filtering removes non-essential tools, never core tools.
+     */
+    val CORE_TOOL_NAMES: Set<String> = setOf(
+        "read_screen",
+        "tap",
+        "type_text",
+        "press_home",
+        "press_back",
+        "open_app",
+        "swipe",
+        "scroll",
+        "wait",
+        "request_tools"
+    )
+
+    private val TOOL_CATEGORIES: Map<String, ToolCategory> = mapOf(
+        "tap" to ToolCategory.INTERACTION,
+        "tap_text" to ToolCategory.INTERACTION,
+        "type_text" to ToolCategory.INTERACTION,
+        "swipe" to ToolCategory.INTERACTION,
+        "press_back" to ToolCategory.NAVIGATION,
+        "press_home" to ToolCategory.NAVIGATION,
+        "open_app" to ToolCategory.NAVIGATION,
+        "open_notifications" to ToolCategory.NAVIGATION,
+        "read_screen" to ToolCategory.OBSERVATION,
+        "scroll" to ToolCategory.INTERACTION,
+        "screenshot" to ToolCategory.OBSERVATION,
+        "copy" to ToolCategory.CLIPBOARD,
+        "set_clipboard" to ToolCategory.CLIPBOARD,
+        "paste" to ToolCategory.INTERACTION,
+        "read_notifications" to ToolCategory.NOTIFICATION,
+        "tap_notification" to ToolCategory.NOTIFICATION,
+        "dismiss_notification" to ToolCategory.NOTIFICATION,
+        "reply_notification" to ToolCategory.NOTIFICATION,
+        "read_file" to ToolCategory.MEMORY,
+        "write_file" to ToolCategory.MEMORY,
+        "list_files" to ToolCategory.MEMORY,
+        "remember" to ToolCategory.MEMORY,
+        "recall" to ToolCategory.MEMORY,
+        "list_memories" to ToolCategory.MEMORY,
+        "learn" to ToolCategory.MEMORY,
+        "think" to ToolCategory.PLANNING,
+        "wait" to ToolCategory.OBSERVATION,
+        "long_press" to ToolCategory.INTERACTION,
+        "web_search" to ToolCategory.RESEARCH,
+        "web_fetch" to ToolCategory.RESEARCH,
+        "web_browse" to ToolCategory.RESEARCH,
+        "request_tools" to ToolCategory.CORE
+    )
+
+    fun categoryOf(toolName: String): ToolCategory =
+        TOOL_CATEGORIES[toolName] ?: throw IllegalArgumentException("Unknown tool: $toolName")
+
+    fun hasCategoryAssignment(toolName: String): Boolean =
+        TOOL_CATEGORIES.containsKey(toolName)
+
+    fun toolsForCategory(category: ToolCategory): List<Tool> =
+        ALL_TOOLS.filter { categoryOf(it.name) == category }
+
+    fun getToolsForCategories(
+        categories: Set<ToolCategory>,
+        modelTier: ModelTier = ModelTier.STANDARD
+    ): List<Tool> {
+        val requested = categories + ToolCategory.CORE
+        val permitted = if (modelTier == ModelTier.SMALL) requested - ToolCategory.RESEARCH else requested
+
+        return ALL_TOOLS.filter { tool ->
+            val category = categoryOf(tool.name)
+            tool.name in CORE_TOOL_NAMES || category in permitted
+        }
+    }
+
     val ALL: List<Tool> = listOf(
         TAP,
         TAP_TEXT,
@@ -635,6 +747,7 @@ object PhoneTools {
         LEARN,
         THINK,
         WAIT,
-        LONG_PRESS
+        LONG_PRESS,
+        REQUEST_TOOLS
     )
 }

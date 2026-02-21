@@ -72,19 +72,8 @@ open class PhoneAgentApi(
      */
     fun getToolsForModel(modelId: String? = null): List<Tool> {
         val tier = modelId?.let { ModelClassifier.classify(it) } ?: ModelTier.STANDARD
-
-        return if (tier != ModelTier.SMALL) {
-            // web_search always available (DuckDuckGo fallback needs no config)
-            // web_browse requires TinyFish API key
-            val apiTools = if (tinyFishApiKey != null) {
-                PhoneTools.API_TOOLS
-            } else {
-                PhoneTools.API_TOOLS.filter { it.name != "web_browse" }
-            }
-            PhoneTools.ALL + apiTools
-        } else {
-            PhoneTools.ALL
-        }
+        val tools = PhoneTools.getToolsForCategories(ToolCategory.entries.toSet(), tier)
+        return if (tinyFishApiKey != null) tools else tools.filter { it.name != "web_browse" }
     }
 
     private val messages: MutableList<Message> = CopyOnWriteArrayList()
@@ -210,7 +199,7 @@ open class PhoneAgentApi(
             Regex("""<tool_call>.*?</tool_call>""", RegexOption.DOT_MATCHES_ALL),
             Regex("""<function_call>.*?</function_call>""", RegexOption.DOT_MATCHES_ALL),
             // JSON tool objects with known tool names (handles one level of nesting)
-            Regex("""\{\s*"name"\s*:\s*"(tap|type_text|swipe|open_app|press_back|press_home|read_screen|screenshot|scroll|long_press|tap_text|open_notifications|wait|think|web_browse|web_search|web_fetch)"[^{}]*(\{[^{}]*\}[^{}]*)?\}""")
+            Regex("""\{\s*"name"\s*:\s*"(tap|type_text|swipe|open_app|press_back|press_home|read_screen|screenshot|scroll|long_press|tap_text|open_notifications|wait|think|web_browse|web_search|web_fetch|request_tools)"[^{}]*(\{[^{}]*\}[^{}]*)?\}""")
         )
 
         /**
@@ -894,6 +883,79 @@ open class PhoneAgentApi(
                     client.browse(url = url, goal = goal, stealth = stealth, onProgress = onToolProgress)
                 }
 
+                "request_tools" -> {
+                    val rawCategories = toolCall.input["categories"] as? List<*>
+                        ?: return ToolResult(
+                            "Missing required parameter: categories (array of strings)",
+                            isError = true
+                        )
+                    val validCategories = ToolCategory.entries
+                        .filter { it != ToolCategory.CORE }
+                        .map { it.name.lowercase() }
+                        .sorted()
+
+                    if (rawCategories.isEmpty()) {
+                        return ToolResult(
+                            "categories must contain at least one category. Available: ${validCategories.joinToString(", ")}",
+                            isError = true
+                        )
+                    }
+
+                    val requested = linkedSetOf<ToolCategory>()
+                    val invalidCategories = mutableListOf<String>()
+                    rawCategories.forEach { item ->
+                        val raw = (item as? String)?.trim()
+                        if (raw.isNullOrEmpty()) {
+                            invalidCategories += item?.toString() ?: "null"
+                            return@forEach
+                        }
+                        val category = try {
+                            ToolCategory.valueOf(raw.uppercase())
+                        } catch (_: IllegalArgumentException) {
+                            null
+                        }
+                        if (category == null || category == ToolCategory.CORE) {
+                            invalidCategories += raw
+                        } else {
+                            requested += category
+                        }
+                    }
+
+                    if (invalidCategories.isNotEmpty()) {
+                        return ToolResult(
+                            "Invalid categories: ${invalidCategories.joinToString(", ")}. Available: ${validCategories.joinToString(", ")}",
+                            isError = true
+                        )
+                    }
+
+                    if (requested.isEmpty()) {
+                        return ToolResult(
+                            "No valid categories requested. Available: ${validCategories.joinToString(", ")}",
+                            isError = true
+                        )
+                    }
+
+                    val tools = PhoneTools.getToolsForCategories(requested, currentExecutionModelTier())
+                        .filter { tinyFishApiKey != null || it.name != "web_browse" }
+                        .sortedBy { it.name }
+
+                    val text = buildString {
+                        append("Requested categories: ")
+                        append(requested.joinToString(", ") { it.name.lowercase() })
+                        append('\n')
+                        append("Available tools:\n")
+                        tools.forEach { tool ->
+                            append("- ")
+                            append(tool.name)
+                            append(": ")
+                            append(tool.description)
+                            append('\n')
+                        }
+                    }.trimEnd()
+
+                    ToolResult(text)
+                }
+
                 else -> {
                     "Failed: unknown tool \"${toolCall.name}\""
                 }
@@ -927,6 +989,9 @@ open class PhoneAgentApi(
             ToolResult(fileToolError(toolName, e.message ?: "Unknown error"), isError = true)
         }
     }
+
+    private fun currentExecutionModelTier(): ModelTier =
+        actionClient.modelId?.let { ModelClassifier.classify(it) } ?: ModelTier.STANDARD
 
     // JSON encoding helpers — short aliases for readability
     private fun encStr(value: String): String =

@@ -12,21 +12,21 @@ class OutputClassifierTest {
 
     @Test
     fun `categoryOf returns correct category for mapped tools`() {
-        assertEquals(ToolCategory.MECHANICAL, OutputClassifier.categoryOf("tap"))
-        assertEquals(ToolCategory.PROMINENT, OutputClassifier.categoryOf("open_app"))
-        assertEquals(ToolCategory.RESEARCH, OutputClassifier.categoryOf("web_search"))
-        assertEquals(ToolCategory.RESEARCH, OutputClassifier.categoryOf("recall"))
-        assertEquals(ToolCategory.REASONING, OutputClassifier.categoryOf("think"))
-        assertEquals(ToolCategory.OTHER, OutputClassifier.categoryOf("learn"))
-        assertEquals(ToolCategory.OTHER, OutputClassifier.categoryOf("remember"))
-        assertEquals(ToolCategory.OTHER, OutputClassifier.categoryOf("list_files"))
-        assertEquals(ToolCategory.OTHER, OutputClassifier.categoryOf("read_file"))
+        assertEquals(OutputToolCategory.MECHANICAL, OutputClassifier.categoryOf("tap"))
+        assertEquals(OutputToolCategory.PROMINENT, OutputClassifier.categoryOf("open_app"))
+        assertEquals(OutputToolCategory.RESEARCH, OutputClassifier.categoryOf("web_search"))
+        assertEquals(OutputToolCategory.RESEARCH, OutputClassifier.categoryOf("recall"))
+        assertEquals(OutputToolCategory.REASONING, OutputClassifier.categoryOf("think"))
+        assertEquals(OutputToolCategory.OTHER, OutputClassifier.categoryOf("learn"))
+        assertEquals(OutputToolCategory.OTHER, OutputClassifier.categoryOf("remember"))
+        assertEquals(OutputToolCategory.OTHER, OutputClassifier.categoryOf("list_files"))
+        assertEquals(OutputToolCategory.OTHER, OutputClassifier.categoryOf("read_file"))
     }
 
     @Test
     fun `categoryOf returns OTHER for unmapped tools`() {
-        assertEquals(ToolCategory.OTHER, OutputClassifier.categoryOf("some_future_tool"))
-        assertEquals(ToolCategory.OTHER, OutputClassifier.categoryOf("read_file"))
+        assertEquals(OutputToolCategory.OTHER, OutputClassifier.categoryOf("some_future_tool"))
+        assertEquals(OutputToolCategory.OTHER, OutputClassifier.categoryOf("read_file"))
     }
 
     @Test
@@ -44,19 +44,19 @@ class OutputClassifierTest {
         )
 
         for (tool in expectedMechanical) {
-            assertEquals(ToolCategory.MECHANICAL, OutputClassifier.TOOL_CATEGORIES[tool], "$tool")
+            assertEquals(OutputToolCategory.MECHANICAL, OutputClassifier.TOOL_CATEGORIES[tool], "$tool")
         }
         for (tool in expectedProminent) {
-            assertEquals(ToolCategory.PROMINENT, OutputClassifier.TOOL_CATEGORIES[tool], "$tool")
+            assertEquals(OutputToolCategory.PROMINENT, OutputClassifier.TOOL_CATEGORIES[tool], "$tool")
         }
         for (tool in expectedResearch) {
-            assertEquals(ToolCategory.RESEARCH, OutputClassifier.TOOL_CATEGORIES[tool], "$tool")
+            assertEquals(OutputToolCategory.RESEARCH, OutputClassifier.TOOL_CATEGORIES[tool], "$tool")
         }
         for (tool in expectedReasoning) {
-            assertEquals(ToolCategory.REASONING, OutputClassifier.TOOL_CATEGORIES[tool], "$tool")
+            assertEquals(OutputToolCategory.REASONING, OutputClassifier.TOOL_CATEGORIES[tool], "$tool")
         }
         for (tool in expectedOther) {
-            assertEquals(ToolCategory.OTHER, OutputClassifier.TOOL_CATEGORIES[tool], "$tool")
+            assertEquals(OutputToolCategory.OTHER, OutputClassifier.TOOL_CATEGORIES[tool], "$tool")
         }
     }
 

@@ -33,7 +33,7 @@ enum class OutputVerbosity {
  * New tools are added to the appropriate category rather than scattering
  * set membership across the classifier.
  */
-enum class ToolCategory {
+enum class OutputToolCategory {
     /** Mechanical UI actions — hidden by default. */
     MECHANICAL,
     /** High-level actions and results — always shown. */
@@ -98,12 +98,12 @@ data class RetryContext(
  * Determines how prominently a tool result should appear in the chat UI
  * and whether it should be spoken in audio/voice mode.
  *
- * Classification uses [ToolCategory] to group tools:
+ * Classification uses [OutputToolCategory] to group tools:
  * - **MECHANICAL/HIDE:** tap, swipe, scroll, press_back, etc.
  * - **REASONING/SHOW_DIMMED:** think
  * - **PROMINENT/SHOW:** open_app, screenshot, subtask
  * - **RESEARCH/SHOW:** web_search, web_fetch
- * - **OTHER/SHOW_DIMMED:** file ops, memory, clipboard, wait, read_screen, etc.
+ * - **OTHER/SHOW_DIMMED:** file ops, clipboard, wait, read_screen, etc.
  *
  * Errors (via [ToolResult.isError]) are classified by [ErrorSeverity] — see [classifyError].
  *
@@ -116,61 +116,62 @@ object OutputClassifier {
     /**
      * Tool name → category mapping.
      *
-     * Tools not in this map default to [ToolCategory.OTHER] (SHOW_DIMMED).
+     * Tools not in this map default to [OutputToolCategory.OTHER] (SHOW_DIMMED).
      * Add new tools here rather than creating separate sets.
      */
-    internal val TOOL_CATEGORIES: Map<String, ToolCategory> = mapOf(
+    internal val TOOL_CATEGORIES: Map<String, OutputToolCategory> = mapOf(
         // Mechanical — hidden by default
-        "tap" to ToolCategory.MECHANICAL,
-        "tap_text" to ToolCategory.MECHANICAL,
-        "long_press" to ToolCategory.MECHANICAL,
-        "swipe" to ToolCategory.MECHANICAL,
-        "scroll" to ToolCategory.MECHANICAL,
-        "press_back" to ToolCategory.MECHANICAL,
-        "press_home" to ToolCategory.MECHANICAL,
-        "type_text" to ToolCategory.MECHANICAL,
+        "tap" to OutputToolCategory.MECHANICAL,
+        "tap_text" to OutputToolCategory.MECHANICAL,
+        "long_press" to OutputToolCategory.MECHANICAL,
+        "swipe" to OutputToolCategory.MECHANICAL,
+        "scroll" to OutputToolCategory.MECHANICAL,
+        "press_back" to OutputToolCategory.MECHANICAL,
+        "press_home" to OutputToolCategory.MECHANICAL,
+        "type_text" to OutputToolCategory.MECHANICAL,
 
         // Prominent — always shown
-        "open_app" to ToolCategory.PROMINENT,
-        "open_notifications" to ToolCategory.PROMINENT,
-        "screenshot" to ToolCategory.PROMINENT,
-        "subtask" to ToolCategory.PROMINENT,
+        "open_app" to OutputToolCategory.PROMINENT,
+        "open_notifications" to OutputToolCategory.PROMINENT,
+        "screenshot" to OutputToolCategory.PROMINENT,
+        "subtask" to OutputToolCategory.PROMINENT,
 
         // Research — always shown
-        "web_search" to ToolCategory.RESEARCH,
-        "web_fetch" to ToolCategory.RESEARCH,
-        "web_browse" to ToolCategory.RESEARCH,
-        "recall" to ToolCategory.RESEARCH,
+        "web_search" to OutputToolCategory.RESEARCH,
+        "web_fetch" to OutputToolCategory.RESEARCH,
+        "web_browse" to OutputToolCategory.RESEARCH,
 
         // Reasoning — shown dimmed
         // Status
-        "wait" to ToolCategory.MECHANICAL,
-        "read_screen" to ToolCategory.MECHANICAL,
-        "read_notifications" to ToolCategory.PROMINENT,
-        "learn" to ToolCategory.OTHER,
-        "remember" to ToolCategory.OTHER,
-        "list_files" to ToolCategory.OTHER,
-        "read_file" to ToolCategory.OTHER,
-        "write_file" to ToolCategory.OTHER,
-        "copy" to ToolCategory.OTHER,
-        "set_clipboard" to ToolCategory.OTHER,
-        "list_memories" to ToolCategory.OTHER,
-        "tap_notification" to ToolCategory.OTHER,
-        "dismiss_notification" to ToolCategory.OTHER,
-        "reply_notification" to ToolCategory.OTHER,
-        "paste" to ToolCategory.OTHER,
-        "clipboard" to ToolCategory.OTHER,
-        "think" to ToolCategory.REASONING
+        "wait" to OutputToolCategory.MECHANICAL,
+        "read_screen" to OutputToolCategory.MECHANICAL,
+        "read_notifications" to OutputToolCategory.PROMINENT,
+        "learn" to OutputToolCategory.OTHER,
+        "remember" to OutputToolCategory.OTHER,
+        "recall" to OutputToolCategory.RESEARCH,
+        "list_files" to OutputToolCategory.OTHER,
+        "read_file" to OutputToolCategory.OTHER,
+        "write_file" to OutputToolCategory.OTHER,
+        "copy" to OutputToolCategory.OTHER,
+        "set_clipboard" to OutputToolCategory.OTHER,
+        "list_memories" to OutputToolCategory.OTHER,
+        "tap_notification" to OutputToolCategory.OTHER,
+        "dismiss_notification" to OutputToolCategory.OTHER,
+        "reply_notification" to OutputToolCategory.OTHER,
+        "paste" to OutputToolCategory.OTHER,
+        "clipboard" to OutputToolCategory.OTHER,
+        "request_tools" to OutputToolCategory.OTHER,
+        "think" to OutputToolCategory.REASONING
     )
 
     /**
      * Look up the category for a tool.
      *
      * @param toolName The tool name
-     * @return The tool's category, or [ToolCategory.OTHER] if not mapped
+     * @return The tool's category, or [OutputToolCategory.OTHER] if not mapped
      */
-    fun categoryOf(toolName: String): ToolCategory {
-        return TOOL_CATEGORIES[toolName] ?: ToolCategory.OTHER
+    fun categoryOf(toolName: String): OutputToolCategory {
+        return TOOL_CATEGORIES[toolName] ?: OutputToolCategory.OTHER
     }
 
     /**
@@ -255,8 +256,8 @@ object OutputClassifier {
 
         // 9-10. Unknown error — classify by tool category
         return when (categoryOf(toolName)) {
-            ToolCategory.MECHANICAL -> escalate(ErrorSeverity.EXPLORATORY, retryContext)
-            ToolCategory.PROMINENT, ToolCategory.RESEARCH -> ErrorSeverity.INFORMATIONAL
+            OutputToolCategory.MECHANICAL -> escalate(ErrorSeverity.EXPLORATORY, retryContext)
+            OutputToolCategory.PROMINENT, OutputToolCategory.RESEARCH -> ErrorSeverity.INFORMATIONAL
             else -> escalate(ErrorSeverity.EXPLORATORY, retryContext)
         }
     }
@@ -290,11 +291,11 @@ object OutputClassifier {
      */
     private fun categoryVisibility(toolName: String): OutputVisibility {
         return when (categoryOf(toolName)) {
-            ToolCategory.MECHANICAL -> OutputVisibility.HIDE
-            ToolCategory.PROMINENT -> OutputVisibility.SHOW
-            ToolCategory.RESEARCH -> OutputVisibility.SHOW
-            ToolCategory.REASONING -> OutputVisibility.SHOW_DIMMED
-            ToolCategory.OTHER -> OutputVisibility.SHOW_DIMMED
+            OutputToolCategory.MECHANICAL -> OutputVisibility.HIDE
+            OutputToolCategory.PROMINENT -> OutputVisibility.SHOW
+            OutputToolCategory.RESEARCH -> OutputVisibility.SHOW
+            OutputToolCategory.REASONING -> OutputVisibility.SHOW_DIMMED
+            OutputToolCategory.OTHER -> OutputVisibility.SHOW_DIMMED
         }
     }
 
@@ -471,7 +472,7 @@ object OutputClassifier {
         return when (visibility) {
             OutputVisibility.HIDE -> null
             OutputVisibility.SHOW_DIMMED -> when (categoryOf(toolName)) {
-                ToolCategory.REASONING -> "💭 ${summarize(result)}"
+                OutputToolCategory.REASONING -> "💭 ${summarize(result)}"
                 else -> "⚙️ ${summarize(result)}"
             }
             OutputVisibility.SHOW -> "🤖 ${summarize(result)}"

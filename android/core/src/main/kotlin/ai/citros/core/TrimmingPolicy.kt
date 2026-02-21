@@ -45,8 +45,8 @@ enum class TrimMode {
  * val policy = TrimmingPolicy(
  *     minMessagesBeforeTrim = 10,
  *     keepFullByCategory = mapOf(
- *         ToolCategory.MECHANICAL to 1,       // Keep last tap/scroll
- *         ToolCategory.RESEARCH to Int.MAX_VALUE  // Never trim web results
+ *         OutputToolCategory.MECHANICAL to 1,       // Keep last tap/scroll
+ *         OutputToolCategory.RESEARCH to Int.MAX_VALUE  // Never trim web results
  *     ),
  *     trimMode = TrimMode.STRIP_SCREEN_ONLY
  * )
@@ -69,18 +69,18 @@ enum class TrimMode {
 data class TrimmingPolicy(
     val enabled: Boolean = true,
     val minMessagesBeforeTrim: Int = 8,
-    val keepFullByCategory: Map<ToolCategory, Int> = DEFAULT_KEEP_FULL,
+    val keepFullByCategory: Map<OutputToolCategory, Int> = DEFAULT_KEEP_FULL,
     val defaultKeepFull: Int = 3,
     val trimMode: TrimMode = TrimMode.STRIP_SCREEN_ONLY,
     val maxTokenEstimate: Int = 60_000,
 ) {
     companion object {
         /** Conservative defaults: strip screen content, never touch research results. */
-        val DEFAULT_KEEP_FULL: Map<ToolCategory, Int> = mapOf(
-            ToolCategory.MECHANICAL to 2,
-            ToolCategory.PROMINENT to 3,
-            ToolCategory.RESEARCH to Int.MAX_VALUE,
-            ToolCategory.REASONING to 1,
+        val DEFAULT_KEEP_FULL: Map<OutputToolCategory, Int> = mapOf(
+            OutputToolCategory.MECHANICAL to 2,
+            OutputToolCategory.PROMINENT to 3,
+            OutputToolCategory.RESEARCH to Int.MAX_VALUE,
+            OutputToolCategory.REASONING to 1,
         )
 
         /** Disabled policy — no trimming at all. */
@@ -88,6 +88,6 @@ data class TrimmingPolicy(
     }
 
     /** Get the keep-full count for a given category. */
-    fun keepFullFor(category: ToolCategory): Int =
+    fun keepFullFor(category: OutputToolCategory): Int =
         keepFullByCategory[category] ?: defaultKeepFull
 }

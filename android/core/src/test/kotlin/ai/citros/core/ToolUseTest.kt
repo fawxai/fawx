@@ -486,8 +486,8 @@ class ToolUseTest {
             "copy", "set_clipboard", "paste",
             "read_notifications", "tap_notification", "dismiss_notification", "reply_notification",
             "read_file", "write_file", "list_files",
-            "remember", "recall", "list_memories",
-            "think", "wait", "long_press"
+            "remember", "recall", "list_memories", "learn",
+            "think", "wait", "long_press", "request_tools"
         )
         assertEquals(expectedTools, toolNames.toSet(), "PhoneTools.ALL should contain exactly the expected tools")
     }

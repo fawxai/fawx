@@ -77,7 +77,7 @@ class ContextCompactorTest {
         val compactor = ContextCompactor(TrimmingPolicy(
             minMessagesBeforeTrim = 1,
             maxTokenEstimate = 0,  // Always triggers
-            keepFullByCategory = mapOf(ToolCategory.MECHANICAL to 2),
+            keepFullByCategory = mapOf(OutputToolCategory.MECHANICAL to 2),
             trimMode = TrimMode.ACTION_SUMMARY
         ))
         val msgs = conversation(
@@ -110,7 +110,7 @@ class ContextCompactorTest {
         val compactor = ContextCompactor(TrimmingPolicy(
             minMessagesBeforeTrim = 1,
             maxTokenEstimate = 0,
-            keepFullByCategory = mapOf(ToolCategory.MECHANICAL to 0),
+            keepFullByCategory = mapOf(OutputToolCategory.MECHANICAL to 0),
             trimMode = TrimMode.ACTION_SUMMARY
         ))
         val msgs = conversation(
@@ -127,7 +127,7 @@ class ContextCompactorTest {
         val compactor = ContextCompactor(TrimmingPolicy(
             minMessagesBeforeTrim = 1,
             maxTokenEstimate = 0,
-            keepFullByCategory = mapOf(ToolCategory.MECHANICAL to 0),
+            keepFullByCategory = mapOf(OutputToolCategory.MECHANICAL to 0),
             trimMode = TrimMode.STRIP_SCREEN_ONLY
         ))
         val msgs = conversation(
@@ -174,9 +174,9 @@ class ContextCompactorTest {
             minMessagesBeforeTrim = 1,
             maxTokenEstimate = 0,
             keepFullByCategory = mapOf(
-                ToolCategory.MECHANICAL to 1,
-                ToolCategory.PROMINENT to 1,
-                ToolCategory.RESEARCH to Int.MAX_VALUE
+                OutputToolCategory.MECHANICAL to 1,
+                OutputToolCategory.PROMINENT to 1,
+                OutputToolCategory.RESEARCH to Int.MAX_VALUE
             ),
             trimMode = TrimMode.ACTION_SUMMARY
         ))
@@ -209,7 +209,7 @@ class ContextCompactorTest {
         val compactor = ContextCompactor(TrimmingPolicy(
             minMessagesBeforeTrim = 1,
             maxTokenEstimate = 0,
-            keepFullByCategory = mapOf(ToolCategory.MECHANICAL to 0),
+            keepFullByCategory = mapOf(OutputToolCategory.MECHANICAL to 0),
             trimMode = TrimMode.ACTION_SUMMARY
         ))
         val msgs = conversation(
@@ -228,7 +228,7 @@ class ContextCompactorTest {
         val compactor = ContextCompactor(TrimmingPolicy(
             minMessagesBeforeTrim = 1,
             maxTokenEstimate = 0,
-            keepFullByCategory = mapOf(ToolCategory.MECHANICAL to 1),
+            keepFullByCategory = mapOf(OutputToolCategory.MECHANICAL to 1),
             trimMode = TrimMode.ACTION_SUMMARY
         ))
         val msgs = conversation(
@@ -278,7 +278,7 @@ class ContextCompactorTest {
     fun `resolveCategory uses toolName when available`() {
         val compactor = ContextCompactor()
         val msg = toolResult("Some content", toolName = "web_search")
-        assertEquals(ToolCategory.RESEARCH, compactor.resolveCategory(msg))
+        assertEquals(OutputToolCategory.RESEARCH, compactor.resolveCategory(msg))
     }
 
     @Test
@@ -289,10 +289,10 @@ class ContextCompactorTest {
         val open = toolResult("Opened Gmail")
         val think = toolResult("Thought: I should try another approach")
 
-        assertEquals(ToolCategory.MECHANICAL, compactor.resolveCategory(tap))
-        assertEquals(ToolCategory.RESEARCH, compactor.resolveCategory(search))
-        assertEquals(ToolCategory.PROMINENT, compactor.resolveCategory(open))
-        assertEquals(ToolCategory.REASONING, compactor.resolveCategory(think))
+        assertEquals(OutputToolCategory.MECHANICAL, compactor.resolveCategory(tap))
+        assertEquals(OutputToolCategory.RESEARCH, compactor.resolveCategory(search))
+        assertEquals(OutputToolCategory.PROMINENT, compactor.resolveCategory(open))
+        assertEquals(OutputToolCategory.REASONING, compactor.resolveCategory(think))
     }
 
     // -- Message structure preserved --
@@ -302,7 +302,7 @@ class ContextCompactorTest {
         val compactor = ContextCompactor(TrimmingPolicy(
             minMessagesBeforeTrim = 1,
             maxTokenEstimate = 0,
-            keepFullByCategory = mapOf(ToolCategory.MECHANICAL to 0),
+            keepFullByCategory = mapOf(OutputToolCategory.MECHANICAL to 0),
             trimMode = TrimMode.ACTION_SUMMARY
         ))
         val original = Message.toolResult("call_123", screenDump("Tapped [0]"), toolName = "tap", isError = true)
@@ -407,7 +407,7 @@ class ContextCompactorTest {
         val compactor = ContextCompactor(TrimmingPolicy(
             minMessagesBeforeTrim = 1,
             maxTokenEstimate = 0,
-            keepFullByCategory = mapOf(ToolCategory.MECHANICAL to 1),
+            keepFullByCategory = mapOf(OutputToolCategory.MECHANICAL to 1),
             trimMode = TrimMode.ACTION_SUMMARY
         ))
         val msgs = conversation(
@@ -429,7 +429,7 @@ class ContextCompactorTest {
         val compactor = ContextCompactor(TrimmingPolicy(
             minMessagesBeforeTrim = 1,
             maxTokenEstimate = 0,
-            keepFullByCategory = mapOf(ToolCategory.MECHANICAL to 0),
+            keepFullByCategory = mapOf(OutputToolCategory.MECHANICAL to 0),
             trimMode = TrimMode.ACTION_SUMMARY
         ))
         val msgs = conversation(
@@ -449,7 +449,7 @@ class ContextCompactorTest {
         val compactor = ContextCompactor(TrimmingPolicy(
             minMessagesBeforeTrim = 1,
             maxTokenEstimate = 0,
-            keepFullByCategory = mapOf(ToolCategory.OTHER to Int.MAX_VALUE)
+            keepFullByCategory = mapOf(OutputToolCategory.OTHER to Int.MAX_VALUE)
         ))
         // Create many OTHER-category tool results ("learn" is OTHER category)
         val msgs = conversation(

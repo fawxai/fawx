@@ -77,7 +77,7 @@ class ContextCompactor(
         // Count tool results per category from the END of the list.
         // Each category has its own counter — "keep last 2 mechanical"
         // is independent of "keep last 3 prominent".
-        val categoryCounters = mutableMapOf<ToolCategory, Int>()
+        val categoryCounters = mutableMapOf<OutputToolCategory, Int>()
 
         // First pass: count per-category from the end, mark which indices to trim
         val trimIndices = mutableSetOf<Int>()
@@ -151,14 +151,14 @@ class ContextCompactor(
      * Falls back to content-based heuristic for messages created before
      * the toolName field was added.
      */
-    internal fun resolveCategory(msg: Message): ToolCategory {
+    internal fun resolveCategory(msg: Message): OutputToolCategory {
         // Prefer explicit tool name
         msg.toolName?.let { name ->
             return try {
                 OutputClassifier.categoryOf(name)
             } catch (e: Exception) {
                 Log.w(TAG, "categoryOf('$name') failed, falling back to OTHER", e)
-                ToolCategory.OTHER
+                OutputToolCategory.OTHER
             }
         }
 

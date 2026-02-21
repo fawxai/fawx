@@ -27,7 +27,7 @@ When they're just chatting, respond naturally without using tools."""
 
     // ── Section 2: Tools by category ────────────────────────────────────
 
-    internal const val SECTION_TOOLS = """## Your Tools
+    internal const val LEGACY_SECTION_TOOLS = """## Your Tools
 
 ### Navigation
 - open_app(app_name) — launch any app
@@ -62,6 +62,7 @@ When they're just chatting, respond naturally without using tools."""
 - remember(content, tags?) — store a memory
 - recall(query, limit?) — search stored memories
 - list_memories(limit?) — list recent memories
+- learn(app_package, pattern, category?) — record app-specific patterns that worked or failed
 - read_file(path) — read from agent directory
 - write_file(path, content) — write to agent directory
 - list_files(path?) — list agent directory contents
@@ -72,7 +73,111 @@ When they're just chatting, respond naturally without using tools."""
 - web_browse(url, goal, stealth?) — automate a live website: navigate, fill forms, click buttons, extract data. Use for complex web tasks (price comparison, booking, multi-step flows)
 
 ### Planning
-- think(thought) — reason about the situation without taking action (not shown to user)"""
+- think(thought) — reason about the situation without taking action (not shown to user)
+
+### Tool Loading
+- request_tools(categories[]) — request additional tool categories: navigation, interaction, observation, notification, clipboard, memory, research, planning"""
+
+    internal val SECTION_TOOLS: String by lazy {
+        buildToolsSection()
+    }
+
+    fun buildToolsSection(
+        activeCategories: Set<ToolCategory> = ToolCategory.entries.toSet(),
+        modelTier: ModelTier = ModelTier.STANDARD
+    ): String {
+        val allCategories = ToolCategory.entries.toSet()
+        if (activeCategories == allCategories && modelTier == ModelTier.STANDARD) {
+            return LEGACY_SECTION_TOOLS
+        }
+        return buildToolsSectionDynamic(activeCategories, modelTier)
+    }
+
+    internal fun buildToolsSectionDynamic(
+        activeCategories: Set<ToolCategory>,
+        modelTier: ModelTier
+    ): String {
+        val allCategories = ToolCategory.entries.toSet()
+        val allTools = PhoneTools.getToolsForCategories(allCategories, modelTier)
+        val activeTools = PhoneTools.getToolsForCategories(activeCategories, modelTier)
+        val detailCategories = (activeCategories + ToolCategory.CORE).toSet()
+
+        val summaryLines = allTools
+            .distinctBy { it.name }
+            .sortedBy { it.name }
+            .joinToString("\n") { "- ${it.name} — ${it.description}" }
+
+        val detailedSection = ToolCategory.entries
+            .filter { it in detailCategories }
+            .mapNotNull { category ->
+                val tools = activeTools
+                    .filter {
+                        if (category == ToolCategory.CORE) it.name in PhoneTools.CORE_TOOL_NAMES
+                        else PhoneTools.categoryOf(it.name) == category && it.name !in PhoneTools.CORE_TOOL_NAMES
+                    }
+                    .distinctBy { it.name }
+                    .sortedBy { it.name }
+                if (tools.isEmpty()) {
+                    null
+                } else {
+                    buildString {
+                        append("### ${categoryDisplayName(category)}\n")
+                        tools.forEach { tool ->
+                            append("- ")
+                            append(toolSignature(tool))
+                            append(" — ")
+                            append(tool.description)
+                            append('\n')
+                            append(toolParameters(tool))
+                        }
+                    }.trimEnd()
+                }
+            }
+            .joinToString("\n\n")
+
+        return buildString {
+            append("## Your Tools\n\n")
+            append("### Always Available Tool Summaries\n")
+            append(summaryLines)
+            append("\n\n### Active Tool Groups (Detailed)\n")
+            append(detailedSection)
+        }
+    }
+
+    private fun categoryDisplayName(category: ToolCategory): String = when (category) {
+        ToolCategory.CORE -> "Core"
+        ToolCategory.NAVIGATION -> "Navigation"
+        ToolCategory.INTERACTION -> "Interaction"
+        ToolCategory.OBSERVATION -> "Observation"
+        ToolCategory.NOTIFICATION -> "Notification"
+        ToolCategory.CLIPBOARD -> "Clipboard"
+        ToolCategory.MEMORY -> "Memory"
+        ToolCategory.RESEARCH -> "Research"
+        ToolCategory.PLANNING -> "Planning"
+    }
+
+    private fun toolSignature(tool: Tool): String {
+        @Suppress("UNCHECKED_CAST")
+        val properties = tool.inputSchema["properties"] as? Map<String, Any> ?: emptyMap()
+        val args = properties.keys.sorted().joinToString(", ")
+        return if (args.isBlank()) tool.name else "${tool.name}($args)"
+    }
+
+    private fun toolParameters(tool: Tool): String {
+        @Suppress("UNCHECKED_CAST")
+        val properties = tool.inputSchema["properties"] as? Map<String, Any> ?: return ""
+        if (properties.isEmpty()) return ""
+
+        return properties.entries
+            .sortedBy { it.key }
+            .joinToString("\n") { (name, schema) ->
+                @Suppress("UNCHECKED_CAST")
+                val schemaMap = schema as? Map<String, Any> ?: emptyMap()
+                val type = schemaMap["type"]?.toString() ?: "any"
+                val description = schemaMap["description"]?.toString() ?: ""
+                "  - $name ($type): $description"
+            } + "\n"
+    }
 
     internal const val SECTION_TOOLS_SMALL = """## Your Tools
 
