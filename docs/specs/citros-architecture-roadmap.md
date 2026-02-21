@@ -229,6 +229,24 @@ This replaces the current "Thinking..." with real-time progress. Doesn't require
 
 **Informed by OpenClaw:** Their block streaming and typing indicators give users instant feedback. We don't need streaming from the API — tool execution names are available synchronously.
 
+#### 2.6 Per-Action Verification Loop
+
+Upgrade from passive stuck detection (screen hash repetition) to **active verification after every action**:
+
+1. **State snapshot** before action — capture screen hash, focused element, package name
+2. **Execute action** — tap, type, scroll, etc.
+3. **Verify state changed** — re-read screen, compare against pre-action snapshot
+4. **React to result:**
+   - State changed as expected → continue
+   - State unchanged → retry with alternative strategy (coordinate tap → text tap → scroll + retry)
+   - Unexpected state → screenshot + reassess before next action
+
+This is the single highest-leverage reliability improvement. Stuck detection catches failure after 3+ repeated screens. Verification catches it on the **first attempt**, cutting wasted steps in half.
+
+**Implementation:** New `ActionVerifier` interface in AgentExecutor, called after every `ToolRunner.execute()`. Lightweight — just a screen hash comparison + optional element check. No extra API calls.
+
+**Informed by real-world testing (2026-02-21):** Flight booking flow on Google Flights showed the agent tapping elements that didn't respond, then continuing without noticing. Per-action verification would have caught this immediately and triggered a retry or alternative strategy.
+
 ---
 
 ### Horizon 3: Ecosystem (3+ months out)
@@ -254,6 +272,56 @@ For power users who want to control their phone from a VPS:
 - Screen content relayed back
 
 This is the horizon 2-3 escape hatch mentioned in the product principle. NOT the core product.
+
+#### 3.5 External Browser Automation API (TinyFish)
+
+Chrome's accessibility layer is fundamentally broken for text input — fields report `active=false, focused=false`, making `type_text` unreliable in web views. Instead of fighting the accessibility layer, delegate web interaction to a purpose-built browser automation API.
+
+- **TinyFish** (or equivalent) provides deterministic web interaction: navigate, click, type, extract content
+- Agent uses `web_browse` tool for interactive web tasks (booking flows, form filling)
+- `web_search` / `web_fetch` remain the default for information retrieval (no browser needed)
+- Chrome on-device is the last-resort fallback, not the primary path
+
+**Policy default:** Information tasks → web_search/web_fetch. Interactive tasks → TinyFish API. Chrome → only when user explicitly requests or both other paths fail.
+
+**Why this matters for scaling:** The agent doesn't need to learn Chrome's quirks on every device. A reliable web API means web interaction "just works" regardless of Chrome version, OEM skin, or accessibility bugs. The agent focuses on *what* to do, not *how* to physically interact with a browser.
+
+**Status (2026-02-21):** In contact with TinyFish (Gargi, Dev Marketing). Demo of on-device accessibility layer requested as proof of working foundation. TinyFish key delivery planned via `/api/keys` endpoint.
+
+#### 3.6 Shared Intelligence — Community Knowledge Pool
+
+The scaling flywheel: every user's agent improves every other user's agent.
+
+**The problem:** Individual agents learn slowly. One user discovers that "Google Flights date picker needs a scroll before the date is visible" — that insight dies on their device. Next user hits the same wall.
+
+**The solution:** Anonymous, versioned pattern sharing across the Citros user base.
+
+```
+User A's agent learns pattern → upload to community pool (anonymous)
+                                       ↓
+                              pattern tagged: app=com.google.android.apps.travel
+                                             version=15.2.1
+                                             confidence=3
+                                             category=navigation
+                                       ↓
+User B's agent encounters same app → pull relevant patterns → inject into prompt
+```
+
+**Key design constraints:**
+- **Privacy:** Patterns are behavioral ("tap the second row to open date picker"), never personal (no user data, no content, no credentials)
+- **Versioning:** Patterns tagged with app package + version code. UI changes invalidate old patterns automatically
+- **Confidence:** Community patterns start at low confidence, get reinforced by successful reuse across users
+- **Opt-in:** Users choose whether to contribute patterns and/or consume community patterns
+- **Staleness:** Patterns that repeatedly fail for new users get auto-deprecated
+
+**Network effect:** This is the moat. The more users, the better every agent gets. New apps get community knowledge within days of release. UI changes get adapted within hours across the user base, not weeks per individual user.
+
+**Tier integration:**
+- **BYO/Base:** Consume community patterns (read-only)
+- **Super:** Contribute + consume (write + read)
+- **Enterprise:** Private pattern pools (org-specific knowledge stays internal)
+
+**Informed by:** OpenClaw's skill sharing model (community skills on clawhub.com), but applied to runtime-learned behavioral patterns instead of authored skill files.
 
 ---
 
@@ -318,7 +386,7 @@ These were initially descoped but belong in the roadmap:
 | **H0: MVP** | 3 PRs (prompt, stuck, overlay) | This week | Calendar + Gmail tasks work < 10 steps |
 | **H1: Loop** | AgentExecutor, boundaries, queuing, trimming | 2-4 weeks | User can redirect mid-task; context stays clean |
 | **H2: Intelligence** | Memory, lifecycle, tool groups, model-aware prompts, progress UI | 1-2 months | Agent remembers preferences; works well on Haiku |
-| **H3: Ecosystem** | Failover, planning, learned paths, gateway | 3+ months | Multi-step tasks, multi-provider resilience |
+| **H3: Ecosystem** | Failover, planning, learned paths, browser API, shared intelligence, gateway | 3+ months | Multi-step tasks, community knowledge, multi-provider resilience |
 
 ---
 
@@ -360,6 +428,6 @@ These were initially descoped but belong in the roadmap:
 
 ---
 
-*Last updated: 2026-02-14*
+*Last updated: 2026-02-21*
 *Sources: OpenClaw docs (17 files), Citros codebase, real-world Pixel testing*
 *Supersedes: `docs/specs/openclaw-architecture-lessons.md` and `docs/specs/mvp-sprint-spec.md`*
