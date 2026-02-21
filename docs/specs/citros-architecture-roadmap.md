@@ -276,7 +276,7 @@ This is the single highest-leverage reliability improvement. Stuck detection cat
 | #668 | Notes app navigation fix |
 | #670 | Tool output verbosity (OutputClassifier.formatStatus) |
 | Voice I/O MVP | SherpaOnnx STT + Android TTS + mic in ChatActivity (#556 closed) |
-#### 2.5 User Interruption Detection 🔲
+#### 2.5 User Interruption Detection ✅ (PR #672, #673)
 
 *Source: agentic-loop-v2.md §12.9*
 
