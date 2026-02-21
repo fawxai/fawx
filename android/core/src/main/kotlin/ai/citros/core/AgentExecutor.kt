@@ -41,6 +41,18 @@ class AgentExecutor(
      */
     private val steerMessageSource: () -> List<String> = { emptyList() },
     /**
+     * Lambda that returns the next user interruption event, or null if none pending.
+     *
+     * Used by [UserInterruptionCheck] to detect app switches, user touches, and
+     * external interrupts. The lambda should drain the event atomically (return
+     * once, then null on subsequent calls).
+     *
+     * Also used to populate [LoopState.pendingInterruption] at each boundary.
+     *
+     * Defaults to `{ null }` for executors without interruption detection.
+     */
+    private val interruptionSource: () -> InterruptionEvent? = { null },
+    /**
      * Optional hook that runs before each LLM call inside the tool loop.
      *
      * This is the injection point for context management: trimming old messages,
@@ -93,6 +105,7 @@ class AgentExecutor(
             StepLimitCheck(),
             StuckDetectionCheck.withDefaults(),
             ActionVerificationCheck(),
+            UserInterruptionCheck(),
             SteerCheck()
         )
 
@@ -119,6 +132,7 @@ class AgentExecutor(
             StepLimitCheck(),
             StuckDetectionCheck.withDefaults(),
             ActionVerificationCheck(),
+            UserInterruptionCheck(),
             SteerCheck()
         )
     }
@@ -276,7 +290,8 @@ class AgentExecutor(
                     isCancelled = isCancelled(),
                     pendingSteerMessages = steerMessages,
                     lastToolWasUiMutating = delegate.isUiMutatingTool(toolCall.name),
-                    preActionScreenHash = preActionHash
+                    preActionScreenHash = preActionHash,
+                    pendingInterruption = interruptionSource()
                 )
                 val checkResult = evaluateBoundaryChecks(loopState)
 

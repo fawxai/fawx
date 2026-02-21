@@ -103,12 +103,13 @@ class ActionVerificationTest {
     @Test
     fun `ActionVerificationCheck is at correct position in default boundary checks`() {
         val defaults = AgentExecutor.defaultBoundaryChecks()
-        assertEquals(5, defaults.size)
+        assertEquals(6, defaults.size)
         assertIs<CancellationCheck>(defaults[0])
         assertIs<StepLimitCheck>(defaults[1])
         assertIs<StuckDetectionCheck>(defaults[2])
         assertIs<ActionVerificationCheck>(defaults[3])
-        assertIs<SteerCheck>(defaults[4])
+        assertIs<UserInterruptionCheck>(defaults[4])
+        assertIs<SteerCheck>(defaults[5])
     }
 
     @Test
@@ -119,13 +120,14 @@ class ActionVerificationTest {
             onReconnected = {},
             onLost = {}
         )
-        assertEquals(6, checks.size)
+        assertEquals(7, checks.size)
         assertIs<CancellationCheck>(checks[0])
         assertIs<AccessibilityGateCheck>(checks[1])
         assertIs<StepLimitCheck>(checks[2])
         assertIs<StuckDetectionCheck>(checks[3])
         assertIs<ActionVerificationCheck>(checks[4])
-        assertIs<SteerCheck>(checks[5])
+        assertIs<UserInterruptionCheck>(checks[5])
+        assertIs<SteerCheck>(checks[6])
     }
 
     // ====== Integration: end-to-end with AgentExecutor ======

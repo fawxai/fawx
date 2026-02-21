@@ -65,7 +65,8 @@ data class LoopState(
     val isCancelled: Boolean,
     val pendingSteerMessages: List<String> = emptyList(),
     val lastToolWasUiMutating: Boolean = false,
-    val preActionScreenHash: Int? = null
+    val preActionScreenHash: Int? = null,
+    val pendingInterruption: InterruptionEvent? = null
 )
 
 /**
@@ -273,5 +274,54 @@ class AccessibilityGateCheck(
         const val DEFAULT_BASE_TIMEOUT_MS = 2000L
         /** Default maximum reconnection attempts. */
         const val DEFAULT_MAX_RETRIES = 3
+    }
+}
+
+
+/**
+ * Represents an event where the user interrupted the agent's execution.
+ *
+ * Three types of interruptions are supported:
+ * - [AppSwitch] — user switched to a different app
+ * - [UserTouch] — user touched the screen during task execution
+ * - [ExternalInterrupt] — external event (e.g. incoming call)
+ */
+sealed class InterruptionEvent {
+    data class AppSwitch(val previousApp: String, val newApp: String) : InterruptionEvent()
+    data class UserTouch(val x: Int, val y: Int) : InterruptionEvent()
+    data class ExternalInterrupt(val description: String) : InterruptionEvent()
+}
+
+/**
+ * Boundary check that detects user interruptions and steers the loop.
+ *
+ * Reads from the provided [interruptionSource] lambda which should atomically
+ * drain any pending interruption event (return it once, then null on subsequent calls).
+ *
+ * Should be placed BEFORE [SteerCheck] but AFTER [ActionVerificationCheck] in the
+ * default boundary checks list.
+ *
+ * @param interruptionSource Lambda that returns the next interruption event, or null
+ */
+class UserInterruptionCheck : BoundaryCheck {
+    override suspend fun check(state: LoopState): CheckResult {
+        val event = state.pendingInterruption ?: return CheckResult.Continue
+        return when (event) {
+            is InterruptionEvent.UserTouch -> CheckResult.Steer(
+                listOf("[SYSTEM: User touched the screen at (${event.x}, ${event.y}) during task execution. " +
+                    "Pause and ask if they want you to continue or cancel.]")
+            )
+            is InterruptionEvent.AppSwitch -> CheckResult.Steer(
+                listOf("[SYSTEM: User switched from ${event.previousApp} to ${event.newApp}. " +
+                    "Pause and ask if they want you to continue or cancel.]")
+            )
+            is InterruptionEvent.ExternalInterrupt -> {
+                val desc = event.description.ifEmpty { "External interruption occurred" }
+                CheckResult.Steer(
+                    listOf("[SYSTEM: $desc. " +
+                        "Pause and ask if they want you to continue or cancel.]")
+                )
+            }
+        }
     }
 }
