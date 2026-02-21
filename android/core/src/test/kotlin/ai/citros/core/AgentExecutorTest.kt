@@ -561,11 +561,12 @@ class AgentExecutorTest {
     fun `default boundary checks are in priority order`() {
         val defaults = AgentExecutor.defaultBoundaryChecks()
 
-        assertEquals(4, defaults.size)
+        assertEquals(5, defaults.size)
         assertIs<CancellationCheck>(defaults[0], "Cancellation should be first (highest priority)")
         assertIs<StepLimitCheck>(defaults[1], "Step limit should be second")
         assertIs<StuckDetectionCheck>(defaults[2], "Stuck detection should be third")
-        assertIs<SteerCheck>(defaults[3], "Steer should be last (user intent after all gates)")
+        assertIs<ActionVerificationCheck>(defaults[3], "Action verification should be fourth")
+        assertIs<SteerCheck>(defaults[4], "Steer should be last (user intent after all gates)")
     }
 
     @Test
@@ -577,12 +578,13 @@ class AgentExecutorTest {
             onLost = {}
         )
 
-        assertEquals(5, checks.size)
+        assertEquals(6, checks.size)
         assertIs<CancellationCheck>(checks[0], "Cancellation should be first")
         assertIs<AccessibilityGateCheck>(checks[1], "Accessibility gate should be second")
         assertIs<StepLimitCheck>(checks[2], "Step limit should be third")
         assertIs<StuckDetectionCheck>(checks[3], "Stuck detection should be fourth")
-        assertIs<SteerCheck>(checks[4], "Steer should be last")
+        assertIs<ActionVerificationCheck>(checks[4], "Action verification should be fifth")
+        assertIs<SteerCheck>(checks[5], "Steer should be last")
     }
 
 

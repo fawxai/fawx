@@ -63,7 +63,9 @@ data class LoopState(
     val lastToolName: String,
     val lastScreenHash: Int?,
     val isCancelled: Boolean,
-    val pendingSteerMessages: List<String> = emptyList()
+    val pendingSteerMessages: List<String> = emptyList(),
+    val lastToolWasUiMutating: Boolean = false,
+    val preActionScreenHash: Int? = null
 )
 
 /**
@@ -157,6 +159,41 @@ class StuckDetectionCheck(
     companion object {
         /** Create a [StuckDetectionCheck] with default [StuckDetector] thresholds. */
         fun withDefaults(): StuckDetectionCheck = StuckDetectionCheck(StuckDetector())
+    }
+}
+
+
+/**
+ * Injects a warning when a UI-mutating tool did not change the screen.
+ *
+ * Tracks the screen hash from the previous boundary check as the "pre-action" hash.
+ * On each check, compares the current (post-action) hash against the stored pre-action hash.
+ * If they match after a UI-mutating tool, injects a warning so the model can try
+ * an alternative approach.
+ *
+ * Non-UI tools (web_search, think, etc.) are skipped -- no verification needed.
+ * Null hashes (before or after) result in Continue (can't verify without data).
+ *
+ * Should be placed after [StuckDetectionCheck] and before [SteerCheck] in the
+ * default boundary checks list.
+ */
+class ActionVerificationCheck : BoundaryCheck {
+    override suspend fun check(state: LoopState): CheckResult {
+        // Can't verify without both hashes
+        if (state.preActionScreenHash == null) return CheckResult.Continue
+        if (state.lastScreenHash == null) return CheckResult.Continue
+        // Only verify UI-mutating tools
+        if (!state.lastToolWasUiMutating) return CheckResult.Continue
+
+        return if (state.lastScreenHash == state.preActionScreenHash) {
+            CheckResult.Inject(
+                "\n⚠️ ACTION_UNVERIFIED: Screen did not change after ${state.lastToolName}. " +
+                "The action may not have taken effect. Try an alternative approach " +
+                "(different element, coordinate tap, or scroll first)."
+            )
+        } else {
+            CheckResult.Continue
+        }
     }
 }
 

@@ -92,6 +92,7 @@ class AgentExecutor(
             CancellationCheck(),
             StepLimitCheck(),
             StuckDetectionCheck.withDefaults(),
+            ActionVerificationCheck(),
             SteerCheck()
         )
 
@@ -117,6 +118,7 @@ class AgentExecutor(
             AccessibilityGateCheck(isAvailable, waitForReconnect, onReconnected, onLost, baseTimeoutMs, maxRetries),
             StepLimitCheck(),
             StuckDetectionCheck.withDefaults(),
+            ActionVerificationCheck(),
             SteerCheck()
         )
     }
@@ -211,6 +213,7 @@ class AgentExecutor(
 
             var steered = false
             for ((toolIndex, toolCall) in response.toolCalls.withIndex()) {
+                val preActionHash = screenContent?.hashCode()
                 progressListener.onToolStarted(toolCall.name, toolIndex, response.toolCalls.size)
 
                 // Execute the tool
@@ -271,7 +274,9 @@ class AgentExecutor(
                     lastToolName = toolCall.name,
                     lastScreenHash = screenContent?.hashCode(),
                     isCancelled = isCancelled(),
-                    pendingSteerMessages = steerMessages
+                    pendingSteerMessages = steerMessages,
+                    lastToolWasUiMutating = delegate.isUiMutatingTool(toolCall.name),
+                    preActionScreenHash = preActionHash
                 )
                 val checkResult = evaluateBoundaryChecks(loopState)
 
