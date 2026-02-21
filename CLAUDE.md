@@ -95,3 +95,37 @@ When running multiple sub-agents in parallel on the same repo:
 6. **The primary `citros/` directory stays on `main`** — only clone directories have feature branches
 
 **Why:** Parallel agents sharing one `.git` directory will switch branches on each other, causing total work loss. This was learned the hard way on 2026-02-08.
+
+## Parallel Code Implementation (NON-NEGOTIABLE)
+
+When implementing multiple features from a roadmap/backlog, use this pipelined process:
+
+### Pipeline Stages
+
+1. **SPEC** — Read existing specs/docs, check reference implementations (e.g., OpenClaw). Write a detailed spec. Pressure test against edge cases. Commit to new branch off main, open PR.
+2. **SPEC REVIEW** — Opus CLI worker reviews the spec PR, posts comment via `gh pr comment`.
+3. **SPEC FIXES** — Opus CLI worker addresses ALL review comments. Push fixes.
+4. **IMPLEMENT** — Opus or Codex CLI worker implements the spec on the same branch. TDD mandatory.
+5. **CODE REVIEW** — Claude CLI review of implementation. Post as PR comment.
+6. **CODE FIXES** — Address all review items. Repeat review → fix until clean.
+7. **CI GREEN** — All CI checks pass. Fix failures.
+8. **READY** — Comment `@abbudjoe ready for merge`.
+
+### Parallelism Rules
+
+- While stage 4 (IMPLEMENT) runs for feature N, begin stage 1 (SPEC) for feature N+1.
+- **Never two CLI workers on the same branch/worktree simultaneously.**
+- Use separate worktrees (`~/citros-codex`, `~/citros-claude`) per active worker.
+- Track active workers and stages in daily memory file.
+
+### Worker Assignment
+
+- **Opus CLI** (`claude -p`): Specs, reviews, complex implementations
+- **Codex CLI** (`codex exec`): Mechanical implementations, search-replace, straightforward tests
+- Choose by reasoning complexity, not task size.
+
+### macOS Notes
+
+- Do NOT use `timeout` command — doesn't exist on macOS.
+- Use `nohup ... &` with PID tracking for background workers.
+- Always create a cron monitor when spawning CLI workers.
