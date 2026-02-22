@@ -98,7 +98,11 @@ When running multiple sub-agents in parallel on the same repo:
 
 ## Parallel Code Implementation (NON-NEGOTIABLE)
 
-When implementing multiple features from a roadmap/backlog, use this pipelined process:
+When implementing multiple features from a roadmap/backlog, use this pipelined process.
+
+**Constitutional reference:** `docs/squad-constitution.md` is the source of truth for Squad no-slop enforcement.
+- Do not mark work done while any blocking issue, nit, or nice-to-have remains unresolved.
+- If anything is deferred, create a backlog issue and link it in the PR before proceeding.
 
 ### Pipeline Stages
 
