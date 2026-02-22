@@ -45,11 +45,11 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.lerp
@@ -531,6 +531,7 @@ private fun ChatNavHost(walletDependencies: WalletDependencies) {
             ChatScreen(
                 viewModel = sharedChatViewModel,
                 onOpenSettings = { navController.navigate("settings") },
+                onOpenApiKeys = { navController.navigate(ROUTE_SETTINGS_WALLET) },
                 onOpenOverlay = { navController.navigate("overlay") { launchSingleTop = true } }
             )
         }
@@ -552,7 +553,7 @@ private fun ChatNavHost(walletDependencies: WalletDependencies) {
                 context = context,
                 walletManager = walletDependencies.walletManager,
                 onBack = { navController.popBackStack() },
-                onOpenWallet = { navController.navigate("settings_wallet") },
+                onOpenWallet = { navController.navigate(ROUTE_SETTINGS_WALLET) },
                 onOpenModels = { navController.navigate("settings_models") },
                 onOpenTrust = { navController.navigate("settings_trust") },
                 onOpenPhoneControl = { navController.navigate("settings_phone_control") },
@@ -561,7 +562,7 @@ private fun ChatNavHost(walletDependencies: WalletDependencies) {
                 onOpenAbout = { navController.navigate("settings_about") }
             )
         }
-        composable("settings_wallet") {
+        composable(ROUTE_SETTINGS_WALLET) {
             ApiKeysSettingsScreen(
                 walletManager = walletDependencies.walletManager,
                 keyStore = walletDependencies.keyStore,
@@ -622,6 +623,7 @@ data class CodexOauthStartRequest(
 internal const val CITROS_PREFS = "citros"
 /** Number of items from the end of the list to consider "near bottom" for auto-scroll. */
 private const val NEAR_BOTTOM_THRESHOLD = 3
+private const val ROUTE_SETTINGS_WALLET = "settings_wallet"
 
 private const val PREF_CLOUD_TOKEN = "cloud_token"
 private const val PREF_CLOUD_PROVIDER = "cloud_provider"
@@ -928,6 +930,7 @@ internal fun createSensorContextPreferenceChangeListener(
 fun ChatScreen(
     viewModel: ChatViewModel = viewModel(),
     onOpenSettings: () -> Unit = {},
+    onOpenApiKeys: () -> Unit = onOpenSettings,
     onOpenOverlay: () -> Unit = {},
     keyStoreOverride: ai.citros.core.KeyStore? = null,
     walletStorageOverride: ai.citros.core.WalletStorage? = null,
@@ -1469,123 +1472,140 @@ fun ChatScreen(
         wasKeyboardHidden.value = imeBottom == 0
     }
     val isConfigured = viewModel.isConfigured.value
+    val hasActiveWalletKey = walletState.activeKeyId != null &&
+        walletState.keys.any { it.id == walletState.activeKeyId }
+    var showApiKeyRequiredModal by rememberSaveable { mutableStateOf(false) }
+    val canInteractWithModel = hasActiveWalletKey && isConfigured
+    val requiresProviderSetup = hasActiveWalletKey && !isConfigured
+    LaunchedEffect(canInteractWithModel) {
+        if (canInteractWithModel) {
+            showApiKeyRequiredModal = false
+        }
+    }
+    val requireModelAccess = {
+        if (canInteractWithModel) {
+            true
+        } else {
+            showApiKeyRequiredModal = true
+            false
+        }
+    }
+    val openModelSwitcher = {
+        if (canInteractWithModel) {
+            showQuickSwitcher = true
+        } else if (requiresProviderSetup) {
+            onOpenSettings()
+        } else {
+            onOpenApiKeys()
+        }
+    }
     Scaffold(
         containerColor = Color.Transparent,
         topBar = {
-            if (isConfigured) {
-                val statusBarTopPadding = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
-                val chatSubtitle = if (walletState.activeKeyId != null) {
-                    shortModelName(walletState.chatModelId)
-                } else {
-                    "No provider connected"
-                }
-                Column(
+            val statusBarTopPadding = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
+            val chatSubtitle = when {
+                canInteractWithModel -> shortModelName(walletState.chatModelId)
+                requiresProviderSetup -> "Provider setup required"
+                else -> "No provider connected"
+            }
+            val chatSubtitleColor = if (canInteractWithModel) {
+                directiveSurfaces.labelSecondary
+            } else {
+                CitrosColorScheme.error
+            }
+            val quickSwitcherArrowColor = if (canInteractWithModel) {
+                directiveSurfaces.labelPrimary
+            } else {
+                CitrosColorScheme.error
+            }
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(directiveSurfaces.background)
+            ) {
+                Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .background(directiveSurfaces.background)
+                        .padding(
+                            top = statusBarTopPadding + 10.dp,
+                            bottom = 10.dp,
+                            start = 14.dp,
+                            end = 14.dp
+                        ),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Row(
+                    CitrosDirectiveOrb(
+                        flavor = selectedFlavor,
+                        size = 32.dp,
                         modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(
-                                top = statusBarTopPadding + 10.dp,
-                                bottom = 10.dp,
-                                start = 14.dp,
-                                end = 14.dp
-                            ),
-                        verticalAlignment = Alignment.CenterVertically
+                            .testTag(TEST_TAG_QUICK_SWITCHER_CHIP)
+                            .clickable { openModelSwitcher() }
+                    )
+                    Spacer(Modifier.width(10.dp))
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(end = 4.dp)
+                            .testTag(TEST_TAG_QUICK_SWITCHER_HEADER)
+                            .clickable { openModelSwitcher() }
                     ) {
-                        CitrosDirectiveOrb(
-                            flavor = selectedFlavor,
-                            size = 32.dp,
-                            modifier = Modifier.let { base ->
-                                if (walletState.activeKeyId != null) {
-                                    base
-                                        .testTag("quick_switcher_chip")
-                                        .clickable { showQuickSwitcher = true }
-                                } else {
-                                    base
-                                }
-                            }
+                        Text(
+                            text = "Citros",
+                            style = CitrosTypography.titleMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = directiveSurfaces.labelPrimary
                         )
-                        Spacer(Modifier.width(10.dp))
-                        Column(
+                        Row(
                             modifier = Modifier
-                                .weight(1f)
-                                .padding(end = 4.dp)
-                                .let { base ->
-                                    if (walletState.activeKeyId != null) {
-                                        base.clickable { showQuickSwitcher = true }
-                                    } else {
-                                        base
-                                    }
-                                }
+                                .padding(top = 1.dp)
+                                .wrapContentWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(2.dp)
                         ) {
                             Text(
-                                text = "Citros",
-                                style = CitrosTypography.titleMedium,
-                                fontWeight = FontWeight.SemiBold,
-                                color = directiveSurfaces.labelPrimary
+                                text = chatSubtitle,
+                                style = CitrosTypography.bodySmall,
+                                color = chatSubtitleColor,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.widthIn(max = 190.dp)
                             )
-                            if (walletState.activeKeyId != null) {
-                                Row(
-                                    modifier = Modifier
-                                        .padding(top = 1.dp)
-                                        .wrapContentWidth(),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(2.dp)
-                                ) {
-                                    Text(
-                                        text = chatSubtitle,
-                                        style = CitrosTypography.bodySmall,
-                                        color = directiveSurfaces.labelSecondary,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                        modifier = Modifier.widthIn(max = 190.dp)
-                                    )
-                                    Text(
-                                        text = "▾",
-                                        fontSize = 22.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        color = directiveSurfaces.labelPrimary,
-                                        modifier = Modifier.padding(bottom = 1.dp)
-                                    )
-                                }
-                            } else {
+                            if (canInteractWithModel) {
                                 Text(
-                                    text = chatSubtitle,
-                                    style = CitrosTypography.bodySmall,
-                                    color = directiveSurfaces.labelTertiary,
-                                    maxLines = 1
-                                )
-                            }
-                        }
-                        CitrosLiquidGlassSurface(
-                            modifier = Modifier
-                                .size(36.dp)
-                                .semantics { contentDescription = "Settings" },
-                            shape = CircleShape,
-                            onClick = onOpenSettings,
-                            baseColor = directiveSurfaces.surface1,
-                            borderColor = directiveSurfaces.separatorLight,
-                            borderWidth = 1.dp
-                        ) {
-                            Box(
-                                modifier = Modifier.fillMaxSize(),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                SettingsGlyph(
-                                    tint = directiveSurfaces.labelPrimary,
-                                    modifier = Modifier.size(20.dp)
+                                    text = "▾",
+                                    fontSize = 22.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = quickSwitcherArrowColor,
+                                    modifier = Modifier.padding(bottom = 1.dp)
                                 )
                             }
                         }
                     }
-                    HorizontalDivider(
-                        color = directiveSurfaces.separator,
-                        thickness = 0.5.dp
-                    )
+                    CitrosLiquidGlassSurface(
+                        modifier = Modifier
+                            .size(36.dp)
+                            .semantics { contentDescription = "Settings" },
+                        shape = CircleShape,
+                        onClick = onOpenSettings,
+                        baseColor = directiveSurfaces.surface1,
+                        borderColor = directiveSurfaces.separatorLight,
+                        borderWidth = 1.dp
+                    ) {
+                        Box(
+                            modifier = Modifier.fillMaxSize(),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            SettingsGlyph(
+                                tint = directiveSurfaces.labelPrimary,
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+                    }
                 }
+                HorizontalDivider(
+                    color = directiveSurfaces.separator,
+                    thickness = 0.5.dp
+                )
             }
         }
     ) { padding ->
@@ -1596,108 +1616,178 @@ fun ChatScreen(
                 .imePadding()
                 .background(directiveSurfaces.background)
         ) {
-            if (!isConfigured) {
-                // #554: Show themed prompt instead of legacy SignInPrompt
-                NoKeyPrompt(
+            // Accessibility banner if not enabled
+            if (!viewModel.accessibilityEnabled.value) {
+                AccessibilityBanner(
                     flavor = selectedFlavor,
-                    onOpenSettings = { onOpenSettings() }
+                    onEnable = { CitrosAccessibilityService.openSettings(context) }
                 )
-            } else {
-                // Accessibility banner if not enabled
-                if (!viewModel.accessibilityEnabled.value) {
-                    AccessibilityBanner(
-                        flavor = selectedFlavor,
-                        onEnable = { CitrosAccessibilityService.openSettings(context) }
+            }
+            val showCenteredEmptyState = viewModel.messages.isEmpty() && !viewModel.isLoading.value
+            if (showCenteredEmptyState) {
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    ChatEmptyState(
+                        flavor = selectedFlavor
                     )
                 }
-                val showCenteredEmptyState = viewModel.messages.isEmpty() && !viewModel.isLoading.value
-                if (showCenteredEmptyState) {
-                    Box(
-                        modifier = Modifier
-                            .weight(1f)
-                            .fillMaxWidth()
-                            .padding(horizontal = 16.dp),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        ChatEmptyState(
-                            flavor = selectedFlavor
+            } else {
+                // Messages list
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    contentPadding = PaddingValues(vertical = 8.dp)
+                ) {
+                    items(viewModel.messages) { message ->
+                        MessageBubble(
+                            message = message,
+                            flavor = selectedFlavor,
                         )
                     }
-                } else {
-                    // Messages list
-                    LazyColumn(
-                        state = listState,
-                        modifier = Modifier
-                            .weight(1f)
-                            .fillMaxWidth()
-                            .padding(horizontal = 16.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp),
-                        contentPadding = PaddingValues(vertical = 8.dp)
-                    ) {
-                        items(viewModel.messages) { message ->
-                            MessageBubble(
-                                message = message,
+                    if (viewModel.isLoading.value) {
+                        item {
+                            LoadingIndicator(
                                 flavor = selectedFlavor,
+                                label = when {
+                                    viewModel.hasQueuedSteer.value -> "Redirecting..."
+                                    viewModel.currentToolStatus.value != null -> viewModel.currentToolStatus.value!!
+                                    else -> "Thinking"
+                                }
                             )
                         }
-                        if (viewModel.isLoading.value) {
-                            item {
-                                LoadingIndicator(
-                                    flavor = selectedFlavor,
-                                    label = when {
-                                        viewModel.hasQueuedSteer.value -> "Redirecting..."
-                                        viewModel.currentToolStatus.value != null -> viewModel.currentToolStatus.value!!
-                                        else -> "Thinking"
-                                    }
-                                )
-                            }
-                        }
-                        // #552: End spacer — scroll target to ensure last message is fully visible.
-                        // animateScrollToItem(messages.size) lands here, pushing content up.
-                        item { Spacer(Modifier.height(4.dp)) }
                     }
+                    // #552: End spacer — scroll target to ensure last message is fully visible.
+                    // animateScrollToItem(messages.size) lands here, pushing content up.
+                    item { Spacer(Modifier.height(4.dp)) }
                 }
-                // Error snackbar
-                viewModel.error.value?.let { error ->
-                    Snackbar(
-                        modifier = Modifier.padding(16.dp),
-                        action = {
-                            TextButton(onClick = { viewModel.clearError() }) {
-                                Text("Dismiss")
-                            }
+            }
+            // Error snackbar
+            viewModel.error.value?.let { error ->
+                Snackbar(
+                    modifier = Modifier.padding(16.dp),
+                    action = {
+                        TextButton(onClick = { viewModel.clearError() }) {
+                            Text("Dismiss")
                         }
-                    ) {
-                        Text(error)
                     }
+                ) {
+                    Text(error)
                 }
-                // Input field
-                val voiceReadyState by viewModel.voiceReady.collectAsState()
-                val voiceManagerState by viewModel.voiceManager.collectAsState()
-                HorizontalDivider(
-                    color = directiveSurfaces.separator,
-                    thickness = 0.5.dp
-                )
-                MessageInput(
-                    onSend = { viewModel.sendMessage(it) },
-                    onSteer = { viewModel.steerMessage(it) },
-                    onQueue = { viewModel.setQueuedMessage(it) },
-                    queuedMessage = viewModel.queuedMessage.value,
-                    onSteerQueuedMessage = {
+            }
+            // Input field
+            val voiceReadyState by viewModel.voiceReady.collectAsState()
+            val voiceManagerState by viewModel.voiceManager.collectAsState()
+            HorizontalDivider(
+                color = directiveSurfaces.separator,
+                thickness = 0.5.dp
+            )
+            MessageInput(
+                onSend = {
+                    if (requireModelAccess()) {
+                        viewModel.sendMessage(it)
+                        true
+                    } else {
+                        false
+                    }
+                },
+                onSteer = {
+                    if (requireModelAccess()) {
+                        viewModel.steerMessage(it)
+                        true
+                    } else {
+                        false
+                    }
+                },
+                onQueue = {
+                    if (requireModelAccess()) {
+                        viewModel.setQueuedMessage(it)
+                        true
+                    } else {
+                        false
+                    }
+                },
+                queuedMessage = viewModel.queuedMessage.value,
+                onSteerQueuedMessage = {
+                    if (requireModelAccess()) {
                         viewModel.setQueuedMessage("")
                         viewModel.steerMessage(it)
-                    },
-                    onCancel = { viewModel.cancelToolExecution() },
-                    isLoading = viewModel.isLoading.value,
-                    flavor = selectedFlavor,
-                    modifier = Modifier.padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 24.dp),
-                    placeholder = "Message",
-                    voiceReady = voiceReadyState,
-                    voiceManager = voiceManagerState
+                    }
+                },
+                onCancel = { viewModel.cancelToolExecution() },
+                isLoading = viewModel.isLoading.value,
+                flavor = selectedFlavor,
+                modifier = Modifier.padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 24.dp),
+                placeholder = "Message",
+                voiceReady = voiceReadyState,
+                voiceManager = voiceManagerState
+            )
+        }
+    }
+    if (showApiKeyRequiredModal) {
+        ModalBottomSheet(
+            onDismissRequest = { showApiKeyRequiredModal = false },
+            containerColor = directiveSurfaces.surface1,
+            contentColor = directiveSurfaces.labelPrimary
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 12.dp)
+                    .testTag(TEST_TAG_API_KEY_REQUIRED_MODAL),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                val modalTitle = if (requiresProviderSetup) {
+                    "Complete provider setup to continue chatting."
+                } else {
+                    "Add an API key to start chatting."
+                }
+                val modalBody = if (requiresProviderSetup) {
+                    "Open Settings to review your provider and model configuration."
+                } else {
+                    "Connect an Anthropic, OpenAI, or OpenRouter key in Settings."
+                }
+                val openSetupDestination = if (requiresProviderSetup) onOpenSettings else onOpenApiKeys
+                Text(
+                    text = modalTitle,
+                    style = CitrosTypography.titleMedium,
+                    color = directiveSurfaces.labelPrimary
                 )
+                Text(
+                    text = modalBody,
+                    style = CitrosTypography.bodyMedium,
+                    color = directiveSurfaces.labelSecondary
+                )
+                CitrusLiquidGlassButton(
+                    text = "Open Settings",
+                    onClick = {
+                        showApiKeyRequiredModal = false
+                        openSetupDestination()
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    tintColor = selectedFlavor.primary
+                )
+                TextButton(
+                    onClick = { showApiKeyRequiredModal = false },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = "Not now",
+                        color = directiveSurfaces.labelSecondary
+                    )
+                }
             }
         }
     }
-    if (showQuickSwitcher) {
+    if (showQuickSwitcher && canInteractWithModel) {
         QuickSwitcherSheet(
             walletState = walletState,
             flavor = selectedFlavor,
@@ -1849,68 +1939,6 @@ internal fun AccessibilityBanner(
                 Text("Enable", color = flavor.primary)
             }
         }
-    }
-}
-/**
- * Minimal themed prompt shown when user completed onboarding but has no API key.
- * Replaces the legacy SignInPrompt (#554). Directs user to Settings > Wallet.
- */
-@Composable
-private fun NoKeyPrompt(
-    flavor: CitrosFlavor = CitrosFlavor.TANGERINE,
-    onOpenSettings: () -> Unit
-) {
-    val isDarkTheme = LocalCitrosIsDark.current
-    val visualTokens = remember(flavor, isDarkTheme) {
-        citrosSplashVisualTokens(flavor, isDark = isDarkTheme)
-    }
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .testTag("no_key_prompt"),
-        contentAlignment = Alignment.Center
-    ) {
-        CitrosHeroShaderSphere(
-            flavor = flavor,
-            modifier = Modifier.fillMaxSize()
-        )
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(horizontal = 24.dp, vertical = 20.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center
-        ) {
-            Text(
-                text = "Add an API Key",
-                style = CitrosTypography.displaySmall.copy(
-                    fontSize = CitrosTypography.displaySmall.fontSize * 1.08f,
-                    shadow = Shadow(
-                        color = visualTokens.hero.deep.copy(alpha = 0.78f),
-                        offset = Offset(0f, 2f),
-                        blurRadius = 18f
-                    )
-                ),
-                color = flavor.primary,
-                fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold
-            )
-            Spacer(modifier = Modifier.height(12.dp))
-            Text(
-                text = "Connect an Anthropic, OpenAI, or OpenRouter key to start chatting.",
-                style = CitrosTypography.bodyLarge,
-                color = CitrosColorScheme.onSurface.copy(alpha = 0.80f),
-                textAlign = androidx.compose.ui.text.style.TextAlign.Center
-            )
-        }
-        CitrusLiquidGlassButton(
-            text = "Open Settings",
-            onClick = onOpenSettings,
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .fillMaxWidth()
-                .padding(horizontal = 24.dp, vertical = 52.dp),
-            tintColor = flavor.primary
-        )
     }
 }
 @Composable
@@ -2787,21 +2815,40 @@ internal fun MessageBubble(
 internal fun LoadingIndicator(flavor: CitrosFlavor = CitrosFlavor.TANGERINE, label: String = "Thinking") {
     PortedLoadingIndicator(flavor = flavor, label = label)
 }
+
+internal data class MessageInputSubmissionState(
+    val text: String,
+    val pendingStopVisual: Boolean
+)
+
+internal fun submitMessageDraft(
+    attemptedText: String,
+    isLoading: Boolean,
+    onSend: (String) -> Boolean,
+    onQueue: (String) -> Boolean
+): MessageInputSubmissionState {
+    val submitted = if (isLoading) onQueue(attemptedText) else onSend(attemptedText)
+    return if (submitted) {
+        MessageInputSubmissionState(text = "", pendingStopVisual = true)
+    } else {
+        MessageInputSubmissionState(text = attemptedText, pendingStopVisual = false)
+    }
+}
+
 @Composable
 internal fun MessageInput(
-    onSend: (String) -> Unit,
-    onSteer: (String) -> Unit = onSend,
-    onQueue: (String) -> Unit = onSteer,
+    onSend: (String) -> Boolean,
+    onSteer: (String) -> Boolean = onSend,
+    onQueue: (String) -> Boolean = onSteer,
     queuedMessage: String? = null,
-    onSteerQueuedMessage: (String) -> Unit = onSteer,
+    onSteerQueuedMessage: (String) -> Unit = { onSteer(it) },
     onCancel: () -> Unit = {},
     isLoading: Boolean = false,
     flavor: CitrosFlavor = CitrosFlavor.TANGERINE,
     modifier: Modifier = Modifier,
     placeholder: String = "Message Citros...",
     voiceReady: Boolean = false,
-    voiceManager: VoiceManager? = null,
-    onVoiceText: ((String) -> Unit)? = null
+    voiceManager: VoiceManager? = null
 ) {
     var text by remember { mutableStateOf("") }
     var pendingStopVisual by remember { mutableStateOf(false) }
@@ -2861,9 +2908,14 @@ internal fun MessageInput(
             )
             val sendText = result.autoSendText
             if (sendText != null) {
-                if (isLoading) onQueue(sendText) else onSend(sendText)
-                text = ""
-                pendingStopVisual = true
+                val submitState = submitMessageDraft(
+                    attemptedText = sendText,
+                    isLoading = isLoading,
+                    onSend = onSend,
+                    onQueue = onQueue
+                )
+                text = submitState.text
+                pendingStopVisual = submitState.pendingStopVisual
             } else {
                 text = result.displayText
             }
@@ -2945,7 +2997,9 @@ internal fun MessageInput(
                         text = "Steer",
                         style = CitrosTypography.labelSmall,
                         color = flavor.primary,
-                        modifier = Modifier.clickable {
+                        modifier = Modifier
+                            .testTag(TEST_TAG_MESSAGE_STEER_QUEUED_BUTTON)
+                            .clickable {
                             onSteerQueuedMessage(queuedText)
                         }
                     )
@@ -2973,6 +3027,7 @@ internal fun MessageInput(
                         onValueChange = { text = it },
                         modifier = Modifier
                             .weight(1f)
+                            .testTag(TEST_TAG_MESSAGE_INPUT_FIELD)
                             .heightIn(max = 132.dp),
                         placeholder = {
                             Text(
@@ -2981,13 +3036,18 @@ internal fun MessageInput(
                             )
                         },
                         enabled = true,
-                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Default),
+                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
                         keyboardActions = KeyboardActions(
                             onSend = {
                                 if (text.isNotBlank()) {
-                                    if (isLoading) onQueue(text) else onSend(text)
-                                    text = ""
-                                    pendingStopVisual = true
+                                    val submitState = submitMessageDraft(
+                                        attemptedText = text,
+                                        isLoading = isLoading,
+                                        onSend = onSend,
+                                        onQueue = onQueue
+                                    )
+                                    text = submitState.text
+                                    pendingStopVisual = submitState.pendingStopVisual
                                 }
                             }
                         ),
@@ -3059,6 +3119,7 @@ internal fun MessageInput(
             val showStopButton = (isLoading || pendingStopVisual) && !hasInputText && !isListening
             val sendEnabled = hasInputText || showStopButton
             MessageInputGlassIconButton(
+                modifier = Modifier.testTag(TEST_TAG_MESSAGE_SEND_BUTTON),
                 onClick = {
                     when {
                         showStopButton -> {
@@ -3066,9 +3127,14 @@ internal fun MessageInput(
                             onCancel()
                         }
                         text.isNotBlank() -> {
-                            if (isLoading) onQueue(text) else onSend(text)
-                            text = ""
-                            pendingStopVisual = true
+                            val submitState = submitMessageDraft(
+                                attemptedText = text,
+                                isLoading = isLoading,
+                                onSend = onSend,
+                                onQueue = onQueue
+                            )
+                            text = submitState.text
+                            pendingStopVisual = submitState.pendingStopVisual
                         }
                     }
                 },
@@ -3203,6 +3269,7 @@ internal fun MessageInputClearGlyph(
 }
 @Composable
 internal fun MessageInputGlassIconButton(
+    modifier: Modifier = Modifier,
     onClick: () -> Unit,
     enabled: Boolean,
     backgroundColor: Color,
@@ -3212,7 +3279,7 @@ internal fun MessageInputGlassIconButton(
 ) {
     val resolvedIconTint = if (enabled) iconTint else iconTint.copy(alpha = 0.55f)
     Box(
-        modifier = Modifier
+        modifier = modifier
             .size(40.dp)
             .clip(CircleShape)
             .background(backgroundColor)

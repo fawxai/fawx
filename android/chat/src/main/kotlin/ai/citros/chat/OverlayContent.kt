@@ -104,6 +104,9 @@ internal fun OverlayMiniChatContent(
     val scrollState = rememberScrollState()
     val isDarkTheme = LocalCitrosIsDark.current
     val surfaces = remember(isDarkTheme) { citrosDirectiveSurfaces(isDarkTheme) }
+    val flavorTokens = remember(flavor, surfaces) {
+        citrosDirectiveFlavorTokens(flavor, surfaces)
+    }
     val panelColor = if (isDarkTheme) {
         Color(0xEB1C1C1E)
     } else {
@@ -271,38 +274,12 @@ internal fun OverlayMiniChatContent(
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 lines.forEach { line ->
-                    val bubbleColor = when (line.type) {
-                        OverlayLineType.SYSTEM -> surfaces.surface2
-                        OverlayLineType.USER -> surfaces.surface1
-                        OverlayLineType.QUEUED -> flavor.primary.copy(alpha = 0.14f)
-                    }
-                    val bubbleBorder = when (line.type) {
-                        OverlayLineType.QUEUED -> flavor.primary.copy(alpha = 0.34f)
-                        else -> surfaces.separatorLight
-                    }
-
-                    Surface(
-                        modifier = if (line.type == OverlayLineType.QUEUED) Modifier.testTag(TEST_TAG_OVERLAY_QUEUED_LINE) else Modifier,
-                        shape = RoundedCornerShape(
-                            topStart = 14.dp,
-                            topEnd = 14.dp,
-                            bottomStart = if (line.type == OverlayLineType.SYSTEM) 6.dp else 14.dp,
-                            bottomEnd = 14.dp
-                        ),
-                        color = bubbleColor,
-                        border = BorderStroke(1.dp, bubbleBorder)
-                    ) {
-                        MarkdownText(
-                            text = line.text,
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
-                            style = CitrosTypography.bodySmall,
-                            color = if (line.type == OverlayLineType.QUEUED) {
-                                surfaces.labelSecondary
-                            } else {
-                                surfaces.labelPrimary
-                            }
-                        )
-                    }
+                    OverlayLineBubble(
+                        line = line,
+                        flavor = flavor,
+                        surfaces = surfaces,
+                        flavorTokens = flavorTokens
+                    )
                 }
 
                 if (runState == OverlayRunState.EXECUTING) {

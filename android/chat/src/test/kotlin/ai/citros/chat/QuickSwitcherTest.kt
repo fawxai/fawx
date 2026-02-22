@@ -1,15 +1,17 @@
 package ai.citros.chat
 
 import android.content.Context
-import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertDoesNotExist
+import androidx.compose.ui.test.assertTextContains
 import androidx.compose.ui.test.junit4.createComposeRule
-import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performImeAction
 import androidx.compose.ui.test.performSemanticsAction
+import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.semantics.SemanticsActions
 import androidx.test.core.app.ApplicationProvider
 import ai.citros.core.ChatResponse
@@ -27,6 +29,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import kotlin.test.assertEquals
+import kotlin.test.assertTrue
 
 @RunWith(RobolectricTestRunner::class)
 class QuickSwitcherTest {
@@ -102,70 +105,228 @@ class QuickSwitcherTest {
 
     @Test
     fun chatScreenQuickSwitcherVisibilityAndOpenFlow() {
-        val context = ApplicationProvider.getApplicationContext<Context>()
-        resetWalletStores(context)
-        val testKeyStore = InMemoryKeyStore()
-        val testWalletStorage = SharedPreferencesWalletStorage(context)
-        val testSecureStore = InMemoryCredentialStore()
-        val walletManager = WalletManager(
-            storage = testWalletStorage,
-            keyStore = testKeyStore
-        )
-        val keyId = walletManager.addKey(Provider.OPENAI, "Work", "sk-test-openai")
-        walletManager.setActiveKey(keyId.id)
-        walletManager.setChatModel(ModelConfig.defaultChatModel(Provider.OPENAI))
-        walletManager.setActionModel(ModelConfig.defaultActionModel(Provider.OPENAI))
+        val fixture = createChatScreenFixture(withActiveKey = true, configureBackend = true)
+        setChatScreenContent(fixture)
 
-        val viewModel = ChatViewModel()
-        val backend = viewModel.createTestBackend(
-            provider = Provider.OPENAI,
-            chatClient = NoopProviderClient(Provider.OPENAI)
-        )
-        viewModel.configureForTesting(listOf(backend))
-
-        composeRule.setContent {
-            ChatScreen(
-                viewModel = viewModel,
-                keyStoreOverride = testKeyStore,
-                walletStorageOverride = testWalletStorage,
-                secureStoreOverride = testSecureStore
-            )
-        }
-
-        composeRule.onNodeWithTag("quick_switcher_chip").assertIsDisplayed()
-
-        composeRule.onNodeWithTag("quick_switcher_chip").performClick()
-
-        // Verify the sheet opened via a stable test tag (not copy text)
+        composeRule.onNodeWithTag(TEST_TAG_QUICK_SWITCHER_CHIP).assertIsDisplayed()
+        composeRule.onNodeWithTag(TEST_TAG_QUICK_SWITCHER_CHIP).performClick()
         composeRule.onNodeWithTag(TEST_TAG_QUICK_SWITCHER_SHEET).assertIsDisplayed()
     }
 
     @Test
-    fun chatScreenHidesQuickSwitcherWhenNoActiveKey() {
-        val context = ApplicationProvider.getApplicationContext<Context>()
-        resetWalletStores(context)
+    fun chatScreenConfiguredAndActiveKeyHeaderTapOpensQuickSwitcher() {
+        val fixture = createChatScreenFixture(withActiveKey = true, configureBackend = true)
+        setChatScreenContent(fixture)
 
-        val testKeyStore = InMemoryKeyStore()
-        val testWalletStorage = SharedPreferencesWalletStorage(context)
-        val testSecureStore = InMemoryCredentialStore()
+        composeRule.onNodeWithTag(TEST_TAG_QUICK_SWITCHER_HEADER).performClick()
+        composeRule.onNodeWithTag(TEST_TAG_QUICK_SWITCHER_SHEET).assertIsDisplayed()
+    }
 
-        val viewModel = ChatViewModel()
-        val backend = viewModel.createTestBackend(
+    @Test
+    fun chatScreenNoProviderChipNavigatesToApiKeys() {
+        val fixture = createChatScreenFixture(withActiveKey = false, configureBackend = true)
+        var openedApiKeys = false
+
+        setChatScreenContent(
+            fixture = fixture,
+            onOpenApiKeys = { openedApiKeys = true }
+        )
+
+        composeRule.onNodeWithText("No provider connected").assertIsDisplayed()
+        composeRule.onNodeWithText("▾").assertDoesNotExist()
+        composeRule.onNodeWithTag(TEST_TAG_QUICK_SWITCHER_CHIP).assertIsDisplayed()
+        composeRule.onNodeWithTag(TEST_TAG_QUICK_SWITCHER_CHIP).performClick()
+        composeRule.runOnIdle {
+            assertTrue(openedApiKeys, "Expected no-provider chip to navigate to API keys")
+        }
+    }
+
+    @Test
+    fun chatScreenNoProviderHeaderNavigatesToApiKeys() {
+        val fixture = createChatScreenFixture(withActiveKey = false, configureBackend = true)
+        var openedApiKeys = false
+
+        setChatScreenContent(
+            fixture = fixture,
+            onOpenApiKeys = { openedApiKeys = true }
+        )
+
+        composeRule.onNodeWithText("No provider connected").assertIsDisplayed()
+        composeRule.onNodeWithTag(TEST_TAG_QUICK_SWITCHER_HEADER).performClick()
+        composeRule.runOnIdle {
+            assertTrue(openedApiKeys, "Expected no-provider header to navigate to API keys")
+        }
+    }
+
+    @Test
+    fun chatScreenNoProviderBlockedSendShowsModalAndRetainsDraft() {
+        val fixture = createChatScreenFixture(withActiveKey = false, configureBackend = true)
+        var openedApiKeys = false
+
+        setChatScreenContent(
+            fixture = fixture,
+            onOpenApiKeys = { openedApiKeys = true }
+        )
+
+        composeRule.onNodeWithTag(TEST_TAG_MESSAGE_INPUT_FIELD).performTextInput("draft message")
+        composeRule.onNodeWithTag(TEST_TAG_MESSAGE_SEND_BUTTON).performClick()
+
+        composeRule.onNodeWithTag(TEST_TAG_API_KEY_REQUIRED_MODAL).assertIsDisplayed()
+        composeRule.onNodeWithTag(TEST_TAG_MESSAGE_INPUT_FIELD).assertTextContains("draft message")
+
+        composeRule.onNodeWithText("Not now").performClick()
+        composeRule.onNodeWithTag(TEST_TAG_API_KEY_REQUIRED_MODAL).assertDoesNotExist()
+
+        composeRule.onNodeWithTag(TEST_TAG_MESSAGE_SEND_BUTTON).performClick()
+        composeRule.onNodeWithText("Open Settings").performClick()
+        composeRule.runOnIdle {
+            assertTrue(openedApiKeys, "Expected Open Settings to route to API keys")
+        }
+    }
+
+    @Test
+    fun chatScreenNoProviderBlockedImeSendShowsModalAndRetainsDraft() {
+        val fixture = createChatScreenFixture(withActiveKey = false, configureBackend = true)
+        setChatScreenContent(fixture)
+
+        composeRule.onNodeWithTag(TEST_TAG_MESSAGE_INPUT_FIELD).performTextInput("ime draft")
+        composeRule.onNodeWithTag(TEST_TAG_MESSAGE_INPUT_FIELD).performImeAction()
+
+        composeRule.onNodeWithTag(TEST_TAG_API_KEY_REQUIRED_MODAL).assertIsDisplayed()
+        composeRule.onNodeWithTag(TEST_TAG_MESSAGE_INPUT_FIELD).assertTextContains("ime draft")
+    }
+
+    @Test
+    fun chatScreenNoProviderBlockedQueuedSteerShowsModalAndPreservesQueuedText() {
+        val fixture = createChatScreenFixture(
+            withActiveKey = false,
+            configureBackend = true,
+            queuedMessage = "queued follow up"
+        )
+        setChatScreenContent(fixture)
+
+        composeRule.onNodeWithTag(TEST_TAG_MESSAGE_STEER_QUEUED_BUTTON).performClick()
+        composeRule.onNodeWithTag(TEST_TAG_API_KEY_REQUIRED_MODAL).assertIsDisplayed()
+        composeRule.onNodeWithText("queued follow up").assertIsDisplayed()
+    }
+
+    @Test
+    fun chatScreenConfiguredFalseWithKeyShowsSetupRequiredAndRoutesHeaderToSettings() {
+        val fixture = createChatScreenFixture(withActiveKey = true, configureBackend = false)
+        var openedSettings = false
+        setChatScreenContent(
+            fixture = fixture,
+            onOpenSettings = { openedSettings = true }
+        )
+
+        composeRule.onNodeWithText("Provider setup required").assertIsDisplayed()
+        composeRule.onNodeWithText("▾").assertDoesNotExist()
+        composeRule.onNodeWithTag(TEST_TAG_QUICK_SWITCHER_CHIP).performClick()
+        composeRule.runOnIdle {
+            assertTrue(openedSettings, "Expected setup-required chip to route to settings")
+            openedSettings = false
+        }
+        composeRule.onNodeWithTag(TEST_TAG_QUICK_SWITCHER_SHEET).assertDoesNotExist()
+
+        composeRule.onNodeWithTag(TEST_TAG_QUICK_SWITCHER_HEADER).performClick()
+        composeRule.runOnIdle {
+            assertTrue(openedSettings, "Expected setup-required header to route to settings")
+            openedSettings = false
+        }
+
+        composeRule.onNodeWithTag(TEST_TAG_MESSAGE_INPUT_FIELD).performTextInput("needs setup")
+        composeRule.onNodeWithTag(TEST_TAG_MESSAGE_SEND_BUTTON).performClick()
+        composeRule.onNodeWithTag(TEST_TAG_API_KEY_REQUIRED_MODAL).assertIsDisplayed()
+        composeRule.onNodeWithText("Complete provider setup to continue chatting.").assertIsDisplayed()
+        composeRule.onNodeWithText("Open Settings").performClick()
+        composeRule.runOnIdle {
+            assertTrue(openedSettings, "Expected setup-required modal CTA to open settings")
+        }
+    }
+
+    @Test
+    fun chatScreenApiKeyModalDismissesWhenModelAccessBecomesAvailable() {
+        val fixture = createChatScreenFixture(withActiveKey = true, configureBackend = false)
+        val backend = fixture.viewModel.createTestBackend(
             provider = Provider.OPENAI,
             chatClient = NoopProviderClient(Provider.OPENAI)
         )
-        viewModel.configureForTesting(listOf(backend))
+        setChatScreenContent(fixture)
 
-        composeRule.setContent {
-            ChatScreen(
-                viewModel = viewModel,
-                keyStoreOverride = testKeyStore,
-                walletStorageOverride = testWalletStorage,
-                secureStoreOverride = testSecureStore
+        composeRule.onNodeWithTag(TEST_TAG_MESSAGE_INPUT_FIELD).performTextInput("unlock models")
+        composeRule.onNodeWithTag(TEST_TAG_MESSAGE_SEND_BUTTON).performClick()
+        composeRule.onNodeWithTag(TEST_TAG_API_KEY_REQUIRED_MODAL).assertIsDisplayed()
+
+        composeRule.runOnIdle {
+            fixture.viewModel.configureForTesting(listOf(backend))
+        }
+        composeRule.waitForIdle()
+
+        composeRule.onNodeWithTag(TEST_TAG_API_KEY_REQUIRED_MODAL).assertDoesNotExist()
+    }
+
+    private data class ChatScreenFixture(
+        val viewModel: ChatViewModel,
+        val keyStore: InMemoryKeyStore,
+        val walletStorage: SharedPreferencesWalletStorage,
+        val secureStore: InMemoryCredentialStore
+    )
+
+    private fun createChatScreenFixture(
+        withActiveKey: Boolean,
+        configureBackend: Boolean,
+        queuedMessage: String? = null
+    ): ChatScreenFixture {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        resetWalletStores(context)
+        val keyStore = InMemoryKeyStore()
+        val walletStorage = SharedPreferencesWalletStorage(context)
+        val secureStore = InMemoryCredentialStore()
+
+        if (withActiveKey) {
+            val walletManager = WalletManager(
+                storage = walletStorage,
+                keyStore = keyStore
             )
+            val keyId = walletManager.addKey(Provider.OPENAI, "Work", "sk-test-openai")
+            walletManager.setActiveKey(keyId.id)
+            walletManager.setChatModel(ModelConfig.defaultChatModel(Provider.OPENAI))
+            walletManager.setActionModel(ModelConfig.defaultActionModel(Provider.OPENAI))
         }
 
-        composeRule.onAllNodesWithTag("quick_switcher_chip").assertCountEquals(0)
+        val viewModel = ChatViewModel()
+        if (configureBackend) {
+            val backend = viewModel.createTestBackend(
+                provider = Provider.OPENAI,
+                chatClient = NoopProviderClient(Provider.OPENAI)
+            )
+            viewModel.configureForTesting(listOf(backend))
+        }
+        queuedMessage?.let(viewModel::setQueuedMessage)
+
+        return ChatScreenFixture(
+            viewModel = viewModel,
+            keyStore = keyStore,
+            walletStorage = walletStorage,
+            secureStore = secureStore
+        )
+    }
+
+    private fun setChatScreenContent(
+        fixture: ChatScreenFixture,
+        onOpenApiKeys: () -> Unit = {},
+        onOpenSettings: () -> Unit = {}
+    ) {
+        composeRule.setContent {
+            ChatScreen(
+                viewModel = fixture.viewModel,
+                keyStoreOverride = fixture.keyStore,
+                walletStorageOverride = fixture.walletStorage,
+                secureStoreOverride = fixture.secureStore,
+                onOpenApiKeys = onOpenApiKeys,
+                onOpenSettings = onOpenSettings
+            )
+        }
     }
 
     private fun resetWalletStores(context: Context) {

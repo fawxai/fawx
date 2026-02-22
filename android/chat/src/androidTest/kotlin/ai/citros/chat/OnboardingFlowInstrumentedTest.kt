@@ -60,11 +60,11 @@ class OnboardingFlowInstrumentedTest {
         composeRule.onNodeWithText("Continue").performClick() // flavor
         composeRule.onNodeWithText("Continue").performClick() // personality
         composeRule.onNodeWithText("Continue").performClick() // acquainted
-        composeRule.onNodeWithTag("api_key_field").performTextInput("sk-ant-test-key-1234567890")
-        composeRule.onNodeWithTag("api_key_start_btn").performClick() // API key
         composeRule.onNodeWithTag("permissions_continue_btn").performClick() // permissions
         composeRule.onNodeWithText("Continue").performClick() // trust
-        composeRule.onNodeWithTag("paywall_plan_byo").performClick()
+        composeRule.onNodeWithTag("paywall_plan_byo").performClick() // choose your plan
+        composeRule.onNodeWithTag("api_key_field").performTextInput("sk-ant-test-key-1234567890")
+        composeRule.onNodeWithTag("api_key_start_btn").performClick() // API key
         composeRule.onNodeWithTag("ready_start_btn").performClick() // ready
 
         composeRule.waitForIdle()
@@ -84,14 +84,14 @@ class OnboardingFlowInstrumentedTest {
         composeRule.onNodeWithText("Continue").performClick() // flavor
         composeRule.onNodeWithText("Continue").performClick() // personality
         composeRule.onNodeWithText("Continue").performClick() // acquainted
-        composeRule.onNodeWithTag("api_key_field").performTextInput("sk-ant-test-key-1234567890")
-        composeRule.onNodeWithTag("api_key_start_btn").performClick() // API key
         composeRule.onNodeWithTag("permissions_continue_btn").performClick() // permissions
         composeRule.onNodeWithText("Continue").performClick() // trust
 
         composeRule.onNodeWithTag("paywall_plan_base").performClick()
         composeRule.onNodeWithTag("waitlist_email_field").performTextInput("test@example.com")
         composeRule.onNodeWithText("Continue With BYO For Now").performClick()
+        composeRule.onNodeWithTag("api_key_field").performTextInput("sk-ant-test-key-1234567890")
+        composeRule.onNodeWithTag("api_key_start_btn").performClick() // API key
         composeRule.onNodeWithTag("ready_start_btn").performClick() // ready
 
         composeRule.waitForIdle()
