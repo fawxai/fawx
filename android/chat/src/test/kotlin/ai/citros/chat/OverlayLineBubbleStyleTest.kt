@@ -9,7 +9,7 @@ class OverlayLineBubbleStyleTest {
     @Test
     fun `user style uses flavor token bubble colors and end anchor`() {
         val flavor = CitrosFlavor.LIME
-        val surfaces = citrosDirectiveSurfaces(isDarkTheme = false)
+        val surfaces = citrosDirectiveSurfaces(isDark = false)
         val flavorTokens = citrosDirectiveFlavorTokens(flavor, surfaces)
 
         val style = overlayLineBubbleStyle(
@@ -28,7 +28,7 @@ class OverlayLineBubbleStyleTest {
     @Test
     fun `system style uses directive surface colors and start anchor`() {
         val flavor = CitrosFlavor.LIME
-        val surfaces = citrosDirectiveSurfaces(isDarkTheme = false)
+        val surfaces = citrosDirectiveSurfaces(isDark = false)
         val flavorTokens = citrosDirectiveFlavorTokens(flavor, surfaces)
 
         val style = overlayLineBubbleStyle(
@@ -47,7 +47,7 @@ class OverlayLineBubbleStyleTest {
     @Test
     fun `queued style uses primary tint variants and start anchor`() {
         val flavor = CitrosFlavor.LIME
-        val surfaces = citrosDirectiveSurfaces(isDarkTheme = false)
+        val surfaces = citrosDirectiveSurfaces(isDark = false)
         val flavorTokens = citrosDirectiveFlavorTokens(flavor, surfaces)
 
         val style = overlayLineBubbleStyle(
