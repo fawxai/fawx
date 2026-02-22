@@ -353,6 +353,7 @@ private fun SettingsGroupedSurface(
 private fun SettingsListRow(
     title: String,
     subtitle: String? = null,
+    modifier: Modifier = Modifier,
     onClick: (() -> Unit)? = null,
     showDivider: Boolean = true,
     trailing: @Composable (() -> Unit)? = null
@@ -360,7 +361,7 @@ private fun SettingsListRow(
     val isDarkTheme = LocalCitrosIsDark.current
     val surfaces = remember(isDarkTheme) { citrosDirectiveSurfaces(isDarkTheme) }
     Column(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .semantics(mergeDescendants = true) {}
             .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
@@ -640,23 +641,30 @@ internal fun TrustSettingsScreen(
             color = surfaces.labelTertiary
         )
         SettingsSectionHeader("Prompt privacy")
+
+        fun updateSensorContextEnabled(enabled: Boolean) {
+            sensorContextEnabled = enabled
+            if (!enabled) {
+                // Hide stale denial warning while sensor sharing is disabled.
+                locationPermissionDenied = false
+            }
+            // Commit synchronously so state is immediately visible to in-process readers
+            // and deterministic under Robolectric compose unit tests.
+            chatPrefs.edit().putBoolean(PREF_SENSOR_CONTEXT_ENABLED, enabled).commit()
+        }
+
         SettingsGroupedSurface {
             SettingsListRow(
                 title = "Send device context to cloud models",
                 subtitle = "Includes battery, network, local time, and location when permission is granted.",
                 showDivider = false,
+                modifier = Modifier.testTag("trust_sensor_context_row"),
+                onClick = { updateSensorContextEnabled(!sensorContextEnabled) },
                 trailing = {
                     Box(modifier = Modifier.padding(start = 12.dp)) {
                         Switch(
                             checked = sensorContextEnabled,
-                            onCheckedChange = {
-                                sensorContextEnabled = it
-                                if (!it) {
-                                    // Hide stale denial warning while sensor sharing is disabled.
-                                    locationPermissionDenied = false
-                                }
-                                chatPrefs.edit().putBoolean(PREF_SENSOR_CONTEXT_ENABLED, it).apply()
-                            },
+                            onCheckedChange = { updateSensorContextEnabled(it) },
                             modifier = Modifier.testTag("trust_sensor_context_toggle"),
                             colors = SwitchDefaults.colors(
                                 checkedThumbColor = Color.White,

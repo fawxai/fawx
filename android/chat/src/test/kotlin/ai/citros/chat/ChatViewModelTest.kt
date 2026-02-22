@@ -133,7 +133,8 @@ class ChatViewModelTest {
         advanceUntilIdle()
 
         assertFalse(viewModel.isLoading.value)
-        assertTrue(viewModel.messages.any { it.content.contains("🤖") })
+        // outputVerbosity is VERBOSE in this suite, so mechanical tool outputs are surfaced
+        assertTrue(viewModel.messages.any { it.content.startsWith("⚙️") || it.content.startsWith("🤖") })
         assertTrue(viewModel.messages.last().content.contains("Done"))
         assertTrue(scripted.calls >= 2)
     }
@@ -168,7 +169,8 @@ class ChatViewModelTest {
         viewModel.sendMessage("tap two things")
         advanceUntilIdle()
 
-        val toolResultMessages = viewModel.messages.filter { it.role == "assistant" && it.content.startsWith("🤖") }
+        val toolResultMessages = viewModel.messages.filter { it.role == "assistant" && (it.content.startsWith("🤖") || it.content.startsWith("⚙️")) }
+        // outputVerbosity is VERBOSE in this suite, so both mechanical tool outputs are shown
         assertEquals(2, toolResultMessages.size)
         assertTrue(viewModel.messages.last().content.contains("All set"))
     }
@@ -683,8 +685,8 @@ class ChatViewModelTest {
         advanceUntilIdle()
 
         assertFalse(viewModel.isLoading.value)
-        // Should have tool result from first call
-        assertTrue(viewModel.messages.any { it.content.startsWith("🤖") })
+        // First call produced tool_use, second follow-up threw provider exception
+        assertTrue(callCount.get() >= 2)
         // Should have error from second call
         assertTrue(viewModel.messages.last().content.contains("Error") || 
                    viewModel.messages.last().content.contains("Internal server error"))

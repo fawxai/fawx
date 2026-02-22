@@ -2,7 +2,9 @@ package ai.citros.chat
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.os.Build
 import android.os.Looper
+import android.util.Log
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import ai.citros.core.KeyStore
@@ -22,20 +24,55 @@ import ai.citros.core.KeyStore
  * **Thread Safety:** Not thread-safe. All calls must be from the main thread.
  * Thread violations will throw IllegalStateException.
  *
- * @param context Android context for accessing SharedPreferences
+ * **Test behavior:** Robolectric does not provide a functional AndroidKeyStore provider.
+ * In that environment only, this class falls back to regular SharedPreferences so
+ * ChatActivity/Onboarding compose tests can initialize wallet dependencies.
  */
 class EncryptedKeyStore(context: Context) : KeyStore {
-    private val masterKey = MasterKey.Builder(context)
-        .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
-        .build()
+    companion object {
+        private const val TAG = "EncryptedKeyStore"
+        private const val ENCRYPTED_PREFS_NAME = "citros_keystore"
+        private const val ROBOLECTRIC_FALLBACK_PREFS_NAME = "citros_keystore_robolectric"
+    }
 
-    private val prefs: SharedPreferences = EncryptedSharedPreferences.create(
-        context,
-        "citros_keystore",
-        masterKey,
-        EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-        EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
-    )
+    private val appContext = context.applicationContext
+
+    private val prefs: SharedPreferences = createPreferences(appContext)
+
+    private fun createPreferences(context: Context): SharedPreferences {
+        return try {
+            val masterKey = MasterKey.Builder(context)
+                .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+                .build()
+
+            EncryptedSharedPreferences.create(
+                context,
+                ENCRYPTED_PREFS_NAME,
+                masterKey,
+                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+            )
+        } catch (e: Exception) {
+            if (isRobolectricEnvironment()) {
+                Log.w(
+                    TAG,
+                    "AndroidKeyStore unavailable under Robolectric; using plaintext SharedPreferences fallback for tests",
+                    e
+                )
+                context.getSharedPreferences(ROBOLECTRIC_FALLBACK_PREFS_NAME, Context.MODE_PRIVATE)
+            } else {
+                throw e
+            }
+        }
+    }
+
+    private fun isRobolectricEnvironment(): Boolean {
+        val fingerprint = Build.FINGERPRINT?.lowercase() ?: ""
+        val model = Build.MODEL?.lowercase() ?: ""
+        return fingerprint.contains("robolectric") ||
+            model.contains("robolectric") ||
+            System.getProperty("robolectric") != null
+    }
 
     private fun assertMainThread() {
         check(Looper.getMainLooper().isCurrentThread) {

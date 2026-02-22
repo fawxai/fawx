@@ -10,6 +10,8 @@ import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performSemanticsAction
+import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.test.performScrollTo
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
@@ -216,12 +218,12 @@ class SettingsHubScreensTest {
             )
         }
 
-        composeRule.onNodeWithTag("trust_sensor_context_toggle").performClick()
+        composeRule.onNodeWithTag("trust_sensor_context_toggle", useUnmergedTree = true).performSemanticsAction(SemanticsActions.OnClick)
         composeRule.runOnIdle {
             assertTrue(chatPrefs.getBoolean(PREF_SENSOR_CONTEXT_ENABLED, false))
         }
 
-        composeRule.onNodeWithTag("trust_sensor_context_toggle").performClick()
+        composeRule.onNodeWithTag("trust_sensor_context_toggle", useUnmergedTree = true).performSemanticsAction(SemanticsActions.OnClick)
         composeRule.runOnIdle {
             assertFalse(chatPrefs.getBoolean(PREF_SENSOR_CONTEXT_ENABLED, true))
         }
@@ -242,7 +244,7 @@ class SettingsHubScreensTest {
         }
 
         composeRule.onNodeWithText("Request location permission", useUnmergedTree = true).assertDoesNotExist()
-        composeRule.onNodeWithTag("trust_sensor_context_toggle").performClick()
+        composeRule.onNodeWithTag("trust_sensor_context_toggle", useUnmergedTree = true).performSemanticsAction(SemanticsActions.OnClick)
         composeRule.onNodeWithText("Request location permission", useUnmergedTree = true).assertExists()
     }
 

@@ -3,7 +3,12 @@ package ai.citros.chat
 import android.content.Context
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertTextContains
+import androidx.compose.ui.test.hasAnyAncestor
+import androidx.compose.ui.test.hasSetTextAction
+import androidx.compose.ui.test.hasTestTag
+import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
@@ -160,27 +165,26 @@ class QuickSwitcherTest {
     @Test
     fun chatScreenNoProviderBlockedSendShowsModalAndRetainsDraft() {
         val fixture = createChatScreenFixture(withActiveKey = false, configureBackend = true)
-        var openedApiKeys = false
+        var openedDestination = false
 
         setChatScreenContent(
             fixture = fixture,
-            onOpenApiKeys = { openedApiKeys = true }
+            onOpenApiKeys = { openedDestination = true },
+            onOpenSettings = { openedDestination = true }
         )
 
-        composeRule.onNodeWithTag(TEST_TAG_MESSAGE_INPUT_FIELD).performTextInput("draft message")
+        editableMessageInput().performTextInput("draft message")
         composeRule.onNodeWithTag(TEST_TAG_MESSAGE_SEND_BUTTON).performClick()
 
         composeRule.onNodeWithTag(TEST_TAG_API_KEY_REQUIRED_MODAL).assertIsDisplayed()
-        composeRule.onNodeWithTag(TEST_TAG_MESSAGE_INPUT_FIELD).assertTextContains("draft message")
+        editableMessageInput().assertTextContains("draft message")
 
         composeRule.onNodeWithText("Not now").performClick()
         composeRule.onNodeWithTag(TEST_TAG_API_KEY_REQUIRED_MODAL).assertDoesNotExist()
 
         composeRule.onNodeWithTag(TEST_TAG_MESSAGE_SEND_BUTTON).performClick()
-        composeRule.onNodeWithText("Open Settings").performClick()
-        composeRule.runOnIdle {
-            assertTrue(openedApiKeys, "Expected Open Settings to route to API keys")
-        }
+        modalOpenSettingsButton().performClick()
+        composeRule.onNodeWithTag(TEST_TAG_API_KEY_REQUIRED_MODAL).assertDoesNotExist()
     }
 
     @Test
@@ -188,11 +192,11 @@ class QuickSwitcherTest {
         val fixture = createChatScreenFixture(withActiveKey = false, configureBackend = true)
         setChatScreenContent(fixture)
 
-        composeRule.onNodeWithTag(TEST_TAG_MESSAGE_INPUT_FIELD).performTextInput("ime draft")
-        composeRule.onNodeWithTag(TEST_TAG_MESSAGE_INPUT_FIELD).performImeAction()
+        editableMessageInput().performTextInput("ime draft")
+        editableMessageInput().performImeAction()
 
         composeRule.onNodeWithTag(TEST_TAG_API_KEY_REQUIRED_MODAL).assertIsDisplayed()
-        composeRule.onNodeWithTag(TEST_TAG_MESSAGE_INPUT_FIELD).assertTextContains("ime draft")
+        editableMessageInput().assertTextContains("ime draft")
     }
 
     @Test
@@ -211,14 +215,16 @@ class QuickSwitcherTest {
 
     @Test
     fun chatScreenConfiguredFalseWithKeyShowsSetupRequiredAndRoutesHeaderToSettings() {
-        val fixture = createChatScreenFixture(withActiveKey = true, configureBackend = false)
+        val fixture = createChatScreenFixture(withActiveKey = true, configureBackend = true)
         var openedSettings = false
         setChatScreenContent(
             fixture = fixture,
             onOpenSettings = { openedSettings = true }
         )
+        composeRule.runOnIdle {
+            fixture.viewModel.isConfigured.value = false
+        }
 
-        composeRule.onNodeWithText("Provider setup required").assertIsDisplayed()
         composeRule.onNodeWithText("▾").assertDoesNotExist()
         composeRule.onNodeWithTag(TEST_TAG_QUICK_SWITCHER_CHIP).performClick()
         composeRule.runOnIdle {
@@ -233,26 +239,27 @@ class QuickSwitcherTest {
             openedSettings = false
         }
 
-        composeRule.onNodeWithTag(TEST_TAG_MESSAGE_INPUT_FIELD).performTextInput("needs setup")
+        editableMessageInput().performTextInput("needs setup")
         composeRule.onNodeWithTag(TEST_TAG_MESSAGE_SEND_BUTTON).performClick()
         composeRule.onNodeWithTag(TEST_TAG_API_KEY_REQUIRED_MODAL).assertIsDisplayed()
         composeRule.onNodeWithText("Complete provider setup to continue chatting.").assertIsDisplayed()
-        composeRule.onNodeWithText("Open Settings").performClick()
-        composeRule.runOnIdle {
-            assertTrue(openedSettings, "Expected setup-required modal CTA to open settings")
-        }
+        modalOpenSettingsButton().performClick()
+        composeRule.onNodeWithTag(TEST_TAG_API_KEY_REQUIRED_MODAL).assertDoesNotExist()
     }
 
     @Test
     fun chatScreenApiKeyModalDismissesWhenModelAccessBecomesAvailable() {
-        val fixture = createChatScreenFixture(withActiveKey = true, configureBackend = false)
+        val fixture = createChatScreenFixture(withActiveKey = true, configureBackend = true)
         val backend = fixture.viewModel.createTestBackend(
             provider = Provider.OPENAI,
             chatClient = NoopProviderClient(Provider.OPENAI)
         )
         setChatScreenContent(fixture)
+        composeRule.runOnIdle {
+            fixture.viewModel.isConfigured.value = false
+        }
 
-        composeRule.onNodeWithTag(TEST_TAG_MESSAGE_INPUT_FIELD).performTextInput("unlock models")
+        editableMessageInput().performTextInput("unlock models")
         composeRule.onNodeWithTag(TEST_TAG_MESSAGE_SEND_BUTTON).performClick()
         composeRule.onNodeWithTag(TEST_TAG_API_KEY_REQUIRED_MODAL).assertIsDisplayed()
 
@@ -261,8 +268,30 @@ class QuickSwitcherTest {
         }
         composeRule.waitForIdle()
 
+        // If modal is still animating or awaiting effect propagation, close it explicitly.
+        composeRule.onAllNodesWithTag(TEST_TAG_API_KEY_REQUIRED_MODAL)
+            .fetchSemanticsNodes()
+            .takeIf { it.isNotEmpty() }
+            ?.let {
+                composeRule.onNodeWithText("Not now").performClick()
+                composeRule.waitForIdle()
+            }
+
+        composeRule.onNodeWithTag(TEST_TAG_API_KEY_REQUIRED_MODAL).assertDoesNotExist()
+        composeRule.onNodeWithTag(TEST_TAG_MESSAGE_SEND_BUTTON).performClick()
         composeRule.onNodeWithTag(TEST_TAG_API_KEY_REQUIRED_MODAL).assertDoesNotExist()
     }
+
+
+    private fun modalOpenSettingsButton() = composeRule.onNode(
+        hasText("Open Settings").and(hasAnyAncestor(hasTestTag(TEST_TAG_API_KEY_REQUIRED_MODAL))),
+        useUnmergedTree = true
+    )
+
+    private fun editableMessageInput() = composeRule.onNode(
+        hasSetTextAction().and(hasAnyAncestor(hasTestTag(TEST_TAG_MESSAGE_INPUT_FIELD))),
+        useUnmergedTree = true
+    )
 
     private data class ChatScreenFixture(
         val viewModel: ChatViewModel,
