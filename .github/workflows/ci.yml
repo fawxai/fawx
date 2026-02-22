@@ -122,6 +122,38 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
+  spec_contracts:
+    name: Spec Contracts
+    runs-on: ubuntu-latest
+    # Keep this independent from other jobs (no `needs`) so spec/contract regressions
+    # surface immediately and are not blocked behind language/build pipelines.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: |
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y shellcheck
+          fi
+
+      - name: Shellcheck spec scripts
+        run: |
+          shellcheck scripts/spec-tests/ci-workflow-cache-paths-check.sh
+          shellcheck scripts/spec-tests/h23-tool-grouping-spec-contract.sh
+          shellcheck scripts/spec-tests/fixtures/h23-contract-fixture-builder.sh
+          shellcheck scripts/spec-tests/tests/h23-tool-grouping-spec-contract-test.sh
+          shellcheck scripts/spec-tests/tests/ci-workflow-cache-paths-test.sh
+
+      - name: Run H2.3 contract check
+        run: ./scripts/spec-tests/h23-tool-grouping-spec-contract.sh
+
+      - name: Run H2.3 contract test harness
+        run: ./scripts/spec-tests/tests/h23-tool-grouping-spec-contract-test.sh
+
+      - name: Verify workflow cache path safety
+        run: ./scripts/spec-tests/tests/ci-workflow-cache-paths-test.sh
+
   android:
     name: Android
     runs-on: ubuntu-latest

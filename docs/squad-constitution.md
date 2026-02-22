@@ -45,3 +45,28 @@ A PR may be marked ready only when all conditions are true:
 ## Enforcement
 
 These rules apply to humans, OpenClaw, Codex workers, Claude workers, and subagents equally.
+
+
+## 5.2 Policy Precedence
+
+Security constraints are non-bypassable and must be applied before lower-priority policy layers.
+
+## 5.3 Determinism
+
+Given identical explicit inputs, policy decisions must be deterministic.
+
+## 7.3 Acceptance Criteria
+
+Spec updates must define measurable acceptance gates and satisfy them before broad rollout.
+
+## 8.1 Testing Baseline
+
+Behavioral changes require TDD coverage for pass and fail boundaries.
+
+## 8.6 Privacy Baseline
+
+No raw user message content may appear in policy telemetry.
+
+## 9. Rollout And Gates
+
+Rollout requires explicit promotion gates and rollback criteria.

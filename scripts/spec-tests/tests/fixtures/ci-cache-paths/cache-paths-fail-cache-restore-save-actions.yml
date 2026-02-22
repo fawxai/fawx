@@ -1,0 +1,13 @@
+name: CI
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/cache/restore@v4
+        with:
+          path: /var/cache/cargo
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+      - uses: actions/cache/save@v4
+        with:
+          path: /etc/ssl
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
