@@ -1,5 +1,7 @@
 package ai.citros.core
 
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.Json
@@ -11,10 +13,13 @@ import org.junit.After
 import org.junit.Before
 import org.junit.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
-import kotlin.test.assertFalse
 import kotlin.test.assertTrue
+import kotlin.system.measureTimeMillis
+import kotlin.time.Duration.Companion.milliseconds
 
 class PhoneAgentApiTest {
 
@@ -35,7 +40,8 @@ class PhoneAgentApiTest {
         chatClient: ClaudeClient? = null,
         actionClient: ClaudeClient? = null,
         fileManager: AgentFileManager? = null,
-        memoryProvider: MemoryProvider? = null
+        memoryProvider: MemoryProvider? = null,
+        sensorProvider: SensorProvider? = null
     ): PhoneAgentApi {
         val defaultClient = ClaudeClient(
             apiKey = "sk-ant-api03-test",
@@ -44,7 +50,13 @@ class PhoneAgentApiTest {
         )
         val resolvedChat = chatClient ?: defaultClient
         val resolvedAction = actionClient ?: resolvedChat
-        return PhoneAgentApi(resolvedChat, resolvedAction, fileManager, memoryProvider).also {
+        return PhoneAgentApi(
+            chatClient = resolvedChat,
+            actionClient = resolvedAction,
+            agentFileManager = fileManager,
+            memoryProvider = memoryProvider,
+            sensorProvider = sensorProvider
+        ).also {
             it.phoneControlOverride = true // Simulate phone control available in tests
         }
     }
@@ -1809,6 +1821,662 @@ class PhoneAgentApiTest {
         assertEquals("Summary of progress", result)
         assertNotNull(client.lastSystemPrompt, "sendEphemeral must pass a non-null system prompt (#606)")
         assertTrue(client.lastSystemPrompt!!.isNotBlank(), "system prompt must not be blank")
+    }
+
+    @Test
+    fun `sendMessage handles SensorProvider snapshot exceptions gracefully`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(listOf(
+                ChatResponse(text = "ok", toolCalls = emptyList(), stopReason = "end_turn")
+            ))
+        )
+        val throwingProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext {
+                throw IllegalStateException("boom")
+            }
+        }
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            sensorProvider = throwingProvider
+        ).also { it.phoneControlOverride = true }
+
+        val response = agent.sendMessage("Open Settings", screenContent = null, isActionLoop = false)
+
+        assertEquals("ok", response.text)
+        assertNotNull(client.lastSystemPrompt)
+        assertFalse(client.lastSystemPrompt!!.contains("Device Awareness"))
+    }
+
+    @Test
+    fun `sendMessage rethrows SensorProvider CancellationException`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(listOf(
+                ChatResponse(text = "ok", toolCalls = emptyList(), stopReason = "end_turn")
+            ))
+        )
+        val cancellingProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext {
+                throw kotlinx.coroutines.CancellationException("cancelled")
+            }
+        }
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            sensorProvider = cancellingProvider
+        ).also { it.phoneControlOverride = true }
+
+        assertFailsWith<kotlinx.coroutines.CancellationException> {
+            agent.sendMessage("Open Settings", screenContent = null, isActionLoop = false)
+        }
+    }
+
+    @Test
+    fun `sendMessage non-action loop injects sensor context into system prompt integration`() = runTest {
+        server.enqueue(MockResponse()
+            .setBody("""{"content":[{"type":"text","text":"Done"}],"role":"assistant","stop_reason":"end_turn"}""")
+            .setResponseCode(200)
+            .addHeader("Content-Type", "application/json"))
+
+        val sensorProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext =
+                SensorContext(batteryPercent = 44, networkType = NetworkType.WIFI)
+        }
+        val agent = createAgent(sensorProvider = sensorProvider)
+
+        val response = agent.sendMessage("Open Settings", screenContent = null, isActionLoop = false)
+
+        assertEquals("Done", response.text)
+        val request = server.takeRequest()
+        val body = request.body.readUtf8()
+        assertTrue(body.contains("Device: battery=44% | wifi"))
+    }
+
+    @Test
+    fun `sendMessage action loop captures sensor snapshot once per task`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(listOf(
+                ChatResponse(text = "ok", toolCalls = emptyList(), stopReason = "end_turn")
+            ))
+        )
+        var snapshotCalls = 0
+        val countingProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext {
+                snapshotCalls++
+                return SensorContext(batteryPercent = 44, networkType = NetworkType.WIFI)
+            }
+        }
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            sensorProvider = countingProvider
+        ).also { it.phoneControlOverride = true }
+
+        val response = agent.sendMessage("continue", screenContent = null, isActionLoop = true)
+
+        assertEquals("ok", response.text)
+        assertEquals(1, snapshotCalls)
+    }
+
+    @Test
+    fun `sendMessage action loop without prior task start injects fresh sensor context into system prompt`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(listOf(
+                ChatResponse(text = "ok", toolCalls = emptyList(), stopReason = "end_turn")
+            ))
+        )
+        val sensorProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext =
+                SensorContext(batteryPercent = 44, networkType = NetworkType.WIFI)
+        }
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            sensorProvider = sensorProvider
+        ).also { it.phoneControlOverride = true }
+
+        val response = agent.sendMessage("continue", screenContent = null, isActionLoop = true)
+
+        assertEquals("ok", response.text)
+        assertNotNull(client.lastSystemPrompt)
+        assertTrue(client.lastSystemPrompt!!.contains("Device: battery=44% | wifi"))
+    }
+
+    @Test
+    fun `sensor snapshot is reused for continuation prompts within a task`() = runTest {
+        val chatClient = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(listOf(
+                ChatResponse(
+                    text = null,
+                    toolCalls = listOf(ToolCall("tc1", "tap", mapOf("element_id" to 7))),
+                    stopReason = "tool_use"
+                )
+            ))
+        )
+        val actionClient = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(listOf(
+                ChatResponse(text = "Done", toolCalls = emptyList(), stopReason = "end_turn")
+            ))
+        )
+        var snapshotCalls = 0
+        val batterySeries = ArrayDeque(listOf(44, 66))
+        val sensorProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext {
+                snapshotCalls++
+                return SensorContext(
+                    batteryPercent = batterySeries.first(),
+                    networkType = NetworkType.WIFI,
+                    localTime = java.time.ZonedDateTime.now(java.time.ZoneOffset.UTC).minusSeconds(45)
+                )
+            }
+        }
+        val agent = PhoneAgentApi(
+            chatClient = chatClient,
+            actionClient = actionClient,
+            sensorProvider = sensorProvider
+        ).also { it.phoneControlOverride = true }
+
+        val initial = agent.sendMessage("Tap it", screenContent = null, isActionLoop = false)
+        assertEquals(1, snapshotCalls)
+        assertEquals(1, chatClient.chatWithToolsCalls)
+        assertNotNull(chatClient.lastSystemPrompt)
+        assertTrue(chatClient.lastSystemPrompt!!.contains("Device: battery=44% | wifi"))
+        assertTrue(initial.toolCalls.isNotEmpty())
+
+        agent.addToolResult("tc1", "Tapped element 7")
+        val continuation = agent.continueAfterTools()
+
+        assertEquals("Done", continuation.text)
+        assertEquals(1, snapshotCalls)
+        assertEquals(1, actionClient.chatWithToolsCalls)
+        assertNotNull(actionClient.lastSystemPrompt)
+        assertTrue(actionClient.lastSystemPrompt!!.contains("Device: battery=44% | wifi"))
+        assertFalse(actionClient.lastSystemPrompt!!.contains("## Device Awareness"))
+    }
+
+    @Test
+    fun `clearConversation clears prior sensor context before subsequent action loop prompt`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(text = "first", toolCalls = emptyList(), stopReason = "end_turn"),
+                    ChatResponse(text = "second", toolCalls = emptyList(), stopReason = "end_turn")
+                )
+            )
+        )
+        val sensorProvider = object : SensorProvider {
+            private val values = ArrayDeque(listOf(44, 88))
+            override suspend fun snapshot(): SensorContext =
+                SensorContext(batteryPercent = values.removeFirst(), networkType = NetworkType.WIFI)
+        }
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            sensorProvider = sensorProvider
+        ).also { it.phoneControlOverride = true }
+
+        agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        assertNotNull(client.lastSystemPrompt)
+        assertTrue(client.lastSystemPrompt!!.contains("Device: battery=44% | wifi"))
+
+        agent.clearConversation()
+        agent.sendMessage("continue", screenContent = null, isActionLoop = true)
+
+        assertNotNull(client.lastSystemPrompt)
+        assertTrue(client.lastSystemPrompt!!.contains("Device: battery=88% | wifi"))
+        assertFalse(client.lastSystemPrompt!!.contains("Device: battery=44% | wifi"))
+    }
+
+    @Test
+    fun `concurrent action-loop sends reuse one sensor snapshot for the current task`() = runTest {
+        val promptLog = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val client = object : ProviderClient {
+            override val provider: Provider = Provider.ANTHROPIC
+            override val modelId: String? = null
+
+            override suspend fun chat(conversation: Conversation): Result<String> = Result.success("chat")
+
+            override suspend fun chatWithTools(
+                messages: List<Message>,
+                systemPrompt: String?,
+                tools: List<Tool>,
+                tokenLimit: Int?
+            ): Result<ChatResponse> {
+                if (systemPrompt != null) promptLog.add(systemPrompt)
+                return Result.success(ChatResponse(text = "ok", toolCalls = emptyList(), stopReason = "end_turn"))
+            }
+
+            override suspend fun describeImage(base64Image: String, prompt: String, maxTokens: Int): Result<String> {
+                return Result.success("desc")
+            }
+        }
+
+        val snapshotCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val sensorProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext {
+                val next = snapshotCalls.incrementAndGet()
+                // Deterministically exposes check-then-set races when cache access is unsynchronized.
+                delay(10)
+                return SensorContext(batteryPercent = next, networkType = NetworkType.WIFI)
+            }
+        }
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            sensorProvider = sensorProvider
+        ).also { it.phoneControlOverride = true }
+
+        kotlinx.coroutines.coroutineScope {
+            repeat(6) { idx ->
+                launch {
+                    agent.sendMessage("continue-$idx", screenContent = null, isActionLoop = true)
+                }
+            }
+        }
+
+        assertEquals(1, snapshotCalls.get())
+        assertEquals(6, promptLog.size)
+        promptLog.forEach { prompt ->
+            assertTrue(prompt.contains("Device: battery=1% | wifi"))
+        }
+    }
+
+    @Test
+    fun `sensor snapshot exceptions are counted as failures and return no metadata`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(text = "ok", toolCalls = emptyList(), stopReason = "end_turn")
+                )
+            )
+        )
+        val sensorProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext {
+                error("boom")
+            }
+        }
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            sensorProvider = sensorProvider
+        ).also { it.phoneControlOverride = true }
+
+        agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+
+        assertEquals(1, agent.sensorSnapshotFailureTotal)
+        assertEquals(0, agent.sensorSnapshotTimeoutTotal)
+        assertNull(agent.cachedTaskSensorSnapshot)
+        assertNotNull(client.lastSystemPrompt)
+        assertFalse(client.lastSystemPrompt!!.contains("Device:"))
+    }
+
+    @Test
+    fun `sensor snapshot timeout increments timeout counter and keeps prompt metadata empty`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(text = "ok", toolCalls = emptyList(), stopReason = "end_turn")
+                )
+            )
+        )
+        val sensorProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext {
+                kotlinx.coroutines.withTimeout(1) {
+                    delay(10)
+                }
+                return SensorContext(batteryPercent = 77, networkType = NetworkType.WIFI)
+            }
+        }
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            sensorProvider = sensorProvider
+        ).also { it.phoneControlOverride = true }
+
+        agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+
+        assertEquals(0, agent.sensorSnapshotFailureTotal)
+        assertEquals(1, agent.sensorSnapshotTimeoutTotal)
+        assertNull(agent.cachedTaskSensorSnapshot)
+        assertNotNull(client.lastSystemPrompt)
+        assertFalse(client.lastSystemPrompt!!.contains("Device:"))
+    }
+
+    @Test
+    fun `sensor snapshot task-start budget is enforced by timeout constant`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(
+                listOf(ChatResponse(text = "ok", toolCalls = emptyList(), stopReason = "end_turn"))
+            )
+        )
+        val sensorProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext {
+                delay(PhoneAgentApi.SENSOR_SNAPSHOT_TIMEOUT_MS + 100)
+                return SensorContext(batteryPercent = 50, networkType = NetworkType.WIFI)
+            }
+        }
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            sensorProvider = sensorProvider
+        ).also { it.phoneControlOverride = true }
+
+        val elapsedMs = measureTimeMillis {
+            agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        }
+
+        assertTrue(
+            elapsedMs < (PhoneAgentApi.SENSOR_SNAPSHOT_TIMEOUT_MS + 120),
+            "Task start should not wait for slow sensor capture (elapsed=${elapsedMs}ms)"
+        )
+        assertEquals(1, agent.sensorSnapshotTimeoutTotal)
+        assertEquals(0, agent.sensorSnapshotFailureTotal)
+        assertEquals(1, agent.sensorSnapshotTotal)
+        assertTrue(agent.sensorSnapshotLatencyTotalMs > 0)
+        assertTrue(agent.sensorSnapshotLatencyMaxMs > 0)
+        assertNotNull(client.lastSystemPrompt)
+        assertFalse(client.lastSystemPrompt!!.contains("Device:"))
+    }
+
+    @Test
+    fun `sensor snapshot preserves non-location fields when capture is slower than old 15ms budget`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(text = "ok", toolCalls = emptyList(), stopReason = "end_turn")
+                )
+            )
+        )
+        val sensorProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext {
+                // Simulate a slow location branch while still returning partial sensor fields.
+                delay(20)
+                return SensorContext(
+                    batteryPercent = 77,
+                    networkType = NetworkType.WIFI,
+                    localTime = java.time.ZonedDateTime.now(java.time.ZoneOffset.UTC),
+                    location = null
+                )
+            }
+        }
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            sensorProvider = sensorProvider
+        ).also { it.phoneControlOverride = true }
+
+        agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+
+        assertEquals(0, agent.sensorSnapshotFailureTotal)
+        assertEquals(0, agent.sensorSnapshotTimeoutTotal)
+        assertNotNull(agent.cachedTaskSensorSnapshot)
+        assertEquals(77, agent.cachedTaskSensorSnapshot!!.batteryPercent)
+        assertEquals(NetworkType.WIFI, agent.cachedTaskSensorSnapshot!!.networkType)
+        assertNull(agent.cachedTaskSensorSnapshot!!.location)
+        assertNotNull(client.lastSystemPrompt)
+        assertTrue(client.lastSystemPrompt!!.contains("Device: battery=77% | wifi"))
+        assertFalse(client.lastSystemPrompt!!.contains("location="))
+    }
+
+    @Test
+    fun `clearConversation does not block when sensor snapshot is in flight`() = runTest(timeout = 5_000.milliseconds) {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(
+                listOf(ChatResponse(text = "ok", toolCalls = emptyList(), stopReason = "end_turn"))
+            )
+        )
+        val started = CompletableDeferred<Unit>()
+        val unblock = CompletableDeferred<Unit>()
+        val sensorProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext {
+                started.complete(Unit)
+                unblock.await()
+                return SensorContext(batteryPercent = 77, networkType = NetworkType.WIFI)
+            }
+        }
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            sensorProvider = sensorProvider
+        ).also { it.phoneControlOverride = true }
+
+        val sendJob = launch {
+            agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        }
+        started.await()
+
+        val clearElapsedMs = measureTimeMillis { agent.clearConversation() }
+        assertTrue(clearElapsedMs < 50, "clearConversation should return immediately (elapsed=${clearElapsedMs}ms)")
+
+        unblock.complete(Unit)
+        sendJob.join()
+
+        assertNull(agent.cachedTaskSensorSnapshot, "In-flight snapshot from prior epoch must not be cached")
+    }
+
+    @Test
+    fun `sensor snapshot failure on task start is cached and not retried on continuation turns`() = runTest {
+        val chatClient = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(ToolCall("tc1", "tap", mapOf("element_id" to 5))),
+                        stopReason = "tool_use"
+                    )
+                )
+            )
+        )
+        val actionClient = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(
+                listOf(ChatResponse(text = "done", toolCalls = emptyList(), stopReason = "end_turn"))
+            )
+        )
+        var snapshotCalls = 0
+        val sensorProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext {
+                snapshotCalls++
+                error("boom")
+            }
+        }
+        val agent = PhoneAgentApi(
+            chatClient = chatClient,
+            actionClient = actionClient,
+            sensorProvider = sensorProvider
+        ).also { it.phoneControlOverride = true }
+
+        val first = agent.sendMessage("Tap it", screenContent = null, isActionLoop = false)
+        assertTrue(first.toolCalls.isNotEmpty())
+        agent.addToolResult("tc1", "Tapped element 5")
+        val second = agent.continueAfterTools()
+
+        assertEquals("done", second.text)
+        assertEquals(1, snapshotCalls)
+        assertEquals(1, agent.sensorSnapshotFailureTotal)
+        assertEquals(0, agent.sensorSnapshotTimeoutTotal)
+    }
+
+    @Test
+    fun `sensor snapshot timeout on task start is cached and not retried on continuation turns`() = runTest {
+        val chatClient = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(ToolCall("tc1", "tap", mapOf("element_id" to 9))),
+                        stopReason = "tool_use"
+                    )
+                )
+            )
+        )
+        val actionClient = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(
+                listOf(ChatResponse(text = "done", toolCalls = emptyList(), stopReason = "end_turn"))
+            )
+        )
+        var snapshotCalls = 0
+        val sensorProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext {
+                snapshotCalls++
+                kotlinx.coroutines.delay(PhoneAgentApi.SENSOR_SNAPSHOT_TIMEOUT_MS + 20)
+                return SensorContext(batteryPercent = 77, networkType = NetworkType.WIFI)
+            }
+        }
+        val agent = PhoneAgentApi(
+            chatClient = chatClient,
+            actionClient = actionClient,
+            sensorProvider = sensorProvider
+        ).also { it.phoneControlOverride = true }
+
+        val first = agent.sendMessage("Tap it", screenContent = null, isActionLoop = false)
+        assertTrue(first.toolCalls.isNotEmpty())
+        agent.addToolResult("tc1", "Tapped element 9")
+        val second = agent.continueAfterTools()
+
+        assertEquals("done", second.text)
+        assertEquals(1, snapshotCalls)
+        assertEquals(0, agent.sensorSnapshotFailureTotal)
+        assertEquals(1, agent.sensorSnapshotTimeoutTotal)
+    }
+
+    @Test
+    fun `sensor context toggle flow updates prompt payload behavior end to end`() = runTest {
+        val promptLog = mutableListOf<String>()
+        val client = object : ProviderClient {
+            override val provider: Provider = Provider.ANTHROPIC
+            override val modelId: String? = null
+
+            override suspend fun chat(conversation: Conversation): Result<String> = Result.success("chat")
+
+            override suspend fun chatWithTools(
+                messages: List<Message>,
+                systemPrompt: String?,
+                tools: List<Tool>,
+                tokenLimit: Int?
+            ): Result<ChatResponse> {
+                if (systemPrompt != null) promptLog.add(systemPrompt)
+                return Result.success(ChatResponse(text = "ok", toolCalls = emptyList(), stopReason = "end_turn"))
+            }
+
+            override suspend fun describeImage(base64Image: String, prompt: String, maxTokens: Int): Result<String> {
+                return Result.success("desc")
+            }
+        }
+
+        var sensorContextEnabled = true
+        val sensorProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext {
+                return if (sensorContextEnabled) {
+                    SensorContext(batteryPercent = 55, networkType = NetworkType.WIFI)
+                } else {
+                    SensorContext()
+                }
+            }
+        }
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            sensorProvider = sensorProvider
+        ).also { it.phoneControlOverride = true }
+
+        agent.sendMessage("Open Settings", screenContent = null, isActionLoop = false)
+        assertTrue(promptLog.last().contains("Device: battery=55% | wifi"))
+
+        sensorContextEnabled = false
+        agent.clearConversation()
+        agent.sendMessage("Open Settings again", screenContent = null, isActionLoop = false)
+        assertFalse(promptLog.last().contains("Device:"))
+    }
+
+    @Test
+    fun `sendEphemeral injects sensor context into system prompt`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(listOf(
+                ChatResponse(text = "Summary", toolCalls = emptyList(), stopReason = "end_turn")
+            ))
+        )
+        val sensorProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext =
+                SensorContext(batteryPercent = 44, networkType = NetworkType.WIFI)
+        }
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            sensorProvider = sensorProvider
+        ).also { it.phoneControlOverride = true }
+
+        val result = agent.sendEphemeral("[System: Summarize progress]")
+
+        assertEquals("Summary", result)
+        assertNotNull(client.lastSystemPrompt)
+        assertTrue(client.lastSystemPrompt!!.contains("Device: battery=44% | wifi"))
+    }
+
+    @Test
+    fun `sendEphemeral swallows SensorProvider exception and still succeeds`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(listOf(
+                ChatResponse(text = "Summary", toolCalls = emptyList(), stopReason = "end_turn")
+            ))
+        )
+        val throwingProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext {
+                throw IllegalStateException("boom")
+            }
+        }
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            sensorProvider = throwingProvider
+        ).also { it.phoneControlOverride = true }
+
+        val result = agent.sendEphemeral("[System: Summarize progress]")
+
+        assertEquals("Summary", result)
+        assertNotNull(client.lastSystemPrompt)
+        assertFalse(client.lastSystemPrompt!!.contains("Device Awareness"))
+    }
+
+    @Test
+    fun `sendEphemeral rethrows SensorProvider CancellationException`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(listOf(
+                ChatResponse(text = "Summary", toolCalls = emptyList(), stopReason = "end_turn")
+            ))
+        )
+        val cancellingProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext {
+                throw kotlinx.coroutines.CancellationException("cancelled")
+            }
+        }
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            sensorProvider = cancellingProvider
+        ).also { it.phoneControlOverride = true }
+
+        assertFailsWith<kotlinx.coroutines.CancellationException> {
+            agent.sendEphemeral("[System: Summarize progress]")
+        }
     }
 
     // ── Learn tool tests ──

@@ -89,6 +89,7 @@ import ai.citros.core.ProviderClient
 import ai.citros.core.ProviderConfig
 import ai.citros.core.PhoneAgentPrompts
 import ai.citros.core.ScreenReader
+import ai.citros.core.SensorProvider
 import ai.citros.core.WalletManager
 import ai.citros.core.WalletState
 import ai.citros.core.ModelConfig
@@ -649,6 +650,8 @@ private const val PREF_LAST_CONVERSATION_DATE = "last_conversation_date"
 internal const val PREF_SEARCH_BASE_URL = "search_base_url"
 internal const val PREF_BRAVE_API_KEY = "brave_api_key"
 internal const val PREF_TINYFISH_API_KEY = "tinyfish_api_key"
+internal const val PREF_SENSOR_CONTEXT_ENABLED = "sensor_context_enabled"
+internal const val PREF_SENSOR_CONTEXT_ENABLED_DEFAULT = false
 internal const val PREF_OVERLAY_USE_ISLAND_WHEN_IDLE = "overlay_use_island_when_idle"
 internal const val PREF_OVERLAY_USE_ISLAND_WHEN_IDLE_DEFAULT = true
 internal const val PREF_OVERLAY_SHOW_SEARCH_BAR_WHEN_IDLE = "overlay_show_search_bar_when_idle"
@@ -890,6 +893,37 @@ internal fun CitrosChatTheme(
         content()
     }
 }
+
+internal fun resolveSensorProviderForPreference(
+    sensorContextEnabled: Boolean,
+    appContext: Context
+): SensorProvider? = if (sensorContextEnabled) {
+    AndroidSensorProvider(appContext)
+} else {
+    null
+}
+
+internal fun applySensorContextPreference(
+    prefs: android.content.SharedPreferences,
+    appContext: Context,
+    viewModel: ChatViewModel
+) {
+    val enabled = prefs.getBoolean(PREF_SENSOR_CONTEXT_ENABLED, PREF_SENSOR_CONTEXT_ENABLED_DEFAULT)
+    viewModel.setSensorProvider(resolveSensorProviderForPreference(enabled, appContext))
+}
+
+internal fun createSensorContextPreferenceChangeListener(
+    prefs: android.content.SharedPreferences,
+    appContext: Context,
+    viewModel: ChatViewModel
+): android.content.SharedPreferences.OnSharedPreferenceChangeListener {
+    return android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        if (key == PREF_SENSOR_CONTEXT_ENABLED) {
+            applySensorContextPreference(prefs = prefs, appContext = appContext, viewModel = viewModel)
+        }
+    }
+}
+
 @Composable
 fun ChatScreen(
     viewModel: ChatViewModel = viewModel(),
@@ -927,6 +961,13 @@ fun ChatScreen(
     val walletStateFlow = remember { MutableStateFlow(walletManager.loadOrDefault()) }
     val walletMutationMutex = remember { Mutex() }
     val walletState by walletStateFlow.collectAsState()
+    val applySensorContextPreferenceFromPrefs = {
+        applySensorContextPreference(
+            prefs = prefs,
+            appContext = context.applicationContext,
+            viewModel = viewModel
+        )
+    }
     val stopEmbeddedBridge = {
         embeddedBridge?.stop()
         embeddedBridge = null
@@ -1167,6 +1208,17 @@ fun ChatScreen(
             lifecycleOwner.lifecycle.removeObserver(observer)
         }
     }
+    DisposableEffect(prefs) {
+        val listener = createSensorContextPreferenceChangeListener(
+            prefs = prefs,
+            appContext = context.applicationContext,
+            viewModel = viewModel
+        )
+        prefs.registerOnSharedPreferenceChangeListener(listener)
+        onDispose {
+            prefs.unregisterOnSharedPreferenceChangeListener(listener)
+        }
+    }
     // Load saved credentials on first launch
     LaunchedEffect(Unit) {
         // Migrate legacy plaintext sensitive OAuth/device-code fields into encrypted storage.
@@ -1178,6 +1230,7 @@ fun ChatScreen(
         ).forEach { key ->
             readSecureBackedValue(key)
         }
+        applySensorContextPreferenceFromPrefs()
         // Initialize on-device memory provider for remember/recall/list_memories tools.
         // Store DB reference on the hosting Activity for cleanup in onDestroy().
         val activity = context as? ChatActivity

@@ -1,9 +1,13 @@
 package ai.citros.chat
+import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -48,6 +52,7 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.role
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
@@ -60,6 +65,7 @@ import ai.citros.core.WalletManager
 import ai.citros.core.Provider
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.view.accessibility.AccessibilityManager
+import androidx.core.content.ContextCompat
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 /**
@@ -70,6 +76,12 @@ private fun isAccessibilityServiceEnabled(context: Context): Boolean {
     val enabledServices = accessibilityManager.getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK)
     val packageName = context.packageName
     return enabledServices.any { it.resolveInfo.serviceInfo.packageName == packageName }
+}
+
+private fun isLocationPermissionGranted(context: Context): Boolean {
+    val coarse = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION)
+    val fine = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION)
+    return coarse == PackageManager.PERMISSION_GRANTED || fine == PackageManager.PERMISSION_GRANTED
 }
 @Composable
 private fun SettingsSubPageScaffold(
@@ -554,12 +566,37 @@ internal fun SettingsHubScreen(
 @Composable
 internal fun TrustSettingsScreen(
     context: Context,
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    locationPermissionChecker: (Context) -> Boolean = ::isLocationPermissionGranted
 ) {
     val prefs = remember(context) { context.getSharedPreferences(ONBOARDING_PREFS, Context.MODE_PRIVATE) }
+    val chatPrefs = remember(context) { context.getSharedPreferences(CITROS_PREFS, Context.MODE_PRIVATE) }
     val flavor = remember { readSelectedFlavor(context) }
     var selected by rememberSaveable {
         mutableStateOf(prefs.getString(PREF_PERSONALITY_TRUST, "Ask for risky stuff") ?: "Ask for risky stuff")
+    }
+    var sensorContextEnabled by rememberSaveable {
+        mutableStateOf(chatPrefs.getBoolean(PREF_SENSOR_CONTEXT_ENABLED, PREF_SENSOR_CONTEXT_ENABLED_DEFAULT))
+    }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var locationPermissionGranted by rememberSaveable { mutableStateOf(locationPermissionChecker(context)) }
+    var locationPermissionDenied by rememberSaveable { mutableStateOf(false) }
+    DisposableEffect(lifecycleOwner, context) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                val granted = locationPermissionChecker(context)
+                locationPermissionGranted = granted
+                if (granted) locationPermissionDenied = false
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    val locationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        locationPermissionGranted = granted || locationPermissionChecker(context)
+        locationPermissionDenied = !locationPermissionGranted
     }
     val options = listOf(
         "Ask before everything",
@@ -601,6 +638,78 @@ internal fun TrustSettingsScreen(
             "Trust level controls how much confirmation Citros requires before taking actions on your phone.",
             style = CitrosTypography.bodySmall,
             color = surfaces.labelTertiary
+        )
+        SettingsSectionHeader("Prompt privacy")
+        SettingsGroupedSurface {
+            SettingsListRow(
+                title = "Send device context to cloud models",
+                subtitle = "Includes battery, network, local time, and location when permission is granted.",
+                showDivider = false,
+                trailing = {
+                    Box(modifier = Modifier.padding(start = 12.dp)) {
+                        Switch(
+                            checked = sensorContextEnabled,
+                            onCheckedChange = {
+                                sensorContextEnabled = it
+                                if (!it) {
+                                    // Hide stale denial warning while sensor sharing is disabled.
+                                    locationPermissionDenied = false
+                                }
+                                chatPrefs.edit().putBoolean(PREF_SENSOR_CONTEXT_ENABLED, it).apply()
+                            },
+                            modifier = Modifier.testTag("trust_sensor_context_toggle"),
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = Color.White,
+                                checkedTrackColor = surfaces.green,
+                                uncheckedThumbColor = surfaces.surface4,
+                                uncheckedTrackColor = surfaces.surface3
+                            )
+                        )
+                    }
+                }
+            )
+        }
+        Text(
+            "Off by default. Citros only sends this metadata to cloud prompts when enabled and data is available.",
+            style = CitrosTypography.bodySmall,
+            color = surfaces.labelTertiary
+        )
+        if (sensorContextEnabled || locationPermissionGranted) {
+            SettingsGlassPillButton(
+                text = if (locationPermissionGranted) "Location permission granted" else "Request location permission",
+                tint = surfaces.green,
+                modifier = Modifier.padding(top = 6.dp),
+                onClick = {
+                    if (locationPermissionGranted || !sensorContextEnabled) return@SettingsGlassPillButton
+                    locationPermissionDenied = false
+                    locationPermissionLauncher.launch(Manifest.permission.ACCESS_COARSE_LOCATION)
+                }
+            )
+        } else {
+            Text(
+                "Location permission is optional and only used when device context sharing is enabled.",
+                style = CitrosTypography.bodySmall,
+                color = surfaces.labelTertiary
+            )
+        }
+        if (sensorContextEnabled && locationPermissionDenied) {
+            Text(
+                "Location permission denied. You can grant it anytime in App Info.",
+                style = CitrosTypography.bodySmall,
+                color = surfaces.labelTertiary
+            )
+        }
+        SettingsGlassPillButton(
+            text = "Open app permissions",
+            tint = surfaces.labelSecondary,
+            modifier = Modifier.padding(top = 6.dp),
+            onClick = {
+                val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                    data = Uri.fromParts("package", context.packageName, null)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                context.startActivity(intent)
+            }
         )
         Spacer(Modifier.height(6.dp))
     }

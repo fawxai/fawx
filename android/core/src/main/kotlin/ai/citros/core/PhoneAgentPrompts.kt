@@ -15,6 +15,7 @@ object PhoneAgentPrompts {
 
     /** Default prompt for vision-based screenshot description. */
     const val DEFAULT_VISION_PROMPT = "Describe what you see on this phone screen in detail. Include all visible text, UI elements, and their layout."
+    private const val LOW_BATTERY_THRESHOLD_PERCENT = 15
 
     // ── Section 1: Identity ─────────────────────────────────────────────
 
@@ -439,12 +440,48 @@ Respond conversationally. If the user asks you to do something on their phone,
 tell them to enable the Citros accessibility service in Android Settings → Accessibility."""
     }
 
-    private fun buildRuntimeSection(phoneControlAvailable: Boolean, modelName: String?, modelTier: ModelTier, mode: PromptMode): String? {
+    private fun buildRuntimeSection(
+        phoneControlAvailable: Boolean,
+        modelName: String?,
+        modelTier: ModelTier,
+        mode: PromptMode,
+        sensorContext: SensorContext?
+    ): String? {
         if (mode == PromptMode.NONE) return null
         val modelId = modelName?.takeIf { it.isNotBlank() } ?: "unknown"
         val accessibility = if (phoneControlAvailable) "enabled" else "disabled"
         val timestamp = Instant.now().atOffset(ZoneOffset.UTC).format(DateTimeFormatter.ISO_OFFSET_DATE_TIME)
-        return "Runtime: model=$modelId | tier=$modelTier | accessibility=$accessibility | time=$timestamp"
+        val runtimeParts = mutableListOf(
+            "Runtime: model=$modelId",
+            "tier=$modelTier",
+            "accessibility=$accessibility",
+            "time=$timestamp"
+        )
+
+        val sensorLine = sensorContext?.toPromptLine()?.takeIf { it.isNotBlank() }
+        if (sensorLine != null) {
+            runtimeParts.add(sensorLine)
+            sensorContext.localTime?.toInstant()?.let { capturedAt ->
+                val ageSeconds = (Instant.now().epochSecond - capturedAt.epochSecond).coerceAtLeast(0)
+                runtimeParts.add("sensor_age_sec=$ageSeconds")
+            }
+        }
+
+        return runtimeParts.joinToString(" | ")
+    }
+
+    private fun buildDeviceAwarenessSection(sensorContext: SensorContext?, mode: PromptMode): String? {
+        if (mode != PromptMode.FULL) return null
+        if (sensorContext == null) return null
+        val line = sensorContext.toPromptLine()
+        if (line.isBlank()) return null
+        return """## Device Awareness
+$line
+- If battery is below $LOW_BATTERY_THRESHOLD_PERCENT%, warn the user before starting multi-step tasks.
+- If offline, do not attempt web_search, web_fetch, or web_browse.
+- Use location context to enhance local queries ("nearby", "around here").
+- Respect local time for time-sensitive queries.
+- Do not proactively tell the user their device state unless they ask or it's directly relevant to the task."""
     }
 
     // ── Prompt builders ─────────────────────────────────────────────────
@@ -465,7 +502,8 @@ tell them to enable the Citros accessibility service in Android Settings → Acc
         memoryContent: String? = null,
         securityContent: String? = null,
         mode: PromptMode = PromptMode.FULL,
-        modelTier: ModelTier? = null
+        modelTier: ModelTier? = null,
+        sensorContext: SensorContext? = null
     ): String {
         val tier = resolveTier(modelName, modelTier)
 
@@ -473,6 +511,7 @@ tell them to enable the Citros accessibility service in Android Settings → Acc
             buildIdentitySection(identityContent, mode),
             buildToolsSection(phoneControlAvailable, mode, tier),
             buildStrategySection(mode, tier, phoneControlAvailable),
+            buildDeviceAwarenessSection(sensorContext, mode),
             buildRecoverySection(mode),
             buildCommunicationSection(phoneControlAvailable, mode),
             buildDisambiguationSection(mode),
@@ -482,7 +521,7 @@ tell them to enable the Citros accessibility service in Android Settings → Acc
             buildUserContextSection(userContent, mode),
             buildMemorySection(memoryContent, mode),
             buildAccessibilityWarningSection(phoneControlAvailable, mode),
-            buildRuntimeSection(phoneControlAvailable, modelName, tier, mode)
+            buildRuntimeSection(phoneControlAvailable, modelName, tier, mode, sensorContext)
         )
 
         return sections.joinToString("\n\n")
@@ -496,14 +535,16 @@ tell them to enable the Citros accessibility service in Android Settings → Acc
         phoneControlAvailable: Boolean = true,
         modelName: String? = null,
         securityContent: String? = null,
-        modelTier: ModelTier? = null
+        modelTier: ModelTier? = null,
+        sensorContext: SensorContext? = null
     ): String {
         return buildSystemPrompt(
             phoneControlAvailable = phoneControlAvailable,
             modelName = modelName,
             securityContent = securityContent,
             mode = PromptMode.MINIMAL,
-            modelTier = modelTier
+            modelTier = modelTier,
+            sensorContext = sensorContext
         )
     }
 

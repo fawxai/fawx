@@ -13,6 +13,8 @@ import ai.citros.core.ProviderClient
 import ai.citros.core.ProviderException
 import ai.citros.core.ScreenContent
 import ai.citros.core.ScreenElement
+import ai.citros.core.SensorContext
+import ai.citros.core.SensorProvider
 import ai.citros.core.Tool
 import ai.citros.core.ToolCall
 import kotlinx.coroutines.Dispatchers
@@ -1000,6 +1002,164 @@ class ChatViewModelTest {
         } finally {
             tempDir.deleteRecursively()
         }
+    }
+
+    @Test
+    fun `setSensorProvider wires provider into built backends`() {
+        val sensorProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext = SensorContext(batteryPercent = 42)
+        }
+        viewModel.setSensorProvider(sensorProvider)
+
+        val keyStore = InMemoryKeyStore()
+        val storage = InMemoryWalletStorage()
+        val walletManager = ai.citros.core.WalletManager(storage, keyStore)
+
+        walletManager.addKey(Provider.OPENAI, "OpenAI Key", "sk-test-openai-key")
+        walletManager.setActiveKey(walletManager.loadOrDefault().keys.first().id)
+        viewModel.configureWithWallet(walletManager)
+
+        val backends = getPrivateField<List<Any>>("apiBackends")!!
+        val activeIndex = getPrivateField<Int>("activeApiBackendIndex")!!
+        val backend = backends[activeIndex]
+        val agentField = backend::class.java.getDeclaredField("agent")
+        agentField.isAccessible = true
+        val agent = agentField.get(backend)
+
+        val sensorField = agent::class.java.getDeclaredField("sensorProvider")
+        sensorField.isAccessible = true
+        assertTrue(
+            sensorField.get(agent) === sensorProvider,
+            "SensorProvider should be wired into PhoneAgentApi"
+        )
+    }
+
+    @Test
+    fun `setSensorProvider rebuilds configured api backends`() {
+        val keyStore = InMemoryKeyStore()
+        val storage = InMemoryWalletStorage()
+        val walletManager = ai.citros.core.WalletManager(storage, keyStore)
+
+        walletManager.addKey(Provider.OPENAI, "OpenAI Key", "sk-test-openai-key")
+        walletManager.setActiveKey(walletManager.loadOrDefault().keys.first().id)
+        viewModel.configureWithWallet(walletManager)
+
+        val backendsBefore = getPrivateField<List<Any>>("apiBackends")!!
+        val activeIndex = getPrivateField<Int>("activeApiBackendIndex")!!
+        val backendBefore = backendsBefore[activeIndex]
+
+        val sensorProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext = SensorContext(networkType = ai.citros.core.NetworkType.WIFI)
+        }
+        viewModel.setSensorProvider(sensorProvider)
+
+        val backendsAfter = getPrivateField<List<Any>>("apiBackends")!!
+        val backendAfter = backendsAfter[activeIndex]
+        assertNotEquals(
+            System.identityHashCode(backendBefore),
+            System.identityHashCode(backendAfter),
+            "Active backend should be rebuilt when sensor provider changes"
+        )
+
+        val agentField = backendAfter::class.java.getDeclaredField("agent")
+        agentField.isAccessible = true
+        val agent = agentField.get(backendAfter)
+        val sensorField = agent::class.java.getDeclaredField("sensorProvider")
+        sensorField.isAccessible = true
+        assertTrue(sensorField.get(agent) === sensorProvider)
+    }
+
+    @Test
+    fun `setSensorProvider with same instance avoids backend rebuild churn`() {
+        val keyStore = InMemoryKeyStore()
+        val storage = InMemoryWalletStorage()
+        val walletManager = ai.citros.core.WalletManager(storage, keyStore)
+
+        walletManager.addKey(Provider.OPENAI, "OpenAI Key", "sk-test-openai-key")
+        walletManager.setActiveKey(walletManager.loadOrDefault().keys.first().id)
+        viewModel.configureWithWallet(walletManager)
+
+        class TestSensorProvider : SensorProvider {
+            override suspend fun snapshot(): SensorContext = SensorContext(batteryPercent = 33)
+        }
+
+        val provider = TestSensorProvider()
+        viewModel.setSensorProvider(provider)
+        val backendsAfterFirstSet = getPrivateField<List<Any>>("apiBackends")!!
+        val activeIndex = getPrivateField<Int>("activeApiBackendIndex")!!
+        val backendAfterFirstSet = backendsAfterFirstSet[activeIndex]
+
+        viewModel.setSensorProvider(provider)
+        val backendsAfterSecondSet = getPrivateField<List<Any>>("apiBackends")!!
+        val backendAfterSecondSet = backendsAfterSecondSet[activeIndex]
+
+        assertEquals(
+            System.identityHashCode(backendAfterFirstSet),
+            System.identityHashCode(backendAfterSecondSet),
+            "Identical provider instance should not force backend list rebuild"
+        )
+        assertEquals(
+            System.identityHashCode(backendsAfterFirstSet),
+            System.identityHashCode(backendsAfterSecondSet),
+            "Backend list identity should remain stable when provider instance is unchanged"
+        )
+    }
+
+    @Test
+    fun `setSensorProvider with different instance of same class rebuilds backends`() {
+        val keyStore = InMemoryKeyStore()
+        val storage = InMemoryWalletStorage()
+        val walletManager = ai.citros.core.WalletManager(storage, keyStore)
+
+        walletManager.addKey(Provider.OPENAI, "OpenAI Key", "sk-test-openai-key")
+        walletManager.setActiveKey(walletManager.loadOrDefault().keys.first().id)
+        viewModel.configureWithWallet(walletManager)
+
+        class TestSensorProvider : SensorProvider {
+            override suspend fun snapshot(): SensorContext = SensorContext(batteryPercent = 33)
+        }
+
+        viewModel.setSensorProvider(TestSensorProvider())
+        val backendsAfterFirstSet = getPrivateField<List<Any>>("apiBackends")!!
+        val activeIndex = getPrivateField<Int>("activeApiBackendIndex")!!
+        val backendAfterFirstSet = backendsAfterFirstSet[activeIndex]
+
+        viewModel.setSensorProvider(TestSensorProvider())
+        val backendsAfterSecondSet = getPrivateField<List<Any>>("apiBackends")!!
+        val backendAfterSecondSet = backendsAfterSecondSet[activeIndex]
+
+        assertNotEquals(
+            System.identityHashCode(backendAfterFirstSet),
+            System.identityHashCode(backendAfterSecondSet),
+            "Different provider instances must rebuild backend even when class matches"
+        )
+    }
+
+    @Test
+    fun `setSensorProvider null disables provider and rebuilds backends`() {
+        val keyStore = InMemoryKeyStore()
+        val storage = InMemoryWalletStorage()
+        val walletManager = ai.citros.core.WalletManager(storage, keyStore)
+
+        walletManager.addKey(Provider.OPENAI, "OpenAI Key", "sk-test-openai-key")
+        walletManager.setActiveKey(walletManager.loadOrDefault().keys.first().id)
+
+        val sensorProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext = SensorContext(batteryPercent = 50)
+        }
+        viewModel.setSensorProvider(sensorProvider)
+        viewModel.configureWithWallet(walletManager)
+        viewModel.setSensorProvider(null)
+
+        val backends = getPrivateField<List<Any>>("apiBackends")!!
+        val activeIndex = getPrivateField<Int>("activeApiBackendIndex")!!
+        val backend = backends[activeIndex]
+        val agentField = backend::class.java.getDeclaredField("agent")
+        agentField.isAccessible = true
+        val agent = agentField.get(backend)
+        val sensorField = agent::class.java.getDeclaredField("sensorProvider")
+        sensorField.isAccessible = true
+        assertNull(sensorField.get(agent))
     }
 
     @Test

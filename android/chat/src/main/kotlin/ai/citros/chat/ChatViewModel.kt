@@ -305,6 +305,9 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
     /** On-device memory provider for remember/recall/list_memories tools. */
     private var memoryProvider: MemoryProvider? = null
 
+    /** Device sensor provider for runtime prompt context injection. */
+    private var sensorProvider: SensorProvider? = null
+
     private val toolLoopCancelled = AtomicBoolean(false)
     private var lastUserMessage: String? = null
 
@@ -568,6 +571,7 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
                 actionClient = actionClient,
                 actionModelId = actionModelId,
                 memoryProvider = memoryProvider,
+                sensorProvider = sensorProvider,
                 agentFileManager = agentFileManager,
                 searchBaseUrl = searchBaseUrl,
                 braveApiKey = braveApiKey,
@@ -770,6 +774,26 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
             memoryProvider = provider
 
             // Rebuild backends so PhoneAgentApi picks up the provider
+            if (mode != Mode.API || apiBackends.isEmpty() || apiBackendConfigs.size != apiBackends.size) {
+                return
+            }
+            val activeIndex = activeApiBackendIndex.coerceAtLeast(0)
+            val rebuilt = apiBackendConfigs.map { config -> buildWalletBackend(config) }
+            apiBackends.clear()
+            apiBackends.addAll(rebuilt)
+            activateApiBackend(activeIndex.coerceAtMost(apiBackends.lastIndex))
+        }
+    }
+
+    /**
+     * Set the device sensor provider. If API backends are already configured,
+     * rebuild them so [PhoneAgentApi] receives the new provider.
+     */
+    fun setSensorProvider(provider: SensorProvider?) {
+        synchronized(apiBackends) {
+            if (sensorProvider === provider) return
+            sensorProvider = provider
+
             if (mode != Mode.API || apiBackends.isEmpty() || apiBackendConfigs.size != apiBackends.size) {
                 return
             }

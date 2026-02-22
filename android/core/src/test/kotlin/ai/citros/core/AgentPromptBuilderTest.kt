@@ -83,4 +83,17 @@ class AgentPromptBuilderTest {
         assertTrue(skippedFiles.any { it.contains("Skipping SOUL.md: blank or whitespace-only") },
             "Expected log for blank SOUL.md, got: $skippedFiles")
     }
+
+    @Test
+    fun `full passes sensorContext through to composed prompt`() {
+        val manager = AgentFileManager.fromDirectory(tempRoot)
+        val builder = AgentPromptBuilder(manager)
+
+        val full = builder.full(
+            sensorContext = SensorContext(batteryPercent = 83, networkType = NetworkType.WIFI)
+        )
+
+        assertTrue(full.contains("Device Awareness"))
+        assertTrue(full.contains("Device: battery=83% | wifi"))
+    }
 }

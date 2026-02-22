@@ -19,7 +19,7 @@ class AgentPromptBuilder(
      * Reads identity files and passes them to [PhoneAgentPrompts.buildSystemPrompt]
      * which weaves them into the correct positions among phone-specific sections.
      */
-    fun full(phoneControlAvailable: Boolean = true, modelName: String? = null): String {
+    fun full(phoneControlAvailable: Boolean = true, modelName: String? = null, sensorContext: SensorContext? = null): String {
         val soulContent = readFileOrNull(AgentFileManager.SOUL_FILE)
         val identityContent = readFileOrNull(AgentFileManager.IDENTITY_FILE)
         val userContent = readFileOrNull(AgentFileManager.USER_FILE)
@@ -37,7 +37,8 @@ class AgentPromptBuilder(
             userContent = userContent,
             agentsContent = agentsContent,
             memoryContent = memoryContent,
-            securityContent = securityContent
+            securityContent = securityContent,
+            sensorContext = sensorContext
         )
     }
 
@@ -45,12 +46,17 @@ class AgentPromptBuilder(
      * Build the trimmed action-loop prompt.
      * Uses the action prompt with identity reminder.
      */
-    fun trimmed(phoneControlAvailable: Boolean = true, modelName: String? = null): String {
+    fun trimmed(
+        phoneControlAvailable: Boolean = true,
+        modelName: String? = null,
+        sensorContext: SensorContext? = null
+    ): String {
         val securityContent = readFileOrNull(AgentFileManager.SECURITY_FILE)
         return PhoneAgentPrompts.buildActionPrompt(
             phoneControlAvailable = phoneControlAvailable,
             modelName = modelName,
-            securityContent = securityContent
+            securityContent = securityContent,
+            sensorContext = sensorContext
         )
     }
 

@@ -13,6 +13,12 @@ package ai.citros.core
  */
 import android.util.Log
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 open class PhoneAgentApi(
     private val chatClient: ProviderClient,
@@ -34,8 +40,120 @@ open class PhoneAgentApi(
     /** TinyFish endpoint override for testing. Null uses production default. */
     private val tinyFishEndpoint: String? = null,
     /** Citros app token for authenticating to Citros API endpoints. */
-    private val citrosAppToken: String? = null
+    private val citrosAppToken: String? = null,
+    /** Sensor provider for device context injection. Null to disable. */
+    private val sensorProvider: SensorProvider? = null
 ) {
+    private val taskSensorSnapshotLock = Any()
+    @Volatile
+    private var taskSensorSnapshot: SensorContext? = null
+    @Volatile
+    private var taskSensorSnapshotInitialized: Boolean = false
+    private val taskSensorSnapshotCaptureMutex = Mutex()
+    private val taskSensorSnapshotEpoch = AtomicLong(0L)
+    private val sensorSnapshotFailureCount = AtomicInteger(0)
+    private val sensorSnapshotTimeoutCount = AtomicInteger(0)
+    private val sensorSnapshotCount = AtomicInteger(0)
+    private val sensorSnapshotLatencyTotalMsCounter = AtomicLong(0L)
+    private val sensorSnapshotLatencyMaxMsCounter = AtomicLong(0L)
+
+    private enum class SnapshotOutcome { SUCCESS, TIMEOUT, FAILURE }
+
+    private fun recordSensorSnapshotMetrics(durationMs: Long, outcome: SnapshotOutcome) {
+        sensorSnapshotCount.incrementAndGet()
+        sensorSnapshotLatencyTotalMsCounter.addAndGet(durationMs)
+        sensorSnapshotLatencyMaxMsCounter.updateAndGet { current -> maxOf(current, durationMs) }
+        Log.d(TAG, "sensor snapshot outcome=$outcome duration_ms=$durationMs")
+    }
+
+    /** Gather sensor context, never throws. */
+    private suspend fun getSensorSnapshot(): SensorContext? {
+        val startedNs = System.nanoTime()
+        return try {
+            val snapshot = withTimeout(SENSOR_SNAPSHOT_TIMEOUT_MS) {
+                sensorProvider?.snapshot()
+            }
+            val elapsedMs = (System.nanoTime() - startedNs) / 1_000_000
+            recordSensorSnapshotMetrics(elapsedMs, SnapshotOutcome.SUCCESS)
+            snapshot
+        } catch (_: TimeoutCancellationException) {
+            val timeouts = sensorSnapshotTimeoutCount.incrementAndGet()
+            Log.w(TAG, "sensor snapshot timed out (count=$timeouts)")
+            val elapsedMs = (System.nanoTime() - startedNs) / 1_000_000
+            recordSensorSnapshotMetrics(elapsedMs, SnapshotOutcome.TIMEOUT)
+            null
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            val failures = sensorSnapshotFailureCount.incrementAndGet()
+            Log.w(TAG, "sensor snapshot failed (count=$failures): ${e.javaClass.simpleName}")
+            val elapsedMs = (System.nanoTime() - startedNs) / 1_000_000
+            recordSensorSnapshotMetrics(elapsedMs, SnapshotOutcome.FAILURE)
+            null  // Defense-in-depth: provider contract says no-throw, but be safe
+        }
+    }
+
+    /**
+     * Return the cached task snapshot, refreshing only when a new task starts.
+     *
+     * New task boundary: non-action `sendMessage` call.
+     * Continuations (`continueAfterTools`) and action-loop turns reuse the same snapshot.
+     */
+    private suspend fun getTaskSensorSnapshot(startNewTask: Boolean): SensorContext? {
+        val captureEpoch = synchronized(taskSensorSnapshotLock) {
+            if (startNewTask) {
+                taskSensorSnapshotEpoch.incrementAndGet()
+                taskSensorSnapshot = null
+                taskSensorSnapshotInitialized = false
+            }
+            if (taskSensorSnapshotInitialized) {
+                return taskSensorSnapshot
+            }
+            taskSensorSnapshotEpoch.get()
+        }
+
+        val captured = taskSensorSnapshotCaptureMutex.withLock {
+            synchronized(taskSensorSnapshotLock) {
+                if (taskSensorSnapshotInitialized && taskSensorSnapshotEpoch.get() == captureEpoch) {
+                    return@withLock taskSensorSnapshot
+                }
+            }
+            getSensorSnapshot()
+        }
+
+        return synchronized(taskSensorSnapshotLock) {
+            if (!taskSensorSnapshotInitialized && taskSensorSnapshotEpoch.get() == captureEpoch) {
+                taskSensorSnapshot = captured
+                taskSensorSnapshotInitialized = true
+            }
+            taskSensorSnapshot
+        }
+    }
+
+    @get:androidx.annotation.VisibleForTesting
+    internal val sensorSnapshotFailureTotal: Int
+        get() = sensorSnapshotFailureCount.get()
+
+    @get:androidx.annotation.VisibleForTesting
+    internal val sensorSnapshotTimeoutTotal: Int
+        get() = sensorSnapshotTimeoutCount.get()
+
+    @get:androidx.annotation.VisibleForTesting
+    internal val sensorSnapshotTotal: Int
+        get() = sensorSnapshotCount.get()
+
+    @get:androidx.annotation.VisibleForTesting
+    internal val sensorSnapshotLatencyTotalMs: Long
+        get() = sensorSnapshotLatencyTotalMsCounter.get()
+
+    @get:androidx.annotation.VisibleForTesting
+    internal val sensorSnapshotLatencyMaxMs: Long
+        get() = sensorSnapshotLatencyMaxMsCounter.get()
+
+    @get:androidx.annotation.VisibleForTesting
+    internal val cachedTaskSensorSnapshot: SensorContext?
+        get() = taskSensorSnapshot
+
     /** Shared search client — reuses OkHttpClient connection pools across calls. */
     private val searchClient by lazy {
         WebSearchClient(citrosAppToken = citrosAppToken, searxngBaseUrl = searchBaseUrl, braveApiKey = braveApiKey)
@@ -156,6 +274,9 @@ open class PhoneAgentApi(
 
     companion object {
         private const val TAG = "CitrosAgent"
+        // Failsafe cap for full snapshot capture. Individual sensors should enforce
+        // tighter per-field budgets to preserve partial context when one field is slow.
+        internal const val SENSOR_SNAPSHOT_TIMEOUT_MS = 60L
         private const val CLIPBOARD_NOT_ATTACHED =
             "Clipboard not available (accessibility service not attached)"
         private const val NOTIFICATION_NOT_ATTACHED =
@@ -309,11 +430,20 @@ open class PhoneAgentApi(
         // Get response from appropriate client
         val client = if (isActionLoop) actionClient else chatClient
         val modelName = client.modelId
+        val sensorSnapshot = getTaskSensorSnapshot(startNewTask = !isActionLoop)
         val systemPrompt = if (isActionLoop) {
-            promptBuilder?.trimmed(phoneControlAvailable = phoneControlAvailable, modelName = modelName)
-                ?: PhoneAgentPrompts.buildActionPrompt(phoneControlAvailable = phoneControlAvailable, modelName = modelName)
+            promptBuilder?.trimmed(
+                phoneControlAvailable = phoneControlAvailable,
+                modelName = modelName,
+                sensorContext = sensorSnapshot
+            )
+                ?: PhoneAgentPrompts.buildActionPrompt(
+                    phoneControlAvailable = phoneControlAvailable,
+                    modelName = modelName,
+                    sensorContext = sensorSnapshot
+                )
         } else {
-            promptBuilder?.full(phoneControlAvailable = phoneControlAvailable, modelName = modelName) ?: PhoneAgentPrompts.buildSystemPrompt(phoneControlAvailable = phoneControlAvailable, modelName = modelName)
+            promptBuilder?.full(phoneControlAvailable = phoneControlAvailable, modelName = modelName, sensorContext = sensorSnapshot) ?: PhoneAgentPrompts.buildSystemPrompt(phoneControlAvailable = phoneControlAvailable, modelName = modelName, sensorContext = sensorSnapshot)
         }
         
         // Use compacted messages for action loop to manage context window.
@@ -370,8 +500,9 @@ open class PhoneAgentApi(
         }
         val phoneControlAvailable = phoneControlOverride ?: ScreenReader.isAttached()
         val modelName = chatClient.modelId
-        val systemPrompt = promptBuilder?.full(phoneControlAvailable = phoneControlAvailable, modelName = modelName)
-            ?: PhoneAgentPrompts.buildSystemPrompt(phoneControlAvailable = phoneControlAvailable, modelName = modelName)
+        val ephemeralSensors = getTaskSensorSnapshot(startNewTask = false)
+        val systemPrompt = promptBuilder?.full(phoneControlAvailable = phoneControlAvailable, modelName = modelName, sensorContext = ephemeralSensors)
+            ?: PhoneAgentPrompts.buildSystemPrompt(phoneControlAvailable = phoneControlAvailable, modelName = modelName, sensorContext = ephemeralSensors)
         val result = chatClient.chatWithTools(
             ephemeralMessages,
             systemPrompt = systemPrompt,
@@ -405,10 +536,16 @@ open class PhoneAgentApi(
      */
     open suspend fun continueAfterTools(): ChatResponse {
         val phoneControlAvailable = phoneControlOverride ?: ScreenReader.isAttached()
-        val systemPrompt = promptBuilder?.trimmed(phoneControlAvailable = phoneControlAvailable, modelName = actionClient.modelId)
+        val sensorSnapshot = getTaskSensorSnapshot(startNewTask = false)
+        val systemPrompt = promptBuilder?.trimmed(
+            phoneControlAvailable = phoneControlAvailable,
+            modelName = actionClient.modelId,
+            sensorContext = sensorSnapshot
+        )
             ?: PhoneAgentPrompts.buildActionPrompt(
                 phoneControlAvailable = phoneControlAvailable,
-                modelName = actionClient.modelId
+                modelName = actionClient.modelId,
+                sensorContext = sensorSnapshot
             )
 
         // Two-stage compaction: strip old SCREEN dumps first, then summarize old messages
@@ -1171,6 +1308,11 @@ open class PhoneAgentApi(
     fun clearConversation() {
         messages.clear()
         currentToolStep = 0
+        taskSensorSnapshotEpoch.incrementAndGet()
+        synchronized(taskSensorSnapshotLock) {
+            taskSensorSnapshot = null
+            taskSensorSnapshotInitialized = false
+        }
     }
     
     // ========== Legacy compatibility methods ==========
