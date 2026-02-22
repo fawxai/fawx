@@ -267,6 +267,41 @@ class ActionVerifierTest {
         )
     }
 
+    @Test
+    fun `verify returns privacy-blocked error when screenshot is blocked`() = runTest {
+        val verifier = ActionVerifier(
+            actionClient = dummyClient(),
+            mode = VerificationMode.ALWAYS,
+            screenshotDelayMs = 0L,
+            isScreenReaderAttached = { true },
+            takeScreenshot = { ScreenshotResult.PrivacyBlocked }
+        )
+
+        val result = verifier.verify("tap", "Tapped element 5")
+
+        assertFalse(result.verified)
+        assertEquals("Screenshot blocked by privacy mode", result.error)
+        assertTrue(result.description.contains("private_app"))
+        assertFalse(result.description.contains("com.bank.app"))
+    }
+
+    @Test
+    fun `verify returns screenshot failure reason when capture fails`() = runTest {
+        val verifier = ActionVerifier(
+            actionClient = dummyClient(),
+            mode = VerificationMode.ALWAYS,
+            screenshotDelayMs = 0L,
+            isScreenReaderAttached = { true },
+            takeScreenshot = { ScreenshotResult.Failed("Screenshot capture failed") }
+        )
+
+        val result = verifier.verify("tap", "Tapped element 5")
+
+        assertFalse(result.verified)
+        assertEquals("Screenshot capture failed", result.error)
+        assertTrue(result.description.contains("screenshot capture failed", ignoreCase = true))
+    }
+
     // ========== VerificationResult Tests ==========
 
     @Test

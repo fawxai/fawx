@@ -4,14 +4,21 @@ import android.graphics.Bitmap
 import android.os.Build
 import android.util.Base64
 import android.view.accessibility.AccessibilityNodeInfo
+import android.view.accessibility.AccessibilityWindowInfo
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.mockito.kotlin.mock
+import org.mockito.kotlin.whenever
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import org.robolectric.shadows.ShadowLog
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Tests for ScreenReader screenshot utilities.
@@ -93,11 +100,11 @@ class ScreenReaderTest {
     }
 
     @Test
-    fun `takeScreenshot returns null when not attached`() {
+    fun `takeScreenshot returns failed when not attached`() {
         // ScreenReader.service is null when not attached
         ScreenReader.detach()
         val result = kotlinx.coroutines.runBlocking { ScreenReader.takeScreenshot() }
-        assertNull(result)
+        assertTrue(result is ScreenshotResult.Failed)
     }
 
     @Test
@@ -122,22 +129,22 @@ class ScreenReaderTest {
 
     @Test
     @Config(sdk = [Build.VERSION_CODES.Q]) // API 29
-    fun `takeScreenshot returns null on API below 30`() {
+    fun `takeScreenshot returns failed on API below 30`() {
         // Even with a mock service attached, API < 30 should short-circuit
         // We can't attach a real AccessibilityService in Robolectric, but the
         // API check happens before the service is used, so detached is fine
         // for testing the guard.
         ScreenReader.detach()
         val result = kotlinx.coroutines.runBlocking { ScreenReader.takeScreenshot() }
-        assertNull("takeScreenshot should return null on API 29", result)
+        assertTrue("takeScreenshot should fail on API 29", result is ScreenshotResult.Failed)
     }
 
     @Test
     @Config(sdk = [Build.VERSION_CODES.P]) // API 28 (minSdk)
-    fun `takeScreenshot returns null on API 28`() {
+    fun `takeScreenshot returns failed on API 28`() {
         ScreenReader.detach()
         val result = kotlinx.coroutines.runBlocking { ScreenReader.takeScreenshot() }
-        assertNull("takeScreenshot should return null on API 28", result)
+        assertTrue("takeScreenshot should fail on API 28", result is ScreenshotResult.Failed)
     }
 
     @Test
@@ -325,6 +332,90 @@ class ScreenReaderTest {
         }
     }
 
+    @Test
+    fun `privacy block logs for read_screen redact package name`() {
+        ShadowLog.reset()
+        try {
+            simulateAttach()
+            ScreenReader.setPrivacyBlockOverrideForTests("com.bank.private")
+            ScreenReader.getScreenContent()
+        } finally {
+            ScreenReader.clearPrivacyBlockOverrideForTests()
+            ScreenReader.detach()
+        }
+
+        val privacyLog = ShadowLog.getLogsForTag("CitrosPrivacy")
+            .lastOrNull { it.msg.contains("source=read_screen") }
+        assertNotNull("Expected privacy log for read_screen", privacyLog)
+        assertTrue(privacyLog!!.msg.contains("blocked=true"))
+        assertFalse(privacyLog.msg.contains("com.bank.private"))
+        assertPrivacyLogSchema(privacyLog.msg)
+    }
+
+    @Test
+    @Config(sdk = [Build.VERSION_CODES.R])
+    fun `privacy block logs for screenshot redact package name`() = runBlocking {
+        ShadowLog.reset()
+        try {
+            simulateAttach()
+            ScreenReader.setPrivacyBlockOverrideForTests("com.bank.private")
+            val result = ScreenReader.takeScreenshot()
+            assertTrue(result is ScreenshotResult.PrivacyBlocked)
+        } finally {
+            ScreenReader.clearPrivacyBlockOverrideForTests()
+            ScreenReader.detach()
+        }
+
+        val privacyLog = ShadowLog.getLogsForTag("CitrosPrivacy")
+            .lastOrNull { it.msg.contains("source=screenshot") }
+        assertNotNull("Expected privacy log for screenshot", privacyLog)
+        assertTrue(privacyLog!!.msg.contains("blocked=true"))
+        assertFalse(privacyLog.msg.contains("com.bank.private"))
+        assertPrivacyLogSchema(privacyLog.msg)
+    }
+
+    @Test
+    fun `privacy block logs for action redact package name`() {
+        ShadowLog.reset()
+        try {
+            simulateAttach()
+            ScreenReader.setPrivacyBlockOverrideForTests("com.bank.private")
+            val result = ScreenReader.clickElementDetailed(0)
+            assertTrue(result is ScreenReader.ElementActionResult.PrivacyBlocked)
+        } finally {
+            ScreenReader.clearPrivacyBlockOverrideForTests()
+            ScreenReader.detach()
+        }
+
+        val privacyLog = ShadowLog.getLogsForTag("CitrosPrivacy")
+            .lastOrNull { it.msg.contains("source=action") }
+        assertNotNull("Expected privacy log for action", privacyLog)
+        assertTrue(privacyLog!!.msg.contains("blocked=true"))
+        assertFalse(privacyLog.msg.contains("com.bank.private"))
+        assertPrivacyLogSchema(privacyLog.msg)
+    }
+
+    @Test
+    @Config(sdk = [Build.VERSION_CODES.R])
+    fun `privacy block log schema includes only source and blocked metadata`() = runBlocking {
+        ShadowLog.reset()
+        try {
+            simulateAttach()
+            ScreenReader.setPrivacyBlockOverrideForTests("com.bank.private")
+            ScreenReader.getScreenContent()
+            ScreenReader.takeScreenshot()
+            ScreenReader.clickElementDetailed(0)
+        } finally {
+            ScreenReader.clearPrivacyBlockOverrideForTests()
+            ScreenReader.detach()
+        }
+
+        val logs = ShadowLog.getLogsForTag("CitrosPrivacy")
+            .filter { it.msg.startsWith("privacy_block ") }
+        assertTrue("Expected privacy block logs", logs.isNotEmpty())
+        logs.forEach { log -> assertPrivacyLogSchema(log.msg) }
+    }
+
     // ========== Screenshot Overlay Hook Tests (#436) ==========
 
     @Test
@@ -337,7 +428,7 @@ class ScreenReaderTest {
 
         try {
             val result = ScreenReader.takeScreenshot()
-            assertNull(result) // No service attached, returns null
+            assertTrue(result is ScreenshotResult.Failed) // No service attached
             // Hooks should not be called since we bail before them (no service)
             assertTrue("Hooks should not fire without service", callOrder.isEmpty())
         } finally {
@@ -359,7 +450,7 @@ class ScreenReaderTest {
             // captureScreen will fail in Robolectric (no real display), but
             // hooks should still fire: hide before capture, restore in finally
             val result = ScreenReader.takeScreenshot()
-            assertNull(result) // Capture fails in test environment
+            assertTrue(result is ScreenshotResult.Failed) // Capture fails in test environment
             assertEquals(
                 "Hooks should fire in order: hide then restore",
                 listOf("hide", "restore"),
@@ -385,7 +476,7 @@ class ScreenReaderTest {
             // Even if captureScreen throws internally, the finally block
             // should always call the restore hook
             val result = ScreenReader.takeScreenshot()
-            assertNull(result)
+            assertTrue(result is ScreenshotResult.Failed)
             assertTrue("Restore hook must always be called", callOrder.contains("restore"))
         } finally {
             ScreenReader.screenshotOverlayHook = null
@@ -534,5 +625,423 @@ class ScreenReaderTest {
         assertTrue(lines.any { it.startsWith("    [2]") })
         // Deep at depth 5: clamped to 4 levels = 8 spaces
         assertTrue(lines.any { it.startsWith("        [3]") })
+    }
+
+    // ========== Privacy Blocking Logic Tests (H2.6) ==========
+
+    @Test
+    fun `resolvePrivacyBlockedPackage returns null when privacy list is null`() {
+        val blocked = ScreenReader.resolvePrivacyBlockedPackage(
+            rootInActiveWindowPackage = "com.bank.app",
+            foregroundPackage = "com.bank.app",
+            visiblePackages = listOf("com.bank.app"),
+            privacyList = null
+        )
+        assertNull(blocked)
+    }
+
+    @Test
+    fun `resolvePrivacyBlockedPackage blocks when root package is private fail secure`() {
+        val list = InMemoryPrivacyList(setOf("com.bank.app"))
+
+        val blocked = ScreenReader.resolvePrivacyBlockedPackage(
+            rootInActiveWindowPackage = "com.bank.app",
+            foregroundPackage = "com.public.app",
+            visiblePackages = listOf("com.public.app"),
+            privacyList = list
+        )
+
+        assertEquals("com.bank.app", blocked)
+    }
+
+    @Test
+    fun `resolvePrivacyBlockedPackage blocks when app window package is private fail secure`() {
+        val list = InMemoryPrivacyList(setOf("com.bank.app"))
+
+        val blocked = ScreenReader.resolvePrivacyBlockedPackage(
+            rootInActiveWindowPackage = "com.public.app",
+            foregroundPackage = "com.bank.app",
+            visiblePackages = listOf("com.public.app"),
+            privacyList = list
+        )
+
+        assertEquals("com.bank.app", blocked)
+    }
+
+    @Test
+    fun `resolvePrivacyBlockedPackage checks all visible windows for split screen`() {
+        val list = InMemoryPrivacyList(setOf("com.bank.app"))
+
+        val blocked = ScreenReader.resolvePrivacyBlockedPackage(
+            rootInActiveWindowPackage = "com.public.app",
+            foregroundPackage = "com.public.app",
+            visiblePackages = listOf("com.public.app", "com.bank.app"),
+            privacyList = list
+        )
+
+        assertEquals("com.bank.app", blocked)
+    }
+
+    @Test
+    fun `resolvePrivacyBlockedPackage blocks systemui reads when privacy list has entries`() {
+        val list = InMemoryPrivacyList(setOf("com.bank.app"))
+
+        val blocked = ScreenReader.resolvePrivacyBlockedPackage(
+            rootInActiveWindowPackage = "com.android.systemui",
+            foregroundPackage = "com.android.systemui",
+            visiblePackages = listOf("com.android.systemui"),
+            privacyList = list
+        )
+
+        assertEquals("com.android.systemui", blocked)
+    }
+
+    @Test
+    fun `resolvePrivacyBlockedPackage does not block systemui reads when privacy list is empty`() {
+        val list = InMemoryPrivacyList(emptySet())
+
+        val blocked = ScreenReader.resolvePrivacyBlockedPackage(
+            rootInActiveWindowPackage = "com.android.systemui",
+            foregroundPackage = "com.android.systemui",
+            visiblePackages = listOf("com.android.systemui"),
+            privacyList = list
+        )
+
+        assertNull(blocked)
+    }
+
+    @Test
+    fun `resolvePrivacyBlockedPackage returns null when no package is private`() {
+        val list = InMemoryPrivacyList(setOf("com.bank.app"))
+
+        val blocked = ScreenReader.resolvePrivacyBlockedPackage(
+            rootInActiveWindowPackage = "com.public.app",
+            foregroundPackage = "com.public.app",
+            visiblePackages = listOf("com.public.app", "com.other.app"),
+            privacyList = list
+        )
+
+        assertNull(blocked)
+    }
+
+    @Test
+    fun `configurePrivacyList publishes updates across threads`() {
+        val published = InMemoryPrivacyList(setOf("com.visible.app"))
+        val start = CountDownLatch(1)
+        val writerDone = CountDownLatch(1)
+        val readerDone = CountDownLatch(1)
+        val observed = AtomicReference<PrivacyList?>()
+
+        val writer = Thread {
+            start.await()
+            ScreenReader.configurePrivacyList(published)
+            writerDone.countDown()
+        }
+        val reader = Thread {
+            start.await()
+            while (!writerDone.await(5, TimeUnit.MILLISECONDS)) {
+                observed.set(ScreenReader.privacyList)
+            }
+            observed.set(ScreenReader.privacyList)
+            readerDone.countDown()
+        }
+
+        try {
+            ScreenReader.configurePrivacyList(null)
+            writer.start()
+            reader.start()
+            start.countDown()
+            assertTrue(writerDone.await(2, TimeUnit.SECONDS))
+            assertTrue(readerDone.await(2, TimeUnit.SECONDS))
+            writer.join(2000)
+            reader.join(2000)
+            assertSame(published, observed.get())
+        } finally {
+            ScreenReader.configurePrivacyList(null)
+        }
+    }
+
+    @Test
+    fun `attach with privacy list publishes service and privacy atomically`() {
+        val published = InMemoryPrivacyList(setOf("com.visible.app"))
+        val start = CountDownLatch(1)
+        val writerDone = CountDownLatch(1)
+        val readerDone = CountDownLatch(1)
+        val observedPrivacyWhenAttached = AtomicReference<PrivacyList?>()
+
+        val writer = Thread {
+            start.await()
+            val controller = org.robolectric.Robolectric.buildService(StubAccessibilityService::class.java)
+            val service = controller.create().get()
+            ScreenReader.attach(service, published)
+            writerDone.countDown()
+        }
+
+        val reader = Thread {
+            start.await()
+            while (!ScreenReader.isAttached()) {
+                Thread.yield()
+            }
+            observedPrivacyWhenAttached.set(ScreenReader.privacyList)
+            readerDone.countDown()
+        }
+
+        try {
+            ScreenReader.configurePrivacyList(null)
+            ScreenReader.detach()
+            writer.start()
+            reader.start()
+            start.countDown()
+
+            assertTrue(writerDone.await(2, TimeUnit.SECONDS))
+            assertTrue(readerDone.await(2, TimeUnit.SECONDS))
+            writer.join(2000)
+            reader.join(2000)
+            assertSame(published, observedPrivacyWhenAttached.get())
+        } finally {
+            ScreenReader.configurePrivacyList(null)
+            ScreenReader.detach()
+        }
+    }
+
+    @Test
+    fun `attach resets privacy block counter for a new session`() {
+        ScreenReader.privacyBlockCounter.set(3)
+
+        try {
+            val controller = org.robolectric.Robolectric.buildService(StubAccessibilityService::class.java)
+            val service = controller.create().get()
+            ScreenReader.attach(service)
+
+            assertEquals(0, ScreenReader.getPrivacyBlockCount())
+        } finally {
+            ScreenReader.detach()
+        }
+    }
+
+    @Test
+    fun `privacy block source counters reset on attach`() {
+        ScreenReader.privacyBlockCounter.set(3)
+        ScreenReader.privacyReadScreenCounter.set(1)
+        ScreenReader.privacyScreenshotCounter.set(1)
+        ScreenReader.privacyActionCounter.set(1)
+
+        try {
+            val controller = org.robolectric.Robolectric.buildService(StubAccessibilityService::class.java)
+            val service = controller.create().get()
+            ScreenReader.attach(service)
+
+            assertEquals(0, ScreenReader.getPrivacyBlockCount())
+            assertEquals(0, ScreenReader.getPrivacyReadScreenBlockCount())
+            assertEquals(0, ScreenReader.getPrivacyScreenshotBlockCount())
+            assertEquals(0, ScreenReader.getPrivacyActionBlockCount())
+        } finally {
+            ScreenReader.detach()
+        }
+    }
+
+    @Test
+    fun `getScreenContent privacy blocked path uses resolver inputs and increments read counter`() {
+        ScreenReader.privacyBlockCounter.set(0)
+        ScreenReader.privacyReadScreenCounter.set(0)
+        val list = InMemoryPrivacyList(setOf("com.bank.app"))
+        ScreenReader.configurePrivacyList(list)
+        ScreenReader.attach(
+            mockService(
+                rootPackage = "com.bank.app",
+                appWindowPackages = listOf("com.bank.app")
+            )
+        )
+
+        try {
+            val content = ScreenReader.getScreenContent()
+            assertTrue(content.privacyMode)
+            assertEquals(PrivacyRedaction.APP_PLACEHOLDER, content.packageName)
+            assertTrue(content.elements.isEmpty())
+            assertEquals(1, ScreenReader.getPrivacyBlockCount())
+            assertEquals(1, ScreenReader.getPrivacyReadScreenBlockCount())
+        } finally {
+            ScreenReader.configurePrivacyList(null)
+            ScreenReader.detach()
+        }
+    }
+
+    @Test
+    fun `privacy blocked ScreenContent never exposes raw package across surfaces`() {
+        ScreenReader.privacyBlockCounter.set(0)
+        ScreenReader.privacyReadScreenCounter.set(0)
+        val list = InMemoryPrivacyList(setOf("com.bank.app"))
+        ScreenReader.configurePrivacyList(list)
+        ScreenReader.attach(
+            mockService(
+                rootPackage = "com.bank.app",
+                appWindowPackages = listOf("com.bank.app")
+            )
+        )
+
+        try {
+            val content = ScreenReader.getScreenContent()
+            val rawPackage = "com.bank.app"
+            assertFalse(content.toString().contains(rawPackage))
+            assertFalse(content.toToolResult().contains(rawPackage))
+            assertFalse(content.toPromptText().contains(rawPackage))
+            assertEquals(PrivacyRedaction.APP_PLACEHOLDER, content.packageName)
+        } finally {
+            ScreenReader.configurePrivacyList(null)
+            ScreenReader.detach()
+        }
+    }
+
+    @Test
+    @Config(sdk = [30])
+    fun `takeScreenshot privacy blocked path uses resolver inputs and increments screenshot counter`() = runBlocking {
+        ScreenReader.privacyBlockCounter.set(0)
+        ScreenReader.privacyScreenshotCounter.set(0)
+        val list = InMemoryPrivacyList(setOf("com.bank.app"))
+        ScreenReader.configurePrivacyList(list)
+        ScreenReader.attach(
+            mockService(
+                rootPackage = "com.bank.app",
+                appWindowPackages = listOf("com.bank.app")
+            )
+        )
+
+        try {
+            val result = ScreenReader.takeScreenshot()
+            assertTrue(result is ScreenshotResult.PrivacyBlocked)
+            assertEquals(1, ScreenReader.getPrivacyBlockCount())
+            assertEquals(1, ScreenReader.getPrivacyScreenshotBlockCount())
+        } finally {
+            ScreenReader.configurePrivacyList(null)
+            ScreenReader.detach()
+        }
+    }
+
+    @Test
+    @Config(sdk = [30])
+    fun `privacyBlockCounter increments for each blocked call across paths and sources`() = runBlocking {
+        ScreenReader.privacyBlockCounter.set(0)
+        ScreenReader.privacyReadScreenCounter.set(0)
+        ScreenReader.privacyScreenshotCounter.set(0)
+        val list = InMemoryPrivacyList(setOf("com.bank.app"))
+        ScreenReader.configurePrivacyList(list)
+        ScreenReader.attach(
+            mockService(
+                rootPackage = "com.bank.app",
+                appWindowPackages = listOf("com.bank.app")
+            )
+        )
+
+        try {
+            ScreenReader.getScreenContent()
+            ScreenReader.takeScreenshot()
+            assertEquals(2, ScreenReader.getPrivacyBlockCount())
+            assertEquals(1, ScreenReader.getPrivacyReadScreenBlockCount())
+            assertEquals(1, ScreenReader.getPrivacyScreenshotBlockCount())
+            assertEquals(0, ScreenReader.getPrivacyActionBlockCount())
+        } finally {
+            ScreenReader.configurePrivacyList(null)
+            ScreenReader.detach()
+        }
+    }
+
+    @Test
+    fun `clickElementDetailed returns privacy blocked result from resolver inputs`() {
+        ScreenReader.privacyActionCounter.set(0)
+        val list = InMemoryPrivacyList(setOf("com.bank.app"))
+        ScreenReader.configurePrivacyList(list)
+        ScreenReader.attach(
+            mockService(
+                rootPackage = "com.bank.app",
+                appWindowPackages = listOf("com.bank.app")
+            )
+        )
+
+        try {
+            val result = ScreenReader.clickElementDetailed(0)
+            assertTrue(result is ScreenReader.ElementActionResult.PrivacyBlocked)
+            assertEquals(1, ScreenReader.getPrivacyActionBlockCount())
+        } finally {
+            ScreenReader.configurePrivacyList(null)
+            ScreenReader.detach()
+        }
+    }
+
+    @Test
+    fun `longPressElementDetailed returns privacy blocked result from resolver inputs`() {
+        ScreenReader.privacyActionCounter.set(0)
+        val list = InMemoryPrivacyList(setOf("com.bank.app"))
+        ScreenReader.configurePrivacyList(list)
+        ScreenReader.attach(
+            mockService(
+                rootPackage = "com.bank.app",
+                appWindowPackages = listOf("com.bank.app")
+            )
+        )
+
+        try {
+            val result = ScreenReader.longPressElementDetailed(0)
+            assertTrue(result is ScreenReader.ElementActionResult.PrivacyBlocked)
+            assertEquals(1, ScreenReader.getPrivacyActionBlockCount())
+        } finally {
+            ScreenReader.configurePrivacyList(null)
+            ScreenReader.detach()
+        }
+    }
+
+    private fun mockService(
+        rootPackage: String?,
+        appWindowPackages: List<String>
+    ): android.accessibilityservice.AccessibilityService {
+        val rootNode = rootPackage?.let { mockNodeWithPackage(it) }
+        val windows = appWindowPackages.map { pkg ->
+            val window = mock<AccessibilityWindowInfo>()
+            whenever(window.type).thenReturn(AccessibilityWindowInfo.TYPE_APPLICATION)
+            whenever(window.isActive).thenReturn(true)
+            whenever(window.isFocused).thenReturn(true)
+            whenever(window.root).thenReturn(mockNodeWithPackage(pkg))
+            window
+        }
+
+        val service = mock<android.accessibilityservice.AccessibilityService>()
+        whenever(service.rootInActiveWindow).thenReturn(rootNode)
+        whenever(service.windows).thenReturn(windows)
+        whenever(service.packageName).thenReturn("ai.citros.chat")
+        return service
+    }
+
+    private fun mockNodeWithPackage(pkg: String): AccessibilityNodeInfo {
+        val node = mock<AccessibilityNodeInfo>()
+        whenever(node.packageName).thenReturn(pkg)
+        return node
+    }
+
+    private fun assertPrivacyLogSchema(message: String) {
+        assertTrue(message.startsWith("privacy_block "))
+        val fields = message
+            .removePrefix("privacy_block ")
+            .split(" ")
+            .filter { it.isNotBlank() }
+            .mapNotNull { token ->
+                val idx = token.indexOf('=')
+                if (idx <= 0) null else token.substring(0, idx) to token.substring(idx + 1)
+            }
+            .toMap()
+        assertEquals("true", fields["blocked"])
+        assertTrue(fields["source"] in setOf("read_screen", "screenshot", "action"))
+        assertEquals(setOf("source", "blocked"), fields.keys)
+    }
+
+    private class InMemoryPrivacyList(initial: Set<String> = emptySet()) : PrivacyList {
+        private val packages = initial.toMutableSet()
+
+        override fun isPrivate(packageName: String): Boolean = packageName in packages
+        override fun getAll(): Set<String> = packages.toSet()
+        override fun add(packageName: String) {
+            packages.add(packageName)
+        }
+        override fun remove(packageName: String) {
+            packages.remove(packageName)
+        }
     }
 }

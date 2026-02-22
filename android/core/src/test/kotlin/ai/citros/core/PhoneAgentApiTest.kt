@@ -1,5 +1,10 @@
 package ai.citros.core
 
+import android.content.ClipboardManager
+import android.content.Context
+import android.graphics.Rect
+import android.service.notification.NotificationListenerService
+import android.service.notification.StatusBarNotification
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -12,6 +17,11 @@ import okhttp3.mockwebserver.MockWebServer
 import org.junit.After
 import org.junit.Before
 import org.junit.Test
+import org.mockito.kotlin.any
+import org.mockito.kotlin.doNothing
+import org.mockito.kotlin.doThrow
+import org.mockito.kotlin.mock
+import org.mockito.kotlin.whenever
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
@@ -296,6 +306,166 @@ class PhoneAgentApiTest {
         val valid = ToolCall("t1", "long_press", mapOf("element_id" to 5))
         val result = agent.executeToolCall(valid, null)
         assertTrue(result.text.contains("Long-pressed") || result.text.contains("Failed"))
+    }
+
+    @Test
+    fun `executeToolCall tap returns explicit privacy blocked reason`() = runTest {
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+        val api = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            clickElement = { ScreenReader.ElementActionResult.PrivacyBlocked }
+        )
+
+        val result = api.executeToolCall(ToolCall("t1", "tap", mapOf("element_id" to 5)), null)
+
+        assertTrue(result.isError)
+        assertEquals("Failed: tap: blocked by privacy mode for private_app", result.text)
+        assertEquals(ToolErrorCode.PRIVACY_BLOCKED, result.errorCode)
+        assertFalse(result.text.contains("com.bank.app"))
+    }
+
+    @Test
+    fun `executeToolCall tap reports cause-accurate failures`() = runTest {
+        val cases = listOf(
+            ScreenReader.ElementActionResult.ServiceUnavailable to
+                "Failed: tap: accessibility service unavailable",
+            ScreenReader.ElementActionResult.GestureDispatchFailed to
+                "Failed: tap: gesture dispatch failed",
+            ScreenReader.ElementActionResult.ElementNotFound to
+                "Failed: tap: element 5 not found"
+        )
+
+        for ((actionResult, expected) in cases) {
+            val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+            val api = PhoneAgentApi(
+                chatClient = client,
+                actionClient = client,
+                clickElement = { actionResult }
+            )
+
+            val result = api.executeToolCall(ToolCall("t1", "tap", mapOf("element_id" to 5)), null)
+
+            assertTrue(result.isError)
+            assertEquals(expected, result.text)
+        }
+    }
+
+    @Test
+    fun `executeToolCall long_press returns explicit privacy blocked reason`() = runTest {
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+        val api = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            longPressElement = { ScreenReader.ElementActionResult.PrivacyBlocked }
+        )
+
+        val result = api.executeToolCall(ToolCall("t1", "long_press", mapOf("element_id" to 2)), null)
+
+        assertTrue(result.isError)
+        assertEquals("Failed: long_press: blocked by privacy mode for private_app", result.text)
+        assertEquals(ToolErrorCode.PRIVACY_BLOCKED, result.errorCode)
+        assertFalse(result.text.contains("com.bank.app"))
+    }
+
+    @Test
+    fun `executeToolCall long_press reports cause-accurate failures`() = runTest {
+        val cases = listOf(
+            ScreenReader.ElementActionResult.ServiceUnavailable to
+                "Failed: long_press: accessibility service unavailable",
+            ScreenReader.ElementActionResult.GestureDispatchFailed to
+                "Failed: long_press: gesture dispatch failed",
+            ScreenReader.ElementActionResult.ElementNotFound to
+                "Failed: long_press: element 2 not found"
+        )
+
+        for ((actionResult, expected) in cases) {
+            val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+            val api = PhoneAgentApi(
+                chatClient = client,
+                actionClient = client,
+                longPressElement = { actionResult }
+            )
+
+            val result = api.executeToolCall(ToolCall("t1", "long_press", mapOf("element_id" to 2)), null)
+
+            assertTrue(result.isError)
+            assertEquals(expected, result.text)
+        }
+    }
+
+    @Test
+    fun `executeToolCall tap_text reports cause-accurate failures`() = runTest {
+        val screen = ScreenContent(
+            packageName = "com.example.app",
+            elements = listOf(
+                ScreenElement(
+                    id = 7,
+                    text = "Settings",
+                    contentDescription = null,
+                    className = "android.widget.TextView",
+                    isClickable = true,
+                    isEditable = false,
+                    bounds = Rect(0, 0, 10, 10)
+                )
+            )
+        )
+
+        val cases = listOf(
+            ScreenReader.ElementActionResult.ServiceUnavailable to
+                "Failed: tap_text: accessibility service unavailable",
+            ScreenReader.ElementActionResult.GestureDispatchFailed to
+                "Failed: tap_text: gesture dispatch failed",
+            ScreenReader.ElementActionResult.PrivacyBlocked to
+                "Failed: tap_text: blocked by privacy mode for private_app",
+            ScreenReader.ElementActionResult.ElementNotFound to
+                "Failed: tap_text: no element matching \"Settings\""
+        )
+
+        for ((actionResult, expected) in cases) {
+            val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+            val api = PhoneAgentApi(
+                chatClient = client,
+                actionClient = client,
+                clickElement = { actionResult }
+            )
+            val result = api.executeToolCall(
+                ToolCall("tc1", "tap_text", mapOf("text" to "Settings")),
+                screen
+            )
+            assertEquals(expected, result.text)
+            assertTrue(result.isError)
+            val expectedCode = if (actionResult is ScreenReader.ElementActionResult.PrivacyBlocked) {
+                ToolErrorCode.PRIVACY_BLOCKED
+            } else {
+                ToolErrorCode.EXECUTION_FAILED
+            }
+            assertEquals(expectedCode, result.errorCode)
+        }
+    }
+
+    @Test
+    fun `executeToolCall tap_text returns privacy blocked when screen content is privacy mode`() = runTest {
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+        val api = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            clickElement = { ScreenReader.ElementActionResult.Success }
+        )
+        val privacyScreen = ScreenContent(
+            packageName = PrivacyRedaction.APP_PLACEHOLDER,
+            elements = emptyList(),
+            privacyMode = true
+        )
+
+        val result = api.executeToolCall(
+            ToolCall("tc1", "tap_text", mapOf("text" to "Settings")),
+            privacyScreen
+        )
+
+        assertTrue(result.isError)
+        assertEquals("Failed: tap_text: blocked by privacy mode for private_app", result.text)
+        assertEquals(ToolErrorCode.PRIVACY_BLOCKED, result.errorCode)
     }
 
     @Test
@@ -585,6 +755,27 @@ class PhoneAgentApiTest {
         }
     }
 
+    private class EmptyNotificationListenerService : NotificationListenerService() {
+        override fun getActiveNotifications(): Array<StatusBarNotification> = emptyArray()
+    }
+
+    private class AccessDeniedNotificationListenerService : NotificationListenerService() {
+        override fun getActiveNotifications(): Array<StatusBarNotification> {
+            throw SecurityException("Notification access denied")
+        }
+    }
+
+    private fun cancelAccessDeniedNotificationListenerService(
+        notificationKey: String
+    ): NotificationListenerService {
+        val service: NotificationListenerService = mock()
+        val activeNotification: StatusBarNotification = mock()
+        whenever(activeNotification.key).thenReturn(notificationKey)
+        whenever(service.activeNotifications).thenReturn(arrayOf(activeNotification))
+        doThrow(SecurityException("Notification access denied")).whenever(service).cancelNotification(any())
+        return service
+    }
+
     // ========== Screenshot Tool Tests (#338) ==========
 
     @Test
@@ -601,6 +792,108 @@ class PhoneAgentApiTest {
         val result = api.executeToolCall(toolCall, null)
 
         assertEquals("Accessibility service not attached", result.text)
+        assertTrue(result.isError)
+    }
+
+    @Test
+    fun `screenshot tool returns privacy blocked error when screenshot is blocked`() = runTest {
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+        val api = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            isScreenReaderAttached = { true },
+            takeScreenshot = { ScreenshotResult.PrivacyBlocked }
+        )
+
+        val result = api.executeToolCall(ToolCall("tc1", "screenshot", emptyMap()), null)
+
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.PRIVACY_BLOCKED, result.errorCode)
+        assertEquals(
+            "Failed: screenshot: blocked by privacy mode for private_app",
+            result.text
+        )
+        assertFalse(result.text.contains("com.bank.app"))
+    }
+
+    @Test
+    fun `screenshot tool returns explicit failure reason when screenshot capture fails`() = runTest {
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+        val api = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            isScreenReaderAttached = { true },
+            takeScreenshot = { ScreenshotResult.Failed("Screenshot capture failed") }
+        )
+
+        val result = api.executeToolCall(ToolCall("tc1", "screenshot", emptyMap()), null)
+
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.EXECUTION_FAILED, result.errorCode)
+        assertEquals("Failed: screenshot: Screenshot capture failed", result.text)
+    }
+
+    @Test
+    fun `read_screen tool payload uses compactable Screen refreshed colon format`() = runTest {
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+        val api = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            isScreenReaderAttached = { true },
+            getScreenContent = {
+                ScreenContent(
+                    packageName = "com.example.app",
+                    elements = listOf(
+                        ScreenElement(
+                            id = 1,
+                            text = "Open",
+                            contentDescription = null,
+                            className = "Button",
+                            isClickable = true,
+                            isEditable = false,
+                            bounds = android.graphics.Rect(0, 0, 100, 50)
+                        )
+                    )
+                )
+            }
+        )
+
+        val result = api.executeToolCall(ToolCall("tc1", "read_screen", emptyMap()), null)
+        assertTrue(result.text.startsWith("Screen refreshed:\nSCREEN:\n"), result.text)
+    }
+
+    @Test
+    fun `read_screen tool payload returns privacy marker and no raw element text when blocked`() = runTest {
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+        val api = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            isScreenReaderAttached = { true },
+            getScreenContent = {
+                ScreenContent(
+                    packageName = "com.bank.app",
+                    elements = listOf(
+                        ScreenElement(
+                            id = 1,
+                            text = "SECRET BALANCE",
+                            contentDescription = null,
+                            className = "TextView",
+                            isClickable = false,
+                            isEditable = false,
+                            bounds = android.graphics.Rect(0, 0, 100, 50)
+                        )
+                    ),
+                    privacyMode = true
+                )
+            }
+        )
+
+        val result = api.executeToolCall(ToolCall("tc1", "read_screen", emptyMap()), null)
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.PRIVACY_BLOCKED, result.errorCode)
+        assertTrue(result.text.contains("Privacy mode"), result.text)
+        assertFalse(result.text.contains("SECRET BALANCE"), result.text)
+        assertFalse(result.text.contains("com.bank.app"), result.text)
     }
 
     @Test
@@ -661,6 +954,8 @@ class PhoneAgentApiTest {
         val toolCall = ToolCall("tc1", "copy", emptyMap())
         val result = api.executeToolCall(toolCall, null)
 
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.SERVICE_UNAVAILABLE, result.errorCode)
         assertTrue(result.text.contains("not available"))
     }
 
@@ -673,6 +968,8 @@ class PhoneAgentApiTest {
         val toolCall = ToolCall("tc1", "set_clipboard", mapOf("text" to "hello"))
         val result = api.executeToolCall(toolCall, null)
 
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.SERVICE_UNAVAILABLE, result.errorCode)
         assertTrue(result.text.contains("not available"))
     }
 
@@ -685,6 +982,8 @@ class PhoneAgentApiTest {
         val toolCall = ToolCall("tc1", "paste", mapOf("text" to "hello"))
         val result = api.executeToolCall(toolCall, null)
 
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.SERVICE_UNAVAILABLE, result.errorCode)
         assertTrue(result.text.contains("not available"))
     }
 
@@ -696,6 +995,8 @@ class PhoneAgentApiTest {
         val toolCall = ToolCall("tc1", "set_clipboard", mapOf("text" to ""))
         val result = api.executeToolCall(toolCall, null)
 
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, result.errorCode)
         assertTrue(result.text.contains("Failed"))
     }
 
@@ -707,7 +1008,67 @@ class PhoneAgentApiTest {
         val toolCall = ToolCall("tc1", "paste", mapOf("text" to ""))
         val result = api.executeToolCall(toolCall, null)
 
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, result.errorCode)
         assertTrue(result.text.contains("Failed"))
+    }
+
+    @Test
+    fun `paste tool maps writeAndPaste failure to EXECUTION_FAILED`() = runTest {
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+        val api = PhoneAgentApi(client)
+
+        val clipboardManager = mock<ClipboardManager>()
+        doNothing().whenever(clipboardManager).setPrimaryClip(any())
+        val context = mock<Context>()
+        whenever(context.applicationContext).thenReturn(context)
+        whenever(context.getSystemService(Context.CLIPBOARD_SERVICE)).thenReturn(clipboardManager)
+
+        ClipboardHelper.attach(context)
+        ScreenReader.detach()
+
+        try {
+            val toolCall = ToolCall("tc1", "paste", mapOf("text" to "hello"))
+            val result = api.executeToolCall(toolCall, null)
+
+            assertTrue(result.isError)
+            assertEquals(ToolErrorCode.EXECUTION_FAILED, result.errorCode)
+            assertEquals(
+                "Failed: paste: no focused input field or clipboard write failed",
+                result.text
+            )
+        } finally {
+            ClipboardHelper.detach()
+        }
+    }
+
+    @Test
+    fun `set_clipboard tool maps write failure to EXECUTION_FAILED`() = runTest {
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+        val api = PhoneAgentApi(client)
+
+        val clipboardManager = mock<ClipboardManager>()
+        org.mockito.kotlin.doThrow(SecurityException("Clipboard write denied"))
+            .whenever(clipboardManager).setPrimaryClip(any())
+        val context = mock<Context>()
+        whenever(context.applicationContext).thenReturn(context)
+        whenever(context.getSystemService(Context.CLIPBOARD_SERVICE)).thenReturn(clipboardManager)
+
+        ClipboardHelper.attach(context)
+
+        try {
+            val toolCall = ToolCall("tc1", "set_clipboard", mapOf("text" to "hello"))
+            val result = api.executeToolCall(toolCall, null)
+
+            assertTrue(result.isError)
+            assertEquals(ToolErrorCode.EXECUTION_FAILED, result.errorCode)
+            assertEquals(
+                "Failed: set_clipboard: clipboard write denied",
+                result.text
+            )
+        } finally {
+            ClipboardHelper.detach()
+        }
     }
 
     @Test
@@ -749,7 +1110,27 @@ class PhoneAgentApiTest {
         val toolCall = ToolCall("tc1", "read_notifications", emptyMap())
         val result = api.executeToolCall(toolCall, null)
 
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.SERVICE_UNAVAILABLE, result.errorCode)
         assertTrue(result.text.contains("not attached"))
+    }
+
+    @Test
+    fun `read_notifications maps access revocation to ACCESS_DENIED`() = runTest {
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+        val api = PhoneAgentApi(client)
+        NotificationHelper.attach(AccessDeniedNotificationListenerService())
+
+        try {
+            val toolCall = ToolCall("tc1", "read_notifications", emptyMap())
+            val result = api.executeToolCall(toolCall, null)
+
+            assertTrue(result.isError)
+            assertEquals(ToolErrorCode.ACCESS_DENIED, result.errorCode)
+            assertTrue(result.text.contains("Notification access denied"))
+        } finally {
+            NotificationHelper.detach()
+        }
     }
 
     @Test
@@ -765,6 +1146,8 @@ class PhoneAgentApiTest {
         )
         val result = api.executeToolCall(toolCall, null)
 
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.SERVICE_UNAVAILABLE, result.errorCode)
         assertTrue(result.text.contains("not attached"))
     }
 
@@ -781,6 +1164,8 @@ class PhoneAgentApiTest {
         )
         val result = api.executeToolCall(toolCall, null)
 
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.SERVICE_UNAVAILABLE, result.errorCode)
         assertTrue(result.text.contains("not attached"))
     }
 
@@ -800,6 +1185,8 @@ class PhoneAgentApiTest {
         )
         val result = api.executeToolCall(toolCall, null)
 
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.SERVICE_UNAVAILABLE, result.errorCode)
         assertTrue(result.text.contains("not attached"))
     }
 
@@ -815,6 +1202,8 @@ class PhoneAgentApiTest {
         )
         val result = api.executeToolCall(toolCall, null)
 
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, result.errorCode)
         assertTrue(result.text.contains("Failed"))
     }
 
@@ -826,6 +1215,8 @@ class PhoneAgentApiTest {
         val toolCall = ToolCall("tc1", "tap_notification", mapOf("notification_key" to "invalid-key"))
         val result = api.executeToolCall(toolCall, null)
 
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, result.errorCode)
         assertTrue(result.text.contains("valid notification_key format"))
     }
 
@@ -837,6 +1228,8 @@ class PhoneAgentApiTest {
         val toolCall = ToolCall("tc1", "dismiss_notification", mapOf("notification_key" to "a|b"))
         val result = api.executeToolCall(toolCall, null)
 
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, result.errorCode)
         assertTrue(result.text.contains("valid notification_key format"))
     }
 
@@ -852,7 +1245,86 @@ class PhoneAgentApiTest {
         )
         val result = api.executeToolCall(toolCall, null)
 
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, result.errorCode)
         assertTrue(result.text.contains("valid notification_key format"))
+    }
+
+    @Test
+    fun `notification action tools map missing target to EXECUTION_FAILED`() = runTest {
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+        val api = PhoneAgentApi(client)
+        NotificationHelper.attach(EmptyNotificationListenerService())
+
+        try {
+            val validKey = "0|com.example.app|123|null|1000"
+            val cases = listOf(
+                ToolCall("tc1", "tap_notification", mapOf("notification_key" to validKey)) to
+                    "Failed: tap_notification: notification may have been dismissed or has no content intent",
+                ToolCall("tc2", "dismiss_notification", mapOf("notification_key" to validKey)) to
+                    "Failed: dismiss_notification: notification may be ongoing or already dismissed",
+                ToolCall(
+                    "tc3",
+                    "reply_notification",
+                    mapOf("notification_key" to validKey, "text" to "hello")
+                ) to "Failed: reply_notification: notification may not support inline reply or was dismissed"
+            )
+
+            for ((toolCall, expectedText) in cases) {
+                val result = api.executeToolCall(toolCall, null)
+                assertTrue(result.isError, "Expected error for ${toolCall.name}")
+                assertEquals(ToolErrorCode.EXECUTION_FAILED, result.errorCode)
+                assertEquals(expectedText, result.text)
+            }
+        } finally {
+            NotificationHelper.detach()
+        }
+    }
+
+    @Test
+    fun `notification action tools map access revocation to ACCESS_DENIED`() = runTest {
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+        val api = PhoneAgentApi(client)
+        NotificationHelper.attach(AccessDeniedNotificationListenerService())
+
+        try {
+            val validKey = "0|com.example.app|123|null|1000"
+            val cases = listOf(
+                ToolCall("tc1", "tap_notification", mapOf("notification_key" to validKey)),
+                ToolCall("tc2", "dismiss_notification", mapOf("notification_key" to validKey)),
+                ToolCall("tc3", "reply_notification", mapOf("notification_key" to validKey, "text" to "hello"))
+            )
+
+            for (toolCall in cases) {
+                val result = api.executeToolCall(toolCall, null)
+                assertTrue(result.isError, "Expected error for ${toolCall.name}")
+                assertEquals(ToolErrorCode.ACCESS_DENIED, result.errorCode)
+                assertTrue(result.text.contains("Notification access denied"))
+            }
+        } finally {
+            NotificationHelper.detach()
+        }
+    }
+
+    @Test
+    fun `dismiss_notification maps cancelNotification access revocation to ACCESS_DENIED`() = runTest {
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+        val api = PhoneAgentApi(client)
+        val validKey = "0|com.example.app|123|null|1000"
+        NotificationHelper.attach(cancelAccessDeniedNotificationListenerService(validKey))
+
+        try {
+            val result = api.executeToolCall(
+                ToolCall("tc1", "dismiss_notification", mapOf("notification_key" to validKey)),
+                null
+            )
+
+            assertTrue(result.isError)
+            assertEquals(ToolErrorCode.ACCESS_DENIED, result.errorCode)
+            assertTrue(result.text.contains("Notification access denied"))
+        } finally {
+            NotificationHelper.detach()
+        }
     }
 
     @Test
@@ -863,6 +1335,8 @@ class PhoneAgentApiTest {
         val toolCall = ToolCall("tc1", "tap_notification", mapOf("notification_key" to "0|example|123"))
         val result = api.executeToolCall(toolCall, null)
 
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, result.errorCode)
         assertTrue(result.text.contains("valid notification_key format"))
     }
 
@@ -874,6 +1348,8 @@ class PhoneAgentApiTest {
         val toolCall = ToolCall("tc1", "tap_notification", mapOf("notification_key" to "0|com..app|123"))
         val result = api.executeToolCall(toolCall, null)
 
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, result.errorCode)
         assertTrue(result.text.contains("valid notification_key format"))
     }
 
@@ -885,6 +1361,8 @@ class PhoneAgentApiTest {
         val toolCall = ToolCall("tc1", "tap_notification", mapOf("notification_key" to "0|com.example.app"))
         val result = api.executeToolCall(toolCall, null)
 
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, result.errorCode)
         assertTrue(result.text.contains("valid notification_key format"))
     }
 
@@ -898,6 +1376,8 @@ class PhoneAgentApiTest {
         val result = api.executeToolCall(toolCall, null)
 
         // Valid key → falls through to not-attached check (not format error)
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.SERVICE_UNAVAILABLE, result.errorCode)
         assertTrue(result.text.contains("not attached"))
     }
 
@@ -913,6 +1393,8 @@ class PhoneAgentApiTest {
         )
         val result = api.executeToolCall(toolCall, null)
 
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, result.errorCode)
         assertTrue(result.text.contains("whitespace"))
     }
 
@@ -980,6 +1462,21 @@ class PhoneAgentApiTest {
 
         // Verification runs but gracefully handles detached state (error → skipped)
         assertTrue(result.text.contains("[Verification skipped"))
+    }
+
+    @Test
+    fun `executeToolCallWithVerification preserves errorCode and severity from tool result`() = runTest {
+        ScreenReader.detach()
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+        val verifier = ActionVerifier(client, VerificationMode.ALWAYS)
+        val api = PhoneAgentApi(client, client, verifier = verifier)
+
+        val toolCall = ToolCall("tc1", "press_home", emptyMap())
+        val underlying = api.executeToolCall(toolCall, null)
+        val verified = api.executeToolCallWithVerification(toolCall, null)
+
+        assertEquals(underlying.errorCode, verified.errorCode)
+        assertEquals(underlying.severity, verified.severity)
     }
 
     @Test
@@ -1428,27 +1925,148 @@ class PhoneAgentApiTest {
             null
         )
         assertTrue(result.isError, "file tool error should have isError=true")
+        assertEquals(ToolErrorCode.NOT_CONFIGURED, result.errorCode)
     }
 
     @Test
-    fun `memory tool errors return isError true`() = runTest {
+    fun `file tool wrapper maps invalid input to INVALID_INPUT`() = runTest {
+        val tempRoot = createTempDir(prefix = "phone-agent-file-invalid-input")
+        try {
+            val manager = AgentFileManager.fromDirectory(tempRoot)
+            val agent = createAgent(fileManager = manager)
+            val result = agent.executeToolCall(ToolCall("f1", "read_file", emptyMap()), null)
+            assertTrue(result.isError)
+            assertEquals(ToolErrorCode.INVALID_INPUT, result.errorCode)
+        } finally {
+            tempRoot.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `file tool wrapper maps security exceptions to ACCESS_DENIED`() = runTest {
+        val tempRoot = createTempDir(prefix = "phone-agent-file-security")
+        try {
+            val manager = AgentFileManager.fromDirectory(tempRoot)
+            val agent = createAgent(fileManager = manager)
+            val result = agent.executeToolCall(
+                ToolCall("f1", "read_file", mapOf("path" to "../secrets.txt")),
+                null
+            )
+            assertTrue(result.isError)
+            assertEquals(ToolErrorCode.ACCESS_DENIED, result.errorCode)
+        } finally {
+            tempRoot.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `file tool wrapper maps unexpected exceptions to EXECUTION_FAILED`() = runTest {
+        val tempRoot = createTempDir(prefix = "phone-agent-file-execution-failed")
+        try {
+            val manager = AgentFileManager.fromDirectory(tempRoot)
+            tempRoot.resolve("blocked").writeText("this is a file, not a directory")
+            val agent = createAgent(fileManager = manager)
+            val result = agent.executeToolCall(
+                ToolCall("f1", "write_file", mapOf("path" to "blocked/nested.txt", "content" to "x")),
+                null
+            )
+            assertTrue(result.isError)
+            assertEquals(ToolErrorCode.EXECUTION_FAILED, result.errorCode)
+        } finally {
+            tempRoot.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `memory tool wrapper maps not configured to NOT_CONFIGURED`() = runTest {
         val agent = createAgent()
         val result = agent.executeToolCall(
             ToolCall("m1", "remember", mapOf("content" to "test")),
             null
         )
         assertTrue(result.isError, "memory tool error should have isError=true")
+        assertEquals(ToolErrorCode.NOT_CONFIGURED, result.errorCode)
     }
 
     @Test
-    fun `unknown tool returns isError false with failure text`() = runTest {
+    fun `memory tool wrapper maps invalid input to INVALID_INPUT`() = runTest {
+        val agent = createAgent(memoryProvider = InMemoryMemoryProvider())
+        val result = agent.executeToolCall(
+            ToolCall("m1", "remember", emptyMap()),
+            null
+        )
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, result.errorCode)
+    }
+
+    @Test
+    fun `memory tool wrapper maps unexpected exceptions to EXECUTION_FAILED`() = runTest {
+        val explodingProvider = object : MemoryProvider {
+            override suspend fun store(content: String, metadata: MemoryMetadata): String {
+                throw RuntimeException("boom")
+            }
+            override suspend fun search(query: String, limit: Int): List<MemoryResult> = emptyList()
+            override suspend fun delete(id: String) = Unit
+            override suspend fun list(filter: MemoryFilter?): List<MemoryResult> = emptyList()
+        }
+        val agent = createAgent(memoryProvider = explodingProvider)
+        val result = agent.executeToolCall(
+            ToolCall("m1", "remember", mapOf("content" to "test")),
+            null
+        )
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.EXECUTION_FAILED, result.errorCode)
+    }
+
+    @Test
+    fun `unknown tool returns TOOL_NOT_FOUND with isError true`() = runTest {
         val agent = createAgent()
         val result = agent.executeToolCall(
             ToolCall("u1", "nonexistent_tool", emptyMap()),
             null
         )
-        assertFalse(result.isError, "unknown tool should have isError=false (legacy)")
+        assertTrue(result.isError, "unknown tool should have isError=true")
         assertTrue(result.text.contains("unknown tool"), "should mention unknown tool")
+        assertEquals(ToolErrorCode.TOOL_NOT_FOUND, result.errorCode)
+    }
+
+    @Test
+    fun `ui tool failures consistently map to isError true`() = runTest {
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+        val screen = ScreenContent(
+            packageName = "com.example.app",
+            elements = listOf(
+                ScreenElement(
+                    id = 5,
+                    text = "Settings",
+                    contentDescription = null,
+                    className = "android.widget.TextView",
+                    isClickable = true,
+                    isEditable = false,
+                    bounds = Rect(0, 0, 20, 20)
+                )
+            )
+        )
+        val api = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            clickElement = { ScreenReader.ElementActionResult.ServiceUnavailable },
+            longPressElement = { ScreenReader.ElementActionResult.ElementNotFound },
+            isScreenReaderAttached = { false }
+        )
+
+        val cases = listOf(
+            ToolCall("u1", "tap", mapOf("element_id" to 5)) to null,
+            ToolCall("u2", "tap_text", mapOf("text" to "Settings")) to screen,
+            ToolCall("u3", "long_press", mapOf("element_id" to 5)) to null,
+            ToolCall("u4", "screenshot", emptyMap()) to null,
+            ToolCall("u5", "read_screen", emptyMap()) to null
+        )
+
+        for ((call, content) in cases) {
+            val result = api.executeToolCall(call, content)
+            assertTrue(result.isError, "Expected isError=true for ${call.name}, got: ${result.text}")
+        }
     }
 
     @Test
@@ -1459,6 +2077,20 @@ class PhoneAgentApiTest {
             null
         )
         assertFalse(result.isError, "think tool success should have isError=false")
+        assertNull(result.errorCode)
+    }
+
+    @Test
+    fun `read_screen detached classifies structured service unavailable error`() = runTest {
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+        val api = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            isScreenReaderAttached = { false }
+        )
+        val result = api.executeToolCall(ToolCall("r1", "read_screen", emptyMap()), null)
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.SERVICE_UNAVAILABLE, result.errorCode)
     }
 
 
@@ -1481,6 +2113,179 @@ class PhoneAgentApiTest {
         val toolNames = tools.map { it.name }
         assertFalse("web_search" in toolNames, "web_search should be excluded for SMALL tier models")
         assertFalse("web_fetch" in toolNames, "web_fetch should be excluded for SMALL tier models")
+    }
+
+    @Test
+    fun `web_search missing query returns INVALID_INPUT`() = runTest {
+        val agent = createAgent()
+        val result = agent.executeToolCall(ToolCall("ws1", "web_search", emptyMap()), null)
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, result.errorCode)
+        assertTrue(result.text.contains("Missing required parameter: query"))
+    }
+
+    @Test
+    fun `web_fetch missing url returns INVALID_INPUT`() = runTest {
+        val agent = createAgent()
+        val result = agent.executeToolCall(ToolCall("wf1", "web_fetch", emptyMap()), null)
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, result.errorCode)
+        assertTrue(result.text.contains("Missing required parameter: url"))
+    }
+
+    @Test
+    fun `web_browse missing url returns INVALID_INPUT when configured`() = runTest {
+        val defaultClient = ClaudeClient(
+            apiKey = "sk-ant-api03-test",
+            systemPrompt = PhoneAgentPrompts.SYSTEM_PROMPT,
+            baseUrl = server.url("/v1/messages").toString()
+        )
+        val agent = PhoneAgentApi(
+            chatClient = defaultClient,
+            actionClient = defaultClient,
+            tinyFishApiKey = "test-tinyfish-key",
+            tinyFishEndpoint = server.url("/v1/automation/run-sse").toString()
+        ).also {
+            it.phoneControlOverride = true
+        }
+
+        val result = agent.executeToolCall(ToolCall("wb1", "web_browse", mapOf("goal" to "Find answer")), null)
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, result.errorCode)
+        assertTrue(result.text.contains("Missing required parameter: url"))
+    }
+
+    @Test
+    fun `web_browse missing goal returns INVALID_INPUT when configured`() = runTest {
+        val defaultClient = ClaudeClient(
+            apiKey = "sk-ant-api03-test",
+            systemPrompt = PhoneAgentPrompts.SYSTEM_PROMPT,
+            baseUrl = server.url("/v1/messages").toString()
+        )
+        val agent = PhoneAgentApi(
+            chatClient = defaultClient,
+            actionClient = defaultClient,
+            tinyFishApiKey = "test-tinyfish-key",
+            tinyFishEndpoint = server.url("/v1/automation/run-sse").toString()
+        ).also {
+            it.phoneControlOverride = true
+        }
+
+        val result = agent.executeToolCall(ToolCall("wb2", "web_browse", mapOf("url" to "https://example.com")), null)
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, result.errorCode)
+        assertTrue(result.text.contains("Missing required parameter: goal"))
+    }
+
+    @Test
+    fun `request_tools validates missing empty and invalid categories`() = runTest {
+        val agent = createAgent()
+
+        val missing = agent.executeToolCall(ToolCall("rt1", "request_tools", emptyMap()), null)
+        assertTrue(missing.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, missing.errorCode)
+        assertTrue(missing.text.contains("Missing required parameter: categories"))
+
+        val empty = agent.executeToolCall(ToolCall("rt2", "request_tools", mapOf("categories" to emptyList<String>())), null)
+        assertTrue(empty.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, empty.errorCode)
+        assertTrue(empty.text.contains("at least one category"))
+
+        val invalid = agent.executeToolCall(
+            ToolCall(
+                "rt3",
+                "request_tools",
+                mapOf("categories" to listOf("research", "core", "", "invalid_category", 17))
+            ),
+            null
+        )
+        assertTrue(invalid.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, invalid.errorCode)
+        assertTrue(invalid.text.contains("Invalid categories"))
+        assertTrue(invalid.text.contains("core"))
+        assertTrue(invalid.text.contains("invalid_category"))
+    }
+
+    @Test
+    fun `request_tools returns tool list for valid categories`() = runTest {
+        val agent = createAgent()
+        val result = agent.executeToolCall(
+            ToolCall("rt4", "request_tools", mapOf("categories" to listOf("navigation", "observation"))),
+            null
+        )
+
+        assertFalse(result.isError)
+        assertNull(result.errorCode)
+        assertTrue(result.text.contains("Requested categories: navigation, observation"))
+        assertTrue(result.text.contains("open_app"))
+        assertTrue(result.text.contains("read_screen"))
+    }
+
+    @Test
+    fun `tool error mapping is consistent across core ui web and meta tools`() = runTest {
+        val agent = createAgent()
+        val cases = listOf(
+            ToolCall("map1", "nonexistent_tool", emptyMap()) to ToolErrorCode.TOOL_NOT_FOUND,
+            ToolCall("map2", "web_search", emptyMap()) to ToolErrorCode.INVALID_INPUT,
+            ToolCall("map3", "web_fetch", emptyMap()) to ToolErrorCode.INVALID_INPUT,
+            ToolCall("map4", "web_browse", mapOf("url" to "https://example.com", "goal" to "Find")) to ToolErrorCode.NOT_CONFIGURED,
+            ToolCall("map5", "request_tools", emptyMap()) to ToolErrorCode.INVALID_INPUT,
+            ToolCall("map6", "read_screen", emptyMap()) to ToolErrorCode.SERVICE_UNAVAILABLE
+        )
+
+        for ((toolCall, expectedCode) in cases) {
+            val result = agent.executeToolCall(toolCall, null)
+            assertTrue(result.isError, "Expected isError=true for ${toolCall.name}, got: ${result.text}")
+            assertEquals(expectedCode, result.errorCode, "Unexpected error code for ${toolCall.name}")
+        }
+    }
+
+    @Test
+    fun `tool error mapping is consistent for clipboard and notification tools`() = runTest {
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+        val api = PhoneAgentApi(client)
+        ClipboardHelper.detach()
+        NotificationHelper.detach()
+
+        val cases = listOf(
+            ToolCall("map_clip_1", "copy", emptyMap()) to ToolErrorCode.SERVICE_UNAVAILABLE,
+            ToolCall("map_clip_2", "set_clipboard", mapOf("text" to "")) to ToolErrorCode.INVALID_INPUT,
+            ToolCall("map_clip_3", "set_clipboard", mapOf("text" to "hello")) to ToolErrorCode.SERVICE_UNAVAILABLE,
+            ToolCall("map_clip_4", "paste", mapOf("text" to "")) to ToolErrorCode.INVALID_INPUT,
+            ToolCall("map_clip_5", "paste", mapOf("text" to "hello")) to ToolErrorCode.SERVICE_UNAVAILABLE,
+            ToolCall("map_notif_1", "read_notifications", emptyMap()) to ToolErrorCode.SERVICE_UNAVAILABLE,
+            ToolCall("map_notif_2", "tap_notification", mapOf("notification_key" to "invalid")) to ToolErrorCode.INVALID_INPUT,
+            ToolCall("map_notif_3", "tap_notification", mapOf("notification_key" to "0|com.example.app|123|null|1000")) to ToolErrorCode.SERVICE_UNAVAILABLE,
+            ToolCall("map_notif_4", "dismiss_notification", mapOf("notification_key" to "invalid")) to ToolErrorCode.INVALID_INPUT,
+            ToolCall("map_notif_5", "dismiss_notification", mapOf("notification_key" to "0|com.example.app|123|null|1000")) to ToolErrorCode.SERVICE_UNAVAILABLE,
+            ToolCall("map_notif_6", "reply_notification", mapOf("notification_key" to "0|com.example.app|123|null|1000", "text" to "")) to ToolErrorCode.INVALID_INPUT,
+            ToolCall("map_notif_7", "reply_notification", mapOf("notification_key" to "invalid", "text" to "hello")) to ToolErrorCode.INVALID_INPUT,
+            ToolCall("map_notif_8", "reply_notification", mapOf("notification_key" to "0|com.example.app|123|null|1000", "text" to "hello")) to ToolErrorCode.SERVICE_UNAVAILABLE
+        )
+
+        for ((toolCall, expectedCode) in cases) {
+            val result = api.executeToolCall(toolCall, null)
+            assertTrue(result.isError, "Expected isError=true for ${toolCall.name}, got: ${result.text}")
+            assertEquals(expectedCode, result.errorCode, "Unexpected error code for ${toolCall.name}")
+        }
+    }
+
+    @Test
+    fun `tool results with errorCode always set isError true`() = runTest {
+        val agent = createAgent()
+        val cases = listOf(
+            ToolCall("inv1", "nonexistent_tool", emptyMap()),
+            ToolCall("inv2", "web_search", emptyMap()),
+            ToolCall("inv3", "web_fetch", emptyMap()),
+            ToolCall("inv4", "request_tools", emptyMap()),
+            ToolCall("inv5", "web_browse", mapOf("url" to "https://example.com", "goal" to "Find"))
+        )
+
+        for (toolCall in cases) {
+            val result = agent.executeToolCall(toolCall, null)
+            assertNotNull(result.errorCode, "Expected errorCode for ${toolCall.name}")
+            assertTrue(result.isError, "Expected isError=true when errorCode is set for ${toolCall.name}")
+        }
     }
 
 

@@ -137,7 +137,10 @@ object NotificationHelper {
         return try {
             svc.activeNotifications?.find { it.key == key }
         } catch (e: SecurityException) {
-            null
+            throw NotificationAccessDeniedException(
+                "Notification access denied. Re-enable in Settings → Apps → Special access → Notification access.",
+                e
+            )
         }
     }
 
@@ -165,6 +168,7 @@ object NotificationHelper {
      *
      * @param key The stable notification key from [ParsedNotification.key]
      * @return true if dismissal was requested
+     * @throws NotificationAccessDeniedException if notification access has been revoked
      */
     fun dismissNotification(key: String): Boolean {
         val svc = service ?: return false
@@ -173,7 +177,10 @@ object NotificationHelper {
             svc.cancelNotification(sbn.key)
             true
         } catch (e: SecurityException) {
-            false
+            throw NotificationAccessDeniedException(
+                "Notification access denied. Re-enable in Settings → Apps → Special access → Notification access.",
+                e
+            )
         }
     }
 

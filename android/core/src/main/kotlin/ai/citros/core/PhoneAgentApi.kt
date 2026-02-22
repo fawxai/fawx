@@ -42,7 +42,17 @@ open class PhoneAgentApi(
     /** Citros app token for authenticating to Citros API endpoints. */
     private val citrosAppToken: String? = null,
     /** Sensor provider for device context injection. Null to disable. */
-    private val sensorProvider: SensorProvider? = null
+    private val sensorProvider: SensorProvider? = null,
+    /** ScreenReader attachment check, injectable for unit tests. */
+    private val isScreenReaderAttached: () -> Boolean = { ScreenReader.isAttached() },
+    /** Screen content provider, injectable for unit tests. */
+    private val getScreenContent: () -> ScreenContent = { ScreenReader.getScreenContent() },
+    /** Screenshot provider, injectable for unit tests. */
+    private val takeScreenshot: suspend () -> ScreenshotResult = { ScreenReader.takeScreenshot() },
+    /** Element tap provider, injectable for unit tests. */
+    private val clickElement: (Int) -> ScreenReader.ElementActionResult = { ScreenReader.clickElementDetailed(it) },
+    /** Element long-press provider, injectable for unit tests. */
+    private val longPressElement: (Int) -> ScreenReader.ElementActionResult = { ScreenReader.longPressElementDetailed(it) }
 ) {
     private val taskSensorSnapshotLock = Any()
     @Volatile
@@ -624,13 +634,13 @@ open class PhoneAgentApi(
         return when {
             verification.error != null -> {
                 // Verification system itself failed — don't block the loop
-                ToolResult("${result.text}\n[Verification skipped: ${verification.error}]", result.isError)
+                result.copy(text = "${result.text}\n[Verification skipped: ${verification.error}]")
             }
             verification.verified -> {
-                ToolResult("${result.text}\n[Verified: ${verification.description}]", result.isError)
+                result.copy(text = "${result.text}\n[Verified: ${verification.description}]")
             }
             else -> {
-                ToolResult("${result.text}\n[Verification FAILED: ${verification.description}]", result.isError)
+                result.copy(text = "${result.text}\n[Verification FAILED: ${verification.description}]")
             }
         }
     }
@@ -650,42 +660,58 @@ open class PhoneAgentApi(
                 "tap" -> {
                     val elementId = (toolCall.input["element_id"] as? Number)?.toInt()
                         ?: throw IllegalArgumentException("tap requires element_id (integer)")
-                    
-                    if (ScreenReader.clickElement(elementId)) {
-                        "Tapped element $elementId"
-                    } else {
-                        "Failed: tap: could not tap element $elementId"
+
+                    when (clickElement(elementId)) {
+                        is ScreenReader.ElementActionResult.Success -> ToolResult("Tapped element $elementId")
+                        is ScreenReader.ElementActionResult.PrivacyBlocked ->
+                            privacyBlockedResult("tap")
+                        ScreenReader.ElementActionResult.ServiceUnavailable ->
+                            executionFailedResult("Failed: tap: accessibility service unavailable")
+                        ScreenReader.ElementActionResult.GestureDispatchFailed ->
+                            executionFailedResult("Failed: tap: gesture dispatch failed")
+                        ScreenReader.ElementActionResult.ElementNotFound ->
+                            executionFailedResult("Failed: tap: element $elementId not found")
                     }
                 }
-                
+
                 "tap_text" -> {
                     val text = (toolCall.input["text"] as? String)?.takeIf { it.isNotEmpty() }
                         ?: throw IllegalArgumentException("tap_text requires non-empty text (string)")
-                    
-                    // Find element containing the text
-                    val element = screenContent?.elements?.find { 
-                        it.text?.contains(text, ignoreCase = true) == true ||
-                        it.contentDescription?.contains(text, ignoreCase = true) == true
-                    }
-                    
-                    if (element != null && ScreenReader.clickElement(element.id)) {
-                        "Tapped \"$text\""
+
+                    if (screenContent?.privacyMode == true) {
+                        privacyBlockedResult("tap_text")
                     } else {
-                        "Failed: tap_text: no element matching \"$text\""
+                        // Find element containing the text
+                        val element = screenContent?.elements?.find {
+                            it.text?.contains(text, ignoreCase = true) == true ||
+                            it.contentDescription?.contains(text, ignoreCase = true) == true
+                        }
+
+                        when {
+                            element == null -> executionFailedResult("Failed: tap_text: no element matching \"$text\"")
+                            else -> when (clickElement(element.id)) {
+                            is ScreenReader.ElementActionResult.Success -> ToolResult("Tapped \"$text\"")
+                            is ScreenReader.ElementActionResult.PrivacyBlocked ->
+                                privacyBlockedResult("tap_text")
+                            ScreenReader.ElementActionResult.ServiceUnavailable ->
+                                executionFailedResult("Failed: tap_text: accessibility service unavailable")
+                            ScreenReader.ElementActionResult.GestureDispatchFailed ->
+                                executionFailedResult("Failed: tap_text: gesture dispatch failed")
+                            ScreenReader.ElementActionResult.ElementNotFound ->
+                                executionFailedResult("Failed: tap_text: no element matching \"$text\"")
+                        }
+                    }
                     }
                 }
-                
+
                 "type_text" -> {
                     val text = (toolCall.input["text"] as? String)?.takeIf { it.isNotEmpty() }
                         ?: throw IllegalArgumentException("type_text requires non-empty text (string)")
                     
-                    if (ScreenReader.typeText(text)) {
-                        "Typed \"$text\""
-                    } else {
-                        "Failed: type_text: no text field focused"
-                    }
+                    if (ScreenReader.typeText(text)) ToolResult("Typed \"$text\"")
+                    else executionFailedResult("Failed: type_text: no text field focused")
                 }
-                
+
                 "swipe" -> {
                     val direction = toolCall.input["direction"] as? String
                         ?: throw IllegalArgumentException("swipe requires direction (up/down/left/right)")
@@ -703,13 +729,10 @@ open class PhoneAgentApi(
                         else -> throw IllegalArgumentException("Invalid direction \"$direction\" - use up/down/left/right")
                     }
                     
-                    if (ScreenReader.swipe(startX, startY, endX, endY, durationMs = 500)) {
-                        "Swiped $direction"
-                    } else {
-                        "Failed: swipe: gesture not dispatched"
-                    }
+                    if (ScreenReader.swipe(startX, startY, endX, endY, durationMs = 500)) ToolResult("Swiped $direction")
+                    else executionFailedResult("Failed: swipe: gesture not dispatched")
                 }
-                
+
                 "scroll" -> {
                     val direction = toolCall.input["direction"] as? String
                         ?: throw IllegalArgumentException("scroll requires direction (up/down)")
@@ -727,53 +750,41 @@ open class PhoneAgentApi(
                         else -> throw IllegalArgumentException("Invalid direction \"$direction\" - use up/down")
                     }
                     
-                    if (ScreenReader.swipe(startX, startY, endX, endY, durationMs = 500)) {
-                        "Scrolled $direction"
-                    } else {
-                        "Failed: scroll: gesture not dispatched"
-                    }
+                    if (ScreenReader.swipe(startX, startY, endX, endY, durationMs = 500)) ToolResult("Scrolled $direction")
+                    else executionFailedResult("Failed: scroll: gesture not dispatched")
                 }
-                
+
                 "press_back" -> {
-                    if (ScreenReader.pressBack()) {
-                        "Pressed back"
-                    } else {
-                        "Failed: press_back: gesture not dispatched"
-                    }
+                    if (ScreenReader.pressBack()) ToolResult("Pressed back")
+                    else executionFailedResult("Failed: press_back: gesture not dispatched")
                 }
-                
+
                 "press_home" -> {
-                    if (ScreenReader.pressHome()) {
-                        "Pressed home"
-                    } else {
-                        "Failed: press_home: gesture not dispatched"
-                    }
+                    if (ScreenReader.pressHome()) ToolResult("Pressed home")
+                    else executionFailedResult("Failed: press_home: gesture not dispatched")
                 }
-                
+
                 "open_app" -> {
                     val appName = toolCall.input["app_name"] as? String
                         ?: throw IllegalArgumentException("open_app requires app_name (string)")
-                    
+
                     if (ScreenReader.launchApp(appName)) {
-                        "Opened $appName"
+                        ToolResult("Opened $appName")
                     } else {
                         ScreenReader.pressHome()
-                        "Failed: open_app: $appName not found — returned to home"
+                        executionFailedResult("Failed: open_app: $appName not found — returned to home")
                     }
                 }
-                
+
                 "open_notifications" -> {
-                    if (ScreenReader.openNotifications()) {
-                        "Opened notifications"
-                    } else {
-                        "Failed: open_notifications: could not expand status bar"
-                    }
+                    if (ScreenReader.openNotifications()) ToolResult("Opened notifications")
+                    else executionFailedResult("Failed: open_notifications: could not expand status bar")
                 }
-                
+
                 "think" -> {
                     val thought = (toolCall.input["thought"] as? String)?.takeIf { it.isNotEmpty() }
                         ?: throw IllegalArgumentException("think requires non-empty thought (string)")
-                    "Thought: $thought"
+                    ToolResult("Thought: $thought")
                 }
 
                 "wait" -> {
@@ -781,32 +792,42 @@ open class PhoneAgentApi(
                     kotlinx.coroutines.delay(seconds * 1000L)
                     if (ScreenReader.isAttached()) {
                         val content = ScreenReader.getScreenContent()
-                        "Waited ${seconds}s. Screen:\n${content.toPromptText()}"
+                        ToolResult("Waited ${seconds}s. Screen:\n${content.toPromptText()}")
                     } else {
-                        "Waited ${seconds}s"
+                        ToolResult("Waited ${seconds}s")
                     }
                 }
 
                 "long_press" -> {
                     val elementId = (toolCall.input["element_id"] as? Number)?.toInt()
                         ?: throw IllegalArgumentException("long_press requires element_id (integer)")
-                    
-                    if (ScreenReader.longPressElement(elementId)) {
-                        "Long-pressed element $elementId"
-                    } else {
-                        "Failed: long_press: could not long-press element $elementId"
+
+                    when (longPressElement(elementId)) {
+                        is ScreenReader.ElementActionResult.Success -> ToolResult("Long-pressed element $elementId")
+                        is ScreenReader.ElementActionResult.PrivacyBlocked ->
+                            privacyBlockedResult("long_press")
+                        ScreenReader.ElementActionResult.ServiceUnavailable ->
+                            executionFailedResult("Failed: long_press: accessibility service unavailable")
+                        ScreenReader.ElementActionResult.GestureDispatchFailed ->
+                            executionFailedResult("Failed: long_press: gesture dispatch failed")
+                        ScreenReader.ElementActionResult.ElementNotFound ->
+                            executionFailedResult("Failed: long_press: element $elementId not found")
                     }
                 }
 
                 "copy" -> {
                     if (!ClipboardHelper.isAttached()) {
-                        CLIPBOARD_NOT_ATTACHED
+                        ToolResult(
+                            CLIPBOARD_NOT_ATTACHED,
+                            isError = true,
+                            errorCode = ToolErrorCode.SERVICE_UNAVAILABLE
+                        )
                     } else {
                         val text = ClipboardHelper.read()
                         if (text != null) {
-                            "Clipboard content: $text"
+                            ToolResult("Clipboard content: $text")
                         } else {
-                            "Clipboard is empty or access denied (Android 13+ may restrict clipboard reading)"
+                            ToolResult("Clipboard is empty or access denied (Android 13+ may restrict clipboard reading)")
                         }
                     }
                 }
@@ -815,11 +836,15 @@ open class PhoneAgentApi(
                     val text = (toolCall.input["text"] as? String)?.takeIf { it.isNotEmpty() }
                         ?: throw IllegalArgumentException("set_clipboard requires non-empty text (string)")
                     if (!ClipboardHelper.isAttached()) {
-                        CLIPBOARD_NOT_ATTACHED
+                        ToolResult(
+                            CLIPBOARD_NOT_ATTACHED,
+                            isError = true,
+                            errorCode = ToolErrorCode.SERVICE_UNAVAILABLE
+                        )
                     } else if (ClipboardHelper.write(text)) {
-                        "Copied to clipboard (${text.length} chars): \"${text.take(50)}${if (text.length > 50) "…" else ""}\""
+                        ToolResult("Copied to clipboard (${text.length} chars): \"${text.take(50)}${if (text.length > 50) "…" else ""}\"")
                     } else {
-                        "Failed: set_clipboard: clipboard write denied"
+                        executionFailedResult("Failed: set_clipboard: clipboard write denied")
                     }
                 }
 
@@ -827,24 +852,36 @@ open class PhoneAgentApi(
                     val text = (toolCall.input["text"] as? String)?.takeIf { it.isNotEmpty() }
                         ?: throw IllegalArgumentException("paste requires non-empty text (string)")
                     if (!ClipboardHelper.isAttached()) {
-                        CLIPBOARD_NOT_ATTACHED
+                        ToolResult(
+                            CLIPBOARD_NOT_ATTACHED,
+                            isError = true,
+                            errorCode = ToolErrorCode.SERVICE_UNAVAILABLE
+                        )
                     } else if (ClipboardHelper.writeAndPaste(text)) {
-                        "Pasted (${text.length} chars): \"${text.take(50)}${if (text.length > 50) "…" else ""}\""
+                        ToolResult("Pasted (${text.length} chars): \"${text.take(50)}${if (text.length > 50) "…" else ""}\"")
                     } else {
-                        "Failed: paste: no focused input field or clipboard write failed"
+                        executionFailedResult("Failed: paste: no focused input field or clipboard write failed")
                     }
                 }
 
                 "read_notifications" -> {
                     if (!NotificationHelper.isAttached()) {
-                        NOTIFICATION_NOT_ATTACHED
+                        ToolResult(
+                            NOTIFICATION_NOT_ATTACHED,
+                            isError = true,
+                            errorCode = ToolErrorCode.SERVICE_UNAVAILABLE
+                        )
                     } else {
                         try {
                             val includeOngoing = toolCall.input["include_ongoing"] as? Boolean ?: false
                             val notifications = NotificationHelper.getActiveNotifications(includeOngoing)
-                            NotificationHelper.formatForPrompt(notifications)
+                            ToolResult(NotificationHelper.formatForPrompt(notifications))
                         } catch (e: NotificationAccessDeniedException) {
-                            e.message ?: "Notification access denied"
+                            ToolResult(
+                                e.message ?: "Notification access denied",
+                                isError = true,
+                                errorCode = ToolErrorCode.ACCESS_DENIED
+                            )
                         }
                     }
                 }
@@ -852,22 +889,30 @@ open class PhoneAgentApi(
                 "tap_notification" -> {
                     val key = requireValidNotificationKey(toolCall, "tap_notification")
                     if (!NotificationHelper.isAttached()) {
-                        NOTIFICATION_NOT_ATTACHED
+                        ToolResult(
+                            NOTIFICATION_NOT_ATTACHED,
+                            isError = true,
+                            errorCode = ToolErrorCode.SERVICE_UNAVAILABLE
+                        )
                     } else if (NotificationHelper.tapNotification(key)) {
-                        "Opened notification"
+                        ToolResult("Opened notification")
                     } else {
-                        "Failed: tap_notification: notification may have been dismissed or has no content intent"
+                        executionFailedResult("Failed: tap_notification: notification may have been dismissed or has no content intent")
                     }
                 }
 
                 "dismiss_notification" -> {
                     val key = requireValidNotificationKey(toolCall, "dismiss_notification")
                     if (!NotificationHelper.isAttached()) {
-                        NOTIFICATION_NOT_ATTACHED
+                        ToolResult(
+                            NOTIFICATION_NOT_ATTACHED,
+                            isError = true,
+                            errorCode = ToolErrorCode.SERVICE_UNAVAILABLE
+                        )
                     } else if (NotificationHelper.dismissNotification(key)) {
-                        "Dismissed notification"
+                        ToolResult("Dismissed notification")
                     } else {
-                        "Failed: dismiss_notification: notification may be ongoing or already dismissed"
+                        executionFailedResult("Failed: dismiss_notification: notification may be ongoing or already dismissed")
                     }
                 }
 
@@ -876,36 +921,62 @@ open class PhoneAgentApi(
                     val text = (toolCall.input["text"] as? String)?.takeIf { it.isNotEmpty() }
                         ?: throw IllegalArgumentException("reply_notification requires non-empty text (string)")
                     if (!NotificationHelper.isAttached()) {
-                        NOTIFICATION_NOT_ATTACHED
+                        ToolResult(
+                            NOTIFICATION_NOT_ATTACHED,
+                            isError = true,
+                            errorCode = ToolErrorCode.SERVICE_UNAVAILABLE
+                        )
                     } else if (NotificationHelper.replyToNotification(key, text)) {
-                        "Replied to notification"
+                        ToolResult("Replied to notification")
                     } else {
-                        "Failed: reply_notification: notification may not support inline reply or was dismissed"
+                        executionFailedResult("Failed: reply_notification: notification may not support inline reply or was dismissed")
                     }
                 }
 
                 "read_screen" -> {
-                    if (ScreenReader.isAttached()) {
-                        val content = ScreenReader.getScreenContent()
-                        "Screen refreshed:\n${content.toPromptText()}"
+                    if (isScreenReaderAttached()) {
+                        val content = getScreenContent()
+                        if (content.privacyMode) {
+                            ToolResult(
+                                "Screen refreshed:\n${content.toToolResult()}",
+                                isError = true,
+                                errorCode = ToolErrorCode.PRIVACY_BLOCKED
+                            )
+                        } else {
+                            ToolResult("Screen refreshed:\n${content.toToolResult()}")
+                        }
                     } else {
-                        "Accessibility service not attached"
+                        ToolResult(
+                            "Accessibility service not attached",
+                            isError = true,
+                            errorCode = ToolErrorCode.SERVICE_UNAVAILABLE
+                        )
                     }
                 }
 
                 "screenshot" -> {
-                    if (!ScreenReader.isAttached()) {
-                        "Accessibility service not attached"
+                    if (!isScreenReaderAttached()) {
+                        ToolResult(
+                            "Accessibility service not attached",
+                            isError = true,
+                            errorCode = ToolErrorCode.SERVICE_UNAVAILABLE
+                        )
                     } else {
-                        val base64 = ScreenReader.takeScreenshot()
-                            ?: return ToolResult("Failed: screenshot: requires Android 11+", isError = true)
+                        val screenshot = takeScreenshot()
+                        val base64 = when (screenshot) {
+                            is ScreenshotResult.Success -> screenshot.base64
+                            is ScreenshotResult.PrivacyBlocked -> return privacyBlockedResult("screenshot")
+                            is ScreenshotResult.Failed -> return executionFailedResult(
+                                "Failed: screenshot: ${screenshot.reason ?: "requires Android 11+"}"
+                            )
+                        }
                         val prompt = (toolCall.input["prompt"] as? String)?.takeIf { it.isNotBlank() }
                             ?: PhoneAgentPrompts.DEFAULT_VISION_PROMPT
                         // Use chat model (vision-capable) for screenshot description
                         val result = chatClient.describeImage(base64, prompt)
                         result.fold(
-                            onSuccess = { description -> "Screenshot description:\n$description" },
-                            onFailure = { error -> "Screenshot captured but vision failed: ${error.message}" }
+                            onSuccess = { description -> ToolResult("Screenshot description:\n$description") },
+                            onFailure = { error -> executionFailedResult("Screenshot captured but vision failed: ${error.message}") }
                         )
                     }
                 }
@@ -997,44 +1068,44 @@ open class PhoneAgentApi(
 
                 "web_search" -> {
                     val query = toolCall.input["query"]?.toString()
-                        ?: return ToolResult("Missing required parameter: query", isError = true)
+                        ?: return invalidInputResult("Missing required parameter: query")
                     val count = (toolCall.input["count"] as? Number)?.toInt() ?: 3
                     searchClient.search(query, count)
                 }
 
                 "web_fetch" -> {
                     val url = toolCall.input["url"]?.toString()
-                        ?: return ToolResult("Missing required parameter: url", isError = true)
+                        ?: return invalidInputResult("Missing required parameter: url")
                     val maxChars = (toolCall.input["max_chars"] as? Number)?.toInt() ?: 5000
                     fetchClient.fetch(url, maxChars)
                 }
 
                 "web_browse" -> {
                     val client = tinyFishClient
-                        ?: return ToolResult("Web browse not available: TinyFish API key not configured", isError = true)
+                        ?: return ToolResult(
+                            "Web browse not available: TinyFish API key not configured",
+                            isError = true,
+                            errorCode = ToolErrorCode.NOT_CONFIGURED
+                        )
                     val url = toolCall.input["url"]?.toString()
-                        ?: return ToolResult("Missing required parameter: url", isError = true)
+                        ?: return invalidInputResult("Missing required parameter: url")
                     val goal = toolCall.input["goal"]?.toString()
-                        ?: return ToolResult("Missing required parameter: goal", isError = true)
+                        ?: return invalidInputResult("Missing required parameter: goal")
                     val stealth = toolCall.input["stealth"] as? Boolean ?: false
                     client.browse(url = url, goal = goal, stealth = stealth, onProgress = onToolProgress)
                 }
 
                 "request_tools" -> {
                     val rawCategories = toolCall.input["categories"] as? List<*>
-                        ?: return ToolResult(
-                            "Missing required parameter: categories (array of strings)",
-                            isError = true
-                        )
+                        ?: return invalidInputResult("Missing required parameter: categories (array of strings)")
                     val validCategories = ToolCategory.entries
                         .filter { it != ToolCategory.CORE }
                         .map { it.name.lowercase() }
                         .sorted()
 
                     if (rawCategories.isEmpty()) {
-                        return ToolResult(
+                        return invalidInputResult(
                             "categories must contain at least one category. Available: ${validCategories.joinToString(", ")}",
-                            isError = true
                         )
                     }
 
@@ -1059,16 +1130,14 @@ open class PhoneAgentApi(
                     }
 
                     if (invalidCategories.isNotEmpty()) {
-                        return ToolResult(
+                        return invalidInputResult(
                             "Invalid categories: ${invalidCategories.joinToString(", ")}. Available: ${validCategories.joinToString(", ")}",
-                            isError = true
                         )
                     }
 
                     if (requested.isEmpty()) {
-                        return ToolResult(
+                        return invalidInputResult(
                             "No valid categories requested. Available: ${validCategories.joinToString(", ")}",
-                            isError = true
                         )
                     }
 
@@ -1094,38 +1163,84 @@ open class PhoneAgentApi(
                 }
 
                 else -> {
-                    "Failed: unknown tool \"${toolCall.name}\""
+                    ToolResult(
+                        "Failed: unknown tool \"${toolCall.name}\"",
+                        isError = true,
+                        errorCode = ToolErrorCode.TOOL_NOT_FOUND
+                    )
                 }
             }
             val elapsedMs = System.currentTimeMillis() - startMs
-            if (result is ToolResult) {
-                Log.d(TAG, "executeToolCall: name=${toolCall.name} done in ${elapsedMs}ms, result='${result.text.take(120)}'")
-                result
-            } else {
-                val text = result as String
-                Log.d(TAG, "executeToolCall: name=${toolCall.name} done in ${elapsedMs}ms, result='${text.take(120)}'")
-                ToolResult(text)
-            }
+            Log.d(TAG, "executeToolCall: name=${toolCall.name} done in ${elapsedMs}ms, result='${result.text.take(120)}'")
+            result
+        } catch (e: IllegalArgumentException) {
+            val elapsedMs = System.currentTimeMillis() - startMs
+            Log.e(TAG, "executeToolCall: name=${toolCall.name} INVALID_INPUT in ${elapsedMs}ms: ${e.message}")
+            ToolResult(
+                "Failed: ${toolCall.name}: ${e.message?.take(100)}",
+                isError = true,
+                errorCode = ToolErrorCode.INVALID_INPUT
+            )
+        } catch (e: NotificationAccessDeniedException) {
+            val elapsedMs = System.currentTimeMillis() - startMs
+            Log.e(TAG, "executeToolCall: name=${toolCall.name} ACCESS_DENIED in ${elapsedMs}ms: ${e.message}")
+            ToolResult(
+                e.message ?: "Notification access denied",
+                isError = true,
+                errorCode = ToolErrorCode.ACCESS_DENIED
+            )
         } catch (e: Exception) {
             val elapsedMs = System.currentTimeMillis() - startMs
             Log.e(TAG, "executeToolCall: name=${toolCall.name} FAILED in ${elapsedMs}ms: ${e.message}")
-            ToolResult("Failed: ${toolCall.name}: ${e.message?.take(100)}", isError = true)
+            ToolResult(
+                "Failed: ${toolCall.name}: ${e.message?.take(100)}",
+                isError = true,
+                errorCode = ToolErrorCode.EXECUTION_FAILED
+            )
         }
     }
-    
+
+    private fun executionFailedResult(text: String): ToolResult =
+        ToolResult(text, isError = true, errorCode = ToolErrorCode.EXECUTION_FAILED)
+
+    private fun invalidInputResult(text: String): ToolResult =
+        ToolResult(text, isError = true, errorCode = ToolErrorCode.INVALID_INPUT)
+
+    private fun privacyBlockedResult(toolName: String): ToolResult =
+        ToolResult(privacyBlockedByMode(toolName), isError = true, errorCode = ToolErrorCode.PRIVACY_BLOCKED)
+
     private inline fun fileToolResult(toolName: String, block: () -> String): ToolResult {
         return try {
             ToolResult(block())
         } catch (e: SecurityException) {
-            ToolResult(fileToolError(toolName, "Access denied: ${e.message}"), isError = true)
+            ToolResult(
+                fileToolError(toolName, "Access denied: ${e.message}"),
+                isError = true,
+                errorCode = ToolErrorCode.ACCESS_DENIED
+            )
         } catch (e: IllegalArgumentException) {
-            ToolResult(fileToolError(toolName, "Invalid input: ${e.message}"), isError = true)
+            ToolResult(
+                fileToolError(toolName, "Invalid input: ${e.message}"),
+                isError = true,
+                errorCode = ToolErrorCode.INVALID_INPUT
+            )
         } catch (e: IllegalStateException) {
-            ToolResult(fileToolError(toolName, "Tool not configured: ${e.message}"), isError = true)
+            ToolResult(
+                fileToolError(toolName, "Tool not configured: ${e.message}"),
+                isError = true,
+                errorCode = ToolErrorCode.NOT_CONFIGURED
+            )
         } catch (e: Exception) {
-            ToolResult(fileToolError(toolName, e.message ?: "Unknown error"), isError = true)
+            ToolResult(
+                fileToolError(toolName, e.message ?: "Unknown error"),
+                isError = true,
+                errorCode = ToolErrorCode.EXECUTION_FAILED
+            )
         }
     }
+
+    private fun privacyBlockedByMode(toolName: String): String =
+        "Failed: $toolName: blocked by privacy mode for ${PrivacyRedaction.APP_PLACEHOLDER}"
 
     private fun currentExecutionModelTier(): ModelTier =
         actionClient.modelId?.let { ModelClassifier.classify(it) } ?: ModelTier.STANDARD
@@ -1159,11 +1274,23 @@ open class PhoneAgentApi(
         return try {
             ToolResult(block())
         } catch (e: IllegalArgumentException) {
-            ToolResult(memoryToolError(toolName, "Invalid input: ${e.message}"), isError = true)
+            ToolResult(
+                memoryToolError(toolName, "Invalid input: ${e.message}"),
+                isError = true,
+                errorCode = ToolErrorCode.INVALID_INPUT
+            )
         } catch (e: IllegalStateException) {
-            ToolResult(memoryToolError(toolName, "Tool not configured: ${e.message}"), isError = true)
+            ToolResult(
+                memoryToolError(toolName, "Tool not configured: ${e.message}"),
+                isError = true,
+                errorCode = ToolErrorCode.NOT_CONFIGURED
+            )
         } catch (e: Exception) {
-            ToolResult(memoryToolError(toolName, e.message ?: "Unknown error"), isError = true)
+            ToolResult(
+                memoryToolError(toolName, e.message ?: "Unknown error"),
+                isError = true,
+                errorCode = ToolErrorCode.EXECUTION_FAILED
+            )
         }
     }
 

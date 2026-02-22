@@ -162,6 +162,7 @@ class ChatActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         handleOauthCallbackIntent(intent)
         enableEdgeToEdge()
+        configureScreenReaderPrivacyList(applicationContext)
         runCatching {
             syncLauncherIconWithPreferences(this)
         }.onFailure { error ->
@@ -336,6 +337,10 @@ class ChatActivity : ComponentActivity() {
         fun oauthCallbackFlow() = oauthCallbackState.asStateFlow()
         fun clearOauthCallback() {
             oauthCallbackState.value = null
+        }
+
+        internal fun configureScreenReaderPrivacyList(context: Context) {
+            ScreenReader.configurePrivacyList(SharedPrefsPrivacyList(context.applicationContext))
         }
     }
 }

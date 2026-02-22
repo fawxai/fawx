@@ -89,5 +89,16 @@ data class ChatResponse(
 data class ToolResult(
     val text: String,
     val isError: Boolean = false,
-    val severity: ErrorSeverity? = null
+    val severity: ErrorSeverity? = null,
+    val errorCode: ToolErrorCode? = null
 )
+
+enum class ToolErrorCode {
+    INVALID_INPUT,
+    SERVICE_UNAVAILABLE,
+    PRIVACY_BLOCKED,
+    ACCESS_DENIED,
+    NOT_CONFIGURED,
+    TOOL_NOT_FOUND,
+    EXECUTION_FAILED
+}

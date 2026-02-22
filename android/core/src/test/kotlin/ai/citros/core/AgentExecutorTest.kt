@@ -4,6 +4,7 @@ import kotlinx.coroutines.test.runTest
 import org.junit.Before
 import org.junit.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
 import kotlin.test.assertTrue
@@ -233,6 +234,83 @@ class AgentExecutorTest {
         assertIs<LoopResult.Completed>(result)
         assertEquals("end_turn", result.exitReason)
         assertTrue(mockDelegate.toolResults.any { it.second.contains("Error: Crash!") })
+    }
+
+    @Test
+    fun `private read_screen result progresses to blind action without repeated read retries`() = runTest {
+        mockDelegate.onExecute = { toolCall, _ ->
+            when (toolCall.name) {
+                "read_screen" -> ToolResult("Screen refreshed:\nSCREEN: [Privacy mode — screen content hidden for private_app. Ask the user for guidance if needed.]", isError = true)
+                "press_back" -> ToolResult("Pressed back")
+                else -> ToolResult("Unexpected tool ${toolCall.name}", isError = true)
+            }
+        }
+
+        val executor = AgentExecutor(mockDelegate, mockListener)
+        val initialResponse = ChatResponse(
+            text = null,
+            toolCalls = listOf(ToolCall("t1", "read_screen", emptyMap())),
+            stopReason = "tool_use"
+        )
+        var continueCalls = 0
+
+        val result = executor.run(initialResponse, null, { false }) {
+            continueCalls++
+            if (continueCalls == 1) {
+                ChatResponse(
+                    text = null,
+                    toolCalls = listOf(ToolCall("t2", "press_back", emptyMap())),
+                    stopReason = "tool_use"
+                )
+            } else {
+                ChatResponse(text = "Recovered with blind action", toolCalls = emptyList(), stopReason = "end_turn")
+            }
+        }
+
+        assertIs<LoopResult.Completed>(result)
+        assertEquals("end_turn", result.exitReason)
+        assertEquals(listOf("read_screen", "press_back"), mockListener.toolResults.map { it.first })
+        assertEquals(1, mockListener.toolResults.count { it.first == "read_screen" })
+        assertTrue(mockDelegate.toolResults.first().second.contains("private_app"))
+        assertFalse(mockDelegate.toolResults.first().second.contains("com.bank.app"))
+    }
+
+    @Test
+    fun `private screenshot block progresses to blind action without repeated screenshot retries`() = runTest {
+        mockDelegate.onExecute = { toolCall, _ ->
+            when (toolCall.name) {
+                "screenshot" -> ToolResult("Failed: screenshot: blocked by privacy mode for private_app", isError = true)
+                "press_home" -> ToolResult("Pressed home")
+                else -> ToolResult("Unexpected tool ${toolCall.name}", isError = true)
+            }
+        }
+
+        val executor = AgentExecutor(mockDelegate, mockListener)
+        val initialResponse = ChatResponse(
+            text = null,
+            toolCalls = listOf(ToolCall("t1", "screenshot", emptyMap())),
+            stopReason = "tool_use"
+        )
+        var continueCalls = 0
+
+        val result = executor.run(initialResponse, null, { false }) {
+            continueCalls++
+            if (continueCalls == 1) {
+                ChatResponse(
+                    text = null,
+                    toolCalls = listOf(ToolCall("t2", "press_home", emptyMap())),
+                    stopReason = "tool_use"
+                )
+            } else {
+                ChatResponse(text = "Used blind fallback", toolCalls = emptyList(), stopReason = "end_turn")
+            }
+        }
+
+        assertIs<LoopResult.Completed>(result)
+        assertEquals("end_turn", result.exitReason)
+        assertEquals(listOf("screenshot", "press_home"), mockListener.toolResults.map { it.first })
+        assertEquals(1, mockListener.toolResults.count { it.first == "screenshot" })
+        assertTrue(mockDelegate.toolResults.first().second.contains("private_app"))
     }
 
     @Test

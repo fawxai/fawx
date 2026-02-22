@@ -14,6 +14,8 @@ import android.view.Display
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
 import java.io.ByteArrayOutputStream
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
 
@@ -24,8 +26,73 @@ import kotlin.coroutines.suspendCoroutine
 object ScreenReader {
     
     private const val TAG = "CitrosScreen"
+    private const val PRIVACY_TAG = "CitrosPrivacy"
+    private const val SYSTEM_UI_PACKAGE = "com.android.systemui"
+    private const val PRIVACY_APP_PLACEHOLDER = PrivacyRedaction.APP_PLACEHOLDER
     
+    @Volatile
     private var service: AccessibilityService? = null
+    private val startupLock = Any()
+    private val privacyListRef = AtomicReference<PrivacyList?>(null)
+    private val privacyBlockedPackageOverrideForTests = AtomicReference<String?>(null)
+    var privacyList: PrivacyList?
+        get() = privacyListRef.get()
+        private set(value) {
+            privacyListRef.set(value)
+        }
+    private enum class PrivacyBlockSource {
+        READ_SCREEN,
+        SCREENSHOT,
+        ACTION
+    }
+
+    private data class PrivacySignalSnapshot(
+        val rootInActiveWindowPackage: String?,
+        val foregroundPackage: String?,
+        val visiblePackages: List<String?>
+    )
+
+    private class PrivacyBlockMetrics {
+        private val totalCounter = AtomicInteger(0)
+        private val counters = mapOf(
+            PrivacyBlockSource.READ_SCREEN to AtomicInteger(0),
+            PrivacyBlockSource.SCREENSHOT to AtomicInteger(0),
+            PrivacyBlockSource.ACTION to AtomicInteger(0)
+        )
+
+        fun emit(source: PrivacyBlockSource) {
+            totalCounter.incrementAndGet()
+            counters[source]?.incrementAndGet()
+        }
+
+        fun reset() {
+            totalCounter.set(0)
+            counters.values.forEach { it.set(0) }
+        }
+
+        fun total(): Int = totalCounter.get()
+
+        fun bySource(source: PrivacyBlockSource): Int = counters[source]?.get() ?: 0
+
+        fun totalCounterRef(): AtomicInteger = totalCounter
+
+        fun sourceCounterRef(source: PrivacyBlockSource): AtomicInteger =
+            counters[source] ?: AtomicInteger(0)
+    }
+
+    private val privacyMetrics = PrivacyBlockMetrics()
+    internal val privacyBlockCounter = privacyMetrics.totalCounterRef()
+    internal val privacyReadScreenCounter = privacyMetrics.sourceCounterRef(PrivacyBlockSource.READ_SCREEN)
+    internal val privacyScreenshotCounter = privacyMetrics.sourceCounterRef(PrivacyBlockSource.SCREENSHOT)
+    internal val privacyActionCounter = privacyMetrics.sourceCounterRef(PrivacyBlockSource.ACTION)
+
+    sealed interface ElementActionResult {
+        data object Success : ElementActionResult
+        data object PrivacyBlocked : ElementActionResult
+        data object ElementNotFound : ElementActionResult
+        data object ServiceUnavailable : ElementActionResult
+        data object GestureDispatchFailed : ElementActionResult
+    }
 
     /**
      * Delay in milliseconds after hiding the overlay before capturing.
@@ -78,14 +145,39 @@ object ScreenReader {
     var screenshotOverlayRestoreHook: (suspend () -> Unit)? = null
     
     fun attach(accessibilityService: AccessibilityService) {
-        service = accessibilityService
+        synchronized(startupLock) {
+            service = accessibilityService
+            resetPrivacyCounters()
+        }
+    }
+
+    /**
+     * Atomically publish both service attachment and privacy-list configuration.
+     *
+     * This avoids a startup window where other threads could observe an attached
+     * service before privacy enforcement is configured.
+     */
+    fun attach(accessibilityService: AccessibilityService, privacyList: PrivacyList?) {
+        synchronized(startupLock) {
+            privacyListRef.set(privacyList)
+            service = accessibilityService
+            resetPrivacyCounters()
+        }
+    }
+
+    fun configurePrivacyList(list: PrivacyList?) {
+        synchronized(startupLock) {
+            privacyList = list
+        }
     }
     
     fun detach() {
-        service = null
+        synchronized(startupLock) {
+            service = null
+        }
     }
     
-    fun isAttached(): Boolean = service != null
+    fun isAttached(): Boolean = synchronized(startupLock) { service != null }
 
     /**
      * Wait for the accessibility service to (re)attach.
@@ -114,7 +206,7 @@ object ScreenReader {
      * Do not call directly from other components — use ScreenReader's
      * public methods for screen interaction.
      */
-    internal fun getService(): AccessibilityService? = service
+    internal fun getService(): AccessibilityService? = synchronized(startupLock) { service }
     
     /**
      * Get display dimensions in pixels.
@@ -160,11 +252,19 @@ object ScreenReader {
      * Compresses to ~720p width to reduce token usage for vision models.
      * Requires API 30+ (Android 11) for AccessibilityService.takeScreenshot().
      *
-     * @return Base64-encoded PNG string, or null if capture failed
+     * @return [ScreenshotResult] with success, privacy block, or failure reason
      */
-    suspend fun takeScreenshot(): String? {
-        val svc = service ?: return null
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
+    suspend fun takeScreenshot(): ScreenshotResult {
+        val svc = service ?: return ScreenshotResult.Failed("Accessibility service not attached")
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            return ScreenshotResult.Failed("Screenshot requires Android 11+")
+        }
+
+        if (getPrivacyBlockedPackage(svc) != null) {
+            recordPrivacyBlock(source = PrivacyBlockSource.SCREENSHOT)
+            logPrivacyBlock(source = PrivacyBlockSource.SCREENSHOT)
+            return ScreenshotResult.PrivacyBlocked
+        }
 
         // Hide overlay before capture so it doesn't appear in the screenshot
         try {
@@ -187,15 +287,15 @@ object ScreenReader {
             } catch (e: Exception) {
                 Log.w(TAG, "takeScreenshot: overlay restore hook failed: ${e.message}")
             }
-        } ?: return null
+        } ?: return ScreenshotResult.Failed("Screenshot capture failed")
 
         var scaled: Bitmap? = null
         return try {
             scaled = scaleBitmap(bitmap, SCREENSHOT_TARGET_WIDTH)
             val base64 = encodeBitmapToBase64Png(scaled)
-            base64
+            ScreenshotResult.Success(base64)
         } catch (_: Exception) {
-            null
+            ScreenshotResult.Failed("Screenshot encoding failed")
         } finally {
             if (scaled != null && scaled !== bitmap) scaled.recycle()
             bitmap.recycle()
@@ -267,6 +367,23 @@ object ScreenReader {
      */
     fun getScreenContent(): ScreenContent {
         val svc = service ?: return ScreenContent(elements = emptyList(), packageName = null)
+        val snapshot = capturePrivacySignalSnapshot(svc)
+        return getScreenContentInternal(svc, snapshot)
+    }
+
+    private fun getScreenContentInternal(
+        svc: AccessibilityService,
+        snapshot: PrivacySignalSnapshot
+    ): ScreenContent {
+        if (getPrivacyBlockedPackage(snapshot) != null) {
+            recordPrivacyBlock(source = PrivacyBlockSource.READ_SCREEN)
+            logPrivacyBlock(source = PrivacyBlockSource.READ_SCREEN)
+            return ScreenContent(
+                elements = emptyList(),
+                packageName = PRIVACY_APP_PLACEHOLDER,
+                privacyMode = true
+            )
+        }
 
         // Try window-aware approach: pick the best app window that isn't us
         val appRoot = findAppWindowRoot(svc)
@@ -296,6 +413,115 @@ object ScreenReader {
         root.recycle()
         Log.d(TAG, "getScreenContent: FALLBACK rootInActiveWindow, package=$pkg, elements=${elements.size}")
         return ScreenContent(elements = elements, packageName = pkg)
+    }
+
+    internal fun detectForegroundPackage(svc: AccessibilityService): String? {
+        val root = findAppWindowRoot(svc) ?: return null
+        return try {
+            root.packageName?.toString()
+        } finally {
+            root.recycle()
+        }
+    }
+
+    internal fun isPrivacyBlocked(svc: AccessibilityService): Boolean =
+        getPrivacyBlockedPackage(capturePrivacySignalSnapshot(svc)) != null
+
+    private fun getPrivacyBlockedPackage(svc: AccessibilityService): String? =
+        getPrivacyBlockedPackage(capturePrivacySignalSnapshot(svc))
+
+    private fun getPrivacyBlockedPackage(snapshot: PrivacySignalSnapshot): String? {
+        privacyBlockedPackageOverrideForTests.get()?.let { return it }
+        return resolvePrivacyBlockedPackage(
+            rootInActiveWindowPackage = snapshot.rootInActiveWindowPackage,
+            foregroundPackage = snapshot.foregroundPackage,
+            visiblePackages = snapshot.visiblePackages,
+            privacyList = privacyList
+        )
+    }
+
+    internal fun setPrivacyBlockOverrideForTests(packageName: String?) {
+        privacyBlockedPackageOverrideForTests.set(packageName)
+    }
+
+    internal fun clearPrivacyBlockOverrideForTests() {
+        privacyBlockedPackageOverrideForTests.set(null)
+    }
+
+    internal fun resolvePrivacyBlockedPackage(
+        rootInActiveWindowPackage: String?,
+        foregroundPackage: String?,
+        visiblePackages: List<String?>,
+        privacyList: PrivacyList?
+    ): String? {
+        val list = privacyList ?: return null
+
+        fun normalize(pkg: String?): String? = pkg?.trim()?.takeIf { it.isNotEmpty() }
+        fun isPrivate(pkg: String?): Boolean = normalize(pkg)?.let(list::isPrivate) == true
+
+        // Fail-secure dual check: block if either source reports a private package.
+        if (isPrivate(rootInActiveWindowPackage)) return normalize(rootInActiveWindowPackage)
+        if (isPrivate(foregroundPackage)) return normalize(foregroundPackage)
+
+        // Notification shade/system UI can render notification text from other apps without
+        // exposing source package per node. Fail secure whenever systemui is foreground and
+        // privacy mode is active for at least one app.
+        if ((normalize(rootInActiveWindowPackage) == SYSTEM_UI_PACKAGE ||
+                normalize(foregroundPackage) == SYSTEM_UI_PACKAGE) &&
+            list.getAll().isNotEmpty()
+        ) {
+            return SYSTEM_UI_PACKAGE
+        }
+
+        // Split-screen/multi-window: block if any visible app window is private.
+        for (pkg in visiblePackages) {
+            if (isPrivate(pkg)) return normalize(pkg)
+        }
+        return null
+    }
+
+    private fun logPrivacyBlock(source: PrivacyBlockSource) {
+        Log.d(
+            PRIVACY_TAG,
+            "privacy_block source=${source.logValue()} blocked=true"
+        )
+    }
+
+    private fun capturePrivacySignalSnapshot(svc: AccessibilityService): PrivacySignalSnapshot =
+        PrivacySignalSnapshot(
+            rootInActiveWindowPackage = getRootInActiveWindowPackage(svc),
+            foregroundPackage = detectForegroundPackage(svc),
+            visiblePackages = getVisibleApplicationPackages(svc)
+        )
+
+    private fun getRootInActiveWindowPackage(svc: AccessibilityService): String? {
+        val root = svc.rootInActiveWindow ?: return null
+        return try {
+            root.packageName?.toString()
+        } finally {
+            root.recycle()
+        }
+    }
+
+    private fun getVisibleApplicationPackages(svc: AccessibilityService): List<String?> {
+        val windows = try {
+            svc.windows
+        } catch (e: Exception) {
+            Log.w(PRIVACY_TAG, "getVisibleApplicationPackages: getWindows() threw: ${e.message}")
+            null
+        } ?: return emptyList()
+
+        val packages = mutableListOf<String?>()
+        for (window in windows) {
+            if (window.type != AccessibilityWindowInfo.TYPE_APPLICATION) continue
+            val root = window.root ?: continue
+            try {
+                packages.add(root.packageName?.toString())
+            } finally {
+                root.recycle()
+            }
+        }
+        return packages
     }
 
     /**
@@ -345,9 +571,12 @@ object ScreenReader {
             )
         }
 
-        Log.d(TAG, "findAppWindowRoot: ${windows.size} windows, ${candidates.size} app candidates: ${candidates.map { "${it.packageName ?: "unknown"}(active=${it.isActive},focused=${it.isFocused})" }}, self=$selfPackage")
+        Log.d(
+            TAG,
+            "findAppWindowRoot: ${windows.size} windows, ${candidates.size} app candidates, active=${candidates.count { it.isActive }}, focused=${candidates.count { it.isFocused }}"
+        )
         val result = pickBestWindow(candidates, selfPackage)
-        Log.d(TAG, "findAppWindowRoot: selected=${result?.packageName}")
+        Log.d(TAG, "findAppWindowRoot: selected=${result != null}")
         return result
     }
 
@@ -426,9 +655,24 @@ object ScreenReader {
      * Click on an element by ID.
      */
     fun clickElement(elementId: Int): Boolean {
-        val content = getScreenContent()
-        val element = content.elements.getOrNull(elementId) ?: return false
-        return clickAt(element.bounds.centerX(), element.bounds.centerY())
+        return clickElementDetailed(elementId) is ElementActionResult.Success
+    }
+
+    fun clickElementDetailed(elementId: Int): ElementActionResult {
+        val svc = getService() ?: return ElementActionResult.ServiceUnavailable
+        val snapshot = capturePrivacySignalSnapshot(svc)
+        if (getPrivacyBlockedPackage(snapshot) != null) {
+            recordPrivacyBlock(source = PrivacyBlockSource.ACTION)
+            logPrivacyBlock(source = PrivacyBlockSource.ACTION)
+            return ElementActionResult.PrivacyBlocked
+        }
+        val content = getScreenContentInternal(svc, snapshot)
+        if (content.privacyMode) {
+            return ElementActionResult.PrivacyBlocked
+        }
+        val element = content.elements.getOrNull(elementId) ?: return ElementActionResult.ElementNotFound
+        val dispatched = clickAt(element.bounds.centerX(), element.bounds.centerY())
+        return if (dispatched) ElementActionResult.Success else ElementActionResult.GestureDispatchFailed
     }
     
     /** Default long-press duration in milliseconds. Matches ViewConfiguration default. */
@@ -438,9 +682,27 @@ object ScreenReader {
      * Long-press an element by ID.
      */
     fun longPressElement(elementId: Int, durationMs: Long = LONG_PRESS_DURATION_MS): Boolean {
-        val content = getScreenContent()
-        val element = content.elements.getOrNull(elementId) ?: return false
-        return longPressAt(element.bounds.centerX(), element.bounds.centerY(), durationMs)
+        return longPressElementDetailed(elementId, durationMs) is ElementActionResult.Success
+    }
+
+    fun longPressElementDetailed(
+        elementId: Int,
+        durationMs: Long = LONG_PRESS_DURATION_MS
+    ): ElementActionResult {
+        val svc = getService() ?: return ElementActionResult.ServiceUnavailable
+        val snapshot = capturePrivacySignalSnapshot(svc)
+        if (getPrivacyBlockedPackage(snapshot) != null) {
+            recordPrivacyBlock(source = PrivacyBlockSource.ACTION)
+            logPrivacyBlock(source = PrivacyBlockSource.ACTION)
+            return ElementActionResult.PrivacyBlocked
+        }
+        val content = getScreenContentInternal(svc, snapshot)
+        if (content.privacyMode) {
+            return ElementActionResult.PrivacyBlocked
+        }
+        val element = content.elements.getOrNull(elementId) ?: return ElementActionResult.ElementNotFound
+        val dispatched = longPressAt(element.bounds.centerX(), element.bounds.centerY(), durationMs)
+        return if (dispatched) ElementActionResult.Success else ElementActionResult.GestureDispatchFailed
     }
 
     /**
@@ -639,75 +901,26 @@ object ScreenReader {
     fun openNotifications(): Boolean {
         return service?.performGlobalAction(AccessibilityService.GLOBAL_ACTION_NOTIFICATIONS) ?: false
     }
-}
 
-data class ScreenContent(
-    val elements: List<ScreenElement>,
-    val packageName: String?
-) {
-    companion object {
-        /** Default maximum elements included in prompt text. */
-        const val DEFAULT_ELEMENT_CAP = 40
+    fun getPrivacyBlockCount(): Int = privacyMetrics.total()
+
+    fun getPrivacyReadScreenBlockCount(): Int = privacyMetrics.bySource(PrivacyBlockSource.READ_SCREEN)
+
+    fun getPrivacyScreenshotBlockCount(): Int = privacyMetrics.bySource(PrivacyBlockSource.SCREENSHOT)
+
+    fun getPrivacyActionBlockCount(): Int = privacyMetrics.bySource(PrivacyBlockSource.ACTION)
+
+    private fun recordPrivacyBlock(source: PrivacyBlockSource) {
+        privacyMetrics.emit(source)
     }
 
-    /**
-     * Format screen content as prompt text for the LLM.
-     *
-     * @param elementCap Maximum elements to include (default [DEFAULT_ELEMENT_CAP]).
-     *   Complex apps may have 100+ elements; higher caps give the model more context
-     *   at the cost of more tokens. Use model-tier-aware values for optimization.
-     *   Clamped to 1..200 to prevent degenerate cases.
-     */
-    fun toPromptText(elementCap: Int = DEFAULT_ELEMENT_CAP): String {
-        val cap = elementCap.coerceIn(1, 200)
-        if (elements.isEmpty() && packageName == null) {
-            return "No target app is visible. The Citros overlay is in the foreground. Use open_app to launch the app you need."
-        }
-        val sb = StringBuilder()
-        sb.appendLine("App: ${packageName ?: "unknown"}")
-        
-        // Prioritize interactive and labeled elements, cap at configured limit
-        val prioritized = elements
-            .sortedByDescending { e ->
-                var score = 0
-                if (e.isClickable) score += 3
-                if (e.isEditable) score += 4
-                if (e.text != null) score += 2
-                if (e.contentDescription != null) score += 1
-                score
-            }
-            .take(cap)
-            .sortedBy { it.id }  // Restore visual order
-        
-        prioritized.forEach { element ->
-            val desc = buildString {
-                // Indent by depth for hierarchy hints (2 spaces per level, depths 0-4 shown, 5+ clamped to 4)
-                val indent = "  ".repeat(element.depth.coerceAtMost(4))
-                append("$indent[${element.id}]")
-                element.text?.let { append(" \"${it.take(50)}\"") }
-                element.contentDescription?.let { append(" (${it.take(30)})") }
-                if (element.isClickable) append(" [click]")
-                if (element.isEditable) append(" [edit]")
-            }
-            sb.appendLine(desc)
-        }
-        
-        if (elements.size > cap) {
-            sb.appendLine("(${elements.size - cap} more elements hidden)")
-        }
-        
-        return sb.toString()
+    private fun resetPrivacyCounters() {
+        privacyMetrics.reset()
+    }
+
+    private fun PrivacyBlockSource.logValue(): String = when (this) {
+        PrivacyBlockSource.READ_SCREEN -> "read_screen"
+        PrivacyBlockSource.SCREENSHOT -> "screenshot"
+        PrivacyBlockSource.ACTION -> "action"
     }
 }
-
-data class ScreenElement(
-    val id: Int,
-    val text: String?,
-    val contentDescription: String?,
-    val className: String?,
-    val isClickable: Boolean,
-    val isEditable: Boolean,
-    val bounds: Rect,
-    /** Nesting depth in the accessibility tree (0 = top-level). */
-    val depth: Int = 0
-)
