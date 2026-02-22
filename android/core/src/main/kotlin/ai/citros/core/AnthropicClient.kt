@@ -60,19 +60,11 @@ class AnthropicClient : BaseProviderClient {
     }
 
     override suspend fun chat(conversation: Conversation): Result<String> {
-        return executeRequest(
-            requestBody = buildChatRequest(conversation),
-            parseResponse = { jsonResponse ->
-                val text = parseChatResponse(jsonResponse)
-                    ?: throw ProviderException(
-                        provider = provider,
-                        statusCode = null,
-                        message = "API returned no text content in response",
-                        isAuthFailure = false
-                    )
-                ChatResponse(text, emptyList(), null, parseUsage(jsonResponse))
-            }
-        ).map { it.text!! }
+        return executeTextChat(conversation).map { it.text!! }
+    }
+
+    override suspend fun chatWithUsage(conversation: Conversation): Result<Pair<String, TokenUsage?>> {
+        return executeTextChat(conversation).map { response -> response.text!! to response.usage }
     }
 
     /**

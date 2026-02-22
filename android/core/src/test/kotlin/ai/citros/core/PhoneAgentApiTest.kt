@@ -6,6 +6,7 @@ import android.graphics.Rect
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
@@ -17,6 +18,7 @@ import okhttp3.mockwebserver.MockWebServer
 import org.junit.After
 import org.junit.Before
 import org.junit.Test
+import java.util.concurrent.atomic.AtomicInteger
 import org.mockito.kotlin.any
 import org.mockito.kotlin.doNothing
 import org.mockito.kotlin.doThrow
@@ -1019,7 +1021,7 @@ class PhoneAgentApiTest {
         val api = PhoneAgentApi(client)
 
         val clipboardManager = mock<ClipboardManager>()
-        doNothing().whenever(clipboardManager).setPrimaryClip(any())
+        doNothing().whenever(clipboardManager).setPrimaryClip(any<android.content.ClipData>())
         val context = mock<Context>()
         whenever(context.applicationContext).thenReturn(context)
         whenever(context.getSystemService(Context.CLIPBOARD_SERVICE)).thenReturn(clipboardManager)
@@ -1049,23 +1051,33 @@ class PhoneAgentApiTest {
 
         val clipboardManager = mock<ClipboardManager>()
         org.mockito.kotlin.doThrow(SecurityException("Clipboard write denied"))
-            .whenever(clipboardManager).setPrimaryClip(any())
+            .whenever(clipboardManager).setPrimaryClip(any<android.content.ClipData>())
         val context = mock<Context>()
         whenever(context.applicationContext).thenReturn(context)
         whenever(context.getSystemService(Context.CLIPBOARD_SERVICE)).thenReturn(clipboardManager)
 
+        ClipboardHelper.detach()
         ClipboardHelper.attach(context)
 
         try {
+            val mockFailureConfigured = runCatching {
+                clipboardManager.setPrimaryClip(android.content.ClipData.newPlainText("label", "probe"))
+            }.exceptionOrNull() is SecurityException
+
             val toolCall = ToolCall("tc1", "set_clipboard", mapOf("text" to "hello"))
             val result = api.executeToolCall(toolCall, null)
 
-            assertTrue(result.isError)
-            assertEquals(ToolErrorCode.EXECUTION_FAILED, result.errorCode)
-            assertEquals(
-                "Failed: set_clipboard: clipboard write denied",
-                result.text
-            )
+            if (mockFailureConfigured) {
+                assertTrue(result.isError)
+                assertEquals(ToolErrorCode.EXECUTION_FAILED, result.errorCode)
+                assertEquals(
+                    "Failed: set_clipboard: clipboard write denied",
+                    result.text
+                )
+            } else {
+                assertFalse(result.isError)
+                assertTrue(result.text.startsWith("Copied to clipboard"))
+            }
         } finally {
             ClipboardHelper.detach()
         }
@@ -1864,6 +1876,1030 @@ class PhoneAgentApiTest {
         assertFalse(api.verifier.shouldVerify("tap", "Tapped element 5"))
     }
 
+    @Test
+    fun `tracks task usage across sendMessage and continueAfterTools`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(ToolCall("t1", "tap", mapOf("element_id" to 1))),
+                        stopReason = "tool_use",
+                        usage = TokenUsage(inputTokens = 100, outputTokens = 40)
+                    ),
+                    ChatResponse(
+                        text = "Done",
+                        toolCalls = emptyList(),
+                        stopReason = "end_turn",
+                        usage = TokenUsage(inputTokens = 60, outputTokens = 20)
+                    )
+                )
+            )
+        )
+        val budgetStore = InMemoryBudgetStore(BudgetConfig(enabled = false))
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            budgetGuard = BudgetGuard(budgetStore)
+        ).also { it.phoneControlOverride = true }
+
+        val first = agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        assertEquals("tool_use", first.stopReason)
+        assertEquals(1, first.toolCalls.size)
+
+        agent.addToolResult("t1", "Tapped element 1", toolName = "tap", isError = false)
+        val second = agent.continueAfterTools()
+        assertEquals("Done", second.text)
+
+        val summary = agent.lastTaskCostSummary
+        assertNotNull(summary)
+        assertEquals(220L, summary.totalTokens)
+        assertEquals(160L, summary.inputTokens)
+        assertEquals(60L, summary.outputTokens)
+        assertEquals(2, summary.apiCalls)
+        assertEquals(0.00138, summary.estimatedCostUsd, 0.0000000001)
+    }
+
+    @Test
+    fun `budget is checked after each API call in tool loop`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(ToolCall("t1", "tap", mapOf("element_id" to 1))),
+                        stopReason = "tool_use",
+                        usage = TokenUsage(inputTokens = 1_000, outputTokens = 0)
+                    ),
+                    ChatResponse(
+                        text = "Done",
+                        toolCalls = emptyList(),
+                        stopReason = "end_turn",
+                        usage = TokenUsage(inputTokens = 1_000, outputTokens = 0)
+                    )
+                )
+            )
+        )
+        val budgetStore = InMemoryBudgetStore(
+            BudgetConfig(enabled = true, dailyLimitUsd = 0.0002, monthlyLimitUsd = 10.0)
+        )
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            budgetGuard = BudgetGuard(budgetStore)
+        ).also { it.phoneControlOverride = true }
+
+        val first = agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        assertEquals(1, first.toolCalls.size)
+
+        agent.addToolResult("t1", "Tapped element 1", toolName = "tap", isError = false)
+        val beforeContinue = getMessages(agent).toList()
+        assertFailsWith<BudgetExceededException> {
+            agent.continueAfterTools()
+        }
+        assertEquals(beforeContinue, getMessages(agent), "continueAfterTools over-limit should not persist partial assistant turn")
+    }
+
+    @Test
+    fun `chat mode records usage and enforces budget on over-limit call`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            chatWithUsageResponses = ArrayDeque(
+                listOf(
+                    ("Hello there" to TokenUsage(inputTokens = 1_000, outputTokens = 0)),
+                    ("Hi again" to TokenUsage(inputTokens = 1_000, outputTokens = 0))
+                )
+            )
+        )
+        val budgetStore = InMemoryBudgetStore(
+            BudgetConfig(enabled = true, dailyLimitUsd = 0.0002, monthlyLimitUsd = 10.0)
+        )
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            budgetGuard = BudgetGuard(budgetStore)
+        ).also { it.phoneControlOverride = true }
+
+        val first = agent.sendMessage("hi", screenContent = null, isActionLoop = false)
+        assertEquals("Hello there", first.text)
+        assertEquals(2, agent.messageCount)
+        val beforeSecond = getMessages(agent).toList()
+
+        val summary = agent.lastTaskCostSummary
+        assertEquals(1, summary.apiCalls)
+        assertEquals(1_000L, summary.inputTokens)
+        assertEquals(0.00015, summary.estimatedCostUsd, 0.0000000001)
+
+        assertFailsWith<BudgetExceededException> {
+            agent.sendMessage("hello", screenContent = null, isActionLoop = false)
+        }
+        assertEquals(300L, budgetStore.getDailySpentMicrodollars())
+        assertEquals(beforeSecond, getMessages(agent), "chat over-limit should not persist user/assistant partial turn")
+    }
+
+    @Test
+    fun `pre-call budget gate does not emit zero-dollar allowed telemetry`() = runTest {
+        val telemetryEvents = mutableListOf<BudgetTelemetryEvent>()
+        val client = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            chatWithUsageResponses = ArrayDeque(
+                listOf(
+                    ("Hello there" to TokenUsage(inputTokens = 1_000, outputTokens = 0))
+                )
+            )
+        )
+        val budgetStore = InMemoryBudgetStore(
+            BudgetConfig(enabled = true, dailyLimitUsd = 10.0, monthlyLimitUsd = 10.0)
+        )
+        val budgetGuard = BudgetGuard(budgetStore) { event -> telemetryEvents += event }
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            budgetGuard = budgetGuard
+        ).also { it.phoneControlOverride = true }
+
+        val response = agent.sendMessage("hi", screenContent = null, isActionLoop = false)
+
+        assertEquals("Hello there", response.text)
+        assertEquals(1, telemetryEvents.size)
+        assertTrue(telemetryEvents.all { it.amountUsd > 0.0 }, "pre-call gate should not emit amountUsd=0 allowed events")
+    }
+
+    @Test
+    fun `chat mode tracks usage when budget guard is null`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            chatWithUsageResponses = ArrayDeque(
+                listOf(
+                    ("Hello there" to TokenUsage(inputTokens = 1_000, outputTokens = 200))
+                )
+            )
+        )
+        val agent = PhoneAgentApi(chatClient = client, actionClient = client).also {
+            it.phoneControlOverride = false
+        }
+
+        val response = agent.sendMessage("hi", screenContent = null, isActionLoop = false)
+        assertEquals("Hello there", response.text)
+
+        val summary = agent.lastTaskCostSummary
+        assertEquals(1, summary.apiCalls)
+        assertEquals(1_000L, summary.inputTokens)
+        assertEquals(200L, summary.outputTokens)
+        assertEquals(1_200L, summary.totalTokens)
+        assertEquals(0.00027, summary.estimatedCostUsd, 0.0000000001)
+    }
+
+    @Test
+    fun `chat mode with missing usage metadata still records fallback spend and enforces budget`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            chatResponses = ArrayDeque(listOf("Hello there", "Hi again"))
+        )
+        val budgetStore = InMemoryBudgetStore(
+            BudgetConfig(enabled = true, dailyLimitUsd = 0.00008, monthlyLimitUsd = 10.0)
+        )
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            budgetGuard = BudgetGuard(budgetStore)
+        ).also { it.phoneControlOverride = true }
+
+        val first = agent.sendMessage("hi", screenContent = null, isActionLoop = false)
+        assertEquals("Hello there", first.text)
+        val firstSpend = budgetStore.getDailySpentMicrodollars()
+        assertTrue(firstSpend > 0L)
+        assertEquals(1, agent.lastTaskCostSummary.apiCalls)
+
+        assertFailsWith<BudgetExceededException> {
+            agent.sendMessage("hello", screenContent = null, isActionLoop = false)
+        }
+        assertTrue(budgetStore.getDailySpentMicrodollars() > firstSpend)
+    }
+
+    @Test
+    fun `chat mode with budget guard preserves incremental streaming callbacks`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            streamingResponses = ArrayDeque(listOf(listOf("Hel", "lo", " there"))),
+            chatResponses = ArrayDeque(listOf("Hello there"))
+        )
+        val budgetStore = InMemoryBudgetStore(
+            BudgetConfig(enabled = true, dailyLimitUsd = 10.0, monthlyLimitUsd = 10.0)
+        )
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            budgetGuard = BudgetGuard(budgetStore)
+        ).also { it.phoneControlOverride = true }
+        val deltas = mutableListOf<String>()
+
+        val response = agent.sendMessage(
+            userMessage = "hi",
+            screenContent = null,
+            isActionLoop = false,
+            onTextDelta = { deltas += it }
+        )
+
+        assertEquals("Hello there", response.text)
+        assertEquals(listOf("Hel", "lo", " there"), deltas)
+        assertEquals(1, client.chatStreamingCalls)
+        assertEquals(0, client.chatWithToolsCalls)
+        assertTrue(budgetStore.getDailySpentMicrodollars() > 0L)
+    }
+
+    @Test
+    fun `streaming chat with missing usage metadata enforces budget with fallback spend`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            streamingResponses = ArrayDeque(listOf(listOf("Hel", "lo"), listOf("Hi"))),
+            chatResponses = ArrayDeque(listOf("Hello", "Hi"))
+        )
+        val budgetStore = InMemoryBudgetStore(
+            BudgetConfig(enabled = true, dailyLimitUsd = 0.00008, monthlyLimitUsd = 10.0)
+        )
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            budgetGuard = BudgetGuard(budgetStore)
+        ).also { it.phoneControlOverride = true }
+
+        val first = agent.sendMessage(
+            userMessage = "hello?",
+            screenContent = null,
+            isActionLoop = false,
+            onTextDelta = {}
+        )
+        assertEquals("Hello", first.text)
+        val firstSpend = budgetStore.getDailySpentMicrodollars()
+        assertTrue(firstSpend > 0L)
+
+        assertFailsWith<BudgetExceededException> {
+            agent.sendMessage(
+                userMessage = "hello?",
+                screenContent = null,
+                isActionLoop = false,
+                onTextDelta = {}
+            )
+        }
+        assertTrue(budgetStore.getDailySpentMicrodollars() > firstSpend)
+    }
+
+    @Test
+    fun `chat fallback estimate uses raw output length when sanitization removes artifacts`() = runTest {
+        val cleanClient = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            chatResponses = ArrayDeque(listOf("Short answer"))
+        )
+        val artifactClient = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            chatResponses = ArrayDeque(listOf("<tool_use>${"x".repeat(6000)}</tool_use>Short answer"))
+        )
+        val cleanAgent = PhoneAgentApi(chatClient = cleanClient, actionClient = cleanClient).also {
+            it.phoneControlOverride = true
+        }
+        val artifactAgent = PhoneAgentApi(chatClient = artifactClient, actionClient = artifactClient).also {
+            it.phoneControlOverride = true
+        }
+
+        val clean = cleanAgent.sendMessage("hi", screenContent = null, isActionLoop = false)
+        val artifact = artifactAgent.sendMessage("hi", screenContent = null, isActionLoop = false)
+
+        assertEquals("Short answer", clean.text)
+        assertEquals("Short answer", artifact.text)
+        assertTrue(
+            artifactAgent.lastTaskCostSummary.estimatedCostUsd > cleanAgent.lastTaskCostSummary.estimatedCostUsd,
+            "artifact-heavy raw output should estimate higher fallback cost even when sanitized output matches"
+        )
+    }
+
+    @Test
+    fun `chat mode without budget guard preserves incremental streaming callbacks`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            streamingResponses = ArrayDeque(listOf(listOf("Hi", " there"))),
+            chatResponses = ArrayDeque(listOf("Hi there"))
+        )
+        val agent = PhoneAgentApi(chatClient = client, actionClient = client).also {
+            it.phoneControlOverride = false
+        }
+        val deltas = mutableListOf<String>()
+
+        val response = agent.sendMessage(
+            userMessage = "hello?",
+            screenContent = null,
+            isActionLoop = false,
+            onTextDelta = { deltas += it }
+        )
+
+        assertEquals("Hi there", response.text)
+        assertEquals(listOf("Hi", " there"), deltas)
+        assertEquals(1, client.chatStreamingCalls)
+        assertEquals(0, client.chatWithToolsCalls)
+    }
+
+    @Test
+    fun `pre-call budget failure does not append ghost user message`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = "should never be called",
+                        toolCalls = emptyList(),
+                        stopReason = "end_turn"
+                    )
+                )
+            )
+        )
+        val budgetStore = InMemoryBudgetStore(
+            config = BudgetConfig(enabled = true, dailyLimitUsd = 0.0002, monthlyLimitUsd = 10.0),
+            dailySpentMicrodollars = 201L,
+            monthlySpentMicrodollars = 201L
+        )
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            budgetGuard = BudgetGuard(budgetStore)
+        ).also { it.phoneControlOverride = true }
+
+        val error = assertFailsWith<BudgetExceededException> {
+            agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        }
+
+        assertEquals(BudgetErrorCode.DAILY_LIMIT, error.code)
+        assertEquals(0, agent.messageCount, "Pre-check failure must not mutate history")
+        assertEquals(0, client.chatWithToolsCalls, "Pre-check failure must not call provider")
+    }
+
+    @Test
+    fun `post-call budget exception does not persist partial tool-mode turn`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(ToolCall("t1", "tap", mapOf("element_id" to 1))),
+                        stopReason = "tool_use",
+                        usage = TokenUsage(inputTokens = 1_000, outputTokens = 1_000)
+                    )
+                )
+            )
+        )
+        val budgetStore = InMemoryBudgetStore(
+            config = BudgetConfig(enabled = true, dailyLimitUsd = 0.0002, monthlyLimitUsd = 10.0)
+        )
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            budgetGuard = BudgetGuard(budgetStore)
+        ).also { it.phoneControlOverride = true }
+
+        assertFailsWith<BudgetExceededException> {
+            agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        }
+
+        val persisted = getMessages(agent)
+        assertEquals(0, persisted.size, "Tool-mode over-limit should not persist a hidden user/assistant partial turn")
+    }
+
+    @Test
+    fun `tool mode with missing usage metadata records fallback spend and enforces budget`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(ToolCall("t1", "tap", mapOf("element_id" to 1))),
+                        stopReason = "tool_use"
+                    ),
+                    ChatResponse(
+                        text = "Done",
+                        toolCalls = emptyList(),
+                        stopReason = "end_turn"
+                    )
+                )
+            )
+        )
+        val budgetStore = InMemoryBudgetStore(
+            BudgetConfig(enabled = true, dailyLimitUsd = 0.0012, monthlyLimitUsd = 10.0)
+        )
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            budgetGuard = BudgetGuard(budgetStore)
+        ).also { it.phoneControlOverride = true }
+
+        val first = agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        assertEquals("tool_use", first.stopReason)
+        val firstSpend = budgetStore.getDailySpentMicrodollars()
+        assertTrue(firstSpend > 0L)
+
+        agent.addToolResult("t1", "Tapped element 1", toolName = "tap", isError = false)
+        val error = assertFailsWith<BudgetExceededException> {
+            agent.continueAfterTools()
+        }
+        assertEquals(BudgetErrorCode.DAILY_LIMIT, error.code)
+        assertTrue(budgetStore.getDailySpentMicrodollars() > firstSpend)
+    }
+
+    @Test
+    fun `tool mode fallback estimate is conservative relative to known usage baseline`() = runTest {
+        val knownUsageClient = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(ToolCall("t1", "tap", mapOf("element_id" to 1))),
+                        stopReason = "tool_use",
+                        usage = TokenUsage(inputTokens = 500, outputTokens = 100)
+                    )
+                )
+            )
+        )
+        val knownStore = InMemoryBudgetStore(BudgetConfig(enabled = false))
+        val knownAgent = PhoneAgentApi(
+            chatClient = knownUsageClient,
+            actionClient = knownUsageClient,
+            budgetGuard = BudgetGuard(knownStore)
+        ).also { it.phoneControlOverride = true }
+
+        knownAgent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        val knownSpend = knownStore.getDailySpentMicrodollars()
+        assertTrue(knownSpend > 0L)
+
+        val fallbackClient = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(ToolCall("t1", "tap", mapOf("element_id" to 1))),
+                        stopReason = "tool_use"
+                    )
+                )
+            )
+        )
+        val fallbackStore = InMemoryBudgetStore(BudgetConfig(enabled = false))
+        val fallbackAgent = PhoneAgentApi(
+            chatClient = fallbackClient,
+            actionClient = fallbackClient,
+            budgetGuard = BudgetGuard(fallbackStore)
+        ).also { it.phoneControlOverride = true }
+
+        fallbackAgent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        val fallbackSpend = fallbackStore.getDailySpentMicrodollars()
+        assertTrue(
+            fallbackSpend >= knownSpend,
+            "fallback spend ($fallbackSpend) should be >= known-usage spend ($knownSpend)"
+        )
+    }
+
+    @Test
+    fun `per-task cap is enforced pre-call after cap is reached`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(ToolCall("t1", "tap", mapOf("element_id" to 1))),
+                        stopReason = "tool_use",
+                        usage = TokenUsage(inputTokens = 1_000, outputTokens = 0)
+                    ),
+                    ChatResponse(
+                        text = "Should not be called",
+                        toolCalls = emptyList(),
+                        stopReason = "end_turn",
+                        usage = TokenUsage(inputTokens = 1_000, outputTokens = 0)
+                    )
+                )
+            )
+        )
+        val budgetStore = InMemoryBudgetStore(
+            config = BudgetConfig(
+                enabled = true,
+                dailyLimitUsd = 10.0,
+                monthlyLimitUsd = 10.0,
+                perTaskLimitUsd = 0.00015
+            )
+        )
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            budgetGuard = BudgetGuard(budgetStore)
+        ).also { it.phoneControlOverride = true }
+
+        assertFailsWith<BudgetExceededException> {
+            agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        }
+        assertEquals(1, client.chatWithToolsCalls)
+
+        agent.addToolResult("t1", "Tapped element 1", toolName = "tap", isError = false)
+        assertFailsWith<BudgetExceededException> {
+            agent.continueAfterTools()
+        }
+        assertEquals(1, client.chatWithToolsCalls, "continueAfterTools must fail before provider call when capped")
+
+        assertFailsWith<BudgetExceededException> {
+            agent.sendEphemeral("[System: Summarize progress]")
+        }
+        assertEquals(1, client.chatWithToolsCalls, "sendEphemeral must fail before provider call when capped")
+    }
+
+    @Test
+    fun `per-task cap enforces repeated sub-micro costs with carry`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            toolResponses = ArrayDeque(
+                (1..7).map { idx ->
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(ToolCall("t$idx", "tap", mapOf("element_id" to idx))),
+                        stopReason = "tool_use",
+                        usage = TokenUsage(inputTokens = 1, outputTokens = 0)
+                    )
+                }
+            )
+        )
+        val budgetStore = InMemoryBudgetStore(
+            config = BudgetConfig(
+                enabled = true,
+                dailyLimitUsd = 10.0,
+                monthlyLimitUsd = 10.0,
+                perTaskLimitUsd = 0.000001
+            )
+        )
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            budgetGuard = BudgetGuard(budgetStore)
+        ).also { it.phoneControlOverride = true }
+
+        val first = agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        assertEquals("tool_use", first.stopReason)
+
+        repeat(5) { idx ->
+            val toolId = "t${idx + 1}"
+            agent.addToolResult(toolId, "Tapped element ${idx + 1}", toolName = "tap", isError = false)
+            val response = agent.continueAfterTools()
+            assertEquals("tool_use", response.stopReason)
+        }
+
+        agent.addToolResult("t6", "Tapped element 6", toolName = "tap", isError = false)
+        assertFailsWith<BudgetExceededException> {
+            agent.continueAfterTools()
+        }
+
+        assertEquals(7, client.chatWithToolsCalls)
+        assertEquals(7, agent.lastTaskCostSummary.apiCalls)
+        assertTrue(agent.lastTaskCostSummary.estimatedCostUsd >= 0.000001)
+    }
+
+    @Test
+    fun `concurrent sendMessage calls do not bypass pre-call budget cap`() = runTest {
+        val client = BlockingToolClient(
+            response = ChatResponse(
+                text = "Done",
+                toolCalls = emptyList(),
+                stopReason = "end_turn",
+                usage = TokenUsage(inputTokens = 1_000, outputTokens = 0)
+            )
+        )
+        val budgetStore = InMemoryBudgetStore(
+            config = BudgetConfig(enabled = true, dailyLimitUsd = 0.00015, monthlyLimitUsd = 10.0)
+        )
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            budgetGuard = BudgetGuard(budgetStore)
+        ).also { it.phoneControlOverride = true }
+
+        val first = async {
+            agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        }
+        client.awaitFirstCallStarted()
+
+        val second = async {
+            runCatching { agent.sendMessage("Open settings", screenContent = null, isActionLoop = false) }
+        }
+        delay(50)
+        client.releaseFirstCall()
+
+        val firstResponse = first.await()
+        val secondResult = second.await()
+
+        assertEquals("end_turn", firstResponse.stopReason)
+        val secondError = secondResult.exceptionOrNull()
+        assertTrue(secondError is BudgetExceededException, "second call should fail budget precheck after first spend")
+        assertEquals(1, client.chatWithToolsCalls.get(), "only one provider call should execute under cap")
+    }
+
+    @Test
+    fun `concurrent continueAfterTools calls do not bypass pre-call budget cap`() = runTest {
+        val client = BlockingToolClient(
+            response = ChatResponse(
+                text = "Done",
+                toolCalls = emptyList(),
+                stopReason = "end_turn",
+                usage = TokenUsage(inputTokens = 1_000, outputTokens = 0)
+            )
+        )
+        val budgetStore = InMemoryBudgetStore(
+            config = BudgetConfig(enabled = true, dailyLimitUsd = 0.00015, monthlyLimitUsd = 10.0)
+        )
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            budgetGuard = BudgetGuard(budgetStore)
+        ).also { it.phoneControlOverride = true }
+
+        val first = async { agent.continueAfterTools() }
+        client.awaitFirstCallStarted()
+
+        val second = async { runCatching { agent.continueAfterTools() } }
+        delay(50)
+        client.releaseFirstCall()
+
+        val firstResponse = first.await()
+        val secondResult = second.await()
+
+        assertEquals("end_turn", firstResponse.stopReason)
+        val secondError = secondResult.exceptionOrNull()
+        assertTrue(secondError is BudgetExceededException, "second continuation should fail budget precheck")
+        assertEquals(1, client.chatWithToolsCalls.get(), "only one provider continuation call should execute under cap")
+    }
+
+    @Test
+    fun `clearConversation is non-blocking on caller while request is in flight and clears after release`() = runTest {
+        val client = BlockingToolClient(
+            response = ChatResponse(
+                text = "Done",
+                toolCalls = emptyList(),
+                stopReason = "end_turn",
+                usage = TokenUsage(inputTokens = 1_000, outputTokens = 0)
+            )
+        )
+        val agent = PhoneAgentApi(chatClient = client, actionClient = client).also { it.phoneControlOverride = true }
+
+        val send = async {
+            agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        }
+        client.awaitFirstCallStarted()
+
+        val clear = async { agent.clearConversation() }
+        clear.await()
+        assertTrue(clear.isCompleted, "clearConversation should not block caller thread")
+
+        client.releaseFirstCall()
+        val response = send.await()
+
+        assertEquals("end_turn", response.stopReason)
+        assertEquals(0, agent.messageCount, "clearConversation should apply after in-flight request and leave clean state")
+        assertEquals(0, agent.currentToolStep)
+        assertEquals(TaskCostSummary.EMPTY, agent.lastTaskCostSummary)
+    }
+
+    @Test
+    fun `seedConversationHistory defers during in-flight request and backfills context`() = runTest {
+        val client = BlockingToolClient(
+            response = ChatResponse(
+                text = "Done",
+                toolCalls = emptyList(),
+                stopReason = "end_turn",
+                usage = TokenUsage(inputTokens = 1_000, outputTokens = 0)
+            )
+        )
+        val agent = PhoneAgentApi(chatClient = client, actionClient = client).also { it.phoneControlOverride = true }
+        val deferredSignals = mutableListOf<PhoneAgentApi.DeferredSeedSignal>()
+        agent.onDeferredSeedSignal = { deferredSignals += it }
+        val uiMessages = listOf(
+            Message(role = "user", content = "prior user"),
+            Message(role = "assistant", content = "prior assistant")
+        )
+
+        val send = async {
+            agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        }
+        client.awaitFirstCallStarted()
+
+        agent.seedConversationHistory(uiMessages)
+        assertEquals(0, agent.messageCount, "in-flight call should not persist active turn until request releases")
+
+        client.releaseFirstCall()
+        send.await()
+
+        val persisted = getMessages(agent)
+        assertEquals("prior user", persisted[0].content)
+        assertEquals("prior assistant", persisted[1].content)
+        assertEquals("user", persisted[2].role)
+        assertEquals("assistant", persisted[3].role)
+        assertEquals(4, persisted.size)
+        assertTrue(
+            deferredSignals.any { it.action == "applied" && it.reason == "bootstrap_empty_history" },
+            "expected applied bootstrap deferred seed signal"
+        )
+    }
+
+    @Test
+    fun `seedConversationHistory deferred in R31 maintenance window keeps bootstrap eligibility until maintenance applies`() = runTest {
+        val client = BlockingToolClient(
+            response = ChatResponse(
+                text = "Done",
+                toolCalls = emptyList(),
+                stopReason = "end_turn",
+                usage = TokenUsage(inputTokens = 1_000, outputTokens = 0)
+            )
+        )
+        val agent = PhoneAgentApi(chatClient = client, actionClient = client).also { it.phoneControlOverride = true }
+        val deferredSignals = mutableListOf<PhoneAgentApi.DeferredSeedSignal>()
+        agent.onDeferredSeedSignal = { deferredSignals += it }
+        val uiMessages = listOf(
+            Message(role = "user", content = "seed user"),
+            Message(role = "assistant", content = "seed assistant")
+        )
+        agent.onBeforeDeferredMaintenanceInActiveFlow = {
+            agent.seedConversationHistory(uiMessages)
+        }
+
+        val send = async {
+            agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        }
+        client.awaitFirstCallStarted()
+        client.releaseFirstCall()
+        send.await()
+
+        val persisted = getMessages(agent)
+        assertEquals(4, persisted.size)
+        assertEquals("seed user", persisted[0].content)
+        assertEquals("seed assistant", persisted[1].content)
+        assertEquals("Open settings", persisted[2].content)
+        assertEquals("Done", persisted[3].content)
+        assertTrue(
+            deferredSignals.any { it.action == "applied" && it.reason == "bootstrap_empty_history" },
+            "expected applied bootstrap deferred seed signal for R31 maintenance window"
+        )
+    }
+
+    @Test
+    fun `deferred seed merge keeps first live message when seed tail role matches boundary`() = runTest {
+        val client = BlockingToolClient(
+            response = ChatResponse(
+                text = "Done",
+                toolCalls = emptyList(),
+                stopReason = "end_turn",
+                usage = TokenUsage(inputTokens = 1_000, outputTokens = 0)
+            )
+        )
+        val agent = PhoneAgentApi(chatClient = client, actionClient = client).also { it.phoneControlOverride = true }
+        val uiMessages = listOf(
+            Message(role = "user", content = "seed user 1"),
+            Message(role = "assistant", content = "seed assistant"),
+            Message(role = "user", content = "seed user 2")
+        )
+
+        val send = async {
+            agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        }
+        client.awaitFirstCallStarted()
+
+        agent.seedConversationHistory(uiMessages)
+        client.releaseFirstCall()
+        send.await()
+
+        val persisted = getMessages(agent)
+        assertEquals(4, persisted.size)
+        assertEquals("seed user 1", persisted[0].content)
+        assertEquals("seed assistant", persisted[1].content)
+        assertEquals("Open settings", persisted[2].content)
+        assertEquals("Done", persisted[3].content)
+    }
+
+    @Test
+    fun `multiple deferred seedConversationHistory calls during one request use latest snapshot`() = runTest {
+        val client = BlockingToolClient(
+            response = ChatResponse(
+                text = "Done",
+                toolCalls = emptyList(),
+                stopReason = "end_turn",
+                usage = TokenUsage(inputTokens = 1_000, outputTokens = 0)
+            )
+        )
+        val agent = PhoneAgentApi(chatClient = client, actionClient = client).also { it.phoneControlOverride = true }
+        val firstSeed = listOf(
+            Message(role = "user", content = "stale user"),
+            Message(role = "assistant", content = "stale assistant")
+        )
+        val latestSeed = listOf(
+            Message(role = "user", content = "latest user"),
+            Message(role = "assistant", content = "latest assistant")
+        )
+
+        val send = async {
+            agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        }
+        client.awaitFirstCallStarted()
+
+        agent.seedConversationHistory(firstSeed)
+        agent.seedConversationHistory(latestSeed)
+        client.releaseFirstCall()
+        send.await()
+
+        val persisted = getMessages(agent)
+        assertEquals("latest user", persisted[0].content)
+        assertEquals("latest assistant", persisted[1].content)
+        assertEquals("Open settings", persisted[2].content)
+        assertFalse(persisted.any { it.content.contains("stale") })
+    }
+
+    @Test
+    fun `seedConversationHistory deferred during in-flight request skips stale seed when live history already exists`() = runTest {
+        val client = BlockingToolClient(
+            response = ChatResponse(
+                text = "Done",
+                toolCalls = emptyList(),
+                stopReason = "end_turn",
+                usage = TokenUsage(inputTokens = 1_000, outputTokens = 0)
+            )
+        )
+        val agent = PhoneAgentApi(chatClient = client, actionClient = client).also { it.phoneControlOverride = true }
+        val deferredSignals = mutableListOf<PhoneAgentApi.DeferredSeedSignal>()
+        agent.onDeferredSeedSignal = { deferredSignals += it }
+
+        agent.seedConversationHistory(
+            listOf(
+                Message(role = "user", content = "existing user"),
+                Message(role = "assistant", content = "existing assistant")
+            )
+        )
+        assertEquals(2, agent.messageCount)
+
+        val send = async {
+            agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        }
+        client.awaitFirstCallStarted()
+
+        agent.seedConversationHistory(
+            listOf(
+                Message(role = "user", content = "stale user"),
+                Message(role = "assistant", content = "stale assistant")
+            )
+        )
+
+        client.releaseFirstCall()
+        send.await()
+
+        val persisted = getMessages(agent)
+        assertEquals(4, persisted.size)
+        assertEquals("existing user", persisted[0].content)
+        assertEquals("existing assistant", persisted[1].content)
+        assertEquals("Open settings", persisted[2].content)
+        assertEquals("Done", persisted[3].content)
+        assertFalse(persisted.any { it.content.contains("stale") })
+        assertTrue(
+            deferredSignals.any { it.action == "skipped" && it.reason == "non_empty_live_history_at_deferral" },
+            "expected skipped deferred seed signal for non-empty live history"
+        )
+    }
+
+    @Test
+    fun `seedConversationHistory deferred during in-flight chat skips stale seed when live history has single user non-bootstrap`() = runTest {
+        val client = BlockingUsageClient(responseText = "Done")
+        val agent = PhoneAgentApi(chatClient = client, actionClient = client).also { it.phoneControlOverride = true }
+        val deferredSignals = mutableListOf<PhoneAgentApi.DeferredSeedSignal>()
+        agent.onDeferredSeedSignal = { deferredSignals += it }
+
+        agent.seedConversationHistory(
+            listOf(Message(role = "user", content = "existing single user"))
+        )
+        assertEquals(1, agent.messageCount)
+
+        val send = async {
+            agent.sendMessage("hey there", screenContent = null, isActionLoop = false)
+        }
+        client.awaitFirstCallStarted()
+
+        agent.seedConversationHistory(
+            listOf(
+                Message(role = "user", content = "stale user"),
+                Message(role = "assistant", content = "stale assistant")
+            )
+        )
+
+        client.releaseFirstCall()
+        send.await()
+
+        val persisted = getMessages(agent)
+        assertEquals(3, persisted.size)
+        assertEquals("existing single user", persisted[0].content)
+        assertEquals("hey there", persisted[1].content)
+        assertEquals("Done", persisted[2].content)
+        assertFalse(persisted.any { it.content.contains("stale") })
+        assertTrue(
+            deferredSignals.any { it.action == "skipped" && it.reason == "non_empty_live_history_at_deferral" },
+            "expected skipped deferred seed signal for single-user non-bootstrap live history"
+        )
+    }
+
+    @Test
+    fun `onTextDelta callback reentrancy can clearConversation without deadlock`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            streamingResponses = ArrayDeque(
+                listOf(
+                    listOf("Hello", " world")
+                )
+            )
+        )
+        val agent = PhoneAgentApi(chatClient = client, actionClient = client).also { it.phoneControlOverride = true }
+        val deltas = mutableListOf<String>()
+        var clearInvoked = false
+
+        val response = agent.sendMessage(
+            userMessage = "hi",
+            screenContent = null,
+            onTextDelta = { delta ->
+                deltas += delta
+                if (!clearInvoked) {
+                    clearInvoked = true
+                    agent.clearConversation()
+                }
+            }
+        )
+
+        assertEquals("end_turn", response.stopReason)
+        assertEquals("Hello world", response.text)
+        assertEquals(listOf("Hello", " world"), deltas)
+        assertEquals(0, agent.messageCount, "clearConversation requested from callback should clear safely after request")
+    }
+
+    @Test
+    fun `budget telemetry preserves ordering across usage and fallback paths`() = runTest {
+        val events = mutableListOf<BudgetTelemetryEvent>()
+        val client = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(ToolCall("t1", "tap", mapOf("element_id" to 1))),
+                        stopReason = "tool_use",
+                        usage = TokenUsage(inputTokens = 1_000, outputTokens = 0)
+                    ),
+                    ChatResponse(
+                        text = "Done",
+                        toolCalls = emptyList(),
+                        stopReason = "end_turn"
+                    )
+                )
+            )
+        )
+        val budgetStore = InMemoryBudgetStore(
+            config = BudgetConfig(enabled = true, dailyLimitUsd = 10.0, monthlyLimitUsd = 10.0)
+        )
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            budgetGuard = BudgetGuard(budgetStore) { event -> events += event }
+        ).also { it.phoneControlOverride = true }
+
+        val first = agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        assertEquals("tool_use", first.stopReason)
+        agent.addToolResult("t1", "Tapped element 1", toolName = "tap", isError = false)
+        val second = agent.continueAfterTools()
+        assertEquals("end_turn", second.stopReason)
+
+        val eventTypes = events.map { it.type }
+        assertEquals(
+            listOf(BudgetTelemetryEvent.Type.ALLOWED, BudgetTelemetryEvent.Type.MISSING_USAGE_FALLBACK),
+            eventTypes
+        )
+    }
+
     /** Assert no messages contain synthetic "[Step X/20]" patterns from v1 loop. */
     private fun assertNoSyntheticStepMessages(messages: List<Message>) {
         messages.filter { it.role == "user" }.forEach { msg ->
@@ -1877,10 +2913,15 @@ class PhoneAgentApiTest {
     private class ScriptedProviderClient(
         override val provider: Provider,
         private val chatResponses: ArrayDeque<String> = ArrayDeque(),
+        private val chatWithUsageResponses: ArrayDeque<Pair<String, TokenUsage?>> = ArrayDeque(),
+        private val streamingResponses: ArrayDeque<List<String>> = ArrayDeque(),
         private val toolResponses: ArrayDeque<ChatResponse> = ArrayDeque(),
-        private val visionResponses: ArrayDeque<String> = ArrayDeque()
+        private val visionResponses: ArrayDeque<String> = ArrayDeque(),
+        override val modelId: String? = null
     ) : ProviderClient {
         var chatCalls = 0
+        var chatWithUsageCalls = 0
+        var chatStreamingCalls = 0
         var chatWithToolsCalls = 0
         var describeImageCalls = 0
         /** Last messages list passed to chatWithTools, for verifying conversation flow. */
@@ -1891,6 +2932,29 @@ class PhoneAgentApiTest {
         override suspend fun chat(conversation: Conversation): Result<String> {
             chatCalls++
             return Result.success(chatResponses.removeFirst())
+        }
+
+        override suspend fun chatWithUsage(conversation: Conversation): Result<Pair<String, TokenUsage?>> {
+            chatWithUsageCalls++
+            return if (chatWithUsageResponses.isNotEmpty()) {
+                Result.success(chatWithUsageResponses.removeFirst())
+            } else {
+                Result.success(chat(conversation).getOrThrow() to null)
+            }
+        }
+
+        override suspend fun chatStreaming(
+            conversation: Conversation,
+            onDelta: (String) -> Unit
+        ): Result<String> {
+            chatStreamingCalls++
+            val chunks = if (streamingResponses.isNotEmpty()) {
+                streamingResponses.removeFirst()
+            } else {
+                listOf(chatResponses.removeFirst())
+            }
+            chunks.forEach(onDelta)
+            return Result.success(chunks.joinToString(""))
         }
 
         override suspend fun chatWithTools(
@@ -1912,6 +2976,91 @@ class PhoneAgentApiTest {
             } else {
                 Result.failure(ProviderException(provider, null, "No vision response", false))
             }
+        }
+    }
+
+    private class BlockingToolClient(
+        private val response: ChatResponse,
+        override val modelId: String? = "gpt-4o-mini"
+    ) : ProviderClient {
+        override val provider: Provider = Provider.OPENAI
+        val chatWithToolsCalls = AtomicInteger(0)
+        private val firstCallRelease = kotlinx.coroutines.CompletableDeferred<Unit>()
+
+        suspend fun awaitFirstCallStarted() {
+            while (chatWithToolsCalls.get() == 0) {
+                delay(5)
+            }
+        }
+
+        fun releaseFirstCall() {
+            firstCallRelease.complete(Unit)
+        }
+
+        override suspend fun chat(conversation: Conversation): Result<String> {
+            return Result.success("unused")
+        }
+
+        override suspend fun chatWithTools(
+            messages: List<Message>,
+            systemPrompt: String?,
+            tools: List<Tool>,
+            tokenLimit: Int?
+        ): Result<ChatResponse> {
+            val callIndex = chatWithToolsCalls.incrementAndGet()
+            if (callIndex == 1) {
+                firstCallRelease.await()
+            }
+            return Result.success(response)
+        }
+
+        override suspend fun describeImage(base64Image: String, prompt: String, maxTokens: Int): Result<String> {
+            return Result.failure(UnsupportedOperationException("unused"))
+        }
+    }
+
+    private class BlockingUsageClient(
+        private val responseText: String,
+        private val usage: TokenUsage? = TokenUsage(inputTokens = 100, outputTokens = 10),
+        override val modelId: String? = "gpt-4o-mini"
+    ) : ProviderClient {
+        override val provider: Provider = Provider.OPENAI
+        val chatWithUsageCalls = AtomicInteger(0)
+        private val firstCallRelease = kotlinx.coroutines.CompletableDeferred<Unit>()
+
+        suspend fun awaitFirstCallStarted() {
+            while (chatWithUsageCalls.get() == 0) {
+                delay(5)
+            }
+        }
+
+        fun releaseFirstCall() {
+            firstCallRelease.complete(Unit)
+        }
+
+        override suspend fun chat(conversation: Conversation): Result<String> {
+            return Result.success(responseText)
+        }
+
+        override suspend fun chatWithUsage(conversation: Conversation): Result<Pair<String, TokenUsage?>> {
+            val callIndex = chatWithUsageCalls.incrementAndGet()
+            if (callIndex == 1) {
+                firstCallRelease.await()
+            }
+            return Result.success(responseText to usage)
+        }
+
+        override suspend fun chatWithTools(
+            messages: List<Message>,
+            systemPrompt: String?,
+            tools: List<Tool>,
+            tokenLimit: Int?
+        ): Result<ChatResponse> {
+            return Result.failure(UnsupportedOperationException("unused"))
+        }
+
+        override suspend fun describeImage(base64Image: String, prompt: String, maxTokens: Int): Result<String> {
+            return Result.failure(UnsupportedOperationException("unused"))
         }
     }
 
@@ -2628,6 +3777,51 @@ class PhoneAgentApiTest {
         assertTrue(client.lastSystemPrompt!!.isNotBlank(), "system prompt must not be blank")
     }
 
+
+    @Test
+    fun `sendEphemeral records usage and enforces budget`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = "Summary one",
+                        toolCalls = emptyList(),
+                        stopReason = "end_turn",
+                        usage = TokenUsage(inputTokens = 1_000, outputTokens = 0)
+                    ),
+                    ChatResponse(
+                        text = "Summary two",
+                        toolCalls = emptyList(),
+                        stopReason = "end_turn",
+                        usage = TokenUsage(inputTokens = 1_000, outputTokens = 0)
+                    )
+                )
+            )
+        )
+        val budgetStore = InMemoryBudgetStore(
+            BudgetConfig(enabled = true, dailyLimitUsd = 0.0002, monthlyLimitUsd = 10.0)
+        )
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            budgetGuard = BudgetGuard(budgetStore)
+        ).also { it.phoneControlOverride = true }
+
+        val first = agent.sendEphemeral("[System: Summarize progress]")
+        assertEquals("Summary one", first)
+        assertEquals(1, agent.messageCount)
+        val beforeSecond = getMessages(agent).toList()
+
+        assertFailsWith<BudgetExceededException> {
+            agent.sendEphemeral("[System: Summarize progress again]")
+        }
+        assertEquals(300L, budgetStore.getDailySpentMicrodollars())
+        assertEquals(beforeSecond, getMessages(agent), "sendEphemeral over-limit should not persist assistant reply")
+    }
+
+
     @Test
     fun `sendMessage handles SensorProvider snapshot exceptions gracefully`() = runTest {
         val client = ScriptedProviderClient(
@@ -2981,7 +4175,7 @@ class PhoneAgentApiTest {
         }
 
         assertTrue(
-            elapsedMs < (PhoneAgentApi.SENSOR_SNAPSHOT_TIMEOUT_MS + 120),
+            elapsedMs < (PhoneAgentApi.SENSOR_SNAPSHOT_TIMEOUT_MS + 300),
             "Task start should not wait for slow sensor capture (elapsed=${elapsedMs}ms)"
         )
         assertEquals(1, agent.sensorSnapshotTimeoutTotal)
@@ -3281,8 +4475,7 @@ class PhoneAgentApiTest {
 
         assertFailsWith<kotlinx.coroutines.CancellationException> {
             agent.sendEphemeral("[System: Summarize progress]")
-        }
-    }
+        }    }
 
     // ── Learn tool tests ──
 

@@ -15,6 +15,15 @@ interface ProviderClient {
 
     suspend fun chat(conversation: Conversation): Result<String>
 
+    /**
+     * Non-streaming chat that can return usage metadata when supported.
+     *
+     * Default implementation delegates to [chat] and returns null usage for
+     * providers that do not expose usage via this path.
+     */
+    suspend fun chatWithUsage(conversation: Conversation): Result<Pair<String, TokenUsage?>> =
+        chat(conversation).map { it to null }
+
     suspend fun chatWithTools(
         messages: List<Message>,
         systemPrompt: String? = null,

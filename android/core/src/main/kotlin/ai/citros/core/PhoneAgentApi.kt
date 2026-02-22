@@ -13,12 +13,23 @@ package ai.citros.core
  */
 import android.util.Log
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.math.ceil
+import kotlin.math.max
+import kotlin.math.roundToLong
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
 
 open class PhoneAgentApi(
     private val chatClient: ProviderClient,
@@ -52,7 +63,9 @@ open class PhoneAgentApi(
     /** Element tap provider, injectable for unit tests. */
     private val clickElement: (Int) -> ScreenReader.ElementActionResult = { ScreenReader.clickElementDetailed(it) },
     /** Element long-press provider, injectable for unit tests. */
-    private val longPressElement: (Int) -> ScreenReader.ElementActionResult = { ScreenReader.longPressElementDetailed(it) }
+    private val longPressElement: (Int) -> ScreenReader.ElementActionResult = { ScreenReader.longPressElementDetailed(it) },
+    /** Optional spending guard for API usage. */
+    private val budgetGuard: BudgetGuard? = null
 ) {
     private val taskSensorSnapshotLock = Any()
     @Volatile
@@ -205,10 +218,37 @@ open class PhoneAgentApi(
     }
 
     private val messages: MutableList<Message> = CopyOnWriteArrayList()
+    private val requestFlowMutex = Mutex()
+    private val clearRequested = AtomicBoolean(false)
+    private val deferredSeedMessages = AtomicReference<DeferredSeedRequest?>(null)
+    private val deferredSeedBootstrapEligibleInActiveFlow = AtomicBoolean(false)
+    private val taskTokenAccumulator = TaskTokenAccumulator()
+    @Volatile
+    private var taskEstimatedCostNanodollars: Long = 0L
+    @Volatile
+    private var taskEstimatedCostMicrodollars: Long = 0L
+    @Volatile
+    var lastTaskCostSummary: TaskCostSummary = TaskCostSummary.EMPTY
+        private set
 
     /** Expose message count for testing. */
     @get:androidx.annotation.VisibleForTesting
     internal val messageCount: Int get() = messages.size
+
+    data class DeferredSeedSignal(
+        val action: String,
+        val reason: String,
+        val seedMessageCount: Int,
+        val liveMessageCount: Int
+    )
+
+    @androidx.annotation.VisibleForTesting
+    @Volatile
+    internal var onDeferredSeedSignal: ((DeferredSeedSignal) -> Unit)? = null
+
+    @androidx.annotation.VisibleForTesting
+    @Volatile
+    internal var onBeforeDeferredMaintenanceInActiveFlow: (() -> Unit)? = null
 
     /** Current tool step counter, used for context compaction. Set by ChatViewModel. */
     @Volatile
@@ -228,42 +268,21 @@ open class PhoneAgentApi(
      * pairs, and reconstructing those from UI messages is not reliable. Text-only
      * history is sufficient for conversational continuity.
      */
-    @Synchronized
     fun seedConversationHistory(uiMessages: List<Message>) {
-        if (messages.isNotEmpty()) return  // Already has history, skip
-        if (uiMessages.isEmpty()) return
-
-        // Convert UI messages to simple text-only messages for API context.
-        // Drop tool/system messages, keep user and assistant text.
-        val seeded = uiMessages.mapNotNull { msg ->
-            when {
-                msg.role == Message.ROLE_USER -> Message(role = "user", content = msg.content)
-                msg.role == Message.ROLE_ASSISTANT && msg.content.isNotBlank() -> {
-                    // Strip tool metadata suffix (e.g. "[Tools: tap, type]")
-                    val textOnly = msg.content
-                        .replace(Regex("""\s*\[Tools:.*?]"""), "")
-                        .trim()
-                    if (textOnly.isNotEmpty()) Message(role = "assistant", content = textOnly) else null
-                }
-                else -> null
-            }
+        if (!requestFlowMutex.tryLock()) {
+            val liveHistoryWasBootstrapEmptyAtDeferral = deferredSeedBootstrapEligibleInActiveFlow.get()
+            val deferred = DeferredSeedRequest(
+                uiMessages = uiMessages.toList(),
+                liveHistoryWasEmptyAtDeferral = liveHistoryWasBootstrapEmptyAtDeferral
+            )
+            deferredSeedMessages.set(deferred)
+            Log.d(TAG, "seedConversationHistory: deferred while request flow is active")
+            return
         }
-
-        // Deduplicate consecutive same-role messages that can arise when
-        // steer messages (mid-loop user turns) are adjacent to regular user turns
-        // after tool-role messages are stripped. The Anthropic API rejects
-        // consecutive same-role messages.
-        val deduped = mutableListOf<Message>()
-        for (msg in seeded) {
-            if (deduped.isEmpty() || deduped.last().role != msg.role) {
-                deduped.add(msg)
-            }
-            // else: skip consecutive same-role message
-        }
-
-        if (deduped.isNotEmpty()) {
-            messages.addAll(deduped)
-            Log.d(TAG, "seedConversationHistory: seeded ${'$'}{deduped.size} messages from UI (${'$'}{seeded.size - deduped.size} consecutive dupes removed)")
+        try {
+            applySeedConversationHistoryUnlocked(uiMessages, allowPrependToExisting = false)
+        } finally {
+            requestFlowMutex.unlock()
         }
     }
 
@@ -284,6 +303,11 @@ open class PhoneAgentApi(
 
     companion object {
         private const val TAG = "CitrosAgent"
+        private const val NANODOLLARS_PER_USD = 1_000_000_000L
+        private const val NANODOLLARS_PER_MICRODOLLAR = 1_000L
+        private const val FALLBACK_PROVIDER_FRAMING_CHARS = 256
+        private const val FALLBACK_INPUT_CONSERVATISM_FACTOR = 1.25
+        private const val FALLBACK_OUTPUT_CONSERVATISM_FACTOR = 1.10
         // Failsafe cap for full snapshot capture. Individual sensors should enforce
         // tighter per-field budgets to preserve partial context when one field is slow.
         internal const val SENSOR_SNAPSHOT_TIMEOUT_MS = 60L
@@ -382,7 +406,11 @@ open class PhoneAgentApi(
         screenContent: ScreenContent?,
         isActionLoop: Boolean = false,
         onTextDelta: ((String) -> Unit)? = null
-    ): ChatResponse {
+    ): ChatResponse = withRequestFlowLock {
+        if (!isActionLoop) {
+            resetTaskCostTracking()
+        }
+
         // When phone control is not available, always use chat mode without tools (#390).
         // This prevents the model from hallucinating XML tool calls in plain text.
         val phoneControlAvailable = phoneControlOverride ?: ScreenReader.isAttached()
@@ -402,15 +430,26 @@ open class PhoneAgentApi(
             val conversation = Conversation(messages.toMutableList()).apply {
                 addUser(chatMessage)
             }
-            val chatResult = if (onTextDelta != null) {
-                chatClient.chatStreaming(conversation, onTextDelta)
+            checkBudgetBeforeApiCall()
+            val chatResult: Result<Pair<String, TokenUsage?>> = if (onTextDelta != null) {
+                chatClient.chatStreaming(conversation, onTextDelta).map { text ->
+                    text to null
+                }
             } else {
-                chatClient.chat(conversation)
+                chatClient.chatWithUsage(conversation)
             }
             return chatResult.fold(
-                onSuccess = { rawText ->
+                onSuccess = { (rawText, usage) ->
                     // Strip any hallucinated tool artifacts from chat-mode responses
                     val text = stripToolArtifacts(rawText)
+                    recordUsageOutcomeAndCheckBudgets(
+                        usage = usage,
+                        modelId = chatClient.modelId,
+                        promptChars = approximateConversationChars(conversation.messages),
+                        responseChars = max(rawText.length, text.length),
+                        systemPromptChars = 0,
+                        toolSchemaChars = 0
+                    )
                     messages.add(Message(role = "user", content = userMessage))
                     messages.add(Message(role = "assistant", content = text))
                     ChatResponse(text = text, toolCalls = emptyList(), stopReason = "end_turn")
@@ -435,7 +474,9 @@ open class PhoneAgentApi(
             append(userMessage)
         }
 
-        messages.add(Message(role = "user", content = fullMessage))
+        checkBudgetBeforeApiCall()
+        val pendingUserMessage = Message(role = "user", content = fullMessage)
+        val messagesWithPendingUser = messages.toMutableList().apply { add(pendingUserMessage) }
 
         // Get response from appropriate client
         val client = if (isActionLoop) actionClient else chatClient
@@ -461,25 +502,29 @@ open class PhoneAgentApi(
         //   1. ContextCompactor strips SCREEN dumps from old tool results (cheap, regex-based)
         //   2. ContextManager summarizes remaining old messages (step-threshold based)
         val messagesForModel = if (isActionLoop) {
-            val (screenStripped, compactorMetrics) = contextCompactor.compactWithMetrics(messages)
+            val (screenStripped, compactorMetrics) = contextCompactor.compactWithMetrics(messagesWithPendingUser)
             val (compacted, managerMetrics) = contextManager.compactWithMetrics(screenStripped, currentToolStep)
             if (compactorMetrics != null) Log.d(TAG, "sendMessage compaction stage1: $compactorMetrics")
             if (managerMetrics != null) Log.d(TAG, "sendMessage compaction stage2: $managerMetrics")
             compacted
         } else {
-            messages.toList()
+            messagesWithPendingUser.toList()
         }
-        
+
         val result = client.chatWithTools(messagesForModel, systemPrompt = systemPrompt, tools = getToolsForModel())
 
         return result.fold(
             onSuccess = { response ->
-                // Add assistant response to conversation history
-                if (response.toolCalls.isNotEmpty()) {
-                    messages.add(Message.assistantWithTools(response.text, response.toolCalls))
-                } else if (response.text != null) {
-                    messages.add(Message(role = "assistant", content = response.text))
-                }
+                recordUsageOutcomeAndCheckBudgets(
+                    usage = response.usage,
+                    modelId = client.modelId,
+                    promptChars = approximateMessageChars(messagesForModel),
+                    responseChars = approximateResponseChars(response),
+                    systemPromptChars = systemPrompt.length,
+                    toolSchemaChars = approximateToolSchemaChars(getToolsForModel())
+                )
+                messages.add(pendingUserMessage)
+                appendAssistantResponse(response)
                 response
             },
             onFailure = { error ->
@@ -505,6 +550,7 @@ open class PhoneAgentApi(
      * @return The assistant's text response, or null on failure
      */
     open suspend fun sendEphemeral(prompt: String): String? {
+        return withRequestFlowLock {
         val ephemeralMessages = messages.toMutableList().apply {
             add(Message(role = "user", content = prompt))
         }
@@ -513,6 +559,7 @@ open class PhoneAgentApi(
         val ephemeralSensors = getTaskSensorSnapshot(startNewTask = false)
         val systemPrompt = promptBuilder?.full(phoneControlAvailable = phoneControlAvailable, modelName = modelName, sensorContext = ephemeralSensors)
             ?: PhoneAgentPrompts.buildSystemPrompt(phoneControlAvailable = phoneControlAvailable, modelName = modelName, sensorContext = ephemeralSensors)
+        checkBudgetBeforeApiCall()
         val result = chatClient.chatWithTools(
             ephemeralMessages,
             systemPrompt = systemPrompt,
@@ -520,15 +567,25 @@ open class PhoneAgentApi(
         )
         return result.fold(
             onSuccess = { response ->
+                recordUsageOutcomeAndCheckBudgets(
+                    usage = response.usage,
+                    modelId = chatClient.modelId,
+                    promptChars = approximateMessageChars(ephemeralMessages),
+                    responseChars = approximateResponseChars(response),
+                    systemPromptChars = systemPrompt.length,
+                    toolSchemaChars = 0
+                )
                 response.text?.also { text ->
                     messages.add(Message(role = "assistant", content = text))
                 }
+                response.text
             },
             onFailure = { error ->
                 Log.w(TAG, "sendEphemeral failed: ${error.message}")
                 null
             }
         )
+        }
     }
 
     /**
@@ -545,6 +602,7 @@ open class PhoneAgentApi(
      * See docs/agentic-loop-v2.md §3.3
      */
     open suspend fun continueAfterTools(): ChatResponse {
+        return withRequestFlowLock {
         val phoneControlAvailable = phoneControlOverride ?: ScreenReader.isAttached()
         val sensorSnapshot = getTaskSensorSnapshot(startNewTask = false)
         val systemPrompt = promptBuilder?.trimmed(
@@ -565,6 +623,7 @@ open class PhoneAgentApi(
         if (managerMetrics != null) Log.d(TAG, "continueAfterTools compaction stage2: $managerMetrics")
         Log.d(TAG, "continueAfterTools: step=$currentToolStep, rawMessages=${messages.size}, compacted=${messagesForModel.size}")
 
+        checkBudgetBeforeApiCall()
         val result = actionClient.chatWithTools(
             messagesForModel,
             systemPrompt = systemPrompt,
@@ -573,11 +632,15 @@ open class PhoneAgentApi(
 
         return result.fold(
             onSuccess = { response ->
-                if (response.toolCalls.isNotEmpty()) {
-                    messages.add(Message.assistantWithTools(response.text, response.toolCalls))
-                } else if (response.text != null) {
-                    messages.add(Message(role = "assistant", content = response.text))
-                }
+                recordUsageOutcomeAndCheckBudgets(
+                    usage = response.usage,
+                    modelId = actionClient.modelId,
+                    promptChars = approximateMessageChars(messagesForModel),
+                    responseChars = approximateResponseChars(response),
+                    systemPromptChars = systemPrompt.length,
+                    toolSchemaChars = approximateToolSchemaChars(getToolsForModel())
+                )
+                appendAssistantResponse(response)
                 response
             },
             onFailure = { error ->
@@ -588,6 +651,7 @@ open class PhoneAgentApi(
                 )
             }
         )
+        }
     }
 
     /**
@@ -1427,18 +1491,341 @@ open class PhoneAgentApi(
     /**
      * Clear the conversation history.
      *
-     * Thread-safe: synchronized to prevent races with [seedConversationHistory].
-     * Note: if an API call is in-flight, it already has a snapshot of messages
-     * (via `toList()` / `toMutableList()`), so clearing won't corrupt it.
+     * Thread-safe and non-blocking for callers:
+     * - If no request is active, clears immediately.
+     * - If a request is active, defers clear until lock release.
      */
-    @Synchronized
     fun clearConversation() {
+        clearRequested.set(true)
+        if (!requestFlowMutex.tryLock()) {
+            return
+        }
+        try {
+            applyDeferredClearIfRequested()
+        } finally {
+            requestFlowMutex.unlock()
+        }
+    }
+
+    private suspend inline fun <T> withRequestFlowLock(block: suspend () -> T): T {
+        return requestFlowMutex.withLock {
+            deferredSeedBootstrapEligibleInActiveFlow.set(messages.isEmpty())
+            try {
+                block()
+            } finally {
+                onBeforeDeferredMaintenanceInActiveFlow?.invoke()
+                applyDeferredMaintenance()
+                deferredSeedBootstrapEligibleInActiveFlow.set(false)
+            }
+        }
+    }
+
+    private fun applyDeferredMaintenance() {
+        if (applyDeferredClearIfRequested()) {
+            deferredSeedMessages.set(null)
+            return
+        }
+        applyDeferredSeedIfRequested()
+    }
+
+    private fun applyDeferredClearIfRequested(): Boolean {
+        if (clearRequested.getAndSet(false)) {
+            clearConversationUnlocked()
+            return true
+        }
+        return false
+    }
+
+    private fun applyDeferredSeedIfRequested() {
+        val pending = deferredSeedMessages.getAndSet(null) ?: return
+        // Invariant: deferred prepend is only valid for bootstrap restore when the live
+        // in-memory history was empty at deferral time. Otherwise the seed may be stale
+        // and must never be prepended to an already-populated conversation.
+        if (!pending.liveHistoryWasEmptyAtDeferral) {
+            emitDeferredSeedSignal(
+                action = DeferredSeedAction.SKIPPED,
+                reason = DeferredSeedReason.NON_EMPTY_LIVE_HISTORY_AT_DEFERRAL,
+                seedMessageCount = pending.uiMessages.size,
+                liveMessageCount = messages.size
+            )
+            return
+        }
+        val applied = applySeedConversationHistoryUnlocked(
+            pending.uiMessages,
+            allowPrependToExisting = true
+        )
+        emitDeferredSeedSignal(
+            action = if (applied) DeferredSeedAction.APPLIED else DeferredSeedAction.SKIPPED,
+            reason = if (applied) {
+                DeferredSeedReason.BOOTSTRAP_EMPTY_HISTORY
+            } else {
+                DeferredSeedReason.EMPTY_AFTER_NORMALIZATION
+            },
+            seedMessageCount = pending.uiMessages.size,
+            liveMessageCount = messages.size
+        )
+    }
+
+    private fun clearConversationUnlocked() {
         messages.clear()
+        deferredSeedMessages.set(null)
         currentToolStep = 0
         taskSensorSnapshotEpoch.incrementAndGet()
         synchronized(taskSensorSnapshotLock) {
             taskSensorSnapshot = null
             taskSensorSnapshotInitialized = false
+        }
+        resetTaskCostTracking()
+    }
+
+    @Synchronized
+    private fun resetTaskCostTracking() {
+        taskTokenAccumulator.reset()
+        taskEstimatedCostNanodollars = 0L
+        taskEstimatedCostMicrodollars = 0L
+        lastTaskCostSummary = TaskCostSummary.EMPTY
+    }
+
+    private fun checkBudgetBeforeApiCall() {
+        budgetGuard?.checkTaskLimitDecisionMicrodollars(taskEstimatedCostMicrodollars)?.let { error ->
+            throw BudgetExceededException(error.message, error.code)
+        }
+        budgetGuard?.checkWouldExceedBudgetWithoutSpendingDecision()?.let { error ->
+            throw BudgetExceededException(error.message, error.code)
+        }
+    }
+
+    @Synchronized
+    private fun recordUsageAndCheckBudgets(usage: TokenUsage, modelId: String?) {
+        val callCost = CostEstimator.estimate(usage, modelId)
+        recordEstimatedCost(usage, callCost)
+
+        when (val decision = budgetGuard?.trySpendDecision(callCost)) {
+            null, BudgetDecision.Allowed -> Unit
+            is BudgetDecision.OverLimit -> throw BudgetExceededException(decision.message, decision.code)
+            is BudgetDecision.MissingUsageMetadata -> {
+                decision.overLimitMessage?.let { throw BudgetExceededException(it, decision.overLimitCode) }
+            }
+        }
+        budgetGuard?.checkTaskLimitDecisionMicrodollars(taskEstimatedCostMicrodollars)?.let { error ->
+            throw BudgetExceededException(error.message, error.code)
+        }
+    }
+
+    private fun recordUsageOutcomeAndCheckBudgets(
+        usage: TokenUsage?,
+        modelId: String?,
+        promptChars: Int,
+        responseChars: Int,
+        systemPromptChars: Int,
+        toolSchemaChars: Int
+    ) {
+        if (usage != null) {
+            recordUsageAndCheckBudgets(usage, modelId)
+            return
+        }
+
+        val fallbackUsage = estimateFallbackUsage(
+            promptChars = promptChars,
+            responseChars = responseChars,
+            systemPromptChars = systemPromptChars,
+            toolSchemaChars = toolSchemaChars
+        )
+        val fallbackCost = max(CostEstimator.estimate(fallbackUsage, modelId), 0.000001)
+        recordEstimatedCost(fallbackUsage, fallbackCost)
+
+        val fallbackDecision = budgetGuard?.recordFallbackSpendForMissingUsage(fallbackCost)
+        if (fallbackDecision?.overLimitMessage != null) {
+            throw BudgetExceededException(
+                fallbackDecision.overLimitMessage,
+                fallbackDecision.overLimitCode ?: BudgetErrorCode.MISSING_USAGE_FALLBACK
+            )
+        }
+        budgetGuard?.checkTaskLimitDecisionMicrodollars(taskEstimatedCostMicrodollars)?.let { error ->
+            throw BudgetExceededException(error.message, error.code)
+        }
+    }
+
+    private fun estimateFallbackUsage(
+        promptChars: Int,
+        responseChars: Int,
+        systemPromptChars: Int,
+        toolSchemaChars: Int
+    ): TokenUsage {
+        val estimatedInputChars =
+            promptChars + systemPromptChars + toolSchemaChars + FALLBACK_PROVIDER_FRAMING_CHARS
+        val estimatedOutputChars = responseChars + FALLBACK_PROVIDER_FRAMING_CHARS
+        val estimatedInputTokens = max(
+            1,
+            ceil((estimatedInputChars * FALLBACK_INPUT_CONSERVATISM_FACTOR) / 4.0).toInt()
+        )
+        val estimatedOutputTokens = max(
+            1,
+            ceil((estimatedOutputChars * FALLBACK_OUTPUT_CONSERVATISM_FACTOR) / 4.0).toInt()
+        )
+        return TokenUsage(inputTokens = estimatedInputTokens, outputTokens = estimatedOutputTokens)
+    }
+
+    private fun approximateConversationChars(messages: List<Message>): Int = approximateMessageChars(messages)
+
+    private fun approximateMessageChars(messages: List<Message>): Int {
+        return messages.sumOf { msg ->
+            msg.content.length + msg.role.length + (msg.toolCallsJson?.length ?: 0) + (msg.toolCallId?.length ?: 0)
+        }
+    }
+
+    private fun approximateResponseChars(response: ChatResponse): Int {
+        val toolCallChars = response.toolCalls.sumOf { call ->
+            call.id.length + call.name.length + stableSerializedLength(call.input)
+        }
+        return (response.text?.length ?: 0) + toolCallChars
+    }
+
+    private fun approximateToolSchemaChars(tools: List<Tool>): Int {
+        if (tools.isEmpty()) return 0
+        return tools.sumOf { tool ->
+            tool.name.length +
+                tool.description.length +
+                stableSerializedLength(tool.inputSchema)
+        }
+    }
+
+    private fun applySeedConversationHistoryUnlocked(
+        uiMessages: List<Message>,
+        allowPrependToExisting: Boolean
+    ): Boolean {
+        if (uiMessages.isEmpty()) return false
+        if (messages.isNotEmpty() && !allowPrependToExisting) return false
+
+        val seeded = uiMessages.mapNotNull { msg ->
+            when {
+                msg.role == Message.ROLE_USER -> Message(role = "user", content = msg.content)
+                msg.role == Message.ROLE_ASSISTANT && msg.content.isNotBlank() -> {
+                    val textOnly = msg.content
+                        .replace(Regex("""\s*\[Tools:.*?]"""), "")
+                        .trim()
+                    if (textOnly.isNotEmpty()) Message(role = "assistant", content = textOnly) else null
+                }
+                else -> null
+            }
+        }
+
+        val dedupedSeed = dedupeConsecutiveRoles(seeded)
+        if (dedupedSeed.isEmpty()) return false
+
+        val merged = if (messages.isEmpty()) {
+            dedupedSeed
+        } else {
+            if (!allowPrependToExisting) return false
+            mergeSeedWithLiveMessages(dedupedSeed, messages.toList())
+        }
+
+        messages.clear()
+        messages.addAll(merged)
+        Log.d(
+            TAG,
+            "seedConversationHistory: applied ${merged.size} messages from UI (${seeded.size - dedupedSeed.size} consecutive dupes removed)"
+        )
+        return true
+    }
+
+    private data class DeferredSeedRequest(
+        val uiMessages: List<Message>,
+        val liveHistoryWasEmptyAtDeferral: Boolean
+    )
+
+    private enum class DeferredSeedAction(val value: String) {
+        APPLIED("applied"),
+        SKIPPED("skipped")
+    }
+
+    private enum class DeferredSeedReason(val value: String) {
+        BOOTSTRAP_EMPTY_HISTORY("bootstrap_empty_history"),
+        EMPTY_AFTER_NORMALIZATION("empty_after_normalization"),
+        NON_EMPTY_LIVE_HISTORY_AT_DEFERRAL("non_empty_live_history_at_deferral")
+    }
+
+    private fun emitDeferredSeedSignal(
+        action: DeferredSeedAction,
+        reason: DeferredSeedReason,
+        seedMessageCount: Int,
+        liveMessageCount: Int
+    ) {
+        Log.d(
+            TAG,
+            "deferred_seed action=${action.value} reason=${reason.value} seedCount=$seedMessageCount liveCount=$liveMessageCount"
+        )
+        onDeferredSeedSignal?.invoke(
+            DeferredSeedSignal(
+                action = action.value,
+                reason = reason.value,
+                seedMessageCount = seedMessageCount,
+                liveMessageCount = liveMessageCount
+            )
+        )
+    }
+
+    private fun dedupeConsecutiveRoles(source: List<Message>): List<Message> {
+        if (source.isEmpty()) return emptyList()
+        val deduped = mutableListOf<Message>()
+        source.forEach { msg ->
+            if (deduped.isEmpty() || deduped.last().role != msg.role) {
+                deduped += msg
+            }
+        }
+        return deduped
+    }
+
+    private fun mergeSeedWithLiveMessages(seed: List<Message>, live: List<Message>): List<Message> {
+        if (seed.isEmpty()) return live
+        if (live.isEmpty()) return seed
+        return if (seed.last().role == live.first().role) {
+            seed.dropLast(1) + live
+        } else {
+            seed + live
+        }
+    }
+
+    private fun stableSerializedLength(value: Any?): Int {
+        val json = JsonUtils.anyToJsonElement(value)
+        return canonicalizeJsonObjectOrder(json).toString().length
+    }
+
+    private fun canonicalizeJsonObjectOrder(element: JsonElement): JsonElement {
+        return when (element) {
+            is JsonObject -> buildJsonObject {
+                element.entries
+                    .sortedBy { it.key }
+                    .forEach { (key, value) -> put(key, canonicalizeJsonObjectOrder(value)) }
+            }
+            is JsonArray -> buildJsonArray {
+                element.forEach { add(canonicalizeJsonObjectOrder(it)) }
+            }
+            else -> element
+        }
+    }
+
+    @Synchronized
+    private fun recordEstimatedCost(usage: TokenUsage, estimatedCostUsd: Double) {
+        taskTokenAccumulator.record(usage)
+        taskEstimatedCostNanodollars += usdToNanodollars(estimatedCostUsd)
+        taskEstimatedCostMicrodollars = taskEstimatedCostNanodollars / NANODOLLARS_PER_MICRODOLLAR
+        lastTaskCostSummary = TaskCostSummary(
+            totalTokens = taskTokenAccumulator.totalTokens,
+            inputTokens = taskTokenAccumulator.totalInputTokens,
+            outputTokens = taskTokenAccumulator.totalOutputTokens,
+            apiCalls = taskTokenAccumulator.callCount,
+            estimatedCostUsd = taskEstimatedCostNanodollars / NANODOLLARS_PER_USD.toDouble()
+        )
+    }
+
+    private fun usdToNanodollars(usd: Double): Long = (usd * NANODOLLARS_PER_USD).roundToLong()
+
+    private fun appendAssistantResponse(response: ChatResponse) {
+        if (response.toolCalls.isNotEmpty()) {
+            messages.add(Message.assistantWithTools(response.text, response.toolCalls))
+        } else if (response.text != null) {
+            messages.add(Message(role = "assistant", content = response.text))
         }
     }
     
