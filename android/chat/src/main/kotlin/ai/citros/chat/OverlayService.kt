@@ -328,6 +328,15 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
             }
         }
 
+        /**
+         * Guard foreground launches so only explicit user actions can open ChatActivity.
+         * Prevents accidental FULL_APP transitions from stealing focus from host apps.
+         */
+        internal fun shouldLaunchChatActivityOnSurfaceTransition(
+            mode: OverlaySurfaceMode,
+            pendingChatLaunchRequest: Boolean
+        ): Boolean = mode == OverlaySurfaceMode.FULL_APP && pendingChatLaunchRequest
+
     }
 
     internal enum class CutoutEdge {
@@ -367,6 +376,7 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
     private var onboardingPrefsListener: SharedPreferences.OnSharedPreferenceChangeListener? = null
     private var chatPrefs: SharedPreferences? = null
     private var chatPrefsListener: SharedPreferences.OnSharedPreferenceChangeListener? = null
+    private var pendingChatLaunchRequest = false
     private var pendingChatVoiceStartRequest = false
 
     private data class IslandAnchor(
@@ -553,9 +563,15 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
                 .drop(1)
                 .collect { (mode, active) ->
                     if (!active || mode == OverlaySurfaceMode.FULL_APP) {
-                        if (mode == OverlaySurfaceMode.FULL_APP) {
+                        if (
+                            shouldLaunchChatActivityOnSurfaceTransition(
+                                mode = mode,
+                                pendingChatLaunchRequest = pendingChatLaunchRequest
+                            )
+                        ) {
                             launchChatActivity(startVoiceInput = pendingChatVoiceStartRequest)
                         }
+                        pendingChatLaunchRequest = false
                         pendingChatVoiceStartRequest = false
                         stopSelf()
                     } else {
@@ -623,9 +639,14 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
         startActivity(intent)
     }
 
-    private fun launchChatWithVoiceInputFromOverlay() {
-        pendingChatVoiceStartRequest = true
+    private fun requestChatActivityLaunch(startVoiceInput: Boolean) {
+        pendingChatLaunchRequest = true
+        pendingChatVoiceStartRequest = startVoiceInput
         OverlayController.updateSurfaceMode(OverlaySurfaceMode.FULL_APP, fromUser = true)
+    }
+
+    private fun launchChatWithVoiceInputFromOverlay() {
+        requestChatActivityLaunch(startVoiceInput = true)
     }
 
     private fun showOverlay() {
@@ -654,6 +675,7 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
                     OverlayServiceContent(
                         flavor = selectedFlavor,
                         dynamicIslandDebugBadge = dynamicIslandDebugBadge,
+                        onRequestFullChat = { requestChatActivityLaunch(startVoiceInput = false) },
                         onRequestFullChatVoiceInput = { launchChatWithVoiceInputFromOverlay() }
                     )
                 }
@@ -1593,6 +1615,7 @@ private fun readThemeMode(context: Context): String {
 private fun OverlayServiceContent(
     flavor: CitrosFlavor,
     dynamicIslandDebugBadge: String?,
+    onRequestFullChat: () -> Unit,
     onRequestFullChatVoiceInput: () -> Unit
 ) {
     val overlayState by OverlayController.overlayState.collectAsState()
@@ -1768,9 +1791,7 @@ private fun OverlayServiceContent(
                 onResumeOrRetry = {
                     OverlayController.dispatch(OverlayAction.ResumeExecution)
                 },
-                onOpenFull = {
-                    OverlayController.updateSurfaceMode(OverlaySurfaceMode.FULL_APP, fromUser = true)
-                },
+                onOpenFull = onRequestFullChat,
                 onOpenIsland = {
                     OverlayController.updateSurfaceMode(OverlaySurfaceMode.DYNAMIC_ISLAND, fromUser = true)
                 },

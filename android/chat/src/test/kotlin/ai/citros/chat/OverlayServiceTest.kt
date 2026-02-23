@@ -13,6 +13,7 @@ import org.robolectric.RobolectricTestRunner
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
+import kotlin.test.assertFalse
 
 /**
  * Unit tests for OverlayService intents, OverlayController state,
@@ -89,7 +90,7 @@ class OverlayServiceTest {
         // FULL_APP should signal the service to stop
         OverlayController.updateSurfaceMode(OverlaySurfaceMode.FULL_APP)
         assertEquals(OverlaySurfaceMode.FULL_APP, OverlayController.surfaceMode.value)
-        assertTrue(!OverlayController.isOverlayActive.value)
+        assertFalse(OverlayController.isOverlayActive.value)
     }
 
     @Test
@@ -98,7 +99,7 @@ class OverlayServiceTest {
         assertTrue(OverlayController.isOverlayActive.value)
 
         OverlayController.deactivateOverlay()
-        assertTrue(!OverlayController.isOverlayActive.value)
+        assertFalse(OverlayController.isOverlayActive.value)
         assertEquals(OverlaySurfaceMode.FULL_APP, OverlayController.surfaceMode.value)
     }
 
@@ -110,6 +111,85 @@ class OverlayServiceTest {
     @Test
     fun `ACTION_EXPAND constant is correct`() {
         assertEquals("ai.citros.chat.ACTION_EXPAND_OVERLAY", OverlayService.ACTION_EXPAND)
+    }
+
+    @Test
+    fun `FULL_APP transition launches chat only when explicit launch request is pending`() {
+        assertTrue(
+            OverlayService.shouldLaunchChatActivityOnSurfaceTransition(
+                mode = OverlaySurfaceMode.FULL_APP,
+                pendingChatLaunchRequest = true
+            )
+        )
+        assertFalse(
+            OverlayService.shouldLaunchChatActivityOnSurfaceTransition(
+                mode = OverlaySurfaceMode.FULL_APP,
+                pendingChatLaunchRequest = false
+            )
+        )
+    }
+
+    @Test
+    fun `SEARCH_BAR transition never launches chat even with pending request`() {
+        assertFalse(
+            OverlayService.shouldLaunchChatActivityOnSurfaceTransition(
+                mode = OverlaySurfaceMode.SEARCH_BAR,
+                pendingChatLaunchRequest = true
+            )
+        )
+        assertFalse(
+            OverlayService.shouldLaunchChatActivityOnSurfaceTransition(
+                mode = OverlaySurfaceMode.SEARCH_BAR,
+                pendingChatLaunchRequest = false
+            )
+        )
+    }
+
+    @Test
+    fun `DYNAMIC_ISLAND transition never launches chat even with pending request`() {
+        assertFalse(
+            OverlayService.shouldLaunchChatActivityOnSurfaceTransition(
+                mode = OverlaySurfaceMode.DYNAMIC_ISLAND,
+                pendingChatLaunchRequest = true
+            )
+        )
+        assertFalse(
+            OverlayService.shouldLaunchChatActivityOnSurfaceTransition(
+                mode = OverlaySurfaceMode.DYNAMIC_ISLAND,
+                pendingChatLaunchRequest = false
+            )
+        )
+    }
+
+    @Test
+    fun `surface transition launch guard matrix matches expected mode request combinations`() {
+        data class Case(
+            val mode: OverlaySurfaceMode,
+            val pendingChatLaunchRequest: Boolean,
+            val expectedLaunch: Boolean
+        )
+
+        val cases = listOf(
+            Case(OverlaySurfaceMode.FULL_APP, true, true),
+            Case(OverlaySurfaceMode.FULL_APP, false, false),
+            Case(OverlaySurfaceMode.PANEL, true, false),
+            Case(OverlaySurfaceMode.PANEL, false, false),
+            Case(OverlaySurfaceMode.SEARCH_BAR, true, false),
+            Case(OverlaySurfaceMode.SEARCH_BAR, false, false),
+            Case(OverlaySurfaceMode.DYNAMIC_ISLAND, true, false),
+            Case(OverlaySurfaceMode.DYNAMIC_ISLAND, false, false),
+        )
+
+        cases.forEach { case ->
+            assertEquals(
+                case.expectedLaunch,
+                OverlayService.shouldLaunchChatActivityOnSurfaceTransition(
+                    mode = case.mode,
+                    pendingChatLaunchRequest = case.pendingChatLaunchRequest
+                ),
+                "Expected launch=${case.expectedLaunch} for mode=${case.mode} pending=${case.pendingChatLaunchRequest}"
+            )
+        }
     }
 
     @Test
@@ -264,7 +344,7 @@ class OverlayServiceTest {
 
     @Test
     fun `shouldUseCameraCenteredIslandTouchProxy enabled on Android 15 plus`() {
-        assertTrue(!OverlayService.shouldUseCameraCenteredIslandTouchProxy(34))
+        assertFalse(OverlayService.shouldUseCameraCenteredIslandTouchProxy(34))
         assertTrue(OverlayService.shouldUseCameraCenteredIslandTouchProxy(35))
         assertTrue(OverlayService.shouldUseCameraCenteredIslandTouchProxy(36))
     }
@@ -345,7 +425,7 @@ class OverlayServiceTest {
         val surfaceMode = OverlayController.surfaceMode.value
 
         // Not executing, but in SEARCH_BAR mode — should preserve
-        assertTrue(!isExecuting)
+        assertFalse(isExecuting)
         assertEquals(OverlaySurfaceMode.SEARCH_BAR, surfaceMode)
         assertTrue(surfaceMode != OverlaySurfaceMode.FULL_APP)
     }
@@ -370,11 +450,11 @@ class OverlayServiceTest {
         val surfaceMode = OverlayController.surfaceMode.value
 
         // Not executing and in FULL_APP → should stop
-        assertTrue(!isExecuting)
+        assertFalse(isExecuting)
         assertEquals(OverlaySurfaceMode.FULL_APP, surfaceMode)
         // ChatActivity logic: preserve if isExecuting || surfaceMode != FULL_APP
         // Neither is true → service should be stopped
-        assertTrue(!(isExecuting || surfaceMode != OverlaySurfaceMode.FULL_APP))
+        assertFalse(isExecuting || surfaceMode != OverlaySurfaceMode.FULL_APP)
     }
 
     // --- FULL_APP transition tests (#432) ---
@@ -390,7 +470,7 @@ class OverlayServiceTest {
 
         // Service should observe: mode=FULL_APP, active=false → launch activity + stop
         assertEquals(OverlaySurfaceMode.FULL_APP, OverlayController.surfaceMode.value)
-        assertTrue(!OverlayController.isOverlayActive.value)
+        assertFalse(OverlayController.isOverlayActive.value)
     }
 
     @Test
@@ -421,7 +501,7 @@ class OverlayServiceTest {
         val normalIntent = OverlayService.buildChatActivityLaunchIntent(context, startVoiceInput = false)
 
         assertTrue(voiceIntent.getBooleanExtra(EXTRA_START_VOICE_INPUT, false))
-        assertTrue(!normalIntent.getBooleanExtra(EXTRA_START_VOICE_INPUT, false))
+        assertFalse(normalIntent.getBooleanExtra(EXTRA_START_VOICE_INPUT, false))
     }
 
     @Test
@@ -431,7 +511,7 @@ class OverlayServiceTest {
         assertTrue(OverlayController.isOverlayActive.value)
 
         OverlayController.updateSurfaceMode(OverlaySurfaceMode.FULL_APP)
-        assertTrue(!OverlayController.isOverlayActive.value)
+        assertFalse(OverlayController.isOverlayActive.value)
         assertEquals(OverlaySurfaceMode.FULL_APP, OverlayController.surfaceMode.value)
     }
 
