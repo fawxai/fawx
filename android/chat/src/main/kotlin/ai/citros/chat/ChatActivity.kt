@@ -393,7 +393,8 @@ private fun ChatNavHost(
     // ── Voice I/O initialization ──
     // Extract models in background, then create VoiceManager.
     // Voice features are disabled until extraction completes.
-    // LaunchedEffect(Unit) is intentional: runs once per composition entry, not per lifecycle start.
+    // LaunchedEffect(Unit) is intentional: this one-shot only handles process-death recovery on
+    // initial composition entry, not every lifecycle resume/start.
     LaunchedEffect(Unit) {
         val appContext = context.applicationContext
         withContext(Dispatchers.IO) {
@@ -491,12 +492,17 @@ private fun ChatNavHost(
         )
         val isToolExecutionActive = overlayState.runState == OverlayRunState.EXECUTING
             && sharedChatViewModel.currentToolStatus.value != null
+        // Keep overlay alive whenever the model is still processing (#730).
+        // Without this, open_app clears currentToolStatus on result, causing
+        // the overlay to deactivate while the model generates its response.
+        val isModelBusy = sharedChatViewModel.isLoading.value &&
+            overlayState.runState == OverlayRunState.EXECUTING
         val idleSurfaceMode = OverlayController.preferredIdleSurfaceMode()
-        val backgroundSurfaceMode = if (isToolExecutionActive) {
-            OverlaySurfaceMode.DYNAMIC_ISLAND
-        } else {
-            idleSurfaceMode
-        }
+        val backgroundSurfaceMode = deriveBackgroundSurfaceMode(
+            isToolExecutionActive = isToolExecutionActive,
+            isModelBusy = isModelBusy,
+            idleSurfaceMode = idleSurfaceMode
+        )
         val shouldShowOverlayInBackground = backgroundSurfaceMode != OverlaySurfaceMode.FULL_APP
         if (!isAppForeground && OverlayPermission.canDrawOverlays(context) && shouldShowOverlayInBackground) {
             val currentMode = OverlayController.surfaceMode.value
@@ -569,13 +575,17 @@ private fun ChatNavHost(
             )
         }
         composable("overlay") {
+            // Guard: if OverlayService died (e.g. process death), bounce back to chat (#546)
+            LaunchedEffect(Unit) {
+                if (shouldPopOverlayRoute(OverlayService.instance)) {
+                    navController.popBackStack("chat", false)
+                }
+            }
             OverlayPreviewScreen(
                 context = context,
-                onBack = {
-                    if (!sharedChatViewModel.isLoading.value) {
-                        navController.popBackStack()
-                    }
-                },
+                // Intentional: allow back navigation even while isLoading=true.
+                // ViewModel execution continues in background so users never get stuck (#546).
+                onBack = { navController.popBackStack() },
                 viewModel = sharedChatViewModel,
                 onOverlayMinimized = { navController.popBackStack() },
                 onNavigateToChat = { navController.popBackStack("chat", false) },
@@ -723,6 +733,21 @@ private val OverlayInputKeywords = listOf(
     "need your input",
     "tap to continue"
 )
+
+internal fun deriveBackgroundSurfaceMode(
+    isToolExecutionActive: Boolean,
+    isModelBusy: Boolean,
+    idleSurfaceMode: OverlaySurfaceMode
+): OverlaySurfaceMode = if (isToolExecutionActive || isModelBusy) {
+    OverlaySurfaceMode.DYNAMIC_ISLAND
+} else {
+    idleSurfaceMode
+}
+
+@VisibleForTesting
+internal fun shouldPopOverlayRoute(overlayServiceInstance: OverlayService?): Boolean {
+    return overlayServiceInstance == null
+}
 
 internal fun deriveOverlayInteractionDemand(
     overlayState: OverlayState,
