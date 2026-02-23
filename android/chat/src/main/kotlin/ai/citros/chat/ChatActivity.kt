@@ -724,32 +724,38 @@ private val OverlayInputKeywords = listOf(
     "tap to continue"
 )
 
-private fun deriveOverlayInteractionDemand(
+internal fun deriveOverlayInteractionDemand(
     overlayState: OverlayState,
     toolStatus: String?
-): OverlayInteractionDemand {
-    if (overlayState.runState == OverlayRunState.FAILED) {
-        return OverlayInteractionDemand.ERROR_ACTION_REQUIRED
+): OverlayInteractionDemand = when (overlayState.runState) {
+    OverlayRunState.FAILED -> OverlayInteractionDemand.ERROR_ACTION_REQUIRED
+    OverlayRunState.EXECUTING -> {
+        val latestSystem = overlayState.lines
+            .lastOrNull { it.type == OverlayLineType.SYSTEM }
+            ?.text
+            ?.lowercase()
+            .orEmpty()
+        val normalized = buildString {
+            append(toolStatus?.lowercase().orEmpty())
+            append(' ')
+            append(latestSystem)
+        }.trim()
+        if (normalized.isBlank()) return@when OverlayInteractionDemand.NONE
+        if (OverlayPermissionKeywords.any { normalized.contains(it) }) {
+            return@when OverlayInteractionDemand.PERMISSION_REQUIRED
+        }
+        val endsWithQuestion = latestSystem.trimEnd().endsWith("?")
+        if (endsWithQuestion || OverlayInputKeywords.any { normalized.contains(it) }) {
+            return@when OverlayInteractionDemand.INPUT_REQUIRED
+        }
+        OverlayInteractionDemand.NONE
     }
-    val latestSystem = overlayState.lines
-        .lastOrNull { it.type == OverlayLineType.SYSTEM }
-        ?.text
-        ?.lowercase()
-        .orEmpty()
-    val normalized = buildString {
-        append(toolStatus?.lowercase().orEmpty())
-        append(' ')
-        append(latestSystem)
-    }.trim()
-    if (normalized.isBlank()) return OverlayInteractionDemand.NONE
-    if (OverlayPermissionKeywords.any { normalized.contains(it) }) {
-        return OverlayInteractionDemand.PERMISSION_REQUIRED
-    }
-    val endsWithQuestion = latestSystem.trimEnd().endsWith("?")
-    if (endsWithQuestion || OverlayInputKeywords.any { normalized.contains(it) }) {
-        return OverlayInteractionDemand.INPUT_REQUIRED
-    }
-    return OverlayInteractionDemand.NONE
+    // Only force panel interaction while the run is actively executing.
+    // Without this gate, stale question-like system lines from completed/idle/stopped runs
+    // can keep interaction demand pinned and prevent idle-surface transitions.
+    OverlayRunState.IDLE,
+    OverlayRunState.COMPLETED,
+    OverlayRunState.STOPPED -> OverlayInteractionDemand.NONE
 }
 
 private fun generateOauthState(): String = UUID.randomUUID().toString()
