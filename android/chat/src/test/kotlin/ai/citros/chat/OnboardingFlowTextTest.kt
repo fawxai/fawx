@@ -1,23 +1,18 @@
 package ai.citros.chat
 
 import android.content.Context
+import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
-import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performSemanticsAction
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Rule
-import org.junit.Ignore
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 
-/**
- * Tests verifying text conformance with citros-ui-mocks.html for PR #302.
- * These tests ensure the onboarding flow displays the correct user-facing strings
- * as specified in issues #292, #293, and #296.
- */
 @RunWith(RobolectricTestRunner::class)
-@Ignore("Robolectric + Compose touch injection broken — see #361")
 class OnboardingFlowTextTest {
 
     @get:Rule
@@ -26,156 +21,127 @@ class OnboardingFlowTextTest {
     private val context: Context
         get() = ApplicationProvider.getApplicationContext()
 
+    private fun clickByTag(tag: String) {
+        composeRule.onNodeWithTag(tag).performSemanticsAction(SemanticsActions.OnClick)
+        composeRule.waitForIdle()
+    }
+
+    private fun clickByText(text: String, useUnmergedTree: Boolean = false) {
+        composeRule.onNodeWithText(text, useUnmergedTree = useUnmergedTree)
+            .performSemanticsAction(SemanticsActions.OnClick)
+        composeRule.waitForIdle()
+    }
+
+    private fun launchOnboarding() {
+        composeRule.setContent {
+            OnboardingFlow(
+                context = context,
+                walletDependencies = createTestWalletDependencies(context),
+                onFinished = {}
+            )
+        }
+    }
+
+    private fun navigateToPaywall() {
+        clickByTag(TEST_TAG_ONBOARDING_CONTINUE_WELCOME)
+        clickByTag(TEST_TAG_ONBOARDING_CONTINUE_FLAVOR)
+        clickByTag(TEST_TAG_ONBOARDING_CONTINUE_PERSONALITY)
+        clickByTag(TEST_TAG_ONBOARDING_CONTINUE_ACQUAINTED)
+        clickByTag("permissions_continue_btn")
+        clickByTag(TEST_TAG_ONBOARDING_CONTINUE_TRUST)
+    }
+
     @Test
     fun testWelcomeScreenText() {
-        composeRule.setContent {
-            OnboardingFlow(context = context, walletDependencies = createTestWalletDependencies(context), onFinished = {})
-        }
+        launchOnboarding()
 
-        // Verify welcome screen displays correct title and subtitle
-        composeRule.onNodeWithText("Welcome to Citros").assertExists()
-        composeRule.onNodeWithText("AI that uses your phone", useUnmergedTree = true).assertExists()
+        composeRule.onNodeWithText("Citros").assertExists()
+        composeRule.onNodeWithText("Your phone, thinking ahead.", useUnmergedTree = true).assertExists()
+        composeRule.onNodeWithText("Get Started").assertExists()
     }
 
     @Test
     fun testFlavorScreenText() {
-        composeRule.setContent {
-            OnboardingFlow(context = context, walletDependencies = createTestWalletDependencies(context), onFinished = {})
-        }
+        launchOnboarding()
 
-        // Navigate to flavor screen
-        composeRule.onNodeWithText("Continue").performClick()
-        composeRule.waitForIdle()
+        clickByTag(TEST_TAG_ONBOARDING_CONTINUE_WELCOME)
 
-        // Verify flavor screen displays correct title and subtitle
-        composeRule.onNodeWithText("Choose Your Flavor").assertExists()
-        composeRule.onNodeWithText("This sets your personal color theme", useUnmergedTree = true).assertExists()
-    }
-
-    @Test
-    fun testPersonalityScreenText() {
-        composeRule.setContent {
-            OnboardingFlow(context = context, walletDependencies = createTestWalletDependencies(context), onFinished = {})
-        }
-
-        // Navigate to personality screen
-        composeRule.onNodeWithText("Continue").performClick()
-        composeRule.waitForIdle()
-        composeRule.onNodeWithText("Next").performClick()
-        composeRule.waitForIdle()
-
-        // Verify personality screen displays correct title and subtitle
-        composeRule.onNodeWithText("Personalize Citros").assertExists()
-        composeRule.onNodeWithText("Tell me how you like things", useUnmergedTree = true).assertExists()
-    }
-
-    @Test
-    fun testPersonalityComfortLevelQuestion() {
-        composeRule.setContent {
-            OnboardingFlow(context = context, walletDependencies = createTestWalletDependencies(context), onFinished = {})
-        }
-
-        // Navigate to personality screen
-        composeRule.onNodeWithText("Continue").performClick()
-        composeRule.waitForIdle()
-        composeRule.onNodeWithText("Next").performClick()
-        composeRule.waitForIdle()
-
-        // Verify comfort level question text
-        composeRule.onNodeWithText("What's your comfort level?", useUnmergedTree = true).assertExists()
-    }
-
-    @Test
-    fun testPersonalitySaveContinueButton() {
-        composeRule.setContent {
-            OnboardingFlow(context = context, walletDependencies = createTestWalletDependencies(context), onFinished = {})
-        }
-
-        // Navigate to personality screen
-        composeRule.onNodeWithText("Continue").performClick()
-        composeRule.waitForIdle()
-        composeRule.onNodeWithText("Next").performClick()
-        composeRule.waitForIdle()
-
-        // Verify CTA button text
-        composeRule.onNodeWithText("Save & Continue").assertExists()
-    }
-
-    @Test
-    fun testPaywallFooterText() {
-        composeRule.setContent {
-            OnboardingFlow(context = context, walletDependencies = createTestWalletDependencies(context), onFinished = {})
-        }
-
-        // Navigate through onboarding to paywall screen
-        composeRule.onNodeWithText("Continue").performClick()
-        composeRule.waitForIdle()
-        composeRule.onNodeWithText("Next").performClick()
-        composeRule.waitForIdle()
-        composeRule.onNodeWithText("Save & Continue").performClick()
-        composeRule.waitForIdle()
-        
-        // Skip onboarding chat if present
-        try {
-            composeRule.onNodeWithText("Skip").performClick()
-            composeRule.waitForIdle()
-        } catch (e: Exception) {
-            // Chat might be disabled, continue
-        }
-
-        // Verify paywall footer text
-        composeRule.onNodeWithText("Cancel anytime · Usage resets monthly · All plans include phone control", useUnmergedTree = true)
+        composeRule.onNodeWithText("Make It Yours").assertExists()
+        composeRule.onNodeWithText("Pick a flavor and theme. You can change these anytime.", useUnmergedTree = true)
             .assertExists()
     }
 
     @Test
+    fun testPersonalityScreenText() {
+        launchOnboarding()
+
+        clickByTag(TEST_TAG_ONBOARDING_CONTINUE_WELCOME)
+        clickByTag(TEST_TAG_ONBOARDING_CONTINUE_FLAVOR)
+
+        composeRule.onNodeWithText("How Should I Talk?").assertExists()
+        composeRule.onNodeWithText("Choose how Citros communicates with you.", useUnmergedTree = true).assertExists()
+    }
+
+    @Test
+    fun testPersonalityComfortLevelQuestion() {
+        launchOnboarding()
+
+        clickByTag(TEST_TAG_ONBOARDING_CONTINUE_WELCOME)
+        clickByTag(TEST_TAG_ONBOARDING_CONTINUE_FLAVOR)
+
+        composeRule.onNodeWithText("Concise").assertExists()
+        composeRule.onNodeWithText("Balanced").assertExists()
+        composeRule.onNodeWithText("Thorough").assertExists()
+    }
+
+    @Test
+    fun testPersonalitySaveContinueButton() {
+        launchOnboarding()
+
+        clickByTag(TEST_TAG_ONBOARDING_CONTINUE_WELCOME)
+        clickByTag(TEST_TAG_ONBOARDING_CONTINUE_FLAVOR)
+
+        composeRule.onNodeWithTag(TEST_TAG_ONBOARDING_CONTINUE_PERSONALITY).assertExists()
+        composeRule.onNodeWithText("Continue").assertExists()
+    }
+
+    @Test
+    fun testPaywallFooterText() {
+        launchOnboarding()
+
+        navigateToPaywall()
+
+        composeRule.onNodeWithText(
+            "Base and Super are coming soon. You can continue now with your own API key.",
+            useUnmergedTree = true
+        ).assertExists()
+    }
+
+    @Test
     fun testPaywallSkipButtonText() {
-        composeRule.setContent {
-            OnboardingFlow(context = context, walletDependencies = createTestWalletDependencies(context), onFinished = {})
-        }
+        launchOnboarding()
 
-        // Navigate through onboarding to paywall screen
-        composeRule.onNodeWithText("Continue").performClick()
-        composeRule.waitForIdle()
-        composeRule.onNodeWithText("Next").performClick()
-        composeRule.waitForIdle()
-        composeRule.onNodeWithText("Save & Continue").performClick()
-        composeRule.waitForIdle()
-        
-        // Skip onboarding chat if present
-        try {
-            composeRule.onNodeWithText("Skip").performClick()
-            composeRule.waitForIdle()
-        } catch (e: Exception) {
-            // Chat might be disabled, continue
-        }
+        navigateToPaywall()
 
-        // Verify skip button text with arrow
-        composeRule.onNodeWithText("I'll decide later →").assertExists()
+        composeRule.onNodeWithText("Bring Your Own Key - Free").assertExists()
+        composeRule.onNodeWithText("Select").assertExists()
     }
 
     @Test
     fun testAllOnboardingTextUpdatesInSequence() {
-        composeRule.setContent {
-            OnboardingFlow(context = context, walletDependencies = createTestWalletDependencies(context), onFinished = {})
-        }
+        launchOnboarding()
 
-        // Step 1: Welcome screen
-        composeRule.onNodeWithText("Welcome to Citros").assertExists()
-        composeRule.onNodeWithText("AI that uses your phone", useUnmergedTree = true).assertExists()
-        composeRule.onNodeWithText("Continue").performClick()
-        composeRule.waitForIdle()
+        composeRule.onNodeWithText("Citros").assertExists()
+        composeRule.onNodeWithText("Your phone, thinking ahead.", useUnmergedTree = true).assertExists()
+        clickByTag(TEST_TAG_ONBOARDING_CONTINUE_WELCOME)
 
-        // Step 2: Flavor screen
-        composeRule.onNodeWithText("Choose Your Flavor").assertExists()
-        composeRule.onNodeWithText("This sets your personal color theme", useUnmergedTree = true).assertExists()
-        composeRule.onNodeWithText("Next").performClick()
-        composeRule.waitForIdle()
+        composeRule.onNodeWithText("Make It Yours").assertExists()
+        composeRule.onNodeWithText("Pick a flavor and theme. You can change these anytime.", useUnmergedTree = true)
+            .assertExists()
+        clickByTag(TEST_TAG_ONBOARDING_CONTINUE_FLAVOR)
 
-        // Step 3: Personality screen
-        composeRule.onNodeWithText("Personalize Citros").assertExists()
-        composeRule.onNodeWithText("Tell me how you like things", useUnmergedTree = true).assertExists()
-        composeRule.onNodeWithText("What's your comfort level?", useUnmergedTree = true).assertExists()
-        composeRule.onNodeWithText("Save & Continue").assertExists()
+        composeRule.onNodeWithText("How Should I Talk?").assertExists()
+        composeRule.onNodeWithText("Choose how Citros communicates with you.", useUnmergedTree = true).assertExists()
+        clickByTag(TEST_TAG_ONBOARDING_CONTINUE_PERSONALITY)
     }
 }

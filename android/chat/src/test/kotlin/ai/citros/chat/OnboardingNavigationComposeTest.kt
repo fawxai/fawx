@@ -1,9 +1,10 @@
 package ai.citros.chat
 
 import android.content.Context
+import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
-import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performSemanticsAction
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Rule
 import org.junit.Test
@@ -18,6 +19,11 @@ class OnboardingNavigationComposeTest {
 
     private val context: Context
         get() = ApplicationProvider.getApplicationContext()
+
+    private fun clickByTag(tag: String) {
+        composeRule.onNodeWithTag(tag).performSemanticsAction(SemanticsActions.OnClick)
+        composeRule.waitForIdle()
+    }
 
     @Test
     fun backButtonsNavigateToExpectedEditedSteps() {
@@ -34,31 +40,31 @@ class OnboardingNavigationComposeTest {
             )
         }
 
-        composeRule.onNodeWithTag(TEST_TAG_ONBOARDING_CONTINUE_WELCOME).performClick()
-        composeRule.onNodeWithTag(TEST_TAG_ONBOARDING_CONTINUE_FLAVOR).performClick()
-        composeRule.onNodeWithTag(TEST_TAG_ONBOARDING_CONTINUE_PERSONALITY).performClick()
-        composeRule.onNodeWithTag(TEST_TAG_ONBOARDING_CONTINUE_ACQUAINTED).performClick()
+        clickByTag(TEST_TAG_ONBOARDING_CONTINUE_WELCOME)
+        clickByTag(TEST_TAG_ONBOARDING_CONTINUE_FLAVOR)
+        clickByTag(TEST_TAG_ONBOARDING_CONTINUE_PERSONALITY)
+        clickByTag(TEST_TAG_ONBOARDING_CONTINUE_ACQUAINTED)
 
         composeRule.onNodeWithTag(TEST_TAG_ONBOARDING_BACK_PERMISSIONS).assertExists()
-        composeRule.onNodeWithTag(TEST_TAG_ONBOARDING_BACK_PERMISSIONS).performClick()
+        clickByTag(TEST_TAG_ONBOARDING_BACK_PERMISSIONS)
         composeRule.onNodeWithTag(TEST_TAG_ONBOARDING_CONTINUE_ACQUAINTED).assertExists()
 
-        composeRule.onNodeWithTag(TEST_TAG_ONBOARDING_CONTINUE_ACQUAINTED).performClick()
-        composeRule.onNodeWithTag("permissions_continue_btn").performClick()
+        clickByTag(TEST_TAG_ONBOARDING_CONTINUE_ACQUAINTED)
+        clickByTag("permissions_continue_btn")
         composeRule.onNodeWithTag(TEST_TAG_ONBOARDING_BACK_TRUST).assertExists()
-        composeRule.onNodeWithTag(TEST_TAG_ONBOARDING_BACK_TRUST).performClick()
+        clickByTag(TEST_TAG_ONBOARDING_BACK_TRUST)
         composeRule.onNodeWithTag(TEST_TAG_ONBOARDING_BACK_PERMISSIONS).assertExists()
 
-        composeRule.onNodeWithTag("permissions_continue_btn").performClick()
-        composeRule.onNodeWithTag(TEST_TAG_ONBOARDING_CONTINUE_TRUST).performClick()
+        clickByTag("permissions_continue_btn")
+        clickByTag(TEST_TAG_ONBOARDING_CONTINUE_TRUST)
         composeRule.onNodeWithTag(TEST_TAG_ONBOARDING_BACK_PAYWALL).assertExists()
-        composeRule.onNodeWithTag(TEST_TAG_ONBOARDING_BACK_PAYWALL).performClick()
+        clickByTag(TEST_TAG_ONBOARDING_BACK_PAYWALL)
         composeRule.onNodeWithTag(TEST_TAG_ONBOARDING_BACK_TRUST).assertExists()
 
-        composeRule.onNodeWithTag(TEST_TAG_ONBOARDING_CONTINUE_TRUST).performClick()
-        composeRule.onNodeWithTag("paywall_plan_byo").performClick()
+        clickByTag(TEST_TAG_ONBOARDING_CONTINUE_TRUST)
+        clickByTag("paywall_plan_byo")
         composeRule.onNodeWithTag(TEST_TAG_ONBOARDING_BACK_API_KEY).assertExists()
-        composeRule.onNodeWithTag(TEST_TAG_ONBOARDING_BACK_API_KEY).performClick()
+        clickByTag(TEST_TAG_ONBOARDING_BACK_API_KEY)
         composeRule.onNodeWithTag(TEST_TAG_ONBOARDING_BACK_PAYWALL).assertExists()
     }
 }

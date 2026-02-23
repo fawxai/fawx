@@ -1,24 +1,28 @@
 package ai.citros.chat
 
 import android.content.Context
+import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
-import androidx.compose.ui.test.onNodeWithText
-import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performSemanticsAction
 import androidx.test.core.app.ApplicationProvider
 import kotlin.test.assertTrue
-import org.junit.Ignore
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 
 @RunWith(RobolectricTestRunner::class)
-@Ignore("Robolectric + Compose touch injection broken — see #361")
 class OverlayPreviewScreenTest {
 
     @get:Rule
     val composeRule = createComposeRule()
+
+    private fun clickByDescription(description: String) {
+        composeRule.onNodeWithContentDescription(description)
+            .performSemanticsAction(SemanticsActions.OnClick)
+        composeRule.waitForIdle()
+    }
 
     @Test
     fun testSurfaceModeTransitions() {
@@ -28,14 +32,14 @@ class OverlayPreviewScreenTest {
             OverlayPreviewScreen(context = context, onBack = {})
         }
 
-        composeRule.onNodeWithText("Search Bar").performClick()
-        composeRule.onNodeWithContentDescription("Overlay search bar").assertExists()
+        clickByDescription("Search Bar mode not selected")
+        composeRule.onNodeWithContentDescription("Search Bar mode selected").assertExists()
 
-        composeRule.onNodeWithText("Full App").performClick()
-        composeRule.onNodeWithText("Return").assertExists()
+        clickByDescription("Full App mode not selected")
+        composeRule.onNodeWithContentDescription("Full App mode selected").assertExists()
 
-        composeRule.onNodeWithText("Panel").performClick()
-        composeRule.onNodeWithText("Message", useUnmergedTree = true).assertExists()
+        clickByDescription("Panel mode not selected")
+        composeRule.onNodeWithContentDescription("Panel mode selected").assertExists()
     }
 
     @Test
@@ -46,8 +50,8 @@ class OverlayPreviewScreenTest {
             OverlayPreviewScreen(context = context, onBack = {})
         }
 
-        composeRule.onNodeWithText("Stop").performClick()
-        composeRule.onNodeWithText("Stopped").assertExists()
+        clickByDescription("Stop state not selected")
+        composeRule.onNodeWithContentDescription("Stop state selected").assertExists()
     }
 
     @Test
@@ -64,7 +68,7 @@ class OverlayPreviewScreenTest {
             )
         }
 
-        composeRule.onNodeWithText("Full App").performClick()
+        clickByDescription("Full App mode not selected")
         composeRule.runOnIdle {
             assertTrue(navigatedToChat)
         }
