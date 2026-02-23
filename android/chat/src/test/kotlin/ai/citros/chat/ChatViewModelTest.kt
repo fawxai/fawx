@@ -52,6 +52,7 @@ class ChatViewModelTest {
     @Before
     fun setup() {
         Dispatchers.setMain(testDispatcher)
+        ChatStateCache.clear()
         viewModel = ChatViewModel()
         viewModel.outputVerbosity = OutputVerbosity.VERBOSE
     }
@@ -61,6 +62,7 @@ class ChatViewModelTest {
         ai.citros.core.ScreenReader.toolLoopOverlayHideHook = null
         ai.citros.core.ScreenReader.toolLoopOverlayRestoreHook = null
         ModelCatalog.clearCache()
+        ChatStateCache.clear()
         Dispatchers.resetMain()
     }
 
@@ -111,6 +113,39 @@ class ChatViewModelTest {
         assertEquals("user", viewModel.messages[0].role)
         assertEquals("assistant", viewModel.messages[1].role)
         assertTrue(viewModel.messages[1].content.contains("Not configured"))
+    }
+
+
+    @Test
+    fun `restores chat state from process cache after ViewModel recreation`() = runTest {
+        viewModel.messages.add(Message(role = "user", content = "hello"))
+        viewModel.messages.add(Message(role = "assistant", content = "hi"))
+        viewModel.currentToolStatus.value = "Opening app..."
+        viewModel.unreadCount.intValue = 2
+        viewModel.setQueuedMessage("follow up")
+        viewModel.lastActivityTimestamp = 1234L
+        advanceUntilIdle()
+
+        val recreated = ChatViewModel()
+        advanceUntilIdle()
+
+        assertEquals(viewModel.messages.toList(), recreated.messages.toList())
+        assertEquals("Opening app...", recreated.currentToolStatus.value)
+        assertEquals(2, recreated.unreadCount.intValue)
+        assertEquals("follow up", recreated.queuedMessage.value)
+        assertEquals(1234L, recreated.lastActivityTimestamp)
+    }
+
+    @Test
+    fun `new ChatViewModel with empty cache starts with default state`() = runTest {
+        ChatStateCache.clear()
+
+        val fresh = ChatViewModel()
+        advanceUntilIdle()
+
+        assertTrue(fresh.messages.isEmpty())
+        assertNull(fresh.currentToolStatus.value)
+        assertEquals(0, fresh.unreadCount.intValue)
     }
 
     @Test

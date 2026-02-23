@@ -4,6 +4,7 @@ import androidx.annotation.VisibleForTesting
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.snapshotFlow
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import ai.citros.core.*
@@ -14,6 +15,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -340,6 +342,39 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
     /** Accessibility reattachment timeout. Override in tests for speed. */
     @VisibleForTesting
     internal var accessibilityWaitMs: Long = ACCESSIBILITY_WAIT_MS_DEFAULT
+
+    init {
+        restoreFromCache()
+        viewModelScope.launch {
+            snapshotFlow {
+                ChatStateCache.Snapshot(
+                    messages = messages.toList(),
+                    currentToolStatus = currentToolStatus.value,
+                    unreadCount = unreadCount.intValue,
+                    queuedMessage = queuedMessage.value,
+                    lastActivityTimestamp = lastActivityTimestamp
+                )
+            }.distinctUntilChanged().collect { snapshot ->
+                ChatStateCache.write(snapshot)
+            }
+        }
+    }
+
+    private fun restoreFromCache() {
+        val snapshot = ChatStateCache.read() ?: return
+        messages.clear()
+        messages.addAll(snapshot.messages)
+        currentToolStatus.value = snapshot.currentToolStatus
+        unreadCount.intValue = snapshot.unreadCount
+        queuedMessage.value = snapshot.queuedMessage
+        lastActivityTimestamp = snapshot.lastActivityTimestamp
+
+        // Trade-off: clear immediately to avoid retaining stale Snapshot references
+        // for the full process lifetime. If this VM dies before snapshotFlow starts
+        // collecting, a second recreation may miss state — acceptable because
+        // appearance changes recreate Activity/VM without killing the process.
+        ChatStateCache.clear()
+    }
 
     /**
      * After open_app or press_home, poll until the screen package changes from Citros.
