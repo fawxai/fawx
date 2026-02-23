@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016  # intentional single-quoted regex/jq snippets in spec checks
 set -euo pipefail
 
 # Maintainer note: this validator intentionally enforces a strict, line-oriented
