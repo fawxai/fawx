@@ -625,8 +625,8 @@ open class PhoneAgentApi(
 
     private fun buildChatSystemPrompt(
         phoneControlAvailable: Boolean,
-        modelName: String,
-        sensorContext: String
+        modelName: String?,
+        sensorContext: SensorContext?
     ): String {
         return promptBuilder?.full(
             phoneControlAvailable = phoneControlAvailable,
