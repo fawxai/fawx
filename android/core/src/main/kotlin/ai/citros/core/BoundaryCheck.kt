@@ -278,6 +278,10 @@ class AccessibilityGateCheck(
 }
 
 
+
+/** Shared marker string used by interruption steer prompts and resume detection. */
+internal const val INTERRUPTION_RESUME_MARKER = "Pause and ask if they want you to continue or cancel."
+
 /**
  * Represents an event where the user interrupted the agent's execution.
  *
@@ -309,17 +313,17 @@ class UserInterruptionCheck : BoundaryCheck {
         return when (event) {
             is InterruptionEvent.UserTouch -> CheckResult.Steer(
                 listOf("[SYSTEM: User touched the screen at (${event.x}, ${event.y}) during task execution. " +
-                    "Pause and ask if they want you to continue or cancel.]")
+                    "$INTERRUPTION_RESUME_MARKER]")
             )
             is InterruptionEvent.AppSwitch -> CheckResult.Steer(
                 listOf("[SYSTEM: User switched from ${event.previousApp} to ${event.newApp}. " +
-                    "Pause and ask if they want you to continue or cancel.]")
+                    "$INTERRUPTION_RESUME_MARKER]")
             )
             is InterruptionEvent.ExternalInterrupt -> {
                 val desc = event.description.ifEmpty { "External interruption occurred" }
                 CheckResult.Steer(
                     listOf("[SYSTEM: $desc. " +
-                        "Pause and ask if they want you to continue or cancel.]")
+                        "$INTERRUPTION_RESUME_MARKER]")
                 )
             }
         }

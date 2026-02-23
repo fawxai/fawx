@@ -622,6 +622,185 @@ class PhoneAgentApiTest {
     }
 
     @Test
+    fun `continue after interruption pause context routes to tool mode`() = runTest {
+        val toolClient = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            chatResponses = ArrayDeque(listOf("chat fallback")),
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = "Resuming the task",
+                        toolCalls = listOf(ToolCall("tc1", "tap", mapOf("element_id" to 1))),
+                        stopReason = "tool_use"
+                    )
+                )
+            )
+        )
+        val agent = PhoneAgentApi(toolClient, toolClient).also { it.phoneControlOverride = true }
+        agent.seedConversationHistory(
+            listOf(
+                Message(
+                    role = Message.ROLE_USER,
+                    content =
+                        "[SYSTEM: User switched from com.mail to com.calendar. " +
+                            "$INTERRUPTION_RESUME_MARKER]"
+                ),
+                Message(
+                    role = Message.ROLE_ASSISTANT,
+                    content = "You switched apps. Should I continue or cancel?"
+                )
+            )
+        )
+
+        val response = agent.sendMessage("continue", screenContent = null, isActionLoop = false)
+
+        assertEquals(0, toolClient.chatCalls, "continue should bypass chat mode when interruption pause context exists")
+        assertEquals(1, toolClient.chatWithToolsCalls, "continue should re-enter actionable mode")
+        assertEquals("tool_use", response.stopReason)
+        assertTrue(response.toolCalls.isNotEmpty())
+    }
+
+    @Test
+    fun `resume after interruption pause context routes to tool mode`() = runTest {
+        val toolClient = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            chatResponses = ArrayDeque(listOf("chat fallback")),
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = "Resuming now",
+                        toolCalls = listOf(ToolCall("tc2", "press_back", emptyMap())),
+                        stopReason = "tool_use"
+                    )
+                )
+            )
+        )
+        val agent = PhoneAgentApi(toolClient, toolClient).also { it.phoneControlOverride = true }
+        agent.seedConversationHistory(
+            listOf(
+                Message(
+                    role = Message.ROLE_USER,
+                    content =
+                        "[SYSTEM: User switched from com.mail to com.calendar. " +
+                            "$INTERRUPTION_RESUME_MARKER]"
+                ),
+                Message(
+                    role = Message.ROLE_ASSISTANT,
+                    content = "Want me to resume?"
+                )
+            )
+        )
+
+        val response = agent.sendMessage("resume please", screenContent = null, isActionLoop = false)
+
+        assertEquals(0, toolClient.chatCalls)
+        assertEquals(1, toolClient.chatWithToolsCalls)
+        assertEquals("tool_use", response.stopReason)
+    }
+
+    @Test
+    fun `continue after interruption cancel does not re-enter tool mode`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            chatResponses = ArrayDeque(listOf("Canceled already — what next?")),
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = "Should not run tools",
+                        toolCalls = listOf(ToolCall("tc_cancel", "tap", mapOf("element_id" to 9))),
+                        stopReason = "tool_use"
+                    )
+                )
+            )
+        )
+        val agent = PhoneAgentApi(client, client).also { it.phoneControlOverride = true }
+        agent.seedConversationHistory(
+            listOf(
+                Message(
+                    role = Message.ROLE_USER,
+                    content =
+                        "[SYSTEM: User switched from com.mail to com.calendar. " +
+                            "$INTERRUPTION_RESUME_MARKER]"
+                ),
+                Message(role = Message.ROLE_ASSISTANT, content = "You switched apps. Should I continue or cancel?"),
+                Message(role = Message.ROLE_USER, content = "cancel"),
+                Message(role = Message.ROLE_ASSISTANT, content = "Okay, canceled.")
+            )
+        )
+
+        val response = agent.sendMessage("continue", screenContent = null, isActionLoop = false)
+
+        assertEquals("Canceled already — what next?", response.text)
+        assertTrue(response.toolCalls.isEmpty())
+        assertEquals(1, client.chatCalls)
+        assertEquals(0, client.chatWithToolsCalls)
+    }
+
+    @Test
+    fun `continue with interruption marker outside recent window stays chat mode`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            chatResponses = ArrayDeque(listOf("Continue what?")),
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = "Should not run tools",
+                        toolCalls = listOf(ToolCall("tc_old", "tap", mapOf("element_id" to 1))),
+                        stopReason = "tool_use"
+                    )
+                )
+            )
+        )
+        val agent = PhoneAgentApi(client, client).also { it.phoneControlOverride = true }
+        val history = mutableListOf<Message>(
+            Message(
+                role = Message.ROLE_USER,
+                content =
+                    "[SYSTEM: User switched from com.mail to com.calendar. " +
+                        "$INTERRUPTION_RESUME_MARKER]"
+            ),
+            Message(role = Message.ROLE_ASSISTANT, content = "Should I continue?")
+        )
+        repeat(6) { idx ->
+            history += Message(role = Message.ROLE_USER, content = "user filler $idx")
+            history += Message(role = Message.ROLE_ASSISTANT, content = "assistant filler $idx")
+        }
+        agent.seedConversationHistory(history)
+
+        val response = agent.sendMessage("continue", screenContent = null, isActionLoop = false)
+
+        assertEquals("Continue what?", response.text)
+        assertTrue(response.toolCalls.isEmpty())
+        assertEquals(1, client.chatCalls)
+        assertEquals(0, client.chatWithToolsCalls)
+    }
+
+    @Test
+    fun `continue without interruption context stays chat mode`() = runTest {
+        val chatClient = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            chatResponses = ArrayDeque(listOf("Continue what?")),
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = "Should not run tools",
+                        toolCalls = listOf(ToolCall("tc3", "tap", mapOf("element_id" to 9))),
+                        stopReason = "tool_use"
+                    )
+                )
+            )
+        )
+        val agent = PhoneAgentApi(chatClient, chatClient).also { it.phoneControlOverride = true }
+
+        val response = agent.sendMessage("continue", screenContent = null, isActionLoop = false)
+
+        assertEquals("Continue what?", response.text)
+        assertTrue(response.toolCalls.isEmpty())
+        assertEquals(1, chatClient.chatCalls)
+        assertEquals(0, chatClient.chatWithToolsCalls)
+    }
+
+    @Test
     fun `action phrases like take screenshot use tool mode`() = runTest {
         val toolResponse = ChatResponse(
             text = "Done",

@@ -414,9 +414,17 @@ open class PhoneAgentApi(
         // When phone control is not available, always use chat mode without tools (#390).
         // This prevents the model from hallucinating XML tool calls in plain text.
         val phoneControlAvailable = phoneControlOverride ?: ScreenReader.isAttached()
+        val forceToolModeForResume =
+            !isActionLoop &&
+                isResumeIntent(userMessage) &&
+                hasRecentInterruptionPauseContext()
         val useChatMode = !phoneControlAvailable ||
-            (!isActionLoop && isLikelyConversationalMessage(userMessage))
-        Log.d(TAG, "sendMessage: phoneControl=$phoneControlAvailable, chatMode=$useChatMode, isActionLoop=$isActionLoop, msg='${userMessage.take(60)}'")
+            (!isActionLoop && isLikelyConversationalMessage(userMessage) && !forceToolModeForResume)
+        Log.d(
+            TAG,
+            "sendMessage: phoneControl=$phoneControlAvailable, chatMode=$useChatMode, " +
+                "isActionLoop=$isActionLoop, forceResumeToolMode=$forceToolModeForResume, msg='${userMessage.take(60)}'"
+        )
         if (useChatMode) {
             // When phone control is unavailable, prepend a system note so the
             // model knows not to attempt phone actions.
@@ -1469,6 +1477,52 @@ open class PhoneAgentApi(
         // 4. Short message without special chars → chat mode
         val wordCount = normalized.split(Regex("\\s+")).size
         return wordCount <= 3 && normalized.all { it.isLetterOrDigit() || it.isWhitespace() || it == '\'' }
+    }
+
+    /**
+     * Determine whether the user is asking to continue/resume a paused task.
+     *
+     * Keeps matching intentionally narrow: short "continue/resume/proceed" variants.
+     */
+    private fun isResumeIntent(userMessage: String): Boolean {
+        val normalized = userMessage
+            .trim()
+            .lowercase()
+            .replace(Regex("[^a-z0-9\\s]"), "")
+            .replace(Regex("\\s+"), " ")
+        return normalized in setOf(
+            "continue",
+            "continue please",
+            "resume",
+            "resume please",
+            "proceed",
+            "proceed please",
+            "go on",
+            "keep going"
+        )
+    }
+
+    /**
+     * True when recent conversation history contains an interruption pause marker.
+     *
+     * This marker is injected by UserInterruptionCheck and signals that a short
+     * follow-up like "continue" should re-enter actionable mode.
+     */
+    private fun hasRecentInterruptionPauseContext(windowSize: Int = 10): Boolean {
+        val recent = messages.takeLast(windowSize)
+        val markerIndex = recent.indexOfLast { msg ->
+            msg.role == Message.ROLE_USER && msg.content.contains(INTERRUPTION_RESUME_MARKER)
+        }
+        if (markerIndex < 0) return false
+
+        val trailing = recent.drop(markerIndex + 1)
+        if (trailing.none { it.role == Message.ROLE_ASSISTANT }) return false
+
+        // Resume window closes once any subsequent user turn occurs
+        // (e.g. user canceled, asked something else, or moved on).
+        if (trailing.any { it.role == Message.ROLE_USER }) return false
+
+        return true
     }
 
     /**
