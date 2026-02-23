@@ -24,6 +24,7 @@ import ai.citros.core.ToolCall
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
@@ -31,6 +32,8 @@ import kotlinx.coroutines.test.resetMain
 import org.junit.After
 import org.junit.Before
 import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
@@ -39,6 +42,7 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import ai.citros.core.OutputVerbosity
 
+@RunWith(RobolectricTestRunner::class)
 @OptIn(ExperimentalCoroutinesApi::class)
 class ChatViewModelTest {
 
@@ -2530,6 +2534,112 @@ class ChatViewModelTest {
         val label = ChatViewModel.toolStatusLabel("some_new_tool")
         assertTrue(label.contains("some_new_tool"),
             "Unknown tool label should contain the tool name: $label")
+    }
+
+    @Test
+    fun `onToolError TRANSIENT sets retrying status`() {
+        viewModel.onToolError(
+            toolName = "web_fetch",
+            errorText = "timeout",
+            severity = ErrorSeverity.TRANSIENT
+        )
+
+        assertEquals("Retrying...", viewModel.currentToolStatus.value)
+    }
+
+    @Test
+    fun `onToolError PERSISTENT sets warning status`() {
+        viewModel.onToolError(
+            toolName = "web_fetch",
+            errorText = "HTTP 500",
+            severity = ErrorSeverity.PERSISTENT
+        )
+
+        assertEquals("⚠️ HTTP 500", viewModel.currentToolStatus.value)
+    }
+
+    @Test
+    fun `onToolError PERSISTENT JSON payload uses fallback warning status`() {
+        viewModel.onToolError(
+            toolName = "web_fetch",
+            errorText = """{"error":"server_error"}""",
+            severity = ErrorSeverity.PERSISTENT
+        )
+
+        assertEquals("⚠️ Working...", viewModel.currentToolStatus.value)
+    }
+
+    @Test
+    fun `onToolError EXPLORATORY and INFORMATIONAL do not change status`() {
+        viewModel.currentToolStatus.value = "Interacting..."
+
+        viewModel.onToolError(
+            toolName = "web_fetch",
+            errorText = "exploratory miss",
+            severity = ErrorSeverity.EXPLORATORY
+        )
+        assertEquals("Interacting...", viewModel.currentToolStatus.value)
+
+        viewModel.onToolError(
+            toolName = "web_fetch",
+            errorText = "informational",
+            severity = ErrorSeverity.INFORMATIONAL
+        )
+        assertEquals("Interacting...", viewModel.currentToolStatus.value)
+    }
+
+    @Test
+    fun `retrying status auto clears and transient clear job cancellation prevents stale clear`() = runTest {
+        viewModel.onToolError(
+            toolName = "web_fetch",
+            errorText = "timeout one",
+            severity = ErrorSeverity.TRANSIENT
+        )
+        advanceTimeBy(1500)
+
+        // New transient error should cancel previous clear job and keep status visible
+        viewModel.onToolError(
+            toolName = "web_fetch",
+            errorText = "timeout two",
+            severity = ErrorSeverity.TRANSIENT
+        )
+
+        // Pass original clear boundary (2s from first error) — status should still be present
+        advanceTimeBy(600)
+        assertEquals("Retrying...", viewModel.currentToolStatus.value)
+
+        // Pass second clear boundary — now it should clear
+        advanceTimeBy(1400)
+        advanceUntilIdle()
+        assertNull(viewModel.currentToolStatus.value)
+    }
+
+    @Test
+    fun `persistent status is not cleared by error tool result but clears on success`() {
+        viewModel.onToolError(
+            toolName = "web_fetch",
+            errorText = "HTTP 500",
+            severity = ErrorSeverity.PERSISTENT
+        )
+        assertEquals("⚠️ HTTP 500", viewModel.currentToolStatus.value)
+
+        // Subsequent error tool result should not clear persistent warning
+        viewModel.onToolResult(
+            toolName = "web_fetch",
+            result = "Failed: still broken",
+            visibility = ai.citros.core.OutputVisibility.SHOW,
+            isError = true
+        )
+        assertEquals("⚠️ HTTP 500", viewModel.currentToolStatus.value)
+
+        // Success should clear it
+        viewModel.onToolResult(
+            toolName = "web_fetch",
+            result = "Recovered",
+            visibility = ai.citros.core.OutputVisibility.SHOW,
+            isError = false
+        )
+        assertNull(viewModel.currentToolStatus.value)
     }
 
     @Test
