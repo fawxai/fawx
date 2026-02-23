@@ -511,7 +511,11 @@ open class PhoneAgentApi(
                     sensorContext = sensorSnapshot
                 )
         } else {
-            promptBuilder?.full(phoneControlAvailable = phoneControlAvailable, modelName = modelName, sensorContext = sensorSnapshot) ?: PhoneAgentPrompts.buildSystemPrompt(phoneControlAvailable = phoneControlAvailable, modelName = modelName, sensorContext = sensorSnapshot)
+            buildChatSystemPrompt(
+                phoneControlAvailable = phoneControlAvailable,
+                modelName = modelName,
+                sensorContext = sensorSnapshot
+            )
         }
         
         // Use compacted messages for action loop to manage context window.
@@ -581,8 +585,11 @@ open class PhoneAgentApi(
         val phoneControlAvailable = phoneControlOverride ?: ScreenReader.isAttached()
         val modelName = chatClient.modelId
         val ephemeralSensors = getTaskSensorSnapshot(startNewTask = false)
-        val systemPrompt = promptBuilder?.full(phoneControlAvailable = phoneControlAvailable, modelName = modelName, sensorContext = ephemeralSensors)
-            ?: PhoneAgentPrompts.buildSystemPrompt(phoneControlAvailable = phoneControlAvailable, modelName = modelName, sensorContext = ephemeralSensors)
+        val systemPrompt = buildChatSystemPrompt(
+            phoneControlAvailable = phoneControlAvailable,
+            modelName = modelName,
+            sensorContext = ephemeralSensors
+        )
         checkBudgetBeforeApiCall()
         val result = chatClient.chatWithTools(
             ephemeralMessages,
@@ -610,6 +617,22 @@ open class PhoneAgentApi(
             }
         )
         }
+    }
+
+    private fun buildChatSystemPrompt(
+        phoneControlAvailable: Boolean,
+        modelName: String,
+        sensorContext: String
+    ): String {
+        return promptBuilder?.full(
+            phoneControlAvailable = phoneControlAvailable,
+            modelName = modelName,
+            sensorContext = sensorContext
+        ) ?: PhoneAgentPrompts.buildSystemPrompt(
+            phoneControlAvailable = phoneControlAvailable,
+            modelName = modelName,
+            sensorContext = sensorContext
+        )
     }
 
     /**
