@@ -802,11 +802,11 @@ class OutputClassifierTest {
     }
 
     @Test
-    fun `summarize null fallback truncation appends ellipsis`() {
-        // Suggestion #3: verify null fallback (all blank lines) truncates with ellipsis
-        val longWhitespace = "   ".repeat(100)  // only whitespace lines
-        val result = OutputClassifier.summarize(longWhitespace)
+    fun `summarize truncation appends ellipsis`() {
+        val longNonWhitespace = "x".repeat(OutputClassifier.DISPLAY_MAX_CHARS + 50)
+        val result = OutputClassifier.summarize(longNonWhitespace)
         assertTrue(result.length <= OutputClassifier.DISPLAY_MAX_CHARS + 1)
+        assertTrue(result.endsWith("…"))
     }
 
 
