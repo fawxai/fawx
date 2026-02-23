@@ -26,10 +26,20 @@ import java.util.concurrent.TimeUnit
  * @param apiKey TinyFish API key
  * @param endpoint API endpoint (override for testing)
  */
+interface TinyFishBrowserClient {
+    suspend fun browse(
+        url: String,
+        goal: String,
+        stealth: Boolean = false,
+        proxyCountry: String? = null,
+        onProgress: ((String) -> Unit)? = null
+    ): ToolResult
+}
+
 class TinyFishClient(
     private val apiKey: String,
     private val endpoint: String = DEFAULT_ENDPOINT
-) {
+) : TinyFishBrowserClient {
     companion object {
         private const val TAG = "TinyFishClient"
         internal const val DEFAULT_ENDPOINT = "https://agent.tinyfish.ai/v1/automation/run-sse"
@@ -61,12 +71,12 @@ class TinyFishClient(
      * @param onProgress Optional callback for progress events (step descriptions)
      * @return ToolResult with structured result or error
      */
-    suspend fun browse(
+    override suspend fun browse(
         url: String,
         goal: String,
-        stealth: Boolean = false,
-        proxyCountry: String? = null,
-        onProgress: ((String) -> Unit)? = null
+        stealth: Boolean,
+        proxyCountry: String?,
+        onProgress: ((String) -> Unit)?
     ): ToolResult {
         if (url.isBlank()) return ToolResult("URL cannot be empty", isError = true)
         if (goal.isBlank()) return ToolResult("Goal cannot be empty", isError = true)

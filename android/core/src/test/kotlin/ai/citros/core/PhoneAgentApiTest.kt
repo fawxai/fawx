@@ -3952,30 +3952,39 @@ class PhoneAgentApiTest {
         assertTrue("web_browse" in toolNames, "web_browse should be included when API key is set")
     }
 
+
     @Test
     fun `executeToolCall web_browse dispatches to TinyFishClient when key is configured`() = kotlinx.coroutines.runBlocking {
-        // Serve a mock TinyFish SSE response
-        val sseBody = listOf(
-            """data: {"type":"STARTED","runId":"run_1","timestamp":"2026-01-01T00:00:00Z"}""",
-            """data: {"type":"PROGRESS","runId":"run_1","purpose":"Navigating to page","timestamp":"2026-01-01T00:00:01Z"}""",
-            """data: {"type":"COMPLETE","runId":"run_1","status":"COMPLETED","resultJson":{"answer":"42"},"timestamp":"2026-01-01T00:00:05Z"}"""
-        ).joinToString("\n")
-        server.enqueue(MockResponse()
-            .setBody(sseBody)
-            .setResponseCode(200)
-            .addHeader("Content-Type", "text/event-stream"))
+        class RecordingTinyFishClient : TinyFishBrowserClient {
+            var capturedUrl: String? = null
+            var capturedGoal: String? = null
+            var capturedStealth: Boolean? = null
 
-        val tinyFishEndpoint = server.url("/v1/automation/run-sse").toString()
+            override suspend fun browse(
+                url: String,
+                goal: String,
+                stealth: Boolean,
+                proxyCountry: String?,
+                onProgress: ((String) -> Unit)?
+            ): ToolResult {
+                capturedUrl = url
+                capturedGoal = goal
+                capturedStealth = stealth
+                return ToolResult("mock tinyfish success")
+            }
+        }
+
         val defaultClient = ClaudeClient(
             apiKey = "sk-ant-api03-test",
             systemPrompt = PhoneAgentPrompts.SYSTEM_PROMPT,
             baseUrl = server.url("/v1/messages").toString()
         )
+        val fakeTinyFishClient = RecordingTinyFishClient()
         val agent = PhoneAgentApi(
             chatClient = defaultClient,
             actionClient = defaultClient,
             tinyFishApiKey = "test-tinyfish-key",
-            tinyFishEndpoint = tinyFishEndpoint
+            tinyFishClientFactory = { _, _ -> fakeTinyFishClient }
         ).also {
             it.phoneControlOverride = true
         }
@@ -3986,15 +3995,11 @@ class PhoneAgentApiTest {
         )
 
         assertFalse(result.isError, "Expected success but got error: " + result.text)
-        assertTrue(result.text.contains("42"), "Result should contain automation result")
-        // Verify the request actually reached MockWebServer (TinyFish endpoint)
-        val request = server.takeRequest()
-        assertEquals("/v1/automation/run-sse", request.path)
-        val body = request.body.readUtf8()
-        assertTrue(body.contains("example.com"), "Request body should contain URL")
-        assertTrue(body.contains("Find the answer"), "Request body should contain goal")
+        assertEquals("mock tinyfish success", result.text)
+        assertEquals("https://example.com", fakeTinyFishClient.capturedUrl)
+        assertEquals("Find the answer", fakeTinyFishClient.capturedGoal)
+        assertEquals(false, fakeTinyFishClient.capturedStealth)
     }
-
     // --- Conversation history seeding tests (#612) ---
 
     @Test

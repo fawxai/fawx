@@ -52,6 +52,10 @@ open class PhoneAgentApi(
     private val tinyFishApiKey: String? = null,
     /** TinyFish endpoint override for testing. Null uses production default. */
     private val tinyFishEndpoint: String? = null,
+    /** TinyFish client factory override for testing. */
+    private val tinyFishClientFactory: (apiKey: String, endpoint: String) -> TinyFishBrowserClient = { apiKey, endpoint ->
+        TinyFishClient(apiKey = apiKey, endpoint = endpoint)
+    },
     /** Citros app token for authenticating to Citros API endpoints. */
     private val citrosAppToken: String? = null,
     /** Sensor provider for device context injection. Null to disable. */
@@ -189,7 +193,7 @@ open class PhoneAgentApi(
 
     /** Shared TinyFish client for web browser automation. Only initialized when API key is set. */
     private val tinyFishClient by lazy {
-        tinyFishApiKey?.let { TinyFishClient(apiKey = it, endpoint = tinyFishEndpoint ?: TinyFishClient.DEFAULT_ENDPOINT) }
+        tinyFishApiKey?.let { tinyFishClientFactory(it, tinyFishEndpoint ?: TinyFishClient.DEFAULT_ENDPOINT) }
     }
 
     init {
