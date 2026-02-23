@@ -8,6 +8,7 @@ import ai.citros.core.Provider
 import ai.citros.core.ProviderClient
 import ai.citros.core.SensorProvider
 import ai.citros.core.Tool
+import ai.citros.core.SensorContext
 import kotlinx.coroutines.test.runTest
 import org.junit.Before
 import org.junit.Test
@@ -17,6 +18,7 @@ import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 @RunWith(RobolectricTestRunner::class)
 class ChatActivitySensorContextPreferenceTest {
@@ -83,7 +85,7 @@ class ChatActivitySensorContextPreferenceTest {
     }
 
     @Test
-    fun `prefs load plus listener toggle off leaves PhoneAgentApi prompt without sensor metadata`() = runTest {
+    fun `sensor context toggle applies immediately to next prompt build without screen re-entry`() = runTest {
         val prefs = context.getSharedPreferences(CITROS_PREFS, Context.MODE_PRIVATE)
         val viewModel = ChatViewModel()
 
@@ -95,6 +97,26 @@ class ChatActivitySensorContextPreferenceTest {
         )
         assertNotNull(readSensorProvider(viewModel))
 
+        // Step 1: Build prompt with sensor context enabled + deterministic provider
+        val deterministicSensorProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext = SensorContext(batteryPercent = 87)
+        }
+        viewModel.setSensorProvider(deterministicSensorProvider)
+
+        val promptClient = RecordingPromptProviderClient()
+        val enabledAgent = PhoneAgentApi(
+            chatClient = promptClient,
+            actionClient = promptClient,
+            sensorProvider = readSensorProvider(viewModel) as? SensorProvider
+        ).also { it.phoneControlOverride = true }
+
+        enabledAgent.sendMessage("Open Settings", screenContent = null, isActionLoop = false)
+
+        val promptWithSensors = promptClient.systemPrompts.lastOrNull()
+        assertNotNull(promptWithSensors)
+        assertTrue(promptWithSensors.contains("Device: battery=87%"))
+
+        // Step 2: Toggle off and verify next prompt excludes sensor context
         val listener = createSensorContextPreferenceChangeListener(
             prefs = prefs,
             appContext = context.applicationContext,
@@ -106,17 +128,17 @@ class ChatActivitySensorContextPreferenceTest {
         val providerAfterToggleOff = readSensorProvider(viewModel)
         assertNull(providerAfterToggleOff)
 
-        val promptClient = RecordingPromptProviderClient()
-        val agent = PhoneAgentApi(
+        val disabledAgent = PhoneAgentApi(
             chatClient = promptClient,
             actionClient = promptClient,
             sensorProvider = providerAfterToggleOff as? SensorProvider
         ).also { it.phoneControlOverride = true }
 
-        agent.sendMessage("Open Settings", screenContent = null, isActionLoop = false)
+        disabledAgent.sendMessage("Open Settings again", screenContent = null, isActionLoop = false)
 
-        assertNotNull(promptClient.lastSystemPrompt)
-        assertFalse(promptClient.lastSystemPrompt!!.contains("Device:"))
+        val promptAfterToggle = promptClient.systemPrompts.lastOrNull()
+        assertNotNull(promptAfterToggle)
+        assertFalse(promptAfterToggle.contains("Device:"))
     }
 
     private fun readSensorProvider(viewModel: ChatViewModel): Any? {
@@ -128,7 +150,7 @@ class ChatActivitySensorContextPreferenceTest {
     private class RecordingPromptProviderClient : ProviderClient {
         override val provider: Provider = Provider.ANTHROPIC
         override val modelId: String? = null
-        var lastSystemPrompt: String? = null
+        val systemPrompts: MutableList<String> = mutableListOf()
 
         override suspend fun chat(conversation: ai.citros.core.Conversation): Result<String> = Result.success("chat")
 
@@ -138,7 +160,9 @@ class ChatActivitySensorContextPreferenceTest {
             tools: List<Tool>,
             tokenLimit: Int?
         ): Result<ChatResponse> {
-            lastSystemPrompt = systemPrompt
+            if (systemPrompt != null) {
+                systemPrompts.add(systemPrompt)
+            }
             return Result.success(ChatResponse(text = "ok", toolCalls = emptyList(), stopReason = "end_turn"))
         }
 
