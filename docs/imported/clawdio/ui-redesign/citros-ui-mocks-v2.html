@@ -1,0 +1,2091 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Citros UI Mocks V2</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+/* ══════════════════════════════════════════════════════════════
+   CITROS UI MOCKS V2 — Design System
+   Matching citros.ai hero aesthetic for Jetpack Compose translation
+   ══════════════════════════════════════════════════════════════ */
+
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+:root {
+  /* Core palette — matches citros.ai */
+  --bg: #050505;
+  --bg-elevated: #0c0c0c;
+  --bg-card: #111111;
+  --bg-card-hover: #161616;
+  --surface: rgba(255,255,255,0.04);
+  --surface-elevated: rgba(255,255,255,0.07);
+
+  --text: #ffffff;
+  --text-secondary: rgba(255,255,255,0.65);
+  --text-dim: rgba(255,255,255,0.45);
+  --text-faint: rgba(255,255,255,0.22);
+
+  --accent: #f59e0b;
+  --accent-warm: #ff6b2b;
+  --accent-glow: rgba(245,158,11,0.15);
+  --accent-glow-strong: rgba(245,158,11,0.3);
+
+  --border: rgba(255,255,255,0.08);
+  --border-accent: rgba(245,158,11,0.25);
+
+  --danger: #ef4444;
+  --success: #22c55e;
+
+  /* Flavor colors */
+  --lemon: #FFD600;
+  --tangerine: #FF8C00;
+  --lime: #7CB342;
+  --blood-orange: #D84315;
+  --grapefruit: #E91E63;
+
+  /* Spacing */
+  --phone-w: 393px;
+  --phone-h: 852px;
+  --radius-sm: 8px;
+  --radius-md: 14px;
+  --radius-lg: 20px;
+  --radius-pill: 100px;
+}
+
+html { -webkit-font-smoothing: antialiased; }
+
+body {
+  background: #0a0a0a;
+  color: var(--text);
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  overflow-x: hidden;
+}
+
+/* ── SCREEN NAV TOOLBAR ── */
+.toolbar {
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 12px 20px;
+  background: rgba(5,5,5,0.85);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.toolbar::-webkit-scrollbar { display: none; }
+
+.toolbar-title {
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+  margin-right: 12px;
+  white-space: nowrap;
+  text-transform: lowercase;
+}
+.toolbar-title em {
+  font-style: normal;
+  color: var(--accent);
+}
+
+.toolbar-btn {
+  padding: 6px 14px;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+  transition: all 0.25s;
+  white-space: nowrap;
+}
+.toolbar-btn:hover {
+  color: var(--text);
+  border-color: rgba(255,255,255,0.2);
+}
+.toolbar-btn.active {
+  color: var(--bg);
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+/* ── PHONE FRAME ── */
+.stage {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 100vh;
+  padding: 80px 20px 40px;
+}
+
+.phone {
+  position: relative;
+  width: var(--phone-w);
+  height: var(--phone-h);
+  border-radius: 44px;
+  border: 1px solid rgba(255,255,255,0.1);
+  background: var(--bg);
+  overflow: hidden;
+  box-shadow:
+    0 0 0 1px rgba(255,255,255,0.05),
+    0 25px 80px rgba(0,0,0,0.6),
+    0 0 120px -20px var(--accent-glow);
+}
+
+/* Dynamic island */
+.phone::before {
+  content: '';
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 126px;
+  height: 36px;
+  background: #000;
+  border-radius: 20px;
+  z-index: 100;
+}
+
+/* Status bar */
+.status-bar {
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 54px;
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  padding: 0 28px 8px;
+  z-index: 90;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+.status-bar-right {
+  display: flex;
+  gap: 5px;
+  align-items: center;
+  font-size: 11px;
+}
+
+/* Home indicator */
+.home-indicator {
+  position: absolute;
+  bottom: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 134px;
+  height: 5px;
+  background: rgba(255,255,255,0.3);
+  border-radius: 3px;
+  z-index: 100;
+}
+
+/* ── SCREEN CONTAINER ── */
+.screen {
+  position: absolute;
+  inset: 0;
+  display: none;
+  flex-direction: column;
+  overflow: hidden;
+}
+.screen.active {
+  display: flex;
+}
+
+/* ── SHARED COMPONENTS ── */
+
+/* Gradient text — Compose: Brush.linearGradient on TextStyle */
+.gradient-text {
+  background: linear-gradient(135deg, #ffffff 0%, var(--accent) 50%, var(--accent-warm) 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.gradient-text-accent {
+  background: linear-gradient(135deg, var(--accent), var(--accent-warm));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* Gradient button — Compose: Button with Brush.linearGradient background */
+.btn-primary {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 54px;
+  padding: 0 32px;
+  font-family: inherit;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: #050505;
+  background: linear-gradient(135deg, var(--accent), var(--accent-warm));
+  border: none;
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+  transition: transform 0.15s, box-shadow 0.3s;
+}
+.btn-primary:active { transform: scale(0.97); }
+.btn-primary:hover {
+  box-shadow: 0 8px 30px rgba(245,158,11,0.3);
+}
+
+.btn-secondary {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 48px;
+  padding: 0 24px;
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+  transition: all 0.25s;
+}
+.btn-secondary:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* Glow divider — Compose: Canvas drawLine with gradient */
+.glow-line {
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--accent-glow), var(--accent), var(--accent-glow), transparent);
+  opacity: 0.5;
+  margin: 0 20px;
+}
+
+/* Card — Compose: Card with shape + border */
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 20px;
+  transition: border-color 0.3s;
+}
+.card:hover, .card.selected {
+  border-color: var(--border-accent);
+}
+.card.selected {
+  background: rgba(245,158,11,0.06);
+}
+
+/* Step indicator — Compose: Row of Box with weight */
+.step-dots {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+.step-dot {
+  height: 3px;
+  border-radius: 2px;
+  transition: all 0.3s;
+}
+.step-dot.done {
+  width: 20px;
+  background: var(--accent);
+}
+.step-dot.current {
+  width: 28px;
+  background: linear-gradient(90deg, var(--accent), var(--accent-warm));
+}
+.step-dot.pending {
+  width: 12px;
+  background: rgba(255,255,255,0.12);
+}
+
+/* Screen header with back + steps */
+.screen-header {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 62px 24px 16px;
+}
+.back-btn {
+  font-size: 18px;
+  color: var(--text-dim);
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 4px;
+  line-height: 1;
+  font-family: inherit;
+}
+
+/* Section label — Compose: Text with uppercase + letterSpacing */
+.eyebrow {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+/* Ambient orb glow — Compose: Canvas with radialGradient */
+.orb-glow {
+  position: absolute;
+  width: 300px;
+  height: 300px;
+  border-radius: 50%;
+  background: radial-gradient(circle, var(--accent-glow-strong) 0%, transparent 70%);
+  pointer-events: none;
+  filter: blur(40px);
+}
+
+/* ══════════════════════════════════════════════════════════════
+   SCREEN 1 — WELCOME
+   ══════════════════════════════════════════════════════════════ */
+.welcome-screen {
+  background: var(--bg);
+  justify-content: center;
+  align-items: center;
+  padding: 40px 32px;
+  position: relative;
+}
+.welcome-screen .orb-glow {
+  top: 30%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 400px;
+  height: 400px;
+  animation: orbPulse 6s ease-in-out infinite;
+}
+@keyframes orbPulse {
+  0%, 100% { opacity: 0.4; transform: translate(-50%, -50%) scale(0.9); }
+  50% { opacity: 0.7; transform: translate(-50%, -50%) scale(1.1); }
+}
+
+.welcome-logo {
+  font-size: 56px;
+  font-weight: 700;
+  letter-spacing: -0.04em;
+  line-height: 1;
+  margin-bottom: 16px;
+  position: relative;
+  z-index: 2;
+}
+
+.welcome-sub {
+  font-size: 17px;
+  font-weight: 300;
+  color: var(--text-dim);
+  letter-spacing: 0.02em;
+  margin-bottom: 80px;
+  position: relative;
+  z-index: 2;
+}
+
+.welcome-cta {
+  width: 100%;
+  max-width: 280px;
+  position: relative;
+  z-index: 2;
+}
+
+/* Floating particles in welcome */
+.welcome-particles {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 1;
+}
+.welcome-particle {
+  position: absolute;
+  width: 2px;
+  height: 2px;
+  background: var(--accent);
+  border-radius: 50%;
+  opacity: 0;
+  animation: pFloat linear infinite;
+}
+@keyframes pFloat {
+  0% { opacity: 0; transform: translateY(100%) translateX(0); }
+  15% { opacity: 0.35; }
+  85% { opacity: 0.35; }
+  100% { opacity: 0; transform: translateY(-800px) translateX(30px); }
+}
+
+/* ══════════════════════════════════════════════════════════════
+   SCREEN 2 — FLAVOR (Theme picker)
+   ══════════════════════════════════════════════════════════════ */
+.flavor-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  padding: 0 24px;
+}
+.flavor-chip {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 24px 16px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  cursor: pointer;
+  transition: all 0.3s;
+  font-family: inherit;
+  color: var(--text);
+}
+.flavor-chip:hover {
+  border-color: rgba(255,255,255,0.15);
+  background: var(--surface-elevated);
+}
+.flavor-chip.selected {
+  border-color: var(--border-accent);
+  background: rgba(245,158,11,0.06);
+}
+.flavor-swatch {
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  position: relative;
+}
+.flavor-swatch::after {
+  content: '';
+  position: absolute;
+  inset: -4px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  transition: border-color 0.3s;
+}
+.flavor-chip.selected .flavor-swatch::after {
+  border-color: inherit;
+}
+.flavor-name {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+/* ══════════════════════════════════════════════════════════════
+   SCREEN 3 — PERSONALITY
+   ══════════════════════════════════════════════════════════════ */
+.pref-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 20px;
+  margin: 0 24px 14px;
+}
+.pref-question {
+  font-size: 15px;
+  font-weight: 500;
+  color: var(--text);
+  margin-bottom: 14px;
+}
+.pref-options {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.pref-option {
+  padding: 8px 16px;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-dim);
+  background: rgba(255,255,255,0.04);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+  transition: all 0.25s;
+}
+.pref-option:hover {
+  color: var(--text);
+  border-color: rgba(255,255,255,0.2);
+}
+.pref-option.selected {
+  color: #050505;
+  background: linear-gradient(135deg, var(--accent), var(--accent-warm));
+  border-color: transparent;
+}
+
+/* ══════════════════════════════════════════════════════════════
+   SCREEN 4 — ONBOARDING CHAT
+   ══════════════════════════════════════════════════════════════ */
+.chat-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 62px 20px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.chat-avatar {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--accent), var(--accent-warm));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+}
+.chat-name {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+.chat-status {
+  font-size: 11px;
+  color: var(--success);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.chat-status::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--success);
+}
+
+.chat-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 16px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.chat-bubble {
+  max-width: 82%;
+  padding: 12px 16px;
+  font-size: 14px;
+  line-height: 1.5;
+  border-radius: 18px;
+  animation: bubbleIn 0.3s ease-out;
+}
+@keyframes bubbleIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.chat-bubble.assistant {
+  align-self: flex-start;
+  background: var(--surface-elevated);
+  color: var(--text);
+  border-bottom-left-radius: 6px;
+}
+.chat-bubble.user {
+  align-self: flex-end;
+  background: linear-gradient(135deg, var(--accent), var(--accent-warm));
+  color: #050505;
+  border-bottom-right-radius: 6px;
+}
+
+.chat-input-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px 30px;
+  border-top: 1px solid var(--border);
+}
+.chat-input {
+  flex: 1;
+  height: 42px;
+  padding: 0 16px;
+  font-family: inherit;
+  font-size: 14px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  outline: none;
+}
+.chat-input::placeholder { color: var(--text-faint); }
+.chat-send {
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--accent), var(--accent-warm));
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  color: #050505;
+}
+
+/* Identity summary card */
+.identity-card {
+  margin: 12px 16px;
+  padding: 16px;
+  background: var(--surface);
+  border: 1px solid var(--border-accent);
+  border-radius: var(--radius-lg);
+}
+.identity-title {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  margin-bottom: 12px;
+}
+.identity-items {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.identity-tag {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  background: rgba(245,158,11,0.08);
+  border-radius: var(--radius-pill);
+  font-size: 12px;
+}
+.identity-tag-label { color: var(--text-faint); }
+.identity-tag-value { color: var(--text-secondary); font-weight: 500; }
+
+/* ══════════════════════════════════════════════════════════════
+   SCREEN 5 — PAYWALL
+   ══════════════════════════════════════════════════════════════ */
+.plan-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 20px;
+  margin: 0 24px 12px;
+  cursor: pointer;
+  transition: all 0.3s;
+  position: relative;
+  overflow: hidden;
+}
+.plan-card:hover {
+  border-color: rgba(255,255,255,0.15);
+}
+.plan-card.recommended {
+  border-color: var(--border-accent);
+  background: rgba(245,158,11,0.04);
+}
+.plan-card.recommended::before {
+  content: 'RECOMMENDED';
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  color: var(--accent);
+  padding: 3px 8px;
+  border: 1px solid var(--border-accent);
+  border-radius: var(--radius-pill);
+}
+.plan-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.plan-icon {
+  font-size: 28px;
+}
+.plan-name {
+  font-size: 17px;
+  font-weight: 600;
+  color: var(--text);
+}
+.plan-price {
+  font-size: 14px;
+  font-weight: 400;
+  color: var(--text-dim);
+}
+.plan-lines {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+.plan-line {
+  font-size: 13px;
+  color: var(--text-dim);
+  line-height: 1.5;
+  padding-left: 16px;
+  position: relative;
+}
+.plan-line::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 8px;
+  width: 6px;
+  height: 1px;
+  background: var(--accent);
+}
+.plan-badge {
+  display: inline-block;
+  padding: 4px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  border-radius: var(--radius-pill);
+}
+
+/* ══════════════════════════════════════════════════════════════
+   SCREEN 6 — API KEY
+   ══════════════════════════════════════════════════════════════ */
+.key-card {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 16px 20px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  margin: 0 24px 10px;
+}
+.key-provider-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.key-info {
+  flex: 1;
+  min-width: 0;
+}
+.key-label {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.key-masked {
+  font-size: 12px;
+  color: var(--text-faint);
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  letter-spacing: 0.05em;
+}
+.key-status {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+/* ══════════════════════════════════════════════════════════════
+   SCREEN 7 — PERMISSIONS
+   ══════════════════════════════════════════════════════════════ */
+.perm-item {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 16px 24px;
+  border-bottom: 1px solid var(--border);
+}
+.perm-icon {
+  width: 40px;
+  height: 40px;
+  border-radius: 12px;
+  background: var(--surface);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  flex-shrink: 0;
+}
+.perm-info { flex: 1; }
+.perm-name {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text);
+  margin-bottom: 2px;
+}
+.perm-desc {
+  font-size: 12px;
+  color: var(--text-faint);
+}
+.perm-toggle {
+  width: 44px;
+  height: 26px;
+  border-radius: 13px;
+  background: rgba(255,255,255,0.12);
+  position: relative;
+  cursor: pointer;
+  transition: background 0.25s;
+  flex-shrink: 0;
+}
+.perm-toggle.on {
+  background: linear-gradient(135deg, var(--accent), var(--accent-warm));
+}
+.perm-toggle::after {
+  content: '';
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: white;
+  transition: transform 0.25s;
+}
+.perm-toggle.on::after {
+  transform: translateX(18px);
+}
+
+/* ══════════════════════════════════════════════════════════════
+   SCREEN 8 — READY
+   ══════════════════════════════════════════════════════════════ */
+.ready-screen {
+  justify-content: center;
+  align-items: center;
+  padding: 40px 32px;
+  position: relative;
+}
+.ready-checkmark {
+  width: 80px;
+  height: 80px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--accent), var(--accent-warm));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 36px;
+  margin-bottom: 24px;
+  box-shadow: 0 0 60px var(--accent-glow-strong);
+}
+.ready-headline {
+  font-size: 28px;
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  margin-bottom: 8px;
+}
+.ready-sub {
+  font-size: 15px;
+  color: var(--text-dim);
+  margin-bottom: 40px;
+}
+.ready-summary {
+  width: 100%;
+  max-width: 300px;
+  padding: 20px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  margin-bottom: 40px;
+}
+.ready-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 0;
+}
+.ready-row:not(:last-child) {
+  border-bottom: 1px solid var(--border);
+}
+.ready-row-label {
+  font-size: 12px;
+  color: var(--text-faint);
+}
+.ready-row-value {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* ══════════════════════════════════════════════════════════════
+   SCREEN 9 — MAIN CHAT
+   ══════════════════════════════════════════════════════════════ */
+/* Re-uses chat styles above with slight modifications */
+
+/* ══════════════════════════════════════════════════════════════
+   SCREEN 10 — OVERLAY
+   ══════════════════════════════════════════════════════════════ */
+.android-home {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(180deg, #0F1923 0%, #0A1628 100%);
+  padding: 60px 24px 30px;
+}
+.android-clock {
+  text-align: center;
+  font-size: 60px;
+  font-weight: 200;
+  color: rgba(255,255,255,0.9);
+  letter-spacing: -0.02em;
+  margin-bottom: 4px;
+}
+.android-date {
+  text-align: center;
+  font-size: 14px;
+  color: rgba(255,255,255,0.5);
+  margin-bottom: 30px;
+}
+.overlay-fab {
+  position: absolute;
+  bottom: 120px;
+  right: 20px;
+  width: 56px;
+  height: 56px;
+  border-radius: 16px;
+  background: linear-gradient(135deg, var(--accent), var(--accent-warm));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 22px;
+  box-shadow:
+    0 4px 20px rgba(245,158,11,0.4),
+    0 0 40px rgba(245,158,11,0.15);
+  z-index: 20;
+}
+.overlay-sheet {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  background: rgba(12,12,12,0.95);
+  backdrop-filter: blur(30px);
+  -webkit-backdrop-filter: blur(30px);
+  border-top: 1px solid var(--border);
+  border-radius: 24px 24px 0 0;
+  padding: 12px 20px 40px;
+  z-index: 30;
+}
+.overlay-handle {
+  width: 36px;
+  height: 4px;
+  background: rgba(255,255,255,0.2);
+  border-radius: 2px;
+  margin: 0 auto 16px;
+}
+.overlay-input-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+/* ══════════════════════════════════════════════════════════════
+   SCREEN 11 — SETTINGS
+   ══════════════════════════════════════════════════════════════ */
+.settings-item {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 14px 24px;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+.settings-item:hover {
+  background: var(--surface);
+}
+.settings-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  background: var(--surface);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  flex-shrink: 0;
+}
+.settings-label {
+  flex: 1;
+  font-size: 15px;
+  font-weight: 400;
+  color: var(--text);
+}
+.settings-chevron {
+  font-size: 14px;
+  color: var(--text-faint);
+}
+
+/* ══════════════════════════════════════════════════════════════
+   SCREEN 12 — WALLET
+   ══════════════════════════════════════════════════════════════ */
+.wallet-balance-card {
+  margin: 0 24px 20px;
+  padding: 28px 24px;
+  background: linear-gradient(135deg, rgba(245,158,11,0.08) 0%, rgba(255,107,43,0.06) 100%);
+  border: 1px solid var(--border-accent);
+  border-radius: var(--radius-lg);
+  position: relative;
+  overflow: hidden;
+}
+.wallet-balance-card::before {
+  content: '';
+  position: absolute;
+  top: -50px;
+  right: -50px;
+  width: 150px;
+  height: 150px;
+  background: radial-gradient(circle, var(--accent-glow) 0%, transparent 70%);
+  pointer-events: none;
+}
+.wallet-eyebrow {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-bottom: 8px;
+}
+.wallet-amount {
+  font-size: 36px;
+  font-weight: 700;
+  letter-spacing: -0.03em;
+}
+.wallet-bar {
+  height: 4px;
+  background: rgba(255,255,255,0.08);
+  border-radius: 2px;
+  margin-top: 16px;
+  overflow: hidden;
+}
+.wallet-bar-fill {
+  height: 100%;
+  border-radius: 2px;
+  background: linear-gradient(90deg, var(--accent), var(--accent-warm));
+}
+
+.usage-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 14px 24px;
+  border-bottom: 1px solid var(--border);
+}
+.usage-model {
+  font-size: 14px;
+  color: var(--text);
+}
+.usage-cost {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-dim);
+  font-family: 'SF Mono', monospace;
+}
+
+/* ══════════════════════════════════════════════════════════════
+   SCREEN 13 — MODELS
+   ══════════════════════════════════════════════════════════════ */
+.model-card {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 16px 24px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  transition: background 0.2s;
+}
+.model-card:hover { background: var(--surface); }
+.model-card.active { background: rgba(245,158,11,0.04); }
+.model-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.model-info { flex: 1; }
+.model-name {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text);
+}
+.model-provider {
+  font-size: 12px;
+  color: var(--text-faint);
+}
+.model-check {
+  color: var(--accent);
+  font-size: 16px;
+}
+
+/* ══════════════════════════════════════════════════════════════
+   SCREEN 14 — TRUST
+   ══════════════════════════════════════════════════════════════ */
+.trust-level {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 0 24px;
+}
+.trust-option {
+  padding: 16px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  cursor: pointer;
+  transition: all 0.3s;
+}
+.trust-option:hover { border-color: rgba(255,255,255,0.15); }
+.trust-option.selected {
+  border-color: var(--border-accent);
+  background: rgba(245,158,11,0.04);
+}
+.trust-option-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+.trust-option-icon { font-size: 18px; }
+.trust-option-name {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+.trust-option-desc {
+  font-size: 13px;
+  color: var(--text-dim);
+  line-height: 1.5;
+  padding-left: 28px;
+}
+
+/* ══════════════════════════════════════════════════════════════
+   SCREEN 15 — APPEARANCE
+   ══════════════════════════════════════════════════════════════ */
+.theme-toggle-row {
+  display: flex;
+  gap: 12px;
+  padding: 0 24px;
+  margin-bottom: 24px;
+}
+.theme-toggle-btn {
+  flex: 1;
+  padding: 16px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  cursor: pointer;
+  text-align: center;
+  font-family: inherit;
+  color: var(--text);
+  transition: all 0.3s;
+}
+.theme-toggle-btn.selected {
+  border-color: var(--border-accent);
+  background: rgba(245,158,11,0.06);
+}
+.theme-toggle-icon { font-size: 24px; margin-bottom: 6px; }
+.theme-toggle-label { font-size: 13px; font-weight: 500; }
+
+/* ══════════════════════════════════════════════════════════════
+   SCREEN 16 — ABOUT
+   ══════════════════════════════════════════════════════════════ */
+.about-screen {
+  align-items: center;
+  padding-top: 100px;
+}
+.about-logo {
+  font-size: 42px;
+  font-weight: 700;
+  letter-spacing: -0.04em;
+  margin-bottom: 4px;
+}
+.about-version {
+  font-size: 13px;
+  color: var(--text-faint);
+  margin-bottom: 32px;
+}
+.about-tagline {
+  font-size: 15px;
+  color: var(--text-dim);
+  font-weight: 300;
+  text-align: center;
+  max-width: 260px;
+  line-height: 1.6;
+  margin-bottom: 40px;
+}
+.about-row {
+  display: flex;
+  justify-content: space-between;
+  width: 100%;
+  padding: 14px 24px;
+  border-bottom: 1px solid var(--border);
+}
+.about-row-label {
+  font-size: 13px;
+  color: var(--text-dim);
+}
+.about-row-value {
+  font-size: 13px;
+  color: var(--text);
+  font-weight: 500;
+}
+.about-footer {
+  margin-top: auto;
+  padding: 20px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+/* ── Compose annotation comments ── */
+/* Compose: Column(modifier = Modifier.fillMaxSize()) */
+/* Compose: Row(horizontalArrangement = Arrangement.SpaceBetween) */
+/* Compose: Box(modifier = Modifier.background(Brush.linearGradient(...))) */
+
+/* ── Scrollable content area ── */
+.scroll-content {
+  flex: 1;
+  overflow-y: auto;
+  padding-bottom: 30px;
+  scrollbar-width: none;
+}
+.scroll-content::-webkit-scrollbar { display: none; }
+
+/* Section titles inside screens */
+.screen-title {
+  font-size: 26px;
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  line-height: 1.2;
+  padding: 0 24px;
+  margin-bottom: 6px;
+}
+.screen-subtitle {
+  font-size: 14px;
+  color: var(--text-dim);
+  font-weight: 300;
+  padding: 0 24px;
+  margin-bottom: 24px;
+}
+
+/* Bottom action area */
+.bottom-action {
+  padding: 16px 24px 34px;
+  border-top: 1px solid var(--border);
+}
+</style>
+</head>
+<body>
+
+<!-- TOOLBAR -->
+<div class="toolbar" id="toolbar">
+  <span class="toolbar-title">citr<em>o</em>s v2</span>
+</div>
+
+<!-- STAGE -->
+<div class="stage">
+  <div class="phone">
+    <!-- Status bar -->
+    <div class="status-bar">
+      <span>9:41</span>
+      <div class="status-bar-right">
+        <svg width="16" height="11" viewBox="0 0 16 11" fill="none"><path d="M1 7.5h2v3H1zM5 5h2v5.5H5zM9 2.5h2v8H9zM13 0h2v10.5h-2z" fill="white" opacity="0.9"/></svg>
+        <svg width="22" height="12" viewBox="0 0 22 12" fill="none"><rect x="0.5" y="1" width="18" height="10" rx="2" stroke="white" stroke-opacity="0.35"/><rect x="2" y="2.5" width="12" height="7" rx="1" fill="white" opacity="0.9"/><path d="M20 4.5v3a1.5 1.5 0 000-3z" fill="white" opacity="0.35"/></svg>
+      </div>
+    </div>
+
+    <!-- Home indicator -->
+    <div class="home-indicator"></div>
+
+    <!-- ══════════ SCREEN: WELCOME ══════════ -->
+    <div class="screen welcome-screen active" data-screen="welcome">
+      <div class="orb-glow"></div>
+      <div class="welcome-particles" id="welcomeParticles"></div>
+      <h1 class="welcome-logo gradient-text">citros</h1>
+      <p class="welcome-sub">Something is waking up.</p>
+      <div class="welcome-cta">
+        <button class="btn-primary" style="width:100%">Get Started</button>
+      </div>
+    </div>
+
+    <!-- ══════════ SCREEN: FLAVOR ══════════ -->
+    <div class="screen" data-screen="flavor">
+      <div class="screen-header">
+        <button class="back-btn">←</button>
+        <div class="step-dots">
+          <div class="step-dot current"></div>
+          <div class="step-dot pending"></div>
+          <div class="step-dot pending"></div>
+          <div class="step-dot pending"></div>
+          <div class="step-dot pending"></div>
+          <div class="step-dot pending"></div>
+          <div class="step-dot pending"></div>
+        </div>
+      </div>
+      <div class="scroll-content">
+        <h2 class="screen-title">Choose Your Flavor</h2>
+        <p class="screen-subtitle">This sets your personal color theme</p>
+        <div class="flavor-grid">
+          <button class="flavor-chip selected">
+            <div class="flavor-swatch" style="background:linear-gradient(135deg, #FFD600, #FFEB3B); border-color: #FFD600;"></div>
+            <span class="flavor-name">Lemon</span>
+          </button>
+          <button class="flavor-chip">
+            <div class="flavor-swatch" style="background:linear-gradient(135deg, #FF8C00, #FFA726);"></div>
+            <span class="flavor-name">Tangerine</span>
+          </button>
+          <button class="flavor-chip">
+            <div class="flavor-swatch" style="background:linear-gradient(135deg, #7CB342, #9CCC65);"></div>
+            <span class="flavor-name">Lime</span>
+          </button>
+          <button class="flavor-chip">
+            <div class="flavor-swatch" style="background:linear-gradient(135deg, #D84315, #FF5722);"></div>
+            <span class="flavor-name">Blood Orange</span>
+          </button>
+          <button class="flavor-chip" style="grid-column: 1 / -1; justify-self: center; width: calc(50% - 6px);">
+            <div class="flavor-swatch" style="background:linear-gradient(135deg, #E91E63, #F06292);"></div>
+            <span class="flavor-name">Grapefruit</span>
+          </button>
+        </div>
+      </div>
+      <div class="bottom-action">
+        <button class="btn-primary" style="width:100%">Continue</button>
+      </div>
+    </div>
+
+    <!-- ══════════ SCREEN: PERSONALITY ══════════ -->
+    <div class="screen" data-screen="personality">
+      <div class="screen-header">
+        <button class="back-btn">←</button>
+        <div class="step-dots">
+          <div class="step-dot done"></div>
+          <div class="step-dot current"></div>
+          <div class="step-dot pending"></div>
+          <div class="step-dot pending"></div>
+          <div class="step-dot pending"></div>
+          <div class="step-dot pending"></div>
+          <div class="step-dot pending"></div>
+        </div>
+      </div>
+      <div class="scroll-content">
+        <h2 class="screen-title">Personalize Citros</h2>
+        <p class="screen-subtitle">Tell me how you like things</p>
+        <div class="pref-card">
+          <p class="pref-question">How should I talk to you?</p>
+          <div class="pref-options">
+            <button class="pref-option selected">Casual</button>
+            <button class="pref-option">Professional</button>
+            <button class="pref-option">Playful</button>
+          </div>
+        </div>
+        <div class="pref-card">
+          <p class="pref-question">How much should I explain?</p>
+          <div class="pref-options">
+            <button class="pref-option">Brief</button>
+            <button class="pref-option selected">Balanced</button>
+            <button class="pref-option">Detailed</button>
+          </div>
+        </div>
+        <div class="pref-card">
+          <p class="pref-question">What's your comfort level?</p>
+          <div class="pref-options">
+            <button class="pref-option">Ask before everything</button>
+            <button class="pref-option selected">Ask for risky stuff</button>
+            <button class="pref-option">Full autonomy</button>
+          </div>
+        </div>
+      </div>
+      <div class="bottom-action">
+        <button class="btn-primary" style="width:100%">Continue</button>
+      </div>
+    </div>
+
+    <!-- ══════════ SCREEN: ONBOARD CHAT ══════════ -->
+    <div class="screen" data-screen="onboarding-chat">
+      <div class="chat-header">
+        <button class="back-btn" style="margin-right:-4px">←</button>
+        <div class="chat-avatar">🍋</div>
+        <div>
+          <div class="chat-name">Zest</div>
+          <div class="chat-status">online</div>
+        </div>
+      </div>
+      <div class="chat-body">
+        <div class="chat-bubble assistant">Hey! I'm brand new here — just woke up on your phone. Before we get rolling, I'd love to figure out who I am and how you'd like me to work with you.</div>
+        <div class="chat-bubble user">Sounds good! What should I call you?</div>
+        <div class="chat-bubble assistant">Hmm, how about Zest? Feels sharp and citrusy. But you pick — what name feels right?</div>
+        <div class="chat-bubble user">Zest works. I like it.</div>
+        <div class="chat-bubble assistant">Zest it is! 🍋 What's your name?</div>
+        <div class="chat-bubble user">Joe.</div>
+        <div class="chat-bubble assistant">Nice to meet you, Joe. How should I talk to you — casual and direct, or more polished?</div>
+        <div class="chat-bubble user">Casual. No corporate speak.</div>
+        <div class="chat-bubble assistant">My kind of vibe. One more thing — are there any boundaries I should know about?</div>
+        <div class="chat-bubble user">Always ask before sending, deleting, or buying anything.</div>
+        <div class="chat-bubble assistant">Got it — I'll always check first on anything that sends, deletes, or costs money. Let me summarize what I know.</div>
+        <div class="identity-card">
+          <div class="identity-title">Identity Summary</div>
+          <div class="identity-items">
+            <div class="identity-tag"><span class="identity-tag-label">Name</span><span class="identity-tag-value">Zest</span></div>
+            <div class="identity-tag"><span class="identity-tag-label">Emoji</span><span class="identity-tag-value">🍋</span></div>
+            <div class="identity-tag"><span class="identity-tag-label">Vibe</span><span class="identity-tag-value">chill but sharp</span></div>
+            <div class="identity-tag"><span class="identity-tag-label">You</span><span class="identity-tag-value">Joe</span></div>
+            <div class="identity-tag"><span class="identity-tag-label">Style</span><span class="identity-tag-value">casual, no corporate speak</span></div>
+          </div>
+        </div>
+      </div>
+      <div class="chat-input-bar">
+        <input class="chat-input" placeholder="Type a message..." disabled>
+        <button class="chat-send">↑</button>
+      </div>
+    </div>
+
+    <!-- ══════════ SCREEN: PAYWALL ══════════ -->
+    <div class="screen" data-screen="paywall">
+      <div class="screen-header">
+        <button class="back-btn">←</button>
+        <div class="step-dots">
+          <div class="step-dot done"></div>
+          <div class="step-dot done"></div>
+          <div class="step-dot done"></div>
+          <div class="step-dot current"></div>
+          <div class="step-dot pending"></div>
+          <div class="step-dot pending"></div>
+          <div class="step-dot pending"></div>
+        </div>
+      </div>
+      <div class="scroll-content">
+        <h2 class="screen-title">Choose Your Plan</h2>
+        <div class="glow-line" style="margin:0 24px 24px; width: 120px;"></div>
+
+        <div class="plan-card">
+          <div class="plan-header">
+            <span class="plan-icon">🔧</span>
+            <div>
+              <div class="plan-name">Bring Your Own Key</div>
+              <div class="plan-price">Free</div>
+            </div>
+          </div>
+          <div class="plan-lines">
+            <div class="plan-line">Use your own API key from Anthropic, OpenAI, or OpenRouter</div>
+            <div class="plan-line">All models, no limits — you pay your provider directly</div>
+          </div>
+          <span class="plan-badge" style="background:rgba(50,205,50,0.12); color:#32CD32;">Try free for 2 days</span>
+        </div>
+
+        <div class="plan-card recommended">
+          <div class="plan-header">
+            <span class="plan-icon">🍊</span>
+            <div>
+              <div class="plan-name">Citros Base</div>
+              <div class="plan-price">$9/mo</div>
+            </div>
+          </div>
+          <div class="plan-lines">
+            <div class="plan-line">All models included — Haiku, Sonnet, Opus, GPT, Gemini</div>
+            <div class="plan-line">$5 monthly usage cap · Perfect for getting started</div>
+          </div>
+          <span class="plan-badge" style="background:rgba(255,111,0,0.12); color:#FF6F00;">$5 free to start</span>
+        </div>
+
+        <div class="plan-card">
+          <div class="plan-header">
+            <span class="plan-icon">🚀</span>
+            <div>
+              <div class="plan-name">Citros Super</div>
+              <div class="plan-price">$29/mo</div>
+            </div>
+          </div>
+          <div class="plan-lines">
+            <div class="plan-line">All models included — same full catalog, higher caps</div>
+            <div class="plan-line">$50 monthly usage cap · For power users</div>
+          </div>
+          <span class="plan-badge" style="background:rgba(255,61,0,0.12); color:#FF3D00;">$5 free to start</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══════════ SCREEN: API KEY ══════════ -->
+    <div class="screen" data-screen="apikey">
+      <div class="screen-header">
+        <button class="back-btn">←</button>
+        <div class="step-dots">
+          <div class="step-dot done"></div>
+          <div class="step-dot done"></div>
+          <div class="step-dot done"></div>
+          <div class="step-dot done"></div>
+          <div class="step-dot current"></div>
+          <div class="step-dot pending"></div>
+          <div class="step-dot pending"></div>
+        </div>
+      </div>
+      <div class="scroll-content">
+        <h2 class="screen-title">Your API Keys</h2>
+        <p class="screen-subtitle">Keys stay encrypted on-device</p>
+
+        <div class="key-card">
+          <div class="key-provider-dot" style="background:#D97757"></div>
+          <div class="key-info">
+            <div class="key-label">Personal Anthropic</div>
+            <div class="key-masked">sk-ant-•••4f2k</div>
+          </div>
+          <div class="key-status" style="background:var(--success)"></div>
+        </div>
+
+        <div class="key-card">
+          <div class="key-provider-dot" style="background:#10A37F"></div>
+          <div class="key-info">
+            <div class="key-label">Work OpenAI</div>
+            <div class="key-masked">sk-•••m9xp</div>
+          </div>
+          <div class="key-status" style="background:var(--success)"></div>
+        </div>
+
+        <div class="key-card" style="border-style:dashed; cursor:pointer; justify-content:center;">
+          <span style="font-size:20px; color:var(--text-faint);">+</span>
+          <span style="font-size:14px; color:var(--text-faint);">Add new key</span>
+        </div>
+      </div>
+      <div class="bottom-action">
+        <button class="btn-primary" style="width:100%">Continue</button>
+      </div>
+    </div>
+
+    <!-- ══════════ SCREEN: PERMISSIONS ══════════ -->
+    <div class="screen" data-screen="permissions">
+      <div class="screen-header">
+        <button class="back-btn">←</button>
+        <div class="step-dots">
+          <div class="step-dot done"></div>
+          <div class="step-dot done"></div>
+          <div class="step-dot done"></div>
+          <div class="step-dot done"></div>
+          <div class="step-dot done"></div>
+          <div class="step-dot current"></div>
+          <div class="step-dot pending"></div>
+        </div>
+      </div>
+      <div class="scroll-content">
+        <h2 class="screen-title">Permissions</h2>
+        <p class="screen-subtitle">Citros needs these to act on your behalf</p>
+
+        <div class="perm-item">
+          <div class="perm-icon">🖥</div>
+          <div class="perm-info">
+            <div class="perm-name">Accessibility Service</div>
+            <div class="perm-desc">Read & control the screen</div>
+          </div>
+          <div class="perm-toggle on"></div>
+        </div>
+        <div class="perm-item">
+          <div class="perm-icon">📱</div>
+          <div class="perm-info">
+            <div class="perm-name">Display Over Apps</div>
+            <div class="perm-desc">Show floating overlay</div>
+          </div>
+          <div class="perm-toggle on"></div>
+        </div>
+        <div class="perm-item">
+          <div class="perm-icon">🔔</div>
+          <div class="perm-info">
+            <div class="perm-name">Notification Access</div>
+            <div class="perm-desc">Read & manage notifications</div>
+          </div>
+          <div class="perm-toggle on"></div>
+        </div>
+        <div class="perm-item">
+          <div class="perm-icon">🎤</div>
+          <div class="perm-info">
+            <div class="perm-name">Microphone</div>
+            <div class="perm-desc">Voice commands & dictation</div>
+          </div>
+          <div class="perm-toggle"></div>
+        </div>
+        <div class="perm-item">
+          <div class="perm-icon">📷</div>
+          <div class="perm-info">
+            <div class="perm-name">Camera</div>
+            <div class="perm-desc">Visual context awareness</div>
+          </div>
+          <div class="perm-toggle"></div>
+        </div>
+        <div class="perm-item">
+          <div class="perm-icon">📍</div>
+          <div class="perm-info">
+            <div class="perm-name">Location</div>
+            <div class="perm-desc">Context-aware suggestions</div>
+          </div>
+          <div class="perm-toggle"></div>
+        </div>
+      </div>
+      <div class="bottom-action">
+        <button class="btn-primary" style="width:100%">Continue</button>
+      </div>
+    </div>
+
+    <!-- ══════════ SCREEN: READY ══════════ -->
+    <div class="screen ready-screen" data-screen="ready">
+      <div class="orb-glow" style="top:25%; left:50%; transform:translate(-50%,-50%); width:350px; height:350px; animation:orbPulse 6s ease-in-out infinite;"></div>
+      <div class="ready-checkmark" style="position:relative; z-index:2;">✓</div>
+      <h2 class="ready-headline gradient-text" style="position:relative; z-index:2;">You're all set!</h2>
+      <p class="ready-sub" style="position:relative; z-index:2;">Your AI phone agent is ready to go</p>
+      <div class="ready-summary" style="position:relative; z-index:2;">
+        <div class="ready-row">
+          <span class="ready-row-label">Provider</span>
+          <span class="ready-row-value"><span style="width:8px;height:8px;border-radius:50%;background:#D97757;display:inline-block;"></span> Anthropic</span>
+        </div>
+        <div class="ready-row">
+          <span class="ready-row-label">Model</span>
+          <span class="ready-row-value">Claude Sonnet</span>
+        </div>
+        <div class="ready-row">
+          <span class="ready-row-label">Plan</span>
+          <span class="ready-row-value">Bring Your Own Key</span>
+        </div>
+        <div class="ready-row">
+          <span class="ready-row-label">Agent</span>
+          <span class="ready-row-value">🍋 Zest</span>
+        </div>
+      </div>
+      <div style="width:100%; max-width:280px; position:relative; z-index:2;">
+        <button class="btn-primary" style="width:100%">Launch Citros</button>
+      </div>
+    </div>
+
+    <!-- ══════════ SCREEN: CHAT (Main) ══════════ -->
+    <div class="screen" data-screen="chat">
+      <div class="chat-header">
+        <div class="chat-avatar">🍋</div>
+        <div style="flex:1;">
+          <div class="chat-name">Zest</div>
+          <div class="chat-status">online</div>
+        </div>
+        <button class="back-btn" style="font-size:20px;">⚙</button>
+      </div>
+      <div class="chat-body">
+        <div class="chat-bubble assistant">Morning, Joe. You've got 3 unread emails — one from Sarah about the project deadline. Want me to summarize them?</div>
+        <div class="chat-bubble user">Yeah, give me the highlights.</div>
+        <div class="chat-bubble assistant">Sarah's asking if you can push the deadline to Friday. Marcus sent the design files. And there's a promo email from Figma — probably safe to archive. Want me to reply to Sarah?</div>
+        <div class="chat-bubble user">Tell her Friday works. Archive the Figma one.</div>
+        <div class="chat-bubble assistant">Done. Replied to Sarah confirming Friday, and archived the Figma email. Anything else?</div>
+        <div class="chat-bubble user">What's on my calendar today?</div>
+        <div class="chat-bubble assistant">You've got a 10:30 standup with the team and a 2pm call with the client. After that, you're free. Want me to block off some focus time?</div>
+      </div>
+      <div class="chat-input-bar">
+        <input class="chat-input" placeholder="Ask Zest anything...">
+        <button class="chat-send">↑</button>
+      </div>
+    </div>
+
+    <!-- ══════════ SCREEN: OVERLAY ══════════ -->
+    <div class="screen" data-screen="overlay">
+      <div class="android-home">
+        <div class="android-clock">9:41</div>
+        <div class="android-date">Monday, February 16</div>
+
+        <!-- Notification-style cards -->
+        <div style="display:flex; flex-direction:column; gap:8px; padding:0 4px;">
+          <div style="background:rgba(255,255,255,0.07); backdrop-filter:blur(20px); border-radius:16px; padding:14px 16px; display:flex; gap:12px; align-items:flex-start;">
+            <div style="width:28px;height:28px;border-radius:8px;background:linear-gradient(135deg, var(--accent), var(--accent-warm));display:flex;align-items:center;justify-content:center;font-size:14px;flex-shrink:0;">🍋</div>
+            <div style="flex:1; min-width:0;">
+              <div style="font-size:13px; font-weight:600; color:rgba(255,255,255,0.9); margin-bottom:2px;">Zest</div>
+              <div style="font-size:12px; color:rgba(255,255,255,0.5); line-height:1.4;">Noticed you have a meeting in 20 min. Want me to pull up the notes from last week's call?</div>
+            </div>
+            <div style="font-size:10px; color:rgba(255,255,255,0.3);">now</div>
+          </div>
+          <div style="background:rgba(255,255,255,0.05); backdrop-filter:blur(20px); border-radius:16px; padding:14px 16px; display:flex; gap:12px; align-items:flex-start;">
+            <div style="width:28px;height:28px;border-radius:8px;background:#1a73e8;display:flex;align-items:center;justify-content:center;font-size:14px;flex-shrink:0;">📧</div>
+            <div style="flex:1;">
+              <div style="font-size:13px; font-weight:600; color:rgba(255,255,255,0.9); margin-bottom:2px;">Gmail</div>
+              <div style="font-size:12px; color:rgba(255,255,255,0.5);">Sarah: Re: Project deadline — Sounds good, Friday it is!</div>
+            </div>
+            <div style="font-size:10px; color:rgba(255,255,255,0.3);">2m</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- FAB -->
+      <div class="overlay-fab">🍋</div>
+
+      <!-- Bottom sheet -->
+      <div class="overlay-sheet">
+        <div class="overlay-handle"></div>
+        <div class="overlay-input-row">
+          <input class="chat-input" placeholder="Ask Zest..." style="flex:1;">
+          <button class="chat-send" style="width:38px; height:38px;">↑</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══════════ SCREEN: SETTINGS ══════════ -->
+    <div class="screen" data-screen="settings">
+      <div style="padding:62px 24px 8px;">
+        <h2 class="screen-title" style="padding:0;">Settings</h2>
+      </div>
+      <div class="scroll-content">
+        <!-- Profile card -->
+        <div style="display:flex; align-items:center; gap:14px; padding:16px 24px 20px; border-bottom:1px solid var(--border);">
+          <div class="chat-avatar" style="width:48px; height:48px; font-size:22px;">🍋</div>
+          <div>
+            <div style="font-size:17px; font-weight:600; color:var(--text);">Zest</div>
+            <div style="font-size:13px; color:var(--text-dim);">Joe's AI agent · Lemon theme</div>
+          </div>
+        </div>
+
+        <div class="settings-item"><div class="settings-icon">🧠</div><span class="settings-label">Models</span><span class="settings-chevron">›</span></div>
+        <div class="settings-item"><div class="settings-icon">🔑</div><span class="settings-label">API Keys</span><span class="settings-chevron">›</span></div>
+        <div class="settings-item"><div class="settings-icon">💰</div><span class="settings-label">Wallet & Usage</span><span class="settings-chevron">›</span></div>
+        <div style="height:1px; background:var(--border); margin:8px 24px;"></div>
+        <div class="settings-item"><div class="settings-icon">🛡</div><span class="settings-label">Trust & Safety</span><span class="settings-chevron">›</span></div>
+        <div class="settings-item"><div class="settings-icon">🔒</div><span class="settings-label">Permissions</span><span class="settings-chevron">›</span></div>
+        <div class="settings-item"><div class="settings-icon">🎨</div><span class="settings-label">Appearance</span><span class="settings-chevron">›</span></div>
+        <div style="height:1px; background:var(--border); margin:8px 24px;"></div>
+        <div class="settings-item"><div class="settings-icon">📄</div><span class="settings-label">About Citros</span><span class="settings-chevron">›</span></div>
+      </div>
+    </div>
+
+    <!-- ══════════ SCREEN: WALLET ══════════ -->
+    <div class="screen" data-screen="wallet">
+      <div style="padding:62px 24px 16px; display:flex; align-items:center; gap:14px;">
+        <button class="back-btn">←</button>
+        <h2 style="font-size:18px; font-weight:600;">Wallet & Usage</h2>
+      </div>
+      <div class="scroll-content">
+        <div class="wallet-balance-card">
+          <div class="wallet-eyebrow">Remaining Balance</div>
+          <div class="wallet-amount gradient-text-accent">$3.42</div>
+          <div class="wallet-bar">
+            <div class="wallet-bar-fill" style="width:68%"></div>
+          </div>
+          <div style="display:flex; justify-content:space-between; margin-top:8px;">
+            <span style="font-size:11px; color:var(--text-faint);">$1.58 used</span>
+            <span style="font-size:11px; color:var(--text-faint);">$5.00 cap</span>
+          </div>
+        </div>
+
+        <div style="padding:0 24px 12px;">
+          <span class="eyebrow">Recent Usage</span>
+        </div>
+        <div class="usage-row">
+          <span class="usage-model">Claude Sonnet 4</span>
+          <span class="usage-cost">$0.82</span>
+        </div>
+        <div class="usage-row">
+          <span class="usage-model">Claude Haiku 4</span>
+          <span class="usage-cost">$0.34</span>
+        </div>
+        <div class="usage-row">
+          <span class="usage-model">GPT-4o</span>
+          <span class="usage-cost">$0.28</span>
+        </div>
+        <div class="usage-row">
+          <span class="usage-model">Gemini 2.5 Flash</span>
+          <span class="usage-cost">$0.14</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══════════ SCREEN: MODELS ══════════ -->
+    <div class="screen" data-screen="models">
+      <div style="padding:62px 24px 16px; display:flex; align-items:center; gap:14px;">
+        <button class="back-btn">←</button>
+        <h2 style="font-size:18px; font-weight:600;">Models</h2>
+      </div>
+      <div class="scroll-content">
+        <div style="padding:0 24px 16px;">
+          <span class="eyebrow">Active Model</span>
+        </div>
+        <div class="model-card active">
+          <div class="model-dot" style="background:#D97757"></div>
+          <div class="model-info">
+            <div class="model-name">Claude Sonnet 4</div>
+            <div class="model-provider">Anthropic</div>
+          </div>
+          <span class="model-check">✓</span>
+        </div>
+        <div style="padding:16px 24px 12px;">
+          <span class="eyebrow">Available</span>
+        </div>
+        <div class="model-card">
+          <div class="model-dot" style="background:#D97757"></div>
+          <div class="model-info">
+            <div class="model-name">Claude Haiku 4</div>
+            <div class="model-provider">Anthropic</div>
+          </div>
+        </div>
+        <div class="model-card">
+          <div class="model-dot" style="background:#D97757"></div>
+          <div class="model-info">
+            <div class="model-name">Claude Opus 4</div>
+            <div class="model-provider">Anthropic</div>
+          </div>
+        </div>
+        <div class="model-card">
+          <div class="model-dot" style="background:#10A37F"></div>
+          <div class="model-info">
+            <div class="model-name">GPT-4o</div>
+            <div class="model-provider">OpenAI</div>
+          </div>
+        </div>
+        <div class="model-card">
+          <div class="model-dot" style="background:#4285F4"></div>
+          <div class="model-info">
+            <div class="model-name">Gemini 2.5 Pro</div>
+            <div class="model-provider">Google</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══════════ SCREEN: TRUST ══════════ -->
+    <div class="screen" data-screen="trust">
+      <div style="padding:62px 24px 16px; display:flex; align-items:center; gap:14px;">
+        <button class="back-btn">←</button>
+        <h2 style="font-size:18px; font-weight:600;">Trust & Safety</h2>
+      </div>
+      <div class="scroll-content">
+        <h2 class="screen-title" style="font-size:20px;">Autonomy Level</h2>
+        <p class="screen-subtitle">How much should Citros do on its own?</p>
+        <div class="trust-level">
+          <div class="trust-option">
+            <div class="trust-option-header">
+              <span class="trust-option-icon">🔒</span>
+              <span class="trust-option-name">Ask Before Everything</span>
+            </div>
+            <p class="trust-option-desc">Citros always confirms before taking any action.</p>
+          </div>
+          <div class="trust-option selected">
+            <div class="trust-option-header">
+              <span class="trust-option-icon">🛡</span>
+              <span class="trust-option-name">Ask for Risky Stuff</span>
+            </div>
+            <p class="trust-option-desc">Auto-handles safe actions; confirms sends, deletes, and purchases.</p>
+          </div>
+          <div class="trust-option">
+            <div class="trust-option-header">
+              <span class="trust-option-icon">⚡</span>
+              <span class="trust-option-name">Full Autonomy</span>
+            </div>
+            <p class="trust-option-desc">Citros acts freely. Use at your own risk.</p>
+          </div>
+        </div>
+
+        <div style="padding:24px;">
+          <div class="glow-line" style="margin:0 0 24px;"></div>
+          <span class="eyebrow">Safety Features</span>
+        </div>
+        <div class="perm-item">
+          <div class="perm-info">
+            <div class="perm-name">Audit Trail</div>
+            <div class="perm-desc">Append-only log of all agent actions</div>
+          </div>
+          <div class="perm-toggle on"></div>
+        </div>
+        <div class="perm-item">
+          <div class="perm-info">
+            <div class="perm-name">Hardware Encryption</div>
+            <div class="perm-desc">Keys stored in secure element</div>
+          </div>
+          <div class="perm-toggle on"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══════════ SCREEN: APPEARANCE ══════════ -->
+    <div class="screen" data-screen="appearance">
+      <div style="padding:62px 24px 16px; display:flex; align-items:center; gap:14px;">
+        <button class="back-btn">←</button>
+        <h2 style="font-size:18px; font-weight:600;">Appearance</h2>
+      </div>
+      <div class="scroll-content">
+        <div style="padding:0 24px 16px;">
+          <span class="eyebrow">Theme Mode</span>
+        </div>
+        <div class="theme-toggle-row">
+          <button class="theme-toggle-btn selected">
+            <div class="theme-toggle-icon">🌙</div>
+            <div class="theme-toggle-label">Dark</div>
+          </button>
+          <button class="theme-toggle-btn">
+            <div class="theme-toggle-icon">☀️</div>
+            <div class="theme-toggle-label">Light</div>
+          </button>
+        </div>
+
+        <div style="padding:8px 24px 16px;">
+          <span class="eyebrow">Color Flavor</span>
+        </div>
+        <div class="flavor-grid" style="padding:0 24px;">
+          <button class="flavor-chip selected" style="padding:16px 12px;">
+            <div class="flavor-swatch" style="width:32px;height:32px;background:linear-gradient(135deg, #FFD600, #FFEB3B);"></div>
+            <span class="flavor-name">Lemon</span>
+          </button>
+          <button class="flavor-chip" style="padding:16px 12px;">
+            <div class="flavor-swatch" style="width:32px;height:32px;background:linear-gradient(135deg, #FF8C00, #FFA726);"></div>
+            <span class="flavor-name">Tangerine</span>
+          </button>
+          <button class="flavor-chip" style="padding:16px 12px;">
+            <div class="flavor-swatch" style="width:32px;height:32px;background:linear-gradient(135deg, #7CB342, #9CCC65);"></div>
+            <span class="flavor-name">Lime</span>
+          </button>
+          <button class="flavor-chip" style="padding:16px 12px;">
+            <div class="flavor-swatch" style="width:32px;height:32px;background:linear-gradient(135deg, #D84315, #FF5722);"></div>
+            <span class="flavor-name">Blood Orange</span>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══════════ SCREEN: ABOUT ══════════ -->
+    <div class="screen about-screen" data-screen="about">
+      <div style="position:absolute; top:62px; left:24px;">
+        <button class="back-btn">←</button>
+      </div>
+      <h1 class="about-logo gradient-text">citros</h1>
+      <p class="about-version">v0.1.0-alpha · Build 42</p>
+      <p class="about-tagline">Intelligence that lives on your device. Not in a data center.</p>
+      <div class="glow-line" style="width:80px; margin:0 0 24px;"></div>
+      <div style="width:100%;">
+        <div class="about-row">
+          <span class="about-row-label">Runtime</span>
+          <span class="about-row-value">Rust + Tokio</span>
+        </div>
+        <div class="about-row">
+          <span class="about-row-label">Encryption</span>
+          <span class="about-row-value">ring (AES-256-GCM)</span>
+        </div>
+        <div class="about-row">
+          <span class="about-row-label">Storage</span>
+          <span class="about-row-value">redb (encrypted)</span>
+        </div>
+        <div class="about-row">
+          <span class="about-row-label">Target</span>
+          <span class="about-row-value">Pixel 10 Pro</span>
+        </div>
+        <div class="about-row">
+          <span class="about-row-label">Min SDK</span>
+          <span class="about-row-value">Android 8.0 (API 26)</span>
+        </div>
+      </div>
+      <div class="about-footer">Made with 🍊 by the Citros team</div>
+    </div>
+
+  </div><!-- /phone -->
+</div><!-- /stage -->
+
+<script>
+(function() {
+  'use strict';
+
+  // ── Screen definitions ──
+  const screens = [
+    { id: 'welcome',          label: 'Welcome' },
+    { id: 'flavor',           label: 'Flavor' },
+    { id: 'personality',      label: 'Personality' },
+    { id: 'onboarding-chat',  label: 'Onboard Chat' },
+    { id: 'paywall',          label: 'Paywall' },
+    { id: 'apikey',           label: 'API Key' },
+    { id: 'permissions',      label: 'Permissions' },
+    { id: 'ready',            label: 'Ready' },
+    { id: 'chat',             label: 'Chat' },
+    { id: 'overlay',          label: 'Overlay' },
+    { id: 'settings',         label: 'Settings' },
+    { id: 'wallet',           label: 'Wallet' },
+    { id: 'models',           label: 'Models' },
+    { id: 'trust',            label: 'Trust' },
+    { id: 'appearance',       label: 'Appearance' },
+    { id: 'about',            label: 'About' },
+  ];
+
+  // ── Build toolbar buttons ──
+  const toolbar = document.getElementById('toolbar');
+  screens.forEach((s, i) => {
+    const btn = document.createElement('button');
+    btn.className = 'toolbar-btn' + (i === 0 ? ' active' : '');
+    btn.textContent = s.label;
+    btn.dataset.target = s.id;
+    btn.addEventListener('click', () => switchScreen(s.id));
+    toolbar.appendChild(btn);
+  });
+
+  function switchScreen(id) {
+    document.querySelectorAll('.screen').forEach(el => el.classList.remove('active'));
+    const target = document.querySelector(`[data-screen="${id}"]`);
+    if (target) target.classList.add('active');
+
+    document.querySelectorAll('.toolbar-btn').forEach(btn => {
+      btn.classList.toggle('active', btn.dataset.target === id);
+    });
+  }
+
+  // ── Welcome particles ──
+  const pc = document.getElementById('welcomeParticles');
+  for (let i = 0; i < 12; i++) {
+    const p = document.createElement('div');
+    p.className = 'welcome-particle';
+    p.style.left = (10 + Math.random() * 80) + '%';
+    p.style.bottom = '0';
+    p.style.animationDuration = (12 + Math.random() * 18) + 's';
+    p.style.animationDelay = (Math.random() * 15) + 's';
+    p.style.width = p.style.height = (1 + Math.random() * 2) + 'px';
+    pc.appendChild(p);
+  }
+
+  // ── Interactive flavor chips ──
+  document.querySelectorAll('.flavor-grid').forEach(grid => {
+    grid.addEventListener('click', (e) => {
+      const chip = e.target.closest('.flavor-chip');
+      if (!chip) return;
+      grid.querySelectorAll('.flavor-chip').forEach(c => c.classList.remove('selected'));
+      chip.classList.add('selected');
+    });
+  });
+
+  // ── Interactive pref options ──
+  document.querySelectorAll('.pref-options').forEach(group => {
+    group.addEventListener('click', (e) => {
+      const opt = e.target.closest('.pref-option');
+      if (!opt) return;
+      group.querySelectorAll('.pref-option').forEach(o => o.classList.remove('selected'));
+      opt.classList.add('selected');
+    });
+  });
+
+  // ── Interactive toggles ──
+  document.querySelectorAll('.perm-toggle').forEach(toggle => {
+    toggle.addEventListener('click', () => toggle.classList.toggle('on'));
+  });
+
+  // ── Interactive trust options ──
+  document.querySelectorAll('.trust-option').forEach(opt => {
+    opt.addEventListener('click', () => {
+      document.querySelectorAll('.trust-option').forEach(o => o.classList.remove('selected'));
+      opt.classList.add('selected');
+    });
+  });
+
+  // ── Interactive theme toggle ──
+  document.querySelectorAll('.theme-toggle-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.theme-toggle-btn').forEach(b => b.classList.remove('selected'));
+      btn.classList.add('selected');
+    });
+  });
+
+  // ── Keyboard nav ──
+  document.addEventListener('keydown', (e) => {
+    const btns = [...document.querySelectorAll('.toolbar-btn')];
+    const currentIdx = btns.findIndex(b => b.classList.contains('active'));
+    if (e.key === 'ArrowRight' && currentIdx < btns.length - 1) {
+      btns[currentIdx + 1].click();
+    } else if (e.key === 'ArrowLeft' && currentIdx > 0) {
+      btns[currentIdx - 1].click();
+    }
+  });
+
+})();
+</script>
+</body>
+</html>

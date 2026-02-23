@@ -1,0 +1,1181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Citros — Give Your Phone Agency</title>
+
+<!-- Favicon & Icons -->
+<link rel="icon" type="image/x-icon" href="/favicon.ico">
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+
+<!-- Open Graph / Link Preview -->
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://citros.ai/">
+<meta property="og:title" content="Citros — Give Your Phone Agency">
+<meta property="og:description" content="An AI agent that lives on your Android phone. Controls any app. Speaks and listens. Try the alpha.">
+<meta property="og:image" content="https://citros.ai/og-image.jpg">
+
+<!-- Twitter Card -->
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Citros — Give Your Phone Agency">
+<meta name="twitter:description" content="An AI agent that lives on your Android phone. Controls any app. Speaks and listens. Try the alpha.">
+<meta name="twitter:image" content="https://citros.ai/og-image.jpg">
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+:root {
+  --bg: #050505;
+  --text: #ffffff;
+  --text-dim: rgba(255,255,255,0.5);
+  --text-faint: rgba(255,255,255,0.25);
+  --accent: #f59e0b;
+  --accent-warm: #ff6b2b;
+  --accent-glow: rgba(245,158,11,0.15);
+}
+
+html {
+  scroll-behavior: smooth;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  font-weight: 400;
+  line-height: 1.6;
+  overflow-x: hidden;
+}
+
+/* ── NAV ── */
+nav {
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 24px 48px;
+  transition: background 0.4s, backdrop-filter 0.4s;
+}
+
+nav.scrolled {
+  background: rgba(5,5,5,0.8);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+}
+
+.nav-logo {
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: lowercase;
+  color: var(--text);
+  text-decoration: none;
+}
+
+.nav-logo span {
+  color: var(--accent);
+}
+
+.nav-cta {
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text);
+  text-decoration: none;
+  padding: 10px 24px;
+  border: 1px solid rgba(255,255,255,0.2);
+  border-radius: 100px;
+  transition: all 0.3s;
+}
+
+.nav-cta:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  box-shadow: 0 0 20px var(--accent-glow);
+}
+
+/* ── HERO ── */
+#hero {
+  position: relative;
+  height: 100vh;
+  min-height: 700px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+#canvas-container {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+}
+
+#canvas-container canvas {
+  display: block;
+  width: 100% !important;
+  height: 100% !important;
+}
+
+.hero-content {
+  position: relative;
+  z-index: 10;
+  text-align: center;
+  pointer-events: none;
+}
+
+.hero-title {
+  font-size: clamp(64px, 12vw, 140px);
+  font-weight: 700;
+  letter-spacing: -0.04em;
+  line-height: 1;
+  margin-bottom: 24px;
+  background: linear-gradient(135deg, #ffffff 0%, var(--accent) 50%, var(--accent-warm) 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  opacity: 0;
+  transform: translateY(30px);
+  animation: heroFadeUp 1.2s cubic-bezier(0.16, 1, 0.3, 1) 0.3s forwards;
+}
+
+.hero-subtitle {
+  font-size: clamp(16px, 2.5vw, 22px);
+  font-weight: 300;
+  color: var(--text-dim);
+  letter-spacing: 0.02em;
+  opacity: 0;
+  transform: translateY(20px);
+  animation: heroFadeUp 1s cubic-bezier(0.16, 1, 0.3, 1) 0.7s forwards;
+}
+
+.scroll-indicator {
+  position: absolute;
+  bottom: 40px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  opacity: 0;
+  animation: heroFadeUp 1s cubic-bezier(0.16, 1, 0.3, 1) 1.2s forwards;
+}
+
+.scroll-indicator span {
+  font-size: 11px;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.scroll-line {
+  width: 1px;
+  height: 40px;
+  background: linear-gradient(to bottom, var(--accent), transparent);
+  animation: scrollPulse 2s ease-in-out infinite;
+}
+
+@keyframes heroFadeUp {
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes scrollPulse {
+  0%, 100% { opacity: 0.3; transform: scaleY(0.6); }
+  50% { opacity: 1; transform: scaleY(1); }
+}
+
+/* ── SECTIONS ── */
+.section {
+  position: relative;
+  padding: 160px 48px;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+.reveal {
+  opacity: 0;
+  transform: translateY(60px);
+  transition: opacity 0.9s cubic-bezier(0.16, 1, 0.3, 1),
+              transform 0.9s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.reveal.visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.reveal-delay-1 { transition-delay: 0.15s; }
+.reveal-delay-2 { transition-delay: 0.3s; }
+.reveal-delay-3 { transition-delay: 0.45s; }
+
+/* ── WHAT IS CITROS ── */
+.about-section {
+  padding: 200px 48px;
+  max-width: 900px;
+  margin: 0 auto;
+  text-align: center;
+}
+
+.about-headline {
+  font-size: clamp(36px, 6vw, 56px);
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  line-height: 1.15;
+  margin-bottom: 32px;
+}
+
+.about-headline .highlight {
+  background: linear-gradient(135deg, var(--accent), var(--accent-warm));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.about-body {
+  font-size: clamp(16px, 2vw, 20px);
+  color: var(--text-dim);
+  line-height: 1.7;
+  max-width: 650px;
+  margin: 0 auto;
+}
+
+/* ── SCREENSHOTS ── */
+.screenshots-section {
+  padding: 120px 48px;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+.screenshots-header {
+  font-size: clamp(14px, 1.5vw, 16px);
+  font-weight: 500;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 60px;
+  text-align: center;
+}
+
+.screenshots-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 24px;
+  max-width: 1000px;
+  margin: 0 auto;
+}
+
+.screenshot-card {
+  position: relative;
+  border-radius: 24px;
+  overflow: hidden;
+  background: rgba(255,255,255,0.03);
+  border: 1px solid rgba(255,255,255,0.08);
+  transition: transform 0.4s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.4s;
+}
+
+.screenshot-card:hover {
+  transform: translateY(-8px);
+  box-shadow: 0 20px 60px rgba(245,158,11,0.1);
+}
+
+.screenshot-card img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border-radius: 24px;
+}
+
+.screenshot-label {
+  text-align: center;
+  padding: 16px 12px;
+  font-size: 13px;
+  color: var(--text-dim);
+  letter-spacing: 0.02em;
+}
+
+/* ── FEATURES / PRINCIPLES ── */
+.principles-section {
+  padding: 200px 48px;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+.principles-header {
+  font-size: clamp(14px, 1.5vw, 16px);
+  font-weight: 500;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 80px;
+}
+
+.principles-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 60px;
+}
+
+.principle {
+  position: relative;
+}
+
+.principle::before {
+  content: '';
+  display: block;
+  width: 40px;
+  height: 2px;
+  background: linear-gradient(90deg, var(--accent), transparent);
+  margin-bottom: 32px;
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: transform 0.8s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.principle.visible::before {
+  transform: scaleX(1);
+}
+
+.principle-title {
+  font-size: 22px;
+  font-weight: 600;
+  margin-bottom: 16px;
+  line-height: 1.3;
+}
+
+.principle-desc {
+  font-size: 15px;
+  color: var(--text-dim);
+  line-height: 1.7;
+}
+
+/* ── DIVIDER ── */
+.glow-divider {
+  width: 100%;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--accent-glow), var(--accent), var(--accent-glow), transparent);
+  margin: 0 auto;
+  max-width: 800px;
+  opacity: 0.6;
+}
+
+/* ── CTA / ALPHA ── */
+.cta-section {
+  position: relative;
+  padding: 200px 48px;
+  text-align: center;
+  overflow: hidden;
+}
+
+.cta-section::before {
+  content: '';
+  position: absolute;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  width: 800px;
+  height: 800px;
+  background: radial-gradient(circle, var(--accent-glow) 0%, transparent 70%);
+  pointer-events: none;
+  opacity: 0.5;
+}
+
+.cta-headline {
+  position: relative;
+  font-size: clamp(36px, 6vw, 64px);
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  line-height: 1.15;
+  margin-bottom: 24px;
+}
+
+.cta-sub {
+  position: relative;
+  font-size: clamp(16px, 2vw, 20px);
+  color: var(--text-dim);
+  margin-bottom: 60px;
+}
+
+.waitlist-form {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  max-width: 520px;
+  margin: 0 auto 24px;
+}
+
+.waitlist-input {
+  flex: 1;
+  height: 56px;
+  padding: 0 24px;
+  font-family: 'Inter', sans-serif;
+  font-size: 15px;
+  color: var(--text);
+  background: rgba(255,255,255,0.06);
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 100px;
+  outline: none;
+  transition: border-color 0.3s, box-shadow 0.3s;
+}
+
+.waitlist-input::placeholder { color: var(--text-faint); }
+
+.waitlist-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+
+.waitlist-btn {
+  height: 56px;
+  padding: 0 32px;
+  font-family: 'Inter', sans-serif;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  color: #050505;
+  background: linear-gradient(135deg, var(--accent), var(--accent-warm));
+  border: none;
+  border-radius: 100px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: transform 0.2s, box-shadow 0.3s;
+}
+
+.waitlist-btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 8px 30px rgba(245,158,11,0.3);
+}
+
+.waitlist-btn:active {
+  transform: translateY(0);
+}
+
+.waitlist-note {
+  position: relative;
+  font-size: 13px;
+  color: var(--text-faint);
+  margin-top: 16px;
+}
+
+/* ── DOWNLOAD SECTION (hidden until email submitted) ── */
+.download-section {
+  display: none;
+  position: relative;
+  max-width: 700px;
+  margin: 0 auto;
+  text-align: center;
+}
+
+.download-success-msg {
+  font-size: 16px;
+  font-weight: 500;
+  color: var(--accent);
+  margin-bottom: 40px;
+}
+
+.download-btn {
+  display: inline-block;
+  height: 60px;
+  line-height: 60px;
+  padding: 0 48px;
+  font-family: 'Inter', sans-serif;
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  color: #050505;
+  background: linear-gradient(135deg, var(--accent), var(--accent-warm));
+  border: none;
+  border-radius: 100px;
+  cursor: pointer;
+  text-decoration: none;
+  transition: transform 0.2s, box-shadow 0.3s;
+  margin-bottom: 48px;
+}
+
+.download-btn:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 12px 40px rgba(245,158,11,0.35);
+}
+
+.download-btn:active {
+  transform: translateY(0);
+}
+
+/* ── SIDELOAD GUIDE ── */
+.sideload-guide {
+  text-align: left;
+  background: rgba(255,255,255,0.03);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 20px;
+  padding: 40px;
+  margin-top: 20px;
+}
+
+.sideload-guide h3 {
+  font-size: 18px;
+  font-weight: 600;
+  margin-bottom: 28px;
+  color: var(--accent);
+}
+
+.sideload-steps {
+  list-style: none;
+  counter-reset: steps;
+}
+
+.sideload-steps li {
+  counter-increment: steps;
+  position: relative;
+  padding-left: 48px;
+  margin-bottom: 20px;
+  font-size: 15px;
+  color: var(--text-dim);
+  line-height: 1.6;
+}
+
+.sideload-steps li::before {
+  content: counter(steps);
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: rgba(245,158,11,0.12);
+  border: 1px solid rgba(245,158,11,0.3);
+  color: var(--accent);
+  font-size: 14px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+}
+
+.sideload-note {
+  margin-top: 24px;
+  padding: 16px 20px;
+  background: rgba(245,158,11,0.06);
+  border-left: 3px solid var(--accent);
+  border-radius: 0 12px 12px 0;
+  font-size: 13px;
+  color: var(--text-dim);
+  line-height: 1.6;
+}
+
+/* ── FOOTER ── */
+footer {
+  padding: 60px 48px;
+  text-align: center;
+  border-top: 1px solid rgba(255,255,255,0.06);
+}
+
+.footer-logo {
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: lowercase;
+  margin-bottom: 12px;
+}
+
+.footer-logo span { color: var(--accent); }
+
+.footer-tagline {
+  font-size: 13px;
+  color: var(--text-faint);
+  letter-spacing: 0.04em;
+}
+
+/* ── AMBIENT PARTICLES ── */
+.ambient-particles {
+  position: fixed;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  overflow: hidden;
+}
+
+.ambient-particle {
+  position: absolute;
+  width: 2px;
+  height: 2px;
+  background: var(--accent);
+  border-radius: 50%;
+  opacity: 0;
+  animation: particleFloat linear infinite;
+}
+
+@keyframes particleFloat {
+  0% { opacity: 0; transform: translateY(100vh) translateX(0); }
+  10% { opacity: 0.4; }
+  90% { opacity: 0.4; }
+  100% { opacity: 0; transform: translateY(-10vh) translateX(40px); }
+}
+
+/* ── RESPONSIVE ── */
+@media (max-width: 768px) {
+  nav { padding: 16px 24px; }
+  .about-section, .screenshots-section, .principles-section,
+  .cta-section { padding-left: 24px; padding-right: 24px; }
+  .principles-grid { grid-template-columns: 1fr; gap: 40px; }
+  .waitlist-form { flex-direction: column; }
+  .waitlist-input, .waitlist-btn { width: 100%; }
+  .about-section, .principles-section,
+  .cta-section { padding-top: 120px; padding-bottom: 120px; }
+  .screenshots-grid {
+    grid-template-columns: repeat(2, 1fr);
+    gap: 16px;
+  }
+  .sideload-guide { padding: 24px; }
+}
+
+@media (max-width: 480px) {
+  .screenshots-grid {
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+}
+</style>
+</head>
+<body>
+
+<!-- NAV -->
+<nav id="nav">
+  <a href="#" class="nav-logo">citr<span>o</span>s</a>
+  <a href="#alpha" class="nav-cta">Try the Alpha</a>
+</nav>
+
+<!-- AMBIENT PARTICLES -->
+<div class="ambient-particles" id="ambientParticles"></div>
+
+<!-- HERO -->
+<section id="hero">
+  <div id="canvas-container"></div>
+  <div class="hero-content">
+    <h1 class="hero-title">citros</h1>
+    <p class="hero-subtitle">Give your phone agency.</p>
+  </div>
+  <div class="scroll-indicator">
+    <span>Scroll</span>
+    <div class="scroll-line"></div>
+  </div>
+</section>
+
+<!-- WHAT IS CITROS -->
+<section class="about-section">
+  <div class="reveal">
+    <h2 class="about-headline">What is <span class="highlight">Citros</span>?</h2>
+  </div>
+  <div class="reveal reveal-delay-1">
+    <p class="about-body">
+      Citros is an AI agent that lives on your Android phone. It can see your screen, control any app, and talk to you.
+    </p>
+  </div>
+</section>
+
+<div class="glow-divider"></div>
+
+<!-- SCREENSHOTS -->
+<section class="screenshots-section">
+  <div class="reveal">
+    <p class="screenshots-header">See it in action</p>
+  </div>
+  <div class="screenshots-grid">
+    <div class="screenshot-card reveal reveal-delay-1">
+      <img src="screenshots/welcome.jpg" alt="Citros welcome screen" loading="lazy">
+      <p class="screenshot-label">Welcome</p>
+    </div>
+    <div class="screenshot-card reveal reveal-delay-1">
+      <img src="screenshots/chat.jpg" alt="Citros chat interface" loading="lazy">
+      <p class="screenshot-label">Chat</p>
+    </div>
+    <div class="screenshot-card reveal reveal-delay-2">
+      <img src="screenshots/style.jpg" alt="Citros style picker" loading="lazy">
+      <p class="screenshot-label">Style</p>
+    </div>
+    <div class="screenshot-card reveal reveal-delay-2">
+      <img src="screenshots/onboarding.jpg" alt="Citros onboarding" loading="lazy">
+      <p class="screenshot-label">Onboarding</p>
+    </div>
+  </div>
+</section>
+
+<div class="glow-divider"></div>
+
+<!-- FEATURES -->
+<section class="principles-section">
+  <div class="reveal">
+    <p class="principles-header">What it can do</p>
+  </div>
+  <div class="principles-grid">
+    <div class="principle reveal reveal-delay-1">
+      <h3 class="principle-title">Controls any app.</h3>
+      <p class="principle-desc">Uses Android's accessibility service to tap, type, scroll, and navigate — in any app, not just its own.</p>
+    </div>
+    <div class="principle reveal reveal-delay-2">
+      <h3 class="principle-title">Speaks and listens.</h3>
+      <p class="principle-desc">On-device voice with sherpa-onnx. No cloud STT/TTS. Conversations happen naturally.</p>
+    </div>
+    <div class="principle reveal reveal-delay-3">
+      <h3 class="principle-title">Your keys, your models.</h3>
+      <p class="principle-desc">Bring your own API key. Choose your AI provider. Hardware-encrypted storage keeps credentials safe.</p>
+    </div>
+  </div>
+</section>
+
+<div class="glow-divider"></div>
+
+<!-- TRY THE ALPHA -->
+<section class="cta-section" id="alpha">
+  <div class="reveal">
+    <h2 class="cta-headline">Try the Alpha</h2>
+  </div>
+  <div class="reveal reveal-delay-1">
+    <p class="cta-sub">Enter your email to get the download link.</p>
+  </div>
+  <form class="waitlist-form reveal reveal-delay-2" id="waitlistForm">
+    <input type="email" class="waitlist-input" placeholder="your@email.com" required autocomplete="email">
+    <button type="submit" class="waitlist-btn">Get Access</button>
+  </form>
+  <p class="waitlist-note reveal reveal-delay-2" id="waitlistNote">No spam. Just signal.</p>
+
+  <!-- DOWNLOAD (shown after email) -->
+  <div class="download-section" id="downloadSection">
+    <p class="download-success-msg">You're in. Download the APK below.</p>
+    <a href="https://vd3n81y03t20vpea.public.blob.vercel-storage.com/citros-v0.1.0.apk" class="download-btn">Download Citros APK</a>
+    <div class="sideload-guide">
+      <h3>How to install</h3>
+      <ol class="sideload-steps">
+        <li>Download the APK file</li>
+        <li>Open it on your Android device (or transfer from computer)</li>
+        <li>Tap "Install" — Android will ask to allow installs from this source, tap "Allow"</li>
+        <li>Open Citros and follow the onboarding</li>
+      </ol>
+      <div class="sideload-note">
+        Requires Android 12 or later. The app uses the Accessibility Service to control your phone — you'll be prompted to enable it during setup.
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- FOOTER -->
+<footer>
+  <p class="footer-logo">citr<span>o</span>s</p>
+  <p class="footer-tagline">Built with Rust. Designed for autonomy.</p>
+</footer>
+
+<!-- THREE.JS -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(function() {
+  'use strict';
+
+  // ─── AMBIENT PARTICLES ───
+  const ambientContainer = document.getElementById('ambientParticles');
+  for (let i = 0; i < 20; i++) {
+    const p = document.createElement('div');
+    p.className = 'ambient-particle';
+    p.style.left = Math.random() * 100 + '%';
+    p.style.animationDuration = (15 + Math.random() * 25) + 's';
+    p.style.animationDelay = (Math.random() * 20) + 's';
+    p.style.width = p.style.height = (1 + Math.random() * 2) + 'px';
+    ambientContainer.appendChild(p);
+  }
+
+  // ─── NAV SCROLL ───
+  const nav = document.getElementById('nav');
+  window.addEventListener('scroll', () => {
+    nav.classList.toggle('scrolled', window.scrollY > 80);
+  });
+
+  // ─── REVEAL ON SCROLL ───
+  const reveals = document.querySelectorAll('.reveal');
+  const revealObserver = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        entry.target.classList.add('visible');
+      }
+    });
+  }, { threshold: 0.15, rootMargin: '0px 0px -60px 0px' });
+  reveals.forEach(el => revealObserver.observe(el));
+
+  // ─── ALPHA FORM ───
+  document.getElementById('waitlistForm').addEventListener('submit', function(e) {
+    e.preventDefault();
+    const email = this.querySelector('.waitlist-input').value;
+    const btn = this.querySelector('.waitlist-btn');
+    btn.textContent = 'Sending...';
+    btn.disabled = true;
+
+    fetch('https://formsubmit.co/ajax/joe@citros.ai', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify({ email: email, _subject: 'Citros Alpha Signup', _template: 'table' })
+    })
+    .then(r => r.json())
+    .then(() => {
+      document.getElementById('waitlistForm').style.display = 'none';
+      document.getElementById('waitlistNote').style.display = 'none';
+      document.getElementById('downloadSection').style.display = 'block';
+    })
+    .catch(() => {
+      document.getElementById('waitlistForm').style.display = 'none';
+      document.getElementById('waitlistNote').style.display = 'none';
+      document.getElementById('downloadSection').style.display = 'block';
+    });
+  });
+
+  // ─── THREE.JS SCENE ───
+  const container = document.getElementById('canvas-container');
+  const isMobile = window.innerWidth < 768;
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+  camera.position.z = 5;
+
+  const renderer = new THREE.WebGLRenderer({ antialias: !isMobile, alpha: true });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setClearColor(0x000000, 0);
+  container.appendChild(renderer.domElement);
+
+  // ─── SHADERS ───
+  const vertexShader = `
+    uniform float uTime;
+    uniform float uNoiseAmp;
+    uniform float uNoiseFreq;
+
+    varying float vDisplacement;
+    varying vec3 vNormal;
+    varying vec3 vWorldPos;
+
+    // Simplex 3D noise (Ashima Arts)
+    vec3 mod289(vec3 x){ return x - floor(x*(1.0/289.0))*289.0; }
+    vec4 mod289(vec4 x){ return x - floor(x*(1.0/289.0))*289.0; }
+    vec4 permute(vec4 x){ return mod289(((x*34.0)+1.0)*x); }
+    vec4 taylorInvSqrt(vec4 r){ return 1.79284291400159 - 0.85373472095314*r; }
+
+    float snoise(vec3 v){
+      const vec2 C = vec2(1.0/6.0, 1.0/3.0);
+      const vec4 D = vec4(0.0, 0.5, 1.0, 2.0);
+      vec3 i = floor(v + dot(v, C.yyy));
+      vec3 x0 = v - i + dot(i, C.xxx);
+      vec3 g = step(x0.yzx, x0.xyz);
+      vec3 l = 1.0 - g;
+      vec3 i1 = min(g.xyz, l.zxy);
+      vec3 i2 = max(g.xyz, l.zxy);
+      vec3 x1 = x0 - i1 + C.xxx;
+      vec3 x2 = x0 - i2 + C.yyy;
+      vec3 x3 = x0 - D.yyy;
+      i = mod289(i);
+      vec4 p = permute(permute(permute(
+        i.z + vec4(0.0, i1.z, i2.z, 1.0))
+        + i.y + vec4(0.0, i1.y, i2.y, 1.0))
+        + i.x + vec4(0.0, i1.x, i2.x, 1.0));
+      float n_ = 0.142857142857;
+      vec3 ns = n_ * D.wyz - D.xzx;
+      vec4 j = p - 49.0*floor(p*ns.z*ns.z);
+      vec4 x_ = floor(j*ns.z);
+      vec4 y_ = floor(j - 7.0*x_);
+      vec4 x = x_ * ns.x + ns.yyyy;
+      vec4 y = y_ * ns.x + ns.yyyy;
+      vec4 h = 1.0 - abs(x) - abs(y);
+      vec4 b0 = vec4(x.xy, y.xy);
+      vec4 b1 = vec4(x.zw, y.zw);
+      vec4 s0 = floor(b0)*2.0 + 1.0;
+      vec4 s1 = floor(b1)*2.0 + 1.0;
+      vec4 sh = -step(h, vec4(0.0));
+      vec4 a0 = b0.xzyw + s0.xzyw*sh.xxyy;
+      vec4 a1 = b1.xzyw + s1.xzyw*sh.zzww;
+      vec3 p0 = vec3(a0.xy, h.x);
+      vec3 p1 = vec3(a0.zw, h.y);
+      vec3 p2 = vec3(a1.xy, h.z);
+      vec3 p3 = vec3(a1.zw, h.w);
+      vec4 norm = taylorInvSqrt(vec4(dot(p0,p0),dot(p1,p1),dot(p2,p2),dot(p3,p3)));
+      p0 *= norm.x; p1 *= norm.y; p2 *= norm.z; p3 *= norm.w;
+      vec4 m = max(0.6 - vec4(dot(x0,x0),dot(x1,x1),dot(x2,x2),dot(x3,x3)), 0.0);
+      m = m * m;
+      return 42.0 * dot(m*m, vec4(dot(p0,x0),dot(p1,x1),dot(p2,x2),dot(p3,x3)));
+    }
+
+    void main(){
+      float t = uTime * 0.25;
+      float n1 = snoise(position * uNoiseFreq + t);
+      float n2 = snoise(position * uNoiseFreq * 2.0 + t * 1.3) * 0.5;
+      float noise = n1 + n2;
+      float displacement = noise * uNoiseAmp;
+
+      vec3 newPos = position + normal * displacement;
+
+      vDisplacement = noise;
+      vNormal = normalize(normalMatrix * normal);
+      vWorldPos = (modelMatrix * vec4(newPos, 1.0)).xyz;
+
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(newPos, 1.0);
+    }
+  `;
+
+  const fragmentShader = `
+    uniform float uTime;
+    uniform float uOpacity;
+    uniform vec3 uColor1;
+    uniform vec3 uColor2;
+    uniform vec3 uColor3;
+
+    varying float vDisplacement;
+    varying vec3 vNormal;
+    varying vec3 vWorldPos;
+
+    void main(){
+      vec3 viewDir = normalize(cameraPosition - vWorldPos);
+      float fresnel = pow(1.0 - max(dot(vNormal, viewDir), 0.0), 3.0);
+
+      float t = vDisplacement * 0.5 + 0.5;
+      vec3 color = mix(uColor1, uColor2, t);
+      color = mix(color, uColor3, fresnel * 0.6);
+      color += fresnel * uColor2 * 0.4;
+
+      float alpha = (0.88 + fresnel * 0.12) * uOpacity;
+      gl_FragColor = vec4(color, alpha);
+    }
+  `;
+
+  // ─── SPHERE ───
+  const sphereDetail = isMobile ? 4 : 5;
+  const sphereGeo = new THREE.IcosahedronGeometry(1.2, sphereDetail);
+
+  const sphereMat = new THREE.ShaderMaterial({
+    vertexShader,
+    fragmentShader,
+    uniforms: {
+      uTime: { value: 0 },
+      uOpacity: { value: 1.0 },
+      uNoiseAmp: { value: 0.25 },
+      uNoiseFreq: { value: 1.4 },
+      uColor1: { value: new THREE.Color('#1a0a00') },
+      uColor2: { value: new THREE.Color('#f59e0b') },
+      uColor3: { value: new THREE.Color('#ff6b2b') },
+    },
+    transparent: true,
+    side: THREE.FrontSide,
+  });
+
+  const sphere = new THREE.Mesh(sphereGeo, sphereMat);
+  scene.add(sphere);
+
+  // ─── WIREFRAME ───
+  const wireMat = new THREE.MeshBasicMaterial({
+    color: new THREE.Color('#f59e0b'),
+    wireframe: true,
+    transparent: true,
+    opacity: 0.04,
+  });
+  const wireGeo = new THREE.IcosahedronGeometry(1.22, sphereDetail);
+  const wireMesh = new THREE.Mesh(wireGeo, wireMat);
+  scene.add(wireMesh);
+
+  // ─── GLOW SPHERE ───
+  const glowGeo = new THREE.IcosahedronGeometry(1.6, 3);
+  const glowMat = new THREE.ShaderMaterial({
+    vertexShader: `
+      varying vec3 vNormal;
+      varying vec3 vWorldPos;
+      void main(){
+        vNormal = normalize(normalMatrix * normal);
+        vWorldPos = (modelMatrix * vec4(position, 1.0)).xyz;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: `
+      uniform float uOpacity;
+      varying vec3 vNormal;
+      varying vec3 vWorldPos;
+      void main(){
+        vec3 viewDir = normalize(cameraPosition - vWorldPos);
+        float fresnel = pow(1.0 - max(dot(vNormal, viewDir), 0.0), 2.5);
+        vec3 glowColor = vec3(0.96, 0.62, 0.04);
+        gl_FragColor = vec4(glowColor, fresnel * 0.18 * uOpacity);
+      }
+    `,
+    uniforms: {
+      uOpacity: { value: 1.0 },
+    },
+    transparent: true,
+    side: THREE.BackSide,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+  });
+  const glowMesh = new THREE.Mesh(glowGeo, glowMat);
+  scene.add(glowMesh);
+
+  // ─── PARTICLES ───
+  const particleCount = isMobile ? 800 : 2000;
+  const particlePositions = new Float32Array(particleCount * 3);
+  const particleSizes = new Float32Array(particleCount);
+
+  for (let i = 0; i < particleCount; i++) {
+    const theta = Math.random() * Math.PI * 2;
+    const phi = Math.acos(2 * Math.random() - 1);
+    const r = 2.0 + Math.random() * 3.5;
+    particlePositions[i*3]     = r * Math.sin(phi) * Math.cos(theta);
+    particlePositions[i*3 + 1] = r * Math.sin(phi) * Math.sin(theta);
+    particlePositions[i*3 + 2] = r * Math.cos(phi);
+    particleSizes[i] = 0.5 + Math.random() * 2.0;
+  }
+
+  const particleGeo = new THREE.BufferGeometry();
+  particleGeo.setAttribute('position', new THREE.BufferAttribute(particlePositions, 3));
+  particleGeo.setAttribute('size', new THREE.BufferAttribute(particleSizes, 1));
+
+  const particleMat = new THREE.ShaderMaterial({
+    vertexShader: `
+      attribute float size;
+      varying float vAlpha;
+      void main(){
+        vec4 mvPos = modelViewMatrix * vec4(position, 1.0);
+        float dist = length(position);
+        vAlpha = smoothstep(5.5, 2.0, dist) * 0.6;
+        gl_PointSize = size * (200.0 / -mvPos.z);
+        gl_Position = projectionMatrix * mvPos;
+      }
+    `,
+    fragmentShader: `
+      uniform float uOpacity;
+      varying float vAlpha;
+      void main(){
+        float d = length(gl_PointCoord - 0.5) * 2.0;
+        float circle = 1.0 - smoothstep(0.4, 1.0, d);
+        gl_FragColor = vec4(0.96, 0.62, 0.04, circle * vAlpha * uOpacity);
+      }
+    `,
+    uniforms: {
+      uOpacity: { value: 1.0 },
+    },
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+  });
+
+  const particles = new THREE.Points(particleGeo, particleMat);
+  scene.add(particles);
+
+  // ─── ORBITAL RING ───
+  const ringGeo = new THREE.TorusGeometry(2.0, 0.003, 8, 128);
+  const ringMat = new THREE.MeshBasicMaterial({
+    color: new THREE.Color('#f59e0b'),
+    transparent: true,
+    opacity: 0.15,
+  });
+  const ring1 = new THREE.Mesh(ringGeo, ringMat);
+  ring1.rotation.x = Math.PI * 0.35;
+  ring1.rotation.y = Math.PI * 0.1;
+  scene.add(ring1);
+
+  const ring2 = ring1.clone();
+  ring2.rotation.x = Math.PI * 0.6;
+  ring2.rotation.y = Math.PI * 0.5;
+  scene.add(ring2);
+
+  const ring3 = ring1.clone();
+  ring3.rotation.x = Math.PI * 0.15;
+  ring3.rotation.y = Math.PI * 0.85;
+  ring3.scale.set(1.3, 1.3, 1.3);
+  scene.add(ring3);
+
+  // ─── MOUSE TRACKING ───
+  const mouse = { x: 0, y: 0, tx: 0, ty: 0 };
+  window.addEventListener('mousemove', (e) => {
+    mouse.tx = (e.clientX / window.innerWidth - 0.5) * 2;
+    mouse.ty = (e.clientY / window.innerHeight - 0.5) * 2;
+  });
+
+  // ─── SCROLL TRACKING ───
+  let scrollY = 0;
+  let scrollProgress = 0;
+  window.addEventListener('scroll', () => {
+    scrollY = window.scrollY;
+    scrollProgress = scrollY / (document.body.scrollHeight - window.innerHeight);
+  });
+
+  // ─── RESIZE ───
+  window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+
+  // ─── ANIMATION LOOP ───
+  const clock = new THREE.Clock();
+
+  function animate() {
+    requestAnimationFrame(animate);
+
+    const elapsed = clock.getElapsedTime();
+
+    // Smooth mouse
+    mouse.x += (mouse.tx - mouse.x) * 0.05;
+    mouse.y += (mouse.ty - mouse.y) * 0.05;
+
+    // Scroll-based fade
+    const heroFade = Math.max(0, 1 - scrollY / (window.innerHeight * 0.6));
+
+    // Update sphere uniforms
+    sphereMat.uniforms.uTime.value = elapsed;
+    sphereMat.uniforms.uOpacity.value = heroFade;
+
+    // Update glow and particle opacity
+    glowMat.uniforms.uOpacity.value = heroFade;
+    particleMat.uniforms.uOpacity.value = heroFade;
+
+    // Sphere animation
+    sphere.rotation.y = elapsed * 0.08 + mouse.x * 0.3;
+    sphere.rotation.x = Math.sin(elapsed * 0.05) * 0.15 + mouse.y * 0.2;
+    sphere.scale.setScalar(1 + Math.sin(elapsed * 0.4) * 0.02);
+
+    // Wireframe follows sphere
+    wireMesh.rotation.copy(sphere.rotation);
+    wireMesh.scale.copy(sphere.scale);
+    wireMesh.material.opacity = 0.04 * heroFade;
+
+    // Glow follows sphere
+    glowMesh.rotation.y = elapsed * 0.06;
+    glowMesh.scale.setScalar(1 + Math.sin(elapsed * 0.3) * 0.05);
+
+    // Particles orbit
+    particles.rotation.y = elapsed * 0.03;
+    particles.rotation.x = Math.sin(elapsed * 0.02) * 0.1;
+
+    // Rings orbit
+    ring1.rotation.z = elapsed * 0.12;
+    ring2.rotation.z = -elapsed * 0.08;
+    ring3.rotation.z = elapsed * 0.05;
+    ring1.material.opacity = 0.15 * heroFade;
+    ring2.material.opacity = 0.15 * heroFade;
+    ring3.material.opacity = 0.15 * heroFade;
+
+    // Scroll-based camera
+    const scrollOffset = scrollY * 0.001;
+    camera.position.z = 5 + scrollOffset * 2;
+    camera.position.y = scrollOffset * -0.5;
+
+    renderer.render(scene, camera);
+  }
+
+  animate();
+})();
+</script>
+</body>
+</html>
