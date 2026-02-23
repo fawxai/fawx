@@ -14,6 +14,7 @@ import org.junit.runner.RunWith
 import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.shadows.ShadowLog
+import org.json.JSONObject
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -43,6 +44,7 @@ class SharedPrefsPrivacyListTest {
         context.getSharedPreferences(CITROS_PREFS, Context.MODE_PRIVATE)
             .edit()
             .remove(SharedPrefsPrivacyList.KEY_PRIVACY_APP_LIST)
+            .remove(SharedPrefsPrivacyList.KEY_PRIVACY_RECOVERY_PROMPT_PENDING)
             .commit()
     }
 
@@ -50,6 +52,98 @@ class SharedPrefsPrivacyListTest {
     fun `default list is empty`() {
         assertTrue(list.getAll().isEmpty())
         assertFalse(list.isPrivate("com.bank.app"))
+    }
+
+    @Test
+    fun `seed defaults initializes privacy list once and marks recovery prompt pending`() {
+        assertTrue(list.seedDefaultsIfNeeded())
+
+        val seeded = list.getAll()
+        assertEquals(SharedPrefsPrivacyList.DEFAULT_PRIVACY_PACKAGES, seeded)
+        assertTrue(list.isRecoveryPromptPending())
+
+        val before = seeded
+        assertFalse(list.seedDefaultsIfNeeded())
+        assertEquals(before, list.getAll())
+    }
+
+    @Test
+    fun `seed defaults is no-op when privacy list already has manual entries`() {
+        list.add("com.manual.app")
+
+        assertFalse(list.seedDefaultsIfNeeded())
+        assertEquals(setOf("com.manual.app"), list.getAll())
+        assertFalse(list.isRecoveryPromptPending())
+    }
+
+    @Test
+    fun `export and restore json roundtrip`() {
+        list.add("com.bank.app")
+        list.add("com.health.app")
+        val exported = list.exportToJson()
+
+        clearPrivacyListPrefs()
+        val reloaded = SharedPrefsPrivacyList(
+            prefs = context.getSharedPreferences(CITROS_PREFS, Context.MODE_PRIVATE),
+            isMainThread = { false },
+            isDebugBuild = { true }
+        )
+
+        val restoredCount = reloaded.restoreFromJson(exported)
+        assertEquals(2, restoredCount)
+        assertEquals(setOf("com.bank.app", "com.health.app"), reloaded.getAll())
+        assertFalse(reloaded.isRecoveryPromptPending())
+
+        val payload = JSONObject(reloaded.exportToJson())
+        assertEquals(1, payload.getInt("version"))
+    }
+
+    @Test
+    fun `restore rejects malformed payload`() {
+        assertFailsWith<IllegalArgumentException> {
+            list.restoreFromJson("{\"version\":1}")
+        }
+    }
+
+    @Test
+    fun `restore rejects unsupported backup version`() {
+        assertFailsWith<IllegalArgumentException> {
+            list.restoreFromJson("{\"version\":99,\"privacyPackages\":[\"com.bank.app\"]}")
+        }
+    }
+
+    @Test
+    fun `restore rejects empty privacy packages payload`() {
+        assertFailsWith<IllegalArgumentException> {
+            list.restoreFromJson("{\"version\":1,\"privacyPackages\":[]}")
+        }
+    }
+
+    @Test
+    fun `restore replaces existing privacy list`() {
+        list.add("com.old.app")
+        val restoredCount = list.restoreFromJson("{\"version\":1,\"privacyPackages\":[\"com.new.app\",\"com.new.app2\"]}")
+
+        assertEquals(2, restoredCount)
+        assertEquals(setOf("com.new.app", "com.new.app2"), list.getAll())
+        assertFalse(list.isPrivate("com.old.app"))
+    }
+
+    @Test
+    fun `mark recovery prompt handled clears pending flag`() {
+        list.seedDefaultsIfNeeded()
+        assertTrue(list.isRecoveryPromptPending())
+
+        list.markRecoveryPromptHandled()
+
+        assertFalse(list.isRecoveryPromptPending())
+    }
+
+    @Test
+    fun `export json includes empty package list when list is empty`() {
+        val payload = JSONObject(list.exportToJson())
+        assertEquals(1, payload.getInt("version"))
+        assertEquals(0, payload.getJSONArray("privacyPackages").length())
     }
 
     @Test
@@ -77,6 +171,9 @@ class SharedPrefsPrivacyListTest {
         try {
             ChatActivity.configureScreenReaderPrivacyList(context)
             assertTrue(ScreenReader.privacyList is SharedPrefsPrivacyList)
+            val configured = ScreenReader.privacyList as SharedPrefsPrivacyList
+            assertTrue(configured.getAll().contains("com.whatsapp"))
+            assertTrue(configured.isRecoveryPromptPending())
         } finally {
             ScreenReader.configurePrivacyList(null)
         }

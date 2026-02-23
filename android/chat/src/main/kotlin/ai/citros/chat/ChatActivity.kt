@@ -361,7 +361,9 @@ class ChatActivity : ComponentActivity() {
         }
 
         internal fun configureScreenReaderPrivacyList(context: Context) {
-            ScreenReader.configurePrivacyList(SharedPrefsPrivacyList(context.applicationContext))
+            val privacyList = SharedPrefsPrivacyList(context.applicationContext)
+            privacyList.seedDefaultsIfNeeded()
+            ScreenReader.configurePrivacyList(privacyList)
         }
     }
 }
