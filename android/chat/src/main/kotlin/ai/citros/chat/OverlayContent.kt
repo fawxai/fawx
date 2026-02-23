@@ -871,7 +871,8 @@ internal fun OverlayDynamicIslandContent(
     val islandHeight = if (isExpanded) cg(20) else cg(18)
     val touchTargetWidth = islandWidth + cg(6)
     val sideLaneWidth = if (isExpanded) cg(17) else cg(15)
-    val sideLaneVerticalPadding = cg(1)
+    val sideCornerInset = cg(1)
+    val bottomCornerInset = cg(1.5f)
     val textBottomPadding = cg(1.5f)
 
     val statusText = when (runState) {
@@ -919,20 +920,19 @@ internal fun OverlayDynamicIslandContent(
 
                 Row(
                     modifier = Modifier
-                        .fillMaxSize()
-                        .padding(horizontal = cg(2.5f)),
+                        .fillMaxSize(),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Box(
                         modifier = Modifier
                             .fillMaxHeight()
                             .width(sideLaneWidth)
-                            .padding(vertical = sideLaneVerticalPadding),
-                        contentAlignment = Alignment.Center
+                            .padding(start = sideCornerInset, bottom = bottomCornerInset),
+                        contentAlignment = Alignment.BottomStart
                     ) {
                         Box(
                             modifier = Modifier.fillMaxSize(),
-                            contentAlignment = Alignment.Center
+                            contentAlignment = Alignment.BottomStart
                         ) {
                             if (isExecuting) {
                                 CircularProgressIndicator(
@@ -966,11 +966,13 @@ internal fun OverlayDynamicIslandContent(
                             text = statusText,
                             style = CitrosTypography.labelMedium.copy(fontSize = 11.sp),
                             color = surfaces.labelSecondary,
-                            maxLines = 2,
+                            maxLines = 1,
+                            softWrap = false,
                             overflow = TextOverflow.Ellipsis,
                             textAlign = TextAlign.Center,
                             modifier = Modifier
                                 .fillMaxWidth()
+                                .testTag("dynamic_island_status_text")
                                 .padding(start = cg(1), end = cg(1), bottom = textBottomPadding)
                         )
                     }
@@ -979,8 +981,8 @@ internal fun OverlayDynamicIslandContent(
                         modifier = Modifier
                             .fillMaxHeight()
                             .width(sideLaneWidth)
-                            .padding(vertical = sideLaneVerticalPadding),
-                        contentAlignment = Alignment.Center
+                            .padding(end = sideCornerInset, bottom = bottomCornerInset),
+                        contentAlignment = Alignment.BottomEnd
                     ) {
                         when (runState) {
                             OverlayRunState.EXECUTING -> {

@@ -4,11 +4,13 @@ import android.content.Context
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertHasClickAction
+import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performSemanticsAction
 import androidx.compose.ui.semantics.SemanticsActions
@@ -146,6 +148,62 @@ class SettingsHubScreensTest {
         assertTrue(backClicked, "Expected back callback to fire when Back button clicked")
     }
 
+
+
+    @Test
+    fun `ModelsSettingsScreen sections expand and collapse to show and hide model rows`() {
+        val walletManager = createTestWalletManager()
+        val firstModel = shortModelName(ai.citros.core.ModelConfig.runtimeChatModels(Provider.ANTHROPIC).first())
+
+        composeRule.setContent {
+            ModelsSettingsScreen(
+                walletManager = walletManager,
+                onBack = {}
+            )
+        }
+
+        composeRule.onNodeWithContentDescription("CHAT MODEL expanded").assertHasClickAction()
+        composeRule.onNodeWithContentDescription("ACTION MODEL expanded").assertHasClickAction()
+        composeRule.onAllNodesWithText(firstModel, useUnmergedTree = true).assertCountEquals(2)
+
+        composeRule.onNodeWithContentDescription("CHAT MODEL expanded").performClick()
+        composeRule.onNodeWithContentDescription("CHAT MODEL collapsed").assertExists()
+        composeRule.onAllNodesWithText(firstModel, useUnmergedTree = true).assertCountEquals(1)
+
+        composeRule.onNodeWithContentDescription("ACTION MODEL expanded").performClick()
+        composeRule.onNodeWithContentDescription("ACTION MODEL collapsed").assertExists()
+        composeRule.onAllNodesWithText(firstModel, useUnmergedTree = true).assertCountEquals(0)
+
+        composeRule.onNodeWithContentDescription("CHAT MODEL collapsed").performClick()
+        composeRule.onNodeWithContentDescription("ACTION MODEL collapsed").performClick()
+        composeRule.onAllNodesWithText(firstModel, useUnmergedTree = true).assertCountEquals(2)
+    }
+
+    @Test
+    fun `ModelsSettingsScreen collapsed section state survives recomposition`() {
+        val walletManager = createTestWalletManager()
+        val firstModel = shortModelName(ai.citros.core.ModelConfig.runtimeChatModels(Provider.ANTHROPIC).first())
+        val recomposeTrigger = androidx.compose.runtime.mutableStateOf(0)
+
+        composeRule.setContent {
+            recomposeTrigger.value
+            ModelsSettingsScreen(
+                walletManager = walletManager,
+                onBack = {}
+            )
+        }
+
+        composeRule.onAllNodesWithText(firstModel, useUnmergedTree = true).assertCountEquals(2)
+        composeRule.onNodeWithContentDescription("CHAT MODEL expanded").performClick()
+        composeRule.onNodeWithContentDescription("CHAT MODEL collapsed").assertExists()
+        composeRule.onAllNodesWithText(firstModel, useUnmergedTree = true).assertCountEquals(1)
+
+        composeRule.runOnIdle { recomposeTrigger.value += 1 }
+        composeRule.waitForIdle()
+
+        composeRule.onNodeWithContentDescription("CHAT MODEL collapsed").assertExists()
+        composeRule.onAllNodesWithText(firstModel, useUnmergedTree = true).assertCountEquals(1)
+    }
     /** Verifies ModelsSettingsScreen shows "No API Key Active" when wallet has no key. */
     @Test
     fun `ModelsSettingsScreen without active key shows no key message`() {

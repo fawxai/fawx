@@ -86,11 +86,11 @@ internal fun ProviderModelChip(
             fontWeight = FontWeight.SemiBold,
             color = accent
         )
-        Text(
-            text = "▾",
-            style = CitrosTypography.titleLarge,
-            fontWeight = FontWeight.Bold,
-            color = surfaces.labelPrimary
+        Icon(
+            imageVector = Icons.Default.ExpandMore,
+            contentDescription = null,
+            tint = surfaces.labelPrimary,
+            modifier = Modifier.size(18.dp)
         )
     }
 }

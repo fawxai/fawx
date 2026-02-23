@@ -13,11 +13,16 @@ import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performSemanticsAction
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
+import androidx.compose.ui.semantics.SemanticsActions
+import androidx.compose.ui.text.TextLayoutResult
 import org.robolectric.RobolectricTestRunner
 import kotlin.test.assertTrue
+import kotlin.test.assertEquals
+import kotlin.test.assertNotNull
 
 /**
  * Tests for the live overlay composables in OverlayContent.kt.
@@ -447,6 +452,74 @@ class OverlayContentTest {
         )
     }
 
+
+
+    @Test
+    fun `dynamic island long executing status remains single line and ellipsized`() {
+        val longStatus = "Executing very long action name with additional progress detail that should truncate in dynamic island ".repeat(8)
+        var layoutResult: TextLayoutResult? = null
+
+        composeRule.setContent {
+            OverlayDynamicIslandContent(
+                flavor = CitrosFlavor.LIME,
+                runState = OverlayRunState.EXECUTING,
+                currentStepLabel = longStatus,
+                unreadCount = 0,
+                onExpand = {},
+                onStopAction = {},
+                onDismiss = {}
+            )
+        }
+
+        composeRule.onNodeWithTag("dynamic_island_status_text", useUnmergedTree = true)
+            .performSemanticsAction(SemanticsActions.GetTextLayoutResult) { action ->
+                val results = mutableListOf<TextLayoutResult>()
+                action(results)
+                if (results.isNotEmpty()) {
+                    layoutResult = results.first()
+                }
+            }
+
+        composeRule.runOnIdle {
+            val result = layoutResult
+            assertNotNull(result, "Expected text layout result for dynamic island status text")
+            assertEquals(1, result.lineCount, "Dynamic island status text should stay single line")
+            assertTrue(result.getLineEnd(0, visibleEnd = true) < longStatus.length, "Dynamic island status text should truncate long content")
+        }
+    }
+
+    @Test
+    fun `dynamic island renders expected run state visuals for executing stopped and failed`() {
+        val runState = androidx.compose.runtime.mutableStateOf(OverlayRunState.EXECUTING)
+        val currentLabel = androidx.compose.runtime.mutableStateOf("Running tool")
+
+        composeRule.setContent {
+            OverlayDynamicIslandContent(
+                flavor = CitrosFlavor.LIME,
+                runState = runState.value,
+                currentStepLabel = currentLabel.value,
+                unreadCount = 0,
+                onExpand = {},
+                onStopAction = {},
+                onDismiss = {}
+            )
+        }
+        composeRule.onNodeWithText("Running tool", useUnmergedTree = true).assertExists()
+        composeRule.onNodeWithContentDescription("Dynamic island overlay").assertExists()
+
+        composeRule.runOnIdle {
+            runState.value = OverlayRunState.STOPPED
+            currentLabel.value = ""
+        }
+        composeRule.onNodeWithText("Tap to resume", useUnmergedTree = true).assertExists()
+        composeRule.onNodeWithContentDescription("Dynamic island overlay").assertExists()
+
+        composeRule.runOnIdle {
+            runState.value = OverlayRunState.FAILED
+        }
+        composeRule.onNodeWithText("Tap to open settings", useUnmergedTree = true).assertExists()
+        composeRule.onNodeWithContentDescription("Dynamic island overlay").assertExists()
+    }
     // ========== PR #614: Stop button visibility ==========
 
     @Test

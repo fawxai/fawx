@@ -30,6 +30,9 @@ import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ChevronRight
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -41,6 +44,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
@@ -332,6 +336,41 @@ private fun SettingsSectionHeader(
         style = CitrosTypography.labelSmall,
         color = surfaces.labelSecondary
     )
+}
+
+@Composable
+private fun SettingsCollapsibleSectionHeader(
+    text: String,
+    expanded: Boolean,
+    onToggle: () -> Unit
+) {
+    val isDarkTheme = LocalCitrosIsDark.current
+    val surfaces = remember(isDarkTheme) { citrosDirectiveSurfaces(isDarkTheme) }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .clickable(onClick = onToggle)
+            .padding(vertical = 2.dp)
+            .semantics {
+                role = Role.Button
+                contentDescription = "${text.uppercase()} ${if (expanded) "expanded" else "collapsed"}"
+            },
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = text.uppercase(),
+            style = CitrosTypography.labelSmall,
+            color = surfaces.labelSecondary,
+            modifier = Modifier.weight(1f)
+        )
+        CitrosIcon(
+            imageVector = if (expanded) Icons.Default.ExpandMore else Icons.Default.ChevronRight,
+            contentDescription = null,
+            tint = surfaces.labelSecondary,
+            modifier = Modifier.size(16.dp)
+        )
+    }
 }
 @Composable
 private fun SettingsGroupedSurface(
@@ -1387,6 +1426,8 @@ internal fun ModelsSettingsScreen(
     var useLocalFallback by rememberSaveable {
         mutableStateOf(chatPrefs.getBoolean("models_use_local_offline", true))
     }
+    var chatModelsExpanded by rememberSaveable { mutableStateOf(true) }
+    var actionModelsExpanded by rememberSaveable { mutableStateOf(true) }
     fun modelSubtitle(modelId: String): String = when {
         modelId.contains("llama", ignoreCase = true) -> "On-device fallback model"
         modelId.contains("sonnet", ignoreCase = true) -> "Balanced speed and capability"
@@ -1402,44 +1443,56 @@ internal fun ModelsSettingsScreen(
         if (activeProvider != null) {
             val chatModels = ai.citros.core.ModelConfig.runtimeChatModels(activeProvider)
             val actionModels = ai.citros.core.ModelConfig.runtimeActionModels(activeProvider)
-            SettingsSectionHeader("Chat Model")
-            SettingsGroupedSurface {
-                chatModels.forEachIndexed { index, modelId ->
-                    val selected = modelId == walletState.chatModelId
-                    SettingsListRow(
-                        title = shortModelName(modelId),
-                        subtitle = modelSubtitle(modelId),
-                        onClick = {
-                            walletManager.setChatModel(modelId)
-                            walletState = walletManager.loadOrDefault()
-                        },
-                        showDivider = index < chatModels.lastIndex,
-                        trailing = {
-                            if (selected) {
-                                SettingsSelectionCheck()
+            SettingsCollapsibleSectionHeader(
+                text = "Chat Model",
+                expanded = chatModelsExpanded,
+                onToggle = { chatModelsExpanded = !chatModelsExpanded }
+            )
+            if (chatModelsExpanded) {
+                SettingsGroupedSurface {
+                    chatModels.forEachIndexed { index, modelId ->
+                        val selected = modelId == walletState.chatModelId
+                        SettingsListRow(
+                            title = shortModelName(modelId),
+                            subtitle = modelSubtitle(modelId),
+                            onClick = {
+                                walletManager.setChatModel(modelId)
+                                walletState = walletManager.loadOrDefault()
+                            },
+                            showDivider = index < chatModels.lastIndex,
+                            trailing = {
+                                if (selected) {
+                                    SettingsSelectionCheck()
+                                }
                             }
-                        }
-                    )
+                        )
+                    }
                 }
             }
-            SettingsSectionHeader("Action Model")
-            SettingsGroupedSurface {
-                actionModels.forEachIndexed { index, modelId ->
-                    val selected = modelId == walletState.actionModelId
-                    SettingsListRow(
-                        title = shortModelName(modelId),
-                        subtitle = modelSubtitle(modelId),
-                        onClick = {
-                            walletManager.setActionModel(modelId)
-                            walletState = walletManager.loadOrDefault()
-                        },
-                        showDivider = index < actionModels.lastIndex,
-                        trailing = {
-                            if (selected) {
-                                SettingsSelectionCheck()
+            SettingsCollapsibleSectionHeader(
+                text = "Action Model",
+                expanded = actionModelsExpanded,
+                onToggle = { actionModelsExpanded = !actionModelsExpanded }
+            )
+            if (actionModelsExpanded) {
+                SettingsGroupedSurface {
+                    actionModels.forEachIndexed { index, modelId ->
+                        val selected = modelId == walletState.actionModelId
+                        SettingsListRow(
+                            title = shortModelName(modelId),
+                            subtitle = modelSubtitle(modelId),
+                            onClick = {
+                                walletManager.setActionModel(modelId)
+                                walletState = walletManager.loadOrDefault()
+                            },
+                            showDivider = index < actionModels.lastIndex,
+                            trailing = {
+                                if (selected) {
+                                    SettingsSelectionCheck()
+                                }
                             }
-                        }
-                    )
+                        )
+                    }
                 }
             }
             SettingsSectionHeader("Fallback")

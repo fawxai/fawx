@@ -44,6 +44,9 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material3.Icon
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
@@ -1645,12 +1648,11 @@ fun ChatScreen(
                                 modifier = Modifier.widthIn(max = 190.dp)
                             )
                             if (canInteractWithModel) {
-                                Text(
-                                    text = "▾",
-                                    fontSize = 22.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = quickSwitcherArrowColor,
-                                    modifier = Modifier.padding(bottom = 1.dp)
+                                Icon(
+                                    imageVector = Icons.Default.ExpandMore,
+                                    contentDescription = null,
+                                    tint = quickSwitcherArrowColor,
+                                    modifier = Modifier.size(18.dp)
                                 )
                             }
                         }
