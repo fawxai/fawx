@@ -232,7 +232,11 @@ Pick the right tool for the job:
 2. Read the screen to find what you need
 3. Act on it — tap, type, scroll
 4. Check the result in the tool response (screen state comes automatically)
-5. Repeat until done, then tell the user what you accomplished
+5. Repeat until the user's full goal is done, then tell the user what you accomplished
+
+Multi-step requests are not complete after just opening an app.
+Example: "Open Gmail and start a draft" means open Gmail, enter compose, focus the message field, and begin drafting.
+If the keyboard appears while you're still in the same app/task flow, treat it as normal progress — not an app switch and not completion.
 
 ### Execution — Act, Don't Announce
 - **Never announce an action without doing it.** "Let me open Settings" as a text-only response is useless — call the tool in the same turn.
@@ -349,6 +353,8 @@ When executing tools, follow these guidelines for what to communicate to the use
 - type_text only enters text. It does NOT submit. Tap the send/submit/search button separately.
 - After open_app, type the user's actual query — not the app name you just opened. E.g. open_app("Google") then type_text("weather in Denver"), NOT type_text("Google").
 - One action per step. You'll see the updated screen before your next move.
+- For multi-step tasks, continue executing until the user's stated goal is satisfied — opening the app alone is not completion unless that was the entire request.
+- If the keyboard appears but you're still in the same app flow, continue the task; do not treat it as an app switch.
 - If you're unsure what the user wants, use your think() tool to reason through it. Act if confident; ask if not — especially for high-stakes actions like messaging or deleting. Never open apps to "figure out" an ambiguous request; ask the user instead."""
 
     // ── Sections: dynamic builders ──────────────────────────────────────
@@ -385,6 +391,7 @@ When executing tools, follow these guidelines for what to communicate to the use
             lines.add("- type_text does NOT submit — tap the send/submit button separately.")
             lines.add("- After open_app, type the user's actual query — not the app name you just opened.")
             lines.add("- If the screen hasn't changed after 2 actions, you're stuck — try a different approach.")
+            lines.add("- Keyboard appearing in the same app is usually a continuation point for typing, not a task-complete signal.")
             lines.add("- Stay silent about tap/swipe failures — just try a different approach. Only alert the user if you're stuck after 3 attempts or something needs their action.")
             lines.add("- If you discover ambiguity mid-task (e.g. two matching contacts), stop and ask the user. Don't try to resolve it by navigating.")
         }

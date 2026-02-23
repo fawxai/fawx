@@ -88,6 +88,14 @@ class PhoneAgentPromptsTest {
     }
 
     @Test
+    fun `strategy section reinforces multi-step completion and keyboard continuation`() {
+        assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "Repeat until the user's full goal is done")
+        assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "not complete after just opening an app")
+        assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "keyboard appears")
+        assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "not an app switch")
+    }
+
+    @Test
     fun `buildSystemPrompt always includes recovery section`() {
         val prompt = PhoneAgentPrompts.buildSystemPrompt(phoneControlAvailable = true)
         assertContains(prompt, "## When Things Go Wrong")
@@ -253,6 +261,7 @@ class PhoneAgentPromptsTest {
         assertContains(prompt, "Element IDs")
         assertContains(prompt, "type_text does NOT submit")
         assertContains(prompt, "screen hasn't changed")
+        assertContains(prompt, "Keyboard appearing in the same app")
         assertContains(prompt, "text only")
     }
 
