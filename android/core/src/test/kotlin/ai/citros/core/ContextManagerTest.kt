@@ -125,6 +125,23 @@ class ContextManagerTest {
         assertEquals(messages[0].content, result[0].content)
     }
 
+    @Test
+    fun `compactMessage compacts user screen messages`() {
+        val message = Message(
+            role = "user",
+            content = """CURRENT SCREEN:
+App: com.google.android.settings
+[1] \"WiFi\" [click]
+
+Tap WiFi please"""
+        )
+
+        val result = manager.compactMessage(message)
+
+        assertTrue(result.content.contains("PREVIOUS SCREEN"))
+        assertTrue(result.content.contains("Tap WiFi please"))
+    }
+
     // ========== compactWithMetrics() tests ==========
 
     @Test

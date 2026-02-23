@@ -108,7 +108,7 @@ class ContextManager(
      * Compact a single message by summarizing screen content and truncating tool results.
      */
     internal fun compactMessage(message: Message): Message {
-        val content = message.content ?: return message
+        val content = message.content
 
         // Compact screen content in user messages
         if (message.role == "user" && content.contains("CURRENT SCREEN:")) {
