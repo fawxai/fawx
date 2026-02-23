@@ -136,7 +136,7 @@ class ChatViewModelTest {
         // outputVerbosity is VERBOSE in this suite, so mechanical tool outputs are surfaced
         assertTrue(viewModel.messages.any { it.content.startsWith("⚙️") || it.content.startsWith("🤖") })
         assertTrue(viewModel.messages.last().content.contains("Done"))
-        assertTrue(scripted.calls >= 2)
+        assertEquals(2, scripted.calls)
     }
 
     @Test
@@ -686,7 +686,7 @@ class ChatViewModelTest {
 
         assertFalse(viewModel.isLoading.value)
         // First call produced tool_use, second follow-up threw provider exception
-        assertTrue(callCount.get() >= 2)
+        assertEquals(2, callCount.get())
         // Should have error from second call
         assertTrue(viewModel.messages.last().content.contains("Error") || 
                    viewModel.messages.last().content.contains("Internal server error"))

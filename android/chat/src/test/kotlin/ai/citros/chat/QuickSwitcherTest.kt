@@ -165,12 +165,13 @@ class QuickSwitcherTest {
     @Test
     fun chatScreenNoProviderBlockedSendShowsModalAndRetainsDraft() {
         val fixture = createChatScreenFixture(withActiveKey = false, configureBackend = true)
-        var openedDestination = false
+        var openedApiKeys = false
+        var openedSettings = false
 
         setChatScreenContent(
             fixture = fixture,
-            onOpenApiKeys = { openedDestination = true },
-            onOpenSettings = { openedDestination = true }
+            onOpenApiKeys = { openedApiKeys = true },
+            onOpenSettings = { openedSettings = true }
         )
 
         editableMessageInput().performTextInput("draft message")
@@ -217,8 +218,10 @@ class QuickSwitcherTest {
     fun chatScreenConfiguredFalseWithKeyShowsSetupRequiredAndRoutesHeaderToSettings() {
         val fixture = createChatScreenFixture(withActiveKey = true, configureBackend = true)
         var openedSettings = false
+        var openedApiKeys = false
         setChatScreenContent(
             fixture = fixture,
+            onOpenApiKeys = { openedApiKeys = true },
             onOpenSettings = { openedSettings = true }
         )
         composeRule.runOnIdle {
@@ -266,16 +269,7 @@ class QuickSwitcherTest {
         composeRule.runOnIdle {
             fixture.viewModel.configureForTesting(listOf(backend))
         }
-        composeRule.waitForIdle()
-
-        // If modal is still animating or awaiting effect propagation, close it explicitly.
-        composeRule.onAllNodesWithTag(TEST_TAG_API_KEY_REQUIRED_MODAL)
-            .fetchSemanticsNodes()
-            .takeIf { it.isNotEmpty() }
-            ?.let {
-                composeRule.onNodeWithText("Not now").performClick()
-                composeRule.waitForIdle()
-            }
+        waitUntilApiKeyModalHidden()
 
         composeRule.onNodeWithTag(TEST_TAG_API_KEY_REQUIRED_MODAL).assertDoesNotExist()
         composeRule.onNodeWithTag(TEST_TAG_MESSAGE_SEND_BUTTON).performClick()
@@ -283,8 +277,8 @@ class QuickSwitcherTest {
     }
 
 
-    private fun modalOpenSettingsButton() = composeRule.onNode(
-        hasText("Open Settings").and(hasAnyAncestor(hasTestTag(TEST_TAG_API_KEY_REQUIRED_MODAL))),
+    private fun modalOpenSettingsButton() = composeRule.onNodeWithTag(
+        TEST_TAG_API_KEY_REQUIRED_OPEN_SETTINGS,
         useUnmergedTree = true
     )
 
@@ -292,6 +286,12 @@ class QuickSwitcherTest {
         hasSetTextAction().and(hasAnyAncestor(hasTestTag(TEST_TAG_MESSAGE_INPUT_FIELD))),
         useUnmergedTree = true
     )
+
+    private fun waitUntilApiKeyModalHidden(timeoutMillis: Long = 5_000L) {
+        composeRule.waitUntil(timeoutMillis = timeoutMillis) {
+            composeRule.onAllNodesWithTag(TEST_TAG_API_KEY_REQUIRED_MODAL).fetchSemanticsNodes().isEmpty()
+        }
+    }
 
     private data class ChatScreenFixture(
         val viewModel: ChatViewModel,

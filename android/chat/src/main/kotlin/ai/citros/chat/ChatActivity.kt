@@ -1777,7 +1777,9 @@ fun ChatScreen(
                         showApiKeyRequiredModal = false
                         openSetupDestination()
                     },
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag(TEST_TAG_API_KEY_REQUIRED_OPEN_SETTINGS),
                     tintColor = selectedFlavor.primary
                 )
                 TextButton(

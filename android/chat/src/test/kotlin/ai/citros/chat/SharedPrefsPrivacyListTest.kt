@@ -85,12 +85,16 @@ class SharedPrefsPrivacyListTest {
     @Test
     fun `ChatActivity onCreate wires privacy list configuration`() {
         ScreenReader.configurePrivacyList(null)
+        walletDependenciesFactoryForTests = { appContext ->
+            createTestWalletDependencies(appContext.applicationContext)
+        }
 
         val controller = Robolectric.buildActivity(ChatActivity::class.java)
         try {
             controller.setup()
             assertTrue(ScreenReader.privacyList is SharedPrefsPrivacyList)
         } finally {
+            walletDependenciesFactoryForTests = null
             controller.pause().stop().destroy()
             ScreenReader.configurePrivacyList(null)
         }

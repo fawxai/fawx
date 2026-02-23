@@ -648,9 +648,7 @@ internal fun TrustSettingsScreen(
                 // Hide stale denial warning while sensor sharing is disabled.
                 locationPermissionDenied = false
             }
-            // Commit synchronously so state is immediately visible to in-process readers
-            // and deterministic under Robolectric compose unit tests.
-            chatPrefs.edit().putBoolean(PREF_SENSOR_CONTEXT_ENABLED, enabled).commit()
+            chatPrefs.edit().putBoolean(PREF_SENSOR_CONTEXT_ENABLED, enabled).apply()
         }
 
         SettingsGroupedSurface {

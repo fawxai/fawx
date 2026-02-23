@@ -1,5 +1,8 @@
 package ai.citros.chat
 
+import android.content.Context
+import ai.citros.core.WalletManager
+
 /**
  * Shared test fakes used across multiple test classes.
  * Extracted to reduce duplication between ChatViewModelTest and QuickSwitcherTest.
@@ -37,4 +40,17 @@ internal class InMemoryCredentialStore : CredentialStore {
     override fun remove(key: String) {
         store.remove(key)
     }
+}
+
+/** Wallet dependencies for Compose/Robolectric tests that should avoid AndroidKeyStore. */
+internal fun createTestWalletDependencies(context: Context): WalletDependencies {
+    val appContext = context.applicationContext
+    val keyStore = InMemoryKeyStore()
+    val walletStorage = SharedPreferencesWalletStorage(appContext)
+    val walletManager = WalletManager(walletStorage, keyStore)
+    return WalletDependencies(
+        keyStore = keyStore,
+        walletStorage = walletStorage,
+        walletManager = walletManager
+    )
 }

@@ -27,7 +27,11 @@ class OnboardingNavigationComposeTest {
             .commit()
 
         composeRule.setContent {
-            OnboardingFlow(context = context, onFinished = {})
+            OnboardingFlow(
+                context = context,
+                walletDependencies = createTestWalletDependencies(context),
+                onFinished = {}
+            )
         }
 
         composeRule.onNodeWithTag(TEST_TAG_ONBOARDING_CONTINUE_WELCOME).performClick()

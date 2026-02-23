@@ -29,7 +29,7 @@ class OnboardingFlowTextTest {
     @Test
     fun testWelcomeScreenText() {
         composeRule.setContent {
-            OnboardingFlow(context = context, onFinished = {})
+            OnboardingFlow(context = context, walletDependencies = createTestWalletDependencies(context), onFinished = {})
         }
 
         // Verify welcome screen displays correct title and subtitle
@@ -40,7 +40,7 @@ class OnboardingFlowTextTest {
     @Test
     fun testFlavorScreenText() {
         composeRule.setContent {
-            OnboardingFlow(context = context, onFinished = {})
+            OnboardingFlow(context = context, walletDependencies = createTestWalletDependencies(context), onFinished = {})
         }
 
         // Navigate to flavor screen
@@ -55,7 +55,7 @@ class OnboardingFlowTextTest {
     @Test
     fun testPersonalityScreenText() {
         composeRule.setContent {
-            OnboardingFlow(context = context, onFinished = {})
+            OnboardingFlow(context = context, walletDependencies = createTestWalletDependencies(context), onFinished = {})
         }
 
         // Navigate to personality screen
@@ -72,7 +72,7 @@ class OnboardingFlowTextTest {
     @Test
     fun testPersonalityComfortLevelQuestion() {
         composeRule.setContent {
-            OnboardingFlow(context = context, onFinished = {})
+            OnboardingFlow(context = context, walletDependencies = createTestWalletDependencies(context), onFinished = {})
         }
 
         // Navigate to personality screen
@@ -88,7 +88,7 @@ class OnboardingFlowTextTest {
     @Test
     fun testPersonalitySaveContinueButton() {
         composeRule.setContent {
-            OnboardingFlow(context = context, onFinished = {})
+            OnboardingFlow(context = context, walletDependencies = createTestWalletDependencies(context), onFinished = {})
         }
 
         // Navigate to personality screen
@@ -104,7 +104,7 @@ class OnboardingFlowTextTest {
     @Test
     fun testPaywallFooterText() {
         composeRule.setContent {
-            OnboardingFlow(context = context, onFinished = {})
+            OnboardingFlow(context = context, walletDependencies = createTestWalletDependencies(context), onFinished = {})
         }
 
         // Navigate through onboarding to paywall screen
@@ -131,7 +131,7 @@ class OnboardingFlowTextTest {
     @Test
     fun testPaywallSkipButtonText() {
         composeRule.setContent {
-            OnboardingFlow(context = context, onFinished = {})
+            OnboardingFlow(context = context, walletDependencies = createTestWalletDependencies(context), onFinished = {})
         }
 
         // Navigate through onboarding to paywall screen
@@ -157,7 +157,7 @@ class OnboardingFlowTextTest {
     @Test
     fun testAllOnboardingTextUpdatesInSequence() {
         composeRule.setContent {
-            OnboardingFlow(context = context, onFinished = {})
+            OnboardingFlow(context = context, walletDependencies = createTestWalletDependencies(context), onFinished = {})
         }
 
         // Step 1: Welcome screen
