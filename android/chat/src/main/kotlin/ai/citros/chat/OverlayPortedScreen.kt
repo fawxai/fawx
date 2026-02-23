@@ -75,8 +75,8 @@ private object OverlayColors {
     val FakePhoneTextDim = Color(0xFFBBBBBB)
     val FakePhoneAccent = Color(0xFFFFD600)
     val FakePhoneChevron = Color(0xFF6B7280)
-    val Success = Color(0xFF22C55E)
-    val Error = Color(0xFFEF4444)
+    val Success = CitrosFlavor.LIME.primary
+    val Error = CitrosFlavor.BLOOD_ORANGE.primary
 }
 // Preview-only demo strings/data. These stay local for fast UI iteration and are not production i18n resources.
 private val overlaySteps = listOf(
@@ -101,7 +101,8 @@ internal fun OverlayPreviewScreen(
     onBack: () -> Unit,
     viewModel: ChatViewModel? = null, // Optional: connect to live ChatViewModel
     onOverlayMinimized: (() -> Unit)? = null,
-    onNavigateToChat: (() -> Unit)? = null
+    onNavigateToChat: (() -> Unit)? = null,
+    onRequestVoiceInput: (() -> Unit)? = null
 ) {
     val onboardingPrefs = remember(context) {
         context.getSharedPreferences(ONBOARDING_PREFS, Context.MODE_PRIVATE)
@@ -402,7 +403,12 @@ internal fun OverlayPreviewScreen(
                                 onStopAction = stopAction,
                                 onOpenFull = { if (viewModel != null) onNavigateToChat?.invoke() else surfaceMode = OverlaySurfaceMode.FULL_APP },
                                 onOpenIsland = { surfaceMode = OverlaySurfaceMode.DYNAMIC_ISLAND },
-                                onMinimize = { surfaceMode = OverlaySurfaceMode.SEARCH_BAR }
+                                onMinimize = { surfaceMode = OverlaySurfaceMode.SEARCH_BAR },
+                                onVoiceInput = {
+                                    if (viewModel != null) {
+                                        onRequestVoiceInput?.invoke() ?: onNavigateToChat?.invoke()
+                                    }
+                                }
                             )
                         }
                         if (surfaceMode == OverlaySurfaceMode.SEARCH_BAR) {
@@ -794,6 +800,7 @@ internal fun MiniChatOverlayCard(
     onStopAction: () -> Unit,
     onOpenFull: () -> Unit,
     onOpenIsland: () -> Unit,
+    onVoiceInput: () -> Unit = {},
     onMinimize: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
@@ -1107,8 +1114,13 @@ internal fun MiniChatOverlayCard(
                                 .clip(CircleShape)
                                 .background(if (hasInputText) surfaces.surface3 else Color.Transparent)
                                 .clickable(
-                                    enabled = hasInputText,
-                                    onClick = { onQueuedDraftChange("") }
+                                    onClick = {
+                                        if (hasInputText) {
+                                            onQueuedDraftChange("")
+                                        } else {
+                                            onVoiceInput()
+                                        }
+                                    }
                                 ),
                             contentAlignment = Alignment.Center
                         ) {

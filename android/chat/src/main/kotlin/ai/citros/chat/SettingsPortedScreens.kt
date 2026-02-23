@@ -1209,6 +1209,15 @@ internal fun PhoneControlSettingsScreen(
             )
         )
     }
+    var showDynamicIslandDebugBadge by rememberSaveable {
+        mutableStateOf(
+            chatPrefs.getBoolean(
+                PREF_OVERLAY_DYNAMIC_ISLAND_DEBUG_BADGE,
+                PREF_OVERLAY_DYNAMIC_ISLAND_DEBUG_BADGE_DEFAULT
+            )
+        )
+    }
+    val showDebugToggle = BuildConfig.DEBUG
     val okColor = Color(0xFF88F5B4)
     val warningColor = Color(0xFFFF8A8A)
     fun refreshPermissionStatus() {
@@ -1312,7 +1321,7 @@ internal fun PhoneControlSettingsScreen(
             SettingsListRow(
                 title = "Show search bar when idle",
                 subtitle = "Turn off to hide idle overlay when island idle mode is disabled.",
-                showDivider = false,
+                showDivider = showDebugToggle,
                 trailing = {
                     Box(modifier = Modifier.padding(start = 12.dp)) {
                         Switch(
@@ -1332,6 +1341,32 @@ internal fun PhoneControlSettingsScreen(
                     }
                 }
             )
+            if (showDebugToggle) {
+                SettingsListRow(
+                    title = "Show dynamic island debug badge",
+                    subtitle = "Developer debug overlay for camera alignment diagnostics.",
+                    showDivider = false,
+                    trailing = {
+                        Box(modifier = Modifier.padding(start = 12.dp)) {
+                            Switch(
+                                checked = showDynamicIslandDebugBadge,
+                                onCheckedChange = {
+                                    showDynamicIslandDebugBadge = it
+                                    chatPrefs.edit()
+                                        .putBoolean(PREF_OVERLAY_DYNAMIC_ISLAND_DEBUG_BADGE, it)
+                                        .apply()
+                                },
+                                colors = SwitchDefaults.colors(
+                                    checkedThumbColor = Color.White,
+                                    checkedTrackColor = surfaces.green,
+                                    uncheckedThumbColor = surfaces.surface4,
+                                    uncheckedTrackColor = surfaces.surface3
+                                )
+                            )
+                        }
+                    }
+                )
+            }
         }
     }
 }

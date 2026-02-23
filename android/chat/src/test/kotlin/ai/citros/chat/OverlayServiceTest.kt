@@ -129,6 +129,182 @@ class OverlayServiceTest {
     }
 
     @Test
+    fun `calculateDynamicIslandFallbackTopY converts dp to px`() {
+        assertEquals(12, OverlayService.calculateDynamicIslandFallbackTopY(1f))
+        assertEquals(24, OverlayService.calculateDynamicIslandFallbackTopY(2f))
+    }
+
+    @Test
+    fun `expectedCameraEdgeForRotation maps all rotations`() {
+        assertEquals(
+            OverlayService.CutoutEdge.TOP,
+            OverlayService.expectedCameraEdgeForRotation(android.view.Surface.ROTATION_0)
+        )
+        assertEquals(
+            OverlayService.CutoutEdge.RIGHT,
+            OverlayService.expectedCameraEdgeForRotation(android.view.Surface.ROTATION_90)
+        )
+        assertEquals(
+            OverlayService.CutoutEdge.BOTTOM,
+            OverlayService.expectedCameraEdgeForRotation(android.view.Surface.ROTATION_180)
+        )
+        assertEquals(
+            OverlayService.CutoutEdge.LEFT,
+            OverlayService.expectedCameraEdgeForRotation(android.view.Surface.ROTATION_270)
+        )
+    }
+
+    @Test
+    fun `detectCutoutEdge returns closest touched edge within tolerance`() {
+        val topCutout = android.graphics.Rect(490, 0, 590, 48)
+        val detected = OverlayService.detectCutoutEdge(
+            cutout = topCutout,
+            screenWidth = 1080,
+            screenHeight = 2400,
+            tolerancePx = 4
+        )
+        assertEquals(OverlayService.CutoutEdge.TOP, detected)
+    }
+
+    @Test
+    fun `selectFrontCameraCutout prefers top center cutout`() {
+        val leftTop = android.graphics.Rect(0, 0, 120, 48)
+        val centerTop = android.graphics.Rect(490, 0, 590, 48)
+        val lowerCenter = android.graphics.Rect(490, 40, 590, 88)
+
+        val selected = OverlayService.selectFrontCameraCutout(
+            cutoutBounds = listOf(leftTop, centerTop, lowerCenter),
+            screenWidth = 1080,
+            screenHeight = 2400,
+            expectedEdge = OverlayService.CutoutEdge.TOP,
+            edgeTolerancePx = 4
+        )
+
+        assertEquals(centerTop, selected)
+    }
+
+    @Test
+    fun `selectFrontCameraCutout returns null for empty bounds`() {
+        val selected = OverlayService.selectFrontCameraCutout(
+            cutoutBounds = emptyList(),
+            screenWidth = 1080,
+            screenHeight = 2400,
+            expectedEdge = OverlayService.CutoutEdge.TOP,
+            edgeTolerancePx = 4
+        )
+        assertEquals(null, selected)
+    }
+
+    @Test
+    fun `selectFrontCameraCutout prefers expected edge in landscape`() {
+        val topCenter = android.graphics.Rect(490, 0, 590, 48)
+        val rightCenter = android.graphics.Rect(1032, 1160, 1080, 1240)
+
+        val selected = OverlayService.selectFrontCameraCutout(
+            cutoutBounds = listOf(topCenter, rightCenter),
+            screenWidth = 1080,
+            screenHeight = 2400,
+            expectedEdge = OverlayService.CutoutEdge.RIGHT,
+            edgeTolerancePx = 4
+        )
+
+        assertEquals(rightCenter, selected)
+    }
+
+    @Test
+    fun `calculateDynamicIslandCenterOffsetX aligns window center to camera center`() {
+        val offset = OverlayService.calculateDynamicIslandCenterOffsetX(
+            cutoutCenterX = 600,
+            screenWidth = 1080
+        )
+        assertEquals(60, offset)
+    }
+
+    @Test
+    fun `calculateDynamicIslandTopYForCameraCenter aligns island center Y to camera center`() {
+        val topY = OverlayService.calculateDynamicIslandTopYForCameraCenter(
+            cutoutCenterY = 42,
+            islandHeight = 30
+        )
+        assertEquals(27, topY)
+    }
+
+    @Test
+    fun `calculateDynamicIslandRestrictedTopInset uses conservative clamp pre Android 15`() {
+        val restrictedTop = OverlayService.calculateDynamicIslandRestrictedTopInset(
+            sdkInt = 34,
+            statusBarInsetTop = 64,
+            cutoutSafeInsetTop = 52,
+            tappableInsetTop = 0
+        )
+        assertEquals(64, restrictedTop)
+    }
+
+    @Test
+    fun `calculateDynamicIslandRestrictedTopInset uses tappable inset on Android 15 plus`() {
+        val restrictedTop = OverlayService.calculateDynamicIslandRestrictedTopInset(
+            sdkInt = 35,
+            statusBarInsetTop = 64,
+            cutoutSafeInsetTop = 52,
+            tappableInsetTop = 0
+        )
+        assertEquals(0, restrictedTop)
+    }
+
+    @Test
+    fun `calculateDynamicIslandRestrictedTopInset uses tappable inset on Android 16 plus`() {
+        val restrictedTop = OverlayService.calculateDynamicIslandRestrictedTopInset(
+            sdkInt = 36,
+            statusBarInsetTop = 64,
+            cutoutSafeInsetTop = 52,
+            tappableInsetTop = 0
+        )
+        assertEquals(0, restrictedTop)
+    }
+
+    @Test
+    fun `shouldUseCameraCenteredIslandTouchProxy enabled on Android 15 plus`() {
+        assertTrue(!OverlayService.shouldUseCameraCenteredIslandTouchProxy(34))
+        assertTrue(OverlayService.shouldUseCameraCenteredIslandTouchProxy(35))
+        assertTrue(OverlayService.shouldUseCameraCenteredIslandTouchProxy(36))
+    }
+
+    @Test
+    fun `calculateDynamicIslandTouchProxyBounds matches visible island when fully tappable`() {
+        val bounds = OverlayService.calculateDynamicIslandTouchProxyBounds(
+            screenHeightPx = 2400,
+            islandTopY = 100,
+            islandHeightPx = 40,
+            tappableInsetTop = 0
+        )
+        assertEquals(100, bounds?.topY)
+        assertEquals(40, bounds?.heightPx)
+    }
+
+    @Test
+    fun `calculateDynamicIslandTouchProxyBounds trims untappable top without extending height`() {
+        val bounds = OverlayService.calculateDynamicIslandTouchProxyBounds(
+            screenHeightPx = 2400,
+            islandTopY = 20,
+            islandHeightPx = 40,
+            tappableInsetTop = 36
+        )
+        assertEquals(36, bounds?.topY)
+        assertEquals(24, bounds?.heightPx)
+    }
+
+    @Test
+    fun `calculateDynamicIslandTouchProxyBounds returns null when island has no tappable overlap`() {
+        val bounds = OverlayService.calculateDynamicIslandTouchProxyBounds(
+            screenHeightPx = 2400,
+            islandTopY = 10,
+            islandHeightPx = 16,
+            tappableInsetTop = 32
+        )
+        assertEquals(null, bounds)
+    }
+
+    @Test
     fun `startIntent with flavor includes flavor extra`() {
         val context = mock(Context::class.java)
         val intent = OverlayService.startIntent(context, CitrosFlavor.TANGERINE)
@@ -219,15 +395,11 @@ class OverlayServiceTest {
 
     @Test
     fun `launchChatActivity intent has correct flags`() {
-        // Verify the intent constructed by launchChatActivity() has the right flags.
-        // We can't call the private method directly, but we can verify the intent
-        // construction pattern used in the service.
+        // Verify build helper used by launchChatActivity().
         val context = mock(Context::class.java)
         `when`(context.packageName).thenReturn("ai.citros.chat")
 
-        val intent = Intent(context, ChatActivity::class.java).apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-        }
+        val intent = OverlayService.buildChatActivityLaunchIntent(context)
 
         assertTrue(
             intent.flags and Intent.FLAG_ACTIVITY_NEW_TASK != 0,
@@ -238,6 +410,18 @@ class OverlayServiceTest {
             "Intent must have FLAG_ACTIVITY_SINGLE_TOP (reuse existing instance)"
         )
         assertEquals(ChatActivity::class.java.name, intent.component?.className)
+    }
+
+    @Test
+    fun `launchChatActivity intent includes voice start extra when requested`() {
+        val context = mock(Context::class.java)
+        `when`(context.packageName).thenReturn("ai.citros.chat")
+
+        val voiceIntent = OverlayService.buildChatActivityLaunchIntent(context, startVoiceInput = true)
+        val normalIntent = OverlayService.buildChatActivityLaunchIntent(context, startVoiceInput = false)
+
+        assertTrue(voiceIntent.getBooleanExtra(EXTRA_START_VOICE_INPUT, false))
+        assertTrue(!normalIntent.getBooleanExtra(EXTRA_START_VOICE_INPUT, false))
     }
 
     @Test

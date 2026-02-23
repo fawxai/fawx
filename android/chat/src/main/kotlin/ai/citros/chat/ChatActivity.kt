@@ -116,6 +116,7 @@ import kotlin.math.sin
 class ChatActivity : ComponentActivity() {
     private val walletDependencies by lazy { provideWalletDependencies(this) }
     internal var memoryDb: android.database.sqlite.SQLiteDatabase? = null
+    private val overlayVoiceStartRequests = MutableStateFlow(0)
     override fun onDestroy() {
         OverlayController.setChatInForeground(false)
         // Clear hooks to avoid leaking this Activity (#436, #457)
@@ -157,10 +158,12 @@ class ChatActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         handleOauthCallbackIntent(intent)
+        handleOverlayVoiceInputIntent(intent)
     }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         handleOauthCallbackIntent(intent)
+        handleOverlayVoiceInputIntent(intent)
         enableEdgeToEdge()
         configureScreenReaderPrivacyList(applicationContext)
         runCatching {
@@ -241,6 +244,7 @@ class ChatActivity : ComponentActivity() {
             }
         }
         setContent {
+            val overlayVoiceStartToken by overlayVoiceStartRequests.collectAsState()
             val onboardingPrefs = remember {
                 getSharedPreferences(ONBOARDING_PREFS, MODE_PRIVATE)
             }
@@ -313,7 +317,13 @@ class ChatActivity : ComponentActivity() {
             }
             CitrosChatTheme(themeMode = themeMode, flavor = selectedFlavor) {
                 CompositionLocalProvider(LocalWalletDependencies provides walletDependencies) {
-                    ChatNavHost(walletDependencies = walletDependencies)
+                    ChatNavHost(
+                        walletDependencies = walletDependencies,
+                        overlayVoiceStartToken = overlayVoiceStartToken,
+                        onOverlayVoiceInputRequest = {
+                            overlayVoiceStartRequests.value = overlayVoiceStartRequests.value + 1
+                        }
+                    )
                 }
             }
         }
@@ -326,6 +336,14 @@ class ChatActivity : ComponentActivity() {
             uri.path == OAUTH_CALLBACK_PATH
         ) {
             oauthCallbackState.value = uri
+        }
+    }
+
+    private fun handleOverlayVoiceInputIntent(intent: Intent?) {
+        if (intent?.getBooleanExtra(EXTRA_START_VOICE_INPUT, false) == true) {
+            Log.d("ChatActivity", "Received overlay voice input request intent")
+            overlayVoiceStartRequests.value = overlayVoiceStartRequests.value + 1
+            intent.removeExtra(EXTRA_START_VOICE_INPUT)
         }
     }
     companion object {
@@ -345,7 +363,11 @@ class ChatActivity : ComponentActivity() {
     }
 }
 @Composable
-private fun ChatNavHost(walletDependencies: WalletDependencies) {
+private fun ChatNavHost(
+    walletDependencies: WalletDependencies,
+    overlayVoiceStartToken: Int = 0,
+    onOverlayVoiceInputRequest: () -> Unit = {}
+) {
     val navController = rememberNavController()
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -519,6 +541,11 @@ private fun ChatNavHost(walletDependencies: WalletDependencies) {
             }
         }
     }
+    LaunchedEffect(overlayVoiceStartToken) {
+        if (overlayVoiceStartToken > 0) {
+            navController.navigate("chat") { launchSingleTop = true }
+        }
+    }
     NavHost(navController = navController, startDestination = startDestination) {
         composable("onboarding") {
             OnboardingFlow(
@@ -537,7 +564,8 @@ private fun ChatNavHost(walletDependencies: WalletDependencies) {
                 viewModel = sharedChatViewModel,
                 onOpenSettings = { navController.navigate("settings") },
                 onOpenApiKeys = { navController.navigate(ROUTE_SETTINGS_WALLET) },
-                onOpenOverlay = { navController.navigate("overlay") { launchSingleTop = true } }
+                onOpenOverlay = { navController.navigate("overlay") { launchSingleTop = true } },
+                startVoiceInputToken = overlayVoiceStartToken
             )
         }
         composable("overlay") {
@@ -550,7 +578,11 @@ private fun ChatNavHost(walletDependencies: WalletDependencies) {
                 },
                 viewModel = sharedChatViewModel,
                 onOverlayMinimized = { navController.popBackStack() },
-                onNavigateToChat = { navController.popBackStack("chat", false) }
+                onNavigateToChat = { navController.popBackStack("chat", false) },
+                onRequestVoiceInput = {
+                    onOverlayVoiceInputRequest()
+                    navController.popBackStack("chat", false)
+                }
             )
         }
         composable("settings") {
@@ -663,6 +695,9 @@ internal const val PREF_OVERLAY_USE_ISLAND_WHEN_IDLE = "overlay_use_island_when_
 internal const val PREF_OVERLAY_USE_ISLAND_WHEN_IDLE_DEFAULT = true
 internal const val PREF_OVERLAY_SHOW_SEARCH_BAR_WHEN_IDLE = "overlay_show_search_bar_when_idle"
 internal const val PREF_OVERLAY_SHOW_SEARCH_BAR_WHEN_IDLE_DEFAULT = true
+internal const val PREF_OVERLAY_DYNAMIC_ISLAND_DEBUG_BADGE = "overlay_dynamic_island_debug_badge"
+internal const val PREF_OVERLAY_DYNAMIC_ISLAND_DEBUG_BADGE_DEFAULT = false
+internal const val EXTRA_START_VOICE_INPUT = "extra_start_voice_input"
 private const val TOKEN_PREVIEW_LIMIT = 80
 private const val DIAGNOSTIC_PREVIEW_LIMIT = 60
 private const val OAUTH_STATE_EXPIRY_MS = 600_000L // 10 minutes
@@ -937,6 +972,7 @@ fun ChatScreen(
     onOpenSettings: () -> Unit = {},
     onOpenApiKeys: () -> Unit = onOpenSettings,
     onOpenOverlay: () -> Unit = {},
+    startVoiceInputToken: Int = 0,
     keyStoreOverride: ai.citros.core.KeyStore? = null,
     walletStorageOverride: ai.citros.core.WalletStorage? = null,
     secureStoreOverride: CredentialStore? = null
@@ -1479,19 +1515,19 @@ fun ChatScreen(
     val isConfigured = viewModel.isConfigured.value
     val hasActiveWalletKey = walletState.activeKeyId != null &&
         walletState.keys.any { it.id == walletState.activeKeyId }
-    var showApiKeyRequiredModal by rememberSaveable { mutableStateOf(false) }
+    var showApiKeyRequiredFlag by rememberSaveable { mutableStateOf(false) }
     val canInteractWithModel = hasActiveWalletKey && isConfigured
     val requiresProviderSetup = hasActiveWalletKey && !isConfigured
     LaunchedEffect(canInteractWithModel) {
         if (canInteractWithModel) {
-            showApiKeyRequiredModal = false
+            showApiKeyRequiredFlag = false
         }
     }
     val requireModelAccess = {
         if (canInteractWithModel) {
             true
         } else {
-            showApiKeyRequiredModal = true
+            showApiKeyRequiredFlag = true
             false
         }
     }
@@ -1611,6 +1647,42 @@ fun ChatScreen(
                     color = directiveSurfaces.separator,
                     thickness = 0.5.dp
                 )
+                if (showApiKeyRequiredFlag) {
+                    Surface(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag(TEST_TAG_API_KEY_REQUIRED_MODAL),
+                        color = directiveSurfaces.surface1,
+                        border = BorderStroke(1.dp, directiveSurfaces.red.copy(alpha = 0.9f))
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 14.dp, vertical = 10.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            if (requiresProviderSetup) {
+                                Text(
+                                    text = "Provider setup is incomplete.",
+                                    style = CitrosTypography.bodySmall,
+                                    color = directiveSurfaces.labelSecondary
+                                )
+                            }
+                            Text(
+                                text = "Connect a provider to continue →",
+                                style = CitrosTypography.bodySmall,
+                                fontWeight = FontWeight.Medium,
+                                color = directiveSurfaces.red,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        showApiKeyRequiredFlag = false
+                                        onOpenApiKeys()
+                                    }
+                            )
+                        }
+                    }
+                }
             }
         }
     ) { padding ->
@@ -1733,65 +1805,9 @@ fun ChatScreen(
                 modifier = Modifier.padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 24.dp),
                 placeholder = "Message",
                 voiceReady = voiceReadyState,
-                voiceManager = voiceManagerState
+                voiceManager = voiceManagerState,
+                startListeningToken = startVoiceInputToken
             )
-        }
-    }
-    if (showApiKeyRequiredModal) {
-        ModalBottomSheet(
-            onDismissRequest = { showApiKeyRequiredModal = false },
-            containerColor = directiveSurfaces.surface1,
-            contentColor = directiveSurfaces.labelPrimary
-        ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 12.dp)
-                    .testTag(TEST_TAG_API_KEY_REQUIRED_MODAL),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                val modalTitle = if (requiresProviderSetup) {
-                    "Complete provider setup to continue chatting."
-                } else {
-                    "Add an API key to start chatting."
-                }
-                val modalBody = if (requiresProviderSetup) {
-                    "Open Settings to review your provider and model configuration."
-                } else {
-                    "Connect an Anthropic, OpenAI, or OpenRouter key in Settings."
-                }
-                val openSetupDestination = if (requiresProviderSetup) onOpenSettings else onOpenApiKeys
-                Text(
-                    text = modalTitle,
-                    style = CitrosTypography.titleMedium,
-                    color = directiveSurfaces.labelPrimary
-                )
-                Text(
-                    text = modalBody,
-                    style = CitrosTypography.bodyMedium,
-                    color = directiveSurfaces.labelSecondary
-                )
-                CitrusLiquidGlassButton(
-                    text = "Open Settings",
-                    onClick = {
-                        showApiKeyRequiredModal = false
-                        openSetupDestination()
-                    },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .testTag(TEST_TAG_API_KEY_REQUIRED_OPEN_SETTINGS),
-                    tintColor = selectedFlavor.primary
-                )
-                TextButton(
-                    onClick = { showApiKeyRequiredModal = false },
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text(
-                        text = "Not now",
-                        color = directiveSurfaces.labelSecondary
-                    )
-                }
-            }
         }
     }
     if (showQuickSwitcher && canInteractWithModel) {
@@ -2828,6 +2844,70 @@ internal data class MessageInputSubmissionState(
     val pendingStopVisual: Boolean
 )
 
+internal data class VoiceStartRetryState(
+    val lastConsumedToken: Int = 0,
+    val pendingToken: Int = 0,
+    val permissionRequestedToken: Int = 0
+)
+
+internal enum class VoiceStartRetryAction {
+    NONE,
+    REQUEST_PERMISSION,
+    START_LISTENING
+}
+
+internal data class VoiceStartRetryResolution(
+    val state: VoiceStartRetryState,
+    val action: VoiceStartRetryAction
+)
+
+internal fun resolveVoiceStartRetry(
+    state: VoiceStartRetryState,
+    incomingToken: Int,
+    isLoading: Boolean,
+    isListening: Boolean,
+    hasVoiceManager: Boolean,
+    hasActiveStt: Boolean,
+    hasMicPermission: Boolean
+): VoiceStartRetryResolution {
+    var next = state
+    if (incomingToken > next.lastConsumedToken && incomingToken > next.pendingToken) {
+        next = next.copy(pendingToken = incomingToken)
+    }
+    if (next.pendingToken <= next.lastConsumedToken) {
+        return VoiceStartRetryResolution(next, VoiceStartRetryAction.NONE)
+    }
+    if (isLoading || isListening || !hasVoiceManager || !hasActiveStt) {
+        return VoiceStartRetryResolution(next, VoiceStartRetryAction.NONE)
+    }
+    if (hasMicPermission) {
+        return VoiceStartRetryResolution(
+            next.copy(
+                lastConsumedToken = next.pendingToken,
+                pendingToken = 0,
+                permissionRequestedToken = 0
+            ),
+            VoiceStartRetryAction.START_LISTENING
+        )
+    }
+    if (next.permissionRequestedToken < next.pendingToken) {
+        return VoiceStartRetryResolution(
+            next.copy(permissionRequestedToken = next.pendingToken),
+            VoiceStartRetryAction.REQUEST_PERMISSION
+        )
+    }
+    return VoiceStartRetryResolution(next, VoiceStartRetryAction.NONE)
+}
+
+internal fun applyVoiceStartPermissionResult(
+    state: VoiceStartRetryState,
+    granted: Boolean
+): VoiceStartRetryState = if (granted) {
+    state.copy(permissionRequestedToken = 0)
+} else {
+    state
+}
+
 internal fun submitMessageDraft(
     attemptedText: String,
     isLoading: Boolean,
@@ -2855,14 +2935,22 @@ internal fun MessageInput(
     modifier: Modifier = Modifier,
     placeholder: String = "Message Citros...",
     voiceReady: Boolean = false,
-    voiceManager: VoiceManager? = null
+    voiceManager: VoiceManager? = null,
+    startListeningToken: Int = 0
 ) {
-    var text by remember { mutableStateOf("") }
+    var text by rememberSaveable { mutableStateOf("") }
     var pendingStopVisual by remember { mutableStateOf(false) }
     var isListening by remember { mutableStateOf(false) }
     var listeningJob by remember { mutableStateOf<Job?>(null) }
+    var lastConsumedListeningToken by rememberSaveable { mutableIntStateOf(0) }
+    var pendingListeningToken by rememberSaveable { mutableIntStateOf(0) }
+    var permissionRequestedToken by rememberSaveable { mutableIntStateOf(0) }
+    var manualPermissionRequestInFlight by remember { mutableStateOf(false) }
+    var voiceStartRetryTrigger by remember { mutableIntStateOf(0) }
     val coroutineScope = rememberCoroutineScope()
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val activeStt = voiceManager?.activeStt?.collectAsState()?.value
     LaunchedEffect(pendingStopVisual, isLoading) {
         if (pendingStopVisual && isLoading) {
             pendingStopVisual = false
@@ -2928,18 +3016,48 @@ internal fun MessageInput(
             }
         }
     }
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                voiceStartRetryTrigger += 1
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
+        val permissionUpdate = applyVoiceStartPermissionResult(
+            state = VoiceStartRetryState(
+                lastConsumedToken = lastConsumedListeningToken,
+                pendingToken = pendingListeningToken,
+                permissionRequestedToken = permissionRequestedToken
+            ),
+            granted = granted
+        )
+        permissionRequestedToken = permissionUpdate.permissionRequestedToken
         if (granted) {
-            val stt = voiceManager?.activeStt?.value ?: return@rememberLauncherForActivityResult
-            beginListening(stt)
+            if (manualPermissionRequestInFlight) {
+                val stt = activeStt
+                if (stt != null) {
+                    beginListening(stt)
+                    if (pendingListeningToken > lastConsumedListeningToken) {
+                        lastConsumedListeningToken = pendingListeningToken
+                        pendingListeningToken = 0
+                    }
+                }
+            }
         } else {
             Toast.makeText(context, "Microphone permission is required for voice input", Toast.LENGTH_SHORT).show()
         }
+        manualPermissionRequestInFlight = false
+        voiceStartRetryTrigger += 1
     }
     val startListening = {
-        val stt = voiceManager?.activeStt?.value
+        val stt = activeStt
         if (stt != null) {
             val hasPermission = ContextCompat.checkSelfPermission(
                 context, Manifest.permission.RECORD_AUDIO
@@ -2947,8 +3065,59 @@ internal fun MessageInput(
             if (hasPermission) {
                 beginListening(stt)
             } else {
+                manualPermissionRequestInFlight = true
                 permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
             }
+            true
+        } else {
+            false
+        }
+    }
+    LaunchedEffect(
+        startListeningToken,
+        voiceManager,
+        activeStt,
+        isLoading,
+        isListening,
+        voiceStartRetryTrigger
+    ) {
+        val hasMicPermission = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
+        val resolution = resolveVoiceStartRetry(
+            state = VoiceStartRetryState(
+                lastConsumedToken = lastConsumedListeningToken,
+                pendingToken = pendingListeningToken,
+                permissionRequestedToken = permissionRequestedToken
+            ),
+            incomingToken = startListeningToken,
+            isLoading = isLoading,
+            isListening = isListening,
+            hasVoiceManager = voiceManager != null,
+            hasActiveStt = activeStt != null,
+            hasMicPermission = hasMicPermission
+        )
+        lastConsumedListeningToken = resolution.state.lastConsumedToken
+        pendingListeningToken = resolution.state.pendingToken
+        permissionRequestedToken = resolution.state.permissionRequestedToken
+        when (resolution.action) {
+            VoiceStartRetryAction.START_LISTENING -> {
+                val stt = activeStt
+                if (stt != null) {
+                    beginListening(stt)
+                } else {
+                    // Runtime changed between decision and launch; keep retry pending.
+                    pendingListeningToken = maxOf(
+                        pendingListeningToken,
+                        resolution.state.lastConsumedToken
+                    )
+                }
+            }
+            VoiceStartRetryAction.REQUEST_PERMISSION -> {
+                permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+            }
+            VoiceStartRetryAction.NONE -> Unit
         }
     }
     val isDarkTheme = LocalCitrosIsDark.current
@@ -3086,7 +3255,7 @@ internal fun MessageInput(
                                         isListening -> {
                                             listeningJob?.cancel()
                                             listeningJob = null
-                                            voiceManager?.activeStt?.value?.stopListening()
+                                            activeStt?.stopListening()
                                             isListening = false
                                         }
                                         else -> {

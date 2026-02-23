@@ -1,6 +1,7 @@
 package ai.citros.chat
 
 import android.content.Context
+import android.util.Log
 import android.view.MotionEvent
 import android.view.VelocityTracker
 import android.view.WindowManager
@@ -42,6 +43,23 @@ class DraggableOverlayFrame(context: Context) : FrameLayout(context) {
     private val dragThresholdPx: Float
         get() = DRAG_THRESHOLD_DP * resources.displayMetrics.density
 
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (BuildConfig.DEBUG) {
+            when (ev.actionMasked) {
+                MotionEvent.ACTION_DOWN,
+                MotionEvent.ACTION_UP,
+                MotionEvent.ACTION_CANCEL -> {
+                    Log.d(
+                        TAG,
+                        "dispatchTouchEvent action=${MotionEvent.actionToString(ev.actionMasked)} " +
+                            "raw=(${ev.rawX.toInt()},${ev.rawY.toInt()}) dragEnabled=$dragEnabled"
+                    )
+                }
+            }
+        }
+        return super.dispatchTouchEvent(ev)
+    }
+
     override fun onInterceptTouchEvent(ev: MotionEvent): Boolean {
         if (!dragEnabled) return false
         when (ev.action) {
@@ -63,6 +81,13 @@ class DraggableOverlayFrame(context: Context) : FrameLayout(context) {
                 val dy = ev.rawY - initialTouchY
                 if (dx * dx + dy * dy > dragThresholdPx * dragThresholdPx) {
                     isDragging = true
+                    if (BuildConfig.DEBUG) {
+                        Log.d(
+                            TAG,
+                            "onInterceptTouchEvent intercept drag " +
+                                "raw=(${ev.rawX.toInt()},${ev.rawY.toInt()})"
+                        )
+                    }
                     return true // Steal gesture from Compose
                 }
                 return false
@@ -99,6 +124,13 @@ class DraggableOverlayFrame(context: Context) : FrameLayout(context) {
                 velocityTracker?.apply {
                     addMovement(ev)
                     computeCurrentVelocity(1000)
+                    if (BuildConfig.DEBUG) {
+                        Log.d(
+                            TAG,
+                            "onTouchEvent drag end velocityY=${yVelocity.toInt()} " +
+                                "raw=(${ev.rawX.toInt()},${ev.rawY.toInt()})"
+                        )
+                    }
                     callback?.onDragEnd(yVelocity, ev.rawX, ev.rawY)
                 }
                 velocityTracker?.recycle()
@@ -117,6 +149,7 @@ class DraggableOverlayFrame(context: Context) : FrameLayout(context) {
     }
 
     companion object {
+        private const val TAG = "OverlayTouch"
         private const val DRAG_THRESHOLD_DP = 8f
     }
 }

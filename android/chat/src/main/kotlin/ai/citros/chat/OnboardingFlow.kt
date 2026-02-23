@@ -13,13 +13,17 @@ import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.imePadding
-import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.only
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -56,6 +60,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.lifecycle.Lifecycle
@@ -126,6 +131,12 @@ internal fun readSelectedFlavor(context: Context): CitrosFlavor {
         prefs.getString(PREF_SELECTED_FLAVOR, CitrosFlavor.TANGERINE.storageValue)
     )
 }
+
+@Composable
+private fun Modifier.onboardingTopSafePadding(extraTop: Dp = 12.dp): Modifier =
+    this
+        .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Top))
+        .padding(top = extraTop)
 private fun providerKeyUrl(provider: Provider): String = when (provider) {
     Provider.ANTHROPIC -> "https://console.anthropic.com/settings/keys"
     Provider.OPENAI -> "https://platform.openai.com/api-keys"
@@ -514,20 +525,10 @@ internal fun OnboardingFlow(
                             ),
                         contentAlignment = Alignment.Center
                     ) {
-                            OnboardingProgressDots(
-                                stepIndex = 1,
-                                totalSteps = 9,
-                                accentColor = onboardingAccentColor,
-                                futureColor = onboardingFutureDotColor,
+                            Column(
                                 modifier = Modifier
-                                    .align(Alignment.TopCenter)
-                                    .statusBarsPadding()
-                                .padding(top = 12.dp)
-                        )
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 34.dp),
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 34.dp),
                             horizontalAlignment = Alignment.CenterHorizontally
                         ) {
                             CitrosDirectiveOrb(
@@ -583,7 +584,8 @@ internal fun OnboardingFlow(
                                 stepIndex = 2,
                                 totalSteps = 9,
                                 accentColor = onboardingAccentColor,
-                                futureColor = onboardingFutureDotColor
+                                futureColor = onboardingFutureDotColor,
+                                modifier = Modifier.onboardingTopSafePadding()
                             )
                             CitrosIcon(
                                 imageVector = CitrosIcons.Palette,
@@ -786,7 +788,8 @@ internal fun OnboardingFlow(
                                 stepIndex = 3,
                                 totalSteps = 9,
                                 accentColor = onboardingAccentColor,
-                                futureColor = onboardingFutureDotColor
+                                futureColor = onboardingFutureDotColor,
+                                modifier = Modifier.onboardingTopSafePadding()
                             )
                             CitrosIcon(
                                 imageVector = CitrosIcons.ChatBubble,
@@ -906,7 +909,8 @@ internal fun OnboardingFlow(
                                 stepIndex = 4,
                                 totalSteps = 9,
                                 accentColor = onboardingAccentColor,
-                                futureColor = onboardingFutureDotColor
+                                futureColor = onboardingFutureDotColor,
+                                modifier = Modifier.onboardingTopSafePadding()
                             )
                             CitrosIcon(
                                 imageVector = CitrosIcons.Person,
@@ -1097,7 +1101,8 @@ internal fun OnboardingFlow(
                                 stepIndex = 7,
                                 totalSteps = 9,
                                 accentColor = onboardingAccentColor,
-                                futureColor = onboardingFutureDotColor
+                                futureColor = onboardingFutureDotColor,
+                                modifier = Modifier.onboardingTopSafePadding()
                             )
                             CitrosIcon(
                                 imageVector = CitrosIcons.Star,
@@ -1195,7 +1200,9 @@ internal fun OnboardingFlow(
                                 totalSteps = 9,
                                 accentColor = onboardingAccentColor,
                                 futureColor = onboardingFutureDotColor,
-                                modifier = Modifier.align(Alignment.CenterHorizontally)
+                                modifier = Modifier
+                                    .align(Alignment.CenterHorizontally)
+                                    .onboardingTopSafePadding()
                             )
                             Text(
                                 text = "Connect a Provider",
@@ -1356,7 +1363,7 @@ internal fun OnboardingFlow(
                                 val isWarning = status.startsWith("WARN:")
                                 val statusText = status.substringAfter(": ", status)
                                 val statusColor = when {
-                                    isSuccess -> Color(0xFF22C55E)
+                                    isSuccess -> CitrosFlavor.LIME.primary
                                     isPending -> onboardingAccentColor.copy(alpha = 0.90f)
                                     isWarning -> directiveSurfaces.labelSecondary.copy(alpha = 0.92f)
                                     else -> CitrosColorScheme.error
@@ -1370,13 +1377,13 @@ internal fun OnboardingFlow(
                                         Box(
                                             modifier = Modifier
                                                 .size(20.dp)
-                                                .background(Color(0xFF22C55E).copy(alpha = 0.18f), CircleShape),
+                                                .background(CitrosFlavor.LIME.primary.copy(alpha = 0.18f), CircleShape),
                                             contentAlignment = Alignment.Center
                                         ) {
                                             CitrosIcon(
                                                 imageVector = CitrosIcons.SearchBarCheck,
                                                 contentDescription = null,
-                                                tint = Color(0xFF22C55E),
+                                                tint = CitrosFlavor.LIME.primary,
                                                 modifier = Modifier.size(10.dp)
                                             )
                                         }
@@ -1501,7 +1508,7 @@ internal fun OnboardingFlow(
                 OnboardingStep.PERMISSIONS -> {
                     val cardColor = if (isDarkTheme) Color(0xFF1C1C22) else Color(0xFFE0E1E8)
                     val grantButtonColor = if (isDarkTheme) Color(0xFF3A3B44) else Color(0xFFD0D1D9)
-                    val grantedColor = Color(0xFF22C55E)
+                    val grantedColor = CitrosFlavor.LIME.primary
                     val lifecycleOwner = LocalLifecycleOwner.current
                     var accessibilityGranted by remember {
                         mutableStateOf(CitrosAccessibilityService.isEnabled(context))
@@ -1543,7 +1550,8 @@ internal fun OnboardingFlow(
                                 stepIndex = 5,
                                 totalSteps = 9,
                                 accentColor = onboardingAccentColor,
-                                futureColor = onboardingFutureDotColor
+                                futureColor = onboardingFutureDotColor,
+                                modifier = Modifier.onboardingTopSafePadding()
                             )
                             CitrosIcon(
                                 imageVector = CitrosIcons.Shield,
@@ -1673,7 +1681,8 @@ internal fun OnboardingFlow(
                                 stepIndex = 6,
                                 totalSteps = 9,
                                 accentColor = onboardingAccentColor,
-                                futureColor = onboardingFutureDotColor
+                                futureColor = onboardingFutureDotColor,
+                                modifier = Modifier.onboardingTopSafePadding()
                             )
                             CitrosIcon(
                                 imageVector = CitrosIcons.Phone,
@@ -1791,12 +1800,6 @@ internal fun OnboardingFlow(
                                 .padding(top = 10.dp, bottom = 122.dp),
                             horizontalAlignment = Alignment.CenterHorizontally
                         ) {
-                            OnboardingProgressDots(
-                                stepIndex = 9,
-                                totalSteps = 9,
-                                accentColor = onboardingAccentColor,
-                                futureColor = onboardingFutureDotColor
-                            )
                             Spacer(Modifier.weight(1f))
                             CitrosDirectiveOrb(
                                 flavor = selectedFlavor,
@@ -1946,8 +1949,8 @@ private fun OnboardingChatHeader(
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .statusBarsPadding()
-            .padding(horizontal = 16.dp, vertical = 12.dp),
+            .onboardingTopSafePadding()
+            .padding(start = 16.dp, end = 16.dp, bottom = 12.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         CitrosStepHeader(

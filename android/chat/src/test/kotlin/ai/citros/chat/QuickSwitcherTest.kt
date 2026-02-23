@@ -166,12 +166,10 @@ class QuickSwitcherTest {
     fun chatScreenNoProviderBlockedSendShowsModalAndRetainsDraft() {
         val fixture = createChatScreenFixture(withActiveKey = false, configureBackend = true)
         var openedApiKeys = false
-        var openedSettings = false
 
         setChatScreenContent(
             fixture = fixture,
-            onOpenApiKeys = { openedApiKeys = true },
-            onOpenSettings = { openedSettings = true }
+            onOpenApiKeys = { openedApiKeys = true }
         )
 
         editableMessageInput().performTextInput("draft message")
@@ -180,12 +178,10 @@ class QuickSwitcherTest {
         composeRule.onNodeWithTag(TEST_TAG_API_KEY_REQUIRED_MODAL).assertIsDisplayed()
         editableMessageInput().assertTextContains("draft message")
 
-        composeRule.onNodeWithText("Not now").performClick()
-        composeRule.onNodeWithTag(TEST_TAG_API_KEY_REQUIRED_MODAL).assertDoesNotExist()
-
-        composeRule.onNodeWithTag(TEST_TAG_MESSAGE_SEND_BUTTON).performClick()
-        modalOpenSettingsButton().performClick()
-        composeRule.onNodeWithTag(TEST_TAG_API_KEY_REQUIRED_MODAL).assertDoesNotExist()
+        composeRule.onNodeWithText("Connect a provider to continue", substring = true).performClick()
+        composeRule.runOnIdle {
+            assertTrue(openedApiKeys, "Expected setup flag CTA to route to API keys")
+        }
     }
 
     @Test
@@ -215,8 +211,8 @@ class QuickSwitcherTest {
     }
 
     @Test
-    fun chatScreenConfiguredFalseWithKeyShowsSetupRequiredAndRoutesHeaderToSettings() {
-        val fixture = createChatScreenFixture(withActiveKey = true, configureBackend = true)
+    fun chatScreenConfiguredFalseWithKeyShowsSetupRequiredAndRoutesApiKeyCtaToApiKeys() {
+        val fixture = createChatScreenFixture(withActiveKey = true, configureBackend = false)
         var openedSettings = false
         var openedApiKeys = false
         setChatScreenContent(
@@ -245,9 +241,12 @@ class QuickSwitcherTest {
         editableMessageInput().performTextInput("needs setup")
         composeRule.onNodeWithTag(TEST_TAG_MESSAGE_SEND_BUTTON).performClick()
         composeRule.onNodeWithTag(TEST_TAG_API_KEY_REQUIRED_MODAL).assertIsDisplayed()
-        composeRule.onNodeWithText("Complete provider setup to continue chatting.").assertIsDisplayed()
-        modalOpenSettingsButton().performClick()
-        composeRule.onNodeWithTag(TEST_TAG_API_KEY_REQUIRED_MODAL).assertDoesNotExist()
+        composeRule.onNodeWithText("Provider setup is incomplete.").assertIsDisplayed()
+        composeRule.onNodeWithText("Connect a provider to continue", substring = true).assertIsDisplayed()
+        composeRule.onNodeWithText("Connect a provider to continue", substring = true).performClick()
+        composeRule.runOnIdle {
+            assertTrue(openedApiKeys, "Expected setup-required flag CTA to open API keys")
+        }
     }
 
     @Test

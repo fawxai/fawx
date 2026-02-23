@@ -439,8 +439,8 @@ internal fun WalletKeyCard(
 ) {
     val accent = lerp(providerAccent(key.provider), flavor.primary, 0.42f)
     val healthColor = when (health) {
-        KeyHealth.VALID -> Color(0xFF22C55E)
-        KeyHealth.INVALID, KeyHealth.EXPIRED -> Color(0xFFEF4444)
+        KeyHealth.VALID -> CitrosFlavor.LIME.primary
+        KeyHealth.INVALID, KeyHealth.EXPIRED -> CitrosFlavor.BLOOD_ORANGE.primary
         KeyHealth.UNKNOWN, KeyHealth.UNCHECKED -> Color(0xFFEAB308)
     }
 
@@ -481,7 +481,7 @@ internal fun WalletKeyCard(
                         expiry < now -> Text(
                             "⚠\uFE0F Expired",
                             style = MaterialTheme.typography.bodySmall,
-                            color = Color(0xFFEF4444),
+                            color = CitrosFlavor.BLOOD_ORANGE.primary,
                             modifier = Modifier.semantics { contentDescription = "API key expired" }
                         )
                         expiry - now < EXPIRY_WARNING_THRESHOLD_MS -> Text(

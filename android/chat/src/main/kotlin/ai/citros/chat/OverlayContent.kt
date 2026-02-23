@@ -28,6 +28,7 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
@@ -38,8 +39,10 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -61,17 +64,20 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
-private val SuccessColor = Color(0xFF22C55E)
-private val ErrorColor = Color(0xFFEF4444)
+private val SuccessColor = CitrosFlavor.LIME.primary
+private val ErrorColor = CitrosFlavor.BLOOD_ORANGE.primary
 
 /**
  * Mini-chat overlay content composable.
@@ -93,6 +99,9 @@ internal fun OverlayMiniChatContent(
     queuedMessageDraft: String,
     onQueuedDraftChange: (String) -> Unit,
     onSubmitQueuedMessage: () -> Unit,
+    onVoiceInput: () -> Unit = {},
+    isVoiceListening: Boolean = false,
+    isVoiceReady: Boolean = false,
     onStopAction: () -> Unit,
     onResumeOrRetry: () -> Unit,
     onOpenFull: () -> Unit,
@@ -357,6 +366,7 @@ internal fun OverlayMiniChatContent(
             val hasInputText = queuedMessageDraft.isNotBlank()
             val showStopButton = isExecuting && !hasInputText
             val sendEnabled = hasInputText || showStopButton
+            val micActionEnabled = hasInputText || isVoiceListening || (!isExecuting && isVoiceReady)
             val activeSendButtonColor = if (flavor == CitrosFlavor.NONE) {
                 if (isDarkTheme) Color.White else Color.Black
             } else {
@@ -376,9 +386,9 @@ internal fun OverlayMiniChatContent(
                 Surface(
                     modifier = Modifier.weight(1f),
                     shape = RoundedCornerShape(22.dp),
-                    color = surfaces.surface2,
-                    border = BorderStroke(1.dp, surfaces.separatorLight)
-                ) {
+                            color = surfaces.surface2,
+                            border = BorderStroke(1.dp, surfaces.separatorLight)
+                        ) {
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -424,21 +434,45 @@ internal fun OverlayMiniChatContent(
                             modifier = Modifier
                                 .size(32.dp)
                                 .clip(CircleShape)
-                                .background(if (hasInputText) surfaces.surface3 else Color.Transparent)
+                                .background(
+                                    when {
+                                        hasInputText -> surfaces.surface3
+                                        isVoiceListening -> surfaces.red.copy(alpha = 0.18f)
+                                        else -> Color.Transparent
+                                    }
+                                )
                                 .clickable(
-                                    enabled = hasInputText,
-                                    onClick = { onQueuedDraftChange("") }
+                                    enabled = micActionEnabled,
+                                    onClick = {
+                                        if (hasInputText) {
+                                            onQueuedDraftChange("")
+                                        } else {
+                                            onVoiceInput()
+                                        }
+                                    }
                                 ),
                             contentAlignment = Alignment.Center
                         ) {
+                            val micTint = when {
+                                isVoiceListening -> surfaces.red
+                                !hasInputText && !isExecuting && isVoiceReady -> surfaces.labelSecondary.copy(alpha = 0.92f)
+                                else -> surfaces.labelSecondary.copy(alpha = 0.90f)
+                            }
                             if (hasInputText) {
                                 MessageInputClearGlyph(
                                     tint = surfaces.labelSecondary.copy(alpha = 0.92f),
                                     modifier = Modifier.size(13.dp)
                                 )
+                            } else if (isVoiceListening) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(10.dp)
+                                        .clip(RoundedCornerShape(3.dp))
+                                        .background(micTint)
+                                )
                             } else {
                                 MessageInputMicGlyph(
-                                    tint = surfaces.labelSecondary.copy(alpha = 0.72f),
+                                    tint = micTint,
                                     modifier = Modifier.size(16.dp)
                                 )
                             }
@@ -717,11 +751,10 @@ internal fun OverlaySearchBarContent(
                                     .background(surfaces.green.copy(alpha = 0.20f), CircleShape),
                                 contentAlignment = Alignment.Center
                             ) {
-                                CitrosIcon(
-                                    imageVector = CitrosIcons.SearchBarCheck,
-                                    contentDescription = null,
+                                CitrosStatusCheckGlyph(
                                     modifier = Modifier.size(10.dp),
-                                    tint = surfaces.green
+                                    color = surfaces.green,
+                                    strokeWidthFraction = 0.18f
                                 )
                             }
                         }
@@ -821,6 +854,7 @@ internal fun OverlayDynamicIslandContent(
     onExpand: () -> Unit,
     onStopAction: () -> Unit,
     onDismiss: () -> Unit,
+    debugBadgeText: String? = null,
     modifier: Modifier = Modifier
 ) {
     val isDarkTheme = LocalCitrosIsDark.current
@@ -831,20 +865,18 @@ internal fun OverlayDynamicIslandContent(
     val isExpanded = runState != OverlayRunState.IDLE || unreadCount > 0
     val isFailed = runState == OverlayRunState.FAILED || runState == OverlayRunState.STOPPED
     val isExecuting = runState == OverlayRunState.EXECUTING
-    val showErrorBadge = runState == OverlayRunState.FAILED || runState == OverlayRunState.STOPPED
-    val orbSize = if (isExpanded) cg(6) else cg(5)
-    val islandWidth = if (isExpanded) cg(74) else cg(44)
+    val stateIndicatorSize = if (isExpanded) cg(9) else cg(8)
+    val orbSize = stateIndicatorSize
+    val islandWidth = if (isExpanded) cg(64) else cg(52)
+    val islandHeight = if (isExpanded) cg(20) else cg(18)
+    val touchTargetWidth = islandWidth + cg(6)
+    val sideLaneWidth = if (isExpanded) cg(17) else cg(15)
+    val sideLaneVerticalPadding = cg(1)
+    val textBottomPadding = cg(1.5f)
 
-    val titleText = when (runState) {
-        OverlayRunState.IDLE -> if (unreadCount > 0) "Updates" else ""
-        OverlayRunState.EXECUTING -> "Working..."
-        OverlayRunState.COMPLETED -> "Completed"
-        OverlayRunState.FAILED -> "Action failed"
-        OverlayRunState.STOPPED -> "Stopped"
-    }
-    val subtitleText = when (runState) {
+    val statusText = when (runState) {
         OverlayRunState.IDLE -> if (unreadCount > 0) "$unreadCount unread updates" else "Tap to open"
-        OverlayRunState.EXECUTING -> currentStepLabel
+        OverlayRunState.EXECUTING -> currentStepLabel.ifBlank { "Working..." }
         OverlayRunState.COMPLETED -> "Tap to review"
         OverlayRunState.FAILED -> "Tap to open settings"
         OverlayRunState.STOPPED -> "Tap to resume"
@@ -856,150 +888,186 @@ internal fun OverlayDynamicIslandContent(
     }
     val islandBorder = if (isDarkTheme) null else BorderStroke(1.dp, surfaces.separator)
 
-    Surface(
+    Box(
         modifier = modifier
-            .width(islandWidth)
+            .width(touchTargetWidth)
             .combinedClickable(
                 onClick = onExpand,
                 onLongClick = onDismiss
             )
             .semantics { contentDescription = "Dynamic island overlay" },
-        shape = RoundedCornerShape(cg(7)),
-        color = islandColor,
-        border = islandBorder,
-        tonalElevation = 8.dp
+        contentAlignment = Alignment.Center
     ) {
-        Box(
-            modifier = Modifier.fillMaxWidth()
+        Surface(
+            modifier = Modifier
+                .width(islandWidth)
+                .height(islandHeight),
+            shape = RoundedCornerShape(cg(7)),
+            color = islandColor,
+            border = islandBorder,
+            tonalElevation = 8.dp
         ) {
             Box(
-                modifier = Modifier
-                    .matchParentSize()
-                    .background(islandColor)
-                    .blur(40.dp)
-            )
-
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = cg(3), vertical = cg(1.25f)),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(cg(1.5f))
+                modifier = Modifier.fillMaxSize()
             ) {
                 Box(
-                    modifier = Modifier.size(orbSize + cg(2)),
-                    contentAlignment = Alignment.Center
+                    modifier = Modifier
+                        .matchParentSize()
+                        .background(islandColor)
+                        .blur(40.dp)
+                )
+
+                Row(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(horizontal = cg(2.5f)),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    if (isExecuting) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(orbSize + cg(1)),
-                            color = flavorTokens.orbColor,
-                            trackColor = if (isDarkTheme) {
-                                Color.White.copy(alpha = 0.14f)
-                            } else {
-                                Color.Black.copy(alpha = 0.14f)
-                            },
-                            strokeWidth = 1.75.dp
-                        )
-                    }
-                    CitrosDirectiveOrb(
-                        flavor = flavor,
-                        size = orbSize,
-                        colorOverride = if (isFailed) surfaces.red else null,
-                        innerOverride = if (isFailed) Color.White.copy(alpha = 0.22f) else null,
-                        glowOverride = if (isFailed) surfaces.red.copy(alpha = 0.30f) else flavorTokens.orbGlow
-                    )
-                    if (showErrorBadge) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxHeight()
+                            .width(sideLaneWidth)
+                            .padding(vertical = sideLaneVerticalPadding),
+                        contentAlignment = Alignment.Center
+                    ) {
                         Box(
-                            modifier = Modifier
-                                .align(Alignment.TopEnd)
-                                .size(cg(3))
-                                .background(surfaces.red, CircleShape),
+                            modifier = Modifier.fillMaxSize(),
                             contentAlignment = Alignment.Center
                         ) {
-                            Text(
-                                text = "!",
-                                style = CitrosTypography.labelSmall.copy(fontSize = 9.sp),
-                                fontWeight = FontWeight.Bold,
-                                color = Color.White
-                            )
-                        }
-                    }
-                }
-                Column(
-                    modifier = Modifier.weight(1f),
-                    verticalArrangement = Arrangement.spacedBy(1.dp)
-                ) {
-                    if (titleText.isNotBlank()) {
-                        Text(
-                            text = titleText,
-                            style = CitrosTypography.labelLarge.copy(fontSize = 13.sp),
-                            color = surfaces.labelPrimary,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                    }
-                    Text(
-                        text = subtitleText,
-                        style = if (titleText.isBlank()) {
-                            CitrosTypography.labelMedium.copy(fontSize = 12.sp)
-                        } else {
-                            CitrosTypography.labelSmall.copy(fontSize = 11.sp)
-                        },
-                        color = surfaces.labelSecondary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-                when (runState) {
-                    OverlayRunState.EXECUTING -> {
-                        Surface(
-                            shape = RoundedCornerShape(cg(2.5f)),
-                            color = surfaces.red,
-                            modifier = Modifier.clickable(onClick = onStopAction)
-                        ) {
-                            Text(
-                                text = "Stop",
-                                style = CitrosTypography.labelSmall.copy(fontSize = 11.sp),
-                                color = Color.White,
-                                fontWeight = FontWeight.SemiBold,
-                                modifier = Modifier.padding(horizontal = cg(2.5f), vertical = cg(1f))
-                            )
-                        }
-                    }
-                    OverlayRunState.COMPLETED -> {
-                        Box(
-                            modifier = Modifier
-                                .size(cg(4.5f))
-                                .background(surfaces.green, CircleShape),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Text(
-                                text = "✓",
-                                style = CitrosTypography.labelSmall.copy(fontSize = 10.sp),
-                                color = contrastOn(surfaces.green)
-                            )
-                        }
-                    }
-                    OverlayRunState.FAILED,
-                    OverlayRunState.STOPPED -> {
-                        // Error indicator is shown as a red badge over the orb.
-                    }
-                    OverlayRunState.IDLE -> {
-                        if (unreadCount > 0) {
-                            Box(
-                                modifier = Modifier
-                                    .size(cg(4.5f))
-                                    .background(flavor.primary, CircleShape),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Text(
-                                    text = unreadCount.toString(),
-                                    style = CitrosTypography.labelSmall.copy(fontSize = 10.sp),
-                                    color = contrastOn(flavor.primary)
+                            if (isExecuting) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(orbSize + cg(1)),
+                                    color = flavorTokens.orbColor,
+                                    trackColor = if (isDarkTheme) {
+                                        Color.White.copy(alpha = 0.14f)
+                                    } else {
+                                        Color.Black.copy(alpha = 0.14f)
+                                    },
+                                    strokeWidth = 1.75.dp
                                 )
                             }
+                            CitrosDirectiveOrb(
+                                flavor = flavor,
+                                size = orbSize,
+                                colorOverride = if (isFailed) surfaces.red else null,
+                                innerOverride = if (isFailed) Color.White.copy(alpha = 0.22f) else null,
+                                glowOverride = if (isFailed) surfaces.red.copy(alpha = 0.30f) else flavorTokens.orbGlow
+                            )
                         }
+                    }
+
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxHeight(),
+                        contentAlignment = Alignment.BottomCenter
+                    ) {
+                        Text(
+                            text = statusText,
+                            style = CitrosTypography.labelMedium.copy(fontSize = 11.sp),
+                            color = surfaces.labelSecondary,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(start = cg(1), end = cg(1), bottom = textBottomPadding)
+                        )
+                    }
+
+                    Box(
+                        modifier = Modifier
+                            .fillMaxHeight()
+                            .width(sideLaneWidth)
+                            .padding(vertical = sideLaneVerticalPadding),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        when (runState) {
+                            OverlayRunState.EXECUTING -> {
+                                Surface(
+                                    shape = CircleShape,
+                                    color = surfaces.red,
+                                    modifier = Modifier
+                                        .size(stateIndicatorSize)
+                                        .clickable(onClick = onStopAction),
+                                    tonalElevation = 2.dp
+                                ) {
+                                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                        Text(
+                                            text = "■",
+                                            style = CitrosTypography.labelSmall.copy(fontSize = 10.sp),
+                                            color = Color.White
+                                        )
+                                    }
+                                }
+                            }
+                            OverlayRunState.COMPLETED -> {
+                                Box(
+                                    modifier = Modifier
+                                        .size(stateIndicatorSize)
+                                        .background(surfaces.green, CircleShape),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    CitrosStatusCheckGlyph(
+                                        modifier = Modifier.size(stateIndicatorSize * 0.64f),
+                                        color = Color.White,
+                                        strokeWidthFraction = 0.22f
+                                    )
+                                }
+                            }
+                            OverlayRunState.FAILED,
+                            OverlayRunState.STOPPED -> {
+                                Box(
+                                    modifier = Modifier
+                                        .size(stateIndicatorSize)
+                                        .background(surfaces.red, CircleShape),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        text = "!",
+                                        style = CitrosTypography.labelSmall.copy(fontSize = 12.sp),
+                                        color = Color.White,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                            }
+                            OverlayRunState.IDLE -> {
+                                if (unreadCount > 0) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(stateIndicatorSize)
+                                            .background(flavor.primary, CircleShape),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                    Text(
+                                        text = unreadCount.toString(),
+                                        style = CitrosTypography.labelSmall.copy(fontSize = 11.sp),
+                                        color = contrastOn(flavor.primary)
+                                    )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (!debugBadgeText.isNullOrBlank()) {
+                    Surface(
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(top = cg(0.5f), end = cg(0.5f)),
+                        shape = RoundedCornerShape(cg(2)),
+                        color = Color.Black.copy(alpha = 0.62f),
+                        border = BorderStroke(0.5.dp, Color.White.copy(alpha = 0.22f))
+                    ) {
+                        Text(
+                            text = debugBadgeText,
+                            style = CitrosTypography.labelSmall.copy(fontSize = 8.sp),
+                            color = Color.White.copy(alpha = 0.92f),
+                            maxLines = 1,
+                            overflow = TextOverflow.Clip,
+                            modifier = Modifier.padding(horizontal = cg(1), vertical = 1.dp)
+                        )
                     }
                 }
             }
@@ -1014,4 +1082,29 @@ internal fun runStateColor(runState: OverlayRunState): Color = when (runState) {
     OverlayRunState.IDLE -> Color.Unspecified
     OverlayRunState.EXECUTING, OverlayRunState.COMPLETED -> SuccessColor
     OverlayRunState.FAILED, OverlayRunState.STOPPED -> ErrorColor
+}
+
+@Composable
+private fun CitrosStatusCheckGlyph(
+    modifier: Modifier = Modifier,
+    color: Color,
+    strokeWidthFraction: Float = 0.18f
+) {
+    Canvas(modifier = modifier) {
+        val strokeWidth = size.minDimension * strokeWidthFraction.coerceIn(0.10f, 0.30f)
+        drawLine(
+            color = color,
+            start = Offset(x = size.width * 0.18f, y = size.height * 0.56f),
+            end = Offset(x = size.width * 0.42f, y = size.height * 0.80f),
+            strokeWidth = strokeWidth,
+            cap = StrokeCap.Round
+        )
+        drawLine(
+            color = color,
+            start = Offset(x = size.width * 0.40f, y = size.height * 0.80f),
+            end = Offset(x = size.width * 0.84f, y = size.height * 0.24f),
+            strokeWidth = strokeWidth,
+            cap = StrokeCap.Round
+        )
+    }
 }
