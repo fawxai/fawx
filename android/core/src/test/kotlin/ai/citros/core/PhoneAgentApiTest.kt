@@ -115,6 +115,297 @@ class PhoneAgentApiTest {
     }
 
     @Test
+    fun `explicit fetch intent injects web_fetch when model returns end_turn`() = runTest {
+        server.enqueue(MockResponse()
+            .setBody("""{"content":[{"type":"text","text":"I can summarize that."}],"role":"assistant","stop_reason":"end_turn"}""")
+            .setResponseCode(200)
+            .addHeader("Content-Type", "application/json"))
+
+        val agent = createAgent()
+        val response = agent.sendMessage("Fetch https://docs.openclaw.ai and summarize.", null, isActionLoop = false)
+
+        assertEquals("tool_use", response.stopReason)
+        val webFetch = response.toolCalls.firstOrNull { it.name == "web_fetch" }
+        assertNotNull(webFetch)
+        assertEquals("https://docs.openclaw.ai", webFetch.input["url"])
+    }
+
+    @Test
+    fun `explicit fetch intent appends web_fetch when model only emits think`() = runTest {
+        server.enqueue(MockResponse()
+            .setBody(
+                """{"content":[{"type":"tool_use","id":"think_1","name":"think","input":{"thought":"Need page contents first"}}],"role":"assistant","stop_reason":"tool_use"}"""
+            )
+            .setResponseCode(200)
+            .addHeader("Content-Type", "application/json"))
+
+        val agent = createAgent()
+        val response = agent.sendMessage("Fetch https://docs.openclaw.ai and summarize.", null, isActionLoop = false)
+
+        assertEquals("tool_use", response.stopReason)
+        assertTrue(response.toolCalls.any { it.name == "think" })
+        val webFetch = response.toolCalls.firstOrNull { it.name == "web_fetch" }
+        assertNotNull(webFetch)
+        assertEquals("https://docs.openclaw.ai", webFetch.input["url"])
+    }
+
+    @Test
+    fun `explicit fetch intent does not inject when model already returned web_fetch`() = runTest {
+        val modelResponse = ChatResponse(
+            text = null,
+            toolCalls = listOf(
+                ToolCall(
+                    id = "wf_existing",
+                    name = "web_fetch",
+                    input = mapOf("url" to "https://docs.openclaw.ai")
+                )
+            ),
+            stopReason = "tool_use"
+        )
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(listOf(modelResponse))
+        )
+        val agent = PhoneAgentApi(client, client).also { it.phoneControlOverride = true }
+
+        val response = agent.sendMessage("Fetch https://docs.openclaw.ai and summarize.", null, isActionLoop = false)
+
+        assertEquals(modelResponse, response)
+        assertEquals(1, response.toolCalls.count { it.name == "web_fetch" })
+        assertEquals("wf_existing", response.toolCalls.single().id)
+    }
+
+    @Test
+    fun `small tier sendMessage passes model-aware tools to API`() = runTest {
+        val smallTierClient = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            modelId = "claude-3-5-haiku-20241022",
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = "I can summarize that.",
+                        toolCalls = emptyList(),
+                        stopReason = "end_turn"
+                    )
+                )
+            )
+        )
+        val agent = PhoneAgentApi(smallTierClient, smallTierClient).also { it.phoneControlOverride = true }
+
+        val response = agent.sendMessage(
+            "Fetch https://docs.openclaw.ai and summarize.",
+            null,
+            isActionLoop = false
+        )
+
+        val toolNamesPassedToApi = smallTierClient.lastTools.orEmpty().map { it.name }.toSet()
+        assertFalse("web_fetch" in toolNamesPassedToApi)
+        assertFalse("web_search" in toolNamesPassedToApi)
+        assertTrue("tap" in toolNamesPassedToApi)
+        assertTrue(response.toolCalls.isEmpty())
+        assertEquals("end_turn", response.stopReason)
+    }
+
+    @Test
+    fun `small tier continueAfterTools passes model-aware tools to API`() = runTest {
+        val chatClient = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            modelId = "claude-sonnet-4-5-20250929",
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(ToolCall("t1", "tap", mapOf("x" to 10, "y" to 20))),
+                        stopReason = "tool_use"
+                    )
+                )
+            )
+        )
+        val actionClient = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            modelId = "claude-3-5-haiku-20241022",
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = "Done",
+                        toolCalls = emptyList(),
+                        stopReason = "end_turn"
+                    )
+                )
+            )
+        )
+        val agent = PhoneAgentApi(chatClient = chatClient, actionClient = actionClient).also {
+            it.phoneControlOverride = true
+        }
+
+        val first = agent.sendMessage("Tap submit", null, isActionLoop = false)
+        assertEquals("tool_use", first.stopReason)
+
+        val continuation = agent.continueAfterTools()
+        val toolNamesPassedToApi = actionClient.lastTools.orEmpty().map { it.name }.toSet()
+
+        assertEquals("end_turn", continuation.stopReason)
+        assertEquals(1, actionClient.chatWithToolsCalls)
+        assertFalse("web_fetch" in toolNamesPassedToApi)
+        assertFalse("web_search" in toolNamesPassedToApi)
+        assertTrue("tap" in toolNamesPassedToApi)
+    }
+
+    @Test
+    fun `url mention without fetch intent does not inject web_fetch`() = runTest {
+        server.enqueue(MockResponse()
+            .setBody("""{"content":[{"type":"text","text":"That site contains OpenClaw docs."}],"role":"assistant","stop_reason":"end_turn"}""")
+            .setResponseCode(200)
+            .addHeader("Content-Type", "application/json"))
+
+        val agent = createAgent()
+        val response = agent.sendMessage("What is https://docs.openclaw.ai?", null, isActionLoop = false)
+
+        assertTrue(response.toolCalls.isEmpty())
+        assertEquals("end_turn", response.stopReason)
+    }
+
+    @Test
+    fun `explicit fetch intent does not inject during action loop`() = runTest {
+        server.enqueue(MockResponse()
+            .setBody("""{"content":[{"type":"text","text":"I can summarize that."}],"role":"assistant","stop_reason":"end_turn"}""")
+            .setResponseCode(200)
+            .addHeader("Content-Type", "application/json"))
+
+        val agent = createAgent()
+        val response = agent.sendMessage(
+            "Fetch https://docs.openclaw.ai and summarize.",
+            null,
+            isActionLoop = true
+        )
+
+        assertTrue(response.toolCalls.isEmpty())
+        assertEquals("end_turn", response.stopReason)
+    }
+
+    @Test
+    fun `explicit fetch intent does not inject when web_fetch tool unavailable`() = runTest {
+        val smallTierClient = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            modelId = "claude-3-5-haiku-20241022",
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = "I can summarize that.",
+                        toolCalls = emptyList(),
+                        stopReason = "end_turn"
+                    )
+                )
+            )
+        )
+        val agent = PhoneAgentApi(smallTierClient, smallTierClient).also { it.phoneControlOverride = true }
+
+        val response = agent.sendMessage(
+            "Fetch https://docs.openclaw.ai and summarize.",
+            null,
+            isActionLoop = false
+        )
+
+        assertTrue(response.toolCalls.isEmpty())
+        assertEquals("end_turn", response.stopReason)
+    }
+
+    @Test
+    fun `explicit fetch intent does not modify actionable non-think tool responses`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(
+                            ToolCall("ws1", "web_search", mapOf("query" to "openclaw docs"))
+                        ),
+                        stopReason = "tool_use"
+                    )
+                )
+            )
+        )
+        val agent = PhoneAgentApi(client, client).also { it.phoneControlOverride = true }
+
+        val response = agent.sendMessage(
+            "Fetch https://docs.openclaw.ai and summarize.",
+            null,
+            isActionLoop = false
+        )
+
+        assertEquals(1, response.toolCalls.size)
+        assertEquals("web_search", response.toolCalls.single().name)
+        assertFalse(response.toolCalls.any { it.name == "web_fetch" })
+        assertEquals("tool_use", response.stopReason)
+    }
+
+    @Test
+    fun `extractExplicitWebFetchUrl trims trailing punctuation`() {
+        val agent = createAgent()
+        assertEquals(
+            "https://docs.openclaw.ai/path",
+            agent.extractExplicitWebFetchUrl("Fetch https://docs.openclaw.ai/path).")
+        )
+        assertEquals(
+            "https://docs.openclaw.ai/path",
+            agent.extractExplicitWebFetchUrl("Please summarize https://docs.openclaw.ai/path],")
+        )
+    }
+
+    @Test
+    fun `extractExplicitWebFetchUrl rejects no-url and no-intent inputs`() {
+        val agent = createAgent()
+        assertNull(agent.extractExplicitWebFetchUrl("Fetch this page please"))
+        assertNull(agent.extractExplicitWebFetchUrl("https://docs.openclaw.ai"))
+        assertNull(agent.extractExplicitWebFetchUrl("I read https://docs.openclaw.ai yesterday"))
+    }
+
+    @Test
+    fun `extractExplicitWebFetchUrl requires explicit read object to avoid generic over-trigger`() {
+        val agent = createAgent()
+        assertNull(agent.extractExplicitWebFetchUrl("I like to read https://docs.openclaw.ai"))
+        assertEquals(
+            "https://docs.openclaw.ai",
+            agent.extractExplicitWebFetchUrl("Read this URL https://docs.openclaw.ai")
+        )
+        assertEquals(
+            "https://docs.openclaw.ai",
+            agent.extractExplicitWebFetchUrl("https://docs.openclaw.ai and read it")
+        )
+    }
+
+    @Test
+    fun `forced web_fetch id is stable and collision-resistant hex digest`() = runTest {
+        server.enqueue(MockResponse()
+            .setBody("""{"content":[{"type":"text","text":"Will fetch."}],"role":"assistant","stop_reason":"end_turn"}""")
+            .setResponseCode(200)
+            .addHeader("Content-Type", "application/json"))
+        server.enqueue(MockResponse()
+            .setBody("""{"content":[{"type":"text","text":"Will fetch."}],"role":"assistant","stop_reason":"end_turn"}""")
+            .setResponseCode(200)
+            .addHeader("Content-Type", "application/json"))
+        server.enqueue(MockResponse()
+            .setBody("""{"content":[{"type":"text","text":"Will fetch."}],"role":"assistant","stop_reason":"end_turn"}""")
+            .setResponseCode(200)
+            .addHeader("Content-Type", "application/json"))
+
+        val agent = createAgent()
+        val first = agent.sendMessage("Fetch https://docs.openclaw.ai and summarize.", null, false)
+        val second = agent.sendMessage("Fetch https://docs.openclaw.ai and summarize.", null, false)
+        val third = agent.sendMessage("Fetch https://example.com and summarize.", null, false)
+
+        val id1 = first.toolCalls.single { it.name == "web_fetch" }.id
+        val id2 = second.toolCalls.single { it.name == "web_fetch" }.id
+        val id3 = third.toolCalls.single { it.name == "web_fetch" }.id
+
+        assertEquals(id1, id2)
+        assertTrue(id1.matches(Regex("forced_web_fetch_[0-9a-f]{24}")))
+        assertTrue(id3.matches(Regex("forced_web_fetch_[0-9a-f]{24}")))
+        assertFalse(id1 == id3)
+    }
+
+    @Test
     fun `executeToolCall tap validates element_id parameter`() = runTest {
         val agent = createAgent()
 
@@ -3107,6 +3398,8 @@ class PhoneAgentApiTest {
         var lastMessages: List<Message>? = null
         /** Last system prompt passed to chatWithTools. */
         var lastSystemPrompt: String? = null
+        /** Last tool list passed to chatWithTools. */
+        var lastTools: List<Tool>? = null
 
         override suspend fun chat(conversation: Conversation): Result<String> {
             chatCalls++
@@ -3145,6 +3438,7 @@ class PhoneAgentApiTest {
             chatWithToolsCalls++
             lastMessages = messages.toList()
             lastSystemPrompt = systemPrompt
+            lastTools = tools.toList()
             return Result.success(toolResponses.removeFirst())
         }
 

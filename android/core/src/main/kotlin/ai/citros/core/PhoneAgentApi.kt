@@ -12,6 +12,8 @@ package ai.citros.core
  * @param actionClient Client for action loop follow-ups (e.g., Haiku for speed)
  */
 import android.util.Log
+import java.security.MessageDigest
+import java.nio.charset.StandardCharsets
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -334,7 +336,7 @@ open class PhoneAgentApi(
         /** Keywords that indicate the user wants a phone control action, not casual chat. */
         private val ACTION_HINTS = setOf(
             "open", "tap", "click", "press", "type", "send", "swipe", "scroll",
-            "go home", "launch", "find", "search", "turn on", "turn off",
+            "go home", "launch", "find", "search", "fetch", "turn on", "turn off",
             "take", "screenshot", "set", "timer", "check", "show", "call",
             "read", "write", "capture", "navigate", "enable", "disable",
             "go to", "go back", "install", "uninstall", "download", "share",
@@ -355,6 +357,13 @@ open class PhoneAgentApi(
             Regex("""<function_call>.*?</function_call>""", RegexOption.DOT_MATCHES_ALL),
             // JSON tool objects with known tool names (handles one level of nesting)
             Regex("""\{\s*"name"\s*:\s*"(tap|type_text|swipe|open_app|press_back|press_home|read_screen|screenshot|scroll|long_press|tap_text|open_notifications|wait|think|web_browse|web_search|web_fetch|request_tools)"[^{}]*(\{[^{}]*\}[^{}]*)?\}""")
+        )
+
+        private val EXPLICIT_WEB_FETCH_URL_REGEX =
+            Regex("""https?://[^\s\]\)>]+""", RegexOption.IGNORE_CASE)
+
+        private val EXPLICIT_WEB_FETCH_HINTS = setOf(
+            "fetch", "summarize", "summarise", "extract", "read"
         )
 
         /**
@@ -519,17 +528,24 @@ open class PhoneAgentApi(
             messagesWithPendingUser.toList()
         }
 
-        val result = client.chatWithTools(messagesForModel, systemPrompt = systemPrompt, tools = getToolsForModel())
+        val toolsForModel = getToolsForModel(client.modelId)
+        val result = client.chatWithTools(messagesForModel, systemPrompt = systemPrompt, tools = toolsForModel)
 
         return result.fold(
-            onSuccess = { response ->
+            onSuccess = { rawResponse ->
                 recordUsageOutcomeAndCheckBudgets(
-                    usage = response.usage,
+                    usage = rawResponse.usage,
                     modelId = client.modelId,
                     promptChars = approximateMessageChars(messagesForModel),
-                    responseChars = approximateResponseChars(response),
+                    responseChars = approximateResponseChars(rawResponse),
                     systemPromptChars = systemPrompt.length,
-                    toolSchemaChars = approximateToolSchemaChars(getToolsForModel())
+                    toolSchemaChars = approximateToolSchemaChars(toolsForModel)
+                )
+                val response = enforceExplicitWebFetchIntent(
+                    userMessage = userMessage,
+                    response = rawResponse,
+                    isActionLoop = isActionLoop,
+                    modelId = client.modelId
                 )
                 messages.add(pendingUserMessage)
                 appendAssistantResponse(response)
@@ -632,10 +648,11 @@ open class PhoneAgentApi(
         Log.d(TAG, "continueAfterTools: step=$currentToolStep, rawMessages=${messages.size}, compacted=${messagesForModel.size}")
 
         checkBudgetBeforeApiCall()
+        val toolsForModel = getToolsForModel(actionClient.modelId)
         val result = actionClient.chatWithTools(
             messagesForModel,
             systemPrompt = systemPrompt,
-            tools = getToolsForModel()
+            tools = toolsForModel
         )
 
         return result.fold(
@@ -646,7 +663,7 @@ open class PhoneAgentApi(
                     promptChars = approximateMessageChars(messagesForModel),
                     responseChars = approximateResponseChars(response),
                     systemPromptChars = systemPrompt.length,
-                    toolSchemaChars = approximateToolSchemaChars(getToolsForModel())
+                    toolSchemaChars = approximateToolSchemaChars(toolsForModel)
                 )
                 appendAssistantResponse(response)
                 response
@@ -1523,6 +1540,84 @@ open class PhoneAgentApi(
         if (trailing.any { it.role == Message.ROLE_USER }) return false
 
         return true
+    }
+
+    @androidx.annotation.VisibleForTesting
+    internal fun extractExplicitWebFetchUrl(userMessage: String): String? {
+        val normalized = userMessage.trim().lowercase()
+        if (normalized.isEmpty()) return null
+        if (!EXPLICIT_WEB_FETCH_HINTS.any { normalized.contains(it) }) return null
+
+        val urlMatch = EXPLICIT_WEB_FETCH_URL_REGEX.find(userMessage) ?: return null
+        val rawUrl = urlMatch.value
+
+        val preContext = normalized.substring(0, urlMatch.range.first)
+            .takeLast(120)
+            .trim()
+        val postContext = normalized.substring(urlMatch.range.last + 1)
+            .take(120)
+            .trim()
+
+        val hasExplicitVerbBeforeUrl =
+            preContext.matches(Regex(""".*\b(fetch|summari[sz]e|extract)\b.*""")) ||
+                preContext.matches(Regex(""".*\bread\b(?:\s+(?:this|that|the))?\s+(url|link|page|article|website|webpage|site)\b.*"""))
+
+        val hasExplicitVerbAfterUrl =
+            postContext.matches(Regex("""^(?:,|\.|;|:|\)|\]|\s)*(and\s+)?(fetch|summari[sz]e|extract)\b.*""")) ||
+                postContext.matches(Regex("""^(?:,|\.|;|:|\)|\]|\s)*(and\s+)?read\s+(it|this|that|the\s+(url|link|page|article|website|webpage|site))\b.*"""))
+
+        if (!hasExplicitVerbBeforeUrl && !hasExplicitVerbAfterUrl) return null
+
+        return rawUrl.trimEnd('.', ',', ';', ':', ')', ']', '>')
+    }
+
+    @androidx.annotation.VisibleForTesting
+    internal fun enforceExplicitWebFetchIntent(
+        userMessage: String,
+        response: ChatResponse,
+        isActionLoop: Boolean,
+        modelId: String?
+    ): ChatResponse {
+        if (isActionLoop) return response
+        val requestedUrl = extractExplicitWebFetchUrl(userMessage) ?: return response
+        if (response.toolCalls.any { it.name == "web_fetch" }) return response
+
+        val tools = getToolsForModel(modelId)
+        if (tools.none { it.name == "web_fetch" }) return response
+
+        val noActionableToolSelection =
+            response.toolCalls.isEmpty() || response.toolCalls.all { it.name == "think" }
+        if (!noActionableToolSelection) return response
+
+        val forcedToolCall = ToolCall(
+            id = buildForcedWebFetchToolCallId(requestedUrl),
+            name = "web_fetch",
+            input = mapOf("url" to requestedUrl)
+        )
+        val mergedToolCalls = if (response.toolCalls.isEmpty()) {
+            listOf(forcedToolCall)
+        } else {
+            response.toolCalls + forcedToolCall
+        }
+
+        Log.d(
+            TAG,
+            "enforceExplicitWebFetchIntent: injecting web_fetch for explicit fetch URL " +
+                "(url=$requestedUrl, originalStopReason=${response.stopReason}, originalTools=${response.toolCalls.map { it.name }})"
+        )
+
+        return response.copy(
+            text = response.text?.takeIf { it.isNotBlank() } ?: "Fetching requested URL.",
+            toolCalls = mergedToolCalls,
+            stopReason = "tool_use"
+        )
+    }
+
+    private fun buildForcedWebFetchToolCallId(requestedUrl: String): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+            .digest(requestedUrl.toByteArray(StandardCharsets.UTF_8))
+        val suffix = digest.joinToString("") { "%02x".format(it) }.take(24)
+        return "forced_web_fetch_$suffix"
     }
 
     /**
