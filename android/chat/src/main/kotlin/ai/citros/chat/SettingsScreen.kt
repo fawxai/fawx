@@ -42,6 +42,8 @@ import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.SwipeToDismissBox
 import androidx.compose.material3.SwipeToDismissBoxValue
@@ -148,6 +150,7 @@ fun SettingsScreen(
     val health = remember { mutableStateMapOf<String, KeyHealth>() }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
+    val snackbarHostState = remember { SnackbarHostState() }
     val flavor = remember { readSelectedFlavor(context) }
     val isDarkTheme = LocalCitrosIsDark.current
     val visuals = remember(flavor, isDarkTheme) {
@@ -174,6 +177,7 @@ fun SettingsScreen(
 
     Scaffold(
         containerColor = Color.Transparent,
+        snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
         floatingActionButton = {
             CitrosLiquidGlassSurface(
                 modifier = Modifier.size(56.dp),
@@ -347,11 +351,62 @@ fun SettingsScreen(
                 }
 
                 val activeProvider = walletState.keys.find { it.id == walletState.activeKeyId }?.provider
+                val activeConfig = remember(walletState, keyStore) {
+                    walletState.activeConfig(keyStore)
+                }
+                val modelCatalogRefreshTick = rememberModelCatalogRefreshTick(
+                    activeConfig = activeConfig,
+                    extraKey = walletState.activeKeyId,
+                    logTag = "SettingsScreen"
+                )
+
                 if (activeProvider != null) {
+                    val chatModels = remember(activeProvider, modelCatalogRefreshTick) {
+                        ModelConfig.runtimeChatModels(activeProvider)
+                    }
+                    val actionModels = remember(activeProvider, modelCatalogRefreshTick) {
+                        ModelConfig.runtimeActionModels(activeProvider)
+                    }
+
+                    LaunchedEffect(
+                        activeProvider,
+                        chatModels,
+                        actionModels,
+                        walletState.chatModelId,
+                        walletState.actionModelId
+                    ) {
+                        val correction = computeRuntimeModelSelectionCorrection(
+                            provider = activeProvider,
+                            selectedChatModelId = walletState.chatModelId,
+                            selectedActionModelId = walletState.actionModelId,
+                            chatModels = chatModels,
+                            actionModels = actionModels
+                        )
+
+                        var changed = false
+                        if (correction.chatModelId != walletState.chatModelId) {
+                            walletManager.setChatModel(correction.chatModelId)
+                            changed = true
+                        }
+                        if (correction.actionModelId != walletState.actionModelId) {
+                            walletManager.setActionModel(correction.actionModelId)
+                            changed = true
+                        }
+
+                        if (changed) {
+                            refreshAndReconfigure()
+                            correction.notices.forEach { notice ->
+                                snackbarHostState.showSnackbar(notice)
+                            }
+                        }
+                    }
+
                     ModelSelectionSection(
                         activeProvider = activeProvider,
                         chatModelId = walletState.chatModelId,
                         actionModelId = walletState.actionModelId,
+                        chatModels = chatModels,
+                        actionModels = actionModels,
                         flavor = flavor,
                         onChatChange = {
                             walletManager.setChatModel(it)
@@ -513,12 +568,12 @@ internal fun ModelSelectionSection(
     activeProvider: Provider,
     chatModelId: String,
     actionModelId: String,
+    chatModels: List<String>,
+    actionModels: List<String>,
     flavor: CitrosFlavor = CitrosFlavor.TANGERINE,
     onChatChange: (String) -> Unit,
     onActionChange: (String) -> Unit
 ) {
-    val chatModels = ModelConfig.chatModelsForProvider(activeProvider)
-    val actionModels = ModelConfig.actionModelsForProvider(activeProvider)
     var chatExpanded by remember { mutableStateOf(false) }
     var actionExpanded by remember { mutableStateOf(false) }
     val accent = lerp(providerAccent(activeProvider), flavor.primary, 0.44f)

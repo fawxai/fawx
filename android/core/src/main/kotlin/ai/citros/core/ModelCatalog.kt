@@ -242,4 +242,11 @@ object ModelCatalog {
     internal fun clearCache() {
         synchronized(cache) { cache.clear() }
     }
+
+    /** Inject cache for deterministic unit tests without network fetches. */
+    internal fun setCachedModelsForTesting(provider: Provider, models: List<CachedModel>) {
+        synchronized(cache) {
+            cache[provider] = CacheEntry(models = models)
+        }
+    }
 }

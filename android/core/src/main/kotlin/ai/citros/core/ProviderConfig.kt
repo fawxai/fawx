@@ -40,13 +40,16 @@ data class ProviderConfig(
      * - Warnings should be logged via `Log.w` and optionally shown as a toast/snackbar
      *   so users know their model ID may be stale or mistyped.
      */
-    fun validateModels(): List<String> {
+    fun validateModels(
+        knownChatModels: Set<String> = ModelConfig.runtimeChatModels(provider).toSet(),
+        knownActionModels: Set<String> = ModelConfig.runtimeActionModels(provider).toSet()
+    ): List<String> {
         val warnings = mutableListOf<String>()
-        val chatResult = ModelConfig.validateModel(provider, chatModelId)
+        val chatResult = ModelConfig.validateModel(provider, chatModelId, knownChatModels)
         if (!chatResult.valid) {
             warnings += "Chat model: ${chatResult.message}"
         }
-        val actionResult = ModelConfig.validateModel(provider, actionModelId)
+        val actionResult = ModelConfig.validateModel(provider, actionModelId, knownActionModels)
         if (!actionResult.valid) {
             warnings += "Action model: ${actionResult.message}"
         }

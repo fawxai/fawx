@@ -1400,8 +1400,8 @@ internal fun ModelsSettingsScreen(
         onBack = onBack
     ) {
         if (activeProvider != null) {
-            val chatModels = ai.citros.core.ModelConfig.chatModelsForProvider(activeProvider)
-            val actionModels = ai.citros.core.ModelConfig.actionModelsForProvider(activeProvider)
+            val chatModels = ai.citros.core.ModelConfig.runtimeChatModels(activeProvider)
+            val actionModels = ai.citros.core.ModelConfig.runtimeActionModels(activeProvider)
             SettingsSectionHeader("Chat Model")
             SettingsGroupedSurface {
                 chatModels.forEachIndexed { index, modelId ->

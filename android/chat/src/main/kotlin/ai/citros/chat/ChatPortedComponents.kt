@@ -118,6 +118,7 @@ internal fun ChatEmptyState(
 @Composable
 internal fun QuickSwitcherSheet(
     walletState: WalletState,
+    activeConfig: ai.citros.core.ProviderConfig? = null,
     flavor: CitrosFlavor = CitrosFlavor.TANGERINE,
     onDismiss: () -> Unit,
     onSelectKey: (String) -> Unit,
@@ -137,8 +138,12 @@ internal fun QuickSwitcherSheet(
     val localModelId = remember(prefs) {
         prefs.getString("local_model", "qwen2.5:3b") ?: "qwen2.5:3b"
     }
-    val cloudModels = remember(provider) {
-        provider?.let { ModelConfig.chatModelsForProvider(it) } ?: emptyList()
+    val modelCatalogRefreshTick = rememberModelCatalogRefreshTick(
+        activeConfig = activeConfig,
+        logTag = "QuickSwitcherSheet"
+    )
+    val cloudModels = remember(provider, modelCatalogRefreshTick) {
+        provider?.let { ModelConfig.runtimeChatModels(it) } ?: emptyList()
     }
     val modelRows = remember(cloudModels, localModelId) {
         buildList {

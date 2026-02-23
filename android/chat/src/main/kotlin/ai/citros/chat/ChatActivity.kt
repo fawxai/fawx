@@ -1819,6 +1819,7 @@ fun ChatScreen(
     if (showQuickSwitcher && canInteractWithModel) {
         QuickSwitcherSheet(
             walletState = walletState,
+            activeConfig = walletState.activeConfig(walletKeyStore),
             flavor = selectedFlavor,
             onDismiss = { showQuickSwitcher = false },
             onSelectKey = { keyId ->

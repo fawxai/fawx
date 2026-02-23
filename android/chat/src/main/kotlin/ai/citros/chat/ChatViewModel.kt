@@ -397,6 +397,9 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
             return
         }
 
+        // Intentional: fire-and-forget refresh. We build immediately from cached/static
+        // models for fast startup, then UI-level recomposition picks up refreshed catalog.
+        refreshModelCatalogAsync(config)
         val backend = buildWalletBackend(config)
 
         apiBackends.clear()
@@ -443,6 +446,9 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
         // formats or blow the new model's context window. Instead, rely on
         // seedConversationHistory() called in ChatViewModel.sendMessage() which re-seeds text-only
         // conversational context from UI messages on the next turn (#609).
+        // Same intentional ordering as configureWithWallet: use cached/static immediately,
+        // refresh catalog asynchronously for subsequent runtime resolutions.
+        refreshModelCatalogAsync(config)
         val updatedBackend = buildWalletBackend(config)
         apiBackends[activeIndex] = updatedBackend
         activateApiBackend(activeIndex)
@@ -477,6 +483,7 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
                         Provider.OPENROUTER -> ProviderConfig.openRouter(token)
                         Provider.OPENAI -> ProviderConfig.openAi(token)
                     }
+                    refreshModelCatalogAsync(config)
                     config to buildWalletBackend(config)
                 }.getOrNull()
             }
@@ -548,22 +555,67 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
         }
     }
 
+    private fun refreshModelCatalogAsync(config: ProviderConfig) {
+        viewModelScope.launch {
+            runCatching {
+                ModelCatalog.getModels(config)
+            }.onFailure { error ->
+                Log.d(
+                    TAG,
+                    "Model catalog refresh failed for ${config.provider}: ${error.message}"
+                )
+            }
+        }
+    }
+
+    private fun resolveRuntimeProviderConfig(
+        config: ProviderConfig,
+        allowedChatModels: List<String> = ModelConfig.runtimeChatModels(config.provider),
+        allowedActionModels: List<String> = ModelConfig.runtimeActionModels(config.provider)
+    ): ProviderConfig {
+        val provider = config.provider
+
+        val resolvedChatModel = when {
+            config.chatModelId in allowedChatModels -> config.chatModelId
+            ModelConfig.defaultChatModel(provider) in allowedChatModels -> ModelConfig.defaultChatModel(provider)
+            allowedChatModels.isNotEmpty() -> allowedChatModels.first()
+            else -> config.chatModelId
+        }
+
+        val resolvedActionModel = when {
+            config.actionModelId in allowedActionModels &&
+                ModelConfig.isModelAboveFloor(provider, config.actionModelId) -> config.actionModelId
+            ModelConfig.defaultActionModel(provider) in allowedActionModels -> ModelConfig.defaultActionModel(provider)
+            allowedActionModels.isNotEmpty() -> allowedActionModels.first()
+            else -> config.actionModelId
+        }
+
+        if (resolvedChatModel != config.chatModelId || resolvedActionModel != config.actionModelId) {
+            Log.w(
+                TAG,
+                "Adjusted wallet model selection for ${provider.name}: " +
+                    "chat=${config.chatModelId}→$resolvedChatModel, " +
+                    "action=${config.actionModelId}→$resolvedActionModel"
+            )
+        }
+
+        return config.copy(
+            chatModelId = resolvedChatModel,
+            actionModelId = resolvedActionModel
+        )
+    }
+
     private fun buildWalletBackend(config: ProviderConfig): ApiBackend {
-        val chatConfig = config
-        // Action model must meet the security floor (Sonnet-tier minimum) because
-        // the action loop processes untrusted screen content. Always uses the
-        // provider's default action model regardless of chat model selection.
-        // Note: config.actionModelId from the wallet is intentionally ignored here.
-        // lastWalletActionModelId tracking in updateModelsFromWallet() is
-        // forward-compatible for when user-selectable action models are enabled.
-        val actionModelId = ModelConfig.defaultActionModel(config.provider)
-        val actionConfig = config.copy(chatModelId = actionModelId)
+        val runtimeConfig = resolveRuntimeProviderConfig(config)
+        val chatConfig = runtimeConfig
+        val actionModelId = runtimeConfig.actionModelId
+        val actionConfig = runtimeConfig.copy(chatModelId = actionModelId)
 
         val chatClient = createProviderClient(chatConfig)
         val actionClient = createProviderClient(actionConfig)
 
         return ApiBackend(
-            provider = config.provider,
+            provider = runtimeConfig.provider,
             chatClient = chatClient,
             actionClient = actionClient,
             agent = PhoneAgentApi(

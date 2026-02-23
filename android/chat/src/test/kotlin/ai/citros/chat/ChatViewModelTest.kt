@@ -8,8 +8,12 @@ import ai.citros.core.MemoryMetadata
 import ai.citros.core.MemoryProvider
 import ai.citros.core.MemoryResult
 import ai.citros.core.Message
+import ai.citros.core.ModelCatalog
+import ai.citros.core.ModelConfig
+import ai.citros.core.ModelTier
 import ai.citros.core.Provider
 import ai.citros.core.ProviderClient
+import ai.citros.core.ProviderConfig
 import ai.citros.core.ProviderException
 import ai.citros.core.ScreenContent
 import ai.citros.core.ScreenElement
@@ -52,6 +56,7 @@ class ChatViewModelTest {
     fun tearDown() {
         ai.citros.core.ScreenReader.toolLoopOverlayHideHook = null
         ai.citros.core.ScreenReader.toolLoopOverlayRestoreHook = null
+        ModelCatalog.clearCache()
         Dispatchers.resetMain()
     }
 
@@ -1285,6 +1290,136 @@ class ChatViewModelTest {
         assertTrue(viewModel.isConfigured.value)
     }
 
+    @Test
+    fun `configureWithWallet honors selected above-floor action model`() {
+        val keyStore = InMemoryKeyStore()
+        val storage = InMemoryWalletStorage()
+        val walletManager = ai.citros.core.WalletManager(storage, keyStore)
+
+        walletManager.addKey(Provider.OPENROUTER, "OpenRouter Key", "sk-or-test-key")
+        walletManager.setActiveKey(walletManager.loadOrDefault().keys.first().id)
+        walletManager.setChatModel("anthropic/claude-sonnet-4.5")
+        walletManager.setActionModel("anthropic/claude-opus-4.5")
+
+        viewModel.configureWithWallet(walletManager)
+
+        val backends = getPrivateField<List<Any>>("apiBackends")!!
+        val activeIdx = getPrivateField<Int>("activeApiBackendIndex")!!
+        val backend = backends[activeIdx]
+        val actionClientField = backend::class.java.getDeclaredField("actionClient")
+        actionClientField.isAccessible = true
+        val actionClient = actionClientField.get(backend) as ProviderClient
+
+        assertEquals("anthropic/claude-opus-4.5", actionClient.modelId)
+    }
+
+    @Test
+    fun `configureWithWallet falls back action model when below floor`() {
+        val keyStore = InMemoryKeyStore()
+        val storage = InMemoryWalletStorage()
+        val walletManager = ai.citros.core.WalletManager(storage, keyStore)
+
+        walletManager.addKey(Provider.OPENAI, "OpenAI Key", "sk-test-openai-key")
+        walletManager.setActiveKey(walletManager.loadOrDefault().keys.first().id)
+        walletManager.setActionModel("gpt-4o-mini")
+
+        viewModel.configureWithWallet(walletManager)
+
+        val backends = getPrivateField<List<Any>>("apiBackends")!!
+        val activeIdx = getPrivateField<Int>("activeApiBackendIndex")!!
+        val backend = backends[activeIdx]
+        val actionClientField = backend::class.java.getDeclaredField("actionClient")
+        actionClientField.isAccessible = true
+        val actionClient = actionClientField.get(backend) as ProviderClient
+
+        assertEquals(ai.citros.core.ModelConfig.OPENAI_ACTION_MODEL, actionClient.modelId)
+    }
+
+    @Test
+    fun `resolveRuntimeProviderConfig keeps allowed chat and action models`() {
+        ModelCatalog.clearCache()
+        ModelCatalog.setCachedModelsForTesting(
+            Provider.OPENAI,
+            listOf(
+                ModelCatalog.CachedModel("gpt-4o", null, ModelTier.STANDARD, Provider.OPENAI),
+                ModelCatalog.CachedModel("o3", null, ModelTier.FLAGSHIP, Provider.OPENAI)
+            )
+        )
+
+        val resolved = invokeResolveRuntimeProviderConfig(
+            ProviderConfig.openAi("sk-test").copy(chatModelId = "o3", actionModelId = "gpt-4o")
+        )
+        assertEquals("o3", resolved.chatModelId)
+        assertEquals("gpt-4o", resolved.actionModelId)
+    }
+
+    @Test
+    fun `resolveRuntimeProviderConfig falls back chat to default then first allowed`() {
+        ModelCatalog.clearCache()
+        ModelCatalog.setCachedModelsForTesting(
+            Provider.OPENAI,
+            listOf(ModelCatalog.CachedModel("o3", null, ModelTier.FLAGSHIP, Provider.OPENAI))
+        )
+
+        val resolved = invokeResolveRuntimeProviderConfig(
+            ProviderConfig.openAi("sk-test").copy(chatModelId = "unknown-chat", actionModelId = "gpt-4o")
+        )
+        assertEquals("o3", resolved.chatModelId)
+    }
+
+    @Test
+    fun `resolveRuntimeProviderConfig falls back action when below floor or missing`() {
+        ModelCatalog.clearCache()
+        ModelCatalog.setCachedModelsForTesting(
+            Provider.OPENAI,
+            listOf(
+                ModelCatalog.CachedModel("gpt-4o-mini", null, ModelTier.SMALL, Provider.OPENAI),
+                ModelCatalog.CachedModel("o3", null, ModelTier.FLAGSHIP, Provider.OPENAI)
+            )
+        )
+
+        val belowFloorResolved = invokeResolveRuntimeProviderConfig(
+            ProviderConfig.openAi("sk-test").copy(chatModelId = "o3", actionModelId = "gpt-4o-mini")
+        )
+        assertEquals("o3", belowFloorResolved.actionModelId)
+
+        val missingResolved = invokeResolveRuntimeProviderConfig(
+            ProviderConfig.openAi("sk-test").copy(chatModelId = "o3", actionModelId = "missing")
+        )
+        assertEquals("o3", missingResolved.actionModelId)
+    }
+
+    @Test
+    fun `resolveRuntimeProviderConfig preserves config when allowed lists are empty`() {
+        val original = ProviderConfig.openAi("sk-test").copy(
+            chatModelId = "custom-chat",
+            actionModelId = "custom-action"
+        )
+        val resolved = invokeResolveRuntimeProviderConfig(
+            config = original,
+            allowedChatModels = emptyList(),
+            allowedActionModels = emptyList()
+        )
+
+        assertEquals("custom-chat", resolved.chatModelId)
+        assertEquals("custom-action", resolved.actionModelId)
+    }
+
+    @Test
+    fun `resolveRuntimeProviderConfig uses static fallback when cache is cold`() {
+        ModelCatalog.clearCache()
+
+        val resolved = invokeResolveRuntimeProviderConfig(
+            ProviderConfig.openAi("sk-test").copy(
+                chatModelId = "brand-new-model",
+                actionModelId = "brand-new-action"
+            )
+        )
+
+        assertEquals(ModelConfig.defaultChatModel(Provider.OPENAI), resolved.chatModelId)
+        assertEquals(ModelConfig.defaultActionModel(Provider.OPENAI), resolved.actionModelId)
+    }
+
     // ========== PR #622: model switch text-only seed ==========
 
     @Test
@@ -1904,6 +2039,21 @@ class ChatViewModelTest {
         val field = ChatViewModel::class.java.getDeclaredField(name)
         field.isAccessible = true
         return field.get(viewModel) as T?
+    }
+
+    private fun invokeResolveRuntimeProviderConfig(
+        config: ProviderConfig,
+        allowedChatModels: List<String> = ModelConfig.runtimeChatModels(config.provider),
+        allowedActionModels: List<String> = ModelConfig.runtimeActionModels(config.provider)
+    ): ProviderConfig {
+        val method = ChatViewModel::class.java.getDeclaredMethod(
+            "resolveRuntimeProviderConfig",
+            ProviderConfig::class.java,
+            List::class.java,
+            List::class.java
+        )
+        method.isAccessible = true
+        return method.invoke(viewModel, config, allowedChatModels, allowedActionModels) as ProviderConfig
     }
 
     private class ScriptedProviderClient(

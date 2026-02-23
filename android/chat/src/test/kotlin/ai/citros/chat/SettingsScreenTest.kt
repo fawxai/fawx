@@ -21,6 +21,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 @RunWith(RobolectricTestRunner::class)
@@ -275,6 +276,36 @@ class SettingsScreenTest {
             )
         }
         composeRule.onNodeWithText("Version, licenses", useUnmergedTree = true).assertExists()
+    }
+
+    @Test
+    fun `computeRuntimeModelSelectionCorrection applies deterministic fallbacks and notices`() {
+        val correction = computeRuntimeModelSelectionCorrection(
+            provider = Provider.OPENAI,
+            selectedChatModelId = "missing-chat",
+            selectedActionModelId = "gpt-4o-mini",
+            chatModels = listOf("o3", "gpt-4o"),
+            actionModels = listOf("o3", "gpt-4o")
+        )
+
+        assertEquals("o3", correction.chatModelId)
+        assertEquals("o3", correction.actionModelId)
+        assertEquals(2, correction.notices.size)
+    }
+
+    @Test
+    fun `computeRuntimeModelSelectionCorrection keeps valid selections unchanged`() {
+        val correction = computeRuntimeModelSelectionCorrection(
+            provider = Provider.ANTHROPIC,
+            selectedChatModelId = "claude-opus-4-6",
+            selectedActionModelId = "claude-sonnet-4-5-20250929",
+            chatModels = listOf("claude-opus-4-6", "claude-sonnet-4-5-20250929"),
+            actionModels = listOf("claude-sonnet-4-5-20250929")
+        )
+
+        assertEquals("claude-opus-4-6", correction.chatModelId)
+        assertEquals("claude-sonnet-4-5-20250929", correction.actionModelId)
+        assertFalse(correction.notices.isNotEmpty())
     }
 
     private class InMemoryWalletStorage : ai.citros.core.WalletStorage {

@@ -139,7 +139,7 @@ internal fun QuickSwitcherBottomSheet(
                 Text("Chat Model", style = CitrosTypography.titleSmall)
                 Spacer(Modifier.height(QuickSpacingXs))
                 Row(horizontalArrangement = Arrangement.spacedBy(QuickSpacingXs)) {
-                    ModelConfig.chatModelsForProvider(provider).forEach { model ->
+                    ModelConfig.runtimeChatModels(provider).forEach { model ->
                         FilterChip(
                             selected = model == walletState.chatModelId,
                             onClick = { onSelectChatModel(model) },
@@ -152,7 +152,7 @@ internal fun QuickSwitcherBottomSheet(
                 Text("Action Model", style = CitrosTypography.titleSmall)
                 Spacer(Modifier.height(QuickSpacingXs))
                 Row(horizontalArrangement = Arrangement.spacedBy(QuickSpacingXs)) {
-                    ModelConfig.actionModelsForProvider(provider).forEach { model ->
+                    ModelConfig.runtimeActionModels(provider).forEach { model ->
                         FilterChip(
                             selected = model == walletState.actionModelId,
                             onClick = { onSelectActionModel(model) },
