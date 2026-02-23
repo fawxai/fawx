@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertTextContains
 import androidx.compose.ui.test.hasAnyAncestor
+import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.hasSetTextAction
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
@@ -93,7 +94,14 @@ class QuickSwitcherTest {
         }
 
         composeRule
+            .onNodeWithTag("quick_switcher_chat_section_header")
+            .performSemanticsAction(SemanticsActions.OnClick)
+        composeRule
             .onNodeWithTag("quick_switcher_chat_model_gpt-4o")
+            .performSemanticsAction(SemanticsActions.OnClick)
+
+        composeRule
+            .onNodeWithTag("quick_switcher_action_section_header")
             .performSemanticsAction(SemanticsActions.OnClick)
         composeRule
             .onNodeWithTag("quick_switcher_action_model_gpt-4o")
@@ -105,6 +113,152 @@ class QuickSwitcherTest {
         assertEquals("gpt-4o", selectedChatModel)
         assertEquals("gpt-4o", selectedActionModel)
         assertEquals(true, openedManage)
+    }
+
+    @Test
+    fun bottomSheetModelSectionsAreCollapsedByDefault() {
+        val state = WalletState(
+            keys = listOf(WalletKey("k1", Provider.OPENAI, "Personal", 0L)),
+            activeKeyId = "k1",
+            chatModelId = "gpt-4o",
+            actionModelId = "gpt-4o"
+        )
+
+        composeRule.setContent {
+            QuickSwitcherBottomSheet(
+                walletState = state,
+                onDismiss = {},
+                onSelectKey = {},
+                onSelectChatModel = {},
+                onSelectActionModel = {},
+                onManageKeys = {}
+            )
+        }
+
+        composeRule.onNodeWithTag("quick_switcher_chat_model_gpt-4o").assertDoesNotExist()
+        composeRule.onNodeWithTag("quick_switcher_action_model_gpt-4o").assertDoesNotExist()
+    }
+
+    @Test
+    fun bottomSheetChatSectionTogglesExpandedAndCollapsed() {
+        val state = WalletState(
+            keys = listOf(WalletKey("k1", Provider.OPENAI, "Personal", 0L)),
+            activeKeyId = "k1",
+            chatModelId = "gpt-4o",
+            actionModelId = "gpt-4o"
+        )
+
+        composeRule.setContent {
+            QuickSwitcherBottomSheet(
+                walletState = state,
+                onDismiss = {},
+                onSelectKey = {},
+                onSelectChatModel = {},
+                onSelectActionModel = {},
+                onManageKeys = {}
+            )
+        }
+
+        composeRule.onNodeWithTag("quick_switcher_chat_model_gpt-4o").assertDoesNotExist()
+        composeRule.onNodeWithTag("quick_switcher_chat_section_header").performClick()
+        composeRule.onNodeWithTag("quick_switcher_chat_model_gpt-4o").assertIsDisplayed()
+        composeRule.onNodeWithTag("quick_switcher_chat_section_header").performClick()
+        composeRule.onNodeWithTag("quick_switcher_chat_model_gpt-4o").assertDoesNotExist()
+    }
+
+    @Test
+    fun bottomSheetSectionSelectionsUseCorrectCallbacks() {
+        val state = WalletState(
+            keys = listOf(WalletKey("k1", Provider.OPENAI, "Personal", 0L)),
+            activeKeyId = "k1",
+            chatModelId = "gpt-4o",
+            actionModelId = "gpt-4o"
+        )
+
+        var selectedChatModel: String? = null
+        var selectedActionModel: String? = null
+
+        composeRule.setContent {
+            QuickSwitcherBottomSheet(
+                walletState = state,
+                onDismiss = {},
+                onSelectKey = {},
+                onSelectChatModel = { selectedChatModel = it },
+                onSelectActionModel = { selectedActionModel = it },
+                onManageKeys = {}
+            )
+        }
+
+        composeRule.onNodeWithTag("quick_switcher_chat_section_header").performClick()
+        composeRule.onNodeWithTag("quick_switcher_action_section_header").performClick()
+
+        composeRule.onNodeWithTag("quick_switcher_chat_model_gpt-4o").performClick()
+        composeRule.onNodeWithTag("quick_switcher_action_model_gpt-4o").performClick()
+
+        assertEquals("gpt-4o", selectedChatModel)
+        assertEquals("gpt-4o", selectedActionModel)
+    }
+
+    @Test
+    fun bottomSheetBothSectionsCanBeExpandedSimultaneously() {
+        val state = WalletState(
+            keys = listOf(WalletKey("k1", Provider.OPENAI, "Personal", 0L)),
+            activeKeyId = "k1",
+            chatModelId = "gpt-4o",
+            actionModelId = "gpt-4o"
+        )
+
+        composeRule.setContent {
+            QuickSwitcherBottomSheet(
+                walletState = state,
+                onDismiss = {},
+                onSelectKey = {},
+                onSelectChatModel = {},
+                onSelectActionModel = {},
+                onManageKeys = {}
+            )
+        }
+
+        composeRule.onNodeWithTag("quick_switcher_chat_section_header").performClick()
+        composeRule.onNodeWithTag("quick_switcher_action_section_header").performClick()
+
+        composeRule.onNodeWithTag("quick_switcher_chat_model_gpt-4o").assertIsDisplayed()
+        composeRule.onNodeWithTag("quick_switcher_action_model_gpt-4o").assertIsDisplayed()
+    }
+
+    @Test
+    fun bottomSheetSectionHeaderChevronUpdatesWithExpansionState() {
+        val state = WalletState(
+            keys = listOf(WalletKey("k1", Provider.OPENAI, "Personal", 0L)),
+            activeKeyId = "k1",
+            chatModelId = "gpt-4o",
+            actionModelId = "gpt-4o"
+        )
+
+        composeRule.setContent {
+            QuickSwitcherBottomSheet(
+                walletState = state,
+                onDismiss = {},
+                onSelectKey = {},
+                onSelectChatModel = {},
+                onSelectActionModel = {},
+                onManageKeys = {}
+            )
+        }
+
+        composeRule.onNode(
+            hasContentDescription("collapsed").and(
+                hasAnyAncestor(hasTestTag("quick_switcher_chat_section_header"))
+            )
+        ).assertIsDisplayed()
+
+        composeRule.onNodeWithTag("quick_switcher_chat_section_header").performClick()
+
+        composeRule.onNode(
+            hasContentDescription("expanded").and(
+                hasAnyAncestor(hasTestTag("quick_switcher_chat_section_header"))
+            )
+        ).assertIsDisplayed()
     }
 
     @Test

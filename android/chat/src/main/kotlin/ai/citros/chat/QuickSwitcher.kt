@@ -1,4 +1,5 @@
 package ai.citros.chat
+
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -12,27 +13,47 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ChevronRight
+import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material3.Icon
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import ai.citros.core.ModelConfig
 import ai.citros.core.Provider
 import ai.citros.core.WalletKey
 import ai.citros.core.WalletState
+
 private val QuickSpacingXs = 8.dp
 private val QuickSpacingSm = 12.dp
 private val QuickSpacingMd = 16.dp
+
 // Row content in the key list is designed around a 56.dp tap target.
 private val QuickSwitcherKeyRowHeight = 56.dp
 private val QuickSwitcherMaxVisibleKeyRows = 4
+
+// 560.dp mirrors iOS-style sheet ergonomics: enough room for keys + both model sections,
+// while still leaving contextual chat content visible behind the modal.
 private val QuickSwitcherMaxSheetHeight = 560.dp
+
+// Keep the API-key list from dominating the sheet when many keys are configured.
+private val QuickSwitcherMaxKeyListHeight = 360.dp
+
 internal fun abbreviatedModelName(modelId: String): String {
     val normalized = modelId
         .removeSuffix("-latest")
@@ -46,6 +67,7 @@ internal fun abbreviatedModelName(modelId: String): String {
         else -> normalized.replace("-", " ").replaceFirstChar { it.uppercase() }
     }
 }
+
 @Composable
 internal fun QuickSwitcherToolbarChip(
     provider: Provider,
@@ -77,6 +99,7 @@ internal fun QuickSwitcherToolbarChip(
         }
     }
 }
+
 @Composable
 internal fun QuickSwitcherBottomSheet(
     walletState: WalletState,
@@ -88,6 +111,9 @@ internal fun QuickSwitcherBottomSheet(
 ) {
     val activeKey = walletState.keys.find { it.id == walletState.activeKeyId }
     val provider = activeKey?.provider
+    var chatSectionExpanded by remember { mutableStateOf(false) }
+    var actionSectionExpanded by remember { mutableStateOf(false) }
+
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(
             modifier = Modifier
@@ -103,8 +129,9 @@ internal fun QuickSwitcherBottomSheet(
             Spacer(Modifier.height(QuickSpacingXs))
             LazyColumn(
                 verticalArrangement = Arrangement.spacedBy(QuickSpacingXs),
-                modifier = Modifier.height(
-                    QuickSwitcherKeyRowHeight * walletState.keys.size.coerceAtMost(QuickSwitcherMaxVisibleKeyRows)
+                modifier = Modifier.heightIn(
+                    max = QuickSwitcherMaxKeyListHeight,
+                    min = QuickSwitcherKeyRowHeight * walletState.keys.size.coerceAtMost(QuickSwitcherMaxVisibleKeyRows)
                 )
             ) {
                 items(walletState.keys, key = { it.id }) { key ->
@@ -136,29 +163,60 @@ internal fun QuickSwitcherBottomSheet(
             }
             if (provider != null) {
                 Spacer(Modifier.height(QuickSpacingSm))
-                Text("Chat Model", style = CitrosTypography.titleSmall)
-                Spacer(Modifier.height(QuickSpacingXs))
-                Row(horizontalArrangement = Arrangement.spacedBy(QuickSpacingXs)) {
-                    ModelConfig.runtimeChatModels(provider).forEach { model ->
-                        FilterChip(
-                            selected = model == walletState.chatModelId,
-                            onClick = { onSelectChatModel(model) },
-                            modifier = Modifier.testTag("quick_switcher_chat_model_$model"),
-                            label = { Text(abbreviatedModelName(model)) }
-                        )
+
+                QuickSwitcherSectionLabel(
+                    label = "Chat Model",
+                    expanded = chatSectionExpanded,
+                    onClick = { chatSectionExpanded = !chatSectionExpanded },
+                    modifier = Modifier
+                        .testTag("quick_switcher_chat_section_header")
+                )
+
+                val chatModelRows = remember(provider, CitrosColorScheme.primary) {
+                    ModelConfig.runtimeChatModels(provider)
+                }
+
+                if (chatSectionExpanded) {
+                    Spacer(Modifier.height(QuickSpacingXs))
+                    Row(horizontalArrangement = Arrangement.spacedBy(QuickSpacingXs)) {
+                        chatModelRows.forEach { model ->
+                            FilterChip(
+                                selected = model == walletState.chatModelId,
+                                onClick = { onSelectChatModel(model) },
+                                modifier = Modifier.testTag("quick_switcher_chat_model_$model"),
+                                label = { Text(abbreviatedModelName(model)) }
+                            )
+                        }
                     }
                 }
+
                 Spacer(Modifier.height(QuickSpacingSm))
-                Text("Action Model", style = CitrosTypography.titleSmall)
-                Spacer(Modifier.height(QuickSpacingXs))
-                Row(horizontalArrangement = Arrangement.spacedBy(QuickSpacingXs)) {
-                    ModelConfig.runtimeActionModels(provider).forEach { model ->
-                        FilterChip(
-                            selected = model == walletState.actionModelId,
-                            onClick = { onSelectActionModel(model) },
-                            modifier = Modifier.testTag("quick_switcher_action_model_$model"),
-                            label = { Text(abbreviatedModelName(model)) }
-                        )
+
+                QuickSwitcherSectionLabel(
+                    label = "Action Model",
+                    expanded = actionSectionExpanded,
+                    onClick = { actionSectionExpanded = !actionSectionExpanded },
+                    modifier = Modifier
+                        .testTag("quick_switcher_action_section_header")
+                )
+
+                // Intentionally cloud-only: action models power phone-control tasks
+                // (screen/camera/system actions) that currently require hosted tool execution.
+                val actionModelRows = remember(provider, CitrosColorScheme.primary) {
+                    ModelConfig.runtimeActionModels(provider)
+                }
+
+                if (actionSectionExpanded) {
+                    Spacer(Modifier.height(QuickSpacingXs))
+                    Row(horizontalArrangement = Arrangement.spacedBy(QuickSpacingXs)) {
+                        actionModelRows.forEach { model ->
+                            FilterChip(
+                                selected = model == walletState.actionModelId,
+                                onClick = { onSelectActionModel(model) },
+                                modifier = Modifier.testTag("quick_switcher_action_model_$model"),
+                                label = { Text(abbreviatedModelName(model)) }
+                            )
+                        }
                     }
                 }
             }
@@ -170,5 +228,31 @@ internal fun QuickSwitcherBottomSheet(
                 Text("Manage Keys")
             }
         }
+    }
+}
+
+@Composable
+private fun QuickSwitcherSectionLabel(
+    label: String,
+    expanded: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .semantics {
+                role = Role.Button
+                stateDescription = if (expanded) "expanded" else "collapsed"
+            },
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(QuickSpacingXs)
+    ) {
+        Icon(
+            imageVector = if (expanded) Icons.Default.ExpandMore else Icons.Default.ChevronRight,
+            contentDescription = if (expanded) "expanded" else "collapsed"
+        )
+        Text(label, style = CitrosTypography.titleSmall)
     }
 }
