@@ -2,6 +2,7 @@ package ai.citros.chat
 
 import android.content.Context
 import android.content.Intent
+import androidx.compose.ui.unit.dp
 import org.junit.After
 import org.junit.Before
 import org.junit.Test
@@ -74,6 +75,11 @@ class OverlayServiceTest {
     fun `notification ID is non-zero`() {
         assertTrue(OverlayService.NOTIFICATION_ID > 0,
             "OverlayService notification ID must be positive")
+    }
+
+    @Test
+    fun `MiniChatMaxHeight is pinned to 340 dp`() {
+        assertEquals(340.dp, OverlayUiConstants.MiniChatMaxHeight)
     }
 
     @Test
