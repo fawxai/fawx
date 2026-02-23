@@ -157,6 +157,161 @@ class VoiceStartRetryStateTest {
     }
 
     @Test
+    fun `permission grant consumes pending token and starts listening when manual request is in flight`() {
+        val result = handleVoiceStartPermissionResult(
+            state = VoiceStartRetryState(
+                lastConsumedToken = 2,
+                pendingToken = 6,
+                permissionRequestedToken = 6
+            ),
+            granted = true,
+            manualPermissionRequestInFlight = true,
+            hasActiveStt = true
+        )
+
+        assertEquals(true, result.shouldBeginListeningNow)
+        assertEquals(6, result.state.lastConsumedToken)
+        assertEquals(0, result.state.pendingToken)
+        assertEquals(0, result.state.permissionRequestedToken)
+    }
+
+    @Test
+    fun `permission grant keeps pending token when provider is not ready`() {
+        val result = handleVoiceStartPermissionResult(
+            state = VoiceStartRetryState(
+                lastConsumedToken = 2,
+                pendingToken = 6,
+                permissionRequestedToken = 6
+            ),
+            granted = true,
+            manualPermissionRequestInFlight = true,
+            hasActiveStt = false
+        )
+
+        assertEquals(false, result.shouldBeginListeningNow)
+        assertEquals(2, result.state.lastConsumedToken)
+        assertEquals(6, result.state.pendingToken)
+        assertEquals(0, result.state.permissionRequestedToken)
+    }
+
+    @Test
+    fun `permission denial keeps pending token and does not start listening`() {
+        val result = handleVoiceStartPermissionResult(
+            state = VoiceStartRetryState(
+                lastConsumedToken = 2,
+                pendingToken = 6,
+                permissionRequestedToken = 6
+            ),
+            granted = false,
+            manualPermissionRequestInFlight = true,
+            hasActiveStt = true
+        )
+
+        assertEquals(false, result.shouldBeginListeningNow)
+        assertEquals(2, result.state.lastConsumedToken)
+        assertEquals(6, result.state.pendingToken)
+        assertEquals(6, result.state.permissionRequestedToken)
+    }
+
+    @Test
+    fun `permission grant without manual request in flight clears request and waits for retry path`() {
+        val result = handleVoiceStartPermissionResult(
+            state = VoiceStartRetryState(
+                lastConsumedToken = 2,
+                pendingToken = 6,
+                permissionRequestedToken = 6
+            ),
+            granted = true,
+            manualPermissionRequestInFlight = false,
+            hasActiveStt = true
+        )
+
+        assertEquals(false, result.shouldBeginListeningNow)
+        assertEquals(2, result.state.lastConsumedToken)
+        assertEquals(6, result.state.pendingToken)
+        assertEquals(0, result.state.permissionRequestedToken)
+    }
+
+    @Test
+    fun `dispatch request permission action signals permission prompt only`() {
+        val result = dispatchVoiceStartRetryAction(
+            state = VoiceStartRetryState(lastConsumedToken = 2, pendingToken = 6, permissionRequestedToken = 6),
+            action = VoiceStartRetryAction.REQUEST_PERMISSION,
+            hasActiveSttAtLaunch = true
+        )
+
+        assertEquals(false, result.shouldBeginListening)
+        assertEquals(true, result.shouldRequestPermission)
+        assertEquals(2, result.state.lastConsumedToken)
+        assertEquals(6, result.state.pendingToken)
+        assertEquals(6, result.state.permissionRequestedToken)
+    }
+
+    @Test
+    fun `dispatch none action produces no side effects`() {
+        val state = VoiceStartRetryState(lastConsumedToken = 2, pendingToken = 6, permissionRequestedToken = 6)
+        val result = dispatchVoiceStartRetryAction(
+            state = state,
+            action = VoiceStartRetryAction.NONE,
+            hasActiveSttAtLaunch = true
+        )
+
+        assertEquals(false, result.shouldBeginListening)
+        assertEquals(false, result.shouldRequestPermission)
+        assertEquals(state, result.state)
+    }
+
+    @Test
+    fun `launch race requeues token so next retry tick can execute`() {
+        val decision = resolveVoiceStartRetry(
+            state = VoiceStartRetryState(),
+            incomingToken = 21,
+            isLoading = false,
+            isListening = false,
+            hasVoiceManager = true,
+            hasActiveStt = true,
+            hasMicPermission = true
+        )
+        assertEquals(VoiceStartRetryAction.START_LISTENING, decision.action)
+
+        val launchRace = dispatchVoiceStartRetryAction(
+            state = decision.state,
+            action = decision.action,
+            hasActiveSttAtLaunch = false
+        )
+        assertEquals(false, launchRace.shouldBeginListening)
+        assertEquals(21, launchRace.state.pendingToken)
+        assertEquals(20, launchRace.state.lastConsumedToken)
+
+        val retried = resolveVoiceStartRetry(
+            state = launchRace.state,
+            incomingToken = 21,
+            isLoading = false,
+            isListening = false,
+            hasVoiceManager = true,
+            hasActiveStt = true,
+            hasMicPermission = true
+        )
+        assertEquals(VoiceStartRetryAction.START_LISTENING, retried.action)
+        assertEquals(21, retried.state.lastConsumedToken)
+        assertEquals(0, retried.state.pendingToken)
+    }
+
+    @Test
+    fun `launch race with zero-state tokens remains bounded`() {
+        val launchRace = dispatchVoiceStartRetryAction(
+            state = VoiceStartRetryState(),
+            action = VoiceStartRetryAction.START_LISTENING,
+            hasActiveSttAtLaunch = false
+        )
+
+        assertEquals(false, launchRace.shouldBeginListening)
+        assertEquals(false, launchRace.shouldRequestPermission)
+        assertEquals(0, launchRace.state.pendingToken)
+        assertEquals(0, launchRace.state.lastConsumedToken)
+    }
+
+    @Test
     fun `consumed token is ignored`() {
         val resolution = resolveVoiceStartRetry(
             state = VoiceStartRetryState(lastConsumedToken = 4),

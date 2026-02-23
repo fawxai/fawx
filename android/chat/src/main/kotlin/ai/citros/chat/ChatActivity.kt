@@ -2908,6 +2908,86 @@ internal fun applyVoiceStartPermissionResult(
     state
 }
 
+internal data class VoiceStartPermissionHandlingResult(
+    val state: VoiceStartRetryState,
+    val shouldBeginListeningNow: Boolean
+)
+
+internal fun handleVoiceStartPermissionResult(
+    state: VoiceStartRetryState,
+    granted: Boolean,
+    manualPermissionRequestInFlight: Boolean,
+    hasActiveStt: Boolean
+): VoiceStartPermissionHandlingResult {
+    var next = applyVoiceStartPermissionResult(state, granted)
+    if (!granted) {
+        return VoiceStartPermissionHandlingResult(
+            state = next,
+            shouldBeginListeningNow = false
+        )
+    }
+    if (manualPermissionRequestInFlight && hasActiveStt) {
+        if (next.pendingToken > next.lastConsumedToken) {
+            next = next.copy(
+                lastConsumedToken = next.pendingToken,
+                pendingToken = 0
+            )
+        }
+        return VoiceStartPermissionHandlingResult(
+            state = next,
+            shouldBeginListeningNow = true
+        )
+    }
+    return VoiceStartPermissionHandlingResult(
+        state = next,
+        shouldBeginListeningNow = false
+    )
+}
+
+internal data class VoiceStartActionDispatchResult(
+    val state: VoiceStartRetryState,
+    val shouldBeginListening: Boolean,
+    val shouldRequestPermission: Boolean
+)
+
+internal fun dispatchVoiceStartRetryAction(
+    state: VoiceStartRetryState,
+    action: VoiceStartRetryAction,
+    hasActiveSttAtLaunch: Boolean
+): VoiceStartActionDispatchResult = when (action) {
+    VoiceStartRetryAction.START_LISTENING -> {
+        if (hasActiveSttAtLaunch) {
+            VoiceStartActionDispatchResult(
+                state = state,
+                shouldBeginListening = true,
+                shouldRequestPermission = false
+            )
+        } else {
+            val tokenToRetry = maxOf(state.pendingToken, state.lastConsumedToken)
+            VoiceStartActionDispatchResult(
+                state = state.copy(
+                    pendingToken = tokenToRetry,
+                    // Keep retry arithmetic bounded for the zero-state case (0 -> 0) while
+                    // still reopening the gate for non-zero tokens (n -> n-1).
+                    lastConsumedToken = (tokenToRetry - 1).coerceAtLeast(0)
+                ),
+                shouldBeginListening = false,
+                shouldRequestPermission = false
+            )
+        }
+    }
+    VoiceStartRetryAction.REQUEST_PERMISSION -> VoiceStartActionDispatchResult(
+        state = state,
+        shouldBeginListening = false,
+        shouldRequestPermission = true
+    )
+    VoiceStartRetryAction.NONE -> VoiceStartActionDispatchResult(
+        state = state,
+        shouldBeginListening = false,
+        shouldRequestPermission = false
+    )
+}
+
 internal fun submitMessageDraft(
     attemptedText: String,
     isLoading: Boolean,
@@ -3030,27 +3110,22 @@ internal fun MessageInput(
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
-        val permissionUpdate = applyVoiceStartPermissionResult(
+        val permissionHandling = handleVoiceStartPermissionResult(
             state = VoiceStartRetryState(
                 lastConsumedToken = lastConsumedListeningToken,
                 pendingToken = pendingListeningToken,
                 permissionRequestedToken = permissionRequestedToken
             ),
-            granted = granted
+            granted = granted,
+            manualPermissionRequestInFlight = manualPermissionRequestInFlight,
+            hasActiveStt = activeStt != null
         )
-        permissionRequestedToken = permissionUpdate.permissionRequestedToken
-        if (granted) {
-            if (manualPermissionRequestInFlight) {
-                val stt = activeStt
-                if (stt != null) {
-                    beginListening(stt)
-                    if (pendingListeningToken > lastConsumedListeningToken) {
-                        lastConsumedListeningToken = pendingListeningToken
-                        pendingListeningToken = 0
-                    }
-                }
-            }
-        } else {
+        lastConsumedListeningToken = permissionHandling.state.lastConsumedToken
+        pendingListeningToken = permissionHandling.state.pendingToken
+        permissionRequestedToken = permissionHandling.state.permissionRequestedToken
+        if (permissionHandling.shouldBeginListeningNow) {
+            activeStt?.let(::beginListening)
+        } else if (!granted) {
             Toast.makeText(context, "Microphone permission is required for voice input", Toast.LENGTH_SHORT).show()
         }
         manualPermissionRequestInFlight = false
@@ -3101,23 +3176,23 @@ internal fun MessageInput(
         lastConsumedListeningToken = resolution.state.lastConsumedToken
         pendingListeningToken = resolution.state.pendingToken
         permissionRequestedToken = resolution.state.permissionRequestedToken
-        when (resolution.action) {
-            VoiceStartRetryAction.START_LISTENING -> {
-                val stt = activeStt
-                if (stt != null) {
-                    beginListening(stt)
-                } else {
-                    // Runtime changed between decision and launch; keep retry pending.
-                    pendingListeningToken = maxOf(
-                        pendingListeningToken,
-                        resolution.state.lastConsumedToken
-                    )
-                }
-            }
-            VoiceStartRetryAction.REQUEST_PERMISSION -> {
-                permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-            }
-            VoiceStartRetryAction.NONE -> Unit
+        val dispatch = dispatchVoiceStartRetryAction(
+            state = VoiceStartRetryState(
+                lastConsumedToken = lastConsumedListeningToken,
+                pendingToken = pendingListeningToken,
+                permissionRequestedToken = permissionRequestedToken
+            ),
+            action = resolution.action,
+            hasActiveSttAtLaunch = activeStt != null
+        )
+        lastConsumedListeningToken = dispatch.state.lastConsumedToken
+        pendingListeningToken = dispatch.state.pendingToken
+        permissionRequestedToken = dispatch.state.permissionRequestedToken
+        if (dispatch.shouldBeginListening) {
+            activeStt?.let(::beginListening)
+        }
+        if (dispatch.shouldRequestPermission) {
+            permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
         }
     }
     val isDarkTheme = LocalCitrosIsDark.current
