@@ -92,6 +92,19 @@ class OnboardingManagerTest {
     }
 
     @Test
+    fun `skipAccessibility works from prompt and wait`() {
+        val manager = manager()
+
+        manager.currentStep = OnboardingStep.ACCESSIBILITY_PROMPT
+        manager.skipAccessibility()
+        assertEquals(OnboardingStep.FIRST_TASK, manager.currentStep)
+
+        manager.currentStep = OnboardingStep.ACCESSIBILITY_WAIT
+        manager.skipAccessibility()
+        assertEquals(OnboardingStep.FIRST_TASK, manager.currentStep)
+    }
+
+    @Test
     fun `shouldActivate returns false and completes when valid config exists`() {
         val manager = manager(
             hasValidApiKey = { true },

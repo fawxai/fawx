@@ -49,6 +49,14 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import ai.citros.core.OutputVerbosity
+import ai.citros.chat.onboarding.AccessibilitySetupHelper
+import ai.citros.chat.onboarding.AvailableModel
+import ai.citros.chat.onboarding.ModelFetcher
+import ai.citros.chat.onboarding.ModelRecommender
+import ai.citros.chat.onboarding.OnboardingAction
+import ai.citros.chat.onboarding.OnboardingManager
+import ai.citros.chat.onboarding.OnboardingStep
+import androidx.test.core.app.ApplicationProvider
 
 @RunWith(RobolectricTestRunner::class)
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -121,6 +129,65 @@ class ChatViewModelTest {
         assertEquals("user", viewModel.messages[0].role)
         assertEquals("assistant", viewModel.messages[1].role)
         assertTrue(viewModel.messages[1].content.contains("Not configured"))
+    }
+
+    @Test
+    fun `setupOnboarding activates onboarding and emits first message`() = runTest {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val prefs = context.getSharedPreferences("chat_vm_onboarding_a", android.content.Context.MODE_PRIVATE)
+        prefs.edit().clear().commit()
+
+        viewModel.setupOnboarding(
+            onboardingManager = OnboardingManager(prefs),
+            modelRecommender = ModelRecommender(),
+            accessibilityHelper = AccessibilitySetupHelper(context)
+        )
+
+        assertTrue(viewModel.onboardingActive.value)
+        assertNotNull(viewModel.onboardingMessage.value)
+        assertTrue(viewModel.messages.any { it.content.contains("Citros") })
+    }
+
+    @Test
+    fun `onOnboardingPillTapped advances onboarding and updates onboardingMessage`() = runTest {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val prefs = context.getSharedPreferences("chat_vm_onboarding_b", android.content.Context.MODE_PRIVATE)
+        prefs.edit().clear().commit()
+
+        viewModel.setupOnboarding(OnboardingManager(prefs), ModelRecommender(), AccessibilitySetupHelper(context))
+        viewModel.onOnboardingPillTapped(OnboardingAction.CONTINUE)
+
+        assertEquals(OnboardingStep.API_KEY_CHOICE.name, prefs.getString("onboarding_step", null))
+        assertNotNull(viewModel.onboardingMessage.value)
+        assertTrue(viewModel.onboardingMessage.value!!.text.contains("API key"))
+    }
+
+    @Test
+    fun `onOnboardingApiKeyValidated triggers recommendation and onboarding complete resets active`() = runTest {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val prefs = context.getSharedPreferences("chat_vm_onboarding_c", android.content.Context.MODE_PRIVATE)
+        prefs.edit().clear().commit()
+
+        val recommender = ModelRecommender(object : ModelFetcher {
+            override suspend fun fetchAvailableModels(provider: Provider, apiKey: String): List<AvailableModel> {
+                return listOf(AvailableModel("claude-sonnet-4-5-latest", "Claude Sonnet 4.5"))
+            }
+        })
+
+        viewModel.setupOnboarding(OnboardingManager(prefs), recommender, AccessibilitySetupHelper(context))
+        viewModel.onOnboardingPillTapped(OnboardingAction.CONTINUE)
+        viewModel.onOnboardingPillTapped(OnboardingAction.I_HAVE_KEY)
+
+        viewModel.onOnboardingApiKeyValidated(Provider.ANTHROPIC, "sk-ant-test")
+        advanceUntilIdle()
+        assertTrue(viewModel.messages.any { it.content.contains("recommend") })
+
+        viewModel.onOnboardingPillTapped(OnboardingAction.USE_RECOMMENDED_MODEL)
+        viewModel.onOnboardingPillTapped(OnboardingAction.SKIP_ACCESSIBILITY)
+        viewModel.onOnboardingPillTapped(OnboardingAction.DISMISS)
+
+        assertFalse(viewModel.onboardingActive.value)
+        assertNull(viewModel.onboardingMessage.value)
     }
 
 

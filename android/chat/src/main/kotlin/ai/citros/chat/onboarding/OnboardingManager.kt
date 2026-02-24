@@ -64,6 +64,14 @@ class OnboardingManager(
 
     fun onAccessibilitySkip() = transitionTo(OnboardingStep.ACCESSIBILITY_WAIT, OnboardingStep.FIRST_TASK)
 
+    fun skipAccessibility() {
+        when (currentStep) {
+            OnboardingStep.ACCESSIBILITY_PROMPT -> currentStep = OnboardingStep.FIRST_TASK
+            OnboardingStep.ACCESSIBILITY_WAIT -> onAccessibilitySkip()
+            else -> Unit
+        }
+    }
+
     fun onFirstTaskFinished() = transitionTo(OnboardingStep.FIRST_TASK, OnboardingStep.COMPLETE)
 
     fun dismiss() {

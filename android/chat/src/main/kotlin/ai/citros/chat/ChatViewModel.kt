@@ -9,6 +9,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import ai.citros.core.*
 import ai.citros.core.VoiceManager
+import ai.citros.chat.onboarding.*
 import android.util.Log
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -363,6 +364,62 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
     /** Accessibility reattachment timeout. Override in tests for speed. */
     @VisibleForTesting
     internal var accessibilityWaitMs: Long = ACCESSIBILITY_WAIT_MS_DEFAULT
+
+    // ── Onboarding integration ──
+
+    /** Onboarding chat integration, set by ChatActivity when onboarding is needed. */
+    @VisibleForTesting
+    internal var onboardingIntegration: OnboardingChatIntegration? = null
+
+    /** Whether onboarding is currently active and driving the chat UI. */
+    val onboardingActive = mutableStateOf(false)
+
+    /** Current onboarding message with pills, if any. */
+    val onboardingMessage = mutableStateOf<OnboardingMessage?>(null)
+
+    /**
+     * Initialize onboarding integration. Called from ChatActivity with
+     * the appropriate dependencies.
+     */
+    fun setupOnboarding(
+        onboardingManager: OnboardingManager,
+        modelRecommender: ModelRecommender,
+        accessibilityHelper: AccessibilitySetupHelper
+    ) {
+        val integration = OnboardingChatIntegration(
+            onboardingManager = onboardingManager,
+            modelRecommender = modelRecommender,
+            accessibilityHelper = accessibilityHelper,
+            scope = viewModelScope
+        )
+        integration.onMessage = { msg ->
+            messages.add(Message(role = "assistant", content = msg.text))
+            onboardingMessage.value = msg
+        }
+        integration.onComplete = {
+            onboardingActive.value = false
+            onboardingMessage.value = null
+        }
+        onboardingIntegration = integration
+
+        if (integration.activateIfNeeded()) {
+            onboardingActive.value = true
+        }
+    }
+
+    /**
+     * Handle an onboarding pill-button tap from the UI.
+     */
+    fun onOnboardingPillTapped(action: OnboardingAction) {
+        onboardingIntegration?.onPillTapped(action)
+    }
+
+    /**
+     * Notify onboarding that API key validation succeeded.
+     */
+    fun onOnboardingApiKeyValidated(provider: Provider, apiKey: String) {
+        onboardingIntegration?.onApiKeyValidated(provider, apiKey)
+    }
 
     init {
         restoreFromCache()
