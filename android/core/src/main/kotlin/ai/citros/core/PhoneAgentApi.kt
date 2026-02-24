@@ -859,9 +859,18 @@ open class PhoneAgentApi(
                 "type_text" -> {
                     val text = (toolCall.input["text"] as? String)?.takeIf { it.isNotEmpty() }
                         ?: throw IllegalArgumentException("type_text requires non-empty text (string)")
-                    
-                    if (ScreenReader.typeText(text)) ToolResult("Typed \"$text\"")
-                    else executionFailedResult("Failed: type_text: no text field focused")
+
+                    if (!ScreenReader.typeText(text)) {
+                        executionFailedResult("Failed: type_text: no text field focused")
+                    } else {
+                        val mapsHandled = runCatching { executeMapsSuggestionStrategyIfApplicable(text) }
+                            .getOrElse { false }
+                        if (mapsHandled) {
+                            ToolResult("Typed and submitted Maps search \"$text\"")
+                        } else {
+                            ToolResult("Typed \"$text\"")
+                        }
+                    }
                 }
 
                 "swipe" -> {
@@ -1349,6 +1358,38 @@ open class PhoneAgentApi(
                 isError = true,
                 errorCode = ToolErrorCode.EXECUTION_FAILED
             )
+        }
+    }
+
+    /**
+     * Runs Maps-specific suggestion handling after `type_text` only when Google Maps is foreground.
+     *
+     * This avoids generic Enter/tap behavior that can dismiss Maps suggestions and miss the intended
+     * destination selection flow.
+     */
+    internal fun executeMapsSuggestionStrategyIfApplicable(query: String): Boolean {
+        val service = ScreenReader.getService() ?: return false
+        val screen = getScreenContent()
+        if (screen.privacyMode) return false
+        if (screen.packageName != MapsSuggestionStrategy.GOOGLE_MAPS_PACKAGE) return false
+
+        val root = ScreenReader.findAppWindowRoot(service) ?: return false
+        return try {
+            val searchField = root.findFocus(android.view.accessibility.AccessibilityNodeInfo.FOCUS_INPUT)
+                ?: return false
+            try {
+                val result = MapsSuggestionStrategy(
+                    resources = service.resources,
+                    readScreen = getScreenContent,
+                    tapAt = { x, y -> ScreenReader.clickAt(x, y) },
+                    pressEnterKey = { MapsSuggestionStrategy.defaultEnterKeyPress() }
+                ).handleMapsSuggestion(searchField, query)
+                result.success
+            } finally {
+                searchField.recycle()
+            }
+        } finally {
+            root.recycle()
         }
     }
 
