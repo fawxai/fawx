@@ -23,6 +23,7 @@ import android.view.View
 import android.view.WindowInsets
 import android.view.WindowInsetsAnimation
 import android.view.WindowManager
+import android.view.inputmethod.InputMethodManager
 import android.widget.Toast
 import androidx.annotation.MainThread
 import androidx.compose.runtime.Composable
@@ -960,22 +961,48 @@ class OverlayService : Service(), LifecycleOwner, SavedStateRegistryOwner {
 
         when (currentMode) {
             OverlaySurfaceMode.PANEL -> {
-                val action = OverlayGestureHelper.classifyPanelGesture(velocityY, rawY, dm.heightPixels)
-                when (action) {
-                    PanelGestureAction.SNAP_TO_TOP -> moveOverlayToTop()
-                    PanelGestureAction.SNAP_TO_BOTTOM -> moveOverlayToBottom()
-                    PanelGestureAction.MINIMIZE_TO_SEARCH_BAR -> {
-                        OverlayController.updateSurfaceMode(OverlaySurfaceMode.SEARCH_BAR, fromUser = true)
+                when (
+                    val action = OverlayGestureHelper.classifyPanelReleaseAction(
+                        velocityY = velocityY,
+                        releaseY = rawY,
+                        screenHeight = dm.heightPixels,
+                        isImeVisible = lastImeVisible
+                    )
+                ) {
+                    is PanelReleaseAction.DISMISS_KEYBOARD -> {
+                        dismissIme(view)
+                        // Keep panel anchored in its default resting position after keyboard dismissal.
+                        moveOverlayToBottom()
+                        view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                    }
+                    is PanelReleaseAction.PERFORM_GESTURE -> {
+                        when (action.action) {
+                            PanelGestureAction.SNAP_TO_TOP -> moveOverlayToTop()
+                            PanelGestureAction.SNAP_TO_BOTTOM -> moveOverlayToBottom()
+                            PanelGestureAction.MINIMIZE_TO_SEARCH_BAR -> {
+                                OverlayController.updateSurfaceMode(OverlaySurfaceMode.SEARCH_BAR, fromUser = true)
+                            }
+                        }
+                        if (action.action != PanelGestureAction.SNAP_TO_BOTTOM) {
+                            view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                        }
+                        announceGesture(view, action.action)
                     }
                 }
-                if (action != PanelGestureAction.SNAP_TO_BOTTOM) {
-                    view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
-                }
-                announceGesture(view, action)
             }
             OverlaySurfaceMode.SEARCH_BAR,
             OverlaySurfaceMode.DYNAMIC_ISLAND,
             OverlaySurfaceMode.FULL_APP -> Unit
+        }
+    }
+
+    private fun dismissIme(view: View) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            // API 30+: prefer insets-controller behavior to avoid redundant IME calls.
+            view.windowInsetsController?.hide(WindowInsets.Type.ime())
+        } else {
+            val imm = getSystemService(INPUT_METHOD_SERVICE) as? InputMethodManager
+            imm?.hideSoftInputFromWindow(view.windowToken, 0)
         }
     }
 

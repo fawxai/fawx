@@ -46,6 +46,35 @@ object OverlayGestureHelper {
         // Default: snap back to bottom
         return PanelGestureAction.SNAP_TO_BOTTOM
     }
+
+    /**
+     * Resolve final panel release behavior when IME visibility should be considered.
+     *
+     * When keyboard is visible, a fast downward swipe should dismiss keyboard first
+     * instead of minimizing overlay to search bar.
+     */
+    fun classifyPanelReleaseAction(
+        velocityY: Float,
+        releaseY: Float,
+        screenHeight: Int,
+        isImeVisible: Boolean
+    ): PanelReleaseAction {
+        val baseAction = classifyPanelGesture(
+            velocityY = velocityY,
+            releaseY = releaseY,
+            screenHeight = screenHeight
+        )
+        return if (isImeVisible && baseAction == PanelGestureAction.MINIMIZE_TO_SEARCH_BAR) {
+            PanelReleaseAction.DISMISS_KEYBOARD
+        } else {
+            PanelReleaseAction.PERFORM_GESTURE(baseAction)
+        }
+    }
+}
+
+sealed interface PanelReleaseAction {
+    data class PERFORM_GESTURE(val action: PanelGestureAction) : PanelReleaseAction
+    data object DISMISS_KEYBOARD : PanelReleaseAction
 }
 
 /** Actions resulting from a panel drag gesture classification. */
