@@ -27,6 +27,10 @@ package ai.citros.core
 class AgentExecutor(
     private val delegate: ToolExecutionDelegate,
     private val progressListener: LoopProgressListener,
+    private val actionPolicy: ActionPolicy = DefaultActionPolicy(),
+    private val policyAuditLogger: PolicyAuditLogger = NoopPolicyAuditLogger,
+    /** Optional rollout hook: when true, emit audit records for allow decisions too. */
+    private val auditAllowDecisions: Boolean = false,
     private val boundaryChecks: List<BoundaryCheck> = defaultBoundaryChecks(),
     private val maxToolSteps: Int = DEFAULT_MAX_TOOL_STEPS,
     /**
@@ -96,6 +100,7 @@ class AgentExecutor(
 
         /** Maximum length for error messages in tool results and loop results. */
         const val ERROR_MESSAGE_MAX_LENGTH = 100
+        const val CONFIRM_TIMEOUT_MS = 60_000L
 
         /**
          * Default boundary checks (without accessibility gating).
@@ -163,6 +168,25 @@ class AgentExecutor(
      * @param continueAfterTools Lambda to get the next model response after tool results
      * @return Structured [LoopResult] describing what happened
      */
+    private fun extractPolicyEndpointHost(toolCall: ToolCall): String? {
+        val rawUrl = when (toolCall.name) {
+            "web_fetch", "web_browse" -> toolCall.input["url"] as? String
+            "web_search" -> toolCall.input["provider_endpoint"] as? String
+            else -> null
+        } ?: return null
+        val uri = kotlin.runCatching { java.net.URI(rawUrl) }.getOrNull() ?: return null
+        val host = uri.host ?: return null
+        return kotlin.runCatching { java.net.IDN.toASCII(host.trim().trimEnd('.').lowercase()) }.getOrNull()
+    }
+
+    private suspend fun emitRequiredPolicyAudit(event: PolicyAuditEvent, toolCall: ToolCall): Boolean {
+        val writeResult = policyAuditLogger.emit(event)
+        if (writeResult.isSuccess) return true
+        val errorSummary = writeResult.exceptionOrNull()?.message ?: "unknown write failure"
+        delegate.addToolResult(toolCall.id, "Policy audit write failed (${event.decision}); action not executed. error=$errorSummary", toolCall.name, isError = true)
+        return false
+    }
+
     suspend fun run(
         initialResponse: ChatResponse,
         initialScreenContent: ScreenContent?,
@@ -176,6 +200,8 @@ class AgentExecutor(
         // Recovery-level streak across tool calls in this run (global, not per tool name).
         // Distinct from `failureCounts`, which tracks per-tool retries for error severity escalation.
         var consecutiveFailures = 0
+        val taskStartMs = System.currentTimeMillis()
+        val taskId = java.util.UUID.randomUUID().toString()
 
         // If no tool calls in initial response, return immediately
         if (response == null || response.toolCalls.isEmpty()) {
@@ -245,6 +271,150 @@ class AgentExecutor(
                 val preActionScreen = screenContent
                 val preActionHash = preActionScreen?.hashCode()
                 progressListener.onToolStarted(toolCall.name, toolIndex, response.toolCalls.size)
+
+                val policyContext = PolicyContext(
+                    foregroundApp = screenContent?.packageName,
+                    appIdentifier = ActionPolicyNormalizer.normalizeAppIdentifier(
+                        contextAppIdentifier = toolCall.input["app_package"] as? String,
+                        fallbackDisplayName = toolCall.input["app_name"] as? String
+                    ),
+                    screenContentSummary = PolicySummarySanitizer.sanitize(screenContent?.toToolResult())?.take(200),
+                    targetNodeHints = listOfNotNull(
+                        toolCall.input["text"] as? String,
+                        toolCall.input["content_desc"] as? String,
+                        toolCall.input["resource_id"] as? String,
+                        toolCall.input["hint"] as? String
+                    ),
+                    recentActionCount = toolSteps,
+                    taskElapsedMs = System.currentTimeMillis() - taskStartMs
+                )
+
+                val evaluation = try {
+                    actionPolicy.evaluate(toolCall, policyContext)
+                } catch (_: Exception) {
+                    PolicyEvaluation(
+                        decision = PolicyDecision.Confirm(
+                            reasonCode = PolicyReasonCode.CONFIRM_POLICY_EVAL_EXCEPTION,
+                            reason = "Policy evaluation failed; user confirmation required"
+                        )
+                    )
+                }
+
+                when (val decision = evaluation.decision) {
+                    is PolicyDecision.Allow -> {
+                        if (auditAllowDecisions) {
+                            val emitted = emitRequiredPolicyAudit(
+                                PolicyAuditEvent(
+                                    eventId = java.util.UUID.randomUUID().toString(),
+                                    tsUtc = java.time.Instant.now().toString(),
+                                    taskId = taskId,
+                                    toolCallId = toolCall.id,
+                                    toolName = toolCall.name,
+                                    decision = PolicyAuditDecision.ALLOW,
+                                    reasonCode = "allow.default",
+                                    reasonText = null,
+                                    foregroundApp = policyContext.foregroundApp,
+                                    appIdentifier = policyContext.appIdentifier,
+                                    endpointHost = extractPolicyEndpointHost(toolCall),
+                                    firstUseObserved = evaluation.firstUseObserved,
+                                    overrideApplied = false,
+                                    confirmOutcome = PolicyConfirmOutcome.NA,
+                                    confirmationRequestId = null
+                                ),
+                                toolCall
+                            )
+                            if (!emitted) continue
+                        }
+                    }
+                    is PolicyDecision.Confirm -> {
+                        val requestId = java.util.UUID.randomUUID().toString()
+                        val approved = kotlinx.coroutines.withTimeoutOrNull(CONFIRM_TIMEOUT_MS) {
+                            delegate.requestUserConfirmation(toolCall, requestId, decision.reason, CONFIRM_TIMEOUT_MS)
+                        }
+                        val outcome = when (approved) {
+                            true -> PolicyConfirmOutcome.APPROVED
+                            false -> PolicyConfirmOutcome.DENIED
+                            null -> PolicyConfirmOutcome.TIMEOUT
+                        }
+                        val emitted = emitRequiredPolicyAudit(
+                            PolicyAuditEvent(
+                                eventId = java.util.UUID.randomUUID().toString(),
+                                tsUtc = java.time.Instant.now().toString(),
+                                taskId = taskId,
+                                toolCallId = toolCall.id,
+                                toolName = toolCall.name,
+                                decision = PolicyAuditDecision.CONFIRM,
+                                reasonCode = decision.reasonCode,
+                                reasonText = decision.reason,
+                                foregroundApp = policyContext.foregroundApp,
+                                appIdentifier = policyContext.appIdentifier,
+                                endpointHost = extractPolicyEndpointHost(toolCall),
+                                firstUseObserved = evaluation.firstUseObserved,
+                                overrideApplied = decision.reasonCode == PolicyReasonCode.CONFIRM_USER_OVERRIDE,
+                                confirmOutcome = outcome,
+                                confirmationRequestId = requestId
+                            ),
+                            toolCall
+                        )
+                        if (!emitted) continue
+                        if (approved != true) {
+                            val message = if (approved == null) "User confirmation timed out after ${CONFIRM_TIMEOUT_MS}ms" else "User denied: ${decision.reason}"
+                            delegate.addToolResult(toolCall.id, message, toolCall.name, isError = true)
+                            continue
+                        }
+                    }
+                    is PolicyDecision.Deny -> {
+                        val emitted = emitRequiredPolicyAudit(
+                            PolicyAuditEvent(
+                                eventId = java.util.UUID.randomUUID().toString(),
+                                tsUtc = java.time.Instant.now().toString(),
+                                taskId = taskId,
+                                toolCallId = toolCall.id,
+                                toolName = toolCall.name,
+                                decision = PolicyAuditDecision.DENY,
+                                reasonCode = decision.reasonCode,
+                                reasonText = decision.reason,
+                                foregroundApp = policyContext.foregroundApp,
+                                appIdentifier = policyContext.appIdentifier,
+                                endpointHost = extractPolicyEndpointHost(toolCall),
+                                firstUseObserved = evaluation.firstUseObserved,
+                                overrideApplied = decision.reasonCode == PolicyReasonCode.DENY_USER_OVERRIDE,
+                                confirmOutcome = PolicyConfirmOutcome.NA,
+                                confirmationRequestId = null
+                            ),
+                            toolCall
+                        )
+                        if (!emitted) continue
+                        delegate.addToolResult(toolCall.id, "Action blocked by policy: ${decision.reason}", toolCall.name, isError = true)
+                        continue
+                    }
+                    is PolicyDecision.RateLimited -> {
+                        val emitted = emitRequiredPolicyAudit(
+                            PolicyAuditEvent(
+                                eventId = java.util.UUID.randomUUID().toString(),
+                                tsUtc = java.time.Instant.now().toString(),
+                                taskId = taskId,
+                                toolCallId = toolCall.id,
+                                toolName = toolCall.name,
+                                decision = PolicyAuditDecision.RATE_LIMITED,
+                                reasonCode = decision.reasonCode,
+                                reasonText = decision.reason,
+                                foregroundApp = policyContext.foregroundApp,
+                                appIdentifier = policyContext.appIdentifier,
+                                endpointHost = extractPolicyEndpointHost(toolCall),
+                                firstUseObserved = evaluation.firstUseObserved,
+                                overrideApplied = false,
+                                confirmOutcome = PolicyConfirmOutcome.NA,
+                                confirmationRequestId = null
+                            ),
+                            toolCall
+                        )
+                        if (!emitted) continue
+                        kotlinx.coroutines.delay(decision.cooldownMs)
+                        delegate.addToolResult(toolCall.id, decision.reason, toolCall.name, isError = true)
+                        continue
+                    }
+                }
 
                 // Execute the tool
                 val actionResult = try {
@@ -551,6 +721,9 @@ interface ToolExecutionDelegate {
 
     /** Called when a new tool step starts (for syncing step counters). */
     fun onStepStarted(step: Int, maxSteps: Int)
+
+    /** Request runtime user confirmation for a gated tool action. */
+    suspend fun requestUserConfirmation(toolCall: ToolCall, requestId: String, reason: String, timeoutMs: Long): Boolean = false
 }
 
 /**

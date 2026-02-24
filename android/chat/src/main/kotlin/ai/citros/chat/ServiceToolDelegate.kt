@@ -123,4 +123,8 @@ class ServiceToolDelegate(
     override fun onStepStarted(step: Int, maxSteps: Int) {
         phoneAgentApi.currentToolStep = step
     }
+
+    override suspend fun requestUserConfirmation(toolCall: ToolCall, requestId: String, reason: String, timeoutMs: Long): Boolean {
+        return false
+    }
 }
