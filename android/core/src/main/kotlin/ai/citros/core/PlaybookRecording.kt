@@ -57,7 +57,8 @@ data class ExtractedParameters(
         val result = input.toMutableMap()
         for ((paramName, paramDef) in parameters) {
             val current = result[paramDef.sourceField]
-            if (current is String && current.equals(paramDef.exampleValue, ignoreCase = true)) {
+            // Keep matching case-sensitive to avoid false positives from unrelated uppercase/lowercase strings.
+            if (current is String && current == paramDef.exampleValue) {
                 result[paramDef.sourceField] = "{$paramName}"
             }
         }
@@ -94,6 +95,12 @@ fun interface LlmEntityExtractionClient {
     fun extractEntities(message: String): Result<List<Entity>>
 }
 
+/**
+ * Provider-backed LLM extraction client.
+ *
+ * Note: [extractEntities] is synchronous because [EntityExtractor] currently exposes a non-suspending API.
+ * Callers should avoid invoking it from single-threaded coroutine dispatchers.
+ */
 class ProviderClientEntityExtractionClient(
     private val providerClient: ProviderClient
 ) : LlmEntityExtractionClient {
@@ -111,7 +118,7 @@ class ProviderClientEntityExtractionClient(
             providerClient.chat(Conversation().apply { addUser(prompt) })
         }.getOrThrow()
 
-        val payload = PLAYBOOK_JSON.parseToJsonElement(response.trim().removeJsonCodeFence()).jsonObject
+        val payload = PLAYBOOK_JSON.parseToJsonElement(stripJsonCodeFence(response.trim())).jsonObject
         payload["entities"]?.jsonArray.orEmpty().mapNotNull { element ->
             val obj = element.jsonObject
             val text = obj["text"]?.jsonPrimitive?.content?.trim().orEmpty()
@@ -355,8 +362,8 @@ class ExecutionRecorder(
 
 private fun String.containsAny(vararg needles: String): Boolean = needles.any { contains(it) }
 
-private fun String.removeJsonCodeFence(): String {
-    val trimmed = trim()
+internal fun stripJsonCodeFence(raw: String): String {
+    val trimmed = raw.trim()
     if (!trimmed.startsWith("```") || !trimmed.endsWith("```")) return trimmed
     return trimmed
         .removePrefix("```json")

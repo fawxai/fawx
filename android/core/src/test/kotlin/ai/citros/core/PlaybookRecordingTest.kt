@@ -1,5 +1,9 @@
 package ai.citros.core
 
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -156,6 +160,125 @@ class PlaybookRecordingTest {
 
         assertEquals("I'll be late tonight", unchanged["text"])
         assertEquals("{message}", replaced["text"])
+    }
+
+    @Test
+    fun templatize_caseMismatch_doesNotReplace() {
+        val extracted = ExtractedParameters(
+            taskType = "send_message",
+            parameters = mapOf(
+                "recipient" to ParameterDef(
+                    name = "recipient",
+                    type = "string",
+                    sourceField = "text",
+                    exampleValue = "mom"
+                )
+            ),
+            schemaJson = "{}"
+        )
+
+        val unchanged = extracted.templatize(mapOf("text" to "MOM"))
+
+        assertEquals("MOM", unchanged["text"])
+    }
+
+    @Test
+    fun providerClientEntityExtractionClient_parsesPlainJson() {
+        val client = ProviderClientEntityExtractionClient(
+            providerClient = FakeProviderClient("""{"entities":[{"text":"Mom","label":"recipient"}]}""")
+        )
+
+        val result = client.extractEntities("Send a message to Mom")
+
+        assertTrue(result.isSuccess)
+        assertEquals(listOf(Entity(text = "Mom", label = "recipient")), result.getOrThrow())
+    }
+
+    @Test
+    fun providerClientEntityExtractionClient_parsesCodeFencedJson() {
+        val client = ProviderClientEntityExtractionClient(
+            providerClient = FakeProviderClient(
+                """
+                ```json
+                {"entities":[{"text":"Mom","label":"recipient"}]}
+                ```
+                """.trimIndent()
+            )
+        )
+
+        val result = client.extractEntities("Send a message to Mom")
+
+        assertTrue(result.isSuccess)
+        assertEquals(listOf(Entity(text = "Mom", label = "recipient")), result.getOrThrow())
+    }
+
+    @Test
+    fun providerClientEntityExtractionClient_parsesCodeFenceWithoutLanguage() {
+        val client = ProviderClientEntityExtractionClient(
+            providerClient = FakeProviderClient(
+                """
+                ```
+                {"entities":[{"text":"Mom","label":"recipient"}]}
+                ```
+                """.trimIndent()
+            )
+        )
+
+        val result = client.extractEntities("Send a message to Mom")
+
+        assertTrue(result.isSuccess)
+        assertEquals(listOf(Entity(text = "Mom", label = "recipient")), result.getOrThrow())
+    }
+
+    @Test
+    fun providerClientEntityExtractionClient_returnsFailureOnMalformedJson() {
+        val client = ProviderClientEntityExtractionClient(
+            providerClient = FakeProviderClient("{not-json")
+        )
+
+        val result = client.extractEntities("Send a message to Mom")
+
+        assertTrue(result.isFailure)
+    }
+
+    @Test
+    fun stripJsonCodeFence_handlesExpectedFormats() {
+        assertEquals("{\"a\":1}", stripJsonCodeFence("{\"a\":1}"))
+        assertEquals("{\"a\":1}", stripJsonCodeFence("```json\n{\"a\":1}\n```"))
+        assertEquals("{\"a\":1}", stripJsonCodeFence("```\n{\"a\":1}\n```"))
+        assertEquals("already-clean", stripJsonCodeFence("  already-clean  "))
+    }
+
+    @Test
+    fun recorder_onTaskCompletedCalledConcurrently_persistsAtMostOnce() = runBlocking {
+        val dao = FakePlaybookDao()
+        val recorder = ExecutionRecorder(dao, ParameterExtractor(), nowMs = { 1234L })
+
+        recorder.onTaskStarted("Send a text to Mom saying hello")
+        coroutineScope {
+            repeat(8) { idx ->
+                launch(Dispatchers.Default) {
+                    recorder.onToolExecuted(
+                        toolCall = ToolCall("$idx", "tap_text", mapOf("text" to "Mom")),
+                        screenBefore = ScreenFingerprint("a$idx", "com.messages"),
+                        screenAfter = ScreenFingerprint("b$idx", "com.messages"),
+                        result = ToolResult("ok"),
+                        failure = null
+                    )
+                }
+            }
+        }
+
+        coroutineScope {
+            repeat(2) {
+                launch(Dispatchers.Default) {
+                    recorder.onTaskCompleted(TaskStatus.COMPLETED, "Sent")
+                }
+            }
+        }
+
+        assertEquals(1, dao.playbooks.size)
+        assertEquals(8, dao.steps.size)
     }
 
     @Test
@@ -356,6 +479,27 @@ class PlaybookRecordingTest {
         recorder.onTaskCompleted(TaskStatus.COMPLETED, "ok")
 
         assertTrue(dao.playbooks.isEmpty())
+    }
+
+    private class FakeProviderClient(
+        private val response: String
+    ) : ProviderClient {
+        override val provider: Provider = Provider.ANTHROPIC
+
+        override suspend fun chat(conversation: Conversation): Result<String> = Result.success(response)
+
+        override suspend fun chatWithTools(
+            messages: List<Message>,
+            systemPrompt: String?,
+            tools: List<Tool>,
+            tokenLimit: Int?
+        ): Result<ChatResponse> = error("unused in PlaybookRecordingTest")
+
+        override suspend fun describeImage(
+            base64Image: String,
+            prompt: String,
+            maxTokens: Int
+        ): Result<String> = error("unused in PlaybookRecordingTest")
     }
 
     private class FakePlaybookDao : PlaybookDao {
