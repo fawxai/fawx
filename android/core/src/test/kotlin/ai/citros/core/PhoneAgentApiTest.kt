@@ -252,6 +252,55 @@ class PhoneAgentApiTest {
     }
 
     @Test
+    fun `assertSafetyContractDebug via PhoneAgentApi throws for invalid prompt in debug build`() {
+        FeatureFlags.promptTuningV1Enabled = true
+        try {
+            val agent = createAgent().also { it.isDebugBuild = true }
+            val method = PhoneAgentApi::class.java.getDeclaredMethod("assertSafetyContractDebug", String::class.java)
+            method.isAccessible = true
+
+            val error = assertFailsWith<java.lang.reflect.InvocationTargetException> {
+                method.invoke(agent, "You are Citros. No safety clauses here.")
+            }
+            assertTrue(error.cause is AssertionError)
+        } finally {
+            FeatureFlags.resetToDefaults()
+        }
+    }
+
+    @Test
+    fun `assertSafetyContractDebug via PhoneAgentApi passes for valid prompt in debug build`() {
+        FeatureFlags.promptTuningV1Enabled = true
+        try {
+            val agent = createAgent().also { it.isDebugBuild = true }
+            val method = PhoneAgentApi::class.java.getDeclaredMethod("assertSafetyContractDebug", String::class.java)
+            method.isAccessible = true
+
+            val validPrompt = PhoneAgentPrompts.buildSystemPrompt(
+                phoneControlAvailable = true,
+                modelName = "gpt-4o"
+            )
+            method.invoke(agent, validPrompt)
+        } finally {
+            FeatureFlags.resetToDefaults()
+        }
+    }
+
+    @Test
+    fun `logPromptTuningMetadata tolerates missing runtime line`() {
+        FeatureFlags.promptTuningV1Enabled = true
+        try {
+            val agent = createAgent()
+            val method = PhoneAgentApi::class.java.getDeclaredMethod("logPromptTuningMetadata", String::class.java, String::class.java)
+            method.isAccessible = true
+
+            method.invoke(agent, "prompt without structured runtime line", "action")
+        } finally {
+            FeatureFlags.resetToDefaults()
+        }
+    }
+
+    @Test
     fun `url mention without fetch intent does not inject web_fetch`() = runTest {
         server.enqueue(MockResponse()
             .setBody("""{"content":[{"type":"text","text":"That site contains OpenClaw docs."}],"role":"assistant","stop_reason":"end_turn"}""")

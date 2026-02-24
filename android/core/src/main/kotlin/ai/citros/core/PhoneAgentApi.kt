@@ -12,6 +12,7 @@ package ai.citros.core
  * @param actionClient Client for action loop follow-ups (e.g., Haiku for speed)
  */
 import android.util.Log
+import androidx.annotation.VisibleForTesting
 import java.security.MessageDigest
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.CopyOnWriteArrayList
@@ -345,6 +346,24 @@ open class PhoneAgentApi(
 
     companion object {
         private const val TAG = "CitrosAgent"
+        private const val APP_BUILD_CONFIG_CLASS = "ai.citros.chat.BuildConfig"
+
+        /**
+         * Detect debug build without depending on BuildConfig (which may not be
+         * generated for library modules). Falls back to checking the debuggable
+         * flag reflectively, defaulting to false in non-Android environments (tests).
+         */
+        internal fun detectDebugBuild(): Boolean {
+            return try {
+                // Coupled to the app module BuildConfig class name; keep in one constant
+                // so package refactors fail in one place.
+                val cls = Class.forName(APP_BUILD_CONFIG_CLASS)
+                cls.getField("DEBUG").getBoolean(null)
+            } catch (_: Exception) {
+                false
+            }
+        }
+
         private const val NANODOLLARS_PER_USD = 1_000_000_000L
         private const val NANODOLLARS_PER_MICRODOLLAR = 1_000L
         private const val FALLBACK_PROVIDER_FRAMING_CHARS = 256
@@ -540,7 +559,7 @@ open class PhoneAgentApi(
         val modelName = client.modelId
         val sensorSnapshot = getTaskSensorSnapshot(startNewTask = !isActionLoop)
         val systemPrompt = if (isActionLoop) {
-            promptBuilder?.trimmed(
+            val actionPrompt = promptBuilder?.trimmed(
                 phoneControlAvailable = phoneControlAvailable,
                 modelName = modelName,
                 sensorContext = sensorSnapshot
@@ -550,6 +569,9 @@ open class PhoneAgentApi(
                     modelName = modelName,
                     sensorContext = sensorSnapshot
                 )
+            logPromptTuningMetadata(actionPrompt, "action")
+            assertSafetyContractDebug(actionPrompt)
+            actionPrompt
         } else {
             buildChatSystemPrompt(
                 phoneControlAvailable = phoneControlAvailable,
@@ -664,7 +686,7 @@ open class PhoneAgentApi(
         modelName: String?,
         sensorContext: SensorContext?
     ): String {
-        return promptBuilder?.full(
+        val prompt = promptBuilder?.full(
             phoneControlAvailable = phoneControlAvailable,
             modelName = modelName,
             sensorContext = sensorContext
@@ -673,6 +695,43 @@ open class PhoneAgentApi(
             modelName = modelName,
             sensorContext = sensorContext
         )
+        logPromptTuningMetadata(prompt, "chat")
+        assertSafetyContractDebug(prompt)
+        return prompt
+    }
+
+    /**
+     * Log prompt tuning metadata when the budget-enforced path is active.
+     * Extracts and logs the RuntimeLine from the prompt for observability.
+     */
+    private fun logPromptTuningMetadata(prompt: String, path: String) {
+        if (!FeatureFlags.promptTuningV1Enabled) return
+        // RuntimeLine is always appended as the final line when present.
+        val runtimeLine = prompt.substringAfterLast("\n").takeIf { it.startsWith("runtime|") }
+        if (runtimeLine != null) {
+            Log.i(TAG, "RuntimeLine: $runtimeLine")
+            val parsed = RuntimeLine.parse(runtimeLine)
+            if (parsed != null) {
+                Log.d(TAG, "PromptBudget [$path]: chars=${parsed.promptChars} tokens_est=${parsed.promptTokensEst} trimmed=${parsed.trimmed} trimmed_sections=${parsed.trimmedSections}")
+            }
+        }
+    }
+
+    /**
+     * Debug-build-only safety contract assertion.
+     * Verifies all canonical safety clauses are present in the constructed prompt.
+     * Override [isDebugBuild] for testing.
+     */
+    @VisibleForTesting
+    internal var isDebugBuild: Boolean = detectDebugBuild()
+
+    private fun assertSafetyContractDebug(prompt: String) {
+        if (!FeatureFlags.promptTuningV1Enabled) return
+        if (!isDebugBuild) return
+        val missing = PromptSafetyContract.findMissingClauses(prompt)
+        if (missing.isNotEmpty()) {
+            throw AssertionError("Safety contract violation: missing clauses ${missing.joinToString(", ")} in system prompt")
+        }
     }
 
     /**
@@ -702,6 +761,8 @@ open class PhoneAgentApi(
                 modelName = actionClient.modelId,
                 sensorContext = sensorSnapshot
             )
+        logPromptTuningMetadata(systemPrompt, "action-continue")
+        assertSafetyContractDebug(systemPrompt)
 
         // Two-stage compaction: strip old SCREEN dumps first, then summarize old messages
         val (screenStripped, compactorMetrics) = contextCompactor.compactWithMetrics(messages)

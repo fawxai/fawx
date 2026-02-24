@@ -344,6 +344,12 @@ When executing tools, follow these guidelines for what to communicate to the use
 - For type_text, provide only the intended input text; submission is a separate action.
 - For wait, keep delays short (1-5s) and re-check state after waiting."""
 
+    internal const val SECTION_TOOL_PARAMETER_DETAIL_SMALL = """## Tool Parameter Detail
+
+- Use exact, current element IDs from the latest screen state.
+- type_text enters text only; tap submit separately.
+- wait: 1-5s, then re-check."""
+
     // ── Section 6: Disambiguation ───────────────────────────────────────
 
     internal const val SECTION_DISAMBIGUATION = """## Disambiguation
@@ -432,8 +438,10 @@ When executing tools, follow these guidelines for what to communicate to the use
     private fun buildVerboseExamplesSection(phoneControlAvailable: Boolean, mode: PromptMode): String? =
         if (mode == PromptMode.FULL && phoneControlAvailable) SECTION_VERBOSE_EXAMPLES else null
 
-    private fun buildToolParameterDetailSection(phoneControlAvailable: Boolean, mode: PromptMode): String? =
-        if (mode == PromptMode.FULL && phoneControlAvailable) SECTION_TOOL_PARAMETER_DETAIL else null
+    private fun buildToolParameterDetailSection(phoneControlAvailable: Boolean, mode: PromptMode, tier: ModelTier): String? {
+        if (mode != PromptMode.FULL || !phoneControlAvailable) return null
+        return if (tier == ModelTier.SMALL) SECTION_TOOL_PARAMETER_DETAIL_SMALL else SECTION_TOOL_PARAMETER_DETAIL
+    }
 
     private fun buildDisambiguationSection(mode: PromptMode): String? =
         if (mode == PromptMode.FULL) SECTION_DISAMBIGUATION else null
@@ -638,7 +646,7 @@ $line
         addSection(PromptBudget.SectionId.RECOVERY_ELABORATION, buildRecoverySection(mode))
         addSection(PromptBudget.SectionId.COMMUNICATION_STYLE, buildCommunicationSection(phoneControlAvailable, mode))
         addSection(PromptBudget.SectionId.VERBOSE_EXAMPLES, buildVerboseExamplesSection(phoneControlAvailable, mode))
-        addSection(PromptBudget.SectionId.TOOL_PARAMETER_DETAIL, buildToolParameterDetailSection(phoneControlAvailable, mode))
+        addSection(PromptBudget.SectionId.TOOL_PARAMETER_DETAIL, buildToolParameterDetailSection(phoneControlAvailable, mode, tier))
         addSection(PromptBudget.SectionId.DISAMBIGUATION, buildDisambiguationSection(mode))
         addSection(PromptBudget.SectionId.AGENT_DIRECTIVES, buildAgentDirectivesSection(agentsContent, mode))
         addSection(PromptBudget.SectionId.SECURITY_BLOCK, securityWithSafety)
