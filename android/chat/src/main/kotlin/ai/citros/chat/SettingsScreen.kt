@@ -677,11 +677,8 @@ internal fun AddKeyBottomSheet(
     val context = LocalContext.current
     val isDarkTheme = LocalCitrosIsDark.current
     val surfaces = remember(isDarkTheme) { citrosDirectiveSurfaces(isDarkTheme) }
-    val providerUrl = when (selectedProvider) {
-        Provider.ANTHROPIC -> "console.anthropic.com/settings/keys"
-        Provider.OPENAI -> "platform.openai.com/api-keys"
-        Provider.OPENROUTER -> "openrouter.ai/keys"
-    }
+    val providerUrl = providerDashboardUrl(selectedProvider)
+    val providerUrlLabel = providerUrl.removePrefix("https://")
     val hasApiKey = apiKey.trim().isNotBlank()
     val health = testStatus?.health
     val showInvalidState = health == KeyHealth.INVALID || health == KeyHealth.EXPIRED
@@ -823,7 +820,7 @@ internal fun AddKeyBottomSheet(
             }
 
             Text(
-                text = "Get a key at $providerUrl",
+                text = "Manage API keys at $providerUrlLabel",
                 style = CitrosTypography.bodyMedium,
                 color = selectedAccent.copy(alpha = 0.92f),
                 modifier = Modifier
@@ -831,7 +828,7 @@ internal fun AddKeyBottomSheet(
                         context.startActivity(
                             android.content.Intent(
                                 android.content.Intent.ACTION_VIEW,
-                                android.net.Uri.parse("https://$providerUrl")
+                                android.net.Uri.parse(providerUrl)
                             )
                         )
                     }

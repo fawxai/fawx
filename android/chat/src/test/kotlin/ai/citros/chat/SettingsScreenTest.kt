@@ -1,6 +1,8 @@
 package ai.citros.chat
 
+import android.app.Application
 import android.content.Context
+import android.content.Intent
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
@@ -20,8 +22,10 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.Shadows.shadowOf
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 @RunWith(RobolectricTestRunner::class)
@@ -153,6 +157,48 @@ class SettingsScreenTest {
         composeRule.onNodeWithText("sk-ant-...").performTextInput("sk-test-12345678901234567890")
 
         composeRule.onNodeWithText("Validate Key").assertIsEnabled()
+    }
+
+    @Test
+    fun `add key bottom sheet updates API key management link when provider changes`() {
+        composeRule.setContent {
+            SettingsScreen(
+                walletManager = testWalletManager,
+                keyStore = InMemoryKeyStore(),
+                onBack = {}
+            )
+        }
+
+        composeRule.onNodeWithContentDescription("Add Key").performClick()
+        composeRule.onNodeWithText("Manage API keys at console.anthropic.com/settings/keys").assertExists()
+
+        composeRule.onNodeWithText("OpenAI").performClick()
+        composeRule.onNodeWithText("Manage API keys at platform.openai.com/api-keys").assertExists()
+
+        composeRule.onNodeWithText("OpenRouter").performClick()
+        composeRule.onNodeWithText("Manage API keys at openrouter.ai/keys").assertExists()
+    }
+
+    @Test
+    fun `add key bottom sheet opens selected provider API key URL`() {
+        val application = ApplicationProvider.getApplicationContext<Application>()
+
+        composeRule.setContent {
+            SettingsScreen(
+                walletManager = testWalletManager,
+                keyStore = InMemoryKeyStore(),
+                onBack = {}
+            )
+        }
+
+        composeRule.onNodeWithContentDescription("Add Key").performClick()
+        composeRule.onNodeWithText("OpenAI").performClick()
+        composeRule.onNodeWithText("Manage API keys at platform.openai.com/api-keys").performClick()
+
+        val startedIntent = shadowOf(application).nextStartedActivity
+        assertNotNull(startedIntent)
+        assertEquals(Intent.ACTION_VIEW, startedIntent.action)
+        assertEquals("https://platform.openai.com/api-keys", startedIntent.dataString)
     }
 
     @Test
