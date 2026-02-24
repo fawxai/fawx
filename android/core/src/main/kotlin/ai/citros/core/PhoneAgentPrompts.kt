@@ -1,5 +1,7 @@
 package ai.citros.core
 
+import android.util.Log
+import androidx.annotation.VisibleForTesting
 import java.time.Instant
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
@@ -328,6 +330,20 @@ When executing tools, follow these guidelines for what to communicate to the use
 - Your internal debate about which approach to take
 - The word "error" for routine exploration failures"""
 
+    internal const val SECTION_VERBOSE_EXAMPLES = """## Verbose Examples
+
+- User: "Open Gmail and draft an email to Sam about tomorrow's meeting."
+  Assistant behavior: open Gmail, enter compose, set recipient, draft text, confirm completion briefly.
+- User: "What's the weather in Denver?"
+  Assistant behavior: use web_search for the answer directly; don't open Chrome unless explicitly requested."""
+
+    internal const val SECTION_TOOL_PARAMETER_DETAIL = """## Tool Parameter Detail
+
+- Always supply exact, current arguments from the latest screen state.
+- For tap/tap_text, prefer stable element IDs from the newest observation.
+- For type_text, provide only the intended input text; submission is a separate action.
+- For wait, keep delays short (1-5s) and re-check state after waiting."""
+
     // ── Section 6: Disambiguation ───────────────────────────────────────
 
     internal const val SECTION_DISAMBIGUATION = """## Disambiguation
@@ -413,6 +429,12 @@ When executing tools, follow these guidelines for what to communicate to the use
     private fun buildCommunicationSection(phoneControlAvailable: Boolean, mode: PromptMode): String? =
         if (mode == PromptMode.FULL && phoneControlAvailable) SECTION_COMMUNICATION else null
 
+    private fun buildVerboseExamplesSection(phoneControlAvailable: Boolean, mode: PromptMode): String? =
+        if (mode == PromptMode.FULL && phoneControlAvailable) SECTION_VERBOSE_EXAMPLES else null
+
+    private fun buildToolParameterDetailSection(phoneControlAvailable: Boolean, mode: PromptMode): String? =
+        if (mode == PromptMode.FULL && phoneControlAvailable) SECTION_TOOL_PARAMETER_DETAIL else null
+
     private fun buildDisambiguationSection(mode: PromptMode): String? =
         if (mode == PromptMode.FULL) SECTION_DISAMBIGUATION else null
 
@@ -494,11 +516,36 @@ $line
     // ── Prompt builders ─────────────────────────────────────────────────
 
     /**
+     * Mode-selection guard (INV-003): reject NONE for tool-capable turns.
+     * @throws IllegalArgumentException if NONE is used with tools enabled
+     */
+    internal fun guardModeSelection(mode: PromptMode, toolCapable: Boolean) {
+        require(!(mode == PromptMode.NONE && toolCapable)) {
+            "INV-003: NONE mode must not be used for tool-capable turns"
+        }
+    }
+
+    /**
+     * Resolve the tool policy ID for runtime line telemetry.
+     */
+    internal fun resolveToolPolicy(tier: ModelTier, phoneControlAvailable: Boolean): String {
+        if (!phoneControlAvailable) return "none"
+        return when (tier) {
+            ModelTier.SMALL -> "small_restricted"
+            else -> "full"
+        }
+    }
+
+    /**
      * Build the system prompt from modular sections.
      *
      * Identity files from the agent directory SUPPLEMENT the phone prompt.
      * They replace the generic identity section but never displace tools,
      * strategy, recovery, communication, or rules.
+     *
+     * When [FeatureFlags.promptTuningV1Enabled] is true, delegates to
+     * [buildTunedSystemPrompt] for budget enforcement, safety contract
+     * validation, and structured runtime line.
      */
     fun buildSystemPrompt(
         phoneControlAvailable: Boolean = true,
@@ -512,6 +559,21 @@ $line
         modelTier: ModelTier? = null,
         sensorContext: SensorContext? = null
     ): String {
+        if (FeatureFlags.promptTuningV1Enabled) {
+            return buildTunedSystemPrompt(
+                phoneControlAvailable = phoneControlAvailable,
+                modelName = modelName,
+                identityContent = identityContent,
+                userContent = userContent,
+                agentsContent = agentsContent,
+                memoryContent = memoryContent,
+                securityContent = securityContent,
+                mode = mode,
+                modelTier = modelTier,
+                sensorContext = sensorContext
+            ).finalPrompt
+        }
+
         val tier = resolveTier(modelName, modelTier)
 
         val sections = listOfNotNull(
@@ -532,6 +594,105 @@ $line
         )
 
         return sections.joinToString("\n\n")
+    }
+
+    /**
+     * Build a budget-enforced, safety-validated system prompt with structured runtime line.
+     *
+     * This is the H2.4 prompt tuning path, active when [FeatureFlags.promptTuningV1Enabled] is true.
+     * All prompt assembly uses thread-local buffers (no shared mutable state — INV-007).
+     */
+    @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
+    internal fun buildTunedSystemPrompt(
+        phoneControlAvailable: Boolean = true,
+        modelName: String? = null,
+        identityContent: String? = null,
+        userContent: String? = null,
+        agentsContent: String? = null,
+        memoryContent: String? = null,
+        securityContent: String? = null,
+        mode: PromptMode = PromptMode.FULL,
+        modelTier: ModelTier? = null,
+        sensorContext: SensorContext? = null,
+        timestamp: java.time.Instant = java.time.Instant.now()
+    ): PromptBudget.BudgetResult {
+        val tier = resolveTier(modelName, modelTier)
+        guardModeSelection(mode, toolCapable = phoneControlAvailable)
+
+        // Build labeled sections (all thread-local, no shared state)
+        val labeledSections = mutableListOf<PromptBudget.LabeledSection>()
+
+        fun addSection(id: String, content: String?) {
+            if (content != null && content.isNotBlank()) {
+                labeledSections.add(PromptBudget.LabeledSection(id, content))
+            }
+        }
+
+        // Build security section with canonical safety clauses injected
+        val securityWithSafety = buildSecurityWithSafetyClauses(securityContent, mode)
+
+        addSection(PromptBudget.SectionId.IDENTITY_BASELINE, buildIdentitySection(identityContent, mode))
+        addSection(PromptBudget.SectionId.TOOLS, buildToolsSection(phoneControlAvailable, mode, tier))
+        addSection(PromptBudget.SectionId.STRATEGY_DETAIL, buildStrategySection(mode, tier, phoneControlAvailable))
+        addSection(PromptBudget.SectionId.DEVICE_AWARENESS, buildDeviceAwarenessSection(sensorContext, mode))
+        addSection(PromptBudget.SectionId.RECOVERY_ELABORATION, buildRecoverySection(mode))
+        addSection(PromptBudget.SectionId.COMMUNICATION_STYLE, buildCommunicationSection(phoneControlAvailable, mode))
+        addSection(PromptBudget.SectionId.VERBOSE_EXAMPLES, buildVerboseExamplesSection(phoneControlAvailable, mode))
+        addSection(PromptBudget.SectionId.TOOL_PARAMETER_DETAIL, buildToolParameterDetailSection(phoneControlAvailable, mode))
+        addSection(PromptBudget.SectionId.DISAMBIGUATION, buildDisambiguationSection(mode))
+        addSection(PromptBudget.SectionId.AGENT_DIRECTIVES, buildAgentDirectivesSection(agentsContent, mode))
+        addSection(PromptBudget.SectionId.SECURITY_BLOCK, securityWithSafety)
+        addSection(PromptBudget.SectionId.CRITICAL_EXECUTION_RULES, buildRulesSection(mode))
+        addSection(PromptBudget.SectionId.USER_CONTEXT, buildUserContextSection(userContent, mode))
+        addSection(PromptBudget.SectionId.MEMORY_CONTEXT, buildMemorySection(memoryContent, mode))
+        addSection(PromptBudget.SectionId.CAPABILITY_WARNING, buildAccessibilityWarningSection(phoneControlAvailable, mode))
+
+        // Enforce budget (trims as needed)
+        val budgetResult = PromptBudget.enforce(labeledSections, mode)
+
+        if (budgetResult.softBudgetExceeded) {
+            Log.w(
+                "PhoneAgentPrompts",
+                "Prompt exceeded soft budget: mode=$mode tier=$tier chars=${budgetResult.charCount} tokens=${budgetResult.tokenEstimate}"
+            )
+        }
+
+        // Safety-presence guard: verify canonical clauses survive trimming (INV-002)
+        if (mode != PromptMode.NONE) {
+            PromptSafetyContract.assertAllPresent(budgetResult.finalPrompt)
+        }
+
+        // Build runtime line with final metrics
+        val accessibility = if (phoneControlAvailable) "attached" else "detached"
+        val toolPolicy = resolveToolPolicy(tier, phoneControlAvailable)
+        val runtimeLine = RuntimeLine.build(
+            modelName = modelName,
+            tier = tier,
+            mode = mode,
+            accessibility = accessibility,
+            toolPolicy = toolPolicy,
+            promptChars = budgetResult.charCount,
+            promptTokensEst = budgetResult.tokenEstimate,
+            trimmed = budgetResult.trimmed,
+            trimmedSections = budgetResult.trimmedSections,
+            timestamp = timestamp
+        )
+
+        // Append runtime line to final prompt
+        return budgetResult.withAppendedContent(runtimeLine)
+    }
+
+    /**
+     * Build security section with canonical safety clauses injected.
+     */
+    private fun buildSecurityWithSafetyClauses(securityContent: String?, mode: PromptMode): String? {
+        if (mode == PromptMode.NONE) return null
+        val base = buildSecuritySection(securityContent, mode) ?: return null
+        // Inject canonical safety clauses if not already present
+        val clauseBlock = PromptSafetyContract.ALL_CLAUSES.joinToString("\n") { (id, text) ->
+            "- [$id] $text"
+        }
+        return "$base\n\n### Canonical Safety Clauses\n$clauseBlock"
     }
 
     /**

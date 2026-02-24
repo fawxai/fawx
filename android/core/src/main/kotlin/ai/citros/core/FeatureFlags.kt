@@ -29,11 +29,21 @@ object FeatureFlags {
     var actionPolicyAuditAllowDecisions: Boolean = false
 
     /**
+     * Rollout switch for model-aware prompt tuning (H2.4 spec).
+     * When enabled, activates budget enforcement, canonical safety contract,
+     * structured runtime line, and deterministic section trimming.
+     * Default: false (Phase 1 — behind flag per rollout plan Section 7.2).
+     */
+    @Volatile
+    var promptTuningV1Enabled: Boolean = false
+
+    /**
      * Reset all flags to defaults. Used in tests.
      */
     fun resetToDefaults() {
         useServiceArchitecture = true
         actionPolicyEnabled = true
         actionPolicyAuditAllowDecisions = false
+        promptTuningV1Enabled = false
     }
 }
