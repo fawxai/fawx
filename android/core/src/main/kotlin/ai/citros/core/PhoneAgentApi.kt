@@ -72,7 +72,9 @@ open class PhoneAgentApi(
     /** Element long-press provider, injectable for unit tests. */
     private val longPressElement: (Int) -> ScreenReader.ElementActionResult = { ScreenReader.longPressElementDetailed(it) },
     /** Optional spending guard for API usage. */
-    private val budgetGuard: BudgetGuard? = null
+    private val budgetGuard: BudgetGuard? = null,
+    /** Robust text input fallback chain wrapper used by type_text. */
+    private val robustTextInput: RobustTextInput = RobustTextInput()
 ) {
     private val taskSensorSnapshotLock = Any()
     @Volatile
@@ -921,15 +923,16 @@ open class PhoneAgentApi(
                     val text = (toolCall.input["text"] as? String)?.takeIf { it.isNotEmpty() }
                         ?: throw IllegalArgumentException("type_text requires non-empty text (string)")
 
-                    if (!ScreenReader.typeText(text)) {
-                        executionFailedResult("Failed: type_text: no text field focused")
-                    } else {
-                        val mapsHandled = runCatching { executeMapsSuggestionStrategyIfApplicable(text) }
-                            .getOrElse { false }
-                        if (mapsHandled) {
-                            ToolResult("Typed and submitted Maps search \"$text\"")
-                        } else {
-                            ToolResult("Typed \"$text\"")
+                    when (robustTextInput.inputText(text)) {
+                        is InputResult.Failed -> executionFailedResult("Failed: type_text: unable to enter text")
+                        else -> {
+                            val mapsHandled = runCatching { executeMapsSuggestionStrategyIfApplicable(text) }
+                                .getOrElse { false }
+                            if (mapsHandled) {
+                                ToolResult("Typed and submitted Maps search \"$text\"")
+                            } else {
+                                ToolResult("Typed \"$text\"")
+                            }
                         }
                     }
                 }

@@ -23,6 +23,7 @@ import org.mockito.kotlin.any
 import org.mockito.kotlin.doNothing
 import org.mockito.kotlin.doThrow
 import org.mockito.kotlin.mock
+import org.mockito.kotlin.verify
 import org.mockito.kotlin.whenever
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -5162,5 +5163,38 @@ class PhoneAgentApiTest {
         } finally {
             tempDir.deleteRecursively()
         }
+    }
+
+    @Test
+    fun `type_text dispatches through robustTextInput and maps result correctly`() = runTest {
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+
+        val successInput = mock<RobustTextInput>()
+        whenever(successInput.inputText("Hello")).thenReturn(InputResult.Fallback(InputTier.KEY_EVENTS))
+        val successApi = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            isScreenReaderAttached = { true },
+            robustTextInput = successInput
+        )
+
+        val success = successApi.executeToolCall(ToolCall("t1", "type_text", mapOf("text" to "Hello")), null)
+        assertFalse(success.isError)
+        assertEquals("Typed \"Hello\"", success.text)
+        verify(successInput).inputText("Hello")
+
+        val failedInput = mock<RobustTextInput>()
+        whenever(failedInput.inputText("Hello")).thenReturn(InputResult.Failed(InputTier.ADB_INPUT))
+        val failedApi = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            isScreenReaderAttached = { true },
+            robustTextInput = failedInput
+        )
+
+        val failed = failedApi.executeToolCall(ToolCall("t2", "type_text", mapOf("text" to "Hello")), null)
+        assertTrue(failed.isError)
+        assertEquals("Failed: type_text: unable to enter text", failed.text)
+        verify(failedInput).inputText("Hello")
     }
 }
