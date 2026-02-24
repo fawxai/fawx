@@ -56,6 +56,25 @@ class RecoveryScaffoldTest {
     }
 
     @Test
+    fun `detectFailure bypasses no effect for all excluded tools`() {
+        val before = ScreenFingerprint(structuralHash = 111, packageName = "com.app")
+        val after = ScreenFingerprint(structuralHash = 111, packageName = "com.app")
+        val excludedTools = listOf("type_text", "wait", "read_screen", "paste")
+
+        excludedTools.forEach { toolName ->
+            val failure = detectFailure(
+                toolCall = ToolCall("excluded-$toolName", toolName, mapOf("text" to "hello")),
+                result = ToolResult("ok", isError = false),
+                screenBefore = before,
+                screenAfter = after,
+                consecutiveFailures = 1
+            )
+
+            assertNull(failure, "Expected no failure for excluded tool $toolName")
+        }
+    }
+
+    @Test
     fun `detectFailure returns unexpected state when app changes unexpectedly`() {
         val before = ScreenFingerprint(structuralHash = 111, packageName = "com.a")
         val after = ScreenFingerprint(structuralHash = 222, packageName = "com.b")

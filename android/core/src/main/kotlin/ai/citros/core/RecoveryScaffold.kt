@@ -157,16 +157,30 @@ class RecoveryManager(
     }
 }
 
-private val UI_MUTATING_TOOLS_FOR_RECOVERY = setOf(
-    "tap", "tap_text", "type_text", "swipe", "scroll", "press_back", "press_home", "open_app", "long_press", "paste"
-)
+private val NO_EFFECT_EXCLUDED_TOOLS = setOf("type_text", "wait", "read_screen", "paste")
+
+/**
+ * Converts [ScreenContent] into a coarse structural fingerprint for NO_EFFECT detection.
+ *
+ * This currently uses [ScreenContent.hashCode] as the structural hash. That is safe only while
+ * `hashCode()` remains structure-derived (e.g., Kotlin data-class semantics over fields that
+ * represent visible UI state). If `ScreenContent` stops being structural-hash based, NO_EFFECT
+ * detection will become unreliable and this mapping should be updated explicitly.
+ */
+internal fun ScreenContent?.toFingerprint(): ScreenFingerprint? {
+    if (this == null) return null
+    return ScreenFingerprint(structuralHash = this.hashCode(), packageName = this.packageName)
+}
 
 /**
  * Detect whether a tool execution should be recorded as a failure signal for recovery.
  *
  * `consecutiveFailures` is owned by the caller and represents the current streak **before** this
- * tool result is evaluated. When this function detects a failure, it returns an [ActionFailure]
- * with `consecutiveFailures + 1`; when it returns `null`, the caller should treat this attempt as
+ * tool result is evaluated. In [AgentExecutor], this is a single shared counter carried across
+ * sequential tool calls (including multiple tool calls from the same model response).
+ *
+ * When this function detects a failure, it returns an [ActionFailure] with
+ * `consecutiveFailures + 1`; when it returns `null`, the caller should treat this attempt as
  * non-failure and reset/maintain its own counter according to higher-level policy.
  */
 fun detectFailure(
@@ -189,7 +203,8 @@ fun detectFailure(
         )
     }
 
-    if (toolCall.name in UI_MUTATING_TOOLS_FOR_RECOVERY &&
+    if (toolCall.name in PhoneAgentApi.UI_MUTATING_TOOLS &&
+        toolCall.name !in NO_EFFECT_EXCLUDED_TOOLS &&
         screenBefore != null &&
         screenAfter != null &&
         screenBefore.structuralHash == screenAfter.structuralHash

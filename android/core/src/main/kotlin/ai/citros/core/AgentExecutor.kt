@@ -74,13 +74,20 @@ class AgentExecutor(
      * Defaults to `null` (no transformation). Required for H2 context trimming.
      */
     private val transformContext: (suspend () -> Unit)? = null,
+    /** Deterministic recovery strategy manager (advisory guidance injection). */
+    private val recoveryManager: RecoveryManager = RecoveryManager(),
     /**
      * Optional hook invoked after each tool boundary with checkpoint metadata.
      * Used by service architecture to persist durable recovery state.
      */
     private val checkpointCallback: (suspend (LoopCheckpoint) -> Unit)? = null
 ) {
-    /** Per-tool consecutive failure counters for error severity escalation. */
+    /**
+     * Per-tool consecutive failure counters for error severity escalation only.
+     *
+     * Distinct from `consecutiveFailures` in [run], which is a single global streak used by
+     * recovery detection across sequential tool calls (including calls in one model response).
+     */
     private val failureCounts = mutableMapOf<String, Int>()
 
     companion object {
@@ -166,6 +173,9 @@ class AgentExecutor(
         var response: ChatResponse? = initialResponse
         var screenContent = initialScreenContent
         var toolSteps = 0
+        // Recovery-level streak across tool calls in this run (global, not per tool name).
+        // Distinct from `failureCounts`, which tracks per-tool retries for error severity escalation.
+        var consecutiveFailures = 0
 
         // If no tool calls in initial response, return immediately
         if (response == null || response.toolCalls.isEmpty()) {
@@ -232,7 +242,8 @@ class AgentExecutor(
 
             var steered = false
             for ((toolIndex, toolCall) in response.toolCalls.withIndex()) {
-                val preActionHash = screenContent?.hashCode()
+                val preActionScreen = screenContent
+                val preActionHash = preActionScreen?.hashCode()
                 progressListener.onToolStarted(toolCall.name, toolIndex, response.toolCalls.size)
 
                 // Execute the tool
@@ -277,11 +288,31 @@ class AgentExecutor(
                 delegate.settleDelay(toolCall.name, actionResult.text)
 
                 // For UI-mutating tools, refresh screen and format result
-                val toolResult = if (delegate.isUiMutatingTool(toolCall.name)) {
+                val baseToolResult = if (delegate.isUiMutatingTool(toolCall.name)) {
                     screenContent = delegate.refreshScreenAfterTool(toolCall.name, actionResult.text)
                     delegate.formatToolResult(actionResult.text, screenContent)
                 } else {
                     actionResult.text
+                }
+
+                val failure = detectFailure(
+                    toolCall = toolCall,
+                    result = actionResult,
+                    screenBefore = preActionScreen.toFingerprint(),
+                    screenAfter = screenContent.toFingerprint(),
+                    // Shared across sequential tool calls (including calls in the same model batch).
+                    // A success resets this streak, so recovery escalation reflects the current run's
+                    // contiguous failure streak rather than lifetime failures.
+                    consecutiveFailures = consecutiveFailures
+                )
+
+                val recoveryGuidance = failure?.let { recoveryManager.evaluateFailure(it) }
+                if (failure != null) consecutiveFailures++ else consecutiveFailures = 0
+
+                val toolResult = if (recoveryGuidance != null) {
+                    baseToolResult + recoveryGuidance
+                } else {
+                    baseToolResult
                 }
 
                 // === POST-TOOL BOUNDARY CHECK POINT ===
