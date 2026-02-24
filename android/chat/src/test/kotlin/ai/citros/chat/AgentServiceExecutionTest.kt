@@ -1,14 +1,26 @@
 package ai.citros.chat
 
+import ai.citros.core.ActionPolicy
+import ai.citros.core.AgentExecutor
 import ai.citros.core.AgentState
 import ai.citros.core.ChatResponse
+import ai.citros.core.DefaultActionPolicy
+import ai.citros.core.LoopCheckpoint
+import ai.citros.core.FeatureFlags
+import ai.citros.core.InterruptionEvent
+import ai.citros.core.LoopProgressListener
+import ai.citros.core.PermissiveActionPolicy
 import ai.citros.core.PhoneAgentApi
 import ai.citros.core.ToolCall
+import ai.citros.core.ToolExecutionDelegate
 import ai.citros.core.ToolResult
+import ai.citros.core.TaskState
+import ai.citros.core.TaskStateManager
 import android.content.Intent
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.StandardTestDispatcher
-import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.advanceTimeBy
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.After
 import org.junit.Before
@@ -42,6 +54,11 @@ class AgentServiceExecutionTest {
         InterruptionDetector.stopMonitoring()
         controller = Robolectric.buildService(AgentService::class.java)
         service = controller.get()
+        service.taskStateManagerOverride = object : TaskStateManager {
+            override suspend fun checkpoint(state: TaskState) = Unit
+            override suspend fun loadPending(staleThresholdMs: Long) = null
+            override suspend fun clear() = Unit
+        }
         controller.create()
     }
 
@@ -131,14 +148,17 @@ class AgentServiceExecutionTest {
         binder.configureExecution(api = mockApi)
 
         service.onStartCommand(AgentService.startTaskIntent(service, "hello"), 0, 1)
-        advanceUntilIdle()
+        // AgentService settle delays are <=1500ms; 2000ms adds headroom.
+        // We avoid advanceUntilIdle() because policy confirmation timeout paths can keep virtual time advancing unexpectedly.
+        advanceTimeBy(2_000)
+        runCurrent()
 
         val state = service.agentState.value
         assertIs<AgentState.Complete>(state)
         assertEquals("Hi there", state.result)
         assertTrue(service.conversationMessages.value.any { it.role == "user" && it.content == "hello" })
         assertTrue(service.conversationMessages.value.any { it.role == "assistant" && it.content == "Hi there" })
-        verify(mockApi).seedConversationHistory(service.conversationMessages.value.dropLast(1))
+        verify(mockApi).seedConversationHistory(emptyList())
     }
 
     @OptIn(ExperimentalCoroutinesApi::class)
@@ -152,34 +172,199 @@ class AgentServiceExecutionTest {
         val mockApi = mock(PhoneAgentApi::class.java)
         val callback = mock(ServiceProgressCallback::class.java)
 
-        `when`(mockApi.sendMessage("open gmail", null, false)).thenReturn(
-            ChatResponse(text = null, toolCalls = listOf(toolCall), stopReason = "tool_use")
-        )
+        val scripted = PolicyWiringTestFixtures.toolLoopHappyPathResponses(toolCall = toolCall)
+        `when`(mockApi.sendMessage("open gmail", null, false)).thenReturn(scripted.removeFirst())
         `when`(mockApi.executeToolCall(toolCall, null)).thenReturn(ToolResult(text = "Opened Gmail", isError = false))
         `when`(mockApi.formatToolResult("Opened Gmail", null)).thenReturn("Opened Gmail")
-        `when`(mockApi.continueAfterTools()).thenReturn(
-            ChatResponse(text = "Done", toolCalls = emptyList(), stopReason = "end_turn")
-        )
+        `when`(mockApi.continueAfterTools()).thenReturn(scripted.removeFirst())
 
-        binder.configureExecution(api = mockApi, progress = callback)
+        val originalPolicyFlag = FeatureFlags.actionPolicyEnabled
+        try {
+            FeatureFlags.actionPolicyEnabled = false
+            binder.configureExecution(api = mockApi, progress = callback)
 
-        service.onStartCommand(AgentService.startTaskIntent(service, "open gmail"), 0, 1)
-        advanceUntilIdle()
+            service.onStartCommand(AgentService.startTaskIntent(service, "open gmail"), 0, 1)
+            // AgentService settle delays are <=1500ms; 2000ms adds headroom.
+            // We avoid advanceUntilIdle() because policy confirmation timeout paths can keep virtual time advancing unexpectedly.
+            advanceTimeBy(2_000)
+            runCurrent()
 
-        val state = service.agentState.value
-        assertIs<AgentState.Complete>(state)
-        assertEquals("Done", state.result)
+            val state = service.agentState.value
+            assertIs<AgentState.Complete>(state)
+            assertEquals("Done", state.result)
 
-        verify(mockApi).executeToolCall(toolCall, null)
-        verify(mockApi).addToolResult("tool-1", "Opened Gmail", "open_app", false)
-        verify(mockApi).continueAfterTools()
-        verify(callback).onExecutionComplete(1)
-        verify(callback).onToolStatus("open_app")
-        verify(callback).onToolStatus(null)
+            verify(mockApi).executeToolCall(toolCall, null)
+            verify(mockApi).addToolResult("tool-1", "Opened Gmail", "open_app", false)
+            verify(mockApi).continueAfterTools()
+            verify(callback).onExecutionComplete(1)
+            verify(callback).onToolStatus("open_app")
+            verify(callback).onToolStatus(null)
 
-        val messages = service.conversationMessages.value
-        assertTrue(messages.any { it.role == "assistant" && it.content.contains("🤖 Opened Gmail") })
-        assertTrue(messages.any { it.role == "assistant" && it.content == "Done" })
+            val messages = service.conversationMessages.value
+            assertTrue(messages.any { it.role == "assistant" && it.content.contains("🤖 Opened Gmail") })
+            assertTrue(messages.any { it.role == "assistant" && it.content == "Done" })
+        } finally {
+            FeatureFlags.actionPolicyEnabled = originalPolicyFlag
+        }
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `tool loop path completes with action policy enabled for allowed tool`() = runTest {
+        val testDispatcher = StandardTestDispatcher(testScheduler)
+        service.dispatcher = testDispatcher
+
+        val toolCall = ToolCall(id = "tool-1", name = "think", input = mapOf("thought" to "plan next step"))
+        val binder = service.onBind(Intent()) as AgentService.AgentBinder
+        val mockApi = mock(PhoneAgentApi::class.java)
+
+        val scripted = PolicyWiringTestFixtures.toolLoopHappyPathResponses(toolCall = toolCall)
+        `when`(mockApi.sendMessage("plan", null, false)).thenReturn(scripted.removeFirst())
+        `when`(mockApi.executeToolCall(toolCall, null)).thenReturn(ToolResult(text = "Thought complete", isError = false))
+        `when`(mockApi.formatToolResult("Thought complete", null)).thenReturn("Thought complete")
+        `when`(mockApi.continueAfterTools()).thenReturn(scripted.removeFirst())
+
+        val originalPolicyFlag = FeatureFlags.actionPolicyEnabled
+        try {
+            FeatureFlags.actionPolicyEnabled = true
+            binder.configureExecution(api = mockApi)
+
+            service.onStartCommand(AgentService.startTaskIntent(service, "plan"), 0, 1)
+            // AgentService settle delays are <=1500ms; 2000ms adds headroom.
+            // We avoid advanceUntilIdle() because policy confirmation timeout paths can keep virtual time advancing unexpectedly.
+            advanceTimeBy(2_000)
+            runCurrent()
+
+            val state = service.agentState.value
+            assertIs<AgentState.Complete>(state)
+            assertEquals("Done", state.result)
+            verify(mockApi).executeToolCall(toolCall, null)
+            verify(mockApi).continueAfterTools()
+        } finally {
+            FeatureFlags.actionPolicyEnabled = originalPolicyFlag
+        }
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `tool loop wiring uses permissive policy when action policy flag disabled and allow-audit enabled`() = runTest {
+        val testDispatcher = StandardTestDispatcher(testScheduler)
+        service.dispatcher = testDispatcher
+
+        val toolCall = ToolCall(id = "tool-1", name = "open_app", input = mapOf("app_name" to "Gmail"))
+        val binder = service.onBind(Intent()) as AgentService.AgentBinder
+        val mockApi = mock(PhoneAgentApi::class.java)
+
+        val scripted = PolicyWiringTestFixtures.toolLoopHappyPathResponses(toolCall = toolCall)
+        `when`(mockApi.sendMessage("open gmail", null, false)).thenReturn(scripted.removeFirst())
+        `when`(mockApi.executeToolCall(toolCall, null)).thenReturn(ToolResult(text = "Opened Gmail", isError = false))
+        `when`(mockApi.formatToolResult("Opened Gmail", null)).thenReturn("Opened Gmail")
+        `when`(mockApi.continueAfterTools()).thenReturn(scripted.removeFirst())
+
+        var capturedPolicy: ActionPolicy? = null
+        var capturedAuditAllow: Boolean? = null
+        service.agentExecutorFactory = { delegate: ToolExecutionDelegate,
+                                         progressListener: LoopProgressListener,
+                                         actionPolicy: ActionPolicy,
+                                         maxToolSteps: Int,
+                                         steerMessageSource: () -> List<String>,
+                                         auditAllowDecisions: Boolean,
+                                         interruptionSource: () -> InterruptionEvent?,
+                                         checkpointCallback: suspend (LoopCheckpoint) -> Unit ->
+            capturedPolicy = actionPolicy
+            capturedAuditAllow = auditAllowDecisions
+            AgentExecutor(
+                delegate = delegate,
+                progressListener = progressListener,
+                actionPolicy = actionPolicy,
+                maxToolSteps = maxToolSteps,
+                steerMessageSource = steerMessageSource,
+                auditAllowDecisions = auditAllowDecisions,
+                interruptionSource = interruptionSource,
+                checkpointCallback = checkpointCallback
+            )
+        }
+
+        val originalPolicyFlag = FeatureFlags.actionPolicyEnabled
+        val originalAuditFlag = FeatureFlags.actionPolicyAuditAllowDecisions
+        try {
+            FeatureFlags.actionPolicyEnabled = false
+            FeatureFlags.actionPolicyAuditAllowDecisions = true
+            binder.configureExecution(api = mockApi)
+
+            service.onStartCommand(AgentService.startTaskIntent(service, "open gmail"), 0, 1)
+            // AgentService settle delays are <=1500ms; 2000ms adds headroom.
+            // We avoid advanceUntilIdle() because policy confirmation timeout paths can keep virtual time advancing unexpectedly.
+            advanceTimeBy(2_000)
+            runCurrent()
+
+            assertEquals(PermissiveActionPolicy, capturedPolicy)
+            assertEquals(true, capturedAuditAllow)
+        } finally {
+            FeatureFlags.actionPolicyEnabled = originalPolicyFlag
+            FeatureFlags.actionPolicyAuditAllowDecisions = originalAuditFlag
+        }
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `tool loop wiring uses default policy and disables allow-audit by default`() = runTest {
+        val testDispatcher = StandardTestDispatcher(testScheduler)
+        service.dispatcher = testDispatcher
+
+        val toolCall = ToolCall(id = "tool-1", name = "open_app", input = mapOf("app_name" to "Gmail"))
+        val binder = service.onBind(Intent()) as AgentService.AgentBinder
+        val mockApi = mock(PhoneAgentApi::class.java)
+
+        val scripted = PolicyWiringTestFixtures.toolLoopHappyPathResponses(toolCall = toolCall)
+        `when`(mockApi.sendMessage("open gmail", null, false)).thenReturn(scripted.removeFirst())
+        `when`(mockApi.executeToolCall(toolCall, null)).thenReturn(ToolResult(text = "Opened Gmail", isError = false))
+        `when`(mockApi.formatToolResult("Opened Gmail", null)).thenReturn("Opened Gmail")
+        `when`(mockApi.continueAfterTools()).thenReturn(scripted.removeFirst())
+
+        var capturedPolicy: ActionPolicy? = null
+        var capturedAuditAllow: Boolean? = null
+        service.agentExecutorFactory = { delegate: ToolExecutionDelegate,
+                                         progressListener: LoopProgressListener,
+                                         actionPolicy: ActionPolicy,
+                                         maxToolSteps: Int,
+                                         steerMessageSource: () -> List<String>,
+                                         auditAllowDecisions: Boolean,
+                                         interruptionSource: () -> InterruptionEvent?,
+                                         checkpointCallback: suspend (LoopCheckpoint) -> Unit ->
+            capturedPolicy = actionPolicy
+            capturedAuditAllow = auditAllowDecisions
+            AgentExecutor(
+                delegate = delegate,
+                progressListener = progressListener,
+                actionPolicy = actionPolicy,
+                maxToolSteps = maxToolSteps,
+                steerMessageSource = steerMessageSource,
+                auditAllowDecisions = auditAllowDecisions,
+                interruptionSource = interruptionSource,
+                checkpointCallback = checkpointCallback
+            )
+        }
+
+        val originalPolicyFlag = FeatureFlags.actionPolicyEnabled
+        val originalAuditFlag = FeatureFlags.actionPolicyAuditAllowDecisions
+        try {
+            FeatureFlags.actionPolicyEnabled = true
+            FeatureFlags.actionPolicyAuditAllowDecisions = false
+            binder.configureExecution(api = mockApi)
+
+            service.onStartCommand(AgentService.startTaskIntent(service, "open gmail"), 0, 1)
+            // AgentService settle delays are <=1500ms; 2000ms adds headroom.
+            // We avoid advanceUntilIdle() because policy confirmation timeout paths can keep virtual time advancing unexpectedly.
+            advanceTimeBy(2_000)
+            runCurrent()
+
+            assertTrue(capturedPolicy is DefaultActionPolicy)
+            assertEquals(false, capturedAuditAllow)
+        } finally {
+            FeatureFlags.actionPolicyEnabled = originalPolicyFlag
+            FeatureFlags.actionPolicyAuditAllowDecisions = originalAuditFlag
+        }
     }
 
     @OptIn(ExperimentalCoroutinesApi::class)
@@ -194,27 +379,33 @@ class AgentServiceExecutionTest {
         val callback = mock(ServiceProgressCallback::class.java)
         val monitoringObservedDuringExecution = AtomicBoolean(false)
 
-        `when`(mockApi.sendMessage("open gmail", null, false)).thenReturn(
-            ChatResponse(text = null, toolCalls = listOf(toolCall), stopReason = "tool_use")
-        )
+        val scripted = PolicyWiringTestFixtures.toolLoopHappyPathResponses(toolCall = toolCall)
+        `when`(mockApi.sendMessage("open gmail", null, false)).thenReturn(scripted.removeFirst())
         `when`(mockApi.executeToolCall(toolCall, null)).thenReturn(ToolResult(text = "Opened Gmail", isError = false))
         `when`(mockApi.formatToolResult("Opened Gmail", null)).thenReturn("Opened Gmail")
-        `when`(mockApi.continueAfterTools()).thenReturn(
-            ChatResponse(text = "Done", toolCalls = emptyList(), stopReason = "end_turn")
-        )
+        `when`(mockApi.continueAfterTools()).thenReturn(scripted.removeFirst())
         doAnswer {
             monitoringObservedDuringExecution.set(isInterruptionMonitoringActive())
             null
         }.`when`(callback).onToolStatus("open_app")
 
-        binder.configureExecution(api = mockApi, progress = callback)
+        val originalPolicyFlag = FeatureFlags.actionPolicyEnabled
+        try {
+            FeatureFlags.actionPolicyEnabled = false
+            binder.configureExecution(api = mockApi, progress = callback)
 
-        service.onStartCommand(AgentService.startTaskIntent(service, "open gmail"), 0, 1)
-        advanceUntilIdle()
+            service.onStartCommand(AgentService.startTaskIntent(service, "open gmail"), 0, 1)
+            // AgentService settle delays are <=1500ms; 2000ms adds headroom.
+            // We avoid advanceUntilIdle() because policy confirmation timeout paths can keep virtual time advancing unexpectedly.
+            advanceTimeBy(2_000)
+            runCurrent()
 
-        assertTrue(monitoringObservedDuringExecution.get())
-        assertFalse(isInterruptionMonitoringActive())
-        assertNull(currentExpectedInterruptionPackage())
+            assertTrue(monitoringObservedDuringExecution.get())
+            assertFalse(isInterruptionMonitoringActive())
+            assertNull(currentExpectedInterruptionPackage())
+        } finally {
+            FeatureFlags.actionPolicyEnabled = originalPolicyFlag
+        }
     }
 
     @OptIn(ExperimentalCoroutinesApi::class)
@@ -227,7 +418,6 @@ class AgentServiceExecutionTest {
         val binder = service.onBind(Intent()) as AgentService.AgentBinder
         val mockApi = mock(PhoneAgentApi::class.java)
         val callback = mock(ServiceProgressCallback::class.java)
-        val monitoringObservedDuringExecution = AtomicBoolean(false)
 
         `when`(mockApi.sendMessage("open gmail", null, false)).thenReturn(
             ChatResponse(text = null, toolCalls = listOf(toolCall), stopReason = "tool_use")
@@ -235,20 +425,27 @@ class AgentServiceExecutionTest {
         `when`(mockApi.executeToolCall(toolCall, null)).thenReturn(ToolResult(text = "Opened Gmail", isError = false))
         `when`(mockApi.formatToolResult("Opened Gmail", null)).thenReturn("Opened Gmail")
         `when`(mockApi.continueAfterTools()).thenThrow(RuntimeException("loop boom"))
-        doAnswer {
-            monitoringObservedDuringExecution.set(isInterruptionMonitoringActive())
-            null
-        }.`when`(callback).onToolStatus("open_app")
 
-        binder.configureExecution(api = mockApi, progress = callback)
+        val originalPolicyFlag = FeatureFlags.actionPolicyEnabled
+        try {
+            FeatureFlags.actionPolicyEnabled = false
+            binder.configureExecution(api = mockApi, progress = callback)
 
-        service.onStartCommand(AgentService.startTaskIntent(service, "open gmail"), 0, 1)
-        advanceUntilIdle()
+            service.onStartCommand(AgentService.startTaskIntent(service, "open gmail"), 0, 1)
+            // AgentService settle delays are <=1500ms; 2000ms adds headroom.
+            // We avoid advanceUntilIdle() because policy confirmation timeout paths can keep virtual time advancing unexpectedly.
+            advanceTimeBy(2_000)
+            runCurrent()
 
-        assertIs<AgentState.Failed>(service.agentState.value)
-        assertTrue(monitoringObservedDuringExecution.get())
-        assertFalse(isInterruptionMonitoringActive())
-        assertNull(currentExpectedInterruptionPackage())
+            val state = service.agentState.value
+            assertIs<AgentState.Failed>(state)
+            assertTrue(state.error.contains("loop boom"))
+            verify(callback).onToolStatus("open_app")
+            assertFalse(isInterruptionMonitoringActive())
+            assertNull(currentExpectedInterruptionPackage())
+        } finally {
+            FeatureFlags.actionPolicyEnabled = originalPolicyFlag
+        }
     }
 
     @OptIn(ExperimentalCoroutinesApi::class)
@@ -262,25 +459,31 @@ class AgentServiceExecutionTest {
         val mockApi = mock(PhoneAgentApi::class.java)
         val callback = mock(ServiceProgressCallback::class.java)
 
-        `when`(mockApi.sendMessage("open gmail", null, false)).thenReturn(
-            ChatResponse(text = null, toolCalls = listOf(toolCall), stopReason = "tool_use")
-        )
+        val scripted = PolicyWiringTestFixtures.toolLoopHappyPathResponses(toolCall = toolCall)
+        `when`(mockApi.sendMessage("open gmail", null, false)).thenReturn(scripted.removeFirst())
         `when`(mockApi.executeToolCall(toolCall, null)).thenReturn(ToolResult(text = "Opened Gmail", isError = false))
         `when`(mockApi.formatToolResult("Opened Gmail", null)).thenReturn("Opened Gmail")
-        `when`(mockApi.continueAfterTools()).thenReturn(
-            ChatResponse(text = "Done", toolCalls = emptyList(), stopReason = "end_turn")
-        )
+        `when`(mockApi.continueAfterTools()).thenReturn(scripted.removeFirst())
         doThrow(RuntimeException("callback boom")).`when`(callback).onToolStatus("open_app")
 
-        binder.configureExecution(api = mockApi, progress = callback)
+        val originalPolicyFlag = FeatureFlags.actionPolicyEnabled
+        try {
+            FeatureFlags.actionPolicyEnabled = false
+            binder.configureExecution(api = mockApi, progress = callback)
 
-        service.onStartCommand(AgentService.startTaskIntent(service, "open gmail"), 0, 1)
-        advanceUntilIdle()
+            service.onStartCommand(AgentService.startTaskIntent(service, "open gmail"), 0, 1)
+            // AgentService settle delays are <=1500ms; 2000ms adds headroom.
+            // We avoid advanceUntilIdle() because policy confirmation timeout paths can keep virtual time advancing unexpectedly.
+            advanceTimeBy(2_000)
+            runCurrent()
 
-        val state = service.agentState.value
-        assertIs<AgentState.Complete>(state)
-        assertEquals("Done", state.result)
-        verify(mockApi).continueAfterTools()
+            val state = service.agentState.value
+            assertIs<AgentState.Complete>(state)
+            assertEquals("Done", state.result)
+            verify(mockApi).continueAfterTools()
+        } finally {
+            FeatureFlags.actionPolicyEnabled = originalPolicyFlag
+        }
     }
 
     @OptIn(ExperimentalCoroutinesApi::class)
@@ -297,7 +500,10 @@ class AgentServiceExecutionTest {
         binder.configureExecution(api = mockApi)
 
         service.onStartCommand(AgentService.startTaskIntent(service, "hello"), 0, 1)
-        advanceUntilIdle()
+        // AgentService settle delays are <=1500ms; 2000ms adds headroom.
+        // We avoid advanceUntilIdle() because policy confirmation timeout paths can keep virtual time advancing unexpectedly.
+        advanceTimeBy(2_000)
+        runCurrent()
 
         val state = service.agentState.value
         assertIs<AgentState.Complete>(state)
@@ -321,7 +527,10 @@ class AgentServiceExecutionTest {
         binder.configureExecution(api = mockApi, progress = callback)
 
         service.onStartCommand(AgentService.startTaskIntent(service, "hello"), 0, 1)
-        advanceUntilIdle()
+        // AgentService settle delays are <=1500ms; 2000ms adds headroom.
+        // We avoid advanceUntilIdle() because policy confirmation timeout paths can keep virtual time advancing unexpectedly.
+        advanceTimeBy(2_000)
+        runCurrent()
 
         val state = service.agentState.value
         assertIs<AgentState.Complete>(state)

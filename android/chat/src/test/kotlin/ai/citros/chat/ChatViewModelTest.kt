@@ -1,8 +1,14 @@
 package ai.citros.chat
 
+import ai.citros.core.ActionPolicy
+import ai.citros.core.AgentExecutor
 import ai.citros.core.AgentFileManager
 import ai.citros.core.ChatResponse
 import ai.citros.core.ErrorSeverity
+import ai.citros.core.DefaultActionPolicy
+import ai.citros.core.FeatureFlags
+import ai.citros.core.InterruptionEvent
+import ai.citros.core.LoopProgressListener
 import ai.citros.core.MemoryFilter
 import ai.citros.core.MemoryMetadata
 import ai.citros.core.MemoryProvider
@@ -11,6 +17,7 @@ import ai.citros.core.Message
 import ai.citros.core.ModelCatalog
 import ai.citros.core.ModelConfig
 import ai.citros.core.ModelTier
+import ai.citros.core.PermissiveActionPolicy
 import ai.citros.core.Provider
 import ai.citros.core.ProviderClient
 import ai.citros.core.ProviderConfig
@@ -21,6 +28,7 @@ import ai.citros.core.SensorContext
 import ai.citros.core.SensorProvider
 import ai.citros.core.Tool
 import ai.citros.core.ToolCall
+import ai.citros.core.ToolExecutionDelegate
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.StandardTestDispatcher
@@ -2190,6 +2198,108 @@ class ChatViewModelTest {
             )
         } finally {
             viewModel.screenReaderAvailableOverride = null
+        }
+    }
+
+    @Test
+    fun `chat view model wiring uses permissive policy and allow-audit when flags enabled`() = runTest {
+        val scripted = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            scripted = PolicyWiringTestFixtures.toolLoopHappyPathResponses(
+                toolCall = ToolCall("t1", "open_app", mapOf("app_name" to "Gmail"))
+            )
+        )
+        val agent = ai.citros.core.PhoneAgentApi(scripted, scripted).also { it.phoneControlOverride = true }
+        val backend = viewModel.createTestBackend(Provider.ANTHROPIC, scripted, scripted, agent = agent)
+        setApiModeWithBackends(viewModel, listOf(backend))
+
+        var capturedPolicy: ActionPolicy? = null
+        var capturedAuditAllow: Boolean? = null
+        viewModel.agentExecutorFactory = { delegate: ToolExecutionDelegate,
+                                          progressListener: LoopProgressListener,
+                                          actionPolicy: ActionPolicy,
+                                          maxToolSteps: Int,
+                                          steerMessageSource: () -> List<String>,
+                                          auditAllowDecisions: Boolean,
+                                          interruptionSource: () -> InterruptionEvent? ->
+            capturedPolicy = actionPolicy
+            capturedAuditAllow = auditAllowDecisions
+            AgentExecutor(
+                delegate = delegate,
+                progressListener = progressListener,
+                actionPolicy = actionPolicy,
+                maxToolSteps = maxToolSteps,
+                steerMessageSource = steerMessageSource,
+                auditAllowDecisions = auditAllowDecisions,
+                interruptionSource = interruptionSource
+            )
+        }
+
+        val originalPolicyFlag = FeatureFlags.actionPolicyEnabled
+        val originalAuditFlag = FeatureFlags.actionPolicyAuditAllowDecisions
+        try {
+            FeatureFlags.actionPolicyEnabled = false
+            FeatureFlags.actionPolicyAuditAllowDecisions = true
+
+            viewModel.sendMessage("open gmail")
+            advanceUntilIdle()
+
+            assertEquals(PermissiveActionPolicy, capturedPolicy)
+            assertEquals(true, capturedAuditAllow)
+        } finally {
+            FeatureFlags.actionPolicyEnabled = originalPolicyFlag
+            FeatureFlags.actionPolicyAuditAllowDecisions = originalAuditFlag
+        }
+    }
+
+    @Test
+    fun `chat view model wiring uses default policy and disables allow-audit by default`() = runTest {
+        val scripted = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            scripted = PolicyWiringTestFixtures.toolLoopHappyPathResponses(
+                toolCall = ToolCall("t1", "open_app", mapOf("app_name" to "Gmail"))
+            )
+        )
+        val agent = ai.citros.core.PhoneAgentApi(scripted, scripted).also { it.phoneControlOverride = true }
+        val backend = viewModel.createTestBackend(Provider.ANTHROPIC, scripted, scripted, agent = agent)
+        setApiModeWithBackends(viewModel, listOf(backend))
+
+        var capturedPolicy: ActionPolicy? = null
+        var capturedAuditAllow: Boolean? = null
+        viewModel.agentExecutorFactory = { delegate: ToolExecutionDelegate,
+                                          progressListener: LoopProgressListener,
+                                          actionPolicy: ActionPolicy,
+                                          maxToolSteps: Int,
+                                          steerMessageSource: () -> List<String>,
+                                          auditAllowDecisions: Boolean,
+                                          interruptionSource: () -> InterruptionEvent? ->
+            capturedPolicy = actionPolicy
+            capturedAuditAllow = auditAllowDecisions
+            AgentExecutor(
+                delegate = delegate,
+                progressListener = progressListener,
+                actionPolicy = actionPolicy,
+                maxToolSteps = maxToolSteps,
+                steerMessageSource = steerMessageSource,
+                auditAllowDecisions = auditAllowDecisions,
+                interruptionSource = interruptionSource
+            )
+        }
+
+        val originalPolicyFlag = FeatureFlags.actionPolicyEnabled
+        val originalAuditFlag = FeatureFlags.actionPolicyAuditAllowDecisions
+        try {
+            FeatureFlags.actionPolicyEnabled = true
+            FeatureFlags.actionPolicyAuditAllowDecisions = false
+
+            viewModel.sendMessage("open gmail")
+            advanceUntilIdle()
+
+            assertTrue(capturedPolicy is DefaultActionPolicy)
+            assertEquals(false, capturedAuditAllow)
+        } finally {
+            FeatureFlags.actionPolicyEnabled = originalPolicyFlag
+            FeatureFlags.actionPolicyAuditAllowDecisions = originalAuditFlag
         }
     }
 

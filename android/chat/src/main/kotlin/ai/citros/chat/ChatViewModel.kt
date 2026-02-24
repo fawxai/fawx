@@ -304,6 +304,27 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
     /** User preference for tool output verbosity. Default: NORMAL (hide mechanical actions). */
     var outputVerbosity: OutputVerbosity = OutputVerbosity.NORMAL
 
+    @VisibleForTesting
+    internal var agentExecutorFactory: (
+        delegate: ToolExecutionDelegate,
+        progressListener: LoopProgressListener,
+        actionPolicy: ActionPolicy,
+        maxToolSteps: Int,
+        steerMessageSource: () -> List<String>,
+        auditAllowDecisions: Boolean,
+        interruptionSource: () -> InterruptionEvent?
+    ) -> AgentExecutor = { delegate, progressListener, actionPolicy, maxToolSteps, steerMessageSource, auditAllowDecisions, interruptionSource ->
+        AgentExecutor(
+            delegate = delegate,
+            progressListener = progressListener,
+            actionPolicy = actionPolicy,
+            maxToolSteps = maxToolSteps,
+            steerMessageSource = steerMessageSource,
+            auditAllowDecisions = auditAllowDecisions,
+            interruptionSource = interruptionSource
+        )
+    }
+
     /** On-device memory provider for remember/recall/list_memories tools. */
     private var memoryProvider: MemoryProvider? = null
 
@@ -1028,12 +1049,14 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
                     // Local mode fallback — run legacy loop
                     toolSteps = runLocalModeLoop(response, screenContent)
                 } else {
-                    val executor = AgentExecutor(
-                        delegate = this@ChatViewModel,
-                        progressListener = this@ChatViewModel,
-                        maxToolSteps = MAX_TOOL_STEPS,
-                        steerMessageSource = { drainSteerQueue() },
-                        interruptionSource = { InterruptionDetector.drain() }
+                    val executor = agentExecutorFactory(
+                        this@ChatViewModel,
+                        this@ChatViewModel,
+                        createConfiguredActionPolicy(),
+                        MAX_TOOL_STEPS,
+                        { drainSteerQueue() },
+                        FeatureFlags.actionPolicyAuditAllowDecisions,
+                        { InterruptionDetector.drain() }
                     )
                     InterruptionDetector.startMonitoring(screenContent?.packageName)
                     val result = executor.run(

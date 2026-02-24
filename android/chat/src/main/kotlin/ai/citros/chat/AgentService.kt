@@ -13,6 +13,9 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import ai.citros.core.AgentExecutor
 import ai.citros.core.AgentState
+import ai.citros.core.ActionPolicy
+import ai.citros.core.LoopCheckpoint
+import ai.citros.core.FeatureFlags
 import ai.citros.core.InputType
 import ai.citros.core.ToolCall
 import ai.citros.core.ErrorSeverity
@@ -28,7 +31,9 @@ import ai.citros.core.ScreenReader
 import ai.citros.core.TaskState
 import ai.citros.core.TaskStateManager
 import ai.citros.core.TaskStatus
+import ai.citros.core.ToolExecutionDelegate
 import ai.citros.core.toSerializedToolCall
+import ai.citros.core.createConfiguredActionPolicy
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -144,6 +149,30 @@ class AgentService : Service() {
      */
     @androidx.annotation.VisibleForTesting
     internal var dispatcher: kotlinx.coroutines.CoroutineDispatcher = Dispatchers.Main
+
+    @androidx.annotation.VisibleForTesting
+    internal var agentExecutorFactory: (
+        delegate: ToolExecutionDelegate,
+        progressListener: LoopProgressListener,
+        actionPolicy: ActionPolicy,
+        maxToolSteps: Int,
+        steerMessageSource: () -> List<String>,
+        auditAllowDecisions: Boolean,
+        interruptionSource: () -> InterruptionEvent?,
+        checkpointCallback: suspend (LoopCheckpoint) -> Unit
+    ) -> AgentExecutor = { delegate, progressListener, actionPolicy, maxToolSteps, steerMessageSource, auditAllowDecisions, interruptionSource, checkpointCallback ->
+        AgentExecutor(
+            delegate = delegate,
+            progressListener = progressListener,
+            actionPolicy = actionPolicy,
+            maxToolSteps = maxToolSteps,
+            steerMessageSource = steerMessageSource,
+            auditAllowDecisions = auditAllowDecisions,
+            interruptionSource = interruptionSource,
+            checkpointCallback = checkpointCallback
+        )
+    }
+
     private val serviceScope: CoroutineScope
         get() = CoroutineScope(dispatcher + serviceJob)
 
@@ -603,13 +632,15 @@ class AgentService : Service() {
                 }
             }
 
-            val executor = AgentExecutor(
-                delegate = delegate,
-                progressListener = serviceProgressListener,
-                maxToolSteps = maxToolSteps,
-                steerMessageSource = { steerMessageSource?.invoke() ?: emptyList() },
-                interruptionSource = { interruptionSource?.invoke() },
-                checkpointCallback = { checkpoint ->
+            val executor = agentExecutorFactory(
+                delegate,
+                serviceProgressListener,
+                createConfiguredActionPolicy(),
+                maxToolSteps,
+                { steerMessageSource?.invoke() ?: emptyList() },
+                FeatureFlags.actionPolicyAuditAllowDecisions,
+                { interruptionSource?.invoke() },
+                { checkpoint ->
                     checkpointTask(
                         taskId = taskId,
                         userMessage = userMessage,

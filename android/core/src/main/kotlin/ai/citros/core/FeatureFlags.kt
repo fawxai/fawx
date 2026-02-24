@@ -20,10 +20,20 @@ object FeatureFlags {
     @Volatile
     var useServiceArchitecture: Boolean = true
 
+    /** Remote rollout switch for action policy enforcement path. */
+    @Volatile
+    var actionPolicyEnabled: Boolean = true
+
+    /** Rollout switch: emit audit records for allow decisions in addition to required decisions. */
+    @Volatile
+    var actionPolicyAuditAllowDecisions: Boolean = false
+
     /**
      * Reset all flags to defaults. Used in tests.
      */
     fun resetToDefaults() {
         useServiceArchitecture = true
+        actionPolicyEnabled = true
+        actionPolicyAuditAllowDecisions = false
     }
 }

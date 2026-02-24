@@ -31,6 +31,7 @@ class AgentExecutor(
     private val policyAuditLogger: PolicyAuditLogger = NoopPolicyAuditLogger,
     /** Optional rollout hook: when true, emit audit records for allow decisions too. */
     private val auditAllowDecisions: Boolean = false,
+    private val rolloutTelemetry: PolicyRolloutTelemetry = PolicyRolloutTelemetry(),
     private val boundaryChecks: List<BoundaryCheck> = defaultBoundaryChecks(),
     private val maxToolSteps: Int = DEFAULT_MAX_TOOL_STEPS,
     /**
@@ -182,6 +183,7 @@ class AgentExecutor(
 
     private suspend fun emitRequiredPolicyAudit(event: PolicyAuditEvent, toolCall: ToolCall): Boolean {
         val writeResult = policyAuditLogger.emit(event)
+        rolloutTelemetry.recordRequiredAuditEmission(writeResult.isSuccess)
         if (writeResult.isSuccess) return true
         val errorSummary = writeResult.exceptionOrNull()?.message ?: "unknown write failure"
         delegate.addToolResult(toolCall.id, "Policy audit write failed (${event.decision}); action not executed. error=$errorSummary", toolCall.name, isError = true)
@@ -300,6 +302,7 @@ class AgentExecutor(
                         )
                     )
                 }
+                rolloutTelemetry.recordEvaluation(evaluation)
 
                 when (val decision = evaluation.decision) {
                     is PolicyDecision.Allow -> {
@@ -337,6 +340,7 @@ class AgentExecutor(
                             false -> PolicyConfirmOutcome.DENIED
                             null -> PolicyConfirmOutcome.TIMEOUT
                         }
+                        rolloutTelemetry.recordConfirmationOutcome(outcome)
                         val emitted = emitRequiredPolicyAudit(
                             PolicyAuditEvent(
                                 eventId = java.util.UUID.randomUUID().toString(),
@@ -624,6 +628,8 @@ class AgentExecutor(
         return if (injections.isEmpty()) CheckResult.Continue
         else CheckResult.Inject(injections.joinToString(""))
     }
+    internal fun policyRolloutTelemetrySnapshot(): PolicyRolloutTelemetry.Snapshot = rolloutTelemetry.snapshot()
+
 }
 
 /**

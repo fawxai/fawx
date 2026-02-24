@@ -41,6 +41,7 @@ object PolicyReasonCode {
     const val DENY_EGRESS_UNSIGNED_ALLOWLIST = "deny.egress.allowlist_unsigned"
 
     const val ALLOW_DEFAULT = "allow.default"
+    const val ALLOW_PERMISSIVE_BYPASS = "allow.permissive_bypass"
     const val ALLOW_EGRESS_ALLOWLISTED = "allow.egress.allowlisted"
     const val DENY_FINANCIAL_SUBMIT = "deny.financial_submit"
     const val DENY_DEGRADED_FINANCIAL_SUBMIT = "deny.degraded_context_financial_submit"

@@ -18,3 +18,8 @@ data class PolicyContext(
     val recentActionCount: Int = 0,
     val taskElapsedMs: Long = 0L
 )
+
+object PermissiveActionPolicy : ActionPolicy {
+    override fun evaluate(toolCall: ToolCall, context: PolicyContext): PolicyEvaluation =
+        PolicyEvaluation(PolicyDecision.Allow, reasonCode = PolicyReasonCode.ALLOW_PERMISSIVE_BYPASS)
+}
