@@ -1,3 +1,5 @@
+import org.gradle.api.tasks.testing.Test
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -58,6 +60,20 @@ android {
     buildFeatures {
         compose = true
         buildConfig = true
+    }
+}
+
+tasks.register<Test>("androidSensorProviderCiTest") {
+    group = "verification"
+    description = "Runs AndroidSensorProviderTest for CI sensor timeout/concurrency coverage"
+
+    val debugUnitTest = tasks.named<Test>("testDebugUnitTest").get()
+    testClassesDirs = debugUnitTest.testClassesDirs
+    classpath = debugUnitTest.classpath
+    shouldRunAfter(debugUnitTest)
+
+    filter {
+        includeTestsMatching("ai.citros.chat.AndroidSensorProviderTest")
     }
 }
 

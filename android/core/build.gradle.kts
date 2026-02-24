@@ -1,3 +1,5 @@
+import org.gradle.api.tasks.testing.Test
+
 plugins {
     id("com.android.library")
     id("org.jetbrains.kotlin.android")
@@ -26,6 +28,23 @@ android {
             isReturnDefaultValues = true
             isIncludeAndroidResources = true
         }
+    }
+}
+
+tasks.register<Test>("phoneAgentApiSensorCiTest") {
+    group = "verification"
+    description = "Runs PhoneAgentApiTest for CI sensor timeout/concurrency coverage"
+
+    val debugUnitTest = tasks.named<Test>("testDebugUnitTest").get()
+    testClassesDirs = debugUnitTest.testClassesDirs
+    classpath = debugUnitTest.classpath
+    shouldRunAfter(debugUnitTest)
+
+    filter {
+        includeTestsMatching("ai.citros.core.PhoneAgentApiTest.*sensor*")
+        includeTestsMatching("ai.citros.core.PhoneAgentApiTest.*Sensor*")
+        includeTestsMatching("ai.citros.core.PhoneAgentApiTest.*timeout*")
+        includeTestsMatching("ai.citros.core.PhoneAgentApiTest.*concurrent*")
     }
 }
 

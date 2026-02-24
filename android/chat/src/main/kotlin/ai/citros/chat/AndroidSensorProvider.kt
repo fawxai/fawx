@@ -149,7 +149,13 @@ class AndroidSensorProvider(
             val manager = context.getSystemService(LocationManager::class.java) ?: return null
             val providers = manager.getProviders(true)
             providers.asSequence()
-                .mapNotNull { provider -> runCatching { manager.getLastKnownLocation(provider) }.getOrNull() }
+                .mapNotNull { provider ->
+                    try {
+                        manager.getLastKnownLocation(provider)
+                    } catch (_: SecurityException) {
+                        null
+                    }
+                }
                 .maxByOrNull(Location::getTime)
         }.getOrNull() ?: return null
 

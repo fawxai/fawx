@@ -4300,6 +4300,10 @@ class PhoneAgentApiTest {
     }
 
 
+    // --- Sensor/timeout/concurrency CI-targeted tests ---
+    // Keep test names containing one of: sensor, Sensor, timeout, concurrent,
+    // so :core:phoneAgentApiSensorCiTest includes this section via Gradle filter patterns.
+
     @Test
     fun `sendMessage handles SensorProvider snapshot exceptions gracefully`() = runTest {
         val client = ScriptedProviderClient(
