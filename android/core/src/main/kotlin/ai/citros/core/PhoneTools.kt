@@ -265,6 +265,37 @@ object PhoneTools {
      * Wait for the screen to update before reading again.
      * Useful after launching apps or triggering loading states.
      */
+
+    val SUBTASK = Tool(
+        name = "subtask",
+        description = "Decompose a complex goal into a focused sub-task that runs in isolated context and returns a structured result.",
+        inputSchema = mapOf(
+            "type" to "object",
+            "properties" to mapOf(
+                "goal" to mapOf(
+                    "type" to "string",
+                    "description" to "Clear description of what the sub-task should accomplish"
+                ),
+                "success_criteria" to mapOf(
+                    "type" to "string",
+                    "description" to "How to determine if the sub-task succeeded"
+                ),
+                "max_steps" to mapOf(
+                    "type" to "integer",
+                    "description" to "Maximum tool steps for this sub-task (default: 10)",
+                    "default" to 10
+                ),
+                "max_time_seconds" to mapOf(
+                    "type" to "integer",
+                    "description" to "Maximum wall-clock time in seconds (10-300, default: 60)",
+                    "minimum" to 10,
+                    "maximum" to 300,
+                    "default" to 60
+                )
+            ),
+            "required" to listOf("goal", "success_criteria")
+        )
+    )
     val WAIT = Tool(
         name = "wait",
         description = "Wait for the screen to update (e.g., after launching an app or loading content), then read the screen. Use when you expect the UI to change after an action.",
@@ -689,6 +720,7 @@ object PhoneTools {
         "list_memories" to ToolCategory.MEMORY,
         "learn" to ToolCategory.MEMORY,
         "think" to ToolCategory.PLANNING,
+        "subtask" to ToolCategory.PLANNING,
         "wait" to ToolCategory.OBSERVATION,
         "long_press" to ToolCategory.INTERACTION,
         "web_search" to ToolCategory.RESEARCH,
@@ -746,6 +778,7 @@ object PhoneTools {
         LIST_MEMORIES,
         LEARN,
         THINK,
+        SUBTASK,
         WAIT,
         LONG_PRESS,
         REQUEST_TOOLS
