@@ -83,9 +83,21 @@ class DefaultActionPolicyTest {
     }
 
     @Test
-    fun `egress denied when endpoint not signed approved`() {
+    fun `egress denied when allowlist signature missing`() {
         val d = policy.evaluate(ToolCall("1", "web_fetch", mapOf("url" to "https://example.com/x")), PolicyContext()).decision
-        assertEquals(PolicyReasonCode.DENY_EGRESS_UNAPPROVED, (d as PolicyDecision.Deny).reasonCode)
+        assertEquals(PolicyReasonCode.DENY_EGRESS_UNSIGNED_ALLOWLIST, (d as PolicyDecision.Deny).reasonCode)
+    }
+
+    @Test
+    fun `egress denied for malformed url`() {
+        val d = policy.evaluate(ToolCall("1", "web_fetch", mapOf("url" to "https://")), PolicyContext()).decision
+        assertEquals(PolicyReasonCode.DENY_EGRESS_MALFORMED_URL, (d as PolicyDecision.Deny).reasonCode)
+    }
+
+    @Test
+    fun `egress denied for non https scheme`() {
+        val d = policy.evaluate(ToolCall("1", "web_fetch", mapOf("url" to "http://example.com/x")), PolicyContext()).decision
+        assertEquals(PolicyReasonCode.DENY_EGRESS_INSECURE_SCHEME, (d as PolicyDecision.Deny).reasonCode)
     }
 
     @Test
@@ -100,14 +112,28 @@ class DefaultActionPolicyTest {
                 )
             }
         )
-        val d = p.evaluate(ToolCall("1", "web_fetch", mapOf("url" to "https://api.example.com/x")), PolicyContext()).decision
-        assertIs<PolicyDecision.Allow>(d)
+        val eval = p.evaluate(ToolCall("1", "web_fetch", mapOf("url" to "https://api.example.com/x")), PolicyContext())
+        assertIs<PolicyDecision.Allow>(eval.decision)
+        assertEquals(PolicyReasonCode.ALLOW_EGRESS_ALLOWLISTED, eval.reasonCode)
     }
 
     @Test
     fun `non app-targeted tool never sets first use observed`() {
         val eval = policy.evaluate(ToolCall("1", "wait", emptyMap()), PolicyContext(foregroundApp = "com.example.app"))
         assertFalse(eval.firstUseObserved)
+    }
+
+    @Test
+    fun `egress denied when url missing`() {
+        val d = policy.evaluate(ToolCall("1", "web_fetch", emptyMap()), PolicyContext()).decision
+        assertEquals(PolicyReasonCode.DENY_EGRESS_MISSING_URL, (d as PolicyDecision.Deny).reasonCode)
+    }
+
+    @Test
+    fun `web_search bypasses url egress gate and remains allow`() {
+        val eval = policy.evaluate(ToolCall("1", "web_search", mapOf("query" to "openclaw docs")), PolicyContext())
+        assertIs<PolicyDecision.Allow>(eval.decision)
+        assertEquals(PolicyReasonCode.ALLOW_DEFAULT, eval.reasonCode)
     }
 
     @Test

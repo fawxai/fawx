@@ -4,7 +4,7 @@ package ai.citros.core
  * Shared test fakes for AgentExecutor tests.
  */
 
-class FakeToolExecutionDelegate : ToolExecutionDelegate {
+open class FakeToolExecutionDelegate : ToolExecutionDelegate {
     var executeResult: ToolResult = ToolResult("Success")
     var onExecuteThrow: Throwable? = null
     var onExecute: (suspend (ToolCall, ScreenContent?) -> ToolResult)? = null

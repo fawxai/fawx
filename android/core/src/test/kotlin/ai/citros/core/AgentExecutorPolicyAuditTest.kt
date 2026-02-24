@@ -23,7 +23,7 @@ class AgentExecutorPolicyAuditTest {
             progressListener = listener,
             actionPolicy = object : ActionPolicy {
                 override fun evaluate(toolCall: ToolCall, context: PolicyContext): PolicyEvaluation {
-                    return PolicyEvaluation(PolicyDecision.Allow)
+                    return PolicyEvaluation(PolicyDecision.Allow, reasonCode = PolicyReasonCode.ALLOW_EGRESS_ALLOWLISTED)
                 }
             },
             policyAuditLogger = logger,
@@ -35,5 +35,6 @@ class AgentExecutorPolicyAuditTest {
 
         assertEquals(1, events.size)
         assertEquals(PolicyAuditDecision.ALLOW, events.first().decision)
+        assertEquals(PolicyReasonCode.ALLOW_EGRESS_ALLOWLISTED, events.first().reasonCode)
     }
 }

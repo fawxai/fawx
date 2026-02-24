@@ -171,7 +171,6 @@ class AgentExecutor(
     private fun extractPolicyEndpointHost(toolCall: ToolCall): String? {
         val rawUrl = when (toolCall.name) {
             "web_fetch", "web_browse" -> toolCall.input["url"] as? String
-            "web_search" -> toolCall.input["provider_endpoint"] as? String
             else -> null
         } ?: return null
         val uri = kotlin.runCatching { java.net.URI(rawUrl) }.getOrNull() ?: return null
@@ -293,9 +292,9 @@ class AgentExecutor(
                     actionPolicy.evaluate(toolCall, policyContext)
                 } catch (_: Exception) {
                     PolicyEvaluation(
-                        decision = PolicyDecision.Confirm(
-                            reasonCode = PolicyReasonCode.CONFIRM_POLICY_EVAL_EXCEPTION,
-                            reason = "Policy evaluation failed; user confirmation required"
+                        decision = PolicyDecision.Deny(
+                            reasonCode = PolicyReasonCode.DENY_POLICY_EVAL_EXCEPTION,
+                            reason = "Policy evaluation failed; action blocked (fail-closed)"
                         )
                     )
                 }
@@ -311,7 +310,7 @@ class AgentExecutor(
                                     toolCallId = toolCall.id,
                                     toolName = toolCall.name,
                                     decision = PolicyAuditDecision.ALLOW,
-                                    reasonCode = "allow.default",
+                                    reasonCode = evaluation.reasonCode ?: PolicyReasonCode.ALLOW_DEFAULT,
                                     reasonText = null,
                                     foregroundApp = policyContext.foregroundApp,
                                     appIdentifier = policyContext.appIdentifier,

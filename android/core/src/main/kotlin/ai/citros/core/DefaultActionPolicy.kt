@@ -80,7 +80,7 @@ class DefaultActionPolicy(
         val firstUseObserved = peekFirstUseSignal(toolCall, context)
         attemptTimestamps.add(now)
 
-        checkHardDeny(toolCall, context)?.let { return PolicyEvaluation(it, firstUseObserved) }
+        checkHardDeny(toolCall)?.let { return PolicyEvaluation(it, firstUseObserved) }
         checkRateLimit(toolCall, context, now)?.let { return PolicyEvaluation(it, firstUseObserved) }
 
         val base = DEFAULT_POLICIES[toolCall.name] ?: PolicyDecision.Confirm(PolicyReasonCode.CONFIRM_UNKNOWN_TOOL, "Unknown tool: ${toolCall.name}")
@@ -89,13 +89,19 @@ class DefaultActionPolicy(
         val final = applyUserOverrides(toolCall.name, escalated)
 
         if (isMessageAction(toolCall, context)) messageTimestamps.add(now)
-        return PolicyEvaluation(final, firstUseObserved)
+        val reasonCode = when {
+            final is PolicyDecision.Allow && isUrlEgressTool(toolCall) -> PolicyReasonCode.ALLOW_EGRESS_ALLOWLISTED
+            final is PolicyDecision.Allow -> PolicyReasonCode.ALLOW_DEFAULT
+            else -> null
+        }
+        return PolicyEvaluation(final, firstUseObserved, reasonCode)
+
     }
 
-    private fun checkHardDeny(toolCall: ToolCall, context: PolicyContext): PolicyDecision.Deny? {
+    private fun checkHardDeny(toolCall: ToolCall): PolicyDecision.Deny? {
         PHASE1_DENY_TOOLS[toolCall.name]?.let { return PolicyDecision.Deny(PolicyReasonCode.DENY_PHASE1_TOOL, it) }
-        if (isUrlEgressTool(toolCall) && !isApprovedEgressEndpoint(toolCall)) {
-            return PolicyDecision.Deny(PolicyReasonCode.DENY_EGRESS_UNAPPROVED, "Sending data to unrecognized or unapproved endpoints is blocked in Phase 1")
+        if (isUrlEgressTool(toolCall)) {
+            return egressDenyDecision(toolCall)
         }
         return null
     }
@@ -189,21 +195,37 @@ class DefaultActionPolicy(
         return isMessaging && (text.contains("send") || text.contains("submit"))
     }
 
-    private fun isUrlEgressTool(toolCall: ToolCall): Boolean = toolCall.name in setOf("web_fetch", "web_browse", "web_search")
+    // URL egress gate is intentionally limited to tools that accept caller-provided URLs.
+    // web_search takes only {query,count} (see PhoneTools.WEB_SEARCH schema) and routes through
+    // controlled provider clients; there is no model-controlled endpoint field to validate here.
+    // Keep fail-closed behavior for arbitrary egress via web_fetch/web_browse URL enforcement.
+    private fun isUrlEgressTool(toolCall: ToolCall): Boolean = toolCall.name in setOf("web_fetch", "web_browse")
 
-    private fun isApprovedEgressEndpoint(toolCall: ToolCall): Boolean {
+    private fun egressDenyDecision(toolCall: ToolCall): PolicyDecision.Deny? {
         val url = when (toolCall.name) {
             "web_fetch", "web_browse" -> toolCall.input["url"] as? String
-            "web_search" -> toolCall.input["provider_endpoint"] as? String
             else -> null
-        } ?: return false
-        val uri = kotlin.runCatching { java.net.URI(url) }.getOrNull() ?: return false
-        if (uri.scheme?.lowercase() != "https") return false
-        val host = canonicalizeHost(uri.host) ?: return false
+        } ?: return PolicyDecision.Deny(PolicyReasonCode.DENY_EGRESS_MISSING_URL, "Egress request missing endpoint URL")
+
+        val uri = kotlin.runCatching { java.net.URI(url) }.getOrNull()
+            ?: return PolicyDecision.Deny(PolicyReasonCode.DENY_EGRESS_MALFORMED_URL, "Egress endpoint URL is malformed")
+
+        if (uri.scheme?.lowercase() != "https") {
+            return PolicyDecision.Deny(PolicyReasonCode.DENY_EGRESS_INSECURE_SCHEME, "Only HTTPS egress endpoints are allowed")
+        }
+
+        val host = canonicalizeHost(uri.host)
+            ?: return PolicyDecision.Deny(PolicyReasonCode.DENY_EGRESS_MALFORMED_URL, "Egress endpoint host is invalid")
+
         val snapshot = egressAllowlistProvider.currentSnapshot()
-        if (!snapshot.signatureVerified) return false
+        if (!snapshot.signatureVerified) {
+            return PolicyDecision.Deny(PolicyReasonCode.DENY_EGRESS_UNSIGNED_ALLOWLIST, "Signed egress allowlist unavailable; blocking outbound request")
+        }
+
         val allowed = snapshot.hosts.mapNotNull(::canonicalizeHost)
-        return allowed.any { host == it || host.endsWith(".$it") }
+        val approved = allowed.any { host == it || host.endsWith(".$it") }
+        return if (approved) null
+        else PolicyDecision.Deny(PolicyReasonCode.DENY_EGRESS_UNAPPROVED, "Sending data to unrecognized or unapproved endpoints is blocked in Phase 1")
     }
 
     private fun canonicalizeHost(raw: String?): String? {

@@ -6,7 +6,8 @@ interface ActionPolicy {
 
 data class PolicyEvaluation(
     val decision: PolicyDecision,
-    val firstUseObserved: Boolean = false
+    val firstUseObserved: Boolean = false,
+    val reasonCode: String? = null
 )
 
 data class PolicyContext(
