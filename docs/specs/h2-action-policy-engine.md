@@ -1211,6 +1211,141 @@ override suspend fun requestUserConfirmation(
 
 This document is spec-only. Runtime implementation and UI wiring are delivered in follow-up implementation PRs.
 
+### 8a. State-Dependent Pill Buttons (Required)
+
+When the agent needs user input — whether from a policy CONFIRM gate, an ambiguous task, or a mid-task decision point — the UI presents **contextual pill buttons** that map to the most likely user responses for the current state. This replaces the generic "Allow/Deny" binary with richer, state-aware interaction.
+
+#### Design
+
+```kotlin
+/**
+ * A contextual action pill shown to the user during agent interaction.
+ *
+ * Pills are state-dependent: the set of available pills changes based on
+ * what the agent is doing and what it needs from the user.
+ */
+data class ActionPill(
+    val id: String,
+    val label: String,
+    val icon: Int? = null,          // Optional icon resource
+    val style: PillStyle = PillStyle.DEFAULT,
+    val action: PillAction
+)
+
+enum class PillStyle {
+    DEFAULT,     // Neutral (outline)
+    PRIMARY,     // Recommended action (filled, accent color)
+    DANGER,      // Destructive or deny action (filled, red)
+    SUBTLE       // De-emphasized option (text only)
+}
+
+sealed class PillAction {
+    /** Approve the pending confirmation request. */
+    data class Approve(val requestId: String) : PillAction()
+    /** Deny the pending confirmation request. */
+    data class Deny(val requestId: String) : PillAction()
+    /** Inject a steer message into the agent's conversation. */
+    data class Steer(val message: String) : PillAction()
+    /** Trigger authentication (biometric/PIN) before proceeding. */
+    data class Authenticate(val requestId: String) : PillAction()
+    /** Cancel the current task entirely. */
+    object Cancel : PillAction()
+    /** Dismiss pills and return to free-text input. */
+    object Dismiss : PillAction()
+}
+```
+
+#### State → Pill Mapping
+
+| Agent State | Pill Set | Notes |
+|-------------|----------|-------|
+| **CONFIRM gate (standard)** | `[Yes ✅ PRIMARY, No ❌ DANGER, Do something else SUBTLE]` | "Do something else" steers with "try a different approach" |
+| **CONFIRM gate (sensitive app)** | `[Allow once ✅ PRIMARY, Deny ❌ DANGER, Always deny for this app SUBTLE]` | "Always deny" calls `ActionPolicyStore.setOverride(appPackage, PolicyOverrideLevel.DENY)` — persisted via the existing override mechanism (§3). Override is permanent until user manually reverses it in Settings. |
+| **CONFIRM gate (financial context)** | `[Authenticate & allow 🔐 PRIMARY, Deny ❌ DANGER]` | Authenticate triggers biometric/PIN before approval |
+| **First-use app confirmation** | `[Continue ✅ PRIMARY, Not now DEFAULT, Never for this app SUBTLE]` | "Never" creates a permanent DENY override for the app |
+| **Ambiguous task (agent asks clarifying question)** | `[Yes DEFAULT, No DEFAULT, <context-specific options> DEFAULT]` | Agent generates pill labels based on the question. E.g., "Maps or Chrome?" → `[Maps, Chrome, Something else]` |
+| **Task in progress (steer opportunity)** | `[Stop ❌ DANGER, Faster SUBTLE, Do something else SUBTLE]` | Always available during execution via overlay |
+| **Task complete** | `[Thanks 👍 SUBTLE, Redo DEFAULT, Do something else DEFAULT]` | Lightweight feedback + quick re-dispatch |
+| **Error / stuck** | `[Try again DEFAULT, Do something else DEFAULT, Cancel ❌ DANGER]` | Recovery options |
+
+#### Agent-Generated Pills
+
+For ambiguous situations where the fixed pill set doesn't cover the options, the agent can generate custom pills via a new tool:
+
+```kotlin
+val OFFER_CHOICES_TOOL = Tool(
+    name = "offer_choices",
+    description = """Present the user with 2-5 choices as pill buttons.
+        Use when you need user input to proceed and the options are discrete.
+        Example: user says "send a message" but didn't specify which app.
+        Offer: ["Messages", "WhatsApp", "Telegram"]""",
+    inputSchema = mapOf(
+        "type" to "object",
+        "properties" to mapOf(
+            "question" to mapOf(
+                "type" to "string",
+                "description" to "Brief question shown above the pills"
+            ),
+            "choices" to mapOf(
+                "type" to "array",
+                "items" to mapOf("type" to "string"),
+                "minItems" to 2,
+                "maxItems" to 5,
+                "description" to "Button labels for each option"
+            )
+        ),
+        "required" to listOf("question", "choices")
+    )
+)
+```
+
+**Policy classification:** `offer_choices` MUST be added to `DefaultActionPolicy.DEFAULT_POLICIES` as `PolicyDecision.Allow` — it is a user-input tool (like `think` or `read_screen`), not a mutating action. Until added, the unknown-tool fallback classifies it as CONFIRM (fail-closed), which is safe but creates unnecessary confirmation prompts.
+
+**Accessibility:** All pill buttons MUST meet Android accessibility guidelines: minimum 48dp touch targets, `contentDescription` for screen readers, sufficient color contrast (WCAG AA). Pill labels should be concise (≤20 chars) for screen reader announce-ability. The `PillStyle.SUBTLE` text-only variant must still meet minimum touch target size.
+
+When the agent calls `offer_choices`, the UI:
+1. Displays the question as a chat bubble
+2. Shows pills below it with each choice
+3. User taps a pill → the choice text is injected as the tool result
+4. Agent continues with the user's selection
+
+This replaces the current pattern where the agent asks a question in text and the user types a response — pills are faster, reduce ambiguity, and work well on the overlay.
+
+#### Integration with AgentService (Sprint 0)
+
+The `AgentState.WaitingConfirmation` state already includes `reason: String`. Extend it to include pill definitions:
+
+```kotlin
+data class WaitingConfirmation(
+    val taskId: String,
+    val requestId: String,
+    val toolName: String,
+    val reason: String,
+    val pills: List<ActionPill>
+) : AgentState()
+```
+
+The notification (Sprint 0 §6) uses the first two pills as notification actions (Android supports up to 3 actions). The full pill set is available in the activity/overlay UI.
+
+#### Confirmation Flow with Pills
+
+```
+Agent calls tap_text("Send $500") in Venmo
+  → Policy: CONFIRM (financial context)
+    → AgentService emits WaitingConfirmation with pills:
+        [Authenticate & allow 🔐, Deny ❌]
+      → Notification shows: "Citros wants to tap 'Send $500' in Venmo"
+        Actions: [Authenticate & allow] [Deny]
+      → Overlay shows: same pills
+      → Activity shows: same pills in chat
+
+User taps "Authenticate & allow"
+  → Biometric prompt (FingerprintManager / BiometricPrompt)
+    → Success → tool call executes
+    → Failure → treated as Deny
+  → 60s timeout → auto-Deny (fail-closed)
+```
+
 ---
 
 ## App Identifier Normalization (Required)
