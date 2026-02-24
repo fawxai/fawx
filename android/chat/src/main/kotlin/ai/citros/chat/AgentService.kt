@@ -13,6 +13,8 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import ai.citros.core.AgentExecutor
 import ai.citros.core.AgentState
+import ai.citros.core.InputType
+import ai.citros.core.ToolCall
 import ai.citros.core.ErrorSeverity
 import ai.citros.core.LoopProgressListener
 import ai.citros.core.LoopResult
@@ -36,6 +38,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.util.UUID
@@ -200,6 +203,16 @@ class AgentService : Service() {
     @androidx.annotation.VisibleForTesting
     internal var maxToolSteps: Int = 25
 
+    private data class PendingPolicyConfirmation(
+        val requestId: String,
+        val toolName: String,
+        val deferred: CompletableDeferred<Boolean>
+    )
+
+    @Volatile
+    private var pendingPolicyConfirmation: PendingPolicyConfirmation? = null
+    private val pendingPolicyConfirmationLock = Any()
+
     // --- Observable state ---
     private val _agentState = MutableStateFlow<AgentState>(AgentState.Idle)
     val agentState: StateFlow<AgentState> = _agentState.asStateFlow()
@@ -253,6 +266,19 @@ class AgentService : Service() {
             interruptionSource = null
             progressCallback = null
         }
+
+        /** Submit a decision for the currently pending policy confirmation. */
+        fun submitPolicyConfirmation(requestId: String, approved: Boolean): Boolean {
+            return resolvePolicyConfirmation(requestId, approved)
+        }
+
+        /** Submit a decision for whichever policy confirmation is currently active. */
+        fun submitActivePolicyConfirmation(approved: Boolean): Boolean {
+            val activeRequestId = synchronized(pendingPolicyConfirmationLock) {
+                pendingPolicyConfirmation?.requestId
+            } ?: return false
+            return resolvePolicyConfirmation(activeRequestId, approved)
+        }
     }
 
     override fun onBind(intent: Intent?): IBinder = binder
@@ -301,6 +327,7 @@ class AgentService : Service() {
     }
 
     override fun onDestroy() {
+        cancelPendingPolicyConfirmation("onDestroy")
         super.onDestroy()
         serviceScope.cancel()
         Log.d(TAG, "onDestroy: AgentService destroyed")
@@ -350,6 +377,21 @@ class AgentService : Service() {
             Log.w(TAG, "handleSteer: no active task, ignoring steer")
             return
         }
+
+        if (currentState is AgentState.WaitingForInput && currentState.inputType == InputType.POLICY_CONFIRMATION) {
+            val normalized = message.trim().lowercase()
+            when (normalized) {
+                "yes", "y", "allow", "approve", "continue", "resume", "ok" -> {
+                    resolvePolicyConfirmation(currentState.requestId, approved = true)
+                    return
+                }
+                "no", "n", "deny", "reject", "stop", "cancel" -> {
+                    resolvePolicyConfirmation(currentState.requestId, approved = false)
+                    return
+                }
+            }
+        }
+
         Log.d(TAG, "handleSteer: injecting steer message: '${message.take(60)}'")
         // Steer queue integration comes in PR 2.
     }
@@ -368,6 +410,7 @@ class AgentService : Service() {
         currentTaskJob?.cancel()
         currentTaskJob = null
         pendingResumeState = null
+        cancelPendingPolicyConfirmation("cancel")
         clearCheckpointAsync()
         _agentState.value = AgentState.Idle
         updateNotification()
@@ -379,6 +422,7 @@ class AgentService : Service() {
         currentTaskJob?.cancel()
         currentTaskJob = null
         pendingResumeState = null
+        cancelPendingPolicyConfirmation("stop")
         cancelIdleTimeout()
         _agentState.value = AgentState.Idle
         isForeground = false
@@ -522,7 +566,13 @@ class AgentService : Service() {
                 Log.w(TAG, "executeTask: overlay hide hook failed: ${e.message}")
             }
 
-            val delegate = ServiceToolDelegate(api)
+            val delegate = ServiceToolDelegate(
+                phoneAgentApi = api,
+                onConfirmationRequested = { toolCall, requestId, reason ->
+                    onPolicyConfirmationRequested(taskId, toolCall, requestId, reason)
+                },
+                awaitConfirmationDecision = { requestId -> awaitPolicyConfirmationDecision(requestId) }
+            )
             val serviceProgressListener = object : LoopProgressListener {
                 override fun onToolStarted(toolName: String, toolIndex: Int, batchSize: Int) {
                     _agentState.value = AgentState.Executing(taskId, toolName, toolIndex, batchSize)
@@ -625,6 +675,92 @@ class AgentService : Service() {
                 Log.w(TAG, "executeTask: overlay restore hook failed: ${e.message}")
             }
         }
+    }
+
+    private fun onPolicyConfirmationRequested(taskId: String, toolCall: ToolCall, requestId: String, reason: String) {
+        val deferred = CompletableDeferred<Boolean>()
+        synchronized(pendingPolicyConfirmationLock) {
+            pendingPolicyConfirmation = PendingPolicyConfirmation(requestId, toolCall.name, deferred)
+        }
+        _agentState.value = AgentState.WaitingForInput(
+            taskId = taskId,
+            requestId = requestId,
+            reason = "Confirm ${toolCall.name}: $reason",
+            inputType = InputType.POLICY_CONFIRMATION
+        )
+        appendConversation(
+            "assistant",
+            "🔐 Confirm ${toolCall.name}? $reason Reply Yes/No."
+        )
+        updateNotification()
+    }
+
+    private suspend fun awaitPolicyConfirmationDecision(requestId: String): Boolean {
+        val pending = synchronized(pendingPolicyConfirmationLock) {
+            pendingPolicyConfirmation
+        }
+        if (pending == null || pending.requestId != requestId) return false
+        return try {
+            pending.deferred.await()
+        } finally {
+            synchronized(pendingPolicyConfirmationLock) {
+                if (pendingPolicyConfirmation?.requestId == requestId) {
+                    pendingPolicyConfirmation = null
+                }
+            }
+        }
+    }
+
+    @androidx.annotation.VisibleForTesting
+    internal fun setPendingPolicyConfirmationForTest(
+        requestId: String,
+        toolName: String = "tap",
+        deferred: CompletableDeferred<Boolean> = CompletableDeferred()
+    ) {
+        synchronized(pendingPolicyConfirmationLock) {
+            pendingPolicyConfirmation = PendingPolicyConfirmation(requestId, toolName, deferred)
+        }
+    }
+
+    private fun resolvePolicyConfirmation(requestId: String, approved: Boolean): Boolean {
+        val completed = synchronized(pendingPolicyConfirmationLock) {
+            val pending = pendingPolicyConfirmation
+            if (pending == null) {
+                Log.w(TAG, "resolvePolicyConfirmation: no pending confirmation for requestId=$requestId")
+                return false
+            }
+            if (pending.requestId != requestId) {
+                Log.w(TAG, "resolvePolicyConfirmation: requestId mismatch expected=${pending.requestId} actual=$requestId")
+                return false
+            }
+
+            // check-then-complete must be synchronized because this can be triggered from
+            // concurrent entry points (steer intent + binder call). complete() is atomic,
+            // but this lock keeps behavior deterministic and logging coherent.
+            pending.deferred.complete(approved)
+        }
+        if (!completed) {
+            Log.w(TAG, "resolvePolicyConfirmation: decision already completed for requestId=$requestId")
+            return false
+        }
+        appendConversation(
+            "user",
+            if (approved) "Approved policy confirmation" else "Denied policy confirmation"
+        )
+        val state = _agentState.value
+        if (state is AgentState.WaitingForInput && state.requestId == requestId) {
+            _agentState.value = AgentState.Thinking(state.taskId)
+        }
+        updateNotification()
+        return true
+    }
+
+    private fun cancelPendingPolicyConfirmation(source: String) {
+        synchronized(pendingPolicyConfirmationLock) {
+            pendingPolicyConfirmation?.deferred?.cancel()
+            pendingPolicyConfirmation = null
+        }
+        Log.d(TAG, "cancelPendingPolicyConfirmation: source=$source")
     }
 
     private suspend fun sendMessageWithFallback(

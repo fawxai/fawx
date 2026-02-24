@@ -17,7 +17,9 @@ import android.util.Log
  */
 class ServiceToolDelegate(
     private val phoneAgentApi: PhoneAgentApi,
-    private val outputVerbosity: OutputVerbosity = OutputVerbosity.NORMAL
+    private val outputVerbosity: OutputVerbosity = OutputVerbosity.NORMAL,
+    private val onConfirmationRequested: ((ToolCall, String, String) -> Unit)? = null,
+    private val awaitConfirmationDecision: (suspend (String) -> Boolean)? = null
 ) : ToolExecutionDelegate {
 
     companion object {
@@ -125,6 +127,10 @@ class ServiceToolDelegate(
     }
 
     override suspend fun requestUserConfirmation(toolCall: ToolCall, requestId: String, reason: String, timeoutMs: Long): Boolean {
-        return false
+        // timeoutMs is enforced by AgentExecutor via withTimeoutOrNull around this call.
+        // ServiceToolDelegate intentionally only bridges request/response plumbing.
+        onConfirmationRequested?.invoke(toolCall, requestId, reason)
+        val waiter = awaitConfirmationDecision ?: return false
+        return waiter(requestId)
     }
 }

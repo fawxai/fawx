@@ -7,6 +7,7 @@ import ai.citros.core.TaskState
 import ai.citros.core.TaskStateManager
 import ai.citros.core.TaskStatus
 import android.content.Intent
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
@@ -274,6 +275,66 @@ class AgentServiceTest {
     }
 
     // --- S6: Steer intent ---
+
+    @Test
+    fun `STEER yes resolves pending policy confirmation as approve`() {
+        configureWithMockApi()
+        service.setPendingPolicyConfirmationForTest("req-1")
+        service.updateState(AgentState.WaitingForInput("task-1", "req-1", "confirm", ai.citros.core.InputType.POLICY_CONFIRMATION))
+
+        service.onStartCommand(AgentService.steerIntent(service, "yes"), 0, 1)
+
+        assertFalse(service.agentState.value is AgentState.WaitingForInput)
+    }
+
+    @Test
+    fun `STEER no resolves pending policy confirmation as deny`() {
+        configureWithMockApi()
+        service.setPendingPolicyConfirmationForTest("req-no")
+        service.updateState(AgentState.WaitingForInput("task-1", "req-no", "confirm", ai.citros.core.InputType.POLICY_CONFIRMATION))
+
+        service.onStartCommand(AgentService.steerIntent(service, "no"), 0, 1)
+
+        assertFalse(service.agentState.value is AgentState.WaitingForInput)
+    }
+
+    @Test
+    fun `STEER yes in non confirmation waiting state falls through`() {
+        configureWithMockApi()
+        service.updateState(AgentState.WaitingForInput("task-1", "req-free", "type details", ai.citros.core.InputType.FREE_TEXT))
+
+        service.onStartCommand(AgentService.steerIntent(service, "yes"), 0, 1)
+
+        val state = service.agentState.value
+        assertIs<AgentState.WaitingForInput>(state)
+        assertEquals(ai.citros.core.InputType.FREE_TEXT, state.inputType)
+    }
+
+    @Test
+    fun `binder submitPolicyConfirmation with wrong requestId returns false`() {
+        configureWithMockApi()
+        service.setPendingPolicyConfirmationForTest("req-expected")
+        service.updateState(AgentState.WaitingForInput("task-1", "req-expected", "confirm", ai.citros.core.InputType.POLICY_CONFIRMATION))
+        val binder = service.onBind(Intent()) as AgentService.AgentBinder
+
+        val handled = binder.submitPolicyConfirmation("req-wrong", approved = true)
+
+        assertFalse(handled)
+        assertIs<AgentState.WaitingForInput>(service.agentState.value)
+    }
+
+    @Test
+    fun `binder can submit active policy confirmation`() {
+        configureWithMockApi()
+        service.setPendingPolicyConfirmationForTest("req-2")
+        service.updateState(AgentState.WaitingForInput("task-1", "req-2", "confirm", ai.citros.core.InputType.POLICY_CONFIRMATION))
+        val binder = service.onBind(Intent()) as AgentService.AgentBinder
+
+        val handled = binder.submitActivePolicyConfirmation(approved = false)
+
+        assertTrue(handled)
+        assertFalse(service.agentState.value is AgentState.WaitingForInput)
+    }
 
     @Test
     fun `STEER intent during active task does not change state`() {
@@ -606,6 +667,29 @@ class AgentServiceTest {
         service.onStartCommand(stopIntent, 0, 2)
 
         assertNull(service.currentTaskJob)
+    }
+
+    @Test
+    fun `cancel clears pending policy confirmation deferred`() {
+        configureWithMockApi()
+        val deferred = CompletableDeferred<Boolean>()
+        service.setPendingPolicyConfirmationForTest("req-cancel", deferred = deferred)
+        service.updateState(AgentState.WaitingForInput("task-1", "req-cancel", "confirm", ai.citros.core.InputType.POLICY_CONFIRMATION))
+
+        service.onStartCommand(AgentService.cancelIntent(service), 0, 1)
+
+        assertTrue(deferred.isCancelled)
+    }
+
+    @Test
+    fun `onDestroy cancels pending policy confirmation deferred`() {
+        controller.create()
+        val deferred = CompletableDeferred<Boolean>()
+        service.setPendingPolicyConfirmationForTest("req-destroy", deferred = deferred)
+
+        controller.destroy()
+
+        assertTrue(deferred.isCancelled)
     }
 
     // --- NH1: Notification channel ---
