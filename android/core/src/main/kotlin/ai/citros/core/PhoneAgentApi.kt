@@ -223,6 +223,42 @@ open class PhoneAgentApi(
         return if (tinyFishApiKey != null) tools else tools.filter { it.name != "web_browse" }
     }
 
+    /**
+     * Get tools for a model with tool grouping policy applied.
+     * When [FeatureFlags.toolGroupingV1Enabled] is true, uses [ToolGroupingPolicy]
+     * to dynamically select categories. When false, falls back to legacy all-category behavior.
+     *
+     * @return Pair of tool list and optional [ResolvedToolPlan] (null when grouping is off)
+     */
+    internal fun getToolsForModelWithGrouping(
+        modelId: String? = null,
+        messageText: String = "",
+        userSettings: UserToolCategorySettings = UserToolCategorySettings.allEnabled()
+    ): Pair<List<Tool>, ResolvedToolPlan?> {
+        if (!FeatureFlags.toolGroupingV1Enabled) {
+            return getToolsForModel(modelId) to null
+        }
+
+        val tier = modelId?.let { ModelClassifier.classify(it) } ?: ModelTier.STANDARD
+        val capabilities = ToolGroupingPolicy.Capabilities(
+            accessibilityAttached = phoneControlOverride ?: isScreenReaderAttached(),
+            hasTinyFishKey = tinyFishApiKey != null
+        )
+
+        val plan = ToolGroupingPolicy.resolve(
+            messageText = messageText,
+            modelTier = tier,
+            capabilities = capabilities,
+            userSettings = userSettings.snapshot()
+        )
+
+        // Filter from a single tool list using policy-selected tool names.
+        val allTools = PhoneTools.getToolsForCategories(ToolCategory.entries.toSet(), tier)
+        val tools = allTools.filter { it.name in plan.toolNames }
+
+        return tools to plan
+    }
+
     private val messages: MutableList<Message> = CopyOnWriteArrayList()
     private val requestFlowMutex = Mutex()
     private val clearRequested = AtomicBoolean(false)

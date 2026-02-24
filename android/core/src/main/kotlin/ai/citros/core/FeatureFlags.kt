@@ -38,6 +38,15 @@ object FeatureFlags {
     var promptTuningV1Enabled: Boolean = false
 
     /**
+     * Tool grouping v1: dynamic category selection per turn.
+     * When true, uses ToolGroupingPolicy to select active tool categories.
+     * When false, all categories are included (legacy behavior).
+     * See docs/specs/h2-3-tool-grouping-spec.md Section 5.6.
+     */
+    @Volatile
+    var toolGroupingV1Enabled: Boolean = false
+
+    /**
      * Reset all flags to defaults. Used in tests.
      */
     fun resetToDefaults() {
@@ -45,5 +54,6 @@ object FeatureFlags {
         actionPolicyEnabled = true
         actionPolicyAuditAllowDecisions = false
         promptTuningV1Enabled = false
+        toolGroupingV1Enabled = false
     }
 }
