@@ -24,8 +24,8 @@ class RecoveryScaffoldTest {
 
     @Test
     fun `detectFailure returns no effect when ui tool leaves same screen hash`() {
-        val before = ScreenFingerprint(structuralHash = 111, packageName = "com.app")
-        val after = ScreenFingerprint(structuralHash = 111, packageName = "com.app")
+        val before = ScreenFingerprint(structuralHash = "111", packageName = "com.app")
+        val after = ScreenFingerprint(structuralHash = "111", packageName = "com.app")
 
         val failure = detectFailure(
             toolCall = ToolCall("t2", "tap", emptyMap()),
@@ -41,8 +41,8 @@ class RecoveryScaffoldTest {
 
     @Test
     fun `detectFailure does not mark non ui tool as no effect when hash unchanged`() {
-        val before = ScreenFingerprint(structuralHash = 111, packageName = "com.app")
-        val after = ScreenFingerprint(structuralHash = 111, packageName = "com.app")
+        val before = ScreenFingerprint(structuralHash = "111", packageName = "com.app")
+        val after = ScreenFingerprint(structuralHash = "111", packageName = "com.app")
 
         val failure = detectFailure(
             toolCall = ToolCall("t2b", "read_screen", emptyMap()),
@@ -57,8 +57,8 @@ class RecoveryScaffoldTest {
 
     @Test
     fun `detectFailure bypasses no effect for all excluded tools`() {
-        val before = ScreenFingerprint(structuralHash = 111, packageName = "com.app")
-        val after = ScreenFingerprint(structuralHash = 111, packageName = "com.app")
+        val before = ScreenFingerprint(structuralHash = "111", packageName = "com.app")
+        val after = ScreenFingerprint(structuralHash = "111", packageName = "com.app")
         val excludedTools = listOf("type_text", "wait", "read_screen", "paste")
 
         excludedTools.forEach { toolName ->
@@ -76,8 +76,8 @@ class RecoveryScaffoldTest {
 
     @Test
     fun `detectFailure returns unexpected state when app changes unexpectedly`() {
-        val before = ScreenFingerprint(structuralHash = 111, packageName = "com.a")
-        val after = ScreenFingerprint(structuralHash = 222, packageName = "com.b")
+        val before = ScreenFingerprint(structuralHash = "111", packageName = "com.a")
+        val after = ScreenFingerprint(structuralHash = "222", packageName = "com.b")
 
         val failure = detectFailure(
             toolCall = ToolCall("t3", "tap_text", mapOf("text" to "Send")),
@@ -93,8 +93,8 @@ class RecoveryScaffoldTest {
 
     @Test
     fun `detectFailure returns null when no failure pattern applies`() {
-        val before = ScreenFingerprint(structuralHash = 111, packageName = "com.a")
-        val after = ScreenFingerprint(structuralHash = 222, packageName = "com.a")
+        val before = ScreenFingerprint(structuralHash = "111", packageName = "com.a")
+        val after = ScreenFingerprint(structuralHash = "222", packageName = "com.a")
 
         val failure = detectFailure(
             toolCall = ToolCall("t4", "tap", emptyMap()),

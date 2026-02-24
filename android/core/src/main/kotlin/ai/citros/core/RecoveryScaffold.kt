@@ -6,11 +6,28 @@ package ai.citros.core
  * `structuralHash` is expected to change when visible UI structure changes in a user-meaningful
  * way (new screen, dialog, layout/content mutation) and stay stable when structure is unchanged.
  * It is intentionally coarse and may ignore non-structural rendering noise.
+ *
+ * Hash format migration note:
+ * - legacy values were decimal Int strings (from `hashCode()`) and may still exist in persisted data
+ * - current values are SHA-256 hex strings (from [ScreenFingerprinting.compute])
+ *
+ * Callers should treat mixed legacy/current hashes as non-equal unless an explicit migration step
+ * rewrites persisted legacy fingerprints.
  */
 data class ScreenFingerprint(
-    val structuralHash: Int,
-    val packageName: String?
-)
+    val structuralHash: String,
+    val packageName: String?,
+    val activityName: String? = null,
+    val interactiveCount: Int = 0,
+    val maxDepth: Int = 0,
+    val classSignature: List<String> = emptyList()
+) {
+    /** Source-level compatibility helper for old Int-hash call sites. */
+    constructor(structuralHash: Int, packageName: String?) : this(
+        structuralHash = structuralHash.toString(),
+        packageName = packageName
+    )
+}
 
 data class ActionFailure(
     val toolCall: ToolCall,
@@ -169,7 +186,7 @@ private val NO_EFFECT_EXCLUDED_TOOLS = setOf("type_text", "wait", "read_screen",
  */
 internal fun ScreenContent?.toFingerprint(): ScreenFingerprint? {
     if (this == null) return null
-    return ScreenFingerprint(structuralHash = this.hashCode(), packageName = this.packageName)
+    return ScreenFingerprinting.compute(this)
 }
 
 /**
