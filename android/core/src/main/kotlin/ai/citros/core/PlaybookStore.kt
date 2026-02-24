@@ -96,7 +96,12 @@ interface PlaybookDao {
     fun insertPlaybook(entity: PlaybookEntity): Long
     fun insertStep(entity: PlaybookStepEntity): Long
     fun findByAppAndType(appPackage: String, taskType: String): List<PlaybookEntity>
+    fun getPlaybook(playbookId: Long): PlaybookEntity?
     fun getSteps(playbookId: Long): List<PlaybookStepEntity>
+    fun incrementSuccess(playbookId: Long)
+    fun incrementFail(playbookId: Long)
+    fun updateConfidence(playbookId: Long, confidence: Float)
+    fun recordExecution(playbookId: Long, success: Boolean)
 }
 
 class SqlitePlaybookDao(
@@ -137,6 +142,39 @@ class SqlitePlaybookDao(
             put("alternatives", entity.alternatives)
         }
         return database.insertOrThrow("playbook_steps", null, values)
+    }
+
+    override fun getPlaybook(playbookId: Long): PlaybookEntity? {
+        val cursor = database.rawQuery(
+            """
+            SELECT id, app_package, task_type, description, parameter_schema, success_count, fail_count,
+                   confidence, app_version_code, created_at, last_used_at, last_succeeded_at, shared, source
+            FROM playbooks
+            WHERE id = ?
+            LIMIT 1
+            """.trimIndent(),
+            arrayOf(playbookId.toString())
+        )
+
+        cursor.use {
+            if (!it.moveToFirst()) return null
+            return PlaybookEntity(
+                id = it.getLong(it.getColumnIndexOrThrow("id")),
+                appPackage = it.getString(it.getColumnIndexOrThrow("app_package")),
+                taskType = it.getString(it.getColumnIndexOrThrow("task_type")),
+                description = it.getString(it.getColumnIndexOrThrow("description")),
+                parameterSchema = it.getString(it.getColumnIndexOrThrow("parameter_schema")),
+                successCount = it.getInt(it.getColumnIndexOrThrow("success_count")),
+                failCount = it.getInt(it.getColumnIndexOrThrow("fail_count")),
+                confidence = it.getFloat(it.getColumnIndexOrThrow("confidence")),
+                appVersionCode = it.getColumnIndexOrThrow("app_version_code").let { idx -> if (it.isNull(idx)) null else it.getInt(idx) },
+                createdAt = it.getLong(it.getColumnIndexOrThrow("created_at")),
+                lastUsedAt = it.getLong(it.getColumnIndexOrThrow("last_used_at")),
+                lastSucceededAt = it.getColumnIndexOrThrow("last_succeeded_at").let { idx -> if (it.isNull(idx)) null else it.getLong(idx) },
+                shared = it.getInt(it.getColumnIndexOrThrow("shared")) == 1,
+                source = it.getString(it.getColumnIndexOrThrow("source"))
+            )
+        }
     }
 
     override fun findByAppAndType(appPackage: String, taskType: String): List<PlaybookEntity> {
@@ -237,6 +275,56 @@ class SqlitePlaybookDao(
                 )
             }
             return rows
+        }
+    }
+
+    override fun incrementSuccess(playbookId: Long) {
+        val now = System.currentTimeMillis()
+        database.execSQL(
+            "UPDATE playbooks SET success_count = success_count + 1, last_used_at = ?, last_succeeded_at = ? WHERE id = ?",
+            arrayOf(now, now, playbookId)
+        )
+    }
+
+    override fun incrementFail(playbookId: Long) {
+        database.execSQL(
+            "UPDATE playbooks SET fail_count = fail_count + 1, last_used_at = ? WHERE id = ?",
+            arrayOf(System.currentTimeMillis(), playbookId)
+        )
+    }
+
+    override fun updateConfidence(playbookId: Long, confidence: Float) {
+        database.execSQL(
+            "UPDATE playbooks SET confidence = ? WHERE id = ?",
+            arrayOf(confidence, playbookId)
+        )
+    }
+
+    override fun recordExecution(playbookId: Long, success: Boolean) {
+        val now = System.currentTimeMillis()
+        if (success) {
+            database.execSQL(
+                """
+                UPDATE playbooks
+                SET success_count = success_count + 1,
+                    last_used_at = ?,
+                    last_succeeded_at = ?,
+                    confidence = CAST(success_count + 1 AS REAL) / (success_count + fail_count + 1)
+                WHERE id = ?
+                """.trimIndent(),
+                arrayOf(now, now, playbookId)
+            )
+        } else {
+            database.execSQL(
+                """
+                UPDATE playbooks
+                SET fail_count = fail_count + 1,
+                    last_used_at = ?,
+                    confidence = CAST(success_count AS REAL) / (success_count + fail_count + 1)
+                WHERE id = ?
+                """.trimIndent(),
+                arrayOf(now, playbookId)
+            )
         }
     }
 }
