@@ -168,11 +168,13 @@ class AgentExecutor(
      * @param continueAfterTools Lambda to get the next model response after tool results
      * @return Structured [LoopResult] describing what happened
      */
+    private fun extractEgressUrl(toolCall: ToolCall): String? = when (toolCall.name) {
+        "web_fetch", "web_browse" -> toolCall.input["url"] as? String
+        else -> null
+    }
+
     private fun extractPolicyEndpointHost(toolCall: ToolCall): String? {
-        val rawUrl = when (toolCall.name) {
-            "web_fetch", "web_browse" -> toolCall.input["url"] as? String
-            else -> null
-        } ?: return null
+        val rawUrl = extractEgressUrl(toolCall) ?: return null
         val uri = kotlin.runCatching { java.net.URI(rawUrl) }.getOrNull() ?: return null
         val host = uri.host ?: return null
         return kotlin.runCatching { java.net.IDN.toASCII(host.trim().trimEnd('.').lowercase()) }.getOrNull()
@@ -294,7 +296,7 @@ class AgentExecutor(
                     PolicyEvaluation(
                         decision = PolicyDecision.Deny(
                             reasonCode = PolicyReasonCode.DENY_POLICY_EVAL_EXCEPTION,
-                            reason = "Policy evaluation failed; action blocked (fail-closed)"
+                            reason = "Policy evaluation failed; action blocked"
                         )
                     )
                 }

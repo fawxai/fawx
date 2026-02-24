@@ -196,30 +196,32 @@ class DefaultActionPolicy(
     }
 
     // URL egress gate is intentionally limited to tools that accept caller-provided URLs.
-    // web_search takes only {query,count} (see PhoneTools.WEB_SEARCH schema) and routes through
-    // controlled provider clients; there is no model-controlled endpoint field to validate here.
-    // Keep fail-closed behavior for arbitrary egress via web_fetch/web_browse URL enforcement.
+    // web_search takes only {query,count} and routes through controlled provider clients;
+    // there is no model-controlled endpoint field to validate in this policy.
     private fun isUrlEgressTool(toolCall: ToolCall): Boolean = toolCall.name in setOf("web_fetch", "web_browse")
 
+    private fun extractEgressUrl(toolCall: ToolCall): String? = when (toolCall.name) {
+        "web_fetch", "web_browse" -> toolCall.input["url"] as? String
+        else -> null
+    }
+
     private fun egressDenyDecision(toolCall: ToolCall): PolicyDecision.Deny? {
-        val url = when (toolCall.name) {
-            "web_fetch", "web_browse" -> toolCall.input["url"] as? String
-            else -> null
-        } ?: return PolicyDecision.Deny(PolicyReasonCode.DENY_EGRESS_MISSING_URL, "Egress request missing endpoint URL")
+        val url = extractEgressUrl(toolCall)
+            ?: return PolicyDecision.Deny(PolicyReasonCode.DENY_EGRESS_MISSING_URL, "Egress URL is required for this tool")
 
         val uri = kotlin.runCatching { java.net.URI(url) }.getOrNull()
-            ?: return PolicyDecision.Deny(PolicyReasonCode.DENY_EGRESS_MALFORMED_URL, "Egress endpoint URL is malformed")
+            ?: return PolicyDecision.Deny(PolicyReasonCode.DENY_EGRESS_MALFORMED_URL, "Egress URL must be a valid absolute URL")
 
         if (uri.scheme?.lowercase() != "https") {
-            return PolicyDecision.Deny(PolicyReasonCode.DENY_EGRESS_INSECURE_SCHEME, "Only HTTPS egress endpoints are allowed")
+            return PolicyDecision.Deny(PolicyReasonCode.DENY_EGRESS_INSECURE_SCHEME, "Only HTTPS egress is allowed in Phase 1")
         }
 
         val host = canonicalizeHost(uri.host)
-            ?: return PolicyDecision.Deny(PolicyReasonCode.DENY_EGRESS_MALFORMED_URL, "Egress endpoint host is invalid")
+            ?: return PolicyDecision.Deny(PolicyReasonCode.DENY_EGRESS_MALFORMED_URL, "Egress URL host is malformed")
 
         val snapshot = egressAllowlistProvider.currentSnapshot()
         if (!snapshot.signatureVerified) {
-            return PolicyDecision.Deny(PolicyReasonCode.DENY_EGRESS_UNSIGNED_ALLOWLIST, "Signed egress allowlist unavailable; blocking outbound request")
+            return PolicyDecision.Deny(PolicyReasonCode.DENY_EGRESS_UNSIGNED_ALLOWLIST, "Egress allowlist signature is invalid; outbound traffic blocked")
         }
 
         val allowed = snapshot.hosts.mapNotNull(::canonicalizeHost)

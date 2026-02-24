@@ -130,7 +130,7 @@ class DefaultActionPolicyTest {
     }
 
     @Test
-    fun `web_search bypasses url egress gate and remains allow`() {
+    fun `web_search remains allow without model-supplied endpoint`() {
         val eval = policy.evaluate(ToolCall("1", "web_search", mapOf("query" to "openclaw docs")), PolicyContext())
         assertIs<PolicyDecision.Allow>(eval.decision)
         assertEquals(PolicyReasonCode.ALLOW_DEFAULT, eval.reasonCode)
