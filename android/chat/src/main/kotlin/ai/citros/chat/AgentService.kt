@@ -11,8 +11,18 @@ import android.os.Binder
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import ai.citros.core.AgentExecutor
 import ai.citros.core.AgentState
+import ai.citros.core.ErrorSeverity
+import ai.citros.core.LoopProgressListener
+import ai.citros.core.LoopResult
 import ai.citros.core.Message
+import ai.citros.core.InterruptionEvent
+import ai.citros.core.OutputClassifier
+import ai.citros.core.OutputVisibility
+import ai.citros.core.PhoneAgentApi
+import ai.citros.core.ScreenContent
+import ai.citros.core.ScreenReader
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -39,6 +49,18 @@ import java.util.UUID
  *
  * See docs/specs/sprint-0-service-architecture.md
  */
+/**
+ * Callback interface for UI progress events from the service.
+ * Implemented by ChatViewModel to receive execution progress.
+ * When null (activity dead), the service continues headlessly.
+ */
+interface ServiceProgressCallback {
+    fun onAssistantMessage(text: String)
+    fun onToolStatus(status: String?)
+    fun onExecutionComplete(steps: Int)
+    fun onExecutionError(error: String, steps: Int)
+}
+
 class AgentService : Service() {
 
     companion object {
@@ -120,6 +142,48 @@ class AgentService : Service() {
     @androidx.annotation.VisibleForTesting
     internal var currentTaskJob: kotlinx.coroutines.Job? = null
 
+    // --- Execution dependencies (set by ChatViewModel via binder) ---
+
+    /**
+     * PhoneAgentApi reference set by ChatViewModel when dispatching a task.
+     * Survives activity death because it's a network client with no Activity dependency.
+     */
+    @Volatile
+    private var phoneAgentApi: PhoneAgentApi? = null
+
+    /**
+     * Steer message source. Returns pending steer messages drained from the queue.
+     * Set by ChatViewModel when bound. Null when unbound (headless mode — no steers).
+     */
+    @Volatile
+    var steerMessageSource: (() -> List<String>)? = null
+
+    /**
+     * Cancellation check. Returns true if the user wants to cancel.
+     * Falls back to service-level cancel flag when ViewModel is unbound.
+     */
+    @Volatile
+    private var externalCancelCheck: (() -> Boolean)? = null
+    private val serviceCancelFlag = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /**
+     * Interruption source for detecting app interruptions during tool loop.
+     * Returns a pending InterruptionEvent or null. Set by ChatViewModel.
+     */
+    @Volatile
+    var interruptionSource: (() -> InterruptionEvent?)? = null
+
+    /**
+     * UI callback for progress events. Set by ChatViewModel when bound.
+     * Null when unbound (headless mode — progress goes to StateFlow only).
+     */
+    @Volatile
+    var progressCallback: ServiceProgressCallback? = null
+
+    /** Max tool steps per task. */
+    @androidx.annotation.VisibleForTesting
+    internal var maxToolSteps: Int = 25
+
     // --- Observable state ---
     private val _agentState = MutableStateFlow<AgentState>(AgentState.Idle)
     val agentState: StateFlow<AgentState> = _agentState.asStateFlow()
@@ -141,6 +205,37 @@ class AgentService : Service() {
 
     inner class AgentBinder : Binder() {
         fun getService(): AgentService = this@AgentService
+
+        /**
+         * Configure execution dependencies. Called by ChatViewModel when binding.
+         * These references survive activity death (PhoneAgentApi is a network client,
+         * steer/cancel sources gracefully degrade to null when ViewModel unbinds).
+         */
+        fun configureExecution(
+            api: PhoneAgentApi,
+            steerSource: (() -> List<String>)? = null,
+            cancelCheck: (() -> Boolean)? = null,
+            interruptSource: (() -> InterruptionEvent?)? = null,
+            progress: ServiceProgressCallback? = null
+        ) {
+            phoneAgentApi = api
+            steerMessageSource = steerSource
+            externalCancelCheck = cancelCheck
+            interruptionSource = interruptSource
+            progressCallback = progress
+        }
+
+        /**
+         * Clear ViewModel-dependent references on unbind.
+         * PhoneAgentApi is kept (survives activity death).
+         * Callbacks are cleared (they reference ViewModel/Activity).
+         */
+        fun clearCallbacks() {
+            steerMessageSource = null
+            externalCancelCheck = null
+            interruptionSource = null
+            progressCallback = null
+        }
     }
 
     override fun onBind(intent: Intent?): IBinder = binder
@@ -210,15 +305,19 @@ class AgentService : Service() {
 
         Log.i(TAG, "handleStartTask: starting task $taskId: '${message.take(60)}'")
         cancelIdleTimeout()
+        serviceCancelFlag.set(false)
         _agentState.value = AgentState.Thinking(taskId)
         updateNotification()
 
-        // B4: Establish task job skeleton for cancellation support.
-        // AgentExecutor integration comes in PR 2 — this job will own
-        // the executor.run() coroutine. For now, it's a placeholder that
-        // enables cancel tests to verify job cancellation.
+        val api = phoneAgentApi
+        if (api == null) {
+            Log.e(TAG, "handleStartTask: no PhoneAgentApi registered — cannot execute")
+            failTask(taskId, "Agent not configured")
+            return
+        }
+
         currentTaskJob = serviceScope.launch {
-            // PR 2: AgentExecutor.run() goes here
+            executeTask(taskId, message, api)
         }
     }
 
@@ -244,8 +343,10 @@ class AgentService : Service() {
             return
         }
         Log.i(TAG, "handleCancel: cancelling active task")
-        // B4: cancel the active task's coroutine job. AgentExecutor checks
-        // isCancelled() which will return true once the job is cancelled.
+        // Signal cancellation through both mechanisms:
+        // 1. serviceCancelFlag — checked by AgentExecutor's isCancelled lambda
+        // 2. coroutine job cancellation — propagates CancellationException
+        serviceCancelFlag.set(true)
         currentTaskJob?.cancel()
         currentTaskJob = null
         _agentState.value = AgentState.Idle
@@ -271,13 +372,176 @@ class AgentService : Service() {
         startIdleTimeout()
     }
 
+    // --- Task execution ---
+
+    /**
+     * Run the full agent task lifecycle: initial API call → tool loop → result.
+     *
+     * This is the core of the service architecture migration. The executor
+     * runs in serviceScope (not viewModelScope), surviving activity death.
+     */
+    private suspend fun executeTask(taskId: String, message: String, api: PhoneAgentApi) {
+        var toolSteps = 0
+        var monitoringStarted = false
+        try {
+            val screenContent = try {
+                if (ScreenReader.isAttached()) ScreenReader.getScreenContent() else null
+            } catch (_: Exception) { null }
+
+            appendConversation("user", message)
+            api.seedConversationHistory(_conversationMessages.value.dropLast(1))
+
+            val response = sendMessageWithFallback(api, message, screenContent)
+            if (response == null) {
+                failTask(taskId, "No response from API")
+                return
+            }
+
+            if (response.toolCalls.isEmpty()) {
+                val text = response.text ?: ""
+                appendConversation("assistant", text)
+                safeProgressCallback { it.onAssistantMessage(text) }
+                completeTask(taskId, text)
+                return
+            }
+
+            try {
+                ScreenReader.toolLoopOverlayHideHook?.invoke()
+            } catch (e: Exception) {
+                Log.w(TAG, "executeTask: overlay hide hook failed: ${e.message}")
+            }
+
+            val delegate = ServiceToolDelegate(api)
+            val serviceProgressListener = object : LoopProgressListener {
+                override fun onToolStarted(toolName: String, toolIndex: Int, batchSize: Int) {
+                    _agentState.value = AgentState.Executing(taskId, toolName, toolIndex, batchSize)
+                    updateNotification()
+                    safeProgressCallback { it.onToolStatus(toolName) }
+                }
+
+                override fun onToolResult(toolName: String, result: String, visibility: OutputVisibility, isError: Boolean) {
+                    safeProgressCallback { it.onToolStatus(null) }
+                    val displayText = OutputClassifier.formatForDisplay(toolName, result, visibility)
+                    if (displayText != null) {
+                        appendConversation("assistant", displayText)
+                        safeProgressCallback { it.onAssistantMessage(displayText) }
+                    }
+                }
+
+                override fun onToolError(toolName: String, errorText: String, severity: ErrorSeverity) {
+                    if (severity == ErrorSeverity.PERSISTENT) {
+                        safeProgressCallback { it.onToolStatus("⚠️ $errorText") }
+                    }
+                }
+
+                override fun onAccessibilityLost() {
+                    val warning = "⚠️ Phone control disconnected. Please re-enable it in Settings → Accessibility."
+                    appendConversation("assistant", warning)
+                    safeProgressCallback { it.onAssistantMessage(warning) }
+                    serviceCancelFlag.set(true)
+                }
+            }
+
+            val executor = AgentExecutor(
+                delegate = delegate,
+                progressListener = serviceProgressListener,
+                maxToolSteps = maxToolSteps,
+                steerMessageSource = { steerMessageSource?.invoke() ?: emptyList() },
+                interruptionSource = { interruptionSource?.invoke() }
+            )
+
+            val isCancelled = {
+                serviceCancelFlag.get() || (externalCancelCheck?.invoke() ?: false)
+            }
+
+            InterruptionDetector.startMonitoring(screenContent?.packageName)
+            monitoringStarted = true
+
+            val result = executor.run(
+                initialResponse = response,
+                initialScreenContent = screenContent,
+                isCancelled = isCancelled,
+                continueAfterTools = { api.continueAfterTools() }
+            )
+
+            toolSteps = when (result) {
+                is LoopResult.Completed -> {
+                    var finalText = result.text
+                    val explanationPrompt = explanationPromptForExit(result.exitReason)
+                    if (finalText == null && explanationPrompt != null) {
+                        finalText = api.sendEphemeral(explanationPrompt)
+                    }
+                    if (finalText != null) {
+                        appendConversation("assistant", finalText)
+                        safeProgressCallback { it.onAssistantMessage(finalText) }
+                    }
+                    safeProgressCallback { it.onExecutionComplete(result.steps) }
+                    completeTask(taskId, finalText ?: "Task completed")
+                    result.steps
+                }
+                is LoopResult.Error -> {
+                    safeProgressCallback { it.onExecutionError(result.message, result.steps) }
+                    failTask(taskId, result.message)
+                    result.steps
+                }
+            }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            Log.i(TAG, "executeTask: cancelled")
+            _agentState.value = AgentState.Idle
+            updateNotification()
+        } catch (e: Exception) {
+            Log.e(TAG, "executeTask: crashed: ${e.message}", e)
+            safeProgressCallback { it.onExecutionError("Crashed: ${e.message?.take(120)}", toolSteps) }
+            failTask(taskId, "Crashed: ${e.message?.take(120)}")
+        } finally {
+            if (monitoringStarted) {
+                InterruptionDetector.stopMonitoring()
+            }
+            try {
+                ScreenReader.toolLoopOverlayRestoreHook?.invoke()
+            } catch (e: Exception) {
+                Log.w(TAG, "executeTask: overlay restore hook failed: ${e.message}")
+            }
+        }
+    }
+
+    private suspend fun sendMessageWithFallback(
+        api: PhoneAgentApi,
+        message: String,
+        screenContent: ScreenContent?
+    ) = try {
+        api.sendMessage(message, screenContent, isActionLoop = false)
+    } catch (e: Exception) {
+        Log.w(TAG, "sendMessageWithFallback: first attempt failed (${e.message}), retrying once")
+        api.sendMessage(message, screenContent, isActionLoop = false)
+    }
+
+    private fun safeProgressCallback(block: (ServiceProgressCallback) -> Unit) {
+        try {
+            progressCallback?.let(block)
+        } catch (e: Exception) {
+            Log.w(TAG, "progress callback failed: ${e.message}")
+        }
+    }
+
+    private fun appendConversation(role: String, content: String) {
+        if (content.isBlank()) return
+        _conversationMessages.value = _conversationMessages.value + Message(role = role, content = content)
+    }
+
+    private fun explanationPromptForExit(exitReason: String): String? = when (exitReason) {
+        "max_steps" -> "[System: You hit the step limit and couldn't finish the task. Summarize what you accomplished so far and ask the user how they'd like to proceed.]"
+        "accessibility_lost" -> "[System: You lost connection to the phone's accessibility service during the task. Let the user know what happened and ask if they'd like to retry or do something else.]"
+        else -> null
+    }
+
     // --- Task lifecycle helpers ---
 
     /**
      * Transition to a terminal state and start idle timeout.
-     * Called by AgentExecutor callbacks when a task finishes.
+     * Called when task finishes (success or failure).
      */
-    fun completeTask(taskId: String, result: String) {
+    internal fun completeTask(taskId: String, result: String) {
         _agentState.value = AgentState.Complete(taskId, result)
         updateNotification()
         startIdleTimeout()
@@ -286,7 +550,7 @@ class AgentService : Service() {
     /**
      * Transition to failed state and start idle timeout.
      */
-    fun failTask(taskId: String, error: String) {
+    internal fun failTask(taskId: String, error: String) {
         _agentState.value = AgentState.Failed(taskId, error)
         updateNotification()
         startIdleTimeout()

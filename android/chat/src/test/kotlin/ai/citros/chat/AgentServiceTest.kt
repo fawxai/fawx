@@ -1,6 +1,7 @@
 package ai.citros.chat
 
 import ai.citros.core.AgentState
+import ai.citros.core.PhoneAgentApi
 import android.content.Intent
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.StandardTestDispatcher
@@ -10,6 +11,7 @@ import org.junit.After
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.mockito.Mockito.mock
 import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.android.controller.ServiceController
@@ -39,6 +41,16 @@ class AgentServiceTest {
         service = controller.get()
     }
 
+    /**
+     * Configure a mock PhoneAgentApi on the service so that START_TASK
+     * transitions to Thinking instead of immediately failing.
+     */
+    private fun configureWithMockApi() {
+        controller.create()
+        val binder = service.onBind(Intent()) as AgentService.AgentBinder
+        binder.configureExecution(api = mock(PhoneAgentApi::class.java))
+    }
+
     @After
     fun tearDown() {
         try {
@@ -66,9 +78,8 @@ class AgentServiceTest {
 
     @Test
     fun `START_TASK transitions to Thinking`() {
-        controller.create()
+        configureWithMockApi()
         val intent = AgentService.startTaskIntent(service, "Open Settings")
-        controller.startCommand(0, 0)
         service.onStartCommand(intent, 0, 1)
 
         assertIs<AgentState.Thinking>(service.agentState.value)
@@ -76,7 +87,7 @@ class AgentServiceTest {
 
     @Test
     fun `START_TASK includes taskId`() {
-        controller.create()
+        configureWithMockApi()
         val intent = AgentService.startTaskIntent(service, "Open Settings")
         service.onStartCommand(intent, 0, 1)
 
@@ -89,7 +100,7 @@ class AgentServiceTest {
 
     @Test
     fun `completeTask transitions to Complete`() {
-        controller.create()
+        configureWithMockApi()
         val intent = AgentService.startTaskIntent(service, "test")
         service.onStartCommand(intent, 0, 1)
 
@@ -102,7 +113,7 @@ class AgentServiceTest {
 
     @Test
     fun `failTask transitions to Failed`() {
-        controller.create()
+        configureWithMockApi()
         val intent = AgentService.startTaskIntent(service, "test")
         service.onStartCommand(intent, 0, 1)
 
@@ -126,7 +137,7 @@ class AgentServiceTest {
 
     @Test
     fun `CANCEL intent transitions active task to Idle`() {
-        controller.create()
+        configureWithMockApi()
         // Start a task
         val startIntent = AgentService.startTaskIntent(service, "test")
         service.onStartCommand(startIntent, 0, 1)
@@ -152,7 +163,7 @@ class AgentServiceTest {
 
     @Test
     fun `START_TASK during active task stays in current state`() {
-        controller.create()
+        configureWithMockApi()
         // Start first task
         val firstIntent = AgentService.startTaskIntent(service, "Open Settings")
         service.onStartCommand(firstIntent, 0, 1)
@@ -173,7 +184,7 @@ class AgentServiceTest {
 
     @Test
     fun `STEER intent during active task does not change state`() {
-        controller.create()
+        configureWithMockApi()
         val startIntent = AgentService.startTaskIntent(service, "test")
         service.onStartCommand(startIntent, 0, 1)
 
@@ -276,7 +287,7 @@ class AgentServiceTest {
 
     @Test
     fun `isActive reflects state correctly through transitions`() {
-        controller.create()
+        configureWithMockApi()
 
         // Idle → not active
         assertFalse(service.agentState.value.isActive())
@@ -297,7 +308,7 @@ class AgentServiceTest {
     @Test
     fun `idle timeout starts after completeTask`() = runTest {
         val testDispatcher = StandardTestDispatcher(testScheduler)
-        controller.create()
+        configureWithMockApi()
         service.dispatcher = testDispatcher
 
         // Start and complete a task
@@ -314,7 +325,7 @@ class AgentServiceTest {
     @Test
     fun `idle timeout starts after failTask`() = runTest {
         val testDispatcher = StandardTestDispatcher(testScheduler)
-        controller.create()
+        configureWithMockApi()
         service.dispatcher = testDispatcher
 
         val intent = AgentService.startTaskIntent(service, "test")
@@ -329,7 +340,7 @@ class AgentServiceTest {
     @Test
     fun `idle timeout starts after handleCancel`() = runTest {
         val testDispatcher = StandardTestDispatcher(testScheduler)
-        controller.create()
+        configureWithMockApi()
         service.dispatcher = testDispatcher
 
         val startIntent = AgentService.startTaskIntent(service, "test")
@@ -346,7 +357,7 @@ class AgentServiceTest {
     @Test
     fun `idle timeout is cancelled when new task starts`() = runTest {
         val testDispatcher = StandardTestDispatcher(testScheduler)
-        controller.create()
+        configureWithMockApi()
         service.dispatcher = testDispatcher
 
         // Complete a task → idle timeout starts
@@ -379,7 +390,7 @@ class AgentServiceTest {
 
     @Test
     fun `cancel cancels currentTaskJob`() {
-        controller.create()
+        configureWithMockApi()
         val startIntent = AgentService.startTaskIntent(service, "test")
         service.onStartCommand(startIntent, 0, 1)
 
@@ -395,7 +406,7 @@ class AgentServiceTest {
 
     @Test
     fun `stop cancels currentTaskJob`() {
-        controller.create()
+        configureWithMockApi()
         // Need to go foreground first
         val startIntent = AgentService.startTaskIntent(service, "test")
         service.onStartCommand(startIntent, 0, 1)
@@ -436,7 +447,7 @@ class AgentServiceTest {
 
     @Test
     fun `STOP during active task transitions to Idle and cancels job`() {
-        controller.create()
+        configureWithMockApi()
         val startIntent = AgentService.startTaskIntent(service, "test")
         service.onStartCommand(startIntent, 0, 1)
         assertIs<AgentState.Thinking>(service.agentState.value)
