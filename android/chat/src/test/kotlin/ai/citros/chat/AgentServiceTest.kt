@@ -2,10 +2,13 @@ package ai.citros.chat
 
 import ai.citros.core.AgentState
 import ai.citros.core.PhoneAgentApi
+import ai.citros.core.TaskState
+import ai.citros.core.TaskStateManager
+import ai.citros.core.TaskStatus
 import android.content.Intent
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.StandardTestDispatcher
-import kotlinx.coroutines.test.advanceTimeBy
+import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
 import org.junit.After
 import org.junit.Before
@@ -124,6 +127,62 @@ class AgentServiceTest {
         assertEquals("Network error", state.error)
     }
 
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `completeTask clears persisted checkpoint`() = runTest {
+        val testDispatcher = StandardTestDispatcher(testScheduler)
+        val fakeManager = FakeTaskStateManager(
+            pendingState = TaskState(
+                taskId = "task-complete",
+                userMessage = "finish",
+                conversationHistory = emptyList(),
+                currentStep = 3,
+                maxSteps = 25,
+                startedAtMs = 1L,
+                lastCheckpointMs = System.currentTimeMillis(),
+                pendingToolCalls = emptyList(),
+                status = TaskStatus.ACTIVE
+            )
+        )
+        configureWithMockApi()
+        service.dispatcher = testDispatcher
+        service.taskStateManagerOverride = fakeManager
+
+        service.completeTask("task-complete", "Done")
+        advanceUntilIdle()
+
+        assertNull(fakeManager.pendingState)
+        assertTrue(fakeManager.clearCalls > 0)
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `failTask clears persisted checkpoint`() = runTest {
+        val testDispatcher = StandardTestDispatcher(testScheduler)
+        val fakeManager = FakeTaskStateManager(
+            pendingState = TaskState(
+                taskId = "task-fail",
+                userMessage = "fail",
+                conversationHistory = emptyList(),
+                currentStep = 3,
+                maxSteps = 25,
+                startedAtMs = 1L,
+                lastCheckpointMs = System.currentTimeMillis(),
+                pendingToolCalls = emptyList(),
+                status = TaskStatus.ACTIVE
+            )
+        )
+        configureWithMockApi()
+        service.dispatcher = testDispatcher
+        service.taskStateManagerOverride = fakeManager
+
+        service.failTask("task-fail", "boom")
+        advanceUntilIdle()
+
+        assertNull(fakeManager.pendingState)
+        assertTrue(fakeManager.clearCalls > 0)
+    }
+
     @Test
     fun `updateState sets arbitrary state`() {
         controller.create()
@@ -157,6 +216,39 @@ class AgentServiceTest {
         service.onStartCommand(cancelIntent, 0, 1)
 
         assertIs<AgentState.Idle>(service.agentState.value)
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `cancel clears persisted checkpoint`() = runTest {
+        val testDispatcher = StandardTestDispatcher(testScheduler)
+        val fakeManager = FakeTaskStateManager(
+            pendingState = TaskState(
+                taskId = "task-cancel",
+                userMessage = "open settings",
+                conversationHistory = emptyList(),
+                currentStep = 1,
+                maxSteps = 25,
+                startedAtMs = 1L,
+                lastCheckpointMs = System.currentTimeMillis(),
+                pendingToolCalls = emptyList(),
+                status = TaskStatus.ACTIVE
+            )
+        )
+        controller.create()
+        service.dispatcher = testDispatcher
+        service.taskStateManagerOverride = fakeManager
+
+        val binder = service.onBind(Intent()) as AgentService.AgentBinder
+        binder.configureExecution(api = mock(PhoneAgentApi::class.java))
+
+        val startIntent = AgentService.startTaskIntent(service, "test")
+        service.onStartCommand(startIntent, 0, 1)
+        service.onStartCommand(AgentService.cancelIntent(service), 0, 2)
+        advanceUntilIdle()
+
+        assertNull(fakeManager.pendingState)
+        assertTrue(fakeManager.clearCalls > 0)
     }
 
     // --- Concurrent task policy: new message during active task = steer ---
@@ -222,6 +314,103 @@ class AgentServiceTest {
         controller.create()
         // Simulate system restart: null intent
         service.onStartCommand(null, 0, 1)
+
+        assertIs<AgentState.Idle>(service.agentState.value)
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `null intent with pending checkpoint transitions to Resuming when api is configured`() = runTest {
+        val testDispatcher = StandardTestDispatcher(testScheduler)
+        controller.create()
+        service.dispatcher = testDispatcher
+
+        val fakeManager = FakeTaskStateManager(
+            pendingState = TaskState(
+                taskId = "resume-1",
+                userMessage = "open calendar",
+                conversationHistory = emptyList(),
+                currentStep = 2,
+                maxSteps = 25,
+                startedAtMs = 1L,
+                lastCheckpointMs = System.currentTimeMillis(),
+                pendingToolCalls = emptyList(),
+                status = TaskStatus.ACTIVE
+            )
+        )
+        service.taskStateManagerOverride = fakeManager
+
+        val binder = service.onBind(Intent()) as AgentService.AgentBinder
+        binder.configureExecution(api = mock(PhoneAgentApi::class.java))
+
+        service.onStartCommand(null, 0, 1)
+        advanceUntilIdle()
+
+        val state = service.agentState.value
+        assertTrue(state is AgentState.Resuming || state is AgentState.Thinking || state is AgentState.Failed)
+    }
+
+    @Test
+    fun `null intent with no pending checkpoint stays Idle`() {
+        controller.create()
+        service.taskStateManagerOverride = FakeTaskStateManager(pendingState = null)
+
+        service.onStartCommand(null, 0, 1)
+
+        assertIs<AgentState.Idle>(service.agentState.value)
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `system restart with stale checkpoint stays Idle and clears state`() = runTest {
+        val testDispatcher = StandardTestDispatcher(testScheduler)
+        controller.create()
+        service.dispatcher = testDispatcher
+
+        val staleState = TaskState(
+            taskId = "stale-1",
+            userMessage = "old task",
+            conversationHistory = listOf(Message(role = "user", content = "old task")),
+            currentStep = 2,
+            maxSteps = 25,
+            startedAtMs = 1L,
+            lastCheckpointMs = System.currentTimeMillis() - TaskStateManager.STALE_THRESHOLD_MS - 1,
+            pendingToolCalls = emptyList(),
+            status = TaskStatus.ACTIVE
+        )
+        val fakeManager = FakeTaskStateManager(pendingState = staleState)
+        service.taskStateManagerOverride = fakeManager
+
+        service.onStartCommand(null, 0, 1)
+        advanceUntilIdle()
+
+        assertIs<AgentState.Idle>(service.agentState.value)
+        assertNull(fakeManager.pendingState)
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `null intent with stale checkpoint stays Idle`() = runTest {
+        val testDispatcher = StandardTestDispatcher(testScheduler)
+        controller.create()
+        service.dispatcher = testDispatcher
+
+        service.taskStateManagerOverride = FakeTaskStateManager(
+            pendingState = TaskState(
+                taskId = "stale-1",
+                userMessage = "open maps",
+                conversationHistory = emptyList(),
+                currentStep = 1,
+                maxSteps = 25,
+                startedAtMs = 1L,
+                lastCheckpointMs = System.currentTimeMillis() - TaskStateManager.STALE_THRESHOLD_MS - 1,
+                pendingToolCalls = emptyList(),
+                status = TaskStatus.ACTIVE
+            )
+        )
+
+        service.onStartCommand(null, 0, 1)
+        advanceUntilIdle()
 
         assertIs<AgentState.Idle>(service.agentState.value)
     }
@@ -457,4 +646,32 @@ class AgentServiceTest {
 
         assertIs<AgentState.Idle>(service.agentState.value)
     }
+
+    private class FakeTaskStateManager(
+        var pendingState: TaskState?
+    ) : TaskStateManager {
+        var clearCalls: Int = 0
+            private set
+
+        override suspend fun checkpoint(state: TaskState) {
+            pendingState = state
+        }
+
+        override suspend fun loadPending(staleThresholdMs: Long): TaskState? {
+            val pending = pendingState ?: return null
+            val ageMs = System.currentTimeMillis() - pending.lastCheckpointMs
+            return if (ageMs > staleThresholdMs) {
+                pendingState = null
+                null
+            } else {
+                pending
+            }
+        }
+
+        override suspend fun clear() {
+            clearCalls += 1
+            pendingState = null
+        }
+    }
+
 }

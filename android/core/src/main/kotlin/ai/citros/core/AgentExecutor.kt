@@ -73,7 +73,12 @@ class AgentExecutor(
      *
      * Defaults to `null` (no transformation). Required for H2 context trimming.
      */
-    private val transformContext: (suspend () -> Unit)? = null
+    private val transformContext: (suspend () -> Unit)? = null,
+    /**
+     * Optional hook invoked after each tool boundary with checkpoint metadata.
+     * Used by service architecture to persist durable recovery state.
+     */
+    private val checkpointCallback: (suspend (LoopCheckpoint) -> Unit)? = null
 ) {
     /** Per-tool consecutive failure counters for error severity escalation. */
     private val failureCounts = mutableMapOf<String, Int>()
@@ -295,6 +300,10 @@ class AgentExecutor(
                 )
                 val checkResult = evaluateBoundaryChecks(loopState)
 
+                var pendingForCheckpoint = response.toolCalls.drop(toolIndex + 1)
+                var stopReason: String? = null
+                var shouldBreakToolBatch = false
+
                 when (checkResult) {
                     is CheckResult.Steer -> {
                         // Commit this tool's result as-is
@@ -311,23 +320,44 @@ class AgentExecutor(
                         for (msg in checkResult.userMessages) {
                             delegate.addSteerMessage(msg)
                         }
+                        pendingForCheckpoint = emptyList()
                         steered = true
-                        break  // Skip remaining tool calls in this batch
+                        shouldBreakToolBatch = true
                     }
                     is CheckResult.Stop -> {
                         delegate.addToolResult(toolCall.id, toolResult, toolCall.name, actionResult.isError)
-                        return LoopResult.Completed(
-                            text = null,
-                            steps = toolSteps,
-                            exitReason = checkResult.reason
-                        )
+                        pendingForCheckpoint = emptyList()
+                        stopReason = checkResult.reason
                     }
                     is CheckResult.Inject -> {
                         delegate.addToolResult(toolCall.id, toolResult + checkResult.message, toolCall.name, actionResult.isError)
                     }
                     CheckResult.Continue -> {
+                        // Continue intentionally relies on the shared checkpoint path below,
+                        // so every branch emits exactly one checkpoint callback per tool boundary.
                         delegate.addToolResult(toolCall.id, toolResult, toolCall.name, actionResult.isError)
                     }
+                }
+
+                checkpointCallback?.invoke(
+                    LoopCheckpoint(
+                        step = toolSteps,
+                        maxSteps = maxToolSteps,
+                        lastToolName = toolCall.name,
+                        pendingToolCalls = pendingForCheckpoint
+                    )
+                )
+
+                if (stopReason != null) {
+                    return LoopResult.Completed(
+                        text = null,
+                        steps = toolSteps,
+                        exitReason = stopReason
+                    )
+                }
+
+                if (shouldBreakToolBatch) {
+                    break // Skip remaining tool calls in this batch
                 }
             }
 
@@ -393,6 +423,16 @@ class AgentExecutor(
         else CheckResult.Inject(injections.joinToString(""))
     }
 }
+
+/**
+ * Minimal persisted checkpoint metadata emitted by [AgentExecutor] after each tool boundary.
+ */
+data class LoopCheckpoint(
+    val step: Int,
+    val maxSteps: Int,
+    val lastToolName: String,
+    val pendingToolCalls: List<ToolCall>
+)
 
 /**
  * Structured result from [AgentExecutor.run].

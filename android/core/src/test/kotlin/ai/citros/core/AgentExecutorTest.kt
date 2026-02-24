@@ -1260,6 +1260,72 @@ class AgentExecutorTest {
         }
     }
 
+
+    @Test
+    fun `checkpoint callback fires after each tool boundary`() = runTest {
+        val checkpoints = mutableListOf<LoopCheckpoint>()
+        val executor = AgentExecutor(
+            mockDelegate,
+            mockListener,
+            checkpointCallback = { checkpoints.add(it) }
+        )
+        val response = ChatResponse(
+            text = null,
+            toolCalls = listOf(
+                ToolCall("t1", "press_back", emptyMap()),
+                ToolCall("t2", "press_home", emptyMap())
+            ),
+            stopReason = "tool_use"
+        )
+
+        executor.run(response, null, { false }) {
+            ChatResponse(text = "Done", toolCalls = emptyList(), stopReason = "end_turn")
+        }
+
+        assertEquals(2, checkpoints.size)
+        assertEquals("press_back", checkpoints[0].lastToolName)
+        assertEquals(1, checkpoints[0].pendingToolCalls.size)
+        assertEquals("press_home", checkpoints[1].lastToolName)
+        assertEquals(0, checkpoints[1].pendingToolCalls.size)
+    }
+
+    @Test
+    fun `steer branch emits one checkpoint for executed tool`() = runTest {
+        val checkpoints = mutableListOf<LoopCheckpoint>()
+        val steerCheck = object : BoundaryCheck {
+            override suspend fun check(state: LoopState): CheckResult {
+                return if (state.lastToolName == "press_back") {
+                    CheckResult.Steer(listOf("new direction"))
+                } else {
+                    CheckResult.Continue
+                }
+            }
+        }
+        val executor = AgentExecutor(
+            mockDelegate,
+            mockListener,
+            boundaryChecks = listOf(steerCheck),
+            checkpointCallback = { checkpoints.add(it) }
+        )
+        val response = ChatResponse(
+            text = null,
+            toolCalls = listOf(
+                ToolCall("t1", "press_back", emptyMap()),
+                ToolCall("t2", "press_home", emptyMap())
+            ),
+            stopReason = "tool_use"
+        )
+
+        executor.run(response, null, { false }) {
+            ChatResponse(text = "Done", toolCalls = emptyList(), stopReason = "end_turn")
+        }
+
+        assertEquals(1, checkpoints.size)
+        assertEquals("press_back", checkpoints.single().lastToolName)
+        assertEquals(0, checkpoints.single().pendingToolCalls.size)
+    }
+
+
     // ====== Mocks ======
 
 

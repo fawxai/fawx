@@ -23,6 +23,10 @@ import ai.citros.core.OutputVisibility
 import ai.citros.core.PhoneAgentApi
 import ai.citros.core.ScreenContent
 import ai.citros.core.ScreenReader
+import ai.citros.core.TaskState
+import ai.citros.core.TaskStateManager
+import ai.citros.core.TaskStatus
+import ai.citros.core.toSerializedToolCall
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -32,6 +36,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.util.UUID
 
 /**
@@ -142,6 +148,16 @@ class AgentService : Service() {
     @androidx.annotation.VisibleForTesting
     internal var currentTaskJob: kotlinx.coroutines.Job? = null
 
+    @androidx.annotation.VisibleForTesting
+    internal var taskStateManagerOverride: TaskStateManager? = null
+
+    private val stateManagerInitLock = Mutex()
+    @Volatile
+    private var defaultTaskStateManager: TaskStateManager? = null
+
+    @Volatile
+    private var pendingResumeState: TaskState? = null
+
     // --- Execution dependencies (set by ChatViewModel via binder) ---
 
     /**
@@ -223,6 +239,7 @@ class AgentService : Service() {
             externalCancelCheck = cancelCheck
             interruptionSource = interruptSource
             progressCallback = progress
+            maybeResumePendingTask()
         }
 
         /**
@@ -305,6 +322,7 @@ class AgentService : Service() {
 
         Log.i(TAG, "handleStartTask: starting task $taskId: '${message.take(60)}'")
         cancelIdleTimeout()
+        pendingResumeState = null
         serviceCancelFlag.set(false)
         _agentState.value = AgentState.Thinking(taskId)
         updateNotification()
@@ -349,6 +367,8 @@ class AgentService : Service() {
         serviceCancelFlag.set(true)
         currentTaskJob?.cancel()
         currentTaskJob = null
+        pendingResumeState = null
+        clearCheckpointAsync()
         _agentState.value = AgentState.Idle
         updateNotification()
         startIdleTimeout()
@@ -358,6 +378,7 @@ class AgentService : Service() {
         Log.i(TAG, "handleStop: stopping service")
         currentTaskJob?.cancel()
         currentTaskJob = null
+        pendingResumeState = null
         cancelIdleTimeout()
         _agentState.value = AgentState.Idle
         isForeground = false
@@ -366,10 +387,58 @@ class AgentService : Service() {
     }
 
     private fun handleSystemRestart() {
-        // Durable state recovery (TaskStateManager) comes in PR 3.
-        // For now, just go idle and start the timeout.
-        _agentState.value = AgentState.Idle
-        startIdleTimeout()
+        serviceScope.launch {
+            val pending = runCatching { stateManager().loadPending() }
+                .onFailure { Log.w(TAG, "handleSystemRestart: failed to load pending state", it) }
+                .getOrNull()
+
+            if (pending == null) {
+                _agentState.value = AgentState.Idle
+                updateNotification()
+                startIdleTimeout()
+                return@launch
+            }
+
+            pendingResumeState = pending
+
+            if (phoneAgentApi != null) {
+                _agentState.value = AgentState.Resuming(pending.taskId)
+                updateNotification()
+                maybeResumePendingTask()
+            } else {
+                // Service restarted before UI rebind. Keep checkpoint and wait for binder.
+                _agentState.value = AgentState.Idle
+                updateNotification()
+                startIdleTimeout()
+            }
+        }
+    }
+
+    private fun maybeResumePendingTask() {
+        val pending = pendingResumeState ?: return
+        if (currentTaskJob != null) return
+
+        val api = phoneAgentApi
+        if (api == null) {
+            Log.i(TAG, "maybeResumePendingTask: waiting for PhoneAgentApi binding")
+            return
+        }
+
+        Log.i(TAG, "maybeResumePendingTask: resuming task ${pending.taskId}")
+        pendingResumeState = null
+        serviceCancelFlag.set(false)
+        cancelIdleTimeout()
+        _agentState.value = AgentState.Resuming(pending.taskId)
+        updateNotification()
+
+        currentTaskJob = serviceScope.launch {
+            executeTask(
+                taskId = pending.taskId,
+                message = pending.userMessage,
+                api = api,
+                resumeState = pending
+            )
+        }
     }
 
     // --- Task execution ---
@@ -380,22 +449,64 @@ class AgentService : Service() {
      * This is the core of the service architecture migration. The executor
      * runs in serviceScope (not viewModelScope), surviving activity death.
      */
-    private suspend fun executeTask(taskId: String, message: String, api: PhoneAgentApi) {
+    private suspend fun executeTask(
+        taskId: String,
+        message: String,
+        api: PhoneAgentApi,
+        resumeState: TaskState? = null
+    ) {
         var toolSteps = 0
         var monitoringStarted = false
+        val startedAtMs = resumeState?.startedAtMs ?: System.currentTimeMillis()
+        val userMessage = resumeState?.userMessage ?: message
+        val dispatchMessage = if (resumeState != null) {
+            "Continue the interrupted task. Original request: ${resumeState.userMessage}"
+        } else {
+            message
+        }
+
         try {
             val screenContent = try {
                 if (ScreenReader.isAttached()) ScreenReader.getScreenContent() else null
             } catch (_: Exception) { null }
 
-            appendConversation("user", message)
-            api.seedConversationHistory(_conversationMessages.value.dropLast(1))
+            if (resumeState != null) {
+                _conversationMessages.value = resumeState.conversationHistory
+                // Resume contract: seed persisted history before dispatching
+                // the synthetic continue instruction so the model sees prior
+                // tool results and avoids re-executing completed actions.
+                api.seedConversationHistory(_conversationMessages.value)
+                appendConversation("user", dispatchMessage)
+            } else {
+                appendConversation("user", dispatchMessage)
+                api.seedConversationHistory(_conversationMessages.value.dropLast(1))
+            }
 
-            val response = sendMessageWithFallback(api, message, screenContent)
+            checkpointTask(
+                taskId = taskId,
+                userMessage = userMessage,
+                currentStep = resumeState?.currentStep ?: 0,
+                maxSteps = maxToolSteps,
+                status = TaskStatus.ACTIVE,
+                startedAtMs = startedAtMs,
+                pendingToolCalls = emptyList()
+            )
+
+            val response = sendMessageWithFallback(api, dispatchMessage, screenContent)
             if (response == null) {
                 failTask(taskId, "No response from API")
                 return
             }
+
+            checkpointTask(
+                taskId = taskId,
+                userMessage = userMessage,
+                currentStep = resumeState?.currentStep ?: 0,
+                maxSteps = maxToolSteps,
+                status = TaskStatus.ACTIVE,
+                startedAtMs = startedAtMs,
+                pendingToolCalls = response.toolCalls
+            )
 
             if (response.toolCalls.isEmpty()) {
                 val text = response.text ?: ""
@@ -447,7 +558,18 @@ class AgentService : Service() {
                 progressListener = serviceProgressListener,
                 maxToolSteps = maxToolSteps,
                 steerMessageSource = { steerMessageSource?.invoke() ?: emptyList() },
-                interruptionSource = { interruptionSource?.invoke() }
+                interruptionSource = { interruptionSource?.invoke() },
+                checkpointCallback = { checkpoint ->
+                    checkpointTask(
+                        taskId = taskId,
+                        userMessage = userMessage,
+                        currentStep = checkpoint.step,
+                        maxSteps = checkpoint.maxSteps,
+                        status = TaskStatus.ACTIVE,
+                        startedAtMs = startedAtMs,
+                        pendingToolCalls = checkpoint.pendingToolCalls
+                    )
+                }
             )
 
             val isCancelled = {
@@ -529,6 +651,52 @@ class AgentService : Service() {
         _conversationMessages.value = _conversationMessages.value + Message(role = role, content = content)
     }
 
+    private suspend fun stateManager(): TaskStateManager {
+        taskStateManagerOverride?.let { return it }
+        defaultTaskStateManager?.let { return it }
+
+        return stateManagerInitLock.withLock {
+            taskStateManagerOverride
+                ?: defaultTaskStateManager
+                ?: ProtoTaskStateManager(applicationContext).also { defaultTaskStateManager = it }
+        }
+    }
+
+    private suspend fun checkpointTask(
+        taskId: String,
+        userMessage: String,
+        currentStep: Int,
+        maxSteps: Int,
+        status: TaskStatus,
+        startedAtMs: Long,
+        pendingToolCalls: List<ai.citros.core.ToolCall>
+    ) {
+        runCatching {
+            stateManager().checkpoint(
+                TaskState(
+                    taskId = taskId,
+                    userMessage = userMessage,
+                    conversationHistory = _conversationMessages.value,
+                    currentStep = currentStep,
+                    maxSteps = maxSteps,
+                    startedAtMs = startedAtMs,
+                    lastCheckpointMs = System.currentTimeMillis(),
+                    pendingToolCalls = pendingToolCalls.map { it.toSerializedToolCall() },
+                    status = status
+                )
+            )
+        }.onFailure {
+            Log.w(TAG, "checkpointTask failed: ${it.message}")
+        }
+    }
+
+    private fun clearCheckpointAsync() {
+        serviceScope.launch {
+            runCatching { stateManager().clear() }
+                .onFailure { Log.w(TAG, "clear checkpoint failed", it) }
+        }
+    }
+
     private fun explanationPromptForExit(exitReason: String): String? = when (exitReason) {
         "max_steps" -> "[System: You hit the step limit and couldn't finish the task. Summarize what you accomplished so far and ask the user how they'd like to proceed.]"
         "accessibility_lost" -> "[System: You lost connection to the phone's accessibility service during the task. Let the user know what happened and ask if they'd like to retry or do something else.]"
@@ -543,6 +711,7 @@ class AgentService : Service() {
      */
     internal fun completeTask(taskId: String, result: String) {
         _agentState.value = AgentState.Complete(taskId, result)
+        clearCheckpointAsync()
         updateNotification()
         startIdleTimeout()
     }
@@ -552,6 +721,7 @@ class AgentService : Service() {
      */
     internal fun failTask(taskId: String, error: String) {
         _agentState.value = AgentState.Failed(taskId, error)
+        clearCheckpointAsync()
         updateNotification()
         startIdleTimeout()
     }

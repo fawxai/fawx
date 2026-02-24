@@ -5,6 +5,7 @@ plugins {
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
     id("org.jetbrains.kotlin.plugin.serialization")
+    id("com.google.protobuf")
 }
 
 android {
@@ -63,6 +64,21 @@ android {
     }
 }
 
+protobuf {
+    protoc {
+        artifact = "com.google.protobuf:protoc:4.29.3"
+    }
+    generateProtoTasks {
+        all().forEach { task ->
+            task.builtins {
+                create("java") {
+                    option("lite")
+                }
+            }
+        }
+    }
+}
+
 tasks.register<Test>("androidSensorProviderCiTest") {
     group = "verification"
     description = "Runs AndroidSensorProviderTest for CI sensor timeout/concurrency coverage"
@@ -90,6 +106,8 @@ dependencies {
     implementation("androidx.navigation:navigation-compose:2.8.5")
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+    implementation("androidx.datastore:datastore:1.1.1")
+    implementation("com.google.protobuf:protobuf-javalite:4.29.3")
     implementation("androidx.browser:browser:1.8.0")
     // Alpha is the de facto stable release — 1.0.0 lacks MasterKey.Builder API.
     // Google has not shipped a stable 1.1.x; the entire Android ecosystem uses alpha06.
