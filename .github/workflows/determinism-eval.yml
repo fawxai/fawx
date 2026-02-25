@@ -1,0 +1,174 @@
+name: Determinism Eval
+
+on:
+  pull_request:
+    branches: [ main, feat/android-mvp ]
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Eval mode"
+        required: true
+        type: choice
+        default: full
+        options:
+          - ci-lite
+          - full
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  eval:
+    name: Determinism Eval
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select eval mode
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            selected="ci-lite"
+          elif [ "${{ github.event_name }}" = "schedule" ]; then
+            selected="full"
+          else
+            selected="${{ github.event.inputs.mode }}"
+          fi
+
+          selected="${selected:-ci-lite}"
+
+          echo "value=${selected}" >> "$GITHUB_OUTPUT"
+          echo "output=.ci/determinism/report-${selected}.json" >> "$GITHUB_OUTPUT"
+          echo "baseline=.ci/determinism/baseline-${selected}.json" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-determinism-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-determinism-
+
+      - name: Run eval harness
+        run: |
+          cargo run -p ct-cli --bin citros -- eval-determinism \
+            --mode ${{ steps.mode.outputs.value }} \
+            --output ${{ steps.mode.outputs.output }} \
+            --baseline ${{ steps.mode.outputs.baseline }}
+
+      - name: Build markdown summary
+        env:
+          REPORT_PATH: ${{ steps.mode.outputs.output }}
+          MODE: ${{ steps.mode.outputs.value }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import pathlib
+
+          report_path = pathlib.Path(os.environ["REPORT_PATH"])
+          mode = os.environ["MODE"]
+
+          report = json.loads(report_path.read_text())
+          metrics = report["metrics"]
+          domain_counts = report["domain_counts"]
+          trend = report.get("trend_vs_baseline")
+
+          lines = [
+              f"## Determinism Eval ({mode})",
+              "",
+              f"Scenarios: **{report['scenario_count']}**",
+              "",
+              "| Metric | Value |",
+              "| --- | ---: |",
+              f"| false_success_claim_rate | {metrics['false_success_claim_rate']:.6f} |",
+              f"| completion_artifact_pass_rate | {metrics['completion_artifact_pass_rate']:.6f} |",
+              f"| deterministic_fallback_correctness | {metrics['deterministic_fallback_correctness']:.6f} |",
+              f"| retry_bound_adherence | {metrics['retry_bound_adherence']:.6f} |",
+              "",
+              "### Domain coverage",
+              "",
+              "| Domain | Cases |",
+              "| --- | ---: |",
+          ]
+
+          for domain, count in sorted(domain_counts.items()):
+              lines.append(f"| {domain} | {count} |")
+
+          if trend is not None:
+              lines.extend([
+                  "",
+                  "### Trend vs baseline",
+                  "",
+                  "| Metric delta | Value |",
+                  "| --- | ---: |",
+              ])
+              for key, val in sorted(trend.items()):
+                  lines.append(f"| {key} | {val:+.6f} |")
+
+          summary = "\n".join(lines) + "\n"
+          pathlib.Path("determinism-summary.md").write_text(summary)
+          print(summary)
+          PY
+
+          cat determinism-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: determinism-${{ steps.mode.outputs.value }}
+          path: |
+            ${{ steps.mode.outputs.output }}
+            determinism-summary.md
+
+      - name: Post PR comment
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- determinism-eval-report -->';
+            const summary = fs.readFileSync('determinism-summary.md', 'utf8');
+            const body = `${marker}\n${summary}`;
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number,
+              per_page: 100,
+            });
+
+            const existing = comments.find(
+              (comment) => comment.user?.type === 'Bot' && comment.body?.includes(marker),
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number,
+                body,
+              });
+            }

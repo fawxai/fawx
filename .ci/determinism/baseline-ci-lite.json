@@ -1,0 +1,18 @@
+{
+  "report_version": 1,
+  "generated_at": "2026-02-25T00:00:00Z",
+  "mode": "ci-lite",
+  "scenario_count": 3,
+  "domain_counts": {
+    "travel": 1,
+    "shopping": 1,
+    "general_web_research": 1
+  },
+  "metrics": {
+    "false_success_claim_rate": 0.0,
+    "completion_artifact_pass_rate": 1.0,
+    "deterministic_fallback_correctness": 1.0,
+    "retry_bound_adherence": 1.0
+  },
+  "trend_vs_baseline": null
+}

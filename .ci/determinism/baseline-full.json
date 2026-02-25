@@ -1,0 +1,18 @@
+{
+  "report_version": 1,
+  "generated_at": "2026-02-25T00:00:00Z",
+  "mode": "full",
+  "scenario_count": 9,
+  "domain_counts": {
+    "travel": 3,
+    "shopping": 3,
+    "general_web_research": 3
+  },
+  "metrics": {
+    "false_success_claim_rate": 0.1111111111111111,
+    "completion_artifact_pass_rate": 0.7777777777777778,
+    "deterministic_fallback_correctness": 0.8888888888888888,
+    "retry_bound_adherence": 0.8888888888888888
+  },
+  "trend_vs_baseline": null
+}
