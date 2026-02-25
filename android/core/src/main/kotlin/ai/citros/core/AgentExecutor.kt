@@ -211,6 +211,7 @@ class AgentExecutor(
         // Recovery-level streak across tool calls in this run (global, not per tool name).
         // Distinct from `failureCounts`, which tracks per-tool retries for error severity escalation.
         var consecutiveFailures = 0
+        val sideEffectCompletionGuard = SideEffectCompletionGuard()
         val taskStartMs = System.currentTimeMillis()
         val taskId = java.util.UUID.randomUUID().toString()
 
@@ -470,13 +471,23 @@ class AgentExecutor(
                 // Settle delay
                 delegate.settleDelay(toolCall.name, actionResult.text)
 
+                val isUiMutatingTool = delegate.isUiMutatingTool(toolCall.name)
+
                 // For UI-mutating tools, refresh screen and format result
-                val baseToolResult = if (delegate.isUiMutatingTool(toolCall.name)) {
+                val baseToolResult = if (isUiMutatingTool) {
                     screenContent = delegate.refreshScreenAfterTool(toolCall.name, actionResult.text)
                     delegate.formatToolResult(actionResult.text, screenContent)
                 } else {
                     actionResult.text
                 }
+
+                sideEffectCompletionGuard.recordExecution(
+                    toolCall = toolCall,
+                    actionResult = actionResult,
+                    screenBefore = preActionScreen,
+                    screenAfter = screenContent,
+                    isUiMutatingTool = isUiMutatingTool
+                )
 
                 val failure = detectFailure(
                     toolCall = toolCall,
@@ -508,7 +519,7 @@ class AgentExecutor(
                     lastScreenHash = screenContent?.hashCode(),
                     isCancelled = isCancelled(),
                     pendingSteerMessages = steerMessages,
-                    lastToolWasUiMutating = delegate.isUiMutatingTool(toolCall.name),
+                    lastToolWasUiMutating = isUiMutatingTool,
                     preActionScreenHash = preActionHash,
                     pendingInterruption = interruptionSource()
                 )
@@ -601,7 +612,7 @@ class AgentExecutor(
             }
         }
 
-        val finalText = response?.text
+        val finalText = sideEffectCompletionGuard.guardFinalText(response?.text)
         val exitReason = if (finalText != null) "end_turn" else "no_response"
 
         return LoopResult.Completed(

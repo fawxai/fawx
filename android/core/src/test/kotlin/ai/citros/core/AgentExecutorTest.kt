@@ -61,6 +61,251 @@ class AgentExecutorTest {
     }
 
     @Test
+    fun `side-effect completion claim without evidence is rewritten to not completed`() = runTest {
+        val executor = AgentExecutor(
+            mockDelegate,
+            mockListener,
+            actionPolicy = PermissiveActionPolicy
+        )
+        val initialResponse = ChatResponse(
+            text = null,
+            toolCalls = listOf(ToolCall("t1", "open_app", mapOf("app_name" to "Gmail"))),
+            stopReason = "tool_use"
+        )
+
+        val result = executor.run(initialResponse, null, { false }) {
+            ChatResponse(
+                text = "I sent the email to Sam.",
+                toolCalls = emptyList(),
+                stopReason = "end_turn"
+            )
+        }
+
+        assertIs<LoopResult.Completed>(result)
+        val text = result.text.orEmpty()
+        assertTrue(text.startsWith("NOT_COMPLETED:"))
+        assertTrue(text.contains("email sending"))
+    }
+
+    @Test
+    fun `side-effect completion claim with execution evidence is allowed`() = runTest {
+        mockDelegate.onExecute = { toolCall, _ ->
+            when (toolCall.name) {
+                "tap_text" -> ToolResult("Tapped \"Send\"")
+                else -> ToolResult("Success")
+            }
+        }
+
+        val executor = AgentExecutor(
+            mockDelegate,
+            mockListener,
+            actionPolicy = PermissiveActionPolicy
+        )
+        val initialResponse = ChatResponse(
+            text = null,
+            toolCalls = listOf(ToolCall("t1", "tap_text", mapOf("text" to "Send"))),
+            stopReason = "tool_use"
+        )
+
+        val result = executor.run(initialResponse, null, { false }) {
+            ChatResponse(
+                text = "I sent the email to Sam.",
+                toolCalls = emptyList(),
+                stopReason = "end_turn"
+            )
+        }
+
+        assertIs<LoopResult.Completed>(result)
+        assertEquals("I sent the email to Sam.", result.text)
+    }
+
+    @Test
+    fun `non-side-effect informational text is not rewritten`() = runTest {
+        val executor = AgentExecutor(
+            mockDelegate,
+            mockListener,
+            actionPolicy = PermissiveActionPolicy
+        )
+        val initialResponse = ChatResponse(
+            text = null,
+            toolCalls = listOf(ToolCall("t1", "read_screen", emptyMap())),
+            stopReason = "tool_use"
+        )
+
+        val result = executor.run(initialResponse, null, { false }) {
+            ChatResponse(
+                text = "Gmail uses a paper-plane icon for sending mail.",
+                toolCalls = emptyList(),
+                stopReason = "end_turn"
+            )
+        }
+
+        assertIs<LoopResult.Completed>(result)
+        assertEquals("Gmail uses a paper-plane icon for sending mail.", result.text)
+    }
+
+    @Test
+    fun `booking completion claim with execution evidence is allowed`() = runTest {
+        mockDelegate.onExecute = { toolCall, _ ->
+            when (toolCall.name) {
+                "tap_text" -> ToolResult("Tapped \"Book now\"")
+                else -> ToolResult("Success")
+            }
+        }
+
+        val executor = AgentExecutor(
+            mockDelegate,
+            mockListener,
+            actionPolicy = PermissiveActionPolicy
+        )
+        val initialResponse = ChatResponse(
+            text = null,
+            toolCalls = listOf(ToolCall("t1", "tap_text", mapOf("text" to "Book now"))),
+            stopReason = "tool_use"
+        )
+
+        val result = executor.run(initialResponse, null, { false }) {
+            ChatResponse(
+                text = "I booked the flight to Denver.",
+                toolCalls = emptyList(),
+                stopReason = "end_turn"
+            )
+        }
+
+        assertIs<LoopResult.Completed>(result)
+        assertEquals("I booked the flight to Denver.", result.text)
+    }
+
+    @Test
+    fun `scheduling completion claim with execution evidence is allowed`() = runTest {
+        mockDelegate.onExecute = { toolCall, _ ->
+            when (toolCall.name) {
+                "tap_text" -> ToolResult("Tapped \"Schedule\"")
+                else -> ToolResult("Success")
+            }
+        }
+
+        val executor = AgentExecutor(
+            mockDelegate,
+            mockListener,
+            actionPolicy = PermissiveActionPolicy
+        )
+        val initialResponse = ChatResponse(
+            text = null,
+            toolCalls = listOf(ToolCall("t1", "tap_text", mapOf("text" to "Schedule"))),
+            stopReason = "tool_use"
+        )
+
+        val result = executor.run(initialResponse, null, { false }) {
+            ChatResponse(
+                text = "I scheduled the meeting for tomorrow.",
+                toolCalls = emptyList(),
+                stopReason = "end_turn"
+            )
+        }
+
+        assertIs<LoopResult.Completed>(result)
+        assertEquals("I scheduled the meeting for tomorrow.", result.text)
+    }
+
+    @Test
+    fun `mixed side-effect claims only rewrite the unsupported claim`() = runTest {
+        mockDelegate.onExecute = { toolCall, _ ->
+            when (toolCall.name) {
+                "tap_text" -> ToolResult("Tapped \"Send\"")
+                else -> ToolResult("Success")
+            }
+        }
+
+        val executor = AgentExecutor(
+            mockDelegate,
+            mockListener,
+            actionPolicy = PermissiveActionPolicy
+        )
+        val initialResponse = ChatResponse(
+            text = null,
+            toolCalls = listOf(ToolCall("t1", "tap_text", mapOf("text" to "Send"))),
+            stopReason = "tool_use"
+        )
+
+        val result = executor.run(initialResponse, null, { false }) {
+            ChatResponse(
+                text = "I sent the email to Sam. I booked the flight to Denver.",
+                toolCalls = emptyList(),
+                stopReason = "end_turn"
+            )
+        }
+
+        assertIs<LoopResult.Completed>(result)
+        val rewritten = result.text.orEmpty()
+        assertTrue(rewritten.startsWith("NOT_COMPLETED:"))
+        assertTrue(rewritten.contains("booking"))
+        assertFalse(rewritten.contains("email sending"))
+        assertTrue(rewritten.contains("I sent the email to Sam."))
+    }
+
+    @Test
+    fun `passive read_screen output cannot satisfy side-effect evidence`() = runTest {
+        mockDelegate.onExecute = { toolCall, _ ->
+            when (toolCall.name) {
+                "read_screen" -> ToolResult("SCREEN: Gmail Sent folder (42).")
+                else -> ToolResult("Success")
+            }
+        }
+
+        val executor = AgentExecutor(
+            mockDelegate,
+            mockListener,
+            actionPolicy = PermissiveActionPolicy
+        )
+        val initialResponse = ChatResponse(
+            text = null,
+            toolCalls = listOf(ToolCall("t1", "read_screen", emptyMap())),
+            stopReason = "tool_use"
+        )
+        val initialScreen = ScreenContent(elements = emptyList(), packageName = "com.google.android.gm")
+
+        val result = executor.run(initialResponse, initialScreen, { false }) {
+            ChatResponse(
+                text = "I sent the email to Sam.",
+                toolCalls = emptyList(),
+                stopReason = "end_turn"
+            )
+        }
+
+        assertIs<LoopResult.Completed>(result)
+        val rewritten = result.text.orEmpty()
+        assertTrue(rewritten.startsWith("NOT_COMPLETED:"))
+        assertTrue(rewritten.contains("email sending"))
+    }
+
+    @Test
+    fun `negated side-effect text is not rewritten`() = runTest {
+        val executor = AgentExecutor(
+            mockDelegate,
+            mockListener,
+            actionPolicy = PermissiveActionPolicy
+        )
+        val initialResponse = ChatResponse(
+            text = null,
+            toolCalls = listOf(ToolCall("t1", "read_screen", emptyMap())),
+            stopReason = "tool_use"
+        )
+
+        val finalText = "I have not sent the email yet. I still need to tap Send."
+        val result = executor.run(initialResponse, null, { false }) {
+            ChatResponse(
+                text = finalText,
+                toolCalls = emptyList(),
+                stopReason = "end_turn"
+            )
+        }
+
+        assertIs<LoopResult.Completed>(result)
+        assertEquals(finalText, result.text)
+    }
+
+    @Test
     fun `loop stops at max steps via StepLimitCheck`() = runTest {
         val executor = AgentExecutor(mockDelegate, mockListener, maxToolSteps = 3)
         val toolResponse = ChatResponse(
