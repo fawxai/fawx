@@ -187,8 +187,8 @@ class WebSearchClientTest {
         val result = client.search("test")
 
         assertTrue(result.isError)
-        assertTrue(result.text.contains("failed") || result.text.contains("500"),
-            "Error should mention failure: ${result.text}")
+        assertTrue(result.text.contains("temporarily unavailable") || result.text.contains("failed") || result.text.contains("500"),
+            "Error should mention provider failure or aggregate fallback: ${result.text}")
     }
 
     @Test
@@ -200,8 +200,26 @@ class WebSearchClientTest {
 
         assertFalse(result.isError)
         assertTrue(result.text.contains("No results found"))
-        assertTrue(result.text.contains("Do NOT open a browser"),
-            "Empty results should include anti-browser directive: ${result.text}")
+        assertFalse(result.text.contains("Do NOT open"),
+            "Generic mode should avoid tactical anti-browser directive: ${result.text}")
+    }
+
+    @Test
+    fun `search returns no results message with anti-browser directive in compatibility mode`() = runTest {
+        server.enqueue(MockResponse().setBody("""{"results": []}""").setResponseCode(200))
+
+        val client = WebSearchClient(
+            citrosSearchEndpoint = null,
+            searxngBaseUrl = server.url("/").toString(),
+            ddgEndpoint = null,
+            domainGuardrailMode = PhoneAgentPrompts.DomainGuardrailMode.COMPATIBILITY
+        )
+        val result = client.search("xyznonexistent")
+
+        assertFalse(result.isError)
+        assertTrue(result.text.contains("No results found"))
+        assertTrue(result.text.contains("Do NOT open"),
+            "Compatibility mode should preserve tactical anti-browser directive: ${result.text}")
     }
 
     @Test
@@ -209,8 +227,22 @@ class WebSearchClientTest {
         val client = WebSearchClient(citrosSearchEndpoint = null, ddgEndpoint = null)
         val result = client.search("test")
         assertTrue(result.isError, "Should fail when all providers are unavailable")
+        assertFalse(result.text.contains("Do NOT open"),
+            "Generic mode should avoid tactical anti-browser directive: ${result.text}")
+    }
+
+    @Test
+    fun `search returns error when all providers fail in compatibility mode`() = runTest {
+        val client = WebSearchClient(
+            citrosSearchEndpoint = null,
+            ddgEndpoint = null,
+            domainGuardrailMode = PhoneAgentPrompts.DomainGuardrailMode.COMPATIBILITY
+        )
+        val result = client.search("test")
+
+        assertTrue(result.isError, "Should fail when all providers are unavailable")
         assertTrue(result.text.contains("Do NOT open Chrome"),
-            "Error should include anti-browser directive: ${result.text}")
+            "Compatibility mode should preserve tactical anti-browser directive: ${result.text}")
     }
 
     // ========== Brave fallback tests ==========
@@ -261,18 +293,45 @@ class WebSearchClientTest {
         val result = client.search("test")
 
         assertTrue(result.isError)
-        // Falls through to all-providers-failed which has the anti-browser directive
-        assertTrue(result.text.contains("Do NOT open Chrome"),
-            "Should include anti-browser directive: ${result.text}")
+        assertFalse(result.text.contains("Do NOT open"),
+            "Generic mode should avoid tactical anti-browser directive: ${result.text}")
     }
 
     @Test
-    fun `formatResults empty results include anti-browser directive`() {
+    fun `search returns error when SearXNG fails and no Brave key in compatibility mode`() = runTest {
+        server.enqueue(MockResponse().setResponseCode(503))
+
+        val client = WebSearchClient(
+            citrosSearchEndpoint = null,
+            searxngBaseUrl = server.url("/").toString(),
+            ddgEndpoint = null,
+            domainGuardrailMode = PhoneAgentPrompts.DomainGuardrailMode.COMPATIBILITY
+        )
+        val result = client.search("test")
+
+        assertTrue(result.isError)
+        assertTrue(result.text.contains("Do NOT open Chrome"),
+            "Compatibility mode should preserve tactical anti-browser directive: ${result.text}")
+    }
+
+    @Test
+    fun `formatResults empty results avoid anti-browser directive by default`() {
         val client = WebSearchClient()
         val formatted = client.formatResults("test", emptyList())
         assertTrue(formatted.contains("No results found"))
-        assertTrue(formatted.contains("Do NOT open a browser"),
-            "Empty results should warn against browser fallback: $formatted")
+        assertFalse(formatted.contains("Do NOT open"),
+            "Generic mode should avoid tactical anti-browser directive: $formatted")
+    }
+
+    @Test
+    fun `formatResults empty results include anti-browser directive in compatibility mode`() {
+        val client = WebSearchClient(
+            domainGuardrailMode = PhoneAgentPrompts.DomainGuardrailMode.COMPATIBILITY
+        )
+        val formatted = client.formatResults("test", emptyList())
+        assertTrue(formatted.contains("No results found"))
+        assertTrue(formatted.contains("Do NOT open"),
+            "Compatibility mode should preserve tactical anti-browser directive: $formatted")
     }
 
     // ========== Parsing tests ==========

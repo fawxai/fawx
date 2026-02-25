@@ -30,12 +30,15 @@ import java.util.concurrent.TimeUnit
  * @param citrosAppToken Bearer token for Citros API auth (null to skip auth)
  * @param searxngBaseUrl Base URL for SearXNG instance (e.g., "http://localhost:8888")
  * @param braveApiKey Optional Brave Search API key for direct Brave access
+ * @param domainGuardrailMode Whether to emit tactical anti-browser directives in fallback text
  */
 class WebSearchClient(
     private val citrosSearchEndpoint: String? = CITROS_SEARCH_ENDPOINT,
     private val citrosAppToken: String? = null,
     private val searxngBaseUrl: String? = null,
     private val braveApiKey: String? = null,
+    private val domainGuardrailMode: PhoneAgentPrompts.DomainGuardrailMode =
+        PhoneAgentPrompts.DomainGuardrailMode.GENERIC,
     /** Brave Search API endpoint. Override for testing. */
     private val braveEndpoint: String = BRAVE_ENDPOINT,
     /** DuckDuckGo Lite endpoint. Override for testing. Set to null to skip DDG. */
@@ -77,6 +80,14 @@ class WebSearchClient(
 
     private val json = Json { ignoreUnknownKeys = true }
 
+    private fun browserFallbackDirective(): String {
+        return if (domainGuardrailMode == PhoneAgentPrompts.DomainGuardrailMode.COMPATIBILITY) {
+            " Do NOT open Chrome or any browser app to search manually."
+        } else {
+            ""
+        }
+    }
+
     /**
      * Search the web and return formatted results.
      *
@@ -117,9 +128,10 @@ class WebSearchClient(
             return searchBrave(query, clampedCount)
         }
 
-        // All providers failed — directive prevents model from opening a browser app as workaround
+        // All providers failed.
         return ToolResult(
-            "Web search temporarily unavailable. Tell the user the search could not be completed and suggest they try again later. Do NOT open Chrome or any browser app to search manually.",
+            "Web search temporarily unavailable. Tell the user the search could not be completed and suggest they try again later." +
+                browserFallbackDirective(),
             isError = true
         )
     }
@@ -203,7 +215,7 @@ class WebSearchClient(
                     if (results.isEmpty()) {
                         Log.w(TAG, "DuckDuckGo returned no organic results (body=${body.length} chars, may be rate-limited)")
                         return@withContext ToolResult(
-                            "DuckDuckGo returned no results (may be rate-limited). Do NOT open a browser app to search manually.",
+                            "DuckDuckGo returned no results (may be rate-limited)." + browserFallbackDirective(),
                             isError = true
                         )
                     }
@@ -275,13 +287,13 @@ class WebSearchClient(
                 httpClient.newCall(request).execute().use { response ->
                     if (!response.isSuccessful) {
                         return@withContext ToolResult(
-                            "Brave search failed (${response.code}): ${response.message}. Do NOT open a browser app to search manually.",
+                            "Brave search failed (${response.code}): ${response.message}." + browserFallbackDirective(),
                             isError = true
                         )
                     }
 
                     val body = response.body?.string() ?: return@withContext ToolResult(
-                        "Brave search returned empty response. Do NOT open a browser app to search manually.",
+                        "Brave search returned empty response." + browserFallbackDirective(),
                         isError = true
                     )
 
@@ -401,7 +413,7 @@ class WebSearchClient(
 
     internal fun formatResults(query: String, results: List<SearchResult>): String {
         if (results.isEmpty()) {
-            return "No results found for: $query. Tell the user no results were found. Do NOT open a browser app to search manually."
+            return "No results found for: $query. Tell the user no results were found." + browserFallbackDirective()
         }
         return buildString {
             appendLine("Search results for: $query")

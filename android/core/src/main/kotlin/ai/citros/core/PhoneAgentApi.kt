@@ -34,11 +34,19 @@ open class PhoneAgentApi(
     /** TinyFish endpoint override for testing. Null uses production default. */
     private val tinyFishEndpoint: String? = null,
     /** Citros app token for authenticating to Citros API endpoints. */
-    private val citrosAppToken: String? = null
+    private val citrosAppToken: String? = null,
+    /** Compatibility mode for tactical domain-specific web guardrails. */
+    private val domainGuardrailMode: PhoneAgentPrompts.DomainGuardrailMode =
+        PhoneAgentPrompts.DomainGuardrailMode.GENERIC
 ) {
     /** Shared search client — reuses OkHttpClient connection pools across calls. */
     private val searchClient by lazy {
-        WebSearchClient(citrosAppToken = citrosAppToken, searxngBaseUrl = searchBaseUrl, braveApiKey = braveApiKey)
+        WebSearchClient(
+            citrosAppToken = citrosAppToken,
+            searxngBaseUrl = searchBaseUrl,
+            braveApiKey = braveApiKey,
+            domainGuardrailMode = domainGuardrailMode
+        )
     }
 
     /** Shared fetch client — reuses OkHttpClient connection pool across calls. */
@@ -310,10 +318,27 @@ open class PhoneAgentApi(
         val client = if (isActionLoop) actionClient else chatClient
         val modelName = client.modelId
         val systemPrompt = if (isActionLoop) {
-            promptBuilder?.trimmed(phoneControlAvailable = phoneControlAvailable, modelName = modelName)
-                ?: PhoneAgentPrompts.buildActionPrompt(phoneControlAvailable = phoneControlAvailable, modelName = modelName)
+            promptBuilder?.trimmed(
+                phoneControlAvailable = phoneControlAvailable,
+                modelName = modelName,
+                domainGuardrailMode = domainGuardrailMode
+            )
+                ?: PhoneAgentPrompts.buildActionPrompt(
+                    phoneControlAvailable = phoneControlAvailable,
+                    modelName = modelName,
+                    domainGuardrailMode = domainGuardrailMode
+                )
         } else {
-            promptBuilder?.full(phoneControlAvailable = phoneControlAvailable, modelName = modelName) ?: PhoneAgentPrompts.buildSystemPrompt(phoneControlAvailable = phoneControlAvailable, modelName = modelName)
+            promptBuilder?.full(
+                phoneControlAvailable = phoneControlAvailable,
+                modelName = modelName,
+                domainGuardrailMode = domainGuardrailMode
+            )
+                ?: PhoneAgentPrompts.buildSystemPrompt(
+                    phoneControlAvailable = phoneControlAvailable,
+                    modelName = modelName,
+                    domainGuardrailMode = domainGuardrailMode
+                )
         }
         
         // Use compacted messages for action loop to manage context window.
@@ -370,8 +395,16 @@ open class PhoneAgentApi(
         }
         val phoneControlAvailable = phoneControlOverride ?: ScreenReader.isAttached()
         val modelName = chatClient.modelId
-        val systemPrompt = promptBuilder?.full(phoneControlAvailable = phoneControlAvailable, modelName = modelName)
-            ?: PhoneAgentPrompts.buildSystemPrompt(phoneControlAvailable = phoneControlAvailable, modelName = modelName)
+        val systemPrompt = promptBuilder?.full(
+            phoneControlAvailable = phoneControlAvailable,
+            modelName = modelName,
+            domainGuardrailMode = domainGuardrailMode
+        )
+            ?: PhoneAgentPrompts.buildSystemPrompt(
+                phoneControlAvailable = phoneControlAvailable,
+                modelName = modelName,
+                domainGuardrailMode = domainGuardrailMode
+            )
         val result = chatClient.chatWithTools(
             ephemeralMessages,
             systemPrompt = systemPrompt,
@@ -405,10 +438,15 @@ open class PhoneAgentApi(
      */
     open suspend fun continueAfterTools(): ChatResponse {
         val phoneControlAvailable = phoneControlOverride ?: ScreenReader.isAttached()
-        val systemPrompt = promptBuilder?.trimmed(phoneControlAvailable = phoneControlAvailable, modelName = actionClient.modelId)
+        val systemPrompt = promptBuilder?.trimmed(
+            phoneControlAvailable = phoneControlAvailable,
+            modelName = actionClient.modelId,
+            domainGuardrailMode = domainGuardrailMode
+        )
             ?: PhoneAgentPrompts.buildActionPrompt(
                 phoneControlAvailable = phoneControlAvailable,
-                modelName = actionClient.modelId
+                modelName = actionClient.modelId,
+                domainGuardrailMode = domainGuardrailMode
             )
 
         // Two-stage compaction: strip old SCREEN dumps first, then summarize old messages
