@@ -247,6 +247,6 @@ data class OnboardingChatUiState(
 ## Related Docs
 
 - [Onboarding Spec](onboarding-spec.md) — overall onboarding architecture
-- [Paywall Design Brief](paywall-design-brief.md) — prior step and tier persistence
-- [MVP UI Design Brief](mvp-ui-design-brief.md) — global chat/settings/interaction system
-- [Wallet UI Design Brief](wallet-ui-design-brief.md) — API key flow immediately after this screen
+- [Paywall Design Brief](ui/paywall-design-brief.md) — prior step and tier persistence
+- [MVP UI Design Brief](ui/mvp-ui-design-brief.md) — global chat/settings/interaction system
+- [Wallet UI Design Brief](ui/wallet-ui-design-brief.md) — API key flow immediately after this screen
