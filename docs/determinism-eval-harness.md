@@ -1,6 +1,9 @@
 # Determinism Eval Harness
 
-Tracks loop-confidence metrics for architecture changes (issue #835).
+Tracks loop-confidence metrics for deterministic fallback behavior (issue #833) and harness automation work (issue #835).
+
+Current harness scope is **baseline-only** with fixed synthetic scenarios for stable CI diffs.
+Live agent/state-machine execution realism is a follow-up tracked under issue #835.
 
 ## Modes
 - `ci-lite`: fast subset (3 scenarios, one per domain)

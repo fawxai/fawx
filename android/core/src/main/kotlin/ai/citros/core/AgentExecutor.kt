@@ -79,6 +79,7 @@ class AgentExecutor(
 
     /** Per-tool consecutive failure counters for error severity escalation. */
     private val failureCounts = mutableMapOf<String, Int>()
+    private val fallbackStateMachine = FailureFallbackStateMachine()
 
     companion object {
         /** Maximum number of tool execution steps before forcing loop exit. */
@@ -160,6 +161,7 @@ class AgentExecutor(
         continueAfterTools: suspend () -> ChatResponse
     ): LoopResult {
         failureCounts.clear()
+        fallbackStateMachine.reset()
         completionGate.reset()
         var response: ChatResponse? = initialResponse
         var screenContent = initialScreenContent
@@ -308,10 +310,19 @@ class AgentExecutor(
                 )
                 val checkResult = evaluateBoundaryChecks(loopState)
 
+                val failureClass = classifyFailureClass(actionResult, effectiveSeverity)
+                val fallbackDirective = if (failureClass != null) {
+                    fallbackStateMachine.transition(failureClass).toLoopDirective()
+                } else {
+                    fallbackStateMachine.reset()
+                    ""
+                }
+                val toolResultWithFallback = toolResult + fallbackDirective
+
                 when (checkResult) {
                     is CheckResult.Steer -> {
                         // Commit this tool's result as-is
-                        delegate.addToolResult(toolCall.id, toolResult, toolCall.name, actionResult.isError)
+                        delegate.addToolResult(toolCall.id, toolResultWithFallback, toolCall.name, actionResult.isError)
                         // Provide explicit skip results for remaining tool calls.
                         // The API contract requires every tool_use block to have a
                         // corresponding tool_result. Without this, the next API call
@@ -328,7 +339,7 @@ class AgentExecutor(
                         break  // Skip remaining tool calls in this batch
                     }
                     is CheckResult.Stop -> {
-                        delegate.addToolResult(toolCall.id, toolResult, toolCall.name, actionResult.isError)
+                        delegate.addToolResult(toolCall.id, toolResultWithFallback, toolCall.name, actionResult.isError)
                         return LoopResult.Completed(
                             text = null,
                             steps = toolSteps,
@@ -336,10 +347,10 @@ class AgentExecutor(
                         )
                     }
                     is CheckResult.Inject -> {
-                        delegate.addToolResult(toolCall.id, toolResult + checkResult.message, toolCall.name, actionResult.isError)
+                        delegate.addToolResult(toolCall.id, toolResultWithFallback + checkResult.message, toolCall.name, actionResult.isError)
                     }
                     CheckResult.Continue -> {
-                        delegate.addToolResult(toolCall.id, toolResult, toolCall.name, actionResult.isError)
+                        delegate.addToolResult(toolCall.id, toolResultWithFallback, toolCall.name, actionResult.isError)
                     }
                 }
             }
@@ -380,6 +391,21 @@ class AgentExecutor(
         )
     }
 
+
+    private fun classifyFailureClass(
+        actionResult: ToolResult,
+        effectiveSeverity: ErrorSeverity?
+    ): FailureClass? {
+        if (!actionResult.isError) return null
+
+        return when (effectiveSeverity) {
+            ErrorSeverity.PERSISTENT -> FailureClass.BLOCKED
+            ErrorSeverity.TRANSIENT -> FailureClass.LOW_SIGNAL_DYNAMIC
+            ErrorSeverity.EXPLORATORY -> FailureClass.UNTRUSTED
+            ErrorSeverity.INFORMATIONAL -> FailureClass.PARTIAL
+            null -> FailureClass.UNTRUSTED
+        }
+    }
 
     /**
      * Evaluate all boundary checks against the current state.

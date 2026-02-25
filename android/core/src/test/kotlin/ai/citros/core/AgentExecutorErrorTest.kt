@@ -215,4 +215,75 @@ class AgentExecutorErrorTest {
         assertEquals(ErrorSeverity.TRANSIENT, mockListener.toolErrors[1].third)  // count=2
         assertEquals(ErrorSeverity.PERSISTENT, mockListener.toolErrors[2].third) // count=3 → escalates
     }
+
+    @Test
+    fun `loop fallback metadata is appended deterministically for repeated transient failures`() = runTest {
+        // Pin severity to avoid RetryContext escalation at failure #3 (TRANSIENT -> PERSISTENT)
+        // so this test isolates deterministic fallback sequencing for same-class failures.
+        mockDelegate.onExecute = { _, _ ->
+            ToolResult("timeout connecting", isError = true, severity = ErrorSeverity.TRANSIENT)
+        }
+        val executor = AgentExecutor(mockDelegate, mockListener, maxToolSteps = 3)
+        val toolResponse = ChatResponse(
+            text = null,
+            toolCalls = listOf(ToolCall("t1", "web_search", emptyMap())),
+            stopReason = "tool_use"
+        )
+
+        executor.run(toolResponse, null, { false }) { toolResponse }
+
+        assertEquals(3, mockDelegate.toolResults.size)
+        assertTrue(mockDelegate.toolResults[0].second.contains("action=ALTERNATE_SOURCE"))
+        assertTrue(mockDelegate.toolResults[1].second.contains("action=NARROWED_QUERY"))
+        assertTrue(mockDelegate.toolResults[2].second.contains("action=SUMMARIZE_UNCERTAINTY"))
+    }
+
+    @Test
+    fun `inject warnings on successful tools do not trigger fallback directives`() = runTest {
+        mockDelegate.executeResult = ToolResult("Search completed", isError = false)
+        val injectOnlyCheck = object : BoundaryCheck {
+            override suspend fun check(state: LoopState): CheckResult {
+                return CheckResult.Inject("\n[SYSTEM_WARNING ACTION_UNVERIFIED] Verify action outcome.")
+            }
+        }
+        val executor = AgentExecutor(
+            delegate = mockDelegate,
+            progressListener = mockListener,
+            boundaryChecks = listOf(injectOnlyCheck),
+            maxToolSteps = 1
+        )
+        val toolResponse = ChatResponse(
+            text = null,
+            toolCalls = listOf(ToolCall("t1", "web_search", emptyMap())),
+            stopReason = "tool_use"
+        )
+
+        executor.run(toolResponse, null, { false }) {
+            ChatResponse(text = "done", toolCalls = emptyList(), stopReason = "end_turn")
+        }
+
+        val result = mockDelegate.toolResults.single().second
+        assertTrue(result.contains("ACTION_UNVERIFIED"), "Inject warning should still be appended")
+        assertTrue(!result.contains("SYSTEM_FALLBACK"), "Successful tool must not emit fallback directive")
+    }
+
+    @Test
+    fun `blocked failures produce explicit blocker directive`() = runTest {
+        mockDelegate.onExecute = { _, _ ->
+            ToolResult("permission denied", isError = true, severity = ErrorSeverity.PERSISTENT)
+        }
+        val executor = AgentExecutor(mockDelegate, mockListener, maxToolSteps = 1)
+        val toolResponse = ChatResponse(
+            text = null,
+            toolCalls = listOf(ToolCall("t1", "tap", emptyMap())),
+            stopReason = "tool_use"
+        )
+
+        executor.run(toolResponse, null, { false }) {
+            ChatResponse(text = "done", toolCalls = emptyList(), stopReason = "end_turn")
+        }
+
+        assertTrue(mockDelegate.toolResults[0].second.contains("action=EXPLICIT_BLOCKER"))
+    }
 }
+

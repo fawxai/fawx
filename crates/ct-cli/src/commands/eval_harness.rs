@@ -212,6 +212,9 @@ fn default_baseline_path(mode: EvalMode) -> PathBuf {
 }
 
 fn scenarios_for_mode(mode: EvalMode) -> Vec<ScenarioCase> {
+    // Baseline harness scope (issue #833): fixed synthetic fixtures for deterministic
+    // metric diffing in CI. This intentionally does not execute the live Android loop;
+    // realism/live wiring is tracked as follow-up in issue #835.
     let ci_lite = vec![
         ScenarioCase {
             id: "travel-lite-1",
