@@ -176,6 +176,9 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
     /** Agent file manager for knowledge file tools (learn, read_file, etc.). */
     private var agentFileManager: AgentFileManager? = null
 
+    /** User tool category settings for tool grouping policy. Set from Activity. */
+    private var toolCategorySettings: UserToolCategorySettings? = null
+
     /**
      * Update search provider configuration.
      *
@@ -196,6 +199,14 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
      */
     fun setAgentFileManager(manager: AgentFileManager) {
         agentFileManager = manager
+    }
+
+    /**
+     * Set user tool category settings from SharedPreferences.
+     * Call from Activity before [configureWithWallet].
+     */
+    fun setToolCategorySettings(settings: UserToolCategorySettings) {
+        toolCategorySettings = settings
     }
 
     /**
@@ -742,7 +753,12 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
                 braveApiKey = braveApiKey,
                 tinyFishApiKey = tinyFishApiKey,
                 citrosAppToken = citrosAppToken
-            )
+            ).also { api ->
+                // Load user tool category settings if tool grouping is enabled
+                if (ai.citros.core.FeatureFlags.toolGroupingV1Enabled) {
+                    toolCategorySettings?.let { api.userToolCategorySettings = it }
+                }
+            }
         )
     }
 

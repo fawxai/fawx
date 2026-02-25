@@ -96,6 +96,14 @@ When they're just chatting, respond naturally without using tools."""
         return buildToolsSectionDynamic(activeCategories, modelTier)
     }
 
+    /**
+     * Build tools section from a [ResolvedToolPlan].
+     * Shows summary listing for all tools, detailed descriptions only for active categories.
+     */
+    fun buildToolsSection(plan: ResolvedToolPlan, modelTier: ModelTier = ModelTier.STANDARD): String {
+        return buildToolsSectionDynamic(plan.activeCategories.toSet(), modelTier)
+    }
+
     internal fun buildToolsSectionDynamic(
         activeCategories: Set<ToolCategory>,
         modelTier: ModelTier
@@ -396,9 +404,15 @@ When executing tools, follow these guidelines for what to communicate to the use
         }
     }
 
-    private fun buildToolsSection(phoneControlAvailable: Boolean, mode: PromptMode, tier: ModelTier): String? {
+    private fun buildToolsSection(
+        phoneControlAvailable: Boolean,
+        mode: PromptMode,
+        tier: ModelTier,
+        resolvedToolPlan: ResolvedToolPlan? = null
+    ): String? {
         if (mode == PromptMode.NONE || mode == PromptMode.MINIMAL || !phoneControlAvailable) return null
-        return if (tier == ModelTier.SMALL) SECTION_TOOLS_SMALL else SECTION_TOOLS
+        return resolvedToolPlan?.let { buildToolsSection(it, tier) }
+            ?: if (tier == ModelTier.SMALL) SECTION_TOOLS_SMALL else SECTION_TOOLS
     }
 
     private fun buildMinimalReminders(phoneControlAvailable: Boolean): String {
@@ -565,7 +579,8 @@ $line
         securityContent: String? = null,
         mode: PromptMode = PromptMode.FULL,
         modelTier: ModelTier? = null,
-        sensorContext: SensorContext? = null
+        sensorContext: SensorContext? = null,
+        resolvedToolPlan: ResolvedToolPlan? = null
     ): String {
         if (FeatureFlags.promptTuningV1Enabled) {
             return buildTunedSystemPrompt(
@@ -578,7 +593,8 @@ $line
                 securityContent = securityContent,
                 mode = mode,
                 modelTier = modelTier,
-                sensorContext = sensorContext
+                sensorContext = sensorContext,
+                resolvedToolPlan = resolvedToolPlan
             ).finalPrompt
         }
 
@@ -586,7 +602,7 @@ $line
 
         val sections = listOfNotNull(
             buildIdentitySection(identityContent, mode),
-            buildToolsSection(phoneControlAvailable, mode, tier),
+            buildToolsSection(phoneControlAvailable, mode, tier, resolvedToolPlan),
             buildStrategySection(mode, tier, phoneControlAvailable),
             buildDeviceAwarenessSection(sensorContext, mode),
             buildRecoverySection(mode),
@@ -622,6 +638,7 @@ $line
         mode: PromptMode = PromptMode.FULL,
         modelTier: ModelTier? = null,
         sensorContext: SensorContext? = null,
+        resolvedToolPlan: ResolvedToolPlan? = null,
         timestamp: java.time.Instant = java.time.Instant.now()
     ): PromptBudget.BudgetResult {
         val tier = resolveTier(modelName, modelTier)
@@ -640,7 +657,7 @@ $line
         val securityWithSafety = buildSecurityWithSafetyClauses(securityContent, mode)
 
         addSection(PromptBudget.SectionId.IDENTITY_BASELINE, buildIdentitySection(identityContent, mode))
-        addSection(PromptBudget.SectionId.TOOLS, buildToolsSection(phoneControlAvailable, mode, tier))
+        addSection(PromptBudget.SectionId.TOOLS, buildToolsSection(phoneControlAvailable, mode, tier, resolvedToolPlan))
         addSection(PromptBudget.SectionId.STRATEGY_DETAIL, buildStrategySection(mode, tier, phoneControlAvailable))
         addSection(PromptBudget.SectionId.DEVICE_AWARENESS, buildDeviceAwarenessSection(sensorContext, mode))
         addSection(PromptBudget.SectionId.RECOVERY_ELABORATION, buildRecoverySection(mode))
@@ -712,7 +729,8 @@ $line
         modelName: String? = null,
         securityContent: String? = null,
         modelTier: ModelTier? = null,
-        sensorContext: SensorContext? = null
+        sensorContext: SensorContext? = null,
+        resolvedToolPlan: ResolvedToolPlan? = null
     ): String {
         return buildSystemPrompt(
             phoneControlAvailable = phoneControlAvailable,
@@ -720,7 +738,8 @@ $line
             securityContent = securityContent,
             mode = PromptMode.MINIMAL,
             modelTier = modelTier,
-            sensorContext = sensorContext
+            sensorContext = sensorContext,
+            resolvedToolPlan = resolvedToolPlan
         )
     }
 

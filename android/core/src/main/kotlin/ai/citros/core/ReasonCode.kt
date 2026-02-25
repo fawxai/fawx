@@ -21,5 +21,7 @@ enum class ReasonCode {
     capability_missing_accessibility_blocks_phone_control,
     fallback_action_intent,
     fallback_empty_candidate_set,
-    core_forced_required
+    core_forced_required,
+    request_tools_expanded,
+    request_tools_capped
 }

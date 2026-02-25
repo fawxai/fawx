@@ -444,6 +444,7 @@ internal fun SettingsHubScreen(
     onOpenModels: () -> Unit,
     onOpenTrust: () -> Unit,
     onOpenPhoneControl: () -> Unit,
+    onOpenToolCategories: () -> Unit,
     onOpenSound: () -> Unit,
     onOpenAppearance: () -> Unit,
     onOpenAbout: () -> Unit
@@ -598,6 +599,15 @@ internal fun SettingsHubScreen(
                     flavor = flavor,
                     onClick = onOpenPhoneControl
                 )
+                if (ai.citros.core.FeatureFlags.toolGroupingV1Enabled) {
+                    SettingsNavCard(
+                        icon = CitrosIcons.Tune,
+                        title = "Tool Categories",
+                        subtitle = "Enable/disable tool groups",
+                        flavor = flavor,
+                        onClick = onOpenToolCategories
+                    )
+                }
                 Spacer(Modifier.height(16.dp))
             }
         }
@@ -1794,4 +1804,98 @@ private fun SettingsNavCard(
             Text("›", color = surfaces.labelTertiary)
         }
     }
+}
+
+/**
+ * Settings screen for enabling/disabling tool categories.
+ * CORE category is always on and cannot be toggled.
+ * Persists via SharedPreferences under CITROS_PREFS with key prefix "tool_category_".
+ */
+@Composable
+internal fun ToolCategoriesSettingsScreen(onBack: () -> Unit) {
+    val context = LocalContext.current
+    val flavor = remember { readSelectedFlavor(context) }
+    val isDarkTheme = LocalCitrosIsDark.current
+    val surfaces = remember(isDarkTheme) { citrosDirectiveSurfaces(isDarkTheme) }
+    val prefs = remember(context) { context.getSharedPreferences(CITROS_PREFS, Context.MODE_PRIVATE) }
+
+    // Load initial state from prefs
+    val categoryStates = remember {
+        ai.citros.core.ToolCategory.entries.associateWith { category ->
+            mutableStateOf(
+                if (category == ai.citros.core.ToolCategory.CORE) true
+                else prefs.getBoolean("tool_category_${category.name.lowercase()}", true)
+            )
+        }
+    }
+
+    SettingsSubPageScaffold(flavor = flavor, title = "Tool Categories", onBack = onBack) {
+        Text(
+            text = "Control which tool categories are available to the AI. " +
+                "Core tools are always enabled. Disabling a category removes those tools from all turns.",
+            style = CitrosTypography.bodyMedium,
+            color = surfaces.labelSecondary,
+            modifier = Modifier.padding(vertical = 8.dp)
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+        SettingsGroupedSurface {
+            ai.citros.core.ToolCategory.entries.forEachIndexed { index, category ->
+                val isCore = category == ai.citros.core.ToolCategory.CORE
+                val state = categoryStates[category]!!
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 14.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = category.name.lowercase()
+                                .replaceFirstChar { it.uppercase() },
+                            style = CitrosTypography.bodyLarge,
+                            color = surfaces.labelPrimary
+                        )
+                        if (isCore) {
+                            Text(
+                                text = "Always enabled",
+                                style = CitrosTypography.bodySmall,
+                                color = surfaces.labelTertiary
+                            )
+                        }
+                    }
+                    Switch(
+                        checked = state.value,
+                        onCheckedChange = if (isCore) null else { enabled ->
+                            state.value = enabled
+                            prefs.edit()
+                                .putBoolean("tool_category_${category.name.lowercase()}", enabled)
+                                .apply()
+                        },
+                        enabled = !isCore,
+                        modifier = Modifier.testTag("tool_category_toggle_${category.name.lowercase()}")
+                    )
+                }
+                if (index < ai.citros.core.ToolCategory.entries.lastIndex) {
+                    HorizontalDivider(
+                        color = surfaces.separatorLight,
+                        thickness = 0.5.dp
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Load [ai.citros.core.UserToolCategorySettings] from SharedPreferences.
+ */
+fun loadToolCategorySettings(prefs: android.content.SharedPreferences): ai.citros.core.UserToolCategorySettings {
+    val builder = ai.citros.core.UserToolCategorySettings.builder()
+    ai.citros.core.ToolCategory.entries
+        .filter { it != ai.citros.core.ToolCategory.CORE }
+        .forEach { category ->
+            val enabled = prefs.getBoolean("tool_category_${category.name.lowercase()}", true)
+            builder.setEnabled(category, enabled)
+        }
+    return builder.build()
 }

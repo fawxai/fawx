@@ -609,6 +609,7 @@ private fun ChatNavHost(
                 onOpenModels = { navController.navigate("settings_models") },
                 onOpenTrust = { navController.navigate("settings_trust") },
                 onOpenPhoneControl = { navController.navigate("settings_phone_control") },
+                onOpenToolCategories = { navController.navigate("settings_tool_categories") },
                 onOpenSound = { navController.navigate("settings_sound") },
                 onOpenAppearance = { navController.navigate("settings_appearance") },
                 onOpenAbout = { navController.navigate("settings_about") }
@@ -653,6 +654,9 @@ private fun ChatNavHost(
         }
         composable("settings_about") {
             AboutSettingsScreen(onBack = { navController.popBackStack() })
+        }
+        composable("settings_tool_categories") {
+            ToolCategoriesSettingsScreen(onBack = { navController.popBackStack() })
         }
     }
 }
@@ -1326,6 +1330,11 @@ fun ChatScreen(
             android.util.Log.w("ChatActivity", "Context is not ChatActivity — memory provider not initialized")
         }
         viewModel.setAgentFileManager(agentFileManager)
+        // Load tool category settings from SharedPreferences
+        if (ai.citros.core.FeatureFlags.toolGroupingV1Enabled) {
+            val toolCatPrefs = context.getSharedPreferences(CITROS_PREFS, android.content.Context.MODE_PRIVATE)
+            viewModel.setToolCategorySettings(loadToolCategorySettings(toolCatPrefs))
+        }
         viewModel.setSystemPrompt(OnboardingPersistence.systemPromptForStartup(agentFileManager))
         // Search config: user Settings override server-delivered keys
         val searchPrefs = context.getSharedPreferences(CITROS_PREFS, android.content.Context.MODE_PRIVATE)

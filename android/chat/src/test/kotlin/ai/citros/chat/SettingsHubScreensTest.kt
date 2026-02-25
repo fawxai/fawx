@@ -2,9 +2,10 @@ package ai.citros.chat
 
 import android.content.Context
 import androidx.compose.runtime.CompositionLocalProvider
-import androidx.compose.ui.test.assertIsDisplayed
-import androidx.compose.ui.test.assertHasClickAction
 import androidx.compose.ui.test.assertCountEquals
+import androidx.compose.ui.test.assertHasClickAction
+import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
@@ -19,7 +20,9 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
 import androidx.test.core.app.ApplicationProvider
+import ai.citros.core.FeatureFlags
 import ai.citros.core.Provider
+import ai.citros.core.ToolCategory
 import ai.citros.core.WalletKey
 import ai.citros.core.WalletManager
 import ai.citros.core.WalletState
@@ -255,7 +258,7 @@ class SettingsHubScreensTest {
             "Location permission is optional and only used when device context sharing is enabled.",
             useUnmergedTree = true
         ).assertExists()
-        composeRule.onNodeWithText("Request location permission", useUnmergedTree = true).assertDoesNotExist()
+        composeRule.onAllNodesWithText("Request location permission", useUnmergedTree = true).assertCountEquals(0)
         composeRule.onNodeWithText("Open app permissions", useUnmergedTree = true).assertExists()
 
         composeRule.onNodeWithContentDescription("Back").performClick()
@@ -301,7 +304,7 @@ class SettingsHubScreensTest {
             )
         }
 
-        composeRule.onNodeWithText("Request location permission", useUnmergedTree = true).assertDoesNotExist()
+        composeRule.onAllNodesWithText("Request location permission", useUnmergedTree = true).assertCountEquals(0)
         composeRule.onNodeWithTag("trust_sensor_context_toggle", useUnmergedTree = true).performSemanticsAction(SemanticsActions.OnClick)
         composeRule.onNodeWithText("Request location permission", useUnmergedTree = true).assertExists()
     }
@@ -396,6 +399,7 @@ class SettingsHubScreensTest {
                 onOpenPhoneControl = {},
                 onOpenSound = {},
                 onOpenAppearance = {},
+                onOpenToolCategories = {},
                 onOpenAbout = {}
             )
         }
@@ -426,6 +430,7 @@ class SettingsHubScreensTest {
                 onOpenPhoneControl = {},
                 onOpenSound = {},
                 onOpenAppearance = {},
+                onOpenToolCategories = {},
                 onOpenAbout = {}
             )
         }
@@ -437,6 +442,100 @@ class SettingsHubScreensTest {
         composeRule.onNodeWithText("Accessibility & overlay", useUnmergedTree = true).assertExists()
         composeRule.onNodeWithText("Theme & flavor settings", useUnmergedTree = true).assertExists()
         composeRule.onNodeWithText("Version, licenses", useUnmergedTree = true).assertExists()
+    }
+
+    @Test
+    fun `SettingsHubScreen shows Tool Categories card when feature flag is enabled`() {
+        FeatureFlags.toolGroupingV1Enabled = true
+        try {
+            val context = ApplicationProvider.getApplicationContext<Context>()
+            val walletManager = createEmptyWalletManager()
+
+            composeRule.setContent {
+                SettingsHubScreen(
+                    context = context,
+                    walletManager = walletManager,
+                    onBack = {},
+                    onOpenWallet = {},
+                    onOpenModels = {},
+                    onOpenTrust = {},
+                    onOpenPhoneControl = {},
+                    onOpenSound = {},
+                    onOpenAppearance = {},
+                    onOpenToolCategories = {},
+                    onOpenAbout = {}
+                )
+            }
+
+            composeRule.onNodeWithText("Tool Categories", useUnmergedTree = true).performScrollTo().assertExists()
+            composeRule.onNodeWithText("Enable/disable tool groups", useUnmergedTree = true).assertExists()
+        } finally {
+            FeatureFlags.toolGroupingV1Enabled = false
+        }
+    }
+
+    @Test
+    fun `SettingsHubScreen hides Tool Categories card when feature flag is disabled`() {
+        FeatureFlags.toolGroupingV1Enabled = false
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val walletManager = createEmptyWalletManager()
+
+        composeRule.setContent {
+            SettingsHubScreen(
+                context = context,
+                walletManager = walletManager,
+                onBack = {},
+                onOpenWallet = {},
+                onOpenModels = {},
+                onOpenTrust = {},
+                onOpenPhoneControl = {},
+                onOpenSound = {},
+                onOpenAppearance = {},
+                onOpenToolCategories = {},
+                onOpenAbout = {}
+            )
+        }
+
+        composeRule.onAllNodesWithText("Tool Categories", useUnmergedTree = true).assertCountEquals(0)
+    }
+
+    @Test
+    fun `ToolCategoriesSettingsScreen keeps CORE forced on and non-toggleable`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val prefs = context.getSharedPreferences(CITROS_PREFS, Context.MODE_PRIVATE)
+        prefs.edit().putBoolean("tool_category_core", false).commit()
+
+        composeRule.setContent {
+            ToolCategoriesSettingsScreen(onBack = {})
+        }
+
+        composeRule.onNodeWithTag("tool_category_toggle_core", useUnmergedTree = true)
+            .assertIsNotEnabled()
+        composeRule.runOnIdle {
+            val loaded = loadToolCategorySettings(prefs)
+            assertTrue(loaded.isEnabled(ToolCategory.CORE))
+        }
+    }
+
+    @Test
+    fun `loadToolCategorySettings round-trips SharedPreferences values with defaults`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val prefs = context.getSharedPreferences(CITROS_PREFS, Context.MODE_PRIVATE)
+        prefs.edit().clear().commit()
+        prefs.edit()
+            .putBoolean("tool_category_navigation", false)
+            .putBoolean("tool_category_memory", false)
+            .putBoolean("tool_category_interaction", true)
+            .putBoolean("tool_category_core", false)
+            .commit()
+
+        val loaded = loadToolCategorySettings(prefs)
+        assertTrue(loaded.isEnabled(ToolCategory.CORE))
+        assertFalse(loaded.isEnabled(ToolCategory.NAVIGATION))
+        assertFalse(loaded.isEnabled(ToolCategory.MEMORY))
+        assertTrue(loaded.isEnabled(ToolCategory.INTERACTION))
+        assertTrue(loaded.isEnabled(ToolCategory.RESEARCH)) // default true when missing
+        assertTrue(loaded.disabledCategories().containsAll(listOf(ToolCategory.NAVIGATION, ToolCategory.MEMORY)))
     }
 
     /** Verifies the Sound & Haptics card renders and its subtitle is correct. */
@@ -457,6 +556,7 @@ class SettingsHubScreensTest {
                 onOpenPhoneControl = {},
                 onOpenSound = { soundClicked = true },
                 onOpenAppearance = {},
+                onOpenToolCategories = {},
                 onOpenAbout = {}
             )
         }
@@ -485,6 +585,7 @@ class SettingsHubScreensTest {
                 onOpenPhoneControl = {},
                 onOpenSound = {},
                 onOpenAppearance = {},
+                onOpenToolCategories = {},
                 onOpenAbout = {}
             )
         }
@@ -514,6 +615,7 @@ class SettingsHubScreensTest {
                 onOpenPhoneControl = {},
                 onOpenSound = {},
                 onOpenAppearance = {},
+                onOpenToolCategories = {},
                 onOpenAbout = {}
             )
         }
@@ -540,6 +642,7 @@ class SettingsHubScreensTest {
                 onOpenPhoneControl = {},
                 onOpenSound = {},
                 onOpenAppearance = {},
+                onOpenToolCategories = {},
                 onOpenAbout = {}
             )
         }
@@ -568,6 +671,7 @@ class SettingsHubScreensTest {
                 onOpenPhoneControl = {},
                 onOpenSound = {},
                 onOpenAppearance = {},
+                onOpenToolCategories = {},
                 onOpenAbout = {}
             )
         }
@@ -595,6 +699,7 @@ class SettingsHubScreensTest {
                 onOpenPhoneControl = { phoneControlClicked = true },
                 onOpenSound = {},
                 onOpenAppearance = {},
+                onOpenToolCategories = {},
                 onOpenAbout = {}
             )
         }
@@ -621,6 +726,7 @@ class SettingsHubScreensTest {
                 onOpenPhoneControl = {},
                 onOpenSound = {},
                 onOpenAppearance = { appearanceClicked = true },
+                onOpenToolCategories = {},
                 onOpenAbout = {}
             )
         }
@@ -647,6 +753,7 @@ class SettingsHubScreensTest {
                 onOpenPhoneControl = {},
                 onOpenSound = {},
                 onOpenAppearance = {},
+                onOpenToolCategories = {},
                 onOpenAbout = { aboutClicked = true }
             )
         }

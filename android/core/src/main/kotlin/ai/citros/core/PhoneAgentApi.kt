@@ -91,6 +91,20 @@ open class PhoneAgentApi(
 
     private enum class SnapshotOutcome { SUCCESS, TIMEOUT, FAILURE }
 
+    /**
+     * Log tool plan telemetry per turn. No user message content in logs.
+     */
+    private fun logToolPlanTelemetry(plan: ResolvedToolPlan, isActionLoop: Boolean) {
+        Log.d(
+            TAG,
+            "toolPlan: isActionLoop=$isActionLoop, " +
+                "categories=${plan.activeCategories.joinToString(",") { it.name.lowercase() }}, " +
+                "categoryCount=${plan.activeCategories.size}, " +
+                "toolCount=${plan.estimatedToolCount}, " +
+                "reasons=${plan.reasonCodes.joinToString(",") { it.name }}"
+        )
+    }
+
     private fun recordSensorSnapshotMetrics(durationMs: Long, outcome: SnapshotOutcome) {
         sensorSnapshotCount.incrementAndGet()
         sensorSnapshotLatencyTotalMsCounter.addAndGet(durationMs)
@@ -236,7 +250,9 @@ open class PhoneAgentApi(
     internal fun getToolsForModelWithGrouping(
         modelId: String? = null,
         messageText: String = "",
-        userSettings: UserToolCategorySettings = UserToolCategorySettings.allEnabled()
+        userSettings: UserToolCategorySettings = UserToolCategorySettings.allEnabled(),
+        expandedCategories: Set<ToolCategory> = emptySet(),
+        includeRequestToolsCappedReason: Boolean = false
     ): Pair<List<Tool>, ResolvedToolPlan?> {
         if (!FeatureFlags.toolGroupingV1Enabled) {
             return getToolsForModel(modelId) to null
@@ -255,11 +271,43 @@ open class PhoneAgentApi(
             userSettings = userSettings.snapshot()
         )
 
+        // Merge request_tools expanded categories into active set
+        val mergedActiveCategories = if (expandedCategories.isNotEmpty()) {
+            val merged = plan.activeCategories.toMutableSet()
+            merged.addAll(expandedCategories)
+            val mergedOrdered = ResolvedToolPlan.canonicalOrder(merged)
+            val mergedToolNames = PhoneTools.getToolsForCategories(merged, tier)
+                .map { it.name }.toMutableSet()
+            if (!capabilities.hasTinyFishKey) mergedToolNames -= "web_browse"
+            val mergedReasons = plan.reasonCodes.toMutableList()
+            if (expandedCategories.any { it !in plan.activeCategories }) {
+                mergedReasons += ReasonCode.request_tools_expanded
+            }
+            if (includeRequestToolsCappedReason) {
+                mergedReasons += ReasonCode.request_tools_capped
+            }
+            val mergedPlan = ResolvedToolPlan(
+                activeCategories = mergedOrdered,
+                toolNames = mergedToolNames,
+                reasonCodes = mergedReasons.distinct(),
+                estimatedToolCount = mergedToolNames.size
+            )
+            val allTools = PhoneTools.getToolsForCategories(ToolCategory.entries.toSet(), tier)
+            return allTools.filter { it.name in mergedPlan.toolNames } to mergedPlan
+        } else {
+            null
+        }
+
         // Filter from a single tool list using policy-selected tool names.
         val allTools = PhoneTools.getToolsForCategories(ToolCategory.entries.toSet(), tier)
         val tools = allTools.filter { it.name in plan.toolNames }
+        val finalPlan = if (includeRequestToolsCappedReason) {
+            plan.copy(reasonCodes = (plan.reasonCodes + ReasonCode.request_tools_capped).distinct())
+        } else {
+            plan
+        }
 
-        return tools to plan
+        return tools to finalPlan
     }
 
     private val messages: MutableList<Message> = CopyOnWriteArrayList()
@@ -345,6 +393,40 @@ open class PhoneAgentApi(
     @androidx.annotation.VisibleForTesting
     @Volatile
     var phoneControlOverride: Boolean? = null
+
+    /**
+     * User tool category settings for tool grouping policy.
+     * Injected from UI layer (SharedPreferences). Default: all enabled.
+     */
+    @Volatile
+    var userToolCategorySettings: UserToolCategorySettings = UserToolCategorySettings.allEnabled()
+
+    /**
+     * Tracks the most recent [ResolvedToolPlan] from the last turn.
+     * Visible for telemetry and testing.
+     */
+    @Volatile
+    var lastResolvedToolPlan: ResolvedToolPlan? = null
+        private set
+
+    /**
+     * Categories expanded via request_tools calls.
+     * Persisted across turns within a task, intersected with policy allow_set.
+     */
+    private val requestToolsExpandedCategories = mutableSetOf<ToolCategory>()
+
+    /**
+     * Tracks consecutive identical request_tools calls for cap enforcement.
+     * Key: sorted set of requested categories as string, Value: count.
+     */
+    private val requestToolsCallCounts = mutableMapOf<String, Int>()
+
+    /**
+     * True after a repeated request_tools call is capped (max 2).
+     * Added to subsequent ResolvedToolPlan reason codes for telemetry/debugging.
+     */
+    @Volatile
+    private var requestToolsCappedThisTask: Boolean = false
 
     companion object {
         private const val TAG = "CitrosAgent"
@@ -479,6 +561,9 @@ open class PhoneAgentApi(
     ): ChatResponse = withRequestFlowLock {
         if (!isActionLoop) {
             resetTaskCostTracking()
+            requestToolsExpandedCategories.clear()
+            requestToolsCallCounts.clear()
+            requestToolsCappedThisTask = false
         }
 
         // When phone control is not available, always use chat mode without tools (#390).
@@ -560,16 +645,31 @@ open class PhoneAgentApi(
         val client = if (isActionLoop) actionClient else chatClient
         val modelName = client.modelId
         val sensorSnapshot = getTaskSensorSnapshot(startNewTask = !isActionLoop)
+
+        val (toolsForModel, toolPlan) = getToolsForModelWithGrouping(
+            modelId = client.modelId,
+            messageText = userMessage,
+            userSettings = userToolCategorySettings,
+            expandedCategories = requestToolsExpandedCategories.toSet(),
+            includeRequestToolsCappedReason = requestToolsCappedThisTask
+        )
+        if (toolPlan != null) {
+            lastResolvedToolPlan = toolPlan
+            logToolPlanTelemetry(toolPlan, isActionLoop = isActionLoop)
+        }
+
         val systemPrompt = if (isActionLoop) {
             val actionPrompt = promptBuilder?.trimmed(
                 phoneControlAvailable = phoneControlAvailable,
                 modelName = modelName,
-                sensorContext = sensorSnapshot
+                sensorContext = sensorSnapshot,
+                resolvedToolPlan = toolPlan
             )
                 ?: PhoneAgentPrompts.buildActionPrompt(
                     phoneControlAvailable = phoneControlAvailable,
                     modelName = modelName,
-                    sensorContext = sensorSnapshot
+                    sensorContext = sensorSnapshot,
+                    resolvedToolPlan = toolPlan
                 )
             logPromptTuningMetadata(actionPrompt, "action")
             assertSafetyContractDebug(actionPrompt)
@@ -578,10 +678,11 @@ open class PhoneAgentApi(
             buildChatSystemPrompt(
                 phoneControlAvailable = phoneControlAvailable,
                 modelName = modelName,
-                sensorContext = sensorSnapshot
+                sensorContext = sensorSnapshot,
+                resolvedToolPlan = toolPlan
             )
         }
-        
+
         // Use compacted messages for action loop to manage context window.
         // Two-stage compaction:
         //   1. ContextCompactor strips SCREEN dumps from old tool results (cheap, regex-based)
@@ -596,7 +697,6 @@ open class PhoneAgentApi(
             messagesWithPendingUser.toList()
         }
 
-        val toolsForModel = getToolsForModel(client.modelId)
         val result = client.chatWithTools(messagesForModel, systemPrompt = systemPrompt, tools = toolsForModel)
 
         return result.fold(
@@ -686,16 +786,19 @@ open class PhoneAgentApi(
     private fun buildChatSystemPrompt(
         phoneControlAvailable: Boolean,
         modelName: String?,
-        sensorContext: SensorContext?
+        sensorContext: SensorContext?,
+        resolvedToolPlan: ResolvedToolPlan? = null
     ): String {
         val prompt = promptBuilder?.full(
             phoneControlAvailable = phoneControlAvailable,
             modelName = modelName,
-            sensorContext = sensorContext
+            sensorContext = sensorContext,
+            resolvedToolPlan = resolvedToolPlan
         ) ?: PhoneAgentPrompts.buildSystemPrompt(
             phoneControlAvailable = phoneControlAvailable,
             modelName = modelName,
-            sensorContext = sensorContext
+            sensorContext = sensorContext,
+            resolvedToolPlan = resolvedToolPlan
         )
         logPromptTuningMetadata(prompt, "chat")
         assertSafetyContractDebug(prompt)
@@ -753,15 +856,30 @@ open class PhoneAgentApi(
         return withRequestFlowLock {
         val phoneControlAvailable = phoneControlOverride ?: ScreenReader.isAttached()
         val sensorSnapshot = getTaskSensorSnapshot(startNewTask = false)
+
+        val (toolsForModel, actionToolPlan) = getToolsForModelWithGrouping(
+            modelId = actionClient.modelId,
+            messageText = "", // action loop has no new user message
+            userSettings = userToolCategorySettings,
+            expandedCategories = requestToolsExpandedCategories.toSet(),
+            includeRequestToolsCappedReason = requestToolsCappedThisTask
+        )
+        if (actionToolPlan != null) {
+            lastResolvedToolPlan = actionToolPlan
+            logToolPlanTelemetry(actionToolPlan, isActionLoop = true)
+        }
+
         val systemPrompt = promptBuilder?.trimmed(
             phoneControlAvailable = phoneControlAvailable,
             modelName = actionClient.modelId,
-            sensorContext = sensorSnapshot
+            sensorContext = sensorSnapshot,
+            resolvedToolPlan = actionToolPlan
         )
             ?: PhoneAgentPrompts.buildActionPrompt(
                 phoneControlAvailable = phoneControlAvailable,
                 modelName = actionClient.modelId,
-                sensorContext = sensorSnapshot
+                sensorContext = sensorSnapshot,
+                resolvedToolPlan = actionToolPlan
             )
         logPromptTuningMetadata(systemPrompt, "action-continue")
         assertSafetyContractDebug(systemPrompt)
@@ -774,7 +892,6 @@ open class PhoneAgentApi(
         Log.d(TAG, "continueAfterTools: step=$currentToolStep, rawMessages=${messages.size}, compacted=${messagesForModel.size}")
 
         checkBudgetBeforeApiCall()
-        val toolsForModel = getToolsForModel(actionClient.modelId)
         val result = actionClient.chatWithTools(
             messagesForModel,
             systemPrompt = systemPrompt,
@@ -1366,25 +1483,87 @@ open class PhoneAgentApi(
                         )
                     }
 
-                    val tools = PhoneTools.getToolsForCategories(requested, currentExecutionModelTier())
-                        .filter { tinyFishApiKey != null || it.name != "web_browse" }
-                        .sortedBy { it.name }
-
-                    val text = buildString {
-                        append("Requested categories: ")
-                        append(requested.joinToString(", ") { it.name.lowercase() })
-                        append('\n')
-                        append("Available tools:\n")
-                        tools.forEach { tool ->
-                            append("- ")
-                            append(tool.name)
-                            append(": ")
-                            append(tool.description)
-                            append('\n')
+                    // Tool grouping: intersect with policy allow_set, cap repeated identical requests
+                    if (FeatureFlags.toolGroupingV1Enabled) {
+                        val tier = currentExecutionModelTier()
+                        val capabilities = ToolGroupingPolicy.Capabilities(
+                            accessibilityAttached = phoneControlOverride ?: isScreenReaderAttached(),
+                            hasTinyFishKey = tinyFishApiKey != null
+                        )
+                        // Compute allow_set inline (same logic as policy)
+                        val allowSet = ToolCategory.entries.toMutableSet()
+                        if (tier == ModelTier.SMALL) allowSet -= ToolCategory.RESEARCH
+                        if (!capabilities.accessibilityAttached) {
+                            allowSet -= setOf(ToolCategory.NAVIGATION, ToolCategory.INTERACTION, ToolCategory.OBSERVATION)
                         }
-                    }.trimEnd()
+                        allowSet -= userToolCategorySettings.disabledCategories()
+                        allowSet += ToolCategory.CORE
 
-                    ToolResult(text)
+                        val allowed = requested.filter { it in allowSet }.toSet()
+                        val blocked = requested - allowed
+
+                        // Cap repeated identical requests at 2
+                        val requestKey = requested.sortedBy { it.ordinal }.joinToString(",") { it.name }
+                        val callCount = requestToolsCallCounts.getOrDefault(requestKey, 0) + 1
+                        requestToolsCallCounts[requestKey] = callCount
+
+                        if (callCount > 2) {
+                            requestToolsCappedThisTask = true
+                            Log.d(TAG, "request_tools: capped repeated request ($callCount) for $requestKey")
+                            return ToolResult(
+                                "Request capped: identical request_tools call repeated $callCount times (max 2). " +
+                                    "These categories are already available in the next tool step.",
+                            )
+                        }
+
+                        // Add allowed categories to expanded set for next turn
+                        requestToolsExpandedCategories.addAll(allowed)
+                        Log.d(TAG, "request_tools: expanded=${allowed.map { it.name.lowercase() }}, blocked=${blocked.map { it.name.lowercase() }}")
+
+                        val tools = PhoneTools.getToolsForCategories(allowed, tier)
+                            .filter { tinyFishApiKey != null || it.name != "web_browse" }
+                            .sortedBy { it.name }
+
+                        val text = buildString {
+                            append("Expanded categories: ")
+                            append(allowed.joinToString(", ") { it.name.lowercase() })
+                            if (blocked.isNotEmpty()) {
+                                append("\nBlocked categories (policy/settings): ")
+                                append(blocked.joinToString(", ") { it.name.lowercase() })
+                            }
+                            append("\nTools now available in next step:\n")
+                            tools.forEach { tool ->
+                                append("- ")
+                                append(tool.name)
+                                append(": ")
+                                append(tool.description)
+                                append('\n')
+                            }
+                        }.trimEnd()
+
+                        ToolResult(text)
+                    } else {
+                        // Legacy behavior: no policy filtering
+                        val tools = PhoneTools.getToolsForCategories(requested, currentExecutionModelTier())
+                            .filter { tinyFishApiKey != null || it.name != "web_browse" }
+                            .sortedBy { it.name }
+
+                        val text = buildString {
+                            append("Requested categories: ")
+                            append(requested.joinToString(", ") { it.name.lowercase() })
+                            append('\n')
+                            append("Available tools:\n")
+                            tools.forEach { tool ->
+                                append("- ")
+                                append(tool.name)
+                                append(": ")
+                                append(tool.description)
+                                append('\n')
+                            }
+                        }.trimEnd()
+
+                        ToolResult(text)
+                    }
                 }
 
                 else -> {

@@ -242,6 +242,7 @@ class SettingsScreenTest {
                 onOpenPhoneControl = {},
                 onOpenSound = {},
                 onOpenAppearance = {},
+                onOpenToolCategories = {},
                 onOpenAbout = {}
             )
         }
@@ -261,6 +262,7 @@ class SettingsScreenTest {
                 onOpenPhoneControl = {},
                 onOpenSound = {},
                 onOpenAppearance = {},
+                onOpenToolCategories = {},
                 onOpenAbout = {}
             )
         }
@@ -280,6 +282,7 @@ class SettingsScreenTest {
                 onOpenPhoneControl = {},
                 onOpenSound = {},
                 onOpenAppearance = {},
+                onOpenToolCategories = {},
                 onOpenAbout = {}
             )
         }
@@ -299,6 +302,7 @@ class SettingsScreenTest {
                 onOpenPhoneControl = {},
                 onOpenSound = {},
                 onOpenAppearance = {},
+                onOpenToolCategories = {},
                 onOpenAbout = {}
             )
         }
@@ -318,6 +322,7 @@ class SettingsScreenTest {
                 onOpenPhoneControl = {},
                 onOpenSound = {},
                 onOpenAppearance = {},
+                onOpenToolCategories = {},
                 onOpenAbout = {}
             )
         }
