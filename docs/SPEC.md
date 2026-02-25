@@ -385,7 +385,7 @@ Category: RATE-LIMITED
 - More than 5 messages sent in 2 minutes → pause and ask
 ```
 
-Phase 1 concrete default scope (see `docs/specs/h2-action-policy-engine.md`):
+Phase 1 concrete default scope (see `docs/archive/implemented/specs/h2-action-policy-engine.md`):
 - Hard deny precedence is explicit: `DENY > RATE_LIMIT > CONFIRM > ALLOW`.
 - First-use scope is explicit: first app-targeted action in an unseen app context this session requires confirmation (not `open_app` only).
 - Exfiltration controls are explicit: sending data to unrecognized/unapproved endpoints remains denied in Phase 1.

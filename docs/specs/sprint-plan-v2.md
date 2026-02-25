@@ -52,12 +52,12 @@ Survive app switches + screen off.   Better first-execution success.
 
 | Sprint | Spec | Focus | Depends On | PRs Est. |
 |--------|------|-------|------------|----------|
-| **0: Service Architecture** | `sprint-0-service-architecture.md` | Move AgentExecutor to foreground service, durable task state, wake lock management, service binding | — | 3-4 |
-| **1: Loop Tuning** | `sprint-1-loop-tuning.md` | Subtask decomposition, deterministic recovery behaviors, regression harness skeleton | Sprint 0 | 3-4 |
-| **2: Action Playbooks** | `sprint-2-action-playbooks.md` | Screen fingerprinting, playbook recording, parameterized templates, playbook-guided execution | Sprint 1 | 3-4 |
-| **3: Safety Layer** | `h2-action-policy-engine.md` (updated) | HITL policy engine, state-dependent pill buttons, confirmation UI, audit, rate limiting, egress control | Sprint 0 | 5-7 |
+| **0: Service Architecture** | `../archive/implemented/specs/sprint-0-service-architecture.md` | Move AgentExecutor to foreground service, durable task state, wake lock management, service binding | — | 3-4 |
+| **1: Loop Tuning** | `../archive/implemented/specs/sprint-1-loop-tuning.md` | Subtask decomposition, deterministic recovery behaviors, regression harness skeleton | Sprint 0 | 3-4 |
+| **2: Action Playbooks** | `../archive/implemented/specs/sprint-2-action-playbooks.md` | Screen fingerprinting, playbook recording, parameterized templates, playbook-guided execution | Sprint 1 | 3-4 |
+| **3: Safety Layer** | `../archive/implemented/specs/h2-action-policy-engine.md` (updated) | HITL policy engine, state-dependent pill buttons, confirmation UI, audit, rate limiting, egress control | Sprint 0 | 5-7 |
 
-**Sprint 3 spec updated** (`h2-action-policy-engine.md`) with §8a State-Dependent Pill Buttons — contextual UI pills that replace generic Allow/Deny with state-aware options (Authenticate, Continue, Do something else, etc.) and an `offer_choices` tool for agent-generated disambiguation pills.
+**Sprint 3 spec updated** (`../archive/implemented/specs/h2-action-policy-engine.md`) with §8a State-Dependent Pill Buttons — contextual UI pills that replace generic Allow/Deny with state-aware options (Authenticate, Continue, Do something else, etc.) and an `offer_choices` tool for agent-generated disambiguation pills.
 
 **Sprint 1 and 2 are sequential** — playbooks built on unreliable first executions produce bad playbooks. Loop tuning first, then record from higher-quality executions.
 

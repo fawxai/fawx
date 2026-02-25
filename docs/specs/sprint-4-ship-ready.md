@@ -53,8 +53,8 @@ Token reduction, model-tier          Voice input fix (#663)
 
 | Stream | Focus | Issues | Spec | Node | Est. PRs |
 |--------|-------|--------|------|------|----------|
-| **A1: Tool Grouping** | Runtime category selection, user prefs, token reduction | #557, #680 | `h2-3-tool-grouping-spec.md` ✅ | Mac Mini | 3-4 |
-| **A2: Prompt Tuning** | Budget enforcement, tier-based sections, rollout safety | #558, #681, #682 | `h2-4-model-aware-prompt-tuning-spec.md` ✅ | Mac Mini | 3-4 |
+| **A1: Tool Grouping** | Runtime category selection, user prefs, token reduction | #557, #680 | `../archive/implemented/specs/h2-3-tool-grouping-spec.md` ✅ | Mac Mini | 3-4 |
+| **A2: Prompt Tuning** | Budget enforcement, tier-based sections, rollout safety | #558, #681, #682 | `../archive/implemented/specs/h2-4-model-aware-prompt-tuning-spec.md` ✅ | Mac Mini | 3-4 |
 | **B: Reliability** | Bug fixes for top workflows + regression suite flesh-out | #647, #638, #663, harness | `sprint-4-reliability.md` 🆕 | MacBook Pro | 4-5 |
 | **C: Test Infra** | CI stabilization + Sprint 3 safety backlog | #751, #698, #779, #780 | Folded into B (PR 5) | MacBook Pro | 1 (combined) |
 | **D: Onboarding** | Conversational first-run + key wallet + zero-infra flow | #470, #596, #571 | `sprint-4-onboarding.md` 🆕 | Either | 3-4 |
