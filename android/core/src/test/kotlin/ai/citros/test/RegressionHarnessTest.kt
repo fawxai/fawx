@@ -51,6 +51,25 @@ class RegressionHarnessTest {
     }
 
     @Test
+    fun `ResponseContains fails when expected text is blank`() {
+        val task = RegressionTask(
+            id = "t-blank-response-criterion",
+            name = "Blank criterion",
+            userMessage = "Do thing",
+            successCriteria = listOf(SuccessCriterion.ResponseContains("   "))
+        )
+        val outcome = RegressionOutcome(
+            status = RegressionStatus.COMPLETED,
+            stepsUsed = 1,
+            responseText = "Some response text"
+        )
+
+        val results = SuccessCriteriaEvaluator().evaluate(task, outcome)
+        assertEquals(1, results.size)
+        assertFalse(results.single().passed)
+    }
+
+    @Test
     fun `ResponseContains fails safely when responseText is null`() {
         val task = RegressionTask(
             id = "t-null-response",
@@ -131,6 +150,72 @@ class RegressionHarnessTest {
         val results = SuccessCriteriaEvaluator().evaluate(task, outcome)
         assertFalse(results.all { it.passed })
         assertEquals(3, results.count { !it.passed })
+    }
+
+    @Test
+    fun `AppInForeground criterion has pass and fail cases`() {
+        val task = RegressionTask(
+            id = "criterion-app",
+            name = "App foreground",
+            userMessage = "open settings",
+            successCriteria = listOf(SuccessCriterion.AppInForeground("com.android.settings"))
+        )
+
+        val passing = SuccessCriteriaEvaluator().evaluate(
+            task,
+            RegressionOutcome(status = RegressionStatus.COMPLETED, stepsUsed = 1, screenPackageName = "com.android.settings")
+        )
+        val failing = SuccessCriteriaEvaluator().evaluate(
+            task,
+            RegressionOutcome(status = RegressionStatus.COMPLETED, stepsUsed = 1, screenPackageName = "com.other.app")
+        )
+
+        assertTrue(passing.single().passed)
+        assertFalse(failing.single().passed)
+    }
+
+    @Test
+    fun `ScreenContainsText criterion has pass and fail cases`() {
+        val task = RegressionTask(
+            id = "criterion-screen",
+            name = "Screen contains",
+            userMessage = "find text",
+            successCriteria = listOf(SuccessCriterion.ScreenContainsText("Do Not Disturb"))
+        )
+
+        val passing = SuccessCriteriaEvaluator().evaluate(
+            task,
+            RegressionOutcome(status = RegressionStatus.COMPLETED, stepsUsed = 1, screenText = "Quick settings\nDo Not Disturb")
+        )
+        val failing = SuccessCriteriaEvaluator().evaluate(
+            task,
+            RegressionOutcome(status = RegressionStatus.COMPLETED, stepsUsed = 1, screenText = "Quick settings\nWi-Fi")
+        )
+
+        assertTrue(passing.single().passed)
+        assertFalse(failing.single().passed)
+    }
+
+    @Test
+    fun `StepsLessThan criterion has pass and fail cases`() {
+        val task = RegressionTask(
+            id = "criterion-steps",
+            name = "Step budget",
+            userMessage = "do thing",
+            successCriteria = listOf(SuccessCriterion.StepsLessThan(3))
+        )
+
+        val passing = SuccessCriteriaEvaluator().evaluate(
+            task,
+            RegressionOutcome(status = RegressionStatus.FAILED, stepsUsed = 2)
+        )
+        val failing = SuccessCriteriaEvaluator().evaluate(
+            task,
+            RegressionOutcome(status = RegressionStatus.COMPLETED, stepsUsed = 3)
+        )
+
+        assertTrue(passing.single().passed)
+        assertFalse(failing.single().passed)
     }
 
     @Test
@@ -222,6 +307,42 @@ class RegressionHarnessTest {
     @Test
     fun `suite seeds include expected starter tasks`() {
         val ids = REGRESSION_SUITE_SEEDS.map { it.id }.toSet()
-        assertEquals(setOf("nav-001", "nav-002", "info-001", "multi-001", "msg-001"), ids)
+        assertEquals(
+            setOf(
+                "nav-001", "nav-002", "info-001", "multi-001", "msg-001",
+                "nav-003", "nav-004", "search-001", "screen-001", "notif-001"
+            ),
+            ids
+        )
+    }
+
+    @Test
+    fun `runner returns failed result when scripted outcome does not satisfy criteria`() = runTest {
+        val task = RegressionTask(
+            id = "t-fail",
+            name = "Failure path",
+            userMessage = "Do thing",
+            successCriteria = listOf(
+                SuccessCriterion.CompletedWithinSteps,
+                SuccessCriterion.ResponseContains("ok")
+            ),
+            maxSteps = 3
+        )
+        val driver = object : RegressionHarnessDriver {
+            override suspend fun enforcePrecondition(precondition: Precondition) = Unit
+
+            override suspend fun execute(task: RegressionTask): RegressionOutcome {
+                return RegressionOutcome(
+                    status = RegressionStatus.FAILED,
+                    stepsUsed = 4,
+                    responseText = "not ok"
+                )
+            }
+        }
+
+        val result = RegressionRunner(driver).run(task)
+        assertFalse(result.passed)
+        assertEquals(1, result.criteriaResults.count { it.passed })
+        assertEquals(1, result.criteriaResults.count { !it.passed })
     }
 }

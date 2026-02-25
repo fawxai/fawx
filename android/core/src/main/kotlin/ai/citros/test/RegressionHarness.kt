@@ -105,8 +105,9 @@ class SuccessCriteriaEvaluator {
                 }
 
                 is SuccessCriterion.ResponseContains -> {
+                    val expected = criterion.text.trim()
                     val response = outcome.responseText.orEmpty()
-                    val passed = response.contains(criterion.text, ignoreCase = true)
+                    val passed = expected.isNotEmpty() && response.contains(expected, ignoreCase = true)
                     CriterionEvaluation(
                         criterion,
                         passed,
@@ -209,5 +210,58 @@ val REGRESSION_SUITE_SEEDS: List<RegressionTask> = listOf(
             SuccessCriterion.StepsLessThan(6)
         ),
         tags = setOf("messaging", "multi-step")
+    ),
+    RegressionTask(
+        id = "nav-003",
+        name = "Turn on Do Not Disturb",
+        userMessage = "Turn on Do Not Disturb",
+        successCriteria = listOf(
+            SuccessCriterion.AppInForeground("com.android.settings"),
+            SuccessCriterion.ScreenContainsText("Do Not Disturb"),
+            SuccessCriterion.StepsLessThan(8)
+        ),
+        tags = setOf("navigation", "settings")
+    ),
+    RegressionTask(
+        id = "nav-004",
+        name = "Open the camera and take a photo",
+        userMessage = "Open the camera and take a photo",
+        successCriteria = listOf(
+            SuccessCriterion.AppInForeground("com.google.android.GoogleCamera"),
+            SuccessCriterion.StepsLessThan(5)
+        ),
+        tags = setOf("navigation", "camera")
+    ),
+    RegressionTask(
+        id = "search-001",
+        name = "Search for pizza near me",
+        userMessage = "Search for pizza near me",
+        successCriteria = listOf(
+            SuccessCriterion.CompletedWithinSteps,
+            SuccessCriterion.ResponseContains("pizza"),
+            SuccessCriterion.StepsLessThan(8)
+        ),
+        tags = setOf("search", "maps")
+    ),
+    RegressionTask(
+        id = "screen-001",
+        name = "What's on my screen?",
+        userMessage = "What's on my screen?",
+        successCriteria = listOf(
+            SuccessCriterion.CompletedWithinSteps,
+            SuccessCriterion.ResponseContains("screen"),
+            SuccessCriterion.StepsLessThan(3)
+        ),
+        tags = setOf("screen", "awareness")
+    ),
+    RegressionTask(
+        id = "notif-001",
+        name = "Read my last notification",
+        userMessage = "Read my last notification",
+        successCriteria = listOf(
+            SuccessCriterion.CompletedWithinSteps,
+            SuccessCriterion.StepsLessThan(5)
+        ),
+        tags = setOf("notifications")
     )
 )

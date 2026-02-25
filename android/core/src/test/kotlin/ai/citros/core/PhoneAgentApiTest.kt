@@ -7,6 +7,7 @@ import android.content.Context
 import android.graphics.Rect
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
+import ai.citros.test.ScriptedProviderClient
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
@@ -3439,77 +3440,6 @@ class PhoneAgentApiTest {
         }
     }
 
-    private class ScriptedProviderClient(
-        override val provider: Provider,
-        private val chatResponses: ArrayDeque<String> = ArrayDeque(),
-        private val chatWithUsageResponses: ArrayDeque<Pair<String, TokenUsage?>> = ArrayDeque(),
-        private val streamingResponses: ArrayDeque<List<String>> = ArrayDeque(),
-        private val toolResponses: ArrayDeque<ChatResponse> = ArrayDeque(),
-        private val visionResponses: ArrayDeque<String> = ArrayDeque(),
-        override val modelId: String? = null
-    ) : ProviderClient {
-        var chatCalls = 0
-        var chatWithUsageCalls = 0
-        var chatStreamingCalls = 0
-        var chatWithToolsCalls = 0
-        var describeImageCalls = 0
-        /** Last messages list passed to chatWithTools, for verifying conversation flow. */
-        var lastMessages: List<Message>? = null
-        /** Last system prompt passed to chatWithTools. */
-        var lastSystemPrompt: String? = null
-        /** Last tool list passed to chatWithTools. */
-        var lastTools: List<Tool>? = null
-
-        override suspend fun chat(conversation: Conversation): Result<String> {
-            chatCalls++
-            return Result.success(chatResponses.removeFirst())
-        }
-
-        override suspend fun chatWithUsage(conversation: Conversation): Result<Pair<String, TokenUsage?>> {
-            chatWithUsageCalls++
-            return if (chatWithUsageResponses.isNotEmpty()) {
-                Result.success(chatWithUsageResponses.removeFirst())
-            } else {
-                Result.success(chat(conversation).getOrThrow() to null)
-            }
-        }
-
-        override suspend fun chatStreaming(
-            conversation: Conversation,
-            onDelta: (String) -> Unit
-        ): Result<String> {
-            chatStreamingCalls++
-            val chunks = if (streamingResponses.isNotEmpty()) {
-                streamingResponses.removeFirst()
-            } else {
-                listOf(chatResponses.removeFirst())
-            }
-            chunks.forEach(onDelta)
-            return Result.success(chunks.joinToString(""))
-        }
-
-        override suspend fun chatWithTools(
-            messages: List<Message>,
-            systemPrompt: String?,
-            tools: List<Tool>,
-            tokenLimit: Int?
-        ): Result<ChatResponse> {
-            chatWithToolsCalls++
-            lastMessages = messages.toList()
-            lastSystemPrompt = systemPrompt
-            lastTools = tools.toList()
-            return Result.success(toolResponses.removeFirst())
-        }
-
-        override suspend fun describeImage(base64Image: String, prompt: String, maxTokens: Int): Result<String> {
-            describeImageCalls++
-            return if (visionResponses.isNotEmpty()) {
-                Result.success(visionResponses.removeFirst())
-            } else {
-                Result.failure(ProviderException(provider, null, "No vision response", false))
-            }
-        }
-    }
 
     private class BlockingToolClient(
         private val response: ChatResponse,
