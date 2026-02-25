@@ -54,6 +54,9 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
         /** How long to wait for the accessibility service to reattach before aborting. */
         private const val ACCESSIBILITY_WAIT_MS_DEFAULT = 5000L
 
+        /** SharedPreferences name for onboarding runtime metrics. */
+        private const val ONBOARDING_METRICS_PREFS = "onboarding_metrics"
+
         /**
          * Map a tool name to a user-friendly status label using [OutputClassifier.categoryOf].
          *
@@ -388,6 +391,10 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
     /** Current onboarding message with pills, if any. */
     val onboardingMessage = mutableStateOf<OnboardingMessage?>(null)
 
+    /** True when a selected first task is executing through the normal chat pipeline. */
+    @VisibleForTesting
+    internal var onboardingFirstTaskPending = false
+
     /**
      * Initialize onboarding integration. Called from ChatActivity with
      * the appropriate dependencies.
@@ -397,11 +404,16 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
         modelRecommender: ModelRecommender,
         accessibilityHelper: AccessibilitySetupHelper
     ) {
+        val metricsPrefs = accessibilityHelper.appContext.getSharedPreferences(
+            ONBOARDING_METRICS_PREFS,
+            android.content.Context.MODE_PRIVATE
+        )
         val integration = OnboardingChatIntegration(
             onboardingManager = onboardingManager,
             modelRecommender = modelRecommender,
             accessibilityHelper = accessibilityHelper,
-            scope = viewModelScope
+            scope = viewModelScope,
+            metricsTracker = OnboardingMetricsTracker(metricsPrefs)
         )
         integration.onMessage = { msg ->
             messages.add(Message(role = "assistant", content = msg.text))
@@ -410,6 +422,10 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
         integration.onComplete = {
             onboardingActive.value = false
             onboardingMessage.value = null
+        }
+        integration.onFirstTaskSelected = { task ->
+            onboardingFirstTaskPending = true
+            sendMessage(task.text)
         }
         onboardingIntegration = integration
 
@@ -1022,6 +1038,7 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
 
         viewModelScope.launch {
             var toolSteps = 0
+            var runSuccessful = false
             try {
                 var screenContent = try {
                     if (ScreenReader.isAttached()) ScreenReader.getScreenContent() else null
@@ -1083,6 +1100,7 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
 
                 // If no tool calls, display text and we're done
                 if (response.toolCalls.isEmpty()) {
+                    runSuccessful = true
                     val text = response.text
                     if (text != null) {
                         // Update the streaming placeholder with the final text.
@@ -1121,6 +1139,7 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
                 if (agent == null) {
                     // Local mode fallback — run legacy loop
                     toolSteps = runLocalModeLoop(response, screenContent)
+                    runSuccessful = !toolLoopCancelled.get()
                 } else {
                     val executor = agentExecutorFactory(
                         this@ChatViewModel,
@@ -1141,6 +1160,7 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
 
                     toolSteps = when (result) {
                         is LoopResult.Completed -> {
+                            runSuccessful = !toolLoopCancelled.get()
                             val finalText = result.text
                             if (finalText != null) {
                                 messages.add(Message(role = "assistant", content = finalText))
@@ -1197,6 +1217,11 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
                 if (!toolLoopCancelled.get()) {
                     pendingTaskMessage = null
                 }
+                if (onboardingFirstTaskPending) {
+                    onboardingFirstTaskPending = false
+                    onboardingIntegration?.onFirstTaskCompleted(runSuccessful)
+                }
+
                 // Dispatch queued message only if loop was not cancelled.
                 // Clear before sending to prevent duplicate dispatch (#561):
                 // if sendMessage re-enters before the clear, the same message

@@ -5,7 +5,6 @@ import android.content.Context
 import android.provider.Settings
 import androidx.test.core.app.ApplicationProvider
 import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
@@ -16,7 +15,6 @@ import org.robolectric.RobolectricTestRunner
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
-import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 @RunWith(RobolectricTestRunner::class)
@@ -28,6 +26,7 @@ class OnboardingChatIntegrationTest {
     private lateinit var accessibilityHelper: AccessibilitySetupHelper
 
     private val collectedMessages = mutableListOf<OnboardingMessage>()
+    private val selectedFirstTasks = mutableListOf<SuggestedTask>()
     private var completeCalled = false
 
     @Before
@@ -37,6 +36,7 @@ class OnboardingChatIntegrationTest {
         prefs.edit().clear().commit()
         accessibilityHelper = AccessibilitySetupHelper(context)
         collectedMessages.clear()
+        selectedFirstTasks.clear()
         completeCalled = false
     }
 
@@ -82,12 +82,13 @@ class OnboardingChatIntegrationTest {
         integration.onPillTapped(OnboardingAction.SKIP_ACCESSIBILITY)
         assertEquals(OnboardingStep.FIRST_TASK, manager.currentStep)
         assertEquals(6, collectedMessages.size)
-        assertTrue(collectedMessages.last().text.contains("All set"))
+        assertTrue(collectedMessages.last().text.contains("Pick one first task"))
 
-        // Dismiss → COMPLETE
-        integration.onPillTapped(OnboardingAction.DISMISS)
+        // Complete first task → success message then COMPLETE
+        integration.onFirstTaskCompleted(success = true)
         assertTrue(completeCalled)
         assertTrue(manager.isComplete)
+        assertTrue(collectedMessages[collectedMessages.lastIndex - 1].text.contains("Nice — your first task"))
     }
 
     @Test
@@ -169,6 +170,25 @@ class OnboardingChatIntegrationTest {
         assertTrue(timeoutMessage.pills.any { it.action == OnboardingAction.RETRY_ACCESSIBILITY })
     }
 
+    @Test
+    fun `first task state generates suggested pills and tap triggers callback`() = runTest {
+        val manager = OnboardingManager(prefs)
+        manager.currentStep = OnboardingStep.FIRST_TASK
+        val integration = createIntegration(manager, ModelRecommender())
+
+        assertTrue(integration.activateIfNeeded())
+        val message = collectedMessages.last()
+        assertEquals(7, message.pills.size)
+        assertEquals("🌤️ Open the weather app", message.pills.first().label)
+
+        val firstAction = message.pills.first().action
+        assertTrue(firstAction is OnboardingAction.FIRST_TASK_SELECTED)
+        integration.onPillTapped(firstAction)
+
+        assertEquals(1, selectedFirstTasks.size)
+        assertEquals(SuggestedTask("Open the weather app", "🌤️"), selectedFirstTasks.first())
+    }
+
     private fun TestScope.createIntegration(
         manager: OnboardingManager,
         recommender: ModelRecommender
@@ -181,6 +201,7 @@ class OnboardingChatIntegrationTest {
         )
         integration.onMessage = { collectedMessages.add(it) }
         integration.onComplete = { completeCalled = true }
+        integration.onFirstTaskSelected = { selectedFirstTasks.add(it) }
         return integration
     }
 

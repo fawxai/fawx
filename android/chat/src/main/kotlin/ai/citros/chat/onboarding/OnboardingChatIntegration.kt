@@ -1,7 +1,7 @@
 package ai.citros.chat.onboarding
 
-import ai.citros.core.Message
 import ai.citros.core.Provider
+import kotlin.math.max
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 
@@ -16,7 +16,9 @@ class OnboardingChatIntegration(
     private val onboardingManager: OnboardingManager,
     private val modelRecommender: ModelRecommender,
     private val accessibilityHelper: AccessibilitySetupHelper,
-    private val scope: CoroutineScope
+    private val scope: CoroutineScope,
+    private val firstTaskGuide: FirstTaskGuide = FirstTaskGuide(),
+    private val metricsTracker: OnboardingMetricsTracker? = null
 ) {
 
     /** Callback for adding messages to the chat UI. */
@@ -24,6 +26,9 @@ class OnboardingChatIntegration(
 
     /** Callback when onboarding completes (all steps done or dismissed). */
     var onComplete: (() -> Unit)? = null
+
+    /** Callback when user selects a suggested first task. */
+    var onFirstTaskSelected: ((SuggestedTask) -> Unit)? = null
 
     /** Last recommendation cached for "See other models" flow. */
     private var lastRecommendation: ModelRecommendation? = null
@@ -39,6 +44,7 @@ class OnboardingChatIntegration(
      */
     fun activateIfNeeded(): Boolean {
         if (!onboardingManager.shouldActivate()) return false
+        metricsTracker?.load() ?: metricsTracker?.start()
         showMessageForCurrentStep()
         return true
     }
@@ -65,12 +71,11 @@ class OnboardingChatIntegration(
                 showMessageForCurrentStep()
             }
             OnboardingAction.USE_RECOMMENDED_MODEL -> {
+                metricsTracker?.recordModel(lastRecommendation?.model.orEmpty())
                 onboardingManager.onModelSelected()
                 showMessageForCurrentStep()
             }
-            OnboardingAction.SEE_OTHER_MODELS -> {
-                showAlternativeModels()
-            }
+            OnboardingAction.SEE_OTHER_MODELS -> showAlternativeModels()
             OnboardingAction.OPEN_SETTINGS -> {
                 if (accessibilityHelper.openAccessibilitySettings()) {
                     onboardingManager.onAccessibilityPromptShown()
@@ -87,7 +92,11 @@ class OnboardingChatIntegration(
             }
             OnboardingAction.DISMISS -> {
                 onboardingManager.dismiss()
+                metricsTracker?.complete()
                 onComplete?.invoke()
+            }
+            is OnboardingAction.FIRST_TASK_SELECTED -> {
+                onFirstTaskSelected?.invoke(action.task)
             }
         }
     }
@@ -98,17 +107,31 @@ class OnboardingChatIntegration(
      */
     fun onApiKeyValidated(provider: Provider, apiKey: String) {
         validatedApiKey = apiKey
+        metricsTracker?.recordProvider(provider.name)
         onboardingManager.onApiKeyValidated()
         recommendModel(provider, apiKey)
     }
 
+    /**
+     * Called after the selected first task finishes.
+     */
+    fun onFirstTaskCompleted(success: Boolean) {
+        if (onboardingManager.currentStep != OnboardingStep.FIRST_TASK) return
+        metricsTracker?.recordFirstTask(success)
+        if (success) {
+            onMessage?.invoke(OnboardingMessage(text = firstTaskGuide.successMessage(), pills = emptyList()))
+        }
+        onboardingManager.onFirstTaskFinished()
+        metricsTracker?.complete()
+        showMessageForCurrentStep()
+    }
+
     private fun showMessageForCurrentStep() {
+        metricsTracker?.recordStep(onboardingManager.currentStep.name)
         val message = when (onboardingManager.currentStep) {
             OnboardingStep.WELCOME -> OnboardingMessage(
-                text = "Hey! I'm Citros \u2014 I can control your phone to help you get things done. Let's get set up. It'll take about a minute.",
-                pills = listOf(
-                    Pill("Let's go!", OnboardingAction.CONTINUE)
-                )
+                text = "Hey! I'm Citros — I can control your phone to help you get things done. Let's get set up. It'll take about a minute.",
+                pills = listOf(Pill("Let's go!", OnboardingAction.CONTINUE))
             )
             OnboardingStep.API_KEY_CHOICE -> OnboardingMessage(
                 text = "I need an API key to think. Do you have one?",
@@ -122,17 +145,12 @@ class OnboardingChatIntegration(
                 pills = emptyList()
             )
             OnboardingStep.API_KEY_PROVIDER_GUIDE -> OnboardingMessage(
-                text = "Here are the providers you can use. Anthropic (Claude) is recommended \u2014 best quality for phone control.",
-                pills = listOf(
-                    Pill("I've got a key now", OnboardingAction.GOT_KEY_FROM_GUIDE)
-                )
+                text = "Here are the providers you can use. Anthropic (Claude) is recommended — best quality for phone control.",
+                pills = listOf(Pill("I've got a key now", OnboardingAction.GOT_KEY_FROM_GUIDE))
             )
-            OnboardingStep.MODEL_SELECTION -> {
-                // This step is handled by recommendModel() which posts its own message
-                null
-            }
+            OnboardingStep.MODEL_SELECTION -> null // handled by recommendModel()
             OnboardingStep.ACCESSIBILITY_PROMPT -> OnboardingMessage(
-                text = "One more thing \u2014 I need accessibility access to see and interact with your screen.",
+                text = "One more thing — I need accessibility access to see and interact with your screen.",
                 pills = listOf(
                     Pill("Open Settings", OnboardingAction.OPEN_SETTINGS),
                     Pill("Skip for now", OnboardingAction.SKIP_ACCESSIBILITY)
@@ -140,14 +158,13 @@ class OnboardingChatIntegration(
             )
             OnboardingStep.ACCESSIBILITY_WAIT -> null // handled by waitForAccessibility()
             OnboardingStep.FIRST_TASK -> OnboardingMessage(
-                text = "All set! Try saying:",
-                pills = listOf(
-                    Pill("Open my messages", OnboardingAction.DISMISS),
-                    Pill("What's the weather?", OnboardingAction.DISMISS),
-                    Pill("Set a timer for 5 minutes", OnboardingAction.DISMISS)
-                )
+                text = "All set! Pick one first task:",
+                pills = firstTaskGuide.suggestedTasks.map { task ->
+                    Pill("${task.emoji} ${task.text}", OnboardingAction.FIRST_TASK_SELECTED(task))
+                }
             )
             OnboardingStep.COMPLETE -> {
+                metricsTracker?.complete()
                 onComplete?.invoke()
                 null
             }
@@ -182,21 +199,22 @@ class OnboardingChatIntegration(
 
     private fun showAlternativeModels() {
         val rec = lastRecommendation ?: return
-        val alts = rec.alternatives.joinToString("\n") { "\u2022 ${AvailableModel(it, it).displayId}" }
+        val alts = rec.alternatives.joinToString("\n") { "• ${AvailableModel(it, it).displayId}" }
         onMessage?.invoke(
             OnboardingMessage(
                 text = "Other available models:\n$alts\n\nOr stick with the recommended one.",
-                pills = listOf(
-                    Pill("Use ${AvailableModel(rec.model, rec.model).displayId}", OnboardingAction.USE_RECOMMENDED_MODEL)
-                )
+                pills = listOf(Pill("Use ${AvailableModel(rec.model, rec.model).displayId}", OnboardingAction.USE_RECOMMENDED_MODEL))
             )
         )
     }
 
     private fun waitForAccessibility() {
         scope.launch {
+            val waitStart = System.currentTimeMillis()
             val granted = accessibilityHelper.waitForPermission()
             if (granted) {
+                val elapsed = max(0L, System.currentTimeMillis() - waitStart)
+                metricsTracker?.recordAccessibilityGrant(elapsed)
                 onboardingManager.onAccessibilityGranted()
                 showMessageForCurrentStep()
             } else {
@@ -216,17 +234,18 @@ class OnboardingChatIntegration(
 }
 
 /** Actions available as pill buttons during onboarding. */
-enum class OnboardingAction {
-    CONTINUE,
-    I_HAVE_KEY,
-    HELP_ME_GET_ONE,
-    GOT_KEY_FROM_GUIDE,
-    USE_RECOMMENDED_MODEL,
-    SEE_OTHER_MODELS,
-    OPEN_SETTINGS,
-    RETRY_ACCESSIBILITY,
-    SKIP_ACCESSIBILITY,
-    DISMISS
+sealed class OnboardingAction {
+    data object CONTINUE : OnboardingAction()
+    data object I_HAVE_KEY : OnboardingAction()
+    data object HELP_ME_GET_ONE : OnboardingAction()
+    data object GOT_KEY_FROM_GUIDE : OnboardingAction()
+    data object USE_RECOMMENDED_MODEL : OnboardingAction()
+    data object SEE_OTHER_MODELS : OnboardingAction()
+    data object OPEN_SETTINGS : OnboardingAction()
+    data object RETRY_ACCESSIBILITY : OnboardingAction()
+    data object SKIP_ACCESSIBILITY : OnboardingAction()
+    data object DISMISS : OnboardingAction()
+    data class FIRST_TASK_SELECTED(val task: SuggestedTask) : OnboardingAction()
 }
 
 /** A pill button displayed in the chat UI. */

@@ -59,6 +59,7 @@ import ai.citros.chat.onboarding.ModelRecommender
 import ai.citros.chat.onboarding.OnboardingAction
 import ai.citros.chat.onboarding.OnboardingManager
 import ai.citros.chat.onboarding.OnboardingStep
+import ai.citros.chat.onboarding.SuggestedTask
 import androidx.test.core.app.ApplicationProvider
 
 @RunWith(RobolectricTestRunner::class)
@@ -156,6 +157,58 @@ class ChatViewModelTest {
     }
 
     @Test
+    fun `setupOnboarding wires runtime onboarding metrics tracking`() = runTest {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        context
+            .getSharedPreferences("onboarding_metrics", android.content.Context.MODE_PRIVATE)
+            .edit()
+            .clear()
+            .commit()
+
+        val onboardingStatePrefs = context.getSharedPreferences(
+            "chat_vm_onboarding_metrics_state",
+            android.content.Context.MODE_PRIVATE
+        )
+        onboardingStatePrefs.edit().clear().commit()
+
+        viewModel.setupOnboarding(
+            onboardingManager = OnboardingManager(onboardingStatePrefs),
+            modelRecommender = ModelRecommender(),
+            accessibilityHelper = AccessibilitySetupHelper(context)
+        )
+
+        val metricsJson = context
+            .getSharedPreferences("onboarding_metrics", android.content.Context.MODE_PRIVATE)
+            .getString("onboarding_metrics", null)
+
+        assertNotNull(metricsJson)
+        assertTrue(metricsJson!!.contains("WELCOME"))
+    }
+
+    @Test
+    fun `setupOnboarding wires first-task callback to dispatch through sendMessage`() = runTest {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val prefs = context.getSharedPreferences("chat_vm_onboarding_first_task_callback", android.content.Context.MODE_PRIVATE)
+        prefs.edit().clear().commit()
+
+        viewModel.setupOnboarding(
+            onboardingManager = OnboardingManager(prefs),
+            modelRecommender = ModelRecommender(),
+            accessibilityHelper = AccessibilitySetupHelper(context)
+        )
+
+        val task = SuggestedTask(text = "open gmail and draft a check-in", emoji = "✉️")
+        val callback = viewModel.onboardingIntegration?.onFirstTaskSelected
+        assertNotNull(callback)
+
+        callback.invoke(task)
+        advanceUntilIdle()
+
+        assertTrue(viewModel.messages.any { it.role == "user" && it.content == task.text })
+        assertFalse(viewModel.onboardingFirstTaskPending)
+    }
+
+    @Test
     fun `onOnboardingPillTapped advances onboarding and updates onboardingMessage`() = runTest {
         val context = ApplicationProvider.getApplicationContext<android.content.Context>()
         val prefs = context.getSharedPreferences("chat_vm_onboarding_b", android.content.Context.MODE_PRIVATE)
@@ -191,8 +244,13 @@ class ChatViewModelTest {
 
         viewModel.onOnboardingPillTapped(OnboardingAction.USE_RECOMMENDED_MODEL)
         viewModel.onOnboardingPillTapped(OnboardingAction.SKIP_ACCESSIBILITY)
-        viewModel.onOnboardingPillTapped(OnboardingAction.DISMISS)
 
+        val firstTaskAction = viewModel.onboardingMessage.value?.pills?.firstOrNull()?.action
+        assertTrue(firstTaskAction is OnboardingAction.FIRST_TASK_SELECTED)
+        viewModel.onOnboardingPillTapped(firstTaskAction)
+        advanceUntilIdle()
+
+        assertFalse(viewModel.onboardingFirstTaskPending)
         assertFalse(viewModel.onboardingActive.value)
         assertNull(viewModel.onboardingMessage.value)
     }

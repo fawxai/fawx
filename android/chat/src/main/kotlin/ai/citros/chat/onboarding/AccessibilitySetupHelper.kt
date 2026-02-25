@@ -19,6 +19,9 @@ class AccessibilitySetupHelper(
     private val serviceClass: String = DEFAULT_SERVICE_CLASS
 ) {
 
+    val appContext: Context
+        get() = context.applicationContext
+
     /**
      * Launch the system accessibility settings screen.
      * Uses the standard ACTION_ACCESSIBILITY_SETTINGS intent — no OEM-specific extras.
