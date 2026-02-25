@@ -89,13 +89,11 @@ class AgentExecutor(
     /** Domain-agnostic source-quality classifier for runtime fallback signaling. */
     private val toolSignalClassifier: ToolSignalClassifier = ToolSignalClassifier()
 ) {
-    /**
-     * Per-tool consecutive failure counters for error severity escalation only.
-     *
-     * Distinct from `consecutiveFailures` in [run], which is a single global streak used by
-     * recovery detection across sequential tool calls (including calls in one model response).
-     */
+    private val completionGate = TaskCompletionGate()
+
+    /** Per-tool consecutive failure counters for error severity escalation. */
     private val failureCounts = mutableMapOf<String, Int>()
+    private val fallbackStateMachine = FailureFallbackStateMachine()
 
     companion object {
         /** Maximum number of tool execution steps before forcing loop exit. */
@@ -232,6 +230,7 @@ class AgentExecutor(
         continueAfterTools: suspend () -> ChatResponse
     ): LoopResult {
         failureCounts.clear()
+        completionGate.reset()
         var response: ChatResponse? = initialResponse
         var screenContent = initialScreenContent
         var toolSteps = 0
@@ -239,14 +238,13 @@ class AgentExecutor(
         // Distinct from `failureCounts`, which tracks per-tool retries for error severity escalation.
         var consecutiveFailures = 0
         var loopStateContext = LoopStateContext()
-        val sideEffectCompletionGuard = SideEffectCompletionGuard()
         val taskStartMs = System.currentTimeMillis()
         val taskId = java.util.UUID.randomUUID().toString()
 
         // If no tool calls in initial response, return immediately
         if (response == null || response.toolCalls.isEmpty()) {
             return LoopResult.Completed(
-                text = response?.text,
+                text = completionGate.guardFinalText(response?.text),
                 steps = 0,
                 exitReason = "no_tools"
             )
@@ -508,18 +506,18 @@ class AgentExecutor(
                 val isUiMutatingTool = delegate.isUiMutatingTool(toolCall.name)
 
                 // For UI-mutating tools, refresh screen and format result
-                val baseToolResult = if (isUiMutatingTool) {
+                val toolResult = if (isUiMutatingTool) {
                     screenContent = delegate.refreshScreenAfterTool(toolCall.name, actionResult.text)
                     delegate.formatToolResult(actionResult.text, screenContent)
                 } else {
                     actionResult.text
                 }
 
-                sideEffectCompletionGuard.recordExecution(
-                    toolCall = toolCall,
-                    actionResult = actionResult,
-                    screenBefore = preActionScreen,
-                    screenAfter = screenContent,
+                completionGate.recordExecution(
+                    toolName = toolCall.name,
+                    toolInput = toolCall.input,
+                    resultText = toolResult,
+                    isError = actionResult.isError,
                     isUiMutatingTool = isUiMutatingTool
                 )
 
@@ -527,10 +525,10 @@ class AgentExecutor(
                     toolCall = toolCall,
                     result = actionResult,
                     screenBefore = preActionScreen.toFingerprint(),
-                    screenAfter = screenContent.toFingerprint(),
                     // Shared across sequential tool calls (including calls in the same model batch).
                     // A success resets this streak, so recovery escalation reflects the current run's
                     // contiguous failure streak rather than lifetime failures.
+                    screenAfter = screenContent.toFingerprint(),
                     consecutiveFailures = consecutiveFailures
                 )
 
@@ -542,8 +540,8 @@ class AgentExecutor(
                     loopStateContext = loopStateContext.withLatestSignal(toolCall.name, signalClass)
                 }
 
-                val resultWithSignal = annotateResultWithSignal(baseToolResult, signalClass)
-                val toolResult = if (recoveryGuidance != null) {
+                val resultWithSignal = annotateResultWithSignal(toolResult, signalClass)
+                val toolResultWithRecovery = if (recoveryGuidance != null) {
                     // Keep deterministic signal annotation attached to the raw tool output first,
                     // then append optional recovery guidance. This preserves stable signal parsing
                     // while allowing recovery scaffolds to evolve independently.
@@ -569,6 +567,15 @@ class AgentExecutor(
                 )
                 val checkResult = evaluateBoundaryChecks(loopState)
 
+                val failureClass = classifyFailureClass(actionResult, effectiveSeverity)
+                val fallbackDirective = if (failureClass != null) {
+                    fallbackStateMachine.transition(failureClass).toLoopDirective()
+                } else {
+                    fallbackStateMachine.reset()
+                    ""
+                }
+                val toolResultWithFallback = toolResultWithRecovery + fallbackDirective
+
                 var pendingForCheckpoint = response.toolCalls.drop(toolIndex + 1)
                 var stopReason: String? = null
                 var shouldBreakToolBatch = false
@@ -576,7 +583,7 @@ class AgentExecutor(
                 when (checkResult) {
                     is CheckResult.Steer -> {
                         // Commit this tool's result as-is
-                        delegate.addToolResult(toolCall.id, toolResult, toolCall.name, actionResult.isError)
+                        delegate.addToolResult(toolCall.id, toolResultWithFallback, toolCall.name, actionResult.isError)
                         // Provide explicit skip results for remaining tool calls.
                         // The API contract requires every tool_use block to have a
                         // corresponding tool_result. Without this, the next API call
@@ -593,18 +600,24 @@ class AgentExecutor(
                         steered = true
                         shouldBreakToolBatch = true
                     }
+
                     is CheckResult.Stop -> {
-                        delegate.addToolResult(toolCall.id, toolResult, toolCall.name, actionResult.isError)
+                        delegate.addToolResult(toolCall.id, toolResultWithFallback, toolCall.name, actionResult.isError)
                         pendingForCheckpoint = emptyList()
                         stopReason = checkResult.reason
                     }
+
                     is CheckResult.Inject -> {
-                        delegate.addToolResult(toolCall.id, toolResult + checkResult.message, toolCall.name, actionResult.isError)
+                        delegate.addToolResult(
+                            toolCall.id,
+                            toolResultWithFallback + checkResult.message,
+                            toolCall.name,
+                            actionResult.isError
+                        )
                     }
+
                     CheckResult.Continue -> {
-                        // Continue intentionally relies on the shared checkpoint path below,
-                        // so every branch emits exactly one checkpoint callback per tool boundary.
-                        delegate.addToolResult(toolCall.id, toolResult, toolCall.name, actionResult.isError)
+                        delegate.addToolResult(toolCall.id, toolResultWithFallback, toolCall.name, actionResult.isError)
                     }
                 }
 
@@ -622,7 +635,7 @@ class AgentExecutor(
                     return LoopResult.Completed(
                         text = null,
                         steps = toolSteps,
-                        exitReason = stopReason
+                        exitReason = stopReason ?: "stopped"
                     )
                 }
 
@@ -657,7 +670,7 @@ class AgentExecutor(
             }
         }
 
-        val finalText = sideEffectCompletionGuard.guardFinalText(response?.text)
+        val finalText = completionGate.guardFinalText(response?.text)
         val exitReason = if (finalText != null) "end_turn" else "no_response"
 
         return LoopResult.Completed(
@@ -665,6 +678,21 @@ class AgentExecutor(
             steps = toolSteps,
             exitReason = exitReason
         )
+    }
+
+    private fun classifyFailureClass(
+        actionResult: ToolResult,
+        effectiveSeverity: ErrorSeverity?
+    ): FailureClass? {
+        if (!actionResult.isError) return null
+
+        return when (effectiveSeverity) {
+            ErrorSeverity.PERSISTENT -> FailureClass.BLOCKED
+            ErrorSeverity.TRANSIENT -> FailureClass.LOW_SIGNAL_DYNAMIC
+            ErrorSeverity.EXPLORATORY -> FailureClass.UNTRUSTED
+            ErrorSeverity.INFORMATIONAL -> FailureClass.PARTIAL
+            null -> FailureClass.UNTRUSTED
+        }
     }
 
     /**
