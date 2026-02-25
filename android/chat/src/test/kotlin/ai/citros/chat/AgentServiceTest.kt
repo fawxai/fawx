@@ -288,6 +288,28 @@ class AgentServiceTest {
     }
 
     @Test
+    fun `STEER natural-language permission resolves pending policy confirmation as approve`() {
+        configureWithMockApi()
+        service.setPendingPolicyConfirmationForTest("req-natural")
+        service.updateState(AgentState.WaitingForInput("task-1", "req-natural", "confirm", ai.citros.core.InputType.POLICY_CONFIRMATION))
+
+        service.onStartCommand(AgentService.steerIntent(service, "you have permission"), 0, 1)
+
+        assertFalse(service.agentState.value is AgentState.WaitingForInput)
+    }
+
+    @Test
+    fun `STEER natural-language denial resolves pending policy confirmation as deny`() {
+        configureWithMockApi()
+        service.setPendingPolicyConfirmationForTest("req-natural-deny")
+        service.updateState(AgentState.WaitingForInput("task-1", "req-natural-deny", "confirm", ai.citros.core.InputType.POLICY_CONFIRMATION))
+
+        service.onStartCommand(AgentService.steerIntent(service, "not now, cancel"), 0, 1)
+
+        assertFalse(service.agentState.value is AgentState.WaitingForInput)
+    }
+
+    @Test
     fun `STEER no resolves pending policy confirmation as deny`() {
         configureWithMockApi()
         service.setPendingPolicyConfirmationForTest("req-no")

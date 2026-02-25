@@ -31,7 +31,9 @@ import ai.citros.core.SensorProvider
 import ai.citros.core.Tool
 import ai.citros.core.ToolCall
 import ai.citros.core.ToolExecutionDelegate
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceTimeBy
@@ -2455,6 +2457,179 @@ class ChatViewModelTest {
         assertEquals(1, viewModel.steerQueue.size)
         assertEquals("go back instead", viewModel.steerQueue.peek())
         assertTrue(viewModel.hasQueuedSteer.value)
+    }
+
+    @Test
+    fun `steerMessage resolves pending policy confirmation from natural language`() {
+        val deferred = CompletableDeferred<Boolean>()
+        viewModel.setPendingPolicyConfirmationForTest("req-1", deferred)
+        viewModel.isLoading.value = true
+
+        viewModel.steerMessage("you have permission")
+
+        assertTrue(deferred.isCompleted)
+        assertEquals(true, deferred.getCompleted())
+        assertTrue(viewModel.steerQueue.isEmpty())
+        assertFalse(viewModel.hasQueuedSteer.value)
+        assertTrue(viewModel.messages.any { it.role == "user" && it.content == "you have permission" && it.isSteer })
+    }
+
+    @Test
+    fun `steerMessage keeps hasQueuedSteer true when confirmation resolves but queue already has steers`() {
+        val deferred = CompletableDeferred<Boolean>()
+        viewModel.setPendingPolicyConfirmationForTest("req-queued", deferred)
+        viewModel.isLoading.value = true
+        viewModel.steerQueue.offer("existing steer")
+        viewModel.hasQueuedSteer.value = true
+
+        viewModel.steerMessage("you have permission")
+
+        assertTrue(deferred.isCompleted)
+        assertEquals(true, deferred.getCompleted())
+        assertEquals(1, viewModel.steerQueue.size)
+        assertEquals("existing steer", viewModel.steerQueue.peek())
+        assertTrue(viewModel.hasQueuedSteer.value)
+    }
+
+    @Test
+    fun `setQueuedMessage resolves pending policy confirmation instead of queueing`() {
+        val deferred = CompletableDeferred<Boolean>()
+        viewModel.setPendingPolicyConfirmationForTest("req-2", deferred)
+        viewModel.isLoading.value = true
+
+        viewModel.setQueuedMessage("allow")
+
+        assertTrue(deferred.isCompleted)
+        assertEquals(true, deferred.getCompleted())
+        assertNull(viewModel.queuedMessage.value)
+        assertTrue(viewModel.messages.any { it.role == "user" && it.content == "allow" && !it.isSteer })
+    }
+
+    @Test
+    fun `steerMessage resolves deny confirmation from natural language`() {
+        val deferred = CompletableDeferred<Boolean>()
+        viewModel.setPendingPolicyConfirmationForTest("req-deny-steer", deferred)
+        viewModel.isLoading.value = true
+
+        viewModel.steerMessage("don't do that")
+
+        assertTrue(deferred.isCompleted)
+        assertEquals(false, deferred.getCompleted())
+        assertTrue(viewModel.steerQueue.isEmpty())
+        assertFalse(viewModel.hasQueuedSteer.value)
+        assertTrue(viewModel.messages.any { it.role == "user" && it.content == "don't do that" && it.isSteer })
+    }
+
+    @Test
+    fun `setQueuedMessage resolves deny confirmation from natural language`() {
+        val deferred = CompletableDeferred<Boolean>()
+        viewModel.setPendingPolicyConfirmationForTest("req-deny-queued", deferred)
+        viewModel.isLoading.value = true
+
+        viewModel.setQueuedMessage("no")
+
+        assertTrue(deferred.isCompleted)
+        assertEquals(false, deferred.getCompleted())
+        assertNull(viewModel.queuedMessage.value)
+        assertTrue(viewModel.messages.any { it.role == "user" && it.content == "no" && !it.isSteer })
+    }
+
+    @Test
+    fun `setQueuedMessage unrelated input passes through while confirmation remains pending`() {
+        val deferred = CompletableDeferred<Boolean>()
+        viewModel.setPendingPolicyConfirmationForTest("req-pass-through", deferred)
+        viewModel.isLoading.value = true
+
+        viewModel.setQueuedMessage("what is blocking you")
+
+        assertFalse(deferred.isCompleted)
+        assertEquals("what is blocking you", viewModel.queuedMessage.value)
+    }
+
+    @Test
+    fun `steerMessage unrelated input is queued while confirmation remains pending`() {
+        val deferred = CompletableDeferred<Boolean>()
+        viewModel.setPendingPolicyConfirmationForTest("req-pass-through-steer", deferred)
+        viewModel.isLoading.value = true
+
+        viewModel.steerMessage("what is blocking you")
+
+        assertFalse(deferred.isCompleted)
+        assertEquals(1, viewModel.steerQueue.size)
+        assertEquals("what is blocking you", viewModel.steerQueue.peek())
+    }
+
+    @Test
+    fun `confirmation reply message is added before deferred completion continuation`() {
+        val deferred = CompletableDeferred<Boolean>()
+        viewModel.setPendingPolicyConfirmationForTest("req-order", deferred)
+        viewModel.isLoading.value = true
+
+        deferred.invokeOnCompletion {
+            viewModel.messages.add(Message(role = "assistant", content = "continuation"))
+        }
+
+        viewModel.setQueuedMessage("yes")
+
+        val userIndex = viewModel.messages.indexOfFirst { it.role == "user" && it.content == "yes" }
+        val continuationIndex = viewModel.messages.indexOfFirst { it.role == "assistant" && it.content == "continuation" }
+        assertTrue(userIndex >= 0)
+        assertTrue(continuationIndex >= 0)
+        assertTrue(userIndex < continuationIndex)
+    }
+
+    @Test
+    fun `requestUserConfirmation replaces pending confirmation and cancels old deferred`() = runTest {
+        val first = CompletableDeferred<Boolean>()
+        viewModel.setPendingPolicyConfirmationForTest("req-old", first)
+
+        val secondRequest = backgroundScope.async {
+            viewModel.requestUserConfirmation(
+                toolCall = ToolCall("tc-1", "test_tool", emptyMap()),
+                requestId = "req-new",
+                reason = "Need approval",
+                timeoutMs = 5_000
+            )
+        }
+        advanceUntilIdle()
+
+        assertTrue(first.isCancelled)
+        viewModel.isLoading.value = true
+        viewModel.steerMessage("allow")
+        advanceUntilIdle()
+
+        assertTrue(secondRequest.await())
+    }
+
+    @Test
+    fun `requestUserConfirmation times out when wrapped by caller timeout`() = runTest {
+        val result = backgroundScope.async {
+            kotlinx.coroutines.withTimeoutOrNull(1_000) {
+                viewModel.requestUserConfirmation(
+                    toolCall = ToolCall("tc-timeout", "test_tool", emptyMap()),
+                    requestId = "req-timeout",
+                    reason = "Need approval",
+                    timeoutMs = 1_000
+                )
+            } ?: false
+        }
+
+        advanceTimeBy(1_001)
+        advanceUntilIdle()
+
+        assertFalse(result.await())
+    }
+
+    @Test
+    fun `onCleared cancels pending confirmation deferred`() {
+        val deferred = CompletableDeferred<Boolean>()
+        viewModel.setPendingPolicyConfirmationForTest("req-clear", deferred)
+
+        val onCleared = ChatViewModel::class.java.getDeclaredMethod("onCleared")
+        onCleared.isAccessible = true
+        onCleared.invoke(viewModel)
+
+        assertTrue(deferred.isCancelled)
     }
 
     @Test

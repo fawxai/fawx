@@ -408,16 +408,10 @@ class AgentService : Service() {
         }
 
         if (currentState is AgentState.WaitingForInput && currentState.inputType == InputType.POLICY_CONFIRMATION) {
-            val normalized = message.trim().lowercase()
-            when (normalized) {
-                "yes", "y", "allow", "approve", "continue", "resume", "ok" -> {
-                    resolvePolicyConfirmation(currentState.requestId, approved = true)
-                    return
-                }
-                "no", "n", "deny", "reject", "stop", "cancel" -> {
-                    resolvePolicyConfirmation(currentState.requestId, approved = false)
-                    return
-                }
+            val decision = PolicyConfirmationInputParser.parse(message)
+            if (decision != null) {
+                resolvePolicyConfirmation(currentState.requestId, approved = decision)
+                return
             }
         }
 

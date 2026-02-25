@@ -11,6 +11,7 @@ import ai.citros.core.*
 import ai.citros.core.VoiceManager
 import ai.citros.chat.onboarding.*
 import android.util.Log
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -282,6 +283,10 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
     }
 
     override fun onCleared() {
+        synchronized(pendingPolicyConfirmationLock) {
+            pendingPolicyConfirmation?.deferred?.cancel()
+            pendingPolicyConfirmation = null
+        }
         super.onCleared()
         releaseVoiceManager()
     }
@@ -371,6 +376,23 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
 
     /** Observable flag: true when steer messages are queued but not yet consumed. */
     val hasQueuedSteer = mutableStateOf(false)
+
+    @VisibleForTesting
+    internal data class PendingPolicyConfirmation(
+        val requestId: String,
+        val deferred: CompletableDeferred<Boolean>
+    )
+
+    private val pendingPolicyConfirmationLock = Any()
+
+    private var pendingPolicyConfirmation: PendingPolicyConfirmation? = null
+
+    @VisibleForTesting
+    internal fun setPendingPolicyConfirmationForTest(requestId: String, deferred: CompletableDeferred<Boolean>) {
+        synchronized(pendingPolicyConfirmationLock) {
+            pendingPolicyConfirmation = PendingPolicyConfirmation(requestId, deferred)
+        }
+    }
 
     /** Epoch millis of last user/agent activity. Updated on send and tool result. */
     var lastActivityTimestamp: Long = 0L
@@ -1394,6 +1416,37 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
         phoneAgentApi?.let { it.currentToolStep = step }
     }
 
+    override suspend fun requestUserConfirmation(
+        toolCall: ToolCall,
+        requestId: String,
+        reason: String,
+        timeoutMs: Long
+    ): Boolean {
+        val deferred = CompletableDeferred<Boolean>()
+        synchronized(pendingPolicyConfirmationLock) {
+            pendingPolicyConfirmation?.deferred?.cancel()
+            pendingPolicyConfirmation = PendingPolicyConfirmation(requestId, deferred)
+        }
+        messages.add(
+            Message(
+                role = "assistant",
+                content = "🔐 Confirm ${toolCall.name}? $reason Reply Yes/No."
+            )
+        )
+
+        return try {
+            // AgentExecutor owns confirmation timeout semantics (approve/deny/timeout).
+            // This delegate only handles request/response plumbing.
+            deferred.await()
+        } finally {
+            synchronized(pendingPolicyConfirmationLock) {
+                if (pendingPolicyConfirmation?.requestId == requestId) {
+                    pendingPolicyConfirmation = null
+                }
+            }
+        }
+    }
+
     // ========== LoopProgressListener implementation ==========
 
     override fun onToolStarted(toolName: String, toolIndex: Int, batchSize: Int) {
@@ -1473,7 +1526,34 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
         sendMessage(content)
     }
 
+    private fun resolvePendingPolicyConfirmationFromInput(
+        text: String,
+        fromSteer: Boolean
+    ): Boolean {
+        val approved = PolicyConfirmationInputParser.parse(text) ?: return false
+        val resolved = synchronized(pendingPolicyConfirmationLock) {
+            val pending = pendingPolicyConfirmation
+            if (pending == null) {
+                false
+            } else {
+                // Preserve chat ordering: surface user's confirmation reply before
+                // resuming the awaiting tool loop continuation.
+                messages.add(Message(role = "user", content = text, isSteer = fromSteer))
+                pending.deferred.complete(approved)
+            }
+        }
+        if (!resolved) return false
+
+        if (!fromSteer) {
+            queuedMessage.value = null
+        }
+        return true
+    }
+
     fun setQueuedMessage(text: String) {
+        if (isLoading.value && resolvePendingPolicyConfirmationFromInput(text, fromSteer = false)) {
+            return
+        }
         queuedMessage.value = text.takeIf { it.isNotBlank() }
     }
 
@@ -1593,6 +1673,10 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
      * also appears immediately in the UI message list with [Message.isSteer] = true.
      */
     fun steerMessage(text: String) {
+        if (isLoading.value && resolvePendingPolicyConfirmationFromInput(text, fromSteer = true)) {
+            hasQueuedSteer.value = steerQueue.isNotEmpty()
+            return
+        }
         if (!isLoading.value) {
             sendMessage(text)
             return
@@ -1729,6 +1813,10 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
         toolLoopCancelled.set(false)
         steerQueue.clear()
         hasQueuedSteer.value = false
+        synchronized(pendingPolicyConfirmationLock) {
+            pendingPolicyConfirmation?.deferred?.cancel()
+            pendingPolicyConfirmation = null
+        }
         isLoading.value = false
         currentToolStatus.value = null
         error.value = null
@@ -1768,6 +1856,10 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
         toolLoopCancelled.set(false)
         steerQueue.clear()
         hasQueuedSteer.value = false
+        synchronized(pendingPolicyConfirmationLock) {
+            pendingPolicyConfirmation?.deferred?.cancel()
+            pendingPolicyConfirmation = null
+        }
         lastUserMessage = null
         messages.clear()
     }
