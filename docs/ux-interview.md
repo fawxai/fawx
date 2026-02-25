@@ -68,7 +68,7 @@ In all cases, user can opt in or out of specific settings.
 - Tap-hold is primary wake gesture; 3D press is bonus on supported devices
 
 ### Design output
-→ Full spec: `docs/ui-spec-floating-bubble.md`
+→ Full spec: `docs/ui/ui-spec-floating-bubble.md`
 
 ---
 
@@ -94,7 +94,7 @@ Default tier decided during onboarding.
 - Idle orb shows faint colored ring indicating pending action
 
 ### Design output
-→ Full spec: `docs/ui-spec-floating-bubble.md` §4
+→ Full spec: `docs/ui/ui-spec-floating-bubble.md` §4
 
 ---
 
@@ -118,7 +118,7 @@ Screen-off bumps up one tier (moderate → speaks).
 - Specific tones/sounds to be decided later
 
 ### Design output
-→ Full spec: `docs/ui-spec-floating-bubble.md` §5
+→ Full spec: `docs/ui/ui-spec-floating-bubble.md` §5
 
 ---
 
@@ -130,7 +130,7 @@ Screen-off bumps up one tier (moderate → speaks).
 - **Theme:** Follows system theme (dark/light)
 
 ### Design output
-→ Full spec: `docs/ui-spec-floating-bubble.md` §6
+→ Full spec: `docs/ui/ui-spec-floating-bubble.md` §6
 
 ---
 
