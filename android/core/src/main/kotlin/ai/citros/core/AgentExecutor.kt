@@ -75,6 +75,8 @@ class AgentExecutor(
      */
     private val transformContext: (suspend () -> Unit)? = null
 ) {
+    private val completionGate = TaskCompletionGate()
+
     /** Per-tool consecutive failure counters for error severity escalation. */
     private val failureCounts = mutableMapOf<String, Int>()
 
@@ -158,6 +160,7 @@ class AgentExecutor(
         continueAfterTools: suspend () -> ChatResponse
     ): LoopResult {
         failureCounts.clear()
+        completionGate.reset()
         var response: ChatResponse? = initialResponse
         var screenContent = initialScreenContent
         var toolSteps = 0
@@ -165,7 +168,7 @@ class AgentExecutor(
         // If no tool calls in initial response, return immediately
         if (response == null || response.toolCalls.isEmpty()) {
             return LoopResult.Completed(
-                text = response?.text,
+                text = completionGate.guardFinalText(response?.text),
                 steps = 0,
                 exitReason = "no_tools"
             )
@@ -271,13 +274,23 @@ class AgentExecutor(
                 // Settle delay
                 delegate.settleDelay(toolCall.name, actionResult.text)
 
+                val isUiMutatingTool = delegate.isUiMutatingTool(toolCall.name)
+
                 // For UI-mutating tools, refresh screen and format result
-                val toolResult = if (delegate.isUiMutatingTool(toolCall.name)) {
+                val toolResult = if (isUiMutatingTool) {
                     screenContent = delegate.refreshScreenAfterTool(toolCall.name, actionResult.text)
                     delegate.formatToolResult(actionResult.text, screenContent)
                 } else {
                     actionResult.text
                 }
+
+                completionGate.recordExecution(
+                    toolName = toolCall.name,
+                    toolInput = toolCall.input,
+                    resultText = toolResult,
+                    isError = actionResult.isError,
+                    isUiMutatingTool = isUiMutatingTool
+                )
 
                 // === POST-TOOL BOUNDARY CHECK POINT ===
                 // Drain steer messages at each tool boundary so SteerCheck can see them.
@@ -289,7 +302,7 @@ class AgentExecutor(
                     lastScreenHash = screenContent?.hashCode(),
                     isCancelled = isCancelled(),
                     pendingSteerMessages = steerMessages,
-                    lastToolWasUiMutating = delegate.isUiMutatingTool(toolCall.name),
+                    lastToolWasUiMutating = isUiMutatingTool,
                     preActionScreenHash = preActionHash,
                     pendingInterruption = interruptionSource()
                 )
@@ -357,7 +370,7 @@ class AgentExecutor(
             }
         }
 
-        val finalText = response?.text
+        val finalText = completionGate.guardFinalText(response?.text)
         val exitReason = if (finalText != null) "end_turn" else "no_response"
 
         return LoopResult.Completed(
@@ -366,6 +379,7 @@ class AgentExecutor(
             exitReason = exitReason
         )
     }
+
 
     /**
      * Evaluate all boundary checks against the current state.
