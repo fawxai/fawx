@@ -51,6 +51,12 @@ android {
         unitTests {
             isReturnDefaultValues = true
             isIncludeAndroidResources = true
+            all {
+                it.systemProperty(
+                    "citros.runFlakyTests",
+                    project.findProperty("citrosRunFlakyTests")?.toString() ?: "true"
+                )
+            }
         }
     }
 

@@ -1,6 +1,8 @@
 package ai.citros.chat
 
 import ai.citros.core.ActionPolicy
+import ai.citros.test.Flaky
+import ai.citros.test.FlakyTestRule
 import ai.citros.core.AgentExecutor
 import ai.citros.core.AgentFileManager
 import ai.citros.core.ChatResponse
@@ -39,6 +41,7 @@ import kotlinx.coroutines.test.setMain
 import kotlinx.coroutines.test.resetMain
 import org.junit.After
 import org.junit.Before
+import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -61,6 +64,10 @@ import androidx.test.core.app.ApplicationProvider
 @RunWith(RobolectricTestRunner::class)
 @OptIn(ExperimentalCoroutinesApi::class)
 class ChatViewModelTest {
+
+    @Rule
+    @JvmField
+    val flakyTestRule = FlakyTestRule()
 
     private lateinit var viewModel: ChatViewModel
     private val testDispatcher = StandardTestDispatcher()
@@ -2800,6 +2807,7 @@ class ChatViewModelTest {
         assertEquals("Interacting...", viewModel.currentToolStatus.value)
     }
 
+    @Flaky("#751")
     @Test
     fun `retrying status auto clears and transient clear job cancellation prevents stale clear`() = runTest {
         viewModel.onToolError(

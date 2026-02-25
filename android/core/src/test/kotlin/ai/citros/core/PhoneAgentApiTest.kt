@@ -1,5 +1,7 @@
 package ai.citros.core
 
+import ai.citros.test.Flaky
+import ai.citros.test.FlakyTestRule
 import android.content.ClipboardManager
 import android.content.Context
 import android.graphics.Rect
@@ -17,6 +19,7 @@ import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.After
 import org.junit.Before
+import org.junit.Rule
 import org.junit.Test
 import java.util.concurrent.atomic.AtomicInteger
 import org.mockito.kotlin.any
@@ -35,6 +38,10 @@ import kotlin.system.measureTimeMillis
 import kotlin.time.Duration.Companion.milliseconds
 
 class PhoneAgentApiTest {
+
+    @Rule
+    @JvmField
+    val flakyTestRule = FlakyTestRule()
 
     private lateinit var server: MockWebServer
 
@@ -2998,6 +3005,7 @@ class PhoneAgentApiTest {
         assertTrue(agent.lastTaskCostSummary.estimatedCostUsd >= 0.000001)
     }
 
+    @Flaky("#751")
     @Test
     fun `concurrent sendMessage calls do not bypass pre-call budget cap`() = runTest {
         val client = BlockingToolClient(
@@ -3037,6 +3045,7 @@ class PhoneAgentApiTest {
         assertEquals(1, client.chatWithToolsCalls.get(), "only one provider call should execute under cap")
     }
 
+    @Flaky("#751")
     @Test
     fun `concurrent continueAfterTools calls do not bypass pre-call budget cap`() = runTest {
         val client = BlockingToolClient(
