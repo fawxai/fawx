@@ -385,6 +385,23 @@ Category: RATE-LIMITED
 - Any action on an app the agent hasn't used before → confirm first time
 ```
 
+Phase 1 concrete default scope (see `docs/archive/implemented/specs/h2-action-policy-engine.md`):
+- Hard deny precedence is explicit: `DENY > RATE_LIMIT > CONFIRM > ALLOW`.
+- First-use scope is explicit: first app-targeted action in an unseen app context this session requires confirmation (not `open_app` only).
+- Exfiltration controls are explicit: sending data to unrecognized/unapproved endpoints remains denied in Phase 1.
+- Hard deny list is concrete (`factory_reset`, `disable_policy_engine`, `modify_audit_log`, `root_shell`, `financial_transaction`) plus app-agnostic financial submit intents (including unknown/degraded app context).
+- Degraded-context fail-closed behavior is explicit: if foreground package is unknown and financial submit signals are present, interaction is denied in Phase 1.
+- Endpoint semantics are explicit: `unrecognized` means host parsing/canonicalization failed; `unapproved` means host is parsed but absent from signed allowlist.
+- URL egress bootstrap is explicit: a signed initial endpoint allowlist must be provisioned before `web_fetch`/`web_browse`/`web_search` can succeed.
+- URL-mode tool semantics are explicit: Phase 1 treats `web_browse` as URL-mode egress; query mode should use `web_search`.
+- Migration impact is explicit: query-style `web_browse` calls (without `url`) are hard-rejected in Phase 1 and must migrate to `web_search` + URL-mode `web_browse`.
+- `web_search` endpoint governance is explicit: policy host extraction uses `input.provider_endpoint` (not query text), matching signed allowlist rules.
+- App-targeted first-use behavior is fail-closed: if app identity cannot be resolved from tool input or foreground context, decision is `confirm.missing_app_identifier`.
+- Unknown tools default to `CONFIRM` (not `ALLOW`).
+- Confirmation is fail-closed: explicit user approval required; timeout or missing response is deny.
+- Policy wiring is fail-closed: no runtime "policy missing => allow all" mode.
+
+
 The policy engine runs in the same process as the daemon but is architecturally separated — the agent module cannot modify or bypass the policy module. Policy rules are loaded from a signed config file. Changing the policy requires re-signing the config with the user's key.
 
 #### 3.5.4 WASM Skill System
