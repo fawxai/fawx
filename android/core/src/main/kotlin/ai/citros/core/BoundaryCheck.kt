@@ -45,6 +45,24 @@ sealed class CheckResult {
 }
 
 /**
+ * Runtime signal context captured at tool boundaries.
+ *
+ * Slice-1 semantics intentionally keep only the latest classified signal/tool pair.
+ * In multi-tool batches (e.g., `web_search` followed by `web_fetch`) each new
+ * classified signal replaces the previous one.
+ */
+data class LoopStateContext(
+    /** Latest classified signal for research tools, overwritten at each classified boundary. */
+    val latestToolSignal: ToolSignalClass? = null,
+    /** Tool name that produced [latestToolSignal]. */
+    val latestSignalToolName: String? = null
+) {
+    // TODO(slice-2): Consider accumulating signal history for multi-tool research sequences.
+    fun withLatestSignal(toolName: String, signalClass: ToolSignalClass): LoopStateContext =
+        copy(latestToolSignal = signalClass, latestSignalToolName = toolName)
+}
+
+/**
  * Snapshot of the loop's state at a tool boundary, passed to [BoundaryCheck]es.
  *
  * Built by [AgentExecutor] after each tool call. Checks read from this
@@ -56,6 +74,7 @@ sealed class CheckResult {
  * @param lastScreenHash Hash of the current screen content, or null if screen unavailable
  * @param isCancelled Whether the user has requested cancellation
  * @param pendingSteerMessages User messages queued for mid-loop injection via [SteerCheck]
+ * @param context Runtime loop context (e.g. latest tool signal classification)
  */
 data class LoopState(
     val step: Int,
@@ -66,7 +85,8 @@ data class LoopState(
     val pendingSteerMessages: List<String> = emptyList(),
     val lastToolWasUiMutating: Boolean = false,
     val preActionScreenHash: Int? = null,
-    val pendingInterruption: InterruptionEvent? = null
+    val pendingInterruption: InterruptionEvent? = null,
+    val context: LoopStateContext = LoopStateContext()
 )
 
 /**

@@ -85,7 +85,9 @@ class AgentExecutor(
      * Optional hook invoked after each tool boundary with checkpoint metadata.
      * Used by service architecture to persist durable recovery state.
      */
-    private val checkpointCallback: (suspend (LoopCheckpoint) -> Unit)? = null
+    private val checkpointCallback: (suspend (LoopCheckpoint) -> Unit)? = null,
+    /** Domain-agnostic source-quality classifier for runtime fallback signaling. */
+    private val toolSignalClassifier: ToolSignalClassifier = ToolSignalClassifier()
 ) {
     /**
      * Per-tool consecutive failure counters for error severity escalation only.
@@ -102,6 +104,9 @@ class AgentExecutor(
         /** Maximum length for error messages in tool results and loop results. */
         const val ERROR_MESSAGE_MAX_LENGTH = 100
         const val CONFIRM_TIMEOUT_MS = 60_000L
+
+        /** Tool names currently covered by runtime research signal classification. */
+        private val RESEARCH_SIGNAL_TOOL_NAMES = setOf("web_search", "web_fetch")
 
         /**
          * Default boundary checks (without accessibility gating).
@@ -189,6 +194,28 @@ class AgentExecutor(
         return kotlin.runCatching { java.net.IDN.toASCII(host.trim().trimEnd('.').lowercase()) }.getOrNull()
     }
 
+    /**
+     * Classify runtime source quality for research tools.
+     *
+     * Slice-1 intentionally scopes this to `web_search` and `web_fetch` so rollout
+     * remains low-risk while fallback hint behavior is validated. Future slices can
+     * extend [RESEARCH_SIGNAL_TOOL_NAMES] as additional tools adopt signal semantics.
+     */
+    private fun classifyResearchSignal(toolCall: ToolCall, actionResult: ToolResult): ToolSignalClass? {
+        if (toolCall.name !in RESEARCH_SIGNAL_TOOL_NAMES) return null
+        return toolSignalClassifier.classify(toolCall, actionResult)
+    }
+
+    private fun annotateResultWithSignal(toolResult: String, signalClass: ToolSignalClass?): String {
+        val annotation = signalClass?.let { ToolSignalFallbackHints.annotationFor(it) } ?: return toolResult
+        return buildString {
+            append(toolResult.trimEnd())
+            appendLine()
+            appendLine()
+            append(annotation)
+        }
+    }
+
     private suspend fun emitRequiredPolicyAudit(event: PolicyAuditEvent, toolCall: ToolCall): Boolean {
         val writeResult = policyAuditLogger.emit(event)
         rolloutTelemetry.recordRequiredAuditEmission(writeResult.isSuccess)
@@ -211,6 +238,7 @@ class AgentExecutor(
         // Recovery-level streak across tool calls in this run (global, not per tool name).
         // Distinct from `failureCounts`, which tracks per-tool retries for error severity escalation.
         var consecutiveFailures = 0
+        var loopStateContext = LoopStateContext()
         val sideEffectCompletionGuard = SideEffectCompletionGuard()
         val taskStartMs = System.currentTimeMillis()
         val taskId = java.util.UUID.randomUUID().toString()
@@ -503,10 +531,19 @@ class AgentExecutor(
                 val recoveryGuidance = failure?.let { recoveryManager.evaluateFailure(it) }
                 if (failure != null) consecutiveFailures++ else consecutiveFailures = 0
 
+                val signalClass = classifyResearchSignal(toolCall, actionResult)
+                if (signalClass != null) {
+                    loopStateContext = loopStateContext.withLatestSignal(toolCall.name, signalClass)
+                }
+
+                val resultWithSignal = annotateResultWithSignal(baseToolResult, signalClass)
                 val toolResult = if (recoveryGuidance != null) {
-                    baseToolResult + recoveryGuidance
+                    // Keep deterministic signal annotation attached to the raw tool output first,
+                    // then append optional recovery guidance. This preserves stable signal parsing
+                    // while allowing recovery scaffolds to evolve independently.
+                    resultWithSignal + recoveryGuidance
                 } else {
-                    baseToolResult
+                    resultWithSignal
                 }
 
                 // === POST-TOOL BOUNDARY CHECK POINT ===
@@ -521,7 +558,8 @@ class AgentExecutor(
                     pendingSteerMessages = steerMessages,
                     lastToolWasUiMutating = isUiMutatingTool,
                     preActionScreenHash = preActionHash,
-                    pendingInterruption = interruptionSource()
+                    pendingInterruption = interruptionSource(),
+                    context = loopStateContext
                 )
                 val checkResult = evaluateBoundaryChecks(loopState)
 
@@ -569,7 +607,8 @@ class AgentExecutor(
                         step = toolSteps,
                         maxSteps = maxToolSteps,
                         lastToolName = toolCall.name,
-                        pendingToolCalls = pendingForCheckpoint
+                        pendingToolCalls = pendingForCheckpoint,
+                        context = loopStateContext
                     )
                 )
 
@@ -658,7 +697,8 @@ data class LoopCheckpoint(
     val step: Int,
     val maxSteps: Int,
     val lastToolName: String,
-    val pendingToolCalls: List<ToolCall>
+    val pendingToolCalls: List<ToolCall>,
+    val context: LoopStateContext = LoopStateContext()
 )
 
 /**

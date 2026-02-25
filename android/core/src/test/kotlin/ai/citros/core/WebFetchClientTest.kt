@@ -114,19 +114,19 @@ class WebFetchClientTest {
     }
 
     @Test
-    fun `fetch dynamic travel HTTP error includes best-effort guidance`() = runTest {
+    fun `fetch dynamic travel HTTP error includes dynamic-page marker`() = runTest {
         server.enqueue(MockResponse().setResponseCode(403).setBody("Forbidden"))
 
         val client = WebFetchClient()
         val result = client.fetch(server.url("/travel/flights/flights-from-denver-to-tampa.html").toString())
 
         assertTrue(result.isError)
-        assertTrue(result.text.contains("dynamic travel site"))
-        assertTrue(result.text.contains("do NOT ask the user to manually open apps"))
+        assertTrue(result.text.contains("dynamic content page"))
+        assertTrue(result.text.contains("403"))
     }
 
     @Test
-    fun `fetch blank dynamic travel page returns guidance without error flag`() = runTest {
+    fun `fetch blank dynamic travel page returns shell marker without error flag`() = runTest {
         val htmlShell = """
         <html>
           <head><title></title></head>
@@ -144,7 +144,7 @@ class WebFetchClientTest {
         val result = client.fetch(server.url("/travel/flights/flights-from-lax-to-jfk.html").toString())
 
         assertFalse(result.isError)
-        assertTrue(result.text.contains("dynamic travel site"))
+        assertTrue(result.text.contains("dynamic page shell"))
     }
 
     @Test

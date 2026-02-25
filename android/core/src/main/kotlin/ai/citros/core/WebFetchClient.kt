@@ -28,45 +28,6 @@ class WebFetchClient {
         internal const val CONTENT_TYPE_XHTML = "application/xhtml"
         internal const val ACCEPT_HEADER = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
 
-        // Initial dynamic-travel URL coverage for sites known to frequently render flight
-        // results with JavaScript-heavy shells.
-        // TODO(citros): Expand this list as fetch telemetry surfaces additional domains.
-        internal val DYNAMIC_TRAVEL_URL_MARKERS = listOf(
-            "/travel/flights",
-            "google.com/flights",
-            "kayak.com/flight",
-            "flightconnections.com",
-            "expedia.com/flights",
-            "booking.com/flights"
-        )
-
-        // Some providers have variable path structures; require a flight hint to reduce
-        // false positives from non-flight pages on the same domain.
-        internal val DYNAMIC_TRAVEL_DOMAINS_REQUIRING_FLIGHT_HINT = listOf(
-            "skyscanner.",
-            "southwest.com",
-            "united.com",
-            "delta.com"
-        )
-
-        private val PRICE_SIGNAL_REGEX =
-            Regex("""\$\s?\d|usd\s?\d|\d\s?usd""", RegexOption.IGNORE_CASE)
-        private val CITY_ROUTE_SIGNAL_REGEX = Regex(
-            """\bfrom\s+[A-Za-z][A-Za-z.'-]{2,}\s+to\s+[A-Za-z][A-Za-z.'-]{2,}\b""",
-            RegexOption.IGNORE_CASE
-        )
-        private val IATA_ROUTE_SIGNAL_REGEX =
-            Regex("""\b[A-Z]{3}\b\s*(?:→|->|to)\s*\b[A-Z]{3}\b""")
-        private val TRAVEL_CONTEXT_SIGNAL_REGEX = Regex(
-            """\b(flight|flights|fare|fares|airline|airport|depart|arrival)\b""",
-            RegexOption.IGNORE_CASE
-        )
-        private val IATA_TOKEN_REGEX = Regex("""\b[A-Z]{3}\b""")
-        private val NON_ROUTE_IATA_TOKENS = setOf(
-            "USD", "FAQ", "API", "APP", "WWW", "HTTP", "HTTPS",
-            "HTML", "JSON", "XML", "UTC", "EST", "PST", "CST", "MST", "GMT"
-        )
-
         /** User-Agent with Android OS version for accurate site rendering decisions. */
         internal val USER_AGENT = "Citros/1.0 (Android ${Build.VERSION.RELEASE}; ${Build.MODEL}; AI Assistant)"
     }
@@ -107,16 +68,13 @@ class WebFetchClient {
 
                 val response = httpClient.newCall(request).execute()
                 if (!response.isSuccessful) {
-                    if (isLikelyDynamicTravelUrl(url)) {
-                        return@withContext ToolResult(
-                            "Fetch blocked (${response.code}) on a dynamic travel site. " +
-                                "Use web_search results/snippets from multiple sources and provide a best-effort answer with uncertainty; " +
-                                "do NOT ask the user to manually open apps.",
-                            isError = true
-                        )
+                    val prefix = if (isLikelyDynamicTravelUrl(url)) {
+                        "Fetch failed (${response.code}) on a dynamic content page"
+                    } else {
+                        "Fetch failed (${response.code})"
                     }
                     return@withContext ToolResult(
-                        "Fetch failed (${response.code}): ${response.message}",
+                        "$prefix: ${response.message}",
                         isError = true
                     )
                 }
@@ -137,11 +95,10 @@ class WebFetchClient {
                 if (text.isBlank()) {
                     if (isLikelyDynamicTravelUrl(url)) {
                         // Intentionally non-error: the request succeeded, but the page is
-                        // likely a dynamic shell. Treat this as guidance so orchestration can
-                        // continue with search snippets instead of short-circuiting as a hard failure.
+                        // likely a dynamic shell. Runtime fallback guidance is appended by
+                        // AgentExecutor from deterministic signal classification.
                         return@withContext ToolResult(
-                            "Fetched page shell for a dynamic travel site, but no readable fare rows were exposed. " +
-                                "Continue with web_search snippets and provide best-effort options with uncertainty; do NOT ask the user to manually open apps."
+                            "Fetched dynamic page shell with limited static content."
                         )
                     }
                     return@withContext ToolResult(
@@ -151,11 +108,10 @@ class WebFetchClient {
                 }
 
                 if (isLikelyDynamicTravelShell(url, text)) {
-                    // Intentionally non-error: we have partial signal from a shell page and
-                    // should keep the flow moving with best-effort guidance.
+                    // Intentionally non-error: partial signal from a shell page.
+                    // Runtime fallback guidance is appended by deterministic signal class.
                     return@withContext ToolResult(
-                        "Fetched a dynamic travel shell page with limited static fare data. " +
-                            "Use web_search snippets/alternative sources for concrete prices and clearly label uncertainty."
+                        "Fetched dynamic page shell with limited static content."
                     )
                 }
 
@@ -177,40 +133,11 @@ class WebFetchClient {
         }
     }
 
-    internal fun isLikelyDynamicTravelUrl(url: String): Boolean {
-        val lower = url.lowercase()
-        if (DYNAMIC_TRAVEL_URL_MARKERS.any { lower.contains(it) }) {
-            return true
-        }
+    internal fun isLikelyDynamicTravelUrl(url: String): Boolean =
+        TravelSignalCompatibility.isLikelyDynamicTravelUrl(url)
 
-        val knownDomain = DYNAMIC_TRAVEL_DOMAINS_REQUIRING_FLIGHT_HINT.any { lower.contains(it) }
-        return knownDomain && lower.contains("flight")
-    }
-
-    internal fun isLikelyDynamicTravelShell(url: String, extractedText: String): Boolean {
-        if (!isLikelyDynamicTravelUrl(url)) return false
-        val text = extractedText.trim()
-        if (text.isEmpty()) return true
-
-        val hasPriceSignal = PRICE_SIGNAL_REGEX.containsMatchIn(text)
-        val hasRouteSignal = hasGenericRouteSignal(text)
-        return !hasPriceSignal && !hasRouteSignal
-    }
-
-    private fun hasGenericRouteSignal(text: String): Boolean {
-        if (CITY_ROUTE_SIGNAL_REGEX.containsMatchIn(text) || IATA_ROUTE_SIGNAL_REGEX.containsMatchIn(text)) {
-            return true
-        }
-        if (!TRAVEL_CONTEXT_SIGNAL_REGEX.containsMatchIn(text)) {
-            return false
-        }
-
-        val iataTokens = IATA_TOKEN_REGEX.findAll(text)
-            .map { it.value.uppercase() }
-            .filterNot { it in NON_ROUTE_IATA_TOKENS }
-            .toSet()
-        return iataTokens.size >= 2
-    }
+    internal fun isLikelyDynamicTravelShell(url: String, extractedText: String): Boolean =
+        TravelSignalCompatibility.isLikelyDynamicTravelShell(url, extractedText)
 
     /**
      * Extract readable text from HTML using Jsoup.
