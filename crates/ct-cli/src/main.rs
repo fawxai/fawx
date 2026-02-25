@@ -3,7 +3,7 @@
 mod commands;
 mod confirmation;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 pub use confirmation::ConfirmationUi;
 
@@ -70,6 +70,44 @@ enum Commands {
         #[arg(long)]
         scope: Option<String>,
     },
+
+    /// Run deterministic agent-loop eval harness and emit machine-readable metrics.
+    EvalDeterminism {
+        /// Eval mode: ci-lite (fast) or full (nightly/manual)
+        #[arg(long, value_enum, default_value_t = EvalModeArg::CiLite)]
+        mode: EvalModeArg,
+
+        /// Output report path (JSON)
+        #[arg(long, default_value = ".ci/determinism/latest-report.json")]
+        output: String,
+
+        /// Optional baseline report path for trend deltas
+        #[arg(long)]
+        baseline: Option<String>,
+
+        /// Write current report as baseline snapshot
+        #[arg(long, default_value_t = false)]
+        update_baseline: bool,
+
+        /// Exit non-zero when metrics regress against baseline
+        #[arg(long, default_value_t = false)]
+        fail_on_regression: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum EvalModeArg {
+    CiLite,
+    Full,
+}
+
+impl From<EvalModeArg> for commands::eval_harness::EvalMode {
+    fn from(value: EvalModeArg) -> Self {
+        match value {
+            EvalModeArg::CiLite => Self::CiLite,
+            EvalModeArg::Full => Self::Full,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -165,6 +203,22 @@ async fn main() -> anyhow::Result<()> {
                 scope,
             };
             commands::oauth_bridge::run(options).await?
+        }
+        Commands::EvalDeterminism {
+            mode,
+            output,
+            baseline,
+            update_baseline,
+            fail_on_regression,
+        } => {
+            let options = commands::eval_harness::Options {
+                mode: mode.into(),
+                output: output.into(),
+                baseline: baseline.map(Into::into),
+                update_baseline,
+                fail_on_regression,
+            };
+            commands::eval_harness::run(options)?
         }
     };
 

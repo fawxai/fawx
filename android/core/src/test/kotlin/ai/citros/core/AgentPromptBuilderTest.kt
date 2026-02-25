@@ -85,6 +85,65 @@ class AgentPromptBuilderTest {
     }
 
     @Test
+    fun `full passes domain guardrail mode through to PhoneAgentPrompts`() {
+        val manager = AgentFileManager.fromDirectory(tempRoot)
+        val builder = AgentPromptBuilder(manager)
+
+        val genericPrompt = builder.full(
+            domainGuardrailMode = PhoneAgentPrompts.DomainGuardrailMode.GENERIC
+        )
+        val compatibilityPrompt = builder.full(
+            domainGuardrailMode = PhoneAgentPrompts.DomainGuardrailMode.COMPATIBILITY
+        )
+
+        assertFalse(
+            genericPrompt.contains("Search vs Browse vs Chrome"),
+            "GENERIC mode should omit tactical strategy web directives"
+        )
+        assertTrue(
+            genericPrompt.contains("Tool failed or unavailable"),
+            "GENERIC mode should use generic recovery guidance"
+        )
+
+        assertTrue(
+            compatibilityPrompt.contains("Search vs Browse vs Chrome"),
+            "COMPATIBILITY mode should include tactical strategy web directives"
+        )
+        assertTrue(
+            compatibilityPrompt.contains("Web search failed"),
+            "COMPATIBILITY mode should include tactical recovery guidance"
+        )
+    }
+
+    @Test
+    fun `full keeps small tier prompts generic even in compatibility mode`() {
+        val manager = AgentFileManager.fromDirectory(tempRoot)
+        val builder = AgentPromptBuilder(manager)
+
+        val prompt = builder.full(
+            modelName = "claude-3-5-haiku-latest",
+            domainGuardrailMode = PhoneAgentPrompts.DomainGuardrailMode.COMPATIBILITY
+        )
+
+        assertTrue(
+            prompt.contains("- Direct commands: act immediately with one tool call"),
+            "SMALL tier should use compact strategy section"
+        )
+        assertFalse(
+            prompt.contains("Search vs Browse vs Chrome"),
+            "SMALL tier should not include tactical strategy web directives"
+        )
+        assertFalse(
+            prompt.contains("Web search failed"),
+            "SMALL tier should not include tactical recovery guidance"
+        )
+        assertTrue(
+            prompt.contains("Tool failed or unavailable"),
+            "SMALL tier should align with generic recovery guidance"
+        )
+    }
+
+    @Test
     fun `full passes sensorContext through to composed prompt`() {
         val manager = AgentFileManager.fromDirectory(tempRoot)
         val builder = AgentPromptBuilder(manager)

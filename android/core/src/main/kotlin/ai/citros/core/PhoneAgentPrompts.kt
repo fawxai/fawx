@@ -15,6 +15,11 @@ import java.time.format.DateTimeFormatter
  */
 object PhoneAgentPrompts {
 
+    enum class DomainGuardrailMode {
+        GENERIC,
+        COMPATIBILITY
+    }
+
     /** Default prompt for vision-based screenshot description. */
     const val DEFAULT_VISION_PROMPT = "Describe what you see on this phone screen in detail. Include all visible text, UI elements, and their layout."
     private const val LOW_BATTERY_THRESHOLD_PERCENT = 15
@@ -201,43 +206,42 @@ When they're just chatting, respond naturally without using tools."""
 - Planning: think"""
 
     // ── Section 3: Strategy ─────────────────────────────────────────────
+    private const val STRATEGY_SECTION_TITLE = "## Strategy"
 
-    internal const val SECTION_STRATEGY = """## Strategy
-
-### Direct Commands — Act Immediately
+    private const val STRATEGY_DIRECT_COMMANDS = """### Direct Commands — Act Immediately
 "Open Gmail" → open_app("Gmail"). Done.
 "Go home" → press_home. Done.
 "Go back" → press_back. Done.
-One tool call. No observation needed.
+One tool call. No observation needed."""
 
-### Research — Search Before Navigating
+    private const val STRATEGY_RESEARCH = """### Research — Search Before Navigating
 When the user asks a factual question, try web_search first. Only open a browser app if the user specifically asks to browse.
 "What's the weather?" → web_search("weather in [city]"). Return the answer.
 "Look up the score" → web_search("[team] score today"). Return the answer.
 "Open Google" → open_app("Google"). Direct command to launch the app.
 "Google the weather" → web_search("weather"). Search task, not an app launch.
-Don't open Chrome just to Google something — use web_search directly.
+Don't open Chrome just to Google something — use web_search directly."""
 
-### Learning — Record What Works
+    private const val STRATEGY_LEARNING = """### Learning — Record What Works
 After discovering a workaround or successful strategy for an app, use learn() to record it.
 Good patterns to record:
 - Element tap doesn't work → what does work instead
 - Navigation path that's non-obvious (e.g., "Settings is under the 3-dot menu, not the gear icon")
 - App-specific quirks (keyboard blocking, autocomplete issues, elements not in accessibility tree)
-Don't record obvious things (pressing home goes home) or one-time flukes.
+Don't record obvious things (pressing home goes home) or one-time flukes."""
 
-### Save Requests — Prefer Built-in Memory, Not Notes Apps
+    private const val STRATEGY_SAVE_REQUESTS = """### Save Requests — Prefer Built-in Memory, Not Notes Apps
 When the user says things like "write this down", "save this", or "save the top 3 to my notes" without naming an app, use built-in memory tools (remember for general notes; learn for reusable app strategies).
 Do NOT open Notes/Keep/Docs apps by default for generic save phrasing.
-Only navigate to a notes app when the user explicitly requests a specific app, e.g., "open Google Keep and create a note".
+Only navigate to a notes app when the user explicitly requests a specific app, e.g., "open Google Keep and create a note"."""
 
-### Web Tools — Search vs Browse vs Chrome
+    private const val STRATEGY_WEB_TOOLS = """### Web Tools — Search vs Browse vs Chrome
 Pick the right tool for the job:
 - **Need information** (facts, links, answers) → web_search. Fast, lightweight, no browser needed.
 - **Need web interaction** (fill forms, book something, compare prices across sites, multi-step flows) → web_browse. It automates a real browser to navigate pages, click buttons, and complete tasks.
-- **Chrome on device** → Only if the user explicitly asks to open Chrome, or if web_browse is not available and the task requires real browser interaction. Never open Chrome just to search for something.
+- **Chrome on device** → Only if the user explicitly asks to open Chrome, or if web_browse is not available and the task requires real browser interaction. Never open Chrome just to search for something."""
 
-### Tasks — Open, Read, Act, Check
+    private const val STRATEGY_TASKS = """### Tasks — Open, Read, Act, Check
 1. Open the target app
 2. Read the screen to find what you need
 3. Act on it — tap, type, scroll
@@ -246,22 +250,22 @@ Pick the right tool for the job:
 
 Multi-step requests are not complete after just opening an app.
 Example: "Open Gmail and start a draft" means open Gmail, enter compose, focus the message field, and begin drafting.
-If the keyboard appears while you're still in the same app/task flow, treat it as normal progress — not an app switch and not completion.
+If the keyboard appears while you're still in the same app/task flow, treat it as normal progress — not an app switch and not completion."""
 
-### Execution — Act, Don't Announce
+    private const val STRATEGY_EXECUTION = """### Execution — Act, Don't Announce
 - **Never announce an action without doing it.** "Let me open Settings" as a text-only response is useless — call the tool in the same turn.
 - If you intend to do something, include the tool call. Text without tools = conversation, not action.
 - Wrong: "I'll help you change your wallpaper! Let me open the wallpaper settings." (no tool call)
-- Right: Use open_app("Settings") in the same response, then navigate to wallpaper.
+- Right: Use open_app("Settings") in the same response, then navigate to wallpaper."""
 
-### Efficiency
+    private const val STRATEGY_EFFICIENCY = """### Efficiency
 - Every action returns the updated screen. Don't call read_screen after actions — you already have it.
 - One action per step. You see the result before deciding the next move.
 - Prefer tap(element_id) over tap_text — IDs are unambiguous, text can match wrong elements.
 - Scroll before giving up. The element might be below the fold.
-- Don't screenshot to verify simple actions. Trust the tool result.
+- Don't screenshot to verify simple actions. Trust the tool result."""
 
-### When Uncertain — Think, Then Ask or Act
+    private const val STRATEGY_WHEN_UNCERTAIN = """### When Uncertain — Think, Then Ask or Act
 If a request is ambiguous, don't blindly guess and don't blindly ask — reason first.
 
 1. **Use existing context** — conversation history, what's already on screen, recency, the user's wording.
@@ -278,6 +282,40 @@ Calibrate by stakes:
 - **High stakes** (who to message, what to delete, payments) → lean toward asking.
 
 **Messaging rule:** Before messaging or calling someone, you must be confident you have the right person. If the name is common, ambiguous, or has no recent conversation context, ask which contact the user means — don't search and pick one."""
+
+    // Compose tactical and generic strategy variants from shared building blocks
+    // so updates to common guidance stay in one place.
+    private fun composeStrategySection(includeTacticalWebGuidance: Boolean): String {
+        val sections = mutableListOf(
+            STRATEGY_SECTION_TITLE,
+            STRATEGY_DIRECT_COMMANDS
+        )
+        if (includeTacticalWebGuidance) {
+            sections.add(STRATEGY_RESEARCH)
+        }
+        sections.add(STRATEGY_LEARNING)
+        sections.add(STRATEGY_SAVE_REQUESTS)
+        if (includeTacticalWebGuidance) {
+            sections.add(STRATEGY_WEB_TOOLS)
+        }
+        sections.addAll(
+            listOf(
+                STRATEGY_TASKS,
+                STRATEGY_EXECUTION,
+                STRATEGY_EFFICIENCY,
+                STRATEGY_WHEN_UNCERTAIN
+            )
+        )
+        return sections.joinToString("\n\n")
+    }
+
+    internal val SECTION_STRATEGY: String by lazy {
+        composeStrategySection(includeTacticalWebGuidance = true)
+    }
+
+    internal val SECTION_STRATEGY_GENERIC: String by lazy {
+        composeStrategySection(includeTacticalWebGuidance = false)
+    }
 
     internal const val SECTION_STRATEGY_SMALL = """## Strategy
 
@@ -307,6 +345,22 @@ Calibrate by stakes:
 **Web search failed:** Tell the user the search didn't work and suggest they try again. Do NOT open Chrome or any browser app as a workaround — the user asked for information, not a browser window.
 
 **Web browse failed or unavailable:** If web_browse returns an error or isn't configured, tell the user the web task couldn't be completed. Only fall back to Chrome if the task genuinely requires a browser and the user confirms they want that."""
+
+    internal const val SECTION_RECOVERY_GENERIC = """## When Things Go Wrong
+
+**Tap didn't work:** The element may have moved or the screen changed. Read the screen for fresh IDs and try again.
+
+**Screen hasn't changed after 2 actions:** You're stuck. Try a different approach — scroll to find the element, use tap_text instead of tap (or vice versa), press back and take a different path. After 3 failed attempts on the same step, alert the user about what's blocking you.
+
+**App didn't open or "not found":** Press home first, then try open_app again. Check the exact app name.
+
+**Loading or spinner:** Wait 2-3 seconds, then read_screen. Don't wait more than twice — if still loading, tell the user.
+
+**Wrong app or screen:** Press back or press home to reset, then start over from the correct app.
+
+**Keyboard blocking elements:** Scroll down or dismiss the keyboard (press back) to reveal hidden buttons.
+
+**Tool failed or unavailable:** Explain briefly what failed, and choose the next best available tool for the same user intent. Ask for user confirmation before any fallback that changes app/surface significantly."""
 
     // ── Section 5: Communication Policy ────────────────────────────────
 
@@ -435,16 +489,44 @@ When executing tools, follow these guidelines for what to communicate to the use
         return lines.joinToString("\n")
     }
 
-    private fun buildStrategySection(mode: PromptMode, tier: ModelTier, phoneControlAvailable: Boolean): String? {
+    private fun shouldUseCompatibilityDomainGuardrails(
+        tier: ModelTier,
+        domainGuardrailMode: DomainGuardrailMode
+    ): Boolean {
+        return tier != ModelTier.SMALL && domainGuardrailMode == DomainGuardrailMode.COMPATIBILITY
+    }
+
+    private fun buildStrategySection(
+        mode: PromptMode,
+        tier: ModelTier,
+        phoneControlAvailable: Boolean,
+        domainGuardrailMode: DomainGuardrailMode
+    ): String? {
         return when (mode) {
             PromptMode.NONE -> null
             PromptMode.MINIMAL -> buildMinimalReminders(phoneControlAvailable)
-            PromptMode.FULL -> if (tier == ModelTier.SMALL) SECTION_STRATEGY_SMALL else SECTION_STRATEGY
+            PromptMode.FULL -> when {
+                tier == ModelTier.SMALL -> {
+                    // SMALL tier intentionally stays on compact generic strategy guidance.
+                    // Keep this aligned with buildRecoverySection(), which also ignores
+                    // compatibility guardrails for SMALL tier.
+                    SECTION_STRATEGY_SMALL
+                }
+
+                shouldUseCompatibilityDomainGuardrails(tier, domainGuardrailMode) -> SECTION_STRATEGY
+                else -> SECTION_STRATEGY_GENERIC
+            }
         }
     }
 
-    private fun buildRecoverySection(mode: PromptMode): String? =
-        if (mode == PromptMode.FULL) SECTION_RECOVERY else null
+    private fun buildRecoverySection(
+        mode: PromptMode,
+        tier: ModelTier,
+        domainGuardrailMode: DomainGuardrailMode
+    ): String? =
+        if (mode != PromptMode.FULL) null
+        else if (shouldUseCompatibilityDomainGuardrails(tier, domainGuardrailMode)) SECTION_RECOVERY
+        else SECTION_RECOVERY_GENERIC
 
     private fun buildCommunicationSection(phoneControlAvailable: Boolean, mode: PromptMode): String? =
         if (mode == PromptMode.FULL && phoneControlAvailable) SECTION_COMMUNICATION else null
@@ -579,6 +661,7 @@ $line
         securityContent: String? = null,
         mode: PromptMode = PromptMode.FULL,
         modelTier: ModelTier? = null,
+        domainGuardrailMode: DomainGuardrailMode = DomainGuardrailMode.GENERIC,
         sensorContext: SensorContext? = null,
         resolvedToolPlan: ResolvedToolPlan? = null
     ): String {
@@ -593,6 +676,7 @@ $line
                 securityContent = securityContent,
                 mode = mode,
                 modelTier = modelTier,
+                domainGuardrailMode = domainGuardrailMode,
                 sensorContext = sensorContext,
                 resolvedToolPlan = resolvedToolPlan
             ).finalPrompt
@@ -603,9 +687,9 @@ $line
         val sections = listOfNotNull(
             buildIdentitySection(identityContent, mode),
             buildToolsSection(phoneControlAvailable, mode, tier, resolvedToolPlan),
-            buildStrategySection(mode, tier, phoneControlAvailable),
+            buildStrategySection(mode, tier, phoneControlAvailable, domainGuardrailMode),
             buildDeviceAwarenessSection(sensorContext, mode),
-            buildRecoverySection(mode),
+            buildRecoverySection(mode, tier, domainGuardrailMode),
             buildCommunicationSection(phoneControlAvailable, mode),
             buildDisambiguationSection(mode),
             buildAgentDirectivesSection(agentsContent, mode),
@@ -637,6 +721,7 @@ $line
         securityContent: String? = null,
         mode: PromptMode = PromptMode.FULL,
         modelTier: ModelTier? = null,
+        domainGuardrailMode: DomainGuardrailMode = DomainGuardrailMode.GENERIC,
         sensorContext: SensorContext? = null,
         resolvedToolPlan: ResolvedToolPlan? = null,
         timestamp: java.time.Instant = java.time.Instant.now()
@@ -658,9 +743,12 @@ $line
 
         addSection(PromptBudget.SectionId.IDENTITY_BASELINE, buildIdentitySection(identityContent, mode))
         addSection(PromptBudget.SectionId.TOOLS, buildToolsSection(phoneControlAvailable, mode, tier, resolvedToolPlan))
-        addSection(PromptBudget.SectionId.STRATEGY_DETAIL, buildStrategySection(mode, tier, phoneControlAvailable))
+        addSection(
+            PromptBudget.SectionId.STRATEGY_DETAIL,
+            buildStrategySection(mode, tier, phoneControlAvailable, domainGuardrailMode)
+        )
         addSection(PromptBudget.SectionId.DEVICE_AWARENESS, buildDeviceAwarenessSection(sensorContext, mode))
-        addSection(PromptBudget.SectionId.RECOVERY_ELABORATION, buildRecoverySection(mode))
+        addSection(PromptBudget.SectionId.RECOVERY_ELABORATION, buildRecoverySection(mode, tier, domainGuardrailMode))
         addSection(PromptBudget.SectionId.COMMUNICATION_STYLE, buildCommunicationSection(phoneControlAvailable, mode))
         addSection(PromptBudget.SectionId.VERBOSE_EXAMPLES, buildVerboseExamplesSection(phoneControlAvailable, mode))
         addSection(PromptBudget.SectionId.TOOL_PARAMETER_DETAIL, buildToolParameterDetailSection(phoneControlAvailable, mode, tier))
@@ -729,6 +817,7 @@ $line
         modelName: String? = null,
         securityContent: String? = null,
         modelTier: ModelTier? = null,
+        domainGuardrailMode: DomainGuardrailMode = DomainGuardrailMode.GENERIC,
         sensorContext: SensorContext? = null,
         resolvedToolPlan: ResolvedToolPlan? = null
     ): String {
@@ -738,6 +827,7 @@ $line
             securityContent = securityContent,
             mode = PromptMode.MINIMAL,
             modelTier = modelTier,
+            domainGuardrailMode = domainGuardrailMode,
             sensorContext = sensorContext,
             resolvedToolPlan = resolvedToolPlan
         )

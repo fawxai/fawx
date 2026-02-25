@@ -16,7 +16,8 @@ class ScriptedProviderClient(
     private val streamingResponses: ArrayDeque<List<String>> = ArrayDeque<List<String>>(),
     private val toolResponses: ArrayDeque<ChatResponse> = ArrayDeque<ChatResponse>(),
     private val visionResponses: ArrayDeque<String> = ArrayDeque<String>(),
-    override val modelId: String? = null
+    override val modelId: String? = null,
+    private val toolResponseResults: ArrayDeque<Result<ChatResponse>> = ArrayDeque<Result<ChatResponse>>()
 ) : ProviderClient {
     var chatCalls = 0
     var chatWithUsageCalls = 0
@@ -71,7 +72,11 @@ class ScriptedProviderClient(
         lastMessages = messages.toList()
         lastSystemPrompt = systemPrompt
         lastTools = tools.toList()
-        return Result.success(toolResponses.removeFirst())
+        return if (toolResponseResults.isNotEmpty()) {
+            toolResponseResults.removeFirst()
+        } else {
+            Result.success(toolResponses.removeFirst())
+        }
     }
 
     override suspend fun describeImage(base64Image: String, prompt: String, maxTokens: Int): Result<String> {

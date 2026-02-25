@@ -59,6 +59,9 @@ open class PhoneAgentApi(
     },
     /** Citros app token for authenticating to Citros API endpoints. */
     private val citrosAppToken: String? = null,
+    /** Compatibility mode for tactical domain-specific web guardrails. */
+    private val domainGuardrailMode: PhoneAgentPrompts.DomainGuardrailMode =
+        PhoneAgentPrompts.DomainGuardrailMode.GENERIC,
     /** Sensor provider for device context injection. Null to disable. */
     private val sensorProvider: SensorProvider? = null,
     /** ScreenReader attachment check, injectable for unit tests. */
@@ -202,7 +205,12 @@ open class PhoneAgentApi(
 
     /** Shared search client — reuses OkHttpClient connection pools across calls. */
     private val searchClient by lazy {
-        WebSearchClient(citrosAppToken = citrosAppToken, searxngBaseUrl = searchBaseUrl, braveApiKey = braveApiKey)
+        WebSearchClient(
+            citrosAppToken = citrosAppToken,
+            searxngBaseUrl = searchBaseUrl,
+            braveApiKey = braveApiKey,
+            domainGuardrailMode = domainGuardrailMode
+        )
     }
 
     /** Shared fetch client — reuses OkHttpClient connection pool across calls. */
@@ -235,9 +243,128 @@ open class PhoneAgentApi(
      * @return Combined list of phone tools + applicable API tools
      */
     fun getToolsForModel(modelId: String? = null): List<Tool> {
+        val activeConstraints = currentConstraintSnapshot()
+        return getToolsForModel(modelId, activeConstraints)
+    }
+
+    private fun getToolsForModel(
+        modelId: String? = null,
+        activeConstraints: List<RuntimeToolConstraint>
+    ): List<Tool> {
         val tier = modelId?.let { ModelClassifier.classify(it) } ?: ModelTier.STANDARD
         val tools = PhoneTools.getToolsForCategories(ToolCategory.entries.toSet(), tier)
-        return if (tinyFishApiKey != null) tools else tools.filter { it.name != "web_browse" }
+        val base = if (tinyFishApiKey != null) tools else tools.filter { it.name != "web_browse" }
+        return applyConstraintsToTools(base, activeConstraints)
+    }
+
+    private fun currentConstraintSnapshot(): List<RuntimeToolConstraint> {
+        expireConstraintsIfNeeded()
+        return activeConstraintsSnapshot()
+    }
+
+    private fun applyConstraintsToTools(
+        tools: List<Tool>,
+        activeConstraints: List<RuntimeToolConstraint>? = null
+    ): List<Tool> {
+        val constraints = activeConstraints ?: currentConstraintSnapshot()
+        if (constraints.isEmpty()) return tools
+        return tools.filter { tool ->
+            val decision = resolveToolConstraintDecision(tool.name, constraints)
+            if (!decision.allowed) {
+                Log.d(TAG, "Constraint filtered advertised tool '${tool.name}': ${decision.reason ?: "blocked"}")
+            }
+            decision.allowed
+        }
+    }
+
+    /**
+     * Resolve whether a tool is allowed by active runtime constraints.
+     *
+     * Allow-lists use strict intersection semantics: if multiple active constraints
+     * provide non-empty [RuntimeToolConstraint.allowedTools], a tool must appear
+     * in every allow-list to be allowed.
+     */
+    private fun resolveToolConstraintDecision(
+        toolName: String,
+        activeConstraints: List<RuntimeToolConstraint>? = null
+    ): ToolConstraintDecision {
+        val active = activeConstraints ?: currentConstraintSnapshot()
+        if (active.isEmpty()) return ToolConstraintDecision(allowed = true)
+
+        val allowSets = active.map { it.allowedTools }.filter { it.isNotEmpty() }
+        val allowByAllowList = if (allowSets.isEmpty()) true else allowSets.all { toolName in it }
+
+        val denyConstraint = active.firstOrNull { toolName in it.disallowedTools }
+        if (denyConstraint != null) {
+            return ToolConstraintDecision(
+                allowed = false,
+                reason = denyConstraint.reason ?: "${denyConstraint.source} disallowed $toolName"
+            )
+        }
+
+        if (!allowByAllowList) {
+            val source = active.firstOrNull { it.allowedTools.isNotEmpty() }?.source ?: "runtime constraint"
+            return ToolConstraintDecision(
+                allowed = false,
+                reason = "$source allow-list excludes $toolName"
+            )
+        }
+
+        return ToolConstraintDecision(allowed = true)
+    }
+
+    private enum class ConstraintLifecycleState {
+        ACTIVE,
+        INACTIVE,
+        EXPIRED
+    }
+
+    /**
+     * Centralized runtime-constraint lifecycle classifier.
+     *
+     * TASK constraints intentionally distinguish:
+     * - INACTIVE: bound to a future task (`createdTaskId > currentTaskId`)
+     * - EXPIRED: bound to a finished task (`createdTaskId < currentTaskId`)
+     *
+     * This keeps active filtering and expiry sweeps aligned while preserving
+     * the current-task (`==`) vs old-task (`<`) semantics.
+     */
+    private fun constraintLifecycleState(constraint: RuntimeToolConstraint): ConstraintLifecycleState {
+        if (!constraint.enabled) return ConstraintLifecycleState.EXPIRED
+        if (constraint.scope == ConstraintScope.TURN && modelTurnCounter > constraint.createdTurn) {
+            return ConstraintLifecycleState.EXPIRED
+        }
+
+        val turnsSinceCreated = modelTurnCounter - constraint.createdTurn
+        if (constraint.expiresAfterTurns != null && turnsSinceCreated >= constraint.expiresAfterTurns) {
+            return ConstraintLifecycleState.EXPIRED
+        }
+
+        if (constraint.scope == ConstraintScope.TASK && constraint.createdTaskId != currentTaskId) {
+            return if (constraint.createdTaskId < currentTaskId) {
+                ConstraintLifecycleState.EXPIRED
+            } else {
+                ConstraintLifecycleState.INACTIVE
+            }
+        }
+
+        return ConstraintLifecycleState.ACTIVE
+    }
+
+    private fun activeConstraintsSnapshot(): List<RuntimeToolConstraint> {
+        return runtimeConstraints.filter { constraintLifecycleState(it) == ConstraintLifecycleState.ACTIVE }
+    }
+
+    @Synchronized
+    private fun expireConstraintsIfNeeded() {
+        val expired = runtimeConstraints.filter { constraintLifecycleState(it) == ConstraintLifecycleState.EXPIRED }
+        if (expired.isEmpty()) return
+
+        runtimeConstraints.removeAll(expired.toSet())
+
+        val summary = expired.take(3).joinToString { "${it.scope}:${it.source}" }
+        val suffix = if (expired.size > 3) ", +${expired.size - 3} more" else ""
+        Log.d(TAG, "Expired ${expired.size} runtime constraint(s): [$summary$suffix]")
     }
 
     /**
@@ -311,6 +438,33 @@ open class PhoneAgentApi(
     }
 
     private val messages: MutableList<Message> = CopyOnWriteArrayList()
+    private val runtimeConstraints: MutableList<RuntimeToolConstraint> = CopyOnWriteArrayList()
+
+    /**
+     * Constraint snapshot captured when a model response is accepted.
+     *
+     * Execute-time hard gating uses this snapshot so tool execution is evaluated
+     * against the same constraint set that was active when the model emitted the calls.
+     */
+    @Volatile
+    private var executionConstraintSnapshot: List<RuntimeToolConstraint>? = null
+
+    /** Monotonic model turn counter for TURN/session expiry bookkeeping. */
+    @Volatile
+    private var modelTurnCounter: Int = 0
+
+    /** Current task identifier. Advanced on each non-action-loop sendMessage call. */
+    @Volatile
+    private var currentTaskId: Int = 0
+
+    /**
+     * True while the current task is still in-flight (i.e., action loop not finished).
+     *
+     * TASK-scoped constraints created while false are bound to the next task.
+     */
+    @Volatile
+    private var isTaskInProgress: Boolean = false
+
     private val requestFlowMutex = Mutex()
     private val clearRequested = AtomicBoolean(false)
     private val deferredSeedMessages = AtomicReference<DeferredSeedRequest?>(null)
@@ -385,6 +539,124 @@ open class PhoneAgentApi(
      * Set by ChatViewModel to update UI status text.
      */
     var onToolProgress: ((String) -> Unit)? = null
+
+    /** Create and activate a runtime tool constraint. */
+    @Synchronized
+    fun createRuntimeConstraint(
+        scope: ConstraintScope,
+        allowedTools: Set<String> = emptySet(),
+        disallowedTools: Set<String> = emptySet(),
+        source: String,
+        reason: String? = null,
+        expiresAfterTurns: Int? = null
+    ): RuntimeToolConstraint {
+        require(expiresAfterTurns == null || expiresAfterTurns > 0) {
+            "expiresAfterTurns must be > 0 when provided"
+        }
+
+        // TASK constraints created while idle should apply to the *next* user task.
+        // TASK constraints created mid-loop should stay on the current task.
+        val taskScopedId = when (scope) {
+            ConstraintScope.TASK -> if (isTaskInProgress) currentTaskId else currentTaskId + 1
+            else -> currentTaskId
+        }
+
+        val constraint = RuntimeToolConstraint(
+            scope = scope,
+            allowedTools = allowedTools,
+            disallowedTools = disallowedTools,
+            source = source,
+            reason = reason,
+            createdTurn = modelTurnCounter,
+            createdTaskId = taskScopedId,
+            expiresAfterTurns = expiresAfterTurns
+        )
+        runtimeConstraints.add(constraint)
+        executionConstraintSnapshot = null
+        return constraint
+    }
+
+    /**
+     * Update an existing runtime constraint by id.
+     *
+     * Uses clear semantics for optional fields:
+     * - pass clearReason=true to erase reason
+     * - pass clearExpiry=true to erase expiresAfterTurns
+     */
+    @Synchronized
+    fun updateRuntimeConstraint(
+        id: String,
+        allowedTools: Set<String>? = null,
+        disallowedTools: Set<String>? = null,
+        reason: String? = null,
+        enabled: Boolean? = null,
+        expiresAfterTurns: Int? = null,
+        clearReason: Boolean = false,
+        clearExpiry: Boolean = false
+    ): RuntimeToolConstraint? {
+        require(!(clearReason && reason != null)) {
+            "Cannot set reason and clearReason=true in the same update"
+        }
+        require(!(clearExpiry && expiresAfterTurns != null)) {
+            "Cannot set expiresAfterTurns and clearExpiry=true in the same update"
+        }
+        require(expiresAfterTurns == null || expiresAfterTurns > 0) {
+            "expiresAfterTurns must be > 0 when provided"
+        }
+
+        val existing = runtimeConstraints.firstOrNull { it.id == id } ?: return null
+        val updated = existing.copy(
+            allowedTools = allowedTools ?: existing.allowedTools,
+            disallowedTools = disallowedTools ?: existing.disallowedTools,
+            reason = when {
+                clearReason -> null
+                reason != null -> reason
+                else -> existing.reason
+            },
+            enabled = enabled ?: existing.enabled,
+            expiresAfterTurns = when {
+                clearExpiry -> null
+                expiresAfterTurns != null -> expiresAfterTurns
+                else -> existing.expiresAfterTurns
+            }
+        )
+        runtimeConstraints.removeAll { it.id == id }
+        runtimeConstraints.add(updated)
+        executionConstraintSnapshot = null
+        return updated
+    }
+
+    /** Explicitly clear a runtime constraint by id. */
+    @Synchronized
+    fun clearRuntimeConstraint(id: String): Boolean {
+        executionConstraintSnapshot = null
+        return runtimeConstraints.removeAll { it.id == id }
+    }
+
+    /** Expire all constraints matching a scope. */
+    @Synchronized
+    fun clearRuntimeConstraints(scope: ConstraintScope? = null) {
+        executionConstraintSnapshot = null
+        if (scope == null) runtimeConstraints.clear()
+        else runtimeConstraints.removeAll { it.scope == scope }
+    }
+
+    /** Force lifecycle-based expiry and return number of removed constraints. */
+    @Synchronized
+    fun expireRuntimeConstraints(): Int {
+        val before = runtimeConstraints.size
+        expireConstraintsIfNeeded()
+        val expired = before - runtimeConstraints.size
+        if (expired > 0) executionConstraintSnapshot = null
+        return expired
+    }
+
+    /** Exposed for tests/debugging. */
+    @Synchronized
+    internal fun activeRuntimeConstraints(): List<RuntimeToolConstraint> {
+        expireConstraintsIfNeeded()
+        return activeConstraintsSnapshot()
+    }
 
     /**
      * Override for phone control availability check. When null, uses [ScreenReader.isAttached()].
@@ -576,6 +848,10 @@ open class PhoneAgentApi(
         onTextDelta: ((String) -> Unit)? = null
     ): ChatResponse = withRequestFlowLock {
         if (!isActionLoop) {
+            currentTaskId++
+            isTaskInProgress = true
+            expireConstraintsIfNeeded()
+
             resetTaskCostTracking()
             requestToolsExpandedCategories.clear()
             requestToolsCallCounts.clear()
@@ -590,7 +866,7 @@ open class PhoneAgentApi(
 
         // When phone control is not available, always use chat mode without tools (#390).
         // This prevents the model from hallucinating XML tool calls in plain text.
-        val phoneControlAvailable = phoneControlOverride ?: ScreenReader.isAttached()
+        val phoneControlAvailable = phoneControlOverride ?: isScreenReaderAttached()
         val forceToolModeForResume =
             !isActionLoop &&
                 isResumeIntent(userMessage) &&
@@ -603,6 +879,7 @@ open class PhoneAgentApi(
                 "isActionLoop=$isActionLoop, forceResumeToolMode=$forceToolModeForResume, msg='${userMessage.take(60)}'"
         )
         if (useChatMode) {
+            executionConstraintSnapshot = null
             // When phone control is unavailable, prepend a system note so the
             // model knows not to attempt phone actions.
             val chatMessage = if (!phoneControlAvailable) {
@@ -617,13 +894,13 @@ open class PhoneAgentApi(
             }
             checkBudgetBeforeApiCall()
             val chatResult: Result<Pair<String, TokenUsage?>> = if (onTextDelta != null) {
-                chatClient.chatStreaming(conversation, onTextDelta).map { text ->
-                    text to null
+                chatClient.chatStreaming(conversation, onTextDelta).map { streamedText ->
+                    streamedText to null
                 }
             } else {
                 chatClient.chatWithUsage(conversation)
             }
-            return chatResult.fold(
+            return@withRequestFlowLock chatResult.fold(
                 onSuccess = { (rawText, usage) ->
                     // Strip any hallucinated tool artifacts from chat-mode responses
                     val text = stripToolArtifacts(rawText)
@@ -637,9 +914,11 @@ open class PhoneAgentApi(
                     )
                     messages.add(Message(role = "user", content = userMessage))
                     messages.add(Message(role = "assistant", content = text))
+                    isTaskInProgress = false
                     ChatResponse(text = text, toolCalls = emptyList(), stopReason = "end_turn")
                 },
                 onFailure = { error ->
+                    isTaskInProgress = false
                     ChatResponse(
                         text = "Error: ${error.message}",
                         toolCalls = emptyList(),
@@ -675,7 +954,9 @@ open class PhoneAgentApi(
             expandedCategories = requestToolsExpandedCategories.toSet(),
             includeRequestToolsCappedReason = requestToolsCappedThisTask
         )
-        val toolsForModel = applyActiveToolConstraintToToolList(baseToolsForModel)
+        val turnConstraintSnapshot = currentConstraintSnapshot()
+        val toolsWithActiveConstraint = applyActiveToolConstraintToToolList(baseToolsForModel)
+        val toolsForModel = applyConstraintsToTools(toolsWithActiveConstraint, turnConstraintSnapshot)
         if (toolPlan != null) {
             lastResolvedToolPlan = toolPlan
             logToolPlanTelemetry(toolPlan, isActionLoop = isActionLoop)
@@ -685,12 +966,14 @@ open class PhoneAgentApi(
             val actionPrompt = promptBuilder?.trimmed(
                 phoneControlAvailable = phoneControlAvailable,
                 modelName = modelName,
+                domainGuardrailMode = domainGuardrailMode,
                 sensorContext = sensorSnapshot,
                 resolvedToolPlan = toolPlan
             )
                 ?: PhoneAgentPrompts.buildActionPrompt(
                     phoneControlAvailable = phoneControlAvailable,
                     modelName = modelName,
+                    domainGuardrailMode = domainGuardrailMode,
                     sensorContext = sensorSnapshot,
                     resolvedToolPlan = toolPlan
                 )
@@ -720,9 +1003,10 @@ open class PhoneAgentApi(
             messagesWithPendingUser.toList()
         }
 
+        executionConstraintSnapshot = null
         val result = client.chatWithTools(messagesForModel, systemPrompt = systemPrompt, tools = toolsForModel)
 
-        return result.fold(
+        return@withRequestFlowLock result.fold(
             onSuccess = { rawResponse ->
                 recordUsageOutcomeAndCheckBudgets(
                     usage = rawResponse.usage,
@@ -739,11 +1023,19 @@ open class PhoneAgentApi(
                     modelId = client.modelId
                 )
                 val response = enforceActiveToolConstraintOnResponse(explicitFetchEnforced)
+
+                executionConstraintSnapshot = if (response.toolCalls.isNotEmpty()) turnConstraintSnapshot else null
+                modelTurnCounter++
+                expireConstraintsIfNeeded()
+                isTaskInProgress = response.toolCalls.isNotEmpty()
+
                 messages.add(pendingUserMessage)
                 appendAssistantResponse(response)
                 response
             },
             onFailure = { error ->
+                executionConstraintSnapshot = null
+                isTaskInProgress = false
                 ChatResponse(
                     text = "Error: ${error.message}",
                     toolCalls = emptyList(),
@@ -752,7 +1044,7 @@ open class PhoneAgentApi(
             }
         )
     }
-    
+
     /**
      * Send an ephemeral prompt using existing conversation as context,
      * without persisting the user message in conversation history.
@@ -767,43 +1059,44 @@ open class PhoneAgentApi(
      */
     open suspend fun sendEphemeral(prompt: String): String? {
         return withRequestFlowLock {
-        val ephemeralMessages = messages.toMutableList().apply {
-            add(Message(role = "user", content = prompt))
-        }
-        val phoneControlAvailable = phoneControlOverride ?: ScreenReader.isAttached()
-        val modelName = chatClient.modelId
-        val ephemeralSensors = getTaskSensorSnapshot(startNewTask = false)
-        val systemPrompt = buildChatSystemPrompt(
-            phoneControlAvailable = phoneControlAvailable,
-            modelName = modelName,
-            sensorContext = ephemeralSensors
-        )
-        checkBudgetBeforeApiCall()
-        val result = chatClient.chatWithTools(
-            ephemeralMessages,
-            systemPrompt = systemPrompt,
-            tools = emptyList()
-        )
-        return result.fold(
-            onSuccess = { response ->
-                recordUsageOutcomeAndCheckBudgets(
-                    usage = response.usage,
-                    modelId = chatClient.modelId,
-                    promptChars = approximateMessageChars(ephemeralMessages),
-                    responseChars = approximateResponseChars(response),
-                    systemPromptChars = systemPrompt.length,
-                    toolSchemaChars = 0
-                )
-                response.text?.also { text ->
-                    messages.add(Message(role = "assistant", content = text))
-                }
-                response.text
-            },
-            onFailure = { error ->
-                Log.w(TAG, "sendEphemeral failed: ${error.message}")
-                null
+            val ephemeralMessages = messages.toMutableList().apply {
+                add(Message(role = "user", content = prompt))
             }
-        )
+            val phoneControlAvailable = phoneControlOverride ?: isScreenReaderAttached()
+            val modelName = chatClient.modelId
+            val ephemeralSensors = getTaskSensorSnapshot(startNewTask = false)
+            val systemPrompt = buildChatSystemPrompt(
+                phoneControlAvailable = phoneControlAvailable,
+                modelName = modelName,
+                sensorContext = ephemeralSensors
+            )
+            checkBudgetBeforeApiCall()
+
+            val result = chatClient.chatWithTools(
+                ephemeralMessages,
+                systemPrompt = systemPrompt,
+                tools = emptyList()
+            )
+            return@withRequestFlowLock result.fold(
+                onSuccess = { response ->
+                    recordUsageOutcomeAndCheckBudgets(
+                        usage = response.usage,
+                        modelId = chatClient.modelId,
+                        promptChars = approximateMessageChars(ephemeralMessages),
+                        responseChars = approximateResponseChars(response),
+                        systemPromptChars = systemPrompt.length,
+                        toolSchemaChars = 0
+                    )
+                    response.text?.also { text ->
+                        messages.add(Message(role = "assistant", content = text))
+                    }
+                    response.text
+                },
+                onFailure = { error ->
+                    Log.w(TAG, "sendEphemeral failed: ${error.message}")
+                    null
+                }
+            )
         }
     }
 
@@ -816,11 +1109,13 @@ open class PhoneAgentApi(
         val prompt = promptBuilder?.full(
             phoneControlAvailable = phoneControlAvailable,
             modelName = modelName,
+            domainGuardrailMode = domainGuardrailMode,
             sensorContext = sensorContext,
             resolvedToolPlan = resolvedToolPlan
         ) ?: PhoneAgentPrompts.buildSystemPrompt(
             phoneControlAvailable = phoneControlAvailable,
             modelName = modelName,
+            domainGuardrailMode = domainGuardrailMode,
             sensorContext = sensorContext,
             resolvedToolPlan = resolvedToolPlan
         )
@@ -878,73 +1173,86 @@ open class PhoneAgentApi(
      */
     open suspend fun continueAfterTools(): ChatResponse {
         return withRequestFlowLock {
-        val phoneControlAvailable = phoneControlOverride ?: ScreenReader.isAttached()
-        val sensorSnapshot = getTaskSensorSnapshot(startNewTask = false)
+            val phoneControlAvailable = phoneControlOverride ?: isScreenReaderAttached()
+            val sensorSnapshot = getTaskSensorSnapshot(startNewTask = false)
 
-        val (baseToolsForModel, actionToolPlan) = getToolsForModelWithGrouping(
-            modelId = actionClient.modelId,
-            messageText = "", // action loop has no new user message
-            userSettings = userToolCategorySettings,
-            expandedCategories = requestToolsExpandedCategories.toSet(),
-            includeRequestToolsCappedReason = requestToolsCappedThisTask
-        )
-        val toolsForModel = applyActiveToolConstraintToToolList(baseToolsForModel)
-        if (actionToolPlan != null) {
-            lastResolvedToolPlan = actionToolPlan
-            logToolPlanTelemetry(actionToolPlan, isActionLoop = true)
-        }
+            val (baseToolsForModel, actionToolPlan) = getToolsForModelWithGrouping(
+                modelId = actionClient.modelId,
+                messageText = "", // action loop has no new user message
+                userSettings = userToolCategorySettings,
+                expandedCategories = requestToolsExpandedCategories.toSet(),
+                includeRequestToolsCappedReason = requestToolsCappedThisTask
+            )
+            val turnConstraintSnapshot = currentConstraintSnapshot()
+            val toolsWithActiveConstraint = applyActiveToolConstraintToToolList(baseToolsForModel)
+            val toolsForModel = applyConstraintsToTools(toolsWithActiveConstraint, turnConstraintSnapshot)
+            if (actionToolPlan != null) {
+                lastResolvedToolPlan = actionToolPlan
+                logToolPlanTelemetry(actionToolPlan, isActionLoop = true)
+            }
 
-        val systemPrompt = promptBuilder?.trimmed(
-            phoneControlAvailable = phoneControlAvailable,
-            modelName = actionClient.modelId,
-            sensorContext = sensorSnapshot,
-            resolvedToolPlan = actionToolPlan
-        )
-            ?: PhoneAgentPrompts.buildActionPrompt(
+            val systemPrompt = promptBuilder?.trimmed(
                 phoneControlAvailable = phoneControlAvailable,
                 modelName = actionClient.modelId,
+                domainGuardrailMode = domainGuardrailMode,
                 sensorContext = sensorSnapshot,
                 resolvedToolPlan = actionToolPlan
             )
-        logPromptTuningMetadata(systemPrompt, "action-continue")
-        assertSafetyContractDebug(systemPrompt)
-
-        // Two-stage compaction: strip old SCREEN dumps first, then summarize old messages
-        val (screenStripped, compactorMetrics) = contextCompactor.compactWithMetrics(messages)
-        val (messagesForModel, managerMetrics) = contextManager.compactWithMetrics(screenStripped, currentToolStep)
-        if (compactorMetrics != null) Log.d(TAG, "continueAfterTools compaction stage1: $compactorMetrics")
-        if (managerMetrics != null) Log.d(TAG, "continueAfterTools compaction stage2: $managerMetrics")
-        Log.d(TAG, "continueAfterTools: step=$currentToolStep, rawMessages=${messages.size}, compacted=${messagesForModel.size}")
-
-        checkBudgetBeforeApiCall()
-        val result = actionClient.chatWithTools(
-            messagesForModel,
-            systemPrompt = systemPrompt,
-            tools = toolsForModel
-        )
-
-        return result.fold(
-            onSuccess = { rawResponse ->
-                val response = enforceActiveToolConstraintOnResponse(rawResponse)
-                recordUsageOutcomeAndCheckBudgets(
-                    usage = response.usage,
-                    modelId = actionClient.modelId,
-                    promptChars = approximateMessageChars(messagesForModel),
-                    responseChars = approximateResponseChars(response),
-                    systemPromptChars = systemPrompt.length,
-                    toolSchemaChars = approximateToolSchemaChars(toolsForModel)
+                ?: PhoneAgentPrompts.buildActionPrompt(
+                    phoneControlAvailable = phoneControlAvailable,
+                    modelName = actionClient.modelId,
+                    domainGuardrailMode = domainGuardrailMode,
+                    sensorContext = sensorSnapshot,
+                    resolvedToolPlan = actionToolPlan
                 )
-                appendAssistantResponse(response)
-                response
-            },
-            onFailure = { error ->
-                ChatResponse(
-                    text = "Error: ${error.message}",
-                    toolCalls = emptyList(),
-                    stopReason = "error"
-                )
-            }
-        )
+            logPromptTuningMetadata(systemPrompt, "action-continue")
+            assertSafetyContractDebug(systemPrompt)
+
+            // Two-stage compaction: strip old SCREEN dumps first, then summarize old messages
+            val (screenStripped, compactorMetrics) = contextCompactor.compactWithMetrics(messages)
+            val (messagesForModel, managerMetrics) = contextManager.compactWithMetrics(screenStripped, currentToolStep)
+            if (compactorMetrics != null) Log.d(TAG, "continueAfterTools compaction stage1: $compactorMetrics")
+            if (managerMetrics != null) Log.d(TAG, "continueAfterTools compaction stage2: $managerMetrics")
+            Log.d(TAG, "continueAfterTools: step=$currentToolStep, rawMessages=${messages.size}, compacted=${messagesForModel.size}")
+
+            checkBudgetBeforeApiCall()
+            executionConstraintSnapshot = null
+            val result = actionClient.chatWithTools(
+                messagesForModel,
+                systemPrompt = systemPrompt,
+                tools = toolsForModel
+            )
+
+            return@withRequestFlowLock result.fold(
+                onSuccess = { rawResponse ->
+                    val response = enforceActiveToolConstraintOnResponse(rawResponse)
+                    recordUsageOutcomeAndCheckBudgets(
+                        usage = response.usage,
+                        modelId = actionClient.modelId,
+                        promptChars = approximateMessageChars(messagesForModel),
+                        responseChars = approximateResponseChars(response),
+                        systemPromptChars = systemPrompt.length,
+                        toolSchemaChars = approximateToolSchemaChars(toolsForModel)
+                    )
+
+                    executionConstraintSnapshot = if (response.toolCalls.isNotEmpty()) turnConstraintSnapshot else null
+                    modelTurnCounter++
+                    expireConstraintsIfNeeded()
+                    isTaskInProgress = response.toolCalls.isNotEmpty()
+
+                    appendAssistantResponse(response)
+                    response
+                },
+                onFailure = { error ->
+                    executionConstraintSnapshot = null
+                    isTaskInProgress = false
+                    ChatResponse(
+                        text = "Error: ${error.message}",
+                        toolCalls = emptyList(),
+                        stopReason = "error"
+                    )
+                }
+            )
         }
     }
 
@@ -1013,6 +1321,16 @@ open class PhoneAgentApi(
     suspend fun executeToolCall(toolCall: ToolCall, screenContent: ScreenContent?): ToolResult {
         Log.d(TAG, "executeToolCall: name=${toolCall.name}, input=${toolCall.input.toString().take(100)}")
         val startMs = System.currentTimeMillis()
+
+        val decision = resolveToolConstraintDecision(toolCall.name, executionConstraintSnapshot)
+        if (!decision.allowed) {
+            Log.d(TAG, "Constraint blocked tool execution '${toolCall.name}': ${decision.reason ?: "not allowed"}")
+            return ToolResult(
+                text = "Blocked by runtime constraint: ${decision.reason ?: "tool ${toolCall.name} is not allowed"}",
+                isError = true
+            )
+        }
+
         return try {
             val constraint = activeToolConstraint
             if (constraint != null && toolCall.name !in constraint.allowedToolNames) {
@@ -2186,6 +2504,8 @@ open class PhoneAgentApi(
         deferredSeedMessages.set(null)
         activeToolConstraint = null
         currentToolStep = 0
+        executionConstraintSnapshot = null
+        isTaskInProgress = false
         taskSensorSnapshotEpoch.incrementAndGet()
         synchronized(taskSensorSnapshotLock) {
             taskSensorSnapshot = null

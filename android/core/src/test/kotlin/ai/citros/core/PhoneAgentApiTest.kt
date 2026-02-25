@@ -3612,7 +3612,6 @@ class PhoneAgentApiTest {
         }
     }
 
-
     private class BlockingToolClient(
         private val response: ChatResponse,
         override val modelId: String? = "gpt-4o-mini"
@@ -3899,6 +3898,394 @@ class PhoneAgentApiTest {
     }
 
     @Test
+    fun `runtime constraints filter tool set presented to model`() {
+        val agent = createAgent()
+        agent.createRuntimeConstraint(
+            scope = ConstraintScope.SESSION,
+            allowedTools = setOf("web_search"),
+            source = "test"
+        )
+
+        val toolNames = agent.getToolsForModel().map { it.name }
+        assertTrue("web_search" in toolNames)
+        assertFalse("tap" in toolNames)
+        assertFalse("type_text" in toolNames)
+    }
+
+    @Test
+    fun `runtime constraints keep model tool calls and rely on execution gate for blocked tools`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            chatResponses = ArrayDeque(),
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(
+                            ToolCall("1", "tap", mapOf("element_id" to 5)),
+                            ToolCall("2", "web_search", mapOf("query" to "weather"))
+                        ),
+                        stopReason = "tool_use"
+                    )
+                )
+            )
+        )
+        val agent = PhoneAgentApi(client, client).also { it.phoneControlOverride = true }
+        agent.createRuntimeConstraint(
+            scope = ConstraintScope.SESSION,
+            allowedTools = setOf("web_search"),
+            source = "test"
+        )
+
+        val response = agent.sendMessage("Find weather", screenContent = null, isActionLoop = false)
+        assertEquals(listOf("tap", "web_search"), response.toolCalls.map { it.name })
+
+        val blocked = agent.executeToolCall(response.toolCalls.first { it.name == "tap" }, null)
+        assertTrue(blocked.isError)
+        assertTrue(blocked.text.contains("Blocked by runtime constraint"))
+    }
+
+    @Test
+    fun `runtime constraints hard gate tool execution`() = runTest {
+        val agent = createAgent()
+        agent.createRuntimeConstraint(
+            scope = ConstraintScope.SESSION,
+            disallowedTools = setOf("tap"),
+            source = "test",
+            reason = "tap disabled"
+        )
+
+        val result = agent.executeToolCall(ToolCall("t1", "tap", mapOf("element_id" to 1)), null)
+        assertTrue(result.isError)
+        assertTrue(result.text.contains("Blocked by runtime constraint"))
+    }
+
+    @Test
+    fun `runtime constraints prefer deny when allow and deny overlap`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            chatResponses = ArrayDeque(),
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(
+                            ToolCall("1", "tap", mapOf("element_id" to 5)),
+                            ToolCall("2", "web_search", mapOf("query" to "weather"))
+                        ),
+                        stopReason = "tool_use"
+                    )
+                )
+            )
+        )
+        val agent = PhoneAgentApi(client, client).also { it.phoneControlOverride = true }
+        agent.createRuntimeConstraint(
+            scope = ConstraintScope.SESSION,
+            allowedTools = setOf("tap", "web_search"),
+            disallowedTools = setOf("tap"),
+            source = "test",
+            reason = "tap blocked for this run"
+        )
+
+        val toolNames = agent.getToolsForModel().map { it.name }
+        assertTrue("web_search" in toolNames)
+        assertFalse("tap" in toolNames)
+
+        val response = agent.sendMessage("Open weather app", screenContent = null, isActionLoop = false)
+        assertEquals(listOf("tap", "web_search"), response.toolCalls.map { it.name })
+
+        val blocked = agent.executeToolCall(response.toolCalls.first { it.name == "tap" }, null)
+        assertTrue(blocked.isError)
+        assertTrue(blocked.text.contains("tap blocked for this run"))
+    }
+
+    @Test
+    fun `runtime constraints intersect overlapping allow-lists`() = runTest {
+        val agent = createAgent()
+        agent.createRuntimeConstraint(
+            scope = ConstraintScope.SESSION,
+            allowedTools = setOf("think", "web_search"),
+            source = "policy-a"
+        )
+        agent.createRuntimeConstraint(
+            scope = ConstraintScope.SESSION,
+            allowedTools = setOf("web_search", "open_app"),
+            source = "policy-b"
+        )
+
+        val toolNames = agent.getToolsForModel().map { it.name }
+        assertTrue("web_search" in toolNames)
+        assertFalse("think" in toolNames)
+        assertFalse("open_app" in toolNames)
+
+        val blockedThink = agent.executeToolCall(
+            ToolCall("t1", "think", mapOf("thought" to "intersection test")),
+            null
+        )
+        assertTrue(blockedThink.isError)
+        assertTrue(blockedThink.text.contains("allow-list excludes think"))
+    }
+
+    @Test
+    fun `turn scoped runtime constraint hard gates execution for same response`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            chatResponses = ArrayDeque(),
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(ToolCall("1", "tap", mapOf("element_id" to 5))),
+                        stopReason = "tool_use"
+                    )
+                )
+            )
+        )
+        val agent = PhoneAgentApi(client, client).also { it.phoneControlOverride = true }
+        agent.createRuntimeConstraint(
+            scope = ConstraintScope.TURN,
+            disallowedTools = setOf("tap"),
+            source = "test",
+            reason = "turn tap blocked"
+        )
+
+        val response = agent.sendMessage("Open app", screenContent = null, isActionLoop = false)
+        assertEquals(listOf("tap"), response.toolCalls.map { it.name })
+        assertTrue(agent.activeRuntimeConstraints().isEmpty())
+
+        val blocked = agent.executeToolCall(response.toolCalls.first(), null)
+        assertTrue(blocked.isError)
+        assertTrue(blocked.text.contains("turn tap blocked"))
+    }
+
+    @Test
+    fun `expiresAfterTurns applies deterministically for exact number of turns`() = runTest {
+        val mixed = ChatResponse(
+            text = null,
+            toolCalls = listOf(
+                ToolCall("1", "tap", mapOf("element_id" to 5)),
+                ToolCall("2", "web_search", mapOf("query" to "weather"))
+            ),
+            stopReason = "tool_use"
+        )
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            chatResponses = ArrayDeque(),
+            toolResponses = ArrayDeque(listOf(mixed, mixed, mixed))
+        )
+        val agent = PhoneAgentApi(client, client).also { it.phoneControlOverride = true }
+        agent.createRuntimeConstraint(
+            scope = ConstraintScope.SESSION,
+            allowedTools = setOf("web_search"),
+            source = "test",
+            expiresAfterTurns = 2
+        )
+
+        val turn1 = agent.sendMessage("Open weather", screenContent = null, isActionLoop = false)
+        assertEquals(listOf("tap", "web_search"), turn1.toolCalls.map { it.name })
+        val turn1Tap = agent.executeToolCall(turn1.toolCalls.first { it.name == "tap" }, null)
+        assertTrue(turn1Tap.isError)
+        assertTrue(turn1Tap.text.contains("allow-list excludes tap"))
+
+        val turn2 = agent.continueAfterTools()
+        assertEquals(listOf("tap", "web_search"), turn2.toolCalls.map { it.name })
+        val turn2Tap = agent.executeToolCall(turn2.toolCalls.first { it.name == "tap" }, null)
+        assertTrue(turn2Tap.isError)
+        assertTrue(turn2Tap.text.contains("allow-list excludes tap"))
+        assertTrue(agent.activeRuntimeConstraints().isEmpty())
+
+        val turn3 = agent.continueAfterTools()
+        assertEquals(listOf("tap", "web_search"), turn3.toolCalls.map { it.name })
+        val turn3Tap = agent.executeToolCall(turn3.toolCalls.first { it.name == "tap" }, null)
+        assertFalse(turn3Tap.text.contains("Blocked by runtime constraint"))
+    }
+
+    @Test
+    fun `turn scoped runtime constraint expires after one model turn`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            chatResponses = ArrayDeque(),
+            toolResponses = ArrayDeque(
+                listOf(ChatResponse(text = "Done", toolCalls = emptyList(), stopReason = "end_turn"))
+            )
+        )
+        val agent = PhoneAgentApi(client, client).also { it.phoneControlOverride = true }
+        agent.createRuntimeConstraint(
+            scope = ConstraintScope.TURN,
+            disallowedTools = setOf("tap"),
+            source = "test"
+        )
+
+        agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        assertTrue(agent.activeRuntimeConstraints().isEmpty())
+    }
+
+    @Test
+    fun `task scoped runtime constraint expires on next user task`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            chatResponses = ArrayDeque(),
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(text = "done1", toolCalls = emptyList(), stopReason = "end_turn"),
+                    ChatResponse(text = "done2", toolCalls = emptyList(), stopReason = "end_turn")
+                )
+            )
+        )
+        val agent = PhoneAgentApi(client, client).also { it.phoneControlOverride = true }
+
+        agent.createRuntimeConstraint(
+            scope = ConstraintScope.TASK,
+            disallowedTools = setOf("tap"),
+            source = "test"
+        )
+
+        agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        assertEquals(1, agent.activeRuntimeConstraints().size)
+
+        agent.sendMessage("Open calendar", screenContent = null, isActionLoop = false)
+        assertTrue(agent.activeRuntimeConstraints().isEmpty())
+    }
+
+    @Test
+    fun `task scoped constraint created during action loop binds to current task`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            chatResponses = ArrayDeque(),
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(ToolCall("1", "think", mapOf("thought" to "step 1"))),
+                        stopReason = "tool_use"
+                    ),
+                    ChatResponse(text = "done", toolCalls = emptyList(), stopReason = "end_turn"),
+                    ChatResponse(text = "done2", toolCalls = emptyList(), stopReason = "end_turn")
+                )
+            )
+        )
+        val agent = PhoneAgentApi(client, client).also { it.phoneControlOverride = true }
+
+        val firstResponse = agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        assertEquals(listOf("think"), firstResponse.toolCalls.map { it.name })
+
+        agent.createRuntimeConstraint(
+            scope = ConstraintScope.TASK,
+            disallowedTools = setOf("think"),
+            source = "test",
+            reason = "current task block"
+        )
+
+        val blocked = agent.executeToolCall(firstResponse.toolCalls.first(), null)
+        assertTrue(blocked.isError)
+        assertTrue(blocked.text.contains("current task block"))
+
+        agent.continueAfterTools()
+        assertEquals(1, agent.activeRuntimeConstraints().size)
+
+        agent.sendMessage("Open calendar", screenContent = null, isActionLoop = false)
+        assertTrue(agent.activeRuntimeConstraints().isEmpty())
+    }
+
+    @Test
+    fun `task scoped constraint created after continueAfterTools failure binds to next task`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            chatResponses = ArrayDeque(),
+            toolResponses = ArrayDeque(),
+            toolResponseResults = ArrayDeque(
+                listOf(
+                    Result.success(
+                        ChatResponse(
+                            text = null,
+                            toolCalls = listOf(ToolCall("1", "think", mapOf("thought" to "step 1"))),
+                            stopReason = "tool_use"
+                        )
+                    ),
+                    Result.failure(ProviderException(Provider.ANTHROPIC, null, "transient continue failure", false)),
+                    Result.success(
+                        ChatResponse(
+                            text = null,
+                            toolCalls = listOf(ToolCall("2", "tap", mapOf("element_id" to 5))),
+                            stopReason = "tool_use"
+                        )
+                    ),
+                    Result.success(
+                        ChatResponse(
+                            text = "done",
+                            toolCalls = emptyList(),
+                            stopReason = "end_turn"
+                        )
+                    )
+                )
+            )
+        )
+        val agent = PhoneAgentApi(client, client).also { it.phoneControlOverride = true }
+
+        val firstResponse = agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        assertEquals(listOf("think"), firstResponse.toolCalls.map { it.name })
+        agent.addToolResult(firstResponse.toolCalls.first().id, "Thought complete", toolName = "think")
+
+        val failedContinue = agent.continueAfterTools()
+        assertEquals("error", failedContinue.stopReason)
+
+        agent.createRuntimeConstraint(
+            scope = ConstraintScope.TASK,
+            disallowedTools = setOf("tap"),
+            source = "test",
+            reason = "next task tap blocked"
+        )
+
+        val nextTaskResponse = agent.sendMessage("Open calendar", screenContent = null, isActionLoop = false)
+        assertEquals(listOf("tap"), nextTaskResponse.toolCalls.map { it.name })
+        assertEquals(1, agent.activeRuntimeConstraints().size)
+
+        val blocked = agent.executeToolCall(nextTaskResponse.toolCalls.first(), null)
+        assertTrue(blocked.isError)
+        assertTrue(blocked.text.contains("next task tap blocked"))
+
+        agent.sendMessage("Open calculator", screenContent = null, isActionLoop = false)
+        assertTrue(agent.activeRuntimeConstraints().isEmpty())
+    }
+
+    @Test
+    fun `runtime constraint lifecycle supports update clear and explicit expiry sweep`() {
+        val agent = createAgent()
+        val created = agent.createRuntimeConstraint(
+            scope = ConstraintScope.SESSION,
+            allowedTools = setOf("web_search"),
+            source = "test",
+            reason = "initial reason",
+            expiresAfterTurns = 3
+        )
+
+        val updated = agent.updateRuntimeConstraint(
+            id = created.id,
+            disallowedTools = setOf("web_search"),
+            reason = "temporary block",
+            expiresAfterTurns = 2
+        )
+        assertNotNull(updated)
+        val updatedConstraint = updated!!
+        assertEquals(setOf("web_search"), updatedConstraint.disallowedTools)
+        assertEquals("temporary block", updatedConstraint.reason)
+        assertEquals(2, updatedConstraint.expiresAfterTurns)
+
+        val cleared = agent.updateRuntimeConstraint(
+            id = created.id,
+            clearReason = true,
+            clearExpiry = true
+        )
+        assertNotNull(cleared)
+        val clearedConstraint = cleared!!
+        assertNull(clearedConstraint.reason)
+        assertNull(clearedConstraint.expiresAfterTurns)
+
+        assertEquals(0, agent.expireRuntimeConstraints())
+
+        assertTrue(agent.clearRuntimeConstraint(created.id))
+        assertTrue(agent.activeRuntimeConstraints().isEmpty())
+    }
     fun `web_search missing query returns INVALID_INPUT`() = runTest {
         val agent = createAgent()
         val result = agent.executeToolCall(ToolCall("ws1", "web_search", emptyMap()), null)

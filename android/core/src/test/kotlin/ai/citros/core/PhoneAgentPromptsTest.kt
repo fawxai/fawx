@@ -224,18 +224,18 @@ class PhoneAgentPromptsTest {
     }
 
     @Test
-    fun `recovery section covers web search failure with anti-browser directive`() {
+    fun `compatibility recovery section covers web search failure with anti-browser directive`() {
         assertContains(PhoneAgentPrompts.SECTION_RECOVERY, "Web search failed")
         assertContains(PhoneAgentPrompts.SECTION_RECOVERY, "Do NOT open Chrome")
     }
 
     @Test
-    fun `recovery section covers web browse failure`() {
+    fun `compatibility recovery section covers web browse failure`() {
         assertContains(PhoneAgentPrompts.SECTION_RECOVERY, "Web browse failed")
     }
 
     @Test
-    fun `strategy section teaches web tool selection`() {
+    fun `compatibility strategy section teaches web tool selection`() {
         assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "Search vs Browse vs Chrome")
         assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "Need information")
         assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "Need web interaction")
@@ -324,6 +324,41 @@ class PhoneAgentPromptsTest {
             communicationIndex > recoveryIndex)
         assertTrue("Communication Policy should come before Disambiguation",
             communicationIndex < disambiguationIndex)
+    }
+
+
+    @Test
+    fun `buildSystemPrompt defaults to generic domain guardrails`() {
+        val prompt = PhoneAgentPrompts.buildSystemPrompt(phoneControlAvailable = true)
+        assertNotContains(prompt, "Search vs Browse vs Chrome")
+        assertNotContains(prompt, "Never open Chrome just to search")
+        assertNotContains(prompt, "Web search failed")
+        assertContains(prompt, "Tool failed or unavailable")
+    }
+
+    @Test
+    fun `buildSystemPrompt compatibility mode restores tactical web guardrails`() {
+        val prompt = PhoneAgentPrompts.buildSystemPrompt(
+            phoneControlAvailable = true,
+            domainGuardrailMode = PhoneAgentPrompts.DomainGuardrailMode.COMPATIBILITY
+        )
+        assertContains(prompt, "Search vs Browse vs Chrome")
+        assertContains(prompt, "Never open Chrome just to search")
+        assertContains(prompt, "Web search failed")
+    }
+
+    @Test
+    fun `buildSystemPrompt SMALL tier keeps strategy and recovery generic even in compatibility mode`() {
+        val prompt = PhoneAgentPrompts.buildSystemPrompt(
+            phoneControlAvailable = true,
+            modelTier = ModelTier.SMALL,
+            domainGuardrailMode = PhoneAgentPrompts.DomainGuardrailMode.COMPATIBILITY
+        )
+
+        assertContains(prompt, "- Direct commands: act immediately with one tool call")
+        assertNotContains(prompt, "Search vs Browse vs Chrome")
+        assertNotContains(prompt, "Web search failed")
+        assertContains(prompt, "Tool failed or unavailable")
     }
 
     // ── Legacy compatibility ────────────────────────────────────────────

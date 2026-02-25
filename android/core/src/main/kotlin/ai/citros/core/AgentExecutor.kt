@@ -27,7 +27,7 @@ package ai.citros.core
 class AgentExecutor(
     private val delegate: ToolExecutionDelegate,
     private val progressListener: LoopProgressListener,
-    private val actionPolicy: ActionPolicy = DefaultActionPolicy(),
+    private val actionPolicy: ActionPolicy = PermissiveActionPolicy,
     private val policyAuditLogger: PolicyAuditLogger = NoopPolicyAuditLogger,
     /** Optional rollout hook: when true, emit audit records for allow decisions too. */
     private val auditAllowDecisions: Boolean = false,

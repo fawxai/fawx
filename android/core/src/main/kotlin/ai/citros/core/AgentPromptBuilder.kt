@@ -22,6 +22,8 @@ class AgentPromptBuilder(
     fun full(
         phoneControlAvailable: Boolean = true,
         modelName: String? = null,
+        domainGuardrailMode: PhoneAgentPrompts.DomainGuardrailMode =
+            PhoneAgentPrompts.DomainGuardrailMode.GENERIC,
         sensorContext: SensorContext? = null,
         resolvedToolPlan: ResolvedToolPlan? = null
     ): String {
@@ -43,6 +45,7 @@ class AgentPromptBuilder(
             agentsContent = agentsContent,
             memoryContent = memoryContent,
             securityContent = securityContent,
+            domainGuardrailMode = domainGuardrailMode,
             sensorContext = sensorContext,
             resolvedToolPlan = resolvedToolPlan
         )
@@ -55,6 +58,8 @@ class AgentPromptBuilder(
     fun trimmed(
         phoneControlAvailable: Boolean = true,
         modelName: String? = null,
+        domainGuardrailMode: PhoneAgentPrompts.DomainGuardrailMode =
+            PhoneAgentPrompts.DomainGuardrailMode.GENERIC,
         sensorContext: SensorContext? = null,
         resolvedToolPlan: ResolvedToolPlan? = null
     ): String {
@@ -63,6 +68,7 @@ class AgentPromptBuilder(
             phoneControlAvailable = phoneControlAvailable,
             modelName = modelName,
             securityContent = securityContent,
+            domainGuardrailMode = domainGuardrailMode,
             sensorContext = sensorContext,
             resolvedToolPlan = resolvedToolPlan
         )
