@@ -137,7 +137,7 @@ class ServiceToolDelegate(
         requestId: String,
         reason: String,
         timeoutMs: Long,
-        reasonCode: String? = null
+        reasonCode: String?
     ): Boolean {
         // timeoutMs is enforced by AgentExecutor via withTimeoutOrNull around this call.
         // ServiceToolDelegate intentionally only bridges request/response plumbing.

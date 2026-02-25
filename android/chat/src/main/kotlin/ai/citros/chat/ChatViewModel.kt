@@ -1462,7 +1462,7 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
         requestId: String,
         reason: String,
         timeoutMs: Long,
-        reasonCode: String? = null
+        reasonCode: String?
     ): Boolean {
         val deferred = CompletableDeferred<Boolean>()
         synchronized(pendingPolicyConfirmationLock) {
