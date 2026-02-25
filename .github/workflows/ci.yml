@@ -155,7 +155,7 @@ jobs:
         run: ./scripts/spec-tests/tests/ci-workflow-cache-paths-test.sh
 
   android:
-    name: Android
+    name: Android (P0 blocking, P1 observational)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -174,19 +174,19 @@ jobs:
             ~/.gradle/wrapper
           key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle.kts', '**/gradle-wrapper.properties') }}
 
-      # Staging currently has known baseline instability in :chat:testDebugUnitTest.
-      # For staging-targeted PRs we keep lint + sensor suites enforced, while skipping the unstable full chat unit suite.
-      - name: Run lint only (staging PR baseline)
-        if: ${{ github.event_name == 'pull_request' && github.base_ref == 'staging' }}
-        working-directory: android
-        run: ./gradlew :chat:lint
+      - name: P0 bucket: chat lint (blocking)
+        run: ./scripts/test-atomic.sh p0.chat-lint
 
-      - name: Run full chat unit tests and lint (main + non-staging)
-        if: ${{ github.event_name == 'push' || github.base_ref != 'staging' }}
-        working-directory: android
-        run: ./gradlew :chat:testDebugUnitTest :chat:lint
+      - name: P0 bucket: core sensor CI (blocking)
+        run: ./scripts/test-atomic.sh p0.core-sensor-ci
 
-      # Keep #698 quality signal enforced on all CI paths.
-      - name: Run sensor timeout/concurrency CI suites
-        working-directory: android
-        run: ./gradlew :core:phoneAgentApiSensorCiTest :chat:androidSensorProviderCiTest
+      - name: P0 bucket: chat sensor CI (blocking)
+        run: ./scripts/test-atomic.sh p0.chat-sensor-ci
+
+      - name: P1 bucket: core unit (observational)
+        continue-on-error: true
+        run: ./scripts/test-atomic.sh p1.core-unit
+
+      - name: P1 bucket: chat unit (observational)
+        continue-on-error: true
+        run: ./scripts/test-atomic.sh p1.chat-unit

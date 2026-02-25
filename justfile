@@ -59,3 +59,13 @@ check-android:
 # Build for Android (Horizon 1)
 build-android:
     cargo build --target aarch64-linux-android --release
+
+# Atomic Android test buckets
+p0:
+    ./scripts/test-atomic.sh p0
+
+p1:
+    ./scripts/test-atomic.sh p1
+
+p2 ITERATIONS="5":
+    ./scripts/test-atomic.sh p2 --iterations {{ITERATIONS}}
