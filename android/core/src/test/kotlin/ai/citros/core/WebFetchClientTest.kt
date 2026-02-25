@@ -114,6 +114,94 @@ class WebFetchClientTest {
     }
 
     @Test
+    fun `fetch dynamic travel HTTP error includes best-effort guidance`() = runTest {
+        server.enqueue(MockResponse().setResponseCode(403).setBody("Forbidden"))
+
+        val client = WebFetchClient()
+        val result = client.fetch(server.url("/travel/flights/flights-from-denver-to-tampa.html").toString())
+
+        assertTrue(result.isError)
+        assertTrue(result.text.contains("dynamic travel site"))
+        assertTrue(result.text.contains("do NOT ask the user to manually open apps"))
+    }
+
+    @Test
+    fun `fetch blank dynamic travel page returns guidance without error flag`() = runTest {
+        val htmlShell = """
+        <html>
+          <head><title></title></head>
+          <body><script>window.__NEXT_DATA__ = {};</script></body>
+        </html>
+        """.trimIndent()
+        server.enqueue(
+            MockResponse()
+                .setBody(htmlShell)
+                .setHeader("Content-Type", "text/html")
+                .setResponseCode(200)
+        )
+
+        val client = WebFetchClient()
+        val result = client.fetch(server.url("/travel/flights/flights-from-lax-to-jfk.html").toString())
+
+        assertFalse(result.isError)
+        assertTrue(result.text.contains("dynamic travel site"))
+    }
+
+    @Test
+    fun `fetch blank non-travel page remains an error`() = runTest {
+        val htmlShell = """
+        <html>
+          <head><title></title></head>
+          <body><script>window.app = {};</script></body>
+        </html>
+        """.trimIndent()
+        server.enqueue(
+            MockResponse()
+                .setBody(htmlShell)
+                .setHeader("Content-Type", "text/html")
+                .setResponseCode(200)
+        )
+
+        val client = WebFetchClient()
+        val result = client.fetch(server.url("/products/blank").toString())
+
+        assertTrue(result.isError)
+        assertTrue(result.text.contains("no readable content"))
+    }
+
+    @Test
+    fun `dynamic travel shell heuristic detects low-signal flight pages`() {
+        val client = WebFetchClient()
+
+        val dynamicUrl = "https://www.google.com/travel/flights/flights-from-lax-to-jfk.html"
+        val shellText = "Google Flights JavaScript required"
+
+        assertTrue(client.isLikelyDynamicTravelUrl(dynamicUrl))
+        assertTrue(client.isLikelyDynamicTravelShell(dynamicUrl, shellText))
+        assertFalse(client.isLikelyDynamicTravelShell(dynamicUrl, "LAX to JFK fares available"))
+    }
+
+    @Test
+    fun `dynamic travel shell heuristic ignores den substring in common words`() {
+        val client = WebFetchClient()
+        val dynamicUrl = "https://www.google.com/travel/flights/flights-from-denver-to-tampa.html"
+        val noisyShellText = "Hidden travel widget loading. Garden offers for students."
+
+        assertTrue(client.isLikelyDynamicTravelShell(dynamicUrl, noisyShellText))
+    }
+
+    @Test
+    fun `dynamic travel URL heuristic covers additional major travel domains`() {
+        val client = WebFetchClient()
+
+        assertTrue(client.isLikelyDynamicTravelUrl("https://www.booking.com/flights/index.html"))
+        assertTrue(client.isLikelyDynamicTravelUrl("https://www.skyscanner.com/transport/flights/lax/jfk/"))
+        assertTrue(client.isLikelyDynamicTravelUrl("https://www.southwest.com/air/booking/select.html?flightSearch=true"))
+        assertTrue(client.isLikelyDynamicTravelUrl("https://www.united.com/en/us/fsr/choose-flights?flightType=oneway"))
+        assertTrue(client.isLikelyDynamicTravelUrl("https://www.delta.com/flight-search/book-a-flight"))
+    }
+
+    @Test
     fun `fetch clamps maxChars to valid range`() = runTest {
         val content = "Hello World"
         server.enqueue(MockResponse()

@@ -464,6 +464,178 @@ class PhoneAgentApiTest {
     }
 
     @Test
+    fun `resolveExplicitToolConstraint detects web_search only phrasing`() {
+        val agent = createAgent()
+
+        val strict = agent.resolveExplicitToolConstraint("Use web_search only and do not open a browser app")
+        val relaxed = agent.resolveExplicitToolConstraint("search for flights")
+
+        assertEquals(setOf("think", "web_search"), strict)
+        assertNull(relaxed)
+    }
+
+    @Test
+    fun `sendMessage web_search only constrains tools and blocks disallowed tool call response`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(
+                            ToolCall("wf1", "web_fetch", mapOf("url" to "https://www.google.com/travel/flights"))
+                        ),
+                        stopReason = "tool_use"
+                    )
+                )
+            )
+        )
+        val agent = PhoneAgentApi(client, client).also { it.phoneControlOverride = true }
+
+        val response = agent.sendMessage(
+            "Use web_search only. Find DEN to TPA flights tomorrow. Do not open any browser app.",
+            null,
+            isActionLoop = false
+        )
+
+        val toolNamesPassedToApi = client.lastTools.orEmpty().map { it.name }.toSet()
+        assertEquals(setOf("think", "web_search"), toolNamesPassedToApi)
+        assertTrue(response.toolCalls.isEmpty())
+        assertEquals("end_turn", response.stopReason)
+        assertTrue(response.text?.contains("Tool selection blocked by constraint") == true)
+    }
+
+    @Test
+    fun `sendMessage web_search only strips disallowed calls but preserves allowed ones`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(
+                            ToolCall("ws1", "web_search", mapOf("query" to "LAX to JFK")),
+                            ToolCall("wf1", "web_fetch", mapOf("url" to "https://example.com/flights"))
+                        ),
+                        stopReason = "tool_use"
+                    )
+                )
+            )
+        )
+        val agent = PhoneAgentApi(client, client).also { it.phoneControlOverride = true }
+
+        val response = agent.sendMessage(
+            "Use web_search only. Find LAX to JFK flights tomorrow.",
+            null,
+            isActionLoop = false
+        )
+
+        val toolNamesPassedToApi = client.lastTools.orEmpty().map { it.name }.toSet()
+        assertEquals(setOf("think", "web_search"), toolNamesPassedToApi)
+        assertEquals(listOf("web_search"), response.toolCalls.map { it.name })
+        assertEquals("tool_use", response.stopReason)
+    }
+
+    @Test
+    fun `web_search only constraint suppresses explicit web_fetch injection`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = "Using search-only mode.",
+                        toolCalls = emptyList(),
+                        stopReason = "end_turn"
+                    )
+                )
+            )
+        )
+        val agent = PhoneAgentApi(client, client).also { it.phoneControlOverride = true }
+
+        val response = agent.sendMessage(
+            "Use web_search only. Fetch https://docs.openclaw.ai and summarize.",
+            null,
+            isActionLoop = false
+        )
+
+        val toolNamesPassedToApi = client.lastTools.orEmpty().map { it.name }.toSet()
+        assertEquals(setOf("think", "web_search"), toolNamesPassedToApi)
+        assertTrue(response.toolCalls.isEmpty())
+        assertEquals("end_turn", response.stopReason)
+        assertEquals("Using search-only mode.", response.text)
+    }
+
+    @Test
+    fun `web_search only constraint persists through continueAfterTools and constrains action model tools`() = runTest {
+        val chatClient = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(ToolCall("ws1", "web_search", mapOf("query" to "DEN TPA flights"))),
+                        stopReason = "tool_use"
+                    )
+                )
+            )
+        )
+        val actionClient = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(ToolCall("wf1", "web_fetch", mapOf("url" to "https://example.com"))),
+                        stopReason = "tool_use"
+                    )
+                )
+            )
+        )
+        val agent = PhoneAgentApi(chatClient = chatClient, actionClient = actionClient).also {
+            it.phoneControlOverride = true
+        }
+
+        val first = agent.sendMessage(
+            "Use web_search only. Find cheapest DEN to TPA flights.",
+            null,
+            isActionLoop = false
+        )
+        assertEquals("tool_use", first.stopReason)
+        assertEquals("web_search", first.toolCalls.single().name)
+
+        agent.addToolResult("ws1", "Search results: sample")
+        val continuation = agent.continueAfterTools()
+
+        val actionToolNames = actionClient.lastTools.orEmpty().map { it.name }.toSet()
+        assertEquals(setOf("think", "web_search"), actionToolNames)
+        assertTrue(continuation.toolCalls.isEmpty())
+        assertEquals("end_turn", continuation.stopReason)
+    }
+
+    @Test
+    fun `new non-action user turn clears previous web_search only constraint`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(text = "ok", toolCalls = emptyList(), stopReason = "end_turn"),
+                    ChatResponse(text = "ok", toolCalls = emptyList(), stopReason = "end_turn")
+                )
+            )
+        )
+        val agent = PhoneAgentApi(client, client).also { it.phoneControlOverride = true }
+
+        agent.sendMessage("Use web_search only for this request", null, isActionLoop = false)
+        val constrainedTools = client.lastTools.orEmpty().map { it.name }.toSet()
+        assertEquals(setOf("think", "web_search"), constrainedTools)
+
+        agent.sendMessage("Open Gmail", null, isActionLoop = false)
+        val unconstrainedTools = client.lastTools.orEmpty().map { it.name }.toSet()
+        assertTrue("open_app" in unconstrainedTools)
+        assertTrue("web_fetch" in unconstrainedTools)
+    }
+
+    @Test
     fun `executeToolCall tap validates element_id parameter`() = runTest {
         val agent = createAgent()
 

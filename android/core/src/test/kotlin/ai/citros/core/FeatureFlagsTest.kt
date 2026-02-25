@@ -31,4 +31,21 @@ class FeatureFlagsTest {
         FeatureFlags.resetToDefaults()
         assertTrue(FeatureFlags.useServiceArchitecture)
     }
+
+    @Test
+    fun `HITL defaults are disabled for regression stabilization`() {
+        assertFalse(FeatureFlags.actionPolicyEnabled)
+        assertFalse(FeatureFlags.userInterruptionCheckEnabled)
+    }
+
+    @Test
+    fun `resetToDefaults restores HITL disabled defaults`() {
+        FeatureFlags.actionPolicyEnabled = true
+        FeatureFlags.userInterruptionCheckEnabled = true
+
+        FeatureFlags.resetToDefaults()
+
+        assertFalse(FeatureFlags.actionPolicyEnabled)
+        assertFalse(FeatureFlags.userInterruptionCheckEnabled)
+    }
 }

@@ -428,6 +428,14 @@ open class PhoneAgentApi(
     @Volatile
     private var requestToolsCappedThisTask: Boolean = false
 
+    private data class ActiveToolConstraint(
+        val allowedToolNames: Set<String>,
+        val reason: String
+    )
+
+    @Volatile
+    private var activeToolConstraint: ActiveToolConstraint? = null
+
     companion object {
         private const val TAG = "CitrosAgent"
         private const val APP_BUILD_CONFIG_CLASS = "ai.citros.chat.BuildConfig"
@@ -509,6 +517,14 @@ open class PhoneAgentApi(
             "fetch", "summarize", "summarise", "extract", "read"
         )
 
+        private val WEB_SEARCH_ONLY_ALLOWED_TOOLS = setOf("think", "web_search")
+
+        private val WEB_SEARCH_ONLY_REGEXES = listOf(
+            Regex("""\buse\s+web[_\s]?search\s+only\b""", RegexOption.IGNORE_CASE),
+            Regex("""\bonly\s+(?:use\s+)?web[_\s]?search\b""", RegexOption.IGNORE_CASE),
+            Regex("""\bweb[_\s]?search\s+only\b""", RegexOption.IGNORE_CASE)
+        )
+
         /**
          * Strip hallucinated tool-use artifacts from chat-mode responses.
          * Defense-in-depth: even when tools are not provided, some models may
@@ -564,6 +580,12 @@ open class PhoneAgentApi(
             requestToolsExpandedCategories.clear()
             requestToolsCallCounts.clear()
             requestToolsCappedThisTask = false
+            activeToolConstraint = resolveExplicitToolConstraint(userMessage)?.let {
+                ActiveToolConstraint(
+                    allowedToolNames = it,
+                    reason = "explicit user tool restriction"
+                )
+            }
         }
 
         // When phone control is not available, always use chat mode without tools (#390).
@@ -646,13 +668,14 @@ open class PhoneAgentApi(
         val modelName = client.modelId
         val sensorSnapshot = getTaskSensorSnapshot(startNewTask = !isActionLoop)
 
-        val (toolsForModel, toolPlan) = getToolsForModelWithGrouping(
+        val (baseToolsForModel, toolPlan) = getToolsForModelWithGrouping(
             modelId = client.modelId,
             messageText = userMessage,
             userSettings = userToolCategorySettings,
             expandedCategories = requestToolsExpandedCategories.toSet(),
             includeRequestToolsCappedReason = requestToolsCappedThisTask
         )
+        val toolsForModel = applyActiveToolConstraintToToolList(baseToolsForModel)
         if (toolPlan != null) {
             lastResolvedToolPlan = toolPlan
             logToolPlanTelemetry(toolPlan, isActionLoop = isActionLoop)
@@ -709,12 +732,13 @@ open class PhoneAgentApi(
                     systemPromptChars = systemPrompt.length,
                     toolSchemaChars = approximateToolSchemaChars(toolsForModel)
                 )
-                val response = enforceExplicitWebFetchIntent(
+                val explicitFetchEnforced = enforceExplicitWebFetchIntent(
                     userMessage = userMessage,
                     response = rawResponse,
                     isActionLoop = isActionLoop,
                     modelId = client.modelId
                 )
+                val response = enforceActiveToolConstraintOnResponse(explicitFetchEnforced)
                 messages.add(pendingUserMessage)
                 appendAssistantResponse(response)
                 response
@@ -857,13 +881,14 @@ open class PhoneAgentApi(
         val phoneControlAvailable = phoneControlOverride ?: ScreenReader.isAttached()
         val sensorSnapshot = getTaskSensorSnapshot(startNewTask = false)
 
-        val (toolsForModel, actionToolPlan) = getToolsForModelWithGrouping(
+        val (baseToolsForModel, actionToolPlan) = getToolsForModelWithGrouping(
             modelId = actionClient.modelId,
             messageText = "", // action loop has no new user message
             userSettings = userToolCategorySettings,
             expandedCategories = requestToolsExpandedCategories.toSet(),
             includeRequestToolsCappedReason = requestToolsCappedThisTask
         )
+        val toolsForModel = applyActiveToolConstraintToToolList(baseToolsForModel)
         if (actionToolPlan != null) {
             lastResolvedToolPlan = actionToolPlan
             logToolPlanTelemetry(actionToolPlan, isActionLoop = true)
@@ -899,7 +924,8 @@ open class PhoneAgentApi(
         )
 
         return result.fold(
-            onSuccess = { response ->
+            onSuccess = { rawResponse ->
+                val response = enforceActiveToolConstraintOnResponse(rawResponse)
                 recordUsageOutcomeAndCheckBudgets(
                     usage = response.usage,
                     modelId = actionClient.modelId,
@@ -988,6 +1014,16 @@ open class PhoneAgentApi(
         Log.d(TAG, "executeToolCall: name=${toolCall.name}, input=${toolCall.input.toString().take(100)}")
         val startMs = System.currentTimeMillis()
         return try {
+            val constraint = activeToolConstraint
+            if (constraint != null && toolCall.name !in constraint.allowedToolNames) {
+                return ToolResult(
+                    "Blocked by active tool constraint (${constraint.reason}). " +
+                        "Allowed tools: ${constraint.allowedToolNames.joinToString(", ")}.",
+                    isError = true,
+                    errorCode = ToolErrorCode.ACCESS_DENIED
+                )
+            }
+
             val result = when (toolCall.name) {
                 "tap" -> {
                     val elementId = (toolCall.input["element_id"] as? Number)?.toInt()
@@ -1890,6 +1926,78 @@ open class PhoneAgentApi(
     }
 
     @androidx.annotation.VisibleForTesting
+    internal fun resolveExplicitToolConstraint(userMessage: String): Set<String>? {
+        if (WEB_SEARCH_ONLY_REGEXES.any { it.containsMatchIn(userMessage) }) {
+            return WEB_SEARCH_ONLY_ALLOWED_TOOLS
+        }
+
+        val normalized = userMessage.lowercase()
+        val mentionsWebSearch = normalized.contains("web_search")
+        val blocksBrowserOpen =
+            normalized.contains("do not open") && normalized.contains("browser")
+        if (mentionsWebSearch && blocksBrowserOpen) {
+            return WEB_SEARCH_ONLY_ALLOWED_TOOLS
+        }
+        return null
+    }
+
+    /**
+     * Applies the active constraint to the tool list advertised to the model.
+     *
+     * If filtering would remove every tool, we intentionally keep the original list.
+     * Runtime enforcement still happens in [enforceActiveToolConstraintOnResponse]
+     * and [executeToolCall], which prevents disallowed execution while avoiding a
+     * zero-tool dead-end if capability discovery and constraints drift.
+     */
+    private fun applyActiveToolConstraintToToolList(tools: List<Tool>): List<Tool> {
+        val constraint = activeToolConstraint ?: return tools
+        val filtered = tools.filter { it.name in constraint.allowedToolNames }
+        if (filtered.isEmpty()) {
+            Log.w(
+                TAG,
+                "tool constraint produced empty advertised list; keeping original tools and relying on response/execution guards"
+            )
+            return tools
+        }
+        if (filtered.size != tools.size) {
+            Log.d(
+                TAG,
+                "active tool constraint applied: allowed=${constraint.allowedToolNames.joinToString(",")}, " +
+                    "before=${tools.size}, after=${filtered.size}, reason=${constraint.reason}"
+            )
+        }
+        return filtered
+    }
+
+    @androidx.annotation.VisibleForTesting
+    internal fun enforceActiveToolConstraintOnResponse(response: ChatResponse): ChatResponse {
+        val constraint = activeToolConstraint ?: return response
+        if (response.toolCalls.isEmpty()) return response
+
+        val allowedToolCalls = response.toolCalls.filter { it.name in constraint.allowedToolNames }
+        if (allowedToolCalls.size == response.toolCalls.size) return response
+
+        val blockedToolNames = response.toolCalls
+            .filter { it.name !in constraint.allowedToolNames }
+            .map { it.name }
+            .distinct()
+
+        Log.w(
+            TAG,
+            "blocked tool calls by active constraint: blocked=${blockedToolNames.joinToString(",")}, " +
+                "allowed=${constraint.allowedToolNames.joinToString(",")}, reason=${constraint.reason}"
+        )
+
+        if (allowedToolCalls.isNotEmpty()) {
+            return response.copy(toolCalls = allowedToolCalls, stopReason = "tool_use")
+        }
+
+        val text = response.text?.takeIf { it.isNotBlank() }
+            ?: "Tool selection blocked by constraint (${constraint.reason}). Use only ${constraint.allowedToolNames.joinToString(", ")}."
+        return response.copy(text = text, toolCalls = emptyList(), stopReason = "end_turn")
+    }
+
+    @androidx.annotation.VisibleForTesting
     internal fun extractExplicitWebFetchUrl(userMessage: String): String? {
         val normalized = userMessage.trim().lowercase()
         if (normalized.isEmpty()) return null
@@ -1927,6 +2035,9 @@ open class PhoneAgentApi(
     ): ChatResponse {
         if (isActionLoop) return response
         val requestedUrl = extractExplicitWebFetchUrl(userMessage) ?: return response
+        val constraint = activeToolConstraint
+        // Explicit per-turn tool constraints take precedence over fetch-intent auto injection.
+        if (constraint != null && "web_fetch" !in constraint.allowedToolNames) return response
         if (response.toolCalls.any { it.name == "web_fetch" }) return response
 
         val tools = getToolsForModel(modelId)
@@ -2065,6 +2176,7 @@ open class PhoneAgentApi(
     private fun clearConversationUnlocked() {
         messages.clear()
         deferredSeedMessages.set(null)
+        activeToolConstraint = null
         currentToolStep = 0
         taskSensorSnapshotEpoch.incrementAndGet()
         synchronized(taskSensorSnapshotLock) {

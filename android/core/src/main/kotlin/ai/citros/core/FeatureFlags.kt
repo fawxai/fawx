@@ -20,9 +20,22 @@ object FeatureFlags {
     @Volatile
     var useServiceArchitecture: Boolean = true
 
-    /** Remote rollout switch for action policy enforcement path. */
+    /**
+     * Remote rollout switch for action policy enforcement path.
+     *
+     * Default false while we stabilize core agentic loop reliability before
+     * incrementally re-enabling HITL guardrails.
+     */
     @Volatile
-    var actionPolicyEnabled: Boolean = true
+    var actionPolicyEnabled: Boolean = false
+
+    /**
+     * Rollout switch for interruption steer checks ("continue/cancel" app-switch prompts).
+     *
+     * Default false while HITL is temporarily deactivated for regression stabilization.
+     */
+    @Volatile
+    var userInterruptionCheckEnabled: Boolean = false
 
     /** Rollout switch: emit audit records for allow decisions in addition to required decisions. */
     @Volatile
@@ -51,7 +64,8 @@ object FeatureFlags {
      */
     fun resetToDefaults() {
         useServiceArchitecture = true
-        actionPolicyEnabled = true
+        actionPolicyEnabled = false
+        userInterruptionCheckEnabled = false
         actionPolicyAuditAllowDecisions = false
         promptTuningV1Enabled = false
         toolGroupingV1Enabled = false

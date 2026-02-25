@@ -116,16 +116,20 @@ class AgentExecutor(
          * 1. [CancellationCheck] — highest priority, exits immediately
          * 2. [StepLimitCheck] — hard ceiling on loop iterations
          * 3. [StuckDetectionCheck] — injects warning when screen is unchanged
-         * 4. [SteerCheck] — injects user messages (last: stop should short-circuit first)
+         * 4. [ActionVerificationCheck] — warns when UI-mutating actions appear ineffective
+         * 5. [UserInterruptionCheck] — optional (feature-flagged)
+         * 6. [SteerCheck] — injects user messages (last: stop should short-circuit first)
          */
-        fun defaultBoundaryChecks(): List<BoundaryCheck> = listOf(
-            CancellationCheck(),
-            StepLimitCheck(),
-            StuckDetectionCheck.withDefaults(),
-            ActionVerificationCheck(),
-            UserInterruptionCheck(),
-            SteerCheck()
-        )
+        fun defaultBoundaryChecks(): List<BoundaryCheck> = buildList {
+            add(CancellationCheck())
+            add(StepLimitCheck())
+            add(StuckDetectionCheck.withDefaults())
+            add(ActionVerificationCheck())
+            if (FeatureFlags.userInterruptionCheckEnabled) {
+                add(UserInterruptionCheck())
+            }
+            add(SteerCheck())
+        }
 
         /**
          * Default boundary checks including accessibility gating.
@@ -135,7 +139,9 @@ class AgentExecutor(
          * 2. [AccessibilityGateCheck] — gate on service availability
          * 3. [StepLimitCheck] — hard ceiling
          * 4. [StuckDetectionCheck] — injects warning when screen is unchanged
-         * 5. [SteerCheck] — injects user messages (last: stop should short-circuit first)
+         * 5. [ActionVerificationCheck] — warns when UI-mutating actions appear ineffective
+         * 6. [UserInterruptionCheck] — optional (feature-flagged)
+         * 7. [SteerCheck] — injects user messages (last: stop should short-circuit first)
          */
         fun defaultBoundaryChecksWithAccessibility(
             isAvailable: () -> Boolean,
@@ -144,15 +150,17 @@ class AgentExecutor(
             onLost: () -> Unit,
             baseTimeoutMs: Long = AccessibilityGateCheck.DEFAULT_BASE_TIMEOUT_MS,
             maxRetries: Int = AccessibilityGateCheck.DEFAULT_MAX_RETRIES
-        ): List<BoundaryCheck> = listOf(
-            CancellationCheck(),
-            AccessibilityGateCheck(isAvailable, waitForReconnect, onReconnected, onLost, baseTimeoutMs, maxRetries),
-            StepLimitCheck(),
-            StuckDetectionCheck.withDefaults(),
-            ActionVerificationCheck(),
-            UserInterruptionCheck(),
-            SteerCheck()
-        )
+        ): List<BoundaryCheck> = buildList {
+            add(CancellationCheck())
+            add(AccessibilityGateCheck(isAvailable, waitForReconnect, onReconnected, onLost, baseTimeoutMs, maxRetries))
+            add(StepLimitCheck())
+            add(StuckDetectionCheck.withDefaults())
+            add(ActionVerificationCheck())
+            if (FeatureFlags.userInterruptionCheckEnabled) {
+                add(UserInterruptionCheck())
+            }
+            add(SteerCheck())
+        }
     }
 
     /**

@@ -101,33 +101,44 @@ class ActionVerificationTest {
     // ====== Integration: default boundary checks position ======
 
     @Test
-    fun `ActionVerificationCheck is at correct position in default boundary checks`() {
-        val defaults = AgentExecutor.defaultBoundaryChecks()
-        assertEquals(6, defaults.size)
-        assertIs<CancellationCheck>(defaults[0])
-        assertIs<StepLimitCheck>(defaults[1])
-        assertIs<StuckDetectionCheck>(defaults[2])
-        assertIs<ActionVerificationCheck>(defaults[3])
-        assertIs<UserInterruptionCheck>(defaults[4])
-        assertIs<SteerCheck>(defaults[5])
+    fun `ActionVerificationCheck is at correct position in default boundary checks when interruption checks disabled`() {
+        val original = FeatureFlags.userInterruptionCheckEnabled
+        try {
+            FeatureFlags.userInterruptionCheckEnabled = false
+            val defaults = AgentExecutor.defaultBoundaryChecks()
+            assertEquals(5, defaults.size)
+            assertIs<CancellationCheck>(defaults[0])
+            assertIs<StepLimitCheck>(defaults[1])
+            assertIs<StuckDetectionCheck>(defaults[2])
+            assertIs<ActionVerificationCheck>(defaults[3])
+            assertIs<SteerCheck>(defaults[4])
+        } finally {
+            FeatureFlags.userInterruptionCheckEnabled = original
+        }
     }
 
     @Test
-    fun `ActionVerificationCheck is at correct position in accessibility boundary checks`() {
-        val checks = AgentExecutor.defaultBoundaryChecksWithAccessibility(
-            isAvailable = { true },
-            waitForReconnect = { true },
-            onReconnected = {},
-            onLost = {}
-        )
-        assertEquals(7, checks.size)
-        assertIs<CancellationCheck>(checks[0])
-        assertIs<AccessibilityGateCheck>(checks[1])
-        assertIs<StepLimitCheck>(checks[2])
-        assertIs<StuckDetectionCheck>(checks[3])
-        assertIs<ActionVerificationCheck>(checks[4])
-        assertIs<UserInterruptionCheck>(checks[5])
-        assertIs<SteerCheck>(checks[6])
+    fun `ActionVerificationCheck keeps UserInterruptionCheck ordering when interruption checks enabled`() {
+        val original = FeatureFlags.userInterruptionCheckEnabled
+        try {
+            FeatureFlags.userInterruptionCheckEnabled = true
+            val checks = AgentExecutor.defaultBoundaryChecksWithAccessibility(
+                isAvailable = { true },
+                waitForReconnect = { true },
+                onReconnected = {},
+                onLost = {}
+            )
+            assertEquals(7, checks.size)
+            assertIs<CancellationCheck>(checks[0])
+            assertIs<AccessibilityGateCheck>(checks[1])
+            assertIs<StepLimitCheck>(checks[2])
+            assertIs<StuckDetectionCheck>(checks[3])
+            assertIs<ActionVerificationCheck>(checks[4])
+            assertIs<UserInterruptionCheck>(checks[5])
+            assertIs<SteerCheck>(checks[6])
+        } finally {
+            FeatureFlags.userInterruptionCheckEnabled = original
+        }
     }
 
     // ====== Integration: end-to-end with AgentExecutor ======
