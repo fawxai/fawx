@@ -111,6 +111,8 @@ class AnthropicClient : BaseProviderClient {
      * Format: system as top-level field, messages array with user/assistant roles.
      */
     override fun buildChatRequest(conversation: Conversation): JsonObject {
+        val sanitizedChatMessages = sanitizeChatMessagesForApi(conversation.toApiMessages())
+
         return buildJsonObject {
             put("model", config.chatModelId)
             put("max_tokens", maxTokens)
@@ -122,10 +124,10 @@ class AnthropicClient : BaseProviderClient {
                 }
             }
             putJsonArray("messages") {
-                conversation.toApiMessages().forEach { msg ->
+                sanitizedChatMessages.forEach { msg ->
                     addJsonObject {
-                        put("role", msg["role"])
-                        put("content", msg["content"])
+                        put("role", msg.getValue("role"))
+                        put("content", msg.getValue("content"))
                     }
                 }
             }
@@ -311,6 +313,59 @@ class AnthropicClient : BaseProviderClient {
         return sanitized
     }
 
+    /**
+     * Anthropic rejects assistant text that ends with trailing whitespace.
+     *
+     * We intentionally use [trimEnd] (not [trim]) so we preserve leading
+     * whitespace/indentation (for example Markdown/code formatting) while
+     * removing the API-invalid suffix.
+     */
+    private fun sanitizeAssistantTextForApi(text: String): String = text.trimEnd()
+
+    /**
+     * Return sanitized assistant text or null when trimming would produce empty content.
+     *
+     * Anthropic rejects empty assistant text payloads, so callers should drop
+     * assistant messages/blocks that become empty after sanitization.
+     */
+    private fun sanitizeAssistantTextForApiOrNull(text: String): String? =
+        sanitizeAssistantTextForApi(text).takeIf { it.isNotEmpty() }
+
+    /**
+     * Apply Anthropic assistant-text sanitization to chat-mode API messages.
+     *
+     * This keeps sanitization centralized for both [buildChatRequest] and
+     * [buildToolRequest] and drops assistant messages that would serialize as
+     * empty strings.
+     */
+    private fun sanitizeChatMessagesForApi(messages: List<Map<String, String>>): List<Map<String, String>> {
+        return messages.mapNotNull { message ->
+            if (message["role"] != Message.ROLE_ASSISTANT) {
+                return@mapNotNull message
+            }
+
+            val rawContent = message["content"] ?: return@mapNotNull null
+            val sanitizedContent = sanitizeAssistantTextForApiOrNull(rawContent)
+                ?: return@mapNotNull null
+
+            message + ("content" to sanitizedContent)
+        }
+    }
+
+    private fun sanitizeAssistantContentBlocksForApi(blocks: List<Map<String, Any>>): List<Map<String, Any>> {
+        return blocks.mapNotNull { block ->
+            if (block["type"] != "text") {
+                return@mapNotNull block
+            }
+
+            val rawText = block["text"] as? String ?: return@mapNotNull block
+            val sanitizedText = sanitizeAssistantTextForApiOrNull(rawText)
+                ?: return@mapNotNull null
+
+            block + ("text" to sanitizedText)
+        }
+    }
+
     internal override fun buildToolRequest(
         messages: List<Message>,
         systemPrompt: String,
@@ -393,13 +448,21 @@ class AnthropicClient : BaseProviderClient {
                         }
                         // Assistant message with tool calls: role="assistant" with content blocks
                         msg.role == "assistant" && blocks != null -> {
-                            addJsonObject {
-                                put("role", "assistant")
-                                putJsonArray("content") {
-                                    blocks.forEach { block ->
-                                        addJsonObject {
-                                            block.forEach { (key, value) ->
-                                                put(key, anyToJsonElement(value))
+                            val sanitizedBlocks = sanitizeAssistantContentBlocksForApi(blocks)
+                            if (sanitizedBlocks.isEmpty()) {
+                                Log.w(
+                                    "CitrosAPI",
+                                    "buildToolRequest: dropping assistant content-block message with empty text after sanitization"
+                                )
+                            } else {
+                                addJsonObject {
+                                    put("role", "assistant")
+                                    putJsonArray("content") {
+                                        sanitizedBlocks.forEach { block ->
+                                            addJsonObject {
+                                                block.forEach { (key, value) ->
+                                                    put(key, anyToJsonElement(value))
+                                                }
                                             }
                                         }
                                     }
@@ -408,9 +471,22 @@ class AnthropicClient : BaseProviderClient {
                         }
                         // Regular text message
                         else -> {
-                            addJsonObject {
-                                put("role", msg.role)
-                                put("content", msg.content)
+                            val content = if (msg.role == Message.ROLE_ASSISTANT) {
+                                sanitizeAssistantTextForApiOrNull(msg.content)
+                            } else {
+                                msg.content
+                            }
+
+                            if (content == null) {
+                                Log.w(
+                                    "CitrosAPI",
+                                    "buildToolRequest: dropping assistant text message with empty content after sanitization"
+                                )
+                            } else {
+                                addJsonObject {
+                                    put("role", msg.role)
+                                    put("content", content)
+                                }
                             }
                         }
                     }
