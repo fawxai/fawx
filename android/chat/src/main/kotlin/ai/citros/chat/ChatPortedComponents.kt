@@ -9,6 +9,7 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -20,6 +21,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -45,12 +47,15 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import ai.citros.core.ModelConfig
+import ai.citros.core.ActionPill
 import ai.citros.core.Message
+import ai.citros.core.PillStyle
 import ai.citros.core.Provider
 import ai.citros.core.WalletState
 import android.content.Context
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
@@ -128,6 +133,56 @@ internal fun ChatEmptyState(
         }
     }
 }
+
+@Composable
+internal fun RuntimeActionPillRow(
+    pills: List<ActionPill>,
+    flavor: CitrosFlavor = CitrosFlavor.TANGERINE,
+    onPillTapped: (ActionPill) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    if (pills.isEmpty()) return
+    val isDarkTheme = LocalCitrosIsDark.current
+    val surfaces = remember(isDarkTheme) { citrosDirectiveSurfaces(isDarkTheme) }
+
+    LazyRow(
+        modifier = modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        contentPadding = PaddingValues(vertical = 2.dp)
+    ) {
+        items(items = pills, key = { it.id }) { pill ->
+            val (containerColor, borderColor, textColor) = when (pill.style) {
+                PillStyle.PRIMARY -> Triple(surfaces.green, Color.Transparent, contrastOn(surfaces.green))
+                PillStyle.DANGER -> Triple(surfaces.red, Color.Transparent, contrastOn(surfaces.red))
+                PillStyle.SUBTLE -> Triple(Color.Transparent, Color.Transparent, surfaces.labelSecondary)
+                PillStyle.DEFAULT -> Triple(surfaces.surface2, surfaces.separatorLight, surfaces.labelPrimary)
+            }
+
+            Surface(
+                shape = RoundedCornerShape(999.dp),
+                color = containerColor,
+                border = BorderStroke(
+                    width = if (borderColor == Color.Transparent) 0.dp else 1.dp,
+                    color = borderColor
+                ),
+                modifier = Modifier
+                    .heightIn(min = 48.dp)
+                    .clip(RoundedCornerShape(999.dp))
+                    .semantics { contentDescription = "Action ${pill.label}" }
+                    .testTag("runtime_pill_${pill.id}")
+                    .clickable(role = Role.Button) { onPillTapped(pill) }
+            ) {
+                Text(
+                    text = pill.label,
+                    style = CitrosTypography.labelMedium,
+                    color = textColor,
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 11.dp)
+                )
+            }
+        }
+    }
+}
+
 @Composable
 internal fun QuickSwitcherSheet(
     walletState: WalletState,

@@ -470,6 +470,9 @@ private fun ChatNavHost(
                     OverlayController.updateSurfaceMode(OverlaySurfaceMode.PANEL, fromUser = true)
                     sharedChatViewModel.resetUnreadCount()
                 }
+                is OverlayAction.RuntimePillTapped -> {
+                    sharedChatViewModel.onRuntimePillTapped(action.action)
+                }
             }
         }
     }
@@ -479,11 +482,13 @@ private fun ChatNavHost(
         sharedChatViewModel.messages.size,
         sharedChatViewModel.currentToolStatus.value,
         sharedChatViewModel.queuedMessage.value,
+        sharedChatViewModel.runtimeActionPills.value,
         isAppForeground
     ) {
         val overlayState = OverlayStateMapper.mapToOverlayState(
             messages = sharedChatViewModel.messages.toList(),
-            isLoading = sharedChatViewModel.isLoading.value
+            isLoading = sharedChatViewModel.isLoading.value,
+            actionPills = sharedChatViewModel.runtimeActionPills.value
         )
         OverlayController.updateOverlayState(overlayState)
         OverlayController.updateUnreadCount(sharedChatViewModel.unreadCount.intValue)
@@ -762,6 +767,9 @@ internal fun deriveOverlayInteractionDemand(
     overlayState: OverlayState,
     toolStatus: String?
 ): OverlayInteractionDemand {
+    if (overlayState.actionPills.isNotEmpty()) {
+        return OverlayInteractionDemand.INPUT_REQUIRED
+    }
     return when (overlayState.runState) {
         OverlayRunState.FAILED -> OverlayInteractionDemand.ERROR_ACTION_REQUIRED
         OverlayRunState.EXECUTING -> {
@@ -1775,6 +1783,16 @@ fun ChatScreen(
                             message = message,
                             flavor = selectedFlavor,
                         )
+                    }
+                    if (viewModel.runtimeActionPills.value.isNotEmpty()) {
+                        item {
+                            RuntimeActionPillRow(
+                                pills = viewModel.runtimeActionPills.value,
+                                onPillTapped = { pill ->
+                                    viewModel.onRuntimePillTapped(pill.action)
+                                }
+                            )
+                        }
                     }
                     if (viewModel.isLoading.value) {
                         item {

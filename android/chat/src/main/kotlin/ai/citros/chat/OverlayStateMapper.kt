@@ -35,7 +35,8 @@ object OverlayStateMapper {
      */
     fun mapToOverlayState(
         messages: List<Message>,
-        isLoading: Boolean
+        isLoading: Boolean,
+        actionPills: List<ActionPill> = emptyList()
     ): OverlayState {
         // Find the last user message index
         val lastUserIndex = messages.indexOfLast { it.role == "user" }
@@ -110,7 +111,8 @@ object OverlayStateMapper {
             steps = steps,
             lines = lines,
             currentStepIndex = currentStepIndex,
-            totalSteps = steps.size
+            totalSteps = steps.size,
+            actionPills = actionPills
         )
     }
     

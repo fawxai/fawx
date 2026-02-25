@@ -370,7 +370,13 @@ class AgentExecutor(
                     is PolicyDecision.Confirm -> {
                         val requestId = java.util.UUID.randomUUID().toString()
                         val approved = kotlinx.coroutines.withTimeoutOrNull(CONFIRM_TIMEOUT_MS) {
-                            delegate.requestUserConfirmation(toolCall, requestId, decision.reason, CONFIRM_TIMEOUT_MS)
+                            delegate.requestUserConfirmation(
+                                toolCall = toolCall,
+                                requestId = requestId,
+                                reason = decision.reason,
+                                timeoutMs = CONFIRM_TIMEOUT_MS,
+                                reasonCode = decision.reasonCode
+                            )
                         }
                         val outcome = when (approved) {
                             true -> PolicyConfirmOutcome.APPROVED
@@ -789,7 +795,13 @@ interface ToolExecutionDelegate {
     fun onStepStarted(step: Int, maxSteps: Int)
 
     /** Request runtime user confirmation for a gated tool action. */
-    suspend fun requestUserConfirmation(toolCall: ToolCall, requestId: String, reason: String, timeoutMs: Long): Boolean = false
+    suspend fun requestUserConfirmation(
+        toolCall: ToolCall,
+        requestId: String,
+        reason: String,
+        timeoutMs: Long,
+        reasonCode: String? = null
+    ): Boolean = false
 }
 
 /**

@@ -19,7 +19,10 @@ import ai.citros.core.Message
 import ai.citros.core.ModelCatalog
 import ai.citros.core.ModelConfig
 import ai.citros.core.ModelTier
+import ai.citros.core.InputType
+import ai.citros.core.PillAction
 import ai.citros.core.PermissiveActionPolicy
+import ai.citros.core.PolicyReasonCode
 import ai.citros.core.Provider
 import ai.citros.core.ProviderClient
 import ai.citros.core.ProviderConfig
@@ -30,8 +33,10 @@ import ai.citros.core.SensorContext
 import ai.citros.core.SensorProvider
 import ai.citros.core.Tool
 import ai.citros.core.ToolCall
+import ai.citros.core.ToolErrorCode
 import ai.citros.core.ToolExecutionDelegate
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -1545,7 +1550,7 @@ class ChatViewModelTest {
         val resolved = invokeResolveRuntimeProviderConfig(
             ProviderConfig.openAi("sk-test").copy(chatModelId = "unknown-chat", actionModelId = "gpt-4o")
         )
-        assertEquals("o3", resolved.chatModelId)
+        assertEquals("gpt-4o", resolved.chatModelId)
     }
 
     @Test
@@ -1890,6 +1895,37 @@ class ChatViewModelTest {
         advanceUntilIdle()
 
         assertTrue(restoreCalled, "toolLoopOverlayRestoreHook should be invoked even on exception")
+    }
+
+    @Test
+    fun `tool loop exception path surfaces crash message and recovery pills`() = runTest {
+        val scripted = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            scripted = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = "I'll act",
+                        toolCalls = listOf(ToolCall("t1", "press_back", emptyMap())),
+                        stopReason = "tool_use"
+                    )
+                )
+            )
+        )
+        setApiModeWithBackends(
+            viewModel,
+            listOf(viewModel.createTestBackend(Provider.ANTHROPIC, scripted, scripted))
+        )
+
+        viewModel.agentExecutorFactory = { _, _, _, _, _, _, _ ->
+            throw RuntimeException("executor failed")
+        }
+
+        viewModel.sendMessage("press back")
+        advanceUntilIdle()
+
+        assertTrue(viewModel.messages.any { it.role == "assistant" && it.content.contains("💥 Crashed: executor failed") })
+        assertEquals(InputType.FREE_TEXT, viewModel.waitingInputType.value)
+        assertEquals(listOf("Try again", "Do something else", "Cancel"), viewModel.runtimeActionPills.value.map { it.label })
     }
 
     @Test
@@ -2583,7 +2619,7 @@ class ChatViewModelTest {
         val first = CompletableDeferred<Boolean>()
         viewModel.setPendingPolicyConfirmationForTest("req-old", first)
 
-        val secondRequest = backgroundScope.async {
+        val secondRequest = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) {
             viewModel.requestUserConfirmation(
                 toolCall = ToolCall("tc-1", "test_tool", emptyMap()),
                 requestId = "req-new",
@@ -2599,6 +2635,237 @@ class ChatViewModelTest {
         advanceUntilIdle()
 
         assertTrue(secondRequest.await())
+    }
+
+    @Test
+    fun `requestUserConfirmation exposes runtime pills and approve pill resolves`() = runTest {
+        val decision = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) {
+            viewModel.requestUserConfirmation(
+                toolCall = ToolCall("tc-pill", "tap", emptyMap()),
+                requestId = "req-pill",
+                reason = "Need approval",
+                timeoutMs = 5_000
+            )
+        }
+        advanceUntilIdle()
+
+        assertEquals(InputType.POLICY_CONFIRMATION, viewModel.waitingInputType.value)
+        assertTrue(viewModel.runtimeActionPills.value.isNotEmpty())
+        val approveAction = viewModel.runtimeActionPills.value
+            .map { it.action }
+            .filterIsInstance<PillAction.Approve>()
+            .first()
+
+        viewModel.onRuntimePillTapped(approveAction)
+        advanceUntilIdle()
+
+        assertTrue(decision.await())
+        assertTrue(viewModel.runtimeActionPills.value.isEmpty())
+        assertNull(viewModel.waitingInputType.value)
+    }
+
+    @Test
+    fun `requestUserConfirmation uses reason code for pill mapping`() = runTest {
+        val request = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) {
+            viewModel.requestUserConfirmation(
+                toolCall = ToolCall("tc-pill-code", "tap", emptyMap()),
+                requestId = "req-pill-code",
+                reason = "Need approval",
+                timeoutMs = 5_000,
+                reasonCode = PolicyReasonCode.CONFIRM_SENSITIVE_APP
+            )
+        }
+        advanceUntilIdle()
+
+        assertEquals(
+            listOf("Allow once", "Deny", "Always deny for this app"),
+            viewModel.runtimeActionPills.value.map { it.label }
+        )
+
+        viewModel.onRuntimePillTapped(PillAction.Deny("req-pill-code"))
+        advanceUntilIdle()
+        assertFalse(request.await())
+    }
+
+    @Test
+    fun `offer choices publishes disambiguation pills and returns selected choice`() = runTest {
+        val toolResult = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) {
+            viewModel.executeToolCall(
+                ToolCall(
+                    id = "tc-offer",
+                    name = "offer_choices",
+                    input = mapOf(
+                        "question" to "Which app?",
+                        "choices" to listOf("Maps", "Chrome")
+                    )
+                ),
+                screenContent = null
+            )
+        }
+        advanceUntilIdle()
+
+        assertEquals(InputType.DISAMBIGUATION, viewModel.waitingInputType.value)
+        assertEquals(listOf("Maps", "Chrome"), viewModel.runtimeActionPills.value.map { it.label })
+
+        viewModel.onRuntimePillTapped(PillAction.Steer("Maps"))
+        advanceUntilIdle()
+
+        val result = toolResult.await()
+        assertFalse(result.isError)
+        assertEquals("Maps", result.text)
+        assertNull(viewModel.waitingInputType.value)
+        assertTrue(viewModel.runtimeActionPills.value.isEmpty())
+    }
+
+    @Test
+    fun `requestUserConfirmation deny pill resolves false`() = runTest {
+        val decision = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) {
+            viewModel.requestUserConfirmation(
+                toolCall = ToolCall("tc-pill-deny", "tap", emptyMap()),
+                requestId = "req-pill-deny",
+                reason = "Need approval",
+                timeoutMs = 5_000
+            )
+        }
+        advanceUntilIdle()
+
+        val denyAction = viewModel.runtimeActionPills.value
+            .map { it.action }
+            .filterIsInstance<PillAction.Deny>()
+            .first()
+
+        viewModel.onRuntimePillTapped(denyAction)
+        advanceUntilIdle()
+
+        assertFalse(decision.await())
+        assertTrue(viewModel.runtimeActionPills.value.isEmpty())
+        assertNull(viewModel.waitingInputType.value)
+    }
+
+    @Test
+    fun `requestUserConfirmation authenticate pill resolves true`() = runTest {
+        val decision = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) {
+            viewModel.requestUserConfirmation(
+                toolCall = ToolCall("tc-pill-auth", "tap", emptyMap()),
+                requestId = "req-pill-auth",
+                reason = "Financial transfer requires authenticate before proceeding",
+                timeoutMs = 5_000
+            )
+        }
+        advanceUntilIdle()
+
+        val authAction = viewModel.runtimeActionPills.value
+            .map { it.action }
+            .filterIsInstance<PillAction.Authenticate>()
+            .first()
+
+        viewModel.onRuntimePillTapped(authAction)
+        advanceUntilIdle()
+
+        assertTrue(decision.await())
+        assertTrue(viewModel.runtimeActionPills.value.isEmpty())
+        assertNull(viewModel.waitingInputType.value)
+    }
+
+    @Test
+    fun `dismiss pill is ignored during policy confirmation to avoid deadlock`() {
+        val deferred = CompletableDeferred<Boolean>()
+        viewModel.setPendingPolicyConfirmationForTest("req-dismiss", deferred)
+        viewModel.waitingInputType.value = InputType.POLICY_CONFIRMATION
+        viewModel.runtimeActionPills.value = RuntimeActionPillMapper.policyConfirmationPills(
+            requestId = "req-dismiss",
+            reason = "Need approval"
+        )
+
+        viewModel.onRuntimePillTapped(PillAction.Dismiss)
+
+        assertFalse(deferred.isCompleted)
+        assertEquals(InputType.POLICY_CONFIRMATION, viewModel.waitingInputType.value)
+        assertTrue(viewModel.runtimeActionPills.value.isNotEmpty())
+    }
+
+    @Test
+    fun `dismiss pill clears free text recovery pills`() {
+        viewModel.waitingInputType.value = InputType.FREE_TEXT
+        viewModel.runtimeActionPills.value = RuntimeActionPillMapper.errorRecoveryPills()
+
+        viewModel.onRuntimePillTapped(PillAction.Dismiss)
+
+        assertNull(viewModel.waitingInputType.value)
+        assertTrue(viewModel.runtimeActionPills.value.isEmpty())
+    }
+
+    @Test
+    fun `cancel pill clears recovery pills and marks tool loop cancelled`() {
+        viewModel.waitingInputType.value = InputType.FREE_TEXT
+        viewModel.runtimeActionPills.value = RuntimeActionPillMapper.errorRecoveryPills()
+
+        viewModel.onRuntimePillTapped(PillAction.Cancel)
+
+        assertTrue(viewModel.isToolLoopCancelledForTesting())
+        assertNull(viewModel.waitingInputType.value)
+        assertTrue(viewModel.runtimeActionPills.value.isEmpty())
+    }
+
+    @Test
+    fun `setQueuedMessage resolves disambiguation from partial unique match`() {
+        val deferred = CompletableDeferred<String>()
+        viewModel.setPendingOfferChoicesForTest(
+            requestId = "req-offer-partial",
+            choices = listOf("Google Maps", "Chrome"),
+            deferred = deferred
+        )
+        viewModel.isLoading.value = true
+
+        viewModel.setQueuedMessage("maps")
+
+        assertTrue(deferred.isCompleted)
+        assertEquals("Google Maps", deferred.getCompleted())
+        assertNull(viewModel.queuedMessage.value)
+    }
+
+    @Test
+    fun `setQueuedMessage leaves ambiguous disambiguation as queued input`() {
+        val deferred = CompletableDeferred<String>()
+        viewModel.setPendingOfferChoicesForTest(
+            requestId = "req-offer-ambiguous",
+            choices = listOf("Google Maps", "Maps Go"),
+            deferred = deferred
+        )
+        viewModel.isLoading.value = true
+
+        viewModel.setQueuedMessage("maps")
+
+        assertFalse(deferred.isCompleted)
+        assertEquals("maps", viewModel.queuedMessage.value)
+    }
+
+    @Test
+    fun `offer choices validation errors include invalid input error code`() = runTest {
+        val missingQuestion = viewModel.executeToolCall(
+            ToolCall(
+                id = "tc-offer-missing-question",
+                name = "offer_choices",
+                input = mapOf("choices" to listOf("Maps", "Chrome"))
+            ),
+            screenContent = null
+        )
+        assertTrue(missingQuestion.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, missingQuestion.errorCode)
+
+        val invalidCount = viewModel.executeToolCall(
+            ToolCall(
+                id = "tc-offer-invalid-count",
+                name = "offer_choices",
+                input = mapOf(
+                    "question" to "Which app?",
+                    "choices" to listOf("Maps")
+                )
+            ),
+            screenContent = null
+        )
+        assertTrue(invalidCount.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, invalidCount.errorCode)
     }
 
     @Test
@@ -3000,7 +3267,7 @@ class ChatViewModelTest {
     }
 
     @Test
-    fun `onToolError PERSISTENT sets warning status`() {
+    fun `onToolError PERSISTENT sets warning status and recovery pills`() {
         viewModel.onToolError(
             toolName = "web_fetch",
             errorText = "HTTP 500",
@@ -3008,6 +3275,8 @@ class ChatViewModelTest {
         )
 
         assertEquals("⚠️ HTTP 500", viewModel.currentToolStatus.value)
+        assertEquals(InputType.FREE_TEXT, viewModel.waitingInputType.value)
+        assertEquals(listOf("Try again", "Do something else", "Cancel"), viewModel.runtimeActionPills.value.map { it.label })
     }
 
     @Test

@@ -5,6 +5,7 @@ import ai.citros.core.PhoneAgentApi
 import ai.citros.core.ScreenContent
 import ai.citros.core.ScreenReader
 import ai.citros.core.ToolCall
+import ai.citros.core.ToolErrorCode
 import ai.citros.core.ToolExecutionDelegate
 import ai.citros.core.ToolResult
 import android.util.Log
@@ -18,8 +19,10 @@ import android.util.Log
 class ServiceToolDelegate(
     private val phoneAgentApi: PhoneAgentApi,
     private val outputVerbosity: OutputVerbosity = OutputVerbosity.NORMAL,
-    private val onConfirmationRequested: ((ToolCall, String, String) -> Unit)? = null,
-    private val awaitConfirmationDecision: (suspend (String) -> Boolean)? = null
+    private val onConfirmationRequested: ((ToolCall, String, String?, String) -> Unit)? = null,
+    private val awaitConfirmationDecision: (suspend (String) -> Boolean)? = null,
+    private val onOfferChoicesRequested: ((String, String, List<String>) -> Unit)? = null,
+    private val awaitOfferChoiceDecision: (suspend (String) -> String?)? = null
 ) : ToolExecutionDelegate {
 
     companion object {
@@ -31,6 +34,9 @@ class ServiceToolDelegate(
     }
 
     override suspend fun executeToolCall(toolCall: ToolCall, screenContent: ScreenContent?): ToolResult {
+        if (toolCall.name == "offer_choices") {
+            return executeOfferChoices(toolCall)
+        }
         val isUiMutating = isUiMutatingTool(toolCall.name)
         if (isUiMutating) InterruptionDetector.markAgentAction()
         return try {
@@ -126,11 +132,73 @@ class ServiceToolDelegate(
         phoneAgentApi.currentToolStep = step
     }
 
-    override suspend fun requestUserConfirmation(toolCall: ToolCall, requestId: String, reason: String, timeoutMs: Long): Boolean {
+    override suspend fun requestUserConfirmation(
+        toolCall: ToolCall,
+        requestId: String,
+        reason: String,
+        timeoutMs: Long,
+        reasonCode: String? = null
+    ): Boolean {
         // timeoutMs is enforced by AgentExecutor via withTimeoutOrNull around this call.
         // ServiceToolDelegate intentionally only bridges request/response plumbing.
-        onConfirmationRequested?.invoke(toolCall, requestId, reason)
+        onConfirmationRequested?.invoke(toolCall, requestId, reasonCode, reason)
         val waiter = awaitConfirmationDecision ?: return false
         return waiter(requestId)
+    }
+
+    private suspend fun executeOfferChoices(toolCall: ToolCall): ToolResult {
+        val question = (toolCall.input["question"] as? String)?.trim()
+            ?.takeIf { it.isNotEmpty() }
+            ?: return ToolResult(
+                "Failed: offer_choices: question is required",
+                isError = true,
+                errorCode = ToolErrorCode.INVALID_INPUT
+            )
+
+        val rawChoices = toolCall.input["choices"] as? List<*>
+            ?: return ToolResult(
+                "Failed: offer_choices: choices must be an array of strings",
+                isError = true,
+                errorCode = ToolErrorCode.INVALID_INPUT
+            )
+
+        val choices = rawChoices.map { it as? String }
+        if (choices.any { it.isNullOrBlank() }) {
+            return ToolResult(
+                "Failed: offer_choices: choices must contain only non-empty strings",
+                isError = true,
+                errorCode = ToolErrorCode.INVALID_INPUT
+            )
+        }
+
+        val normalizedChoices = choices.filterNotNull().map { it.trim() }
+        if (normalizedChoices.size !in 2..5) {
+            return ToolResult(
+                "Failed: offer_choices: choices must include 2-5 options",
+                isError = true,
+                errorCode = ToolErrorCode.INVALID_INPUT
+            )
+        }
+
+        val requestId = "offer_choices:${toolCall.id.ifBlank { System.nanoTime().toString() }}"
+        val notify = onOfferChoicesRequested
+        val waiter = awaitOfferChoiceDecision
+        if (notify == null || waiter == null) {
+            return ToolResult(
+                "Failed: offer_choices: runtime choice handler is not configured",
+                isError = true,
+                errorCode = ToolErrorCode.NOT_CONFIGURED
+            )
+        }
+
+        notify(requestId, question, normalizedChoices)
+        val selection = waiter(requestId)
+            ?: return ToolResult(
+                "Failed: offer_choices: no choice selected",
+                isError = true,
+                errorCode = ToolErrorCode.EXECUTION_FAILED
+            )
+
+        return ToolResult(selection)
     }
 }

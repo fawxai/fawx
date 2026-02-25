@@ -161,6 +161,7 @@ object OutputClassifier {
         "paste" to OutputToolCategory.OTHER,
         "clipboard" to OutputToolCategory.OTHER,
         "request_tools" to OutputToolCategory.OTHER,
+        "offer_choices" to OutputToolCategory.OTHER,
         "think" to OutputToolCategory.REASONING
     )
 

@@ -38,6 +38,7 @@ class AgentStateTest {
     fun `waitingForInput statusLabel returns reason`() {
         val state = AgentState.WaitingForInput("task-1", "req-1", "Confirm send?", InputType.POLICY_CONFIRMATION)
         assertEquals("Confirm send?", state.statusLabel())
+        assertTrue(state.pills.isEmpty())
     }
 
     @Test
@@ -75,6 +76,25 @@ class AgentStateTest {
     @Test
     fun `waitingForInput is active`() {
         assertTrue(AgentState.WaitingForInput("task-1", "req-1", "Confirm?", InputType.DISAMBIGUATION).isActive())
+    }
+
+    @Test
+    fun `waitingForInput can carry runtime pills`() {
+        val pill = ActionPill(
+            id = "p1",
+            label = "Yes",
+            style = PillStyle.PRIMARY,
+            action = PillAction.Approve("req-1")
+        )
+        val state = AgentState.WaitingForInput(
+            taskId = "task-1",
+            requestId = "req-1",
+            reason = "Confirm?",
+            inputType = InputType.POLICY_CONFIRMATION,
+            pills = listOf(pill)
+        )
+        assertEquals(1, state.pills.size)
+        assertEquals("Yes", state.pills.first().label)
     }
 
     @Test

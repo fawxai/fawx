@@ -2,8 +2,10 @@ package ai.citros.chat
 
 import ai.citros.core.OutputVerbosity
 import ai.citros.core.PhoneAgentApi
+import ai.citros.core.PolicyReasonCode
 import ai.citros.core.ScreenContent
 import ai.citros.core.ToolCall
+import ai.citros.core.ToolErrorCode
 import ai.citros.core.ToolResult
 import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runTest
@@ -120,6 +122,86 @@ class ServiceToolDelegateTest {
     fun `addSteerMessage delegates to PhoneAgentApi`() {
         delegate.addSteerMessage("try something else")
         verify(mockApi).addSteerMessage("try something else")
+    }
+
+    @Test
+    fun `requestUserConfirmation forwards structured reason code to callback`() = runTest {
+        var capturedReasonCode: String? = null
+        var capturedReason: String? = null
+        val confirmationDelegate = ServiceToolDelegate(
+            phoneAgentApi = mockApi,
+            outputVerbosity = OutputVerbosity.NORMAL,
+            onConfirmationRequested = { _, _, reasonCode, reason ->
+                capturedReasonCode = reasonCode
+                capturedReason = reason
+            },
+            awaitConfirmationDecision = { true }
+        )
+
+        val approved = confirmationDelegate.requestUserConfirmation(
+            toolCall = ToolCall(id = "tc-confirm", name = "tap", input = emptyMap<String, Any>()),
+            requestId = "req-confirm",
+            reason = "Need approval",
+            timeoutMs = 5_000,
+            reasonCode = PolicyReasonCode.CONFIRM_SENSITIVE_APP
+        )
+
+        assertTrue(approved)
+        assertEquals(PolicyReasonCode.CONFIRM_SENSITIVE_APP, capturedReasonCode)
+        assertEquals("Need approval", capturedReason)
+    }
+
+    @Test
+    fun `offer choices delegates to runtime choice callbacks and returns selected value`() = runTest {
+        var capturedRequestId: String? = null
+        var capturedQuestion: String? = null
+        var capturedChoices: List<String>? = null
+        val offerDelegate = ServiceToolDelegate(
+            phoneAgentApi = mockApi,
+            outputVerbosity = OutputVerbosity.NORMAL,
+            onOfferChoicesRequested = { requestId, question, choices ->
+                capturedRequestId = requestId
+                capturedQuestion = question
+                capturedChoices = choices
+            },
+            awaitOfferChoiceDecision = { "Messages" }
+        )
+
+        val result = offerDelegate.executeToolCall(
+            ToolCall(
+                id = "tool-1",
+                name = "offer_choices",
+                input = mapOf(
+                    "question" to "Which app?",
+                    "choices" to listOf("Messages", "WhatsApp")
+                )
+            ),
+            screenContent = null
+        )
+
+        assertFalse(result.isError)
+        assertEquals("Messages", result.text)
+        assertTrue(capturedRequestId?.startsWith("offer_choices:") == true)
+        assertEquals("Which app?", capturedQuestion)
+        assertEquals(listOf("Messages", "WhatsApp"), capturedChoices)
+    }
+
+    @Test
+    fun `offer choices fails validation for bad input`() = runTest {
+        val result = delegate.executeToolCall(
+            ToolCall(
+                id = "tool-2",
+                name = "offer_choices",
+                input = mapOf(
+                    "question" to "Pick one",
+                    "choices" to listOf("A")
+                )
+            ),
+            screenContent = null
+        )
+
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, result.errorCode)
     }
 
     @Test

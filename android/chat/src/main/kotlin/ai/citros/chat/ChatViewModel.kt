@@ -287,6 +287,12 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
             pendingPolicyConfirmation?.deferred?.cancel()
             pendingPolicyConfirmation = null
         }
+        synchronized(pendingOfferChoicesLock) {
+            pendingOfferChoices?.deferred?.cancel()
+            pendingOfferChoices = null
+        }
+        runtimeActionPills.value = emptyList()
+        waitingInputType.value = null
         super.onCleared()
         releaseVoiceManager()
     }
@@ -383,9 +389,18 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
         val deferred: CompletableDeferred<Boolean>
     )
 
+    @VisibleForTesting
+    internal data class PendingOfferChoices(
+        val requestId: String,
+        val choices: List<String>,
+        val deferred: CompletableDeferred<String>
+    )
+
     private val pendingPolicyConfirmationLock = Any()
+    private val pendingOfferChoicesLock = Any()
 
     private var pendingPolicyConfirmation: PendingPolicyConfirmation? = null
+    private var pendingOfferChoices: PendingOfferChoices? = null
 
     @VisibleForTesting
     internal fun setPendingPolicyConfirmationForTest(requestId: String, deferred: CompletableDeferred<Boolean>) {
@@ -393,6 +408,23 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
             pendingPolicyConfirmation = PendingPolicyConfirmation(requestId, deferred)
         }
     }
+
+    @VisibleForTesting
+    internal fun setPendingOfferChoicesForTest(
+        requestId: String,
+        choices: List<String>,
+        deferred: CompletableDeferred<String>
+    ) {
+        synchronized(pendingOfferChoicesLock) {
+            pendingOfferChoices = PendingOfferChoices(requestId, choices, deferred)
+        }
+    }
+
+    /** Runtime action pills rendered in chat/overlay while waiting for input. */
+    val runtimeActionPills = mutableStateOf<List<ActionPill>>(emptyList())
+
+    /** Input mode backing the currently visible runtime pills, when any. */
+    val waitingInputType = mutableStateOf<InputType?>(null)
 
     /** Epoch millis of last user/agent activity. Updated on send and tool result. */
     var lastActivityTimestamp: Long = 0L
@@ -1051,6 +1083,8 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
         toolLoopCancelled.set(false)
         steerQueue.clear()
         hasQueuedSteer.value = false
+        runtimeActionPills.value = emptyList()
+        waitingInputType.value = null
         error.value = null
         isLoading.value = true
 
@@ -1209,6 +1243,8 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
                         }
                         is LoopResult.Error -> {
                             messages.add(Message(role = "assistant", content = "💥 Error: ${result.message}"))
+                            waitingInputType.value = InputType.FREE_TEXT
+                            runtimeActionPills.value = RuntimeActionPillMapper.errorRecoveryPills()
                             result.steps
                         }
                     }
@@ -1217,6 +1253,8 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
                 throw e
             } catch (e: Exception) {
                 messages.add(Message(role = "assistant", content = "💥 Crashed: ${e.message?.take(120)}"))
+                waitingInputType.value = InputType.FREE_TEXT
+                runtimeActionPills.value = RuntimeActionPillMapper.errorRecoveryPills()
             } finally {
                 // Stop interruption monitoring
                 InterruptionDetector.stopMonitoring()
@@ -1336,6 +1374,9 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
     // ========== ToolExecutionDelegate implementation ==========
 
     override suspend fun executeToolCall(toolCall: ToolCall, screenContent: ScreenContent?): ToolResult {
+        if (toolCall.name == "offer_choices") {
+            return requestOfferChoices(toolCall)
+        }
         val isUiMutating = isUiMutatingTool(toolCall.name)
         if (isUiMutating) InterruptionDetector.markAgentAction()
         try {
@@ -1420,17 +1461,24 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
         toolCall: ToolCall,
         requestId: String,
         reason: String,
-        timeoutMs: Long
+        timeoutMs: Long,
+        reasonCode: String? = null
     ): Boolean {
         val deferred = CompletableDeferred<Boolean>()
         synchronized(pendingPolicyConfirmationLock) {
             pendingPolicyConfirmation?.deferred?.cancel()
             pendingPolicyConfirmation = PendingPolicyConfirmation(requestId, deferred)
         }
+        waitingInputType.value = InputType.POLICY_CONFIRMATION
+        runtimeActionPills.value = RuntimeActionPillMapper.policyConfirmationPills(
+            requestId = requestId,
+            reason = reason,
+            reasonCode = reasonCode
+        )
         messages.add(
             Message(
                 role = "assistant",
-                content = "🔐 Confirm ${toolCall.name}? $reason Reply Yes/No."
+                content = "🔐 Confirm ${toolCall.name}? $reason"
             )
         )
 
@@ -1444,6 +1492,64 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
                     pendingPolicyConfirmation = null
                 }
             }
+            runtimeActionPills.value = emptyList()
+            waitingInputType.value = null
+        }
+    }
+
+    private suspend fun requestOfferChoices(toolCall: ToolCall): ToolResult {
+        val question = (toolCall.input["question"] as? String)?.trim()
+            ?.takeIf { it.isNotEmpty() }
+            ?: return ToolResult(
+                "Failed: offer_choices requires question",
+                isError = true,
+                errorCode = ToolErrorCode.INVALID_INPUT
+            )
+
+        val rawChoices = toolCall.input["choices"] as? List<*>
+            ?: return ToolResult(
+                "Failed: offer_choices requires choices[]",
+                isError = true,
+                errorCode = ToolErrorCode.INVALID_INPUT
+            )
+        val choices = rawChoices.map { (it as? String)?.trim() }
+        if (choices.any { it.isNullOrBlank() }) {
+            return ToolResult(
+                "Failed: offer_choices choices must be non-empty strings",
+                isError = true,
+                errorCode = ToolErrorCode.INVALID_INPUT
+            )
+        }
+        val normalizedChoices = choices.filterNotNull()
+        if (normalizedChoices.size !in 2..5) {
+            return ToolResult(
+                "Failed: offer_choices choices must include 2-5 options",
+                isError = true,
+                errorCode = ToolErrorCode.INVALID_INPUT
+            )
+        }
+
+        val requestId = "offer_choices:${toolCall.id.ifBlank { System.nanoTime().toString() }}"
+        val deferred = CompletableDeferred<String>()
+        synchronized(pendingOfferChoicesLock) {
+            pendingOfferChoices?.deferred?.cancel()
+            pendingOfferChoices = PendingOfferChoices(requestId, normalizedChoices, deferred)
+        }
+        waitingInputType.value = InputType.DISAMBIGUATION
+        runtimeActionPills.value = RuntimeActionPillMapper.offerChoicePills(normalizedChoices)
+        messages.add(Message(role = "assistant", content = question))
+
+        return try {
+            val selected = deferred.await()
+            ToolResult(selected)
+        } finally {
+            synchronized(pendingOfferChoicesLock) {
+                if (pendingOfferChoices?.requestId == requestId) {
+                    pendingOfferChoices = null
+                }
+            }
+            runtimeActionPills.value = emptyList()
+            waitingInputType.value = null
         }
     }
 
@@ -1491,6 +1597,8 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
             ErrorSeverity.PERSISTENT -> {
                 // Sticky warning status
                 currentToolStatus.value = "⚠️ ${OutputClassifier.formatStatus(errorText)}"
+                waitingInputType.value = InputType.FREE_TEXT
+                runtimeActionPills.value = RuntimeActionPillMapper.errorRecoveryPills()
             }
             ErrorSeverity.EXPLORATORY,
             ErrorSeverity.INFORMATIONAL -> {
@@ -1504,6 +1612,8 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
             role = "assistant",
             content = "⚠️ Phone control disconnected. Please re-enable it in Settings → Accessibility."
         ))
+        waitingInputType.value = InputType.FREE_TEXT
+        runtimeActionPills.value = RuntimeActionPillMapper.errorRecoveryPills()
         toolLoopCancelled.set(true)
     }
 
@@ -1531,26 +1641,146 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
         fromSteer: Boolean
     ): Boolean {
         val approved = PolicyConfirmationInputParser.parse(text) ?: return false
+        return resolvePendingPolicyConfirmation(
+            approved = approved,
+            userText = text,
+            fromSteer = fromSteer
+        )
+    }
+
+    private fun resolvePendingPolicyConfirmation(
+        approved: Boolean,
+        userText: String,
+        fromSteer: Boolean,
+        requestId: String? = null
+    ): Boolean {
         val resolved = synchronized(pendingPolicyConfirmationLock) {
-            val pending = pendingPolicyConfirmation
-            if (pending == null) {
-                false
-            } else {
-                // Preserve chat ordering: surface user's confirmation reply before
-                // resuming the awaiting tool loop continuation.
-                messages.add(Message(role = "user", content = text, isSteer = fromSteer))
-                pending.deferred.complete(approved)
+            val pending = pendingPolicyConfirmation ?: return@synchronized false
+            if (requestId != null && pending.requestId != requestId) {
+                return@synchronized false
             }
+            messages.add(Message(role = "user", content = userText, isSteer = fromSteer))
+            pending.deferred.complete(approved)
         }
         if (!resolved) return false
 
         if (!fromSteer) {
             queuedMessage.value = null
         }
+        runtimeActionPills.value = emptyList()
+        waitingInputType.value = null
         return true
     }
 
+    private fun resolvePendingOfferChoiceFromInput(
+        text: String,
+        fromSteer: Boolean
+    ): Boolean {
+        val normalized = text.trim()
+        if (normalized.isEmpty()) return false
+        val match = synchronized(pendingOfferChoicesLock) {
+            val pending = pendingOfferChoices ?: return@synchronized null
+            OfferChoiceResolver.resolveChoice(pending.choices, normalized)
+        } ?: return false
+        return resolvePendingOfferChoice(
+            selectedChoice = match,
+            userText = text,
+            fromSteer = fromSteer
+        )
+    }
+
+    private fun resolvePendingOfferChoice(
+        selectedChoice: String,
+        userText: String = selectedChoice,
+        fromSteer: Boolean,
+        requestId: String? = null
+    ): Boolean {
+        val resolved = synchronized(pendingOfferChoicesLock) {
+            val pending = pendingOfferChoices ?: return@synchronized false
+            if (requestId != null && pending.requestId != requestId) {
+                return@synchronized false
+            }
+            messages.add(Message(role = "user", content = userText, isSteer = fromSteer))
+            pending.deferred.complete(selectedChoice)
+        }
+        if (!resolved) return false
+
+        if (!fromSteer) {
+            queuedMessage.value = null
+        }
+        runtimeActionPills.value = emptyList()
+        waitingInputType.value = null
+        return true
+    }
+
+    fun onRuntimePillTapped(action: PillAction) {
+        when (action) {
+            is PillAction.Approve -> {
+                resolvePendingPolicyConfirmation(
+                    approved = true,
+                    userText = "Yes",
+                    fromSteer = true,
+                    requestId = action.requestId
+                )
+            }
+
+            is PillAction.Deny -> {
+                resolvePendingPolicyConfirmation(
+                    approved = false,
+                    userText = "No",
+                    fromSteer = true,
+                    requestId = action.requestId
+                )
+            }
+
+            is PillAction.Authenticate -> {
+                resolvePendingPolicyConfirmation(
+                    approved = true,
+                    userText = "Authenticate & allow",
+                    fromSteer = true,
+                    requestId = action.requestId
+                )
+            }
+
+            is PillAction.Steer -> {
+                val disambiguationResolved = resolvePendingOfferChoice(
+                    selectedChoice = action.message,
+                    userText = action.message,
+                    fromSteer = true
+                )
+                if (!disambiguationResolved) {
+                    val deniedConfirmation = resolvePendingPolicyConfirmation(
+                        approved = false,
+                        userText = "Do something else",
+                        fromSteer = true
+                    )
+                    steerMessage(action.message)
+                    if (!deniedConfirmation) {
+                        runtimeActionPills.value = emptyList()
+                        waitingInputType.value = null
+                    }
+                }
+            }
+
+            PillAction.Cancel -> {
+                cancelToolExecution()
+                runtimeActionPills.value = emptyList()
+                waitingInputType.value = null
+            }
+
+            PillAction.Dismiss -> {
+                if (waitingInputType.value == InputType.FREE_TEXT) {
+                    runtimeActionPills.value = emptyList()
+                    waitingInputType.value = null
+                }
+            }
+        }
+    }
+
     fun setQueuedMessage(text: String) {
+        if (isLoading.value && resolvePendingOfferChoiceFromInput(text, fromSteer = false)) {
+            return
+        }
         if (isLoading.value && resolvePendingPolicyConfirmationFromInput(text, fromSteer = false)) {
             return
         }
@@ -1673,6 +1903,10 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
      * also appears immediately in the UI message list with [Message.isSteer] = true.
      */
     fun steerMessage(text: String) {
+        if (isLoading.value && resolvePendingOfferChoiceFromInput(text, fromSteer = true)) {
+            hasQueuedSteer.value = steerQueue.isNotEmpty()
+            return
+        }
         if (isLoading.value && resolvePendingPolicyConfirmationFromInput(text, fromSteer = true)) {
             hasQueuedSteer.value = steerQueue.isNotEmpty()
             return
@@ -1817,6 +2051,12 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
             pendingPolicyConfirmation?.deferred?.cancel()
             pendingPolicyConfirmation = null
         }
+        synchronized(pendingOfferChoicesLock) {
+            pendingOfferChoices?.deferred?.cancel()
+            pendingOfferChoices = null
+        }
+        runtimeActionPills.value = emptyList()
+        waitingInputType.value = null
         isLoading.value = false
         currentToolStatus.value = null
         error.value = null
@@ -1860,6 +2100,12 @@ class ChatViewModel : ViewModel(), ToolExecutionDelegate, LoopProgressListener {
             pendingPolicyConfirmation?.deferred?.cancel()
             pendingPolicyConfirmation = null
         }
+        synchronized(pendingOfferChoicesLock) {
+            pendingOfferChoices?.deferred?.cancel()
+            pendingOfferChoices = null
+        }
+        runtimeActionPills.value = emptyList()
+        waitingInputType.value = null
         lastUserMessage = null
         messages.clear()
     }

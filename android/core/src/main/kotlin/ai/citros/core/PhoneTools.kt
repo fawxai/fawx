@@ -582,6 +582,32 @@ object PhoneTools {
     )
 
     /**
+     * Ask the UI to present deterministic user choices as action pills.
+     * Execution is delegated to runtime UI/service plumbing.
+     */
+    val OFFER_CHOICES = Tool(
+        name = "offer_choices",
+        description = "Present the user with 2-5 choices as pill buttons and return the selected choice text.",
+        inputSchema = mapOf(
+            "type" to "object",
+            "properties" to mapOf(
+                "question" to mapOf(
+                    "type" to "string",
+                    "description" to "Question shown above the choices"
+                ),
+                "choices" to mapOf(
+                    "type" to "array",
+                    "description" to "List of 2-5 choice labels",
+                    "items" to mapOf("type" to "string"),
+                    "minItems" to 2,
+                    "maxItems" to 5
+                )
+            ),
+            "required" to listOf("question", "choices")
+        )
+    )
+
+    /**
      * All available phone control tools.
      * Use this list when calling chatWithTools().
      */
@@ -690,7 +716,8 @@ object PhoneTools {
         "swipe",
         "scroll",
         "wait",
-        "request_tools"
+        "request_tools",
+        "offer_choices"
     )
 
     private val TOOL_CATEGORIES: Map<String, ToolCategory> = mapOf(
@@ -726,7 +753,8 @@ object PhoneTools {
         "web_search" to ToolCategory.RESEARCH,
         "web_fetch" to ToolCategory.RESEARCH,
         "web_browse" to ToolCategory.RESEARCH,
-        "request_tools" to ToolCategory.CORE
+        "request_tools" to ToolCategory.CORE,
+        "offer_choices" to ToolCategory.CORE
     )
 
     fun categoryOf(toolName: String): ToolCategory =
@@ -781,6 +809,7 @@ object PhoneTools {
         SUBTASK,
         WAIT,
         LONG_PRESS,
-        REQUEST_TOOLS
+        REQUEST_TOOLS,
+        OFFER_CHOICES
     )
 }

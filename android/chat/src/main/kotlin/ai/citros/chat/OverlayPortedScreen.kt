@@ -142,7 +142,8 @@ internal fun OverlayPreviewScreen(
             androidx.compose.runtime.derivedStateOf {
                 OverlayStateMapper.mapToOverlayState(
                     messages = viewModel.messages.toList(),
-                    isLoading = viewModel.isLoading.value
+                    isLoading = viewModel.isLoading.value,
+                    actionPills = viewModel.runtimeActionPills.value
                 )
             }
         }.value
@@ -162,6 +163,7 @@ internal fun OverlayPreviewScreen(
     }
     val activeRunState = liveOverlayState?.runState ?: runState
     val activeStepIndex = liveOverlayState?.currentStepIndex ?: stepIndex
+    val activeActionPills = liveOverlayState?.actionPills ?: emptyList()
     val currentStep = if (activeSteps.isEmpty()) {
         overlaySteps.first()
     } else {
@@ -367,6 +369,7 @@ internal fun OverlayPreviewScreen(
                                 runState = activeRunState,
                                 currentStep = currentStep,
                                 lines = activeLines,
+                                actionPills = activeActionPills,
                                 queuedMessageDraft = queuedMessageDraft,
                                 onQueuedDraftChange = {
                                     queuedMessageDraft = it
@@ -404,6 +407,9 @@ internal fun OverlayPreviewScreen(
                                 onOpenFull = { if (viewModel != null) onNavigateToChat?.invoke() else surfaceMode = OverlaySurfaceMode.FULL_APP },
                                 onOpenIsland = { surfaceMode = OverlaySurfaceMode.DYNAMIC_ISLAND },
                                 onMinimize = { surfaceMode = OverlaySurfaceMode.SEARCH_BAR },
+                                onActionPillTap = { pill ->
+                                    viewModel?.onRuntimePillTapped(pill.action)
+                                },
                                 onVoiceInput = {
                                     if (viewModel != null) {
                                         onRequestVoiceInput?.invoke() ?: onNavigateToChat?.invoke()
@@ -792,6 +798,7 @@ internal fun MiniChatOverlayCard(
     runState: OverlayRunState,
     currentStep: OverlayStep,
     lines: List<OverlayLine>,
+    actionPills: List<ActionPill> = emptyList(),
     queuedMessageDraft: String,
     onQueuedDraftChange: (String) -> Unit,
     onSubmitQueuedMessage: () -> Unit,
@@ -800,6 +807,7 @@ internal fun MiniChatOverlayCard(
     onStopAction: () -> Unit,
     onOpenFull: () -> Unit,
     onOpenIsland: () -> Unit,
+    onActionPillTap: (ActionPill) -> Unit = {},
     onVoiceInput: () -> Unit = {},
     onMinimize: () -> Unit = {},
     modifier: Modifier = Modifier
@@ -1035,6 +1043,15 @@ internal fun MiniChatOverlayCard(
                         )
                     }
                 }
+            }
+            if (actionPills.isNotEmpty()) {
+                RuntimeActionPillRow(
+                    pills = actionPills,
+                    onPillTapped = onActionPillTap,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 10.dp)
+                )
             }
             // Input row — always visible (#473)
             val isExecuting = runState == OverlayRunState.EXECUTING

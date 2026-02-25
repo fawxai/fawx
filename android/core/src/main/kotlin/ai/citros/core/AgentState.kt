@@ -42,7 +42,8 @@ sealed class AgentState {
         val taskId: String,
         val requestId: String,
         val reason: String,
-        val inputType: InputType
+        val inputType: InputType,
+        val pills: List<ActionPill> = emptyList()
     ) : AgentState()
 
     /** Task completed successfully. */

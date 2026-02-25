@@ -1,7 +1,11 @@
 package ai.citros.chat
 
 import ai.citros.core.AgentState
+import ai.citros.core.ActionPill
+import ai.citros.core.InputType
 import ai.citros.core.Message
+import ai.citros.core.PillAction
+import ai.citros.core.PillStyle
 import ai.citros.core.PhoneAgentApi
 import ai.citros.core.TaskState
 import ai.citros.core.TaskStateManager
@@ -11,6 +15,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.After
 import org.junit.Before
@@ -359,6 +364,137 @@ class AgentServiceTest {
     }
 
     @Test
+    fun `binder submitActionPill approve resolves confirmation`() {
+        configureWithMockApi()
+        service.setPendingPolicyConfirmationForTest("req-pill")
+        service.updateState(
+            AgentState.WaitingForInput(
+                taskId = "task-1",
+                requestId = "req-pill",
+                reason = "confirm",
+                inputType = InputType.POLICY_CONFIRMATION,
+                pills = listOf(
+                    ActionPill(
+                        id = "yes",
+                        label = "Yes",
+                        style = PillStyle.PRIMARY,
+                        action = PillAction.Approve("req-pill")
+                    )
+                )
+            )
+        )
+        val binder = service.onBind(Intent()) as AgentService.AgentBinder
+
+        val handled = binder.submitActionPill(PillAction.Approve("req-pill"))
+
+        assertTrue(handled)
+        assertFalse(service.agentState.value is AgentState.WaitingForInput)
+    }
+
+    @Test
+    fun `binder submitActionPill steer during confirmation denies then continues`() {
+        configureWithMockApi()
+        service.setPendingPolicyConfirmationForTest("req-steer")
+        service.updateState(
+            AgentState.WaitingForInput(
+                taskId = "task-1",
+                requestId = "req-steer",
+                reason = "confirm",
+                inputType = InputType.POLICY_CONFIRMATION
+            )
+        )
+        val binder = service.onBind(Intent()) as AgentService.AgentBinder
+
+        val handled = binder.submitActionPill(PillAction.Steer("Try a different approach."))
+
+        assertTrue(handled)
+        assertFalse(service.agentState.value is AgentState.WaitingForInput)
+    }
+
+    @Test
+    fun `binder submitActionPill cancel follows cancel path`() {
+        configureWithMockApi()
+        val startIntent = AgentService.startTaskIntent(service, "do task")
+        service.onStartCommand(startIntent, 0, 1)
+        assertTrue(service.agentState.value.isActive())
+
+        val binder = service.onBind(Intent()) as AgentService.AgentBinder
+        val handled = binder.submitActionPill(PillAction.Cancel)
+
+        assertTrue(handled)
+        assertIs<AgentState.Idle>(service.agentState.value)
+    }
+
+    @Test
+    fun `binder submitActionPill dismiss is ignored during policy confirmation`() {
+        configureWithMockApi()
+        val deferred = CompletableDeferred<Boolean>()
+        service.setPendingPolicyConfirmationForTest("req-dismiss", deferred = deferred)
+        service.updateState(
+            AgentState.WaitingForInput(
+                taskId = "task-1",
+                requestId = "req-dismiss",
+                reason = "confirm",
+                inputType = InputType.POLICY_CONFIRMATION,
+                pills = listOf(ActionPill("dismiss", "Dismiss", PillStyle.SUBTLE, PillAction.Dismiss))
+            )
+        )
+        val binder = service.onBind(Intent()) as AgentService.AgentBinder
+
+        val handled = binder.submitActionPill(PillAction.Dismiss)
+
+        assertFalse(handled)
+        assertIs<AgentState.WaitingForInput>(service.agentState.value)
+        assertFalse(deferred.isCompleted)
+    }
+
+    @Test
+    fun `binder submitActionPill dismiss is allowed for free text waiting state`() {
+        configureWithMockApi()
+        service.updateState(
+            AgentState.WaitingForInput(
+                taskId = "task-1",
+                requestId = "req-free",
+                reason = "Need your input",
+                inputType = InputType.FREE_TEXT,
+                pills = listOf(ActionPill("dismiss", "Dismiss", PillStyle.SUBTLE, PillAction.Dismiss))
+            )
+        )
+        val binder = service.onBind(Intent()) as AgentService.AgentBinder
+
+        val handled = binder.submitActionPill(PillAction.Dismiss)
+
+        assertTrue(handled)
+        assertIs<AgentState.Thinking>(service.agentState.value)
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `STEER partial text resolves pending disambiguation choice`() = runTest {
+        configureWithMockApi()
+        val deferred = CompletableDeferred<String>()
+        service.setPendingOfferChoicesForTest(
+            requestId = "req-offer",
+            choices = listOf("Google Maps", "Chrome"),
+            deferred = deferred
+        )
+        service.updateState(
+            AgentState.WaitingForInput(
+                taskId = "task-1",
+                requestId = "req-offer",
+                reason = "Which app?",
+                inputType = InputType.DISAMBIGUATION
+            )
+        )
+
+        service.onStartCommand(AgentService.steerIntent(service, "maps"), 0, 1)
+
+        assertTrue(deferred.isCompleted)
+        assertEquals("Google Maps", deferred.await())
+        assertFalse(service.agentState.value is AgentState.WaitingForInput)
+    }
+
+    @Test
     fun `STEER intent during active task does not change state`() {
         configureWithMockApi()
         val startIntent = AgentService.startTaskIntent(service, "test")
@@ -428,10 +564,16 @@ class AgentServiceTest {
         binder.configureExecution(api = mock(PhoneAgentApi::class.java))
 
         service.onStartCommand(null, 0, 1)
-        advanceUntilIdle()
+        runCurrent()
 
         val state = service.agentState.value
-        assertTrue(state is AgentState.Resuming || state is AgentState.Thinking || state is AgentState.Failed)
+        assertTrue(
+            state is AgentState.Resuming ||
+                state is AgentState.Thinking ||
+                state is AgentState.Complete ||
+                state is AgentState.Failed,
+            "unexpected restart state: $state"
+        )
     }
 
     @Test
@@ -651,11 +793,13 @@ class AgentServiceTest {
         val testDispatcher = StandardTestDispatcher(testScheduler)
         controller.create()
         service.dispatcher = testDispatcher
+        service.taskStateManagerOverride = FakeTaskStateManager(pendingState = null)
 
         // Simulate system restart (null intent)
         service.onStartCommand(null, 0, 1)
+        runCurrent()
 
-        assertNotNull(service.idleTimeoutJob)
+        assertNotNull(service.idleTimeoutJob, "idleTimeoutJob should be created after restart")
         assertTrue(service.idleTimeoutJob!!.isActive)
     }
 
@@ -723,6 +867,32 @@ class AgentServiceTest {
         val channel = nm.getNotificationChannel(AgentService.CHANNEL_ID)
         assertNotNull(channel)
         assertEquals(AgentService.CHANNEL_NAME, channel.name.toString())
+    }
+
+    @Test
+    fun `waiting input notification uses first two pill actions`() {
+        controller.create()
+        val state = AgentState.WaitingForInput(
+            taskId = "task-1",
+            requestId = "req-1",
+            reason = "Need your input",
+            inputType = InputType.POLICY_CONFIRMATION,
+            pills = listOf(
+                ActionPill("p1", "Allow", style = PillStyle.PRIMARY, action = PillAction.Approve("req-1")),
+                ActionPill("p2", "Deny", style = PillStyle.DANGER, action = PillAction.Deny("req-1")),
+                ActionPill("p3", "Cancel", style = PillStyle.SUBTLE, action = PillAction.Cancel)
+            )
+        )
+        service.updateState(state)
+
+        val method = AgentService::class.java.getDeclaredMethod("buildNotification", AgentState::class.java)
+        method.isAccessible = true
+        val notification = method.invoke(service, state) as android.app.Notification
+        val actions = notification.actions.orEmpty()
+
+        assertEquals(2, actions.size)
+        assertEquals("Allow", actions[0].title.toString())
+        assertEquals("Deny", actions[1].title.toString())
     }
 
     // --- NB4 related: handleStartTask with null message ---

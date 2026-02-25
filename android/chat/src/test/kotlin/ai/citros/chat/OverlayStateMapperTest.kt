@@ -24,6 +24,26 @@ class OverlayStateMapperTest {
     }
 
     @Test
+    fun `mapToOverlayState carries runtime action pills`() {
+        val pills = listOf(
+            ActionPill(
+                id = "p1",
+                label = "Yes",
+                style = PillStyle.PRIMARY,
+                action = PillAction.Approve("req-1")
+            )
+        )
+        val state = OverlayStateMapper.mapToOverlayState(
+            messages = listOf(Message(role = "user", content = "Confirm?")),
+            isLoading = true,
+            actionPills = pills
+        )
+
+        assertEquals(1, state.actionPills.size)
+        assertEquals("Yes", state.actionPills.first().label)
+    }
+
+    @Test
     fun `mapToOverlayState with single user message returns USER line and IDLE state`() {
         val messages = listOf(
             Message(role = "user", content = "Turn on Wi-Fi")

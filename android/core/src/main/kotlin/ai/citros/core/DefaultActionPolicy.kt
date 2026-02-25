@@ -42,6 +42,7 @@ class DefaultActionPolicy(
             "web_fetch" to PolicyDecision.Allow,
             "web_browse" to PolicyDecision.Allow,
             "request_tools" to PolicyDecision.Allow,
+            "offer_choices" to PolicyDecision.Allow,
             "list_files" to PolicyDecision.Allow,
             "read_file" to PolicyDecision.Allow,
             "recall" to PolicyDecision.Allow,

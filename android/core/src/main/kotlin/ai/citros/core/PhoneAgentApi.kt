@@ -507,7 +507,7 @@ open class PhoneAgentApi(
             Regex("""<tool_call>.*?</tool_call>""", RegexOption.DOT_MATCHES_ALL),
             Regex("""<function_call>.*?</function_call>""", RegexOption.DOT_MATCHES_ALL),
             // JSON tool objects with known tool names (handles one level of nesting)
-            Regex("""\{\s*"name"\s*:\s*"(tap|type_text|swipe|open_app|press_back|press_home|read_screen|screenshot|scroll|long_press|tap_text|open_notifications|wait|think|web_browse|web_search|web_fetch|request_tools)"[^{}]*(\{[^{}]*\}[^{}]*)?\}""")
+            Regex("""\{\s*"name"\s*:\s*"(tap|type_text|swipe|open_app|press_back|press_home|read_screen|screenshot|scroll|long_press|tap_text|open_notifications|wait|think|web_browse|web_search|web_fetch|request_tools|offer_choices)"[^{}]*(\{[^{}]*\}[^{}]*)?\}""")
         )
 
         private val EXPLICIT_WEB_FETCH_URL_REGEX =
@@ -1600,6 +1600,14 @@ open class PhoneAgentApi(
 
                         ToolResult(text)
                     }
+                }
+
+                "offer_choices" -> {
+                    ToolResult(
+                        "offer_choices requires runtime UI delegate handling",
+                        isError = true,
+                        errorCode = ToolErrorCode.NOT_CONFIGURED
+                    )
                 }
 
                 else -> {

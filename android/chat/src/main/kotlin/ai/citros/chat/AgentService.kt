@@ -13,10 +13,12 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import ai.citros.core.AgentExecutor
 import ai.citros.core.AgentState
+import ai.citros.core.ActionPill
 import ai.citros.core.ActionPolicy
 import ai.citros.core.LoopCheckpoint
 import ai.citros.core.FeatureFlags
 import ai.citros.core.InputType
+import ai.citros.core.PillAction
 import ai.citros.core.ToolCall
 import ai.citros.core.ErrorSeverity
 import ai.citros.core.LoopProgressListener
@@ -47,6 +49,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.util.UUID
+import java.util.concurrent.ConcurrentLinkedQueue
 
 /**
  * Foreground service that owns the agent execution lifecycle.
@@ -91,10 +94,14 @@ class AgentService : Service() {
         const val ACTION_STEER = "ai.citros.action.STEER"
         const val ACTION_CANCEL = "ai.citros.action.CANCEL"
         const val ACTION_STOP = "ai.citros.action.STOP"
+        const val ACTION_PILL = "ai.citros.action.PILL"
 
         // Intent extras
         const val EXTRA_MESSAGE = "message"
         const val EXTRA_TASK_ID = "task_id"
+        const val EXTRA_PILL_KIND = "pill_kind"
+        const val EXTRA_PILL_REQUEST_ID = "pill_request_id"
+        const val EXTRA_PILL_STEER = "pill_steer"
 
         /**
          * Create an intent to start a new task.
@@ -136,6 +143,44 @@ class AgentService : Service() {
         fun stopIntent(context: Context): Intent {
             return Intent(context, AgentService::class.java).apply {
                 action = ACTION_STOP
+            }
+        }
+
+        /**
+         * Create an intent to execute a deterministic runtime pill action.
+         */
+        fun pillIntent(context: Context, action: PillAction): Intent {
+            return Intent(context, AgentService::class.java).apply {
+                this.action = ACTION_PILL
+                when (action) {
+                    is PillAction.Approve -> {
+                        putExtra(EXTRA_PILL_KIND, "approve")
+                        putExtra(EXTRA_PILL_REQUEST_ID, action.requestId)
+                    }
+
+                    is PillAction.Deny -> {
+                        putExtra(EXTRA_PILL_KIND, "deny")
+                        putExtra(EXTRA_PILL_REQUEST_ID, action.requestId)
+                    }
+
+                    is PillAction.Steer -> {
+                        putExtra(EXTRA_PILL_KIND, "steer")
+                        putExtra(EXTRA_PILL_STEER, action.message)
+                    }
+
+                    is PillAction.Authenticate -> {
+                        putExtra(EXTRA_PILL_KIND, "authenticate")
+                        putExtra(EXTRA_PILL_REQUEST_ID, action.requestId)
+                    }
+
+                    PillAction.Cancel -> {
+                        putExtra(EXTRA_PILL_KIND, "cancel")
+                    }
+
+                    PillAction.Dismiss -> {
+                        putExtra(EXTRA_PILL_KIND, "dismiss")
+                    }
+                }
             }
         }
     }
@@ -238,9 +283,23 @@ class AgentService : Service() {
         val deferred: CompletableDeferred<Boolean>
     )
 
+    private data class PendingOfferChoices(
+        val requestId: String,
+        val question: String,
+        val choices: List<String>,
+        val deferred: CompletableDeferred<String>
+    )
+
     @Volatile
     private var pendingPolicyConfirmation: PendingPolicyConfirmation? = null
     private val pendingPolicyConfirmationLock = Any()
+
+    @Volatile
+    private var pendingOfferChoices: PendingOfferChoices? = null
+    private val pendingOfferChoicesLock = Any()
+
+    /** Service-owned steer queue so steer works even when UI is unbound. */
+    private val serviceSteerQueue = ConcurrentLinkedQueue<String>()
 
     // --- Observable state ---
     private val _agentState = MutableStateFlow<AgentState>(AgentState.Idle)
@@ -308,6 +367,11 @@ class AgentService : Service() {
             } ?: return false
             return resolvePolicyConfirmation(activeRequestId, approved)
         }
+
+        /** Submit a runtime pill action (chat/overlay/notification). */
+        fun submitActionPill(action: PillAction): Boolean {
+            return handleActionPill(action)
+        }
     }
 
     override fun onBind(intent: Intent?): IBinder = binder
@@ -339,6 +403,7 @@ class AgentService : Service() {
             ACTION_START_TASK -> handleStartTask(intent)
             ACTION_STEER -> handleSteer(intent)
             ACTION_CANCEL -> handleCancel()
+            ACTION_PILL -> handlePillIntent(intent)
             ACTION_STOP -> handleStop()
             null -> {
                 // System restart after kill — attempt recovery from durable state.
@@ -357,6 +422,8 @@ class AgentService : Service() {
 
     override fun onDestroy() {
         cancelPendingPolicyConfirmation("onDestroy")
+        cancelPendingOfferChoices("onDestroy")
+        serviceSteerQueue.clear()
         super.onDestroy()
         serviceScope.cancel()
         Log.d(TAG, "onDestroy: AgentService destroyed")
@@ -380,6 +447,9 @@ class AgentService : Service() {
         cancelIdleTimeout()
         pendingResumeState = null
         serviceCancelFlag.set(false)
+        serviceSteerQueue.clear()
+        cancelPendingPolicyConfirmation("start_task")
+        cancelPendingOfferChoices("start_task")
         _agentState.value = AgentState.Thinking(taskId)
         updateNotification()
 
@@ -400,6 +470,27 @@ class AgentService : Service() {
         handleSteerMessage(message)
     }
 
+    private fun handlePillIntent(intent: Intent) {
+        val action = parsePillAction(intent)
+        if (action == null) {
+            Log.w(TAG, "handlePillIntent: invalid pill payload")
+            return
+        }
+        handleActionPill(action)
+    }
+
+    private fun parsePillAction(intent: Intent): PillAction? {
+        return when (intent.getStringExtra(EXTRA_PILL_KIND)) {
+            "approve" -> intent.getStringExtra(EXTRA_PILL_REQUEST_ID)?.let { PillAction.Approve(it) }
+            "deny" -> intent.getStringExtra(EXTRA_PILL_REQUEST_ID)?.let { PillAction.Deny(it) }
+            "steer" -> intent.getStringExtra(EXTRA_PILL_STEER)?.let { PillAction.Steer(it) }
+            "authenticate" -> intent.getStringExtra(EXTRA_PILL_REQUEST_ID)?.let { PillAction.Authenticate(it) }
+            "cancel" -> PillAction.Cancel
+            "dismiss" -> PillAction.Dismiss
+            else -> null
+        }
+    }
+
     private fun handleSteerMessage(message: String) {
         val currentState = _agentState.value
         if (!currentState.isActive()) {
@@ -407,16 +498,28 @@ class AgentService : Service() {
             return
         }
 
-        if (currentState is AgentState.WaitingForInput && currentState.inputType == InputType.POLICY_CONFIRMATION) {
-            val decision = PolicyConfirmationInputParser.parse(message)
-            if (decision != null) {
-                resolvePolicyConfirmation(currentState.requestId, approved = decision)
-                return
+        if (currentState is AgentState.WaitingForInput) {
+            when (currentState.inputType) {
+                InputType.POLICY_CONFIRMATION -> {
+                    val decision = PolicyConfirmationInputParser.parse(message)
+                    if (decision != null) {
+                        resolvePolicyConfirmation(currentState.requestId, approved = decision)
+                        return
+                    }
+                }
+
+                InputType.DISAMBIGUATION -> {
+                    if (resolveOfferChoicesByText(currentState.requestId, message)) {
+                        return
+                    }
+                }
+
+                else -> Unit
             }
         }
 
         Log.d(TAG, "handleSteer: injecting steer message: '${message.take(60)}'")
-        // Steer queue integration comes in PR 2.
+        serviceSteerQueue.offer(message)
     }
 
     private fun handleCancel() {
@@ -434,6 +537,8 @@ class AgentService : Service() {
         currentTaskJob = null
         pendingResumeState = null
         cancelPendingPolicyConfirmation("cancel")
+        cancelPendingOfferChoices("cancel")
+        serviceSteerQueue.clear()
         clearCheckpointAsync()
         _agentState.value = AgentState.Idle
         updateNotification()
@@ -446,6 +551,8 @@ class AgentService : Service() {
         currentTaskJob = null
         pendingResumeState = null
         cancelPendingPolicyConfirmation("stop")
+        cancelPendingOfferChoices("stop")
+        serviceSteerQueue.clear()
         cancelIdleTimeout()
         _agentState.value = AgentState.Idle
         isForeground = false
@@ -591,10 +698,14 @@ class AgentService : Service() {
 
             val delegate = ServiceToolDelegate(
                 phoneAgentApi = api,
-                onConfirmationRequested = { toolCall, requestId, reason ->
-                    onPolicyConfirmationRequested(taskId, toolCall, requestId, reason)
+                onConfirmationRequested = { toolCall, requestId, reasonCode, reason ->
+                    onPolicyConfirmationRequested(taskId, toolCall, requestId, reasonCode, reason)
                 },
-                awaitConfirmationDecision = { requestId -> awaitPolicyConfirmationDecision(requestId) }
+                awaitConfirmationDecision = { requestId -> awaitPolicyConfirmationDecision(requestId) },
+                onOfferChoicesRequested = { requestId, question, choices ->
+                    onOfferChoicesRequested(taskId, requestId, question, choices)
+                },
+                awaitOfferChoiceDecision = { requestId -> awaitOfferChoiceDecision(requestId) }
             )
             val serviceProgressListener = object : LoopProgressListener {
                 override fun onToolStarted(toolName: String, toolIndex: Int, batchSize: Int) {
@@ -631,7 +742,7 @@ class AgentService : Service() {
                 serviceProgressListener,
                 createConfiguredActionPolicy(),
                 maxToolSteps,
-                { steerMessageSource?.invoke() ?: emptyList() },
+                { drainAllSteerMessages() },
                 FeatureFlags.actionPolicyAuditAllowDecisions,
                 { interruptionSource?.invoke() },
                 { checkpoint ->
@@ -684,10 +795,16 @@ class AgentService : Service() {
             }
         } catch (e: kotlinx.coroutines.CancellationException) {
             Log.i(TAG, "executeTask: cancelled")
+            cancelPendingPolicyConfirmation("execute_cancelled")
+            cancelPendingOfferChoices("execute_cancelled")
+            serviceSteerQueue.clear()
             _agentState.value = AgentState.Idle
             updateNotification()
         } catch (e: Exception) {
             Log.e(TAG, "executeTask: crashed: ${e.message}", e)
+            cancelPendingPolicyConfirmation("execute_crashed")
+            cancelPendingOfferChoices("execute_crashed")
+            serviceSteerQueue.clear()
             safeProgressCallback { it.onExecutionError("Crashed: ${e.message?.take(120)}", toolSteps) }
             failTask(taskId, "Crashed: ${e.message?.take(120)}")
         } finally {
@@ -702,20 +819,33 @@ class AgentService : Service() {
         }
     }
 
-    private fun onPolicyConfirmationRequested(taskId: String, toolCall: ToolCall, requestId: String, reason: String) {
+    private fun onPolicyConfirmationRequested(
+        taskId: String,
+        toolCall: ToolCall,
+        requestId: String,
+        reasonCode: String?,
+        reason: String
+    ) {
+        cancelPendingOfferChoices("policy_requested")
         val deferred = CompletableDeferred<Boolean>()
         synchronized(pendingPolicyConfirmationLock) {
             pendingPolicyConfirmation = PendingPolicyConfirmation(requestId, toolCall.name, deferred)
         }
+        val pills = RuntimeActionPillMapper.policyConfirmationPills(
+            requestId = requestId,
+            reason = reason,
+            reasonCode = reasonCode
+        )
         _agentState.value = AgentState.WaitingForInput(
             taskId = taskId,
             requestId = requestId,
             reason = "Confirm ${toolCall.name}: $reason",
-            inputType = InputType.POLICY_CONFIRMATION
+            inputType = InputType.POLICY_CONFIRMATION,
+            pills = pills
         )
         appendConversation(
             "assistant",
-            "🔐 Confirm ${toolCall.name}? $reason Reply Yes/No."
+            "🔐 Confirm ${toolCall.name}? $reason"
         )
         updateNotification()
     }
@@ -736,6 +866,44 @@ class AgentService : Service() {
         }
     }
 
+    private fun onOfferChoicesRequested(
+        taskId: String,
+        requestId: String,
+        question: String,
+        choices: List<String>
+    ) {
+        cancelPendingPolicyConfirmation("offer_choices_requested")
+        val deferred = CompletableDeferred<String>()
+        synchronized(pendingOfferChoicesLock) {
+            pendingOfferChoices = PendingOfferChoices(requestId, question, choices, deferred)
+        }
+        _agentState.value = AgentState.WaitingForInput(
+            taskId = taskId,
+            requestId = requestId,
+            reason = question,
+            inputType = InputType.DISAMBIGUATION,
+            pills = RuntimeActionPillMapper.offerChoicePills(choices)
+        )
+        appendConversation("assistant", question)
+        updateNotification()
+    }
+
+    private suspend fun awaitOfferChoiceDecision(requestId: String): String? {
+        val pending = synchronized(pendingOfferChoicesLock) {
+            pendingOfferChoices
+        }
+        if (pending == null || pending.requestId != requestId) return null
+        return try {
+            pending.deferred.await()
+        } finally {
+            synchronized(pendingOfferChoicesLock) {
+                if (pendingOfferChoices?.requestId == requestId) {
+                    pendingOfferChoices = null
+                }
+            }
+        }
+    }
+
     @androidx.annotation.VisibleForTesting
     internal fun setPendingPolicyConfirmationForTest(
         requestId: String,
@@ -745,6 +913,55 @@ class AgentService : Service() {
         synchronized(pendingPolicyConfirmationLock) {
             pendingPolicyConfirmation = PendingPolicyConfirmation(requestId, toolName, deferred)
         }
+    }
+
+    @androidx.annotation.VisibleForTesting
+    internal fun setPendingOfferChoicesForTest(
+        requestId: String,
+        question: String = "Choose an option",
+        choices: List<String>,
+        deferred: CompletableDeferred<String> = CompletableDeferred()
+    ) {
+        synchronized(pendingOfferChoicesLock) {
+            pendingOfferChoices = PendingOfferChoices(requestId, question, choices, deferred)
+        }
+    }
+
+    private fun resolveOfferChoices(requestId: String, choice: String): Boolean {
+        val completed = synchronized(pendingOfferChoicesLock) {
+            val pending = pendingOfferChoices
+            if (pending == null) {
+                Log.w(TAG, "resolveOfferChoices: no pending offer_choices for requestId=$requestId")
+                return false
+            }
+            if (pending.requestId != requestId) {
+                Log.w(TAG, "resolveOfferChoices: requestId mismatch expected=${pending.requestId} actual=$requestId")
+                return false
+            }
+            pending.deferred.complete(choice)
+        }
+        if (!completed) {
+            Log.w(TAG, "resolveOfferChoices: choice already completed for requestId=$requestId")
+            return false
+        }
+        appendConversation("user", choice)
+        val state = _agentState.value
+        if (state is AgentState.WaitingForInput && state.requestId == requestId) {
+            _agentState.value = AgentState.Thinking(state.taskId)
+        }
+        updateNotification()
+        return true
+    }
+
+    private fun resolveOfferChoicesByText(requestId: String, text: String): Boolean {
+        val normalized = text.trim()
+        if (normalized.isEmpty()) return false
+        val match = synchronized(pendingOfferChoicesLock) {
+            val pending = pendingOfferChoices ?: return@synchronized null
+            if (pending.requestId != requestId) return@synchronized null
+            OfferChoiceResolver.resolveChoice(pending.choices, normalized)
+        } ?: return false
+        return resolveOfferChoices(requestId, match)
     }
 
     private fun resolvePolicyConfirmation(requestId: String, approved: Boolean): Boolean {
@@ -786,6 +1003,66 @@ class AgentService : Service() {
             pendingPolicyConfirmation = null
         }
         Log.d(TAG, "cancelPendingPolicyConfirmation: source=$source")
+    }
+
+    private fun cancelPendingOfferChoices(source: String) {
+        synchronized(pendingOfferChoicesLock) {
+            pendingOfferChoices?.deferred?.cancel()
+            pendingOfferChoices = null
+        }
+        Log.d(TAG, "cancelPendingOfferChoices: source=$source")
+    }
+
+    private fun handleActionPill(action: PillAction): Boolean {
+        val state = _agentState.value
+        return when (action) {
+            is PillAction.Approve -> resolvePolicyConfirmation(action.requestId, approved = true)
+            is PillAction.Deny -> resolvePolicyConfirmation(action.requestId, approved = false)
+            is PillAction.Authenticate -> resolvePolicyConfirmation(action.requestId, approved = true)
+            is PillAction.Steer -> {
+                if (!state.isActive()) return false
+                if (state is AgentState.WaitingForInput && state.inputType == InputType.DISAMBIGUATION) {
+                    if (resolveOfferChoicesByText(state.requestId, action.message)) {
+                        return true
+                    }
+                }
+                if (state is AgentState.WaitingForInput && state.inputType == InputType.POLICY_CONFIRMATION) {
+                    resolvePolicyConfirmation(state.requestId, approved = false)
+                }
+                handleSteerMessage(action.message)
+                true
+            }
+
+            PillAction.Cancel -> {
+                if (!state.isActive()) return false
+                handleCancel()
+                true
+            }
+
+            PillAction.Dismiss -> {
+                if (state is AgentState.WaitingForInput && state.inputType == InputType.FREE_TEXT) {
+                    _agentState.value = AgentState.Thinking(state.taskId)
+                    updateNotification()
+                    true
+                } else {
+                    Log.w(
+                        TAG,
+                        "Ignoring dismiss pill outside FREE_TEXT waiting state to avoid leaving pending confirmations unresolved"
+                    )
+                    false
+                }
+            }
+        }
+    }
+
+    private fun drainAllSteerMessages(): List<String> {
+        val drained = mutableListOf<String>()
+        drained += steerMessageSource?.invoke().orEmpty()
+        while (true) {
+            val next = serviceSteerQueue.poll() ?: break
+            drained += next
+        }
+        return drained.filter { it.isNotBlank() }
     }
 
     private suspend fun sendMessageWithFallback(
@@ -976,6 +1253,9 @@ class AgentService : Service() {
                 builder.setContentTitle("Needs your input")
                     .setContentText(state.reason)
                     .setPriority(NotificationCompat.PRIORITY_HIGH)
+                state.pills.take(2).forEachIndexed { index, pill ->
+                    builder.addAction(buildPillNotificationAction(pill, 100 + index))
+                }
             }
             is AgentState.Complete -> {
                 builder.setContentTitle("Done")
@@ -1012,6 +1292,16 @@ class AgentService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         return NotificationCompat.Action.Builder(0, "Cancel", intent).build()
+    }
+
+    private fun buildPillNotificationAction(pill: ActionPill, requestCode: Int): NotificationCompat.Action {
+        val intent = PendingIntent.getService(
+            this,
+            requestCode,
+            pillIntent(this, pill.action),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        return NotificationCompat.Action.Builder(0, pill.label, intent).build()
     }
 
     private fun buildStopAction(): NotificationCompat.Action {

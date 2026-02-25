@@ -16,6 +16,16 @@ class DefaultActionPolicyTest {
     }
 
     @Test
+    fun `offer choices is allow by default`() {
+        val eval = policy.evaluate(
+            ToolCall("1", "offer_choices", mapOf("question" to "Pick one", "choices" to listOf("A", "B"))),
+            PolicyContext()
+        )
+        assertIs<PolicyDecision.Allow>(eval.decision)
+        assertEquals(PolicyReasonCode.ALLOW_DEFAULT, eval.reasonCode)
+    }
+
+    @Test
     fun `known confirm tool returns stable reason code`() {
         val decision = policy.evaluate(ToolCall("1", "reply_notification", mapOf("text" to "ok")), PolicyContext()).decision as PolicyDecision.Confirm
         assertEquals(PolicyReasonCode.defaultConfirmForTool("reply_notification"), decision.reasonCode)

@@ -4,6 +4,9 @@ import ai.citros.core.OverlayLine
 import ai.citros.core.OverlayLineType
 import ai.citros.core.OverlayRunState
 import ai.citros.core.OverlayStep
+import ai.citros.core.ActionPill
+import ai.citros.core.PillAction
+import ai.citros.core.PillStyle
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
@@ -63,6 +66,42 @@ class OverlayContentTest {
         }
 
         composeRule.onNodeWithContentDescription("Send").assertIsDisplayed()
+    }
+
+    @Test
+    fun `mini chat renders runtime pills and dispatches tap action`() {
+        var tappedAction: PillAction? = null
+        val pills = listOf(
+            ActionPill(
+                id = "approve",
+                label = "Allow once",
+                style = PillStyle.PRIMARY,
+                action = PillAction.Approve("req-1")
+            )
+        )
+
+        composeRule.setContent {
+            OverlayMiniChatContent(
+                flavor = CitrosFlavor.LIME,
+                runState = OverlayRunState.EXECUTING,
+                currentStep = executingStep,
+                lines = emptyList(),
+                actionPills = pills,
+                onActionPillTap = { tappedAction = it.action },
+                queuedMessageDraft = "",
+                onQueuedDraftChange = {},
+                onSubmitQueuedMessage = {},
+                onStopAction = {},
+                onResumeOrRetry = {},
+                onOpenFull = {},
+                onOpenIsland = {}
+            )
+        }
+
+        composeRule.onNodeWithTag("runtime_pill_approve").assertIsDisplayed()
+            .performSemanticsAction(SemanticsActions.OnClick)
+        assertNotNull(tappedAction)
+        assertTrue(tappedAction is PillAction.Approve)
     }
 
     @Test

@@ -1743,6 +1743,10 @@ private fun OverlayServiceContent(
                 runState = overlayState.runState,
                 currentStep = currentStep,
                 lines = lines,
+                actionPills = overlayState.actionPills,
+                onActionPillTap = { pill ->
+                    OverlayController.dispatch(OverlayAction.RuntimePillTapped(pill.action))
+                },
                 queuedMessageDraft = queuedDraft,
                 onQueuedDraftChange = {
                     queuedDraft = it

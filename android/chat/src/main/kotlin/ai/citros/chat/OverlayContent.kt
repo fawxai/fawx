@@ -15,6 +15,7 @@ package ai.citros.chat
  * floating overlay. Update OverlayPortedScreen.kt separately if parity is needed.
  */
 
+import ai.citros.core.ActionPill
 import ai.citros.core.OverlayLine
 import ai.citros.core.OverlayLineType
 import ai.citros.core.OverlayRunState
@@ -96,6 +97,8 @@ internal fun OverlayMiniChatContent(
     runState: OverlayRunState,
     currentStep: OverlayStep,
     lines: List<OverlayLine>,
+    actionPills: List<ActionPill> = emptyList(),
+    onActionPillTap: (ActionPill) -> Unit = {},
     queuedMessageDraft: String,
     onQueuedDraftChange: (String) -> Unit,
     onSubmitQueuedMessage: () -> Unit,
@@ -360,6 +363,16 @@ internal fun OverlayMiniChatContent(
                         )
                     }
                 }
+            }
+
+            if (actionPills.isNotEmpty()) {
+                RuntimeActionPillRow(
+                    pills = actionPills,
+                    onPillTapped = onActionPillTap,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 10.dp)
+                )
             }
 
             val isExecuting = runState == OverlayRunState.EXECUTING

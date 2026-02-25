@@ -11,7 +11,13 @@ class AgentExecutorPolicyEnforcementTest {
     fun `confirm approved executes tool`() = runTest {
         var executeCount = 0
         val delegate = object : FakeToolExecutionDelegate() {
-            override suspend fun requestUserConfirmation(toolCall: ToolCall, requestId: String, reason: String, timeoutMs: Long): Boolean = true
+            override suspend fun requestUserConfirmation(
+                toolCall: ToolCall,
+                requestId: String,
+                reason: String,
+                timeoutMs: Long,
+                reasonCode: String?
+            ): Boolean = true
         }
         delegate.onExecute = { _, _ ->
             executeCount++
@@ -38,7 +44,13 @@ class AgentExecutorPolicyEnforcementTest {
     fun `confirm denied skips tool execution`() = runTest {
         var executeCount = 0
         val delegate = object : FakeToolExecutionDelegate() {
-            override suspend fun requestUserConfirmation(toolCall: ToolCall, requestId: String, reason: String, timeoutMs: Long): Boolean = false
+            override suspend fun requestUserConfirmation(
+                toolCall: ToolCall,
+                requestId: String,
+                reason: String,
+                timeoutMs: Long,
+                reasonCode: String?
+            ): Boolean = false
         }
         delegate.onExecute = { _, _ ->
             executeCount++
