@@ -141,16 +141,16 @@ impl OpenAiResponsesProvider {
     }
 
     fn build_headers(&self) -> reqwest::header::HeaderMap {
+        use reqwest::header::HeaderValue;
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            "chatgpt-account-id",
-            self.account_id.parse().unwrap_or_default(),
-        );
+        if let Ok(val) = HeaderValue::from_str(&self.account_id) {
+            headers.insert("chatgpt-account-id", val);
+        }
         headers.insert(
             "openai-beta",
-            "responses=experimental".parse().unwrap_or_default(),
+            HeaderValue::from_static("responses=experimental"),
         );
-        headers.insert("originator", "citros".parse().unwrap_or_default());
+        headers.insert("originator", HeaderValue::from_static("citros"));
         headers
     }
 

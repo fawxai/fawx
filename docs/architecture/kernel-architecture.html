@@ -554,5 +554,24 @@
   <strong>Design principle:</strong> The kernel is the smallest possible set of guarantees that cannot be violated. Everything else — intelligence, capabilities, strategies, UI — lives above the kernel in layers the agent can evolve. Safety comes from architecture, not from trust.
 </div>
 
+<h2>Extensibility: Agent Identity Primitives</h2>
+
+<p>Emerging patterns — agent-owned email addresses (agentmail), on-chain wallets, and machine-to-machine payment protocols (x402) — are gaining traction. Citros does not implement these today, but the four-layer architecture accommodates them without kernel changes:</p>
+
+<div style="background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 16px 20px; margin: 16px 0; font-size: 0.82em;">
+  <div style="display: grid; grid-template-columns: auto 1fr; gap: 8px 16px;">
+    <span style="color: #8957e5; font-weight: 600;">Agent email</span>
+    <span style="color: #8b949e;">New <code>AuthMethod::Email</code> variant in the storage layer. Sending/receiving maps to existing perception (input) and action (output) loop steps.</span>
+    <span style="color: #3fb950; font-weight: 600;">Wallets</span>
+    <span style="color: #8b949e;">New <code>AuthMethod::Wallet { chain, address }</code> credential. Signing keys stored encrypted alongside API keys. Transaction authorization governed by existing budget/policy enforcement in the kernel — user sets a spending envelope, agent operates within it.</span>
+    <span style="color: #d29922; font-weight: 600;">Payment protocols</span>
+    <span style="color: #8b949e;">New loadable tools (<code>pay_402</code>, <code>sign_transaction</code>). Hot-swappable, no kernel recompile. Budget system extends from token limits to monetary limits via a data-only change.</span>
+    <span style="color: #58a6ff; font-weight: 600;">Agent-to-agent comms</span>
+    <span style="color: #8b949e;">Messages from other agents are just another perception source. The loop doesn't care whether input comes from a human, an email, or another agent — it's all <code>PerceptionSnapshot</code>.</span>
+  </div>
+</div>
+
+<p>The critical invariant holds: <strong>user-only permissions</strong>. An agent with a wallet still cannot authorize spending beyond what the user's policy allows. The kernel enforces the envelope; the loadable layer provides the capabilities.</p>
+
 </body>
 </html>
