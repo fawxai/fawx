@@ -1153,7 +1153,7 @@ mod tests {
         let models = router.available_models();
 
         assert!(models.iter().any(|model| {
-            model.model_id == "claude-opus-4"
+            model.model_id == "claude-opus-4-20250514"
                 && model.provider_name == "anthropic"
                 && model.auth_method == "subscription"
         }));
