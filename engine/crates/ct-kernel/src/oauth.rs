@@ -7,9 +7,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 
+/// OpenAI OAuth client ID (matches Codex CLI / OpenClaw).
+pub const OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OPENAI_OAUTH_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
-const DEFAULT_REDIRECT_URI: &str = "http://127.0.0.1:1455/auth/callback";
+/// OpenAI OAuth token endpoint.
+pub const OPENAI_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+const DEFAULT_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 const DEFAULT_SCOPE: &str = "openid profile email offline_access";
+/// JWT claim path for extracting account ID from OpenAI access tokens.
+pub const OPENAI_JWT_CLAIM_PATH: &str = "https://api.openai.com/auth";
 
 /// PKCE OAuth flow for ChatGPT subscription auth.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,16 +53,16 @@ impl PkceFlow {
         }
     }
 
-    /// Build the authorization URL.
+    /// Build the authorization URL with all required OAuth + OpenAI params.
     pub fn authorization_url(&self, client_id: &str) -> String {
         format!(
-            "{base}?client_id={client_id}&redirect_uri={redirect_uri}&code_challenge={code_challenge}&code_challenge_method=S256&state={state}&response_type=code&scope={scope}",
+            "{base}?response_type=code&client_id={client_id}&redirect_uri={redirect_uri}&scope={scope}&code_challenge={code_challenge}&code_challenge_method=S256&state={state}&id_token_add_organizations=true&codex_cli_simplified_flow=true&originator=citros",
             base = OPENAI_OAUTH_AUTHORIZE_URL,
             client_id = percent_encode(client_id),
             redirect_uri = percent_encode(&self.redirect_uri),
+            scope = percent_encode(DEFAULT_SCOPE),
             code_challenge = percent_encode(&self.code_challenge),
             state = percent_encode(&self.state),
-            scope = percent_encode(DEFAULT_SCOPE),
         )
     }
 
@@ -206,6 +212,26 @@ impl fmt::Display for AuthError {
 }
 
 impl std::error::Error for AuthError {}
+
+/// Extract the ChatGPT account ID from an OpenAI OAuth access token JWT.
+/// Returns `None` if the token is not a valid JWT or doesn't contain the claim.
+pub fn extract_openai_account_id(access_token: &str) -> Option<String> {
+    let parts: Vec<&str> = access_token.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    // Decode the payload (part 1) — base64url without padding
+    let payload_bytes = URL_SAFE_NO_PAD.decode(parts[1]).ok()?;
+    let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
+    let account_id = payload
+        .get(OPENAI_JWT_CLAIM_PATH)?
+        .get("chatgpt_account_id")?
+        .as_str()?;
+    if account_id.is_empty() {
+        return None;
+    }
+    Some(account_id.to_string())
+}
 
 fn parse_query_params(callback_url: &str) -> Result<HashMap<String, String>, AuthError> {
     let query = callback_url

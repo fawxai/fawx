@@ -146,32 +146,70 @@ impl TuiApp {
                 let client_id = std::env::var("CITROS_OPENAI_CLIENT_ID")
                     .ok()
                     .filter(|value| !value.trim().is_empty())
-                    .unwrap_or_else(|| "citros-cli".to_string());
+                    .unwrap_or_else(|| ct_kernel::oauth::OPENAI_CLIENT_ID.to_string());
                 let auth_url = flow.authorization_url(&client_id);
 
-                println!("Opening browser for ChatGPT sign-in...");
-                if let Err(error) = open_browser(&auth_url) {
-                    println!(
-                        "Couldn't open browser automatically ({error}). Open this URL manually:\n{auth_url}"
-                    );
-                }
-                println!("Waiting for callback on {}...", flow.redirect_uri());
+                // Start local callback server before opening browser
+                let auth_code = match start_oauth_callback_server(flow.state()).await {
+                    Ok(server) => {
+                        println!("Opening browser for ChatGPT sign-in...");
+                        if let Err(error) = open_browser(&auth_url) {
+                            println!(
+                                "Couldn't open browser automatically ({error}). Open this URL manually:\n{auth_url}"
+                            );
+                        }
+                        println!(
+                            "Waiting for callback on http://localhost:1455/auth/callback..."
+                        );
+                        println!("(Or paste the redirect URL/code below if browser didn't work)\n");
 
-                let callback_url = prompt_non_empty_line(
-                    "Paste callback URL: ",
-                    "Callback URL cannot be empty.\n",
-                    "OAuth callback URL",
-                )?;
-
-                let authorization_code = flow.parse_callback(&callback_url).map_err(|error| {
-                    TuiError::Auth(format!("invalid OAuth callback URL: {error}"))
-                })?;
+                        // Race: wait for callback server OR manual paste
+                        let code = tokio::select! {
+                            result = server => {
+                                match result {
+                                    Ok(code) => code,
+                                    Err(_) => {
+                                        // Server failed, fall back to manual paste
+                                        let input = prompt_non_empty_line(
+                                            "Paste the redirect URL or authorization code: ",
+                                            "Input cannot be empty.\n",
+                                            "OAuth redirect URL or code",
+                                        )?;
+                                        flow.parse_callback(&input).or_else(|_| {
+                                            // Maybe they pasted just the code
+                                            Ok::<String, ct_kernel::oauth::AuthError>(input.trim().to_string())
+                                        }).map_err(|e| TuiError::Auth(format!("{e}")))?
+                                    }
+                                }
+                            }
+                        };
+                        code
+                    }
+                    Err(_) => {
+                        // Couldn't bind port 1455, fall back to manual flow
+                        println!("Couldn't start local server. Open this URL in your browser:\n");
+                        println!("  {auth_url}\n");
+                        let input = prompt_non_empty_line(
+                            "Paste the redirect URL or authorization code: ",
+                            "Input cannot be empty.\n",
+                            "OAuth redirect URL or code",
+                        )?;
+                        flow.parse_callback(&input).or_else(|_| {
+                            Ok::<String, ct_kernel::oauth::AuthError>(input.trim().to_string())
+                        }).map_err(|e| TuiError::Auth(format!("{e}")))?
+                    }
+                };
 
                 println!("Exchanging authorization code for tokens...");
-                let token_response =
-                    exchange_oauth_code_for_tokens(&flow, &client_id, &authorization_code).await?;
+                let token_response = exchange_oauth_code_for_tokens(
+                    &flow,
+                    &client_id,
+                    &auth_code,
+                )
+                .await?;
 
-                let account_id = prompt_line("OpenAI account id (optional): ")?;
+                let account_id =
+                    ct_kernel::oauth::extract_openai_account_id(&token_response.access_token);
                 let expires_at = current_time_ms()
                     .saturating_add(token_response.expires_in.saturating_mul(1_000));
 
@@ -182,7 +220,7 @@ impl TuiApp {
                         access_token: token_response.access_token,
                         refresh_token: token_response.refresh_token,
                         expires_at,
-                        account_id: empty_to_none(account_id),
+                        account_id,
                     },
                 );
 
@@ -545,6 +583,81 @@ async fn persist_auth_manager(auth_manager: &AuthManager) -> Result<(), TuiError
     Ok(())
 }
 
+const OAUTH_SUCCESS_HTML: &str = r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Authentication successful</title></head>
+<body><p>Authentication successful. Return to your terminal to continue.</p></body></html>"#;
+
+/// Start a local HTTP server on port 1455 to capture the OAuth callback.
+/// Returns a future that resolves with the authorization code when received.
+async fn start_oauth_callback_server(
+    expected_state: &str,
+) -> Result<impl std::future::Future<Output = Result<String, TuiError>>, TuiError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:1455")
+        .await
+        .map_err(|e| TuiError::Auth(format!("failed to bind port 1455: {e}")))?;
+
+    let state = expected_state.to_string();
+    Ok(async move {
+        // Wait up to 60 seconds for the callback
+        let accept = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            listener.accept(),
+        )
+        .await
+        .map_err(|_| TuiError::Auth("OAuth callback timed out (60s)".to_string()))?
+        .map_err(|e| TuiError::Auth(format!("failed to accept connection: {e}")))?;
+
+        let (mut stream, _addr) = accept;
+        let mut buf = vec![0u8; 4096];
+        let n = stream
+            .read(&mut buf)
+            .await
+            .map_err(|e| TuiError::Auth(format!("failed to read request: {e}")))?;
+        let request = String::from_utf8_lossy(&buf[..n]);
+
+        // Extract the path from "GET /auth/callback?code=...&state=... HTTP/1.1"
+        let path = request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .ok_or_else(|| TuiError::Auth("malformed HTTP request".to_string()))?;
+
+        // Parse query params from the path
+        let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let params: std::collections::HashMap<&str, &str> = query
+            .split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .collect();
+
+        // Validate state
+        let returned_state = params
+            .get("state")
+            .ok_or_else(|| TuiError::Auth("callback missing state parameter".to_string()))?;
+        if *returned_state != state {
+            let response = "HTTP/1.1 400 Bad Request\r\nContent-Length: 14\r\n\r\nState mismatch";
+            let _ = stream.write_all(response.as_bytes()).await;
+            return Err(TuiError::Auth("OAuth state mismatch".to_string()));
+        }
+
+        // Extract code
+        let code = params
+            .get("code")
+            .ok_or_else(|| TuiError::Auth("callback missing authorization code".to_string()))?;
+
+        // Send success page
+        let body = OAUTH_SUCCESS_HTML;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+
+        Ok(code.to_string())
+    })
+}
+
 fn openai_oauth_token_endpoint() -> String {
     std::env::var("CITROS_OPENAI_TOKEN_URL")
         .ok()
@@ -649,9 +762,10 @@ fn register_auth_provider(
         AuthMethod::OAuth {
             provider,
             access_token,
+            account_id,
             ..
         } => {
-            let provider_client =
+            let mut provider_client =
                 OpenAiProvider::new(base_url_for_provider(provider), access_token.clone())
                     .map_err(|error| {
                         TuiError::Router(format!(
@@ -660,6 +774,10 @@ fn register_auth_provider(
                     })?
                     .with_name(provider.clone())
                     .with_supported_models(models_for_provider(provider));
+
+            if let Some(acct_id) = account_id {
+                provider_client = provider_client.with_account_id(acct_id);
+            }
 
             router.register_provider_with_auth(Box::new(provider_client), "subscription");
         }
