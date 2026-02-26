@@ -20,11 +20,11 @@ mod router;
 mod routing;
 mod types;
 
+pub use anthropic::AnthropicAuthMode;
 pub use anthropic::AnthropicProvider;
 pub use config::LocalModelConfig;
 pub use fallback::{FallbackResult, FallbackRouter, ProviderHealth};
 pub use local::LocalModel;
-pub use anthropic::AnthropicAuthMode;
 pub use openai::OpenAiProvider;
 pub use openai_responses::OpenAiResponsesProvider;
 pub use provider::{CompletionStream, LlmProvider as CompletionProvider};

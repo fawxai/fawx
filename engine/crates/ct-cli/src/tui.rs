@@ -159,9 +159,7 @@ impl TuiApp {
                                 "Couldn't open browser automatically ({error}). Open this URL manually:\n{auth_url}"
                             );
                         }
-                        println!(
-                            "Waiting for callback on http://localhost:1455/auth/callback..."
-                        );
+                        println!("Waiting for callback on http://localhost:1455/auth/callback...");
                         println!("(Or paste the redirect URL/code below if browser didn't work)\n");
 
                         // Race: wait for callback server OR manual paste
@@ -195,19 +193,17 @@ impl TuiApp {
                             "Input cannot be empty.\n",
                             "OAuth redirect URL or code",
                         )?;
-                        flow.parse_callback(&input).or_else(|_| {
-                            Ok::<String, ct_kernel::oauth::AuthError>(input.trim().to_string())
-                        }).map_err(|e| TuiError::Auth(format!("{e}")))?
+                        flow.parse_callback(&input)
+                            .or_else(|_| {
+                                Ok::<String, ct_kernel::oauth::AuthError>(input.trim().to_string())
+                            })
+                            .map_err(|e| TuiError::Auth(format!("{e}")))?
                     }
                 };
 
                 println!("Exchanging authorization code for tokens...");
-                let token_response = exchange_oauth_code_for_tokens(
-                    &flow,
-                    &client_id,
-                    &auth_code,
-                )
-                .await?;
+                let token_response =
+                    exchange_oauth_code_for_tokens(&flow, &client_id, &auth_code).await?;
 
                 let account_id =
                     ct_kernel::oauth::extract_openai_account_id(&token_response.access_token);
@@ -601,13 +597,10 @@ async fn start_oauth_callback_server(
     let state = expected_state.to_string();
     Ok(async move {
         // Wait up to 60 seconds for the callback
-        let accept = tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            listener.accept(),
-        )
-        .await
-        .map_err(|_| TuiError::Auth("OAuth callback timed out (60s)".to_string()))?
-        .map_err(|e| TuiError::Auth(format!("failed to accept connection: {e}")))?;
+        let accept = tokio::time::timeout(std::time::Duration::from_secs(60), listener.accept())
+            .await
+            .map_err(|_| TuiError::Auth("OAuth callback timed out (60s)".to_string()))?
+            .map_err(|e| TuiError::Auth(format!("failed to accept connection: {e}")))?;
 
         let (mut stream, _addr) = accept;
         let mut buf = vec![0u8; 4096];
@@ -768,21 +761,16 @@ fn register_auth_provider(
         } => {
             if let Some(acct_id) = account_id {
                 // Use Responses API provider for subscription OAuth
-                let provider_client = OpenAiResponsesProvider::new(
-                    access_token.clone(),
-                    acct_id.clone(),
-                )
-                .map_err(|error| {
-                    TuiError::Router(format!(
-                        "failed to configure {provider} Responses provider: {error}"
-                    ))
-                })?
-                .with_supported_models(models_for_provider(provider));
+                let provider_client =
+                    OpenAiResponsesProvider::new(access_token.clone(), acct_id.clone())
+                        .map_err(|error| {
+                            TuiError::Router(format!(
+                                "failed to configure {provider} Responses provider: {error}"
+                            ))
+                        })?
+                        .with_supported_models(models_for_provider(provider));
 
-                router.register_provider_with_auth(
-                    Box::new(provider_client),
-                    "subscription",
-                );
+                router.register_provider_with_auth(Box::new(provider_client), "subscription");
             } else {
                 // No account ID — fall back to standard OpenAI provider
                 let provider_client =
@@ -795,10 +783,7 @@ fn register_auth_provider(
                         .with_name(provider.clone())
                         .with_supported_models(models_for_provider(provider));
 
-                router.register_provider_with_auth(
-                    Box::new(provider_client),
-                    "subscription",
-                );
+                router.register_provider_with_auth(Box::new(provider_client), "subscription");
             }
         }
     }

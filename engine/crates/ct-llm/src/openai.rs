@@ -396,10 +396,7 @@ impl LlmProvider for OpenAiProvider {
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
         let body = self.build_request_body(&request, false)?;
 
-        let mut builder = self
-            .client
-            .post(self.endpoint())
-            .bearer_auth(&self.api_key);
+        let mut builder = self.client.post(self.endpoint()).bearer_auth(&self.api_key);
         if let Some(ref account_id) = self.account_id {
             builder = builder.header("chatgpt-account-id", account_id);
         }
@@ -428,10 +425,7 @@ impl LlmProvider for OpenAiProvider {
     ) -> Result<CompletionStream, LlmError> {
         let body = self.build_request_body(&request, true)?;
 
-        let mut builder = self
-            .client
-            .post(self.endpoint())
-            .bearer_auth(&self.api_key);
+        let mut builder = self.client.post(self.endpoint()).bearer_auth(&self.api_key);
         if let Some(ref account_id) = self.account_id {
             builder = builder.header("chatgpt-account-id", account_id);
         }

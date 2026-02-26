@@ -94,18 +94,12 @@ impl AnthropicProvider {
     }
 
     /// Apply auth headers to a request builder based on auth mode.
-    fn apply_auth(
-        &self,
-        builder: reqwest::RequestBuilder,
-    ) -> reqwest::RequestBuilder {
+    fn apply_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match &self.auth_mode {
             AnthropicAuthMode::ApiKey(key) => builder.header("x-api-key", key),
             AnthropicAuthMode::SetupToken(token) => builder
                 .header("Authorization", format!("Bearer {token}"))
-                .header(
-                    "anthropic-beta",
-                    "claude-code-20250219,oauth-2025-04-20",
-                )
+                .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
                 .header("x-app", "cli"),
         }
     }

@@ -41,15 +41,11 @@ impl OpenAiResponsesProvider {
         let account_id = account_id.into();
 
         if access_token.trim().is_empty() {
-            return Err(LlmError::Config(
-                "access_token cannot be empty".to_string(),
-            ));
+            return Err(LlmError::Config("access_token cannot be empty".to_string()));
         }
 
         if account_id.trim().is_empty() {
-            return Err(LlmError::Config(
-                "account_id cannot be empty".to_string(),
-            ));
+            return Err(LlmError::Config("account_id cannot be empty".to_string()));
         }
 
         let client = reqwest::Client::builder()
@@ -186,7 +182,9 @@ impl OpenAiResponsesProvider {
         let response_text = text_parts.join("");
 
         CompletionResponse {
-            content: vec![ContentBlock::Text { text: response_text }],
+            content: vec![ContentBlock::Text {
+                text: response_text,
+            }],
             usage: body.usage.map(|u| Usage {
                 input_tokens: u.input_tokens.unwrap_or(0) as u32,
                 output_tokens: u.output_tokens.unwrap_or(0) as u32,
@@ -473,10 +471,7 @@ mod tests {
         );
 
         let custom = provider.clone().with_base_url("https://example.com/api");
-        assert_eq!(
-            custom.endpoint(),
-            "https://example.com/api/codex/responses"
-        );
+        assert_eq!(custom.endpoint(), "https://example.com/api/codex/responses");
 
         let already_full = provider
             .clone()
@@ -507,7 +502,9 @@ mod tests {
         let response = OpenAiResponsesProvider::parse_response(body);
         assert_eq!(
             response.content,
-            vec![ContentBlock::Text { text: "Hello from ChatGPT!".to_string() }]
+            vec![ContentBlock::Text {
+                text: "Hello from ChatGPT!".to_string()
+            }]
         );
         let usage = response.usage.unwrap();
         assert_eq!(usage.input_tokens, 10);
@@ -522,7 +519,9 @@ mod tests {
             model: "gpt-4.1".to_string(),
             messages: vec![crate::types::Message {
                 role: MessageRole::User,
-                content: vec![ContentBlock::Text { text: "Hello".to_string() }],
+                content: vec![ContentBlock::Text {
+                    text: "Hello".to_string(),
+                }],
             }],
             system_prompt: Some("You are helpful.".to_string()),
             tools: vec![],
