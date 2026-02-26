@@ -4,6 +4,7 @@ use ct_kernel::auth::{AuthManager, AuthMethod};
 use ct_kernel::oauth::{PkceFlow, TokenExchangeRequest, TokenResponse};
 use ct_llm::{
     AnthropicProvider, CompletionRequest, ContentBlock, Message, ModelRouter, OpenAiProvider,
+    OpenAiResponsesProvider,
 };
 use std::fmt;
 use std::io::{self, Write};
@@ -765,21 +766,40 @@ fn register_auth_provider(
             account_id,
             ..
         } => {
-            let mut provider_client =
-                OpenAiProvider::new(base_url_for_provider(provider), access_token.clone())
-                    .map_err(|error| {
-                        TuiError::Router(format!(
-                            "failed to configure {provider} provider: {error}"
-                        ))
-                    })?
-                    .with_name(provider.clone())
-                    .with_supported_models(models_for_provider(provider));
-
             if let Some(acct_id) = account_id {
-                provider_client = provider_client.with_account_id(acct_id);
-            }
+                // Use Responses API provider for subscription OAuth
+                let provider_client = OpenAiResponsesProvider::new(
+                    access_token.clone(),
+                    acct_id.clone(),
+                )
+                .map_err(|error| {
+                    TuiError::Router(format!(
+                        "failed to configure {provider} Responses provider: {error}"
+                    ))
+                })?
+                .with_supported_models(models_for_provider(provider));
 
-            router.register_provider_with_auth(Box::new(provider_client), "subscription");
+                router.register_provider_with_auth(
+                    Box::new(provider_client),
+                    "subscription",
+                );
+            } else {
+                // No account ID — fall back to standard OpenAI provider
+                let provider_client =
+                    OpenAiProvider::new(base_url_for_provider(provider), access_token.clone())
+                        .map_err(|error| {
+                            TuiError::Router(format!(
+                                "failed to configure {provider} provider: {error}"
+                            ))
+                        })?
+                        .with_name(provider.clone())
+                        .with_supported_models(models_for_provider(provider));
+
+                router.register_provider_with_auth(
+                    Box::new(provider_client),
+                    "subscription",
+                );
+            }
         }
     }
 
