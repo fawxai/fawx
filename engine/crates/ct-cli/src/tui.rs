@@ -790,10 +790,60 @@ async fn exchange_oauth_code_for_tokens(
         .map_err(|error| TuiError::Auth(format!("oauth token response was invalid JSON: {error}")))
 }
 
+async fn catalog_models_for_auth(catalog: &mut ModelCatalog, auth_method: &AuthMethod) -> Vec<String> {
+    let (provider, credential, auth_mode) = auth_context(auth_method);
+
+    let discovered = catalog
+        .get_models(provider, credential, auth_mode)
+        .await
+        .into_iter()
+        .map(|model| model.id)
+        .collect::<Vec<_>>();
+
+    if discovered.is_empty() {
+        default_supported_models(auth_method)
+    } else {
+        discovered
+    }
+}
+
+fn auth_context<'a>(auth_method: &'a AuthMethod) -> (&'a str, &'a str, &'static str) {
+    match auth_method {
+        AuthMethod::SetupToken { token } => ("anthropic", token.as_str(), "setup_token"),
+        AuthMethod::ApiKey { provider, key } => {
+            let mode = if provider == "anthropic" {
+                "api_key"
+            } else {
+                "bearer"
+            };
+            (provider.as_str(), key.as_str(), mode)
+        }
+        AuthMethod::OAuth {
+            provider,
+            access_token,
+            ..
+        } => (provider.as_str(), access_token.as_str(), "bearer"),
+    }
+}
+
 fn register_auth_provider(
     router: &mut ModelRouter,
     auth_method: &AuthMethod,
 ) -> Result<(), TuiError> {
+    register_auth_provider_with_models(router, auth_method, default_supported_models(auth_method))
+}
+
+fn register_auth_provider_with_models(
+    router: &mut ModelRouter,
+    auth_method: &AuthMethod,
+    supported_models: Vec<String>,
+) -> Result<(), TuiError> {
+    let supported_models = if supported_models.is_empty() {
+        default_supported_models(auth_method)
+    } else {
+        supported_models
+    };
+
     match auth_method {
         AuthMethod::SetupToken { token } => {
             let provider =
@@ -801,7 +851,7 @@ fn register_auth_provider(
                     .map_err(|error| {
                         TuiError::Router(format!("failed to configure Anthropic provider: {error}"))
                     })?
-                    .with_supported_models(to_strings(DEFAULT_ANTHROPIC_MODELS));
+                    .with_supported_models(supported_models);
 
             router.register_provider_with_auth(Box::new(provider), "subscription");
         }
@@ -814,7 +864,7 @@ fn register_auth_provider(
                                 "failed to configure Anthropic provider: {error}"
                             ))
                         })?
-                        .with_supported_models(models_for_provider("anthropic"));
+                        .with_supported_models(supported_models);
 
                 router.register_provider_with_auth(Box::new(anthropic_provider), "api_key");
             } else {
@@ -826,7 +876,7 @@ fn register_auth_provider(
                             ))
                         })?
                         .with_name(provider.clone())
-                        .with_supported_models(models_for_provider(provider));
+                        .with_supported_models(supported_models);
 
                 router.register_provider_with_auth(Box::new(provider_client), "api_key");
             }
@@ -838,7 +888,6 @@ fn register_auth_provider(
             ..
         } => {
             if let Some(acct_id) = account_id {
-                // Use Responses API provider for subscription OAuth with Codex-compatible models
                 let provider_client =
                     OpenAiResponsesProvider::new(access_token.clone(), acct_id.clone())
                         .map_err(|error| {
@@ -846,11 +895,10 @@ fn register_auth_provider(
                                 "failed to configure {provider} Responses provider: {error}"
                             ))
                         })?
-                        .with_supported_models(to_strings(DEFAULT_OPENAI_SUBSCRIPTION_MODELS));
+                        .with_supported_models(supported_models);
 
                 router.register_provider_with_auth(Box::new(provider_client), "subscription");
             } else {
-                // No account ID — fall back to standard OpenAI provider
                 let provider_client =
                     OpenAiProvider::new(base_url_for_provider(provider), access_token.clone())
                         .map_err(|error| {
@@ -859,7 +907,7 @@ fn register_auth_provider(
                             ))
                         })?
                         .with_name(provider.clone())
-                        .with_supported_models(models_for_provider(provider));
+                        .with_supported_models(supported_models);
 
                 router.register_provider_with_auth(Box::new(provider_client), "subscription");
             }
@@ -867,6 +915,20 @@ fn register_auth_provider(
     }
 
     Ok(())
+}
+
+fn default_supported_models(auth_method: &AuthMethod) -> Vec<String> {
+    match auth_method {
+        AuthMethod::SetupToken { .. } => to_strings(DEFAULT_ANTHROPIC_MODELS),
+        AuthMethod::ApiKey { provider, .. } => models_for_provider(provider),
+        AuthMethod::OAuth { account_id, provider, .. } => {
+            if account_id.is_some() {
+                to_strings(DEFAULT_OPENAI_SUBSCRIPTION_MODELS)
+            } else {
+                models_for_provider(provider)
+            }
+        }
+    }
 }
 
 fn auth_file_path() -> Result<PathBuf, TuiError> {
