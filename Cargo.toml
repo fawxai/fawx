@@ -1,13 +1,15 @@
 [workspace]
 members = [
-    "crates/ct-core",
-    "crates/ct-agent",
-    "crates/ct-llm",
-    "crates/ct-security",
-    "crates/ct-skills",
-    "crates/ct-storage",
-    "crates/ct-cli",
-    "ffi/llama-cpp-sys",
+    "engine/crates/ct-core",
+    "engine/crates/ct-kernel",
+    "engine/crates/ct-loadable",
+    "engine/crates/ct-agent",
+    "engine/crates/ct-llm",
+    "engine/crates/ct-security",
+    "engine/crates/ct-skills",
+    "engine/crates/ct-storage",
+    "engine/crates/ct-cli",
+    "engine/crates/llama-cpp-sys",
 ]
 resolver = "2"
 
@@ -57,8 +59,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 futures = "0.3"
 
 # Shared crates
-ct-core = { path = "crates/ct-core" }
-ct-agent = { path = "crates/ct-agent" }
-ct-security = { path = "crates/ct-security" }
-ct-skills = { path = "crates/ct-skills" }
-ct-storage = { path = "crates/ct-storage" }
+ct-core = { path = "engine/crates/ct-core" }
+ct-kernel = { path = "engine/crates/ct-kernel" }
+ct-loadable = { path = "engine/crates/ct-loadable" }
+ct-agent = { path = "engine/crates/ct-agent" }
+ct-security = { path = "engine/crates/ct-security" }
+ct-skills = { path = "engine/crates/ct-skills" }
+ct-storage = { path = "engine/crates/ct-storage" }

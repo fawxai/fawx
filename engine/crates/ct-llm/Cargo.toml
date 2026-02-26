@@ -15,4 +15,4 @@ tokio.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
-llama-cpp-sys = { path = "../../ffi/llama-cpp-sys", optional = true }
+llama-cpp-sys = { path = "../llama-cpp-sys", optional = true }

@@ -71,26 +71,28 @@ For the full vision and three-horizon roadmap, see [`docs/SPEC.md`](docs/SPEC.md
 
 ## Architecture
 
-Citros is a Rust workspace with 12 crates, designed for modularity and testability:
+Citros is a Rust workspace organized into four architectural layers:
 
 ```
 citros/
-├── crates/
-│   ├── ct-core/           # Core types, traits, and utilities
-│   ├── ct-agent/          # Agent orchestration, intent classification, Claude API
-│   ├── ct-llm/            # Local LLM inference via llama.cpp
-│   ├── ct-security/       # Policy engine, capability management, action validation
-│   ├── ct-storage/        # Encrypted key-value store, audit log persistence
-│   ├── ct-skills/         # WASM skill runtime, host API, module loading
-│   ├── ct-phone/          # Phone-specific actions (UI automation, app control)
-│   ├── ct-voice/          # Voice interface (STT, TTS, wake word)
-│   ├── ct-sensors/        # Sensor access (camera, microphone, location, etc.)
-│   ├── ct-sync/           # Multi-device encrypted sync protocol
-│   ├── ct-cli/            # Interactive CLI for development and testing
-│   └── ct-audit/          # Audit log (CLI commands, verification, querying)
-└── ffi/
-    └── llama-cpp-sys/     # Rust FFI bindings to llama.cpp
-
+├── engine/
+│   └── crates/
+│       ├── ct-kernel/       # Loop orchestration, policy, permissions, verification, rollback
+│       ├── ct-loadable/     # WASM skills, strategies, config, templates, A/B slots
+│       ├── ct-core/         # Core types, traits, and utilities
+│       ├── ct-llm/          # LLM provider abstraction (local + cloud)
+│       ├── ct-storage/      # Encrypted persistence, memory stores, graph index
+│       ├── ct-agent/        # Agent logic (being decomposed into kernel + loadable)
+│       ├── ct-security/     # Policy engine, audit (being decomposed into kernel + storage)
+│       ├── ct-skills/       # Skill runtime (migrating into ct-loadable)
+│       ├── ct-cli/          # Interactive CLI for development and testing
+│       └── llama-cpp-sys/   # Rust FFI bindings to llama.cpp
+├── android/                 # Kotlin shell (drives the engine via FFI)
+├── bindings/
+│   ├── jni/                 # UniFFI-generated Kotlin bindings
+│   └── swift/               # UniFFI-generated Swift bindings (future)
+└── docs/
+    └── architecture/        # HTML architecture spec (10 documents)
 ```
 
 ### Key Dependencies

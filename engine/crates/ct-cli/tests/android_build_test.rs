@@ -4,7 +4,9 @@ use std::process::Command;
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .expect("workspace crates dir")
+        .expect("engine/crates dir")
+        .parent()
+        .expect("engine dir")
         .parent()
         .expect("workspace root")
         .to_path_buf()
@@ -12,7 +14,7 @@ fn repo_root() -> PathBuf {
 
 #[test]
 fn android_hello_source_has_module_docs_and_expected_message() {
-    let path = repo_root().join("crates/ct-cli/src/bin/android_hello.rs");
+    let path = repo_root().join("engine/crates/ct-cli/src/bin/android_hello.rs");
     let source = std::fs::read_to_string(path).expect("read android_hello.rs");
 
     assert!(
