@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 pub mod act;
 pub mod budget;
 pub mod checkpoint;
+pub mod context_manager;
 pub mod continuation;
 pub mod decide;
 pub mod learn;
