@@ -151,6 +151,26 @@ impl BudgetTracker {
         current_time_ms.saturating_sub(self.start_time_ms) > self.config.max_wall_time_ms
     }
 
+    /// Number of LLM calls consumed so far.
+    pub fn llm_calls_used(&self) -> u32 {
+        self.llm_calls
+    }
+
+    /// Number of tool invocations consumed so far.
+    pub fn tool_invocations_used(&self) -> u32 {
+        self.tool_invocations
+    }
+
+    /// Tokens consumed so far.
+    pub fn tokens_used(&self) -> u64 {
+        self.tokens_used
+    }
+
+    /// Cost consumed so far, in cents.
+    pub fn cost_cents_used(&self) -> u64 {
+        self.cost_cents
+    }
+
     /// Create a child budget config by partitioning remaining resources.
     ///
     /// `fraction` is clamped into `[0.0, 1.0]` and partitioning uses *remaining*
@@ -275,6 +295,9 @@ pub struct BudgetRemaining {
     /// Remaining wall time in milliseconds.
     pub wall_time_ms: u64,
 }
+
+/// Alias used by the loop engine perception pipeline.
+pub type BudgetSnapshot = BudgetRemaining;
 
 /// Error returned when a requested action would exceed a budget limit.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

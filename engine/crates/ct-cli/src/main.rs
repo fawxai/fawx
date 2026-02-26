@@ -156,7 +156,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Tui => {
             let auth_manager = tui::load_auth_manager().await?;
             let router = tui::build_router(&auth_manager)?;
-            let mut app = tui::TuiApp::new(auth_manager, router);
+            let loop_engine = tui::build_loop_engine();
+            let mut app = tui::TuiApp::new(auth_manager, router, loop_engine);
             app.run().await?;
             0
         }

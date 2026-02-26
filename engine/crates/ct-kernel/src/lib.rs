@@ -27,8 +27,6 @@
 //! - Consolidation requires validated checkpoint before mutations
 //! - Three-gate decision: policy → budget → permission, no gate skippable
 
-use serde::{Deserialize, Serialize};
-
 pub mod act;
 pub mod auth;
 pub mod budget;
@@ -48,25 +46,11 @@ pub mod types;
 pub mod verify;
 pub mod watchdog;
 
+pub use act::{ActionResult, TokenUsage, ToolResult};
+pub use continuation::Continuation;
+pub use decide::Decision;
+pub use learn::Learning;
+pub use loop_engine::{LoopEngine, LoopResult, LoopStatus};
+pub use perceive::ProcessedPerception;
 pub use types::{ContinuationDecision, EscalationContext, LoopError, LoopEvidence};
-
-/// The core loop result type.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum LoopResult {
-    /// Goal achieved with verification evidence.
-    Completed(LoopEvidence),
-    /// Unrecoverable failure.
-    Failed(LoopError),
-    /// User input needed to proceed.
-    NeedsUser(EscalationContext),
-    /// Hit maximum recursion depth.
-    DepthExceeded,
-    /// Budget exhausted for this loop invocation.
-    BudgetExhausted,
-    /// User cancelled; state checkpointed for potential resume.
-    Interrupted(CheckpointId),
-}
-
-/// Stable checkpoint identifier.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct CheckpointId(pub u64);
+pub use verify::Verification;

@@ -1,7 +1,14 @@
+use async_trait::async_trait;
 use crossterm::style::Stylize;
-use crossterm::{event, style, terminal, ExecutableCommand};
+use crossterm::{cursor, event, style, terminal, ExecutableCommand};
+use ct_core::error::LlmError as CoreLlmError;
+use ct_core::types::{InputSource, ScreenState, UserInput};
 use ct_kernel::auth::{AuthManager, AuthMethod};
+use ct_kernel::budget::{BudgetConfig, BudgetTracker};
+use ct_kernel::context_manager::ContextCompactor;
+use ct_kernel::loop_engine::{LoopEngine, LoopResult, LlmProvider as LoopLlmProvider};
 use ct_kernel::oauth::{PkceFlow, TokenExchangeRequest, TokenResponse};
+use ct_kernel::types::PerceptionSnapshot;
 use ct_llm::{
     AnthropicProvider, CompletionRequest, Message, ModelCatalog, ModelRouter, OpenAiProvider,
     OpenAiResponsesProvider,
@@ -38,16 +45,18 @@ pub struct TuiApp {
     router: ModelRouter,
     auth_manager: AuthManager,
     catalog: ModelCatalog,
+    loop_engine: LoopEngine,
     running: bool,
 }
 
 impl TuiApp {
     /// Create a new TUI application.
-    pub fn new(auth_manager: AuthManager, router: ModelRouter) -> Self {
+    pub fn new(auth_manager: AuthManager, router: ModelRouter, loop_engine: LoopEngine) -> Self {
         Self {
             router,
             auth_manager,
-            catalog: ModelCatalog::new(),
+    catalog: ModelCatalog::new(),
+            loop_engine,
             running: true,
         }
     }
@@ -327,6 +336,7 @@ impl TuiApp {
                 }
             }
             ParsedCommand::Budget => self.show_budget_status(),
+            ParsedCommand::Loop => self.show_loop_status(),
             ParsedCommand::Help => self.show_help(),
             ParsedCommand::Quit => {
                 self.running = false;
@@ -341,7 +351,7 @@ impl TuiApp {
         Ok(())
     }
 
-    /// Process a user message (sent to the model router).
+    /// Process a user message by running the full loop engine.
     async fn handle_message(&mut self, input: &str) -> Result<String, TuiError> {
         let active_model = self
             .router
@@ -349,44 +359,29 @@ impl TuiApp {
             .ok_or_else(|| TuiError::Router("no active model selected".to_string()))?
             .to_string();
 
-        let request = CompletionRequest {
-            model: active_model,
-            messages: vec![Message::user(input)],
-            tools: Vec::new(),
-            temperature: Some(0.2),
-            max_tokens: Some(1024),
-            system_prompt: Some(
-                "You are Citros, a helpful AI assistant. Be concise and direct.".to_string(),
-            ),
+        let snapshot = self.build_perception_snapshot(input);
+        let loop_result = {
+            let router = &self.router;
+            let llm = RouterLoopLlmProvider::new(router, active_model);
+            let loop_engine = &mut self.loop_engine;
+            loop_engine
+                .run_cycle(snapshot, &llm)
+                .await
+                .map_err(|error| TuiError::Loop(error.reason))?
         };
 
-        // Use streaming — required by the Codex Responses API, and gives
-        // better UX by printing tokens as they arrive.
-        let mut stream = self
-            .router
-            .complete_stream(request)
-            .await
-            .map_err(|error| TuiError::Loop(error.to_string()))?;
+        Ok(render_loop_result(loop_result))
+    }
 
-        let mut full_response = String::new();
-        print!("\x1b[36mAssistant\x1b[0m ");
-        while let Some(chunk) = stream.next().await {
-            match chunk {
-                Ok(chunk) => {
-                    if let Some(delta) = &chunk.delta_content {
-                        print!("{delta}");
-                        io::stdout().flush().map_err(TuiError::Io)?;
-                        full_response.push_str(delta);
-                    }
-                }
-                Err(error) => {
-                    println!();
-                    return Err(TuiError::Loop(error.to_string()));
-                }
-            }
-        }
-        println!("\n");
-        Ok(full_response)
+    /// Display formatted output to the terminal.
+    fn display_response(&self, response: &str) {
+        let mut stdout = io::stdout();
+        let _ = stdout.execute(cursor::MoveToColumn(0));
+
+        println!();
+        println!("{}", "Assistant".bold().with(style::Color::Cyan));
+        println!("{response}");
+        println!();
     }
 
     /// Display the model selection menu.
@@ -482,6 +477,7 @@ impl TuiApp {
         println!("  /model <name>  Switch active model");
         println!("  /auth          Show auth status and run auth wizard");
         println!("  /budget        Show current budget usage");
+        println!("  /loop          Show loop status (iterations, budget, tokens)");
         println!("  /help          Show this help message");
         println!("  /quit          Exit Citros");
         println!("  /exit          Exit Citros");
@@ -517,8 +513,171 @@ impl TuiApp {
     }
 
     fn show_budget_status(&self) {
-        println!("Budget integration lands in PR 9.");
-        println!("Current mode: direct model chat (no loop budget accounting yet).");
+        let status = self.loop_engine.status(current_time_ms());
+        println!("Budget usage:");
+        println!("  - LLM calls used: {}", status.llm_calls_used);
+        println!("  - Tool calls used: {}", status.tool_invocations_used);
+        println!("  - Tokens used: {}", status.tokens_used);
+        println!("  - Cost used (cents): {}", status.cost_cents_used);
+        println!("  - Tokens remaining: {}", status.remaining.tokens);
+        println!("  - LLM calls remaining: {}", status.remaining.llm_calls);
+    }
+
+    fn show_loop_status(&self) {
+        let status = self.loop_engine.status(current_time_ms());
+        println!("Loop status:");
+        println!(
+            "  - Iterations (last cycle): {}/{}",
+            status.iteration_count, status.max_iterations
+        );
+        println!("  - Tokens used (tracker): {}", status.tokens_used);
+        println!("  - Tokens remaining: {}", status.remaining.tokens);
+        println!("  - LLM calls remaining: {}", status.remaining.llm_calls);
+        println!("  - Tool calls remaining: {}", status.remaining.tool_invocations);
+        println!("  - Wall time remaining (ms): {}", status.remaining.wall_time_ms);
+    }
+
+    fn build_perception_snapshot(&self, input: &str) -> PerceptionSnapshot {
+        let timestamp_ms = current_time_ms();
+
+        PerceptionSnapshot {
+            screen: ScreenState {
+                current_app: "citros.tui".to_string(),
+                elements: Vec::new(),
+                text_content: input.to_string(),
+            },
+            notifications: Vec::new(),
+            active_app: "citros.tui".to_string(),
+            timestamp_ms,
+            sensor_data: None,
+            user_input: Some(UserInput {
+                text: input.to_string(),
+                source: InputSource::Text,
+                timestamp: timestamp_ms,
+                context_id: None,
+            }),
+        }
+    }
+}
+
+/// Build a loop engine with sensible defaults for the TUI shell.
+pub fn build_loop_engine() -> LoopEngine {
+    let budget = BudgetTracker::new(BudgetConfig::default(), current_time_ms(), 0);
+    let context = ContextCompactor::new(8_000, 6_000);
+    LoopEngine::new(budget, context, 10)
+}
+
+#[derive(Debug)]
+struct RouterLoopLlmProvider<'a> {
+    router: &'a ModelRouter,
+    active_model: String,
+}
+
+impl<'a> RouterLoopLlmProvider<'a> {
+    fn new(router: &'a ModelRouter, active_model: String) -> Self {
+        Self {
+            router,
+            active_model,
+        }
+    }
+}
+
+#[async_trait]
+impl LoopLlmProvider for RouterLoopLlmProvider<'_> {
+    async fn generate(&self, prompt: &str, max_tokens: u32) -> Result<String, CoreLlmError> {
+        let request = CompletionRequest {
+            model: self.active_model.clone(),
+            messages: vec![Message::user(prompt)],
+            tools: Vec::new(),
+            temperature: Some(0.2),
+            max_tokens: Some(max_tokens),
+            system_prompt: None,
+        };
+
+        let response = self
+            .router
+            .complete(request)
+            .await
+            .map_err(|error| CoreLlmError::Inference(error.to_string()))?;
+
+        let rendered = render_completion_blocks(&response.content);
+        if rendered.trim().is_empty() {
+            Err(CoreLlmError::InvalidResponse(
+                "provider returned an empty completion".to_string(),
+            ))
+        } else {
+            Ok(rendered)
+        }
+    }
+
+    async fn generate_streaming(
+        &self,
+        prompt: &str,
+        max_tokens: u32,
+        callback: Box<dyn Fn(String) + Send + 'static>,
+    ) -> Result<String, CoreLlmError> {
+        let rendered = self.generate(prompt, max_tokens).await?;
+        callback(rendered.clone());
+        Ok(rendered)
+    }
+
+    fn model_name(&self) -> &str {
+        &self.active_model
+    }
+}
+
+fn render_completion_blocks(content: &[ContentBlock]) -> String {
+    content
+        .iter()
+        .map(|block| match block {
+            ContentBlock::Text { text } => text.clone(),
+            ContentBlock::ToolUse { name, .. } => format!("[tool requested: {name}]"),
+            ContentBlock::ToolResult { tool_use_id, .. } => {
+                format!("[tool result: {tool_use_id}]")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_loop_result(result: LoopResult) -> String {
+    match result {
+        LoopResult::Complete {
+            response,
+            iterations,
+            tokens_used,
+            ..
+        } => {
+            format!(
+                "{response}\n\n[loop complete in {iterations} iteration(s); tokens in/out: {}/{}]",
+                tokens_used.input_tokens, tokens_used.output_tokens
+            )
+        }
+        LoopResult::BudgetExhausted {
+            partial_response,
+            iterations,
+        } => {
+            if let Some(partial) = partial_response {
+                format!(
+                    "{partial}\n\n[loop stopped: budget exhausted after {iterations} iteration(s)]"
+                )
+            } else {
+                format!("[loop stopped: budget exhausted after {iterations} iteration(s)]")
+            }
+        }
+        LoopResult::NeedsInput { prompt, iterations } => {
+            format!("{prompt}\n\n[loop needs input after {iterations} iteration(s)]")
+        }
+        LoopResult::Error {
+            message,
+            recoverable,
+        } => {
+            if recoverable {
+                format!("{message}\n\n[loop error is recoverable — try again]")
+            } else {
+                format!("{message}\n\n[loop error is not recoverable]")
+            }
+        }
     }
 }
 
@@ -1204,6 +1363,7 @@ enum ParsedCommand {
     Model(Option<String>),
     Auth,
     Budget,
+    Loop,
     Help,
     Quit,
     Unknown(String),
@@ -1224,6 +1384,7 @@ fn parse_command(value: &str) -> ParsedCommand {
         "model" => ParsedCommand::Model(parts.next().map(ToString::to_string)),
         "auth" => ParsedCommand::Auth,
         "budget" => ParsedCommand::Budget,
+        "loop" => ParsedCommand::Loop,
         "help" => ParsedCommand::Help,
         "quit" | "exit" => ParsedCommand::Quit,
         other => ParsedCommand::Unknown(other.to_string()),
@@ -1248,6 +1409,7 @@ impl Drop for RawModeGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use std::ffi::OsString;
     use tempfile::TempDir;
 
@@ -1280,7 +1442,7 @@ mod tests {
     }
 
     fn new_test_app() -> TuiApp {
-        TuiApp::new(AuthManager::new(), ModelRouter::new())
+        TuiApp::new(AuthManager::new(), ModelRouter::new(), build_loop_engine())
     }
 
     fn test_auth_manager() -> AuthManager {
@@ -1299,6 +1461,70 @@ mod tests {
             },
         );
         auth_manager
+    }
+
+    #[derive(Debug)]
+    struct StaticCompletionProvider {
+        provider_name: String,
+        model: String,
+        response: String,
+    }
+
+    impl StaticCompletionProvider {
+        fn new(model: &str, response: &str) -> Self {
+            Self {
+                provider_name: "mock-provider".to_string(),
+                model: model.to_string(),
+                response: response.to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ct_llm::CompletionProvider for StaticCompletionProvider {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<ct_llm::CompletionResponse, ct_llm::ProviderError> {
+            Ok(ct_llm::CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: self.response.clone(),
+                }],
+                tool_calls: Vec::new(),
+                usage: None,
+                stop_reason: Some("end_turn".to_string()),
+            })
+        }
+
+        async fn complete_stream(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<ct_llm::CompletionStream, ct_llm::ProviderError> {
+            Err(ct_llm::ProviderError::Streaming(
+                "streaming not implemented in test provider".to_string(),
+            ))
+        }
+
+        fn name(&self) -> &str {
+            &self.provider_name
+        }
+
+        fn supported_models(&self) -> Vec<String> {
+            vec![self.model.clone()]
+        }
+    }
+
+    fn app_with_mock_model(response: &str) -> TuiApp {
+        let mut router = ModelRouter::new();
+        router.register_provider_with_auth(
+            Box::new(StaticCompletionProvider::new("mock-loop-model", response)),
+            "test",
+        );
+        router
+            .set_active("mock-loop-model")
+            .expect("set active mock model");
+
+        TuiApp::new(AuthManager::new(), router, build_loop_engine())
     }
 
     #[test]
@@ -1323,6 +1549,7 @@ mod tests {
             ParsedCommand::Model(Some("claude-opus-4".to_string()))
         );
         assert_eq!(parse_command("/help"), ParsedCommand::Help);
+        assert_eq!(parse_command("/loop"), ParsedCommand::Loop);
         assert_eq!(parse_command("/quit"), ParsedCommand::Quit);
         assert_eq!(parse_command("/exit"), ParsedCommand::Quit);
     }
@@ -1343,6 +1570,21 @@ mod tests {
         app.handle_command("/quit").await.unwrap();
 
         assert!(!app.running);
+    }
+
+    #[tokio::test]
+    async fn handle_message_returns_loop_result_not_raw_completion_payload() {
+        let mut app = app_with_mock_model(
+            r#"{"action":{"Respond":{"text":"Loop-integrated reply"}},"rationale":"direct","confidence":0.91,"expected_outcome":null,"sub_goals":[]}"#,
+        );
+
+        let rendered = app
+            .handle_message("hello")
+            .await
+            .expect("loop-generated message");
+
+        assert!(rendered.contains("Loop-integrated reply"));
+        assert!(rendered.contains("[loop complete"));
     }
 
     #[tokio::test]

@@ -1,7 +1,22 @@
 //! Perceive-step context assembly utilities.
 
+use crate::budget::BudgetSnapshot;
 use crate::types::*;
+use ct_llm::Message;
 use serde::{Deserialize, Serialize};
+
+/// Processed perception payload passed from Perceive to Reason.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessedPerception {
+    /// Latest user-facing text input.
+    pub user_message: String,
+    /// Conversation context assembled for this reasoning turn.
+    pub context_window: Vec<Message>,
+    /// Goals currently active in this loop.
+    pub active_goals: Vec<String>,
+    /// Remaining budget snapshot captured at perception time.
+    pub budget_remaining: BudgetSnapshot,
+}
 
 /// Assembles a [`ReasoningContext`] from perception and memory retrieval outputs.
 ///

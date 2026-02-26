@@ -24,6 +24,7 @@ ct-skills = { path = "../ct-skills" }
 ct-storage.workspace = true
 clap.workspace = true
 tokio.workspace = true
+async-trait.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
