@@ -129,7 +129,7 @@ impl TuiApp {
         println!(
             "{:padding$}{}",
             "",
-            "Agentic engine \u{00b7} type /help for commands".with(style::Color::DarkGrey)
+            "Agentic engine - type /help for commands".with(style::Color::DarkGrey)
         );
         println!();
     }

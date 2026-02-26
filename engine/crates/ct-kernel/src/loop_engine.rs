@@ -113,7 +113,15 @@ const TOOL_SYNTHESIS_TOKEN_HEURISTIC: u64 = 320;
 const REASONING_MAX_OUTPUT_TOKENS: u32 = 768;
 const TOOL_SYNTHESIS_MAX_OUTPUT_TOKENS: u32 = 384;
 const DEFAULT_LLM_ACTION_COST_CENTS: u64 = 2;
-const REASONING_SYSTEM_PROMPT: &str = "You are Citros, an autonomous assistant kernel. Reason step output MUST be JSON. Return one ReasonedIntent with action, rationale, confidence, expected_outcome (optional), and sub_goals.";
+const REASONING_SYSTEM_PROMPT: &str = "You are Citros, an autonomous assistant kernel. \
+Reason step output MUST be valid JSON matching this schema: \
+{\"action\": <IntendedAction>, \"rationale\": \"...\", \"confidence\": 0.0-1.0, \
+\"expected_outcome\": \"...\" or null, \"sub_goals\": []}. \
+IntendedAction variants: {\"Respond\": {\"text\": \"your answer\"}} for direct replies, \
+{\"UseTools\": {\"tool_calls\": [{\"tool\": \"name\", \"args\": {}}]}} for tool use, \
+{\"Clarify\": {\"question\": \"what to ask\"}} when the request is ambiguous, \
+{\"Defer\": {\"reason\": \"why\"}} when you cannot help. \
+For simple questions, use Respond with your answer in the text field.";
 
 const VERIFICATION_CONFIDENCE_CLEAN: f64 = 0.9;
 const VERIFICATION_CONFIDENCE_SINGLE_DISCREPANCY: f64 = 0.45;
@@ -810,17 +818,15 @@ fn message_to_text(message: &Message) -> String {
 }
 
 fn parse_reasoned_intent(raw: &str, fallback_user_message: &str) -> ReasonedIntent {
-    parse_reasoned_intent_inner(raw).unwrap_or_else(|| ReasonedIntent {
-        action: IntendedAction::Respond {
-            text: raw
-                .trim()
-                .strip_prefix("```json")
-                .unwrap_or(raw.trim())
-                .trim_matches('`')
-                .trim()
-                .to_string(),
-        },
-        rationale: "Fallback intent generated from unstructured reasoning output".to_string(),
+    parse_reasoned_intent_inner(raw)
+        .unwrap_or_else(|| build_fallback_intent(raw, fallback_user_message))
+}
+
+fn build_fallback_intent(raw: &str, fallback_user_message: &str) -> ReasonedIntent {
+    let text = extract_fallback_text(raw);
+    ReasonedIntent {
+        action: IntendedAction::Respond { text },
+        rationale: "Fallback: model output did not match schema".to_string(),
         confidence: 0.4,
         expected_outcome: None,
         sub_goals: vec![Goal::new(
@@ -828,7 +834,47 @@ fn parse_reasoned_intent(raw: &str, fallback_user_message: &str) -> ReasonedInte
             vec!["User receives a relevant response".to_string()],
             Some(1),
         )],
-    })
+    }
+}
+
+fn extract_fallback_text(raw: &str) -> String {
+    // Try to pull a readable response from malformed JSON
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) {
+        // Look for text in common response-like fields
+        let candidates = ["text", "response", "answer", "message", "rationale"];
+        if let Some(text) = find_text_in_json(&value, &candidates) {
+            return text;
+        }
+    }
+    // Strip markdown fences and return as-is
+    raw.trim()
+        .strip_prefix("```json")
+        .unwrap_or(raw.trim())
+        .trim_matches('`')
+        .trim()
+        .to_string()
+}
+
+fn find_text_in_json(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    match value {
+        serde_json::Value::Object(map) => {
+            for key in keys {
+                if let Some(serde_json::Value::String(s)) = map.get(*key) {
+                    if !s.is_empty() {
+                        return Some(s.clone());
+                    }
+                }
+            }
+            // Recurse one level into nested objects
+            for v in map.values() {
+                if let Some(found) = find_text_in_json(v, keys) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 fn parse_reasoned_intent_inner(raw: &str) -> Option<ReasonedIntent> {
@@ -1464,6 +1510,32 @@ mod tests {
                 assert_eq!(response, "Integrated response");
             }
             other => panic!("expected complete result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fallback_extracts_text_from_malformed_intent_json() {
+        let raw =
+            r#"{"ReasonedIntent":{"action":"greet","rationale":"Hello there!","confidence":0.9}}"#;
+        let intent = parse_reasoned_intent(raw, "hey");
+        match &intent.action {
+            IntendedAction::Respond { text } => {
+                assert!(!text.contains("ReasonedIntent"));
+                assert!(text.contains("Hello there!"));
+            }
+            other => panic!("expected Respond, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fallback_extracts_nested_text_field() {
+        let raw = r#"{"response":{"text":"Paris is the capital.","meta":"ignored"}}"#;
+        let intent = parse_reasoned_intent(raw, "capital?");
+        match &intent.action {
+            IntendedAction::Respond { text } => {
+                assert_eq!(text, "Paris is the capital.");
+            }
+            other => panic!("expected Respond, got {other:?}"),
         }
     }
 }
