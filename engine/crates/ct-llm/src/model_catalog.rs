@@ -73,11 +73,19 @@ impl ModelCatalog {
         auth_mode: &str,
     ) -> Vec<CatalogModel> {
         let provider_key = normalize_provider(provider);
+        let fetch_result = self.fetch_models(&provider_key, api_key, auth_mode).await;
+        self.apply_fetch_result(&provider_key, fetch_result)
+    }
 
-        match self.fetch_models(&provider_key, api_key, auth_mode).await {
+    fn apply_fetch_result(
+        &mut self,
+        provider_key: &str,
+        fetch_result: Result<Vec<CatalogModel>, String>,
+    ) -> Vec<CatalogModel> {
+        match fetch_result {
             Ok(models) => {
                 self.cache.insert(
-                    provider_key,
+                    provider_key.to_string(),
                     CacheEntry {
                         models: models.clone(),
                         fetched_at: Instant::now(),
@@ -85,12 +93,15 @@ impl ModelCatalog {
                 );
                 models
             }
-            Err(_) => self
-                .cache
-                .get(&provider_key)
-                .map(|entry| entry.models.clone())
-                .unwrap_or_else(|| Self::hardcoded_fallback(&provider_key)),
+            Err(_) => self.cached_or_fallback_models(provider_key),
         }
+    }
+
+    fn cached_or_fallback_models(&self, provider_key: &str) -> Vec<CatalogModel> {
+        self.cache
+            .get(provider_key)
+            .map(|entry| entry.models.clone())
+            .unwrap_or_else(|| Self::hardcoded_fallback(provider_key))
     }
 
     async fn fetch_models(
@@ -515,5 +526,46 @@ mod tests {
         let headers = openai_bearer.headers();
         assert_eq!(headers.get(AUTHORIZATION).unwrap(), "Bearer openai-key");
         assert!(headers.get("anthropic-version").is_none());
+    }
+
+    #[test]
+    fn apply_fetch_result_updates_cache_on_successful_fetch() {
+        let mut catalog = ModelCatalog::new();
+        let expected = vec![make_model("gpt-4o", "openai")];
+
+        let models = catalog.apply_fetch_result("openai", Ok(expected.clone()));
+
+        assert_eq!(models, expected);
+        let cached = catalog.cache.get("openai").expect("cache entry");
+        assert_eq!(cached.models, expected);
+    }
+
+    #[test]
+    fn apply_fetch_result_uses_cached_models_when_fetch_fails() {
+        let mut catalog = ModelCatalog::new();
+        let cached_models = vec![make_model("gpt-4o-mini", "openai")];
+        catalog.cache.insert(
+            "openai".to_string(),
+            CacheEntry {
+                models: cached_models.clone(),
+                fetched_at: Instant::now(),
+            },
+        );
+
+        let models =
+            catalog.apply_fetch_result("openai", Err("simulated network failure".to_string()));
+
+        assert_eq!(models, cached_models);
+    }
+
+    #[test]
+    fn apply_fetch_result_returns_empty_when_fetch_succeeds_with_empty_payload() {
+        let mut catalog = ModelCatalog::new();
+
+        let models = catalog.apply_fetch_result("openai", Ok(Vec::new()));
+
+        assert!(models.is_empty());
+        let cached = catalog.cache.get("openai").expect("cache entry");
+        assert!(cached.models.is_empty());
     }
 }

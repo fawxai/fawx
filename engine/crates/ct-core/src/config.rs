@@ -10,7 +10,7 @@ use crate::error::{CoreError, Result};
 /// Main configuration structure for Citros.
 ///
 /// This configuration is loaded from a JSON file and defines all system-level settings.
-/// TODO: Evaluate JSON5 for comments in config files (Epic 2+).
+/// TODO(#861): Evaluate JSON5 for comments in config files (Epic 2+).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Path to the local LLM model file (GGUF format)

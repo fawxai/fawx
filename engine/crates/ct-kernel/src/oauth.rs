@@ -633,4 +633,24 @@ mod tests {
         let account = extract_openai_account_id(&token);
         assert_eq!(account.as_deref(), Some("acct_123"));
     }
+
+    #[test]
+    fn extract_openai_account_id_returns_none_for_invalid_jwt() {
+        assert_eq!(extract_openai_account_id("not-a-jwt"), None);
+
+        let invalid_payload_token = "header.not-base64.sig";
+        assert_eq!(extract_openai_account_id(invalid_payload_token), None);
+    }
+
+    #[test]
+    fn extract_openai_account_id_returns_none_when_claim_missing() {
+        let payload = serde_json::json!({
+            OPENAI_JWT_CLAIM_PATH: {"other": "value"}
+        });
+        let payload_json = serde_json::to_vec(&payload).expect("payload json");
+        let payload_b64 = URL_SAFE_NO_PAD.encode(payload_json);
+        let token = format!("header.{payload_b64}.sig");
+
+        assert_eq!(extract_openai_account_id(&token), None);
+    }
 }
