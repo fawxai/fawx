@@ -3,14 +3,14 @@
 //! Supports OpenAI and OpenRouter style APIs via configurable `base_url`.
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use futures::{stream, Stream, StreamExt};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::VecDeque, time::Duration};
+use std::time::Duration;
 
 use crate::provider::{CompletionStream, LlmProvider, ProviderCapabilities};
+use crate::sse::{SseFrame, SseFramer};
 use crate::types::{
     CompletionRequest, CompletionResponse, ContentBlock, LlmError, Message, MessageRole,
     StreamChunk, ToolCall, ToolUseDelta, Usage,
@@ -181,35 +181,17 @@ impl OpenAiProvider {
 
     #[allow(dead_code)]
     fn parse_sse_payload(payload: &str) -> Result<Vec<StreamChunk>, LlmError> {
+        let mut framer = SseFramer::default();
         let mut chunks = Vec::new();
 
         for line in payload.lines() {
-            match Self::parse_sse_line(line)? {
-                ParsedSseLine::Ignore => {}
-                ParsedSseLine::Done => break,
-                ParsedSseLine::Chunks(mut parsed_chunks) => chunks.append(&mut parsed_chunks),
-            }
+            let mut framed = framer.push_bytes(format!("{line}\n").as_bytes())?;
+            chunks.append(&mut Self::map_sse_frames(&mut framed)?);
         }
 
+        let mut final_frames = framer.finish()?;
+        chunks.append(&mut Self::map_sse_frames(&mut final_frames)?);
         Ok(chunks)
-    }
-
-    fn parse_sse_line(line: &str) -> Result<ParsedSseLine, LlmError> {
-        let line = line.trim_start().trim_end_matches('\r');
-        let Some(data) = line.strip_prefix("data:") else {
-            return Ok(ParsedSseLine::Ignore);
-        };
-
-        let data = data.trim_start();
-        if data.is_empty() {
-            return Ok(ParsedSseLine::Ignore);
-        }
-
-        if data == "[DONE]" {
-            return Ok(ParsedSseLine::Done);
-        }
-
-        Ok(ParsedSseLine::Chunks(Self::parse_sse_data(data)?))
     }
 
     fn parse_sse_data(data: &str) -> Result<Vec<StreamChunk>, LlmError> {
@@ -297,11 +279,22 @@ impl OpenAiProvider {
 
                     match state.bytes_stream.as_mut().next().await {
                         Some(Ok(bytes)) => {
-                            state.buffer.extend_from_slice(&bytes);
+                            let mut frames = match state.framer.push_bytes(&bytes) {
+                                Ok(frames) => frames,
+                                Err(error) => {
+                                    state.finished = true;
+                                    return Some((Err(error), state));
+                                }
+                            };
 
-                            if let Err(error) = Self::drain_buffered_lines(&mut state) {
-                                state.finished = true;
-                                return Some((Err(error), state));
+                            match Self::map_sse_frames(&mut frames) {
+                                Ok(chunks) => {
+                                    state.pending_chunks.extend(chunks.into_iter().map(Ok))
+                                }
+                                Err(error) => {
+                                    state.finished = true;
+                                    return Some((Err(error), state));
+                                }
                             }
                         }
                         Some(Err(error)) => {
@@ -309,26 +302,19 @@ impl OpenAiProvider {
                             return Some((Err(LlmError::Streaming(error.to_string())), state));
                         }
                         None => {
-                            if !state.buffer.is_empty() {
-                                let remaining = std::mem::take(&mut state.buffer);
-                                let line = match std::str::from_utf8(&remaining) {
-                                    Ok(line) => line,
-                                    Err(error) => {
-                                        state.finished = true;
-                                        return Some((
-                                            Err(LlmError::Streaming(format!(
-                                                "stream was not valid UTF-8: {error}"
-                                            ))),
-                                            state,
-                                        ));
-                                    }
-                                };
+                            let mut frames = match state.framer.finish() {
+                                Ok(frames) => frames,
+                                Err(error) => {
+                                    state.finished = true;
+                                    return Some((Err(error), state));
+                                }
+                            };
 
-                                if let Err(error) = Self::enqueue_parsed_line(
-                                    line,
-                                    &mut state.pending_chunks,
-                                    &mut state.finished,
-                                ) {
+                            match Self::map_sse_frames(&mut frames) {
+                                Ok(chunks) => {
+                                    state.pending_chunks.extend(chunks.into_iter().map(Ok))
+                                }
+                                Err(error) => {
                                     state.finished = true;
                                     return Some((Err(error), state));
                                 }
@@ -342,42 +328,15 @@ impl OpenAiProvider {
         )
     }
 
-    fn drain_buffered_lines(state: &mut OpenAiSseState) -> Result<(), LlmError> {
-        while let Some(newline_index) = state.buffer.iter().position(|byte| *byte == b'\n') {
-            let line_bytes = state.buffer.drain(..=newline_index).collect::<Vec<_>>();
-            let line_bytes = &line_bytes[..line_bytes.len().saturating_sub(1)];
-
-            let line = std::str::from_utf8(line_bytes).map_err(|error| {
-                LlmError::Streaming(format!("stream was not valid UTF-8: {error}"))
-            })?;
-
-            Self::enqueue_parsed_line(line, &mut state.pending_chunks, &mut state.finished)?;
-
-            if state.finished {
-                state.buffer.clear();
-                break;
+    fn map_sse_frames(frames: &mut Vec<SseFrame>) -> Result<Vec<StreamChunk>, LlmError> {
+        let mut chunks = Vec::new();
+        for frame in frames.drain(..) {
+            match frame {
+                SseFrame::Data(data) => chunks.append(&mut Self::parse_sse_data(&data)?),
+                SseFrame::Done => break,
             }
         }
-
-        Ok(())
-    }
-
-    fn enqueue_parsed_line(
-        line: &str,
-        pending_chunks: &mut VecDeque<Result<StreamChunk, LlmError>>,
-        finished: &mut bool,
-    ) -> Result<(), LlmError> {
-        match Self::parse_sse_line(line)? {
-            ParsedSseLine::Ignore => {}
-            ParsedSseLine::Done => {
-                *finished = true;
-            }
-            ParsedSseLine::Chunks(chunks) => {
-                pending_chunks.extend(chunks.into_iter().map(Ok));
-            }
-        }
-
-        Ok(())
+        Ok(chunks)
     }
 
     fn map_http_error(status: StatusCode, body: String) -> LlmError {
@@ -685,28 +644,23 @@ struct OpenAiToolFunctionDelta {
     arguments: Option<String>,
 }
 
-enum ParsedSseLine {
-    Ignore,
-    Done,
-    Chunks(Vec<StreamChunk>),
-}
-
 struct OpenAiSseState {
-    bytes_stream: std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
-    buffer: Vec<u8>,
-    pending_chunks: VecDeque<Result<StreamChunk, LlmError>>,
+    bytes_stream:
+        std::pin::Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,
+    framer: SseFramer,
+    pending_chunks: std::collections::VecDeque<Result<StreamChunk, LlmError>>,
     finished: bool,
 }
 
 impl OpenAiSseState {
     fn new<S>(bytes_stream: S) -> Self
     where
-        S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+        S: Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
     {
         Self {
             bytes_stream: Box::pin(bytes_stream),
-            buffer: Vec::new(),
-            pending_chunks: VecDeque::new(),
+            framer: SseFramer::default(),
+            pending_chunks: std::collections::VecDeque::new(),
             finished: false,
         }
     }
@@ -792,8 +746,11 @@ mod tests {
     fn test_parse_sse_payload_maps_text_tool_and_stop_chunks() {
         let payload = r#"
             data: {"choices":[{"delta":{"content":"hel"},"finish_reason":null}]}
+
             data: {"choices":[{"delta":{"tool_calls":[{"id":"call_1","function":{"name":"lookup","arguments":"{\"q\":\"ci"}}]},"finish_reason":null}]}
+
             data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":8}}
+
             data: [DONE]
         "#;
 
