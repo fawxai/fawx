@@ -345,7 +345,7 @@ fn extract_fenced_segments(raw_response: &str) -> Vec<(usize, String, String)> {
 }
 
 fn extract_json_from_first_bracket(raw_response: &str) -> Option<String> {
-    let first_bracket = raw_response.find(|character| character == '{' || character == '[')?;
+    let first_bracket = raw_response.find(['{', '['])?;
     extract_balanced_json(&raw_response[first_bracket..])
         .or_else(|| Some(raw_response[first_bracket..].trim().to_owned()))
 }

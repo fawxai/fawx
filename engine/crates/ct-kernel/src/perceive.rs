@@ -246,7 +246,7 @@ fn estimate_text_tokens(text: &str) -> usize {
         return 0;
     }
 
-    let char_estimate = (text.chars().count() + 3) / 4;
+    let char_estimate = text.chars().count().div_ceil(4);
     let word_estimate = text.split_whitespace().count();
     char_estimate.max(word_estimate).max(1)
 }
