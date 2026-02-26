@@ -523,10 +523,7 @@ impl TuiApp {
 /// Build a loop engine with sensible defaults for the TUI shell.
 pub fn build_loop_engine() -> LoopEngine {
     let budget = BudgetTracker::new(BudgetConfig::default(), current_time_ms(), 0);
-    let context = ContextCompactor::new(
-        DEFAULT_CONTEXT_MAX_TOKENS,
-        DEFAULT_CONTEXT_COMPACT_TARGET,
-    );
+    let context = ContextCompactor::new(DEFAULT_CONTEXT_MAX_TOKENS, DEFAULT_CONTEXT_COMPACT_TARGET);
     LoopEngine::new(budget, context, DEFAULT_MAX_LOOP_ITERATIONS)
 }
 
