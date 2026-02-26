@@ -1,6 +1,6 @@
 //! Dynamic model discovery with provider-aware filtering and cache fallback.
 
-use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -132,10 +132,7 @@ impl ModelCatalog {
 
         match provider.as_str() {
             "anthropic" => {
-                headers.insert(
-                    "anthropic-version",
-                    HeaderValue::from_static("2023-06-01"),
-                );
+                headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
 
                 match auth_mode {
                     "api_key" => {
@@ -222,8 +219,11 @@ impl ModelCatalog {
         match provider {
             "anthropic" => id.starts_with("claude-"),
             "openai" => {
-                let includes =
-                    id.starts_with("gpt-") || id.starts_with("gpt-5") || id.starts_with("o1") || id.starts_with("o3") || id.starts_with("o4");
+                let includes = id.starts_with("gpt-")
+                    || id.starts_with("gpt-5")
+                    || id.starts_with("o1")
+                    || id.starts_with("o3")
+                    || id.starts_with("o4");
 
                 let excludes = id.contains("embedding")
                     || id.contains("tts")
@@ -376,14 +376,15 @@ mod tests {
         assert!(parsed
             .iter()
             .any(|model| model.id == "anthropic/claude-3.5-sonnet"));
-        assert!(parsed
-            .iter()
-            .any(|model| model.id == "openai/gpt-4o-mini"));
+        assert!(parsed.iter().any(|model| model.id == "openai/gpt-4o-mini"));
     }
 
     #[test]
     fn is_chat_capable_filters_each_provider() {
-        assert!(ModelCatalog::is_chat_capable("anthropic", "claude-sonnet-4"));
+        assert!(ModelCatalog::is_chat_capable(
+            "anthropic",
+            "claude-sonnet-4"
+        ));
         assert!(!ModelCatalog::is_chat_capable(
             "anthropic",
             "text-embedding-3-large"
@@ -391,9 +392,18 @@ mod tests {
 
         assert!(ModelCatalog::is_chat_capable("openai", "gpt-4o"));
         assert!(ModelCatalog::is_chat_capable("openai", "o3-mini-high"));
-        assert!(!ModelCatalog::is_chat_capable("openai", "text-embedding-3-large"));
-        assert!(!ModelCatalog::is_chat_capable("openai", "gpt-4o-realtime-preview"));
-        assert!(!ModelCatalog::is_chat_capable("openai", "gpt-4o-audio-preview"));
+        assert!(!ModelCatalog::is_chat_capable(
+            "openai",
+            "text-embedding-3-large"
+        ));
+        assert!(!ModelCatalog::is_chat_capable(
+            "openai",
+            "gpt-4o-realtime-preview"
+        ));
+        assert!(!ModelCatalog::is_chat_capable(
+            "openai",
+            "gpt-4o-audio-preview"
+        ));
 
         assert!(ModelCatalog::is_chat_capable(
             "openrouter",
@@ -492,10 +502,7 @@ mod tests {
             .build_models_request("anthropic", "setup-token", "setup_token")
             .unwrap();
         let headers = anthropic_setup.headers();
-        assert_eq!(
-            headers.get(AUTHORIZATION).unwrap(),
-            "Bearer setup-token"
-        );
+        assert_eq!(headers.get(AUTHORIZATION).unwrap(), "Bearer setup-token");
         assert_eq!(
             headers.get("anthropic-beta").unwrap(),
             ANTHROPIC_SETUP_TOKEN_BETA

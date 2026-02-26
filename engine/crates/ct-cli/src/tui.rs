@@ -320,7 +320,7 @@ impl TuiApp {
                         self.show_model_menu();
                     }
                 }
-            },
+            }
             ParsedCommand::Auth => {
                 self.show_auth_status();
                 let add_more = prompt_line("Run auth wizard to add/update credentials? [y/N]: ")?;
@@ -468,7 +468,8 @@ impl TuiApp {
     async fn refresh_router_models(&mut self) -> Result<(), TuiError> {
         let previous_active = self.router.active_model().map(ToString::to_string);
 
-        let mut refreshed = build_router_with_catalog(&self.auth_manager, &mut self.catalog).await?;
+        let mut refreshed =
+            build_router_with_catalog(&self.auth_manager, &mut self.catalog).await?;
 
         if let Some(active_model) = previous_active {
             if refreshed.set_active(&active_model).is_err() {
@@ -790,7 +791,10 @@ async fn exchange_oauth_code_for_tokens(
         .map_err(|error| TuiError::Auth(format!("oauth token response was invalid JSON: {error}")))
 }
 
-async fn catalog_models_for_auth(catalog: &mut ModelCatalog, auth_method: &AuthMethod) -> Vec<String> {
+async fn catalog_models_for_auth(
+    catalog: &mut ModelCatalog,
+    auth_method: &AuthMethod,
+) -> Vec<String> {
     let (provider, credential, auth_mode) = auth_context(auth_method);
 
     let discovered = catalog
@@ -807,7 +811,7 @@ async fn catalog_models_for_auth(catalog: &mut ModelCatalog, auth_method: &AuthM
     }
 }
 
-fn auth_context<'a>(auth_method: &'a AuthMethod) -> (&'a str, &'a str, &'static str) {
+fn auth_context(auth_method: &AuthMethod) -> (&str, &str, &'static str) {
     match auth_method {
         AuthMethod::SetupToken { token } => ("anthropic", token.as_str(), "setup_token"),
         AuthMethod::ApiKey { provider, key } => {
@@ -921,7 +925,11 @@ fn default_supported_models(auth_method: &AuthMethod) -> Vec<String> {
     match auth_method {
         AuthMethod::SetupToken { .. } => to_strings(DEFAULT_ANTHROPIC_MODELS),
         AuthMethod::ApiKey { provider, .. } => models_for_provider(provider),
-        AuthMethod::OAuth { account_id, provider, .. } => {
+        AuthMethod::OAuth {
+            account_id,
+            provider,
+            ..
+        } => {
             if account_id.is_some() {
                 to_strings(DEFAULT_OPENAI_SUBSCRIPTION_MODELS)
             } else {
