@@ -138,7 +138,11 @@ impl LoopEngine {
             let processed = self.perceive(&perception).await?;
 
             let reason_cost = self.estimate_reasoning_cost(&processed);
-            if self.budget.check_at(current_time_ms(), &reason_cost).is_err() {
+            if self
+                .budget
+                .check_at(current_time_ms(), &reason_cost)
+                .is_err()
+            {
                 return Ok(LoopResult::BudgetExhausted {
                     partial_response,
                     iterations: self.iteration_count,
@@ -168,7 +172,11 @@ impl LoopEngine {
             let action = self.act(&decision, llm).await?;
 
             let action_cost = self.action_cost_from_result(&action);
-            if self.budget.check_at(current_time_ms(), &action_cost).is_err() {
+            if self
+                .budget
+                .check_at(current_time_ms(), &action_cost)
+                .is_err()
+            {
                 return Ok(LoopResult::BudgetExhausted {
                     partial_response: Some(action.response_text),
                     iterations: self.iteration_count,
@@ -724,7 +732,6 @@ mod tests {
     use ct_core::types::ScreenState;
     use std::collections::VecDeque;
     use std::sync::Mutex;
-
 
     #[derive(Debug)]
     struct MockLlm {
