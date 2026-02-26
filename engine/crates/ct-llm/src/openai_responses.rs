@@ -134,7 +134,7 @@ impl OpenAiResponsesProvider {
             input,
             stream,
             store: false,
-            temperature: request.temperature,
+            temperature: None, // Codex Responses API does not support temperature
         })
     }
 
