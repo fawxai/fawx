@@ -16,6 +16,7 @@ use ct_core::types::{InputSource, UserInput};
 use ct_llm::Message;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Re-exported LLM provider trait used by the loop.
 pub use ct_llm::LlmProvider;
@@ -123,10 +124,9 @@ impl LoopEngine {
         while self.iteration_count < self.max_iterations {
             self.iteration_count = self.iteration_count.saturating_add(1);
 
-            let check_time_ms = perception.timestamp_ms;
             if self
                 .budget
-                .check_at(check_time_ms, &ActionCost::default())
+                .check_at(current_time_ms(), &ActionCost::default())
                 .is_err()
             {
                 return Ok(LoopResult::BudgetExhausted {
@@ -138,7 +138,7 @@ impl LoopEngine {
             let processed = self.perceive(&perception).await?;
 
             let reason_cost = self.estimate_reasoning_cost(&processed);
-            if self.budget.check_at(check_time_ms, &reason_cost).is_err() {
+            if self.budget.check_at(current_time_ms(), &reason_cost).is_err() {
                 return Ok(LoopResult::BudgetExhausted {
                     partial_response,
                     iterations: self.iteration_count,
@@ -156,7 +156,7 @@ impl LoopEngine {
             let estimated_action_cost = self.estimate_action_cost(&decision);
             if self
                 .budget
-                .check_at(check_time_ms, &estimated_action_cost)
+                .check_at(current_time_ms(), &estimated_action_cost)
                 .is_err()
             {
                 return Ok(LoopResult::BudgetExhausted {
@@ -168,7 +168,7 @@ impl LoopEngine {
             let action = self.act(&decision, llm).await?;
 
             let action_cost = self.action_cost_from_result(&action);
-            if self.budget.check_at(check_time_ms, &action_cost).is_err() {
+            if self.budget.check_at(current_time_ms(), &action_cost).is_err() {
                 return Ok(LoopResult::BudgetExhausted {
                     partial_response: Some(action.response_text),
                     iterations: self.iteration_count,
@@ -709,6 +709,13 @@ fn loop_error(stage: &str, reason: &str, recoverable: bool) -> LoopError {
     }
 }
 
+fn current_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -718,7 +725,6 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
-    const MOCK_TIMESTAMP_MS: u64 = 1_700_000_000_000;
 
     #[derive(Debug)]
     struct MockLlm {
@@ -767,6 +773,7 @@ mod tests {
     }
 
     fn base_snapshot(text: &str) -> PerceptionSnapshot {
+        let timestamp_ms = current_time_ms();
         PerceptionSnapshot {
             screen: ScreenState {
                 current_app: "citros.tui".to_string(),
@@ -775,12 +782,12 @@ mod tests {
             },
             notifications: Vec::new(),
             active_app: "citros.tui".to_string(),
-            timestamp_ms: MOCK_TIMESTAMP_MS,
+            timestamp_ms,
             sensor_data: None,
             user_input: Some(UserInput {
                 text: text.to_string(),
                 source: InputSource::Text,
-                timestamp: MOCK_TIMESTAMP_MS,
+                timestamp: timestamp_ms,
                 context_id: None,
             }),
         }
@@ -788,7 +795,7 @@ mod tests {
 
     fn default_engine(max_iterations: u32) -> LoopEngine {
         let budget =
-            BudgetTracker::new(crate::budget::BudgetConfig::default(), MOCK_TIMESTAMP_MS, 0);
+            BudgetTracker::new(crate::budget::BudgetConfig::default(), current_time_ms(), 0);
         let context = ContextCompactor::new(4_000, 3_000);
         LoopEngine::new(budget, context, max_iterations)
     }
@@ -849,7 +856,7 @@ mod tests {
             max_wall_time_ms: 10_000,
             max_recursion_depth: 2,
         };
-        let budget = BudgetTracker::new(config, MOCK_TIMESTAMP_MS, 0);
+        let budget = BudgetTracker::new(config, current_time_ms(), 0);
         let context = ContextCompactor::new(4_000, 3_000);
         let mut engine = LoopEngine::new(budget, context, 10);
 
@@ -874,9 +881,9 @@ mod tests {
     #[tokio::test]
     async fn run_cycle_enforces_wall_time_budget() {
         let mut config = crate::budget::BudgetConfig::unlimited();
-        config.max_wall_time_ms = 2;
+        config.max_wall_time_ms = 1;
 
-        let budget = BudgetTracker::new(config, MOCK_TIMESTAMP_MS, 0);
+        let budget = BudgetTracker::new(config, current_time_ms(), 0);
         let context = ContextCompactor::new(4_000, 3_000);
         let mut engine = LoopEngine::new(budget, context, 10);
 
@@ -884,13 +891,12 @@ mod tests {
             r#"{"action":{"Respond":{"text":"never used"}},"rationale":"n/a","confidence":0.9,"expected_outcome":null,"sub_goals":[]}"#,
         ]);
 
-        let mut snapshot = base_snapshot("hi");
-        snapshot.timestamp_ms = MOCK_TIMESTAMP_MS.saturating_add(10);
-        if let Some(user_input) = snapshot.user_input.as_mut() {
-            user_input.timestamp = snapshot.timestamp_ms;
-        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
 
-        let result = engine.run_cycle(snapshot, &llm).await.expect("loop result");
+        let result = engine
+            .run_cycle(base_snapshot("hi"), &llm)
+            .await
+            .expect("loop result");
 
         assert!(matches!(
             result,
