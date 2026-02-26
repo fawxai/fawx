@@ -284,36 +284,10 @@ impl LoopEngine {
         &self,
         snapshot: &PerceptionSnapshot,
     ) -> Result<ProcessedPerception, LoopError> {
-        let user_message = snapshot
-            .user_input
-            .as_ref()
-            .map(|input| input.text.trim().to_string())
-            .filter(|text| !text.is_empty())
-            .unwrap_or_else(|| snapshot.screen.text_content.trim().to_string());
-
-        if user_message.is_empty() {
-            return Err(loop_error(
-                "perceive",
-                "no user message or screen text available for processing",
-                true,
-            ));
-        }
-
+        let user_message = extract_user_message(snapshot)?;
         let mut context_window = vec![Message::user(user_message.clone())];
 
-        let synthetic_context = self.synthetic_context(snapshot, &user_message);
-        if self.context.needs_compaction(&synthetic_context) {
-            let compacted = self
-                .context
-                .compact(synthetic_context, TrimmingPolicy::ByRelevance);
-            if let Some(summary) = compacted
-                .working_memory
-                .iter()
-                .find(|entry| entry.key == "compacted_context_summary")
-            {
-                context_window.push(Message::assistant(summary.value.clone()));
-            }
-        }
+        self.append_compacted_summary(snapshot, &user_message, &mut context_window);
 
         Ok(ProcessedPerception {
             user_message: user_message.clone(),
@@ -370,67 +344,10 @@ impl LoopEngine {
         llm: &dyn LlmProvider,
     ) -> Result<ActionResult, LoopError> {
         match decision {
-            Decision::Respond(text) => Ok(ActionResult {
-                decision: decision.clone(),
-                tool_results: Vec::new(),
-                response_text: text.clone(),
-                tokens_used: TokenUsage::default(),
-            }),
-            Decision::Clarify(text) => Ok(ActionResult {
-                decision: decision.clone(),
-                tool_results: Vec::new(),
-                response_text: text.clone(),
-                tokens_used: TokenUsage::default(),
-            }),
-            Decision::Defer(text) => Ok(ActionResult {
-                decision: decision.clone(),
-                tool_results: Vec::new(),
-                response_text: text.clone(),
-                tokens_used: TokenUsage::default(),
-            }),
-            Decision::UseTools(calls) => {
-                let tool_results = calls
-                    .iter()
-                    .map(|call| ToolResult {
-                        tool_name: call.name.clone(),
-                        success: true,
-                        output: format!(
-                            "Stub tool execution for '{}' with args {}",
-                            call.name, call.arguments
-                        ),
-                    })
-                    .collect::<Vec<_>>();
-
-                let tool_summary = tool_results
-                    .iter()
-                    .map(|result| format!("- {}: {}", result.tool_name, result.output))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-
-                let synthesis_prompt = format!(
-                    "You are Citros. Summarize the following tool activity for the user in concise text:\n{tool_summary}\n\nNote: tool execution is stubbed in this build."
-                );
-
-                let llm_text = llm.generate(&synthesis_prompt, 384).await.map_err(|error| {
-                    loop_error(
-                        "act",
-                        &format!("tool synthesis generation failed: {error}"),
-                        true,
-                    )
-                })?;
-
-                let usage = TokenUsage {
-                    input_tokens: estimate_tokens(&synthesis_prompt),
-                    output_tokens: estimate_tokens(&llm_text),
-                };
-
-                Ok(ActionResult {
-                    decision: decision.clone(),
-                    tool_results,
-                    response_text: llm_text,
-                    tokens_used: usage,
-                })
+            Decision::Respond(text) | Decision::Clarify(text) | Decision::Defer(text) => {
+                Ok(self.text_action_result(decision, text))
             }
+            Decision::UseTools(calls) => self.act_with_tools(decision, calls, llm).await,
         }
     }
 
@@ -442,52 +359,15 @@ impl LoopEngine {
     ) -> Result<Verification, LoopError> {
         let mut discrepancies = Vec::new();
 
-        let action_matches_intent = match &intent.action {
-            IntendedAction::Respond { text } => {
-                let expected = text.trim().to_ascii_lowercase();
-                let actual = action.response_text.trim().to_ascii_lowercase();
-                actual == expected || actual.contains(&expected)
-            }
-            IntendedAction::Delegate { .. }
-            | IntendedAction::Tap { .. }
-            | IntendedAction::Type { .. }
-            | IntendedAction::Swipe { .. }
-            | IntendedAction::LaunchApp { .. }
-            | IntendedAction::Navigate { .. }
-            | IntendedAction::Wait { .. }
-            | IntendedAction::Composite(_) => !action.response_text.trim().is_empty(),
-        };
-
-        if !action_matches_intent {
+        if !action_matches_intent(action, intent) {
             discrepancies.push("action response does not align with intent action".to_string());
         }
 
-        if let Some(expected) = &intent.expected_outcome {
-            let expected_text = expected.description.to_ascii_lowercase();
-            let response_text = action.response_text.to_ascii_lowercase();
-
-            if !response_text.contains(&expected_text) {
-                discrepancies.push(format!(
-                    "expected outcome not reflected in action response: {}",
-                    expected.description
-                ));
-            }
+        if let Some(mismatch) = expected_outcome_mismatch(action, intent) {
+            discrepancies.push(mismatch);
         }
 
-        let outcome_matches_intent = discrepancies.is_empty();
-        let confidence = if outcome_matches_intent {
-            0.9
-        } else if discrepancies.len() == 1 {
-            0.45
-        } else {
-            0.25
-        };
-
-        Ok(Verification {
-            outcome_matches_intent,
-            confidence,
-            discrepancies,
-        })
+        Ok(build_verification(discrepancies))
     }
 
     /// Learn step.
@@ -545,6 +425,67 @@ impl LoopEngine {
         Ok(Continuation::Continue(
             "Refine the response using tighter intent alignment.".to_string(),
         ))
+    }
+
+    fn append_compacted_summary(
+        &self,
+        snapshot: &PerceptionSnapshot,
+        user_message: &str,
+        context_window: &mut Vec<Message>,
+    ) {
+        let synthetic_context = self.synthetic_context(snapshot, user_message);
+        if !self.context.needs_compaction(&synthetic_context) {
+            return;
+        }
+
+        let compacted = self
+            .context
+            .compact(synthetic_context, TrimmingPolicy::ByRelevance);
+        if let Some(summary) = compacted_context_summary(&compacted) {
+            context_window.push(Message::assistant(summary.to_string()));
+        }
+    }
+
+    fn text_action_result(&self, decision: &Decision, text: &str) -> ActionResult {
+        ActionResult {
+            decision: decision.clone(),
+            tool_results: Vec::new(),
+            response_text: text.to_string(),
+            tokens_used: TokenUsage::default(),
+        }
+    }
+
+    async fn act_with_tools(
+        &self,
+        decision: &Decision,
+        calls: &[ct_llm::ToolCall],
+        llm: &dyn LlmProvider,
+    ) -> Result<ActionResult, LoopError> {
+        let tool_results = stub_tool_results(calls);
+        let synthesis_prompt = tool_synthesis_prompt(&tool_results);
+        let llm_text = self.generate_tool_summary(&synthesis_prompt, llm).await?;
+        let usage = synthesis_usage(&synthesis_prompt, &llm_text);
+
+        Ok(ActionResult {
+            decision: decision.clone(),
+            tool_results,
+            response_text: llm_text,
+            tokens_used: usage,
+        })
+    }
+
+    async fn generate_tool_summary(
+        &self,
+        synthesis_prompt: &str,
+        llm: &dyn LlmProvider,
+    ) -> Result<String, LoopError> {
+        llm.generate(synthesis_prompt, 384).await.map_err(|error| {
+            loop_error(
+                "act",
+                &format!("tool synthesis generation failed: {error}"),
+                true,
+            )
+        })
     }
 
     fn estimate_reasoning_cost(&self, perception: &ProcessedPerception) -> ActionCost {
@@ -637,6 +578,115 @@ impl LoopEngine {
             depth: 0,
             parent_context: None,
         }
+    }
+}
+
+fn extract_user_message(snapshot: &PerceptionSnapshot) -> Result<String, LoopError> {
+    let user_message = snapshot
+        .user_input
+        .as_ref()
+        .map(|input| input.text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| snapshot.screen.text_content.trim().to_string());
+
+    if user_message.is_empty() {
+        return Err(loop_error(
+            "perceive",
+            "no user message or screen text available for processing",
+            true,
+        ));
+    }
+
+    Ok(user_message)
+}
+
+fn compacted_context_summary(context: &ReasoningContext) -> Option<&str> {
+    context
+        .working_memory
+        .iter()
+        .find(|entry| entry.key == "compacted_context_summary")
+        .map(|entry| entry.value.as_str())
+}
+
+fn stub_tool_results(calls: &[ct_llm::ToolCall]) -> Vec<ToolResult> {
+    calls
+        .iter()
+        .map(|call| ToolResult {
+            tool_name: call.name.clone(),
+            success: true,
+            output: format!(
+                "Stub tool execution for '{}' with args {}",
+                call.name, call.arguments
+            ),
+        })
+        .collect::<Vec<_>>()
+}
+
+fn tool_synthesis_prompt(tool_results: &[ToolResult]) -> String {
+    let tool_summary = tool_results
+        .iter()
+        .map(|result| format!("- {}: {}", result.tool_name, result.output))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "You are Citros. Summarize the following tool activity for the user in concise text:\n{tool_summary}\n\nNote: tool execution is stubbed in this build."
+    )
+}
+
+fn synthesis_usage(prompt: &str, response: &str) -> TokenUsage {
+    TokenUsage {
+        input_tokens: estimate_tokens(prompt),
+        output_tokens: estimate_tokens(response),
+    }
+}
+
+fn action_matches_intent(action: &ActionResult, intent: &ReasonedIntent) -> bool {
+    match &intent.action {
+        IntendedAction::Respond { text } => {
+            let expected = text.trim().to_ascii_lowercase();
+            let actual = action.response_text.trim().to_ascii_lowercase();
+            actual == expected || actual.contains(&expected)
+        }
+        IntendedAction::Delegate { .. }
+        | IntendedAction::Tap { .. }
+        | IntendedAction::Type { .. }
+        | IntendedAction::Swipe { .. }
+        | IntendedAction::LaunchApp { .. }
+        | IntendedAction::Navigate { .. }
+        | IntendedAction::Wait { .. }
+        | IntendedAction::Composite(_) => !action.response_text.trim().is_empty(),
+    }
+}
+
+fn expected_outcome_mismatch(action: &ActionResult, intent: &ReasonedIntent) -> Option<String> {
+    let expected = intent.expected_outcome.as_ref()?;
+    let expected_text = expected.description.to_ascii_lowercase();
+    let response_text = action.response_text.to_ascii_lowercase();
+
+    if response_text.contains(&expected_text) {
+        return None;
+    }
+
+    Some(format!(
+        "expected outcome not reflected in action response: {}",
+        expected.description
+    ))
+}
+
+fn build_verification(discrepancies: Vec<String>) -> Verification {
+    let confidence = if discrepancies.is_empty() {
+        0.9
+    } else if discrepancies.len() == 1 {
+        0.45
+    } else {
+        0.25
+    };
+
+    Verification {
+        outcome_matches_intent: discrepancies.is_empty(),
+        confidence,
+        discrepancies,
     }
 }
 
@@ -1110,6 +1160,44 @@ mod tests {
         let verification = engine.verify(&action, &intent).await.expect("verification");
         assert!(!verification.outcome_matches_intent);
         assert!(!verification.discrepancies.is_empty());
+    }
+
+    #[test]
+    fn extract_user_message_returns_error_when_all_input_is_empty() {
+        let mut snapshot = base_snapshot("   ");
+        snapshot.user_input = None;
+        snapshot.screen.text_content = "   ".to_string();
+
+        let result = extract_user_message(&snapshot);
+
+        assert!(matches!(result, Err(error) if error.stage == "perceive"));
+    }
+
+    #[test]
+    fn stub_tool_results_preserve_requested_tool_names() {
+        let calls = vec![ct_llm::ToolCall {
+            id: "tool-1".to_string(),
+            name: "search".to_string(),
+            arguments: serde_json::json!({"q":"citros"}),
+        }];
+
+        let results = stub_tool_results(&calls);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].tool_name, "search");
+        assert!(results[0].success);
+    }
+
+    #[test]
+    fn build_verification_confidence_scales_with_discrepancy_count() {
+        let clean = build_verification(Vec::new());
+        let one = build_verification(vec!["mismatch".to_string()]);
+        let two = build_verification(vec!["a".to_string(), "b".to_string()]);
+
+        assert!(clean.outcome_matches_intent);
+        assert_eq!(clean.confidence, 0.9);
+        assert_eq!(one.confidence, 0.45);
+        assert_eq!(two.confidence, 0.25);
     }
 
     #[tokio::test]

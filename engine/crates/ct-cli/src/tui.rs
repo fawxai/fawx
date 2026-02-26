@@ -93,13 +93,13 @@ impl TuiApp {
 
             if input.starts_with('/') {
                 if let Err(error) = self.handle_command(input).await {
-                    println!("[31mError: {error}[0m\n");
+                    println!("{}\n", format_error_message(&error.to_string()));
                 }
             } else {
                 match self.handle_message(input).await {
-                    Ok(response) => self.display_response(&response),
+                    Ok(response) => self.display_response(&response)?,
                     Err(error) => {
-                        println!("[31mError: {error}[0m\n");
+                        println!("{}\n", format_error_message(&error.to_string()));
                     }
                 }
             }
@@ -379,14 +379,16 @@ impl TuiApp {
     }
 
     /// Display formatted output to the terminal.
-    fn display_response(&self, response: &str) {
+    fn display_response(&self, response: &str) -> Result<(), TuiError> {
         let mut stdout = io::stdout();
-        let _ = stdout.execute(cursor::MoveToColumn(0));
+        move_cursor_to_start(&mut stdout)?;
 
         println!();
         println!("{}", "Assistant".bold().with(style::Color::Cyan));
         println!("{response}");
         println!();
+
+        Ok(())
     }
 
     /// Display the model selection menu.
@@ -697,6 +699,14 @@ fn render_loop_result(result: LoopResult) -> String {
             }
         }
     }
+}
+
+fn format_error_message(error: &str) -> String {
+    format!("\x1b[31mError: {error}\x1b[0m")
+}
+
+fn move_cursor_to_start(stdout: &mut impl Write) -> Result<(), TuiError> {
+    stdout.execute(cursor::MoveToColumn(0)).map(|_| ()).map_err(TuiError::Io)
 }
 
 /// User-facing TUI errors.
@@ -1584,6 +1594,19 @@ mod tests {
         TuiApp::new(AuthManager::new(), router, build_loop_engine())
     }
 
+    #[derive(Debug, Default)]
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("write failed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn router_loop_llm_provider_generate_returns_stream_error() {
         let mut router = ModelRouter::new();
@@ -1639,6 +1662,22 @@ mod tests {
         );
         assert_eq!(parse_auth_selection("3"), Some(AuthSelection::ApiKey));
         assert_eq!(parse_auth_selection("9"), None);
+    }
+
+    #[test]
+    fn format_error_message_uses_ansi_escape_sequences() {
+        let message = format_error_message("boom");
+
+        assert!(message.contains("\x1b[31mError: boom\x1b[0m"));
+        assert!(!message.contains("[31mError: boom[0m"));
+    }
+
+    #[test]
+    fn move_cursor_to_start_returns_error_when_terminal_write_fails() {
+        let mut writer = FailingWriter;
+
+        let error = move_cursor_to_start(&mut writer).expect_err("terminal error expected");
+        assert!(matches!(error, TuiError::Io(io_error) if io_error.to_string().contains("write failed")));
     }
 
     #[test]
