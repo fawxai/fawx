@@ -1253,7 +1253,10 @@ mod tests {
         assert!(clean.outcome_matches_intent);
         assert_eq!(clean.confidence, VERIFICATION_CONFIDENCE_CLEAN);
         assert_eq!(one.confidence, VERIFICATION_CONFIDENCE_SINGLE_DISCREPANCY);
-        assert_eq!(two.confidence, VERIFICATION_CONFIDENCE_MULTIPLE_DISCREPANCIES);
+        assert_eq!(
+            two.confidence,
+            VERIFICATION_CONFIDENCE_MULTIPLE_DISCREPANCIES
+        );
     }
 
     #[tokio::test]

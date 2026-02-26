@@ -730,7 +730,9 @@ pub fn build_router(auth_manager: &AuthManager) -> Result<ModelRouter, TuiError>
         .next()
         .map(|model| model.model_id)
     {
-        if let Err(error) = router.set_active(&first_model) { eprintln!("failed to set initial model {first_model}: {error}"); }
+        if let Err(error) = router.set_active(&first_model) {
+            eprintln!("failed to set initial model {first_model}: {error}");
+        }
     }
 
     Ok(router)
@@ -755,7 +757,9 @@ async fn build_router_with_catalog(
         .next()
         .map(|model| model.model_id)
     {
-        if let Err(error) = router.set_active(&first_model) { eprintln!("failed to set initial model {first_model}: {error}"); }
+        if let Err(error) = router.set_active(&first_model) {
+            eprintln!("failed to set initial model {first_model}: {error}");
+        }
     }
 
     Ok(router)
@@ -885,7 +889,9 @@ async fn start_oauth_callback_server(
             let (path_only, query) = path.split_once('?').map_or((path, ""), |(p, q)| (p, q));
             if path_only != "/auth/callback" {
                 let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot found";
-                if let Err(error) = stream.write_all(response.as_bytes()).await { eprintln!("oauth callback write failed: {error}"); }
+                if let Err(error) = stream.write_all(response.as_bytes()).await {
+                    eprintln!("oauth callback write failed: {error}");
+                }
                 continue;
             }
 
@@ -915,7 +921,9 @@ async fn start_oauth_callback_server(
             if returned_state != state {
                 let response =
                     "HTTP/1.1 400 Bad Request\r\nContent-Length: 14\r\n\r\nState mismatch";
-                if let Err(error) = stream.write_all(response.as_bytes()).await { eprintln!("oauth callback write failed: {error}"); }
+                if let Err(error) = stream.write_all(response.as_bytes()).await {
+                    eprintln!("oauth callback write failed: {error}");
+                }
                 return Err(TuiError::Auth("OAuth state mismatch".to_string()));
             }
 
@@ -929,7 +937,9 @@ async fn start_oauth_callback_server(
                 body.len(),
                 body
             );
-            if let Err(error) = stream.write_all(response.as_bytes()).await { eprintln!("oauth callback write failed: {error}"); }
+            if let Err(error) = stream.write_all(response.as_bytes()).await {
+                eprintln!("oauth callback write failed: {error}");
+            }
 
             return Ok(code);
         }
