@@ -86,10 +86,8 @@ impl TuiApp {
                 if let Err(error) = self.handle_command(input).await {
                     println!("\x1b[31mError: {error}\x1b[0m\n");
                 }
-            } else {
-                if let Err(error) = self.handle_message(input).await {
-                    println!("\x1b[31mError: {error}\x1b[0m\n");
-                }
+            } else if let Err(error) = self.handle_message(input).await {
+                println!("\x1b[31mError: {error}\x1b[0m\n");
             }
         }
 
@@ -724,7 +722,8 @@ async fn start_oauth_callback_server(
             // Validate state (after percent-decoding)
             let returned_state = decode_param("state")?;
             if returned_state != state {
-                let response = "HTTP/1.1 400 Bad Request\r\nContent-Length: 14\r\n\r\nState mismatch";
+                let response =
+                    "HTTP/1.1 400 Bad Request\r\nContent-Length: 14\r\n\r\nState mismatch";
                 let _ = stream.write_all(response.as_bytes()).await;
                 return Err(TuiError::Auth("OAuth state mismatch".to_string()));
             }
