@@ -1,0 +1,30 @@
+[package]
+name = "fx-security"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+fx-core.workspace = true
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+toml = { workspace = true }
+ring = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util"] }
+uuid = { version = "1.11", features = ["v4"] }
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3.15"
+# E2E integration tests intentionally depend on multiple crates to test
+# cross-component interactions (agent, skills, storage). This coupling is
+# expected for integration tests and helps verify the full system works together.
+fx-agent = { workspace = true }
+fx-skills = { workspace = true }
+fx-storage = { workspace = true }
+async-trait = { workspace = true }
+semver = { workspace = true }
+reqwest = { workspace = true }
