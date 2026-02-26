@@ -595,14 +595,14 @@ impl LoopLlmProvider for RouterLoopLlmProvider<'_> {
             .await
             .map_err(|error| CoreLlmError::Inference(error.to_string()))?;
 
-        let rendered = consume_stream_with_print(&mut stream).await?;
+        let collected = consume_stream_silent(&mut stream).await?;
 
-        if rendered.trim().is_empty() {
+        if collected.trim().is_empty() {
             Err(CoreLlmError::InvalidResponse(
                 "provider returned an empty completion".to_string(),
             ))
         } else {
-            Ok(rendered)
+            Ok(collected)
         }
     }
 
@@ -675,25 +675,26 @@ fn render_loop_error(message: &str, recoverable: bool) -> String {
     format!("\x1b[31m  \u{2717} {message}{suffix}\x1b[0m")
 }
 
-async fn consume_stream_with_print(
+/// Collect all stream chunks into a string without printing.
+///
+/// Used by the loop LLM provider so internal reasoning output is not leaked
+/// to the terminal. User-facing display is handled separately by
+/// [`TuiApp::display_response`].
+async fn consume_stream_silent(
     stream: &mut (impl futures::Stream<Item = Result<StreamChunk, ProviderError>> + Unpin),
 ) -> Result<String, CoreLlmError> {
-    let mut rendered = String::new();
+    let mut collected = String::new();
     while let Some(chunk) = stream.next().await {
         match chunk {
             Ok(chunk) => {
                 if let Some(delta) = &chunk.delta_content {
-                    print!("{delta}");
-                    io::stdout()
-                        .flush()
-                        .map_err(|error| CoreLlmError::Inference(error.to_string()))?;
-                    rendered.push_str(delta);
+                    collected.push_str(delta);
                 }
             }
             Err(error) => return Err(CoreLlmError::Inference(error.to_string())),
         }
     }
-    Ok(rendered)
+    Ok(collected)
 }
 
 fn format_error_message(error: &str) -> String {
@@ -2169,5 +2170,76 @@ mod tests {
         });
         assert!(result.contains("\u{2717} timeout"));
         assert!(result.contains("recoverable"));
+    }
+
+    #[tokio::test]
+    async fn consume_stream_silent_collects_all_chunks_without_printing() {
+        let chunks = vec![
+            Ok(StreamChunk {
+                delta_content: Some("Hello".to_string()),
+                tool_use_deltas: Vec::new(),
+                usage: None,
+                stop_reason: None,
+            }),
+            Ok(StreamChunk {
+                delta_content: Some(" world".to_string()),
+                tool_use_deltas: Vec::new(),
+                usage: None,
+                stop_reason: Some("end_turn".to_string()),
+            }),
+        ];
+        let mut stream = futures::stream::iter(chunks);
+
+        let result = consume_stream_silent(&mut stream).await.unwrap();
+
+        assert_eq!(result, "Hello world");
+    }
+
+    #[tokio::test]
+    async fn consume_stream_silent_returns_error_on_stream_failure() {
+        let chunks: Vec<Result<StreamChunk, ProviderError>> =
+            vec![Err(ProviderError::Streaming("broken pipe".to_string()))];
+        let mut stream = futures::stream::iter(chunks);
+
+        let result = consume_stream_silent(&mut stream).await;
+
+        assert!(
+            matches!(&result, Err(CoreLlmError::Inference(msg)) if msg.contains("broken pipe"))
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_message_strips_reasoned_intent_json_from_response() {
+        // Regression test: LLM returns wrapped ReasonedIntent JSON instead of
+        // following the schema. The loop's fallback parser should extract a
+        // human-readable response; the TUI must never display raw JSON to the user.
+        let malformed_json = r#"{"ReasonedIntent":{"action":"greet_user_warmly","rationale":"A friendly greeting is appropriate.","confidence":0.98,"expected_outcome":"Positive connection","sub_goals":["Greet"]}}"#;
+        let mut app = app_with_mock_model(malformed_json);
+
+        let rendered = app.handle_message("Hey!").await.expect("loop result");
+
+        assert!(
+            !rendered.contains("ReasonedIntent"),
+            "raw ReasonedIntent JSON must not appear in user-facing output, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("greet_user_warmly"),
+            "internal action name must not appear in user-facing output, got: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_message_returns_parsed_response_not_raw_json() {
+        // When the LLM follows the schema correctly, the Respond text
+        // should appear in the rendered output.
+        let valid_json = r#"{"action":{"Respond":{"text":"Hey there! How can I help?"}},"rationale":"greeting","confidence":0.95,"expected_outcome":null,"sub_goals":[]}"#;
+        let mut app = app_with_mock_model(valid_json);
+
+        let rendered = app.handle_message("Hey!").await.expect("loop result");
+
+        assert!(
+            rendered.contains("Hey there! How can I help?"),
+            "expected parsed response text, got: {rendered}"
+        );
     }
 }
