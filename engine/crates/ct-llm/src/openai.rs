@@ -271,7 +271,9 @@ impl OpenAiProvider {
         Ok(chunks)
     }
 
-    fn stream_from_sse(response: reqwest::Response) -> impl Stream<Item = Result<StreamChunk, LlmError>> + Send {
+    fn stream_from_sse(
+        response: reqwest::Response,
+    ) -> impl Stream<Item = Result<StreamChunk, LlmError>> + Send {
         stream::unfold(
             OpenAiSseState::new(response.bytes_stream()),
             |mut state| async move {
@@ -336,8 +338,9 @@ impl OpenAiProvider {
             let line_bytes = state.buffer.drain(..=newline_index).collect::<Vec<_>>();
             let line_bytes = &line_bytes[..line_bytes.len().saturating_sub(1)];
 
-            let line = std::str::from_utf8(line_bytes)
-                .map_err(|error| LlmError::Streaming(format!("stream was not valid UTF-8: {error}")))?;
+            let line = std::str::from_utf8(line_bytes).map_err(|error| {
+                LlmError::Streaming(format!("stream was not valid UTF-8: {error}"))
+            })?;
 
             Self::enqueue_parsed_line(line, &mut state.pending_chunks, &mut state.finished)?;
 
@@ -813,20 +816,32 @@ mod tests {
 
     #[test]
     fn test_map_http_error_maps_client_and_server_statuses() {
-        let client_error = OpenAiProvider::map_http_error(StatusCode::BAD_REQUEST, "bad".to_string());
-        assert!(matches!(client_error, LlmError::Request(message) if message.contains("client error 400")));
+        let client_error =
+            OpenAiProvider::map_http_error(StatusCode::BAD_REQUEST, "bad".to_string());
+        assert!(
+            matches!(client_error, LlmError::Request(message) if message.contains("client error 400"))
+        );
 
-        let server_error = OpenAiProvider::map_http_error(StatusCode::INTERNAL_SERVER_ERROR, "oops".to_string());
-        assert!(matches!(server_error, LlmError::Provider(message) if message.contains("server error 500")));
+        let server_error =
+            OpenAiProvider::map_http_error(StatusCode::INTERNAL_SERVER_ERROR, "oops".to_string());
+        assert!(
+            matches!(server_error, LlmError::Provider(message) if message.contains("server error 500"))
+        );
     }
 
     #[test]
     fn test_endpoint_avoids_duplicate_v1_segment() {
         let with_v1 = OpenAiProvider::new("https://api.openai.com/v1", "test-key").unwrap();
-        assert_eq!(with_v1.endpoint(), "https://api.openai.com/v1/chat/completions");
+        assert_eq!(
+            with_v1.endpoint(),
+            "https://api.openai.com/v1/chat/completions"
+        );
 
         let without_v1 = OpenAiProvider::new("https://api.openai.com", "test-key").unwrap();
-        assert_eq!(without_v1.endpoint(), "https://api.openai.com/v1/chat/completions");
+        assert_eq!(
+            without_v1.endpoint(),
+            "https://api.openai.com/v1/chat/completions"
+        );
     }
 
     #[test]

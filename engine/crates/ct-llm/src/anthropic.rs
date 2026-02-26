@@ -91,7 +91,9 @@ impl AnthropicProvider {
                 let extracted = extract_text(&message.content);
                 if !extracted.is_empty() {
                     let merged = match system_prompt.take() {
-                        Some(existing) if !existing.is_empty() => format!("{existing}\n{extracted}"),
+                        Some(existing) if !existing.is_empty() => {
+                            format!("{existing}\n{extracted}")
+                        }
                         _ => extracted,
                     };
                     system_prompt = Some(merged);
@@ -302,7 +304,9 @@ impl AnthropicProvider {
         Ok(chunks)
     }
 
-    fn stream_from_sse(response: reqwest::Response) -> impl Stream<Item = Result<StreamChunk, LlmError>> + Send {
+    fn stream_from_sse(
+        response: reqwest::Response,
+    ) -> impl Stream<Item = Result<StreamChunk, LlmError>> + Send {
         stream::unfold(
             AnthropicSseState::new(response.bytes_stream()),
             |mut state| async move {
@@ -367,8 +371,9 @@ impl AnthropicProvider {
             let line_bytes = state.buffer.drain(..=newline_index).collect::<Vec<_>>();
             let line_bytes = &line_bytes[..line_bytes.len().saturating_sub(1)];
 
-            let line = std::str::from_utf8(line_bytes)
-                .map_err(|error| LlmError::Streaming(format!("stream was not valid UTF-8: {error}")))?;
+            let line = std::str::from_utf8(line_bytes).map_err(|error| {
+                LlmError::Streaming(format!("stream was not valid UTF-8: {error}"))
+            })?;
 
             Self::enqueue_parsed_line(line, &mut state.pending_chunks, &mut state.finished)?;
 
@@ -536,9 +541,18 @@ struct AnthropicTool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum AnthropicContentBlock {
-    Text { text: String },
-    ToolUse { id: String, name: String, input: Value },
-    ToolResult { tool_use_id: String, content: Value },
+    Text {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    ToolResult {
+        tool_use_id: String,
+        content: Value,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -655,10 +669,7 @@ mod tests {
         assert_eq!(serialized["stream"], false);
         assert_eq!(serialized["max_tokens"], 256);
         assert_eq!(serialized["messages"].as_array().unwrap().len(), 1);
-        assert_eq!(
-            serialized["system"],
-            "System prelude\nFollow policy"
-        );
+        assert_eq!(serialized["system"], "System prelude\nFollow policy");
         assert_eq!(serialized["tools"].as_array().unwrap().len(), 1);
         assert_eq!(serialized["tools"][0]["input_schema"]["type"], "object");
     }
@@ -768,11 +779,19 @@ mod tests {
 
     #[test]
     fn test_map_http_error_maps_client_and_server_statuses() {
-        let client_error = AnthropicProvider::map_http_error(StatusCode::BAD_REQUEST, "bad".to_string());
-        assert!(matches!(client_error, LlmError::Request(message) if message.contains("client error 400")));
+        let client_error =
+            AnthropicProvider::map_http_error(StatusCode::BAD_REQUEST, "bad".to_string());
+        assert!(
+            matches!(client_error, LlmError::Request(message) if message.contains("client error 400"))
+        );
 
-        let server_error = AnthropicProvider::map_http_error(StatusCode::INTERNAL_SERVER_ERROR, "oops".to_string());
-        assert!(matches!(server_error, LlmError::Provider(message) if message.contains("server error 500")));
+        let server_error = AnthropicProvider::map_http_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "oops".to_string(),
+        );
+        assert!(
+            matches!(server_error, LlmError::Provider(message) if message.contains("server error 500"))
+        );
     }
 
     #[test]
