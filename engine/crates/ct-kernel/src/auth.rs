@@ -266,7 +266,10 @@ mod tests {
             manager.get("anthropic"),
             Some(AuthMethod::SetupToken { .. })
         ));
-        assert!(matches!(manager.get("openai"), Some(AuthMethod::OAuth { .. })));
+        assert!(matches!(
+            manager.get("openai"),
+            Some(AuthMethod::OAuth { .. })
+        ));
         assert!(manager.get("missing").is_none());
 
         let removed = manager.remove("anthropic");
