@@ -24,12 +24,8 @@ const DEFAULT_ANTHROPIC_MODELS: &[&str] = &[
     "claude-3-7-sonnet-latest",
 ];
 const DEFAULT_OPENAI_MODELS: &[&str] = &["gpt-4.1", "gpt-4o", "gpt-4o-mini"];
-const DEFAULT_OPENAI_SUBSCRIPTION_MODELS: &[&str] = &[
-    "gpt-5.3-codex",
-    "gpt-5.2",
-    "gpt-5.1",
-    "o4-mini",
-];
+const DEFAULT_OPENAI_SUBSCRIPTION_MODELS: &[&str] =
+    &["gpt-5.3-codex", "gpt-5.2", "gpt-5.1", "o4-mini"];
 const DEFAULT_OPENROUTER_MODELS: &[&str] = &[
     "openai/gpt-4o-mini",
     "anthropic/claude-3.5-sonnet",
