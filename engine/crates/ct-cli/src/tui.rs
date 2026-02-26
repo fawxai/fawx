@@ -1,17 +1,20 @@
 use crossterm::style::Stylize;
 use crossterm::{cursor, event, style, terminal, ExecutableCommand};
 use ct_kernel::auth::{AuthManager, AuthMethod};
-use ct_kernel::oauth::PkceFlow;
+use ct_kernel::oauth::{PkceFlow, TokenExchangeRequest, TokenResponse};
 use ct_llm::{
     AnthropicProvider, CompletionRequest, ContentBlock, Message, ModelRouter, OpenAiProvider,
 };
 use std::fmt;
 use std::io::{self, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_AUTH_FILE: &str = ".citros/auth.json";
+const DEFAULT_OPENAI_TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
 
 const DEFAULT_ANTHROPIC_MODELS: &[&str] =
     &["claude-opus-4", "claude-sonnet-4", "claude-3-7-sonnet-latest"];
@@ -137,29 +140,35 @@ impl TuiApp {
                     }
                     println!("Waiting for callback on {}...", flow.redirect_uri());
 
-                    let callback_url = prompt_line("Paste callback URL (optional): ")?;
-                    if !callback_url.is_empty() {
-                        flow.parse_callback(&callback_url).map_err(|error| {
-                            TuiError::Auth(format!("invalid OAuth callback URL: {error}"))
-                        })?;
-                    }
-
-                    let access_token = prompt_secret("Enter OpenAI access token: ")?;
-                    if access_token.is_empty() {
-                        println!("Access token cannot be empty.\n");
+                    let callback_url = prompt_line("Paste callback URL: ")?;
+                    if callback_url.is_empty() {
+                        println!("Callback URL cannot be empty.\n");
                         continue;
                     }
 
-                    let refresh_token = prompt_secret("Enter OpenAI refresh token (optional): ")?;
+                    let authorization_code = flow.parse_callback(&callback_url).map_err(|error| {
+                        TuiError::Auth(format!("invalid OAuth callback URL: {error}"))
+                    })?;
+
+                    println!("Exchanging authorization code for tokens...");
+                    let token_response = exchange_oauth_code_for_tokens(
+                        &flow,
+                        &client_id,
+                        &authorization_code,
+                    )
+                    .await?;
+
                     let account_id = prompt_line("OpenAI account id (optional): ")?;
+                    let expires_at = current_time_ms()
+                        .saturating_add(token_response.expires_in.saturating_mul(1_000));
 
                     self.auth_manager.store(
                         "openai",
                         AuthMethod::OAuth {
                             provider: "openai".to_string(),
-                            access_token,
-                            refresh_token,
-                            expires_at: current_time_ms() + 3_600_000,
+                            access_token: token_response.access_token,
+                            refresh_token: token_response.refresh_token,
+                            expires_at,
                             account_id: empty_to_none(account_id),
                         },
                     );
@@ -521,7 +530,76 @@ async fn persist_auth_manager(auth_manager: &AuthManager) -> Result<(), TuiError
 
     tokio::fs::write(&auth_path, payload)
         .await
-        .map_err(TuiError::Io)
+        .map_err(TuiError::Io)?;
+
+    #[cfg(unix)]
+    {
+        tokio::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .map_err(TuiError::Io)?;
+    }
+
+    Ok(())
+}
+
+fn openai_oauth_token_endpoint() -> String {
+    std::env::var("CITROS_OPENAI_TOKEN_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_OPENAI_TOKEN_ENDPOINT.to_string())
+}
+
+async fn exchange_oauth_code_for_tokens(
+    flow: &PkceFlow,
+    client_id: &str,
+    authorization_code: &str,
+) -> Result<TokenResponse, TuiError> {
+    let request = TokenExchangeRequest {
+        grant_type: "authorization_code".to_string(),
+        code: authorization_code.to_string(),
+        redirect_uri: flow.redirect_uri().to_string(),
+        code_verifier: flow.code_verifier().to_string(),
+        client_id: client_id.to_string(),
+    };
+
+    let token_endpoint = openai_oauth_token_endpoint();
+    let response = reqwest::Client::new()
+        .post(&token_endpoint)
+        .form(&request)
+        .send()
+        .await
+        .map_err(|error| {
+            TuiError::Auth(format!(
+                "failed to exchange OAuth authorization code: {error}"
+            ))
+        })?;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| TuiError::Auth(format!("failed to read OAuth token response: {error}")))?;
+
+    if !status.is_success() {
+        let reason = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|json| {
+                json.get("error_description")
+                    .or_else(|| json.get("error"))
+                    .and_then(|value| value.as_str())
+                    .map(ToString::to_string)
+            })
+            .unwrap_or_else(|| "token endpoint request failed".to_string());
+
+        return Err(TuiError::Auth(format!(
+            "oauth token exchange failed ({}): {reason}",
+            status.as_u16()
+        )));
+    }
+
+    serde_json::from_str::<TokenResponse>(&body)
+        .map_err(|error| TuiError::Auth(format!("oauth token response was invalid JSON: {error}")))
 }
 
 fn register_auth_provider(router: &mut ModelRouter, auth_method: &AuthMethod) -> Result<(), TuiError> {
@@ -794,9 +872,57 @@ impl Drop for RawModeGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use tempfile::TempDir;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    struct ScopedEnvVar {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl ScopedEnvVar {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     fn new_test_app() -> TuiApp {
         TuiApp::new(AuthManager::new(), ModelRouter::new())
+    }
+
+    fn test_auth_manager() -> AuthManager {
+        let mut auth_manager = AuthManager::new();
+        auth_manager.store(
+            "anthropic",
+            AuthMethod::SetupToken {
+                token: "setup-token-123".to_string(),
+            },
+        );
+        auth_manager.store(
+            "openrouter",
+            AuthMethod::ApiKey {
+                provider: "openrouter".to_string(),
+                key: "openrouter-key-456".to_string(),
+            },
+        );
+        auth_manager
     }
 
     #[test]
@@ -841,5 +967,146 @@ mod tests {
         app.handle_command("/quit").await.unwrap();
 
         assert!(!app.running);
+    }
+
+    #[tokio::test]
+    async fn load_auth_manager_loads_expected_auth_manager_from_temp_file() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let temp_dir = TempDir::new().unwrap();
+        let auth_path = temp_dir.path().join("auth.json");
+        let expected = test_auth_manager();
+
+        tokio::fs::write(&auth_path, expected.to_json().unwrap())
+            .await
+            .unwrap();
+        let _auth_path_env = ScopedEnvVar::set("CITROS_AUTH_FILE", auth_path.to_str().unwrap());
+
+        let loaded = load_auth_manager().await.unwrap();
+
+        assert_eq!(loaded, expected);
+    }
+
+    #[tokio::test]
+    async fn persist_auth_manager_writes_expected_json_to_temp_file() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let temp_dir = TempDir::new().unwrap();
+        let auth_path = temp_dir.path().join("nested").join("auth.json");
+        let auth_manager = test_auth_manager();
+        let _auth_path_env = ScopedEnvVar::set("CITROS_AUTH_FILE", auth_path.to_str().unwrap());
+
+        persist_auth_manager(&auth_manager).await.unwrap();
+
+        assert!(auth_path.exists());
+
+        let persisted = tokio::fs::read_to_string(&auth_path).await.unwrap();
+        let persisted_json: serde_json::Value = serde_json::from_str(&persisted).unwrap();
+        let expected_json: serde_json::Value =
+            serde_json::from_str(&auth_manager.to_json().unwrap()).unwrap();
+
+        assert_eq!(persisted_json, expected_json);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn persist_auth_manager_sets_0600_permissions_on_unix() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let temp_dir = TempDir::new().unwrap();
+        let auth_path = temp_dir.path().join("auth.json");
+        let auth_manager = test_auth_manager();
+        let _auth_path_env = ScopedEnvVar::set("CITROS_AUTH_FILE", auth_path.to_str().unwrap());
+
+        persist_auth_manager(&auth_manager).await.unwrap();
+
+        let mode = tokio::fs::metadata(&auth_path)
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[tokio::test]
+    async fn persist_then_load_round_trip_returns_equivalent_auth_manager() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let temp_dir = TempDir::new().unwrap();
+        let auth_path = temp_dir.path().join("auth.json");
+
+        let mut expected = AuthManager::new();
+        expected.store(
+            "anthropic",
+            AuthMethod::SetupToken {
+                token: "setup-token-round-trip".to_string(),
+            },
+        );
+        expected.store(
+            "openai",
+            AuthMethod::OAuth {
+                provider: "openai".to_string(),
+                access_token: "access-token-round-trip".to_string(),
+                refresh_token: "refresh-token-round-trip".to_string(),
+                expires_at: 1_700_000_000_000,
+                account_id: Some("acct_round_trip".to_string()),
+            },
+        );
+
+        let _auth_path_env = ScopedEnvVar::set("CITROS_AUTH_FILE", auth_path.to_str().unwrap());
+
+        persist_auth_manager(&expected).await.unwrap();
+        let loaded = load_auth_manager().await.unwrap();
+
+        assert_eq!(loaded, expected);
+    }
+
+    #[test]
+    fn build_router_with_mixed_credentials_sets_expected_models_and_auth_labels() {
+        let mut auth_manager = AuthManager::new();
+        auth_manager.store(
+            "anthropic",
+            AuthMethod::SetupToken {
+                token: "setup-token-mixed".to_string(),
+            },
+        );
+        auth_manager.store(
+            "openrouter",
+            AuthMethod::ApiKey {
+                provider: "openrouter".to_string(),
+                key: "openrouter-key-mixed".to_string(),
+            },
+        );
+
+        let router = build_router(&auth_manager).unwrap();
+        let models = router.available_models();
+
+        assert!(models.iter().any(|model| {
+            model.model_id == "claude-opus-4"
+                && model.provider_name == "anthropic"
+                && model.auth_method == "subscription"
+        }));
+        assert!(models.iter().any(|model| {
+            model.model_id == "openai/gpt-4o-mini"
+                && model.provider_name == "openrouter"
+                && model.auth_method == "api_key"
+        }));
+
+        let anthropic_auth_labels = models
+            .iter()
+            .filter(|model| model.provider_name == "anthropic")
+            .map(|model| model.auth_method.as_str())
+            .collect::<Vec<_>>();
+        assert!(!anthropic_auth_labels.is_empty());
+        assert!(anthropic_auth_labels
+            .iter()
+            .all(|auth_method| *auth_method == "subscription"));
+
+        let openrouter_auth_labels = models
+            .iter()
+            .filter(|model| model.provider_name == "openrouter")
+            .map(|model| model.auth_method.as_str())
+            .collect::<Vec<_>>();
+        assert!(!openrouter_auth_labels.is_empty());
+        assert!(openrouter_auth_labels
+            .iter()
+            .all(|auth_method| *auth_method == "api_key"));
     }
 }
