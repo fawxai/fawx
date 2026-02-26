@@ -865,9 +865,17 @@ fn find_text_in_json(value: &serde_json::Value, keys: &[&str]) -> Option<String>
                     }
                 }
             }
-            // Recurse one level into nested objects
+            // Recurse into nested values.
             for v in map.values() {
                 if let Some(found) = find_text_in_json(v, keys) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                if let Some(found) = find_text_in_json(value, keys) {
                     return Some(found);
                 }
             }
@@ -1534,6 +1542,32 @@ mod tests {
         match &intent.action {
             IntendedAction::Respond { text } => {
                 assert_eq!(text, "Paris is the capital.");
+            }
+            other => panic!("expected Respond, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fallback_extracts_text_from_array_wrapped_response() {
+        let raw = r#"[{"text":"Hello from array"}]"#;
+        let intent = parse_reasoned_intent(raw, "hey");
+
+        match &intent.action {
+            IntendedAction::Respond { text } => {
+                assert_eq!(text, "Hello from array");
+            }
+            other => panic!("expected Respond, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fallback_extracts_text_from_nested_array_in_object() {
+        let raw = r#"{"responses":[{"text":"Nested array text"}]}"#;
+        let intent = parse_reasoned_intent(raw, "hey");
+
+        match &intent.action {
+            IntendedAction::Respond { text } => {
+                assert_eq!(text, "Nested array text");
             }
             other => panic!("expected Respond, got {other:?}"),
         }
