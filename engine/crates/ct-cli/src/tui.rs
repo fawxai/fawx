@@ -1,5 +1,5 @@
 use crossterm::style::Stylize;
-use crossterm::{cursor, event, style, terminal, ExecutableCommand};
+use crossterm::{event, style, terminal, ExecutableCommand};
 use ct_kernel::auth::{AuthManager, AuthMethod};
 use ct_kernel::oauth::{PkceFlow, TokenExchangeRequest, TokenResponse};
 use ct_llm::{
@@ -389,17 +389,6 @@ impl TuiApp {
         }
         println!("\n");
         Ok(full_response)
-    }
-
-    /// Display formatted output to the terminal.
-    fn display_response(&self, response: &str) {
-        let mut stdout = io::stdout();
-        let _ = stdout.execute(cursor::MoveToColumn(0));
-
-        println!();
-        println!("{}", "Assistant".bold().with(style::Color::Cyan));
-        println!("{response}");
-        println!();
     }
 
     /// Display the model selection menu.
