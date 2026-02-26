@@ -3,9 +3,10 @@ use crossterm::{cursor, event, style, terminal, ExecutableCommand};
 use ct_kernel::auth::{AuthManager, AuthMethod};
 use ct_kernel::oauth::{PkceFlow, TokenExchangeRequest, TokenResponse};
 use ct_llm::{
-    AnthropicProvider, CompletionRequest, ContentBlock, Message, ModelCatalog, ModelRouter,
-    OpenAiProvider, OpenAiResponsesProvider,
+    AnthropicProvider, CompletionRequest, Message, ModelCatalog, ModelRouter, OpenAiProvider,
+    OpenAiResponsesProvider,
 };
+use futures::StreamExt;
 use std::fmt;
 use std::io::{self, Write};
 #[cfg(unix)]
@@ -363,7 +364,6 @@ impl TuiApp {
 
         // Use streaming — required by the Codex Responses API, and gives
         // better UX by printing tokens as they arrive.
-        use futures::StreamExt;
         let mut stream = self
             .router
             .complete_stream(request)
