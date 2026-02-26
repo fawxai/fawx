@@ -1594,6 +1594,13 @@ mod tests {
         auth_manager
     }
 
+    fn mock_provider_capabilities() -> ct_llm::ProviderCapabilities {
+        ct_llm::ProviderCapabilities {
+            supports_temperature: true,
+            requires_streaming: false,
+        }
+    }
+
     #[derive(Debug)]
     struct StaticCompletionProvider {
         provider_name: String,
@@ -1647,6 +1654,10 @@ mod tests {
         fn supported_models(&self) -> Vec<String> {
             vec![self.model.clone()]
         }
+
+        fn capabilities(&self) -> ct_llm::ProviderCapabilities {
+            mock_provider_capabilities()
+        }
     }
 
     #[derive(Debug)]
@@ -1686,6 +1697,29 @@ mod tests {
         fn supported_models(&self) -> Vec<String> {
             vec![self.model.clone()]
         }
+
+        fn capabilities(&self) -> ct_llm::ProviderCapabilities {
+            mock_provider_capabilities()
+        }
+    }
+
+    #[test]
+    fn test_completion_providers_expose_router_capabilities() {
+        let static_provider = StaticCompletionProvider::new("mock-loop-model", "ok");
+        assert_eq!(
+            ct_llm::CompletionProvider::capabilities(&static_provider),
+            mock_provider_capabilities()
+        );
+
+        let streaming_provider = StreamingTestProvider {
+            provider_name: "stream-test".to_string(),
+            model: "stream-model".to_string(),
+            chunks: Vec::new(),
+        };
+        assert_eq!(
+            ct_llm::CompletionProvider::capabilities(&streaming_provider),
+            mock_provider_capabilities()
+        );
     }
 
     fn app_with_mock_model(response: &str) -> TuiApp {

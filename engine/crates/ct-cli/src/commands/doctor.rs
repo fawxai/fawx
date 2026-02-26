@@ -147,7 +147,10 @@ mod tests {
     #[test]
     fn workspace_and_related_paths_match_contract() {
         let workspace = get_workspace_dir().expect("workspace path");
-        assert_eq!(workspace.file_name().and_then(|name| name.to_str()), Some(".citros"));
+        assert_eq!(
+            workspace.file_name().and_then(|name| name.to_str()),
+            Some(".citros")
+        );
 
         let config = get_config_path().expect("config path");
         let storage = get_storage_dir().expect("storage path");
