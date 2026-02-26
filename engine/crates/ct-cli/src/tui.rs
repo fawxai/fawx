@@ -851,7 +851,6 @@ fn prompt_for_oauth_code(flow: &PkceFlow) -> Result<String, TuiError> {
 async fn start_oauth_callback_server(
     expected_state: &str,
 ) -> Result<impl std::future::Future<Output = Result<String, TuiError>>, TuiError> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:1455")
         .await
         .map_err(|e| TuiError::Auth(format!("failed to bind port 1455: {e}")))?;
@@ -859,49 +858,70 @@ async fn start_oauth_callback_server(
     let state = expected_state.to_string();
     Ok(async move {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
-
         loop {
-            let now = tokio::time::Instant::now();
-            if now >= deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
                 return Err(TuiError::Auth("OAuth callback timed out (60s)".to_string()));
             }
-
-            let accept = tokio::time::timeout(deadline - now, listener.accept())
-                .await
-                .map_err(|_| TuiError::Auth("OAuth callback timed out (60s)".to_string()))?
-                .map_err(|e| TuiError::Auth(format!("failed to accept connection: {e}")))?;
-
-            let (mut stream, _addr) = accept;
-            let mut buf = vec![0u8; 4096];
-            let n = stream
-                .read(&mut buf)
-                .await
-                .map_err(|e| TuiError::Auth(format!("failed to read request: {e}")))?;
-            let request = String::from_utf8_lossy(&buf[..n]);
-            let (path, query) = parse_oauth_callback_request(&request)?;
-
-            if path != "/auth/callback" {
-                let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot found";
-                if let Err(error) = stream.write_all(response.as_bytes()).await {
-                    eprintln!("oauth callback write failed: {error}");
-                }
-                continue;
+            let stream = accept_with_timeout(&listener, remaining).await?;
+            match handle_oauth_connection(stream, &state).await? {
+                Some(code) => return Ok(code),
+                None => continue,
             }
-
-            let code = validate_and_extract_code(query, &state)?;
-            let body = OAUTH_SUCCESS_HTML;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            if let Err(error) = stream.write_all(response.as_bytes()).await {
-                eprintln!("oauth callback write failed: {error}");
-            }
-
-            return Ok(code);
         }
     })
+}
+
+async fn accept_with_timeout(
+    listener: &tokio::net::TcpListener,
+    timeout: std::time::Duration,
+) -> Result<tokio::net::TcpStream, TuiError> {
+    let (stream, _) = tokio::time::timeout(timeout, listener.accept())
+        .await
+        .map_err(|_| TuiError::Auth("OAuth callback timed out (60s)".to_string()))?
+        .map_err(|e| TuiError::Auth(format!("failed to accept connection: {e}")))?;
+    Ok(stream)
+}
+
+async fn handle_oauth_connection(
+    mut stream: tokio::net::TcpStream,
+    expected_state: &str,
+) -> Result<Option<String>, TuiError> {
+    use tokio::io::AsyncReadExt;
+
+    let mut buf = vec![0u8; 4096];
+    let n = stream
+        .read(&mut buf)
+        .await
+        .map_err(|e| TuiError::Auth(format!("failed to read request: {e}")))?;
+    let request = String::from_utf8_lossy(&buf[..n]);
+    let (path, query) = parse_oauth_callback_request(&request)?;
+
+    if path != "/auth/callback" {
+        send_http_response(
+            &mut stream,
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot found",
+        )
+        .await;
+        return Ok(None);
+    }
+
+    let code = validate_and_extract_code(query, expected_state)?;
+    let body = OAUTH_SUCCESS_HTML;
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    send_http_response(&mut stream, &response).await;
+    Ok(Some(code))
+}
+
+async fn send_http_response(stream: &mut tokio::net::TcpStream, response: &str) {
+    use tokio::io::AsyncWriteExt;
+    if let Err(error) = stream.write_all(response.as_bytes()).await {
+        eprintln!("oauth callback write failed: {error}");
+    }
 }
 
 fn parse_oauth_callback_request(request: &str) -> Result<(&str, &str), TuiError> {

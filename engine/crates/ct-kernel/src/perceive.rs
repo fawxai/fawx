@@ -2,6 +2,7 @@
 
 use crate::budget::BudgetSnapshot;
 use crate::types::*;
+use ct_core::types::{Notification, UiElement, UserInput};
 use ct_llm::Message;
 use serde::{Deserialize, Serialize};
 
@@ -124,124 +125,18 @@ impl PerceptionAssembler {
     /// The heuristic combines a character-based estimate with per-structure overhead.
     pub fn estimate_tokens(context: &ReasoningContext) -> usize {
         let mut total = BASE_CONTEXT_OVERHEAD_TOKENS;
-
-        total += estimate_text_tokens(&context.perception.active_app);
-        total += estimate_text_tokens(&context.perception.screen.current_app);
-        total += estimate_text_tokens(&context.perception.screen.text_content);
-
-        total += context
-            .perception
-            .screen
-            .elements
-            .iter()
-            .map(|element| {
-                SCREEN_ELEMENT_OVERHEAD_TOKENS
-                    + estimate_text_tokens(&element.id)
-                    + estimate_text_tokens(&element.element_type)
-                    + estimate_text_tokens(&element.text)
-            })
-            .sum::<usize>();
-
-        total += context
-            .perception
-            .notifications
-            .iter()
-            .map(|notification| {
-                NOTIFICATION_OVERHEAD_TOKENS
-                    + estimate_text_tokens(&notification.id)
-                    + estimate_text_tokens(&notification.app)
-                    + estimate_text_tokens(&notification.title)
-                    + estimate_text_tokens(&notification.content)
-            })
-            .sum::<usize>();
-
-        if let Some(sensor) = &context.perception.sensor_data {
-            total += SENSOR_BASE_OVERHEAD_TOKENS;
-            if sensor.location.is_some() {
-                total += SENSOR_LOCATION_TOKENS;
-            }
-            if sensor.battery_percent.is_some() {
-                total += SENSOR_BATTERY_TOKENS;
-            }
-        }
-
-        if let Some(user_input) = &context.perception.user_input {
-            total += USER_INPUT_OVERHEAD_TOKENS + estimate_text_tokens(&user_input.text);
-            if let Some(context_id) = &user_input.context_id {
-                total += estimate_text_tokens(context_id);
-            }
-        }
-
-        total += context
-            .working_memory
-            .iter()
-            .map(|entry| {
-                MEMORY_ENTRY_OVERHEAD_TOKENS
-                    + estimate_text_tokens(&entry.key)
-                    + estimate_text_tokens(&entry.value)
-            })
-            .sum::<usize>();
-
-        total += context
-            .relevant_episodic
-            .iter()
-            .map(|entry| MEMORY_ENTRY_OVERHEAD_TOKENS + estimate_text_tokens(&entry.summary))
-            .sum::<usize>();
-
-        total += context
-            .relevant_semantic
-            .iter()
-            .map(|entry| MEMORY_ENTRY_OVERHEAD_TOKENS + estimate_text_tokens(&entry.fact))
-            .sum::<usize>();
-
-        total += context
-            .active_procedures
-            .iter()
-            .map(|procedure| {
-                MEMORY_ENTRY_OVERHEAD_TOKENS
-                    + estimate_text_tokens(&procedure.id)
-                    + estimate_text_tokens(&procedure.name)
-            })
-            .sum::<usize>();
-
-        if let Some(user_name) = &context.identity_context.user_name {
-            total += estimate_text_tokens(user_name);
-        }
-
-        total += context
-            .identity_context
-            .preferences
-            .iter()
-            .map(|(key, value)| {
-                PREFERENCE_ENTRY_OVERHEAD_TOKENS
-                    + estimate_text_tokens(key)
-                    + estimate_text_tokens(value)
-            })
-            .sum::<usize>();
-
-        total += context
-            .identity_context
-            .personality_traits
-            .iter()
-            .map(|trait_text| estimate_text_tokens(trait_text))
-            .sum::<usize>();
-
-        total += GOAL_OVERHEAD_TOKENS + estimate_text_tokens(&context.goal.description);
-        total += context
-            .goal
-            .success_criteria
-            .iter()
-            .map(|criterion| estimate_text_tokens(criterion))
-            .sum::<usize>();
-
-        if context.goal.max_steps.is_some() {
-            total += 1;
-        }
-
+        total += estimate_perception_tokens(&context.perception);
+        total += estimate_memory_tokens(
+            &context.working_memory,
+            &context.relevant_episodic,
+            &context.relevant_semantic,
+            &context.active_procedures,
+        );
+        total += estimate_identity_tokens(&context.identity_context);
+        total += estimate_goal_tokens(&context.goal);
         if let Some(parent) = &context.parent_context {
             total += Self::estimate_tokens(parent);
         }
-
         total
     }
 
@@ -279,6 +174,134 @@ impl PerceptionAssembler {
             break;
         }
     }
+}
+
+fn estimate_perception_tokens(perception: &PerceptionSnapshot) -> usize {
+    let mut total = estimate_text_tokens(&perception.active_app)
+        + estimate_text_tokens(&perception.screen.current_app)
+        + estimate_text_tokens(&perception.screen.text_content);
+
+    total += estimate_screen_element_tokens(&perception.screen.elements);
+    total += estimate_notification_tokens(&perception.notifications);
+    total += estimate_sensor_tokens(&perception.sensor_data);
+    total += estimate_user_input_tokens(&perception.user_input);
+    total
+}
+
+fn estimate_screen_element_tokens(elements: &[UiElement]) -> usize {
+    elements
+        .iter()
+        .map(|el| {
+            SCREEN_ELEMENT_OVERHEAD_TOKENS
+                + estimate_text_tokens(&el.id)
+                + estimate_text_tokens(&el.element_type)
+                + estimate_text_tokens(&el.text)
+        })
+        .sum()
+}
+
+fn estimate_notification_tokens(notifications: &[Notification]) -> usize {
+    notifications
+        .iter()
+        .map(|n| {
+            NOTIFICATION_OVERHEAD_TOKENS
+                + estimate_text_tokens(&n.id)
+                + estimate_text_tokens(&n.app)
+                + estimate_text_tokens(&n.title)
+                + estimate_text_tokens(&n.content)
+        })
+        .sum()
+}
+
+fn estimate_sensor_tokens(sensor_data: &Option<SensorData>) -> usize {
+    let Some(sensor) = sensor_data else { return 0 };
+    let mut total = SENSOR_BASE_OVERHEAD_TOKENS;
+    if sensor.location.is_some() {
+        total += SENSOR_LOCATION_TOKENS;
+    }
+    if sensor.battery_percent.is_some() {
+        total += SENSOR_BATTERY_TOKENS;
+    }
+    total
+}
+
+fn estimate_user_input_tokens(user_input: &Option<UserInput>) -> usize {
+    let Some(input) = user_input else { return 0 };
+    let mut total = USER_INPUT_OVERHEAD_TOKENS + estimate_text_tokens(&input.text);
+    if let Some(ctx_id) = &input.context_id {
+        total += estimate_text_tokens(ctx_id);
+    }
+    total
+}
+
+fn estimate_memory_tokens(
+    working: &[WorkingMemoryEntry],
+    episodic: &[EpisodicMemoryRef],
+    semantic: &[SemanticMemoryRef],
+    procedures: &[ProcedureRef],
+) -> usize {
+    let working_tokens: usize = working
+        .iter()
+        .map(|e| {
+            MEMORY_ENTRY_OVERHEAD_TOKENS
+                + estimate_text_tokens(&e.key)
+                + estimate_text_tokens(&e.value)
+        })
+        .sum();
+
+    let episodic_tokens: usize = episodic
+        .iter()
+        .map(|e| MEMORY_ENTRY_OVERHEAD_TOKENS + estimate_text_tokens(&e.summary))
+        .sum();
+
+    let semantic_tokens: usize = semantic
+        .iter()
+        .map(|e| MEMORY_ENTRY_OVERHEAD_TOKENS + estimate_text_tokens(&e.fact))
+        .sum();
+
+    let procedure_tokens: usize = procedures
+        .iter()
+        .map(|p| {
+            MEMORY_ENTRY_OVERHEAD_TOKENS
+                + estimate_text_tokens(&p.id)
+                + estimate_text_tokens(&p.name)
+        })
+        .sum();
+
+    working_tokens + episodic_tokens + semantic_tokens + procedure_tokens
+}
+
+fn estimate_identity_tokens(identity: &IdentityContext) -> usize {
+    let mut total = 0;
+    if let Some(name) = &identity.user_name {
+        total += estimate_text_tokens(name);
+    }
+    total += identity
+        .preferences
+        .iter()
+        .map(|(k, v)| {
+            PREFERENCE_ENTRY_OVERHEAD_TOKENS + estimate_text_tokens(k) + estimate_text_tokens(v)
+        })
+        .sum::<usize>();
+    total += identity
+        .personality_traits
+        .iter()
+        .map(|t| estimate_text_tokens(t))
+        .sum::<usize>();
+    total
+}
+
+fn estimate_goal_tokens(goal: &Goal) -> usize {
+    let mut total = GOAL_OVERHEAD_TOKENS + estimate_text_tokens(&goal.description);
+    total += goal
+        .success_criteria
+        .iter()
+        .map(|c| estimate_text_tokens(c))
+        .sum::<usize>();
+    if goal.max_steps.is_some() {
+        total += 1;
+    }
+    total
 }
 
 /// Trimming policy for contexts that exceed budget.
@@ -347,32 +370,42 @@ enum EntryKind {
 }
 
 fn remove_by_relevance(context: &mut ReasoningContext) -> bool {
+    let candidate = find_lowest_relevance_entry(context);
+    remove_entry_by_kind(context, candidate)
+}
+
+fn find_lowest_relevance_entry(context: &ReasoningContext) -> Option<(EntryKind, usize, f32)> {
     let working = context
         .working_memory
         .iter()
         .enumerate()
-        .min_by(|(_, left), (_, right)| left.relevance.total_cmp(&right.relevance))
-        .map(|(idx, entry)| (EntryKind::Working, idx, entry.relevance));
+        .min_by(|(_, l), (_, r)| l.relevance.total_cmp(&r.relevance))
+        .map(|(i, e)| (EntryKind::Working, i, e.relevance));
 
     let episodic = context
         .relevant_episodic
         .iter()
         .enumerate()
-        .min_by(|(_, left), (_, right)| left.relevance.total_cmp(&right.relevance))
-        .map(|(idx, entry)| (EntryKind::Episodic, idx, entry.relevance));
+        .min_by(|(_, l), (_, r)| l.relevance.total_cmp(&r.relevance))
+        .map(|(i, e)| (EntryKind::Episodic, i, e.relevance));
 
     let semantic = context
         .relevant_semantic
         .iter()
         .enumerate()
-        .min_by(|(_, left), (_, right)| left.confidence.total_cmp(&right.confidence))
-        .map(|(idx, entry)| (EntryKind::Semantic, idx, entry.confidence));
+        .min_by(|(_, l), (_, r)| l.confidence.total_cmp(&r.confidence))
+        .map(|(i, e)| (EntryKind::Semantic, i, e.confidence));
 
-    let candidate = [working, episodic, semantic]
+    [working, episodic, semantic]
         .into_iter()
         .flatten()
-        .min_by(|left, right| left.2.total_cmp(&right.2));
+        .min_by(|l, r| l.2.total_cmp(&r.2))
+}
 
+fn remove_entry_by_kind(
+    context: &mut ReasoningContext,
+    candidate: Option<(EntryKind, usize, f32)>,
+) -> bool {
     match candidate {
         Some((EntryKind::Working, idx, _)) => {
             context.working_memory.remove(idx);

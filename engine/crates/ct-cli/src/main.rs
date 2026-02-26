@@ -208,15 +208,8 @@ async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
             client_secret,
             scope,
         } => {
-            let options = commands::oauth_bridge::Options {
-                listen,
-                auth_url,
-                token_url,
-                client_id,
-                client_secret,
-                scope,
-            };
-            commands::oauth_bridge::run(options).await
+            dispatch_oauth_bridge(listen, auth_url, token_url, client_id, client_secret, scope)
+                .await
         }
         Commands::EvalDeterminism {
             mode,
@@ -224,17 +217,43 @@ async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
             baseline,
             update_baseline,
             fail_on_regression,
-        } => {
-            let options = commands::eval_harness::Options {
-                mode: mode.into(),
-                output: output.into(),
-                baseline: baseline.map(Into::into),
-                update_baseline,
-                fail_on_regression,
-            };
-            Ok(commands::eval_harness::run(options)?)
-        }
+        } => dispatch_eval(mode, output, baseline, update_baseline, fail_on_regression),
     }
+}
+
+async fn dispatch_oauth_bridge(
+    listen: String,
+    auth_url: Option<String>,
+    token_url: Option<String>,
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    scope: Option<String>,
+) -> anyhow::Result<i32> {
+    commands::oauth_bridge::run(commands::oauth_bridge::Options {
+        listen,
+        auth_url,
+        token_url,
+        client_id,
+        client_secret,
+        scope,
+    })
+    .await
+}
+
+fn dispatch_eval(
+    mode: EvalModeArg,
+    output: String,
+    baseline: Option<String>,
+    update_baseline: bool,
+    fail_on_regression: bool,
+) -> anyhow::Result<i32> {
+    commands::eval_harness::run(commands::eval_harness::Options {
+        mode: mode.into(),
+        output: output.into(),
+        baseline: baseline.map(Into::into),
+        update_baseline,
+        fail_on_regression,
+    })
 }
 
 #[tokio::main]
