@@ -33,6 +33,31 @@ pub struct PerceptionAssembler {
     max_context_tokens: usize,
 }
 
+/// Inputs for assembling a [`ReasoningContext`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssembleInput {
+    pub perception: PerceptionSnapshot,
+    pub working_memory: Vec<WorkingMemoryEntry>,
+    pub episodic: Vec<EpisodicMemoryRef>,
+    pub semantic: Vec<SemanticMemoryRef>,
+    pub procedures: Vec<ProcedureRef>,
+    pub identity: IdentityContext,
+    pub goal: Goal,
+    pub depth: u32,
+    pub parent: Option<Box<ReasoningContext>>,
+}
+
+const BASE_CONTEXT_OVERHEAD_TOKENS: usize = 24;
+const SCREEN_ELEMENT_OVERHEAD_TOKENS: usize = 4;
+const NOTIFICATION_OVERHEAD_TOKENS: usize = 6;
+const SENSOR_BASE_OVERHEAD_TOKENS: usize = 6;
+const SENSOR_LOCATION_TOKENS: usize = 8;
+const SENSOR_BATTERY_TOKENS: usize = 2;
+const USER_INPUT_OVERHEAD_TOKENS: usize = 4;
+const MEMORY_ENTRY_OVERHEAD_TOKENS: usize = 3;
+const GOAL_OVERHEAD_TOKENS: usize = 4;
+const PREFERENCE_ENTRY_OVERHEAD_TOKENS: usize = 2;
+
 impl PerceptionAssembler {
     /// Create a new [`PerceptionAssembler`] with fixed limits.
     pub fn new(
@@ -53,19 +78,18 @@ impl PerceptionAssembler {
     ///
     /// Retrieved memories are prioritized by relevance/confidence and trimmed to fit
     /// the configured context token budget.
-    #[allow(clippy::too_many_arguments)]
-    pub fn assemble(
-        &self,
-        perception: PerceptionSnapshot,
-        mut working_memory: Vec<WorkingMemoryEntry>,
-        mut episodic: Vec<EpisodicMemoryRef>,
-        mut semantic: Vec<SemanticMemoryRef>,
-        procedures: Vec<ProcedureRef>,
-        identity: IdentityContext,
-        goal: Goal,
-        depth: u32,
-        parent: Option<Box<ReasoningContext>>,
-    ) -> ReasoningContext {
+    pub fn assemble(&self, input: AssembleInput) -> ReasoningContext {
+        let AssembleInput {
+            perception,
+            mut working_memory,
+            mut episodic,
+            mut semantic,
+            procedures,
+            identity,
+            goal,
+            depth,
+            parent,
+        } = input;
         working_memory = retain_top_by_score_preserving_order(
             working_memory,
             self.max_working_memory,
@@ -99,7 +123,7 @@ impl PerceptionAssembler {
     ///
     /// The heuristic combines a character-based estimate with per-structure overhead.
     pub fn estimate_tokens(context: &ReasoningContext) -> usize {
-        let mut total = 24;
+        let mut total = BASE_CONTEXT_OVERHEAD_TOKENS;
 
         total += estimate_text_tokens(&context.perception.active_app);
         total += estimate_text_tokens(&context.perception.screen.current_app);
@@ -111,7 +135,8 @@ impl PerceptionAssembler {
             .elements
             .iter()
             .map(|element| {
-                4 + estimate_text_tokens(&element.id)
+                SCREEN_ELEMENT_OVERHEAD_TOKENS
+                    + estimate_text_tokens(&element.id)
                     + estimate_text_tokens(&element.element_type)
                     + estimate_text_tokens(&element.text)
             })
@@ -122,7 +147,8 @@ impl PerceptionAssembler {
             .notifications
             .iter()
             .map(|notification| {
-                6 + estimate_text_tokens(&notification.id)
+                NOTIFICATION_OVERHEAD_TOKENS
+                    + estimate_text_tokens(&notification.id)
                     + estimate_text_tokens(&notification.app)
                     + estimate_text_tokens(&notification.title)
                     + estimate_text_tokens(&notification.content)
@@ -130,17 +156,17 @@ impl PerceptionAssembler {
             .sum::<usize>();
 
         if let Some(sensor) = &context.perception.sensor_data {
-            total += 6;
+            total += SENSOR_BASE_OVERHEAD_TOKENS;
             if sensor.location.is_some() {
-                total += 8;
+                total += SENSOR_LOCATION_TOKENS;
             }
             if sensor.battery_percent.is_some() {
-                total += 2;
+                total += SENSOR_BATTERY_TOKENS;
             }
         }
 
         if let Some(user_input) = &context.perception.user_input {
-            total += 4 + estimate_text_tokens(&user_input.text);
+            total += USER_INPUT_OVERHEAD_TOKENS + estimate_text_tokens(&user_input.text);
             if let Some(context_id) = &user_input.context_id {
                 total += estimate_text_tokens(context_id);
             }
@@ -149,26 +175,32 @@ impl PerceptionAssembler {
         total += context
             .working_memory
             .iter()
-            .map(|entry| 3 + estimate_text_tokens(&entry.key) + estimate_text_tokens(&entry.value))
+            .map(|entry| {
+                MEMORY_ENTRY_OVERHEAD_TOKENS
+                    + estimate_text_tokens(&entry.key)
+                    + estimate_text_tokens(&entry.value)
+            })
             .sum::<usize>();
 
         total += context
             .relevant_episodic
             .iter()
-            .map(|entry| 3 + estimate_text_tokens(&entry.summary))
+            .map(|entry| MEMORY_ENTRY_OVERHEAD_TOKENS + estimate_text_tokens(&entry.summary))
             .sum::<usize>();
 
         total += context
             .relevant_semantic
             .iter()
-            .map(|entry| 3 + estimate_text_tokens(&entry.fact))
+            .map(|entry| MEMORY_ENTRY_OVERHEAD_TOKENS + estimate_text_tokens(&entry.fact))
             .sum::<usize>();
 
         total += context
             .active_procedures
             .iter()
             .map(|procedure| {
-                3 + estimate_text_tokens(&procedure.id) + estimate_text_tokens(&procedure.name)
+                MEMORY_ENTRY_OVERHEAD_TOKENS
+                    + estimate_text_tokens(&procedure.id)
+                    + estimate_text_tokens(&procedure.name)
             })
             .sum::<usize>();
 
@@ -180,7 +212,11 @@ impl PerceptionAssembler {
             .identity_context
             .preferences
             .iter()
-            .map(|(key, value)| 2 + estimate_text_tokens(key) + estimate_text_tokens(value))
+            .map(|(key, value)| {
+                PREFERENCE_ENTRY_OVERHEAD_TOKENS
+                    + estimate_text_tokens(key)
+                    + estimate_text_tokens(value)
+            })
             .sum::<usize>();
 
         total += context
@@ -190,7 +226,7 @@ impl PerceptionAssembler {
             .map(|trait_text| estimate_text_tokens(trait_text))
             .sum::<usize>();
 
-        total += 4 + estimate_text_tokens(&context.goal.description);
+        total += GOAL_OVERHEAD_TOKENS + estimate_text_tokens(&context.goal.description);
         total += context
             .goal
             .success_criteria
@@ -510,9 +546,9 @@ mod tests {
     fn assemble_respects_limits_and_relevance_order() {
         let assembler = PerceptionAssembler::new(2, 2, 2, 2_000);
 
-        let context = assembler.assemble(
-            sample_perception("Inbox"),
-            vec![
+        let context = assembler.assemble(AssembleInput {
+            perception: sample_perception("Inbox"),
+            working_memory: vec![
                 WorkingMemoryEntry {
                     key: "low".to_owned(),
                     value: "low relevance".to_owned(),
@@ -529,7 +565,7 @@ mod tests {
                     relevance: 0.5,
                 },
             ],
-            vec![
+            episodic: vec![
                 EpisodicMemoryRef {
                     id: 1,
                     summary: "old low relevance episode".to_owned(),
@@ -549,7 +585,7 @@ mod tests {
                     timestamp_ms: 30,
                 },
             ],
-            vec![
+            semantic: vec![
                 SemanticMemoryRef {
                     id: 11,
                     fact: "Low confidence fact".to_owned(),
@@ -566,12 +602,12 @@ mod tests {
                     confidence: 0.55,
                 },
             ],
-            vec![],
-            sample_identity(),
-            sample_goal(),
-            0,
-            None,
-        );
+            procedures: vec![],
+            identity: sample_identity(),
+            goal: sample_goal(),
+            depth: 0,
+            parent: None,
+        });
 
         assert_eq!(context.working_memory.len(), 2);
         assert_eq!(context.working_memory[0].key, "high");
@@ -588,21 +624,22 @@ mod tests {
 
     #[test]
     fn estimate_tokens_increases_with_added_context() {
-        let mut base_context = PerceptionAssembler::new(2, 1, 1, 10_000).assemble(
-            sample_perception("Messages"),
-            vec![WorkingMemoryEntry {
+        let assembler = PerceptionAssembler::new(2, 1, 1, 10_000);
+        let mut base_context = assembler.assemble(AssembleInput {
+            perception: sample_perception("Messages"),
+            working_memory: vec![WorkingMemoryEntry {
                 key: "thread_id".to_owned(),
                 value: "42".to_owned(),
                 relevance: 0.8,
             }],
-            vec![],
-            vec![],
-            vec![],
-            sample_identity(),
-            sample_goal(),
-            0,
-            None,
-        );
+            episodic: vec![],
+            semantic: vec![],
+            procedures: vec![],
+            identity: sample_identity(),
+            goal: sample_goal(),
+            depth: 0,
+            parent: None,
+        });
 
         let base_tokens = PerceptionAssembler::estimate_tokens(&base_context);
 
@@ -622,16 +659,16 @@ mod tests {
 
         let long_text = "very long memory entry repeated repeated repeated repeated";
 
-        let context = assembler.assemble(
-            sample_perception("Chat"),
-            (0..6)
+        let context = assembler.assemble(AssembleInput {
+            perception: sample_perception("Chat"),
+            working_memory: (0..6)
                 .map(|index| WorkingMemoryEntry {
                     key: format!("wm-{index}"),
                     value: long_text.to_owned(),
                     relevance: 0.9 - index as f32 * 0.1,
                 })
                 .collect(),
-            (0..5)
+            episodic: (0..5)
                 .map(|index| EpisodicMemoryRef {
                     id: index,
                     summary: long_text.to_owned(),
@@ -639,19 +676,19 @@ mod tests {
                     timestamp_ms: index,
                 })
                 .collect(),
-            (0..5)
+            semantic: (0..5)
                 .map(|index| SemanticMemoryRef {
                     id: index,
                     fact: long_text.to_owned(),
                     confidence: 0.8 - index as f32 * 0.1,
                 })
                 .collect(),
-            vec![],
-            sample_identity(),
-            sample_goal(),
-            0,
-            None,
-        );
+            procedures: vec![],
+            identity: sample_identity(),
+            goal: sample_goal(),
+            depth: 0,
+            parent: None,
+        });
 
         let estimated = PerceptionAssembler::estimate_tokens(&context);
         assert!(estimated <= 90, "estimated tokens: {estimated}");
@@ -666,9 +703,9 @@ mod tests {
     fn by_recency_removes_oldest_working_memory_entry() {
         let assembler = PerceptionAssembler::new(3, 0, 0, 10_000);
 
-        let mut context = assembler.assemble(
-            sample_perception("Chat"),
-            vec![
+        let mut context = assembler.assemble(AssembleInput {
+            perception: sample_perception("Chat"),
+            working_memory: vec![
                 WorkingMemoryEntry {
                     key: "oldest".to_owned(),
                     value: "first inserted".to_owned(),
@@ -685,14 +722,14 @@ mod tests {
                     relevance: 0.70,
                 },
             ],
-            vec![],
-            vec![],
-            vec![],
-            sample_identity(),
-            sample_goal(),
-            0,
-            None,
-        );
+            episodic: vec![],
+            semantic: vec![],
+            procedures: vec![],
+            identity: sample_identity(),
+            goal: sample_goal(),
+            depth: 0,
+            parent: None,
+        });
 
         assert!(remove_next_memory_entry(
             &mut context,
@@ -763,34 +800,34 @@ mod tests {
     fn assemble_handles_zero_token_budget_without_panicking() {
         let assembler = PerceptionAssembler::new(4, 4, 4, 0);
 
-        let context = assembler.assemble(
-            sample_perception("Chat"),
-            vec![WorkingMemoryEntry {
+        let context = assembler.assemble(AssembleInput {
+            perception: sample_perception("Chat"),
+            working_memory: vec![WorkingMemoryEntry {
                 key: "wm".to_owned(),
                 value: "value".to_owned(),
                 relevance: 0.9,
             }],
-            vec![EpisodicMemoryRef {
+            episodic: vec![EpisodicMemoryRef {
                 id: 1,
                 summary: "episode".to_owned(),
                 relevance: 0.8,
                 timestamp_ms: 123,
             }],
-            vec![SemanticMemoryRef {
+            semantic: vec![SemanticMemoryRef {
                 id: 1,
                 fact: "fact".to_owned(),
                 confidence: 0.7,
             }],
-            vec![ProcedureRef {
+            procedures: vec![ProcedureRef {
                 id: "reply".to_owned(),
                 name: "Reply".to_owned(),
                 version: 1,
             }],
-            sample_identity(),
-            sample_goal(),
-            0,
-            None,
-        );
+            identity: sample_identity(),
+            goal: sample_goal(),
+            depth: 0,
+            parent: None,
+        });
 
         assert!(context.working_memory.is_empty());
         assert!(context.relevant_episodic.is_empty());

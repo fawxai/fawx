@@ -145,59 +145,61 @@ enum SkillCommands {
     },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // Initialize tracing
-    tracing_subscriber::fmt::init();
+async fn run_tui() -> anyhow::Result<i32> {
+    let auth_manager = tui::load_auth_manager().await?;
+    let router = tui::build_router(&auth_manager)?;
+    let loop_engine = tui::build_loop_engine();
+    let mut app = tui::TuiApp::new(auth_manager, router, loop_engine);
+    app.run().await?;
+    Ok(0)
+}
 
-    let cli = Cli::parse();
+fn run_stub(action: &str) -> i32 {
+    println!("{action} Citros agent daemon...");
+    println!("(Implementation pending - Epic 9)");
+    0
+}
 
-    let exit_code = match cli.command.unwrap_or(Commands::Tui) {
-        Commands::Tui => {
-            let auth_manager = tui::load_auth_manager().await?;
-            let router = tui::build_router(&auth_manager)?;
-            let loop_engine = tui::build_loop_engine();
-            let mut app = tui::TuiApp::new(auth_manager, router, loop_engine);
-            app.run().await?;
-            0
+async fn dispatch_audit(command: AuditCommands) -> anyhow::Result<i32> {
+    match command {
+        AuditCommands::Show { limit } => {
+            commands::audit::show(limit).await?;
+            Ok(0)
         }
-        Commands::Start => {
-            println!("Starting Citros agent daemon...");
-            println!("(Implementation pending - Epic 9)");
-            0
+        AuditCommands::Verify => Ok(commands::audit::verify().await?),
+    }
+}
+
+async fn dispatch_skill(command: SkillCommands) -> anyhow::Result<i32> {
+    match command {
+        SkillCommands::List => {
+            commands::skills::list().await?;
+            Ok(0)
         }
-        Commands::Stop => {
-            println!("Stopping Citros agent daemon...");
-            println!("(Implementation pending - Epic 9)");
-            0
+        SkillCommands::Install { path } => {
+            commands::skills::install(&path).await?;
+            Ok(0)
         }
-        Commands::Chat => commands::chat::run().await?,
-        Commands::Doctor => commands::doctor::run().await?,
+        SkillCommands::Remove { name } => {
+            commands::skills::remove(&name).await?;
+            Ok(0)
+        }
+    }
+}
+
+async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
+    match command {
+        Commands::Tui => run_tui().await,
+        Commands::Start => Ok(run_stub("Starting")),
+        Commands::Stop => Ok(run_stub("Stopping")),
+        Commands::Chat => Ok(commands::chat::run().await?),
+        Commands::Doctor => Ok(commands::doctor::run().await?),
         Commands::Config => {
             commands::config::run().await?;
-            0
+            Ok(0)
         }
-        Commands::Audit { command } => match command {
-            AuditCommands::Show { limit } => {
-                commands::audit::show(limit).await?;
-                0
-            }
-            AuditCommands::Verify => commands::audit::verify().await?,
-        },
-        Commands::Skill { command } => match command {
-            SkillCommands::List => {
-                commands::skills::list().await?;
-                0
-            }
-            SkillCommands::Install { path } => {
-                commands::skills::install(&path).await?;
-                0
-            }
-            SkillCommands::Remove { name } => {
-                commands::skills::remove(&name).await?;
-                0
-            }
-        },
+        Commands::Audit { command } => dispatch_audit(command).await,
+        Commands::Skill { command } => dispatch_skill(command).await,
         Commands::OauthBridge {
             listen,
             auth_url,
@@ -214,7 +216,7 @@ async fn main() -> anyhow::Result<()> {
                 client_secret,
                 scope,
             };
-            commands::oauth_bridge::run(options).await?
+            commands::oauth_bridge::run(options).await
         }
         Commands::EvalDeterminism {
             mode,
@@ -230,9 +232,15 @@ async fn main() -> anyhow::Result<()> {
                 update_baseline,
                 fail_on_regression,
             };
-            commands::eval_harness::run(options)?
+            Ok(commands::eval_harness::run(options)?)
         }
-    };
+    }
+}
 
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt::init();
+    let cli = Cli::parse();
+    let exit_code = dispatch_command(cli.command.unwrap_or(Commands::Tui)).await?;
     std::process::exit(exit_code);
 }

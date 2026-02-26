@@ -109,6 +109,7 @@ enum IterationStep {
 const REASONING_OUTPUT_TOKEN_HEURISTIC: u64 = 192;
 const TOOL_SYNTHESIS_TOKEN_HEURISTIC: u64 = 320;
 const DEFAULT_LLM_ACTION_COST_CENTS: u64 = 2;
+const REASONING_SYSTEM_PROMPT: &str = "You are Citros, an autonomous assistant kernel. Reason step output MUST be JSON. Return one ReasonedIntent with action, rationale, confidence, expected_outcome (optional), and sub_goals.";
 
 const VERIFICATION_CONFIDENCE_CLEAN: f64 = 0.9;
 const VERIFICATION_CONFIDENCE_SINGLE_DISCREPANCY: f64 = 0.45;
@@ -329,7 +330,7 @@ impl LoopEngine {
         perception: &ProcessedPerception,
         llm: &dyn LlmProvider,
     ) -> Result<ReasonedIntent, LoopError> {
-        let system_prompt = "You are Citros, an autonomous assistant kernel. Reason step output MUST be JSON. Return one ReasonedIntent with action, rationale, confidence, expected_outcome (optional), and sub_goals.";
+        let system_prompt = REASONING_SYSTEM_PROMPT;
         let context_messages = perception
             .context_window
             .iter()

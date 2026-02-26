@@ -878,16 +878,9 @@ async fn start_oauth_callback_server(
                 .await
                 .map_err(|e| TuiError::Auth(format!("failed to read request: {e}")))?;
             let request = String::from_utf8_lossy(&buf[..n]);
+            let (path, query) = parse_oauth_callback_request(&request)?;
 
-            // Extract the path from "GET /auth/callback?code=...&state=... HTTP/1.1"
-            let path = request
-                .lines()
-                .next()
-                .and_then(|line| line.split_whitespace().nth(1))
-                .ok_or_else(|| TuiError::Auth("malformed HTTP request".to_string()))?;
-
-            let (path_only, query) = path.split_once('?').map_or((path, ""), |(p, q)| (p, q));
-            if path_only != "/auth/callback" {
+            if path != "/auth/callback" {
                 let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot found";
                 if let Err(error) = stream.write_all(response.as_bytes()).await {
                     eprintln!("oauth callback write failed: {error}");
@@ -895,42 +888,7 @@ async fn start_oauth_callback_server(
                 continue;
             }
 
-            // Parse query params from the path
-
-            let params: std::collections::HashMap<&str, &str> = query
-                .split('&')
-                .filter_map(|pair| pair.split_once('='))
-                .collect();
-
-            let decode_param = |key: &str| -> Result<String, TuiError> {
-                let value = params
-                    .get(key)
-                    .ok_or_else(|| TuiError::Auth(format!("callback missing {key} parameter")))?;
-
-                urlencoding::decode(value)
-                    .map(|decoded| decoded.into_owned())
-                    .map_err(|e| {
-                        TuiError::Auth(format!(
-                            "callback {key} was not valid percent-encoding: {e}"
-                        ))
-                    })
-            };
-
-            // Validate state (after percent-decoding)
-            let returned_state = decode_param("state")?;
-            if returned_state != state {
-                let response =
-                    "HTTP/1.1 400 Bad Request\r\nContent-Length: 14\r\n\r\nState mismatch";
-                if let Err(error) = stream.write_all(response.as_bytes()).await {
-                    eprintln!("oauth callback write failed: {error}");
-                }
-                return Err(TuiError::Auth("OAuth state mismatch".to_string()));
-            }
-
-            // Extract code (after percent-decoding)
-            let code = decode_param("code")?;
-
-            // Send success page
+            let code = validate_and_extract_code(query, &state)?;
             let body = OAUTH_SUCCESS_HTML;
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\r\n{}",
@@ -944,6 +902,46 @@ async fn start_oauth_callback_server(
             return Ok(code);
         }
     })
+}
+
+fn parse_oauth_callback_request(request: &str) -> Result<(&str, &str), TuiError> {
+    let path = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .ok_or_else(|| TuiError::Auth("malformed HTTP request".to_string()))?;
+
+    Ok(path
+        .split_once('?')
+        .map_or((path, ""), |(parsed_path, query)| (parsed_path, query)))
+}
+
+fn validate_and_extract_code(query: &str, expected_state: &str) -> Result<String, TuiError> {
+    let params: std::collections::HashMap<&str, &str> = query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .collect();
+
+    let decode_param = |key: &str| -> Result<String, TuiError> {
+        let value = params
+            .get(key)
+            .ok_or_else(|| TuiError::Auth(format!("callback missing {key} parameter")))?;
+
+        urlencoding::decode(value)
+            .map(|decoded| decoded.into_owned())
+            .map_err(|error| {
+                TuiError::Auth(format!(
+                    "callback {key} was not valid percent-encoding: {error}"
+                ))
+            })
+    };
+
+    let returned_state = decode_param("state")?;
+    if returned_state != expected_state {
+        return Err(TuiError::Auth("OAuth state mismatch".to_string()));
+    }
+
+    decode_param("code")
 }
 
 fn openai_oauth_token_endpoint() -> String {
@@ -986,24 +984,28 @@ async fn exchange_oauth_code_for_tokens(
         .map_err(|error| TuiError::Auth(format!("failed to read OAuth token response: {error}")))?;
 
     if !status.is_success() {
-        let reason = serde_json::from_str::<serde_json::Value>(&body)
-            .ok()
-            .and_then(|json| {
-                json.get("error_description")
-                    .or_else(|| json.get("error"))
-                    .and_then(|value| value.as_str())
-                    .map(ToString::to_string)
-            })
-            .unwrap_or_else(|| "token endpoint request failed".to_string());
-
-        return Err(TuiError::Auth(format!(
-            "oauth token exchange failed ({}): {reason}",
-            status.as_u16()
-        )));
+        return Err(parse_token_error_response(status, &body));
     }
 
     serde_json::from_str::<TokenResponse>(&body)
         .map_err(|error| TuiError::Auth(format!("oauth token response was invalid JSON: {error}")))
+}
+
+fn parse_token_error_response(status: reqwest::StatusCode, body: &str) -> TuiError {
+    let reason = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|json| {
+            json.get("error_description")
+                .or_else(|| json.get("error"))
+                .and_then(|value| value.as_str())
+                .map(ToString::to_string)
+        })
+        .unwrap_or_else(|| "token endpoint request failed".to_string());
+
+    TuiError::Auth(format!(
+        "oauth token exchange failed ({}): {reason}",
+        status.as_u16()
+    ))
 }
 
 async fn catalog_models_for_auth(
@@ -1064,48 +1066,14 @@ fn register_auth_provider_with_models(
     auth_method: &AuthMethod,
     supported_models: Vec<String>,
 ) -> Result<(), TuiError> {
-    let supported_models = if supported_models.is_empty() {
-        default_supported_models(auth_method)
-    } else {
-        supported_models
-    };
+    let models = ensure_supported_models(auth_method, supported_models);
 
     match auth_method {
         AuthMethod::SetupToken { token } => {
-            let provider =
-                AnthropicProvider::new(base_url_for_provider("anthropic"), token.clone())
-                    .map_err(|error| {
-                        TuiError::Router(format!("failed to configure Anthropic provider: {error}"))
-                    })?
-                    .with_supported_models(supported_models);
-
-            router.register_provider_with_auth(Box::new(provider), "subscription");
+            register_setup_token_provider(router, token, models)?;
         }
         AuthMethod::ApiKey { provider, key } => {
-            if provider == "anthropic" {
-                let anthropic_provider =
-                    AnthropicProvider::new(base_url_for_provider("anthropic"), key.clone())
-                        .map_err(|error| {
-                            TuiError::Router(format!(
-                                "failed to configure Anthropic provider: {error}"
-                            ))
-                        })?
-                        .with_supported_models(supported_models);
-
-                router.register_provider_with_auth(Box::new(anthropic_provider), "api_key");
-            } else {
-                let provider_client =
-                    OpenAiProvider::new(base_url_for_provider(provider), key.clone())
-                        .map_err(|error| {
-                            TuiError::Router(format!(
-                                "failed to configure {provider} provider: {error}"
-                            ))
-                        })?
-                        .with_name(provider.clone())
-                        .with_supported_models(supported_models);
-
-                router.register_provider_with_auth(Box::new(provider_client), "api_key");
-            }
+            register_api_key_provider(router, provider, key, models)?;
         }
         AuthMethod::OAuth {
             provider,
@@ -1113,33 +1081,99 @@ fn register_auth_provider_with_models(
             account_id,
             ..
         } => {
-            if let Some(acct_id) = account_id {
-                let provider_client =
-                    OpenAiResponsesProvider::new(access_token.clone(), acct_id.clone())
-                        .map_err(|error| {
-                            TuiError::Router(format!(
-                                "failed to configure {provider} Responses provider: {error}"
-                            ))
-                        })?
-                        .with_supported_models(supported_models);
-
-                router.register_provider_with_auth(Box::new(provider_client), "subscription");
-            } else {
-                let provider_client =
-                    OpenAiProvider::new(base_url_for_provider(provider), access_token.clone())
-                        .map_err(|error| {
-                            TuiError::Router(format!(
-                                "failed to configure {provider} provider: {error}"
-                            ))
-                        })?
-                        .with_name(provider.clone())
-                        .with_supported_models(supported_models);
-
-                router.register_provider_with_auth(Box::new(provider_client), "subscription");
-            }
+            register_oauth_provider(
+                router,
+                provider,
+                access_token,
+                account_id.as_deref(),
+                models,
+            )?;
         }
     }
 
+    Ok(())
+}
+
+fn ensure_supported_models(auth_method: &AuthMethod, supported_models: Vec<String>) -> Vec<String> {
+    if supported_models.is_empty() {
+        default_supported_models(auth_method)
+    } else {
+        supported_models
+    }
+}
+
+fn register_setup_token_provider(
+    router: &mut ModelRouter,
+    token: &str,
+    supported_models: Vec<String>,
+) -> Result<(), TuiError> {
+    let provider = AnthropicProvider::new(base_url_for_provider("anthropic"), token.to_string())
+        .map_err(|error| {
+            TuiError::Router(format!("failed to configure Anthropic provider: {error}"))
+        })?
+        .with_supported_models(supported_models);
+
+    router.register_provider_with_auth(Box::new(provider), "subscription");
+    Ok(())
+}
+
+fn register_api_key_provider(
+    router: &mut ModelRouter,
+    provider: &str,
+    key: &str,
+    supported_models: Vec<String>,
+) -> Result<(), TuiError> {
+    if provider == "anthropic" {
+        let anthropic = AnthropicProvider::new(base_url_for_provider("anthropic"), key.to_string())
+            .map_err(|error| {
+                TuiError::Router(format!("failed to configure Anthropic provider: {error}"))
+            })?
+            .with_supported_models(supported_models);
+        router.register_provider_with_auth(Box::new(anthropic), "api_key");
+        return Ok(());
+    }
+
+    let provider_client = OpenAiProvider::new(base_url_for_provider(provider), key.to_string())
+        .map_err(|error| {
+            TuiError::Router(format!("failed to configure {provider} provider: {error}"))
+        })?
+        .with_name(provider.to_string())
+        .with_supported_models(supported_models);
+
+    router.register_provider_with_auth(Box::new(provider_client), "api_key");
+    Ok(())
+}
+
+fn register_oauth_provider(
+    router: &mut ModelRouter,
+    provider: &str,
+    access_token: &str,
+    account_id: Option<&str>,
+    supported_models: Vec<String>,
+) -> Result<(), TuiError> {
+    if let Some(account_id) = account_id {
+        let provider_client =
+            OpenAiResponsesProvider::new(access_token.to_string(), account_id.to_string())
+                .map_err(|error| {
+                    TuiError::Router(format!(
+                        "failed to configure {provider} Responses provider: {error}"
+                    ))
+                })?
+                .with_supported_models(supported_models);
+
+        router.register_provider_with_auth(Box::new(provider_client), "subscription");
+        return Ok(());
+    }
+
+    let provider_client =
+        OpenAiProvider::new(base_url_for_provider(provider), access_token.to_string())
+            .map_err(|error| {
+                TuiError::Router(format!("failed to configure {provider} provider: {error}"))
+            })?
+            .with_name(provider.to_string())
+            .with_supported_models(supported_models);
+
+    router.register_provider_with_auth(Box::new(provider_client), "subscription");
     Ok(())
 }
 
@@ -1737,6 +1771,35 @@ mod tests {
         assert!(
             matches!(error, TuiError::Io(io_error) if io_error.to_string().contains("write failed"))
         );
+    }
+
+    #[test]
+    fn parse_oauth_callback_request_extracts_path_and_query() {
+        let request =
+            "GET /auth/callback?code=abc123&state=xyz HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let (path, query) = parse_oauth_callback_request(request).expect("request should parse");
+
+        assert_eq!(path, "/auth/callback");
+        assert_eq!(query, "code=abc123&state=xyz");
+    }
+
+    #[test]
+    fn validate_and_extract_code_rejects_state_mismatch() {
+        let error = validate_and_extract_code("code=abc123&state=wrong", "expected")
+            .expect_err("state mismatch should fail");
+
+        assert!(matches!(error, TuiError::Auth(message) if message.contains("state mismatch")));
+    }
+
+    #[test]
+    fn parse_token_error_response_uses_error_description_when_present() {
+        let status = reqwest::StatusCode::BAD_REQUEST;
+        let error = parse_token_error_response(
+            status,
+            r#"{"error":"invalid_grant","error_description":"bad code"}"#,
+        );
+
+        assert!(matches!(error, TuiError::Auth(message) if message.contains("bad code")));
     }
 
     #[test]
