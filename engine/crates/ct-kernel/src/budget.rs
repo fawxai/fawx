@@ -124,9 +124,7 @@ impl BudgetTracker {
     /// Record an action cost as consumed budget.
     pub fn record(&mut self, cost: &ActionCost) {
         self.llm_calls = self.llm_calls.saturating_add(cost.llm_calls);
-        self.tool_invocations = self
-            .tool_invocations
-            .saturating_add(cost.tool_invocations);
+        self.tool_invocations = self.tool_invocations.saturating_add(cost.tool_invocations);
         self.tokens_used = self.tokens_used.saturating_add(cost.tokens);
         self.cost_cents = self.cost_cents.saturating_add(cost.cost_cents);
     }
@@ -334,16 +332,18 @@ pub fn estimate_cost(action: &IntendedAction) -> ActionCost {
             tokens: DEFAULT_LLM_CALL_TOKENS,
             cost_cents: DEFAULT_LLM_CALL_COST_CENTS + DEFAULT_TOOL_INVOCATION_COST_CENTS,
         },
-        IntendedAction::Composite(actions) => actions.iter().fold(ActionCost::default(), |mut acc, item| {
-            let estimate = estimate_cost(item);
-            acc.llm_calls = acc.llm_calls.saturating_add(estimate.llm_calls);
-            acc.tool_invocations = acc
-                .tool_invocations
-                .saturating_add(estimate.tool_invocations);
-            acc.tokens = acc.tokens.saturating_add(estimate.tokens);
-            acc.cost_cents = acc.cost_cents.saturating_add(estimate.cost_cents);
-            acc
-        }),
+        IntendedAction::Composite(actions) => {
+            actions.iter().fold(ActionCost::default(), |mut acc, item| {
+                let estimate = estimate_cost(item);
+                acc.llm_calls = acc.llm_calls.saturating_add(estimate.llm_calls);
+                acc.tool_invocations = acc
+                    .tool_invocations
+                    .saturating_add(estimate.tool_invocations);
+                acc.tokens = acc.tokens.saturating_add(estimate.tokens);
+                acc.cost_cents = acc.cost_cents.saturating_add(estimate.cost_cents);
+                acc
+            })
+        }
     }
 }
 
