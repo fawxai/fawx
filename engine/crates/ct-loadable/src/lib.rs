@@ -12,11 +12,11 @@
 //! - **templates** — prompt template management
 //! - **ab_slots** — A/B slot lifecycle (pending → active → fallback)
 
-pub mod ab_slots;
-pub mod config;
-pub mod skills;
-pub mod strategies;
-pub mod templates;
+pub(crate) mod ab_slots;
+pub(crate) mod config;
+pub(crate) mod skills;
+pub(crate) mod strategies;
+pub(crate) mod templates;
 
 /// A strategy identifier for A/B slot management.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -33,4 +33,18 @@ pub enum SlotState {
         pending: StrategyId,
         tasks_evaluated: u32,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn stub_modules_track_shared_implementation_issue() {
+        let expected = "https://github.com/abbudjoe/citros/issues/860";
+
+        assert!(include_str!("ab_slots.rs").contains(expected));
+        assert!(include_str!("config.rs").contains(expected));
+        assert!(include_str!("skills.rs").contains(expected));
+        assert!(include_str!("strategies.rs").contains(expected));
+        assert!(include_str!("templates.rs").contains(expected));
+    }
 }
