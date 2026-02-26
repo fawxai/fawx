@@ -79,10 +79,14 @@ impl TuiApp {
             }
 
             if input.starts_with('/') {
-                self.handle_command(input).await?;
+                if let Err(error) = self.handle_command(input).await {
+                    println!("\x1b[31mError: {error}\x1b[0m\n");
+                }
             } else {
-                let response = self.handle_message(input).await?;
-                self.display_response(&response);
+                match self.handle_message(input).await {
+                    Ok(response) => self.display_response(&response),
+                    Err(error) => println!("\x1b[31mError: {error}\x1b[0m\n"),
+                }
             }
         }
 
