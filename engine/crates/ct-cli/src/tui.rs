@@ -108,7 +108,11 @@ impl TuiApp {
     /// Run the first-time auth wizard if no credentials exist.
     async fn auth_wizard(&mut self) -> Result<(), TuiError> {
         println!("Welcome to Citros.\n");
-        println!("No credentials found. Let's set up authentication.\n");
+        if self.auth_manager.providers().is_empty() {
+            println!("No credentials found. Let's set up authentication.\n");
+        } else {
+            println!("Add another provider.\n");
+        }
 
         println!("How would you like to authenticate?");
         println!("  [1] Claude subscription (paste setup-token)");
