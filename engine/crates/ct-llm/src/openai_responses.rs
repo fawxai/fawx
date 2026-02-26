@@ -24,6 +24,7 @@ pub struct OpenAiResponsesProvider {
     base_url: String,
     access_token: String,
     account_id: String,
+    provider_name: String,
     supported_models: Vec<String>,
     client: reqwest::Client,
 }
@@ -57,6 +58,7 @@ impl OpenAiResponsesProvider {
             base_url: DEFAULT_CODEX_BASE_URL.to_string(),
             access_token,
             account_id,
+            provider_name: "openai".to_string(),
             supported_models: Vec::new(),
             client,
         })
@@ -309,7 +311,7 @@ impl OpenAiResponsesProvider {
 #[async_trait]
 impl LlmProvider for OpenAiResponsesProvider {
     fn name(&self) -> &str {
-        "openai-responses"
+        &self.provider_name
     }
 
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
