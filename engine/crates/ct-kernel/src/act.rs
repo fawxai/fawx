@@ -1,7 +1,7 @@
 //! Act-step execution result types.
 
-use async_trait::async_trait;
 use crate::decide::Decision;
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 /// Token accounting for loop steps that call an LLM.

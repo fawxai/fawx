@@ -381,8 +381,8 @@ fn pkce_challenge(code_verifier: &str) -> String {
 mod tests {
     use super::{
         extract_openai_account_id, percent_encode, pkce_challenge, random_bytes_with_fill,
-        AuthError, PkceFlow, OPENAI_JWT_CLAIM_PATH, TokenExchangeRequest, TokenRefreshRequest,
-        TokenResponse,
+        AuthError, PkceFlow, TokenExchangeRequest, TokenRefreshRequest, TokenResponse,
+        OPENAI_JWT_CLAIM_PATH,
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 

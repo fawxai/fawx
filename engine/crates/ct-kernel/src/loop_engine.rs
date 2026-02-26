@@ -1,8 +1,6 @@
 //! Agentic loop orchestrator.
 
-use crate::act::{
-    ActionResult, StubToolExecutor, TokenUsage, ToolExecutor, ToolResult,
-};
+use crate::act::{ActionResult, StubToolExecutor, TokenUsage, ToolExecutor, ToolResult};
 use crate::budget::{ActionCost, BudgetRemaining, BudgetTracker};
 use crate::context_manager::ContextCompactor;
 use crate::continuation::Continuation;
@@ -124,12 +122,7 @@ const VERIFICATION_CONFIDENCE_MULTIPLE_DISCREPANCIES: f64 = 0.25;
 impl LoopEngine {
     /// Create a new loop engine with budget + context managers.
     pub fn new(budget: BudgetTracker, context: ContextCompactor, max_iterations: u32) -> Self {
-        Self::new_with_executor(
-            budget,
-            context,
-            max_iterations,
-            Arc::new(StubToolExecutor),
-        )
+        Self::new_with_executor(budget, context, max_iterations, Arc::new(StubToolExecutor))
     }
 
     /// Create a loop engine with an injected tool executor.
@@ -513,13 +506,17 @@ impl LoopEngine {
         calls: &[ct_llm::ToolCall],
         llm: &dyn LlmProvider,
     ) -> Result<ActionResult, LoopError> {
-        let tool_results = self.tool_executor.execute_tools(calls).await.map_err(|error| {
-            loop_error(
-                "act",
-                &format!("tool execution failed: {}", error.message),
-                error.recoverable,
-            )
-        })?;
+        let tool_results = self
+            .tool_executor
+            .execute_tools(calls)
+            .await
+            .map_err(|error| {
+                loop_error(
+                    "act",
+                    &format!("tool execution failed: {}", error.message),
+                    error.recoverable,
+                )
+            })?;
         let synthesis_prompt = tool_synthesis_prompt(&tool_results);
         let llm_text = self.generate_tool_summary(&synthesis_prompt, llm).await?;
         let usage = synthesis_usage(&synthesis_prompt, &llm_text);
@@ -696,11 +693,10 @@ fn tool_synthesis_prompt(tool_results: &[ToolResult]) -> String {
     )
 }
 
-
 fn join_streamed_chunks(chunks: &Arc<Mutex<Vec<String>>>) -> Result<String, LoopError> {
-    let parts = chunks.lock().map_err(|_| {
-        loop_error("act", "tool synthesis stream collection failed", true)
-    })?;
+    let parts = chunks
+        .lock()
+        .map_err(|_| loop_error("act", "tool synthesis stream collection failed", true))?;
     Ok(parts.join(""))
 }
 
