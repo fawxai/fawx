@@ -5,8 +5,7 @@
 //! This is the wire format used by ChatGPT Plus/Pro subscriptions via OAuth tokens.
 
 use async_trait::async_trait;
-use bytes::Bytes;
-use futures::{stream, Stream, StreamExt};
+use futures::{stream, StreamExt};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -14,8 +13,7 @@ use std::{collections::VecDeque, time::Duration};
 
 use crate::provider::{CompletionStream, LlmProvider};
 use crate::types::{
-    CompletionRequest, CompletionResponse, ContentBlock, LlmError, Message, MessageRole,
-    StreamChunk, Usage,
+    CompletionRequest, CompletionResponse, ContentBlock, LlmError, MessageRole, StreamChunk, Usage,
 };
 
 const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
@@ -111,12 +109,12 @@ impl OpenAiResponsesProvider {
                 MessageRole::System => {
                     // System messages go into instructions, skip here
                 }
-                MessageRole::User => {
+                MessageRole::User | MessageRole::Tool => {
                     let text = extract_text(&message.content);
                     if !text.is_empty() {
                         input.push(ResponsesMessage {
                             role: "user".to_string(),
-                            content: ResponsesContent::Text(text),
+                            content: text,
                         });
                     }
                 }
@@ -125,28 +123,16 @@ impl OpenAiResponsesProvider {
                     if !text.is_empty() {
                         input.push(ResponsesMessage {
                             role: "assistant".to_string(),
-                            content: ResponsesContent::Text(text),
-                        });
-                    }
-                }
-                MessageRole::Tool => {
-                    let text = extract_text(&message.content);
-                    if !text.is_empty() {
-                        input.push(ResponsesMessage {
-                            role: "user".to_string(),
-                            content: ResponsesContent::Text(text),
+                            content: text,
                         });
                     }
                 }
             }
         }
 
-        // Build system instructions from system prompt + system messages
-        let instructions = request.system_prompt.clone();
-
         Ok(ResponsesRequestBody {
             model: request.model.clone(),
-            instructions,
+            instructions: request.system_prompt.clone(),
             input,
             stream,
             store: false,
@@ -178,10 +164,156 @@ impl OpenAiResponsesProvider {
             _ => LlmError::Request(format!("http {}: {body}", status.as_u16())),
         }
     }
+
+    fn parse_response(body: ResponsesResponseBody) -> CompletionResponse {
+        let mut text_parts = Vec::new();
+
+        for item in &body.output {
+            if let Some(content) = &item.content {
+                for part in content {
+                    if part.r#type == "output_text" {
+                        if let Some(text) = &part.text {
+                            text_parts.push(text.clone());
+                        }
+                    }
+                }
+            }
+            if let Some(text) = &item.text {
+                text_parts.push(text.clone());
+            }
+        }
+
+        let response_text = text_parts.join("");
+
+        CompletionResponse {
+            content: vec![ContentBlock::Text(response_text)],
+            usage: body.usage.map(|u| Usage {
+                input_tokens: u.input_tokens.unwrap_or(0) as u32,
+                output_tokens: u.output_tokens.unwrap_or(0) as u32,
+            }),
+            stop_reason: body.status,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    fn stream_from_sse(
+        response: reqwest::Response,
+    ) -> impl futures::Stream<Item = Result<StreamChunk, LlmError>> {
+        let byte_stream = response.bytes_stream();
+        let buffer = String::new();
+        let pending: VecDeque<Result<StreamChunk, LlmError>> = VecDeque::new();
+        let done = false;
+
+        stream::unfold(
+            (byte_stream, buffer, pending, done),
+            move |(mut byte_stream, mut buffer, mut pending, mut done)| async move {
+                loop {
+                    if let Some(item) = pending.pop_front() {
+                        return Some((item, (byte_stream, buffer, pending, done)));
+                    }
+
+                    if done {
+                        return None;
+                    }
+
+                    match byte_stream.next().await {
+                        Some(Ok(bytes)) => {
+                            buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+                            while let Some(event_end) = buffer.find("\n\n") {
+                                let event_str = buffer[..event_end].to_string();
+                                buffer = buffer[event_end + 2..].to_string();
+
+                                let mut event_type = String::new();
+                                let mut data = String::new();
+                                for line in event_str.lines() {
+                                    if let Some(val) = line.strip_prefix("event:") {
+                                        event_type = val.trim().to_string();
+                                    } else if let Some(val) = line.strip_prefix("data:") {
+                                        data = val.trim().to_string();
+                                    }
+                                }
+
+                                if data == "[DONE]" {
+                                    done = true;
+                                    break;
+                                }
+
+                                if data.is_empty() {
+                                    continue;
+                                }
+
+                                match event_type.as_str() {
+                                    "response.output_text.delta" => {
+                                        if let Ok(parsed) =
+                                            serde_json::from_str::<SseTextDelta>(&data)
+                                        {
+                                            pending.push_back(Ok(StreamChunk {
+                                                delta_content: Some(parsed.delta),
+                                                ..Default::default()
+                                            }));
+                                        }
+                                    }
+                                    "response.completed" | "response.done" => {
+                                        if let Ok(parsed) =
+                                            serde_json::from_str::<SseResponseDone>(&data)
+                                        {
+                                            if let Some(usage) =
+                                                parsed.response.and_then(|r| r.usage)
+                                            {
+                                                pending.push_back(Ok(StreamChunk {
+                                                    usage: Some(Usage {
+                                                        input_tokens: usage
+                                                            .input_tokens
+                                                            .unwrap_or(0)
+                                                            as u32,
+                                                        output_tokens: usage
+                                                            .output_tokens
+                                                            .unwrap_or(0)
+                                                            as u32,
+                                                    }),
+                                                    stop_reason: Some("stop".to_string()),
+                                                    ..Default::default()
+                                                }));
+                                            }
+                                        }
+                                        done = true;
+                                    }
+                                    "response.failed" => {
+                                        if let Ok(parsed) = serde_json::from_str::<Value>(&data) {
+                                            let msg = parsed
+                                                .pointer("/response/error/message")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("response failed")
+                                                .to_string();
+                                            pending.push_back(Err(LlmError::Provider(msg)));
+                                        }
+                                        done = true;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        Some(Err(e)) => {
+                            pending.push_back(Err(LlmError::Request(e.to_string())));
+                            done = true;
+                        }
+                        None => {
+                            done = true;
+                        }
+                    }
+                }
+            },
+        )
+    }
 }
 
 #[async_trait]
 impl LlmProvider for OpenAiResponsesProvider {
+    fn name(&self) -> &str {
+        "openai-responses"
+    }
+
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
         let body = self.build_request_body(&request, false)?;
 
@@ -244,162 +376,6 @@ impl LlmProvider for OpenAiResponsesProvider {
     }
 }
 
-impl OpenAiResponsesProvider {
-    fn parse_response(body: ResponsesResponseBody) -> CompletionResponse {
-        let mut text_parts = Vec::new();
-
-        for item in &body.output {
-            if let Some(content) = &item.content {
-                for part in content {
-                    if part.r#type == "output_text" {
-                        if let Some(text) = &part.text {
-                            text_parts.push(text.clone());
-                        }
-                    }
-                }
-            }
-            // Also check top-level text field
-            if let Some(text) = &item.text {
-                text_parts.push(text.clone());
-            }
-        }
-
-        let response_text = text_parts.join("");
-
-        CompletionResponse {
-            content: vec![ContentBlock::Text(response_text)],
-            usage: body.usage.map(|u| Usage {
-                input_tokens: u.input_tokens.unwrap_or(0),
-                output_tokens: u.output_tokens.unwrap_or(0),
-                cache_read_tokens: 0,
-                cache_creation_tokens: 0,
-                total_tokens: u.total_tokens.unwrap_or(0),
-            }),
-            model: body.model,
-            stop_reason: body.status,
-            tool_calls: Vec::new(),
-        }
-    }
-
-    fn stream_from_sse(
-        response: reqwest::Response,
-    ) -> impl Stream<Item = Result<StreamChunk, LlmError>> {
-        let byte_stream = response.bytes_stream();
-        let mut buffer = String::new();
-        let mut pending: VecDeque<Result<StreamChunk, LlmError>> = VecDeque::new();
-        let mut done = false;
-
-        stream::unfold(
-            (byte_stream, buffer, pending, done),
-            move |(mut byte_stream, mut buffer, mut pending, mut done)| async move {
-                loop {
-                    // Drain pending events first
-                    if let Some(item) = pending.pop_front() {
-                        return Some((item, (byte_stream, buffer, pending, done)));
-                    }
-
-                    if done {
-                        return None;
-                    }
-
-                    // Read more bytes
-                    match byte_stream.next().await {
-                        Some(Ok(bytes)) => {
-                            buffer.push_str(&String::from_utf8_lossy(&bytes));
-
-                            // Parse SSE events from buffer
-                            while let Some(event_end) = buffer.find("\n\n") {
-                                let event_str = buffer[..event_end].to_string();
-                                buffer = buffer[event_end + 2..].to_string();
-
-                                // Parse "event:" and "data:" lines
-                                let mut event_type = String::new();
-                                let mut data = String::new();
-                                for line in event_str.lines() {
-                                    if let Some(val) = line.strip_prefix("event:") {
-                                        event_type = val.trim().to_string();
-                                    } else if let Some(val) = line.strip_prefix("data:") {
-                                        data = val.trim().to_string();
-                                    }
-                                }
-
-                                if data == "[DONE]" {
-                                    done = true;
-                                    break;
-                                }
-
-                                if data.is_empty() {
-                                    continue;
-                                }
-
-                                // Parse the SSE data
-                                match event_type.as_str() {
-                                    "response.output_text.delta" => {
-                                        if let Ok(parsed) =
-                                            serde_json::from_str::<SseTextDelta>(&data)
-                                        {
-                                            pending.push_back(Ok(StreamChunk::Delta(
-                                                parsed.delta,
-                                            )));
-                                        }
-                                    }
-                                    "response.completed" | "response.done" => {
-                                        if let Ok(parsed) =
-                                            serde_json::from_str::<SseResponseDone>(&data)
-                                        {
-                                            if let Some(usage) = parsed.response.and_then(|r| r.usage) {
-                                                pending.push_back(Ok(StreamChunk::Usage(
-                                                    Usage {
-                                                        input_tokens: usage
-                                                            .input_tokens
-                                                            .unwrap_or(0),
-                                                        output_tokens: usage
-                                                            .output_tokens
-                                                            .unwrap_or(0),
-                                                        cache_read_tokens: 0,
-                                                        cache_creation_tokens: 0,
-                                                        total_tokens: usage
-                                                            .total_tokens
-                                                            .unwrap_or(0),
-                                                    },
-                                                )));
-                                            }
-                                        }
-                                        done = true;
-                                    }
-                                    "response.failed" => {
-                                        if let Ok(parsed) =
-                                            serde_json::from_str::<Value>(&data)
-                                        {
-                                            let msg = parsed
-                                                .pointer("/response/error/message")
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or("response failed")
-                                                .to_string();
-                                            pending.push_back(Err(LlmError::Provider(msg)));
-                                        }
-                                        done = true;
-                                    }
-                                    _ => {
-                                        // Ignore other event types
-                                    }
-                                }
-                            }
-                        }
-                        Some(Err(e)) => {
-                            pending.push_back(Err(LlmError::Request(e.to_string())));
-                            done = true;
-                        }
-                        None => {
-                            done = true;
-                        }
-                    }
-                }
-            },
-        )
-    }
-}
-
 // ============================================================================
 // Request/Response types
 // ============================================================================
@@ -419,21 +395,13 @@ struct ResponsesRequestBody {
 #[derive(Serialize)]
 struct ResponsesMessage {
     role: String,
-    content: ResponsesContent,
-}
-
-#[derive(Serialize)]
-#[serde(untagged)]
-enum ResponsesContent {
-    Text(String),
+    content: String,
 }
 
 #[derive(Deserialize)]
 struct ResponsesResponseBody {
     #[serde(default)]
     output: Vec<ResponsesOutputItem>,
-    #[serde(default)]
-    model: Option<String>,
     #[serde(default)]
     status: Option<String>,
     #[serde(default)]
@@ -459,7 +427,6 @@ struct ResponsesContentPart {
 struct ResponsesUsage {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
-    total_tokens: Option<u64>,
 }
 
 // SSE event types
@@ -499,16 +466,13 @@ mod tests {
 
     #[test]
     fn endpoint_resolves_correctly() {
-        let provider =
-            OpenAiResponsesProvider::new("test-token", "test-account").unwrap();
+        let provider = OpenAiResponsesProvider::new("test-token", "test-account").unwrap();
         assert_eq!(
             provider.endpoint(),
             "https://chatgpt.com/backend-api/codex/responses"
         );
 
-        let custom = provider
-            .clone()
-            .with_base_url("https://example.com/api");
+        let custom = provider.clone().with_base_url("https://example.com/api");
         assert_eq!(
             custom.endpoint(),
             "https://example.com/api/codex/responses"
@@ -533,12 +497,10 @@ mod tests {
                 }]),
                 text: None,
             }],
-            model: Some("gpt-4.1".to_string()),
             status: Some("completed".to_string()),
             usage: Some(ResponsesUsage {
                 input_tokens: Some(10),
                 output_tokens: Some(5),
-                total_tokens: Some(15),
             }),
         };
 
@@ -547,7 +509,6 @@ mod tests {
             response.content,
             vec![ContentBlock::Text("Hello from ChatGPT!".to_string())]
         );
-        assert_eq!(response.model, Some("gpt-4.1".to_string()));
         let usage = response.usage.unwrap();
         assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.output_tokens, 5);
@@ -555,17 +516,14 @@ mod tests {
 
     #[test]
     fn build_request_body_maps_messages() {
-        let provider =
-            OpenAiResponsesProvider::new("token", "account").unwrap();
+        let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
 
         let request = CompletionRequest {
             model: "gpt-4.1".to_string(),
-            messages: vec![
-                Message {
-                    role: MessageRole::User,
-                    content: vec![ContentBlock::Text("Hello".to_string())],
-                },
-            ],
+            messages: vec![crate::types::Message {
+                role: MessageRole::User,
+                content: vec![ContentBlock::Text("Hello".to_string())],
+            }],
             system_prompt: Some("You are helpful.".to_string()),
             tools: vec![],
             temperature: None,
@@ -588,8 +546,7 @@ mod tests {
 
     #[test]
     fn headers_include_account_id_and_beta() {
-        let provider =
-            OpenAiResponsesProvider::new("token", "acct_123").unwrap();
+        let provider = OpenAiResponsesProvider::new("token", "acct_123").unwrap();
         let headers = provider.build_headers();
         assert_eq!(headers.get("chatgpt-account-id").unwrap(), "acct_123");
         assert_eq!(
