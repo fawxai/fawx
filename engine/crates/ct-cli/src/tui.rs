@@ -86,9 +86,8 @@ impl TuiApp {
                     println!("\x1b[31mError: {error}\x1b[0m\n");
                 }
             } else {
-                match self.handle_message(input).await {
-                    Ok(response) => self.display_response(&response),
-                    Err(error) => println!("\x1b[31mError: {error}\x1b[0m\n"),
+                if let Err(error) = self.handle_message(input).await {
+                    println!("\x1b[31mError: {error}\x1b[0m\n");
                 }
             }
         }
@@ -362,32 +361,34 @@ impl TuiApp {
             ),
         };
 
-        let response = self
+        // Use streaming — required by the Codex Responses API, and gives
+        // better UX by printing tokens as they arrive.
+        use futures::StreamExt;
+        let mut stream = self
             .router
-            .complete(request)
+            .complete_stream(request)
             .await
             .map_err(|error| TuiError::Loop(error.to_string()))?;
 
-        let rendered = response
-            .content
-            .iter()
-            .map(|block| match block {
-                ContentBlock::Text { text } => text.clone(),
-                ContentBlock::ToolUse { name, .. } => {
-                    format!("[tool requested: {name}]")
+        let mut full_response = String::new();
+        print!("\x1b[36mAssistant\x1b[0m ");
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(chunk) => {
+                    if let Some(delta) = &chunk.delta_content {
+                        print!("{delta}");
+                        io::stdout().flush().map_err(TuiError::Io)?;
+                        full_response.push_str(delta);
+                    }
                 }
-                ContentBlock::ToolResult { tool_use_id, .. } => {
-                    format!("[tool result: {tool_use_id}]")
+                Err(error) => {
+                    println!();
+                    return Err(TuiError::Loop(error.to_string()));
                 }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        if rendered.is_empty() {
-            Ok("(No text response returned.)".to_string())
-        } else {
-            Ok(rendered)
+            }
         }
+        println!("\n");
+        Ok(full_response)
     }
 
     /// Display formatted output to the terminal.

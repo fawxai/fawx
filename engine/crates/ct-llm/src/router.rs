@@ -109,6 +109,31 @@ impl ModelRouter {
         request.model = active_model;
         provider.complete(request).await
     }
+
+    /// Send a streaming completion request to the active provider.
+    pub async fn complete_stream(
+        &self,
+        mut request: CompletionRequest,
+    ) -> Result<crate::provider::CompletionStream, crate::types::LlmError> {
+        let active_model = self.active_model.clone().ok_or_else(|| {
+            crate::types::LlmError::Config(RouterError::NoActiveModel.to_string())
+        })?;
+
+        let provider_name = self.model_to_provider.get(&active_model).ok_or_else(|| {
+            crate::types::LlmError::Config(
+                RouterError::ModelNotFound(active_model.clone()).to_string(),
+            )
+        })?;
+
+        let provider = self.providers.get(provider_name).ok_or_else(|| {
+            crate::types::LlmError::Provider(format!(
+                "provider '{provider_name}' was not registered"
+            ))
+        })?;
+
+        request.model = active_model;
+        provider.complete_stream(request).await
+    }
 }
 
 /// Metadata for an available model.
