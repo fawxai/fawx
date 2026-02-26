@@ -1577,9 +1577,7 @@ mod tests {
             &self,
             _request: CompletionRequest,
         ) -> Result<ct_llm::CompletionStream, ct_llm::ProviderError> {
-            Ok(Box::pin(futures::stream::iter(
-                self.chunks.clone().into_iter(),
-            )))
+            Ok(Box::pin(futures::stream::iter(self.chunks.clone())))
         }
 
         fn name(&self) -> &str {
