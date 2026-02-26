@@ -29,7 +29,7 @@ impl AnthropicAuthMode {
     /// Tokens starting with `sk-ant-oat` use Bearer auth; everything else uses x-api-key.
     pub fn detect(credential: impl Into<String>) -> Self {
         let cred = credential.into();
-        if cred.contains("sk-ant-oat") {
+        if cred.starts_with("sk-ant-oat") {
             Self::SetupToken(cred)
         } else {
             Self::ApiKey(cred)

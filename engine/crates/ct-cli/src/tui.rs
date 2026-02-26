@@ -665,59 +665,83 @@ async fn start_oauth_callback_server(
 
     let state = expected_state.to_string();
     Ok(async move {
-        // Wait up to 60 seconds for the callback
-        let accept = tokio::time::timeout(std::time::Duration::from_secs(60), listener.accept())
-            .await
-            .map_err(|_| TuiError::Auth("OAuth callback timed out (60s)".to_string()))?
-            .map_err(|e| TuiError::Auth(format!("failed to accept connection: {e}")))?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
 
-        let (mut stream, _addr) = accept;
-        let mut buf = vec![0u8; 4096];
-        let n = stream
-            .read(&mut buf)
-            .await
-            .map_err(|e| TuiError::Auth(format!("failed to read request: {e}")))?;
-        let request = String::from_utf8_lossy(&buf[..n]);
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(TuiError::Auth("OAuth callback timed out (60s)".to_string()));
+            }
 
-        // Extract the path from "GET /auth/callback?code=...&state=... HTTP/1.1"
-        let path = request
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .ok_or_else(|| TuiError::Auth("malformed HTTP request".to_string()))?;
+            let accept = tokio::time::timeout(deadline - now, listener.accept())
+                .await
+                .map_err(|_| TuiError::Auth("OAuth callback timed out (60s)".to_string()))?
+                .map_err(|e| TuiError::Auth(format!("failed to accept connection: {e}")))?;
 
-        // Parse query params from the path
-        let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
-        let params: std::collections::HashMap<&str, &str> = query
-            .split('&')
-            .filter_map(|pair| pair.split_once('='))
-            .collect();
+            let (mut stream, _addr) = accept;
+            let mut buf = vec![0u8; 4096];
+            let n = stream
+                .read(&mut buf)
+                .await
+                .map_err(|e| TuiError::Auth(format!("failed to read request: {e}")))?;
+            let request = String::from_utf8_lossy(&buf[..n]);
 
-        // Validate state
-        let returned_state = params
-            .get("state")
-            .ok_or_else(|| TuiError::Auth("callback missing state parameter".to_string()))?;
-        if *returned_state != state {
-            let response = "HTTP/1.1 400 Bad Request\r\nContent-Length: 14\r\n\r\nState mismatch";
+            // Extract the path from "GET /auth/callback?code=...&state=... HTTP/1.1"
+            let path = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .ok_or_else(|| TuiError::Auth("malformed HTTP request".to_string()))?;
+
+            if !path.starts_with("/auth/callback") {
+                let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot found";
+                let _ = stream.write_all(response.as_bytes()).await;
+                continue;
+            }
+
+            // Parse query params from the path
+            let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+            let params: std::collections::HashMap<&str, &str> = query
+                .split('&')
+                .filter_map(|pair| pair.split_once('='))
+                .collect();
+
+            let decode_param = |key: &str| -> Result<String, TuiError> {
+                let value = params
+                    .get(key)
+                    .ok_or_else(|| TuiError::Auth(format!("callback missing {key} parameter")))?;
+
+                urlencoding::decode(value)
+                    .map(|decoded| decoded.into_owned())
+                    .map_err(|e| {
+                        TuiError::Auth(format!(
+                            "callback {key} was not valid percent-encoding: {e}"
+                        ))
+                    })
+            };
+
+            // Validate state (after percent-decoding)
+            let returned_state = decode_param("state")?;
+            if returned_state != state {
+                let response = "HTTP/1.1 400 Bad Request\r\nContent-Length: 14\r\n\r\nState mismatch";
+                let _ = stream.write_all(response.as_bytes()).await;
+                return Err(TuiError::Auth("OAuth state mismatch".to_string()));
+            }
+
+            // Extract code (after percent-decoding)
+            let code = decode_param("code")?;
+
+            // Send success page
+            let body = OAUTH_SUCCESS_HTML;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
             let _ = stream.write_all(response.as_bytes()).await;
-            return Err(TuiError::Auth("OAuth state mismatch".to_string()));
+
+            return Ok(code);
         }
-
-        // Extract code
-        let code = params
-            .get("code")
-            .ok_or_else(|| TuiError::Auth("callback missing authorization code".to_string()))?;
-
-        // Send success page
-        let body = OAUTH_SUCCESS_HTML;
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        let _ = stream.write_all(response.as_bytes()).await;
-
-        Ok(code.to_string())
     })
 }
 
