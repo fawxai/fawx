@@ -143,26 +143,29 @@ impl TuiApp {
             println!("Add another provider.\n");
         }
 
+        let selection = self.run_auth_selection()?;
+        let preferred_provider = match selection {
+            AuthSelection::ClaudeSubscription => self.auth_wizard_claude_subscription()?,
+            AuthSelection::ChatGptSubscription => self.run_oauth_flow().await?,
+            AuthSelection::ApiKey => self.auth_wizard_api_key()?,
+        };
+
+        self.persist_and_activate_model(&preferred_provider).await
+    }
+
+    fn run_auth_selection(&self) -> Result<AuthSelection, TuiError> {
         println!("How would you like to authenticate?");
         println!("  [1] Claude subscription (paste setup-token)");
         println!("  [2] ChatGPT subscription (browser sign-in)");
         println!("  [3] API key (any provider)");
         println!();
 
-        let selection = prompt_choice(
+        prompt_choice(
             "> ",
             "Please choose 1, 2, or 3.\n",
             "authentication selection",
             parse_auth_selection,
-        )?;
-
-        let preferred_provider = match selection {
-            AuthSelection::ClaudeSubscription => self.auth_wizard_claude_subscription()?,
-            AuthSelection::ChatGptSubscription => self.auth_wizard_chatgpt_subscription().await?,
-            AuthSelection::ApiKey => self.auth_wizard_api_key()?,
-        };
-
-        self.auth_wizard_finalize(&preferred_provider).await
+        )
     }
 
     fn auth_wizard_claude_subscription(&mut self) -> Result<String, TuiError> {
@@ -179,20 +182,23 @@ impl TuiApp {
         Ok("anthropic".to_string())
     }
 
-    async fn auth_wizard_chatgpt_subscription(&mut self) -> Result<String, TuiError> {
+    async fn run_oauth_flow(&mut self) -> Result<String, TuiError> {
         let flow = PkceFlow::try_new().map_err(|error| {
             TuiError::Auth(format!("failed to initialize oauth PKCE flow: {error}"))
         })?;
-        let client_id = std::env::var("CITROS_OPENAI_CLIENT_ID")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| ct_kernel::oauth::OPENAI_CLIENT_ID.to_string());
+        let client_id = openai_oauth_client_id();
         let auth_url = flow.authorization_url(&client_id);
         let auth_code = obtain_oauth_authorization_code(&flow, &auth_url).await?;
 
         println!("Exchanging authorization code for tokens...");
         let token_response = exchange_oauth_code_for_tokens(&flow, &client_id, &auth_code).await?;
+        self.store_openai_oauth_tokens(token_response);
 
+        println!("✓ Authenticated. Tokens stored.\n");
+        Ok("openai".to_string())
+    }
+
+    fn store_openai_oauth_tokens(&mut self, token_response: TokenResponse) {
         let account_id = ct_kernel::oauth::extract_openai_account_id(&token_response.access_token);
         let expires_at =
             current_time_ms().saturating_add(token_response.expires_in.saturating_mul(1_000));
@@ -207,9 +213,6 @@ impl TuiApp {
                 account_id,
             },
         );
-
-        println!("✓ Authenticated. Tokens stored.\n");
-        Ok("openai".to_string())
     }
 
     fn auth_wizard_api_key(&mut self) -> Result<String, TuiError> {
@@ -233,13 +236,21 @@ impl TuiApp {
         Ok(provider)
     }
 
-    async fn auth_wizard_finalize(&mut self, preferred_provider: &str) -> Result<(), TuiError> {
+    async fn persist_and_activate_model(
+        &mut self,
+        preferred_provider: &str,
+    ) -> Result<(), TuiError> {
         persist_auth_manager(&self.auth_manager).await?;
 
         let preferred_models = self.get_models_for_provider(preferred_provider).await;
         self.refresh_router_models().await?;
         self.set_preferred_model(&preferred_models);
+        self.print_active_model();
 
+        Ok(())
+    }
+
+    fn print_active_model(&self) {
         if let Some(active_model) = self.router.active_model() {
             let model_info = self
                 .router
@@ -256,8 +267,6 @@ impl TuiApp {
                 println!("Active model: {active_model}\n");
             }
         }
-
-        Ok(())
     }
 
     /// Process a user command (starts with `/`).
@@ -943,11 +952,15 @@ async fn handle_oauth_connection(
     let (path, query) = parse_oauth_callback_request(&request)?;
 
     if path != "/auth/callback" {
-        send_http_response(
+        if let Err(error) = send_http_response(
             &mut stream,
             "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot found",
         )
-        .await;
+        .await
+        {
+            // Non-critical: wrong callback path is ignored; best-effort response is enough.
+            eprintln!("oauth callback 404 write failed: {error}");
+        }
         return Ok(None);
     }
 
@@ -958,15 +971,25 @@ async fn handle_oauth_connection(
         body.len(),
         body
     );
-    send_http_response(&mut stream, &response).await;
+    send_http_response(&mut stream, &response).await?;
     Ok(Some(code))
 }
 
-async fn send_http_response(stream: &mut tokio::net::TcpStream, response: &str) {
+async fn send_http_response(
+    stream: &mut tokio::net::TcpStream,
+    response: &str,
+) -> Result<(), TuiError> {
+    write_http_response(stream, response)
+        .await
+        .map_err(|error| TuiError::Auth(format!("oauth callback write failed: {error}")))
+}
+
+async fn write_http_response<W>(writer: &mut W, response: &str) -> io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     use tokio::io::AsyncWriteExt;
-    if let Err(error) = stream.write_all(response.as_bytes()).await {
-        eprintln!("oauth callback write failed: {error}");
-    }
+    writer.write_all(response.as_bytes()).await
 }
 
 fn parse_oauth_callback_request(request: &str) -> Result<(&str, &str), TuiError> {
@@ -1007,6 +1030,14 @@ fn validate_and_extract_code(query: &str, expected_state: &str) -> Result<String
     }
 
     decode_param("code")
+}
+
+fn openai_oauth_client_id() -> String {
+    std::env::var("CITROS_OPENAI_CLIENT_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| ct_kernel::oauth::OPENAI_CLIENT_ID.to_string())
 }
 
 fn openai_oauth_token_endpoint() -> String {
@@ -1588,6 +1619,8 @@ mod tests {
     use async_trait::async_trait;
     use ct_llm::ContentBlock;
     use std::ffi::OsString;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
     use tempfile::TempDir;
 
     #[cfg(unix)]
@@ -1794,6 +1827,27 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct FailingAsyncWriter;
+
+    impl tokio::io::AsyncWrite for FailingAsyncWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            _buffer: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::Error::other("async write failed")))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
     #[tokio::test]
     async fn router_loop_llm_provider_generate_returns_stream_error() {
         let mut router = ModelRouter::new();
@@ -1856,6 +1910,25 @@ mod tests {
         );
         assert_eq!(parse_auth_selection("3"), Some(AuthSelection::ApiKey));
         assert_eq!(parse_auth_selection("9"), None);
+    }
+
+    #[tokio::test]
+    async fn write_http_response_surfaces_async_write_failures() {
+        let mut writer = FailingAsyncWriter;
+
+        let error = write_http_response(&mut writer, "HTTP/1.1 200 OK\r\n\r\n")
+            .await
+            .expect_err("write failure should bubble up");
+
+        assert!(error.to_string().contains("async write failed"));
+    }
+
+    #[tokio::test]
+    async fn openai_oauth_client_id_uses_default_when_env_is_blank() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let _client_id = ScopedEnvVar::set("CITROS_OPENAI_CLIENT_ID", "   ");
+
+        assert_eq!(openai_oauth_client_id(), ct_kernel::oauth::OPENAI_CLIENT_ID);
     }
 
     #[test]
