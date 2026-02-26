@@ -3,7 +3,7 @@ use crossterm::style::Stylize;
 use crossterm::{cursor, event, style, terminal, ExecutableCommand};
 use ct_core::error::LlmError as CoreLlmError;
 use ct_core::types::{InputSource, ScreenState, UserInput};
-use ct_kernel::act::StubToolExecutor;
+use ct_kernel::act::{StubToolExecutor, TokenUsage};
 use ct_kernel::auth::{AuthManager, AuthMethod};
 use ct_kernel::budget::{BudgetConfig, BudgetTracker};
 use ct_kernel::context_manager::ContextCompactor;
@@ -76,11 +76,9 @@ impl TuiApp {
             self.select_first_available_model();
         }
 
-        println!("Type /help for commands.\n");
-
         let mut line = String::new();
         while self.running {
-            print!("{}", "> ".with(style::Color::DarkGrey));
+            print!("{}", "you \u{203a} ".with(style::Color::Green));
             io::stdout().flush().map_err(TuiError::Io)?;
 
             line.clear();
@@ -131,7 +129,7 @@ impl TuiApp {
         println!(
             "{:padding$}{}",
             "",
-            "Terminal shell".with(style::Color::DarkGrey)
+            "Agentic engine \u{00b7} type /help for commands".with(style::Color::DarkGrey)
         );
         println!();
     }
@@ -288,6 +286,8 @@ impl TuiApp {
             }
             ParsedCommand::Budget => self.show_budget_status(),
             ParsedCommand::Loop => self.show_loop_status(),
+            ParsedCommand::Status => self.show_status(),
+            ParsedCommand::Clear => self.clear_screen()?,
             ParsedCommand::Help => self.show_help(),
             ParsedCommand::Quit => {
                 self.running = false;
@@ -330,7 +330,7 @@ impl TuiApp {
         move_cursor_to_start(&mut stdout)?;
 
         println!();
-        println!("{}", "Assistant".bold().with(style::Color::Cyan));
+        print!("{} ", "assistant \u{203a}".bold().with(style::Color::Cyan));
         println!("{response}");
         println!();
 
@@ -429,15 +429,16 @@ impl TuiApp {
     }
 
     fn show_help(&self) {
-        println!("Available commands:");
-        println!("  /model         List models and show active model");
-        println!("  /model <name>  Switch active model");
-        println!("  /auth          Show auth status and run auth wizard");
-        println!("  /budget        Show current budget usage");
-        println!("  /loop          Show loop status (iterations, budget, tokens)");
-        println!("  /help          Show this help message");
-        println!("  /quit          Exit Citros");
-        println!("  /exit          Exit Citros");
+        println!("{}", "Commands".bold().with(style::Color::Cyan));
+        println!("  /model         List models and switch active model");
+        println!("  /model <name>  Switch to a specific model");
+        println!("  /auth          Show credentials / run auth wizard");
+        println!("  /status        Show model, tokens, budget summary");
+        println!("  /budget        Show detailed budget usage");
+        println!("  /loop          Show loop iteration details");
+        println!("  /clear         Clear the screen");
+        println!("  /help          Show this help");
+        println!("  /quit          Exit");
     }
 
     fn show_auth_status(&self) {
@@ -498,6 +499,26 @@ impl TuiApp {
             "  - Wall time remaining (ms): {}",
             status.remaining.wall_time_ms
         );
+    }
+
+    fn show_status(&self) {
+        let model = self.router.active_model().unwrap_or_default();
+        let status = self.loop_engine.status(current_time_ms());
+        let providers = self.auth_manager.providers();
+        println!("{}", "Citros Status".bold().with(style::Color::Cyan));
+        println!("  model:     {model}");
+        println!("  providers: {}", providers.join(", "));
+        println!("  tokens:    {} used", status.tokens_used);
+        println!("  budget:    {} tokens remaining", status.remaining.tokens);
+    }
+
+    fn clear_screen(&self) -> Result<(), TuiError> {
+        let mut stdout = io::stdout();
+        stdout
+            .execute(terminal::Clear(terminal::ClearType::All))
+            .map_err(TuiError::Io)?;
+        stdout.execute(cursor::MoveTo(0, 0)).map_err(TuiError::Io)?;
+        Ok(())
     }
 
     fn build_perception_snapshot(&self, input: &str) -> PerceptionSnapshot {
@@ -609,37 +630,49 @@ fn render_loop_result(result: LoopResult) -> String {
             tokens_used,
             ..
         } => {
-            format!(
-                "{response}\n\n[loop complete in {iterations} iteration(s); tokens in/out: {}/{}]",
-                tokens_used.input_tokens, tokens_used.output_tokens
-            )
+            let meta = format_loop_metadata(iterations, &tokens_used);
+            format!("{response}\n{meta}")
         }
         LoopResult::BudgetExhausted {
             partial_response,
             iterations,
-        } => {
-            if let Some(partial) = partial_response {
-                format!(
-                    "{partial}\n\n[loop stopped: budget exhausted after {iterations} iteration(s)]"
-                )
-            } else {
-                format!("[loop stopped: budget exhausted after {iterations} iteration(s)]")
-            }
-        }
+        } => render_budget_exhausted(partial_response, iterations),
         LoopResult::NeedsInput { prompt, iterations } => {
-            format!("{prompt}\n\n[loop needs input after {iterations} iteration(s)]")
+            let meta =
+                format!("\x1b[2m  \u{21b3} {iterations} iteration(s) \u{00b7} needs input\x1b[0m");
+            format!("{prompt}\n{meta}")
         }
         LoopResult::Error {
             message,
             recoverable,
-        } => {
-            if recoverable {
-                format!("{message}\n\n[loop error is recoverable — try again]")
-            } else {
-                format!("{message}\n\n[loop error is not recoverable]")
-            }
-        }
+        } => render_loop_error(&message, recoverable),
     }
+}
+
+fn format_loop_metadata(iterations: u32, tokens: &TokenUsage) -> String {
+    let iter_text = if iterations == 1 {
+        "1 iteration".to_string()
+    } else {
+        format!("{iterations} iterations")
+    };
+    format!(
+        "\x1b[2m  \u{21b3} {iter_text} \u{00b7} {} in / {} out tokens\x1b[0m",
+        tokens.input_tokens, tokens.output_tokens,
+    )
+}
+
+fn render_budget_exhausted(partial: Option<String>, iterations: u32) -> String {
+    let meta =
+        format!("\x1b[33m  \u{2717} budget exhausted after {iterations} iteration(s)\x1b[0m");
+    match partial {
+        Some(text) if !text.is_empty() => format!("{text}\n{meta}"),
+        _ => meta,
+    }
+}
+
+fn render_loop_error(message: &str, recoverable: bool) -> String {
+    let suffix = if recoverable { " (recoverable)" } else { "" };
+    format!("\x1b[31m  \u{2717} {message}{suffix}\x1b[0m")
 }
 
 async fn consume_stream_with_print(
@@ -664,7 +697,7 @@ async fn consume_stream_with_print(
 }
 
 fn format_error_message(error: &str) -> String {
-    format!("\x1b[31mError: {error}\x1b[0m")
+    format!("\x1b[31m  \u{2717} {error}\x1b[0m")
 }
 
 fn move_cursor_to_start(stdout: &mut impl Write) -> Result<(), TuiError> {
@@ -1500,6 +1533,8 @@ enum ParsedCommand {
     Auth,
     Budget,
     Loop,
+    Status,
+    Clear,
     Help,
     Quit,
     Unknown(String),
@@ -1521,6 +1556,8 @@ fn parse_command(value: &str) -> ParsedCommand {
         "auth" => ParsedCommand::Auth,
         "budget" => ParsedCommand::Budget,
         "loop" => ParsedCommand::Loop,
+        "status" => ParsedCommand::Status,
+        "clear" | "cls" => ParsedCommand::Clear,
         "help" => ParsedCommand::Help,
         "quit" | "exit" => ParsedCommand::Quit,
         other => ParsedCommand::Unknown(other.to_string()),
@@ -1824,8 +1861,9 @@ mod tests {
     fn format_error_message_uses_ansi_escape_sequences() {
         let message = format_error_message("boom");
 
-        assert!(message.contains("\x1b[31mError: boom\x1b[0m"));
-        assert!(!message.contains("[31mError: boom[0m"));
+        assert!(message.contains("\x1b[31m"));
+        assert!(message.contains("\u{2717} boom"));
+        assert!(message.contains("\x1b[0m"));
     }
 
     #[test]
@@ -1876,6 +1914,9 @@ mod tests {
         );
         assert_eq!(parse_command("/help"), ParsedCommand::Help);
         assert_eq!(parse_command("/loop"), ParsedCommand::Loop);
+        assert_eq!(parse_command("/status"), ParsedCommand::Status);
+        assert_eq!(parse_command("/clear"), ParsedCommand::Clear);
+        assert_eq!(parse_command("/cls"), ParsedCommand::Clear);
         assert_eq!(parse_command("/quit"), ParsedCommand::Quit);
         assert_eq!(parse_command("/exit"), ParsedCommand::Quit);
     }
@@ -1920,7 +1961,7 @@ mod tests {
             .expect("loop-generated message");
 
         assert!(rendered.contains("Loop-integrated reply"));
-        assert!(rendered.contains("[loop complete"));
+        assert!(rendered.contains("1 iteration"));
     }
 
     #[tokio::test]
@@ -2091,5 +2132,42 @@ mod tests {
         assert!(openai_models
             .iter()
             .any(|model| model.model_id == "gpt-5.3-codex"));
+    }
+
+    #[test]
+    fn render_loop_complete_shows_styled_metadata() {
+        use ct_kernel::act::TokenUsage;
+        let result = render_loop_result(LoopResult::Complete {
+            response: "Paris".to_string(),
+            iterations: 1,
+            tokens_used: TokenUsage {
+                input_tokens: 50,
+                output_tokens: 12,
+            },
+            learnings: Vec::new(),
+        });
+        assert!(result.contains("Paris"));
+        assert!(result.contains("1 iteration"));
+        assert!(result.contains("50 in / 12 out tokens"));
+    }
+
+    #[test]
+    fn render_loop_budget_exhausted_shows_warning() {
+        let result = render_loop_result(LoopResult::BudgetExhausted {
+            partial_response: Some("partial".to_string()),
+            iterations: 3,
+        });
+        assert!(result.contains("partial"));
+        assert!(result.contains("budget exhausted"));
+    }
+
+    #[test]
+    fn render_loop_error_shows_marker() {
+        let result = render_loop_result(LoopResult::Error {
+            message: "timeout".to_string(),
+            recoverable: true,
+        });
+        assert!(result.contains("\u{2717} timeout"));
+        assert!(result.contains("recoverable"));
     }
 }
