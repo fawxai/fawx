@@ -225,7 +225,9 @@ impl OpenAiResponsesProvider {
                                 let crlf_delim = buffer.find("\r\n\r\n").map(|idx| (idx, 4));
 
                                 match (lf_delim, crlf_delim) {
-                                    (Some(lf), Some(crlf)) => Some(if lf.0 <= crlf.0 { lf } else { crlf }),
+                                    (Some(lf), Some(crlf)) => {
+                                        Some(if lf.0 <= crlf.0 { lf } else { crlf })
+                                    }
                                     (Some(lf), None) => Some(lf),
                                     (None, Some(crlf)) => Some(crlf),
                                     (None, None) => None,
