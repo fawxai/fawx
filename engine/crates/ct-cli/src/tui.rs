@@ -969,14 +969,6 @@ fn current_time_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn empty_to_none(value: String) -> Option<String> {
-    if value.trim().is_empty() {
-        None
-    } else {
-        Some(value)
-    }
-}
-
 fn is_yes(value: &str) -> bool {
     matches!(value.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
