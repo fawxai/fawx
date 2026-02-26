@@ -80,7 +80,9 @@ pub struct BudgetTracker {
 
 impl BudgetTracker {
     /// Create a new tracker with zero consumption at the given start timestamp.
-    pub fn new(config: BudgetConfig, start_time_ms: u64) -> Self {
+    ///
+    /// `depth` represents the recursion depth of this tracker in the loop tree.
+    pub fn new(config: BudgetConfig, start_time_ms: u64, depth: u32) -> Self {
         Self {
             config,
             llm_calls: 0,
@@ -88,21 +90,113 @@ impl BudgetTracker {
             tokens_used: 0,
             cost_cents: 0,
             start_time_ms,
-            depth: 0,
+            depth,
         }
     }
 
     /// Check whether the proposed action cost can be admitted under current limits.
     ///
-    /// Returns [`Ok`] when the action is admissible, or [`BudgetExceeded`] with
-    /// details about the first exceeded resource.
+    /// This method validates resource limits (LLM calls, tools, tokens, cost, depth)
+    /// but does not evaluate wall-time. Use [`BudgetTracker::check_at`] to enforce
+    /// wall-time and resource limits together.
     pub fn check(&self, cost: &ActionCost) -> Result<(), BudgetExceeded> {
-        if self.depth > self.config.max_recursion_depth {
+        self.check_resources(cost)
+    }
+
+    /// Check whether the proposed action cost is admissible at a specific time.
+    ///
+    /// Unlike [`BudgetTracker::check`], this method validates both resource budgets
+    /// and wall-time budget in one call.
+    pub fn check_at(&self, current_time_ms: u64, cost: &ActionCost) -> Result<(), BudgetExceeded> {
+        let elapsed = current_time_ms.saturating_sub(self.start_time_ms);
+        if elapsed > self.config.max_wall_time_ms {
+            return Err(BudgetExceeded {
+                resource: BudgetResource::WallTime,
+                limit: self.config.max_wall_time_ms,
+                current: elapsed,
+                requested: 0,
+            });
+        }
+
+        self.check_resources(cost)
+    }
+
+    /// Record an action cost as consumed budget.
+    pub fn record(&mut self, cost: &ActionCost) {
+        self.llm_calls = self.llm_calls.saturating_add(cost.llm_calls);
+        self.tool_invocations = self
+            .tool_invocations
+            .saturating_add(cost.tool_invocations);
+        self.tokens_used = self.tokens_used.saturating_add(cost.tokens);
+        self.cost_cents = self.cost_cents.saturating_add(cost.cost_cents);
+    }
+
+    /// Snapshot remaining budget for each tracked resource at `current_time_ms`.
+    pub fn remaining(&self, current_time_ms: u64) -> BudgetRemaining {
+        BudgetRemaining {
+            llm_calls: self.config.max_llm_calls.saturating_sub(self.llm_calls),
+            tool_invocations: self
+                .config
+                .max_tool_invocations
+                .saturating_sub(self.tool_invocations),
+            tokens: self.config.max_tokens.saturating_sub(self.tokens_used),
+            cost_cents: self.config.max_cost_cents.saturating_sub(self.cost_cents),
+            wall_time_ms: self
+                .config
+                .max_wall_time_ms
+                .saturating_sub(current_time_ms.saturating_sub(self.start_time_ms)),
+        }
+    }
+
+    /// Return true when elapsed wall time is greater than the configured maximum.
+    pub fn wall_time_exceeded(&self, current_time_ms: u64) -> bool {
+        current_time_ms.saturating_sub(self.start_time_ms) > self.config.max_wall_time_ms
+    }
+
+    /// Create a child budget config by partitioning remaining resources.
+    ///
+    /// `fraction` is clamped into `[0.0, 1.0]` and partitioning uses *remaining*
+    /// wall-time at `current_time_ms`, not the original configured wall-time.
+    pub fn partition_child(&self, fraction: f32, current_time_ms: u64) -> BudgetConfig {
+        let bounded_fraction = if fraction.is_finite() {
+            fraction.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+
+        let remaining = self.remaining(current_time_ms);
+
+        BudgetConfig {
+            max_llm_calls: partition_u32(remaining.llm_calls, bounded_fraction),
+            max_tool_invocations: partition_u32(remaining.tool_invocations, bounded_fraction),
+            max_tokens: partition_u64(remaining.tokens, bounded_fraction),
+            max_cost_cents: partition_u64(remaining.cost_cents, bounded_fraction),
+            max_wall_time_ms: partition_u64(remaining.wall_time_ms, bounded_fraction),
+            max_recursion_depth: self.config.max_recursion_depth,
+        }
+    }
+
+    /// Depth to assign to a child tracker spawned from this tracker.
+    pub fn child_depth(&self) -> u32 {
+        self.depth.saturating_add(1)
+    }
+
+    /// Create a child tracker with partitioned config and incremented depth.
+    pub fn child_tracker(&self, fraction: f32, current_time_ms: u64) -> Self {
+        Self::new(
+            self.partition_child(fraction, current_time_ms),
+            current_time_ms,
+            self.child_depth(),
+        )
+    }
+
+    fn check_resources(&self, cost: &ActionCost) -> Result<(), BudgetExceeded> {
+        if self.depth >= self.config.max_recursion_depth {
             return Err(BudgetExceeded {
                 resource: BudgetResource::RecursionDepth,
                 limit: u64::from(self.config.max_recursion_depth),
                 current: u64::from(self.depth),
-                requested: u64::from(self.depth),
+                requested: 1,
             });
         }
 
@@ -135,57 +229,6 @@ impl BudgetTracker {
         )?;
 
         Ok(())
-    }
-
-    /// Record an action cost as consumed budget.
-    pub fn record(&mut self, cost: &ActionCost) {
-        self.llm_calls = self.llm_calls.saturating_add(cost.llm_calls);
-        self.tool_invocations = self
-            .tool_invocations
-            .saturating_add(cost.tool_invocations);
-        self.tokens_used = self.tokens_used.saturating_add(cost.tokens);
-        self.cost_cents = self.cost_cents.saturating_add(cost.cost_cents);
-    }
-
-    /// Snapshot remaining budget for each tracked resource.
-    pub fn remaining(&self) -> BudgetRemaining {
-        BudgetRemaining {
-            llm_calls: self.config.max_llm_calls.saturating_sub(self.llm_calls),
-            tool_invocations: self
-                .config
-                .max_tool_invocations
-                .saturating_sub(self.tool_invocations),
-            tokens: self.config.max_tokens.saturating_sub(self.tokens_used),
-            cost_cents: self.config.max_cost_cents.saturating_sub(self.cost_cents),
-            wall_time_ms: self.config.max_wall_time_ms,
-        }
-    }
-
-    /// Return true when elapsed wall time is greater than the configured maximum.
-    pub fn wall_time_exceeded(&self, current_time_ms: u64) -> bool {
-        current_time_ms.saturating_sub(self.start_time_ms) > self.config.max_wall_time_ms
-    }
-
-    /// Create a child budget config by partitioning remaining resources.
-    ///
-    /// `fraction` is clamped into `[0.0, 1.0]`. Recursion depth is reduced by one.
-    pub fn partition_child(&self, fraction: f32) -> BudgetConfig {
-        let bounded_fraction = if fraction.is_finite() {
-            fraction.clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-
-        let remaining = self.remaining();
-
-        BudgetConfig {
-            max_llm_calls: partition_u32(remaining.llm_calls, bounded_fraction),
-            max_tool_invocations: partition_u32(remaining.tool_invocations, bounded_fraction),
-            max_tokens: partition_u64(remaining.tokens, bounded_fraction),
-            max_cost_cents: partition_u64(remaining.cost_cents, bounded_fraction),
-            max_wall_time_ms: partition_u64(remaining.wall_time_ms, bounded_fraction),
-            max_recursion_depth: self.config.max_recursion_depth.saturating_sub(1),
-        }
     }
 
     fn check_limit(
@@ -310,11 +353,7 @@ fn partition_u64(value: u64, fraction: f32) -> u64 {
     }
 
     let scaled = (value as f64 * f64::from(fraction)).floor() as u64;
-    if fraction > 0.0 {
-        scaled.max(1)
-    } else {
-        0
-    }
+    scaled.max(1)
 }
 
 fn partition_u32(value: u32, fraction: f32) -> u32 {
@@ -323,11 +362,7 @@ fn partition_u32(value: u32, fraction: f32) -> u32 {
     }
 
     let scaled = (f64::from(value) * f64::from(fraction)).floor() as u32;
-    if fraction > 0.0 {
-        scaled.max(1)
-    } else {
-        0
-    }
+    scaled.max(1)
 }
 
 #[cfg(test)]
@@ -349,7 +384,7 @@ mod tests {
     #[test]
     fn tracker_creation_initializes_zero_consumption() {
         let config = test_config();
-        let tracker = BudgetTracker::new(config.clone(), 1_000);
+        let tracker = BudgetTracker::new(config.clone(), 1_000, 2);
 
         assert_eq!(tracker.config, config);
         assert_eq!(tracker.llm_calls, 0);
@@ -357,10 +392,10 @@ mod tests {
         assert_eq!(tracker.tokens_used, 0);
         assert_eq!(tracker.cost_cents, 0);
         assert_eq!(tracker.start_time_ms, 1_000);
-        assert_eq!(tracker.depth, 0);
+        assert_eq!(tracker.depth, 2);
 
         assert_eq!(
-            tracker.remaining(),
+            tracker.remaining(1_000),
             BudgetRemaining {
                 llm_calls: 10,
                 tool_invocations: 20,
@@ -373,7 +408,25 @@ mod tests {
 
     #[test]
     fn check_passes_when_cost_is_within_budget() {
-        let tracker = BudgetTracker::new(test_config(), 0);
+        let tracker = BudgetTracker::new(test_config(), 0, 0);
+
+        let cost = ActionCost {
+            llm_calls: 1,
+            tool_invocations: 2,
+            tokens: 500,
+            cost_cents: 5,
+        };
+
+        assert!(tracker.check(&cost).is_ok());
+    }
+
+    #[test]
+    fn check_passes_at_exact_limit_boundary() {
+        let mut tracker = BudgetTracker::new(test_config(), 0, 0);
+        tracker.llm_calls = 9;
+        tracker.tool_invocations = 18;
+        tracker.tokens_used = 9_500;
+        tracker.cost_cents = 95;
 
         let cost = ActionCost {
             llm_calls: 1,
@@ -387,7 +440,7 @@ mod tests {
 
     #[test]
     fn check_fails_when_llm_calls_exceed_limit() {
-        let mut tracker = BudgetTracker::new(test_config(), 0);
+        let mut tracker = BudgetTracker::new(test_config(), 0, 0);
         tracker.llm_calls = 10;
 
         let result = tracker.check(&ActionCost {
@@ -410,7 +463,7 @@ mod tests {
 
     #[test]
     fn check_fails_when_tool_invocations_exceed_limit() {
-        let mut tracker = BudgetTracker::new(test_config(), 0);
+        let mut tracker = BudgetTracker::new(test_config(), 0, 0);
         tracker.tool_invocations = 20;
 
         let result = tracker.check(&ActionCost {
@@ -433,7 +486,7 @@ mod tests {
 
     #[test]
     fn check_fails_when_tokens_exceed_limit() {
-        let mut tracker = BudgetTracker::new(test_config(), 0);
+        let mut tracker = BudgetTracker::new(test_config(), 0, 0);
         tracker.tokens_used = 9_500;
 
         let result = tracker.check(&ActionCost {
@@ -456,7 +509,7 @@ mod tests {
 
     #[test]
     fn check_fails_when_cost_exceeds_limit() {
-        let mut tracker = BudgetTracker::new(test_config(), 0);
+        let mut tracker = BudgetTracker::new(test_config(), 0, 0);
         tracker.cost_cents = 95;
 
         let result = tracker.check(&ActionCost {
@@ -478,9 +531,8 @@ mod tests {
     }
 
     #[test]
-    fn check_fails_when_recursion_depth_exceeds_limit() {
-        let mut tracker = BudgetTracker::new(test_config(), 0);
-        tracker.depth = 5;
+    fn check_fails_when_recursion_depth_reaches_limit() {
+        let tracker = BudgetTracker::new(test_config(), 0, 4);
 
         let result = tracker.check(&ActionCost::default());
 
@@ -489,15 +541,15 @@ mod tests {
             Err(BudgetExceeded {
                 resource: BudgetResource::RecursionDepth,
                 limit: 4,
-                current: 5,
-                requested: 5,
+                current: 4,
+                requested: 1,
             })
         );
     }
 
     #[test]
     fn record_updates_consumption() {
-        let mut tracker = BudgetTracker::new(test_config(), 0);
+        let mut tracker = BudgetTracker::new(test_config(), 0, 0);
 
         tracker.record(&ActionCost {
             llm_calls: 1,
@@ -521,7 +573,7 @@ mod tests {
 
     #[test]
     fn remaining_reflects_consumed_resources() {
-        let mut tracker = BudgetTracker::new(test_config(), 0);
+        let mut tracker = BudgetTracker::new(test_config(), 0, 0);
         tracker.record(&ActionCost {
             llm_calls: 4,
             tool_invocations: 7,
@@ -530,7 +582,7 @@ mod tests {
         });
 
         assert_eq!(
-            tracker.remaining(),
+            tracker.remaining(0),
             BudgetRemaining {
                 llm_calls: 6,
                 tool_invocations: 13,
@@ -542,8 +594,19 @@ mod tests {
     }
 
     #[test]
+    fn remaining_wall_time_reflects_elapsed_time() {
+        let tracker = BudgetTracker::new(test_config(), 1_000, 0);
+
+        assert_eq!(tracker.remaining(6_000).wall_time_ms, 5_000);
+        assert_eq!(tracker.remaining(20_000).wall_time_ms, 0);
+
+        // Saturating subtraction protects against clock skew/backward values.
+        assert_eq!(tracker.remaining(999).wall_time_ms, 10_000);
+    }
+
+    #[test]
     fn wall_time_exceeded_uses_elapsed_time() {
-        let tracker = BudgetTracker::new(test_config(), 1_000);
+        let tracker = BudgetTracker::new(test_config(), 1_000, 0);
 
         assert!(!tracker.wall_time_exceeded(10_999));
         assert!(!tracker.wall_time_exceeded(11_000));
@@ -554,8 +617,42 @@ mod tests {
     }
 
     #[test]
+    fn check_at_enforces_wall_time_and_resources() {
+        let mut tracker = BudgetTracker::new(test_config(), 1_000, 0);
+        tracker.llm_calls = 10;
+
+        let resource_result = tracker.check_at(
+            1_500,
+            &ActionCost {
+                llm_calls: 1,
+                ..ActionCost::default()
+            },
+        );
+        assert_eq!(
+            resource_result,
+            Err(BudgetExceeded {
+                resource: BudgetResource::LlmCalls,
+                limit: 10,
+                current: 10,
+                requested: 1,
+            })
+        );
+
+        let wall_time_result = tracker.check_at(11_001, &ActionCost::default());
+        assert_eq!(
+            wall_time_result,
+            Err(BudgetExceeded {
+                resource: BudgetResource::WallTime,
+                limit: 10_000,
+                current: 10_001,
+                requested: 0,
+            })
+        );
+    }
+
+    #[test]
     fn partition_child_apportions_remaining_budget() {
-        let mut tracker = BudgetTracker::new(test_config(), 0);
+        let mut tracker = BudgetTracker::new(test_config(), 1_000, 0);
         tracker.record(&ActionCost {
             llm_calls: 2,
             tool_invocations: 4,
@@ -563,7 +660,7 @@ mod tests {
             cost_cents: 20,
         });
 
-        let child = tracker.partition_child(0.5);
+        let child = tracker.partition_child(0.5, 6_000);
 
         assert_eq!(
             child,
@@ -572,10 +669,96 @@ mod tests {
                 max_tool_invocations: 8,
                 max_tokens: 4_000,
                 max_cost_cents: 40,
-                max_wall_time_ms: 5_000,
-                max_recursion_depth: 3,
+                max_wall_time_ms: 2_500,
+                max_recursion_depth: 4,
             }
         );
+    }
+
+    #[test]
+    fn partition_child_with_zero_fraction_produces_minimum_viable_config() {
+        let tracker = BudgetTracker::new(test_config(), 0, 0);
+
+        let child = tracker.partition_child(0.0, 0);
+
+        assert_eq!(child.max_llm_calls, 1);
+        assert_eq!(child.max_tool_invocations, 1);
+        assert_eq!(child.max_tokens, 1);
+        assert_eq!(child.max_cost_cents, 1);
+        assert_eq!(child.max_wall_time_ms, 1);
+        assert_eq!(child.max_recursion_depth, 4);
+    }
+
+    #[test]
+    fn partition_child_with_one_fraction_uses_full_parent_remaining() {
+        let mut tracker = BudgetTracker::new(test_config(), 1_000, 1);
+        tracker.record(&ActionCost {
+            llm_calls: 3,
+            tool_invocations: 5,
+            tokens: 2_500,
+            cost_cents: 25,
+        });
+
+        let child = tracker.partition_child(1.0, 6_000);
+
+        assert_eq!(child.max_llm_calls, 7);
+        assert_eq!(child.max_tool_invocations, 15);
+        assert_eq!(child.max_tokens, 7_500);
+        assert_eq!(child.max_cost_cents, 75);
+        assert_eq!(child.max_wall_time_ms, 5_000);
+        assert_eq!(child.max_recursion_depth, 4);
+    }
+
+    #[test]
+    fn partition_child_clamps_fraction_greater_than_one() {
+        let mut tracker = BudgetTracker::new(test_config(), 1_000, 1);
+        tracker.record(&ActionCost {
+            llm_calls: 3,
+            tool_invocations: 5,
+            tokens: 2_500,
+            cost_cents: 25,
+        });
+
+        let child = tracker.partition_child(1.5, 6_000);
+
+        assert_eq!(child.max_llm_calls, 7);
+        assert_eq!(child.max_tool_invocations, 15);
+        assert_eq!(child.max_tokens, 7_500);
+        assert_eq!(child.max_cost_cents, 75);
+        assert_eq!(child.max_wall_time_ms, 5_000);
+    }
+
+    #[test]
+    fn child_tracker_increments_depth() {
+        let tracker = BudgetTracker::new(test_config(), 1_000, 2);
+
+        assert_eq!(tracker.child_depth(), 3);
+
+        let child = tracker.child_tracker(0.5, 6_000);
+        assert_eq!(child.depth, 3);
+        assert_eq!(child.start_time_ms, 6_000);
+        assert_eq!(child.config.max_recursion_depth, 4);
+    }
+
+    #[test]
+    fn record_uses_saturating_add_for_all_resources() {
+        let mut tracker = BudgetTracker::new(test_config(), 0, 0);
+        tracker.llm_calls = u32::MAX - 1;
+        tracker.tool_invocations = u32::MAX - 1;
+        tracker.tokens_used = u64::MAX - 1;
+        tracker.cost_cents = u64::MAX - 1;
+
+        tracker.record(&ActionCost {
+            llm_calls: 10,
+            tool_invocations: 10,
+            tokens: 10,
+            cost_cents: 10,
+        });
+
+        assert_eq!(tracker.llm_calls, u32::MAX);
+        assert_eq!(tracker.tool_invocations, u32::MAX);
+        assert_eq!(tracker.tokens_used, u64::MAX);
+        assert_eq!(tracker.cost_cents, u64::MAX);
     }
 
     #[test]
