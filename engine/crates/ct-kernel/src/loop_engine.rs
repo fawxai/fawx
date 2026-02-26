@@ -4,7 +4,7 @@ use crate::act::{ActionResult, TokenUsage, ToolResult};
 use crate::budget::{ActionCost, BudgetRemaining, BudgetTracker};
 use crate::context_manager::ContextCompactor;
 use crate::continuation::Continuation;
-use crate::decide::{decide_from_intent, Decision};
+use crate::decide::{decide_from_intent, Decision, CONFIDENCE_CLARIFY_THRESHOLD};
 use crate::learn::Learning;
 use crate::perceive::{ProcessedPerception, TrimmingPolicy};
 use crate::types::{
@@ -148,9 +148,15 @@ impl LoopEngine {
             match self.execute_iteration(&perception, llm, &mut state).await? {
                 IterationStep::Terminal(result) => return Ok(result),
                 IterationStep::Progress(outcome) => {
+                    let IterationOutcome {
+                        response_text,
+                        continuation,
+                        learning,
+                    } = outcome;
                     if let Some(result) = self.handle_continuation(
-                        outcome.continuation.clone(),
-                        &outcome,
+                        continuation,
+                        response_text,
+                        learning,
                         &mut perception,
                         &mut state,
                     ) {
@@ -271,14 +277,15 @@ impl LoopEngine {
     fn handle_continuation(
         &self,
         continuation: Continuation,
-        outcome: &IterationOutcome,
+        response_text: String,
+        learning: Learning,
         perception: &mut PerceptionSnapshot,
         state: &mut CycleState,
     ) -> Option<LoopResult> {
-        state.learnings.push(outcome.learning.clone());
+        state.learnings.push(learning);
         match continuation {
             Continuation::Complete => Some(LoopResult::Complete {
-                response: outcome.response_text.clone(),
+                response: response_text,
                 iterations: self.iteration_count,
                 tokens_used: state.tokens,
                 learnings: state.learnings.clone(),
@@ -430,7 +437,7 @@ impl LoopEngine {
             return Ok(Continuation::Complete);
         }
 
-        if verification.confidence < 0.35 {
+        if verification.confidence < CONFIDENCE_CLARIFY_THRESHOLD {
             return Ok(Continuation::NeedsInput(
                 "I need a bit more detail to continue safely. Could you clarify your goal?"
                     .to_string(),

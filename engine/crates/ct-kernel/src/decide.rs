@@ -37,6 +37,9 @@ impl std::error::Error for DecideError {}
 
 type ParamSerializer = fn(&std::collections::HashMap<String, String>) -> Result<Value, DecideError>;
 
+pub(crate) const CONFIDENCE_DEFER_THRESHOLD: f64 = 0.15;
+pub(crate) const CONFIDENCE_CLARIFY_THRESHOLD: f64 = 0.35;
+
 /// Convert a [`ReasonedIntent`] into a concrete [`Decision`].
 pub fn decide_from_intent(intent: &ReasonedIntent) -> Result<Decision, DecideError> {
     decide_from_intent_with_serializer(intent, serialize_params)
@@ -46,13 +49,13 @@ fn decide_from_intent_with_serializer(
     intent: &ReasonedIntent,
     serializer: ParamSerializer,
 ) -> Result<Decision, DecideError> {
-    if intent.confidence < 0.15 {
+    if f64::from(intent.confidence) < CONFIDENCE_DEFER_THRESHOLD {
         return Ok(Decision::Defer(
             "I'm not confident enough to act safely yet. Could you rephrase?".to_string(),
         ));
     }
 
-    if intent.confidence < 0.35 {
+    if f64::from(intent.confidence) < CONFIDENCE_CLARIFY_THRESHOLD {
         return Ok(Decision::Clarify(
             "Can you share a little more detail so I can get this right?".to_string(),
         ));

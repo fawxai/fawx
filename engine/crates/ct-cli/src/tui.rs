@@ -75,7 +75,6 @@ impl TuiApp {
         println!("Type /help for commands.\n");
 
         let mut line = String::new();
-
         while self.running {
             print!("{}", "> ".with(style::Color::DarkGrey));
             io::stdout().flush().map_err(TuiError::Io)?;
@@ -86,23 +85,27 @@ impl TuiApp {
                 break;
             }
 
-            let input = line.trim();
-            if input.is_empty() {
-                continue;
-            }
+            self.process_input_line(line.trim()).await?;
+        }
 
-            if input.starts_with('/') {
-                if let Err(error) = self.handle_command(input).await {
-                    println!("{}\n", format_error_message(&error.to_string()));
-                }
-            } else {
-                match self.handle_message(input).await {
-                    Ok(response) => self.display_response(&response)?,
-                    Err(error) => {
-                        println!("{}\n", format_error_message(&error.to_string()));
-                    }
-                }
+        Ok(())
+    }
+
+    async fn process_input_line(&mut self, input: &str) -> Result<(), TuiError> {
+        if input.is_empty() {
+            return Ok(());
+        }
+
+        if input.starts_with('/') {
+            if let Err(error) = self.handle_command(input).await {
+                println!("{}\n", format_error_message(&error.to_string()));
             }
+            return Ok(());
+        }
+
+        match self.handle_message(input).await {
+            Ok(response) => self.display_response(&response)?,
+            Err(error) => println!("{}\n", format_error_message(&error.to_string())),
         }
 
         Ok(())
@@ -111,7 +114,9 @@ impl TuiApp {
     /// Display the welcome banner.
     fn show_welcome(&self) {
         let mut stdout = io::stdout();
-        let _ = stdout.execute(terminal::Clear(terminal::ClearType::CurrentLine));
+        if let Err(error) = stdout.execute(terminal::Clear(terminal::ClearType::CurrentLine)) {
+            eprintln!("failed to clear terminal line: {error}");
+        }
 
         let width = terminal::size().map(|(w, _)| w).unwrap_or(80);
         let banner = "Citros";
@@ -150,149 +155,107 @@ impl TuiApp {
         )?;
 
         let preferred_provider = match selection {
-            AuthSelection::ClaudeSubscription => {
-                let token = prompt_non_empty_secret(
-                    "Paste your Claude setup token: ",
-                    "Setup token cannot be empty.\n",
-                    "Claude setup token",
-                )?;
-
-                self.auth_manager
-                    .store("anthropic", AuthMethod::SetupToken { token });
-
-                println!("✓ Authenticated. Token stored.\n");
-                "anthropic".to_string()
-            }
-            AuthSelection::ChatGptSubscription => {
-                let flow = PkceFlow::new();
-                let client_id = std::env::var("CITROS_OPENAI_CLIENT_ID")
-                    .ok()
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or_else(|| ct_kernel::oauth::OPENAI_CLIENT_ID.to_string());
-                let auth_url = flow.authorization_url(&client_id);
-
-                // Start local callback server before opening browser
-                let auth_code = match start_oauth_callback_server(flow.state()).await {
-                    Ok(server) => {
-                        println!("Opening browser for ChatGPT sign-in...");
-                        if let Err(error) = open_browser(&auth_url) {
-                            println!(
-                                "Couldn't open browser automatically ({error}). Open this URL manually:\n{auth_url}"
-                            );
-                        }
-                        println!("Waiting for callback on http://127.0.0.1:1455/auth/callback...");
-                        println!("(Or paste the redirect URL/code below if browser didn't work)\n");
-
-                        // Race: wait for callback server OR manual paste
-                        let code = tokio::select! {
-                            result = server => {
-                                match result {
-                                    Ok(code) => code,
-                                    Err(_) => {
-                                        // Server failed, fall back to manual paste
-                                        let input = prompt_non_empty_line(
-                                            "Paste the redirect URL or authorization code: ",
-                                            "Input cannot be empty.\n",
-                                            "OAuth redirect URL or code",
-                                        )?;
-                                        flow.parse_callback(&input).or_else(|_| {
-                                            // Maybe they pasted just the code
-                                            Ok::<String, ct_kernel::oauth::AuthError>(input.trim().to_string())
-                                        }).map_err(|e| TuiError::Auth(format!("{e}")))?
-                                    }
-                                }
-                            }
-                        };
-                        code
-                    }
-                    Err(_) => {
-                        // Couldn't bind port 1455, fall back to manual flow
-                        println!("Couldn't start local server. Open this URL in your browser:\n");
-                        println!("  {auth_url}\n");
-                        let input = prompt_non_empty_line(
-                            "Paste the redirect URL or authorization code: ",
-                            "Input cannot be empty.\n",
-                            "OAuth redirect URL or code",
-                        )?;
-                        flow.parse_callback(&input)
-                            .or_else(|_| {
-                                Ok::<String, ct_kernel::oauth::AuthError>(input.trim().to_string())
-                            })
-                            .map_err(|e| TuiError::Auth(format!("{e}")))?
-                    }
-                };
-
-                println!("Exchanging authorization code for tokens...");
-                let token_response =
-                    exchange_oauth_code_for_tokens(&flow, &client_id, &auth_code).await?;
-
-                let account_id =
-                    ct_kernel::oauth::extract_openai_account_id(&token_response.access_token);
-                let expires_at = current_time_ms()
-                    .saturating_add(token_response.expires_in.saturating_mul(1_000));
-
-                self.auth_manager.store(
-                    "openai",
-                    AuthMethod::OAuth {
-                        provider: "openai".to_string(),
-                        access_token: token_response.access_token,
-                        refresh_token: token_response.refresh_token,
-                        expires_at,
-                        account_id,
-                    },
-                );
-
-                println!("✓ Authenticated. Tokens stored.\n");
-                "openai".to_string()
-            }
-            AuthSelection::ApiKey => {
-                println!("Which provider?");
-                println!("  [1] Anthropic");
-                println!("  [2] OpenAI");
-                println!("  [3] OpenRouter");
-                println!("  [4] Other (OpenAI-compatible)");
-                println!();
-
-                let provider_choice = prompt_choice(
-                    "> ",
-                    "Please choose 1, 2, 3, or 4.",
-                    "API key provider selection",
-                    parse_api_key_provider_selection,
-                )?;
-
-                let provider = match provider_choice {
-                    ApiKeyProvider::Anthropic => "anthropic".to_string(),
-                    ApiKeyProvider::OpenAi => "openai".to_string(),
-                    ApiKeyProvider::OpenRouter => "openrouter".to_string(),
-                    ApiKeyProvider::Other => prompt_non_empty_line(
-                        "Provider name: ",
-                        "Provider name cannot be empty.",
-                        "API key provider name",
-                    )?,
-                };
-
-                let key = prompt_non_empty_secret(
-                    &format!("Enter your {provider} API key: "),
-                    "API key cannot be empty.\n",
-                    "API key",
-                )?;
-
-                self.auth_manager.store(
-                    &provider,
-                    AuthMethod::ApiKey {
-                        provider: provider.clone(),
-                        key,
-                    },
-                );
-
-                println!("✓ API key stored.\n");
-                provider
-            }
+            AuthSelection::ClaudeSubscription => self.auth_wizard_claude_subscription()?,
+            AuthSelection::ChatGptSubscription => self.auth_wizard_chatgpt_subscription().await?,
+            AuthSelection::ApiKey => self.auth_wizard_api_key()?,
         };
 
+        self.auth_wizard_finalize(&preferred_provider).await
+    }
+
+    fn auth_wizard_claude_subscription(&mut self) -> Result<String, TuiError> {
+        let token = prompt_non_empty_secret(
+            "Paste your Claude setup token: ",
+            "Setup token cannot be empty.\n",
+            "Claude setup token",
+        )?;
+
+        self.auth_manager
+            .store("anthropic", AuthMethod::SetupToken { token });
+
+        println!("✓ Authenticated. Token stored.\n");
+        Ok("anthropic".to_string())
+    }
+
+    async fn auth_wizard_chatgpt_subscription(&mut self) -> Result<String, TuiError> {
+        let flow = PkceFlow::new();
+        let client_id = std::env::var("CITROS_OPENAI_CLIENT_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| ct_kernel::oauth::OPENAI_CLIENT_ID.to_string());
+        let auth_url = flow.authorization_url(&client_id);
+        let auth_code = obtain_oauth_authorization_code(&flow, &auth_url).await?;
+
+        println!("Exchanging authorization code for tokens...");
+        let token_response = exchange_oauth_code_for_tokens(&flow, &client_id, &auth_code).await?;
+
+        let account_id = ct_kernel::oauth::extract_openai_account_id(&token_response.access_token);
+        let expires_at =
+            current_time_ms().saturating_add(token_response.expires_in.saturating_mul(1_000));
+
+        self.auth_manager.store(
+            "openai",
+            AuthMethod::OAuth {
+                provider: "openai".to_string(),
+                access_token: token_response.access_token,
+                refresh_token: token_response.refresh_token,
+                expires_at,
+                account_id,
+            },
+        );
+
+        println!("✓ Authenticated. Tokens stored.\n");
+        Ok("openai".to_string())
+    }
+
+    fn auth_wizard_api_key(&mut self) -> Result<String, TuiError> {
+        println!("Which provider?");
+        println!("  [1] Anthropic");
+        println!("  [2] OpenAI");
+        println!("  [3] OpenRouter");
+        println!("  [4] Other (OpenAI-compatible)");
+        println!();
+
+        let provider_choice = prompt_choice(
+            "> ",
+            "Please choose 1, 2, 3, or 4.",
+            "API key provider selection",
+            parse_api_key_provider_selection,
+        )?;
+
+        let provider = match provider_choice {
+            ApiKeyProvider::Anthropic => "anthropic".to_string(),
+            ApiKeyProvider::OpenAi => "openai".to_string(),
+            ApiKeyProvider::OpenRouter => "openrouter".to_string(),
+            ApiKeyProvider::Other => prompt_non_empty_line(
+                "Provider name: ",
+                "Provider name cannot be empty.",
+                "API key provider name",
+            )?,
+        };
+
+        let key = prompt_non_empty_secret(
+            &format!("Enter your {provider} API key: "),
+            "API key cannot be empty.\n",
+            "API key",
+        )?;
+
+        self.auth_manager.store(
+            &provider,
+            AuthMethod::ApiKey {
+                provider: provider.clone(),
+                key,
+            },
+        );
+
+        println!("✓ API key stored.\n");
+        Ok(provider)
+    }
+
+    async fn auth_wizard_finalize(&mut self, preferred_provider: &str) -> Result<(), TuiError> {
         persist_auth_manager(&self.auth_manager).await?;
 
-        let preferred_models = self.get_models_for_provider(&preferred_provider).await;
+        let preferred_models = self.get_models_for_provider(preferred_provider).await;
         self.refresh_router_models().await?;
         self.set_preferred_model(&preferred_models);
 
@@ -841,6 +804,56 @@ const OAUTH_SUCCESS_HTML: &str = r#"<!doctype html>
 <html><head><meta charset="utf-8"><title>Authentication successful</title></head>
 <body><p>Authentication successful. Return to your terminal to continue.</p></body></html>"#;
 
+async fn obtain_oauth_authorization_code(
+    flow: &PkceFlow,
+    auth_url: &str,
+) -> Result<String, TuiError> {
+    match start_oauth_callback_server(flow.state()).await {
+        Ok(server) => oauth_code_with_callback_server(flow, auth_url, server).await,
+        Err(_) => oauth_code_manual_fallback(flow, auth_url),
+    }
+}
+
+async fn oauth_code_with_callback_server<F>(
+    flow: &PkceFlow,
+    auth_url: &str,
+    server: F,
+) -> Result<String, TuiError>
+where
+    F: std::future::Future<Output = Result<String, TuiError>>,
+{
+    println!("Opening browser for ChatGPT sign-in...");
+    if let Err(error) = open_browser(auth_url) {
+        println!(
+            "Couldn't open browser automatically ({error}). Open this URL manually:\n{auth_url}"
+        );
+    }
+    println!("Waiting for callback on http://127.0.0.1:1455/auth/callback...");
+    println!("(Or paste the redirect URL/code below if browser didn't work)\n");
+
+    tokio::select! {
+        result = server => result.or_else(|_| prompt_for_oauth_code(flow)),
+    }
+}
+
+fn oauth_code_manual_fallback(flow: &PkceFlow, auth_url: &str) -> Result<String, TuiError> {
+    println!("Couldn't start local server. Open this URL in your browser:\n");
+    println!("  {auth_url}\n");
+    prompt_for_oauth_code(flow)
+}
+
+fn prompt_for_oauth_code(flow: &PkceFlow) -> Result<String, TuiError> {
+    let input = prompt_non_empty_line(
+        "Paste the redirect URL or authorization code: ",
+        "Input cannot be empty.\n",
+        "OAuth redirect URL or code",
+    )?;
+
+    flow.parse_callback(&input)
+        .or_else(|_| Ok::<String, ct_kernel::oauth::AuthError>(input.trim().to_string()))
+        .map_err(|error| TuiError::Auth(format!("{error}")))
+}
+
 /// Start a local HTTP server on port 1455 to capture the OAuth callback.
 /// Returns a future that resolves with the authorization code when received.
 async fn start_oauth_callback_server(
@@ -1278,24 +1291,35 @@ fn prompt_secret(prompt: &str) -> Result<String, TuiError> {
 
     let _guard = RawModeGuard::new()?;
     let mut value = String::new();
+    read_secret_input(&mut value)?;
+
+    let trimmed = value.trim().to_string();
+    if trimmed.is_empty() {
+        println!();
+    } else {
+        println!(" ({} chars)", trimmed.len());
+    }
+
+    Ok(trimmed)
+}
+
+fn read_secret_input(value: &mut String) -> Result<(), TuiError> {
     let mut display_len: usize = 0;
 
     loop {
         let event = event::read().map_err(TuiError::Io)?;
         if let event::Event::Key(key_event) = event {
             match key_event.code {
-                event::KeyCode::Enter => break,
+                event::KeyCode::Enter => return Ok(()),
                 event::KeyCode::Char(ch) => {
                     value.push(ch);
                     display_len += 1;
-                    // Show a dot for each character so user knows paste worked
                     print!("•");
                     io::stdout().flush().map_err(TuiError::Io)?;
                 }
                 event::KeyCode::Backspace => {
                     if value.pop().is_some() && display_len > 0 {
                         display_len -= 1;
-                        // Erase the last dot
                         print!("\x08 \x08");
                         io::stdout().flush().map_err(TuiError::Io)?;
                     }
@@ -1304,15 +1328,6 @@ fn prompt_secret(prompt: &str) -> Result<String, TuiError> {
             }
         }
     }
-
-    // Show confirmation with character count
-    let trimmed = value.trim().to_string();
-    if trimmed.is_empty() {
-        println!();
-    } else {
-        println!(" ({} chars)", trimmed.len());
-    }
-    Ok(trimmed)
 }
 
 fn open_browser(url: &str) -> io::Result<()> {
