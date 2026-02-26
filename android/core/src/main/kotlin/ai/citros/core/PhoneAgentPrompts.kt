@@ -252,6 +252,7 @@ Multi-step requests are not complete after just opening an app.
 Example: "Open Gmail and start a draft" means open Gmail, enter compose, focus the message field, and begin drafting.
 If the keyboard appears while you're still in the same app/task flow, treat it as normal progress — not an app switch and not completion."""
 
+
     private const val STRATEGY_EXECUTION = """### Execution — Act, Don't Announce
 - **Never announce an action without doing it.** "Let me open Settings" as a text-only response is useless — call the tool in the same turn.
 - If you intend to do something, include the tool call. Text without tools = conversation, not action.

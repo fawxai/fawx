@@ -25,9 +25,7 @@ class AgentPromptBuilder(
         domainGuardrailMode: PhoneAgentPrompts.DomainGuardrailMode =
             PhoneAgentPrompts.DomainGuardrailMode.GENERIC,
         sensorContext: SensorContext? = null,
-        resolvedToolPlan: ResolvedToolPlan? = null,
-        domainGuardrailMode: PhoneAgentPrompts.DomainGuardrailMode =
-            PhoneAgentPrompts.DomainGuardrailMode.GENERIC
+        resolvedToolPlan: ResolvedToolPlan? = null
     ): String {
         val soulContent = readFileOrNull(AgentFileManager.SOUL_FILE)
         val identityContent = readFileOrNull(AgentFileManager.IDENTITY_FILE)
@@ -49,8 +47,7 @@ class AgentPromptBuilder(
             securityContent = securityContent,
             domainGuardrailMode = domainGuardrailMode,
             sensorContext = sensorContext,
-            resolvedToolPlan = resolvedToolPlan,
-            domainGuardrailMode = domainGuardrailMode
+            resolvedToolPlan = resolvedToolPlan
         )
     }
 
@@ -64,9 +61,7 @@ class AgentPromptBuilder(
         domainGuardrailMode: PhoneAgentPrompts.DomainGuardrailMode =
             PhoneAgentPrompts.DomainGuardrailMode.GENERIC,
         sensorContext: SensorContext? = null,
-        resolvedToolPlan: ResolvedToolPlan? = null,
-        domainGuardrailMode: PhoneAgentPrompts.DomainGuardrailMode =
-            PhoneAgentPrompts.DomainGuardrailMode.GENERIC
+        resolvedToolPlan: ResolvedToolPlan? = null
     ): String {
         val securityContent = readFileOrNull(AgentFileManager.SECURITY_FILE)
         return PhoneAgentPrompts.buildActionPrompt(
@@ -75,8 +70,7 @@ class AgentPromptBuilder(
             securityContent = securityContent,
             domainGuardrailMode = domainGuardrailMode,
             sensorContext = sensorContext,
-            resolvedToolPlan = resolvedToolPlan,
-            domainGuardrailMode = domainGuardrailMode
+            resolvedToolPlan = resolvedToolPlan
         )
     }
 

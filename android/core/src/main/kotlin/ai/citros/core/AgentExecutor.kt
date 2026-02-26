@@ -230,6 +230,7 @@ class AgentExecutor(
         continueAfterTools: suspend () -> ChatResponse
     ): LoopResult {
         failureCounts.clear()
+        fallbackStateMachine.reset()
         completionGate.reset()
         var response: ChatResponse? = initialResponse
         var screenContent = initialScreenContent
