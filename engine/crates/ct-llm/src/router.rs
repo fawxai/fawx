@@ -88,33 +88,25 @@ impl ModelRouter {
     /// Send a completion request using the currently active model/provider pair.
     pub async fn complete(
         &self,
-        mut request: CompletionRequest,
+        request: CompletionRequest,
     ) -> Result<CompletionResponse, crate::types::LlmError> {
-        let active_model = self.active_model.clone().ok_or_else(|| {
-            crate::types::LlmError::Config(RouterError::NoActiveModel.to_string())
-        })?;
-
-        let provider_name = self.model_to_provider.get(&active_model).ok_or_else(|| {
-            crate::types::LlmError::Config(
-                RouterError::ModelNotFound(active_model.clone()).to_string(),
-            )
-        })?;
-
-        let provider = self.providers.get(provider_name).ok_or_else(|| {
-            crate::types::LlmError::Provider(format!(
-                "provider '{provider_name}' was not registered"
-            ))
-        })?;
-
-        request.model = active_model;
-        provider.complete(request).await
+        let (provider, normalized_request) = self.request_for_active_provider(request)?;
+        provider.complete(normalized_request).await
     }
 
     /// Send a streaming completion request to the active provider.
     pub async fn complete_stream(
         &self,
-        mut request: CompletionRequest,
+        request: CompletionRequest,
     ) -> Result<crate::provider::CompletionStream, crate::types::LlmError> {
+        let (provider, normalized_request) = self.request_for_active_provider(request)?;
+        provider.complete_stream(normalized_request).await
+    }
+
+    fn request_for_active_provider(
+        &self,
+        mut request: CompletionRequest,
+    ) -> Result<(&dyn CompletionProvider, CompletionRequest), crate::types::LlmError> {
         let active_model = self.active_model.clone().ok_or_else(|| {
             crate::types::LlmError::Config(RouterError::NoActiveModel.to_string())
         })?;
@@ -132,7 +124,11 @@ impl ModelRouter {
         })?;
 
         request.model = active_model;
-        provider.complete_stream(request).await
+        if !provider.capabilities().supports_temperature {
+            request.temperature = None;
+        }
+
+        Ok((provider.as_ref(), request))
     }
 }
 
@@ -498,9 +494,12 @@ mod tests {
 mod model_router_tests {
     use super::*;
     use async_trait::async_trait;
+    use futures::stream;
     use std::sync::{Arc, Mutex};
 
-    use crate::provider::{CompletionStream, LlmProvider as CompletionProvider};
+    use crate::provider::{
+        CompletionStream, LlmProvider as CompletionProvider, ProviderCapabilities,
+    };
     use crate::types::{CompletionRequest, CompletionResponse, ContentBlock, LlmError, Message};
 
     #[derive(Debug)]
@@ -509,6 +508,8 @@ mod model_router_tests {
         models: Vec<String>,
         response_text: String,
         captured_models: Arc<Mutex<Vec<String>>>,
+        captured_temperatures: Arc<Mutex<Vec<Option<f32>>>>,
+        capabilities: ProviderCapabilities,
     }
 
     impl MockCompletionProvider {
@@ -517,12 +518,16 @@ mod model_router_tests {
             models: Vec<&str>,
             response_text: &str,
             captured_models: Arc<Mutex<Vec<String>>>,
+            captured_temperatures: Arc<Mutex<Vec<Option<f32>>>>,
+            capabilities: ProviderCapabilities,
         ) -> Self {
             Self {
                 provider_name: provider_name.to_string(),
                 models: models.into_iter().map(ToString::to_string).collect(),
                 response_text: response_text.to_string(),
                 captured_models,
+                captured_temperatures,
+                capabilities,
             }
         }
     }
@@ -534,6 +539,10 @@ mod model_router_tests {
             request: CompletionRequest,
         ) -> Result<CompletionResponse, LlmError> {
             self.captured_models.lock().unwrap().push(request.model);
+            self.captured_temperatures
+                .lock()
+                .unwrap()
+                .push(request.temperature);
 
             Ok(CompletionResponse {
                 content: vec![ContentBlock::Text {
@@ -547,11 +556,15 @@ mod model_router_tests {
 
         async fn complete_stream(
             &self,
-            _request: CompletionRequest,
+            request: CompletionRequest,
         ) -> Result<CompletionStream, LlmError> {
-            Err(LlmError::Streaming(
-                "streaming not implemented for mock provider".to_string(),
-            ))
+            self.captured_models.lock().unwrap().push(request.model);
+            self.captured_temperatures
+                .lock()
+                .unwrap()
+                .push(request.temperature);
+
+            Ok(Box::pin(stream::empty()))
         }
 
         fn name(&self) -> &str {
@@ -561,14 +574,22 @@ mod model_router_tests {
         fn supported_models(&self) -> Vec<String> {
             self.models.clone()
         }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            self.capabilities
+        }
     }
 
     fn request_with_model(model: &str) -> CompletionRequest {
+        request_with_temperature(model, None)
+    }
+
+    fn request_with_temperature(model: &str, temperature: Option<f32>) -> CompletionRequest {
         CompletionRequest {
             model: model.to_string(),
             messages: vec![Message::user("hello")],
             tools: Vec::new(),
-            temperature: None,
+            temperature,
             max_tokens: Some(256),
             system_prompt: None,
         }
@@ -581,14 +602,24 @@ mod model_router_tests {
         })
     }
 
+    fn default_capabilities() -> ProviderCapabilities {
+        ProviderCapabilities {
+            supports_temperature: true,
+            requires_streaming: false,
+        }
+    }
+
     #[test]
     fn register_provider_lists_models_and_auth_metadata() {
         let captured = Arc::new(Mutex::new(Vec::new()));
+        let temperatures = Arc::new(Mutex::new(Vec::new()));
         let provider = MockCompletionProvider::new(
             "openai-oauth",
             vec!["gpt-4o", "gpt-4o-mini"],
             "openai",
             captured,
+            temperatures,
+            default_capabilities(),
         );
 
         let mut router = ModelRouter::new();
@@ -605,6 +636,27 @@ mod model_router_tests {
     }
 
     #[test]
+    fn register_provider_with_auth_uses_explicit_auth_method() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let temperatures = Arc::new(Mutex::new(Vec::new()));
+        let provider = MockCompletionProvider::new(
+            "openai",
+            vec!["gpt-4o"],
+            "from openai",
+            captured,
+            temperatures,
+            default_capabilities(),
+        );
+
+        let mut router = ModelRouter::new();
+        router.register_provider_with_auth(Box::new(provider), "api_key");
+
+        let models = router.available_models();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].auth_method, "api_key");
+    }
+
+    #[test]
     fn set_active_returns_error_for_unknown_model() {
         let mut router = ModelRouter::new();
         let result = router.set_active("missing-model");
@@ -615,22 +667,48 @@ mod model_router_tests {
         ));
     }
 
+    #[test]
+    fn active_model_returns_selected_model() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let temperatures = Arc::new(Mutex::new(Vec::new()));
+        let provider = MockCompletionProvider::new(
+            "openai",
+            vec!["gpt-4o"],
+            "from openai",
+            captured,
+            temperatures,
+            default_capabilities(),
+        );
+
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(provider));
+        router.set_active("gpt-4o").unwrap();
+
+        assert_eq!(router.active_model(), Some("gpt-4o"));
+    }
+
     #[tokio::test]
     async fn complete_routes_request_to_active_provider() {
         let anthropic_calls = Arc::new(Mutex::new(Vec::new()));
         let openai_calls = Arc::new(Mutex::new(Vec::new()));
+        let anthropic_temperatures = Arc::new(Mutex::new(Vec::new()));
+        let openai_temperatures = Arc::new(Mutex::new(Vec::new()));
 
         let anthropic = MockCompletionProvider::new(
             "anthropic",
             vec!["claude-opus-4"],
             "from anthropic",
             Arc::clone(&anthropic_calls),
+            Arc::clone(&anthropic_temperatures),
+            default_capabilities(),
         );
         let openai = MockCompletionProvider::new(
             "openai",
             vec!["gpt-4o"],
             "from openai",
             Arc::clone(&openai_calls),
+            Arc::clone(&openai_temperatures),
+            default_capabilities(),
         );
 
         let mut router = ModelRouter::new();
@@ -649,16 +727,21 @@ mod model_router_tests {
             openai_calls.lock().unwrap().clone(),
             vec!["gpt-4o".to_string()]
         );
+        assert_eq!(anthropic_temperatures.lock().unwrap().len(), 0);
+        assert_eq!(openai_temperatures.lock().unwrap().clone(), vec![None]);
     }
 
     #[tokio::test]
     async fn complete_without_active_model_returns_config_error() {
         let captured = Arc::new(Mutex::new(Vec::new()));
+        let temperatures = Arc::new(Mutex::new(Vec::new()));
         let provider = MockCompletionProvider::new(
             "anthropic",
             vec!["claude-opus-4"],
             "from anthropic",
             captured,
+            temperatures,
+            default_capabilities(),
         );
 
         let mut router = ModelRouter::new();
@@ -669,5 +752,63 @@ mod model_router_tests {
         assert!(
             matches!(result, Err(LlmError::Config(message)) if message.contains("no active model selected"))
         );
+    }
+
+    #[tokio::test]
+    async fn complete_strips_temperature_when_provider_does_not_support_it() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let temperatures = Arc::new(Mutex::new(Vec::new()));
+        let provider = MockCompletionProvider::new(
+            "openai-responses",
+            vec!["gpt-5"],
+            "ok",
+            Arc::clone(&calls),
+            Arc::clone(&temperatures),
+            ProviderCapabilities {
+                supports_temperature: false,
+                requires_streaming: false,
+            },
+        );
+
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(provider));
+        router.set_active("gpt-5").unwrap();
+
+        let result = router
+            .complete(request_with_temperature("ignored", Some(0.9)))
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(calls.lock().unwrap().clone(), vec!["gpt-5".to_string()]);
+        assert_eq!(temperatures.lock().unwrap().clone(), vec![None]);
+    }
+
+    #[tokio::test]
+    async fn complete_stream_strips_temperature_when_provider_does_not_support_it() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let temperatures = Arc::new(Mutex::new(Vec::new()));
+        let provider = MockCompletionProvider::new(
+            "openai-responses",
+            vec!["gpt-5"],
+            "ok",
+            Arc::clone(&calls),
+            Arc::clone(&temperatures),
+            ProviderCapabilities {
+                supports_temperature: false,
+                requires_streaming: false,
+            },
+        );
+
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(provider));
+        router.set_active("gpt-5").unwrap();
+
+        let result = router
+            .complete_stream(request_with_temperature("ignored", Some(0.3)))
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(calls.lock().unwrap().clone(), vec!["gpt-5".to_string()]);
+        assert_eq!(temperatures.lock().unwrap().clone(), vec![None]);
     }
 }

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::VecDeque, time::Duration};
 
-use crate::provider::{CompletionStream, LlmProvider};
+use crate::provider::{CompletionStream, LlmProvider, ProviderCapabilities};
 use crate::types::{
     CompletionRequest, CompletionResponse, ContentBlock, LlmError, Message, MessageRole,
     StreamChunk, ToolCall, ToolUseDelta, Usage,
@@ -509,6 +509,13 @@ impl LlmProvider for AnthropicProvider {
 
     fn supported_models(&self) -> Vec<String> {
         self.supported_models.clone()
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            supports_temperature: true,
+            requires_streaming: false,
+        }
     }
 }
 

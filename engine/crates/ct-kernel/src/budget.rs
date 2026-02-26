@@ -604,6 +604,41 @@ mod tests {
     }
 
     #[test]
+    fn reset_clears_usage_and_updates_start_time() {
+        let mut tracker = BudgetTracker::new(test_config(), 1_000, 2);
+        tracker.record(&ActionCost {
+            llm_calls: 3,
+            tool_invocations: 4,
+            tokens: 1_200,
+            cost_cents: 9,
+        });
+
+        tracker.reset(9_999);
+
+        assert_eq!(tracker.llm_calls_used(), 0);
+        assert_eq!(tracker.tool_invocations_used(), 0);
+        assert_eq!(tracker.tokens_used(), 0);
+        assert_eq!(tracker.cost_cents_used(), 0);
+        assert_eq!(tracker.start_time_ms, 9_999);
+        assert_eq!(tracker.depth, 2);
+    }
+
+    #[test]
+    fn usage_accessors_return_recorded_values() {
+        let mut tracker = BudgetTracker::new(test_config(), 0, 0);
+        tracker.record(&ActionCost {
+            llm_calls: 5,
+            tool_invocations: 7,
+            tokens: 3_000,
+            cost_cents: 42,
+        });
+
+        assert_eq!(tracker.llm_calls_used(), 5);
+        assert_eq!(tracker.tool_invocations_used(), 7);
+        assert_eq!(tracker.cost_cents_used(), 42);
+    }
+
+    #[test]
     fn remaining_reflects_consumed_resources() {
         let mut tracker = BudgetTracker::new(test_config(), 0, 0);
         tracker.record(&ActionCost {
