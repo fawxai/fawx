@@ -914,23 +914,41 @@ fn prompt_secret(prompt: &str) -> Result<String, TuiError> {
 
     let _guard = RawModeGuard::new()?;
     let mut value = String::new();
+    let mut display_len: usize = 0;
 
     loop {
         let event = event::read().map_err(TuiError::Io)?;
         if let event::Event::Key(key_event) = event {
             match key_event.code {
                 event::KeyCode::Enter => break,
-                event::KeyCode::Char(ch) => value.push(ch),
+                event::KeyCode::Char(ch) => {
+                    value.push(ch);
+                    display_len += 1;
+                    // Show a dot for each character so user knows paste worked
+                    print!("•");
+                    io::stdout().flush().map_err(TuiError::Io)?;
+                }
                 event::KeyCode::Backspace => {
-                    value.pop();
+                    if value.pop().is_some() && display_len > 0 {
+                        display_len -= 1;
+                        // Erase the last dot
+                        print!("\x08 \x08");
+                        io::stdout().flush().map_err(TuiError::Io)?;
+                    }
                 }
                 _ => {}
             }
         }
     }
 
-    println!();
-    Ok(value.trim().to_string())
+    // Show confirmation with character count
+    let trimmed = value.trim().to_string();
+    if trimmed.is_empty() {
+        println!();
+    } else {
+        println!(" ({} chars)", trimmed.len());
+    }
+    Ok(trimmed)
 }
 
 fn open_browser(url: &str) -> io::Result<()> {
