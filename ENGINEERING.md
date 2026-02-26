@@ -170,4 +170,24 @@ Code that doesn't meet the standards above doesn't get moved to the new structur
 
 ---
 
+## 7. Agent Execution Model
+
+### Roles
+- **Clawdio main session** is the lead. Orchestrates, designs, reviews results, makes architectural calls. Does NOT write code unless absolutely necessary (e.g., a one-line config fix or emergency hotfix with no time to spawn).
+- **Subagents** do all implementation, review, and fix work.
+
+### Model allocation (cost discipline)
+- **Codex xhigh**: Default for everything — implementations, reviews, fixes, quick patches.
+- **Opus high**: Reserved for highly technical work only — complex architectural decisions, subtle concurrency/ownership bugs, novel algorithm design. If in doubt, use Codex xhigh.
+
+### Rules
+1. Main session delegates code work to subagents. No inline code writing in the main chat except trivial edits.
+2. Quick fixes (formatting, one-liner bugs, test updates) → Codex xhigh subagent.
+3. Feature implementation → Codex xhigh subagent.
+4. Code review → Codex xhigh subagent.
+5. Review fix cycles → Codex xhigh subagent.
+6. Opus high subagent only when the problem genuinely requires deeper reasoning (justify in the spawn).
+
+---
+
 *This file is the engineering constitution. Cite it in PR reviews. Update it when standards evolve.*
