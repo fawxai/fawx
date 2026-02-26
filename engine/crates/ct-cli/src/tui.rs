@@ -3,8 +3,8 @@ use crossterm::{cursor, event, style, terminal, ExecutableCommand};
 use ct_kernel::auth::{AuthManager, AuthMethod};
 use ct_kernel::oauth::{PkceFlow, TokenExchangeRequest, TokenResponse};
 use ct_llm::{
-    AnthropicProvider, CompletionRequest, ContentBlock, Message, ModelRouter, OpenAiProvider,
-    OpenAiResponsesProvider,
+    AnthropicProvider, CompletionRequest, ContentBlock, Message, ModelCatalog, ModelRouter,
+    OpenAiProvider, OpenAiResponsesProvider,
 };
 use std::fmt;
 use std::io::{self, Write};
@@ -36,6 +36,7 @@ const DEFAULT_OPENROUTER_MODELS: &[&str] = &[
 pub struct TuiApp {
     router: ModelRouter,
     auth_manager: AuthManager,
+    catalog: ModelCatalog,
     running: bool,
 }
 
@@ -45,6 +46,7 @@ impl TuiApp {
         Self {
             router,
             auth_manager,
+            catalog: ModelCatalog::new(),
             running: true,
         }
     }
@@ -56,6 +58,7 @@ impl TuiApp {
         if !self.auth_manager.has_any() {
             self.auth_wizard().await?;
         } else {
+            self.refresh_router_models().await?;
             self.select_first_available_model();
         }
 
@@ -134,7 +137,7 @@ impl TuiApp {
             parse_auth_selection,
         )?;
 
-        let preferred_models = match selection {
+        let preferred_provider = match selection {
             AuthSelection::ClaudeSubscription => {
                 let token = prompt_non_empty_secret(
                     "Paste your Claude setup token: ",
@@ -146,7 +149,7 @@ impl TuiApp {
                     .store("anthropic", AuthMethod::SetupToken { token });
 
                 println!("✓ Authenticated. Token stored.\n");
-                to_strings(DEFAULT_ANTHROPIC_MODELS)
+                "anthropic".to_string()
             }
             AuthSelection::ChatGptSubscription => {
                 let flow = PkceFlow::new();
@@ -228,7 +231,7 @@ impl TuiApp {
                 );
 
                 println!("✓ Authenticated. Tokens stored.\n");
-                to_strings(DEFAULT_OPENAI_SUBSCRIPTION_MODELS)
+                "openai".to_string()
             }
             AuthSelection::ApiKey => {
                 println!("Which provider?");
@@ -271,13 +274,14 @@ impl TuiApp {
                 );
 
                 println!("✓ API key stored.\n");
-                models_for_provider(&provider)
+                provider
             }
         };
 
         persist_auth_manager(&self.auth_manager).await?;
 
-        self.router = build_router(&self.auth_manager)?;
+        let preferred_models = self.get_models_for_provider(&preferred_provider).await;
+        self.refresh_router_models().await?;
         self.set_preferred_model(&preferred_models);
 
         if let Some(active_model) = self.router.active_model() {
@@ -303,12 +307,18 @@ impl TuiApp {
     /// Process a user command (starts with `/`).
     async fn handle_command(&mut self, input: &str) -> Result<(), TuiError> {
         match parse_command(input) {
-            ParsedCommand::Model(None) => self.show_model_menu(),
-            ParsedCommand::Model(Some(model)) => match self.router.set_active(&model) {
-                Ok(()) => println!("Active model set to: {model}"),
-                Err(error) => {
-                    println!("Couldn't select model: {error}");
-                    self.show_model_menu();
+            ParsedCommand::Model(None) => {
+                self.refresh_router_models().await?;
+                self.show_model_menu();
+            }
+            ParsedCommand::Model(Some(model)) => {
+                self.refresh_router_models().await?;
+                match self.router.set_active(&model) {
+                    Ok(()) => println!("Active model set to: {model}"),
+                    Err(error) => {
+                        println!("Couldn't select model: {error}");
+                        self.show_model_menu();
+                    }
                 }
             },
             ParsedCommand::Auth => {
@@ -347,7 +357,9 @@ impl TuiApp {
             tools: Vec::new(),
             temperature: Some(0.2),
             max_tokens: Some(1024),
-            system_prompt: None,
+            system_prompt: Some(
+                "You are Citros, a helpful AI assistant. Be concise and direct.".to_string(),
+            ),
         };
 
         let response = self
@@ -438,6 +450,41 @@ impl TuiApp {
         }
 
         self.select_first_available_model();
+    }
+
+    async fn get_models_for_provider(&mut self, provider: &str) -> Vec<String> {
+        let Some(auth_method) = self.auth_manager.get(provider).cloned() else {
+            return models_for_provider(provider);
+        };
+
+        let models = catalog_models_for_auth(&mut self.catalog, &auth_method).await;
+        if models.is_empty() {
+            models_for_provider(provider)
+        } else {
+            models
+        }
+    }
+
+    async fn refresh_router_models(&mut self) -> Result<(), TuiError> {
+        let previous_active = self.router.active_model().map(ToString::to_string);
+
+        let mut refreshed = build_router_with_catalog(&self.auth_manager, &mut self.catalog).await?;
+
+        if let Some(active_model) = previous_active {
+            if refreshed.set_active(&active_model).is_err() {
+                if let Some(first_model) = refreshed
+                    .available_models()
+                    .into_iter()
+                    .next()
+                    .map(|model| model.model_id)
+                {
+                    let _ = refreshed.set_active(&first_model);
+                }
+            }
+        }
+
+        self.router = refreshed;
+        Ok(())
     }
 
     fn show_help(&self) {
@@ -544,6 +591,31 @@ pub fn build_router(auth_manager: &AuthManager) -> Result<ModelRouter, TuiError>
     for provider in auth_manager.providers() {
         if let Some(auth_method) = auth_manager.get(&provider) {
             register_auth_provider(&mut router, auth_method)?;
+        }
+    }
+
+    if let Some(first_model) = router
+        .available_models()
+        .into_iter()
+        .next()
+        .map(|model| model.model_id)
+    {
+        let _ = router.set_active(&first_model);
+    }
+
+    Ok(router)
+}
+
+async fn build_router_with_catalog(
+    auth_manager: &AuthManager,
+    catalog: &mut ModelCatalog,
+) -> Result<ModelRouter, TuiError> {
+    let mut router = ModelRouter::new();
+
+    for provider in auth_manager.providers() {
+        if let Some(auth_method) = auth_manager.get(&provider) {
+            let dynamic_models = catalog_models_for_auth(catalog, auth_method).await;
+            register_auth_provider_with_models(&mut router, auth_method, dynamic_models)?;
         }
     }
 
