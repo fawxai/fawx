@@ -24,6 +24,12 @@ const DEFAULT_ANTHROPIC_MODELS: &[&str] = &[
     "claude-3-7-sonnet-latest",
 ];
 const DEFAULT_OPENAI_MODELS: &[&str] = &["gpt-4.1", "gpt-4o", "gpt-4o-mini"];
+const DEFAULT_OPENAI_SUBSCRIPTION_MODELS: &[&str] = &[
+    "gpt-5.3-codex",
+    "gpt-5.2",
+    "gpt-5.1",
+    "o4-mini",
+];
 const DEFAULT_OPENROUTER_MODELS: &[&str] = &[
     "openai/gpt-4o-mini",
     "anthropic/claude-3.5-sonnet",
@@ -222,7 +228,7 @@ impl TuiApp {
                 );
 
                 println!("✓ Authenticated. Tokens stored.\n");
-                to_strings(DEFAULT_OPENAI_MODELS)
+                to_strings(DEFAULT_OPENAI_SUBSCRIPTION_MODELS)
             }
             AuthSelection::ApiKey => {
                 println!("Which provider?");
@@ -760,7 +766,7 @@ fn register_auth_provider(
             ..
         } => {
             if let Some(acct_id) = account_id {
-                // Use Responses API provider for subscription OAuth
+                // Use Responses API provider for subscription OAuth with Codex-compatible models
                 let provider_client =
                     OpenAiResponsesProvider::new(access_token.clone(), acct_id.clone())
                         .map_err(|error| {
@@ -768,7 +774,7 @@ fn register_auth_provider(
                                 "failed to configure {provider} Responses provider: {error}"
                             ))
                         })?
-                        .with_supported_models(models_for_provider(provider));
+                        .with_supported_models(to_strings(DEFAULT_OPENAI_SUBSCRIPTION_MODELS));
 
                 router.register_provider_with_auth(Box::new(provider_client), "subscription");
             } else {
@@ -1345,6 +1351,6 @@ mod tests {
             .all(|model| model.auth_method == "subscription"));
         assert!(openai_models
             .iter()
-            .any(|model| model.model_id == "gpt-4.1"));
+            .any(|model| model.model_id == "gpt-5.3-codex"));
     }
 }
