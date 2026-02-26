@@ -68,3 +68,4 @@ tmp/
 
 # Local Gradle wrapper cache used by sandboxed test runs
 .gradle-local/
+.openclaw-worktrees/
