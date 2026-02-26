@@ -30,6 +30,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod act;
+pub mod auth;
 pub mod budget;
 pub mod checkpoint;
 pub mod context_manager;
@@ -37,6 +38,7 @@ pub mod continuation;
 pub mod decide;
 pub mod learn;
 pub mod loop_engine;
+pub mod oauth;
 pub mod perceive;
 pub mod permissions;
 pub mod policy;
