@@ -67,6 +67,19 @@ pub struct ReasoningContext {
     pub parent_context: Option<Box<ReasoningContext>>,
 }
 
+impl ReasoningContext {
+    /// Validate that parent chain depth matches the depth field.
+    pub fn validate_depth(&self) -> bool {
+        let mut chain_len: u32 = 0;
+        let mut current = &self.parent_context;
+        while let Some(parent) = current {
+            chain_len += 1;
+            current = &parent.parent_context;
+        }
+        chain_len == self.depth
+    }
+}
+
 /// What this loop invocation is trying to achieve.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Goal {
@@ -361,8 +374,8 @@ pub struct ProcedureRef {
 pub struct IdentityContext {
     /// Optional preferred name of the user.
     pub user_name: Option<String>,
-    /// Key/value preference pairs.
-    pub preferences: Vec<(String, String)>,
+    /// Key/value preference map.
+    pub preferences: HashMap<String, String>,
     /// Personality or style traits relevant to behavior.
     pub personality_traits: Vec<String>,
 }
@@ -580,5 +593,226 @@ mod tests {
             ContinuationDecision::BudgetExhausted,
             ContinuationDecision::BudgetExhausted
         ));
+    }
+
+    #[test]
+    fn reasoning_context_depth_validation_and_roundtrip() {
+        let mut parent_preferences = HashMap::new();
+        parent_preferences.insert("lang".to_owned(), "en".to_owned());
+
+        let parent_context = ReasoningContext {
+            perception: PerceptionSnapshot {
+                screen: ScreenState {
+                    current_app: "com.example.mail".to_owned(),
+                    elements: vec![],
+                    text_content: "Inbox".to_owned(),
+                },
+                notifications: vec![],
+                active_app: "com.example.mail".to_owned(),
+                timestamp_ms: 1_700_000_000_001,
+                sensor_data: None,
+                user_input: None,
+            },
+            working_memory: vec![WorkingMemoryEntry {
+                key: "thread_id".to_owned(),
+                value: "42".to_owned(),
+                relevance: 0.8,
+            }],
+            relevant_episodic: vec![],
+            relevant_semantic: vec![],
+            active_procedures: vec![],
+            identity_context: IdentityContext {
+                user_name: Some("Joe".to_owned()),
+                preferences: parent_preferences,
+                personality_traits: vec!["concise".to_owned()],
+            },
+            goal: Goal::new(
+                "Open latest unread email",
+                vec!["Unread thread is visible".to_owned()],
+                Some(3),
+            ),
+            depth: 0,
+            parent_context: None,
+        };
+
+        let mut child_preferences = HashMap::new();
+        child_preferences.insert("theme".to_owned(), "dark".to_owned());
+
+        let context = ReasoningContext {
+            perception: PerceptionSnapshot {
+                screen: ScreenState {
+                    current_app: "com.example.mail".to_owned(),
+                    elements: vec![],
+                    text_content: "Messages".to_owned(),
+                },
+                notifications: vec![],
+                active_app: "com.example.mail".to_owned(),
+                timestamp_ms: 1_700_000_000_123,
+                sensor_data: None,
+                user_input: None,
+            },
+            working_memory: vec![],
+            relevant_episodic: vec![],
+            relevant_semantic: vec![],
+            active_procedures: vec![],
+            identity_context: IdentityContext {
+                user_name: Some("Joe".to_owned()),
+                preferences: child_preferences,
+                personality_traits: vec!["focused".to_owned()],
+            },
+            goal: Goal::new(
+                "Summarize message and draft reply",
+                vec!["Draft reply is prepared".to_owned()],
+                Some(5),
+            ),
+            depth: 1,
+            parent_context: Some(Box::new(parent_context)),
+        };
+
+        assert!(context.validate_depth());
+
+        let encoded = serde_json::to_string(&context).expect("serialize reasoning context");
+        let decoded: ReasoningContext =
+            serde_json::from_str(&encoded).expect("deserialize reasoning context");
+
+        assert_eq!(decoded.depth, 1);
+        assert!(decoded.validate_depth());
+        assert_eq!(decoded.goal.description, "Summarize message and draft reply");
+        assert_eq!(
+            decoded
+                .identity_context
+                .preferences
+                .get("theme")
+                .map(String::as_str),
+            Some("dark")
+        );
+
+        let parent = decoded
+            .parent_context
+            .as_ref()
+            .expect("expected one parent context");
+        assert_eq!(parent.goal.description, "Open latest unread email");
+        assert_eq!(
+            parent
+                .identity_context
+                .preferences
+                .get("lang")
+                .map(String::as_str),
+            Some("en")
+        );
+
+        let mut mismatched_depth = decoded.clone();
+        mismatched_depth.depth = 2;
+        assert!(!mismatched_depth.validate_depth());
+    }
+
+    #[test]
+    fn intended_action_delegate_roundtrip_preserves_params() {
+        let mut params = HashMap::new();
+        params.insert("query".to_owned(), "best ramen nearby".to_owned());
+        params.insert("radius_m".to_owned(), "1500".to_owned());
+
+        let action = IntendedAction::Delegate {
+            skill_id: "local-search".to_owned(),
+            params: params.clone(),
+        };
+
+        let encoded = serde_json::to_string(&action).expect("serialize delegate action");
+        let decoded: IntendedAction =
+            serde_json::from_str(&encoded).expect("deserialize delegate action");
+
+        match decoded {
+            IntendedAction::Delegate {
+                skill_id,
+                params: decoded_params,
+            } => {
+                assert_eq!(skill_id, "local-search");
+                assert_eq!(decoded_params, params);
+            }
+            _ => panic!("expected delegate action"),
+        }
+    }
+
+    #[test]
+    fn reasoned_intent_roundtrip_with_expected_outcome_and_sub_goals() {
+        let intent = ReasonedIntent {
+            action: IntendedAction::Navigate {
+                destination: "123 Main St".to_owned(),
+            },
+            rationale: "Navigate to the confirmed meeting location".to_owned(),
+            confidence: 0.88,
+            expected_outcome: Some(ExpectedOutcome {
+                description: "Maps app shows route ETA".to_owned(),
+                artifact_checks: vec![
+                    ArtifactCheck::AppInForeground("com.maps.app".to_owned()),
+                    ArtifactCheck::ScreenContains("ETA".to_owned()),
+                ],
+            }),
+            sub_goals: vec![
+                Goal::new(
+                    "Open maps app",
+                    vec!["Maps app is in foreground".to_owned()],
+                    Some(2),
+                ),
+                Goal::new(
+                    "Start route guidance",
+                    vec!["Turn-by-turn guidance is active".to_owned()],
+                    Some(3),
+                ),
+            ],
+        };
+
+        let encoded = serde_json::to_string(&intent).expect("serialize reasoned intent");
+        let decoded: ReasonedIntent =
+            serde_json::from_str(&encoded).expect("deserialize reasoned intent");
+
+        assert_eq!(decoded.rationale, intent.rationale);
+        assert_eq!(decoded.confidence, intent.confidence);
+        assert_eq!(decoded.sub_goals.len(), 2);
+        assert_eq!(decoded.sub_goals[0].description, "Open maps app");
+        assert_eq!(decoded.sub_goals[1].description, "Start route guidance");
+
+        let expected = decoded
+            .expected_outcome
+            .as_ref()
+            .expect("expected expected_outcome to be present");
+        assert_eq!(expected.description, "Maps app shows route ETA");
+        assert_eq!(expected.artifact_checks.len(), 2);
+        assert!(matches!(
+            expected.artifact_checks[0],
+            ArtifactCheck::AppInForeground(ref app) if app == "com.maps.app"
+        ));
+    }
+
+    #[test]
+    fn identity_context_preferences_serialize_as_object() {
+        let mut preferences = HashMap::new();
+        preferences.insert("theme".to_owned(), "dark".to_owned());
+        preferences.insert("lang".to_owned(), "en".to_owned());
+
+        let identity = IdentityContext {
+            user_name: Some("Joe".to_owned()),
+            preferences,
+            personality_traits: vec!["friendly".to_owned()],
+        };
+
+        let encoded = serde_json::to_value(&identity).expect("serialize identity context");
+        let preferences_value = encoded
+            .get("preferences")
+            .and_then(serde_json::Value::as_object)
+            .expect("preferences should serialize as a JSON object");
+
+        assert_eq!(
+            preferences_value
+                .get("theme")
+                .and_then(serde_json::Value::as_str),
+            Some("dark")
+        );
+        assert_eq!(
+            preferences_value
+                .get("lang")
+                .and_then(serde_json::Value::as_str),
+            Some("en")
+        );
     }
 }
