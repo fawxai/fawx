@@ -19,6 +19,7 @@ mod openai_responses;
 mod provider;
 mod router;
 mod routing;
+mod sse;
 mod types;
 
 pub use anthropic::AnthropicAuthMode;
@@ -29,7 +30,9 @@ pub use local::LocalModel;
 pub use model_catalog::{CatalogModel, ModelCatalog};
 pub use openai::OpenAiProvider;
 pub use openai_responses::OpenAiResponsesProvider;
-pub use provider::{CompletionStream, LlmProvider as CompletionProvider};
+pub use provider::{
+    CompletionStream, LlmProvider as CompletionProvider, ProviderCapabilities,
+};
 pub use router::{LlmRouter, ModelInfo, ModelRouter, RouterError, RoutingStrategy};
 pub use routing::{resolve_strategy, RoutingCondition, RoutingConfig, RoutingContext, RoutingRule};
 pub use types::{

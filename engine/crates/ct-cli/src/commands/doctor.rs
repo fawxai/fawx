@@ -140,16 +140,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_sync_check_functions_return_bool() {
-        // These should return bool values without panicking
-        let _ = check_workspace();
-        let _ = check_config();
-        let _ = check_model();
+    fn check_model_is_informational_and_always_passes() {
+        assert!(check_model());
+    }
+
+    #[test]
+    fn workspace_and_related_paths_match_contract() {
+        let workspace = get_workspace_dir().expect("workspace path");
+        assert_eq!(workspace.file_name().and_then(|name| name.to_str()), Some(".citros"));
+
+        let config = get_config_path().expect("config path");
+        let storage = get_storage_dir().expect("storage path");
+        let audit = get_audit_log_path().expect("audit path");
+
+        assert_eq!(config, workspace.join("config.toml"));
+        assert_eq!(storage, workspace.join("storage"));
+        assert_eq!(audit, workspace.join("audit.log"));
     }
 
     #[tokio::test]
-    async fn test_async_check_functions_return_bool() {
-        let _ = check_storage().await;
-        let _ = check_audit_log().await;
+    async fn storage_check_creates_and_writes_in_workspace_storage() {
+        assert!(check_storage().await);
+
+        let storage = get_storage_dir().expect("storage path");
+        assert!(storage.exists());
+    }
+
+    #[tokio::test]
+    async fn audit_log_check_matches_integrity_contract() {
+        let log_path = get_audit_log_path().expect("audit log path");
+
+        if !log_path.exists() {
+            assert!(check_audit_log().await);
+            return;
+        }
+
+        let expected = match ct_security::AuditLog::open(&log_path).await {
+            Ok(log) => log.verify_integrity().unwrap_or(false),
+            Err(_) => false,
+        };
+
+        assert_eq!(check_audit_log().await, expected);
     }
 }

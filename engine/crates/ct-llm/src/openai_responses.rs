@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::VecDeque, time::Duration};
 
-use crate::provider::{CompletionStream, LlmProvider};
+use crate::provider::{CompletionStream, LlmProvider, ProviderCapabilities};
 use crate::types::{
     CompletionRequest, CompletionResponse, ContentBlock, LlmError, MessageRole, StreamChunk, Usage,
 };
@@ -134,7 +134,7 @@ impl OpenAiResponsesProvider {
             input,
             stream,
             store: false,
-            temperature: None, // Codex Responses API does not support temperature
+            temperature: request.temperature
         })
     }
 
@@ -386,6 +386,13 @@ impl LlmProvider for OpenAiResponsesProvider {
     fn supported_models(&self) -> Vec<String> {
         self.supported_models.clone()
     }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            supports_temperature: false,
+            requires_streaming: false,
+        }
+    }
 }
 
 // ============================================================================
@@ -566,5 +573,14 @@ mod tests {
             headers.get("openai-beta").unwrap(),
             "responses=experimental"
         );
+    }
+
+    #[test]
+    fn capabilities_report_temperature_unsupported() {
+        let provider = OpenAiResponsesProvider::new("token", "acct_123").unwrap();
+        let capabilities = provider.capabilities();
+
+        assert!(!capabilities.supports_temperature);
+        assert!(!capabilities.requires_streaming);
     }
 }

@@ -1,14 +1,14 @@
 //! Anthropic Messages API provider.
 
 use async_trait::async_trait;
-use bytes::Bytes;
-use futures::{stream, Stream, StreamExt};
+use futures::Stream;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::VecDeque, time::Duration};
+use std::time::Duration;
 
-use crate::provider::{CompletionStream, LlmProvider};
+use crate::provider::{CompletionStream, LlmProvider, ProviderCapabilities};
+use crate::sse::{frame_sse_line, stream_sse_chunks, FramedSseLine};
 use crate::types::{
     CompletionRequest, CompletionResponse, ContentBlock, LlmError, Message, MessageRole,
     StreamChunk, ToolCall, ToolUseDelta, Usage,
@@ -242,21 +242,11 @@ impl AnthropicProvider {
     }
 
     fn parse_sse_line(line: &str) -> Result<ParsedSseLine, LlmError> {
-        let line = line.trim_start().trim_end_matches('\r');
-        let Some(data) = line.strip_prefix("data:") else {
-            return Ok(ParsedSseLine::Ignore);
-        };
-
-        let data = data.trim_start();
-        if data.is_empty() {
-            return Ok(ParsedSseLine::Ignore);
+        match frame_sse_line(line) {
+            FramedSseLine::Ignore => Ok(ParsedSseLine::Ignore),
+            FramedSseLine::Done => Ok(ParsedSseLine::Done),
+            FramedSseLine::Data(data) => Ok(ParsedSseLine::Chunks(Self::parse_sse_data(&data)?)),
         }
-
-        if data == "[DONE]" {
-            return Ok(ParsedSseLine::Done);
-        }
-
-        Ok(ParsedSseLine::Chunks(Self::parse_sse_data(data)?))
     }
 
     fn parse_sse_data(data: &str) -> Result<Vec<StreamChunk>, LlmError> {
@@ -343,101 +333,7 @@ impl AnthropicProvider {
     fn stream_from_sse(
         response: reqwest::Response,
     ) -> impl Stream<Item = Result<StreamChunk, LlmError>> + Send {
-        stream::unfold(
-            AnthropicSseState::new(response.bytes_stream()),
-            |mut state| async move {
-                loop {
-                    if let Some(chunk) = state.pending_chunks.pop_front() {
-                        return Some((chunk, state));
-                    }
-
-                    if state.finished {
-                        return None;
-                    }
-
-                    match state.bytes_stream.as_mut().next().await {
-                        Some(Ok(bytes)) => {
-                            state.buffer.extend_from_slice(&bytes);
-
-                            if let Err(error) = Self::drain_buffered_lines(&mut state) {
-                                state.finished = true;
-                                return Some((Err(error), state));
-                            }
-                        }
-                        Some(Err(error)) => {
-                            state.finished = true;
-                            return Some((Err(LlmError::Streaming(error.to_string())), state));
-                        }
-                        None => {
-                            if !state.buffer.is_empty() {
-                                let remaining = std::mem::take(&mut state.buffer);
-                                let line = match std::str::from_utf8(&remaining) {
-                                    Ok(line) => line,
-                                    Err(error) => {
-                                        state.finished = true;
-                                        return Some((
-                                            Err(LlmError::Streaming(format!(
-                                                "stream was not valid UTF-8: {error}"
-                                            ))),
-                                            state,
-                                        ));
-                                    }
-                                };
-
-                                if let Err(error) = Self::enqueue_parsed_line(
-                                    line,
-                                    &mut state.pending_chunks,
-                                    &mut state.finished,
-                                ) {
-                                    state.finished = true;
-                                    return Some((Err(error), state));
-                                }
-                            }
-
-                            state.finished = true;
-                        }
-                    }
-                }
-            },
-        )
-    }
-
-    fn drain_buffered_lines(state: &mut AnthropicSseState) -> Result<(), LlmError> {
-        while let Some(newline_index) = state.buffer.iter().position(|byte| *byte == b'\n') {
-            let line_bytes = state.buffer.drain(..=newline_index).collect::<Vec<_>>();
-            let line_bytes = &line_bytes[..line_bytes.len().saturating_sub(1)];
-
-            let line = std::str::from_utf8(line_bytes).map_err(|error| {
-                LlmError::Streaming(format!("stream was not valid UTF-8: {error}"))
-            })?;
-
-            Self::enqueue_parsed_line(line, &mut state.pending_chunks, &mut state.finished)?;
-
-            if state.finished {
-                state.buffer.clear();
-                break;
-            }
-        }
-
-        Ok(())
-    }
-
-    fn enqueue_parsed_line(
-        line: &str,
-        pending_chunks: &mut VecDeque<Result<StreamChunk, LlmError>>,
-        finished: &mut bool,
-    ) -> Result<(), LlmError> {
-        match Self::parse_sse_line(line)? {
-            ParsedSseLine::Ignore => {}
-            ParsedSseLine::Done => {
-                *finished = true;
-            }
-            ParsedSseLine::Chunks(chunks) => {
-                pending_chunks.extend(chunks.into_iter().map(Ok));
-            }
-        }
-
-        Ok(())
+        stream_sse_chunks(response, Self::parse_sse_data)
     }
 
     fn map_http_error(status: StatusCode, body: String) -> LlmError {
@@ -509,6 +405,13 @@ impl LlmProvider for AnthropicProvider {
 
     fn supported_models(&self) -> Vec<String> {
         self.supported_models.clone()
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            supports_temperature: true,
+            requires_streaming: false,
+        }
     }
 }
 
@@ -636,27 +539,6 @@ enum ParsedSseLine {
     Ignore,
     Done,
     Chunks(Vec<StreamChunk>),
-}
-
-struct AnthropicSseState {
-    bytes_stream: std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
-    buffer: Vec<u8>,
-    pending_chunks: VecDeque<Result<StreamChunk, LlmError>>,
-    finished: bool,
-}
-
-impl AnthropicSseState {
-    fn new<S>(bytes_stream: S) -> Self
-    where
-        S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
-    {
-        Self {
-            bytes_stream: Box::pin(bytes_stream),
-            buffer: Vec::new(),
-            pending_chunks: VecDeque::new(),
-            finished: false,
-        }
-    }
 }
 
 #[cfg(test)]

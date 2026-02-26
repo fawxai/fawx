@@ -9,6 +9,15 @@ use crate::types::{CompletionRequest, CompletionResponse, LlmError, StreamChunk}
 /// Streaming response type for completion APIs.
 pub type CompletionStream = Pin<Box<dyn Stream<Item = Result<StreamChunk, LlmError>> + Send>>;
 
+/// Static capabilities for a provider backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderCapabilities {
+    /// Whether this backend accepts a `temperature` request parameter.
+    pub supports_temperature: bool,
+    /// Whether this backend requires streaming to be used.
+    pub requires_streaming: bool,
+}
+
 /// Shared provider interface for cloud LLM adapters.
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
@@ -26,4 +35,7 @@ pub trait LlmProvider: Send + Sync {
 
     /// Models supported by this provider.
     fn supported_models(&self) -> Vec<String>;
+
+    /// Provider feature support contract.
+    fn capabilities(&self) -> ProviderCapabilities;
 }
