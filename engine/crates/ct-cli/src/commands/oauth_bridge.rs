@@ -229,41 +229,57 @@ struct PreparedExchangeInput {
 ///
 /// Returns an error if required configuration is missing or the server fails to bind.
 pub async fn run(options: Options) -> anyhow::Result<i32> {
-    let listen = if options.listen.trim().is_empty() {
+    let listen = resolve_listen_address(&options);
+    let settings = BridgeSettings::from_options(&options)?;
+    let state = build_app_state(&settings);
+
+    spawn_session_cleanup(state.clone());
+
+    let app = build_router(state);
+    let listener = bind_listener(&listen).await?;
+
+    print_startup_banner(&listen, &settings);
+    axum::serve(listener, app).await?;
+    Ok(0)
+}
+
+fn resolve_listen_address(options: &Options) -> String {
+    let trimmed = options.listen.trim();
+    if trimmed.is_empty() {
         DEFAULT_LISTEN.to_string()
     } else {
-        options.listen.trim().to_string()
-    };
+        trimmed.to_string()
+    }
+}
 
-    let settings = BridgeSettings::from_options(&options)?;
-    let state = AppState {
+fn build_app_state(settings: &BridgeSettings) -> AppState {
+    AppState {
         settings: settings.clone(),
         sessions: Arc::new(RwLock::new(HashMap::new())),
         http_client: reqwest::Client::new(),
-    };
+    }
+}
 
-    // Start background session cleanup task
-    let cleanup_state = state.clone();
+fn spawn_session_cleanup(state: AppState) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            let mut sessions = cleanup_state.sessions.write().await;
+            let mut sessions = state.sessions.write().await;
             evict_expired_sessions(&mut sessions);
         }
     });
+}
 
-    let app = build_router(state);
-
-    let listener = TcpListener::bind(&listen)
+async fn bind_listener(listen: &str) -> anyhow::Result<TcpListener> {
+    TcpListener::bind(listen)
         .await
-        .with_context(|| format!("Failed to bind OAuth bridge on {listen}"))?;
+        .with_context(|| format!("Failed to bind OAuth bridge on {listen}"))
+}
 
+fn print_startup_banner(listen: &str, settings: &BridgeSettings) {
     println!("Citros OAuth bridge listening on http://{listen}");
     println!("Authorize URL: {}", settings.authorize_url);
     println!("Token URL: {}", settings.token_url);
-
-    axum::serve(listener, app).await?;
-    Ok(0)
 }
 
 /// Builds the Axum router with all endpoints.
@@ -363,62 +379,105 @@ async fn prepare_exchange_input(
     state: &AppState,
     request: ExchangeCodeRequest,
 ) -> Result<PreparedExchangeInput, ApiError> {
-    let code =
-        trim_non_empty(&request.code).ok_or_else(|| ApiError::bad_request("Missing code"))?;
-    let login_id = request
-        .login_id_snake
-        .or(request.login_id_camel)
-        .and_then(|value| trim_non_empty(&value));
-    let code_verifier = request
-        .code_verifier_snake
-        .or(request.code_verifier_camel)
-        .and_then(|value| trim_non_empty(&value));
-    let redirect_uri = request
-        .redirect_uri_snake
-        .or(request.redirect_uri_camel)
-        .and_then(|value| trim_non_empty(&value));
-    let state_value = request.state.and_then(|value| trim_non_empty(&value));
+    let params = ExchangeRequestParams::from_request(request)?;
 
-    if let Some(login_id_value) = login_id {
-        // Read session first (don't remove until validation succeeds)
-        let session = {
-            let sessions = state.sessions.read().await;
-            sessions.get(&login_id_value).cloned()
-        };
-
-        let session =
-            session.ok_or_else(|| ApiError::bad_request("Unknown or expired login_id"))?;
-
-        // Validate state FIRST (constant-time comparison)
-        let incoming_state =
-            state_value.ok_or_else(|| ApiError::bad_request("Missing state parameter"))?;
-        if !constant_time_eq(incoming_state.as_bytes(), session.state.as_bytes()) {
-            return Err(ApiError::bad_request("State mismatch for login session"));
-        }
-
-        // ONLY remove session after successful validation
-        {
-            let mut sessions = state.sessions.write().await;
-            evict_expired_sessions(&mut sessions);
-            sessions.remove(&login_id_value);
-        }
-
-        // Use session values authoritatively
-        return Ok(PreparedExchangeInput {
-            code,
-            redirect_uri: session.redirect_uri,
-            code_verifier: session.code_verifier,
-        });
+    if let Some(login_id) = params.login_id.clone() {
+        return prepare_exchange_from_session(state, params.code, login_id, params.state).await;
     }
 
-    // Legacy fallback: no login_id (direct client-supplied values)
-    let code_verifier =
-        code_verifier.ok_or_else(|| ApiError::bad_request("Missing code_verifier or login_id"))?;
-    let redirect_uri =
-        redirect_uri.ok_or_else(|| ApiError::bad_request("Missing redirect_uri or login_id"))?;
+    prepare_exchange_from_direct_values(params)
+}
+
+#[derive(Debug)]
+struct ExchangeRequestParams {
+    code: String,
+    login_id: Option<String>,
+    state: Option<String>,
+    code_verifier: Option<String>,
+    redirect_uri: Option<String>,
+}
+
+impl ExchangeRequestParams {
+    fn from_request(request: ExchangeCodeRequest) -> Result<Self, ApiError> {
+        let code =
+            trim_non_empty(&request.code).ok_or_else(|| ApiError::bad_request("Missing code"))?;
+
+        Ok(Self {
+            code,
+            login_id: request
+                .login_id_snake
+                .or(request.login_id_camel)
+                .and_then(|value| trim_non_empty(&value)),
+            state: request.state.and_then(|value| trim_non_empty(&value)),
+            code_verifier: request
+                .code_verifier_snake
+                .or(request.code_verifier_camel)
+                .and_then(|value| trim_non_empty(&value)),
+            redirect_uri: request
+                .redirect_uri_snake
+                .or(request.redirect_uri_camel)
+                .and_then(|value| trim_non_empty(&value)),
+        })
+    }
+}
+
+async fn prepare_exchange_from_session(
+    state: &AppState,
+    code: String,
+    login_id: String,
+    state_value: Option<String>,
+) -> Result<PreparedExchangeInput, ApiError> {
+    let session = load_session(state, &login_id).await?;
+    validate_session_state(state_value, &session)?;
+    remove_session(state, &login_id).await;
 
     Ok(PreparedExchangeInput {
         code,
+        redirect_uri: session.redirect_uri,
+        code_verifier: session.code_verifier,
+    })
+}
+
+async fn load_session(state: &AppState, login_id: &str) -> Result<LoginSession, ApiError> {
+    let sessions = state.sessions.read().await;
+    sessions
+        .get(login_id)
+        .cloned()
+        .ok_or_else(|| ApiError::bad_request("Unknown or expired login_id"))
+}
+
+fn validate_session_state(
+    incoming_state: Option<String>,
+    session: &LoginSession,
+) -> Result<(), ApiError> {
+    let incoming_state =
+        incoming_state.ok_or_else(|| ApiError::bad_request("Missing state parameter"))?;
+
+    if constant_time_eq(incoming_state.as_bytes(), session.state.as_bytes()) {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request("State mismatch for login session"))
+    }
+}
+
+async fn remove_session(state: &AppState, login_id: &str) {
+    let mut sessions = state.sessions.write().await;
+    evict_expired_sessions(&mut sessions);
+    sessions.remove(login_id);
+}
+
+fn prepare_exchange_from_direct_values(
+    params: ExchangeRequestParams,
+) -> Result<PreparedExchangeInput, ApiError> {
+    let code_verifier = params
+        .code_verifier
+        .ok_or_else(|| ApiError::bad_request("Missing code_verifier or login_id"))?;
+    let redirect_uri = params
+        .redirect_uri
+        .ok_or_else(|| ApiError::bad_request("Missing redirect_uri or login_id"))?;
+
+    Ok(PreparedExchangeInput {
+        code: params.code,
         redirect_uri,
         code_verifier,
     })
@@ -436,7 +495,14 @@ async fn exchange_with_provider(
     state: &AppState,
     input: PreparedExchangeInput,
 ) -> Result<ProviderTokenResponse, ApiError> {
-    let mut form: Vec<(String, String)> = vec![
+    let form = build_token_form(state, input);
+    let (status, body) = request_token_exchange(state, &form).await?;
+    ensure_success_status(status, &body)?;
+    parse_token_response(&body)
+}
+
+fn build_token_form(state: &AppState, input: PreparedExchangeInput) -> Vec<(String, String)> {
+    let mut form = vec![
         ("grant_type".to_string(), "authorization_code".to_string()),
         ("code".to_string(), input.code),
         ("client_id".to_string(), state.settings.client_id.clone()),
@@ -448,10 +514,17 @@ async fn exchange_with_provider(
         form.push(("client_secret".to_string(), secret.clone()));
     }
 
+    form
+}
+
+async fn request_token_exchange(
+    state: &AppState,
+    form: &[(String, String)],
+) -> Result<(StatusCode, String), ApiError> {
     let response = state
         .http_client
         .post(&state.settings.token_url)
-        .form(&form)
+        .form(form)
         .send()
         .await
         .map_err(|error| ApiError::bad_gateway(format!("Token request failed: {error}")))?;
@@ -461,33 +534,39 @@ async fn exchange_with_provider(
         ApiError::bad_gateway(format!("Failed to read token response: {error}"))
     })?;
 
-    if !status.is_success() {
-        let safe_message = serde_json::from_str::<Value>(&body)
-            .ok()
-            .and_then(|json| json.get("error").and_then(|e| e.as_str()).map(String::from))
-            .unwrap_or_else(|| "upstream_error".to_string());
-        return Err(ApiError::bad_gateway(format!(
-            "Token endpoint returned {}: {}",
-            status.as_u16(),
-            safe_message
-        )));
+    Ok((status, body))
+}
+
+fn ensure_success_status(status: StatusCode, body: &str) -> Result<(), ApiError> {
+    if status.is_success() {
+        return Ok(());
     }
 
-    let json_value: Value = serde_json::from_str(&body).map_err(|error| {
+    let safe_message = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|json| json.get("error").and_then(|e| e.as_str()).map(String::from))
+        .unwrap_or_else(|| "upstream_error".to_string());
+
+    Err(ApiError::bad_gateway(format!(
+        "Token endpoint returned {}: {}",
+        status.as_u16(),
+        safe_message
+    )))
+}
+
+fn parse_token_response(body: &str) -> Result<ProviderTokenResponse, ApiError> {
+    let json_value: Value = serde_json::from_str(body).map_err(|error| {
         ApiError::bad_gateway(format!("Token endpoint returned invalid JSON: {error}"))
     })?;
 
     let access_token = json_string(&json_value, &["access_token", "accessToken", "token"])
         .ok_or_else(|| ApiError::bad_gateway("Token endpoint response missing access token"))?;
-    let token_type = json_string(&json_value, &["token_type", "tokenType"]);
-    let expires_in = json_u64(&json_value, &["expires_in", "expiresIn"]);
-    let refresh_token = json_string(&json_value, &["refresh_token", "refreshToken"]);
 
     Ok(ProviderTokenResponse {
         access_token,
-        token_type,
-        expires_in,
-        refresh_token,
+        token_type: json_string(&json_value, &["token_type", "tokenType"]),
+        expires_in: json_u64(&json_value, &["expires_in", "expiresIn"]),
+        refresh_token: json_string(&json_value, &["refresh_token", "refreshToken"]),
     })
 }
 

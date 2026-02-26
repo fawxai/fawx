@@ -140,6 +140,34 @@ pub struct AuditLog {
 /// Entries exceeding this size will be rejected during log loading.
 const MAX_ENTRY_SIZE: usize = 1_048_576;
 
+fn event_matches_filter(event: &AuditEvent, filter: &AuditFilter) -> bool {
+    if let Some(ref event_type) = filter.event_type {
+        if &event.event_type != event_type {
+            return false;
+        }
+    }
+
+    if let Some(ref actor) = filter.actor {
+        if &event.actor != actor {
+            return false;
+        }
+    }
+
+    if let Some(after) = filter.after {
+        if event.timestamp < after {
+            return false;
+        }
+    }
+
+    if let Some(before) = filter.before {
+        if event.timestamp > before {
+            return false;
+        }
+    }
+
+    true
+}
+
 impl AuditLog {
     /// Generate or load an HMAC key for the audit log.
     ///
@@ -253,43 +281,11 @@ impl AuditLog {
     /// ```
     pub async fn open(path: &Path) -> Result<Self, SecurityError> {
         let key = Self::load_or_create_key(path).await?;
-        let mut entries = Vec::new();
-        let mut last_hash = "GENESIS".to_string();
-
-        // Read existing entries if file exists
-        if path.exists() {
-            let file = fs::File::open(path)
-                .await
-                .map_err(|e| SecurityError::AuditLog(format!("Failed to open log: {}", e)))?;
-
-            let reader = BufReader::new(file);
-            let mut lines = reader.lines();
-
-            while let Some(line) = lines
-                .next_line()
-                .await
-                .map_err(|e| SecurityError::AuditLog(format!("Failed to read line: {}", e)))?
-            {
-                // Skip empty lines gracefully
-                if line.trim().is_empty() {
-                    continue;
-                }
-
-                if line.len() > MAX_ENTRY_SIZE {
-                    return Err(SecurityError::AuditLog(format!(
-                        "Audit log entry exceeds maximum size ({} bytes)",
-                        line.len()
-                    )));
-                }
-
-                let entry: AuditEntry = serde_json::from_str(&line).map_err(|e| {
-                    SecurityError::AuditLog(format!("Failed to parse entry: {}", e))
-                })?;
-
-                last_hash = entry.hash.clone();
-                entries.push(entry);
-            }
-        }
+        let (entries, last_hash) = if path.exists() {
+            Self::read_entries(path).await?
+        } else {
+            (Vec::new(), "GENESIS".to_string())
+        };
 
         Ok(Self {
             path: Some(path.to_path_buf()),
@@ -297,6 +293,46 @@ impl AuditLog {
             entries,
             last_hash,
         })
+    }
+
+    async fn read_entries(path: &Path) -> Result<(Vec<AuditEntry>, String), SecurityError> {
+        let file = fs::File::open(path)
+            .await
+            .map_err(|e| SecurityError::AuditLog(format!("Failed to open log: {}", e)))?;
+
+        let mut lines = BufReader::new(file).lines();
+        let mut entries = Vec::new();
+        let mut last_hash = "GENESIS".to_string();
+
+        while let Some(line) = lines
+            .next_line()
+            .await
+            .map_err(|e| SecurityError::AuditLog(format!("Failed to read line: {}", e)))?
+        {
+            if let Some(entry) = Self::parse_entry_line(&line)? {
+                last_hash = entry.hash.clone();
+                entries.push(entry);
+            }
+        }
+
+        Ok((entries, last_hash))
+    }
+
+    fn parse_entry_line(line: &str) -> Result<Option<AuditEntry>, SecurityError> {
+        if line.trim().is_empty() {
+            return Ok(None);
+        }
+
+        if line.len() > MAX_ENTRY_SIZE {
+            return Err(SecurityError::AuditLog(format!(
+                "Audit log entry exceeds maximum size ({} bytes)",
+                line.len()
+            )));
+        }
+
+        let entry: AuditEntry = serde_json::from_str(line)
+            .map_err(|e| SecurityError::AuditLog(format!("Failed to parse entry: {}", e)))?;
+        Ok(Some(entry))
     }
 
     /// Create an in-memory audit log (for testing).
@@ -424,40 +460,10 @@ impl AuditLog {
         let mut results: Vec<AuditEvent> = self
             .entries
             .iter()
-            .filter(|entry| {
-                // Filter by event type
-                if let Some(ref event_type) = filter.event_type {
-                    if &entry.event.event_type != event_type {
-                        return false;
-                    }
-                }
-
-                // Filter by actor
-                if let Some(ref actor) = filter.actor {
-                    if &entry.event.actor != actor {
-                        return false;
-                    }
-                }
-
-                // Filter by time range
-                if let Some(after) = filter.after {
-                    if entry.event.timestamp < after {
-                        return false;
-                    }
-                }
-
-                if let Some(before) = filter.before {
-                    if entry.event.timestamp > before {
-                        return false;
-                    }
-                }
-
-                true
-            })
+            .filter(|entry| event_matches_filter(&entry.event, filter))
             .map(|entry| entry.event.clone())
             .collect();
 
-        // Apply limit
         if let Some(limit) = filter.limit {
             results.truncate(limit);
         }
