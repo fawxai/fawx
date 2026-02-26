@@ -73,23 +73,16 @@ impl ModelCatalog {
         auth_mode: &str,
     ) -> Vec<CatalogModel> {
         let provider_key = normalize_provider(provider);
-
-        self.refresh_models_with_fetcher(&provider_key, || {
-            self.fetch_models(&provider_key, api_key, auth_mode)
-        })
-        .await
+        let fetch_result = self.fetch_models(&provider_key, api_key, auth_mode).await;
+        self.apply_fetch_result(&provider_key, fetch_result)
     }
 
-    async fn refresh_models_with_fetcher<'a, F, Fut>(
-        &'a mut self,
+    fn apply_fetch_result(
+        &mut self,
         provider_key: &str,
-        fetcher: F,
-    ) -> Vec<CatalogModel>
-    where
-        F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Result<Vec<CatalogModel>, String>> + 'a,
-    {
-        match fetcher().await {
+        fetch_result: Result<Vec<CatalogModel>, String>,
+    ) -> Vec<CatalogModel> {
+        match fetch_result {
             Ok(models) => {
                 self.cache.insert(
                     provider_key.to_string(),
@@ -100,12 +93,15 @@ impl ModelCatalog {
                 );
                 models
             }
-            Err(_) => self
-                .cache
-                .get(provider_key)
-                .map(|entry| entry.models.clone())
-                .unwrap_or_else(|| Self::hardcoded_fallback(provider_key)),
+            Err(_) => self.cached_or_fallback_models(provider_key),
         }
+    }
+
+    fn cached_or_fallback_models(&self, provider_key: &str) -> Vec<CatalogModel> {
+        self.cache
+            .get(provider_key)
+            .map(|entry| entry.models.clone())
+            .unwrap_or_else(|| Self::hardcoded_fallback(provider_key))
     }
 
     async fn fetch_models(
@@ -532,22 +528,20 @@ mod tests {
         assert!(headers.get("anthropic-version").is_none());
     }
 
-    #[tokio::test]
-    async fn refresh_models_updates_cache_on_successful_fetch() {
+    #[test]
+    fn apply_fetch_result_updates_cache_on_successful_fetch() {
         let mut catalog = ModelCatalog::new();
         let expected = vec![make_model("gpt-4o", "openai")];
 
-        let models = catalog
-            .refresh_models_with_fetcher("openai", || async { Ok(expected.clone()) })
-            .await;
+        let models = catalog.apply_fetch_result("openai", Ok(expected.clone()));
 
         assert_eq!(models, expected);
         let cached = catalog.cache.get("openai").expect("cache entry");
         assert_eq!(cached.models, expected);
     }
 
-    #[tokio::test]
-    async fn refresh_models_uses_cached_models_when_fetch_fails() {
+    #[test]
+    fn apply_fetch_result_uses_cached_models_when_fetch_fails() {
         let mut catalog = ModelCatalog::new();
         let cached_models = vec![make_model("gpt-4o-mini", "openai")];
         catalog.cache.insert(
@@ -558,22 +552,17 @@ mod tests {
             },
         );
 
-        let models = catalog
-            .refresh_models_with_fetcher("openai", || async {
-                Err("simulated network failure".to_string())
-            })
-            .await;
+        let models =
+            catalog.apply_fetch_result("openai", Err("simulated network failure".to_string()));
 
         assert_eq!(models, cached_models);
     }
 
-    #[tokio::test]
-    async fn refresh_models_returns_empty_when_fetch_succeeds_with_empty_payload() {
+    #[test]
+    fn apply_fetch_result_returns_empty_when_fetch_succeeds_with_empty_payload() {
         let mut catalog = ModelCatalog::new();
 
-        let models = catalog
-            .refresh_models_with_fetcher("openai", || async { Ok(Vec::new()) })
-            .await;
+        let models = catalog.apply_fetch_result("openai", Ok(Vec::new()));
 
         assert!(models.is_empty());
         let cached = catalog.cache.get("openai").expect("cache entry");
