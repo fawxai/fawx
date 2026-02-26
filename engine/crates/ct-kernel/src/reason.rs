@@ -57,7 +57,10 @@ impl ReasoningEngine {
         if !context.working_memory.is_empty() {
             lines.push("Working memory:".to_owned());
             for entry in &context.working_memory {
-                lines.push(format!("- {} = {} (rel {:.2})", entry.key, entry.value, entry.relevance));
+                lines.push(format!(
+                    "- {} = {} (rel {:.2})",
+                    entry.key, entry.value, entry.relevance
+                ));
             }
         }
 
@@ -494,8 +497,7 @@ mod tests {
         assert!(prompt.messages[0].content.contains("Identity context:"));
         assert!(prompt.messages[0].content.contains("User name: Joe"));
         assert!(prompt.messages[0].content.contains("tone: direct"));
-        assert!(prompt
-            .messages[0]
+        assert!(prompt.messages[0]
             .content
             .contains("Personality traits: helpful"));
         assert!(prompt.tools.iter().any(|tool| tool.name == "emit_intent"));

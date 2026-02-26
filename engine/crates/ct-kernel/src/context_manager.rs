@@ -221,7 +221,10 @@ fn remove_by_goal_distance(context: &mut ReasoningContext) -> Option<String> {
     match candidate {
         Some((EntryKind::Working, index, _, _)) => {
             let removed = context.working_memory.remove(index);
-            Some(format!("WM(goal-distance): {}={}", removed.key, removed.value))
+            Some(format!(
+                "WM(goal-distance): {}={}",
+                removed.key, removed.value
+            ))
         }
         Some((EntryKind::Episodic, index, _, _)) => {
             let removed = context.relevant_episodic.remove(index);
@@ -422,7 +425,8 @@ mod tests {
         let no_compaction = ContextCompactor::new(token_estimate + 10, token_estimate / 2);
         assert!(!no_compaction.needs_compaction(&context));
 
-        let must_compact = ContextCompactor::new(token_estimate.saturating_sub(1), token_estimate / 2);
+        let must_compact =
+            ContextCompactor::new(token_estimate.saturating_sub(1), token_estimate / 2);
         assert!(must_compact.needs_compaction(&context));
     }
 

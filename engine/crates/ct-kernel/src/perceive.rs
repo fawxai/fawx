@@ -593,8 +593,7 @@ mod tests {
 
         base_context.working_memory.push(WorkingMemoryEntry {
             key: "draft_reply".to_owned(),
-            value: "Thanks for the update — I will review and get back to you shortly."
-                .to_owned(),
+            value: "Thanks for the update — I will review and get back to you shortly.".to_owned(),
             relevance: 0.7,
         });
 
@@ -680,7 +679,10 @@ mod tests {
             None,
         );
 
-        assert!(remove_next_memory_entry(&mut context, TrimmingPolicy::ByRecency));
+        assert!(remove_next_memory_entry(
+            &mut context,
+            TrimmingPolicy::ByRecency
+        ));
         assert_eq!(context.working_memory.len(), 2);
         assert!(context
             .working_memory
