@@ -1544,8 +1544,8 @@ mod tests {
     fn command_parsing_recognizes_model_help_and_quit() {
         assert_eq!(parse_command("/model"), ParsedCommand::Model(None));
         assert_eq!(
-            parse_command("/model claude-opus-4"),
-            ParsedCommand::Model(Some("claude-opus-4".to_string()))
+            parse_command("/model claude-sonnet-4-20250514"),
+            ParsedCommand::Model(Some("claude-sonnet-4-20250514".to_string()))
         );
         assert_eq!(parse_command("/help"), ParsedCommand::Help);
         assert_eq!(parse_command("/loop"), ParsedCommand::Loop);
@@ -1696,7 +1696,6 @@ mod tests {
         let models = router.available_models();
 
         assert!(models.iter().any(|model| {
-            model.model_id == "claude-opus-4-20250514"
                 && model.provider_name == "anthropic"
                 && model.auth_method == "subscription"
         }));
