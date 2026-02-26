@@ -168,7 +168,7 @@ impl TuiApp {
                                 "Couldn't open browser automatically ({error}). Open this URL manually:\n{auth_url}"
                             );
                         }
-                        println!("Waiting for callback on http://localhost:1455/auth/callback...");
+                        println!("Waiting for callback on http://127.0.0.1:1455/auth/callback...");
                         println!("(Or paste the redirect URL/code below if browser didn't work)\n");
 
                         // Race: wait for callback server OR manual paste
@@ -693,14 +693,15 @@ async fn start_oauth_callback_server(
                 .and_then(|line| line.split_whitespace().nth(1))
                 .ok_or_else(|| TuiError::Auth("malformed HTTP request".to_string()))?;
 
-            if !path.starts_with("/auth/callback") {
+            let (path_only, query) = path.split_once('?').map_or((path, ""), |(p, q)| (p, q));
+            if path_only != "/auth/callback" {
                 let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot found";
                 let _ = stream.write_all(response.as_bytes()).await;
                 continue;
             }
 
             // Parse query params from the path
-            let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+
             let params: std::collections::HashMap<&str, &str> = query
                 .split('&')
                 .filter_map(|pair| pair.split_once('='))
