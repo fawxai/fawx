@@ -12,8 +12,8 @@
 //! - **templates** — prompt template management
 //! - **ab_slots** — A/B slot lifecycle (pending → active → fallback)
 
-pub mod strategies;
 pub mod config;
+pub mod strategies;
 
 /// A strategy identifier for A/B slot management.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

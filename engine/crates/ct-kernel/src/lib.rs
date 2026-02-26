@@ -27,18 +27,18 @@
 //! - Consolidation requires validated checkpoint before mutations
 //! - Three-gate decision: policy → budget → permission, no gate skippable
 
+pub mod act;
+pub mod budget;
+pub mod checkpoint;
+pub mod continuation;
+pub mod decide;
+pub mod learn;
 pub mod loop_engine;
 pub mod perceive;
-pub mod reason;
-pub mod decide;
-pub mod act;
-pub mod verify;
-pub mod learn;
-pub mod continuation;
-pub mod policy;
-pub mod budget;
 pub mod permissions;
-pub mod checkpoint;
+pub mod policy;
+pub mod reason;
+pub mod verify;
 pub mod watchdog;
 
 /// The core loop result type.
