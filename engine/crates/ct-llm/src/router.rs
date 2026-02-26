@@ -94,14 +94,11 @@ impl ModelRouter {
             crate::types::LlmError::Config(RouterError::NoActiveModel.to_string())
         })?;
 
-        let provider_name = self
-            .model_to_provider
-            .get(&active_model)
-            .ok_or_else(|| {
-                crate::types::LlmError::Config(
-                    RouterError::ModelNotFound(active_model.clone()).to_string(),
-                )
-            })?;
+        let provider_name = self.model_to_provider.get(&active_model).ok_or_else(|| {
+            crate::types::LlmError::Config(
+                RouterError::ModelNotFound(active_model.clone()).to_string(),
+            )
+        })?;
 
         let provider = self.providers.get(provider_name).ok_or_else(|| {
             crate::types::LlmError::Provider(format!(
@@ -142,9 +139,7 @@ pub enum RouterError {
 fn infer_auth_method(provider_name: &str) -> String {
     let provider = provider_name.to_ascii_lowercase();
 
-    if provider.contains("setup")
-        || provider.contains("oauth")
-        || provider.contains("subscription")
+    if provider.contains("setup") || provider.contains("oauth") || provider.contains("subscription")
     {
         return "subscription".to_string();
     }
@@ -509,7 +504,10 @@ mod model_router_tests {
 
     #[async_trait]
     impl CompletionProvider for MockCompletionProvider {
-        async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
             self.captured_models.lock().unwrap().push(request.model);
 
             Ok(CompletionResponse {
@@ -573,7 +571,9 @@ mod model_router_tests {
 
         let models = router.available_models();
         assert_eq!(models.len(), 2);
-        assert!(models.iter().all(|model| model.provider_name == "openai-oauth"));
+        assert!(models
+            .iter()
+            .all(|model| model.provider_name == "openai-oauth"));
         assert!(models
             .iter()
             .all(|model| model.auth_method == "subscription"));
@@ -613,7 +613,10 @@ mod model_router_tests {
         router.register_provider(Box::new(openai));
         router.set_active("gpt-4o").unwrap();
 
-        let response = router.complete(request_with_model("ignored")).await.unwrap();
+        let response = router
+            .complete(request_with_model("ignored"))
+            .await
+            .unwrap();
 
         assert_eq!(first_text(&response).as_deref(), Some("from openai"));
         assert_eq!(anthropic_calls.lock().unwrap().len(), 0);
@@ -638,6 +641,8 @@ mod model_router_tests {
 
         let result = router.complete(request_with_model("claude-opus-4")).await;
 
-        assert!(matches!(result, Err(LlmError::Config(message)) if message.contains("no active model selected")));
+        assert!(
+            matches!(result, Err(LlmError::Config(message)) if message.contains("no active model selected"))
+        );
     }
 }

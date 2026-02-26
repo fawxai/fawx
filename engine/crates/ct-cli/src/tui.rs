@@ -16,8 +16,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const DEFAULT_AUTH_FILE: &str = ".citros/auth.json";
 const DEFAULT_OPENAI_TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
 
-const DEFAULT_ANTHROPIC_MODELS: &[&str] =
-    &["claude-opus-4", "claude-sonnet-4", "claude-3-7-sonnet-latest"];
+const DEFAULT_ANTHROPIC_MODELS: &[&str] = &[
+    "claude-opus-4",
+    "claude-sonnet-4",
+    "claude-3-7-sonnet-latest",
+];
 const DEFAULT_OPENAI_MODELS: &[&str] = &["gpt-4.1", "gpt-4o", "gpt-4o-mini"];
 const DEFAULT_OPENROUTER_MODELS: &[&str] = &[
     "openai/gpt-4o-mini",
@@ -93,7 +96,11 @@ impl TuiApp {
 
         println!();
         println!("{:padding$}{}", "", banner.bold().with(style::Color::Cyan));
-        println!("{:padding$}{}", "", "Terminal shell".with(style::Color::DarkGrey));
+        println!(
+            "{:padding$}{}",
+            "",
+            "Terminal shell".with(style::Color::DarkGrey)
+        );
         println!();
     }
 
@@ -146,17 +153,15 @@ impl TuiApp {
                         continue;
                     }
 
-                    let authorization_code = flow.parse_callback(&callback_url).map_err(|error| {
-                        TuiError::Auth(format!("invalid OAuth callback URL: {error}"))
-                    })?;
+                    let authorization_code =
+                        flow.parse_callback(&callback_url).map_err(|error| {
+                            TuiError::Auth(format!("invalid OAuth callback URL: {error}"))
+                        })?;
 
                     println!("Exchanging authorization code for tokens...");
-                    let token_response = exchange_oauth_code_for_tokens(
-                        &flow,
-                        &client_id,
-                        &authorization_code,
-                    )
-                    .await?;
+                    let token_response =
+                        exchange_oauth_code_for_tokens(&flow, &client_id, &authorization_code)
+                            .await?;
 
                     let account_id = prompt_line("OpenAI account id (optional): ")?;
                     let expires_at = current_time_ms()
@@ -484,7 +489,9 @@ pub async fn load_auth_manager() -> Result<AuthManager, TuiError> {
         return Ok(AuthManager::new());
     }
 
-    let raw = tokio::fs::read_to_string(&auth_path).await.map_err(TuiError::Io)?;
+    let raw = tokio::fs::read_to_string(&auth_path)
+        .await
+        .map_err(TuiError::Io)?;
     AuthManager::from_json(&raw).map_err(|error| {
         TuiError::Auth(format!(
             "failed to parse auth file {}: {error}",
@@ -602,12 +609,18 @@ async fn exchange_oauth_code_for_tokens(
         .map_err(|error| TuiError::Auth(format!("oauth token response was invalid JSON: {error}")))
 }
 
-fn register_auth_provider(router: &mut ModelRouter, auth_method: &AuthMethod) -> Result<(), TuiError> {
+fn register_auth_provider(
+    router: &mut ModelRouter,
+    auth_method: &AuthMethod,
+) -> Result<(), TuiError> {
     match auth_method {
         AuthMethod::SetupToken { token } => {
-            let provider = AnthropicProvider::new(base_url_for_provider("anthropic"), token.clone())
-                .map_err(|error| TuiError::Router(format!("failed to configure Anthropic provider: {error}")))?
-                .with_supported_models(to_strings(DEFAULT_ANTHROPIC_MODELS));
+            let provider =
+                AnthropicProvider::new(base_url_for_provider("anthropic"), token.clone())
+                    .map_err(|error| {
+                        TuiError::Router(format!("failed to configure Anthropic provider: {error}"))
+                    })?
+                    .with_supported_models(to_strings(DEFAULT_ANTHROPIC_MODELS));
 
             router.register_provider_with_auth(Box::new(provider), "subscription");
         }
@@ -642,12 +655,15 @@ fn register_auth_provider(router: &mut ModelRouter, auth_method: &AuthMethod) ->
             access_token,
             ..
         } => {
-            let provider_client = OpenAiProvider::new(base_url_for_provider(provider), access_token.clone())
-                .map_err(|error| {
-                    TuiError::Router(format!("failed to configure {provider} provider: {error}"))
-                })?
-                .with_name(provider.clone())
-                .with_supported_models(models_for_provider(provider));
+            let provider_client =
+                OpenAiProvider::new(base_url_for_provider(provider), access_token.clone())
+                    .map_err(|error| {
+                        TuiError::Router(format!(
+                            "failed to configure {provider} provider: {error}"
+                        ))
+                    })?
+                    .with_name(provider.clone())
+                    .with_supported_models(models_for_provider(provider));
 
             router.register_provider_with_auth(Box::new(provider_client), "subscription");
         }
@@ -748,7 +764,7 @@ fn open_browser(url: &str) -> io::Result<()> {
         if status.success() {
             return Ok(());
         }
-        return Err(io::Error::other("open command failed"));
+        Err(io::Error::other("open command failed"))
     }
 
     #[cfg(target_os = "windows")]
