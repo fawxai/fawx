@@ -38,6 +38,7 @@ pub mod perceive;
 pub mod permissions;
 pub mod policy;
 pub mod reason;
+pub mod rollback;
 pub mod verify;
 pub mod watchdog;
 
