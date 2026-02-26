@@ -11,7 +11,7 @@ use std::{collections::VecDeque, time::Duration};
 use crate::provider::{CompletionStream, LlmProvider};
 use crate::types::{
     CompletionRequest, CompletionResponse, ContentBlock, LlmError, Message, MessageRole,
-    StreamChunk, ToolCall, ToolDefinition, ToolUseDelta, Usage,
+    StreamChunk, ToolCall, ToolUseDelta, Usage,
 };
 
 /// Anthropic API provider implementation.
@@ -188,6 +188,7 @@ impl AnthropicProvider {
         }
     }
 
+    #[allow(dead_code)]
     fn parse_sse_payload(payload: &str) -> Result<Vec<StreamChunk>, LlmError> {
         let mut chunks = Vec::new();
 
@@ -617,6 +618,7 @@ impl AnthropicSseState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ToolDefinition;
     use serde_json::json;
 
     #[test]
