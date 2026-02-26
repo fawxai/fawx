@@ -487,7 +487,10 @@ mod tests {
     fn goal_creation_and_validation() {
         let goal = Goal::new(
             "Respond to latest unread message",
-            vec!["Messages app is foreground".to_owned(), "Reply sent".to_owned()],
+            vec![
+                "Messages app is foreground".to_owned(),
+                "Reply sent".to_owned(),
+            ],
             Some(5),
         );
 
@@ -677,7 +680,10 @@ mod tests {
 
         assert_eq!(decoded.depth, 1);
         assert!(decoded.validate_depth());
-        assert_eq!(decoded.goal.description, "Summarize message and draft reply");
+        assert_eq!(
+            decoded.goal.description,
+            "Summarize message and draft reply"
+        );
         assert_eq!(
             decoded
                 .identity_context
