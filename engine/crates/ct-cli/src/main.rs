@@ -2,6 +2,7 @@
 
 mod commands;
 mod confirmation;
+mod tui;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -12,7 +13,7 @@ pub use confirmation::ConfirmationUi;
 #[command(about = "Citros AI Agent CLI", long_about = None)]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -22,6 +23,9 @@ enum Commands {
 
     /// Stop the agent daemon
     Stop,
+
+    /// Run the terminal shell interface (default)
+    Tui,
 
     /// Interactive chat with the agent
     Chat,
@@ -148,7 +152,14 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    let exit_code = match cli.command {
+    let exit_code = match cli.command.unwrap_or(Commands::Tui) {
+        Commands::Tui => {
+            let auth_manager = tui::load_auth_manager().await?;
+            let router = tui::build_router(&auth_manager)?;
+            let mut app = tui::TuiApp::new(auth_manager, router);
+            app.run().await?;
+            0
+        }
         Commands::Start => {
             println!("Starting Citros agent daemon...");
             println!("(Implementation pending - Epic 9)");

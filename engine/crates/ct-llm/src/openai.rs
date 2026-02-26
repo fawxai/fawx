@@ -23,6 +23,8 @@ pub struct OpenAiProvider {
     api_key: String,
     provider_name: String,
     supported_models: Vec<String>,
+    /// ChatGPT account ID for subscription OAuth (sent as `chatgpt-account-id` header).
+    account_id: Option<String>,
     client: reqwest::Client,
 }
 
@@ -50,6 +52,7 @@ impl OpenAiProvider {
             api_key,
             provider_name: "openai-compatible".to_string(),
             supported_models: Vec::new(),
+            account_id: None,
             client,
         })
     }
@@ -63,6 +66,12 @@ impl OpenAiProvider {
     /// Set explicit supported models list.
     pub fn with_supported_models(mut self, supported_models: Vec<String>) -> Self {
         self.supported_models = supported_models;
+        self
+    }
+
+    /// Set ChatGPT account ID for subscription OAuth (sent as `chatgpt-account-id` header).
+    pub fn with_account_id(mut self, account_id: impl Into<String>) -> Self {
+        self.account_id = Some(account_id.into());
         self
     }
 
@@ -387,13 +396,11 @@ impl LlmProvider for OpenAiProvider {
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
         let body = self.build_request_body(&request, false)?;
 
-        let response = self
-            .client
-            .post(self.endpoint())
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await?;
+        let mut builder = self.client.post(self.endpoint()).bearer_auth(&self.api_key);
+        if let Some(ref account_id) = self.account_id {
+            builder = builder.header("chatgpt-account-id", account_id);
+        }
+        let response = builder.json(&body).send().await?;
 
         let status = response.status();
         if !status.is_success() {
@@ -418,13 +425,11 @@ impl LlmProvider for OpenAiProvider {
     ) -> Result<CompletionStream, LlmError> {
         let body = self.build_request_body(&request, true)?;
 
-        let response = self
-            .client
-            .post(self.endpoint())
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await?;
+        let mut builder = self.client.post(self.endpoint()).bearer_auth(&self.api_key);
+        if let Some(ref account_id) = self.account_id {
+            builder = builder.header("chatgpt-account-id", account_id);
+        }
+        let response = builder.json(&body).send().await?;
 
         let status = response.status();
         if !status.is_success() {

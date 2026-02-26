@@ -14,18 +14,41 @@ use crate::types::{
     StreamChunk, ToolCall, ToolUseDelta, Usage,
 };
 
+/// Anthropic auth mode — determines how credentials are sent.
+#[derive(Debug, Clone)]
+pub enum AnthropicAuthMode {
+    /// Standard API key: sent as `x-api-key` header.
+    ApiKey(String),
+    /// OAuth/setup-token (`sk-ant-oat...`): sent as `Authorization: Bearer` with
+    /// Claude Code identity headers. Matches OpenClaw's behavior.
+    SetupToken(String),
+}
+
+impl AnthropicAuthMode {
+    /// Detect auth mode from a credential string.
+    /// Tokens starting with `sk-ant-oat` use Bearer auth; everything else uses x-api-key.
+    pub fn detect(credential: impl Into<String>) -> Self {
+        let cred = credential.into();
+        if cred.starts_with("sk-ant-oat") {
+            Self::SetupToken(cred)
+        } else {
+            Self::ApiKey(cred)
+        }
+    }
+}
+
 /// Anthropic API provider implementation.
 #[derive(Debug, Clone)]
 pub struct AnthropicProvider {
     base_url: String,
-    api_key: String,
+    auth_mode: AnthropicAuthMode,
     api_version: String,
     supported_models: Vec<String>,
     client: reqwest::Client,
 }
 
 impl AnthropicProvider {
-    /// Create a new Anthropic provider.
+    /// Create a new Anthropic provider. Auto-detects auth mode from the credential.
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Result<Self, LlmError> {
         let base_url = base_url.into();
         let api_key = api_key.into();
@@ -38,6 +61,8 @@ impl AnthropicProvider {
             return Err(LlmError::Config("api_key cannot be empty".to_string()));
         }
 
+        let auth_mode = AnthropicAuthMode::detect(&api_key);
+
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(60))
             .build()
@@ -45,7 +70,7 @@ impl AnthropicProvider {
 
         Ok(Self {
             base_url,
-            api_key,
+            auth_mode,
             api_version: "2023-06-01".to_string(),
             supported_models: Vec::new(),
             client,
@@ -66,6 +91,17 @@ impl AnthropicProvider {
 
     fn endpoint(&self) -> String {
         format!("{}/v1/messages", self.base_url.trim_end_matches('/'))
+    }
+
+    /// Apply auth headers to a request builder based on auth mode.
+    fn apply_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.auth_mode {
+            AnthropicAuthMode::ApiKey(key) => builder.header("x-api-key", key),
+            AnthropicAuthMode::SetupToken(token) => builder
+                .header("Authorization", format!("Bearer {token}"))
+                .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
+                .header("x-app", "cli"),
+        }
     }
 
     fn ensure_supported_model(&self, model: &str) -> Result<(), LlmError> {
@@ -420,14 +456,11 @@ impl LlmProvider for AnthropicProvider {
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
         let body = self.build_request_body(&request, false)?;
 
-        let response = self
+        let request_builder = self
             .client
             .post(self.endpoint())
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", &self.api_version)
-            .json(&body)
-            .send()
-            .await?;
+            .header("anthropic-version", &self.api_version);
+        let response = self.apply_auth(request_builder).json(&body).send().await?;
 
         let status = response.status();
         if !status.is_success() {
@@ -452,14 +485,11 @@ impl LlmProvider for AnthropicProvider {
     ) -> Result<CompletionStream, LlmError> {
         let body = self.build_request_body(&request, true)?;
 
-        let response = self
+        let request_builder = self
             .client
             .post(self.endpoint())
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", &self.api_version)
-            .json(&body)
-            .send()
-            .await?;
+            .header("anthropic-version", &self.api_version);
+        let response = self.apply_auth(request_builder).json(&body).send().await?;
 
         let status = response.status();
         if !status.is_success() {
