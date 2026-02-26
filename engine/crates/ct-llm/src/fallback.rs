@@ -191,65 +191,32 @@ impl FallbackRouter {
         prompt: &str,
         max_tokens: u32,
     ) -> Result<FallbackResult, LlmError> {
-        // Check if local is healthy and available
-        if self.local.is_some()
-            && self
-                .local_health
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_healthy
+        if let Some(result) = self
+            .attempt_provider(
+                &self.local,
+                &self.local_health,
+                "local",
+                prompt,
+                max_tokens,
+                true,
+            )
+            .await?
         {
-            match self.try_provider(&self.local, prompt, max_tokens).await {
-                Ok(text) => {
-                    self.local_health
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .record_success();
-                    return Ok(FallbackResult {
-                        text,
-                        provider_used: "local".to_string(),
-                        fallback_used: false,
-                    });
-                }
-                Err(e) => {
-                    warn!("Local provider failed: {}", e);
-                    self.local_health
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .record_failure();
-                }
-            }
+            return Ok(Self::build_result(result, "local", false));
         }
 
-        // Fall back to cloud
-        if self.cloud.is_some()
-            && self
-                .cloud_health
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_healthy
+        if let Some(result) = self
+            .attempt_provider(
+                &self.cloud,
+                &self.cloud_health,
+                "cloud",
+                prompt,
+                max_tokens,
+                false,
+            )
+            .await?
         {
-            match self.try_provider(&self.cloud, prompt, max_tokens).await {
-                Ok(text) => {
-                    self.cloud_health
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .record_success();
-                    return Ok(FallbackResult {
-                        text,
-                        provider_used: "cloud".to_string(),
-                        fallback_used: true,
-                    });
-                }
-                Err(e) => {
-                    warn!("Cloud provider failed: {}", e);
-                    self.cloud_health
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .record_failure();
-                    return Err(e);
-                }
-            }
+            return Ok(Self::build_result(result, "cloud", true));
         }
 
         Err(LlmError::Inference(
@@ -263,70 +230,96 @@ impl FallbackRouter {
         prompt: &str,
         max_tokens: u32,
     ) -> Result<FallbackResult, LlmError> {
-        // Check if cloud is healthy and available
-        if self.cloud.is_some()
-            && self
-                .cloud_health
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_healthy
+        if let Some(result) = self
+            .attempt_provider(
+                &self.cloud,
+                &self.cloud_health,
+                "cloud",
+                prompt,
+                max_tokens,
+                true,
+            )
+            .await?
         {
-            match self.try_provider(&self.cloud, prompt, max_tokens).await {
-                Ok(text) => {
-                    self.cloud_health
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .record_success();
-                    return Ok(FallbackResult {
-                        text,
-                        provider_used: "cloud".to_string(),
-                        fallback_used: false,
-                    });
-                }
-                Err(e) => {
-                    warn!("Cloud provider failed: {}", e);
-                    self.cloud_health
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .record_failure();
-                }
-            }
+            return Ok(Self::build_result(result, "cloud", false));
         }
 
-        // Fall back to local
-        if self.local.is_some()
-            && self
-                .local_health
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_healthy
+        if let Some(result) = self
+            .attempt_provider(
+                &self.local,
+                &self.local_health,
+                "local",
+                prompt,
+                max_tokens,
+                false,
+            )
+            .await?
         {
-            match self.try_provider(&self.local, prompt, max_tokens).await {
-                Ok(text) => {
-                    self.local_health
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .record_success();
-                    return Ok(FallbackResult {
-                        text,
-                        provider_used: "local".to_string(),
-                        fallback_used: true,
-                    });
-                }
-                Err(e) => {
-                    warn!("Local provider failed: {}", e);
-                    self.local_health
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .record_failure();
-                    return Err(e);
-                }
-            }
+            return Ok(Self::build_result(result, "local", true));
         }
 
         Err(LlmError::Inference(
             "CloudFirst strategy failed: all providers unavailable".to_string(),
         ))
+    }
+
+    async fn attempt_provider(
+        &self,
+        provider: &Option<Box<dyn LlmProvider>>,
+        health: &Arc<Mutex<ProviderHealth>>,
+        provider_name: &str,
+        prompt: &str,
+        max_tokens: u32,
+        continue_on_error: bool,
+    ) -> Result<Option<String>, LlmError> {
+        if !Self::is_provider_available_and_healthy(provider, health) {
+            return Ok(None);
+        }
+
+        match self.try_provider(provider, prompt, max_tokens).await {
+            Ok(text) => {
+                Self::record_provider_success(health);
+                Ok(Some(text))
+            }
+            Err(error) => {
+                warn!("{} provider failed: {}", provider_name, error);
+                Self::record_provider_failure(health);
+                if continue_on_error {
+                    Ok(None)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    fn is_provider_available_and_healthy(
+        provider: &Option<Box<dyn LlmProvider>>,
+        health: &Arc<Mutex<ProviderHealth>>,
+    ) -> bool {
+        provider.is_some() && health.lock().unwrap_or_else(|e| e.into_inner()).is_healthy
+    }
+
+    fn record_provider_success(health: &Arc<Mutex<ProviderHealth>>) {
+        health
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record_success();
+    }
+
+    fn record_provider_failure(health: &Arc<Mutex<ProviderHealth>>) {
+        health
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record_failure();
+    }
+
+    fn build_result(text: String, provider_used: &str, fallback_used: bool) -> FallbackResult {
+        FallbackResult {
+            text,
+            provider_used: provider_used.to_string(),
+            fallback_used,
+        }
     }
 
     /// Only use local provider (no fallback).

@@ -350,56 +350,48 @@ impl AnthropicProvider {
                     if let Some(chunk) = state.pending_chunks.pop_front() {
                         return Some((chunk, state));
                     }
-
                     if state.finished {
                         return None;
                     }
 
-                    match state.bytes_stream.as_mut().next().await {
-                        Some(Ok(bytes)) => {
-                            state.buffer.extend_from_slice(&bytes);
-
-                            if let Err(error) = Self::drain_buffered_lines(&mut state) {
-                                state.finished = true;
-                                return Some((Err(error), state));
-                            }
-                        }
-                        Some(Err(error)) => {
-                            state.finished = true;
-                            return Some((Err(LlmError::Streaming(error.to_string())), state));
-                        }
-                        None => {
-                            if !state.buffer.is_empty() {
-                                let remaining = std::mem::take(&mut state.buffer);
-                                let line = match std::str::from_utf8(&remaining) {
-                                    Ok(line) => line,
-                                    Err(error) => {
-                                        state.finished = true;
-                                        return Some((
-                                            Err(LlmError::Streaming(format!(
-                                                "stream was not valid UTF-8: {error}"
-                                            ))),
-                                            state,
-                                        ));
-                                    }
-                                };
-
-                                if let Err(error) = Self::enqueue_parsed_line(
-                                    line,
-                                    &mut state.pending_chunks,
-                                    &mut state.finished,
-                                ) {
-                                    state.finished = true;
-                                    return Some((Err(error), state));
-                                }
-                            }
-
-                            state.finished = true;
-                        }
+                    let next = state.bytes_stream.as_mut().next().await;
+                    if let Err(error) = Self::process_stream_item(&mut state, next) {
+                        state.finished = true;
+                        return Some((Err(error), state));
                     }
                 }
             },
         )
+    }
+
+    fn process_stream_item(
+        state: &mut AnthropicSseState,
+        item: Option<Result<Bytes, reqwest::Error>>,
+    ) -> Result<(), LlmError> {
+        match item {
+            Some(Ok(bytes)) => {
+                state.buffer.extend_from_slice(&bytes);
+                Self::drain_buffered_lines(state)
+            }
+            Some(Err(error)) => Err(LlmError::Streaming(error.to_string())),
+            None => {
+                Self::flush_remaining_buffer(state)?;
+                state.finished = true;
+                Ok(())
+            }
+        }
+    }
+
+    fn flush_remaining_buffer(state: &mut AnthropicSseState) -> Result<(), LlmError> {
+        if state.buffer.is_empty() {
+            return Ok(());
+        }
+
+        let remaining = std::mem::take(&mut state.buffer);
+        let line = std::str::from_utf8(&remaining)
+            .map_err(|error| LlmError::Streaming(format!("stream was not valid UTF-8: {error}")))?;
+
+        Self::enqueue_parsed_line(line, &mut state.pending_chunks, &mut state.finished)
     }
 
     fn drain_buffered_lines(state: &mut AnthropicSseState) -> Result<(), LlmError> {
