@@ -3,13 +3,9 @@ members = [
     "crates/ct-core",
     "crates/ct-agent",
     "crates/ct-llm",
-    "crates/ct-phone",
-    "crates/ct-voice",
     "crates/ct-security",
     "crates/ct-skills",
-    "crates/ct-sync",
     "crates/ct-storage",
-    "crates/ct-sensors",
     "crates/ct-cli",
     "ffi/llama-cpp-sys",
 ]
