@@ -494,6 +494,7 @@ mod tests {
 mod model_router_tests {
     use super::*;
     use async_trait::async_trait;
+    use futures::stream;
     use std::sync::{Arc, Mutex};
 
     use crate::provider::{
@@ -555,11 +556,15 @@ mod model_router_tests {
 
         async fn complete_stream(
             &self,
-            _request: CompletionRequest,
+            request: CompletionRequest,
         ) -> Result<CompletionStream, LlmError> {
-            Err(LlmError::Streaming(
-                "streaming not implemented for mock provider".to_string(),
-            ))
+            self.captured_models.lock().unwrap().push(request.model);
+            self.captured_temperatures
+                .lock()
+                .unwrap()
+                .push(request.temperature);
+
+            Ok(Box::pin(stream::empty()))
         }
 
         fn name(&self) -> &str {
@@ -633,11 +638,14 @@ mod model_router_tests {
     #[test]
     fn register_provider_with_auth_uses_explicit_auth_method() {
         let captured = Arc::new(Mutex::new(Vec::new()));
+        let temperatures = Arc::new(Mutex::new(Vec::new()));
         let provider = MockCompletionProvider::new(
             "openai",
             vec!["gpt-4o"],
             "from openai",
             captured,
+            temperatures,
+            default_capabilities(),
         );
 
         let mut router = ModelRouter::new();
@@ -662,11 +670,14 @@ mod model_router_tests {
     #[test]
     fn active_model_returns_selected_model() {
         let captured = Arc::new(Mutex::new(Vec::new()));
+        let temperatures = Arc::new(Mutex::new(Vec::new()));
         let provider = MockCompletionProvider::new(
             "openai",
             vec!["gpt-4o"],
             "from openai",
             captured,
+            temperatures,
+            default_capabilities(),
         );
 
         let mut router = ModelRouter::new();
@@ -765,6 +776,35 @@ mod model_router_tests {
 
         let result = router
             .complete(request_with_temperature("ignored", Some(0.9)))
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(calls.lock().unwrap().clone(), vec!["gpt-5".to_string()]);
+        assert_eq!(temperatures.lock().unwrap().clone(), vec![None]);
+    }
+
+    #[tokio::test]
+    async fn complete_stream_strips_temperature_when_provider_does_not_support_it() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let temperatures = Arc::new(Mutex::new(Vec::new()));
+        let provider = MockCompletionProvider::new(
+            "openai-responses",
+            vec!["gpt-5"],
+            "ok",
+            Arc::clone(&calls),
+            Arc::clone(&temperatures),
+            ProviderCapabilities {
+                supports_temperature: false,
+                requires_streaming: false,
+            },
+        );
+
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(provider));
+        router.set_active("gpt-5").unwrap();
+
+        let result = router
+            .complete_stream(request_with_temperature("ignored", Some(0.3)))
             .await;
 
         assert!(result.is_ok());

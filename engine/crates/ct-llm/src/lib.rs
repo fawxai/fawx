@@ -19,7 +19,6 @@ mod openai_responses;
 mod provider;
 mod router;
 mod routing;
-mod sse;
 mod types;
 
 pub use anthropic::AnthropicAuthMode;
