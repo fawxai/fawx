@@ -128,7 +128,9 @@ fn action_to_tool_call(
             Ok(Some(swipe_tool_call(index, direction, target.as_deref())))
         }
         IntendedAction::LaunchApp { package } => Ok(Some(launch_tool_call(index, package))),
-        IntendedAction::Navigate { destination } => Ok(Some(navigate_tool_call(index, destination))),
+        IntendedAction::Navigate { destination } => {
+            Ok(Some(navigate_tool_call(index, destination)))
+        }
         IntendedAction::Wait {
             condition,
             timeout_ms,
@@ -166,7 +168,11 @@ fn type_tool_call(index: usize, text: &str, target: &str) -> ToolCall {
     }
 }
 
-fn swipe_tool_call(index: usize, direction: &ct_core::types::SwipeDirection, target: Option<&str>) -> ToolCall {
+fn swipe_tool_call(
+    index: usize,
+    direction: &ct_core::types::SwipeDirection,
+    target: Option<&str>,
+) -> ToolCall {
     ToolCall {
         id: format!("tool-swipe-{index}"),
         name: "swipe".to_string(),
@@ -217,7 +223,9 @@ fn delegate_tool_call(
     })
 }
 
-fn serialize_params(params: &std::collections::HashMap<String, String>) -> Result<Value, DecideError> {
+fn serialize_params(
+    params: &std::collections::HashMap<String, String>,
+) -> Result<Value, DecideError> {
     serde_json::to_value(params).map_err(|error| DecideError {
         stage: "decide".to_string(),
         reason: format!("failed to serialize delegate params: {error}"),

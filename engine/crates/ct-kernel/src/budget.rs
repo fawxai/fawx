@@ -278,7 +278,7 @@ impl BudgetTracker {
 }
 
 /// Cost of a single action (estimated before execution, measured after execution).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ActionCost {
     /// Number of LLM calls.
     pub llm_calls: u32,

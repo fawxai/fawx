@@ -10,8 +10,8 @@ use ct_kernel::loop_engine::{LlmProvider as LoopLlmProvider, LoopEngine, LoopRes
 use ct_kernel::oauth::{PkceFlow, TokenExchangeRequest, TokenResponse};
 use ct_kernel::types::PerceptionSnapshot;
 use ct_llm::{
-    AnthropicProvider, CompletionRequest, ContentBlock, Message, ModelCatalog, ModelRouter,
-    OpenAiProvider, OpenAiResponsesProvider,
+    AnthropicProvider, CompletionRequest, Message, ModelCatalog, ModelRouter, OpenAiProvider,
+    OpenAiResponsesProvider,
 };
 use futures::StreamExt;
 use std::fmt;
@@ -706,7 +706,10 @@ fn format_error_message(error: &str) -> String {
 }
 
 fn move_cursor_to_start(stdout: &mut impl Write) -> Result<(), TuiError> {
-    stdout.execute(cursor::MoveToColumn(0)).map(|_| ()).map_err(TuiError::Io)
+    stdout
+        .execute(cursor::MoveToColumn(0))
+        .map(|_| ())
+        .map_err(TuiError::Io)
 }
 
 /// User-facing TUI errors.
@@ -1438,6 +1441,7 @@ impl Drop for RawModeGuard {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use ct_llm::ContentBlock;
     use std::ffi::OsString;
     use tempfile::TempDir;
 
@@ -1528,9 +1532,13 @@ mod tests {
             &self,
             _request: CompletionRequest,
         ) -> Result<ct_llm::CompletionStream, ct_llm::ProviderError> {
-            Err(ct_llm::ProviderError::Streaming(
-                "streaming not implemented in test provider".to_string(),
-            ))
+            let chunk = Ok(ct_llm::StreamChunk {
+                delta_content: Some(self.response.clone()),
+                tool_use_deltas: Vec::new(),
+                usage: None,
+                stop_reason: Some("end_turn".to_string()),
+            });
+            Ok(Box::pin(futures::stream::iter(vec![chunk])))
         }
 
         fn name(&self) -> &str {
@@ -1569,7 +1577,9 @@ mod tests {
             &self,
             _request: CompletionRequest,
         ) -> Result<ct_llm::CompletionStream, ct_llm::ProviderError> {
-            Ok(Box::pin(futures::stream::iter(self.chunks.clone().into_iter())))
+            Ok(Box::pin(futures::stream::iter(
+                self.chunks.clone().into_iter(),
+            )))
         }
 
         fn name(&self) -> &str {
@@ -1621,10 +1631,13 @@ mod tests {
             "test",
         );
 
+        router.set_active("stream-model").expect("set active");
         let provider = RouterLoopLlmProvider::new(&router, "stream-model".to_string());
         let result = provider.generate("hello", 32).await;
 
-        assert!(matches!(result, Err(CoreLlmError::Inference(message)) if message.contains("chunk failed")));
+        assert!(
+            matches!(result, Err(CoreLlmError::Inference(message)) if message.contains("chunk failed"))
+        );
     }
 
     #[tokio::test]
@@ -1644,10 +1657,14 @@ mod tests {
             "test",
         );
 
+        router.set_active("empty-model").expect("set active");
         let provider = RouterLoopLlmProvider::new(&router, "empty-model".to_string());
         let result = provider.generate("hello", 32).await;
+        eprintln!("DEBUG result: {result:?}");
 
-        assert!(matches!(result, Err(CoreLlmError::InvalidResponse(message)) if message.contains("empty completion")));
+        assert!(
+            matches!(result, Err(CoreLlmError::InvalidResponse(message)) if message.contains("empty completion"))
+        );
     }
 
     #[test]
@@ -1677,7 +1694,9 @@ mod tests {
         let mut writer = FailingWriter;
 
         let error = move_cursor_to_start(&mut writer).expect_err("terminal error expected");
-        assert!(matches!(error, TuiError::Io(io_error) if io_error.to_string().contains("write failed")));
+        assert!(
+            matches!(error, TuiError::Io(io_error) if io_error.to_string().contains("write failed"))
+        );
     }
 
     #[test]

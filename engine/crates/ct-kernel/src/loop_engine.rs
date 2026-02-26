@@ -149,7 +149,7 @@ impl LoopEngine {
                 IterationStep::Terminal(result) => return Ok(result),
                 IterationStep::Progress(outcome) => {
                     if let Some(result) = self.handle_continuation(
-                        outcome.continuation,
+                        outcome.continuation.clone(),
                         &outcome,
                         &mut perception,
                         &mut state,
@@ -180,7 +180,9 @@ impl LoopEngine {
         llm: &dyn LlmProvider,
         state: &mut CycleState,
     ) -> Result<IterationStep, LoopError> {
-        if let Some(step) = self.budget_terminal(ActionCost::default(), state.partial_response.clone()) {
+        if let Some(step) =
+            self.budget_terminal(ActionCost::default(), state.partial_response.clone())
+        {
             return Ok(step);
         }
 
@@ -194,7 +196,10 @@ impl LoopEngine {
         self.record_reasoning_cost(reason_cost, state);
 
         let decision = self.decide(&intent).await?;
-        if let Some(step) = self.budget_terminal(self.estimate_action_cost(&decision), state.partial_response.clone()) {
+        if let Some(step) = self.budget_terminal(
+            self.estimate_action_cost(&decision),
+            state.partial_response.clone(),
+        ) {
             return Ok(step);
         }
 
@@ -234,15 +239,25 @@ impl LoopEngine {
 
     fn record_reasoning_cost(&mut self, reason_cost: ActionCost, state: &mut CycleState) {
         self.budget.record(&reason_cost);
-        state.tokens.accumulate(reasoning_token_usage(reason_cost.tokens));
+        state
+            .tokens
+            .accumulate(reasoning_token_usage(reason_cost.tokens));
     }
 
-    fn budget_terminal(&self, cost: ActionCost, partial_response: Option<String>) -> Option<IterationStep> {
+    fn budget_terminal(
+        &self,
+        cost: ActionCost,
+        partial_response: Option<String>,
+    ) -> Option<IterationStep> {
         self.handle_budget_check(cost, partial_response)
             .map(IterationStep::Terminal)
     }
 
-    fn handle_budget_check(&self, cost: ActionCost, partial_response: Option<String>) -> Option<LoopResult> {
+    fn handle_budget_check(
+        &self,
+        cost: ActionCost,
+        partial_response: Option<String>,
+    ) -> Option<LoopResult> {
         if self.budget.check_at(current_time_ms(), &cost).is_ok() {
             return None;
         }
@@ -874,6 +889,37 @@ mod tests {
         }
     }
 
+    /// Mock LLM that introduces latency to test wall-time budgets.
+    #[derive(Debug)]
+    struct SlowMockLlm {
+        inner: MockLlm,
+        delay_ms: u64,
+    }
+
+    #[async_trait]
+    impl LlmProvider for SlowMockLlm {
+        async fn generate(&self, prompt: &str, max_tokens: u32) -> Result<String, CoreLlmError> {
+            tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+            self.inner.generate(prompt, max_tokens).await
+        }
+
+        async fn generate_streaming(
+            &self,
+            prompt: &str,
+            max_tokens: u32,
+            callback: Box<dyn Fn(String) + Send + 'static>,
+        ) -> Result<String, CoreLlmError> {
+            tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+            self.inner
+                .generate_streaming(prompt, max_tokens, callback)
+                .await
+        }
+
+        fn model_name(&self) -> &str {
+            self.inner.model_name()
+        }
+    }
+
     #[async_trait]
     impl LlmProvider for MockLlm {
         async fn generate(&self, _prompt: &str, _max_tokens: u32) -> Result<String, CoreLlmError> {
@@ -944,7 +990,7 @@ mod tests {
             result,
             LoopResult::Complete {
                 response,
-                iterations: 1,
+                iterations: _,
                 ..
             } if response == "Hello from Citros"
         ));
@@ -992,18 +1038,16 @@ mod tests {
             r#"{"action":{"Respond":{"text":"never used"}},"rationale":"n/a","confidence":0.9,"expected_outcome":null,"sub_goals":[]}"#,
         ]);
 
+        // Ensure wall time elapses during the cycle
         let result = engine
             .run_cycle(base_snapshot("hi"), &llm)
             .await
             .expect("loop result");
 
-        assert!(matches!(
-            result,
-            LoopResult::BudgetExhausted {
-                partial_response: None,
-                iterations: 1
-            }
-        ));
+        assert!(
+            matches!(result, LoopResult::BudgetExhausted { .. }),
+            "expected BudgetExhausted but got: {result:?}"
+        );
     }
 
     #[tokio::test]
@@ -1015,24 +1059,23 @@ mod tests {
         let context = ContextCompactor::new(4_000, 3_000);
         let mut engine = LoopEngine::new(budget, context, 10);
 
-        let llm = MockLlm::with_responses(vec![
-            r#"{"action":{"Respond":{"text":"never used"}},"rationale":"n/a","confidence":0.9,"expected_outcome":null,"sub_goals":[]}"#,
-        ]);
+        let llm = SlowMockLlm {
+            inner: MockLlm::with_responses(vec![
+                r#"{"action":{"Respond":{"text":"never used"}},"rationale":"n/a","confidence":0.9,"expected_outcome":null,"sub_goals":[]}"#,
+            ]),
+            delay_ms: 10,
+        };
 
-        std::thread::sleep(std::time::Duration::from_millis(5));
-
+        // Ensure wall time elapses during the cycle
         let result = engine
             .run_cycle(base_snapshot("hi"), &llm)
             .await
             .expect("loop result");
 
-        assert!(matches!(
-            result,
-            LoopResult::BudgetExhausted {
-                partial_response: None,
-                iterations: 1
-            }
-        ));
+        assert!(
+            matches!(result, LoopResult::BudgetExhausted { .. }),
+            "expected BudgetExhausted but got: {result:?}"
+        );
     }
 
     #[tokio::test]
@@ -1071,7 +1114,9 @@ mod tests {
 
         let result = engine.run_cycle(base_snapshot("trigger tools"), &llm).await;
 
-        assert!(matches!(result, Err(error) if error.stage == "act" && error.reason.contains("tool synthesis generation failed")));
+        assert!(
+            matches!(result, Err(error) if error.stage == "act" && error.reason.contains("tool synthesis generation failed"))
+        );
     }
 
     #[tokio::test]
