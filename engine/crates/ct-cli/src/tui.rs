@@ -605,7 +605,7 @@ impl LoopLlmProvider for RouterLoopLlmProvider<'_> {
             model: self.active_model.clone(),
             messages: vec![Message::user(prompt)],
             tools: Vec::new(),
-            temperature: Some(0.2),
+            temperature: None, // Codex Responses API does not support temperature
             max_tokens: Some(max_tokens),
             system_prompt: None,
         };
