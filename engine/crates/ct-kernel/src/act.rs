@@ -1,6 +1,7 @@
 //! Act-step execution result types.
 
 use crate::decide::Decision;
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 /// Token accounting for loop steps that call an LLM.
@@ -25,15 +26,58 @@ impl TokenUsage {
     }
 }
 
-/// Placeholder tool execution result.
+/// Tool execution failure.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolExecutorError {
+    /// Human-readable error description.
+    pub message: String,
+    /// Whether retrying might succeed.
+    pub recoverable: bool,
+}
+
+/// Tool execution result.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolResult {
     /// Name of the tool that was requested.
     pub tool_name: String,
     /// Whether the tool succeeded.
     pub success: bool,
-    /// Human-readable output (stubbed in PR9).
+    /// Human-readable tool output.
     pub output: String,
+}
+
+/// Tool execution abstraction for kernel act step.
+#[async_trait]
+pub trait ToolExecutor: Send + Sync + std::fmt::Debug {
+    /// Execute requested tool calls and return tool results.
+    async fn execute_tools(
+        &self,
+        calls: &[ct_llm::ToolCall],
+    ) -> Result<Vec<ToolResult>, ToolExecutorError>;
+}
+
+/// Default in-kernel tool executor for environments without real tool wiring.
+#[derive(Debug, Default)]
+pub struct StubToolExecutor;
+
+#[async_trait]
+impl ToolExecutor for StubToolExecutor {
+    async fn execute_tools(
+        &self,
+        calls: &[ct_llm::ToolCall],
+    ) -> Result<Vec<ToolResult>, ToolExecutorError> {
+        Ok(calls
+            .iter()
+            .map(|call| ToolResult {
+                tool_name: call.name.clone(),
+                success: true,
+                output: format!(
+                    "Stub tool execution for '{}' with args {}",
+                    call.name, call.arguments
+                ),
+            })
+            .collect::<Vec<_>>())
+    }
 }
 
 /// Result of the Act step.

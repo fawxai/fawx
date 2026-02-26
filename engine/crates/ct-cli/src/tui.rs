@@ -3,6 +3,7 @@ use crossterm::style::Stylize;
 use crossterm::{cursor, event, style, terminal, ExecutableCommand};
 use ct_core::error::LlmError as CoreLlmError;
 use ct_core::types::{InputSource, ScreenState, UserInput};
+use ct_kernel::act::StubToolExecutor;
 use ct_kernel::auth::{AuthManager, AuthMethod};
 use ct_kernel::budget::{BudgetConfig, BudgetTracker};
 use ct_kernel::context_manager::ContextCompactor;
@@ -181,7 +182,9 @@ impl TuiApp {
     }
 
     async fn auth_wizard_chatgpt_subscription(&mut self) -> Result<String, TuiError> {
-        let flow = PkceFlow::new();
+        let flow = PkceFlow::try_new().map_err(|error| {
+            TuiError::Auth(format!("failed to initialize oauth PKCE flow: {error}"))
+        })?;
         let client_id = std::env::var("CITROS_OPENAI_CLIENT_ID")
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -524,7 +527,12 @@ impl TuiApp {
 pub fn build_loop_engine() -> LoopEngine {
     let budget = BudgetTracker::new(BudgetConfig::default(), current_time_ms(), 0);
     let context = ContextCompactor::new(DEFAULT_CONTEXT_MAX_TOKENS, DEFAULT_CONTEXT_COMPACT_TARGET);
-    LoopEngine::new(budget, context, DEFAULT_MAX_LOOP_ITERATIONS)
+    LoopEngine::new_with_executor(
+        budget,
+        context,
+        DEFAULT_MAX_LOOP_ITERATIONS,
+        std::sync::Arc::new(StubToolExecutor),
+    )
 }
 
 impl<'a> fmt::Debug for RouterLoopLlmProvider<'a> {

@@ -39,18 +39,18 @@ impl fmt::Debug for PkceFlow {
 
 impl PkceFlow {
     /// Generate a new PKCE flow with random verifier and state.
-    pub fn new() -> Self {
-        let verifier_random = random_bytes::<32>();
+    pub fn try_new() -> Result<Self, AuthError> {
+        let verifier_random = random_bytes::<32>()?;
         let code_verifier = URL_SAFE_NO_PAD.encode(verifier_random);
         let code_challenge = pkce_challenge(&code_verifier);
-        let state = random_hex_string::<32>();
+        let state = random_hex_string::<32>()?;
 
-        Self {
+        Ok(Self {
             code_verifier,
             code_challenge,
             state,
             redirect_uri: DEFAULT_REDIRECT_URI.to_string(),
-        }
+        })
     }
 
     /// Build the authorization URL with all required OAuth + OpenAI params.
@@ -101,12 +101,6 @@ impl PkceFlow {
     /// Borrow the redirect URI associated with this flow.
     pub fn redirect_uri(&self) -> &str {
         &self.redirect_uri
-    }
-}
-
-impl Default for PkceFlow {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -195,6 +189,8 @@ pub enum AuthError {
     RefreshFailed(String),
     /// Callback URL was malformed.
     InvalidCallback(String),
+    /// Secure random byte generation failed.
+    RandomGenerationFailed(String),
 }
 
 impl fmt::Display for AuthError {
@@ -207,6 +203,9 @@ impl fmt::Display for AuthError {
             }
             Self::RefreshFailed(reason) => write!(f, "oauth token refresh failed: {reason}"),
             Self::InvalidCallback(reason) => write!(f, "invalid oauth callback: {reason}"),
+            Self::RandomGenerationFailed(reason) => {
+                write!(f, "oauth random generation failed: {reason}")
+            }
         }
     }
 }
@@ -345,16 +344,24 @@ fn hex_digit(v: u8) -> char {
     }
 }
 
-fn random_bytes<const N: usize>() -> [u8; N] {
-    let rng = SystemRandom::new();
-    let mut out = [0u8; N];
-    rng.fill(&mut out)
-        .expect("SystemRandom failed to generate secure random bytes");
-    out
+fn random_bytes<const N: usize>() -> Result<[u8; N], AuthError> {
+    random_bytes_with_fill::<N>(|dest| {
+        SystemRandom::new().fill(dest).map_err(|error| {
+            AuthError::RandomGenerationFailed(format!("system RNG unavailable: {error:?}"))
+        })
+    })
 }
 
-fn random_hex_string<const N: usize>() -> String {
-    let bytes = random_bytes::<N>();
+fn random_bytes_with_fill<const N: usize>(
+    fill: impl FnOnce(&mut [u8]) -> Result<(), AuthError>,
+) -> Result<[u8; N], AuthError> {
+    let mut out = [0u8; N];
+    fill(&mut out)?;
+    Ok(out)
+}
+
+fn random_hex_string<const N: usize>() -> Result<String, AuthError> {
+    let bytes = random_bytes::<N>()?;
     let mut out = String::with_capacity(N * 2);
 
     for byte in bytes {
@@ -362,7 +369,7 @@ fn random_hex_string<const N: usize>() -> String {
         out.push(hex_digit(byte & 0x0f));
     }
 
-    out
+    Ok(out)
 }
 
 fn pkce_challenge(code_verifier: &str) -> String {
@@ -373,13 +380,15 @@ fn pkce_challenge(code_verifier: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        percent_encode, pkce_challenge, AuthError, PkceFlow, TokenExchangeRequest,
-        TokenRefreshRequest, TokenResponse,
+        extract_openai_account_id, percent_encode, pkce_challenge, random_bytes_with_fill,
+        AuthError, PkceFlow, TokenExchangeRequest, TokenRefreshRequest, TokenResponse,
+        OPENAI_JWT_CLAIM_PATH,
     };
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 
     #[test]
     fn pkce_flow_generates_valid_verifier_and_challenge() {
-        let flow = PkceFlow::new();
+        let flow = PkceFlow::try_new().expect("pkce flow");
 
         assert!(flow.code_verifier().len() >= 43);
         assert!(flow.code_verifier().len() <= 128);
@@ -397,7 +406,7 @@ mod tests {
 
     #[test]
     fn authorization_url_contains_required_parameters() {
-        let flow = PkceFlow::new();
+        let flow = PkceFlow::try_new().expect("pkce flow");
         let client_id = "citros-client-id";
 
         let url = flow.authorization_url(client_id);
@@ -420,7 +429,7 @@ mod tests {
 
     #[test]
     fn parse_callback_extracts_authorization_code() {
-        let flow = PkceFlow::new();
+        let flow = PkceFlow::try_new().expect("pkce flow");
         let callback = format!(
             "{}?code=auth-code-123&state={}",
             flow.redirect_uri(),
@@ -436,7 +445,7 @@ mod tests {
 
     #[test]
     fn parse_callback_without_query_string_returns_invalid_callback() {
-        let flow = PkceFlow::new();
+        let flow = PkceFlow::try_new().expect("pkce flow");
         let callback = flow.redirect_uri().to_string();
 
         let err = flow
@@ -448,7 +457,7 @@ mod tests {
 
     #[test]
     fn parse_callback_with_state_but_no_code_returns_missing_code() {
-        let flow = PkceFlow::new();
+        let flow = PkceFlow::try_new().expect("pkce flow");
         let callback = format!("{}?state={}", flow.redirect_uri(), flow.state());
 
         let err = flow
@@ -460,7 +469,7 @@ mod tests {
 
     #[test]
     fn parse_callback_with_code_but_no_state_returns_invalid_state() {
-        let flow = PkceFlow::new();
+        let flow = PkceFlow::try_new().expect("pkce flow");
         let callback = format!("{}?code=auth-code-123", flow.redirect_uri());
 
         let err = flow
@@ -472,7 +481,7 @@ mod tests {
 
     #[test]
     fn parse_callback_with_wrong_state_returns_invalid_state() {
-        let flow = PkceFlow::new();
+        let flow = PkceFlow::try_new().expect("pkce flow");
         let callback = format!(
             "{}?code=auth-code-123&state=different-state",
             flow.redirect_uri()
@@ -487,7 +496,7 @@ mod tests {
 
     #[test]
     fn parse_callback_decodes_percent_encoded_values() {
-        let flow = PkceFlow::new();
+        let flow = PkceFlow::try_new().expect("pkce flow");
         let encoded_state = flow
             .state()
             .bytes()
@@ -507,7 +516,7 @@ mod tests {
 
     #[test]
     fn token_exchange_request_construction_preserves_expected_fields() {
-        let flow = PkceFlow::new();
+        let flow = PkceFlow::try_new().expect("pkce flow");
         let request = TokenExchangeRequest {
             grant_type: "authorization_code".to_string(),
             code: "oauth-code-xyz".to_string(),
@@ -566,7 +575,7 @@ mod tests {
 
     #[test]
     fn debug_impls_redact_secret_fields() {
-        let flow = PkceFlow::new();
+        let flow = PkceFlow::try_new().expect("pkce flow");
         let flow_debug = format!("{flow:?}");
         assert!(flow_debug.contains("<redacted>"));
         assert!(!flow_debug.contains(flow.code_verifier()));
@@ -601,5 +610,27 @@ mod tests {
         assert!(response_debug.contains("<redacted>"));
         assert!(!response_debug.contains("access-secret"));
         assert!(!response_debug.contains("refresh-secret"));
+    }
+
+    #[test]
+    fn random_bytes_returns_error_when_rng_fails() {
+        let result = random_bytes_with_fill::<8>(|_| {
+            Err(AuthError::RandomGenerationFailed("rng failed".to_string()))
+        });
+
+        assert!(matches!(result, Err(AuthError::RandomGenerationFailed(_))));
+    }
+
+    #[test]
+    fn extract_openai_account_id_returns_expected_claim() {
+        let payload = serde_json::json!({
+            OPENAI_JWT_CLAIM_PATH: {"chatgpt_account_id": "acct_123"}
+        });
+        let payload_json = serde_json::to_vec(&payload).expect("payload json");
+        let payload_b64 = URL_SAFE_NO_PAD.encode(payload_json);
+        let token = format!("header.{payload_b64}.sig");
+
+        let account = extract_openai_account_id(&token);
+        assert_eq!(account.as_deref(), Some("acct_123"));
     }
 }
