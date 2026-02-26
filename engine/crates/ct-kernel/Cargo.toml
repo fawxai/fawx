@@ -1,0 +1,17 @@
+[package]
+name = "ct-kernel"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Citros kernel — loop orchestration, policy engine, permissions, budget enforcement, verification, rollback, watchdog. Immutable at runtime."
+
+[dependencies]
+ct-core = { workspace = true }
+ct-storage = { workspace = true }
+ct-loadable = { workspace = true }
+
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

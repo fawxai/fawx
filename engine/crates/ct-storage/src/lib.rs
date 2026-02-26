@@ -7,6 +7,9 @@
 //! - Sync: `Storage`, `EncryptedStore`
 //! - Async: `AsyncStorage`, `AsyncEncryptedStore` (using `tokio::task::spawn_blocking`)
 
+// Memory stores (planned — four types: working, episodic, semantic, procedural)
+pub mod graph;
+
 pub mod async_encrypted;
 pub mod async_store;
 pub mod conversation;

@@ -1,0 +1,15 @@
+[package]
+name = "ct-loadable"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Citros loadable layer — WASM skill runtime, strategy management, config, prompt templates, A/B slot lifecycle. Hot-swappable at runtime."
+
+[dependencies]
+ct-core = { workspace = true }
+
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
