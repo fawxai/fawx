@@ -3,11 +3,11 @@
 //! Supports OpenAI and OpenRouter style APIs via configurable `base_url`.
 
 use async_trait::async_trait;
-use futures::stream;
-use reqwest::StatusCode;
+use futures::{stream, Stream, StreamExt};
+use reqwest::{bytes::Bytes, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::time::Duration;
+use std::{collections::VecDeque, time::Duration};
 
 use crate::provider::{CompletionStream, LlmProvider};
 use crate::types::{
@@ -66,10 +66,12 @@ impl OpenAiProvider {
     }
 
     fn endpoint(&self) -> String {
-        format!(
-            "{}/v1/chat/completions",
-            self.base_url.trim_end_matches('/')
-        )
+        let base_url = self.base_url.trim_end_matches('/');
+        if base_url.ends_with("/v1") {
+            format!("{base_url}/chat/completions")
+        } else {
+            format!("{base_url}/v1/chat/completions")
+        }
     }
 
     fn ensure_supported_model(&self, model: &str) -> Result<(), LlmError> {
@@ -171,80 +173,197 @@ impl OpenAiProvider {
         let mut chunks = Vec::new();
 
         for line in payload.lines() {
-            let line = line.trim_start();
-            let Some(data) = line.strip_prefix("data: ") else {
-                continue;
-            };
-
-            let trimmed = data.trim();
-            if trimmed.is_empty() || trimmed == "[DONE]" {
-                continue;
-            }
-
-            let envelope: OpenAiStreamEnvelope = serde_json::from_str(trimmed)
-                .map_err(|error| LlmError::Streaming(format!("invalid SSE JSON: {error}")))?;
-
-            if let Some(usage) = envelope.usage {
-                chunks.push(StreamChunk {
-                    delta_content: None,
-                    tool_use_deltas: Vec::new(),
-                    usage: Some(Usage {
-                        input_tokens: usage.prompt_tokens,
-                        output_tokens: usage.completion_tokens,
-                    }),
-                    stop_reason: None,
-                });
-            }
-
-            for choice in envelope.choices {
-                if let Some(content) = choice.delta.content {
-                    chunks.push(StreamChunk {
-                        delta_content: Some(content),
-                        tool_use_deltas: Vec::new(),
-                        usage: None,
-                        stop_reason: None,
-                    });
-                }
-
-                if let Some(tool_calls) = choice.delta.tool_calls {
-                    let deltas = tool_calls
-                        .into_iter()
-                        .map(|tool_call| {
-                            let (name, arguments_delta) = match tool_call.function {
-                                Some(function) => (function.name, function.arguments),
-                                None => (None, None),
-                            };
-
-                            ToolUseDelta {
-                                id: tool_call.id,
-                                name,
-                                arguments_delta,
-                            }
-                        })
-                        .collect::<Vec<_>>();
-
-                    if !deltas.is_empty() {
-                        chunks.push(StreamChunk {
-                            delta_content: None,
-                            tool_use_deltas: deltas,
-                            usage: None,
-                            stop_reason: None,
-                        });
-                    }
-                }
-
-                if let Some(stop_reason) = choice.finish_reason {
-                    chunks.push(StreamChunk {
-                        delta_content: None,
-                        tool_use_deltas: Vec::new(),
-                        usage: None,
-                        stop_reason: Some(stop_reason),
-                    });
-                }
+            match Self::parse_sse_line(line)? {
+                ParsedSseLine::Ignore => {}
+                ParsedSseLine::Done => break,
+                ParsedSseLine::Chunks(mut parsed_chunks) => chunks.append(&mut parsed_chunks),
             }
         }
 
         Ok(chunks)
+    }
+
+    fn parse_sse_line(line: &str) -> Result<ParsedSseLine, LlmError> {
+        let line = line.trim_start().trim_end_matches('\r');
+        let Some(data) = line.strip_prefix("data:") else {
+            return Ok(ParsedSseLine::Ignore);
+        };
+
+        let data = data.trim_start();
+        if data.is_empty() {
+            return Ok(ParsedSseLine::Ignore);
+        }
+
+        if data == "[DONE]" {
+            return Ok(ParsedSseLine::Done);
+        }
+
+        Ok(ParsedSseLine::Chunks(Self::parse_sse_data(data)?))
+    }
+
+    fn parse_sse_data(data: &str) -> Result<Vec<StreamChunk>, LlmError> {
+        let envelope: OpenAiStreamEnvelope = serde_json::from_str(data)
+            .map_err(|error| LlmError::Streaming(format!("invalid SSE JSON: {error}")))?;
+
+        let mut chunks = Vec::new();
+
+        if let Some(usage) = envelope.usage {
+            chunks.push(StreamChunk {
+                delta_content: None,
+                tool_use_deltas: Vec::new(),
+                usage: Some(Usage {
+                    input_tokens: usage.prompt_tokens,
+                    output_tokens: usage.completion_tokens,
+                }),
+                stop_reason: None,
+            });
+        }
+
+        for choice in envelope.choices {
+            if let Some(content) = choice.delta.content {
+                chunks.push(StreamChunk {
+                    delta_content: Some(content),
+                    tool_use_deltas: Vec::new(),
+                    usage: None,
+                    stop_reason: None,
+                });
+            }
+
+            if let Some(tool_calls) = choice.delta.tool_calls {
+                let deltas = tool_calls
+                    .into_iter()
+                    .map(|tool_call| {
+                        let (name, arguments_delta) = match tool_call.function {
+                            Some(function) => (function.name, function.arguments),
+                            None => (None, None),
+                        };
+
+                        ToolUseDelta {
+                            id: tool_call.id,
+                            name,
+                            arguments_delta,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+
+                if !deltas.is_empty() {
+                    chunks.push(StreamChunk {
+                        delta_content: None,
+                        tool_use_deltas: deltas,
+                        usage: None,
+                        stop_reason: None,
+                    });
+                }
+            }
+
+            if let Some(stop_reason) = choice.finish_reason {
+                chunks.push(StreamChunk {
+                    delta_content: None,
+                    tool_use_deltas: Vec::new(),
+                    usage: None,
+                    stop_reason: Some(stop_reason),
+                });
+            }
+        }
+
+        Ok(chunks)
+    }
+
+    fn stream_from_sse(response: reqwest::Response) -> impl Stream<Item = Result<StreamChunk, LlmError>> + Send {
+        stream::unfold(
+            OpenAiSseState::new(response.bytes_stream()),
+            |mut state| async move {
+                loop {
+                    if let Some(chunk) = state.pending_chunks.pop_front() {
+                        return Some((chunk, state));
+                    }
+
+                    if state.finished {
+                        return None;
+                    }
+
+                    match state.bytes_stream.as_mut().next().await {
+                        Some(Ok(bytes)) => {
+                            state.buffer.extend_from_slice(&bytes);
+
+                            if let Err(error) = Self::drain_buffered_lines(&mut state) {
+                                state.finished = true;
+                                return Some((Err(error), state));
+                            }
+                        }
+                        Some(Err(error)) => {
+                            state.finished = true;
+                            return Some((Err(LlmError::Streaming(error.to_string())), state));
+                        }
+                        None => {
+                            if !state.buffer.is_empty() {
+                                let remaining = std::mem::take(&mut state.buffer);
+                                let line = match std::str::from_utf8(&remaining) {
+                                    Ok(line) => line,
+                                    Err(error) => {
+                                        state.finished = true;
+                                        return Some((
+                                            Err(LlmError::Streaming(format!(
+                                                "stream was not valid UTF-8: {error}"
+                                            ))),
+                                            state,
+                                        ));
+                                    }
+                                };
+
+                                if let Err(error) = Self::enqueue_parsed_line(
+                                    line,
+                                    &mut state.pending_chunks,
+                                    &mut state.finished,
+                                ) {
+                                    state.finished = true;
+                                    return Some((Err(error), state));
+                                }
+                            }
+
+                            state.finished = true;
+                        }
+                    }
+                }
+            },
+        )
+    }
+
+    fn drain_buffered_lines(state: &mut OpenAiSseState) -> Result<(), LlmError> {
+        while let Some(newline_index) = state.buffer.iter().position(|byte| *byte == b'\n') {
+            let line_bytes = state.buffer.drain(..=newline_index).collect::<Vec<_>>();
+            let line_bytes = &line_bytes[..line_bytes.len().saturating_sub(1)];
+
+            let line = std::str::from_utf8(line_bytes)
+                .map_err(|error| LlmError::Streaming(format!("stream was not valid UTF-8: {error}")))?;
+
+            Self::enqueue_parsed_line(line, &mut state.pending_chunks, &mut state.finished)?;
+
+            if state.finished {
+                state.buffer.clear();
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn enqueue_parsed_line(
+        line: &str,
+        pending_chunks: &mut VecDeque<Result<StreamChunk, LlmError>>,
+        finished: &mut bool,
+    ) -> Result<(), LlmError> {
+        match Self::parse_sse_line(line)? {
+            ParsedSseLine::Ignore => {}
+            ParsedSseLine::Done => {
+                *finished = true;
+            }
+            ParsedSseLine::Chunks(chunks) => {
+                pending_chunks.extend(chunks.into_iter().map(Ok));
+            }
+        }
+
+        Ok(())
     }
 
     fn map_http_error(status: StatusCode, body: String) -> LlmError {
@@ -311,14 +430,7 @@ impl LlmProvider for OpenAiProvider {
             return Err(Self::map_http_error(status, body));
         }
 
-        // We parse SSE payload into stable provider-agnostic chunks.
-        let payload = response
-            .text()
-            .await
-            .map_err(|error| LlmError::Streaming(error.to_string()))?;
-        let chunks = Self::parse_sse_payload(&payload)?;
-
-        Ok(Box::new(stream::iter(chunks.into_iter().map(Ok))))
+        Ok(Box::pin(Self::stream_from_sse(response)))
     }
 
     fn name(&self) -> &str {
@@ -386,7 +498,7 @@ fn map_messages_to_openai(messages: &[Message]) -> Result<Vec<OpenAiMessage>, Ll
                     for (tool_call_id, content) in tool_results {
                         mapped.push(OpenAiMessage {
                             role: "tool".to_string(),
-                            content: Some(content),
+                            content: Some(value_to_openai_content(content)),
                             tool_calls: None,
                             tool_call_id: Some(tool_call_id),
                         });
@@ -433,6 +545,13 @@ fn extract_text(blocks: &[ContentBlock]) -> String {
 
 fn parse_json_or_string(value: &str) -> Value {
     serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_string()))
+}
+
+fn value_to_openai_content(value: Value) -> String {
+    match value {
+        Value::String(content) => content,
+        other => other.to_string(),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -549,6 +668,33 @@ struct OpenAiToolFunctionDelta {
     arguments: Option<String>,
 }
 
+enum ParsedSseLine {
+    Ignore,
+    Done,
+    Chunks(Vec<StreamChunk>),
+}
+
+struct OpenAiSseState {
+    bytes_stream: std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
+    buffer: Vec<u8>,
+    pending_chunks: VecDeque<Result<StreamChunk, LlmError>>,
+    finished: bool,
+}
+
+impl OpenAiSseState {
+    fn new<S>(bytes_stream: S) -> Self
+    where
+        S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    {
+        Self {
+            bytes_stream: Box::pin(bytes_stream),
+            buffer: Vec::new(),
+            pending_chunks: VecDeque::new(),
+            finished: false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -645,6 +791,56 @@ mod tests {
         assert_eq!(chunks[2].usage.unwrap().input_tokens, 7);
         assert_eq!(chunks[2].usage.unwrap().output_tokens, 8);
         assert_eq!(chunks[3].stop_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn test_parse_sse_payload_malformed_data_cases() {
+        let incomplete_json = "data: {\"choices\":[{";
+        let result = OpenAiProvider::parse_sse_payload(incomplete_json);
+        assert!(matches!(result, Err(LlmError::Streaming(_))));
+
+        let missing_data_prefix = "event: message\nretry: 1000";
+        let result = OpenAiProvider::parse_sse_payload(missing_data_prefix).unwrap();
+        assert!(result.is_empty());
+
+        let unexpected_format = "data: not-json";
+        let result = OpenAiProvider::parse_sse_payload(unexpected_format);
+        assert!(matches!(result, Err(LlmError::Streaming(_))));
+    }
+
+    #[test]
+    fn test_map_http_error_maps_client_and_server_statuses() {
+        let client_error = OpenAiProvider::map_http_error(StatusCode::BAD_REQUEST, "bad".to_string());
+        assert!(matches!(client_error, LlmError::Request(message) if message.contains("client error 400")));
+
+        let server_error = OpenAiProvider::map_http_error(StatusCode::INTERNAL_SERVER_ERROR, "oops".to_string());
+        assert!(matches!(server_error, LlmError::Provider(message) if message.contains("server error 500")));
+    }
+
+    #[test]
+    fn test_endpoint_avoids_duplicate_v1_segment() {
+        let with_v1 = OpenAiProvider::new("https://api.openai.com/v1", "test-key").unwrap();
+        assert_eq!(with_v1.endpoint(), "https://api.openai.com/v1/chat/completions");
+
+        let without_v1 = OpenAiProvider::new("https://api.openai.com", "test-key").unwrap();
+        assert_eq!(without_v1.endpoint(), "https://api.openai.com/v1/chat/completions");
+    }
+
+    #[test]
+    fn test_map_messages_to_openai_serializes_structured_tool_result_content() {
+        let messages = vec![Message {
+            role: MessageRole::Tool,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "call_1".to_string(),
+                content: json!({"ok": true, "items": [1, 2]}),
+            }],
+        }];
+
+        let mapped = map_messages_to_openai(&messages).unwrap();
+        assert_eq!(mapped.len(), 1);
+        assert_eq!(mapped[0].role, "tool");
+        assert_eq!(mapped[0].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(mapped[0].content.as_deref(), Some(r#"{"ok":true,"items":[1,2]}"#));
     }
 
     #[test]

@@ -116,7 +116,7 @@ pub enum ContentBlock {
         /// Tool call identifier this result belongs to.
         tool_use_id: String,
         /// Tool output content.
-        content: String,
+        content: Value,
     },
 }
 

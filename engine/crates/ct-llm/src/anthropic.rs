@@ -1,11 +1,11 @@
 //! Anthropic Messages API provider.
 
 use async_trait::async_trait;
-use futures::stream;
-use reqwest::StatusCode;
+use futures::{stream, Stream, StreamExt};
+use reqwest::{bytes::Bytes, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::time::Duration;
+use std::{collections::VecDeque, time::Duration};
 
 use crate::provider::{CompletionStream, LlmProvider};
 use crate::types::{
@@ -170,7 +170,7 @@ impl AnthropicProvider {
                 } => {
                     content.push(ContentBlock::ToolResult {
                         tool_use_id,
-                        content: value_to_string(result),
+                        content: result,
                     });
                 }
             }
@@ -191,94 +191,210 @@ impl AnthropicProvider {
         let mut chunks = Vec::new();
 
         for line in payload.lines() {
-            let line = line.trim_start();
-            let Some(data) = line.strip_prefix("data: ") else {
-                continue;
-            };
-
-            let trimmed = data.trim();
-            if trimmed.is_empty() || trimmed == "[DONE]" {
-                continue;
+            match Self::parse_sse_line(line)? {
+                ParsedSseLine::Ignore => {}
+                ParsedSseLine::Done => break,
+                ParsedSseLine::Chunks(mut parsed_chunks) => chunks.append(&mut parsed_chunks),
             }
+        }
 
-            let event: AnthropicStreamEvent = serde_json::from_str(trimmed)
-                .map_err(|error| LlmError::Streaming(format!("invalid SSE JSON: {error}")))?;
+        Ok(chunks)
+    }
 
-            match event.event_type.as_str() {
-                "content_block_start" => {
-                    if let Some(AnthropicContentBlock::ToolUse { id, name, .. }) = event.content_block
-                    {
+    fn parse_sse_line(line: &str) -> Result<ParsedSseLine, LlmError> {
+        let line = line.trim_start().trim_end_matches('\r');
+        let Some(data) = line.strip_prefix("data:") else {
+            return Ok(ParsedSseLine::Ignore);
+        };
+
+        let data = data.trim_start();
+        if data.is_empty() {
+            return Ok(ParsedSseLine::Ignore);
+        }
+
+        if data == "[DONE]" {
+            return Ok(ParsedSseLine::Done);
+        }
+
+        Ok(ParsedSseLine::Chunks(Self::parse_sse_data(data)?))
+    }
+
+    fn parse_sse_data(data: &str) -> Result<Vec<StreamChunk>, LlmError> {
+        let event: AnthropicStreamEvent = serde_json::from_str(data)
+            .map_err(|error| LlmError::Streaming(format!("invalid SSE JSON: {error}")))?;
+
+        let mut chunks = Vec::new();
+
+        match event.event_type.as_str() {
+            "content_block_start" => {
+                if let Some(AnthropicContentBlock::ToolUse { id, name, .. }) = event.content_block {
+                    chunks.push(StreamChunk {
+                        delta_content: None,
+                        tool_use_deltas: vec![ToolUseDelta {
+                            id: Some(id),
+                            name: Some(name),
+                            arguments_delta: None,
+                        }],
+                        usage: None,
+                        stop_reason: None,
+                    });
+                }
+            }
+            "content_block_delta" => {
+                if let Some(delta) = event.delta {
+                    if let Some(text) = delta.text {
+                        chunks.push(StreamChunk {
+                            delta_content: Some(text),
+                            tool_use_deltas: Vec::new(),
+                            usage: None,
+                            stop_reason: None,
+                        });
+                    }
+
+                    if let Some(partial_json) = delta.partial_json {
                         chunks.push(StreamChunk {
                             delta_content: None,
                             tool_use_deltas: vec![ToolUseDelta {
-                                id: Some(id),
-                                name: Some(name),
-                                arguments_delta: None,
+                                id: None,
+                                name: None,
+                                arguments_delta: Some(partial_json),
                             }],
                             usage: None,
                             stop_reason: None,
                         });
                     }
                 }
-                "content_block_delta" => {
-                    if let Some(delta) = event.delta {
-                        if let Some(text) = delta.text {
-                            chunks.push(StreamChunk {
-                                delta_content: Some(text),
-                                tool_use_deltas: Vec::new(),
-                                usage: None,
-                                stop_reason: None,
-                            });
-                        }
-
-                        if let Some(partial_json) = delta.partial_json {
-                            chunks.push(StreamChunk {
-                                delta_content: None,
-                                tool_use_deltas: vec![ToolUseDelta {
-                                    id: None,
-                                    name: None,
-                                    arguments_delta: Some(partial_json),
-                                }],
-                                usage: None,
-                                stop_reason: None,
-                            });
-                        }
-                    }
-                }
-                "message_start" => {
-                    if let Some(usage) = event.message.and_then(|message| message.usage) {
-                        chunks.push(StreamChunk {
-                            delta_content: None,
-                            tool_use_deltas: Vec::new(),
-                            usage: Some(Usage {
-                                input_tokens: usage.input_tokens,
-                                output_tokens: usage.output_tokens,
-                            }),
-                            stop_reason: None,
-                        });
-                    }
-                }
-                "message_delta" => {
-                    let usage = event.usage.map(|usage| Usage {
-                        input_tokens: usage.input_tokens,
-                        output_tokens: usage.output_tokens,
-                    });
-                    let stop_reason = event.delta.and_then(|delta| delta.stop_reason);
-
-                    if usage.is_some() || stop_reason.is_some() {
-                        chunks.push(StreamChunk {
-                            delta_content: None,
-                            tool_use_deltas: Vec::new(),
-                            usage,
-                            stop_reason,
-                        });
-                    }
-                }
-                _ => {}
             }
+            "message_start" => {
+                if let Some(usage) = event.message.and_then(|message| message.usage) {
+                    chunks.push(StreamChunk {
+                        delta_content: None,
+                        tool_use_deltas: Vec::new(),
+                        usage: Some(Usage {
+                            input_tokens: usage.input_tokens,
+                            output_tokens: usage.output_tokens,
+                        }),
+                        stop_reason: None,
+                    });
+                }
+            }
+            "message_delta" => {
+                let usage = event.usage.map(|usage| Usage {
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                });
+                let stop_reason = event.delta.and_then(|delta| delta.stop_reason);
+
+                if usage.is_some() || stop_reason.is_some() {
+                    chunks.push(StreamChunk {
+                        delta_content: None,
+                        tool_use_deltas: Vec::new(),
+                        usage,
+                        stop_reason,
+                    });
+                }
+            }
+            _ => {}
         }
 
         Ok(chunks)
+    }
+
+    fn stream_from_sse(response: reqwest::Response) -> impl Stream<Item = Result<StreamChunk, LlmError>> + Send {
+        stream::unfold(
+            AnthropicSseState::new(response.bytes_stream()),
+            |mut state| async move {
+                loop {
+                    if let Some(chunk) = state.pending_chunks.pop_front() {
+                        return Some((chunk, state));
+                    }
+
+                    if state.finished {
+                        return None;
+                    }
+
+                    match state.bytes_stream.as_mut().next().await {
+                        Some(Ok(bytes)) => {
+                            state.buffer.extend_from_slice(&bytes);
+
+                            if let Err(error) = Self::drain_buffered_lines(&mut state) {
+                                state.finished = true;
+                                return Some((Err(error), state));
+                            }
+                        }
+                        Some(Err(error)) => {
+                            state.finished = true;
+                            return Some((Err(LlmError::Streaming(error.to_string())), state));
+                        }
+                        None => {
+                            if !state.buffer.is_empty() {
+                                let remaining = std::mem::take(&mut state.buffer);
+                                let line = match std::str::from_utf8(&remaining) {
+                                    Ok(line) => line,
+                                    Err(error) => {
+                                        state.finished = true;
+                                        return Some((
+                                            Err(LlmError::Streaming(format!(
+                                                "stream was not valid UTF-8: {error}"
+                                            ))),
+                                            state,
+                                        ));
+                                    }
+                                };
+
+                                if let Err(error) = Self::enqueue_parsed_line(
+                                    line,
+                                    &mut state.pending_chunks,
+                                    &mut state.finished,
+                                ) {
+                                    state.finished = true;
+                                    return Some((Err(error), state));
+                                }
+                            }
+
+                            state.finished = true;
+                        }
+                    }
+                }
+            },
+        )
+    }
+
+    fn drain_buffered_lines(state: &mut AnthropicSseState) -> Result<(), LlmError> {
+        while let Some(newline_index) = state.buffer.iter().position(|byte| *byte == b'\n') {
+            let line_bytes = state.buffer.drain(..=newline_index).collect::<Vec<_>>();
+            let line_bytes = &line_bytes[..line_bytes.len().saturating_sub(1)];
+
+            let line = std::str::from_utf8(line_bytes)
+                .map_err(|error| LlmError::Streaming(format!("stream was not valid UTF-8: {error}")))?;
+
+            Self::enqueue_parsed_line(line, &mut state.pending_chunks, &mut state.finished)?;
+
+            if state.finished {
+                state.buffer.clear();
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn enqueue_parsed_line(
+        line: &str,
+        pending_chunks: &mut VecDeque<Result<StreamChunk, LlmError>>,
+        finished: &mut bool,
+    ) -> Result<(), LlmError> {
+        match Self::parse_sse_line(line)? {
+            ParsedSseLine::Ignore => {}
+            ParsedSseLine::Done => {
+                *finished = true;
+            }
+            ParsedSseLine::Chunks(chunks) => {
+                pending_chunks.extend(chunks.into_iter().map(Ok));
+            }
+        }
+
+        Ok(())
     }
 
     fn map_http_error(status: StatusCode, body: String) -> LlmError {
@@ -347,15 +463,7 @@ impl LlmProvider for AnthropicProvider {
             return Err(Self::map_http_error(status, body));
         }
 
-        // We parse SSE payload into logical stream chunks to keep provider output
-        // format deterministic and provider-agnostic.
-        let payload = response
-            .text()
-            .await
-            .map_err(|error| LlmError::Streaming(error.to_string()))?;
-        let chunks = Self::parse_sse_payload(&payload)?;
-
-        Ok(Box::new(stream::iter(chunks.into_iter().map(Ok))))
+        Ok(Box::pin(Self::stream_from_sse(response)))
     }
 
     fn name(&self) -> &str {
@@ -380,7 +488,7 @@ fn map_content_to_anthropic(block: &ContentBlock) -> Result<AnthropicContentBloc
             content,
         } => Ok(AnthropicContentBlock::ToolResult {
             tool_use_id: tool_use_id.clone(),
-            content: Value::String(content.clone()),
+            content: content.clone(),
         }),
     }
 }
@@ -394,13 +502,6 @@ fn extract_text(blocks: &[ContentBlock]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-fn value_to_string(value: Value) -> String {
-    match value {
-        Value::String(value) => value,
-        other => other.to_string(),
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -483,6 +584,33 @@ struct AnthropicStreamDelta {
 struct AnthropicStreamMessage {
     #[serde(default)]
     usage: Option<AnthropicUsage>,
+}
+
+enum ParsedSseLine {
+    Ignore,
+    Done,
+    Chunks(Vec<StreamChunk>),
+}
+
+struct AnthropicSseState {
+    bytes_stream: std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
+    buffer: Vec<u8>,
+    pending_chunks: VecDeque<Result<StreamChunk, LlmError>>,
+    finished: bool,
+}
+
+impl AnthropicSseState {
+    fn new<S>(bytes_stream: S) -> Self
+    where
+        S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    {
+        Self {
+            bytes_stream: Box::pin(bytes_stream),
+            buffer: Vec::new(),
+            pending_chunks: VecDeque::new(),
+            finished: false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -592,6 +720,76 @@ mod tests {
 
         assert_eq!(chunks[3].usage.unwrap().output_tokens, 9);
         assert_eq!(chunks[3].stop_reason.as_deref(), Some("end_turn"));
+    }
+
+    #[test]
+    fn test_parse_completion_response_preserves_structured_tool_result_content() {
+        let response = AnthropicResponseBody {
+            content: vec![AnthropicContentBlock::ToolResult {
+                tool_use_id: "toolu_01".to_string(),
+                content: json!({"status": "ok", "rows": [1, 2, 3]}),
+            }],
+            stop_reason: None,
+            usage: None,
+        };
+
+        let mapped = AnthropicProvider::parse_completion_response(response);
+        assert_eq!(mapped.content.len(), 1);
+        match &mapped.content[0] {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+            } => {
+                assert_eq!(tool_use_id, "toolu_01");
+                assert_eq!(content["status"], "ok");
+                assert_eq!(content["rows"], json!([1, 2, 3]));
+            }
+            other => panic!("expected tool result block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_sse_payload_malformed_data_cases() {
+        let incomplete_json = "data: {\"type\":\"content_block_delta\",\"delta\":{";
+        let result = AnthropicProvider::parse_sse_payload(incomplete_json);
+        assert!(matches!(result, Err(LlmError::Streaming(_))));
+
+        let missing_data_prefix = "event: content_block_delta\nretry: 1000";
+        let result = AnthropicProvider::parse_sse_payload(missing_data_prefix).unwrap();
+        assert!(result.is_empty());
+
+        let unexpected_format = "data: not-json";
+        let result = AnthropicProvider::parse_sse_payload(unexpected_format);
+        assert!(matches!(result, Err(LlmError::Streaming(_))));
+    }
+
+    #[test]
+    fn test_map_http_error_maps_client_and_server_statuses() {
+        let client_error = AnthropicProvider::map_http_error(StatusCode::BAD_REQUEST, "bad".to_string());
+        assert!(matches!(client_error, LlmError::Request(message) if message.contains("client error 400")));
+
+        let server_error = AnthropicProvider::map_http_error(StatusCode::INTERNAL_SERVER_ERROR, "oops".to_string());
+        assert!(matches!(server_error, LlmError::Provider(message) if message.contains("server error 500")));
+    }
+
+    #[test]
+    fn test_map_content_to_anthropic_preserves_structured_tool_result_content() {
+        let block = ContentBlock::ToolResult {
+            tool_use_id: "toolu_01".to_string(),
+            content: json!({"result": true}),
+        };
+
+        let mapped = map_content_to_anthropic(&block).unwrap();
+        match mapped {
+            AnthropicContentBlock::ToolResult {
+                tool_use_id,
+                content,
+            } => {
+                assert_eq!(tool_use_id, "toolu_01");
+                assert_eq!(content, json!({"result": true}));
+            }
+            other => panic!("expected tool result, got {other:?}"),
+        }
     }
 
     #[test]

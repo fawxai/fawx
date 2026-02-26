@@ -2,11 +2,12 @@
 
 use async_trait::async_trait;
 use futures::Stream;
+use std::pin::Pin;
 
 use crate::types::{CompletionRequest, CompletionResponse, LlmError, StreamChunk};
 
 /// Streaming response type for completion APIs.
-pub type CompletionStream = Box<dyn Stream<Item = Result<StreamChunk, LlmError>> + Send + Unpin>;
+pub type CompletionStream = Pin<Box<dyn Stream<Item = Result<StreamChunk, LlmError>> + Send>>;
 
 /// Shared provider interface for cloud LLM adapters.
 #[async_trait]
