@@ -18,8 +18,8 @@ const DEFAULT_OPENAI_TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token
 const MAX_PROMPT_RETRIES: usize = 10;
 
 const DEFAULT_ANTHROPIC_MODELS: &[&str] = &[
-    "claude-opus-4",
-    "claude-sonnet-4",
+    "claude-sonnet-4-20250514",
+    "claude-opus-4-20250514",
     "claude-3-7-sonnet-latest",
 ];
 const DEFAULT_OPENAI_MODELS: &[&str] = &["gpt-4.1", "gpt-4o", "gpt-4o-mini"];
