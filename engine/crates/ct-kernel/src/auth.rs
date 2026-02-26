@@ -117,7 +117,23 @@ impl AuthManager {
     }
 
     /// Store a credential.
-    pub fn store(&mut self, provider: &str, auth: AuthMethod) {
+    pub fn store(&mut self, provider: &str, mut auth: AuthMethod) {
+        match &mut auth {
+            AuthMethod::ApiKey {
+                provider: embedded_provider,
+                ..
+            }
+            | AuthMethod::OAuth {
+                provider: embedded_provider,
+                ..
+            } => {
+                if embedded_provider != provider {
+                    *embedded_provider = provider.to_owned();
+                }
+            }
+            AuthMethod::SetupToken { .. } => {}
+        }
+
         self.credentials.insert(provider.to_owned(), auth);
     }
 
@@ -256,6 +272,38 @@ mod tests {
         let removed = manager.remove("anthropic");
         assert!(matches!(removed, Some(AuthMethod::SetupToken { .. })));
         assert!(manager.get("anthropic").is_none());
+    }
+
+    #[test]
+    fn auth_manager_store_normalizes_embedded_provider_for_keyed_variants() {
+        let mut manager = AuthManager::new();
+
+        manager.store(
+            "openai",
+            AuthMethod::ApiKey {
+                provider: "mismatch".to_string(),
+                key: "key-1".to_string(),
+            },
+        );
+        manager.store(
+            "openrouter",
+            AuthMethod::OAuth {
+                provider: "another-mismatch".to_string(),
+                access_token: "access".to_string(),
+                refresh_token: "refresh".to_string(),
+                expires_at: 100,
+                account_id: None,
+            },
+        );
+
+        assert!(matches!(
+            manager.get("openai"),
+            Some(AuthMethod::ApiKey { provider, .. }) if provider == "openai"
+        ));
+        assert!(matches!(
+            manager.get("openrouter"),
+            Some(AuthMethod::OAuth { provider, .. }) if provider == "openrouter"
+        ));
     }
 
     #[test]

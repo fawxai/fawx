@@ -60,9 +60,14 @@ impl PkceFlow {
         )
     }
 
-    /// Parse the callback URL to extract the authorization code.
+    /// Parse the callback URL, validate state, and extract the authorization code.
     pub fn parse_callback(&self, callback_url: &str) -> Result<String, AuthError> {
         let params = parse_query_params(callback_url)?;
+
+        let returned_state = params.get("state").ok_or(AuthError::InvalidState)?;
+        if returned_state != &self.state {
+            return Err(AuthError::InvalidState);
+        }
 
         let code = params.get("code").ok_or(AuthError::MissingCode)?;
         if code.trim().is_empty() {
@@ -70,11 +75,6 @@ impl PkceFlow {
         }
 
         Ok(code.clone())
-    }
-
-    /// Validate the state parameter matches.
-    pub fn validate_state(&self, returned_state: &str) -> bool {
-        self.state == returned_state
     }
 
     /// Borrow the generated PKCE code verifier.
@@ -409,10 +409,74 @@ mod tests {
     }
 
     #[test]
-    fn validate_state_rejects_mismatch() {
+    fn parse_callback_without_query_string_returns_invalid_callback() {
         let flow = PkceFlow::new();
+        let callback = flow.redirect_uri().to_string();
 
-        assert!(!flow.validate_state("different-state"));
+        let err = flow
+            .parse_callback(&callback)
+            .expect_err("callback without query string should fail");
+
+        assert!(matches!(err, AuthError::InvalidCallback(_)));
+    }
+
+    #[test]
+    fn parse_callback_with_state_but_no_code_returns_missing_code() {
+        let flow = PkceFlow::new();
+        let callback = format!("{}?state={}", flow.redirect_uri(), flow.state());
+
+        let err = flow
+            .parse_callback(&callback)
+            .expect_err("callback without code should fail");
+
+        assert_eq!(err, AuthError::MissingCode);
+    }
+
+    #[test]
+    fn parse_callback_with_code_but_no_state_returns_invalid_state() {
+        let flow = PkceFlow::new();
+        let callback = format!("{}?code=auth-code-123", flow.redirect_uri());
+
+        let err = flow
+            .parse_callback(&callback)
+            .expect_err("callback without state should fail");
+
+        assert_eq!(err, AuthError::InvalidState);
+    }
+
+    #[test]
+    fn parse_callback_with_wrong_state_returns_invalid_state() {
+        let flow = PkceFlow::new();
+        let callback = format!(
+            "{}?code=auth-code-123&state=different-state",
+            flow.redirect_uri()
+        );
+
+        let err = flow
+            .parse_callback(&callback)
+            .expect_err("callback with mismatched state should fail");
+
+        assert_eq!(err, AuthError::InvalidState);
+    }
+
+    #[test]
+    fn parse_callback_decodes_percent_encoded_values() {
+        let flow = PkceFlow::new();
+        let encoded_state = flow
+            .state()
+            .bytes()
+            .map(|byte| format!("%{byte:02X}"))
+            .collect::<String>();
+        let callback = format!(
+            "{}?code=auth%2Bcode%2F123%3D&state={encoded_state}",
+            flow.redirect_uri()
+        );
+
+        let code = flow
+            .parse_callback(&callback)
+            .expect("percent-encoded callback should parse");
+
+        assert_eq!(code, "auth+code/123=");
     }
 
     #[test]
