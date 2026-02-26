@@ -168,8 +168,8 @@ impl TuiApp {
                     exchange_oauth_code_for_tokens(&flow, &client_id, &authorization_code).await?;
 
                 let account_id = prompt_line("OpenAI account id (optional): ")?;
-                let expires_at =
-                    current_time_ms().saturating_add(token_response.expires_in.saturating_mul(1_000));
+                let expires_at = current_time_ms()
+                    .saturating_add(token_response.expires_in.saturating_mul(1_000));
 
                 self.auth_manager.store(
                     "openai",
@@ -728,9 +728,7 @@ fn prompt_line(prompt: &str) -> Result<String, TuiError> {
 }
 
 fn retry_limit_error(context: &str) -> TuiError {
-    TuiError::Auth(format!(
-        "maximum input retries exceeded for {context}"
-    ))
+    TuiError::Auth(format!("maximum input retries exceeded for {context}"))
 }
 
 fn prompt_choice<T, F>(
@@ -754,7 +752,11 @@ where
     Err(retry_limit_error(context))
 }
 
-fn prompt_non_empty_line(prompt: &str, empty_message: &str, context: &str) -> Result<String, TuiError> {
+fn prompt_non_empty_line(
+    prompt: &str,
+    empty_message: &str,
+    context: &str,
+) -> Result<String, TuiError> {
     for _ in 0..MAX_PROMPT_RETRIES {
         let value = prompt_line(prompt)?;
         if !value.is_empty() {
