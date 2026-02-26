@@ -108,6 +108,8 @@ enum IterationStep {
 
 const REASONING_OUTPUT_TOKEN_HEURISTIC: u64 = 192;
 const TOOL_SYNTHESIS_TOKEN_HEURISTIC: u64 = 320;
+const REASONING_MAX_OUTPUT_TOKENS: u32 = 768;
+const TOOL_SYNTHESIS_MAX_OUTPUT_TOKENS: u32 = 384;
 const DEFAULT_LLM_ACTION_COST_CENTS: u64 = 2;
 const REASONING_SYSTEM_PROMPT: &str = "You are Citros, an autonomous assistant kernel. Reason step output MUST be JSON. Return one ReasonedIntent with action, rationale, confidence, expected_outcome (optional), and sub_goals.";
 
@@ -346,9 +348,12 @@ impl LoopEngine {
             perception.user_message,
         );
 
-        let raw = llm.generate(&prompt, 768).await.map_err(|error| {
-            loop_error("reason", &format!("llm generation failed: {error}"), true)
-        })?;
+        let raw = llm
+            .generate(&prompt, REASONING_MAX_OUTPUT_TOKENS)
+            .await
+            .map_err(|error| {
+                loop_error("reason", &format!("llm generation failed: {error}"), true)
+            })?;
 
         Ok(parse_reasoned_intent(&raw, &perception.user_message))
     }
@@ -506,13 +511,15 @@ impl LoopEngine {
         synthesis_prompt: &str,
         llm: &dyn LlmProvider,
     ) -> Result<String, LoopError> {
-        llm.generate(synthesis_prompt, 384).await.map_err(|error| {
-            loop_error(
-                "act",
-                &format!("tool synthesis generation failed: {error}"),
-                true,
-            )
-        })
+        llm.generate(synthesis_prompt, TOOL_SYNTHESIS_MAX_OUTPUT_TOKENS)
+            .await
+            .map_err(|error| {
+                loop_error(
+                    "act",
+                    &format!("tool synthesis generation failed: {error}"),
+                    true,
+                )
+            })
     }
 
     fn estimate_reasoning_cost(&self, perception: &ProcessedPerception) -> ActionCost {
@@ -984,6 +991,21 @@ mod tests {
             BudgetTracker::new(crate::budget::BudgetConfig::default(), current_time_ms(), 0);
         let context = ContextCompactor::new(4_000, 3_000);
         LoopEngine::new(budget, context, max_iterations)
+    }
+
+    #[test]
+    fn status_returns_initial_metrics_before_any_cycle() {
+        let max_iterations = 10;
+        let engine = default_engine(max_iterations);
+
+        let status = engine.status(current_time_ms());
+
+        assert_eq!(status.iteration_count, 0);
+        assert_eq!(status.max_iterations, max_iterations);
+        assert_eq!(status.llm_calls_used, 0);
+        assert_eq!(status.tool_invocations_used, 0);
+        assert_eq!(status.tokens_used, 0);
+        assert_eq!(status.cost_cents_used, 0);
     }
 
     #[tokio::test]

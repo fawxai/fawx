@@ -25,6 +25,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const DEFAULT_AUTH_FILE: &str = ".citros/auth.json";
 const DEFAULT_OPENAI_TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
 const MAX_PROMPT_RETRIES: usize = 10;
+const DEFAULT_CONTEXT_MAX_TOKENS: usize = 8_000;
+const DEFAULT_CONTEXT_COMPACT_TARGET: usize = 6_000;
+const DEFAULT_MAX_LOOP_ITERATIONS: u32 = 10;
 
 const DEFAULT_ANTHROPIC_MODELS: &[&str] = &[
     "claude-sonnet-4-20250514",
@@ -520,8 +523,11 @@ impl TuiApp {
 /// Build a loop engine with sensible defaults for the TUI shell.
 pub fn build_loop_engine() -> LoopEngine {
     let budget = BudgetTracker::new(BudgetConfig::default(), current_time_ms(), 0);
-    let context = ContextCompactor::new(8_000, 6_000);
-    LoopEngine::new(budget, context, 10)
+    let context = ContextCompactor::new(
+        DEFAULT_CONTEXT_MAX_TOKENS,
+        DEFAULT_CONTEXT_COMPACT_TARGET,
+    );
+    LoopEngine::new(budget, context, DEFAULT_MAX_LOOP_ITERATIONS)
 }
 
 impl<'a> fmt::Debug for RouterLoopLlmProvider<'a> {
@@ -1842,6 +1848,16 @@ mod tests {
         app.handle_command("/help").await.unwrap();
 
         assert!(app.running);
+    }
+
+    #[tokio::test]
+    async fn run_exits_immediately_when_not_running() {
+        let mut app = TuiApp::new(test_auth_manager(), ModelRouter::new(), build_loop_engine());
+        app.running = false;
+
+        let result = app.run().await;
+
+        assert!(result.is_ok());
     }
 
     #[tokio::test]
