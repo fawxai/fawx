@@ -567,7 +567,6 @@ pub fn build_loop_engine() -> LoopEngine {
     LoopEngine::new(budget, context, 10)
 }
 
-#[derive(Debug)]
 struct RouterLoopLlmProvider<'a> {
     router: &'a ModelRouter,
     active_model: String,

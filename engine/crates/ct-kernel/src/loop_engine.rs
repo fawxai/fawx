@@ -123,10 +123,22 @@ impl LoopEngine {
         while self.iteration_count < self.max_iterations {
             self.iteration_count = self.iteration_count.saturating_add(1);
 
+            let check_time_ms = perception.timestamp_ms;
+            if self
+                .budget
+                .check_at(check_time_ms, &ActionCost::default())
+                .is_err()
+            {
+                return Ok(LoopResult::BudgetExhausted {
+                    partial_response,
+                    iterations: self.iteration_count,
+                });
+            }
+
             let processed = self.perceive(&perception).await?;
 
             let reason_cost = self.estimate_reasoning_cost(&processed);
-            if self.budget.check(&reason_cost).is_err() {
+            if self.budget.check_at(check_time_ms, &reason_cost).is_err() {
                 return Ok(LoopResult::BudgetExhausted {
                     partial_response,
                     iterations: self.iteration_count,
@@ -142,7 +154,11 @@ impl LoopEngine {
 
             let decision = self.decide(&intent).await?;
             let estimated_action_cost = self.estimate_action_cost(&decision);
-            if self.budget.check(&estimated_action_cost).is_err() {
+            if self
+                .budget
+                .check_at(check_time_ms, &estimated_action_cost)
+                .is_err()
+            {
                 return Ok(LoopResult::BudgetExhausted {
                     partial_response,
                     iterations: self.iteration_count,
@@ -152,7 +168,7 @@ impl LoopEngine {
             let action = self.act(&decision, llm).await?;
 
             let action_cost = self.action_cost_from_result(&action);
-            if self.budget.check(&action_cost).is_err() {
+            if self.budget.check_at(check_time_ms, &action_cost).is_err() {
                 return Ok(LoopResult::BudgetExhausted {
                     partial_response: Some(action.response_text),
                     iterations: self.iteration_count,
@@ -165,7 +181,9 @@ impl LoopEngine {
 
             let verification = self.verify(&action, &intent).await?;
             let learning = self.learn(&verification).await?;
-            let continuation = self.should_continue(&verification, &learning).await?;
+            let continuation = self
+                .should_continue(&action.decision, &verification, &learning)
+                .await?;
 
             learnings.push(learning);
 
@@ -427,9 +445,14 @@ impl LoopEngine {
     /// Continue step.
     async fn should_continue(
         &self,
+        decision: &Decision,
         verification: &Verification,
         _learning: &Learning,
     ) -> Result<Continuation, LoopError> {
+        if let Decision::Clarify(prompt) | Decision::Defer(prompt) = decision {
+            return Ok(Continuation::NeedsInput(prompt.clone()));
+        }
+
         if verification.outcome_matches_intent {
             return Ok(Continuation::Complete);
         }
@@ -552,7 +575,7 @@ fn estimate_tokens(text: &str) -> u64 {
     }
 
     let char_count = text.chars().count();
-    let char_estimate = ((char_count + 3) / 4) as u64;
+    let char_estimate = char_count.div_ceil(4) as u64;
     let word_estimate = text.split_whitespace().count() as u64;
     char_estimate.max(word_estimate).max(1)
 }
@@ -679,6 +702,8 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
+    const MOCK_TIMESTAMP_MS: u64 = 1_700_000_000_000;
+
     #[derive(Debug)]
     struct MockLlm {
         name: String,
@@ -734,19 +759,23 @@ mod tests {
             },
             notifications: Vec::new(),
             active_app: "citros.tui".to_string(),
-            timestamp_ms: 1_700_000_000_000,
+            timestamp_ms: MOCK_TIMESTAMP_MS,
             sensor_data: None,
             user_input: Some(UserInput {
                 text: text.to_string(),
                 source: InputSource::Text,
-                timestamp: 1_700_000_000_000,
+                timestamp: MOCK_TIMESTAMP_MS,
                 context_id: None,
             }),
         }
     }
 
     fn default_engine(max_iterations: u32) -> LoopEngine {
-        let budget = BudgetTracker::new(crate::budget::BudgetConfig::default(), 0, 0);
+        let budget = BudgetTracker::new(
+            crate::budget::BudgetConfig::default(),
+            MOCK_TIMESTAMP_MS,
+            0,
+        );
         let context = ContextCompactor::new(4_000, 3_000);
         LoopEngine::new(budget, context, max_iterations)
     }
@@ -807,7 +836,7 @@ mod tests {
             max_wall_time_ms: 10_000,
             max_recursion_depth: 2,
         };
-        let budget = BudgetTracker::new(config, 0, 0);
+        let budget = BudgetTracker::new(config, MOCK_TIMESTAMP_MS, 0);
         let context = ContextCompactor::new(4_000, 3_000);
         let mut engine = LoopEngine::new(budget, context, 10);
 
@@ -817,6 +846,34 @@ mod tests {
             .run_cycle(base_snapshot("hi"), &llm)
             .await
             .expect("loop result");
+
+        assert!(matches!(
+            result,
+            LoopResult::BudgetExhausted {
+                partial_response: None,
+                iterations: 1
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn run_cycle_enforces_wall_time_budget() {
+        let mut config = crate::budget::BudgetConfig::unlimited();
+        config.max_wall_time_ms = 2;
+
+        let budget = BudgetTracker::new(config, MOCK_TIMESTAMP_MS, 0);
+        let context = ContextCompactor::new(4_000, 3_000);
+        let mut engine = LoopEngine::new(budget, context, 10);
+
+        let llm = MockLlm::with_responses(vec![r#"{"action":{"Respond":{"text":"never used"}},"rationale":"n/a","confidence":0.9,"expected_outcome":null,"sub_goals":[]}"#]);
+
+        let mut snapshot = base_snapshot("hi");
+        snapshot.timestamp_ms = MOCK_TIMESTAMP_MS.saturating_add(10);
+        if let Some(user_input) = snapshot.user_input.as_mut() {
+            user_input.timestamp = snapshot.timestamp_ms;
+        }
+
+        let result = engine.run_cycle(snapshot, &llm).await.expect("loop result");
 
         assert!(matches!(
             result,
@@ -931,7 +988,11 @@ mod tests {
         assert!(learning.adjustment.is_some());
 
         let continuation = engine
-            .should_continue(&failed_verification, &learning)
+            .should_continue(
+                &Decision::Respond("fallback".to_string()),
+                &failed_verification,
+                &learning,
+            )
             .await
             .expect("continuation");
         assert!(matches!(continuation, Continuation::Continue(_)));
@@ -946,10 +1007,55 @@ mod tests {
             .await
             .expect("success learning");
         let done = engine
-            .should_continue(&success_verification, &success_learning)
+            .should_continue(
+                &Decision::Respond("done".to_string()),
+                &success_verification,
+                &success_learning,
+            )
             .await
             .expect("done continuation");
         assert!(matches!(done, Continuation::Complete));
+    }
+
+    #[tokio::test]
+    async fn step_continue_clarify_and_defer_always_need_input() {
+        let engine = default_engine(3);
+        let verification = Verification {
+            outcome_matches_intent: true,
+            confidence: 0.95,
+            discrepancies: Vec::new(),
+        };
+        let learning = Learning {
+            episode: "test".to_string(),
+            pattern: None,
+            adjustment: None,
+        };
+
+        let clarify = engine
+            .should_continue(
+                &Decision::Clarify("Need more detail".to_string()),
+                &verification,
+                &learning,
+            )
+            .await
+            .expect("clarify continuation");
+        assert!(matches!(
+            clarify,
+            Continuation::NeedsInput(prompt) if prompt == "Need more detail"
+        ));
+
+        let defer = engine
+            .should_continue(
+                &Decision::Defer("Please provide more context".to_string()),
+                &verification,
+                &learning,
+            )
+            .await
+            .expect("defer continuation");
+        assert!(matches!(
+            defer,
+            Continuation::NeedsInput(prompt) if prompt == "Please provide more context"
+        ));
     }
 
     #[tokio::test]
