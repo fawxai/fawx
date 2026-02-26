@@ -156,10 +156,10 @@ impl OpenAiResponsesProvider {
 
     fn map_http_error(status: StatusCode, body: String) -> LlmError {
         match status.as_u16() {
-            401 => LlmError::Auth(format!("authentication failed: {body}")),
-            403 => LlmError::Auth(format!("forbidden: {body}")),
+            401 => LlmError::Authentication(format!("authentication failed: {body}")),
+            403 => LlmError::Authentication(format!("forbidden: {body}")),
             404 => LlmError::Config(format!("endpoint not found: {body}")),
-            429 => LlmError::RateLimit(format!("rate limited: {body}")),
+            429 => LlmError::RateLimited(format!("rate limited: {body}")),
             500..=599 => LlmError::Provider(format!("server error {}: {body}", status.as_u16())),
             _ => LlmError::Request(format!("http {}: {body}", status.as_u16())),
         }
@@ -186,7 +186,7 @@ impl OpenAiResponsesProvider {
         let response_text = text_parts.join("");
 
         CompletionResponse {
-            content: vec![ContentBlock::Text(response_text)],
+            content: vec![ContentBlock::Text { text: response_text }],
             usage: body.usage.map(|u| Usage {
                 input_tokens: u.input_tokens.unwrap_or(0) as u32,
                 output_tokens: u.output_tokens.unwrap_or(0) as u32,
@@ -453,7 +453,7 @@ fn extract_text(content: &[ContentBlock]) -> String {
     content
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::Text(text) => Some(text.as_str()),
+            ContentBlock::Text { text } => Some(text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -507,7 +507,7 @@ mod tests {
         let response = OpenAiResponsesProvider::parse_response(body);
         assert_eq!(
             response.content,
-            vec![ContentBlock::Text("Hello from ChatGPT!".to_string())]
+            vec![ContentBlock::Text { text: "Hello from ChatGPT!".to_string() }]
         );
         let usage = response.usage.unwrap();
         assert_eq!(usage.input_tokens, 10);
@@ -522,7 +522,7 @@ mod tests {
             model: "gpt-4.1".to_string(),
             messages: vec![crate::types::Message {
                 role: MessageRole::User,
-                content: vec![ContentBlock::Text("Hello".to_string())],
+                content: vec![ContentBlock::Text { text: "Hello".to_string() }],
             }],
             system_prompt: Some("You are helpful.".to_string()),
             tools: vec![],
