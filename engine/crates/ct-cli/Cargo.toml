@@ -17,6 +17,8 @@ path = "src/bin/android_hello.rs"
 
 [dependencies]
 ct-core.workspace = true
+ct-kernel.workspace = true
+ct-llm = { path = "../ct-llm" }
 ct-security.workspace = true
 ct-skills = { path = "../ct-skills" }
 ct-storage.workspace = true

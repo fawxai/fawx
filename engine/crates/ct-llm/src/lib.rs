@@ -25,7 +25,7 @@ pub use fallback::{FallbackResult, FallbackRouter, ProviderHealth};
 pub use local::LocalModel;
 pub use openai::OpenAiProvider;
 pub use provider::{CompletionStream, LlmProvider as CompletionProvider};
-pub use router::{LlmRouter, RoutingStrategy};
+pub use router::{LlmRouter, ModelInfo, ModelRouter, RouterError, RoutingStrategy};
 pub use routing::{resolve_strategy, RoutingCondition, RoutingConfig, RoutingContext, RoutingRule};
 pub use types::{
     CompletionRequest, CompletionResponse, ContentBlock, LlmError as ProviderError, Message,
