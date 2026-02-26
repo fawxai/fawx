@@ -795,6 +795,13 @@ async fn catalog_models_for_auth(
     catalog: &mut ModelCatalog,
     auth_method: &AuthMethod,
 ) -> Vec<String> {
+    // OAuth subscription tokens use the Codex Responses API which only supports
+    // specific models. Skip dynamic fetch — the API would return models from
+    // api.openai.com that don't work on the Codex endpoint.
+    if matches!(auth_method, AuthMethod::OAuth { .. }) {
+        return default_supported_models(auth_method);
+    }
+
     let (provider, credential, auth_mode) = auth_context(auth_method);
 
     let discovered = catalog
