@@ -15,6 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_AUTH_FILE: &str = ".citros/auth.json";
 const DEFAULT_OPENAI_TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
+const MAX_PROMPT_RETRIES: usize = 10;
 
 const DEFAULT_ANTHROPIC_MODELS: &[&str] = &[
     "claude-opus-4",
@@ -109,132 +110,123 @@ impl TuiApp {
         println!("Welcome to Citros.\n");
         println!("No credentials found. Let's set up authentication.\n");
 
-        let preferred_models = loop {
-            println!("How would you like to authenticate?");
-            println!("  [1] Claude subscription (paste setup-token)");
-            println!("  [2] ChatGPT subscription (browser sign-in)");
-            println!("  [3] API key (any provider)");
-            println!();
+        println!("How would you like to authenticate?");
+        println!("  [1] Claude subscription (paste setup-token)");
+        println!("  [2] ChatGPT subscription (browser sign-in)");
+        println!("  [3] API key (any provider)");
+        println!();
 
-            let selection = prompt_line("> ")?;
-            match parse_auth_selection(&selection) {
-                Some(AuthSelection::ClaudeSubscription) => {
-                    let token = prompt_secret("Paste your Claude setup token: ")?;
-                    if token.is_empty() {
-                        println!("Setup token cannot be empty.\n");
-                        continue;
-                    }
+        let selection = prompt_choice(
+            "> ",
+            "Please choose 1, 2, or 3.\n",
+            "authentication selection",
+            parse_auth_selection,
+        )?;
 
-                    self.auth_manager
-                        .store("anthropic", AuthMethod::SetupToken { token });
+        let preferred_models = match selection {
+            AuthSelection::ClaudeSubscription => {
+                let token = prompt_non_empty_secret(
+                    "Paste your Claude setup token: ",
+                    "Setup token cannot be empty.\n",
+                    "Claude setup token",
+                )?;
 
-                    println!("✓ Authenticated. Token stored.\n");
-                    break to_strings(DEFAULT_ANTHROPIC_MODELS);
-                }
-                Some(AuthSelection::ChatGptSubscription) => {
-                    let flow = PkceFlow::new();
-                    let client_id = std::env::var("CITROS_OPENAI_CLIENT_ID")
-                        .ok()
-                        .filter(|value| !value.trim().is_empty())
-                        .unwrap_or_else(|| "citros-cli".to_string());
-                    let auth_url = flow.authorization_url(&client_id);
+                self.auth_manager
+                    .store("anthropic", AuthMethod::SetupToken { token });
 
-                    println!("Opening browser for ChatGPT sign-in...");
-                    if let Err(error) = open_browser(&auth_url) {
-                        println!(
-                            "Couldn't open browser automatically ({error}). Open this URL manually:\n{auth_url}"
-                        );
-                    }
-                    println!("Waiting for callback on {}...", flow.redirect_uri());
+                println!("✓ Authenticated. Token stored.\n");
+                to_strings(DEFAULT_ANTHROPIC_MODELS)
+            }
+            AuthSelection::ChatGptSubscription => {
+                let flow = PkceFlow::new();
+                let client_id = std::env::var("CITROS_OPENAI_CLIENT_ID")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| "citros-cli".to_string());
+                let auth_url = flow.authorization_url(&client_id);
 
-                    let callback_url = prompt_line("Paste callback URL: ")?;
-                    if callback_url.is_empty() {
-                        println!("Callback URL cannot be empty.\n");
-                        continue;
-                    }
-
-                    let authorization_code =
-                        flow.parse_callback(&callback_url).map_err(|error| {
-                            TuiError::Auth(format!("invalid OAuth callback URL: {error}"))
-                        })?;
-
-                    println!("Exchanging authorization code for tokens...");
-                    let token_response =
-                        exchange_oauth_code_for_tokens(&flow, &client_id, &authorization_code)
-                            .await?;
-
-                    let account_id = prompt_line("OpenAI account id (optional): ")?;
-                    let expires_at = current_time_ms()
-                        .saturating_add(token_response.expires_in.saturating_mul(1_000));
-
-                    self.auth_manager.store(
-                        "openai",
-                        AuthMethod::OAuth {
-                            provider: "openai".to_string(),
-                            access_token: token_response.access_token,
-                            refresh_token: token_response.refresh_token,
-                            expires_at,
-                            account_id: empty_to_none(account_id),
-                        },
+                println!("Opening browser for ChatGPT sign-in...");
+                if let Err(error) = open_browser(&auth_url) {
+                    println!(
+                        "Couldn't open browser automatically ({error}). Open this URL manually:\n{auth_url}"
                     );
-
-                    println!("✓ Authenticated. Tokens stored.\n");
-                    break to_strings(DEFAULT_OPENAI_MODELS);
                 }
-                Some(AuthSelection::ApiKey) => {
-                    println!("Which provider?");
-                    println!("  [1] Anthropic");
-                    println!("  [2] OpenAI");
-                    println!("  [3] OpenRouter");
-                    println!("  [4] Other (OpenAI-compatible)");
-                    println!();
+                println!("Waiting for callback on {}...", flow.redirect_uri());
 
-                    let provider = loop {
-                        let provider_choice = prompt_line("> ")?;
-                        match parse_api_key_provider_selection(&provider_choice) {
-                            Some(ApiKeyProvider::Anthropic) => {
-                                break "anthropic".to_string();
-                            }
-                            Some(ApiKeyProvider::OpenAi) => {
-                                break "openai".to_string();
-                            }
-                            Some(ApiKeyProvider::OpenRouter) => {
-                                break "openrouter".to_string();
-                            }
-                            Some(ApiKeyProvider::Other) => {
-                                let name = prompt_line("Provider name: ")?;
-                                if name.is_empty() {
-                                    println!("Provider name cannot be empty.");
-                                    continue;
-                                }
-                                break name;
-                            }
-                            None => {
-                                println!("Please choose 1, 2, 3, or 4.");
-                            }
-                        }
-                    };
+                let callback_url = prompt_non_empty_line(
+                    "Paste callback URL: ",
+                    "Callback URL cannot be empty.\n",
+                    "OAuth callback URL",
+                )?;
 
-                    let key = prompt_secret(&format!("Enter your {provider} API key: "))?;
-                    if key.is_empty() {
-                        println!("API key cannot be empty.\n");
-                        continue;
-                    }
+                let authorization_code = flow.parse_callback(&callback_url).map_err(|error| {
+                    TuiError::Auth(format!("invalid OAuth callback URL: {error}"))
+                })?;
 
-                    self.auth_manager.store(
-                        &provider,
-                        AuthMethod::ApiKey {
-                            provider: provider.clone(),
-                            key,
-                        },
-                    );
+                println!("Exchanging authorization code for tokens...");
+                let token_response =
+                    exchange_oauth_code_for_tokens(&flow, &client_id, &authorization_code).await?;
 
-                    println!("✓ API key stored.\n");
-                    break models_for_provider(&provider);
-                }
-                None => {
-                    println!("Please choose 1, 2, or 3.\n");
-                }
+                let account_id = prompt_line("OpenAI account id (optional): ")?;
+                let expires_at =
+                    current_time_ms().saturating_add(token_response.expires_in.saturating_mul(1_000));
+
+                self.auth_manager.store(
+                    "openai",
+                    AuthMethod::OAuth {
+                        provider: "openai".to_string(),
+                        access_token: token_response.access_token,
+                        refresh_token: token_response.refresh_token,
+                        expires_at,
+                        account_id: empty_to_none(account_id),
+                    },
+                );
+
+                println!("✓ Authenticated. Tokens stored.\n");
+                to_strings(DEFAULT_OPENAI_MODELS)
+            }
+            AuthSelection::ApiKey => {
+                println!("Which provider?");
+                println!("  [1] Anthropic");
+                println!("  [2] OpenAI");
+                println!("  [3] OpenRouter");
+                println!("  [4] Other (OpenAI-compatible)");
+                println!();
+
+                let provider_choice = prompt_choice(
+                    "> ",
+                    "Please choose 1, 2, 3, or 4.",
+                    "API key provider selection",
+                    parse_api_key_provider_selection,
+                )?;
+
+                let provider = match provider_choice {
+                    ApiKeyProvider::Anthropic => "anthropic".to_string(),
+                    ApiKeyProvider::OpenAi => "openai".to_string(),
+                    ApiKeyProvider::OpenRouter => "openrouter".to_string(),
+                    ApiKeyProvider::Other => prompt_non_empty_line(
+                        "Provider name: ",
+                        "Provider name cannot be empty.",
+                        "API key provider name",
+                    )?,
+                };
+
+                let key = prompt_non_empty_secret(
+                    &format!("Enter your {provider} API key: "),
+                    "API key cannot be empty.\n",
+                    "API key",
+                )?;
+
+                self.auth_manager.store(
+                    &provider,
+                    AuthMethod::ApiKey {
+                        provider: provider.clone(),
+                        key,
+                    },
+                );
+
+                println!("✓ API key stored.\n");
+                models_for_provider(&provider)
             }
         };
 
@@ -727,9 +719,69 @@ fn prompt_line(prompt: &str) -> Result<String, TuiError> {
     io::stdout().flush().map_err(TuiError::Io)?;
 
     let mut input = String::new();
-    io::stdin().read_line(&mut input).map_err(TuiError::Io)?;
+    let bytes = io::stdin().read_line(&mut input).map_err(TuiError::Io)?;
+    if bytes == 0 {
+        return Err(TuiError::Auth("stdin closed unexpectedly".to_string()));
+    }
 
     Ok(input.trim().to_string())
+}
+
+fn retry_limit_error(context: &str) -> TuiError {
+    TuiError::Auth(format!(
+        "maximum input retries exceeded for {context}"
+    ))
+}
+
+fn prompt_choice<T, F>(
+    prompt: &str,
+    invalid_message: &str,
+    context: &str,
+    parser: F,
+) -> Result<T, TuiError>
+where
+    F: Fn(&str) -> Option<T>,
+{
+    for _ in 0..MAX_PROMPT_RETRIES {
+        let value = prompt_line(prompt)?;
+        if let Some(parsed) = parser(&value) {
+            return Ok(parsed);
+        }
+
+        println!("{invalid_message}");
+    }
+
+    Err(retry_limit_error(context))
+}
+
+fn prompt_non_empty_line(prompt: &str, empty_message: &str, context: &str) -> Result<String, TuiError> {
+    for _ in 0..MAX_PROMPT_RETRIES {
+        let value = prompt_line(prompt)?;
+        if !value.is_empty() {
+            return Ok(value);
+        }
+
+        println!("{empty_message}");
+    }
+
+    Err(retry_limit_error(context))
+}
+
+fn prompt_non_empty_secret(
+    prompt: &str,
+    empty_message: &str,
+    context: &str,
+) -> Result<String, TuiError> {
+    for _ in 0..MAX_PROMPT_RETRIES {
+        let value = prompt_secret(prompt)?;
+        if !value.is_empty() {
+            return Ok(value);
+        }
+
+        println!("{empty_message}");
+    }
+
+    Err(retry_limit_error(context))
 }
 
 fn prompt_secret(prompt: &str) -> Result<String, TuiError> {
@@ -1124,5 +1176,36 @@ mod tests {
         assert!(openrouter_auth_labels
             .iter()
             .all(|auth_method| *auth_method == "api_key"));
+    }
+
+    #[test]
+    fn build_router_with_oauth_credentials_registers_openai_subscription_models() {
+        let mut auth_manager = AuthManager::new();
+        auth_manager.store(
+            "openai",
+            AuthMethod::OAuth {
+                provider: "openai".to_string(),
+                access_token: "oauth-access-token".to_string(),
+                refresh_token: "oauth-refresh-token".to_string(),
+                expires_at: 1_700_000_000_000,
+                account_id: Some("acct_oauth_router_test".to_string()),
+            },
+        );
+
+        let router = build_router(&auth_manager).unwrap();
+        let models = router.available_models();
+
+        let openai_models = models
+            .iter()
+            .filter(|model| model.provider_name == "openai")
+            .collect::<Vec<_>>();
+
+        assert!(!openai_models.is_empty());
+        assert!(openai_models
+            .iter()
+            .all(|model| model.auth_method == "subscription"));
+        assert!(openai_models
+            .iter()
+            .any(|model| model.model_id == "gpt-4.1"));
     }
 }

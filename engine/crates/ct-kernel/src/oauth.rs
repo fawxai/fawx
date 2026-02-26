@@ -480,6 +480,24 @@ mod tests {
     }
 
     #[test]
+    fn token_exchange_request_construction_preserves_expected_fields() {
+        let flow = PkceFlow::new();
+        let request = TokenExchangeRequest {
+            grant_type: "authorization_code".to_string(),
+            code: "oauth-code-xyz".to_string(),
+            redirect_uri: flow.redirect_uri().to_string(),
+            code_verifier: flow.code_verifier().to_string(),
+            client_id: "citros-cli".to_string(),
+        };
+
+        assert_eq!(request.grant_type, "authorization_code");
+        assert_eq!(request.code, "oauth-code-xyz");
+        assert_eq!(request.redirect_uri, flow.redirect_uri());
+        assert_eq!(request.code_verifier, flow.code_verifier());
+        assert_eq!(request.client_id, "citros-cli");
+    }
+
+    #[test]
     fn token_response_deserializes_from_json() {
         let json = r#"{
             "access_token": "access-token-value",

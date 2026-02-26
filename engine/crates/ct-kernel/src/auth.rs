@@ -278,6 +278,73 @@ mod tests {
     }
 
     #[test]
+    fn auth_manager_oauth_storage_exposes_bearer_and_expired_refresh_state() {
+        let mut manager = AuthManager::new();
+        manager.store(
+            "openai",
+            AuthMethod::OAuth {
+                provider: "openai".to_string(),
+                access_token: "stored-access-token".to_string(),
+                refresh_token: "stored-refresh-token".to_string(),
+                expires_at: 1_000,
+                account_id: Some("acct_oauth".to_string()),
+            },
+        );
+
+        let stored = manager
+            .get("openai")
+            .expect("oauth credential should be stored");
+
+        assert!(matches!(
+            stored,
+            AuthMethod::OAuth {
+                provider,
+                account_id,
+                ..
+            } if provider == "openai" && account_id.as_deref() == Some("acct_oauth")
+        ));
+        assert_eq!(stored.bearer_token(), "stored-access-token");
+        assert!(stored.needs_refresh(1_001));
+    }
+
+    #[test]
+    fn auth_manager_oauth_refresh_detection_changes_with_expiry_window() {
+        let mut manager = AuthManager::new();
+
+        manager.store(
+            "openai",
+            AuthMethod::OAuth {
+                provider: "openai".to_string(),
+                access_token: "future-access-token".to_string(),
+                refresh_token: "future-refresh-token".to_string(),
+                expires_at: 10_000,
+                account_id: None,
+            },
+        );
+
+        assert!(!manager
+            .get("openai")
+            .expect("oauth credential should exist")
+            .needs_refresh(9_999));
+
+        manager.store(
+            "openai",
+            AuthMethod::OAuth {
+                provider: "openai".to_string(),
+                access_token: "past-access-token".to_string(),
+                refresh_token: "past-refresh-token".to_string(),
+                expires_at: 5_000,
+                account_id: None,
+            },
+        );
+
+        assert!(manager
+            .get("openai")
+            .expect("oauth credential should still exist")
+            .needs_refresh(5_001));
+    }
+
+    #[test]
     fn auth_manager_store_normalizes_embedded_provider_for_keyed_variants() {
         let mut manager = AuthManager::new();
 
