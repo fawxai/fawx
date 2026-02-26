@@ -86,6 +86,30 @@ pub struct LoopEngine {
     iteration_count: u32,
 }
 
+#[derive(Debug, Default, Clone)]
+struct CycleState {
+    learnings: Vec<Learning>,
+    tokens: TokenUsage,
+    partial_response: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct IterationOutcome {
+    response_text: String,
+    continuation: Continuation,
+    learning: Learning,
+}
+
+#[derive(Debug, Clone)]
+enum IterationStep {
+    Progress(IterationOutcome),
+    Terminal(LoopResult),
+}
+
+const REASONING_OUTPUT_TOKEN_HEURISTIC: u64 = 192;
+const TOOL_SYNTHESIS_TOKEN_HEURISTIC: u64 = 320;
+const DEFAULT_LLM_ACTION_COST_CENTS: u64 = 2;
+
 impl LoopEngine {
     /// Create a new loop engine with budget + context managers.
     pub fn new(budget: BudgetTracker, context: ContextCompactor, max_iterations: u32) -> Self {
@@ -116,103 +140,22 @@ impl LoopEngine {
         mut perception: PerceptionSnapshot,
         llm: &dyn LlmProvider,
     ) -> Result<LoopResult, LoopError> {
-        self.iteration_count = 0;
-        self.budget.reset(current_time_ms());
-        let mut learnings = Vec::new();
-        let mut cycle_tokens = TokenUsage::default();
-        let mut partial_response: Option<String> = None;
+        self.prepare_cycle();
+        let mut state = CycleState::default();
 
         while self.iteration_count < self.max_iterations {
             self.iteration_count = self.iteration_count.saturating_add(1);
-
-            if self
-                .budget
-                .check_at(current_time_ms(), &ActionCost::default())
-                .is_err()
-            {
-                return Ok(LoopResult::BudgetExhausted {
-                    partial_response,
-                    iterations: self.iteration_count,
-                });
-            }
-
-            let processed = self.perceive(&perception).await?;
-
-            let reason_cost = self.estimate_reasoning_cost(&processed);
-            if self
-                .budget
-                .check_at(current_time_ms(), &reason_cost)
-                .is_err()
-            {
-                return Ok(LoopResult::BudgetExhausted {
-                    partial_response,
-                    iterations: self.iteration_count,
-                });
-            }
-
-            let intent = self.reason(&processed, llm).await?;
-            self.budget.record(&reason_cost);
-            cycle_tokens.accumulate(TokenUsage {
-                input_tokens: reason_cost.tokens.saturating_mul(3) / 5,
-                output_tokens: reason_cost.tokens.saturating_mul(2) / 5,
-            });
-
-            let decision = self.decide(&intent).await?;
-            let estimated_action_cost = self.estimate_action_cost(&decision);
-            if self
-                .budget
-                .check_at(current_time_ms(), &estimated_action_cost)
-                .is_err()
-            {
-                return Ok(LoopResult::BudgetExhausted {
-                    partial_response,
-                    iterations: self.iteration_count,
-                });
-            }
-
-            let action = self.act(&decision, llm).await?;
-
-            let action_cost = self.action_cost_from_result(&action);
-            if self
-                .budget
-                .check_at(current_time_ms(), &action_cost)
-                .is_err()
-            {
-                return Ok(LoopResult::BudgetExhausted {
-                    partial_response: Some(action.response_text),
-                    iterations: self.iteration_count,
-                });
-            }
-
-            self.budget.record(&action_cost);
-            cycle_tokens.accumulate(action.tokens_used);
-            partial_response = Some(action.response_text.clone());
-
-            let verification = self.verify(&action, &intent).await?;
-            let learning = self.learn(&verification).await?;
-            let continuation = self
-                .should_continue(&action.decision, &verification, &learning)
-                .await?;
-
-            learnings.push(learning);
-
-            match continuation {
-                Continuation::Complete => {
-                    return Ok(LoopResult::Complete {
-                        response: action.response_text,
-                        iterations: self.iteration_count,
-                        tokens_used: cycle_tokens,
-                        learnings,
-                    });
-                }
-                Continuation::NeedsInput(prompt) => {
-                    return Ok(LoopResult::NeedsInput {
-                        prompt,
-                        iterations: self.iteration_count,
-                    });
-                }
-                Continuation::Continue(sub_goal) => {
-                    perception = next_perception_from_sub_goal(&perception, &sub_goal);
+            match self.execute_iteration(&perception, llm, &mut state).await? {
+                IterationStep::Terminal(result) => return Ok(result),
+                IterationStep::Progress(outcome) => {
+                    if let Some(result) = self.handle_continuation(
+                        outcome.continuation,
+                        &outcome,
+                        &mut perception,
+                        &mut state,
+                    ) {
+                        return Ok(result);
+                    }
                 }
             }
         }
@@ -224,6 +167,116 @@ impl LoopEngine {
             ),
             recoverable: true,
         })
+    }
+
+    fn prepare_cycle(&mut self) {
+        self.iteration_count = 0;
+        self.budget.reset(current_time_ms());
+    }
+
+    async fn execute_iteration(
+        &mut self,
+        perception: &PerceptionSnapshot,
+        llm: &dyn LlmProvider,
+        state: &mut CycleState,
+    ) -> Result<IterationStep, LoopError> {
+        if let Some(step) = self.budget_terminal(ActionCost::default(), state.partial_response.clone()) {
+            return Ok(step);
+        }
+
+        let processed = self.perceive(perception).await?;
+        let reason_cost = self.estimate_reasoning_cost(&processed);
+        if let Some(step) = self.budget_terminal(reason_cost, state.partial_response.clone()) {
+            return Ok(step);
+        }
+
+        let intent = self.reason(&processed, llm).await?;
+        self.record_reasoning_cost(reason_cost, state);
+
+        let decision = self.decide(&intent).await?;
+        if let Some(step) = self.budget_terminal(self.estimate_action_cost(&decision), state.partial_response.clone()) {
+            return Ok(step);
+        }
+
+        self.execute_action_and_finalize(&intent, &decision, llm, state)
+            .await
+    }
+
+    async fn execute_action_and_finalize(
+        &mut self,
+        intent: &ReasonedIntent,
+        decision: &Decision,
+        llm: &dyn LlmProvider,
+        state: &mut CycleState,
+    ) -> Result<IterationStep, LoopError> {
+        let action = self.act(decision, llm).await?;
+        let action_cost = self.action_cost_from_result(&action);
+        if let Some(step) = self.budget_terminal(action_cost, Some(action.response_text.clone())) {
+            return Ok(step);
+        }
+
+        self.budget.record(&action_cost);
+        state.tokens.accumulate(action.tokens_used);
+        state.partial_response = Some(action.response_text.clone());
+
+        let verification = self.verify(&action, intent).await?;
+        let learning = self.learn(&verification).await?;
+        let continuation = self
+            .should_continue(&action.decision, &verification, &learning)
+            .await?;
+
+        Ok(IterationStep::Progress(IterationOutcome {
+            response_text: action.response_text,
+            continuation,
+            learning,
+        }))
+    }
+
+    fn record_reasoning_cost(&mut self, reason_cost: ActionCost, state: &mut CycleState) {
+        self.budget.record(&reason_cost);
+        state.tokens.accumulate(reasoning_token_usage(reason_cost.tokens));
+    }
+
+    fn budget_terminal(&self, cost: ActionCost, partial_response: Option<String>) -> Option<IterationStep> {
+        self.handle_budget_check(cost, partial_response)
+            .map(IterationStep::Terminal)
+    }
+
+    fn handle_budget_check(&self, cost: ActionCost, partial_response: Option<String>) -> Option<LoopResult> {
+        if self.budget.check_at(current_time_ms(), &cost).is_ok() {
+            return None;
+        }
+
+        Some(LoopResult::BudgetExhausted {
+            partial_response,
+            iterations: self.iteration_count,
+        })
+    }
+
+    fn handle_continuation(
+        &self,
+        continuation: Continuation,
+        outcome: &IterationOutcome,
+        perception: &mut PerceptionSnapshot,
+        state: &mut CycleState,
+    ) -> Option<LoopResult> {
+        state.learnings.push(outcome.learning.clone());
+        match continuation {
+            Continuation::Complete => Some(LoopResult::Complete {
+                response: outcome.response_text.clone(),
+                iterations: self.iteration_count,
+                tokens_used: state.tokens,
+                learnings: state.learnings.clone(),
+            }),
+            Continuation::NeedsInput(prompt) => Some(LoopResult::NeedsInput {
+                prompt,
+                iterations: self.iteration_count,
+            }),
+            Continuation::Continue(sub_goal) => {
+                *perception = next_perception_from_sub_goal(perception, &sub_goal);
+                None
+            }
+        }
     }
 
     /// Perceive step.
@@ -301,7 +354,13 @@ impl LoopEngine {
 
     /// Decide step.
     async fn decide(&self, intent: &ReasonedIntent) -> Result<Decision, LoopError> {
-        Ok(decide_from_intent(intent))
+        decide_from_intent(intent).map_err(|error| {
+            loop_error(
+                "decide",
+                &format!("intent-to-decision mapping failed: {error}"),
+                true,
+            )
+        })
     }
 
     /// Act step.
@@ -352,9 +411,13 @@ impl LoopEngine {
                     "You are Citros. Summarize the following tool activity for the user in concise text:\n{tool_summary}\n\nNote: tool execution is stubbed in this build."
                 );
 
-                let llm_text = llm.generate(&synthesis_prompt, 384).await.unwrap_or_else(|_| {
-                    "I prepared tool actions, but tool execution is still stubbed in this phase.".to_string()
-                });
+                let llm_text = llm.generate(&synthesis_prompt, 384).await.map_err(|error| {
+                    loop_error(
+                        "act",
+                        &format!("tool synthesis generation failed: {error}"),
+                        true,
+                    )
+                })?;
 
                 let usage = TokenUsage {
                     input_tokens: estimate_tokens(&synthesis_prompt),
@@ -503,13 +566,13 @@ impl LoopEngine {
             .saturating_add(estimate_tokens(&perception.user_message))
             .max(64);
 
-        let output_tokens = 192;
+        let output_tokens = REASONING_OUTPUT_TOKEN_HEURISTIC;
 
         ActionCost {
             llm_calls: 1,
             tool_invocations: 0,
             tokens: input_tokens.saturating_add(output_tokens),
-            cost_cents: 2,
+            cost_cents: DEFAULT_LLM_ACTION_COST_CENTS,
         }
     }
 
@@ -518,8 +581,8 @@ impl LoopEngine {
             Decision::UseTools(calls) => ActionCost {
                 llm_calls: 1,
                 tool_invocations: calls.len() as u32,
-                tokens: 320,
-                cost_cents: 2,
+                tokens: TOOL_SYNTHESIS_TOKEN_HEURISTIC,
+                cost_cents: DEFAULT_LLM_ACTION_COST_CENTS,
             },
             Decision::Respond(_) | Decision::Clarify(_) | Decision::Defer(_) => {
                 ActionCost::default()
@@ -537,7 +600,7 @@ impl LoopEngine {
             tool_invocations: action.tool_results.len() as u32,
             tokens: action.tokens_used.total_tokens(),
             cost_cents: if action.tokens_used.total_tokens() > 0 {
-                2
+                DEFAULT_LLM_ACTION_COST_CENTS
             } else if action.tool_results.is_empty() {
                 0
             } else {
@@ -574,6 +637,13 @@ impl LoopEngine {
             depth: 0,
             parent_context: None,
         }
+    }
+}
+
+fn reasoning_token_usage(total_tokens: u64) -> TokenUsage {
+    TokenUsage {
+        input_tokens: total_tokens.saturating_mul(3) / 5,
+        output_tokens: total_tokens.saturating_mul(2) / 5,
     }
 }
 
@@ -913,6 +983,45 @@ mod tests {
                 iterations: 1
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn run_cycle_resets_budget_tracker_between_messages() {
+        let mut config = crate::budget::BudgetConfig::unlimited();
+        config.max_llm_calls = 1;
+
+        let budget = BudgetTracker::new(config, current_time_ms(), 0);
+        let context = ContextCompactor::new(4_000, 3_000);
+        let mut engine = LoopEngine::new(budget, context, 5);
+
+        let llm = MockLlm::with_responses(vec![
+            r#"{"action":{"Respond":{"text":"first"}},"rationale":"r1","confidence":0.9,"expected_outcome":null,"sub_goals":[]}"#,
+            r#"{"action":{"Respond":{"text":"second"}},"rationale":"r2","confidence":0.9,"expected_outcome":null,"sub_goals":[]}"#,
+        ]);
+
+        let first = engine
+            .run_cycle(base_snapshot("one"), &llm)
+            .await
+            .expect("first run result");
+        let second = engine
+            .run_cycle(base_snapshot("two"), &llm)
+            .await
+            .expect("second run result");
+
+        assert!(matches!(first, LoopResult::Complete { response, .. } if response == "first"));
+        assert!(matches!(second, LoopResult::Complete { response, .. } if response == "second"));
+    }
+
+    #[tokio::test]
+    async fn run_cycle_propagates_act_synthesis_generation_error() {
+        let mut engine = default_engine(5);
+        let llm = MockLlm::with_responses(vec![
+            r#"{"action":{"Delegate":{"skill_id":"search","params":{"q":"docs"}}},"rationale":"need tools","confidence":0.8,"expected_outcome":null,"sub_goals":[]}"#,
+        ]);
+
+        let result = engine.run_cycle(base_snapshot("trigger tools"), &llm).await;
+
+        assert!(matches!(result, Err(error) if error.stage == "act" && error.reason.contains("tool synthesis generation failed")));
     }
 
     #[tokio::test]

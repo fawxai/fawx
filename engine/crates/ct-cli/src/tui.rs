@@ -658,20 +658,6 @@ impl LoopLlmProvider for RouterLoopLlmProvider<'_> {
     }
 }
 
-fn render_completion_blocks(content: &[ContentBlock]) -> String {
-    content
-        .iter()
-        .map(|block| match block {
-            ContentBlock::Text { text } => text.clone(),
-            ContentBlock::ToolUse { name, .. } => format!("[tool requested: {name}]"),
-            ContentBlock::ToolResult { tool_use_id, .. } => {
-                format!("[tool result: {tool_use_id}]")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 fn render_loop_result(result: LoopResult) -> String {
     match result {
         LoopResult::Complete {
@@ -1546,6 +1532,45 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct StreamingTestProvider {
+        provider_name: String,
+        model: String,
+        chunks: Vec<Result<ct_llm::StreamChunk, ct_llm::ProviderError>>,
+    }
+
+    #[async_trait]
+    impl ct_llm::CompletionProvider for StreamingTestProvider {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<ct_llm::CompletionResponse, ct_llm::ProviderError> {
+            Ok(ct_llm::CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "unused".to_string(),
+                }],
+                tool_calls: Vec::new(),
+                usage: None,
+                stop_reason: Some("end_turn".to_string()),
+            })
+        }
+
+        async fn complete_stream(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<ct_llm::CompletionStream, ct_llm::ProviderError> {
+            Ok(Box::pin(futures::stream::iter(self.chunks.clone().into_iter())))
+        }
+
+        fn name(&self) -> &str {
+            &self.provider_name
+        }
+
+        fn supported_models(&self) -> Vec<String> {
+            vec![self.model.clone()]
+        }
+    }
+
     fn app_with_mock_model(response: &str) -> TuiApp {
         let mut router = ModelRouter::new();
         router.register_provider_with_auth(
@@ -1557,6 +1582,49 @@ mod tests {
             .expect("set active mock model");
 
         TuiApp::new(AuthManager::new(), router, build_loop_engine())
+    }
+
+    #[tokio::test]
+    async fn router_loop_llm_provider_generate_returns_stream_error() {
+        let mut router = ModelRouter::new();
+        router.register_provider_with_auth(
+            Box::new(StreamingTestProvider {
+                provider_name: "stream-test".to_string(),
+                model: "stream-model".to_string(),
+                chunks: vec![Err(ct_llm::ProviderError::Streaming(
+                    "chunk failed".to_string(),
+                ))],
+            }),
+            "test",
+        );
+
+        let provider = RouterLoopLlmProvider::new(&router, "stream-model".to_string());
+        let result = provider.generate("hello", 32).await;
+
+        assert!(matches!(result, Err(CoreLlmError::Inference(message)) if message.contains("chunk failed")));
+    }
+
+    #[tokio::test]
+    async fn router_loop_llm_provider_generate_rejects_empty_rendered_output() {
+        let mut router = ModelRouter::new();
+        router.register_provider_with_auth(
+            Box::new(StreamingTestProvider {
+                provider_name: "stream-test".to_string(),
+                model: "empty-model".to_string(),
+                chunks: vec![Ok(ct_llm::StreamChunk {
+                    delta_content: Some("   ".to_string()),
+                    tool_use_deltas: Vec::new(),
+                    usage: None,
+                    stop_reason: Some("end_turn".to_string()),
+                })],
+            }),
+            "test",
+        );
+
+        let provider = RouterLoopLlmProvider::new(&router, "empty-model".to_string());
+        let result = provider.generate("hello", 32).await;
+
+        assert!(matches!(result, Err(CoreLlmError::InvalidResponse(message)) if message.contains("empty completion")));
     }
 
     #[test]
