@@ -110,6 +110,10 @@ const REASONING_OUTPUT_TOKEN_HEURISTIC: u64 = 192;
 const TOOL_SYNTHESIS_TOKEN_HEURISTIC: u64 = 320;
 const DEFAULT_LLM_ACTION_COST_CENTS: u64 = 2;
 
+const VERIFICATION_CONFIDENCE_CLEAN: f64 = 0.9;
+const VERIFICATION_CONFIDENCE_SINGLE_DISCREPANCY: f64 = 0.45;
+const VERIFICATION_CONFIDENCE_MULTIPLE_DISCREPANCIES: f64 = 0.25;
+
 impl LoopEngine {
     /// Create a new loop engine with budget + context managers.
     pub fn new(budget: BudgetTracker, context: ContextCompactor, max_iterations: u32) -> Self {
@@ -698,11 +702,11 @@ fn expected_outcome_mismatch(action: &ActionResult, intent: &ReasonedIntent) -> 
 
 fn build_verification(discrepancies: Vec<String>) -> Verification {
     let confidence = if discrepancies.is_empty() {
-        0.9
+        VERIFICATION_CONFIDENCE_CLEAN
     } else if discrepancies.len() == 1 {
-        0.45
+        VERIFICATION_CONFIDENCE_SINGLE_DISCREPANCY
     } else {
-        0.25
+        VERIFICATION_CONFIDENCE_MULTIPLE_DISCREPANCIES
     };
 
     Verification {
@@ -1247,9 +1251,9 @@ mod tests {
         let two = build_verification(vec!["a".to_string(), "b".to_string()]);
 
         assert!(clean.outcome_matches_intent);
-        assert_eq!(clean.confidence, 0.9);
-        assert_eq!(one.confidence, 0.45);
-        assert_eq!(two.confidence, 0.25);
+        assert_eq!(clean.confidence, VERIFICATION_CONFIDENCE_CLEAN);
+        assert_eq!(one.confidence, VERIFICATION_CONFIDENCE_SINGLE_DISCREPANCY);
+        assert_eq!(two.confidence, VERIFICATION_CONFIDENCE_MULTIPLE_DISCREPANCIES);
     }
 
     #[tokio::test]

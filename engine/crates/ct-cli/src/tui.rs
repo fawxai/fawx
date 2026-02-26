@@ -11,7 +11,7 @@ use ct_kernel::oauth::{PkceFlow, TokenExchangeRequest, TokenResponse};
 use ct_kernel::types::PerceptionSnapshot;
 use ct_llm::{
     AnthropicProvider, CompletionRequest, Message, ModelCatalog, ModelRouter, OpenAiProvider,
-    OpenAiResponsesProvider,
+    OpenAiResponsesProvider, ProviderError, StreamChunk,
 };
 use futures::StreamExt;
 use std::fmt;
@@ -209,30 +209,7 @@ impl TuiApp {
     }
 
     fn auth_wizard_api_key(&mut self) -> Result<String, TuiError> {
-        println!("Which provider?");
-        println!("  [1] Anthropic");
-        println!("  [2] OpenAI");
-        println!("  [3] OpenRouter");
-        println!("  [4] Other (OpenAI-compatible)");
-        println!();
-
-        let provider_choice = prompt_choice(
-            "> ",
-            "Please choose 1, 2, 3, or 4.",
-            "API key provider selection",
-            parse_api_key_provider_selection,
-        )?;
-
-        let provider = match provider_choice {
-            ApiKeyProvider::Anthropic => "anthropic".to_string(),
-            ApiKeyProvider::OpenAi => "openai".to_string(),
-            ApiKeyProvider::OpenRouter => "openrouter".to_string(),
-            ApiKeyProvider::Other => prompt_non_empty_line(
-                "Provider name: ",
-                "Provider name cannot be empty.",
-                "API key provider name",
-            )?,
-        };
+        let provider = prompt_api_key_provider()?;
 
         let key = prompt_non_empty_secret(
             &format!("Enter your {provider} API key: "),
@@ -391,7 +368,9 @@ impl TuiApp {
             .next()
             .map(|model| model.model_id)
         {
-            let _ = self.router.set_active(&model);
+            if let Err(error) = self.router.set_active(&model) {
+                eprintln!("failed to set initial model {model}: {error}");
+            }
         }
     }
 
@@ -432,7 +411,9 @@ impl TuiApp {
                     .next()
                     .map(|model| model.model_id)
                 {
-                    let _ = refreshed.set_active(&first_model);
+                    if let Err(error) = refreshed.set_active(&first_model) {
+                        eprintln!("failed to restore model {first_model}: {error}");
+                    }
                 }
             }
         }
@@ -582,21 +563,7 @@ impl LoopLlmProvider for RouterLoopLlmProvider<'_> {
             .await
             .map_err(|error| CoreLlmError::Inference(error.to_string()))?;
 
-        let mut rendered = String::new();
-        while let Some(chunk) = stream.next().await {
-            match chunk {
-                Ok(chunk) => {
-                    if let Some(delta) = &chunk.delta_content {
-                        print!("{delta}");
-                        io::stdout()
-                            .flush()
-                            .map_err(|error| CoreLlmError::Inference(error.to_string()))?;
-                        rendered.push_str(delta);
-                    }
-                }
-                Err(error) => return Err(CoreLlmError::Inference(error.to_string())),
-            }
-        }
+        let rendered = consume_stream_with_print(&mut stream).await?;
 
         if rendered.trim().is_empty() {
             Err(CoreLlmError::InvalidResponse(
@@ -662,6 +629,27 @@ fn render_loop_result(result: LoopResult) -> String {
             }
         }
     }
+}
+
+async fn consume_stream_with_print(
+    stream: &mut (impl futures::Stream<Item = Result<StreamChunk, ProviderError>> + Unpin),
+) -> Result<String, CoreLlmError> {
+    let mut rendered = String::new();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(chunk) => {
+                if let Some(delta) = &chunk.delta_content {
+                    print!("{delta}");
+                    io::stdout()
+                        .flush()
+                        .map_err(|error| CoreLlmError::Inference(error.to_string()))?;
+                    rendered.push_str(delta);
+                }
+            }
+            Err(error) => return Err(CoreLlmError::Inference(error.to_string())),
+        }
+    }
+    Ok(rendered)
 }
 
 fn format_error_message(error: &str) -> String {
@@ -742,7 +730,7 @@ pub fn build_router(auth_manager: &AuthManager) -> Result<ModelRouter, TuiError>
         .next()
         .map(|model| model.model_id)
     {
-        let _ = router.set_active(&first_model);
+        if let Err(error) = router.set_active(&first_model) { eprintln!("failed to set initial model {first_model}: {error}"); }
     }
 
     Ok(router)
@@ -767,7 +755,7 @@ async fn build_router_with_catalog(
         .next()
         .map(|model| model.model_id)
     {
-        let _ = router.set_active(&first_model);
+        if let Err(error) = router.set_active(&first_model) { eprintln!("failed to set initial model {first_model}: {error}"); }
     }
 
     Ok(router)
@@ -897,7 +885,7 @@ async fn start_oauth_callback_server(
             let (path_only, query) = path.split_once('?').map_or((path, ""), |(p, q)| (p, q));
             if path_only != "/auth/callback" {
                 let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot found";
-                let _ = stream.write_all(response.as_bytes()).await;
+                if let Err(error) = stream.write_all(response.as_bytes()).await { eprintln!("oauth callback write failed: {error}"); }
                 continue;
             }
 
@@ -927,7 +915,7 @@ async fn start_oauth_callback_server(
             if returned_state != state {
                 let response =
                     "HTTP/1.1 400 Bad Request\r\nContent-Length: 14\r\n\r\nState mismatch";
-                let _ = stream.write_all(response.as_bytes()).await;
+                if let Err(error) = stream.write_all(response.as_bytes()).await { eprintln!("oauth callback write failed: {error}"); }
                 return Err(TuiError::Auth("OAuth state mismatch".to_string()));
             }
 
@@ -941,7 +929,7 @@ async fn start_oauth_callback_server(
                 body.len(),
                 body
             );
-            let _ = stream.write_all(response.as_bytes()).await;
+            if let Err(error) = stream.write_all(response.as_bytes()).await { eprintln!("oauth callback write failed: {error}"); }
 
             return Ok(code);
         }
@@ -1268,6 +1256,33 @@ fn prompt_non_empty_line(
     Err(retry_limit_error(context))
 }
 
+fn prompt_api_key_provider() -> Result<String, TuiError> {
+    println!("Which provider?");
+    println!("  [1] Anthropic");
+    println!("  [2] OpenAI");
+    println!("  [3] OpenRouter");
+    println!("  [4] Other (OpenAI-compatible)");
+    println!();
+
+    let choice = prompt_choice(
+        "> ",
+        "Please choose 1, 2, 3, or 4.",
+        "API key provider selection",
+        parse_api_key_provider_selection,
+    )?;
+
+    match choice {
+        ApiKeyProvider::Anthropic => Ok("anthropic".to_string()),
+        ApiKeyProvider::OpenAi => Ok("openai".to_string()),
+        ApiKeyProvider::OpenRouter => Ok("openrouter".to_string()),
+        ApiKeyProvider::Other => prompt_non_empty_line(
+            "Provider name: ",
+            "Provider name cannot be empty.",
+            "API key provider name",
+        ),
+    }
+}
+
 fn prompt_non_empty_secret(
     prompt: &str,
     empty_message: &str,
@@ -1448,7 +1463,9 @@ impl RawModeGuard {
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
-        let _ = terminal::disable_raw_mode();
+        if let Err(error) = terminal::disable_raw_mode() {
+            eprintln!("failed to disable raw mode: {error}");
+        }
     }
 }
 
