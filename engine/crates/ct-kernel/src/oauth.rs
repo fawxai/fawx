@@ -12,7 +12,7 @@ pub const OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OPENAI_OAUTH_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 /// OpenAI OAuth token endpoint.
 pub const OPENAI_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
-const DEFAULT_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
+const DEFAULT_REDIRECT_URI: &str = "http://127.0.0.1:1455/auth/callback";
 const DEFAULT_SCOPE: &str = "openid profile email offline_access";
 /// JWT claim path for extracting account ID from OpenAI access tokens.
 pub const OPENAI_JWT_CLAIM_PATH: &str = "https://api.openai.com/auth";
