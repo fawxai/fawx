@@ -27,7 +27,9 @@ pub fn decide_from_intent(intent: &ReasonedIntent) -> Decision {
     }
 
     if intent.confidence < 0.35 {
-        return Decision::Clarify("Can you share a little more detail so I can get this right?".to_string());
+        return Decision::Clarify(
+            "Can you share a little more detail so I can get this right?".to_string(),
+        );
     }
 
     match &intent.action {
@@ -48,7 +50,9 @@ pub fn decide_from_intent(intent: &ReasonedIntent) -> Decision {
                 .collect::<Vec<_>>();
 
             if tool_calls.is_empty() {
-                Decision::Clarify("I need a little more context before taking the next step.".to_string())
+                Decision::Clarify(
+                    "I need a little more context before taking the next step.".to_string(),
+                )
             } else {
                 Decision::UseTools(tool_calls)
             }
@@ -57,7 +61,9 @@ pub fn decide_from_intent(intent: &ReasonedIntent) -> Decision {
             if let Some(call) = action_to_tool_call(action, 0) {
                 Decision::UseTools(vec![call])
             } else {
-                Decision::Clarify("I couldn't map that plan to an executable action yet.".to_string())
+                Decision::Clarify(
+                    "I couldn't map that plan to an executable action yet.".to_string(),
+                )
             }
         }
     }
@@ -179,6 +185,8 @@ mod tests {
             0.9,
         ));
 
-        assert!(matches!(decision, Decision::UseTools(ref calls) if calls.len() == 1 && calls[0].name == "search"));
+        assert!(
+            matches!(decision, Decision::UseTools(ref calls) if calls.len() == 1 && calls[0].name == "search")
+        );
     }
 }

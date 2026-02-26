@@ -6,14 +6,13 @@ use ct_core::types::{InputSource, ScreenState, UserInput};
 use ct_kernel::auth::{AuthManager, AuthMethod};
 use ct_kernel::budget::{BudgetConfig, BudgetTracker};
 use ct_kernel::context_manager::ContextCompactor;
-use ct_kernel::loop_engine::{LoopEngine, LoopResult, LlmProvider as LoopLlmProvider};
+use ct_kernel::loop_engine::{LlmProvider as LoopLlmProvider, LoopEngine, LoopResult};
 use ct_kernel::oauth::{PkceFlow, TokenExchangeRequest, TokenResponse};
 use ct_kernel::types::PerceptionSnapshot;
 use ct_llm::{
-    AnthropicProvider, CompletionRequest, Message, ModelCatalog, ModelRouter, OpenAiProvider,
-    OpenAiResponsesProvider,
+    AnthropicProvider, CompletionRequest, ContentBlock, Message, ModelCatalog, ModelRouter,
+    OpenAiProvider, OpenAiResponsesProvider,
 };
-use futures::StreamExt;
 use std::fmt;
 use std::io::{self, Write};
 #[cfg(unix)]
@@ -55,7 +54,7 @@ impl TuiApp {
         Self {
             router,
             auth_manager,
-    catalog: ModelCatalog::new(),
+            catalog: ModelCatalog::new(),
             loop_engine,
             running: true,
         }
@@ -93,10 +92,15 @@ impl TuiApp {
 
             if input.starts_with('/') {
                 if let Err(error) = self.handle_command(input).await {
-                    println!("\x1b[31mError: {error}\x1b[0m\n");
+                    println!("[31mError: {error}[0m\n");
                 }
-            } else if let Err(error) = self.handle_message(input).await {
-                println!("\x1b[31mError: {error}\x1b[0m\n");
+            } else {
+                match self.handle_message(input).await {
+                    Ok(response) => self.display_response(&response),
+                    Err(error) => {
+                        println!("[31mError: {error}[0m\n");
+                    }
+                }
             }
         }
 
@@ -533,8 +537,14 @@ impl TuiApp {
         println!("  - Tokens used (tracker): {}", status.tokens_used);
         println!("  - Tokens remaining: {}", status.remaining.tokens);
         println!("  - LLM calls remaining: {}", status.remaining.llm_calls);
-        println!("  - Tool calls remaining: {}", status.remaining.tool_invocations);
-        println!("  - Wall time remaining (ms): {}", status.remaining.wall_time_ms);
+        println!(
+            "  - Tool calls remaining: {}",
+            status.remaining.tool_invocations
+        );
+        println!(
+            "  - Wall time remaining (ms): {}",
+            status.remaining.wall_time_ms
+        );
     }
 
     fn build_perception_snapshot(&self, input: &str) -> PerceptionSnapshot {
@@ -567,6 +577,13 @@ pub fn build_loop_engine() -> LoopEngine {
     LoopEngine::new(budget, context, 10)
 }
 
+impl<'a> fmt::Debug for RouterLoopLlmProvider<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RouterLoopLlmProvider")
+            .field("active_model", &self.active_model)
+            .finish()
+    }
+}
 struct RouterLoopLlmProvider<'a> {
     router: &'a ModelRouter,
     active_model: String,
@@ -1696,8 +1713,7 @@ mod tests {
         let models = router.available_models();
 
         assert!(models.iter().any(|model| {
-                && model.provider_name == "anthropic"
-                && model.auth_method == "subscription"
+            &model.provider_name == "anthropic" && model.auth_method == "subscription"
         }));
         assert!(models.iter().any(|model| {
             model.model_id == "openai/gpt-4o-mini"

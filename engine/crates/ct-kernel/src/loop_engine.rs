@@ -218,7 +218,10 @@ impl LoopEngine {
     }
 
     /// Perceive step.
-    async fn perceive(&self, snapshot: &PerceptionSnapshot) -> Result<ProcessedPerception, LoopError> {
+    async fn perceive(
+        &self,
+        snapshot: &PerceptionSnapshot,
+    ) -> Result<ProcessedPerception, LoopError> {
         let user_message = snapshot
             .user_input
             .as_ref()
@@ -280,10 +283,9 @@ impl LoopEngine {
             perception.user_message,
         );
 
-        let raw = llm
-            .generate(&prompt, 768)
-            .await
-            .map_err(|error| loop_error("reason", &format!("llm generation failed: {error}"), true))?;
+        let raw = llm.generate(&prompt, 768).await.map_err(|error| {
+            loop_error("reason", &format!("llm generation failed: {error}"), true)
+        })?;
 
         Ok(parse_reasoned_intent(&raw, &perception.user_message))
     }
@@ -294,7 +296,11 @@ impl LoopEngine {
     }
 
     /// Act step.
-    async fn act(&self, decision: &Decision, llm: &dyn LlmProvider) -> Result<ActionResult, LoopError> {
+    async fn act(
+        &self,
+        decision: &Decision,
+        llm: &dyn LlmProvider,
+    ) -> Result<ActionResult, LoopError> {
         match decision {
             Decision::Respond(text) => Ok(ActionResult {
                 decision: decision.clone(),
@@ -506,13 +512,19 @@ impl LoopEngine {
                 tokens: 320,
                 cost_cents: 2,
             },
-            Decision::Respond(_) | Decision::Clarify(_) | Decision::Defer(_) => ActionCost::default(),
+            Decision::Respond(_) | Decision::Clarify(_) | Decision::Defer(_) => {
+                ActionCost::default()
+            }
         }
     }
 
     fn action_cost_from_result(&self, action: &ActionResult) -> ActionCost {
         ActionCost {
-            llm_calls: if action.tokens_used.total_tokens() > 0 { 1 } else { 0 },
+            llm_calls: if action.tokens_used.total_tokens() > 0 {
+                1
+            } else {
+                0
+            },
             tool_invocations: action.tool_results.len() as u32,
             tokens: action.tokens_used.total_tokens(),
             cost_cents: if action.tokens_used.total_tokens() > 0 {
@@ -525,7 +537,11 @@ impl LoopEngine {
         }
     }
 
-    fn synthetic_context(&self, snapshot: &PerceptionSnapshot, user_message: &str) -> ReasoningContext {
+    fn synthetic_context(
+        &self,
+        snapshot: &PerceptionSnapshot,
+        user_message: &str,
+    ) -> ReasoningContext {
         ReasoningContext {
             perception: snapshot.clone(),
             working_memory: vec![WorkingMemoryEntry {
@@ -771,11 +787,8 @@ mod tests {
     }
 
     fn default_engine(max_iterations: u32) -> LoopEngine {
-        let budget = BudgetTracker::new(
-            crate::budget::BudgetConfig::default(),
-            MOCK_TIMESTAMP_MS,
-            0,
-        );
+        let budget =
+            BudgetTracker::new(crate::budget::BudgetConfig::default(), MOCK_TIMESTAMP_MS, 0);
         let context = ContextCompactor::new(4_000, 3_000);
         LoopEngine::new(budget, context, max_iterations)
     }
@@ -840,7 +853,9 @@ mod tests {
         let context = ContextCompactor::new(4_000, 3_000);
         let mut engine = LoopEngine::new(budget, context, 10);
 
-        let llm = MockLlm::with_responses(vec![r#"{"action":{"Respond":{"text":"never used"}},"rationale":"n/a","confidence":0.9,"expected_outcome":null,"sub_goals":[]}"#]);
+        let llm = MockLlm::with_responses(vec![
+            r#"{"action":{"Respond":{"text":"never used"}},"rationale":"n/a","confidence":0.9,"expected_outcome":null,"sub_goals":[]}"#,
+        ]);
 
         let result = engine
             .run_cycle(base_snapshot("hi"), &llm)
@@ -865,7 +880,9 @@ mod tests {
         let context = ContextCompactor::new(4_000, 3_000);
         let mut engine = LoopEngine::new(budget, context, 10);
 
-        let llm = MockLlm::with_responses(vec![r#"{"action":{"Respond":{"text":"never used"}},"rationale":"n/a","confidence":0.9,"expected_outcome":null,"sub_goals":[]}"#]);
+        let llm = MockLlm::with_responses(vec![
+            r#"{"action":{"Respond":{"text":"never used"}},"rationale":"n/a","confidence":0.9,"expected_outcome":null,"sub_goals":[]}"#,
+        ]);
 
         let mut snapshot = base_snapshot("hi");
         snapshot.timestamp_ms = MOCK_TIMESTAMP_MS.saturating_add(10);
