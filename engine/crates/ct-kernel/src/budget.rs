@@ -151,6 +151,15 @@ impl BudgetTracker {
         current_time_ms.saturating_sub(self.start_time_ms) > self.config.max_wall_time_ms
     }
 
+    /// Reset consumed budget counters for a fresh cycle starting at `start_time_ms`.
+    pub fn reset(&mut self, start_time_ms: u64) {
+        self.llm_calls = 0;
+        self.tool_invocations = 0;
+        self.tokens_used = 0;
+        self.cost_cents = 0;
+        self.start_time_ms = start_time_ms;
+    }
+
     /// Number of LLM calls consumed so far.
     pub fn llm_calls_used(&self) -> u32 {
         self.llm_calls

@@ -117,6 +117,7 @@ impl LoopEngine {
         llm: &dyn LlmProvider,
     ) -> Result<LoopResult, LoopError> {
         self.iteration_count = 0;
+        self.budget.reset(current_time_ms());
         let mut learnings = Vec::new();
         let mut cycle_tokens = TokenUsage::default();
         let mut partial_response: Option<String> = None;
