@@ -27,6 +27,8 @@
 //! - Consolidation requires validated checkpoint before mutations
 //! - Three-gate decision: policy → budget → permission, no gate skippable
 
+use serde::{Deserialize, Serialize};
+
 pub mod act;
 pub mod budget;
 pub mod checkpoint;
@@ -39,11 +41,14 @@ pub mod permissions;
 pub mod policy;
 pub mod reason;
 pub mod rollback;
+pub mod types;
 pub mod verify;
 pub mod watchdog;
 
+pub use types::{ContinuationDecision, EscalationContext, LoopError, LoopEvidence};
+
 /// The core loop result type.
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LoopResult {
     /// Goal achieved with verification evidence.
     Completed(LoopEvidence),
@@ -59,22 +64,6 @@ pub enum LoopResult {
     Interrupted(CheckpointId),
 }
 
-// Placeholder types — these will be fleshed out as modules are implemented.
-
-#[derive(Debug)]
-pub struct LoopEvidence {
-    pub summary: String,
-}
-
-#[derive(Debug)]
-pub struct LoopError {
-    pub reason: String,
-}
-
-#[derive(Debug)]
-pub struct EscalationContext {
-    pub question: String,
-}
-
-#[derive(Debug, Clone, Copy)]
+/// Stable checkpoint identifier.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct CheckpointId(pub u64);
