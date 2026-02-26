@@ -119,7 +119,9 @@ class PromptModeTest {
             securityContent = "No secrets."
         )
 
-        assertEquals(minimalPrompt, actionPrompt)
+        val normalizedAction = actionPrompt.replace(Regex("""time=.*$"""), "time=<ts>")
+        val normalizedMinimal = minimalPrompt.replace(Regex("""time=.*$"""), "time=<ts>")
+        assertEquals(normalizedMinimal, normalizedAction)
         assertContains(actionPrompt, "## Security Rules")
         assertNotContains(actionPrompt, "## Your Tools")
         assertNotContains(actionPrompt, "### Navigation")
@@ -193,6 +195,21 @@ class PromptModeTest {
         assertNotContains(prompt, "## Security Rules")
         assertNotContains(prompt, "Follow explicit user intent")
         assertNotContains(prompt, "custom rules")
+    }
+
+    @Test
+    fun `NONE mode excludes device awareness even with sensor context`() {
+        val prompt = PhoneAgentPrompts.buildSystemPrompt(
+            mode = PromptMode.NONE,
+            sensorContext = SensorContext(
+                batteryPercent = 44,
+                networkType = NetworkType.WIFI,
+                location = "Denver, CO"
+            )
+        )
+
+        assertNotContains(prompt, "## Device Awareness")
+        assertNotContains(prompt, "Device: battery=44% | wifi | Denver, CO")
     }
 
     @Test

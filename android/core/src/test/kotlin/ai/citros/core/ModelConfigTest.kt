@@ -8,6 +8,9 @@ import kotlin.test.assertTrue
 
 class ModelConfigTest {
 
+    private fun staticKnown(provider: Provider): Set<String> =
+        ModelConfig.allKnownModels(provider)
+
     // ========== actionModelForChat (deprecated) — always returns above-floor default ==========
 
     @Suppress("DEPRECATION")
@@ -106,14 +109,22 @@ class ModelConfigTest {
 
     @Test
     fun `validateModel accepts known Anthropic models`() {
-        val result = ModelConfig.validateModel(Provider.ANTHROPIC, "claude-sonnet-4-5-20250929")
+        val result = ModelConfig.validateModel(
+            Provider.ANTHROPIC,
+            "claude-sonnet-4-5-20250929",
+            staticKnown(Provider.ANTHROPIC)
+        )
         assertTrue(result.valid)
         assertNull(result.message)
     }
 
     @Test
     fun `validateModel rejects unknown model with suggestion`() {
-        val result = ModelConfig.validateModel(Provider.ANTHROPIC, "claude-sonnet-4-5-20250930")
+        val result = ModelConfig.validateModel(
+            Provider.ANTHROPIC,
+            "claude-sonnet-4-5-20250930",
+            staticKnown(Provider.ANTHROPIC)
+        )
         assertFalse(result.valid)
         assertTrue(result.message!!.contains("Unknown model"))
         assertTrue(result.message!!.contains("Did you mean"))
@@ -121,40 +132,80 @@ class ModelConfigTest {
 
     @Test
     fun `validateModel rejects completely wrong model`() {
-        val result = ModelConfig.validateModel(Provider.ANTHROPIC, "gpt-4o")
+        val result = ModelConfig.validateModel(
+            Provider.ANTHROPIC,
+            "gpt-4o",
+            staticKnown(Provider.ANTHROPIC)
+        )
         assertFalse(result.valid)
         assertTrue(result.message!!.contains("Known models"))
     }
 
     @Test
     fun `validateModel works for OpenRouter`() {
-        assertTrue(ModelConfig.validateModel(Provider.OPENROUTER, "anthropic/claude-sonnet-4.5").valid)
-        assertFalse(ModelConfig.validateModel(Provider.OPENROUTER, "anthropic/claude-sonnet-4.6").valid)
+        assertTrue(
+            ModelConfig.validateModel(
+                Provider.OPENROUTER,
+                "anthropic/claude-sonnet-4.5",
+                staticKnown(Provider.OPENROUTER)
+            ).valid
+        )
+        assertFalse(
+            ModelConfig.validateModel(
+                Provider.OPENROUTER,
+                "anthropic/claude-sonnet-4.6",
+                staticKnown(Provider.OPENROUTER)
+            ).valid
+        )
     }
 
     @Test
     fun `validateModel works for OpenAI`() {
-        assertTrue(ModelConfig.validateModel(Provider.OPENAI, "gpt-4o").valid)
-        assertFalse(ModelConfig.validateModel(Provider.OPENAI, "gpt-5").valid)
+        assertTrue(
+            ModelConfig.validateModel(
+                Provider.OPENAI,
+                "gpt-4o",
+                staticKnown(Provider.OPENAI)
+            ).valid
+        )
+        assertFalse(
+            ModelConfig.validateModel(
+                Provider.OPENAI,
+                "gpt-5",
+                staticKnown(Provider.OPENAI)
+            ).valid
+        )
     }
 
     @Test
     fun `validateModel rejects empty model ID`() {
-        val result = ModelConfig.validateModel(Provider.ANTHROPIC, "")
+        val result = ModelConfig.validateModel(
+            Provider.ANTHROPIC,
+            "",
+            staticKnown(Provider.ANTHROPIC)
+        )
         assertFalse(result.valid)
         assertTrue(result.message!!.contains("blank"))
     }
 
     @Test
     fun `validateModel rejects blank model ID`() {
-        val result = ModelConfig.validateModel(Provider.ANTHROPIC, "   ")
+        val result = ModelConfig.validateModel(
+            Provider.ANTHROPIC,
+            "   ",
+            staticKnown(Provider.ANTHROPIC)
+        )
         assertFalse(result.valid)
         assertTrue(result.message!!.contains("blank"))
     }
 
     @Test
     fun `validateModel suggests closest match via Levenshtein distance`() {
-        val result = ModelConfig.validateModel(Provider.ANTHROPIC, "claude-sonnet-4-5-20250930")
+        val result = ModelConfig.validateModel(
+            Provider.ANTHROPIC,
+            "claude-sonnet-4-5-20250930",
+            staticKnown(Provider.ANTHROPIC)
+        )
         assertFalse(result.valid)
         assertTrue(result.message!!.contains("claude-sonnet-4-5-20250929"),
             "Should suggest closest model, got: ${result.message}")
@@ -165,9 +216,89 @@ class ModelConfigTest {
         val anthropic = ModelConfig.allKnownModels(Provider.ANTHROPIC)
         assertTrue(anthropic.contains("claude-sonnet-4-5-20250929"))
         assertTrue(anthropic.contains("claude-opus-4-6"))
-        // Haiku removed from chat models (#455) and was never in action models
+        assertTrue(anthropic.contains("claude-haiku-3-5-20241022"))
+        // 4.5 dated Haiku variant is not in static curated list
         assertFalse(anthropic.contains("claude-haiku-4-5-20251001"))
-        assertFalse(anthropic.contains("claude-3-5-haiku-20241022"))
+    }
+
+    @Test
+    fun `runtime chat and action models fall back to static when cache is empty`() {
+        ModelCatalog.clearCache()
+
+        assertEquals(
+            ModelConfig.chatModelsForProvider(Provider.OPENAI),
+            ModelConfig.runtimeChatModels(Provider.OPENAI)
+        )
+        assertEquals(
+            ModelConfig.actionModelsForProvider(Provider.OPENAI),
+            ModelConfig.runtimeActionModels(Provider.OPENAI)
+        )
+    }
+
+    @Test
+    fun `runtime chat models use cached catalog with curated-first ordering and cap`() {
+        ModelCatalog.clearCache()
+        val cached = (1..40).map { idx ->
+            ModelCatalog.CachedModel(
+                id = "provider/custom-$idx",
+                displayName = null,
+                tier = ModelTier.STANDARD,
+                provider = Provider.OPENROUTER
+            )
+        }
+        ModelCatalog.setCachedModelsForTesting(Provider.OPENROUTER, cached)
+
+        val runtime = ModelConfig.runtimeChatModels(Provider.OPENROUTER)
+        assertTrue(runtime.size <= 24)
+        assertEquals(ModelConfig.chatModelsForProvider(Provider.OPENROUTER).first(), runtime.first())
+        assertTrue(runtime.any { it == "provider/custom-1" })
+    }
+
+    @Test
+    fun `runtime action models filter below floor from cache and use cache when valid models exist`() {
+        ModelCatalog.clearCache()
+        ModelCatalog.setCachedModelsForTesting(
+            Provider.OPENAI,
+            listOf(
+                ModelCatalog.CachedModel("gpt-4o-mini", null, ModelTier.SMALL, Provider.OPENAI),
+                ModelCatalog.CachedModel("gpt-4o", null, ModelTier.STANDARD, Provider.OPENAI)
+            )
+        )
+
+        val runtime = ModelConfig.runtimeActionModels(Provider.OPENAI)
+        assertEquals(listOf("gpt-4o"), runtime)
+    }
+
+    @Test
+    fun `runtime action models fall back to static when cached models are all below floor`() {
+        ModelCatalog.clearCache()
+        ModelCatalog.setCachedModelsForTesting(
+            Provider.OPENAI,
+            listOf(
+                ModelCatalog.CachedModel("gpt-4o-mini", null, ModelTier.SMALL, Provider.OPENAI)
+            )
+        )
+
+        assertEquals(
+            ModelConfig.actionModelsForProvider(Provider.OPENAI),
+            ModelConfig.runtimeActionModels(Provider.OPENAI)
+        )
+    }
+
+    @Test
+    fun `runtime known models is union of runtime chat and action models`() {
+        ModelCatalog.clearCache()
+        ModelCatalog.setCachedModelsForTesting(
+            Provider.OPENAI,
+            listOf(
+                ModelCatalog.CachedModel("gpt-4o", null, ModelTier.STANDARD, Provider.OPENAI),
+                ModelCatalog.CachedModel("gpt-4o-mini", null, ModelTier.SMALL, Provider.OPENAI)
+            )
+        )
+
+        val known = ModelConfig.runtimeKnownModels(Provider.OPENAI)
+        assertTrue(known.contains("gpt-4o"))
+        assertTrue(known.contains("gpt-4o-mini"))
     }
 
     // ========== ProviderConfig Validation ==========

@@ -540,8 +540,8 @@ class WalletManagerTest {
         val models = ModelConfig.chatModelsForProvider(Provider.ANTHROPIC)
 
         assertTrue(models.contains("claude-sonnet-4-5-20250929"))
-        assertTrue(models.contains("claude-opus-4-5-20251101"))
-        assertTrue(models.contains("claude-haiku-4-5-20251001"))
+        assertTrue(models.contains("claude-opus-4-6"))
+        assertTrue(models.contains("claude-haiku-3-5-20241022"))
     }
 
     @Test
@@ -550,7 +550,7 @@ class WalletManagerTest {
 
         assertTrue(models.contains("anthropic/claude-sonnet-4.5"))
         assertTrue(models.contains("anthropic/claude-opus-4.5"))
-        assertTrue(models.contains("anthropic/claude-haiku-4.5"))
+        assertTrue(models.contains("openai/gpt-4o"))
     }
 
     @Test
@@ -559,7 +559,7 @@ class WalletManagerTest {
 
         assertTrue(models.contains("gpt-4o"))
         assertTrue(models.contains("gpt-4o-mini"))
-        assertTrue(models.contains("o1"))
+        assertFalse(models.contains("o1"))
     }
 
     @Test
@@ -568,7 +568,7 @@ class WalletManagerTest {
 
         // Model floor: only Sonnet-tier and above
         assertTrue(models.contains("claude-sonnet-4-5-20250929"))
-        assertFalse("Haiku should not be in action models (below floor)", models.contains("claude-haiku-4-5-20251001"))
+        assertFalse("Haiku should not be in action models (below floor)", models.contains("claude-haiku-3-5-20241022"))
         models.forEach { assertTrue("$it should be above floor", ModelConfig.isModelAboveFloor(Provider.ANTHROPIC, it)) }
     }
 

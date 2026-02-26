@@ -316,6 +316,10 @@ cargo install cargo-husky
 cargo fmt --check && \
 cargo clippy --workspace --all-targets -- -D warnings && \
 cargo test --workspace
+
+# Run Android sensor timeout/concurrency CI-targeted suites
+# Subshell keeps the repo root shell unchanged while running Gradle from android/.
+(cd android && ./gradlew :core:phoneAgentApiSensorCiTest :chat:androidSensorProviderCiTest)
 ```
 
 ---

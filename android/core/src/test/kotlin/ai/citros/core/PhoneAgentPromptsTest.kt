@@ -88,6 +88,14 @@ class PhoneAgentPromptsTest {
     }
 
     @Test
+    fun `strategy section reinforces multi-step completion and keyboard continuation`() {
+        assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "Repeat until the user's full goal is done")
+        assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "not complete after just opening an app")
+        assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "keyboard appears")
+        assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "not an app switch")
+    }
+
+    @Test
     fun `buildSystemPrompt always includes recovery section`() {
         val prompt = PhoneAgentPrompts.buildSystemPrompt(phoneControlAvailable = true)
         assertContains(prompt, "## When Things Go Wrong")
@@ -253,6 +261,7 @@ class PhoneAgentPromptsTest {
         assertContains(prompt, "Element IDs")
         assertContains(prompt, "type_text does NOT submit")
         assertContains(prompt, "screen hasn't changed")
+        assertContains(prompt, "Keyboard appearing in the same app")
         assertContains(prompt, "text only")
     }
 
@@ -428,4 +437,69 @@ class PhoneAgentPromptsTest {
         assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "Only navigate to a notes app when the user explicitly requests a specific app")
         assertContains(PhoneAgentPrompts.SECTION_STRATEGY, "open Google Keep and create a note")
     }
+}
+
+// ── Sensor Context Tests ────────────────────────────────────────
+
+class PhoneAgentPromptsSensorContextTest {
+
+    @Test
+    fun `buildSystemPrompt without sensorContext has no regression`() {
+        val prompt = PhoneAgentPrompts.buildSystemPrompt()
+        assertFalse(prompt.contains("Device:"))
+        assertFalse(prompt.contains("Device Awareness"))
+        assertTrue(prompt.contains("Runtime:"))
+    }
+
+    @Test
+    fun `buildSystemPrompt with sensorContext includes sensor line in runtime and device awareness`() {
+        val ctx = SensorContext(batteryPercent = 72, networkType = NetworkType.WIFI)
+        val prompt = PhoneAgentPrompts.buildSystemPrompt(sensorContext = ctx)
+        assertTrue(prompt.contains("Device: battery=72% | wifi"))
+        assertTrue(prompt.contains("Runtime:"))
+        val runtimeLine = prompt.lineSequence().firstOrNull { it.startsWith("Runtime:") } ?: ""
+        assertTrue(runtimeLine.contains("Device: battery=72% | wifi"))
+    }
+
+    @Test
+    fun `buildSystemPrompt with all-null sensorContext has no sensor line`() {
+        val prompt = PhoneAgentPrompts.buildSystemPrompt(sensorContext = SensorContext())
+        assertFalse(prompt.contains("Device:"))
+        assertTrue(prompt.contains("Runtime:"))
+    }
+
+    @Test
+    fun `buildSystemPrompt includes sensor age metadata marker`() {
+        val ctx = SensorContext(
+            batteryPercent = 42,
+            localTime = java.time.ZonedDateTime.now(java.time.ZoneOffset.UTC).minusMinutes(3)
+        )
+        val prompt = PhoneAgentPrompts.buildSystemPrompt(sensorContext = ctx)
+        assertTrue(prompt.contains("sensor_age_sec="))
+    }
+
+    @Test
+    fun `buildSystemPrompt with sensorContext includes device awareness section`() {
+        val ctx = SensorContext(batteryPercent = 10, networkType = NetworkType.OFFLINE)
+        val prompt = PhoneAgentPrompts.buildSystemPrompt(sensorContext = ctx)
+        assertTrue(prompt.contains("Device Awareness"))
+        assertTrue(prompt.contains("below 15%"))
+        assertTrue(prompt.contains("offline"))
+    }
+
+    @Test
+    fun `buildActionPrompt includes runtime sensor metadata when sensorContext is provided`() {
+        val prompt = PhoneAgentPrompts.buildActionPrompt(
+            sensorContext = SensorContext(
+                batteryPercent = 42,
+                networkType = NetworkType.WIFI,
+                localTime = java.time.ZonedDateTime.now(java.time.ZoneOffset.UTC).minusSeconds(30)
+            )
+        )
+        assertTrue(prompt.contains("Runtime:"))
+        assertTrue(prompt.contains("Device: battery=42% | wifi"))
+        assertTrue(prompt.contains("sensor_age_sec="))
+        assertFalse(prompt.contains("## Device Awareness"))
+    }
+
 }

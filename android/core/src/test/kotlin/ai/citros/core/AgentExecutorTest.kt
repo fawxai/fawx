@@ -4,6 +4,7 @@ import kotlinx.coroutines.test.runTest
 import org.junit.Before
 import org.junit.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
 import kotlin.test.assertTrue
@@ -57,6 +58,251 @@ class AgentExecutorTest {
         assertEquals("Done!", result.text)
         assertEquals(1, result.steps)
         assertEquals("end_turn", result.exitReason)
+    }
+
+    @Test
+    fun `side-effect completion claim without evidence is rewritten to not completed`() = runTest {
+        val executor = AgentExecutor(
+            mockDelegate,
+            mockListener,
+            actionPolicy = PermissiveActionPolicy
+        )
+        val initialResponse = ChatResponse(
+            text = null,
+            toolCalls = listOf(ToolCall("t1", "open_app", mapOf("app_name" to "Gmail"))),
+            stopReason = "tool_use"
+        )
+
+        val result = executor.run(initialResponse, null, { false }) {
+            ChatResponse(
+                text = "I sent the email to Sam.",
+                toolCalls = emptyList(),
+                stopReason = "end_turn"
+            )
+        }
+
+        assertIs<LoopResult.Completed>(result)
+        val text = result.text.orEmpty()
+        assertTrue(text.startsWith("NOT_COMPLETED:"))
+        assertTrue(text.contains("email sending"))
+    }
+
+    @Test
+    fun `side-effect completion claim with execution evidence is allowed`() = runTest {
+        mockDelegate.onExecute = { toolCall, _ ->
+            when (toolCall.name) {
+                "tap_text" -> ToolResult("Tapped \"Send\"")
+                else -> ToolResult("Success")
+            }
+        }
+
+        val executor = AgentExecutor(
+            mockDelegate,
+            mockListener,
+            actionPolicy = PermissiveActionPolicy
+        )
+        val initialResponse = ChatResponse(
+            text = null,
+            toolCalls = listOf(ToolCall("t1", "tap_text", mapOf("text" to "Send"))),
+            stopReason = "tool_use"
+        )
+
+        val result = executor.run(initialResponse, null, { false }) {
+            ChatResponse(
+                text = "I sent the email to Sam.",
+                toolCalls = emptyList(),
+                stopReason = "end_turn"
+            )
+        }
+
+        assertIs<LoopResult.Completed>(result)
+        assertEquals("I sent the email to Sam.", result.text)
+    }
+
+    @Test
+    fun `non-side-effect informational text is not rewritten`() = runTest {
+        val executor = AgentExecutor(
+            mockDelegate,
+            mockListener,
+            actionPolicy = PermissiveActionPolicy
+        )
+        val initialResponse = ChatResponse(
+            text = null,
+            toolCalls = listOf(ToolCall("t1", "read_screen", emptyMap())),
+            stopReason = "tool_use"
+        )
+
+        val result = executor.run(initialResponse, null, { false }) {
+            ChatResponse(
+                text = "Gmail uses a paper-plane icon for sending mail.",
+                toolCalls = emptyList(),
+                stopReason = "end_turn"
+            )
+        }
+
+        assertIs<LoopResult.Completed>(result)
+        assertEquals("Gmail uses a paper-plane icon for sending mail.", result.text)
+    }
+
+    @Test
+    fun `booking completion claim with execution evidence is allowed`() = runTest {
+        mockDelegate.onExecute = { toolCall, _ ->
+            when (toolCall.name) {
+                "tap_text" -> ToolResult("Tapped \"Book now\"")
+                else -> ToolResult("Success")
+            }
+        }
+
+        val executor = AgentExecutor(
+            mockDelegate,
+            mockListener,
+            actionPolicy = PermissiveActionPolicy
+        )
+        val initialResponse = ChatResponse(
+            text = null,
+            toolCalls = listOf(ToolCall("t1", "tap_text", mapOf("text" to "Book now"))),
+            stopReason = "tool_use"
+        )
+
+        val result = executor.run(initialResponse, null, { false }) {
+            ChatResponse(
+                text = "I booked the flight to Denver.",
+                toolCalls = emptyList(),
+                stopReason = "end_turn"
+            )
+        }
+
+        assertIs<LoopResult.Completed>(result)
+        assertEquals("I booked the flight to Denver.", result.text)
+    }
+
+    @Test
+    fun `scheduling completion claim with execution evidence is allowed`() = runTest {
+        mockDelegate.onExecute = { toolCall, _ ->
+            when (toolCall.name) {
+                "tap_text" -> ToolResult("Tapped \"Schedule\"")
+                else -> ToolResult("Success")
+            }
+        }
+
+        val executor = AgentExecutor(
+            mockDelegate,
+            mockListener,
+            actionPolicy = PermissiveActionPolicy
+        )
+        val initialResponse = ChatResponse(
+            text = null,
+            toolCalls = listOf(ToolCall("t1", "tap_text", mapOf("text" to "Schedule"))),
+            stopReason = "tool_use"
+        )
+
+        val result = executor.run(initialResponse, null, { false }) {
+            ChatResponse(
+                text = "I scheduled the meeting for tomorrow.",
+                toolCalls = emptyList(),
+                stopReason = "end_turn"
+            )
+        }
+
+        assertIs<LoopResult.Completed>(result)
+        assertEquals("I scheduled the meeting for tomorrow.", result.text)
+    }
+
+    @Test
+    fun `mixed side-effect claims only rewrite the unsupported claim`() = runTest {
+        mockDelegate.onExecute = { toolCall, _ ->
+            when (toolCall.name) {
+                "tap_text" -> ToolResult("Tapped \"Send\"")
+                else -> ToolResult("Success")
+            }
+        }
+
+        val executor = AgentExecutor(
+            mockDelegate,
+            mockListener,
+            actionPolicy = PermissiveActionPolicy
+        )
+        val initialResponse = ChatResponse(
+            text = null,
+            toolCalls = listOf(ToolCall("t1", "tap_text", mapOf("text" to "Send"))),
+            stopReason = "tool_use"
+        )
+
+        val result = executor.run(initialResponse, null, { false }) {
+            ChatResponse(
+                text = "I sent the email to Sam. I booked the flight to Denver.",
+                toolCalls = emptyList(),
+                stopReason = "end_turn"
+            )
+        }
+
+        assertIs<LoopResult.Completed>(result)
+        val rewritten = result.text.orEmpty()
+        assertTrue(rewritten.startsWith("NOT_COMPLETED:"))
+        assertTrue(rewritten.contains("booking"))
+        assertFalse(rewritten.contains("email sending"))
+        assertTrue(rewritten.contains("I sent the email to Sam."))
+    }
+
+    @Test
+    fun `passive read_screen output cannot satisfy side-effect evidence`() = runTest {
+        mockDelegate.onExecute = { toolCall, _ ->
+            when (toolCall.name) {
+                "read_screen" -> ToolResult("SCREEN: Gmail Sent folder (42).")
+                else -> ToolResult("Success")
+            }
+        }
+
+        val executor = AgentExecutor(
+            mockDelegate,
+            mockListener,
+            actionPolicy = PermissiveActionPolicy
+        )
+        val initialResponse = ChatResponse(
+            text = null,
+            toolCalls = listOf(ToolCall("t1", "read_screen", emptyMap())),
+            stopReason = "tool_use"
+        )
+        val initialScreen = ScreenContent(elements = emptyList(), packageName = "com.google.android.gm")
+
+        val result = executor.run(initialResponse, initialScreen, { false }) {
+            ChatResponse(
+                text = "I sent the email to Sam.",
+                toolCalls = emptyList(),
+                stopReason = "end_turn"
+            )
+        }
+
+        assertIs<LoopResult.Completed>(result)
+        val rewritten = result.text.orEmpty()
+        assertTrue(rewritten.startsWith("NOT_COMPLETED:"))
+        assertTrue(rewritten.contains("email sending"))
+    }
+
+    @Test
+    fun `negated side-effect text is not rewritten`() = runTest {
+        val executor = AgentExecutor(
+            mockDelegate,
+            mockListener,
+            actionPolicy = PermissiveActionPolicy
+        )
+        val initialResponse = ChatResponse(
+            text = null,
+            toolCalls = listOf(ToolCall("t1", "read_screen", emptyMap())),
+            stopReason = "tool_use"
+        )
+
+        val finalText = "I have not sent the email yet. I still need to tap Send."
+        val result = executor.run(initialResponse, null, { false }) {
+            ChatResponse(
+                text = finalText,
+                toolCalls = emptyList(),
+                stopReason = "end_turn"
+            )
+        }
+
+        assertIs<LoopResult.Completed>(result)
+        assertEquals(finalText, result.text)
     }
 
     @Test
@@ -233,6 +479,83 @@ class AgentExecutorTest {
         assertIs<LoopResult.Completed>(result)
         assertEquals("end_turn", result.exitReason)
         assertTrue(mockDelegate.toolResults.any { it.second.contains("Error: Crash!") })
+    }
+
+    @Test
+    fun `private read_screen result progresses to blind action without repeated read retries`() = runTest {
+        mockDelegate.onExecute = { toolCall, _ ->
+            when (toolCall.name) {
+                "read_screen" -> ToolResult("Screen refreshed:\nSCREEN: [Privacy mode — screen content hidden for private_app. Ask the user for guidance if needed.]", isError = true)
+                "press_back" -> ToolResult("Pressed back")
+                else -> ToolResult("Unexpected tool ${toolCall.name}", isError = true)
+            }
+        }
+
+        val executor = AgentExecutor(mockDelegate, mockListener)
+        val initialResponse = ChatResponse(
+            text = null,
+            toolCalls = listOf(ToolCall("t1", "read_screen", emptyMap())),
+            stopReason = "tool_use"
+        )
+        var continueCalls = 0
+
+        val result = executor.run(initialResponse, null, { false }) {
+            continueCalls++
+            if (continueCalls == 1) {
+                ChatResponse(
+                    text = null,
+                    toolCalls = listOf(ToolCall("t2", "press_back", emptyMap())),
+                    stopReason = "tool_use"
+                )
+            } else {
+                ChatResponse(text = "Recovered with blind action", toolCalls = emptyList(), stopReason = "end_turn")
+            }
+        }
+
+        assertIs<LoopResult.Completed>(result)
+        assertEquals("end_turn", result.exitReason)
+        assertEquals(listOf("read_screen", "press_back"), mockListener.toolResults.map { it.first })
+        assertEquals(1, mockListener.toolResults.count { it.first == "read_screen" })
+        assertTrue(mockDelegate.toolResults.first().second.contains("private_app"))
+        assertFalse(mockDelegate.toolResults.first().second.contains("com.bank.app"))
+    }
+
+    @Test
+    fun `private screenshot block progresses to blind action without repeated screenshot retries`() = runTest {
+        mockDelegate.onExecute = { toolCall, _ ->
+            when (toolCall.name) {
+                "screenshot" -> ToolResult("Failed: screenshot: blocked by privacy mode for private_app", isError = true)
+                "press_home" -> ToolResult("Pressed home")
+                else -> ToolResult("Unexpected tool ${toolCall.name}", isError = true)
+            }
+        }
+
+        val executor = AgentExecutor(mockDelegate, mockListener)
+        val initialResponse = ChatResponse(
+            text = null,
+            toolCalls = listOf(ToolCall("t1", "screenshot", emptyMap())),
+            stopReason = "tool_use"
+        )
+        var continueCalls = 0
+
+        val result = executor.run(initialResponse, null, { false }) {
+            continueCalls++
+            if (continueCalls == 1) {
+                ChatResponse(
+                    text = null,
+                    toolCalls = listOf(ToolCall("t2", "press_home", emptyMap())),
+                    stopReason = "tool_use"
+                )
+            } else {
+                ChatResponse(text = "Used blind fallback", toolCalls = emptyList(), stopReason = "end_turn")
+            }
+        }
+
+        assertIs<LoopResult.Completed>(result)
+        assertEquals("end_turn", result.exitReason)
+        assertEquals(listOf("screenshot", "press_home"), mockListener.toolResults.map { it.first })
+        assertEquals(1, mockListener.toolResults.count { it.first == "screenshot" })
+        assertTrue(mockDelegate.toolResults.first().second.contains("private_app"))
     }
 
     @Test
@@ -558,35 +881,46 @@ class AgentExecutorTest {
     }
 
     @Test
-    fun `default boundary checks are in priority order`() {
-        val defaults = AgentExecutor.defaultBoundaryChecks()
+    fun `default boundary checks are in priority order with interruption checks disabled`() {
+        val original = FeatureFlags.userInterruptionCheckEnabled
+        try {
+            FeatureFlags.userInterruptionCheckEnabled = false
+            val defaults = AgentExecutor.defaultBoundaryChecks()
 
-        assertEquals(6, defaults.size)
-        assertIs<CancellationCheck>(defaults[0], "Cancellation should be first (highest priority)")
-        assertIs<StepLimitCheck>(defaults[1], "Step limit should be second")
-        assertIs<StuckDetectionCheck>(defaults[2], "Stuck detection should be third")
-        assertIs<ActionVerificationCheck>(defaults[3], "Action verification should be fourth")
-        assertIs<UserInterruptionCheck>(defaults[4], "User interruption should be fifth")
-        assertIs<SteerCheck>(defaults[5], "Steer should be last (user intent after all gates)")
+            assertEquals(5, defaults.size)
+            assertIs<CancellationCheck>(defaults[0], "Cancellation should be first (highest priority)")
+            assertIs<StepLimitCheck>(defaults[1], "Step limit should be second")
+            assertIs<StuckDetectionCheck>(defaults[2], "Stuck detection should be third")
+            assertIs<ActionVerificationCheck>(defaults[3], "Action verification should be fourth")
+            assertIs<SteerCheck>(defaults[4], "Steer should be last (user intent after all gates)")
+        } finally {
+            FeatureFlags.userInterruptionCheckEnabled = original
+        }
     }
 
     @Test
-    fun `defaultBoundaryChecksWithAccessibility includes AccessibilityGateCheck`() {
-        val checks = AgentExecutor.defaultBoundaryChecksWithAccessibility(
-            isAvailable = { true },
-            waitForReconnect = { true },
-            onReconnected = {},
-            onLost = {}
-        )
+    fun `defaultBoundaryChecksWithAccessibility includes AccessibilityGateCheck and optional interruption check`() {
+        val original = FeatureFlags.userInterruptionCheckEnabled
+        try {
+            FeatureFlags.userInterruptionCheckEnabled = true
+            val checks = AgentExecutor.defaultBoundaryChecksWithAccessibility(
+                isAvailable = { true },
+                waitForReconnect = { true },
+                onReconnected = {},
+                onLost = {}
+            )
 
-        assertEquals(7, checks.size)
-        assertIs<CancellationCheck>(checks[0], "Cancellation should be first")
-        assertIs<AccessibilityGateCheck>(checks[1], "Accessibility gate should be second")
-        assertIs<StepLimitCheck>(checks[2], "Step limit should be third")
-        assertIs<StuckDetectionCheck>(checks[3], "Stuck detection should be fourth")
-        assertIs<ActionVerificationCheck>(checks[4], "Action verification should be fifth")
-        assertIs<UserInterruptionCheck>(checks[5], "User interruption should be sixth")
-        assertIs<SteerCheck>(checks[6], "Steer should be last")
+            assertEquals(7, checks.size)
+            assertIs<CancellationCheck>(checks[0], "Cancellation should be first")
+            assertIs<AccessibilityGateCheck>(checks[1], "Accessibility gate should be second")
+            assertIs<StepLimitCheck>(checks[2], "Step limit should be third")
+            assertIs<StuckDetectionCheck>(checks[3], "Stuck detection should be fourth")
+            assertIs<ActionVerificationCheck>(checks[4], "Action verification should be fifth")
+            assertIs<UserInterruptionCheck>(checks[5], "User interruption should be sixth")
+            assertIs<SteerCheck>(checks[6], "Steer should be last")
+        } finally {
+            FeatureFlags.userInterruptionCheckEnabled = original
+        }
     }
 
 
@@ -1181,6 +1515,72 @@ class AgentExecutorTest {
             }
         }
     }
+
+
+    @Test
+    fun `checkpoint callback fires after each tool boundary`() = runTest {
+        val checkpoints = mutableListOf<LoopCheckpoint>()
+        val executor = AgentExecutor(
+            mockDelegate,
+            mockListener,
+            checkpointCallback = { checkpoints.add(it) }
+        )
+        val response = ChatResponse(
+            text = null,
+            toolCalls = listOf(
+                ToolCall("t1", "press_back", emptyMap()),
+                ToolCall("t2", "press_home", emptyMap())
+            ),
+            stopReason = "tool_use"
+        )
+
+        executor.run(response, null, { false }) {
+            ChatResponse(text = "Done", toolCalls = emptyList(), stopReason = "end_turn")
+        }
+
+        assertEquals(2, checkpoints.size)
+        assertEquals("press_back", checkpoints[0].lastToolName)
+        assertEquals(1, checkpoints[0].pendingToolCalls.size)
+        assertEquals("press_home", checkpoints[1].lastToolName)
+        assertEquals(0, checkpoints[1].pendingToolCalls.size)
+    }
+
+    @Test
+    fun `steer branch emits one checkpoint for executed tool`() = runTest {
+        val checkpoints = mutableListOf<LoopCheckpoint>()
+        val steerCheck = object : BoundaryCheck {
+            override suspend fun check(state: LoopState): CheckResult {
+                return if (state.lastToolName == "press_back") {
+                    CheckResult.Steer(listOf("new direction"))
+                } else {
+                    CheckResult.Continue
+                }
+            }
+        }
+        val executor = AgentExecutor(
+            mockDelegate,
+            mockListener,
+            boundaryChecks = listOf(steerCheck),
+            checkpointCallback = { checkpoints.add(it) }
+        )
+        val response = ChatResponse(
+            text = null,
+            toolCalls = listOf(
+                ToolCall("t1", "press_back", emptyMap()),
+                ToolCall("t2", "press_home", emptyMap())
+            ),
+            stopReason = "tool_use"
+        )
+
+        executor.run(response, null, { false }) {
+            ChatResponse(text = "Done", toolCalls = emptyList(), stopReason = "end_turn")
+        }
+
+        assertEquals(1, checkpoints.size)
+        assertEquals("press_back", checkpoints.single().lastToolName)
+        assertEquals(0, checkpoints.single().pendingToolCalls.size)
+    }
+
 
     // ====== Mocks ======
 

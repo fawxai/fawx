@@ -1,30 +1,57 @@
 package ai.citros.chat
 
+import ai.citros.core.ActionPolicy
+import ai.citros.test.Flaky
+import ai.citros.test.FlakyTestRule
+import ai.citros.core.AgentExecutor
 import ai.citros.core.AgentFileManager
 import ai.citros.core.ChatResponse
 import ai.citros.core.ErrorSeverity
+import ai.citros.core.DefaultActionPolicy
+import ai.citros.core.FeatureFlags
+import ai.citros.core.InterruptionEvent
+import ai.citros.core.LoopProgressListener
 import ai.citros.core.MemoryFilter
 import ai.citros.core.MemoryMetadata
 import ai.citros.core.MemoryProvider
 import ai.citros.core.MemoryResult
 import ai.citros.core.Message
+import ai.citros.core.ModelCatalog
+import ai.citros.core.ModelConfig
+import ai.citros.core.ModelTier
+import ai.citros.core.InputType
+import ai.citros.core.PillAction
+import ai.citros.core.PermissiveActionPolicy
+import ai.citros.core.PolicyReasonCode
 import ai.citros.core.Provider
 import ai.citros.core.ProviderClient
+import ai.citros.core.ProviderConfig
 import ai.citros.core.ProviderException
 import ai.citros.core.ScreenContent
 import ai.citros.core.ScreenElement
+import ai.citros.core.SensorContext
+import ai.citros.core.SensorProvider
 import ai.citros.core.Tool
 import ai.citros.core.ToolCall
+import ai.citros.core.ToolErrorCode
+import ai.citros.core.ToolExecutionDelegate
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import kotlinx.coroutines.test.resetMain
 import org.junit.After
 import org.junit.Before
+import org.junit.Rule
 import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
@@ -32,9 +59,23 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import ai.citros.core.OutputVerbosity
+import ai.citros.chat.onboarding.AccessibilitySetupHelper
+import ai.citros.chat.onboarding.AvailableModel
+import ai.citros.chat.onboarding.ModelFetcher
+import ai.citros.chat.onboarding.ModelRecommender
+import ai.citros.chat.onboarding.OnboardingAction
+import ai.citros.chat.onboarding.OnboardingManager
+import ai.citros.chat.onboarding.OnboardingStep
+import ai.citros.chat.onboarding.SuggestedTask
+import androidx.test.core.app.ApplicationProvider
 
+@RunWith(RobolectricTestRunner::class)
 @OptIn(ExperimentalCoroutinesApi::class)
 class ChatViewModelTest {
+
+    @Rule
+    @JvmField
+    val flakyTestRule = FlakyTestRule()
 
     private lateinit var viewModel: ChatViewModel
     private val testDispatcher = StandardTestDispatcher()
@@ -42,6 +83,7 @@ class ChatViewModelTest {
     @Before
     fun setup() {
         Dispatchers.setMain(testDispatcher)
+        ChatStateCache.clear()
         viewModel = ChatViewModel()
         viewModel.outputVerbosity = OutputVerbosity.VERBOSE
     }
@@ -50,6 +92,8 @@ class ChatViewModelTest {
     fun tearDown() {
         ai.citros.core.ScreenReader.toolLoopOverlayHideHook = null
         ai.citros.core.ScreenReader.toolLoopOverlayRestoreHook = null
+        ModelCatalog.clearCache()
+        ChatStateCache.clear()
         Dispatchers.resetMain()
     }
 
@@ -103,6 +147,155 @@ class ChatViewModelTest {
     }
 
     @Test
+    fun `setupOnboarding activates onboarding and emits first message`() = runTest {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val prefs = context.getSharedPreferences("chat_vm_onboarding_a", android.content.Context.MODE_PRIVATE)
+        prefs.edit().clear().commit()
+
+        viewModel.setupOnboarding(
+            onboardingManager = OnboardingManager(prefs),
+            modelRecommender = ModelRecommender(),
+            accessibilityHelper = AccessibilitySetupHelper(context)
+        )
+
+        assertTrue(viewModel.onboardingActive.value)
+        assertNotNull(viewModel.onboardingMessage.value)
+        assertTrue(viewModel.messages.any { it.content.contains("Citros") })
+    }
+
+    @Test
+    fun `setupOnboarding wires runtime onboarding metrics tracking`() = runTest {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        context
+            .getSharedPreferences("onboarding_metrics", android.content.Context.MODE_PRIVATE)
+            .edit()
+            .clear()
+            .commit()
+
+        val onboardingStatePrefs = context.getSharedPreferences(
+            "chat_vm_onboarding_metrics_state",
+            android.content.Context.MODE_PRIVATE
+        )
+        onboardingStatePrefs.edit().clear().commit()
+
+        viewModel.setupOnboarding(
+            onboardingManager = OnboardingManager(onboardingStatePrefs),
+            modelRecommender = ModelRecommender(),
+            accessibilityHelper = AccessibilitySetupHelper(context)
+        )
+
+        val metricsJson = context
+            .getSharedPreferences("onboarding_metrics", android.content.Context.MODE_PRIVATE)
+            .getString("onboarding_metrics", null)
+
+        assertNotNull(metricsJson)
+        assertTrue(metricsJson!!.contains("WELCOME"))
+    }
+
+    @Test
+    fun `setupOnboarding wires first-task callback to dispatch through sendMessage`() = runTest {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val prefs = context.getSharedPreferences("chat_vm_onboarding_first_task_callback", android.content.Context.MODE_PRIVATE)
+        prefs.edit().clear().commit()
+
+        viewModel.setupOnboarding(
+            onboardingManager = OnboardingManager(prefs),
+            modelRecommender = ModelRecommender(),
+            accessibilityHelper = AccessibilitySetupHelper(context)
+        )
+
+        val task = SuggestedTask(text = "open gmail and draft a check-in", emoji = "✉️")
+        val callback = viewModel.onboardingIntegration?.onFirstTaskSelected
+        assertNotNull(callback)
+
+        callback.invoke(task)
+        advanceUntilIdle()
+
+        assertTrue(viewModel.messages.any { it.role == "user" && it.content == task.text })
+        assertFalse(viewModel.onboardingFirstTaskPending)
+    }
+
+    @Test
+    fun `onOnboardingPillTapped advances onboarding and updates onboardingMessage`() = runTest {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val prefs = context.getSharedPreferences("chat_vm_onboarding_b", android.content.Context.MODE_PRIVATE)
+        prefs.edit().clear().commit()
+
+        viewModel.setupOnboarding(OnboardingManager(prefs), ModelRecommender(), AccessibilitySetupHelper(context))
+        viewModel.onOnboardingPillTapped(OnboardingAction.CONTINUE)
+
+        assertEquals(OnboardingStep.API_KEY_CHOICE.name, prefs.getString("onboarding_step", null))
+        assertNotNull(viewModel.onboardingMessage.value)
+        assertTrue(viewModel.onboardingMessage.value!!.text.contains("API key"))
+    }
+
+    @Test
+    fun `onOnboardingApiKeyValidated triggers recommendation and onboarding complete resets active`() = runTest {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val prefs = context.getSharedPreferences("chat_vm_onboarding_c", android.content.Context.MODE_PRIVATE)
+        prefs.edit().clear().commit()
+
+        val recommender = ModelRecommender(object : ModelFetcher {
+            override suspend fun fetchAvailableModels(provider: Provider, apiKey: String): List<AvailableModel> {
+                return listOf(AvailableModel("claude-sonnet-4-5-latest", "Claude Sonnet 4.5"))
+            }
+        })
+
+        viewModel.setupOnboarding(OnboardingManager(prefs), recommender, AccessibilitySetupHelper(context))
+        viewModel.onOnboardingPillTapped(OnboardingAction.CONTINUE)
+        viewModel.onOnboardingPillTapped(OnboardingAction.I_HAVE_KEY)
+
+        viewModel.onOnboardingApiKeyValidated(Provider.ANTHROPIC, "sk-ant-test")
+        advanceUntilIdle()
+        assertTrue(viewModel.messages.any { it.content.contains("recommend") })
+
+        viewModel.onOnboardingPillTapped(OnboardingAction.USE_RECOMMENDED_MODEL)
+        viewModel.onOnboardingPillTapped(OnboardingAction.SKIP_ACCESSIBILITY)
+
+        val firstTaskAction = viewModel.onboardingMessage.value?.pills?.firstOrNull()?.action
+        assertTrue(firstTaskAction is OnboardingAction.FIRST_TASK_SELECTED)
+        viewModel.onOnboardingPillTapped(firstTaskAction)
+        advanceUntilIdle()
+
+        assertFalse(viewModel.onboardingFirstTaskPending)
+        assertFalse(viewModel.onboardingActive.value)
+        assertNull(viewModel.onboardingMessage.value)
+    }
+
+
+    @Test
+    fun `restores chat state from process cache after ViewModel recreation`() = runTest {
+        viewModel.messages.add(Message(role = "user", content = "hello"))
+        viewModel.messages.add(Message(role = "assistant", content = "hi"))
+        viewModel.currentToolStatus.value = "Opening app..."
+        viewModel.unreadCount.intValue = 2
+        viewModel.setQueuedMessage("follow up")
+        viewModel.lastActivityTimestamp = 1234L
+        advanceUntilIdle()
+
+        val recreated = ChatViewModel()
+        advanceUntilIdle()
+
+        assertEquals(viewModel.messages.toList(), recreated.messages.toList())
+        assertEquals("Opening app...", recreated.currentToolStatus.value)
+        assertEquals(2, recreated.unreadCount.intValue)
+        assertEquals("follow up", recreated.queuedMessage.value)
+        assertEquals(1234L, recreated.lastActivityTimestamp)
+    }
+
+    @Test
+    fun `new ChatViewModel with empty cache starts with default state`() = runTest {
+        ChatStateCache.clear()
+
+        val fresh = ChatViewModel()
+        advanceUntilIdle()
+
+        assertTrue(fresh.messages.isEmpty())
+        assertNull(fresh.currentToolStatus.value)
+        assertEquals(0, fresh.unreadCount.intValue)
+    }
+
+    @Test
     fun `sendMessage action loop starts on tool_use and ends on final text`() = runTest {
         val scripted = ScriptedProviderClient(
             provider = Provider.ANTHROPIC,
@@ -131,9 +324,10 @@ class ChatViewModelTest {
         advanceUntilIdle()
 
         assertFalse(viewModel.isLoading.value)
-        assertTrue(viewModel.messages.any { it.content.contains("🤖") })
+        // outputVerbosity is VERBOSE in this suite, so mechanical tool outputs are surfaced
+        assertTrue(viewModel.messages.any { it.content.startsWith("⚙️") || it.content.startsWith("🤖") })
         assertTrue(viewModel.messages.last().content.contains("Done"))
-        assertTrue(scripted.calls >= 2)
+        assertEquals(2, scripted.calls)
     }
 
     @Test
@@ -166,7 +360,8 @@ class ChatViewModelTest {
         viewModel.sendMessage("tap two things")
         advanceUntilIdle()
 
-        val toolResultMessages = viewModel.messages.filter { it.role == "assistant" && it.content.startsWith("🤖") }
+        val toolResultMessages = viewModel.messages.filter { it.role == "assistant" && (it.content.startsWith("🤖") || it.content.startsWith("⚙️")) }
+        // outputVerbosity is VERBOSE in this suite, so both mechanical tool outputs are shown
         assertEquals(2, toolResultMessages.size)
         assertTrue(viewModel.messages.last().content.contains("All set"))
     }
@@ -681,8 +876,8 @@ class ChatViewModelTest {
         advanceUntilIdle()
 
         assertFalse(viewModel.isLoading.value)
-        // Should have tool result from first call
-        assertTrue(viewModel.messages.any { it.content.startsWith("🤖") })
+        // First call produced tool_use, second follow-up threw provider exception
+        assertEquals(2, callCount.get())
         // Should have error from second call
         assertTrue(viewModel.messages.last().content.contains("Error") || 
                    viewModel.messages.last().content.contains("Internal server error"))
@@ -1003,6 +1198,164 @@ class ChatViewModelTest {
     }
 
     @Test
+    fun `setSensorProvider wires provider into built backends`() {
+        val sensorProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext = SensorContext(batteryPercent = 42)
+        }
+        viewModel.setSensorProvider(sensorProvider)
+
+        val keyStore = InMemoryKeyStore()
+        val storage = InMemoryWalletStorage()
+        val walletManager = ai.citros.core.WalletManager(storage, keyStore)
+
+        walletManager.addKey(Provider.OPENAI, "OpenAI Key", "sk-test-openai-key")
+        walletManager.setActiveKey(walletManager.loadOrDefault().keys.first().id)
+        viewModel.configureWithWallet(walletManager)
+
+        val backends = getPrivateField<List<Any>>("apiBackends")!!
+        val activeIndex = getPrivateField<Int>("activeApiBackendIndex")!!
+        val backend = backends[activeIndex]
+        val agentField = backend::class.java.getDeclaredField("agent")
+        agentField.isAccessible = true
+        val agent = agentField.get(backend)
+
+        val sensorField = agent::class.java.getDeclaredField("sensorProvider")
+        sensorField.isAccessible = true
+        assertTrue(
+            sensorField.get(agent) === sensorProvider,
+            "SensorProvider should be wired into PhoneAgentApi"
+        )
+    }
+
+    @Test
+    fun `setSensorProvider rebuilds configured api backends`() {
+        val keyStore = InMemoryKeyStore()
+        val storage = InMemoryWalletStorage()
+        val walletManager = ai.citros.core.WalletManager(storage, keyStore)
+
+        walletManager.addKey(Provider.OPENAI, "OpenAI Key", "sk-test-openai-key")
+        walletManager.setActiveKey(walletManager.loadOrDefault().keys.first().id)
+        viewModel.configureWithWallet(walletManager)
+
+        val backendsBefore = getPrivateField<List<Any>>("apiBackends")!!
+        val activeIndex = getPrivateField<Int>("activeApiBackendIndex")!!
+        val backendBefore = backendsBefore[activeIndex]
+
+        val sensorProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext = SensorContext(networkType = ai.citros.core.NetworkType.WIFI)
+        }
+        viewModel.setSensorProvider(sensorProvider)
+
+        val backendsAfter = getPrivateField<List<Any>>("apiBackends")!!
+        val backendAfter = backendsAfter[activeIndex]
+        assertNotEquals(
+            System.identityHashCode(backendBefore),
+            System.identityHashCode(backendAfter),
+            "Active backend should be rebuilt when sensor provider changes"
+        )
+
+        val agentField = backendAfter::class.java.getDeclaredField("agent")
+        agentField.isAccessible = true
+        val agent = agentField.get(backendAfter)
+        val sensorField = agent::class.java.getDeclaredField("sensorProvider")
+        sensorField.isAccessible = true
+        assertTrue(sensorField.get(agent) === sensorProvider)
+    }
+
+    @Test
+    fun `setSensorProvider with same instance avoids backend rebuild churn`() {
+        val keyStore = InMemoryKeyStore()
+        val storage = InMemoryWalletStorage()
+        val walletManager = ai.citros.core.WalletManager(storage, keyStore)
+
+        walletManager.addKey(Provider.OPENAI, "OpenAI Key", "sk-test-openai-key")
+        walletManager.setActiveKey(walletManager.loadOrDefault().keys.first().id)
+        viewModel.configureWithWallet(walletManager)
+
+        class TestSensorProvider : SensorProvider {
+            override suspend fun snapshot(): SensorContext = SensorContext(batteryPercent = 33)
+        }
+
+        val provider = TestSensorProvider()
+        viewModel.setSensorProvider(provider)
+        val backendsAfterFirstSet = getPrivateField<List<Any>>("apiBackends")!!
+        val activeIndex = getPrivateField<Int>("activeApiBackendIndex")!!
+        val backendAfterFirstSet = backendsAfterFirstSet[activeIndex]
+
+        viewModel.setSensorProvider(provider)
+        val backendsAfterSecondSet = getPrivateField<List<Any>>("apiBackends")!!
+        val backendAfterSecondSet = backendsAfterSecondSet[activeIndex]
+
+        assertEquals(
+            System.identityHashCode(backendAfterFirstSet),
+            System.identityHashCode(backendAfterSecondSet),
+            "Identical provider instance should not force backend list rebuild"
+        )
+        assertEquals(
+            System.identityHashCode(backendsAfterFirstSet),
+            System.identityHashCode(backendsAfterSecondSet),
+            "Backend list identity should remain stable when provider instance is unchanged"
+        )
+    }
+
+    @Test
+    fun `setSensorProvider with different instance of same class rebuilds backends`() {
+        val keyStore = InMemoryKeyStore()
+        val storage = InMemoryWalletStorage()
+        val walletManager = ai.citros.core.WalletManager(storage, keyStore)
+
+        walletManager.addKey(Provider.OPENAI, "OpenAI Key", "sk-test-openai-key")
+        walletManager.setActiveKey(walletManager.loadOrDefault().keys.first().id)
+        viewModel.configureWithWallet(walletManager)
+
+        class TestSensorProvider : SensorProvider {
+            override suspend fun snapshot(): SensorContext = SensorContext(batteryPercent = 33)
+        }
+
+        viewModel.setSensorProvider(TestSensorProvider())
+        val backendsAfterFirstSet = getPrivateField<List<Any>>("apiBackends")!!
+        val activeIndex = getPrivateField<Int>("activeApiBackendIndex")!!
+        val backendAfterFirstSet = backendsAfterFirstSet[activeIndex]
+
+        viewModel.setSensorProvider(TestSensorProvider())
+        val backendsAfterSecondSet = getPrivateField<List<Any>>("apiBackends")!!
+        val backendAfterSecondSet = backendsAfterSecondSet[activeIndex]
+
+        assertNotEquals(
+            System.identityHashCode(backendAfterFirstSet),
+            System.identityHashCode(backendAfterSecondSet),
+            "Different provider instances must rebuild backend even when class matches"
+        )
+    }
+
+    @Test
+    fun `setSensorProvider null disables provider and rebuilds backends`() {
+        val keyStore = InMemoryKeyStore()
+        val storage = InMemoryWalletStorage()
+        val walletManager = ai.citros.core.WalletManager(storage, keyStore)
+
+        walletManager.addKey(Provider.OPENAI, "OpenAI Key", "sk-test-openai-key")
+        walletManager.setActiveKey(walletManager.loadOrDefault().keys.first().id)
+
+        val sensorProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext = SensorContext(batteryPercent = 50)
+        }
+        viewModel.setSensorProvider(sensorProvider)
+        viewModel.configureWithWallet(walletManager)
+        viewModel.setSensorProvider(null)
+
+        val backends = getPrivateField<List<Any>>("apiBackends")!!
+        val activeIndex = getPrivateField<Int>("activeApiBackendIndex")!!
+        val backend = backends[activeIndex]
+        val agentField = backend::class.java.getDeclaredField("agent")
+        agentField.isAccessible = true
+        val agent = agentField.get(backend)
+        val sensorField = agent::class.java.getDeclaredField("sensorProvider")
+        sensorField.isAccessible = true
+        assertNull(sensorField.get(agent))
+    }
+
+    @Test
     fun `updateModelsFromWallet refreshes tracked chat and action models`() {
         val keyStore = InMemoryKeyStore()
         val storage = InMemoryWalletStorage()
@@ -1121,6 +1474,136 @@ class ChatViewModelTest {
             "Active backend should NOT be rebuilt when models are unchanged"
         )
         assertTrue(viewModel.isConfigured.value)
+    }
+
+    @Test
+    fun `configureWithWallet honors selected above-floor action model`() {
+        val keyStore = InMemoryKeyStore()
+        val storage = InMemoryWalletStorage()
+        val walletManager = ai.citros.core.WalletManager(storage, keyStore)
+
+        walletManager.addKey(Provider.OPENROUTER, "OpenRouter Key", "sk-or-test-key")
+        walletManager.setActiveKey(walletManager.loadOrDefault().keys.first().id)
+        walletManager.setChatModel("anthropic/claude-sonnet-4.5")
+        walletManager.setActionModel("anthropic/claude-opus-4.5")
+
+        viewModel.configureWithWallet(walletManager)
+
+        val backends = getPrivateField<List<Any>>("apiBackends")!!
+        val activeIdx = getPrivateField<Int>("activeApiBackendIndex")!!
+        val backend = backends[activeIdx]
+        val actionClientField = backend::class.java.getDeclaredField("actionClient")
+        actionClientField.isAccessible = true
+        val actionClient = actionClientField.get(backend) as ProviderClient
+
+        assertEquals("anthropic/claude-opus-4.5", actionClient.modelId)
+    }
+
+    @Test
+    fun `configureWithWallet falls back action model when below floor`() {
+        val keyStore = InMemoryKeyStore()
+        val storage = InMemoryWalletStorage()
+        val walletManager = ai.citros.core.WalletManager(storage, keyStore)
+
+        walletManager.addKey(Provider.OPENAI, "OpenAI Key", "sk-test-openai-key")
+        walletManager.setActiveKey(walletManager.loadOrDefault().keys.first().id)
+        walletManager.setActionModel("gpt-4o-mini")
+
+        viewModel.configureWithWallet(walletManager)
+
+        val backends = getPrivateField<List<Any>>("apiBackends")!!
+        val activeIdx = getPrivateField<Int>("activeApiBackendIndex")!!
+        val backend = backends[activeIdx]
+        val actionClientField = backend::class.java.getDeclaredField("actionClient")
+        actionClientField.isAccessible = true
+        val actionClient = actionClientField.get(backend) as ProviderClient
+
+        assertEquals(ai.citros.core.ModelConfig.OPENAI_ACTION_MODEL, actionClient.modelId)
+    }
+
+    @Test
+    fun `resolveRuntimeProviderConfig keeps allowed chat and action models`() {
+        ModelCatalog.clearCache()
+        ModelCatalog.setCachedModelsForTesting(
+            Provider.OPENAI,
+            listOf(
+                ModelCatalog.CachedModel("gpt-4o", null, ModelTier.STANDARD, Provider.OPENAI),
+                ModelCatalog.CachedModel("o3", null, ModelTier.FLAGSHIP, Provider.OPENAI)
+            )
+        )
+
+        val resolved = invokeResolveRuntimeProviderConfig(
+            ProviderConfig.openAi("sk-test").copy(chatModelId = "o3", actionModelId = "gpt-4o")
+        )
+        assertEquals("o3", resolved.chatModelId)
+        assertEquals("gpt-4o", resolved.actionModelId)
+    }
+
+    @Test
+    fun `resolveRuntimeProviderConfig falls back chat to default then first allowed`() {
+        ModelCatalog.clearCache()
+        ModelCatalog.setCachedModelsForTesting(
+            Provider.OPENAI,
+            listOf(ModelCatalog.CachedModel("o3", null, ModelTier.FLAGSHIP, Provider.OPENAI))
+        )
+
+        val resolved = invokeResolveRuntimeProviderConfig(
+            ProviderConfig.openAi("sk-test").copy(chatModelId = "unknown-chat", actionModelId = "gpt-4o")
+        )
+        assertEquals("gpt-4o", resolved.chatModelId)
+    }
+
+    @Test
+    fun `resolveRuntimeProviderConfig falls back action when below floor or missing`() {
+        ModelCatalog.clearCache()
+        ModelCatalog.setCachedModelsForTesting(
+            Provider.OPENAI,
+            listOf(
+                ModelCatalog.CachedModel("gpt-4o-mini", null, ModelTier.SMALL, Provider.OPENAI),
+                ModelCatalog.CachedModel("o3", null, ModelTier.FLAGSHIP, Provider.OPENAI)
+            )
+        )
+
+        val belowFloorResolved = invokeResolveRuntimeProviderConfig(
+            ProviderConfig.openAi("sk-test").copy(chatModelId = "o3", actionModelId = "gpt-4o-mini")
+        )
+        assertEquals("o3", belowFloorResolved.actionModelId)
+
+        val missingResolved = invokeResolveRuntimeProviderConfig(
+            ProviderConfig.openAi("sk-test").copy(chatModelId = "o3", actionModelId = "missing")
+        )
+        assertEquals("o3", missingResolved.actionModelId)
+    }
+
+    @Test
+    fun `resolveRuntimeProviderConfig preserves config when allowed lists are empty`() {
+        val original = ProviderConfig.openAi("sk-test").copy(
+            chatModelId = "custom-chat",
+            actionModelId = "custom-action"
+        )
+        val resolved = invokeResolveRuntimeProviderConfig(
+            config = original,
+            allowedChatModels = emptyList(),
+            allowedActionModels = emptyList()
+        )
+
+        assertEquals("custom-chat", resolved.chatModelId)
+        assertEquals("custom-action", resolved.actionModelId)
+    }
+
+    @Test
+    fun `resolveRuntimeProviderConfig uses static fallback when cache is cold`() {
+        ModelCatalog.clearCache()
+
+        val resolved = invokeResolveRuntimeProviderConfig(
+            ProviderConfig.openAi("sk-test").copy(
+                chatModelId = "brand-new-model",
+                actionModelId = "brand-new-action"
+            )
+        )
+
+        assertEquals(ModelConfig.defaultChatModel(Provider.OPENAI), resolved.chatModelId)
+        assertEquals(ModelConfig.defaultActionModel(Provider.OPENAI), resolved.actionModelId)
     }
 
     // ========== PR #622: model switch text-only seed ==========
@@ -1412,6 +1895,37 @@ class ChatViewModelTest {
         advanceUntilIdle()
 
         assertTrue(restoreCalled, "toolLoopOverlayRestoreHook should be invoked even on exception")
+    }
+
+    @Test
+    fun `tool loop exception path surfaces crash message and recovery pills`() = runTest {
+        val scripted = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            scripted = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = "I'll act",
+                        toolCalls = listOf(ToolCall("t1", "press_back", emptyMap())),
+                        stopReason = "tool_use"
+                    )
+                )
+            )
+        )
+        setApiModeWithBackends(
+            viewModel,
+            listOf(viewModel.createTestBackend(Provider.ANTHROPIC, scripted, scripted))
+        )
+
+        viewModel.agentExecutorFactory = { _, _, _, _, _, _, _ ->
+            throw RuntimeException("executor failed")
+        }
+
+        viewModel.sendMessage("press back")
+        advanceUntilIdle()
+
+        assertTrue(viewModel.messages.any { it.role == "assistant" && it.content.contains("💥 Crashed: executor failed") })
+        assertEquals(InputType.FREE_TEXT, viewModel.waitingInputType.value)
+        assertEquals(listOf("Try again", "Do something else", "Cancel"), viewModel.runtimeActionPills.value.map { it.label })
     }
 
     @Test
@@ -1744,6 +2258,21 @@ class ChatViewModelTest {
         return field.get(viewModel) as T?
     }
 
+    private fun invokeResolveRuntimeProviderConfig(
+        config: ProviderConfig,
+        allowedChatModels: List<String> = ModelConfig.runtimeChatModels(config.provider),
+        allowedActionModels: List<String> = ModelConfig.runtimeActionModels(config.provider)
+    ): ProviderConfig {
+        val method = ChatViewModel::class.java.getDeclaredMethod(
+            "resolveRuntimeProviderConfig",
+            ProviderConfig::class.java,
+            List::class.java,
+            List::class.java
+        )
+        method.isAccessible = true
+        return method.invoke(viewModel, config, allowedChatModels, allowedActionModels) as ProviderConfig
+    }
+
     private class ScriptedProviderClient(
         override val provider: Provider,
         private val scripted: ArrayDeque<ChatResponse>
@@ -1842,6 +2371,108 @@ class ChatViewModelTest {
         }
     }
 
+    @Test
+    fun `chat view model wiring uses permissive policy and allow-audit when flags enabled`() = runTest {
+        val scripted = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            scripted = PolicyWiringTestFixtures.toolLoopHappyPathResponses(
+                toolCall = ToolCall("t1", "open_app", mapOf("app_name" to "Gmail"))
+            )
+        )
+        val agent = ai.citros.core.PhoneAgentApi(scripted, scripted).also { it.phoneControlOverride = true }
+        val backend = viewModel.createTestBackend(Provider.ANTHROPIC, scripted, scripted, agent = agent)
+        setApiModeWithBackends(viewModel, listOf(backend))
+
+        var capturedPolicy: ActionPolicy? = null
+        var capturedAuditAllow: Boolean? = null
+        viewModel.agentExecutorFactory = { delegate: ToolExecutionDelegate,
+                                          progressListener: LoopProgressListener,
+                                          actionPolicy: ActionPolicy,
+                                          maxToolSteps: Int,
+                                          steerMessageSource: () -> List<String>,
+                                          auditAllowDecisions: Boolean,
+                                          interruptionSource: () -> InterruptionEvent? ->
+            capturedPolicy = actionPolicy
+            capturedAuditAllow = auditAllowDecisions
+            AgentExecutor(
+                delegate = delegate,
+                progressListener = progressListener,
+                actionPolicy = actionPolicy,
+                maxToolSteps = maxToolSteps,
+                steerMessageSource = steerMessageSource,
+                auditAllowDecisions = auditAllowDecisions,
+                interruptionSource = interruptionSource
+            )
+        }
+
+        val originalPolicyFlag = FeatureFlags.actionPolicyEnabled
+        val originalAuditFlag = FeatureFlags.actionPolicyAuditAllowDecisions
+        try {
+            FeatureFlags.actionPolicyEnabled = false
+            FeatureFlags.actionPolicyAuditAllowDecisions = true
+
+            viewModel.sendMessage("open gmail")
+            advanceUntilIdle()
+
+            assertEquals(PermissiveActionPolicy, capturedPolicy)
+            assertEquals(true, capturedAuditAllow)
+        } finally {
+            FeatureFlags.actionPolicyEnabled = originalPolicyFlag
+            FeatureFlags.actionPolicyAuditAllowDecisions = originalAuditFlag
+        }
+    }
+
+    @Test
+    fun `chat view model wiring uses default policy and disables allow-audit by default`() = runTest {
+        val scripted = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            scripted = PolicyWiringTestFixtures.toolLoopHappyPathResponses(
+                toolCall = ToolCall("t1", "open_app", mapOf("app_name" to "Gmail"))
+            )
+        )
+        val agent = ai.citros.core.PhoneAgentApi(scripted, scripted).also { it.phoneControlOverride = true }
+        val backend = viewModel.createTestBackend(Provider.ANTHROPIC, scripted, scripted, agent = agent)
+        setApiModeWithBackends(viewModel, listOf(backend))
+
+        var capturedPolicy: ActionPolicy? = null
+        var capturedAuditAllow: Boolean? = null
+        viewModel.agentExecutorFactory = { delegate: ToolExecutionDelegate,
+                                          progressListener: LoopProgressListener,
+                                          actionPolicy: ActionPolicy,
+                                          maxToolSteps: Int,
+                                          steerMessageSource: () -> List<String>,
+                                          auditAllowDecisions: Boolean,
+                                          interruptionSource: () -> InterruptionEvent? ->
+            capturedPolicy = actionPolicy
+            capturedAuditAllow = auditAllowDecisions
+            AgentExecutor(
+                delegate = delegate,
+                progressListener = progressListener,
+                actionPolicy = actionPolicy,
+                maxToolSteps = maxToolSteps,
+                steerMessageSource = steerMessageSource,
+                auditAllowDecisions = auditAllowDecisions,
+                interruptionSource = interruptionSource
+            )
+        }
+
+        val originalPolicyFlag = FeatureFlags.actionPolicyEnabled
+        val originalAuditFlag = FeatureFlags.actionPolicyAuditAllowDecisions
+        try {
+            FeatureFlags.actionPolicyEnabled = true
+            FeatureFlags.actionPolicyAuditAllowDecisions = false
+
+            viewModel.sendMessage("open gmail")
+            advanceUntilIdle()
+
+            assertTrue(capturedPolicy is DefaultActionPolicy)
+            assertEquals(false, capturedAuditAllow)
+        } finally {
+            FeatureFlags.actionPolicyEnabled = originalPolicyFlag
+            FeatureFlags.actionPolicyAuditAllowDecisions = originalAuditFlag
+        }
+    }
+
     private class InMemoryWalletStorage : ai.citros.core.WalletStorage {
         private var state: ai.citros.core.WalletState? = null
 
@@ -1862,6 +2493,410 @@ class ChatViewModelTest {
         assertEquals(1, viewModel.steerQueue.size)
         assertEquals("go back instead", viewModel.steerQueue.peek())
         assertTrue(viewModel.hasQueuedSteer.value)
+    }
+
+    @Test
+    fun `steerMessage resolves pending policy confirmation from natural language`() {
+        val deferred = CompletableDeferred<Boolean>()
+        viewModel.setPendingPolicyConfirmationForTest("req-1", deferred)
+        viewModel.isLoading.value = true
+
+        viewModel.steerMessage("you have permission")
+
+        assertTrue(deferred.isCompleted)
+        assertEquals(true, deferred.getCompleted())
+        assertTrue(viewModel.steerQueue.isEmpty())
+        assertFalse(viewModel.hasQueuedSteer.value)
+        assertTrue(viewModel.messages.any { it.role == "user" && it.content == "you have permission" && it.isSteer })
+    }
+
+    @Test
+    fun `steerMessage keeps hasQueuedSteer true when confirmation resolves but queue already has steers`() {
+        val deferred = CompletableDeferred<Boolean>()
+        viewModel.setPendingPolicyConfirmationForTest("req-queued", deferred)
+        viewModel.isLoading.value = true
+        viewModel.steerQueue.offer("existing steer")
+        viewModel.hasQueuedSteer.value = true
+
+        viewModel.steerMessage("you have permission")
+
+        assertTrue(deferred.isCompleted)
+        assertEquals(true, deferred.getCompleted())
+        assertEquals(1, viewModel.steerQueue.size)
+        assertEquals("existing steer", viewModel.steerQueue.peek())
+        assertTrue(viewModel.hasQueuedSteer.value)
+    }
+
+    @Test
+    fun `setQueuedMessage resolves pending policy confirmation instead of queueing`() {
+        val deferred = CompletableDeferred<Boolean>()
+        viewModel.setPendingPolicyConfirmationForTest("req-2", deferred)
+        viewModel.isLoading.value = true
+
+        viewModel.setQueuedMessage("allow")
+
+        assertTrue(deferred.isCompleted)
+        assertEquals(true, deferred.getCompleted())
+        assertNull(viewModel.queuedMessage.value)
+        assertTrue(viewModel.messages.any { it.role == "user" && it.content == "allow" && !it.isSteer })
+    }
+
+    @Test
+    fun `steerMessage resolves deny confirmation from natural language`() {
+        val deferred = CompletableDeferred<Boolean>()
+        viewModel.setPendingPolicyConfirmationForTest("req-deny-steer", deferred)
+        viewModel.isLoading.value = true
+
+        viewModel.steerMessage("don't do that")
+
+        assertTrue(deferred.isCompleted)
+        assertEquals(false, deferred.getCompleted())
+        assertTrue(viewModel.steerQueue.isEmpty())
+        assertFalse(viewModel.hasQueuedSteer.value)
+        assertTrue(viewModel.messages.any { it.role == "user" && it.content == "don't do that" && it.isSteer })
+    }
+
+    @Test
+    fun `setQueuedMessage resolves deny confirmation from natural language`() {
+        val deferred = CompletableDeferred<Boolean>()
+        viewModel.setPendingPolicyConfirmationForTest("req-deny-queued", deferred)
+        viewModel.isLoading.value = true
+
+        viewModel.setQueuedMessage("no")
+
+        assertTrue(deferred.isCompleted)
+        assertEquals(false, deferred.getCompleted())
+        assertNull(viewModel.queuedMessage.value)
+        assertTrue(viewModel.messages.any { it.role == "user" && it.content == "no" && !it.isSteer })
+    }
+
+    @Test
+    fun `setQueuedMessage unrelated input passes through while confirmation remains pending`() {
+        val deferred = CompletableDeferred<Boolean>()
+        viewModel.setPendingPolicyConfirmationForTest("req-pass-through", deferred)
+        viewModel.isLoading.value = true
+
+        viewModel.setQueuedMessage("what is blocking you")
+
+        assertFalse(deferred.isCompleted)
+        assertEquals("what is blocking you", viewModel.queuedMessage.value)
+    }
+
+    @Test
+    fun `steerMessage unrelated input is queued while confirmation remains pending`() {
+        val deferred = CompletableDeferred<Boolean>()
+        viewModel.setPendingPolicyConfirmationForTest("req-pass-through-steer", deferred)
+        viewModel.isLoading.value = true
+
+        viewModel.steerMessage("what is blocking you")
+
+        assertFalse(deferred.isCompleted)
+        assertEquals(1, viewModel.steerQueue.size)
+        assertEquals("what is blocking you", viewModel.steerQueue.peek())
+    }
+
+    @Test
+    fun `confirmation reply message is added before deferred completion continuation`() {
+        val deferred = CompletableDeferred<Boolean>()
+        viewModel.setPendingPolicyConfirmationForTest("req-order", deferred)
+        viewModel.isLoading.value = true
+
+        deferred.invokeOnCompletion {
+            viewModel.messages.add(Message(role = "assistant", content = "continuation"))
+        }
+
+        viewModel.setQueuedMessage("yes")
+
+        val userIndex = viewModel.messages.indexOfFirst { it.role == "user" && it.content == "yes" }
+        val continuationIndex = viewModel.messages.indexOfFirst { it.role == "assistant" && it.content == "continuation" }
+        assertTrue(userIndex >= 0)
+        assertTrue(continuationIndex >= 0)
+        assertTrue(userIndex < continuationIndex)
+    }
+
+    @Test
+    fun `requestUserConfirmation replaces pending confirmation and cancels old deferred`() = runTest {
+        val first = CompletableDeferred<Boolean>()
+        viewModel.setPendingPolicyConfirmationForTest("req-old", first)
+
+        val secondRequest = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) {
+            viewModel.requestUserConfirmation(
+                toolCall = ToolCall("tc-1", "test_tool", emptyMap()),
+                requestId = "req-new",
+                reason = "Need approval",
+                timeoutMs = 5_000
+            )
+        }
+        advanceUntilIdle()
+
+        assertTrue(first.isCancelled)
+        viewModel.isLoading.value = true
+        viewModel.steerMessage("allow")
+        advanceUntilIdle()
+
+        assertTrue(secondRequest.await())
+    }
+
+    @Test
+    fun `requestUserConfirmation exposes runtime pills and approve pill resolves`() = runTest {
+        val decision = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) {
+            viewModel.requestUserConfirmation(
+                toolCall = ToolCall("tc-pill", "tap", emptyMap()),
+                requestId = "req-pill",
+                reason = "Need approval",
+                timeoutMs = 5_000
+            )
+        }
+        advanceUntilIdle()
+
+        assertEquals(InputType.POLICY_CONFIRMATION, viewModel.waitingInputType.value)
+        assertTrue(viewModel.runtimeActionPills.value.isNotEmpty())
+        val approveAction = viewModel.runtimeActionPills.value
+            .map { it.action }
+            .filterIsInstance<PillAction.Approve>()
+            .first()
+
+        viewModel.onRuntimePillTapped(approveAction)
+        advanceUntilIdle()
+
+        assertTrue(decision.await())
+        assertTrue(viewModel.runtimeActionPills.value.isEmpty())
+        assertNull(viewModel.waitingInputType.value)
+    }
+
+    @Test
+    fun `requestUserConfirmation uses reason code for pill mapping`() = runTest {
+        val request = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) {
+            viewModel.requestUserConfirmation(
+                toolCall = ToolCall("tc-pill-code", "tap", emptyMap()),
+                requestId = "req-pill-code",
+                reason = "Need approval",
+                timeoutMs = 5_000,
+                reasonCode = PolicyReasonCode.CONFIRM_SENSITIVE_APP
+            )
+        }
+        advanceUntilIdle()
+
+        assertEquals(
+            listOf("Allow once", "Deny", "Always deny for this app"),
+            viewModel.runtimeActionPills.value.map { it.label }
+        )
+
+        viewModel.onRuntimePillTapped(PillAction.Deny("req-pill-code"))
+        advanceUntilIdle()
+        assertFalse(request.await())
+    }
+
+    @Test
+    fun `offer choices publishes disambiguation pills and returns selected choice`() = runTest {
+        val toolResult = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) {
+            viewModel.executeToolCall(
+                ToolCall(
+                    id = "tc-offer",
+                    name = "offer_choices",
+                    input = mapOf(
+                        "question" to "Which app?",
+                        "choices" to listOf("Maps", "Chrome")
+                    )
+                ),
+                screenContent = null
+            )
+        }
+        advanceUntilIdle()
+
+        assertEquals(InputType.DISAMBIGUATION, viewModel.waitingInputType.value)
+        assertEquals(listOf("Maps", "Chrome"), viewModel.runtimeActionPills.value.map { it.label })
+
+        viewModel.onRuntimePillTapped(PillAction.Steer("Maps"))
+        advanceUntilIdle()
+
+        val result = toolResult.await()
+        assertFalse(result.isError)
+        assertEquals("Maps", result.text)
+        assertNull(viewModel.waitingInputType.value)
+        assertTrue(viewModel.runtimeActionPills.value.isEmpty())
+    }
+
+    @Test
+    fun `requestUserConfirmation deny pill resolves false`() = runTest {
+        val decision = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) {
+            viewModel.requestUserConfirmation(
+                toolCall = ToolCall("tc-pill-deny", "tap", emptyMap()),
+                requestId = "req-pill-deny",
+                reason = "Need approval",
+                timeoutMs = 5_000
+            )
+        }
+        advanceUntilIdle()
+
+        val denyAction = viewModel.runtimeActionPills.value
+            .map { it.action }
+            .filterIsInstance<PillAction.Deny>()
+            .first()
+
+        viewModel.onRuntimePillTapped(denyAction)
+        advanceUntilIdle()
+
+        assertFalse(decision.await())
+        assertTrue(viewModel.runtimeActionPills.value.isEmpty())
+        assertNull(viewModel.waitingInputType.value)
+    }
+
+    @Test
+    fun `requestUserConfirmation authenticate pill resolves true`() = runTest {
+        val decision = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) {
+            viewModel.requestUserConfirmation(
+                toolCall = ToolCall("tc-pill-auth", "tap", emptyMap()),
+                requestId = "req-pill-auth",
+                reason = "Financial transfer requires authenticate before proceeding",
+                timeoutMs = 5_000
+            )
+        }
+        advanceUntilIdle()
+
+        val authAction = viewModel.runtimeActionPills.value
+            .map { it.action }
+            .filterIsInstance<PillAction.Authenticate>()
+            .first()
+
+        viewModel.onRuntimePillTapped(authAction)
+        advanceUntilIdle()
+
+        assertTrue(decision.await())
+        assertTrue(viewModel.runtimeActionPills.value.isEmpty())
+        assertNull(viewModel.waitingInputType.value)
+    }
+
+    @Test
+    fun `dismiss pill is ignored during policy confirmation to avoid deadlock`() {
+        val deferred = CompletableDeferred<Boolean>()
+        viewModel.setPendingPolicyConfirmationForTest("req-dismiss", deferred)
+        viewModel.waitingInputType.value = InputType.POLICY_CONFIRMATION
+        viewModel.runtimeActionPills.value = RuntimeActionPillMapper.policyConfirmationPills(
+            requestId = "req-dismiss",
+            reason = "Need approval"
+        )
+
+        viewModel.onRuntimePillTapped(PillAction.Dismiss)
+
+        assertFalse(deferred.isCompleted)
+        assertEquals(InputType.POLICY_CONFIRMATION, viewModel.waitingInputType.value)
+        assertTrue(viewModel.runtimeActionPills.value.isNotEmpty())
+    }
+
+    @Test
+    fun `dismiss pill clears free text recovery pills`() {
+        viewModel.waitingInputType.value = InputType.FREE_TEXT
+        viewModel.runtimeActionPills.value = RuntimeActionPillMapper.errorRecoveryPills()
+
+        viewModel.onRuntimePillTapped(PillAction.Dismiss)
+
+        assertNull(viewModel.waitingInputType.value)
+        assertTrue(viewModel.runtimeActionPills.value.isEmpty())
+    }
+
+    @Test
+    fun `cancel pill clears recovery pills and marks tool loop cancelled`() {
+        viewModel.waitingInputType.value = InputType.FREE_TEXT
+        viewModel.runtimeActionPills.value = RuntimeActionPillMapper.errorRecoveryPills()
+
+        viewModel.onRuntimePillTapped(PillAction.Cancel)
+
+        assertTrue(viewModel.isToolLoopCancelledForTesting())
+        assertNull(viewModel.waitingInputType.value)
+        assertTrue(viewModel.runtimeActionPills.value.isEmpty())
+    }
+
+    @Test
+    fun `setQueuedMessage resolves disambiguation from partial unique match`() {
+        val deferred = CompletableDeferred<String>()
+        viewModel.setPendingOfferChoicesForTest(
+            requestId = "req-offer-partial",
+            choices = listOf("Google Maps", "Chrome"),
+            deferred = deferred
+        )
+        viewModel.isLoading.value = true
+
+        viewModel.setQueuedMessage("maps")
+
+        assertTrue(deferred.isCompleted)
+        assertEquals("Google Maps", deferred.getCompleted())
+        assertNull(viewModel.queuedMessage.value)
+    }
+
+    @Test
+    fun `setQueuedMessage leaves ambiguous disambiguation as queued input`() {
+        val deferred = CompletableDeferred<String>()
+        viewModel.setPendingOfferChoicesForTest(
+            requestId = "req-offer-ambiguous",
+            choices = listOf("Google Maps", "Maps Go"),
+            deferred = deferred
+        )
+        viewModel.isLoading.value = true
+
+        viewModel.setQueuedMessage("maps")
+
+        assertFalse(deferred.isCompleted)
+        assertEquals("maps", viewModel.queuedMessage.value)
+    }
+
+    @Test
+    fun `offer choices validation errors include invalid input error code`() = runTest {
+        val missingQuestion = viewModel.executeToolCall(
+            ToolCall(
+                id = "tc-offer-missing-question",
+                name = "offer_choices",
+                input = mapOf("choices" to listOf("Maps", "Chrome"))
+            ),
+            screenContent = null
+        )
+        assertTrue(missingQuestion.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, missingQuestion.errorCode)
+
+        val invalidCount = viewModel.executeToolCall(
+            ToolCall(
+                id = "tc-offer-invalid-count",
+                name = "offer_choices",
+                input = mapOf(
+                    "question" to "Which app?",
+                    "choices" to listOf("Maps")
+                )
+            ),
+            screenContent = null
+        )
+        assertTrue(invalidCount.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, invalidCount.errorCode)
+    }
+
+    @Test
+    fun `requestUserConfirmation times out when wrapped by caller timeout`() = runTest {
+        val result = backgroundScope.async {
+            kotlinx.coroutines.withTimeoutOrNull(1_000) {
+                viewModel.requestUserConfirmation(
+                    toolCall = ToolCall("tc-timeout", "test_tool", emptyMap()),
+                    requestId = "req-timeout",
+                    reason = "Need approval",
+                    timeoutMs = 1_000
+                )
+            } ?: false
+        }
+
+        advanceTimeBy(1_001)
+        advanceUntilIdle()
+
+        assertFalse(result.await())
+    }
+
+    @Test
+    fun `onCleared cancels pending confirmation deferred`() {
+        val deferred = CompletableDeferred<Boolean>()
+        viewModel.setPendingPolicyConfirmationForTest("req-clear", deferred)
+
+        val onCleared = ChatViewModel::class.java.getDeclaredMethod("onCleared")
+        onCleared.isAccessible = true
+        onCleared.invoke(viewModel)
+
+        assertTrue(deferred.isCancelled)
     }
 
     @Test
@@ -2218,6 +3253,115 @@ class ChatViewModelTest {
         val label = ChatViewModel.toolStatusLabel("some_new_tool")
         assertTrue(label.contains("some_new_tool"),
             "Unknown tool label should contain the tool name: $label")
+    }
+
+    @Test
+    fun `onToolError TRANSIENT sets retrying status`() {
+        viewModel.onToolError(
+            toolName = "web_fetch",
+            errorText = "timeout",
+            severity = ErrorSeverity.TRANSIENT
+        )
+
+        assertEquals("Retrying...", viewModel.currentToolStatus.value)
+    }
+
+    @Test
+    fun `onToolError PERSISTENT sets warning status and recovery pills`() {
+        viewModel.onToolError(
+            toolName = "web_fetch",
+            errorText = "HTTP 500",
+            severity = ErrorSeverity.PERSISTENT
+        )
+
+        assertEquals("⚠️ HTTP 500", viewModel.currentToolStatus.value)
+        assertEquals(InputType.FREE_TEXT, viewModel.waitingInputType.value)
+        assertEquals(listOf("Try again", "Do something else", "Cancel"), viewModel.runtimeActionPills.value.map { it.label })
+    }
+
+    @Test
+    fun `onToolError PERSISTENT JSON payload uses fallback warning status`() {
+        viewModel.onToolError(
+            toolName = "web_fetch",
+            errorText = """{"error":"server_error"}""",
+            severity = ErrorSeverity.PERSISTENT
+        )
+
+        assertEquals("⚠️ Working...", viewModel.currentToolStatus.value)
+    }
+
+    @Test
+    fun `onToolError EXPLORATORY and INFORMATIONAL do not change status`() {
+        viewModel.currentToolStatus.value = "Interacting..."
+
+        viewModel.onToolError(
+            toolName = "web_fetch",
+            errorText = "exploratory miss",
+            severity = ErrorSeverity.EXPLORATORY
+        )
+        assertEquals("Interacting...", viewModel.currentToolStatus.value)
+
+        viewModel.onToolError(
+            toolName = "web_fetch",
+            errorText = "informational",
+            severity = ErrorSeverity.INFORMATIONAL
+        )
+        assertEquals("Interacting...", viewModel.currentToolStatus.value)
+    }
+
+    @Flaky("#751")
+    @Test
+    fun `retrying status auto clears and transient clear job cancellation prevents stale clear`() = runTest {
+        viewModel.onToolError(
+            toolName = "web_fetch",
+            errorText = "timeout one",
+            severity = ErrorSeverity.TRANSIENT
+        )
+        advanceTimeBy(1500)
+
+        // New transient error should cancel previous clear job and keep status visible
+        viewModel.onToolError(
+            toolName = "web_fetch",
+            errorText = "timeout two",
+            severity = ErrorSeverity.TRANSIENT
+        )
+
+        // Pass original clear boundary (2s from first error) — status should still be present
+        advanceTimeBy(600)
+        assertEquals("Retrying...", viewModel.currentToolStatus.value)
+
+        // Pass second clear boundary — now it should clear
+        advanceTimeBy(1400)
+        advanceUntilIdle()
+        assertNull(viewModel.currentToolStatus.value)
+    }
+
+    @Test
+    fun `persistent status is not cleared by error tool result but clears on success`() {
+        viewModel.onToolError(
+            toolName = "web_fetch",
+            errorText = "HTTP 500",
+            severity = ErrorSeverity.PERSISTENT
+        )
+        assertEquals("⚠️ HTTP 500", viewModel.currentToolStatus.value)
+
+        // Subsequent error tool result should not clear persistent warning
+        viewModel.onToolResult(
+            toolName = "web_fetch",
+            result = "Failed: still broken",
+            visibility = ai.citros.core.OutputVisibility.SHOW,
+            isError = true
+        )
+        assertEquals("⚠️ HTTP 500", viewModel.currentToolStatus.value)
+
+        // Success should clear it
+        viewModel.onToolResult(
+            toolName = "web_fetch",
+            result = "Recovered",
+            visibility = ai.citros.core.OutputVisibility.SHOW,
+            isError = false
+        )
+        assertNull(viewModel.currentToolStatus.value)
     }
 
     @Test

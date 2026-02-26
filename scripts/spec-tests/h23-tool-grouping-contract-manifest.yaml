@@ -1,0 +1,90 @@
+spec_required_fixed:
+  - ResolvedToolPlan
+  - toolNames
+  - reasonCodes
+  - estimatedToolCount
+  - activeCategories: List<ToolCategory>
+  - fallback_action_intent
+  - final_categories SUBSET_OF policy_allow_set
+  - if active_set == {CORE} and action_oriented_trigger(message, resolver_signal):
+  - for c in [NAVIGATION, INTERACTION, OBSERVATION]:
+  - if c in allow_set: active_set += c
+  - active_set += CORE
+  - active_ordered = ordered_categories(active_set)
+  - open weather app
+  - find weather online
+  - ResolvedToolPlan examples (normative)
+  - ReasonCode (typed enum)
+  - user_disabled_navigation
+  - user_disabled_research
+
+spec_required_regex:
+  - Resolver[[:space:]]+state[[:space:]]+model[[:space:]]*\(normative\)
+  - V1[[:space:]]+is[[:space:]]+stateless
+  - Mixed[[:space:]]+granularity[[:space:]]+semantics
+  - partial[[:space:]]+tool[[:space:]]+pruning
+  - Policy[[:space:]]+resolution[[:space:]]+pseudocode[[:space:]]*\(normative\)
+  - Action-oriented[[:space:]]+fallback[[:space:]]+trigger[[:space:]]*\(normative\)
+  - Fallback[[:space:]]+cannot[[:space:]]+reintroduce[[:space:]]+a[[:space:]]+category[[:space:]]+blocked[[:space:]]+by[[:space:]]+security,[[:space:]]+capability,[[:space:]]+or[[:space:]]+user[[:space:]]+disable
+  - Concurrency/?thread-safety
+  - no[[:space:]]+raw[[:space:]]+user[[:space:]]+message[[:space:]]+content
+  - Locale\.ROOT
+  - word boundary|word-boundary|whole-word
+
+spec_forbidden_fixed:
+  - includedTools
+  - rationaleTags
+  - sticky window
+  - user_disabled_<category>
+  - clearly under-provisioned
+  - List<String>
+  - /tmp/h23-issue-557.json
+
+spec_required_headings:
+  - 3@@@7\.3[[:space:]]+Acceptance[[:space:]]+criteria([[:space:]]|$)@@@7.3 Acceptance criteria
+  - 3@@@7\.4[[:space:]]+ResolvedToolPlan[[:space:]]+examples[[:space:]]*\(normative\)([[:space:]]|$)@@@7.4 ResolvedToolPlan examples (normative)
+
+spec_section_7_3_fixed:
+  - Section 9 success criteria gates #1-#5
+  - completion rate
+  - Policy-violation counter
+
+spec_section_7_4_fixed:
+  - "activeCategories": [
+  - "reasonCodes": [
+  - "activeCategories": ["CORE", "NAVIGATION", "INTERACTION", "OBSERVATION"]
+  - "tier_small_blocks_research"
+  - "fallback_action_intent"
+  - Unknown future `reasonCodes` must be ignored by clients (forward compatibility).
+
+constitution_required_headings:
+  - 2@@@5\.2([[:space:]]|$)@@@5.2
+  - 2@@@5\.3([[:space:]]|$)@@@5.3
+  - 2@@@7\.3([[:space:]]|$)@@@7.3
+  - 2@@@8\.1([[:space:]]|$)@@@8.1
+  - 2@@@8\.6([[:space:]]|$)@@@8.6
+  - 2@@@9\.@@@9.
+
+constitution_section_5_2_regex:
+  - Security.*non-bypassable
+  - applied before lower-priority policy layers
+
+constitution_section_5_3_regex:
+  - identical explicit inputs
+  - deterministic
+
+constitution_section_7_3_regex:
+  - measurable acceptance gates
+  - before broad rollout
+
+constitution_section_8_1_regex:
+  - Behavioral changes require TDD coverage
+  - pass and fail boundaries
+
+constitution_section_8_6_regex:
+  - No raw user message content
+  - policy telemetry
+
+constitution_section_9_regex:
+  - promotion gates
+  - rollback criteria

@@ -2,7 +2,7 @@ name: Determinism Eval
 
 on:
   pull_request:
-    branches: [ main, feat/android-mvp ]
+    branches: [ main, staging, feat/android-mvp ]
   schedule:
     - cron: "0 6 * * *"
   workflow_dispatch:

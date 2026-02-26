@@ -2,6 +2,7 @@ package ai.citros.chat
 
 import android.content.Context
 import androidx.compose.runtime.staticCompositionLocalOf
+import androidx.annotation.VisibleForTesting
 import ai.citros.core.KeyStore
 import ai.citros.core.WalletManager
 import ai.citros.core.WalletStorage
@@ -20,7 +21,13 @@ internal data class WalletDependencies(
 
 internal val LocalWalletDependencies = staticCompositionLocalOf<WalletDependencies?> { null }
 
+@VisibleForTesting
+internal var walletDependenciesFactoryForTests: ((Context) -> WalletDependencies)? = null
+
 internal fun provideWalletDependencies(context: Context): WalletDependencies {
+    walletDependenciesFactoryForTests?.let { factory ->
+        return factory(context)
+    }
     val appContext = context.applicationContext
     val keyStore = EncryptedKeyStore(appContext)
     val walletStorage = SharedPreferencesWalletStorage(appContext)

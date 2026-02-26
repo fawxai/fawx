@@ -64,7 +64,11 @@ data class VerificationResult(
 class ActionVerifier(
     private val actionClient: ProviderClient,
     private val mode: VerificationMode = VerificationMode.NEVER,
-    private val screenshotDelayMs: Long = DEFAULT_SCREENSHOT_DELAY_MS
+    private val screenshotDelayMs: Long = DEFAULT_SCREENSHOT_DELAY_MS,
+    /** ScreenReader attachment check, injectable for unit tests. */
+    private val isScreenReaderAttached: () -> Boolean = { ScreenReader.isAttached() },
+    /** Screenshot provider, injectable for unit tests. */
+    private val takeScreenshot: suspend () -> ScreenshotResult = { ScreenReader.takeScreenshot() }
 ) {
     companion object {
         /** Default delay before screenshot capture (typical Android animation duration). */
@@ -130,7 +134,7 @@ class ActionVerifier(
      */
     suspend fun verify(toolName: String, actionResult: String): VerificationResult {
         // Capture screenshot
-        if (!ScreenReader.isAttached()) {
+        if (!isScreenReaderAttached()) {
             return VerificationResult(
                 verified = false,
                 description = "Verification skipped: accessibility service not attached",
@@ -143,12 +147,23 @@ class ActionVerifier(
             kotlinx.coroutines.delay(screenshotDelayMs)
         }
 
-        val base64 = ScreenReader.takeScreenshot()
-            ?: return VerificationResult(
-                verified = false,
-                description = "Verification skipped: screenshot capture failed (requires Android 11+)",
-                error = "Screenshot capture failed"
-            )
+        val base64 = when (val screenshot = takeScreenshot()) {
+            is ScreenshotResult.Success -> screenshot.base64
+            is ScreenshotResult.PrivacyBlocked -> {
+                return VerificationResult(
+                    verified = false,
+                    description = "Verification skipped: screenshot blocked by privacy mode for ${PrivacyRedaction.APP_PLACEHOLDER}",
+                    error = "Screenshot blocked by privacy mode"
+                )
+            }
+            is ScreenshotResult.Failed -> {
+                return VerificationResult(
+                    verified = false,
+                    description = "Verification skipped: screenshot capture failed (${screenshot.reason ?: "unknown"})",
+                    error = screenshot.reason ?: "Screenshot capture failed"
+                )
+            }
+        }
 
         // Build verification prompt
         val prompt = buildVerificationPrompt(toolName, actionResult)

@@ -7,7 +7,8 @@ import kotlinx.serialization.json.*
  * Identical logic to PhoneAgent but uses LocalLLMClient.
  */
 class PhoneAgentLocal(
-    private val llmClient: LocalLLMClient
+    private val llmClient: LocalLLMClient,
+    private val clickElement: (Int) -> ScreenReader.ElementActionResult = { ScreenReader.clickElementDetailed(it) }
 ) {
     private val json = Json { ignoreUnknownKeys = true }
     
@@ -153,21 +154,43 @@ Rules:
     fun executeAction(action: PhoneAction, screenContent: ScreenContent?): String {
         return when (action) {
             is PhoneAction.Click -> {
-                if (ScreenReader.clickElement(action.elementId)) {
+                when (clickElement(action.elementId)) {
+                    is ScreenReader.ElementActionResult.Success -> {
                     "Clicked element ${action.elementId}"
-                } else {
-                    "Failed to click element ${action.elementId}"
+                    }
+                    is ScreenReader.ElementActionResult.PrivacyBlocked -> {
+                        "Failed: click: blocked by privacy mode for ${PrivacyRedaction.APP_PLACEHOLDER}"
+                    }
+                    ScreenReader.ElementActionResult.ServiceUnavailable ->
+                        "Failed: click: accessibility service unavailable"
+                    ScreenReader.ElementActionResult.GestureDispatchFailed ->
+                        "Failed: click: gesture dispatch failed"
+                    ScreenReader.ElementActionResult.ElementNotFound ->
+                        "Failed to click element ${action.elementId}"
                 }
             }
             is PhoneAction.ClickText -> {
-                val element = screenContent?.elements?.find {
-                    it.text?.contains(action.text, ignoreCase = true) == true ||
-                    it.contentDescription?.contains(action.text, ignoreCase = true) == true
-                }
-                if (element != null && ScreenReader.clickElement(element.id)) {
-                    "Clicked \"${action.text}\""
+                if (screenContent?.privacyMode == true) {
+                    "Failed: click_text: blocked by privacy mode for ${PrivacyRedaction.APP_PLACEHOLDER}"
                 } else {
-                    "Could not find element with text \"${action.text}\""
+                    val element = screenContent?.elements?.find {
+                        it.text?.contains(action.text, ignoreCase = true) == true ||
+                        it.contentDescription?.contains(action.text, ignoreCase = true) == true
+                    }
+                    when {
+                        element == null -> "Could not find element with text \"${action.text}\""
+                        else -> when (clickElement(element.id)) {
+                        is ScreenReader.ElementActionResult.Success -> "Clicked \"${action.text}\""
+                        is ScreenReader.ElementActionResult.PrivacyBlocked ->
+                            "Failed: click_text: blocked by privacy mode for ${PrivacyRedaction.APP_PLACEHOLDER}"
+                        ScreenReader.ElementActionResult.ServiceUnavailable ->
+                            "Failed: click_text: accessibility service unavailable"
+                        ScreenReader.ElementActionResult.GestureDispatchFailed ->
+                            "Failed: click_text: gesture dispatch failed"
+                        ScreenReader.ElementActionResult.ElementNotFound ->
+                            "Could not find element with text \"${action.text}\""
+                    }
+                }
                 }
             }
             is PhoneAction.Type -> {

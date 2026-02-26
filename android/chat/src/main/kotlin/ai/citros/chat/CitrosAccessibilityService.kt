@@ -25,7 +25,7 @@ class CitrosAccessibilityService : AccessibilityService() {
             notificationTimeout = 250
         }
         
-        ScreenReader.attach(this)
+        ScreenReader.attach(this, SharedPrefsPrivacyList(applicationContext))
         InterruptionDetector.attach(this)
         ClipboardHelper.attach(this)
     }

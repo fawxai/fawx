@@ -1,5 +1,16 @@
 package ai.citros.core
 
+import ai.citros.test.Flaky
+import ai.citros.test.FlakyTestRule
+import android.content.ClipboardManager
+import android.content.Context
+import android.graphics.Rect
+import android.service.notification.NotificationListenerService
+import android.service.notification.StatusBarNotification
+import ai.citros.test.ScriptedProviderClient
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.Json
@@ -9,14 +20,29 @@ import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.After
 import org.junit.Before
+import org.junit.Rule
 import org.junit.Test
+import java.util.concurrent.atomic.AtomicInteger
+import org.mockito.kotlin.any
+import org.mockito.kotlin.doNothing
+import org.mockito.kotlin.doThrow
+import org.mockito.kotlin.mock
+import org.mockito.kotlin.verify
+import org.mockito.kotlin.whenever
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
-import kotlin.test.assertFalse
 import kotlin.test.assertTrue
+import kotlin.system.measureTimeMillis
+import kotlin.time.Duration.Companion.milliseconds
 
 class PhoneAgentApiTest {
+
+    @Rule
+    @JvmField
+    val flakyTestRule = FlakyTestRule()
 
     private lateinit var server: MockWebServer
 
@@ -35,7 +61,8 @@ class PhoneAgentApiTest {
         chatClient: ClaudeClient? = null,
         actionClient: ClaudeClient? = null,
         fileManager: AgentFileManager? = null,
-        memoryProvider: MemoryProvider? = null
+        memoryProvider: MemoryProvider? = null,
+        sensorProvider: SensorProvider? = null
     ): PhoneAgentApi {
         val defaultClient = ClaudeClient(
             apiKey = "sk-ant-api03-test",
@@ -44,7 +71,13 @@ class PhoneAgentApiTest {
         )
         val resolvedChat = chatClient ?: defaultClient
         val resolvedAction = actionClient ?: resolvedChat
-        return PhoneAgentApi(resolvedChat, resolvedAction, fileManager, memoryProvider).also {
+        return PhoneAgentApi(
+            chatClient = resolvedChat,
+            actionClient = resolvedAction,
+            agentFileManager = fileManager,
+            memoryProvider = memoryProvider,
+            sensorProvider = sensorProvider
+        ).also {
             it.phoneControlOverride = true // Simulate phone control available in tests
         }
     }
@@ -88,6 +121,518 @@ class PhoneAgentApiTest {
         assertEquals("Task complete!", response.text)
         assertTrue(response.toolCalls.isEmpty())
         assertEquals("end_turn", response.stopReason)
+    }
+
+    @Test
+    fun `explicit fetch intent injects web_fetch when model returns end_turn`() = runTest {
+        server.enqueue(MockResponse()
+            .setBody("""{"content":[{"type":"text","text":"I can summarize that."}],"role":"assistant","stop_reason":"end_turn"}""")
+            .setResponseCode(200)
+            .addHeader("Content-Type", "application/json"))
+
+        val agent = createAgent()
+        val response = agent.sendMessage("Fetch https://docs.openclaw.ai and summarize.", null, isActionLoop = false)
+
+        assertEquals("tool_use", response.stopReason)
+        val webFetch = response.toolCalls.firstOrNull { it.name == "web_fetch" }
+        assertNotNull(webFetch)
+        assertEquals("https://docs.openclaw.ai", webFetch.input["url"])
+    }
+
+    @Test
+    fun `explicit fetch intent appends web_fetch when model only emits think`() = runTest {
+        server.enqueue(MockResponse()
+            .setBody(
+                """{"content":[{"type":"tool_use","id":"think_1","name":"think","input":{"thought":"Need page contents first"}}],"role":"assistant","stop_reason":"tool_use"}"""
+            )
+            .setResponseCode(200)
+            .addHeader("Content-Type", "application/json"))
+
+        val agent = createAgent()
+        val response = agent.sendMessage("Fetch https://docs.openclaw.ai and summarize.", null, isActionLoop = false)
+
+        assertEquals("tool_use", response.stopReason)
+        assertTrue(response.toolCalls.any { it.name == "think" })
+        val webFetch = response.toolCalls.firstOrNull { it.name == "web_fetch" }
+        assertNotNull(webFetch)
+        assertEquals("https://docs.openclaw.ai", webFetch.input["url"])
+    }
+
+    @Test
+    fun `explicit fetch intent does not inject when model already returned web_fetch`() = runTest {
+        val modelResponse = ChatResponse(
+            text = null,
+            toolCalls = listOf(
+                ToolCall(
+                    id = "wf_existing",
+                    name = "web_fetch",
+                    input = mapOf("url" to "https://docs.openclaw.ai")
+                )
+            ),
+            stopReason = "tool_use"
+        )
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(listOf(modelResponse))
+        )
+        val agent = PhoneAgentApi(client, client).also { it.phoneControlOverride = true }
+
+        val response = agent.sendMessage("Fetch https://docs.openclaw.ai and summarize.", null, isActionLoop = false)
+
+        assertEquals(modelResponse, response)
+        assertEquals(1, response.toolCalls.count { it.name == "web_fetch" })
+        assertEquals("wf_existing", response.toolCalls.single().id)
+    }
+
+    @Test
+    fun `small tier sendMessage passes model-aware tools to API`() = runTest {
+        val smallTierClient = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            modelId = "claude-3-5-haiku-20241022",
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = "I can summarize that.",
+                        toolCalls = emptyList(),
+                        stopReason = "end_turn"
+                    )
+                )
+            )
+        )
+        val agent = PhoneAgentApi(smallTierClient, smallTierClient).also { it.phoneControlOverride = true }
+
+        val response = agent.sendMessage(
+            "Fetch https://docs.openclaw.ai and summarize.",
+            null,
+            isActionLoop = false
+        )
+
+        val toolNamesPassedToApi = smallTierClient.lastTools.orEmpty().map { it.name }.toSet()
+        assertFalse("web_fetch" in toolNamesPassedToApi)
+        assertFalse("web_search" in toolNamesPassedToApi)
+        assertTrue("tap" in toolNamesPassedToApi)
+        assertTrue(response.toolCalls.isEmpty())
+        assertEquals("end_turn", response.stopReason)
+    }
+
+    @Test
+    fun `small tier continueAfterTools passes model-aware tools to API`() = runTest {
+        val chatClient = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            modelId = "claude-sonnet-4-5-20250929",
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(ToolCall("t1", "tap", mapOf("x" to 10, "y" to 20))),
+                        stopReason = "tool_use"
+                    )
+                )
+            )
+        )
+        val actionClient = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            modelId = "claude-3-5-haiku-20241022",
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = "Done",
+                        toolCalls = emptyList(),
+                        stopReason = "end_turn"
+                    )
+                )
+            )
+        )
+        val agent = PhoneAgentApi(chatClient = chatClient, actionClient = actionClient).also {
+            it.phoneControlOverride = true
+        }
+
+        val first = agent.sendMessage("Tap submit", null, isActionLoop = false)
+        assertEquals("tool_use", first.stopReason)
+
+        val continuation = agent.continueAfterTools()
+        val toolNamesPassedToApi = actionClient.lastTools.orEmpty().map { it.name }.toSet()
+
+        assertEquals("end_turn", continuation.stopReason)
+        assertEquals(1, actionClient.chatWithToolsCalls)
+        assertFalse("web_fetch" in toolNamesPassedToApi)
+        assertFalse("web_search" in toolNamesPassedToApi)
+        assertTrue("tap" in toolNamesPassedToApi)
+    }
+
+    @Test
+    fun `assertSafetyContractDebug via PhoneAgentApi throws for invalid prompt in debug build`() {
+        FeatureFlags.promptTuningV1Enabled = true
+        try {
+            val agent = createAgent().also { it.isDebugBuild = true }
+            val method = PhoneAgentApi::class.java.getDeclaredMethod("assertSafetyContractDebug", String::class.java)
+            method.isAccessible = true
+
+            val error = assertFailsWith<java.lang.reflect.InvocationTargetException> {
+                method.invoke(agent, "You are Citros. No safety clauses here.")
+            }
+            assertTrue(error.cause is AssertionError)
+        } finally {
+            FeatureFlags.resetToDefaults()
+        }
+    }
+
+    @Test
+    fun `assertSafetyContractDebug via PhoneAgentApi passes for valid prompt in debug build`() {
+        FeatureFlags.promptTuningV1Enabled = true
+        try {
+            val agent = createAgent().also { it.isDebugBuild = true }
+            val method = PhoneAgentApi::class.java.getDeclaredMethod("assertSafetyContractDebug", String::class.java)
+            method.isAccessible = true
+
+            val validPrompt = PhoneAgentPrompts.buildSystemPrompt(
+                phoneControlAvailable = true,
+                modelName = "gpt-4o"
+            )
+            method.invoke(agent, validPrompt)
+        } finally {
+            FeatureFlags.resetToDefaults()
+        }
+    }
+
+    @Test
+    fun `logPromptTuningMetadata tolerates missing runtime line`() {
+        FeatureFlags.promptTuningV1Enabled = true
+        try {
+            val agent = createAgent()
+            val method = PhoneAgentApi::class.java.getDeclaredMethod("logPromptTuningMetadata", String::class.java, String::class.java)
+            method.isAccessible = true
+
+            method.invoke(agent, "prompt without structured runtime line", "action")
+        } finally {
+            FeatureFlags.resetToDefaults()
+        }
+    }
+
+    @Test
+    fun `url mention without fetch intent does not inject web_fetch`() = runTest {
+        server.enqueue(MockResponse()
+            .setBody("""{"content":[{"type":"text","text":"That site contains OpenClaw docs."}],"role":"assistant","stop_reason":"end_turn"}""")
+            .setResponseCode(200)
+            .addHeader("Content-Type", "application/json"))
+
+        val agent = createAgent()
+        val response = agent.sendMessage("What is https://docs.openclaw.ai?", null, isActionLoop = false)
+
+        assertTrue(response.toolCalls.isEmpty())
+        assertEquals("end_turn", response.stopReason)
+    }
+
+    @Test
+    fun `explicit fetch intent does not inject during action loop`() = runTest {
+        server.enqueue(MockResponse()
+            .setBody("""{"content":[{"type":"text","text":"I can summarize that."}],"role":"assistant","stop_reason":"end_turn"}""")
+            .setResponseCode(200)
+            .addHeader("Content-Type", "application/json"))
+
+        val agent = createAgent()
+        val response = agent.sendMessage(
+            "Fetch https://docs.openclaw.ai and summarize.",
+            null,
+            isActionLoop = true
+        )
+
+        assertTrue(response.toolCalls.isEmpty())
+        assertEquals("end_turn", response.stopReason)
+    }
+
+    @Test
+    fun `explicit fetch intent does not inject when web_fetch tool unavailable`() = runTest {
+        val smallTierClient = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            modelId = "claude-3-5-haiku-20241022",
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = "I can summarize that.",
+                        toolCalls = emptyList(),
+                        stopReason = "end_turn"
+                    )
+                )
+            )
+        )
+        val agent = PhoneAgentApi(smallTierClient, smallTierClient).also { it.phoneControlOverride = true }
+
+        val response = agent.sendMessage(
+            "Fetch https://docs.openclaw.ai and summarize.",
+            null,
+            isActionLoop = false
+        )
+
+        assertTrue(response.toolCalls.isEmpty())
+        assertEquals("end_turn", response.stopReason)
+    }
+
+    @Test
+    fun `explicit fetch intent does not modify actionable non-think tool responses`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(
+                            ToolCall("ws1", "web_search", mapOf("query" to "openclaw docs"))
+                        ),
+                        stopReason = "tool_use"
+                    )
+                )
+            )
+        )
+        val agent = PhoneAgentApi(client, client).also { it.phoneControlOverride = true }
+
+        val response = agent.sendMessage(
+            "Fetch https://docs.openclaw.ai and summarize.",
+            null,
+            isActionLoop = false
+        )
+
+        assertEquals(1, response.toolCalls.size)
+        assertEquals("web_search", response.toolCalls.single().name)
+        assertFalse(response.toolCalls.any { it.name == "web_fetch" })
+        assertEquals("tool_use", response.stopReason)
+    }
+
+    @Test
+    fun `extractExplicitWebFetchUrl trims trailing punctuation`() {
+        val agent = createAgent()
+        assertEquals(
+            "https://docs.openclaw.ai/path",
+            agent.extractExplicitWebFetchUrl("Fetch https://docs.openclaw.ai/path).")
+        )
+        assertEquals(
+            "https://docs.openclaw.ai/path",
+            agent.extractExplicitWebFetchUrl("Please summarize https://docs.openclaw.ai/path],")
+        )
+    }
+
+    @Test
+    fun `extractExplicitWebFetchUrl rejects no-url and no-intent inputs`() {
+        val agent = createAgent()
+        assertNull(agent.extractExplicitWebFetchUrl("Fetch this page please"))
+        assertNull(agent.extractExplicitWebFetchUrl("https://docs.openclaw.ai"))
+        assertNull(agent.extractExplicitWebFetchUrl("I read https://docs.openclaw.ai yesterday"))
+    }
+
+    @Test
+    fun `extractExplicitWebFetchUrl requires explicit read object to avoid generic over-trigger`() {
+        val agent = createAgent()
+        assertNull(agent.extractExplicitWebFetchUrl("I like to read https://docs.openclaw.ai"))
+        assertEquals(
+            "https://docs.openclaw.ai",
+            agent.extractExplicitWebFetchUrl("Read this URL https://docs.openclaw.ai")
+        )
+        assertEquals(
+            "https://docs.openclaw.ai",
+            agent.extractExplicitWebFetchUrl("https://docs.openclaw.ai and read it")
+        )
+    }
+
+    @Test
+    fun `forced web_fetch id is stable and collision-resistant hex digest`() = runTest {
+        server.enqueue(MockResponse()
+            .setBody("""{"content":[{"type":"text","text":"Will fetch."}],"role":"assistant","stop_reason":"end_turn"}""")
+            .setResponseCode(200)
+            .addHeader("Content-Type", "application/json"))
+        server.enqueue(MockResponse()
+            .setBody("""{"content":[{"type":"text","text":"Will fetch."}],"role":"assistant","stop_reason":"end_turn"}""")
+            .setResponseCode(200)
+            .addHeader("Content-Type", "application/json"))
+        server.enqueue(MockResponse()
+            .setBody("""{"content":[{"type":"text","text":"Will fetch."}],"role":"assistant","stop_reason":"end_turn"}""")
+            .setResponseCode(200)
+            .addHeader("Content-Type", "application/json"))
+
+        val agent = createAgent()
+        val first = agent.sendMessage("Fetch https://docs.openclaw.ai and summarize.", null, false)
+        val second = agent.sendMessage("Fetch https://docs.openclaw.ai and summarize.", null, false)
+        val third = agent.sendMessage("Fetch https://example.com and summarize.", null, false)
+
+        val id1 = first.toolCalls.single { it.name == "web_fetch" }.id
+        val id2 = second.toolCalls.single { it.name == "web_fetch" }.id
+        val id3 = third.toolCalls.single { it.name == "web_fetch" }.id
+
+        assertEquals(id1, id2)
+        assertTrue(id1.matches(Regex("forced_web_fetch_[0-9a-f]{24}")))
+        assertTrue(id3.matches(Regex("forced_web_fetch_[0-9a-f]{24}")))
+        assertFalse(id1 == id3)
+    }
+
+    @Test
+    fun `resolveExplicitToolConstraint detects web_search only phrasing`() {
+        val agent = createAgent()
+
+        val strict = agent.resolveExplicitToolConstraint("Use web_search only and do not open a browser app")
+        val relaxed = agent.resolveExplicitToolConstraint("search for flights")
+
+        assertEquals(setOf("think", "web_search"), strict)
+        assertNull(relaxed)
+    }
+
+    @Test
+    fun `sendMessage web_search only constrains tools and blocks disallowed tool call response`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(
+                            ToolCall("wf1", "web_fetch", mapOf("url" to "https://www.google.com/travel/flights"))
+                        ),
+                        stopReason = "tool_use"
+                    )
+                )
+            )
+        )
+        val agent = PhoneAgentApi(client, client).also { it.phoneControlOverride = true }
+
+        val response = agent.sendMessage(
+            "Use web_search only. Find DEN to TPA flights tomorrow. Do not open any browser app.",
+            null,
+            isActionLoop = false
+        )
+
+        val toolNamesPassedToApi = client.lastTools.orEmpty().map { it.name }.toSet()
+        assertEquals(setOf("think", "web_search"), toolNamesPassedToApi)
+        assertTrue(response.toolCalls.isEmpty())
+        assertEquals("end_turn", response.stopReason)
+        assertTrue(response.text?.contains("Tool selection blocked by constraint") == true)
+    }
+
+    @Test
+    fun `sendMessage web_search only strips disallowed calls but preserves allowed ones`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(
+                            ToolCall("ws1", "web_search", mapOf("query" to "LAX to JFK")),
+                            ToolCall("wf1", "web_fetch", mapOf("url" to "https://example.com/flights"))
+                        ),
+                        stopReason = "tool_use"
+                    )
+                )
+            )
+        )
+        val agent = PhoneAgentApi(client, client).also { it.phoneControlOverride = true }
+
+        val response = agent.sendMessage(
+            "Use web_search only. Find LAX to JFK flights tomorrow.",
+            null,
+            isActionLoop = false
+        )
+
+        val toolNamesPassedToApi = client.lastTools.orEmpty().map { it.name }.toSet()
+        assertEquals(setOf("think", "web_search"), toolNamesPassedToApi)
+        assertEquals(listOf("web_search"), response.toolCalls.map { it.name })
+        assertEquals("tool_use", response.stopReason)
+    }
+
+    @Test
+    fun `web_search only constraint suppresses explicit web_fetch injection`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = "Using search-only mode.",
+                        toolCalls = emptyList(),
+                        stopReason = "end_turn"
+                    )
+                )
+            )
+        )
+        val agent = PhoneAgentApi(client, client).also { it.phoneControlOverride = true }
+
+        val response = agent.sendMessage(
+            "Use web_search only. Fetch https://docs.openclaw.ai and summarize.",
+            null,
+            isActionLoop = false
+        )
+
+        val toolNamesPassedToApi = client.lastTools.orEmpty().map { it.name }.toSet()
+        assertEquals(setOf("think", "web_search"), toolNamesPassedToApi)
+        assertTrue(response.toolCalls.isEmpty())
+        assertEquals("end_turn", response.stopReason)
+        assertEquals("Using search-only mode.", response.text)
+    }
+
+    @Test
+    fun `web_search only constraint persists through continueAfterTools and constrains action model tools`() = runTest {
+        val chatClient = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(ToolCall("ws1", "web_search", mapOf("query" to "DEN TPA flights"))),
+                        stopReason = "tool_use"
+                    )
+                )
+            )
+        )
+        val actionClient = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(ToolCall("wf1", "web_fetch", mapOf("url" to "https://example.com"))),
+                        stopReason = "tool_use"
+                    )
+                )
+            )
+        )
+        val agent = PhoneAgentApi(chatClient = chatClient, actionClient = actionClient).also {
+            it.phoneControlOverride = true
+        }
+
+        val first = agent.sendMessage(
+            "Use web_search only. Find cheapest DEN to TPA flights.",
+            null,
+            isActionLoop = false
+        )
+        assertEquals("tool_use", first.stopReason)
+        assertEquals("web_search", first.toolCalls.single().name)
+
+        agent.addToolResult("ws1", "Search results: sample")
+        val continuation = agent.continueAfterTools()
+
+        val actionToolNames = actionClient.lastTools.orEmpty().map { it.name }.toSet()
+        assertEquals(setOf("think", "web_search"), actionToolNames)
+        assertTrue(continuation.toolCalls.isEmpty())
+        assertEquals("end_turn", continuation.stopReason)
+    }
+
+    @Test
+    fun `new non-action user turn clears previous web_search only constraint`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(text = "ok", toolCalls = emptyList(), stopReason = "end_turn"),
+                    ChatResponse(text = "ok", toolCalls = emptyList(), stopReason = "end_turn")
+                )
+            )
+        )
+        val agent = PhoneAgentApi(client, client).also { it.phoneControlOverride = true }
+
+        agent.sendMessage("Use web_search only for this request", null, isActionLoop = false)
+        val constrainedTools = client.lastTools.orEmpty().map { it.name }.toSet()
+        assertEquals(setOf("think", "web_search"), constrainedTools)
+
+        agent.sendMessage("Open Gmail", null, isActionLoop = false)
+        val unconstrainedTools = client.lastTools.orEmpty().map { it.name }.toSet()
+        assertTrue("open_app" in unconstrainedTools)
+        assertTrue("web_fetch" in unconstrainedTools)
     }
 
     @Test
@@ -287,6 +832,166 @@ class PhoneAgentApiTest {
     }
 
     @Test
+    fun `executeToolCall tap returns explicit privacy blocked reason`() = runTest {
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+        val api = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            clickElement = { ScreenReader.ElementActionResult.PrivacyBlocked }
+        )
+
+        val result = api.executeToolCall(ToolCall("t1", "tap", mapOf("element_id" to 5)), null)
+
+        assertTrue(result.isError)
+        assertEquals("Failed: tap: blocked by privacy mode for private_app", result.text)
+        assertEquals(ToolErrorCode.PRIVACY_BLOCKED, result.errorCode)
+        assertFalse(result.text.contains("com.bank.app"))
+    }
+
+    @Test
+    fun `executeToolCall tap reports cause-accurate failures`() = runTest {
+        val cases = listOf(
+            ScreenReader.ElementActionResult.ServiceUnavailable to
+                "Failed: tap: accessibility service unavailable",
+            ScreenReader.ElementActionResult.GestureDispatchFailed to
+                "Failed: tap: gesture dispatch failed",
+            ScreenReader.ElementActionResult.ElementNotFound to
+                "Failed: tap: element 5 not found"
+        )
+
+        for ((actionResult, expected) in cases) {
+            val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+            val api = PhoneAgentApi(
+                chatClient = client,
+                actionClient = client,
+                clickElement = { actionResult }
+            )
+
+            val result = api.executeToolCall(ToolCall("t1", "tap", mapOf("element_id" to 5)), null)
+
+            assertTrue(result.isError)
+            assertEquals(expected, result.text)
+        }
+    }
+
+    @Test
+    fun `executeToolCall long_press returns explicit privacy blocked reason`() = runTest {
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+        val api = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            longPressElement = { ScreenReader.ElementActionResult.PrivacyBlocked }
+        )
+
+        val result = api.executeToolCall(ToolCall("t1", "long_press", mapOf("element_id" to 2)), null)
+
+        assertTrue(result.isError)
+        assertEquals("Failed: long_press: blocked by privacy mode for private_app", result.text)
+        assertEquals(ToolErrorCode.PRIVACY_BLOCKED, result.errorCode)
+        assertFalse(result.text.contains("com.bank.app"))
+    }
+
+    @Test
+    fun `executeToolCall long_press reports cause-accurate failures`() = runTest {
+        val cases = listOf(
+            ScreenReader.ElementActionResult.ServiceUnavailable to
+                "Failed: long_press: accessibility service unavailable",
+            ScreenReader.ElementActionResult.GestureDispatchFailed to
+                "Failed: long_press: gesture dispatch failed",
+            ScreenReader.ElementActionResult.ElementNotFound to
+                "Failed: long_press: element 2 not found"
+        )
+
+        for ((actionResult, expected) in cases) {
+            val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+            val api = PhoneAgentApi(
+                chatClient = client,
+                actionClient = client,
+                longPressElement = { actionResult }
+            )
+
+            val result = api.executeToolCall(ToolCall("t1", "long_press", mapOf("element_id" to 2)), null)
+
+            assertTrue(result.isError)
+            assertEquals(expected, result.text)
+        }
+    }
+
+    @Test
+    fun `executeToolCall tap_text reports cause-accurate failures`() = runTest {
+        val screen = ScreenContent(
+            packageName = "com.example.app",
+            elements = listOf(
+                ScreenElement(
+                    id = 7,
+                    text = "Settings",
+                    contentDescription = null,
+                    className = "android.widget.TextView",
+                    isClickable = true,
+                    isEditable = false,
+                    bounds = Rect(0, 0, 10, 10)
+                )
+            )
+        )
+
+        val cases = listOf(
+            ScreenReader.ElementActionResult.ServiceUnavailable to
+                "Failed: tap_text: accessibility service unavailable",
+            ScreenReader.ElementActionResult.GestureDispatchFailed to
+                "Failed: tap_text: gesture dispatch failed",
+            ScreenReader.ElementActionResult.PrivacyBlocked to
+                "Failed: tap_text: blocked by privacy mode for private_app",
+            ScreenReader.ElementActionResult.ElementNotFound to
+                "Failed: tap_text: no element matching \"Settings\""
+        )
+
+        for ((actionResult, expected) in cases) {
+            val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+            val api = PhoneAgentApi(
+                chatClient = client,
+                actionClient = client,
+                clickElement = { actionResult }
+            )
+            val result = api.executeToolCall(
+                ToolCall("tc1", "tap_text", mapOf("text" to "Settings")),
+                screen
+            )
+            assertEquals(expected, result.text)
+            assertTrue(result.isError)
+            val expectedCode = if (actionResult is ScreenReader.ElementActionResult.PrivacyBlocked) {
+                ToolErrorCode.PRIVACY_BLOCKED
+            } else {
+                ToolErrorCode.EXECUTION_FAILED
+            }
+            assertEquals(expectedCode, result.errorCode)
+        }
+    }
+
+    @Test
+    fun `executeToolCall tap_text returns privacy blocked when screen content is privacy mode`() = runTest {
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+        val api = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            clickElement = { ScreenReader.ElementActionResult.Success }
+        )
+        val privacyScreen = ScreenContent(
+            packageName = PrivacyRedaction.APP_PLACEHOLDER,
+            elements = emptyList(),
+            privacyMode = true
+        )
+
+        val result = api.executeToolCall(
+            ToolCall("tc1", "tap_text", mapOf("text" to "Settings")),
+            privacyScreen
+        )
+
+        assertTrue(result.isError)
+        assertEquals("Failed: tap_text: blocked by privacy mode for private_app", result.text)
+        assertEquals(ToolErrorCode.PRIVACY_BLOCKED, result.errorCode)
+    }
+
+    @Test
     fun `memory tools return configured error when provider missing`() = runTest {
         val agent = createAgent(memoryProvider = null)
 
@@ -438,6 +1143,185 @@ class PhoneAgentApiTest {
     }
 
     @Test
+    fun `continue after interruption pause context routes to tool mode`() = runTest {
+        val toolClient = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            chatResponses = ArrayDeque(listOf("chat fallback")),
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = "Resuming the task",
+                        toolCalls = listOf(ToolCall("tc1", "tap", mapOf("element_id" to 1))),
+                        stopReason = "tool_use"
+                    )
+                )
+            )
+        )
+        val agent = PhoneAgentApi(toolClient, toolClient).also { it.phoneControlOverride = true }
+        agent.seedConversationHistory(
+            listOf(
+                Message(
+                    role = Message.ROLE_USER,
+                    content =
+                        "[SYSTEM: User switched from com.mail to com.calendar. " +
+                            "$INTERRUPTION_RESUME_MARKER]"
+                ),
+                Message(
+                    role = Message.ROLE_ASSISTANT,
+                    content = "You switched apps. Should I continue or cancel?"
+                )
+            )
+        )
+
+        val response = agent.sendMessage("continue", screenContent = null, isActionLoop = false)
+
+        assertEquals(0, toolClient.chatCalls, "continue should bypass chat mode when interruption pause context exists")
+        assertEquals(1, toolClient.chatWithToolsCalls, "continue should re-enter actionable mode")
+        assertEquals("tool_use", response.stopReason)
+        assertTrue(response.toolCalls.isNotEmpty())
+    }
+
+    @Test
+    fun `resume after interruption pause context routes to tool mode`() = runTest {
+        val toolClient = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            chatResponses = ArrayDeque(listOf("chat fallback")),
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = "Resuming now",
+                        toolCalls = listOf(ToolCall("tc2", "press_back", emptyMap())),
+                        stopReason = "tool_use"
+                    )
+                )
+            )
+        )
+        val agent = PhoneAgentApi(toolClient, toolClient).also { it.phoneControlOverride = true }
+        agent.seedConversationHistory(
+            listOf(
+                Message(
+                    role = Message.ROLE_USER,
+                    content =
+                        "[SYSTEM: User switched from com.mail to com.calendar. " +
+                            "$INTERRUPTION_RESUME_MARKER]"
+                ),
+                Message(
+                    role = Message.ROLE_ASSISTANT,
+                    content = "Want me to resume?"
+                )
+            )
+        )
+
+        val response = agent.sendMessage("resume please", screenContent = null, isActionLoop = false)
+
+        assertEquals(0, toolClient.chatCalls)
+        assertEquals(1, toolClient.chatWithToolsCalls)
+        assertEquals("tool_use", response.stopReason)
+    }
+
+    @Test
+    fun `continue after interruption cancel does not re-enter tool mode`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            chatResponses = ArrayDeque(listOf("Canceled already — what next?")),
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = "Should not run tools",
+                        toolCalls = listOf(ToolCall("tc_cancel", "tap", mapOf("element_id" to 9))),
+                        stopReason = "tool_use"
+                    )
+                )
+            )
+        )
+        val agent = PhoneAgentApi(client, client).also { it.phoneControlOverride = true }
+        agent.seedConversationHistory(
+            listOf(
+                Message(
+                    role = Message.ROLE_USER,
+                    content =
+                        "[SYSTEM: User switched from com.mail to com.calendar. " +
+                            "$INTERRUPTION_RESUME_MARKER]"
+                ),
+                Message(role = Message.ROLE_ASSISTANT, content = "You switched apps. Should I continue or cancel?"),
+                Message(role = Message.ROLE_USER, content = "cancel"),
+                Message(role = Message.ROLE_ASSISTANT, content = "Okay, canceled.")
+            )
+        )
+
+        val response = agent.sendMessage("continue", screenContent = null, isActionLoop = false)
+
+        assertEquals("Canceled already — what next?", response.text)
+        assertTrue(response.toolCalls.isEmpty())
+        assertEquals(1, client.chatCalls)
+        assertEquals(0, client.chatWithToolsCalls)
+    }
+
+    @Test
+    fun `continue with interruption marker outside recent window stays chat mode`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            chatResponses = ArrayDeque(listOf("Continue what?")),
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = "Should not run tools",
+                        toolCalls = listOf(ToolCall("tc_old", "tap", mapOf("element_id" to 1))),
+                        stopReason = "tool_use"
+                    )
+                )
+            )
+        )
+        val agent = PhoneAgentApi(client, client).also { it.phoneControlOverride = true }
+        val history = mutableListOf<Message>(
+            Message(
+                role = Message.ROLE_USER,
+                content =
+                    "[SYSTEM: User switched from com.mail to com.calendar. " +
+                        "$INTERRUPTION_RESUME_MARKER]"
+            ),
+            Message(role = Message.ROLE_ASSISTANT, content = "Should I continue?")
+        )
+        repeat(6) { idx ->
+            history += Message(role = Message.ROLE_USER, content = "user filler $idx")
+            history += Message(role = Message.ROLE_ASSISTANT, content = "assistant filler $idx")
+        }
+        agent.seedConversationHistory(history)
+
+        val response = agent.sendMessage("continue", screenContent = null, isActionLoop = false)
+
+        assertEquals("Continue what?", response.text)
+        assertTrue(response.toolCalls.isEmpty())
+        assertEquals(1, client.chatCalls)
+        assertEquals(0, client.chatWithToolsCalls)
+    }
+
+    @Test
+    fun `continue without interruption context stays chat mode`() = runTest {
+        val chatClient = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            chatResponses = ArrayDeque(listOf("Continue what?")),
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = "Should not run tools",
+                        toolCalls = listOf(ToolCall("tc3", "tap", mapOf("element_id" to 9))),
+                        stopReason = "tool_use"
+                    )
+                )
+            )
+        )
+        val agent = PhoneAgentApi(chatClient, chatClient).also { it.phoneControlOverride = true }
+
+        val response = agent.sendMessage("continue", screenContent = null, isActionLoop = false)
+
+        assertEquals("Continue what?", response.text)
+        assertTrue(response.toolCalls.isEmpty())
+        assertEquals(1, chatClient.chatCalls)
+        assertEquals(0, chatClient.chatWithToolsCalls)
+    }
+
+    @Test
     fun `action phrases like take screenshot use tool mode`() = runTest {
         val toolResponse = ChatResponse(
             text = "Done",
@@ -573,6 +1457,27 @@ class PhoneAgentApiTest {
         }
     }
 
+    private class EmptyNotificationListenerService : NotificationListenerService() {
+        override fun getActiveNotifications(): Array<StatusBarNotification> = emptyArray()
+    }
+
+    private class AccessDeniedNotificationListenerService : NotificationListenerService() {
+        override fun getActiveNotifications(): Array<StatusBarNotification> {
+            throw SecurityException("Notification access denied")
+        }
+    }
+
+    private fun cancelAccessDeniedNotificationListenerService(
+        notificationKey: String
+    ): NotificationListenerService {
+        val service: NotificationListenerService = mock()
+        val activeNotification: StatusBarNotification = mock()
+        whenever(activeNotification.key).thenReturn(notificationKey)
+        whenever(service.activeNotifications).thenReturn(arrayOf(activeNotification))
+        doThrow(SecurityException("Notification access denied")).whenever(service).cancelNotification(any())
+        return service
+    }
+
     // ========== Screenshot Tool Tests (#338) ==========
 
     @Test
@@ -589,6 +1494,108 @@ class PhoneAgentApiTest {
         val result = api.executeToolCall(toolCall, null)
 
         assertEquals("Accessibility service not attached", result.text)
+        assertTrue(result.isError)
+    }
+
+    @Test
+    fun `screenshot tool returns privacy blocked error when screenshot is blocked`() = runTest {
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+        val api = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            isScreenReaderAttached = { true },
+            takeScreenshot = { ScreenshotResult.PrivacyBlocked }
+        )
+
+        val result = api.executeToolCall(ToolCall("tc1", "screenshot", emptyMap()), null)
+
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.PRIVACY_BLOCKED, result.errorCode)
+        assertEquals(
+            "Failed: screenshot: blocked by privacy mode for private_app",
+            result.text
+        )
+        assertFalse(result.text.contains("com.bank.app"))
+    }
+
+    @Test
+    fun `screenshot tool returns explicit failure reason when screenshot capture fails`() = runTest {
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+        val api = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            isScreenReaderAttached = { true },
+            takeScreenshot = { ScreenshotResult.Failed("Screenshot capture failed") }
+        )
+
+        val result = api.executeToolCall(ToolCall("tc1", "screenshot", emptyMap()), null)
+
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.EXECUTION_FAILED, result.errorCode)
+        assertEquals("Failed: screenshot: Screenshot capture failed", result.text)
+    }
+
+    @Test
+    fun `read_screen tool payload uses compactable Screen refreshed colon format`() = runTest {
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+        val api = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            isScreenReaderAttached = { true },
+            getScreenContent = {
+                ScreenContent(
+                    packageName = "com.example.app",
+                    elements = listOf(
+                        ScreenElement(
+                            id = 1,
+                            text = "Open",
+                            contentDescription = null,
+                            className = "Button",
+                            isClickable = true,
+                            isEditable = false,
+                            bounds = android.graphics.Rect(0, 0, 100, 50)
+                        )
+                    )
+                )
+            }
+        )
+
+        val result = api.executeToolCall(ToolCall("tc1", "read_screen", emptyMap()), null)
+        assertTrue(result.text.startsWith("Screen refreshed:\nSCREEN:\n"), result.text)
+    }
+
+    @Test
+    fun `read_screen tool payload returns privacy marker and no raw element text when blocked`() = runTest {
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+        val api = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            isScreenReaderAttached = { true },
+            getScreenContent = {
+                ScreenContent(
+                    packageName = "com.bank.app",
+                    elements = listOf(
+                        ScreenElement(
+                            id = 1,
+                            text = "SECRET BALANCE",
+                            contentDescription = null,
+                            className = "TextView",
+                            isClickable = false,
+                            isEditable = false,
+                            bounds = android.graphics.Rect(0, 0, 100, 50)
+                        )
+                    ),
+                    privacyMode = true
+                )
+            }
+        )
+
+        val result = api.executeToolCall(ToolCall("tc1", "read_screen", emptyMap()), null)
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.PRIVACY_BLOCKED, result.errorCode)
+        assertTrue(result.text.contains("Privacy mode"), result.text)
+        assertFalse(result.text.contains("SECRET BALANCE"), result.text)
+        assertFalse(result.text.contains("com.bank.app"), result.text)
     }
 
     @Test
@@ -649,6 +1656,8 @@ class PhoneAgentApiTest {
         val toolCall = ToolCall("tc1", "copy", emptyMap())
         val result = api.executeToolCall(toolCall, null)
 
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.SERVICE_UNAVAILABLE, result.errorCode)
         assertTrue(result.text.contains("not available"))
     }
 
@@ -661,6 +1670,8 @@ class PhoneAgentApiTest {
         val toolCall = ToolCall("tc1", "set_clipboard", mapOf("text" to "hello"))
         val result = api.executeToolCall(toolCall, null)
 
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.SERVICE_UNAVAILABLE, result.errorCode)
         assertTrue(result.text.contains("not available"))
     }
 
@@ -673,6 +1684,8 @@ class PhoneAgentApiTest {
         val toolCall = ToolCall("tc1", "paste", mapOf("text" to "hello"))
         val result = api.executeToolCall(toolCall, null)
 
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.SERVICE_UNAVAILABLE, result.errorCode)
         assertTrue(result.text.contains("not available"))
     }
 
@@ -684,6 +1697,8 @@ class PhoneAgentApiTest {
         val toolCall = ToolCall("tc1", "set_clipboard", mapOf("text" to ""))
         val result = api.executeToolCall(toolCall, null)
 
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, result.errorCode)
         assertTrue(result.text.contains("Failed"))
     }
 
@@ -695,7 +1710,77 @@ class PhoneAgentApiTest {
         val toolCall = ToolCall("tc1", "paste", mapOf("text" to ""))
         val result = api.executeToolCall(toolCall, null)
 
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, result.errorCode)
         assertTrue(result.text.contains("Failed"))
+    }
+
+    @Test
+    fun `paste tool maps writeAndPaste failure to EXECUTION_FAILED`() = runTest {
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+        val api = PhoneAgentApi(client)
+
+        val clipboardManager = mock<ClipboardManager>()
+        doNothing().whenever(clipboardManager).setPrimaryClip(any<android.content.ClipData>())
+        val context = mock<Context>()
+        whenever(context.applicationContext).thenReturn(context)
+        whenever(context.getSystemService(Context.CLIPBOARD_SERVICE)).thenReturn(clipboardManager)
+
+        ClipboardHelper.attach(context)
+        ScreenReader.detach()
+
+        try {
+            val toolCall = ToolCall("tc1", "paste", mapOf("text" to "hello"))
+            val result = api.executeToolCall(toolCall, null)
+
+            assertTrue(result.isError)
+            assertEquals(ToolErrorCode.EXECUTION_FAILED, result.errorCode)
+            assertEquals(
+                "Failed: paste: no focused input field or clipboard write failed",
+                result.text
+            )
+        } finally {
+            ClipboardHelper.detach()
+        }
+    }
+
+    @Test
+    fun `set_clipboard tool maps write failure to EXECUTION_FAILED`() = runTest {
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+        val api = PhoneAgentApi(client)
+
+        val clipboardManager = mock<ClipboardManager>()
+        org.mockito.kotlin.doThrow(SecurityException("Clipboard write denied"))
+            .whenever(clipboardManager).setPrimaryClip(any<android.content.ClipData>())
+        val context = mock<Context>()
+        whenever(context.applicationContext).thenReturn(context)
+        whenever(context.getSystemService(Context.CLIPBOARD_SERVICE)).thenReturn(clipboardManager)
+
+        ClipboardHelper.detach()
+        ClipboardHelper.attach(context)
+
+        try {
+            val mockFailureConfigured = runCatching {
+                clipboardManager.setPrimaryClip(android.content.ClipData.newPlainText("label", "probe"))
+            }.exceptionOrNull() is SecurityException
+
+            val toolCall = ToolCall("tc1", "set_clipboard", mapOf("text" to "hello"))
+            val result = api.executeToolCall(toolCall, null)
+
+            if (mockFailureConfigured) {
+                assertTrue(result.isError)
+                assertEquals(ToolErrorCode.EXECUTION_FAILED, result.errorCode)
+                assertEquals(
+                    "Failed: set_clipboard: clipboard write denied",
+                    result.text
+                )
+            } else {
+                assertFalse(result.isError)
+                assertTrue(result.text.startsWith("Copied to clipboard"))
+            }
+        } finally {
+            ClipboardHelper.detach()
+        }
     }
 
     @Test
@@ -737,7 +1822,27 @@ class PhoneAgentApiTest {
         val toolCall = ToolCall("tc1", "read_notifications", emptyMap())
         val result = api.executeToolCall(toolCall, null)
 
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.SERVICE_UNAVAILABLE, result.errorCode)
         assertTrue(result.text.contains("not attached"))
+    }
+
+    @Test
+    fun `read_notifications maps access revocation to ACCESS_DENIED`() = runTest {
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+        val api = PhoneAgentApi(client)
+        NotificationHelper.attach(AccessDeniedNotificationListenerService())
+
+        try {
+            val toolCall = ToolCall("tc1", "read_notifications", emptyMap())
+            val result = api.executeToolCall(toolCall, null)
+
+            assertTrue(result.isError)
+            assertEquals(ToolErrorCode.ACCESS_DENIED, result.errorCode)
+            assertTrue(result.text.contains("Notification access denied"))
+        } finally {
+            NotificationHelper.detach()
+        }
     }
 
     @Test
@@ -753,6 +1858,8 @@ class PhoneAgentApiTest {
         )
         val result = api.executeToolCall(toolCall, null)
 
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.SERVICE_UNAVAILABLE, result.errorCode)
         assertTrue(result.text.contains("not attached"))
     }
 
@@ -769,6 +1876,8 @@ class PhoneAgentApiTest {
         )
         val result = api.executeToolCall(toolCall, null)
 
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.SERVICE_UNAVAILABLE, result.errorCode)
         assertTrue(result.text.contains("not attached"))
     }
 
@@ -788,6 +1897,8 @@ class PhoneAgentApiTest {
         )
         val result = api.executeToolCall(toolCall, null)
 
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.SERVICE_UNAVAILABLE, result.errorCode)
         assertTrue(result.text.contains("not attached"))
     }
 
@@ -803,6 +1914,8 @@ class PhoneAgentApiTest {
         )
         val result = api.executeToolCall(toolCall, null)
 
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, result.errorCode)
         assertTrue(result.text.contains("Failed"))
     }
 
@@ -814,6 +1927,8 @@ class PhoneAgentApiTest {
         val toolCall = ToolCall("tc1", "tap_notification", mapOf("notification_key" to "invalid-key"))
         val result = api.executeToolCall(toolCall, null)
 
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, result.errorCode)
         assertTrue(result.text.contains("valid notification_key format"))
     }
 
@@ -825,6 +1940,8 @@ class PhoneAgentApiTest {
         val toolCall = ToolCall("tc1", "dismiss_notification", mapOf("notification_key" to "a|b"))
         val result = api.executeToolCall(toolCall, null)
 
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, result.errorCode)
         assertTrue(result.text.contains("valid notification_key format"))
     }
 
@@ -840,7 +1957,86 @@ class PhoneAgentApiTest {
         )
         val result = api.executeToolCall(toolCall, null)
 
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, result.errorCode)
         assertTrue(result.text.contains("valid notification_key format"))
+    }
+
+    @Test
+    fun `notification action tools map missing target to EXECUTION_FAILED`() = runTest {
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+        val api = PhoneAgentApi(client)
+        NotificationHelper.attach(EmptyNotificationListenerService())
+
+        try {
+            val validKey = "0|com.example.app|123|null|1000"
+            val cases = listOf(
+                ToolCall("tc1", "tap_notification", mapOf("notification_key" to validKey)) to
+                    "Failed: tap_notification: notification may have been dismissed or has no content intent",
+                ToolCall("tc2", "dismiss_notification", mapOf("notification_key" to validKey)) to
+                    "Failed: dismiss_notification: notification may be ongoing or already dismissed",
+                ToolCall(
+                    "tc3",
+                    "reply_notification",
+                    mapOf("notification_key" to validKey, "text" to "hello")
+                ) to "Failed: reply_notification: notification may not support inline reply or was dismissed"
+            )
+
+            for ((toolCall, expectedText) in cases) {
+                val result = api.executeToolCall(toolCall, null)
+                assertTrue(result.isError, "Expected error for ${toolCall.name}")
+                assertEquals(ToolErrorCode.EXECUTION_FAILED, result.errorCode)
+                assertEquals(expectedText, result.text)
+            }
+        } finally {
+            NotificationHelper.detach()
+        }
+    }
+
+    @Test
+    fun `notification action tools map access revocation to ACCESS_DENIED`() = runTest {
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+        val api = PhoneAgentApi(client)
+        NotificationHelper.attach(AccessDeniedNotificationListenerService())
+
+        try {
+            val validKey = "0|com.example.app|123|null|1000"
+            val cases = listOf(
+                ToolCall("tc1", "tap_notification", mapOf("notification_key" to validKey)),
+                ToolCall("tc2", "dismiss_notification", mapOf("notification_key" to validKey)),
+                ToolCall("tc3", "reply_notification", mapOf("notification_key" to validKey, "text" to "hello"))
+            )
+
+            for (toolCall in cases) {
+                val result = api.executeToolCall(toolCall, null)
+                assertTrue(result.isError, "Expected error for ${toolCall.name}")
+                assertEquals(ToolErrorCode.ACCESS_DENIED, result.errorCode)
+                assertTrue(result.text.contains("Notification access denied"))
+            }
+        } finally {
+            NotificationHelper.detach()
+        }
+    }
+
+    @Test
+    fun `dismiss_notification maps cancelNotification access revocation to ACCESS_DENIED`() = runTest {
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+        val api = PhoneAgentApi(client)
+        val validKey = "0|com.example.app|123|null|1000"
+        NotificationHelper.attach(cancelAccessDeniedNotificationListenerService(validKey))
+
+        try {
+            val result = api.executeToolCall(
+                ToolCall("tc1", "dismiss_notification", mapOf("notification_key" to validKey)),
+                null
+            )
+
+            assertTrue(result.isError)
+            assertEquals(ToolErrorCode.ACCESS_DENIED, result.errorCode)
+            assertTrue(result.text.contains("Notification access denied"))
+        } finally {
+            NotificationHelper.detach()
+        }
     }
 
     @Test
@@ -851,6 +2047,8 @@ class PhoneAgentApiTest {
         val toolCall = ToolCall("tc1", "tap_notification", mapOf("notification_key" to "0|example|123"))
         val result = api.executeToolCall(toolCall, null)
 
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, result.errorCode)
         assertTrue(result.text.contains("valid notification_key format"))
     }
 
@@ -862,6 +2060,8 @@ class PhoneAgentApiTest {
         val toolCall = ToolCall("tc1", "tap_notification", mapOf("notification_key" to "0|com..app|123"))
         val result = api.executeToolCall(toolCall, null)
 
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, result.errorCode)
         assertTrue(result.text.contains("valid notification_key format"))
     }
 
@@ -873,6 +2073,8 @@ class PhoneAgentApiTest {
         val toolCall = ToolCall("tc1", "tap_notification", mapOf("notification_key" to "0|com.example.app"))
         val result = api.executeToolCall(toolCall, null)
 
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, result.errorCode)
         assertTrue(result.text.contains("valid notification_key format"))
     }
 
@@ -886,6 +2088,8 @@ class PhoneAgentApiTest {
         val result = api.executeToolCall(toolCall, null)
 
         // Valid key → falls through to not-attached check (not format error)
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.SERVICE_UNAVAILABLE, result.errorCode)
         assertTrue(result.text.contains("not attached"))
     }
 
@@ -901,6 +2105,8 @@ class PhoneAgentApiTest {
         )
         val result = api.executeToolCall(toolCall, null)
 
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, result.errorCode)
         assertTrue(result.text.contains("whitespace"))
     }
 
@@ -968,6 +2174,21 @@ class PhoneAgentApiTest {
 
         // Verification runs but gracefully handles detached state (error → skipped)
         assertTrue(result.text.contains("[Verification skipped"))
+    }
+
+    @Test
+    fun `executeToolCallWithVerification preserves errorCode and severity from tool result`() = runTest {
+        ScreenReader.detach()
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+        val verifier = ActionVerifier(client, VerificationMode.ALWAYS)
+        val api = PhoneAgentApi(client, client, verifier = verifier)
+
+        val toolCall = ToolCall("tc1", "press_home", emptyMap())
+        val underlying = api.executeToolCall(toolCall, null)
+        val verified = api.executeToolCallWithVerification(toolCall, null)
+
+        assertEquals(underlying.errorCode, verified.errorCode)
+        assertEquals(underlying.severity, verified.severity)
     }
 
     @Test
@@ -1355,6 +2576,1032 @@ class PhoneAgentApiTest {
         assertFalse(api.verifier.shouldVerify("tap", "Tapped element 5"))
     }
 
+    @Test
+    fun `tracks task usage across sendMessage and continueAfterTools`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(ToolCall("t1", "tap", mapOf("element_id" to 1))),
+                        stopReason = "tool_use",
+                        usage = TokenUsage(inputTokens = 100, outputTokens = 40)
+                    ),
+                    ChatResponse(
+                        text = "Done",
+                        toolCalls = emptyList(),
+                        stopReason = "end_turn",
+                        usage = TokenUsage(inputTokens = 60, outputTokens = 20)
+                    )
+                )
+            )
+        )
+        val budgetStore = InMemoryBudgetStore(BudgetConfig(enabled = false))
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            budgetGuard = BudgetGuard(budgetStore)
+        ).also { it.phoneControlOverride = true }
+
+        val first = agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        assertEquals("tool_use", first.stopReason)
+        assertEquals(1, first.toolCalls.size)
+
+        agent.addToolResult("t1", "Tapped element 1", toolName = "tap", isError = false)
+        val second = agent.continueAfterTools()
+        assertEquals("Done", second.text)
+
+        val summary = agent.lastTaskCostSummary
+        assertNotNull(summary)
+        assertEquals(220L, summary.totalTokens)
+        assertEquals(160L, summary.inputTokens)
+        assertEquals(60L, summary.outputTokens)
+        assertEquals(2, summary.apiCalls)
+        assertEquals(0.00138, summary.estimatedCostUsd, 0.0000000001)
+    }
+
+    @Test
+    fun `budget is checked after each API call in tool loop`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(ToolCall("t1", "tap", mapOf("element_id" to 1))),
+                        stopReason = "tool_use",
+                        usage = TokenUsage(inputTokens = 1_000, outputTokens = 0)
+                    ),
+                    ChatResponse(
+                        text = "Done",
+                        toolCalls = emptyList(),
+                        stopReason = "end_turn",
+                        usage = TokenUsage(inputTokens = 1_000, outputTokens = 0)
+                    )
+                )
+            )
+        )
+        val budgetStore = InMemoryBudgetStore(
+            BudgetConfig(enabled = true, dailyLimitUsd = 0.0002, monthlyLimitUsd = 10.0)
+        )
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            budgetGuard = BudgetGuard(budgetStore)
+        ).also { it.phoneControlOverride = true }
+
+        val first = agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        assertEquals(1, first.toolCalls.size)
+
+        agent.addToolResult("t1", "Tapped element 1", toolName = "tap", isError = false)
+        val beforeContinue = getMessages(agent).toList()
+        assertFailsWith<BudgetExceededException> {
+            agent.continueAfterTools()
+        }
+        assertEquals(beforeContinue, getMessages(agent), "continueAfterTools over-limit should not persist partial assistant turn")
+    }
+
+    @Test
+    fun `chat mode records usage and enforces budget on over-limit call`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            chatWithUsageResponses = ArrayDeque(
+                listOf(
+                    ("Hello there" to TokenUsage(inputTokens = 1_000, outputTokens = 0)),
+                    ("Hi again" to TokenUsage(inputTokens = 1_000, outputTokens = 0))
+                )
+            )
+        )
+        val budgetStore = InMemoryBudgetStore(
+            BudgetConfig(enabled = true, dailyLimitUsd = 0.0002, monthlyLimitUsd = 10.0)
+        )
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            budgetGuard = BudgetGuard(budgetStore)
+        ).also { it.phoneControlOverride = true }
+
+        val first = agent.sendMessage("hi", screenContent = null, isActionLoop = false)
+        assertEquals("Hello there", first.text)
+        assertEquals(2, agent.messageCount)
+        val beforeSecond = getMessages(agent).toList()
+
+        val summary = agent.lastTaskCostSummary
+        assertEquals(1, summary.apiCalls)
+        assertEquals(1_000L, summary.inputTokens)
+        assertEquals(0.00015, summary.estimatedCostUsd, 0.0000000001)
+
+        assertFailsWith<BudgetExceededException> {
+            agent.sendMessage("hello", screenContent = null, isActionLoop = false)
+        }
+        assertEquals(300L, budgetStore.getDailySpentMicrodollars())
+        assertEquals(beforeSecond, getMessages(agent), "chat over-limit should not persist user/assistant partial turn")
+    }
+
+    @Test
+    fun `pre-call budget gate does not emit zero-dollar allowed telemetry`() = runTest {
+        val telemetryEvents = mutableListOf<BudgetTelemetryEvent>()
+        val client = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            chatWithUsageResponses = ArrayDeque(
+                listOf(
+                    ("Hello there" to TokenUsage(inputTokens = 1_000, outputTokens = 0))
+                )
+            )
+        )
+        val budgetStore = InMemoryBudgetStore(
+            BudgetConfig(enabled = true, dailyLimitUsd = 10.0, monthlyLimitUsd = 10.0)
+        )
+        val budgetGuard = BudgetGuard(budgetStore) { event -> telemetryEvents += event }
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            budgetGuard = budgetGuard
+        ).also { it.phoneControlOverride = true }
+
+        val response = agent.sendMessage("hi", screenContent = null, isActionLoop = false)
+
+        assertEquals("Hello there", response.text)
+        assertEquals(1, telemetryEvents.size)
+        assertTrue(telemetryEvents.all { it.amountUsd > 0.0 }, "pre-call gate should not emit amountUsd=0 allowed events")
+    }
+
+    @Test
+    fun `chat mode tracks usage when budget guard is null`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            chatWithUsageResponses = ArrayDeque(
+                listOf(
+                    ("Hello there" to TokenUsage(inputTokens = 1_000, outputTokens = 200))
+                )
+            )
+        )
+        val agent = PhoneAgentApi(chatClient = client, actionClient = client).also {
+            it.phoneControlOverride = false
+        }
+
+        val response = agent.sendMessage("hi", screenContent = null, isActionLoop = false)
+        assertEquals("Hello there", response.text)
+
+        val summary = agent.lastTaskCostSummary
+        assertEquals(1, summary.apiCalls)
+        assertEquals(1_000L, summary.inputTokens)
+        assertEquals(200L, summary.outputTokens)
+        assertEquals(1_200L, summary.totalTokens)
+        assertEquals(0.00027, summary.estimatedCostUsd, 0.0000000001)
+    }
+
+    @Test
+    fun `chat mode with missing usage metadata still records fallback spend and enforces budget`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            chatResponses = ArrayDeque(listOf("Hello there", "Hi again"))
+        )
+        val budgetStore = InMemoryBudgetStore(
+            BudgetConfig(enabled = true, dailyLimitUsd = 0.00008, monthlyLimitUsd = 10.0)
+        )
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            budgetGuard = BudgetGuard(budgetStore)
+        ).also { it.phoneControlOverride = true }
+
+        val first = agent.sendMessage("hi", screenContent = null, isActionLoop = false)
+        assertEquals("Hello there", first.text)
+        val firstSpend = budgetStore.getDailySpentMicrodollars()
+        assertTrue(firstSpend > 0L)
+        assertEquals(1, agent.lastTaskCostSummary.apiCalls)
+
+        assertFailsWith<BudgetExceededException> {
+            agent.sendMessage("hello", screenContent = null, isActionLoop = false)
+        }
+        assertTrue(budgetStore.getDailySpentMicrodollars() > firstSpend)
+    }
+
+    @Test
+    fun `chat mode with budget guard preserves incremental streaming callbacks`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            streamingResponses = ArrayDeque(listOf(listOf("Hel", "lo", " there"))),
+            chatResponses = ArrayDeque(listOf("Hello there"))
+        )
+        val budgetStore = InMemoryBudgetStore(
+            BudgetConfig(enabled = true, dailyLimitUsd = 10.0, monthlyLimitUsd = 10.0)
+        )
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            budgetGuard = BudgetGuard(budgetStore)
+        ).also { it.phoneControlOverride = true }
+        val deltas = mutableListOf<String>()
+
+        val response = agent.sendMessage(
+            userMessage = "hi",
+            screenContent = null,
+            isActionLoop = false,
+            onTextDelta = { deltas += it }
+        )
+
+        assertEquals("Hello there", response.text)
+        assertEquals(listOf("Hel", "lo", " there"), deltas)
+        assertEquals(1, client.chatStreamingCalls)
+        assertEquals(0, client.chatWithToolsCalls)
+        assertTrue(budgetStore.getDailySpentMicrodollars() > 0L)
+    }
+
+    @Test
+    fun `streaming chat with missing usage metadata enforces budget with fallback spend`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            streamingResponses = ArrayDeque(listOf(listOf("Hel", "lo"), listOf("Hi"))),
+            chatResponses = ArrayDeque(listOf("Hello", "Hi"))
+        )
+        val budgetStore = InMemoryBudgetStore(
+            BudgetConfig(enabled = true, dailyLimitUsd = 0.00008, monthlyLimitUsd = 10.0)
+        )
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            budgetGuard = BudgetGuard(budgetStore)
+        ).also { it.phoneControlOverride = true }
+
+        val first = agent.sendMessage(
+            userMessage = "hello?",
+            screenContent = null,
+            isActionLoop = false,
+            onTextDelta = {}
+        )
+        assertEquals("Hello", first.text)
+        val firstSpend = budgetStore.getDailySpentMicrodollars()
+        assertTrue(firstSpend > 0L)
+
+        assertFailsWith<BudgetExceededException> {
+            agent.sendMessage(
+                userMessage = "hello?",
+                screenContent = null,
+                isActionLoop = false,
+                onTextDelta = {}
+            )
+        }
+        assertTrue(budgetStore.getDailySpentMicrodollars() > firstSpend)
+    }
+
+    @Test
+    fun `chat fallback estimate uses raw output length when sanitization removes artifacts`() = runTest {
+        val cleanClient = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            chatResponses = ArrayDeque(listOf("Short answer"))
+        )
+        val artifactClient = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            chatResponses = ArrayDeque(listOf("<tool_use>${"x".repeat(6000)}</tool_use>Short answer"))
+        )
+        val cleanAgent = PhoneAgentApi(chatClient = cleanClient, actionClient = cleanClient).also {
+            it.phoneControlOverride = true
+        }
+        val artifactAgent = PhoneAgentApi(chatClient = artifactClient, actionClient = artifactClient).also {
+            it.phoneControlOverride = true
+        }
+
+        val clean = cleanAgent.sendMessage("hi", screenContent = null, isActionLoop = false)
+        val artifact = artifactAgent.sendMessage("hi", screenContent = null, isActionLoop = false)
+
+        assertEquals("Short answer", clean.text)
+        assertEquals("Short answer", artifact.text)
+        assertTrue(
+            artifactAgent.lastTaskCostSummary.estimatedCostUsd > cleanAgent.lastTaskCostSummary.estimatedCostUsd,
+            "artifact-heavy raw output should estimate higher fallback cost even when sanitized output matches"
+        )
+    }
+
+    @Test
+    fun `chat mode without budget guard preserves incremental streaming callbacks`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            streamingResponses = ArrayDeque(listOf(listOf("Hi", " there"))),
+            chatResponses = ArrayDeque(listOf("Hi there"))
+        )
+        val agent = PhoneAgentApi(chatClient = client, actionClient = client).also {
+            it.phoneControlOverride = false
+        }
+        val deltas = mutableListOf<String>()
+
+        val response = agent.sendMessage(
+            userMessage = "hello?",
+            screenContent = null,
+            isActionLoop = false,
+            onTextDelta = { deltas += it }
+        )
+
+        assertEquals("Hi there", response.text)
+        assertEquals(listOf("Hi", " there"), deltas)
+        assertEquals(1, client.chatStreamingCalls)
+        assertEquals(0, client.chatWithToolsCalls)
+    }
+
+    @Test
+    fun `pre-call budget failure does not append ghost user message`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = "should never be called",
+                        toolCalls = emptyList(),
+                        stopReason = "end_turn"
+                    )
+                )
+            )
+        )
+        val budgetStore = InMemoryBudgetStore(
+            config = BudgetConfig(enabled = true, dailyLimitUsd = 0.0002, monthlyLimitUsd = 10.0),
+            dailySpentMicrodollars = 201L,
+            monthlySpentMicrodollars = 201L
+        )
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            budgetGuard = BudgetGuard(budgetStore)
+        ).also { it.phoneControlOverride = true }
+
+        val error = assertFailsWith<BudgetExceededException> {
+            agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        }
+
+        assertEquals(BudgetErrorCode.DAILY_LIMIT, error.code)
+        assertEquals(0, agent.messageCount, "Pre-check failure must not mutate history")
+        assertEquals(0, client.chatWithToolsCalls, "Pre-check failure must not call provider")
+    }
+
+    @Test
+    fun `post-call budget exception does not persist partial tool-mode turn`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(ToolCall("t1", "tap", mapOf("element_id" to 1))),
+                        stopReason = "tool_use",
+                        usage = TokenUsage(inputTokens = 1_000, outputTokens = 1_000)
+                    )
+                )
+            )
+        )
+        val budgetStore = InMemoryBudgetStore(
+            config = BudgetConfig(enabled = true, dailyLimitUsd = 0.0002, monthlyLimitUsd = 10.0)
+        )
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            budgetGuard = BudgetGuard(budgetStore)
+        ).also { it.phoneControlOverride = true }
+
+        assertFailsWith<BudgetExceededException> {
+            agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        }
+
+        val persisted = getMessages(agent)
+        assertEquals(0, persisted.size, "Tool-mode over-limit should not persist a hidden user/assistant partial turn")
+    }
+
+    @Test
+    fun `tool mode with missing usage metadata records fallback spend and enforces budget`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(ToolCall("t1", "tap", mapOf("element_id" to 1))),
+                        stopReason = "tool_use"
+                    ),
+                    ChatResponse(
+                        text = "Done",
+                        toolCalls = emptyList(),
+                        stopReason = "end_turn"
+                    )
+                )
+            )
+        )
+        val budgetStore = InMemoryBudgetStore(
+            BudgetConfig(enabled = true, dailyLimitUsd = 0.0012, monthlyLimitUsd = 10.0)
+        )
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            budgetGuard = BudgetGuard(budgetStore)
+        ).also { it.phoneControlOverride = true }
+
+        val first = agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        assertEquals("tool_use", first.stopReason)
+        val firstSpend = budgetStore.getDailySpentMicrodollars()
+        assertTrue(firstSpend > 0L)
+
+        agent.addToolResult("t1", "Tapped element 1", toolName = "tap", isError = false)
+        val error = assertFailsWith<BudgetExceededException> {
+            agent.continueAfterTools()
+        }
+        assertEquals(BudgetErrorCode.DAILY_LIMIT, error.code)
+        assertTrue(budgetStore.getDailySpentMicrodollars() > firstSpend)
+    }
+
+    @Test
+    fun `tool mode fallback estimate is conservative relative to known usage baseline`() = runTest {
+        val knownUsageClient = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(ToolCall("t1", "tap", mapOf("element_id" to 1))),
+                        stopReason = "tool_use",
+                        usage = TokenUsage(inputTokens = 500, outputTokens = 100)
+                    )
+                )
+            )
+        )
+        val knownStore = InMemoryBudgetStore(BudgetConfig(enabled = false))
+        val knownAgent = PhoneAgentApi(
+            chatClient = knownUsageClient,
+            actionClient = knownUsageClient,
+            budgetGuard = BudgetGuard(knownStore)
+        ).also { it.phoneControlOverride = true }
+
+        knownAgent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        val knownSpend = knownStore.getDailySpentMicrodollars()
+        assertTrue(knownSpend > 0L)
+
+        val fallbackClient = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(ToolCall("t1", "tap", mapOf("element_id" to 1))),
+                        stopReason = "tool_use"
+                    )
+                )
+            )
+        )
+        val fallbackStore = InMemoryBudgetStore(BudgetConfig(enabled = false))
+        val fallbackAgent = PhoneAgentApi(
+            chatClient = fallbackClient,
+            actionClient = fallbackClient,
+            budgetGuard = BudgetGuard(fallbackStore)
+        ).also { it.phoneControlOverride = true }
+
+        fallbackAgent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        val fallbackSpend = fallbackStore.getDailySpentMicrodollars()
+        assertTrue(
+            fallbackSpend >= knownSpend,
+            "fallback spend ($fallbackSpend) should be >= known-usage spend ($knownSpend)"
+        )
+    }
+
+    @Test
+    fun `per-task cap is enforced pre-call after cap is reached`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(ToolCall("t1", "tap", mapOf("element_id" to 1))),
+                        stopReason = "tool_use",
+                        usage = TokenUsage(inputTokens = 1_000, outputTokens = 0)
+                    ),
+                    ChatResponse(
+                        text = "Should not be called",
+                        toolCalls = emptyList(),
+                        stopReason = "end_turn",
+                        usage = TokenUsage(inputTokens = 1_000, outputTokens = 0)
+                    )
+                )
+            )
+        )
+        val budgetStore = InMemoryBudgetStore(
+            config = BudgetConfig(
+                enabled = true,
+                dailyLimitUsd = 10.0,
+                monthlyLimitUsd = 10.0,
+                perTaskLimitUsd = 0.00015
+            )
+        )
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            budgetGuard = BudgetGuard(budgetStore)
+        ).also { it.phoneControlOverride = true }
+
+        assertFailsWith<BudgetExceededException> {
+            agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        }
+        assertEquals(1, client.chatWithToolsCalls)
+
+        agent.addToolResult("t1", "Tapped element 1", toolName = "tap", isError = false)
+        assertFailsWith<BudgetExceededException> {
+            agent.continueAfterTools()
+        }
+        assertEquals(1, client.chatWithToolsCalls, "continueAfterTools must fail before provider call when capped")
+
+        assertFailsWith<BudgetExceededException> {
+            agent.sendEphemeral("[System: Summarize progress]")
+        }
+        assertEquals(1, client.chatWithToolsCalls, "sendEphemeral must fail before provider call when capped")
+    }
+
+    @Test
+    fun `per-task cap enforces repeated sub-micro costs with carry`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            toolResponses = ArrayDeque(
+                (1..7).map { idx ->
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(ToolCall("t$idx", "tap", mapOf("element_id" to idx))),
+                        stopReason = "tool_use",
+                        usage = TokenUsage(inputTokens = 1, outputTokens = 0)
+                    )
+                }
+            )
+        )
+        val budgetStore = InMemoryBudgetStore(
+            config = BudgetConfig(
+                enabled = true,
+                dailyLimitUsd = 10.0,
+                monthlyLimitUsd = 10.0,
+                perTaskLimitUsd = 0.000001
+            )
+        )
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            budgetGuard = BudgetGuard(budgetStore)
+        ).also { it.phoneControlOverride = true }
+
+        val first = agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        assertEquals("tool_use", first.stopReason)
+
+        repeat(5) { idx ->
+            val toolId = "t${idx + 1}"
+            agent.addToolResult(toolId, "Tapped element ${idx + 1}", toolName = "tap", isError = false)
+            val response = agent.continueAfterTools()
+            assertEquals("tool_use", response.stopReason)
+        }
+
+        agent.addToolResult("t6", "Tapped element 6", toolName = "tap", isError = false)
+        assertFailsWith<BudgetExceededException> {
+            agent.continueAfterTools()
+        }
+
+        assertEquals(7, client.chatWithToolsCalls)
+        assertEquals(7, agent.lastTaskCostSummary.apiCalls)
+        assertTrue(agent.lastTaskCostSummary.estimatedCostUsd >= 0.000001)
+    }
+
+    @Flaky("#751")
+    @Test
+    fun `concurrent sendMessage calls do not bypass pre-call budget cap`() = runTest {
+        val client = BlockingToolClient(
+            response = ChatResponse(
+                text = "Done",
+                toolCalls = emptyList(),
+                stopReason = "end_turn",
+                usage = TokenUsage(inputTokens = 1_000, outputTokens = 0)
+            )
+        )
+        val budgetStore = InMemoryBudgetStore(
+            config = BudgetConfig(enabled = true, dailyLimitUsd = 0.00015, monthlyLimitUsd = 10.0)
+        )
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            budgetGuard = BudgetGuard(budgetStore)
+        ).also { it.phoneControlOverride = true }
+
+        val first = async {
+            agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        }
+        client.awaitFirstCallStarted()
+
+        val second = async {
+            runCatching { agent.sendMessage("Open settings", screenContent = null, isActionLoop = false) }
+        }
+        delay(50)
+        client.releaseFirstCall()
+
+        val firstResponse = first.await()
+        val secondResult = second.await()
+
+        assertEquals("end_turn", firstResponse.stopReason)
+        val secondError = secondResult.exceptionOrNull()
+        assertTrue(secondError is BudgetExceededException, "second call should fail budget precheck after first spend")
+        assertEquals(1, client.chatWithToolsCalls.get(), "only one provider call should execute under cap")
+    }
+
+    @Flaky("#751")
+    @Test
+    fun `concurrent continueAfterTools calls do not bypass pre-call budget cap`() = runTest {
+        val client = BlockingToolClient(
+            response = ChatResponse(
+                text = "Done",
+                toolCalls = emptyList(),
+                stopReason = "end_turn",
+                usage = TokenUsage(inputTokens = 1_000, outputTokens = 0)
+            )
+        )
+        val budgetStore = InMemoryBudgetStore(
+            config = BudgetConfig(enabled = true, dailyLimitUsd = 0.00015, monthlyLimitUsd = 10.0)
+        )
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            budgetGuard = BudgetGuard(budgetStore)
+        ).also { it.phoneControlOverride = true }
+
+        val first = async { agent.continueAfterTools() }
+        client.awaitFirstCallStarted()
+
+        val second = async { runCatching { agent.continueAfterTools() } }
+        delay(50)
+        client.releaseFirstCall()
+
+        val firstResponse = first.await()
+        val secondResult = second.await()
+
+        assertEquals("end_turn", firstResponse.stopReason)
+        val secondError = secondResult.exceptionOrNull()
+        assertTrue(secondError is BudgetExceededException, "second continuation should fail budget precheck")
+        assertEquals(1, client.chatWithToolsCalls.get(), "only one provider continuation call should execute under cap")
+    }
+
+    @Test
+    fun `clearConversation is non-blocking on caller while request is in flight and clears after release`() = runTest {
+        val client = BlockingToolClient(
+            response = ChatResponse(
+                text = "Done",
+                toolCalls = emptyList(),
+                stopReason = "end_turn",
+                usage = TokenUsage(inputTokens = 1_000, outputTokens = 0)
+            )
+        )
+        val agent = PhoneAgentApi(chatClient = client, actionClient = client).also { it.phoneControlOverride = true }
+
+        val send = async {
+            agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        }
+        client.awaitFirstCallStarted()
+
+        val clear = async { agent.clearConversation() }
+        clear.await()
+        assertTrue(clear.isCompleted, "clearConversation should not block caller thread")
+
+        client.releaseFirstCall()
+        val response = send.await()
+
+        assertEquals("end_turn", response.stopReason)
+        assertEquals(0, agent.messageCount, "clearConversation should apply after in-flight request and leave clean state")
+        assertEquals(0, agent.currentToolStep)
+        assertEquals(TaskCostSummary.EMPTY, agent.lastTaskCostSummary)
+    }
+
+    @Test
+    fun `seedConversationHistory defers during in-flight request and backfills context`() = runTest {
+        val client = BlockingToolClient(
+            response = ChatResponse(
+                text = "Done",
+                toolCalls = emptyList(),
+                stopReason = "end_turn",
+                usage = TokenUsage(inputTokens = 1_000, outputTokens = 0)
+            )
+        )
+        val agent = PhoneAgentApi(chatClient = client, actionClient = client).also { it.phoneControlOverride = true }
+        val deferredSignals = mutableListOf<PhoneAgentApi.DeferredSeedSignal>()
+        agent.onDeferredSeedSignal = { deferredSignals += it }
+        val uiMessages = listOf(
+            Message(role = "user", content = "prior user"),
+            Message(role = "assistant", content = "prior assistant")
+        )
+
+        val send = async {
+            agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        }
+        client.awaitFirstCallStarted()
+
+        agent.seedConversationHistory(uiMessages)
+        assertEquals(0, agent.messageCount, "in-flight call should not persist active turn until request releases")
+
+        client.releaseFirstCall()
+        send.await()
+
+        val persisted = getMessages(agent)
+        assertEquals("prior user", persisted[0].content)
+        assertEquals("prior assistant", persisted[1].content)
+        assertEquals("user", persisted[2].role)
+        assertEquals("assistant", persisted[3].role)
+        assertEquals(4, persisted.size)
+        assertTrue(
+            deferredSignals.any { it.action == "applied" && it.reason == "bootstrap_empty_history" },
+            "expected applied bootstrap deferred seed signal"
+        )
+    }
+
+    @Test
+    fun `seedConversationHistory deferred in R31 maintenance window keeps bootstrap eligibility until maintenance applies`() = runTest {
+        val client = BlockingToolClient(
+            response = ChatResponse(
+                text = "Done",
+                toolCalls = emptyList(),
+                stopReason = "end_turn",
+                usage = TokenUsage(inputTokens = 1_000, outputTokens = 0)
+            )
+        )
+        val agent = PhoneAgentApi(chatClient = client, actionClient = client).also { it.phoneControlOverride = true }
+        val deferredSignals = mutableListOf<PhoneAgentApi.DeferredSeedSignal>()
+        agent.onDeferredSeedSignal = { deferredSignals += it }
+        val uiMessages = listOf(
+            Message(role = "user", content = "seed user"),
+            Message(role = "assistant", content = "seed assistant")
+        )
+        agent.onBeforeDeferredMaintenanceInActiveFlow = {
+            agent.seedConversationHistory(uiMessages)
+        }
+
+        val send = async {
+            agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        }
+        client.awaitFirstCallStarted()
+        client.releaseFirstCall()
+        send.await()
+
+        val persisted = getMessages(agent)
+        assertEquals(4, persisted.size)
+        assertEquals("seed user", persisted[0].content)
+        assertEquals("seed assistant", persisted[1].content)
+        assertEquals("Open settings", persisted[2].content)
+        assertEquals("Done", persisted[3].content)
+        assertTrue(
+            deferredSignals.any { it.action == "applied" && it.reason == "bootstrap_empty_history" },
+            "expected applied bootstrap deferred seed signal for R31 maintenance window"
+        )
+    }
+
+    @Test
+    fun `deferred seed merge keeps first live message when seed tail role matches boundary`() = runTest {
+        val client = BlockingToolClient(
+            response = ChatResponse(
+                text = "Done",
+                toolCalls = emptyList(),
+                stopReason = "end_turn",
+                usage = TokenUsage(inputTokens = 1_000, outputTokens = 0)
+            )
+        )
+        val agent = PhoneAgentApi(chatClient = client, actionClient = client).also { it.phoneControlOverride = true }
+        val uiMessages = listOf(
+            Message(role = "user", content = "seed user 1"),
+            Message(role = "assistant", content = "seed assistant"),
+            Message(role = "user", content = "seed user 2")
+        )
+
+        val send = async {
+            agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        }
+        client.awaitFirstCallStarted()
+
+        agent.seedConversationHistory(uiMessages)
+        client.releaseFirstCall()
+        send.await()
+
+        val persisted = getMessages(agent)
+        assertEquals(4, persisted.size)
+        assertEquals("seed user 1", persisted[0].content)
+        assertEquals("seed assistant", persisted[1].content)
+        assertEquals("Open settings", persisted[2].content)
+        assertEquals("Done", persisted[3].content)
+    }
+
+    @Test
+    fun `multiple deferred seedConversationHistory calls during one request use latest snapshot`() = runTest {
+        val client = BlockingToolClient(
+            response = ChatResponse(
+                text = "Done",
+                toolCalls = emptyList(),
+                stopReason = "end_turn",
+                usage = TokenUsage(inputTokens = 1_000, outputTokens = 0)
+            )
+        )
+        val agent = PhoneAgentApi(chatClient = client, actionClient = client).also { it.phoneControlOverride = true }
+        val firstSeed = listOf(
+            Message(role = "user", content = "stale user"),
+            Message(role = "assistant", content = "stale assistant")
+        )
+        val latestSeed = listOf(
+            Message(role = "user", content = "latest user"),
+            Message(role = "assistant", content = "latest assistant")
+        )
+
+        val send = async {
+            agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        }
+        client.awaitFirstCallStarted()
+
+        agent.seedConversationHistory(firstSeed)
+        agent.seedConversationHistory(latestSeed)
+        client.releaseFirstCall()
+        send.await()
+
+        val persisted = getMessages(agent)
+        assertEquals("latest user", persisted[0].content)
+        assertEquals("latest assistant", persisted[1].content)
+        assertEquals("Open settings", persisted[2].content)
+        assertFalse(persisted.any { it.content.contains("stale") })
+    }
+
+    @Test
+    fun `seedConversationHistory deferred during in-flight request skips stale seed when live history already exists`() = runTest {
+        val client = BlockingToolClient(
+            response = ChatResponse(
+                text = "Done",
+                toolCalls = emptyList(),
+                stopReason = "end_turn",
+                usage = TokenUsage(inputTokens = 1_000, outputTokens = 0)
+            )
+        )
+        val agent = PhoneAgentApi(chatClient = client, actionClient = client).also { it.phoneControlOverride = true }
+        val deferredSignals = mutableListOf<PhoneAgentApi.DeferredSeedSignal>()
+        agent.onDeferredSeedSignal = { deferredSignals += it }
+
+        agent.seedConversationHistory(
+            listOf(
+                Message(role = "user", content = "existing user"),
+                Message(role = "assistant", content = "existing assistant")
+            )
+        )
+        assertEquals(2, agent.messageCount)
+
+        val send = async {
+            agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        }
+        client.awaitFirstCallStarted()
+
+        agent.seedConversationHistory(
+            listOf(
+                Message(role = "user", content = "stale user"),
+                Message(role = "assistant", content = "stale assistant")
+            )
+        )
+
+        client.releaseFirstCall()
+        send.await()
+
+        val persisted = getMessages(agent)
+        assertEquals(4, persisted.size)
+        assertEquals("existing user", persisted[0].content)
+        assertEquals("existing assistant", persisted[1].content)
+        assertEquals("Open settings", persisted[2].content)
+        assertEquals("Done", persisted[3].content)
+        assertFalse(persisted.any { it.content.contains("stale") })
+        assertTrue(
+            deferredSignals.any { it.action == "skipped" && it.reason == "non_empty_live_history_at_deferral" },
+            "expected skipped deferred seed signal for non-empty live history"
+        )
+    }
+
+    @Test
+    fun `seedConversationHistory deferred during in-flight chat skips stale seed when live history has single user non-bootstrap`() = runTest {
+        val client = BlockingUsageClient(responseText = "Done")
+        val agent = PhoneAgentApi(chatClient = client, actionClient = client).also { it.phoneControlOverride = true }
+        val deferredSignals = mutableListOf<PhoneAgentApi.DeferredSeedSignal>()
+        agent.onDeferredSeedSignal = { deferredSignals += it }
+
+        agent.seedConversationHistory(
+            listOf(Message(role = "user", content = "existing single user"))
+        )
+        assertEquals(1, agent.messageCount)
+
+        val send = async {
+            agent.sendMessage("hey there", screenContent = null, isActionLoop = false)
+        }
+        client.awaitFirstCallStarted()
+
+        agent.seedConversationHistory(
+            listOf(
+                Message(role = "user", content = "stale user"),
+                Message(role = "assistant", content = "stale assistant")
+            )
+        )
+
+        client.releaseFirstCall()
+        send.await()
+
+        val persisted = getMessages(agent)
+        assertEquals(3, persisted.size)
+        assertEquals("existing single user", persisted[0].content)
+        assertEquals("hey there", persisted[1].content)
+        assertEquals("Done", persisted[2].content)
+        assertFalse(persisted.any { it.content.contains("stale") })
+        assertTrue(
+            deferredSignals.any { it.action == "skipped" && it.reason == "non_empty_live_history_at_deferral" },
+            "expected skipped deferred seed signal for single-user non-bootstrap live history"
+        )
+    }
+
+    @Test
+    fun `onTextDelta callback reentrancy can clearConversation without deadlock`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            streamingResponses = ArrayDeque(
+                listOf(
+                    listOf("Hello", " world")
+                )
+            )
+        )
+        val agent = PhoneAgentApi(chatClient = client, actionClient = client).also { it.phoneControlOverride = true }
+        val deltas = mutableListOf<String>()
+        var clearInvoked = false
+
+        val response = agent.sendMessage(
+            userMessage = "hi",
+            screenContent = null,
+            onTextDelta = { delta ->
+                deltas += delta
+                if (!clearInvoked) {
+                    clearInvoked = true
+                    agent.clearConversation()
+                }
+            }
+        )
+
+        assertEquals("end_turn", response.stopReason)
+        assertEquals("Hello world", response.text)
+        assertEquals(listOf("Hello", " world"), deltas)
+        assertEquals(0, agent.messageCount, "clearConversation requested from callback should clear safely after request")
+    }
+
+    @Test
+    fun `budget telemetry preserves ordering across usage and fallback paths`() = runTest {
+        val events = mutableListOf<BudgetTelemetryEvent>()
+        val client = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(ToolCall("t1", "tap", mapOf("element_id" to 1))),
+                        stopReason = "tool_use",
+                        usage = TokenUsage(inputTokens = 1_000, outputTokens = 0)
+                    ),
+                    ChatResponse(
+                        text = "Done",
+                        toolCalls = emptyList(),
+                        stopReason = "end_turn"
+                    )
+                )
+            )
+        )
+        val budgetStore = InMemoryBudgetStore(
+            config = BudgetConfig(enabled = true, dailyLimitUsd = 10.0, monthlyLimitUsd = 10.0)
+        )
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            budgetGuard = BudgetGuard(budgetStore) { event -> events += event }
+        ).also { it.phoneControlOverride = true }
+
+        val first = agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        assertEquals("tool_use", first.stopReason)
+        agent.addToolResult("t1", "Tapped element 1", toolName = "tap", isError = false)
+        val second = agent.continueAfterTools()
+        assertEquals("end_turn", second.stopReason)
+
+        val eventTypes = events.map { it.type }
+        assertEquals(
+            listOf(BudgetTelemetryEvent.Type.ALLOWED, BudgetTelemetryEvent.Type.MISSING_USAGE_FALLBACK),
+            eventTypes
+        )
+    }
+
     /** Assert no messages contain synthetic "[Step X/20]" patterns from v1 loop. */
     private fun assertNoSyntheticStepMessages(messages: List<Message>) {
         messages.filter { it.role == "user" }.forEach { msg ->
@@ -1365,23 +3612,26 @@ class PhoneAgentApiTest {
         }
     }
 
-    private class ScriptedProviderClient(
-        override val provider: Provider,
-        private val chatResponses: ArrayDeque<String> = ArrayDeque(),
-        private val toolResponses: ArrayDeque<ChatResponse> = ArrayDeque(),
-        private val visionResponses: ArrayDeque<String> = ArrayDeque()
+    private class BlockingToolClient(
+        private val response: ChatResponse,
+        override val modelId: String? = "gpt-4o-mini"
     ) : ProviderClient {
-        var chatCalls = 0
-        var chatWithToolsCalls = 0
-        var describeImageCalls = 0
-        /** Last messages list passed to chatWithTools, for verifying conversation flow. */
-        var lastMessages: List<Message>? = null
-        /** Last system prompt passed to chatWithTools. */
-        var lastSystemPrompt: String? = null
+        override val provider: Provider = Provider.OPENAI
+        val chatWithToolsCalls = AtomicInteger(0)
+        private val firstCallRelease = kotlinx.coroutines.CompletableDeferred<Unit>()
+
+        suspend fun awaitFirstCallStarted() {
+            while (chatWithToolsCalls.get() == 0) {
+                delay(5)
+            }
+        }
+
+        fun releaseFirstCall() {
+            firstCallRelease.complete(Unit)
+        }
 
         override suspend fun chat(conversation: Conversation): Result<String> {
-            chatCalls++
-            return Result.success(chatResponses.removeFirst())
+            return Result.success("unused")
         }
 
         override suspend fun chatWithTools(
@@ -1390,19 +3640,60 @@ class PhoneAgentApiTest {
             tools: List<Tool>,
             tokenLimit: Int?
         ): Result<ChatResponse> {
-            chatWithToolsCalls++
-            lastMessages = messages.toList()
-            lastSystemPrompt = systemPrompt
-            return Result.success(toolResponses.removeFirst())
+            val callIndex = chatWithToolsCalls.incrementAndGet()
+            if (callIndex == 1) {
+                firstCallRelease.await()
+            }
+            return Result.success(response)
         }
 
         override suspend fun describeImage(base64Image: String, prompt: String, maxTokens: Int): Result<String> {
-            describeImageCalls++
-            return if (visionResponses.isNotEmpty()) {
-                Result.success(visionResponses.removeFirst())
-            } else {
-                Result.failure(ProviderException(provider, null, "No vision response", false))
+            return Result.failure(UnsupportedOperationException("unused"))
+        }
+    }
+
+    private class BlockingUsageClient(
+        private val responseText: String,
+        private val usage: TokenUsage? = TokenUsage(inputTokens = 100, outputTokens = 10),
+        override val modelId: String? = "gpt-4o-mini"
+    ) : ProviderClient {
+        override val provider: Provider = Provider.OPENAI
+        val chatWithUsageCalls = AtomicInteger(0)
+        private val firstCallRelease = kotlinx.coroutines.CompletableDeferred<Unit>()
+
+        suspend fun awaitFirstCallStarted() {
+            while (chatWithUsageCalls.get() == 0) {
+                delay(5)
             }
+        }
+
+        fun releaseFirstCall() {
+            firstCallRelease.complete(Unit)
+        }
+
+        override suspend fun chat(conversation: Conversation): Result<String> {
+            return Result.success(responseText)
+        }
+
+        override suspend fun chatWithUsage(conversation: Conversation): Result<Pair<String, TokenUsage?>> {
+            val callIndex = chatWithUsageCalls.incrementAndGet()
+            if (callIndex == 1) {
+                firstCallRelease.await()
+            }
+            return Result.success(responseText to usage)
+        }
+
+        override suspend fun chatWithTools(
+            messages: List<Message>,
+            systemPrompt: String?,
+            tools: List<Tool>,
+            tokenLimit: Int?
+        ): Result<ChatResponse> {
+            return Result.failure(UnsupportedOperationException("unused"))
+        }
+
+        override suspend fun describeImage(base64Image: String, prompt: String, maxTokens: Int): Result<String> {
+            return Result.failure(UnsupportedOperationException("unused"))
         }
     }
 
@@ -1416,27 +3707,148 @@ class PhoneAgentApiTest {
             null
         )
         assertTrue(result.isError, "file tool error should have isError=true")
+        assertEquals(ToolErrorCode.NOT_CONFIGURED, result.errorCode)
     }
 
     @Test
-    fun `memory tool errors return isError true`() = runTest {
+    fun `file tool wrapper maps invalid input to INVALID_INPUT`() = runTest {
+        val tempRoot = createTempDir(prefix = "phone-agent-file-invalid-input")
+        try {
+            val manager = AgentFileManager.fromDirectory(tempRoot)
+            val agent = createAgent(fileManager = manager)
+            val result = agent.executeToolCall(ToolCall("f1", "read_file", emptyMap()), null)
+            assertTrue(result.isError)
+            assertEquals(ToolErrorCode.INVALID_INPUT, result.errorCode)
+        } finally {
+            tempRoot.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `file tool wrapper maps security exceptions to ACCESS_DENIED`() = runTest {
+        val tempRoot = createTempDir(prefix = "phone-agent-file-security")
+        try {
+            val manager = AgentFileManager.fromDirectory(tempRoot)
+            val agent = createAgent(fileManager = manager)
+            val result = agent.executeToolCall(
+                ToolCall("f1", "read_file", mapOf("path" to "../secrets.txt")),
+                null
+            )
+            assertTrue(result.isError)
+            assertEquals(ToolErrorCode.ACCESS_DENIED, result.errorCode)
+        } finally {
+            tempRoot.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `file tool wrapper maps unexpected exceptions to EXECUTION_FAILED`() = runTest {
+        val tempRoot = createTempDir(prefix = "phone-agent-file-execution-failed")
+        try {
+            val manager = AgentFileManager.fromDirectory(tempRoot)
+            tempRoot.resolve("blocked").writeText("this is a file, not a directory")
+            val agent = createAgent(fileManager = manager)
+            val result = agent.executeToolCall(
+                ToolCall("f1", "write_file", mapOf("path" to "blocked/nested.txt", "content" to "x")),
+                null
+            )
+            assertTrue(result.isError)
+            assertEquals(ToolErrorCode.EXECUTION_FAILED, result.errorCode)
+        } finally {
+            tempRoot.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `memory tool wrapper maps not configured to NOT_CONFIGURED`() = runTest {
         val agent = createAgent()
         val result = agent.executeToolCall(
             ToolCall("m1", "remember", mapOf("content" to "test")),
             null
         )
         assertTrue(result.isError, "memory tool error should have isError=true")
+        assertEquals(ToolErrorCode.NOT_CONFIGURED, result.errorCode)
     }
 
     @Test
-    fun `unknown tool returns isError false with failure text`() = runTest {
+    fun `memory tool wrapper maps invalid input to INVALID_INPUT`() = runTest {
+        val agent = createAgent(memoryProvider = InMemoryMemoryProvider())
+        val result = agent.executeToolCall(
+            ToolCall("m1", "remember", emptyMap()),
+            null
+        )
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, result.errorCode)
+    }
+
+    @Test
+    fun `memory tool wrapper maps unexpected exceptions to EXECUTION_FAILED`() = runTest {
+        val explodingProvider = object : MemoryProvider {
+            override suspend fun store(content: String, metadata: MemoryMetadata): String {
+                throw RuntimeException("boom")
+            }
+            override suspend fun search(query: String, limit: Int): List<MemoryResult> = emptyList()
+            override suspend fun delete(id: String) = Unit
+            override suspend fun list(filter: MemoryFilter?): List<MemoryResult> = emptyList()
+        }
+        val agent = createAgent(memoryProvider = explodingProvider)
+        val result = agent.executeToolCall(
+            ToolCall("m1", "remember", mapOf("content" to "test")),
+            null
+        )
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.EXECUTION_FAILED, result.errorCode)
+    }
+
+    @Test
+    fun `unknown tool returns TOOL_NOT_FOUND with isError true`() = runTest {
         val agent = createAgent()
         val result = agent.executeToolCall(
             ToolCall("u1", "nonexistent_tool", emptyMap()),
             null
         )
-        assertFalse(result.isError, "unknown tool should have isError=false (legacy)")
+        assertTrue(result.isError, "unknown tool should have isError=true")
         assertTrue(result.text.contains("unknown tool"), "should mention unknown tool")
+        assertEquals(ToolErrorCode.TOOL_NOT_FOUND, result.errorCode)
+    }
+
+    @Test
+    fun `ui tool failures consistently map to isError true`() = runTest {
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+        val screen = ScreenContent(
+            packageName = "com.example.app",
+            elements = listOf(
+                ScreenElement(
+                    id = 5,
+                    text = "Settings",
+                    contentDescription = null,
+                    className = "android.widget.TextView",
+                    isClickable = true,
+                    isEditable = false,
+                    bounds = Rect(0, 0, 20, 20)
+                )
+            )
+        )
+        val api = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            clickElement = { ScreenReader.ElementActionResult.ServiceUnavailable },
+            longPressElement = { ScreenReader.ElementActionResult.ElementNotFound },
+            isScreenReaderAttached = { false }
+        )
+
+        val cases = listOf(
+            ToolCall("u1", "tap", mapOf("element_id" to 5)) to null,
+            ToolCall("u2", "tap_text", mapOf("text" to "Settings")) to screen,
+            ToolCall("u3", "long_press", mapOf("element_id" to 5)) to null,
+            ToolCall("u4", "screenshot", emptyMap()) to null,
+            ToolCall("u5", "read_screen", emptyMap()) to null
+        )
+
+        for ((call, content) in cases) {
+            val result = api.executeToolCall(call, content)
+            assertTrue(result.isError, "Expected isError=true for ${call.name}, got: ${result.text}")
+        }
     }
 
     @Test
@@ -1447,6 +3859,20 @@ class PhoneAgentApiTest {
             null
         )
         assertFalse(result.isError, "think tool success should have isError=false")
+        assertNull(result.errorCode)
+    }
+
+    @Test
+    fun `read_screen detached classifies structured service unavailable error`() = runTest {
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+        val api = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            isScreenReaderAttached = { false }
+        )
+        val result = api.executeToolCall(ToolCall("r1", "read_screen", emptyMap()), null)
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.SERVICE_UNAVAILABLE, result.errorCode)
     }
 
 
@@ -1469,6 +3895,567 @@ class PhoneAgentApiTest {
         val toolNames = tools.map { it.name }
         assertFalse("web_search" in toolNames, "web_search should be excluded for SMALL tier models")
         assertFalse("web_fetch" in toolNames, "web_fetch should be excluded for SMALL tier models")
+    }
+
+    @Test
+    fun `runtime constraints filter tool set presented to model`() {
+        val agent = createAgent()
+        agent.createRuntimeConstraint(
+            scope = ConstraintScope.SESSION,
+            allowedTools = setOf("web_search"),
+            source = "test"
+        )
+
+        val toolNames = agent.getToolsForModel().map { it.name }
+        assertTrue("web_search" in toolNames)
+        assertFalse("tap" in toolNames)
+        assertFalse("type_text" in toolNames)
+    }
+
+    @Test
+    fun `runtime constraints keep model tool calls and rely on execution gate for blocked tools`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            chatResponses = ArrayDeque(),
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(
+                            ToolCall("1", "tap", mapOf("element_id" to 5)),
+                            ToolCall("2", "web_search", mapOf("query" to "weather"))
+                        ),
+                        stopReason = "tool_use"
+                    )
+                )
+            )
+        )
+        val agent = PhoneAgentApi(client, client).also { it.phoneControlOverride = true }
+        agent.createRuntimeConstraint(
+            scope = ConstraintScope.SESSION,
+            allowedTools = setOf("web_search"),
+            source = "test"
+        )
+
+        val response = agent.sendMessage("Find weather", screenContent = null, isActionLoop = false)
+        assertEquals(listOf("tap", "web_search"), response.toolCalls.map { it.name })
+
+        val blocked = agent.executeToolCall(response.toolCalls.first { it.name == "tap" }, null)
+        assertTrue(blocked.isError)
+        assertTrue(blocked.text.contains("Blocked by runtime constraint"))
+    }
+
+    @Test
+    fun `runtime constraints hard gate tool execution`() = runTest {
+        val agent = createAgent()
+        agent.createRuntimeConstraint(
+            scope = ConstraintScope.SESSION,
+            disallowedTools = setOf("tap"),
+            source = "test",
+            reason = "tap disabled"
+        )
+
+        val result = agent.executeToolCall(ToolCall("t1", "tap", mapOf("element_id" to 1)), null)
+        assertTrue(result.isError)
+        assertTrue(result.text.contains("Blocked by runtime constraint"))
+    }
+
+    @Test
+    fun `runtime constraints prefer deny when allow and deny overlap`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            chatResponses = ArrayDeque(),
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(
+                            ToolCall("1", "tap", mapOf("element_id" to 5)),
+                            ToolCall("2", "web_search", mapOf("query" to "weather"))
+                        ),
+                        stopReason = "tool_use"
+                    )
+                )
+            )
+        )
+        val agent = PhoneAgentApi(client, client).also { it.phoneControlOverride = true }
+        agent.createRuntimeConstraint(
+            scope = ConstraintScope.SESSION,
+            allowedTools = setOf("tap", "web_search"),
+            disallowedTools = setOf("tap"),
+            source = "test",
+            reason = "tap blocked for this run"
+        )
+
+        val toolNames = agent.getToolsForModel().map { it.name }
+        assertTrue("web_search" in toolNames)
+        assertFalse("tap" in toolNames)
+
+        val response = agent.sendMessage("Open weather app", screenContent = null, isActionLoop = false)
+        assertEquals(listOf("tap", "web_search"), response.toolCalls.map { it.name })
+
+        val blocked = agent.executeToolCall(response.toolCalls.first { it.name == "tap" }, null)
+        assertTrue(blocked.isError)
+        assertTrue(blocked.text.contains("tap blocked for this run"))
+    }
+
+    @Test
+    fun `runtime constraints intersect overlapping allow-lists`() = runTest {
+        val agent = createAgent()
+        agent.createRuntimeConstraint(
+            scope = ConstraintScope.SESSION,
+            allowedTools = setOf("think", "web_search"),
+            source = "policy-a"
+        )
+        agent.createRuntimeConstraint(
+            scope = ConstraintScope.SESSION,
+            allowedTools = setOf("web_search", "open_app"),
+            source = "policy-b"
+        )
+
+        val toolNames = agent.getToolsForModel().map { it.name }
+        assertTrue("web_search" in toolNames)
+        assertFalse("think" in toolNames)
+        assertFalse("open_app" in toolNames)
+
+        val blockedThink = agent.executeToolCall(
+            ToolCall("t1", "think", mapOf("thought" to "intersection test")),
+            null
+        )
+        assertTrue(blockedThink.isError)
+        assertTrue(blockedThink.text.contains("allow-list excludes think"))
+    }
+
+    @Test
+    fun `turn scoped runtime constraint hard gates execution for same response`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            chatResponses = ArrayDeque(),
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(ToolCall("1", "tap", mapOf("element_id" to 5))),
+                        stopReason = "tool_use"
+                    )
+                )
+            )
+        )
+        val agent = PhoneAgentApi(client, client).also { it.phoneControlOverride = true }
+        agent.createRuntimeConstraint(
+            scope = ConstraintScope.TURN,
+            disallowedTools = setOf("tap"),
+            source = "test",
+            reason = "turn tap blocked"
+        )
+
+        val response = agent.sendMessage("Open app", screenContent = null, isActionLoop = false)
+        assertEquals(listOf("tap"), response.toolCalls.map { it.name })
+        assertTrue(agent.activeRuntimeConstraints().isEmpty())
+
+        val blocked = agent.executeToolCall(response.toolCalls.first(), null)
+        assertTrue(blocked.isError)
+        assertTrue(blocked.text.contains("turn tap blocked"))
+    }
+
+    @Test
+    fun `expiresAfterTurns applies deterministically for exact number of turns`() = runTest {
+        val mixed = ChatResponse(
+            text = null,
+            toolCalls = listOf(
+                ToolCall("1", "tap", mapOf("element_id" to 5)),
+                ToolCall("2", "web_search", mapOf("query" to "weather"))
+            ),
+            stopReason = "tool_use"
+        )
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            chatResponses = ArrayDeque(),
+            toolResponses = ArrayDeque(listOf(mixed, mixed, mixed))
+        )
+        val agent = PhoneAgentApi(client, client).also { it.phoneControlOverride = true }
+        agent.createRuntimeConstraint(
+            scope = ConstraintScope.SESSION,
+            allowedTools = setOf("web_search"),
+            source = "test",
+            expiresAfterTurns = 2
+        )
+
+        val turn1 = agent.sendMessage("Open weather", screenContent = null, isActionLoop = false)
+        assertEquals(listOf("tap", "web_search"), turn1.toolCalls.map { it.name })
+        val turn1Tap = agent.executeToolCall(turn1.toolCalls.first { it.name == "tap" }, null)
+        assertTrue(turn1Tap.isError)
+        assertTrue(turn1Tap.text.contains("allow-list excludes tap"))
+
+        val turn2 = agent.continueAfterTools()
+        assertEquals(listOf("tap", "web_search"), turn2.toolCalls.map { it.name })
+        val turn2Tap = agent.executeToolCall(turn2.toolCalls.first { it.name == "tap" }, null)
+        assertTrue(turn2Tap.isError)
+        assertTrue(turn2Tap.text.contains("allow-list excludes tap"))
+        assertTrue(agent.activeRuntimeConstraints().isEmpty())
+
+        val turn3 = agent.continueAfterTools()
+        assertEquals(listOf("tap", "web_search"), turn3.toolCalls.map { it.name })
+        val turn3Tap = agent.executeToolCall(turn3.toolCalls.first { it.name == "tap" }, null)
+        assertFalse(turn3Tap.text.contains("Blocked by runtime constraint"))
+    }
+
+    @Test
+    fun `turn scoped runtime constraint expires after one model turn`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            chatResponses = ArrayDeque(),
+            toolResponses = ArrayDeque(
+                listOf(ChatResponse(text = "Done", toolCalls = emptyList(), stopReason = "end_turn"))
+            )
+        )
+        val agent = PhoneAgentApi(client, client).also { it.phoneControlOverride = true }
+        agent.createRuntimeConstraint(
+            scope = ConstraintScope.TURN,
+            disallowedTools = setOf("tap"),
+            source = "test"
+        )
+
+        agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        assertTrue(agent.activeRuntimeConstraints().isEmpty())
+    }
+
+    @Test
+    fun `task scoped runtime constraint expires on next user task`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            chatResponses = ArrayDeque(),
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(text = "done1", toolCalls = emptyList(), stopReason = "end_turn"),
+                    ChatResponse(text = "done2", toolCalls = emptyList(), stopReason = "end_turn")
+                )
+            )
+        )
+        val agent = PhoneAgentApi(client, client).also { it.phoneControlOverride = true }
+
+        agent.createRuntimeConstraint(
+            scope = ConstraintScope.TASK,
+            disallowedTools = setOf("tap"),
+            source = "test"
+        )
+
+        agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        assertEquals(1, agent.activeRuntimeConstraints().size)
+
+        agent.sendMessage("Open calendar", screenContent = null, isActionLoop = false)
+        assertTrue(agent.activeRuntimeConstraints().isEmpty())
+    }
+
+    @Test
+    fun `task scoped constraint created during action loop binds to current task`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            chatResponses = ArrayDeque(),
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(ToolCall("1", "think", mapOf("thought" to "step 1"))),
+                        stopReason = "tool_use"
+                    ),
+                    ChatResponse(text = "done", toolCalls = emptyList(), stopReason = "end_turn"),
+                    ChatResponse(text = "done2", toolCalls = emptyList(), stopReason = "end_turn")
+                )
+            )
+        )
+        val agent = PhoneAgentApi(client, client).also { it.phoneControlOverride = true }
+
+        val firstResponse = agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        assertEquals(listOf("think"), firstResponse.toolCalls.map { it.name })
+
+        agent.createRuntimeConstraint(
+            scope = ConstraintScope.TASK,
+            disallowedTools = setOf("think"),
+            source = "test",
+            reason = "current task block"
+        )
+
+        val blocked = agent.executeToolCall(firstResponse.toolCalls.first(), null)
+        assertTrue(blocked.isError)
+        assertTrue(blocked.text.contains("current task block"))
+
+        agent.continueAfterTools()
+        assertEquals(1, agent.activeRuntimeConstraints().size)
+
+        agent.sendMessage("Open calendar", screenContent = null, isActionLoop = false)
+        assertTrue(agent.activeRuntimeConstraints().isEmpty())
+    }
+
+    @Test
+    fun `task scoped constraint created after continueAfterTools failure binds to next task`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            chatResponses = ArrayDeque(),
+            toolResponses = ArrayDeque(),
+            toolResponseResults = ArrayDeque(
+                listOf(
+                    Result.success(
+                        ChatResponse(
+                            text = null,
+                            toolCalls = listOf(ToolCall("1", "think", mapOf("thought" to "step 1"))),
+                            stopReason = "tool_use"
+                        )
+                    ),
+                    Result.failure(ProviderException(Provider.ANTHROPIC, null, "transient continue failure", false)),
+                    Result.success(
+                        ChatResponse(
+                            text = null,
+                            toolCalls = listOf(ToolCall("2", "tap", mapOf("element_id" to 5))),
+                            stopReason = "tool_use"
+                        )
+                    ),
+                    Result.success(
+                        ChatResponse(
+                            text = "done",
+                            toolCalls = emptyList(),
+                            stopReason = "end_turn"
+                        )
+                    )
+                )
+            )
+        )
+        val agent = PhoneAgentApi(client, client).also { it.phoneControlOverride = true }
+
+        val firstResponse = agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        assertEquals(listOf("think"), firstResponse.toolCalls.map { it.name })
+        agent.addToolResult(firstResponse.toolCalls.first().id, "Thought complete", toolName = "think")
+
+        val failedContinue = agent.continueAfterTools()
+        assertEquals("error", failedContinue.stopReason)
+
+        agent.createRuntimeConstraint(
+            scope = ConstraintScope.TASK,
+            disallowedTools = setOf("tap"),
+            source = "test",
+            reason = "next task tap blocked"
+        )
+
+        val nextTaskResponse = agent.sendMessage("Open calendar", screenContent = null, isActionLoop = false)
+        assertEquals(listOf("tap"), nextTaskResponse.toolCalls.map { it.name })
+        assertEquals(1, agent.activeRuntimeConstraints().size)
+
+        val blocked = agent.executeToolCall(nextTaskResponse.toolCalls.first(), null)
+        assertTrue(blocked.isError)
+        assertTrue(blocked.text.contains("next task tap blocked"))
+
+        agent.sendMessage("Open calculator", screenContent = null, isActionLoop = false)
+        assertTrue(agent.activeRuntimeConstraints().isEmpty())
+    }
+
+    @Test
+    fun `runtime constraint lifecycle supports update clear and explicit expiry sweep`() {
+        val agent = createAgent()
+        val created = agent.createRuntimeConstraint(
+            scope = ConstraintScope.SESSION,
+            allowedTools = setOf("web_search"),
+            source = "test",
+            reason = "initial reason",
+            expiresAfterTurns = 3
+        )
+
+        val updated = agent.updateRuntimeConstraint(
+            id = created.id,
+            disallowedTools = setOf("web_search"),
+            reason = "temporary block",
+            expiresAfterTurns = 2
+        )
+        assertNotNull(updated)
+        val updatedConstraint = updated!!
+        assertEquals(setOf("web_search"), updatedConstraint.disallowedTools)
+        assertEquals("temporary block", updatedConstraint.reason)
+        assertEquals(2, updatedConstraint.expiresAfterTurns)
+
+        val cleared = agent.updateRuntimeConstraint(
+            id = created.id,
+            clearReason = true,
+            clearExpiry = true
+        )
+        assertNotNull(cleared)
+        val clearedConstraint = cleared!!
+        assertNull(clearedConstraint.reason)
+        assertNull(clearedConstraint.expiresAfterTurns)
+
+        assertEquals(0, agent.expireRuntimeConstraints())
+
+        assertTrue(agent.clearRuntimeConstraint(created.id))
+        assertTrue(agent.activeRuntimeConstraints().isEmpty())
+    }
+    fun `web_search missing query returns INVALID_INPUT`() = runTest {
+        val agent = createAgent()
+        val result = agent.executeToolCall(ToolCall("ws1", "web_search", emptyMap()), null)
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, result.errorCode)
+        assertTrue(result.text.contains("Missing required parameter: query"))
+    }
+
+    @Test
+    fun `web_fetch missing url returns INVALID_INPUT`() = runTest {
+        val agent = createAgent()
+        val result = agent.executeToolCall(ToolCall("wf1", "web_fetch", emptyMap()), null)
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, result.errorCode)
+        assertTrue(result.text.contains("Missing required parameter: url"))
+    }
+
+    @Test
+    fun `web_browse missing url returns INVALID_INPUT when configured`() = runTest {
+        val defaultClient = ClaudeClient(
+            apiKey = "sk-ant-api03-test",
+            systemPrompt = PhoneAgentPrompts.SYSTEM_PROMPT,
+            baseUrl = server.url("/v1/messages").toString()
+        )
+        val agent = PhoneAgentApi(
+            chatClient = defaultClient,
+            actionClient = defaultClient,
+            tinyFishApiKey = "test-tinyfish-key",
+            tinyFishEndpoint = server.url("/v1/automation/run-sse").toString()
+        ).also {
+            it.phoneControlOverride = true
+        }
+
+        val result = agent.executeToolCall(ToolCall("wb1", "web_browse", mapOf("goal" to "Find answer")), null)
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, result.errorCode)
+        assertTrue(result.text.contains("Missing required parameter: url"))
+    }
+
+    @Test
+    fun `web_browse missing goal returns INVALID_INPUT when configured`() = runTest {
+        val defaultClient = ClaudeClient(
+            apiKey = "sk-ant-api03-test",
+            systemPrompt = PhoneAgentPrompts.SYSTEM_PROMPT,
+            baseUrl = server.url("/v1/messages").toString()
+        )
+        val agent = PhoneAgentApi(
+            chatClient = defaultClient,
+            actionClient = defaultClient,
+            tinyFishApiKey = "test-tinyfish-key",
+            tinyFishEndpoint = server.url("/v1/automation/run-sse").toString()
+        ).also {
+            it.phoneControlOverride = true
+        }
+
+        val result = agent.executeToolCall(ToolCall("wb2", "web_browse", mapOf("url" to "https://example.com")), null)
+        assertTrue(result.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, result.errorCode)
+        assertTrue(result.text.contains("Missing required parameter: goal"))
+    }
+
+    @Test
+    fun `request_tools validates missing empty and invalid categories`() = runTest {
+        val agent = createAgent()
+
+        val missing = agent.executeToolCall(ToolCall("rt1", "request_tools", emptyMap()), null)
+        assertTrue(missing.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, missing.errorCode)
+        assertTrue(missing.text.contains("Missing required parameter: categories"))
+
+        val empty = agent.executeToolCall(ToolCall("rt2", "request_tools", mapOf("categories" to emptyList<String>())), null)
+        assertTrue(empty.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, empty.errorCode)
+        assertTrue(empty.text.contains("at least one category"))
+
+        val invalid = agent.executeToolCall(
+            ToolCall(
+                "rt3",
+                "request_tools",
+                mapOf("categories" to listOf("research", "core", "", "invalid_category", 17))
+            ),
+            null
+        )
+        assertTrue(invalid.isError)
+        assertEquals(ToolErrorCode.INVALID_INPUT, invalid.errorCode)
+        assertTrue(invalid.text.contains("Invalid categories"))
+        assertTrue(invalid.text.contains("core"))
+        assertTrue(invalid.text.contains("invalid_category"))
+    }
+
+    @Test
+    fun `request_tools returns tool list for valid categories`() = runTest {
+        val agent = createAgent()
+        val result = agent.executeToolCall(
+            ToolCall("rt4", "request_tools", mapOf("categories" to listOf("navigation", "observation"))),
+            null
+        )
+
+        assertFalse(result.isError)
+        assertNull(result.errorCode)
+        assertTrue(result.text.contains("Requested categories: navigation, observation"))
+        assertTrue(result.text.contains("open_app"))
+        assertTrue(result.text.contains("read_screen"))
+    }
+
+    @Test
+    fun `tool error mapping is consistent across core ui web and meta tools`() = runTest {
+        val agent = createAgent()
+        val cases = listOf(
+            ToolCall("map1", "nonexistent_tool", emptyMap()) to ToolErrorCode.TOOL_NOT_FOUND,
+            ToolCall("map2", "web_search", emptyMap()) to ToolErrorCode.INVALID_INPUT,
+            ToolCall("map3", "web_fetch", emptyMap()) to ToolErrorCode.INVALID_INPUT,
+            ToolCall("map4", "web_browse", mapOf("url" to "https://example.com", "goal" to "Find")) to ToolErrorCode.NOT_CONFIGURED,
+            ToolCall("map5", "request_tools", emptyMap()) to ToolErrorCode.INVALID_INPUT,
+            ToolCall("map6", "read_screen", emptyMap()) to ToolErrorCode.SERVICE_UNAVAILABLE
+        )
+
+        for ((toolCall, expectedCode) in cases) {
+            val result = agent.executeToolCall(toolCall, null)
+            assertTrue(result.isError, "Expected isError=true for ${toolCall.name}, got: ${result.text}")
+            assertEquals(expectedCode, result.errorCode, "Unexpected error code for ${toolCall.name}")
+        }
+    }
+
+    @Test
+    fun `tool error mapping is consistent for clipboard and notification tools`() = runTest {
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+        val api = PhoneAgentApi(client)
+        ClipboardHelper.detach()
+        NotificationHelper.detach()
+
+        val cases = listOf(
+            ToolCall("map_clip_1", "copy", emptyMap()) to ToolErrorCode.SERVICE_UNAVAILABLE,
+            ToolCall("map_clip_2", "set_clipboard", mapOf("text" to "")) to ToolErrorCode.INVALID_INPUT,
+            ToolCall("map_clip_3", "set_clipboard", mapOf("text" to "hello")) to ToolErrorCode.SERVICE_UNAVAILABLE,
+            ToolCall("map_clip_4", "paste", mapOf("text" to "")) to ToolErrorCode.INVALID_INPUT,
+            ToolCall("map_clip_5", "paste", mapOf("text" to "hello")) to ToolErrorCode.SERVICE_UNAVAILABLE,
+            ToolCall("map_notif_1", "read_notifications", emptyMap()) to ToolErrorCode.SERVICE_UNAVAILABLE,
+            ToolCall("map_notif_2", "tap_notification", mapOf("notification_key" to "invalid")) to ToolErrorCode.INVALID_INPUT,
+            ToolCall("map_notif_3", "tap_notification", mapOf("notification_key" to "0|com.example.app|123|null|1000")) to ToolErrorCode.SERVICE_UNAVAILABLE,
+            ToolCall("map_notif_4", "dismiss_notification", mapOf("notification_key" to "invalid")) to ToolErrorCode.INVALID_INPUT,
+            ToolCall("map_notif_5", "dismiss_notification", mapOf("notification_key" to "0|com.example.app|123|null|1000")) to ToolErrorCode.SERVICE_UNAVAILABLE,
+            ToolCall("map_notif_6", "reply_notification", mapOf("notification_key" to "0|com.example.app|123|null|1000", "text" to "")) to ToolErrorCode.INVALID_INPUT,
+            ToolCall("map_notif_7", "reply_notification", mapOf("notification_key" to "invalid", "text" to "hello")) to ToolErrorCode.INVALID_INPUT,
+            ToolCall("map_notif_8", "reply_notification", mapOf("notification_key" to "0|com.example.app|123|null|1000", "text" to "hello")) to ToolErrorCode.SERVICE_UNAVAILABLE
+        )
+
+        for ((toolCall, expectedCode) in cases) {
+            val result = api.executeToolCall(toolCall, null)
+            assertTrue(result.isError, "Expected isError=true for ${toolCall.name}, got: ${result.text}")
+            assertEquals(expectedCode, result.errorCode, "Unexpected error code for ${toolCall.name}")
+        }
+    }
+
+    @Test
+    fun `tool results with errorCode always set isError true`() = runTest {
+        val agent = createAgent()
+        val cases = listOf(
+            ToolCall("inv1", "nonexistent_tool", emptyMap()),
+            ToolCall("inv2", "web_search", emptyMap()),
+            ToolCall("inv3", "web_fetch", emptyMap()),
+            ToolCall("inv4", "request_tools", emptyMap()),
+            ToolCall("inv5", "web_browse", mapOf("url" to "https://example.com", "goal" to "Find"))
+        )
+
+        for (toolCall in cases) {
+            val result = agent.executeToolCall(toolCall, null)
+            assertNotNull(result.errorCode, "Expected errorCode for ${toolCall.name}")
+            assertTrue(result.isError, "Expected isError=true when errorCode is set for ${toolCall.name}")
+        }
     }
 
 
@@ -1513,30 +4500,39 @@ class PhoneAgentApiTest {
         assertTrue("web_browse" in toolNames, "web_browse should be included when API key is set")
     }
 
+
     @Test
     fun `executeToolCall web_browse dispatches to TinyFishClient when key is configured`() = kotlinx.coroutines.runBlocking {
-        // Serve a mock TinyFish SSE response
-        val sseBody = listOf(
-            """data: {"type":"STARTED","runId":"run_1","timestamp":"2026-01-01T00:00:00Z"}""",
-            """data: {"type":"PROGRESS","runId":"run_1","purpose":"Navigating to page","timestamp":"2026-01-01T00:00:01Z"}""",
-            """data: {"type":"COMPLETE","runId":"run_1","status":"COMPLETED","resultJson":{"answer":"42"},"timestamp":"2026-01-01T00:00:05Z"}"""
-        ).joinToString("\n")
-        server.enqueue(MockResponse()
-            .setBody(sseBody)
-            .setResponseCode(200)
-            .addHeader("Content-Type", "text/event-stream"))
+        class RecordingTinyFishClient : TinyFishBrowserClient {
+            var capturedUrl: String? = null
+            var capturedGoal: String? = null
+            var capturedStealth: Boolean? = null
 
-        val tinyFishEndpoint = server.url("/v1/automation/run-sse").toString()
+            override suspend fun browse(
+                url: String,
+                goal: String,
+                stealth: Boolean,
+                proxyCountry: String?,
+                onProgress: ((String) -> Unit)?
+            ): ToolResult {
+                capturedUrl = url
+                capturedGoal = goal
+                capturedStealth = stealth
+                return ToolResult("mock tinyfish success")
+            }
+        }
+
         val defaultClient = ClaudeClient(
             apiKey = "sk-ant-api03-test",
             systemPrompt = PhoneAgentPrompts.SYSTEM_PROMPT,
             baseUrl = server.url("/v1/messages").toString()
         )
+        val fakeTinyFishClient = RecordingTinyFishClient()
         val agent = PhoneAgentApi(
             chatClient = defaultClient,
             actionClient = defaultClient,
             tinyFishApiKey = "test-tinyfish-key",
-            tinyFishEndpoint = tinyFishEndpoint
+            tinyFishClientFactory = { _, _ -> fakeTinyFishClient }
         ).also {
             it.phoneControlOverride = true
         }
@@ -1547,15 +4543,11 @@ class PhoneAgentApiTest {
         )
 
         assertFalse(result.isError, "Expected success but got error: " + result.text)
-        assertTrue(result.text.contains("42"), "Result should contain automation result")
-        // Verify the request actually reached MockWebServer (TinyFish endpoint)
-        val request = server.takeRequest()
-        assertEquals("/v1/automation/run-sse", request.path)
-        val body = request.body.readUtf8()
-        assertTrue(body.contains("example.com"), "Request body should contain URL")
-        assertTrue(body.contains("Find the answer"), "Request body should contain goal")
+        assertEquals("mock tinyfish success", result.text)
+        assertEquals("https://example.com", fakeTinyFishClient.capturedUrl)
+        assertEquals("Find the answer", fakeTinyFishClient.capturedGoal)
+        assertEquals(false, fakeTinyFishClient.capturedStealth)
     }
-
     // --- Conversation history seeding tests (#612) ---
 
     @Test
@@ -1811,6 +4803,710 @@ class PhoneAgentApiTest {
         assertTrue(client.lastSystemPrompt!!.isNotBlank(), "system prompt must not be blank")
     }
 
+
+    @Test
+    fun `sendEphemeral records usage and enforces budget`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.OPENAI,
+            modelId = "gpt-4o-mini",
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = "Summary one",
+                        toolCalls = emptyList(),
+                        stopReason = "end_turn",
+                        usage = TokenUsage(inputTokens = 1_000, outputTokens = 0)
+                    ),
+                    ChatResponse(
+                        text = "Summary two",
+                        toolCalls = emptyList(),
+                        stopReason = "end_turn",
+                        usage = TokenUsage(inputTokens = 1_000, outputTokens = 0)
+                    )
+                )
+            )
+        )
+        val budgetStore = InMemoryBudgetStore(
+            BudgetConfig(enabled = true, dailyLimitUsd = 0.0002, monthlyLimitUsd = 10.0)
+        )
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            budgetGuard = BudgetGuard(budgetStore)
+        ).also { it.phoneControlOverride = true }
+
+        val first = agent.sendEphemeral("[System: Summarize progress]")
+        assertEquals("Summary one", first)
+        assertEquals(1, agent.messageCount)
+        val beforeSecond = getMessages(agent).toList()
+
+        assertFailsWith<BudgetExceededException> {
+            agent.sendEphemeral("[System: Summarize progress again]")
+        }
+        assertEquals(300L, budgetStore.getDailySpentMicrodollars())
+        assertEquals(beforeSecond, getMessages(agent), "sendEphemeral over-limit should not persist assistant reply")
+    }
+
+
+    // --- Sensor/timeout/concurrency CI-targeted tests ---
+    // Keep test names containing one of: sensor, Sensor, timeout, concurrent,
+    // so :core:phoneAgentApiSensorCiTest includes this section via Gradle filter patterns.
+
+    @Test
+    fun `sendMessage handles SensorProvider snapshot exceptions gracefully`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(listOf(
+                ChatResponse(text = "ok", toolCalls = emptyList(), stopReason = "end_turn")
+            ))
+        )
+        val throwingProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext {
+                throw IllegalStateException("boom")
+            }
+        }
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            sensorProvider = throwingProvider
+        ).also { it.phoneControlOverride = true }
+
+        val response = agent.sendMessage("Open Settings", screenContent = null, isActionLoop = false)
+
+        assertEquals("ok", response.text)
+        assertNotNull(client.lastSystemPrompt)
+        assertFalse(client.lastSystemPrompt!!.contains("Device Awareness"))
+    }
+
+    @Test
+    fun `sendMessage rethrows SensorProvider CancellationException`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(listOf(
+                ChatResponse(text = "ok", toolCalls = emptyList(), stopReason = "end_turn")
+            ))
+        )
+        val cancellingProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext {
+                throw kotlinx.coroutines.CancellationException("cancelled")
+            }
+        }
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            sensorProvider = cancellingProvider
+        ).also { it.phoneControlOverride = true }
+
+        assertFailsWith<kotlinx.coroutines.CancellationException> {
+            agent.sendMessage("Open Settings", screenContent = null, isActionLoop = false)
+        }
+    }
+
+    @Test
+    fun `sendMessage non-action loop injects sensor context into system prompt integration`() = runTest {
+        server.enqueue(MockResponse()
+            .setBody("""{"content":[{"type":"text","text":"Done"}],"role":"assistant","stop_reason":"end_turn"}""")
+            .setResponseCode(200)
+            .addHeader("Content-Type", "application/json"))
+
+        val sensorProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext =
+                SensorContext(batteryPercent = 44, networkType = NetworkType.WIFI)
+        }
+        val agent = createAgent(sensorProvider = sensorProvider)
+
+        val response = agent.sendMessage("Open Settings", screenContent = null, isActionLoop = false)
+
+        assertEquals("Done", response.text)
+        val request = server.takeRequest()
+        val body = request.body.readUtf8()
+        assertTrue(body.contains("Device: battery=44% | wifi"))
+    }
+
+    @Test
+    fun `sendMessage action loop captures sensor snapshot once per task`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(listOf(
+                ChatResponse(text = "ok", toolCalls = emptyList(), stopReason = "end_turn")
+            ))
+        )
+        var snapshotCalls = 0
+        val countingProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext {
+                snapshotCalls++
+                return SensorContext(batteryPercent = 44, networkType = NetworkType.WIFI)
+            }
+        }
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            sensorProvider = countingProvider
+        ).also { it.phoneControlOverride = true }
+
+        val response = agent.sendMessage("continue", screenContent = null, isActionLoop = true)
+
+        assertEquals("ok", response.text)
+        assertEquals(1, snapshotCalls)
+    }
+
+    @Test
+    fun `sendMessage action loop without prior task start injects fresh sensor context into system prompt`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(listOf(
+                ChatResponse(text = "ok", toolCalls = emptyList(), stopReason = "end_turn")
+            ))
+        )
+        val sensorProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext =
+                SensorContext(batteryPercent = 44, networkType = NetworkType.WIFI)
+        }
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            sensorProvider = sensorProvider
+        ).also { it.phoneControlOverride = true }
+
+        val response = agent.sendMessage("continue", screenContent = null, isActionLoop = true)
+
+        assertEquals("ok", response.text)
+        assertNotNull(client.lastSystemPrompt)
+        assertTrue(client.lastSystemPrompt!!.contains("Device: battery=44% | wifi"))
+    }
+
+    @Test
+    fun `sensor snapshot is reused for continuation prompts within a task`() = runTest {
+        val chatClient = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(listOf(
+                ChatResponse(
+                    text = null,
+                    toolCalls = listOf(ToolCall("tc1", "tap", mapOf("element_id" to 7))),
+                    stopReason = "tool_use"
+                )
+            ))
+        )
+        val actionClient = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(listOf(
+                ChatResponse(text = "Done", toolCalls = emptyList(), stopReason = "end_turn")
+            ))
+        )
+        var snapshotCalls = 0
+        val batterySeries = ArrayDeque(listOf(44, 66))
+        val sensorProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext {
+                snapshotCalls++
+                return SensorContext(
+                    batteryPercent = batterySeries.first(),
+                    networkType = NetworkType.WIFI,
+                    localTime = java.time.ZonedDateTime.now(java.time.ZoneOffset.UTC).minusSeconds(45)
+                )
+            }
+        }
+        val agent = PhoneAgentApi(
+            chatClient = chatClient,
+            actionClient = actionClient,
+            sensorProvider = sensorProvider
+        ).also { it.phoneControlOverride = true }
+
+        val initial = agent.sendMessage("Tap it", screenContent = null, isActionLoop = false)
+        assertEquals(1, snapshotCalls)
+        assertEquals(1, chatClient.chatWithToolsCalls)
+        assertNotNull(chatClient.lastSystemPrompt)
+        assertTrue(chatClient.lastSystemPrompt!!.contains("Device: battery=44% | wifi"))
+        assertTrue(initial.toolCalls.isNotEmpty())
+
+        agent.addToolResult("tc1", "Tapped element 7")
+        val continuation = agent.continueAfterTools()
+
+        assertEquals("Done", continuation.text)
+        assertEquals(1, snapshotCalls)
+        assertEquals(1, actionClient.chatWithToolsCalls)
+        assertNotNull(actionClient.lastSystemPrompt)
+        assertTrue(actionClient.lastSystemPrompt!!.contains("Device: battery=44% | wifi"))
+        assertFalse(actionClient.lastSystemPrompt!!.contains("## Device Awareness"))
+    }
+
+    @Test
+    fun `clearConversation clears prior sensor context before subsequent action loop prompt`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(text = "first", toolCalls = emptyList(), stopReason = "end_turn"),
+                    ChatResponse(text = "second", toolCalls = emptyList(), stopReason = "end_turn")
+                )
+            )
+        )
+        val sensorProvider = object : SensorProvider {
+            private val values = ArrayDeque(listOf(44, 88))
+            override suspend fun snapshot(): SensorContext =
+                SensorContext(batteryPercent = values.removeFirst(), networkType = NetworkType.WIFI)
+        }
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            sensorProvider = sensorProvider
+        ).also { it.phoneControlOverride = true }
+
+        agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        assertNotNull(client.lastSystemPrompt)
+        assertTrue(client.lastSystemPrompt!!.contains("Device: battery=44% | wifi"))
+
+        agent.clearConversation()
+        agent.sendMessage("continue", screenContent = null, isActionLoop = true)
+
+        assertNotNull(client.lastSystemPrompt)
+        assertTrue(client.lastSystemPrompt!!.contains("Device: battery=88% | wifi"))
+        assertFalse(client.lastSystemPrompt!!.contains("Device: battery=44% | wifi"))
+    }
+
+    @Test
+    fun `concurrent action-loop sends reuse one sensor snapshot for the current task`() = runTest {
+        val promptLog = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val client = object : ProviderClient {
+            override val provider: Provider = Provider.ANTHROPIC
+            override val modelId: String? = null
+
+            override suspend fun chat(conversation: Conversation): Result<String> = Result.success("chat")
+
+            override suspend fun chatWithTools(
+                messages: List<Message>,
+                systemPrompt: String?,
+                tools: List<Tool>,
+                tokenLimit: Int?
+            ): Result<ChatResponse> {
+                if (systemPrompt != null) promptLog.add(systemPrompt)
+                return Result.success(ChatResponse(text = "ok", toolCalls = emptyList(), stopReason = "end_turn"))
+            }
+
+            override suspend fun describeImage(base64Image: String, prompt: String, maxTokens: Int): Result<String> {
+                return Result.success("desc")
+            }
+        }
+
+        val snapshotCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val sensorProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext {
+                val next = snapshotCalls.incrementAndGet()
+                // Deterministically exposes check-then-set races when cache access is unsynchronized.
+                delay(10)
+                return SensorContext(batteryPercent = next, networkType = NetworkType.WIFI)
+            }
+        }
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            sensorProvider = sensorProvider
+        ).also { it.phoneControlOverride = true }
+
+        kotlinx.coroutines.coroutineScope {
+            repeat(6) { idx ->
+                launch {
+                    agent.sendMessage("continue-$idx", screenContent = null, isActionLoop = true)
+                }
+            }
+        }
+
+        assertEquals(1, snapshotCalls.get())
+        assertEquals(6, promptLog.size)
+        promptLog.forEach { prompt ->
+            assertTrue(prompt.contains("Device: battery=1% | wifi"))
+        }
+    }
+
+    @Test
+    fun `sensor snapshot exceptions are counted as failures and return no metadata`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(text = "ok", toolCalls = emptyList(), stopReason = "end_turn")
+                )
+            )
+        )
+        val sensorProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext {
+                error("boom")
+            }
+        }
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            sensorProvider = sensorProvider
+        ).also { it.phoneControlOverride = true }
+
+        agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+
+        assertEquals(1, agent.sensorSnapshotFailureTotal)
+        assertEquals(0, agent.sensorSnapshotTimeoutTotal)
+        assertNull(agent.cachedTaskSensorSnapshot)
+        assertNotNull(client.lastSystemPrompt)
+        assertFalse(client.lastSystemPrompt!!.contains("Device:"))
+    }
+
+    @Test
+    fun `sensor snapshot timeout increments timeout counter and keeps prompt metadata empty`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(text = "ok", toolCalls = emptyList(), stopReason = "end_turn")
+                )
+            )
+        )
+        val sensorProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext {
+                kotlinx.coroutines.withTimeout(1) {
+                    delay(10)
+                }
+                return SensorContext(batteryPercent = 77, networkType = NetworkType.WIFI)
+            }
+        }
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            sensorProvider = sensorProvider
+        ).also { it.phoneControlOverride = true }
+
+        agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+
+        assertEquals(0, agent.sensorSnapshotFailureTotal)
+        assertEquals(1, agent.sensorSnapshotTimeoutTotal)
+        assertNull(agent.cachedTaskSensorSnapshot)
+        assertNotNull(client.lastSystemPrompt)
+        assertFalse(client.lastSystemPrompt!!.contains("Device:"))
+    }
+
+    @Test
+    fun `sensor snapshot task-start budget is enforced by timeout constant`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(
+                listOf(ChatResponse(text = "ok", toolCalls = emptyList(), stopReason = "end_turn"))
+            )
+        )
+        val sensorProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext {
+                delay(PhoneAgentApi.SENSOR_SNAPSHOT_TIMEOUT_MS + 100)
+                return SensorContext(batteryPercent = 50, networkType = NetworkType.WIFI)
+            }
+        }
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            sensorProvider = sensorProvider
+        ).also { it.phoneControlOverride = true }
+
+        val elapsedMs = measureTimeMillis {
+            agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        }
+
+        assertTrue(
+            elapsedMs < (PhoneAgentApi.SENSOR_SNAPSHOT_TIMEOUT_MS + 300),
+            "Task start should not wait for slow sensor capture (elapsed=${elapsedMs}ms)"
+        )
+        assertEquals(1, agent.sensorSnapshotTimeoutTotal)
+        assertEquals(0, agent.sensorSnapshotFailureTotal)
+        assertEquals(1, agent.sensorSnapshotTotal)
+        assertTrue(agent.sensorSnapshotLatencyTotalMs > 0)
+        assertTrue(agent.sensorSnapshotLatencyMaxMs > 0)
+        assertNotNull(client.lastSystemPrompt)
+        assertFalse(client.lastSystemPrompt!!.contains("Device:"))
+    }
+
+    @Test
+    fun `sensor snapshot preserves non-location fields when capture is slower than old 15ms budget`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(text = "ok", toolCalls = emptyList(), stopReason = "end_turn")
+                )
+            )
+        )
+        val sensorProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext {
+                // Simulate a slow location branch while still returning partial sensor fields.
+                delay(20)
+                return SensorContext(
+                    batteryPercent = 77,
+                    networkType = NetworkType.WIFI,
+                    localTime = java.time.ZonedDateTime.now(java.time.ZoneOffset.UTC),
+                    location = null
+                )
+            }
+        }
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            sensorProvider = sensorProvider
+        ).also { it.phoneControlOverride = true }
+
+        agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+
+        assertEquals(0, agent.sensorSnapshotFailureTotal)
+        assertEquals(0, agent.sensorSnapshotTimeoutTotal)
+        assertNotNull(agent.cachedTaskSensorSnapshot)
+        assertEquals(77, agent.cachedTaskSensorSnapshot!!.batteryPercent)
+        assertEquals(NetworkType.WIFI, agent.cachedTaskSensorSnapshot!!.networkType)
+        assertNull(agent.cachedTaskSensorSnapshot!!.location)
+        assertNotNull(client.lastSystemPrompt)
+        assertTrue(client.lastSystemPrompt!!.contains("Device: battery=77% | wifi"))
+        assertFalse(client.lastSystemPrompt!!.contains("location="))
+    }
+
+    @Test
+    fun `clearConversation does not block when sensor snapshot is in flight`() = runTest(timeout = 5_000.milliseconds) {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(
+                listOf(ChatResponse(text = "ok", toolCalls = emptyList(), stopReason = "end_turn"))
+            )
+        )
+        val started = CompletableDeferred<Unit>()
+        val unblock = CompletableDeferred<Unit>()
+        val sensorProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext {
+                started.complete(Unit)
+                unblock.await()
+                return SensorContext(batteryPercent = 77, networkType = NetworkType.WIFI)
+            }
+        }
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            sensorProvider = sensorProvider
+        ).also { it.phoneControlOverride = true }
+
+        val sendJob = launch {
+            agent.sendMessage("Open settings", screenContent = null, isActionLoop = false)
+        }
+        started.await()
+
+        val clearElapsedMs = measureTimeMillis { agent.clearConversation() }
+        assertTrue(clearElapsedMs < 50, "clearConversation should return immediately (elapsed=${clearElapsedMs}ms)")
+
+        unblock.complete(Unit)
+        sendJob.join()
+
+        assertNull(agent.cachedTaskSensorSnapshot, "In-flight snapshot from prior epoch must not be cached")
+    }
+
+    @Test
+    fun `sensor snapshot failure on task start is cached and not retried on continuation turns`() = runTest {
+        val chatClient = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(ToolCall("tc1", "tap", mapOf("element_id" to 5))),
+                        stopReason = "tool_use"
+                    )
+                )
+            )
+        )
+        val actionClient = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(
+                listOf(ChatResponse(text = "done", toolCalls = emptyList(), stopReason = "end_turn"))
+            )
+        )
+        var snapshotCalls = 0
+        val sensorProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext {
+                snapshotCalls++
+                error("boom")
+            }
+        }
+        val agent = PhoneAgentApi(
+            chatClient = chatClient,
+            actionClient = actionClient,
+            sensorProvider = sensorProvider
+        ).also { it.phoneControlOverride = true }
+
+        val first = agent.sendMessage("Tap it", screenContent = null, isActionLoop = false)
+        assertTrue(first.toolCalls.isNotEmpty())
+        agent.addToolResult("tc1", "Tapped element 5")
+        val second = agent.continueAfterTools()
+
+        assertEquals("done", second.text)
+        assertEquals(1, snapshotCalls)
+        assertEquals(1, agent.sensorSnapshotFailureTotal)
+        assertEquals(0, agent.sensorSnapshotTimeoutTotal)
+    }
+
+    @Test
+    fun `sensor snapshot timeout on task start is cached and not retried on continuation turns`() = runTest {
+        val chatClient = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(
+                listOf(
+                    ChatResponse(
+                        text = null,
+                        toolCalls = listOf(ToolCall("tc1", "tap", mapOf("element_id" to 9))),
+                        stopReason = "tool_use"
+                    )
+                )
+            )
+        )
+        val actionClient = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(
+                listOf(ChatResponse(text = "done", toolCalls = emptyList(), stopReason = "end_turn"))
+            )
+        )
+        var snapshotCalls = 0
+        val sensorProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext {
+                snapshotCalls++
+                kotlinx.coroutines.delay(PhoneAgentApi.SENSOR_SNAPSHOT_TIMEOUT_MS + 20)
+                return SensorContext(batteryPercent = 77, networkType = NetworkType.WIFI)
+            }
+        }
+        val agent = PhoneAgentApi(
+            chatClient = chatClient,
+            actionClient = actionClient,
+            sensorProvider = sensorProvider
+        ).also { it.phoneControlOverride = true }
+
+        val first = agent.sendMessage("Tap it", screenContent = null, isActionLoop = false)
+        assertTrue(first.toolCalls.isNotEmpty())
+        agent.addToolResult("tc1", "Tapped element 9")
+        val second = agent.continueAfterTools()
+
+        assertEquals("done", second.text)
+        assertEquals(1, snapshotCalls)
+        assertEquals(0, agent.sensorSnapshotFailureTotal)
+        assertEquals(1, agent.sensorSnapshotTimeoutTotal)
+    }
+
+    @Test
+    fun `sensor context toggle flow updates prompt payload behavior end to end`() = runTest {
+        val promptLog = mutableListOf<String>()
+        val client = object : ProviderClient {
+            override val provider: Provider = Provider.ANTHROPIC
+            override val modelId: String? = null
+
+            override suspend fun chat(conversation: Conversation): Result<String> = Result.success("chat")
+
+            override suspend fun chatWithTools(
+                messages: List<Message>,
+                systemPrompt: String?,
+                tools: List<Tool>,
+                tokenLimit: Int?
+            ): Result<ChatResponse> {
+                if (systemPrompt != null) promptLog.add(systemPrompt)
+                return Result.success(ChatResponse(text = "ok", toolCalls = emptyList(), stopReason = "end_turn"))
+            }
+
+            override suspend fun describeImage(base64Image: String, prompt: String, maxTokens: Int): Result<String> {
+                return Result.success("desc")
+            }
+        }
+
+        var sensorContextEnabled = true
+        val sensorProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext {
+                return if (sensorContextEnabled) {
+                    SensorContext(batteryPercent = 55, networkType = NetworkType.WIFI)
+                } else {
+                    SensorContext()
+                }
+            }
+        }
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            sensorProvider = sensorProvider
+        ).also { it.phoneControlOverride = true }
+
+        agent.sendMessage("Open Settings", screenContent = null, isActionLoop = false)
+        assertTrue(promptLog.last().contains("Device: battery=55% | wifi"))
+
+        sensorContextEnabled = false
+        agent.clearConversation()
+        agent.sendMessage("Open Settings again", screenContent = null, isActionLoop = false)
+        assertFalse(promptLog.last().contains("Device:"))
+    }
+
+    @Test
+    fun `sendEphemeral injects sensor context into system prompt`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(listOf(
+                ChatResponse(text = "Summary", toolCalls = emptyList(), stopReason = "end_turn")
+            ))
+        )
+        val sensorProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext =
+                SensorContext(batteryPercent = 44, networkType = NetworkType.WIFI)
+        }
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            sensorProvider = sensorProvider
+        ).also { it.phoneControlOverride = true }
+
+        val result = agent.sendEphemeral("[System: Summarize progress]")
+
+        assertEquals("Summary", result)
+        assertNotNull(client.lastSystemPrompt)
+        assertTrue(client.lastSystemPrompt!!.contains("Device: battery=44% | wifi"))
+    }
+
+    @Test
+    fun `sendEphemeral swallows SensorProvider exception and still succeeds`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(listOf(
+                ChatResponse(text = "Summary", toolCalls = emptyList(), stopReason = "end_turn")
+            ))
+        )
+        val throwingProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext {
+                throw IllegalStateException("boom")
+            }
+        }
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            sensorProvider = throwingProvider
+        ).also { it.phoneControlOverride = true }
+
+        val result = agent.sendEphemeral("[System: Summarize progress]")
+
+        assertEquals("Summary", result)
+        assertNotNull(client.lastSystemPrompt)
+        assertFalse(client.lastSystemPrompt!!.contains("Device Awareness"))
+    }
+
+    @Test
+    fun `sendEphemeral rethrows SensorProvider CancellationException`() = runTest {
+        val client = ScriptedProviderClient(
+            provider = Provider.ANTHROPIC,
+            toolResponses = ArrayDeque(listOf(
+                ChatResponse(text = "Summary", toolCalls = emptyList(), stopReason = "end_turn")
+            ))
+        )
+        val cancellingProvider = object : SensorProvider {
+            override suspend fun snapshot(): SensorContext {
+                throw kotlinx.coroutines.CancellationException("cancelled")
+            }
+        }
+        val agent = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            sensorProvider = cancellingProvider
+        ).also { it.phoneControlOverride = true }
+
+        assertFailsWith<kotlinx.coroutines.CancellationException> {
+            agent.sendEphemeral("[System: Summarize progress]")
+        }    }
+
     // ── Learn tool tests ──
 
     @Test
@@ -1965,5 +5661,38 @@ class PhoneAgentApiTest {
         } finally {
             tempDir.deleteRecursively()
         }
+    }
+
+    @Test
+    fun `type_text dispatches through robustTextInput and maps result correctly`() = runTest {
+        val client = ScriptedProviderClient(Provider.ANTHROPIC, ArrayDeque(), ArrayDeque())
+
+        val successInput = mock<RobustTextInput>()
+        whenever(successInput.inputText("Hello")).thenReturn(InputResult.Fallback(InputTier.KEY_EVENTS))
+        val successApi = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            isScreenReaderAttached = { true },
+            robustTextInput = successInput
+        )
+
+        val success = successApi.executeToolCall(ToolCall("t1", "type_text", mapOf("text" to "Hello")), null)
+        assertFalse(success.isError)
+        assertEquals("Typed \"Hello\"", success.text)
+        verify(successInput).inputText("Hello")
+
+        val failedInput = mock<RobustTextInput>()
+        whenever(failedInput.inputText("Hello")).thenReturn(InputResult.Failed(InputTier.ADB_INPUT))
+        val failedApi = PhoneAgentApi(
+            chatClient = client,
+            actionClient = client,
+            isScreenReaderAttached = { true },
+            robustTextInput = failedInput
+        )
+
+        val failed = failedApi.executeToolCall(ToolCall("t2", "type_text", mapOf("text" to "Hello")), null)
+        assertTrue(failed.isError)
+        assertEquals("Failed: type_text: unable to enter text", failed.text)
+        verify(failedInput).inputText("Hello")
     }
 }

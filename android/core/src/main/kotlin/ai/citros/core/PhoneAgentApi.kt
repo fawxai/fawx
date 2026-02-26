@@ -12,7 +12,27 @@ package ai.citros.core
  * @param actionClient Client for action loop follow-ups (e.g., Haiku for speed)
  */
 import android.util.Log
+import androidx.annotation.VisibleForTesting
+import java.security.MessageDigest
+import java.nio.charset.StandardCharsets
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.math.ceil
+import kotlin.math.max
+import kotlin.math.roundToLong
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
 
 open class PhoneAgentApi(
     private val chatClient: ProviderClient,
@@ -33,12 +53,156 @@ open class PhoneAgentApi(
     private val tinyFishApiKey: String? = null,
     /** TinyFish endpoint override for testing. Null uses production default. */
     private val tinyFishEndpoint: String? = null,
+    /** TinyFish client factory override for testing. */
+    private val tinyFishClientFactory: (apiKey: String, endpoint: String) -> TinyFishBrowserClient = { apiKey, endpoint ->
+        TinyFishClient(apiKey = apiKey, endpoint = endpoint)
+    },
     /** Citros app token for authenticating to Citros API endpoints. */
     private val citrosAppToken: String? = null,
     /** Compatibility mode for tactical domain-specific web guardrails. */
     private val domainGuardrailMode: PhoneAgentPrompts.DomainGuardrailMode =
-        PhoneAgentPrompts.DomainGuardrailMode.GENERIC
+        PhoneAgentPrompts.DomainGuardrailMode.GENERIC,
+    /** Sensor provider for device context injection. Null to disable. */
+    private val sensorProvider: SensorProvider? = null,
+    /** ScreenReader attachment check, injectable for unit tests. */
+    private val isScreenReaderAttached: () -> Boolean = { ScreenReader.isAttached() },
+    /** Screen content provider, injectable for unit tests. */
+    private val getScreenContent: () -> ScreenContent = { ScreenReader.getScreenContent() },
+    /** Screenshot provider, injectable for unit tests. */
+    private val takeScreenshot: suspend () -> ScreenshotResult = { ScreenReader.takeScreenshot() },
+    /** Element tap provider, injectable for unit tests. */
+    private val clickElement: (Int) -> ScreenReader.ElementActionResult = { ScreenReader.clickElementDetailed(it) },
+    /** Element long-press provider, injectable for unit tests. */
+    private val longPressElement: (Int) -> ScreenReader.ElementActionResult = { ScreenReader.longPressElementDetailed(it) },
+    /** Optional spending guard for API usage. */
+    private val budgetGuard: BudgetGuard? = null,
+    /** Robust text input fallback chain wrapper used by type_text. */
+    private val robustTextInput: RobustTextInput = RobustTextInput()
 ) {
+    private val taskSensorSnapshotLock = Any()
+    @Volatile
+    private var taskSensorSnapshot: SensorContext? = null
+    @Volatile
+    private var taskSensorSnapshotInitialized: Boolean = false
+    private val taskSensorSnapshotCaptureMutex = Mutex()
+    private val taskSensorSnapshotEpoch = AtomicLong(0L)
+    private val sensorSnapshotFailureCount = AtomicInteger(0)
+    private val sensorSnapshotTimeoutCount = AtomicInteger(0)
+    private val sensorSnapshotCount = AtomicInteger(0)
+    private val sensorSnapshotLatencyTotalMsCounter = AtomicLong(0L)
+    private val sensorSnapshotLatencyMaxMsCounter = AtomicLong(0L)
+
+    private enum class SnapshotOutcome { SUCCESS, TIMEOUT, FAILURE }
+
+    /**
+     * Log tool plan telemetry per turn. No user message content in logs.
+     */
+    private fun logToolPlanTelemetry(plan: ResolvedToolPlan, isActionLoop: Boolean) {
+        Log.d(
+            TAG,
+            "toolPlan: isActionLoop=$isActionLoop, " +
+                "categories=${plan.activeCategories.joinToString(",") { it.name.lowercase() }}, " +
+                "categoryCount=${plan.activeCategories.size}, " +
+                "toolCount=${plan.estimatedToolCount}, " +
+                "reasons=${plan.reasonCodes.joinToString(",") { it.name }}"
+        )
+    }
+
+    private fun recordSensorSnapshotMetrics(durationMs: Long, outcome: SnapshotOutcome) {
+        sensorSnapshotCount.incrementAndGet()
+        sensorSnapshotLatencyTotalMsCounter.addAndGet(durationMs)
+        sensorSnapshotLatencyMaxMsCounter.updateAndGet { current -> maxOf(current, durationMs) }
+        Log.d(TAG, "sensor snapshot outcome=$outcome duration_ms=$durationMs")
+    }
+
+    /** Gather sensor context, never throws. */
+    private suspend fun getSensorSnapshot(): SensorContext? {
+        val startedNs = System.nanoTime()
+        return try {
+            val snapshot = withTimeout(SENSOR_SNAPSHOT_TIMEOUT_MS) {
+                sensorProvider?.snapshot()
+            }
+            val elapsedMs = (System.nanoTime() - startedNs) / 1_000_000
+            recordSensorSnapshotMetrics(elapsedMs, SnapshotOutcome.SUCCESS)
+            snapshot
+        } catch (_: TimeoutCancellationException) {
+            val timeouts = sensorSnapshotTimeoutCount.incrementAndGet()
+            Log.w(TAG, "sensor snapshot timed out (count=$timeouts)")
+            val elapsedMs = (System.nanoTime() - startedNs) / 1_000_000
+            recordSensorSnapshotMetrics(elapsedMs, SnapshotOutcome.TIMEOUT)
+            null
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            val failures = sensorSnapshotFailureCount.incrementAndGet()
+            Log.w(TAG, "sensor snapshot failed (count=$failures): ${e.javaClass.simpleName}")
+            val elapsedMs = (System.nanoTime() - startedNs) / 1_000_000
+            recordSensorSnapshotMetrics(elapsedMs, SnapshotOutcome.FAILURE)
+            null  // Defense-in-depth: provider contract says no-throw, but be safe
+        }
+    }
+
+    /**
+     * Return the cached task snapshot, refreshing only when a new task starts.
+     *
+     * New task boundary: non-action `sendMessage` call.
+     * Continuations (`continueAfterTools`) and action-loop turns reuse the same snapshot.
+     */
+    private suspend fun getTaskSensorSnapshot(startNewTask: Boolean): SensorContext? {
+        val captureEpoch = synchronized(taskSensorSnapshotLock) {
+            if (startNewTask) {
+                taskSensorSnapshotEpoch.incrementAndGet()
+                taskSensorSnapshot = null
+                taskSensorSnapshotInitialized = false
+            }
+            if (taskSensorSnapshotInitialized) {
+                return taskSensorSnapshot
+            }
+            taskSensorSnapshotEpoch.get()
+        }
+
+        val captured = taskSensorSnapshotCaptureMutex.withLock {
+            synchronized(taskSensorSnapshotLock) {
+                if (taskSensorSnapshotInitialized && taskSensorSnapshotEpoch.get() == captureEpoch) {
+                    return@withLock taskSensorSnapshot
+                }
+            }
+            getSensorSnapshot()
+        }
+
+        return synchronized(taskSensorSnapshotLock) {
+            if (!taskSensorSnapshotInitialized && taskSensorSnapshotEpoch.get() == captureEpoch) {
+                taskSensorSnapshot = captured
+                taskSensorSnapshotInitialized = true
+            }
+            taskSensorSnapshot
+        }
+    }
+
+    @get:androidx.annotation.VisibleForTesting
+    internal val sensorSnapshotFailureTotal: Int
+        get() = sensorSnapshotFailureCount.get()
+
+    @get:androidx.annotation.VisibleForTesting
+    internal val sensorSnapshotTimeoutTotal: Int
+        get() = sensorSnapshotTimeoutCount.get()
+
+    @get:androidx.annotation.VisibleForTesting
+    internal val sensorSnapshotTotal: Int
+        get() = sensorSnapshotCount.get()
+
+    @get:androidx.annotation.VisibleForTesting
+    internal val sensorSnapshotLatencyTotalMs: Long
+        get() = sensorSnapshotLatencyTotalMsCounter.get()
+
+    @get:androidx.annotation.VisibleForTesting
+    internal val sensorSnapshotLatencyMaxMs: Long
+        get() = sensorSnapshotLatencyMaxMsCounter.get()
+
+    @get:androidx.annotation.VisibleForTesting
+    internal val cachedTaskSensorSnapshot: SensorContext?
+        get() = taskSensorSnapshot
+
     /** Shared search client — reuses OkHttpClient connection pools across calls. */
     private val searchClient by lazy {
         WebSearchClient(
@@ -54,7 +218,7 @@ open class PhoneAgentApi(
 
     /** Shared TinyFish client for web browser automation. Only initialized when API key is set. */
     private val tinyFishClient by lazy {
-        tinyFishApiKey?.let { TinyFishClient(apiKey = it, endpoint = tinyFishEndpoint ?: TinyFishClient.DEFAULT_ENDPOINT) }
+        tinyFishApiKey?.let { tinyFishClientFactory(it, tinyFishEndpoint ?: TinyFishClient.DEFAULT_ENDPOINT) }
     }
 
     init {
@@ -79,16 +243,259 @@ open class PhoneAgentApi(
      * @return Combined list of phone tools + applicable API tools
      */
     fun getToolsForModel(modelId: String? = null): List<Tool> {
+        val activeConstraints = currentConstraintSnapshot()
+        return getToolsForModel(modelId, activeConstraints)
+    }
+
+    private fun getToolsForModel(
+        modelId: String? = null,
+        activeConstraints: List<RuntimeToolConstraint>
+    ): List<Tool> {
         val tier = modelId?.let { ModelClassifier.classify(it) } ?: ModelTier.STANDARD
         val tools = PhoneTools.getToolsForCategories(ToolCategory.entries.toSet(), tier)
-        return if (tinyFishApiKey != null) tools else tools.filter { it.name != "web_browse" }
+        val base = if (tinyFishApiKey != null) tools else tools.filter { it.name != "web_browse" }
+        return applyConstraintsToTools(base, activeConstraints)
+    }
+
+    private fun currentConstraintSnapshot(): List<RuntimeToolConstraint> {
+        expireConstraintsIfNeeded()
+        return activeConstraintsSnapshot()
+    }
+
+    private fun applyConstraintsToTools(
+        tools: List<Tool>,
+        activeConstraints: List<RuntimeToolConstraint>? = null
+    ): List<Tool> {
+        val constraints = activeConstraints ?: currentConstraintSnapshot()
+        if (constraints.isEmpty()) return tools
+        return tools.filter { tool ->
+            val decision = resolveToolConstraintDecision(tool.name, constraints)
+            if (!decision.allowed) {
+                Log.d(TAG, "Constraint filtered advertised tool '${tool.name}': ${decision.reason ?: "blocked"}")
+            }
+            decision.allowed
+        }
+    }
+
+    /**
+     * Resolve whether a tool is allowed by active runtime constraints.
+     *
+     * Allow-lists use strict intersection semantics: if multiple active constraints
+     * provide non-empty [RuntimeToolConstraint.allowedTools], a tool must appear
+     * in every allow-list to be allowed.
+     */
+    private fun resolveToolConstraintDecision(
+        toolName: String,
+        activeConstraints: List<RuntimeToolConstraint>? = null
+    ): ToolConstraintDecision {
+        val active = activeConstraints ?: currentConstraintSnapshot()
+        if (active.isEmpty()) return ToolConstraintDecision(allowed = true)
+
+        val allowSets = active.map { it.allowedTools }.filter { it.isNotEmpty() }
+        val allowByAllowList = if (allowSets.isEmpty()) true else allowSets.all { toolName in it }
+
+        val denyConstraint = active.firstOrNull { toolName in it.disallowedTools }
+        if (denyConstraint != null) {
+            return ToolConstraintDecision(
+                allowed = false,
+                reason = denyConstraint.reason ?: "${denyConstraint.source} disallowed $toolName"
+            )
+        }
+
+        if (!allowByAllowList) {
+            val source = active.firstOrNull { it.allowedTools.isNotEmpty() }?.source ?: "runtime constraint"
+            return ToolConstraintDecision(
+                allowed = false,
+                reason = "$source allow-list excludes $toolName"
+            )
+        }
+
+        return ToolConstraintDecision(allowed = true)
+    }
+
+    private enum class ConstraintLifecycleState {
+        ACTIVE,
+        INACTIVE,
+        EXPIRED
+    }
+
+    /**
+     * Centralized runtime-constraint lifecycle classifier.
+     *
+     * TASK constraints intentionally distinguish:
+     * - INACTIVE: bound to a future task (`createdTaskId > currentTaskId`)
+     * - EXPIRED: bound to a finished task (`createdTaskId < currentTaskId`)
+     *
+     * This keeps active filtering and expiry sweeps aligned while preserving
+     * the current-task (`==`) vs old-task (`<`) semantics.
+     */
+    private fun constraintLifecycleState(constraint: RuntimeToolConstraint): ConstraintLifecycleState {
+        if (!constraint.enabled) return ConstraintLifecycleState.EXPIRED
+        if (constraint.scope == ConstraintScope.TURN && modelTurnCounter > constraint.createdTurn) {
+            return ConstraintLifecycleState.EXPIRED
+        }
+
+        val turnsSinceCreated = modelTurnCounter - constraint.createdTurn
+        if (constraint.expiresAfterTurns != null && turnsSinceCreated >= constraint.expiresAfterTurns) {
+            return ConstraintLifecycleState.EXPIRED
+        }
+
+        if (constraint.scope == ConstraintScope.TASK && constraint.createdTaskId != currentTaskId) {
+            return if (constraint.createdTaskId < currentTaskId) {
+                ConstraintLifecycleState.EXPIRED
+            } else {
+                ConstraintLifecycleState.INACTIVE
+            }
+        }
+
+        return ConstraintLifecycleState.ACTIVE
+    }
+
+    private fun activeConstraintsSnapshot(): List<RuntimeToolConstraint> {
+        return runtimeConstraints.filter { constraintLifecycleState(it) == ConstraintLifecycleState.ACTIVE }
+    }
+
+    @Synchronized
+    private fun expireConstraintsIfNeeded() {
+        val expired = runtimeConstraints.filter { constraintLifecycleState(it) == ConstraintLifecycleState.EXPIRED }
+        if (expired.isEmpty()) return
+
+        runtimeConstraints.removeAll(expired.toSet())
+
+        val summary = expired.take(3).joinToString { "${it.scope}:${it.source}" }
+        val suffix = if (expired.size > 3) ", +${expired.size - 3} more" else ""
+        Log.d(TAG, "Expired ${expired.size} runtime constraint(s): [$summary$suffix]")
+    }
+
+    /**
+     * Get tools for a model with tool grouping policy applied.
+     * When [FeatureFlags.toolGroupingV1Enabled] is true, uses [ToolGroupingPolicy]
+     * to dynamically select categories. When false, falls back to legacy all-category behavior.
+     *
+     * @return Pair of tool list and optional [ResolvedToolPlan] (null when grouping is off)
+     */
+    internal fun getToolsForModelWithGrouping(
+        modelId: String? = null,
+        messageText: String = "",
+        userSettings: UserToolCategorySettings = UserToolCategorySettings.allEnabled(),
+        expandedCategories: Set<ToolCategory> = emptySet(),
+        includeRequestToolsCappedReason: Boolean = false
+    ): Pair<List<Tool>, ResolvedToolPlan?> {
+        if (!FeatureFlags.toolGroupingV1Enabled) {
+            return getToolsForModel(modelId) to null
+        }
+
+        val tier = modelId?.let { ModelClassifier.classify(it) } ?: ModelTier.STANDARD
+        val capabilities = ToolGroupingPolicy.Capabilities(
+            accessibilityAttached = phoneControlOverride ?: isScreenReaderAttached(),
+            hasTinyFishKey = tinyFishApiKey != null
+        )
+
+        val plan = ToolGroupingPolicy.resolve(
+            messageText = messageText,
+            modelTier = tier,
+            capabilities = capabilities,
+            userSettings = userSettings.snapshot()
+        )
+
+        // Merge request_tools expanded categories into active set
+        val mergedActiveCategories = if (expandedCategories.isNotEmpty()) {
+            val merged = plan.activeCategories.toMutableSet()
+            merged.addAll(expandedCategories)
+            val mergedOrdered = ResolvedToolPlan.canonicalOrder(merged)
+            val mergedToolNames = PhoneTools.getToolsForCategories(merged, tier)
+                .map { it.name }.toMutableSet()
+            if (!capabilities.hasTinyFishKey) mergedToolNames -= "web_browse"
+            val mergedReasons = plan.reasonCodes.toMutableList()
+            if (expandedCategories.any { it !in plan.activeCategories }) {
+                mergedReasons += ReasonCode.request_tools_expanded
+            }
+            if (includeRequestToolsCappedReason) {
+                mergedReasons += ReasonCode.request_tools_capped
+            }
+            val mergedPlan = ResolvedToolPlan(
+                activeCategories = mergedOrdered,
+                toolNames = mergedToolNames,
+                reasonCodes = mergedReasons.distinct(),
+                estimatedToolCount = mergedToolNames.size
+            )
+            val allTools = PhoneTools.getToolsForCategories(ToolCategory.entries.toSet(), tier)
+            return allTools.filter { it.name in mergedPlan.toolNames } to mergedPlan
+        } else {
+            null
+        }
+
+        // Filter from a single tool list using policy-selected tool names.
+        val allTools = PhoneTools.getToolsForCategories(ToolCategory.entries.toSet(), tier)
+        val tools = allTools.filter { it.name in plan.toolNames }
+        val finalPlan = if (includeRequestToolsCappedReason) {
+            plan.copy(reasonCodes = (plan.reasonCodes + ReasonCode.request_tools_capped).distinct())
+        } else {
+            plan
+        }
+
+        return tools to finalPlan
     }
 
     private val messages: MutableList<Message> = CopyOnWriteArrayList()
+    private val runtimeConstraints: MutableList<RuntimeToolConstraint> = CopyOnWriteArrayList()
+
+    /**
+     * Constraint snapshot captured when a model response is accepted.
+     *
+     * Execute-time hard gating uses this snapshot so tool execution is evaluated
+     * against the same constraint set that was active when the model emitted the calls.
+     */
+    @Volatile
+    private var executionConstraintSnapshot: List<RuntimeToolConstraint>? = null
+
+    /** Monotonic model turn counter for TURN/session expiry bookkeeping. */
+    @Volatile
+    private var modelTurnCounter: Int = 0
+
+    /** Current task identifier. Advanced on each non-action-loop sendMessage call. */
+    @Volatile
+    private var currentTaskId: Int = 0
+
+    /**
+     * True while the current task is still in-flight (i.e., action loop not finished).
+     *
+     * TASK-scoped constraints created while false are bound to the next task.
+     */
+    @Volatile
+    private var isTaskInProgress: Boolean = false
+
+    private val requestFlowMutex = Mutex()
+    private val clearRequested = AtomicBoolean(false)
+    private val deferredSeedMessages = AtomicReference<DeferredSeedRequest?>(null)
+    private val deferredSeedBootstrapEligibleInActiveFlow = AtomicBoolean(false)
+    private val taskTokenAccumulator = TaskTokenAccumulator()
+    @Volatile
+    private var taskEstimatedCostNanodollars: Long = 0L
+    @Volatile
+    private var taskEstimatedCostMicrodollars: Long = 0L
+    @Volatile
+    var lastTaskCostSummary: TaskCostSummary = TaskCostSummary.EMPTY
+        private set
 
     /** Expose message count for testing. */
     @get:androidx.annotation.VisibleForTesting
     internal val messageCount: Int get() = messages.size
+
+    data class DeferredSeedSignal(
+        val action: String,
+        val reason: String,
+        val seedMessageCount: Int,
+        val liveMessageCount: Int
+    )
+
+    @androidx.annotation.VisibleForTesting
+    @Volatile
+    internal var onDeferredSeedSignal: ((DeferredSeedSignal) -> Unit)? = null
+
+    @androidx.annotation.VisibleForTesting
+    @Volatile
+    internal var onBeforeDeferredMaintenanceInActiveFlow: (() -> Unit)? = null
 
     /** Current tool step counter, used for context compaction. Set by ChatViewModel. */
     @Volatile
@@ -108,42 +515,21 @@ open class PhoneAgentApi(
      * pairs, and reconstructing those from UI messages is not reliable. Text-only
      * history is sufficient for conversational continuity.
      */
-    @Synchronized
     fun seedConversationHistory(uiMessages: List<Message>) {
-        if (messages.isNotEmpty()) return  // Already has history, skip
-        if (uiMessages.isEmpty()) return
-
-        // Convert UI messages to simple text-only messages for API context.
-        // Drop tool/system messages, keep user and assistant text.
-        val seeded = uiMessages.mapNotNull { msg ->
-            when {
-                msg.role == Message.ROLE_USER -> Message(role = "user", content = msg.content)
-                msg.role == Message.ROLE_ASSISTANT && msg.content.isNotBlank() -> {
-                    // Strip tool metadata suffix (e.g. "[Tools: tap, type]")
-                    val textOnly = msg.content
-                        .replace(Regex("""\s*\[Tools:.*?]"""), "")
-                        .trim()
-                    if (textOnly.isNotEmpty()) Message(role = "assistant", content = textOnly) else null
-                }
-                else -> null
-            }
+        if (!requestFlowMutex.tryLock()) {
+            val liveHistoryWasBootstrapEmptyAtDeferral = deferredSeedBootstrapEligibleInActiveFlow.get()
+            val deferred = DeferredSeedRequest(
+                uiMessages = uiMessages.toList(),
+                liveHistoryWasEmptyAtDeferral = liveHistoryWasBootstrapEmptyAtDeferral
+            )
+            deferredSeedMessages.set(deferred)
+            Log.d(TAG, "seedConversationHistory: deferred while request flow is active")
+            return
         }
-
-        // Deduplicate consecutive same-role messages that can arise when
-        // steer messages (mid-loop user turns) are adjacent to regular user turns
-        // after tool-role messages are stripped. The Anthropic API rejects
-        // consecutive same-role messages.
-        val deduped = mutableListOf<Message>()
-        for (msg in seeded) {
-            if (deduped.isEmpty() || deduped.last().role != msg.role) {
-                deduped.add(msg)
-            }
-            // else: skip consecutive same-role message
-        }
-
-        if (deduped.isNotEmpty()) {
-            messages.addAll(deduped)
-            Log.d(TAG, "seedConversationHistory: seeded ${'$'}{deduped.size} messages from UI (${'$'}{seeded.size - deduped.size} consecutive dupes removed)")
+        try {
+            applySeedConversationHistoryUnlocked(uiMessages, allowPrependToExisting = false)
+        } finally {
+            requestFlowMutex.unlock()
         }
     }
 
@@ -154,6 +540,124 @@ open class PhoneAgentApi(
      */
     var onToolProgress: ((String) -> Unit)? = null
 
+    /** Create and activate a runtime tool constraint. */
+    @Synchronized
+    fun createRuntimeConstraint(
+        scope: ConstraintScope,
+        allowedTools: Set<String> = emptySet(),
+        disallowedTools: Set<String> = emptySet(),
+        source: String,
+        reason: String? = null,
+        expiresAfterTurns: Int? = null
+    ): RuntimeToolConstraint {
+        require(expiresAfterTurns == null || expiresAfterTurns > 0) {
+            "expiresAfterTurns must be > 0 when provided"
+        }
+
+        // TASK constraints created while idle should apply to the *next* user task.
+        // TASK constraints created mid-loop should stay on the current task.
+        val taskScopedId = when (scope) {
+            ConstraintScope.TASK -> if (isTaskInProgress) currentTaskId else currentTaskId + 1
+            else -> currentTaskId
+        }
+
+        val constraint = RuntimeToolConstraint(
+            scope = scope,
+            allowedTools = allowedTools,
+            disallowedTools = disallowedTools,
+            source = source,
+            reason = reason,
+            createdTurn = modelTurnCounter,
+            createdTaskId = taskScopedId,
+            expiresAfterTurns = expiresAfterTurns
+        )
+        runtimeConstraints.add(constraint)
+        executionConstraintSnapshot = null
+        return constraint
+    }
+
+    /**
+     * Update an existing runtime constraint by id.
+     *
+     * Uses clear semantics for optional fields:
+     * - pass clearReason=true to erase reason
+     * - pass clearExpiry=true to erase expiresAfterTurns
+     */
+    @Synchronized
+    fun updateRuntimeConstraint(
+        id: String,
+        allowedTools: Set<String>? = null,
+        disallowedTools: Set<String>? = null,
+        reason: String? = null,
+        enabled: Boolean? = null,
+        expiresAfterTurns: Int? = null,
+        clearReason: Boolean = false,
+        clearExpiry: Boolean = false
+    ): RuntimeToolConstraint? {
+        require(!(clearReason && reason != null)) {
+            "Cannot set reason and clearReason=true in the same update"
+        }
+        require(!(clearExpiry && expiresAfterTurns != null)) {
+            "Cannot set expiresAfterTurns and clearExpiry=true in the same update"
+        }
+        require(expiresAfterTurns == null || expiresAfterTurns > 0) {
+            "expiresAfterTurns must be > 0 when provided"
+        }
+
+        val existing = runtimeConstraints.firstOrNull { it.id == id } ?: return null
+        val updated = existing.copy(
+            allowedTools = allowedTools ?: existing.allowedTools,
+            disallowedTools = disallowedTools ?: existing.disallowedTools,
+            reason = when {
+                clearReason -> null
+                reason != null -> reason
+                else -> existing.reason
+            },
+            enabled = enabled ?: existing.enabled,
+            expiresAfterTurns = when {
+                clearExpiry -> null
+                expiresAfterTurns != null -> expiresAfterTurns
+                else -> existing.expiresAfterTurns
+            }
+        )
+        runtimeConstraints.removeAll { it.id == id }
+        runtimeConstraints.add(updated)
+        executionConstraintSnapshot = null
+        return updated
+    }
+
+    /** Explicitly clear a runtime constraint by id. */
+    @Synchronized
+    fun clearRuntimeConstraint(id: String): Boolean {
+        executionConstraintSnapshot = null
+        return runtimeConstraints.removeAll { it.id == id }
+    }
+
+    /** Expire all constraints matching a scope. */
+    @Synchronized
+    fun clearRuntimeConstraints(scope: ConstraintScope? = null) {
+        executionConstraintSnapshot = null
+        if (scope == null) runtimeConstraints.clear()
+        else runtimeConstraints.removeAll { it.scope == scope }
+    }
+
+    /** Force lifecycle-based expiry and return number of removed constraints. */
+    @Synchronized
+    fun expireRuntimeConstraints(): Int {
+        val before = runtimeConstraints.size
+        expireConstraintsIfNeeded()
+        val expired = before - runtimeConstraints.size
+        if (expired > 0) executionConstraintSnapshot = null
+        return expired
+    }
+
+    /** Exposed for tests/debugging. */
+    @Synchronized
+    internal fun activeRuntimeConstraints(): List<RuntimeToolConstraint> {
+        expireConstraintsIfNeeded()
+        return activeConstraintsSnapshot()
+    }
+
     /**
      * Override for phone control availability check. When null, uses [ScreenReader.isAttached()].
      * Set to `true` in tests to simulate phone control being available.
@@ -162,8 +666,76 @@ open class PhoneAgentApi(
     @Volatile
     var phoneControlOverride: Boolean? = null
 
+    /**
+     * User tool category settings for tool grouping policy.
+     * Injected from UI layer (SharedPreferences). Default: all enabled.
+     */
+    @Volatile
+    var userToolCategorySettings: UserToolCategorySettings = UserToolCategorySettings.allEnabled()
+
+    /**
+     * Tracks the most recent [ResolvedToolPlan] from the last turn.
+     * Visible for telemetry and testing.
+     */
+    @Volatile
+    var lastResolvedToolPlan: ResolvedToolPlan? = null
+        private set
+
+    /**
+     * Categories expanded via request_tools calls.
+     * Persisted across turns within a task, intersected with policy allow_set.
+     */
+    private val requestToolsExpandedCategories = mutableSetOf<ToolCategory>()
+
+    /**
+     * Tracks consecutive identical request_tools calls for cap enforcement.
+     * Key: sorted set of requested categories as string, Value: count.
+     */
+    private val requestToolsCallCounts = mutableMapOf<String, Int>()
+
+    /**
+     * True after a repeated request_tools call is capped (max 2).
+     * Added to subsequent ResolvedToolPlan reason codes for telemetry/debugging.
+     */
+    @Volatile
+    private var requestToolsCappedThisTask: Boolean = false
+
+    private data class ActiveToolConstraint(
+        val allowedToolNames: Set<String>,
+        val reason: String
+    )
+
+    @Volatile
+    private var activeToolConstraint: ActiveToolConstraint? = null
+
     companion object {
         private const val TAG = "CitrosAgent"
+        private const val APP_BUILD_CONFIG_CLASS = "ai.citros.chat.BuildConfig"
+
+        /**
+         * Detect debug build without depending on BuildConfig (which may not be
+         * generated for library modules). Falls back to checking the debuggable
+         * flag reflectively, defaulting to false in non-Android environments (tests).
+         */
+        internal fun detectDebugBuild(): Boolean {
+            return try {
+                // Coupled to the app module BuildConfig class name; keep in one constant
+                // so package refactors fail in one place.
+                val cls = Class.forName(APP_BUILD_CONFIG_CLASS)
+                cls.getField("DEBUG").getBoolean(null)
+            } catch (_: Exception) {
+                false
+            }
+        }
+
+        private const val NANODOLLARS_PER_USD = 1_000_000_000L
+        private const val NANODOLLARS_PER_MICRODOLLAR = 1_000L
+        private const val FALLBACK_PROVIDER_FRAMING_CHARS = 256
+        private const val FALLBACK_INPUT_CONSERVATISM_FACTOR = 1.25
+        private const val FALLBACK_OUTPUT_CONSERVATISM_FACTOR = 1.10
+        // Failsafe cap for full snapshot capture. Individual sensors should enforce
+        // tighter per-field budgets to preserve partial context when one field is slow.
+        internal const val SENSOR_SNAPSHOT_TIMEOUT_MS = 60L
         private const val CLIPBOARD_NOT_ATTACHED =
             "Clipboard not available (accessibility service not attached)"
         private const val NOTIFICATION_NOT_ATTACHED =
@@ -187,7 +759,7 @@ open class PhoneAgentApi(
         /** Keywords that indicate the user wants a phone control action, not casual chat. */
         private val ACTION_HINTS = setOf(
             "open", "tap", "click", "press", "type", "send", "swipe", "scroll",
-            "go home", "launch", "find", "search", "turn on", "turn off",
+            "go home", "launch", "find", "search", "fetch", "turn on", "turn off",
             "take", "screenshot", "set", "timer", "check", "show", "call",
             "read", "write", "capture", "navigate", "enable", "disable",
             "go to", "go back", "install", "uninstall", "download", "share",
@@ -207,7 +779,22 @@ open class PhoneAgentApi(
             Regex("""<tool_call>.*?</tool_call>""", RegexOption.DOT_MATCHES_ALL),
             Regex("""<function_call>.*?</function_call>""", RegexOption.DOT_MATCHES_ALL),
             // JSON tool objects with known tool names (handles one level of nesting)
-            Regex("""\{\s*"name"\s*:\s*"(tap|type_text|swipe|open_app|press_back|press_home|read_screen|screenshot|scroll|long_press|tap_text|open_notifications|wait|think|web_browse|web_search|web_fetch|request_tools)"[^{}]*(\{[^{}]*\}[^{}]*)?\}""")
+            Regex("""\{\s*"name"\s*:\s*"(tap|type_text|swipe|open_app|press_back|press_home|read_screen|screenshot|scroll|long_press|tap_text|open_notifications|wait|think|web_browse|web_search|web_fetch|request_tools|offer_choices)"[^{}]*(\{[^{}]*\}[^{}]*)?\}""")
+        )
+
+        private val EXPLICIT_WEB_FETCH_URL_REGEX =
+            Regex("""https?://[^\s\]\)>]+""", RegexOption.IGNORE_CASE)
+
+        private val EXPLICIT_WEB_FETCH_HINTS = setOf(
+            "fetch", "summarize", "summarise", "extract", "read"
+        )
+
+        private val WEB_SEARCH_ONLY_ALLOWED_TOOLS = setOf("think", "web_search")
+
+        private val WEB_SEARCH_ONLY_REGEXES = listOf(
+            Regex("""\buse\s+web[_\s]?search\s+only\b""", RegexOption.IGNORE_CASE),
+            Regex("""\bonly\s+(?:use\s+)?web[_\s]?search\b""", RegexOption.IGNORE_CASE),
+            Regex("""\bweb[_\s]?search\s+only\b""", RegexOption.IGNORE_CASE)
         )
 
         /**
@@ -259,14 +846,40 @@ open class PhoneAgentApi(
         screenContent: ScreenContent?,
         isActionLoop: Boolean = false,
         onTextDelta: ((String) -> Unit)? = null
-    ): ChatResponse {
+    ): ChatResponse = withRequestFlowLock {
+        if (!isActionLoop) {
+            currentTaskId++
+            isTaskInProgress = true
+            expireConstraintsIfNeeded()
+
+            resetTaskCostTracking()
+            requestToolsExpandedCategories.clear()
+            requestToolsCallCounts.clear()
+            requestToolsCappedThisTask = false
+            activeToolConstraint = resolveExplicitToolConstraint(userMessage)?.let {
+                ActiveToolConstraint(
+                    allowedToolNames = it,
+                    reason = "explicit user tool restriction"
+                )
+            }
+        }
+
         // When phone control is not available, always use chat mode without tools (#390).
         // This prevents the model from hallucinating XML tool calls in plain text.
-        val phoneControlAvailable = phoneControlOverride ?: ScreenReader.isAttached()
+        val phoneControlAvailable = phoneControlOverride ?: isScreenReaderAttached()
+        val forceToolModeForResume =
+            !isActionLoop &&
+                isResumeIntent(userMessage) &&
+                hasRecentInterruptionPauseContext()
         val useChatMode = !phoneControlAvailable ||
-            (!isActionLoop && isLikelyConversationalMessage(userMessage))
-        Log.d(TAG, "sendMessage: phoneControl=$phoneControlAvailable, chatMode=$useChatMode, isActionLoop=$isActionLoop, msg='${userMessage.take(60)}'")
+            (!isActionLoop && isLikelyConversationalMessage(userMessage) && !forceToolModeForResume)
+        Log.d(
+            TAG,
+            "sendMessage: phoneControl=$phoneControlAvailable, chatMode=$useChatMode, " +
+                "isActionLoop=$isActionLoop, forceResumeToolMode=$forceToolModeForResume, msg='${userMessage.take(60)}'"
+        )
         if (useChatMode) {
+            executionConstraintSnapshot = null
             // When phone control is unavailable, prepend a system note so the
             // model knows not to attempt phone actions.
             val chatMessage = if (!phoneControlAvailable) {
@@ -279,20 +892,33 @@ open class PhoneAgentApi(
             val conversation = Conversation(messages.toMutableList()).apply {
                 addUser(chatMessage)
             }
-            val chatResult = if (onTextDelta != null) {
-                chatClient.chatStreaming(conversation, onTextDelta)
+            checkBudgetBeforeApiCall()
+            val chatResult: Result<Pair<String, TokenUsage?>> = if (onTextDelta != null) {
+                chatClient.chatStreaming(conversation, onTextDelta).map { streamedText ->
+                    streamedText to null
+                }
             } else {
-                chatClient.chat(conversation)
+                chatClient.chatWithUsage(conversation)
             }
-            return chatResult.fold(
-                onSuccess = { rawText ->
+            return@withRequestFlowLock chatResult.fold(
+                onSuccess = { (rawText, usage) ->
                     // Strip any hallucinated tool artifacts from chat-mode responses
                     val text = stripToolArtifacts(rawText)
+                    recordUsageOutcomeAndCheckBudgets(
+                        usage = usage,
+                        modelId = chatClient.modelId,
+                        promptChars = approximateConversationChars(conversation.messages),
+                        responseChars = max(rawText.length, text.length),
+                        systemPromptChars = 0,
+                        toolSchemaChars = 0
+                    )
                     messages.add(Message(role = "user", content = userMessage))
                     messages.add(Message(role = "assistant", content = text))
+                    isTaskInProgress = false
                     ChatResponse(text = text, toolCalls = emptyList(), stopReason = "end_turn")
                 },
                 onFailure = { error ->
+                    isTaskInProgress = false
                     ChatResponse(
                         text = "Error: ${error.message}",
                         toolCalls = emptyList(),
@@ -312,62 +938,104 @@ open class PhoneAgentApi(
             append(userMessage)
         }
 
-        messages.add(Message(role = "user", content = fullMessage))
+        checkBudgetBeforeApiCall()
+        val pendingUserMessage = Message(role = "user", content = fullMessage)
+        val messagesWithPendingUser = messages.toMutableList().apply { add(pendingUserMessage) }
 
         // Get response from appropriate client
         val client = if (isActionLoop) actionClient else chatClient
         val modelName = client.modelId
+        val sensorSnapshot = getTaskSensorSnapshot(startNewTask = !isActionLoop)
+
+        val (baseToolsForModel, toolPlan) = getToolsForModelWithGrouping(
+            modelId = client.modelId,
+            messageText = userMessage,
+            userSettings = userToolCategorySettings,
+            expandedCategories = requestToolsExpandedCategories.toSet(),
+            includeRequestToolsCappedReason = requestToolsCappedThisTask
+        )
+        val turnConstraintSnapshot = currentConstraintSnapshot()
+        val toolsWithActiveConstraint = applyActiveToolConstraintToToolList(baseToolsForModel)
+        val toolsForModel = applyConstraintsToTools(toolsWithActiveConstraint, turnConstraintSnapshot)
+        if (toolPlan != null) {
+            lastResolvedToolPlan = toolPlan
+            logToolPlanTelemetry(toolPlan, isActionLoop = isActionLoop)
+        }
+
         val systemPrompt = if (isActionLoop) {
-            promptBuilder?.trimmed(
+            val actionPrompt = promptBuilder?.trimmed(
                 phoneControlAvailable = phoneControlAvailable,
                 modelName = modelName,
-                domainGuardrailMode = domainGuardrailMode
+                domainGuardrailMode = domainGuardrailMode,
+                sensorContext = sensorSnapshot,
+                resolvedToolPlan = toolPlan
             )
                 ?: PhoneAgentPrompts.buildActionPrompt(
                     phoneControlAvailable = phoneControlAvailable,
                     modelName = modelName,
-                    domainGuardrailMode = domainGuardrailMode
+                    domainGuardrailMode = domainGuardrailMode,
+                    sensorContext = sensorSnapshot,
+                    resolvedToolPlan = toolPlan
                 )
+            logPromptTuningMetadata(actionPrompt, "action")
+            assertSafetyContractDebug(actionPrompt)
+            actionPrompt
         } else {
-            promptBuilder?.full(
+            buildChatSystemPrompt(
                 phoneControlAvailable = phoneControlAvailable,
                 modelName = modelName,
-                domainGuardrailMode = domainGuardrailMode
+                sensorContext = sensorSnapshot,
+                resolvedToolPlan = toolPlan
             )
-                ?: PhoneAgentPrompts.buildSystemPrompt(
-                    phoneControlAvailable = phoneControlAvailable,
-                    modelName = modelName,
-                    domainGuardrailMode = domainGuardrailMode
-                )
         }
-        
+
         // Use compacted messages for action loop to manage context window.
         // Two-stage compaction:
         //   1. ContextCompactor strips SCREEN dumps from old tool results (cheap, regex-based)
         //   2. ContextManager summarizes remaining old messages (step-threshold based)
         val messagesForModel = if (isActionLoop) {
-            val (screenStripped, compactorMetrics) = contextCompactor.compactWithMetrics(messages)
+            val (screenStripped, compactorMetrics) = contextCompactor.compactWithMetrics(messagesWithPendingUser)
             val (compacted, managerMetrics) = contextManager.compactWithMetrics(screenStripped, currentToolStep)
             if (compactorMetrics != null) Log.d(TAG, "sendMessage compaction stage1: $compactorMetrics")
             if (managerMetrics != null) Log.d(TAG, "sendMessage compaction stage2: $managerMetrics")
             compacted
         } else {
-            messages.toList()
+            messagesWithPendingUser.toList()
         }
-        
-        val result = client.chatWithTools(messagesForModel, systemPrompt = systemPrompt, tools = getToolsForModel())
 
-        return result.fold(
-            onSuccess = { response ->
-                // Add assistant response to conversation history
-                if (response.toolCalls.isNotEmpty()) {
-                    messages.add(Message.assistantWithTools(response.text, response.toolCalls))
-                } else if (response.text != null) {
-                    messages.add(Message(role = "assistant", content = response.text))
-                }
+        executionConstraintSnapshot = null
+        val result = client.chatWithTools(messagesForModel, systemPrompt = systemPrompt, tools = toolsForModel)
+
+        return@withRequestFlowLock result.fold(
+            onSuccess = { rawResponse ->
+                recordUsageOutcomeAndCheckBudgets(
+                    usage = rawResponse.usage,
+                    modelId = client.modelId,
+                    promptChars = approximateMessageChars(messagesForModel),
+                    responseChars = approximateResponseChars(rawResponse),
+                    systemPromptChars = systemPrompt.length,
+                    toolSchemaChars = approximateToolSchemaChars(toolsForModel)
+                )
+                val explicitFetchEnforced = enforceExplicitWebFetchIntent(
+                    userMessage = userMessage,
+                    response = rawResponse,
+                    isActionLoop = isActionLoop,
+                    modelId = client.modelId
+                )
+                val response = enforceActiveToolConstraintOnResponse(explicitFetchEnforced)
+
+                executionConstraintSnapshot = if (response.toolCalls.isNotEmpty()) turnConstraintSnapshot else null
+                modelTurnCounter++
+                expireConstraintsIfNeeded()
+                isTaskInProgress = response.toolCalls.isNotEmpty()
+
+                messages.add(pendingUserMessage)
+                appendAssistantResponse(response)
                 response
             },
             onFailure = { error ->
+                executionConstraintSnapshot = null
+                isTaskInProgress = false
                 ChatResponse(
                     text = "Error: ${error.message}",
                     toolCalls = emptyList(),
@@ -376,7 +1044,7 @@ open class PhoneAgentApi(
             }
         )
     }
-    
+
     /**
      * Send an ephemeral prompt using existing conversation as context,
      * without persisting the user message in conversation history.
@@ -390,37 +1058,104 @@ open class PhoneAgentApi(
      * @return The assistant's text response, or null on failure
      */
     open suspend fun sendEphemeral(prompt: String): String? {
-        val ephemeralMessages = messages.toMutableList().apply {
-            add(Message(role = "user", content = prompt))
-        }
-        val phoneControlAvailable = phoneControlOverride ?: ScreenReader.isAttached()
-        val modelName = chatClient.modelId
-        val systemPrompt = promptBuilder?.full(
-            phoneControlAvailable = phoneControlAvailable,
-            modelName = modelName,
-            domainGuardrailMode = domainGuardrailMode
-        )
-            ?: PhoneAgentPrompts.buildSystemPrompt(
+        return withRequestFlowLock {
+            val ephemeralMessages = messages.toMutableList().apply {
+                add(Message(role = "user", content = prompt))
+            }
+            val phoneControlAvailable = phoneControlOverride ?: isScreenReaderAttached()
+            val modelName = chatClient.modelId
+            val ephemeralSensors = getTaskSensorSnapshot(startNewTask = false)
+            val systemPrompt = buildChatSystemPrompt(
                 phoneControlAvailable = phoneControlAvailable,
                 modelName = modelName,
-                domainGuardrailMode = domainGuardrailMode
+                sensorContext = ephemeralSensors
             )
-        val result = chatClient.chatWithTools(
-            ephemeralMessages,
-            systemPrompt = systemPrompt,
-            tools = emptyList()
-        )
-        return result.fold(
-            onSuccess = { response ->
-                response.text?.also { text ->
-                    messages.add(Message(role = "assistant", content = text))
+            checkBudgetBeforeApiCall()
+
+            val result = chatClient.chatWithTools(
+                ephemeralMessages,
+                systemPrompt = systemPrompt,
+                tools = emptyList()
+            )
+            return@withRequestFlowLock result.fold(
+                onSuccess = { response ->
+                    recordUsageOutcomeAndCheckBudgets(
+                        usage = response.usage,
+                        modelId = chatClient.modelId,
+                        promptChars = approximateMessageChars(ephemeralMessages),
+                        responseChars = approximateResponseChars(response),
+                        systemPromptChars = systemPrompt.length,
+                        toolSchemaChars = 0
+                    )
+                    response.text?.also { text ->
+                        messages.add(Message(role = "assistant", content = text))
+                    }
+                    response.text
+                },
+                onFailure = { error ->
+                    Log.w(TAG, "sendEphemeral failed: ${error.message}")
+                    null
                 }
-            },
-            onFailure = { error ->
-                Log.w(TAG, "sendEphemeral failed: ${error.message}")
-                null
-            }
+            )
+        }
+    }
+
+    private fun buildChatSystemPrompt(
+        phoneControlAvailable: Boolean,
+        modelName: String?,
+        sensorContext: SensorContext?,
+        resolvedToolPlan: ResolvedToolPlan? = null
+    ): String {
+        val prompt = promptBuilder?.full(
+            phoneControlAvailable = phoneControlAvailable,
+            modelName = modelName,
+            domainGuardrailMode = domainGuardrailMode,
+            sensorContext = sensorContext,
+            resolvedToolPlan = resolvedToolPlan
+        ) ?: PhoneAgentPrompts.buildSystemPrompt(
+            phoneControlAvailable = phoneControlAvailable,
+            modelName = modelName,
+            domainGuardrailMode = domainGuardrailMode,
+            sensorContext = sensorContext,
+            resolvedToolPlan = resolvedToolPlan
         )
+        logPromptTuningMetadata(prompt, "chat")
+        assertSafetyContractDebug(prompt)
+        return prompt
+    }
+
+    /**
+     * Log prompt tuning metadata when the budget-enforced path is active.
+     * Extracts and logs the RuntimeLine from the prompt for observability.
+     */
+    private fun logPromptTuningMetadata(prompt: String, path: String) {
+        if (!FeatureFlags.promptTuningV1Enabled) return
+        // RuntimeLine is always appended as the final line when present.
+        val runtimeLine = prompt.substringAfterLast("\n").takeIf { it.startsWith("runtime|") }
+        if (runtimeLine != null) {
+            Log.i(TAG, "RuntimeLine: $runtimeLine")
+            val parsed = RuntimeLine.parse(runtimeLine)
+            if (parsed != null) {
+                Log.d(TAG, "PromptBudget [$path]: chars=${parsed.promptChars} tokens_est=${parsed.promptTokensEst} trimmed=${parsed.trimmed} trimmed_sections=${parsed.trimmedSections}")
+            }
+        }
+    }
+
+    /**
+     * Debug-build-only safety contract assertion.
+     * Verifies all canonical safety clauses are present in the constructed prompt.
+     * Override [isDebugBuild] for testing.
+     */
+    @VisibleForTesting
+    internal var isDebugBuild: Boolean = detectDebugBuild()
+
+    private fun assertSafetyContractDebug(prompt: String) {
+        if (!FeatureFlags.promptTuningV1Enabled) return
+        if (!isDebugBuild) return
+        val missing = PromptSafetyContract.findMissingClauses(prompt)
+        if (missing.isNotEmpty()) {
+            throw AssertionError("Safety contract violation: missing clauses ${missing.joinToString(", ")} in system prompt")
+        }
     }
 
     /**
@@ -437,48 +1172,88 @@ open class PhoneAgentApi(
      * See docs/agentic-loop-v2.md §3.3
      */
     open suspend fun continueAfterTools(): ChatResponse {
-        val phoneControlAvailable = phoneControlOverride ?: ScreenReader.isAttached()
-        val systemPrompt = promptBuilder?.trimmed(
-            phoneControlAvailable = phoneControlAvailable,
-            modelName = actionClient.modelId,
-            domainGuardrailMode = domainGuardrailMode
-        )
-            ?: PhoneAgentPrompts.buildActionPrompt(
+        return withRequestFlowLock {
+            val phoneControlAvailable = phoneControlOverride ?: isScreenReaderAttached()
+            val sensorSnapshot = getTaskSensorSnapshot(startNewTask = false)
+
+            val (baseToolsForModel, actionToolPlan) = getToolsForModelWithGrouping(
+                modelId = actionClient.modelId,
+                messageText = "", // action loop has no new user message
+                userSettings = userToolCategorySettings,
+                expandedCategories = requestToolsExpandedCategories.toSet(),
+                includeRequestToolsCappedReason = requestToolsCappedThisTask
+            )
+            val turnConstraintSnapshot = currentConstraintSnapshot()
+            val toolsWithActiveConstraint = applyActiveToolConstraintToToolList(baseToolsForModel)
+            val toolsForModel = applyConstraintsToTools(toolsWithActiveConstraint, turnConstraintSnapshot)
+            if (actionToolPlan != null) {
+                lastResolvedToolPlan = actionToolPlan
+                logToolPlanTelemetry(actionToolPlan, isActionLoop = true)
+            }
+
+            val systemPrompt = promptBuilder?.trimmed(
                 phoneControlAvailable = phoneControlAvailable,
                 modelName = actionClient.modelId,
-                domainGuardrailMode = domainGuardrailMode
+                domainGuardrailMode = domainGuardrailMode,
+                sensorContext = sensorSnapshot,
+                resolvedToolPlan = actionToolPlan
+            )
+                ?: PhoneAgentPrompts.buildActionPrompt(
+                    phoneControlAvailable = phoneControlAvailable,
+                    modelName = actionClient.modelId,
+                    domainGuardrailMode = domainGuardrailMode,
+                    sensorContext = sensorSnapshot,
+                    resolvedToolPlan = actionToolPlan
+                )
+            logPromptTuningMetadata(systemPrompt, "action-continue")
+            assertSafetyContractDebug(systemPrompt)
+
+            // Two-stage compaction: strip old SCREEN dumps first, then summarize old messages
+            val (screenStripped, compactorMetrics) = contextCompactor.compactWithMetrics(messages)
+            val (messagesForModel, managerMetrics) = contextManager.compactWithMetrics(screenStripped, currentToolStep)
+            if (compactorMetrics != null) Log.d(TAG, "continueAfterTools compaction stage1: $compactorMetrics")
+            if (managerMetrics != null) Log.d(TAG, "continueAfterTools compaction stage2: $managerMetrics")
+            Log.d(TAG, "continueAfterTools: step=$currentToolStep, rawMessages=${messages.size}, compacted=${messagesForModel.size}")
+
+            checkBudgetBeforeApiCall()
+            executionConstraintSnapshot = null
+            val result = actionClient.chatWithTools(
+                messagesForModel,
+                systemPrompt = systemPrompt,
+                tools = toolsForModel
             )
 
-        // Two-stage compaction: strip old SCREEN dumps first, then summarize old messages
-        val (screenStripped, compactorMetrics) = contextCompactor.compactWithMetrics(messages)
-        val (messagesForModel, managerMetrics) = contextManager.compactWithMetrics(screenStripped, currentToolStep)
-        if (compactorMetrics != null) Log.d(TAG, "continueAfterTools compaction stage1: $compactorMetrics")
-        if (managerMetrics != null) Log.d(TAG, "continueAfterTools compaction stage2: $managerMetrics")
-        Log.d(TAG, "continueAfterTools: step=$currentToolStep, rawMessages=${messages.size}, compacted=${messagesForModel.size}")
+            return@withRequestFlowLock result.fold(
+                onSuccess = { rawResponse ->
+                    val response = enforceActiveToolConstraintOnResponse(rawResponse)
+                    recordUsageOutcomeAndCheckBudgets(
+                        usage = response.usage,
+                        modelId = actionClient.modelId,
+                        promptChars = approximateMessageChars(messagesForModel),
+                        responseChars = approximateResponseChars(response),
+                        systemPromptChars = systemPrompt.length,
+                        toolSchemaChars = approximateToolSchemaChars(toolsForModel)
+                    )
 
-        val result = actionClient.chatWithTools(
-            messagesForModel,
-            systemPrompt = systemPrompt,
-            tools = getToolsForModel()
-        )
+                    executionConstraintSnapshot = if (response.toolCalls.isNotEmpty()) turnConstraintSnapshot else null
+                    modelTurnCounter++
+                    expireConstraintsIfNeeded()
+                    isTaskInProgress = response.toolCalls.isNotEmpty()
 
-        return result.fold(
-            onSuccess = { response ->
-                if (response.toolCalls.isNotEmpty()) {
-                    messages.add(Message.assistantWithTools(response.text, response.toolCalls))
-                } else if (response.text != null) {
-                    messages.add(Message(role = "assistant", content = response.text))
+                    appendAssistantResponse(response)
+                    response
+                },
+                onFailure = { error ->
+                    executionConstraintSnapshot = null
+                    isTaskInProgress = false
+                    ChatResponse(
+                        text = "Error: ${error.message}",
+                        toolCalls = emptyList(),
+                        stopReason = "error"
+                    )
                 }
-                response
-            },
-            onFailure = { error ->
-                ChatResponse(
-                    text = "Error: ${error.message}",
-                    toolCalls = emptyList(),
-                    stopReason = "error"
-                )
-            }
-        )
+            )
+        }
     }
 
     /**
@@ -525,13 +1300,13 @@ open class PhoneAgentApi(
         return when {
             verification.error != null -> {
                 // Verification system itself failed — don't block the loop
-                ToolResult("${result.text}\n[Verification skipped: ${verification.error}]", result.isError)
+                result.copy(text = "${result.text}\n[Verification skipped: ${verification.error}]")
             }
             verification.verified -> {
-                ToolResult("${result.text}\n[Verified: ${verification.description}]", result.isError)
+                result.copy(text = "${result.text}\n[Verified: ${verification.description}]")
             }
             else -> {
-                ToolResult("${result.text}\n[Verification FAILED: ${verification.description}]", result.isError)
+                result.copy(text = "${result.text}\n[Verification FAILED: ${verification.description}]")
             }
         }
     }
@@ -546,47 +1321,93 @@ open class PhoneAgentApi(
     suspend fun executeToolCall(toolCall: ToolCall, screenContent: ScreenContent?): ToolResult {
         Log.d(TAG, "executeToolCall: name=${toolCall.name}, input=${toolCall.input.toString().take(100)}")
         val startMs = System.currentTimeMillis()
+
+        val decision = resolveToolConstraintDecision(toolCall.name, executionConstraintSnapshot)
+        if (!decision.allowed) {
+            Log.d(TAG, "Constraint blocked tool execution '${toolCall.name}': ${decision.reason ?: "not allowed"}")
+            return ToolResult(
+                text = "Blocked by runtime constraint: ${decision.reason ?: "tool ${toolCall.name} is not allowed"}",
+                isError = true
+            )
+        }
+
         return try {
+            val constraint = activeToolConstraint
+            if (constraint != null && toolCall.name !in constraint.allowedToolNames) {
+                return ToolResult(
+                    "Blocked by active tool constraint (${constraint.reason}). " +
+                        "Allowed tools: ${constraint.allowedToolNames.joinToString(", ")}.",
+                    isError = true,
+                    errorCode = ToolErrorCode.ACCESS_DENIED
+                )
+            }
+
             val result = when (toolCall.name) {
                 "tap" -> {
                     val elementId = (toolCall.input["element_id"] as? Number)?.toInt()
                         ?: throw IllegalArgumentException("tap requires element_id (integer)")
-                    
-                    if (ScreenReader.clickElement(elementId)) {
-                        "Tapped element $elementId"
-                    } else {
-                        "Failed: tap: could not tap element $elementId"
+
+                    when (clickElement(elementId)) {
+                        is ScreenReader.ElementActionResult.Success -> ToolResult("Tapped element $elementId")
+                        is ScreenReader.ElementActionResult.PrivacyBlocked ->
+                            privacyBlockedResult("tap")
+                        ScreenReader.ElementActionResult.ServiceUnavailable ->
+                            executionFailedResult("Failed: tap: accessibility service unavailable")
+                        ScreenReader.ElementActionResult.GestureDispatchFailed ->
+                            executionFailedResult("Failed: tap: gesture dispatch failed")
+                        ScreenReader.ElementActionResult.ElementNotFound ->
+                            executionFailedResult("Failed: tap: element $elementId not found")
                     }
                 }
-                
+
                 "tap_text" -> {
                     val text = (toolCall.input["text"] as? String)?.takeIf { it.isNotEmpty() }
                         ?: throw IllegalArgumentException("tap_text requires non-empty text (string)")
-                    
-                    // Find element containing the text
-                    val element = screenContent?.elements?.find { 
-                        it.text?.contains(text, ignoreCase = true) == true ||
-                        it.contentDescription?.contains(text, ignoreCase = true) == true
-                    }
-                    
-                    if (element != null && ScreenReader.clickElement(element.id)) {
-                        "Tapped \"$text\""
+
+                    if (screenContent?.privacyMode == true) {
+                        privacyBlockedResult("tap_text")
                     } else {
-                        "Failed: tap_text: no element matching \"$text\""
+                        // Find element containing the text
+                        val element = screenContent?.elements?.find {
+                            it.text?.contains(text, ignoreCase = true) == true ||
+                            it.contentDescription?.contains(text, ignoreCase = true) == true
+                        }
+
+                        when {
+                            element == null -> executionFailedResult("Failed: tap_text: no element matching \"$text\"")
+                            else -> when (clickElement(element.id)) {
+                            is ScreenReader.ElementActionResult.Success -> ToolResult("Tapped \"$text\"")
+                            is ScreenReader.ElementActionResult.PrivacyBlocked ->
+                                privacyBlockedResult("tap_text")
+                            ScreenReader.ElementActionResult.ServiceUnavailable ->
+                                executionFailedResult("Failed: tap_text: accessibility service unavailable")
+                            ScreenReader.ElementActionResult.GestureDispatchFailed ->
+                                executionFailedResult("Failed: tap_text: gesture dispatch failed")
+                            ScreenReader.ElementActionResult.ElementNotFound ->
+                                executionFailedResult("Failed: tap_text: no element matching \"$text\"")
+                        }
+                    }
                     }
                 }
-                
+
                 "type_text" -> {
                     val text = (toolCall.input["text"] as? String)?.takeIf { it.isNotEmpty() }
                         ?: throw IllegalArgumentException("type_text requires non-empty text (string)")
-                    
-                    if (ScreenReader.typeText(text)) {
-                        "Typed \"$text\""
-                    } else {
-                        "Failed: type_text: no text field focused"
+
+                    when (robustTextInput.inputText(text)) {
+                        is InputResult.Failed -> executionFailedResult("Failed: type_text: unable to enter text")
+                        else -> {
+                            val mapsHandled = runCatching { executeMapsSuggestionStrategyIfApplicable(text) }
+                                .getOrElse { false }
+                            if (mapsHandled) {
+                                ToolResult("Typed and submitted Maps search \"$text\"")
+                            } else {
+                                ToolResult("Typed \"$text\"")
+                            }
+                        }
                     }
                 }
-                
+
                 "swipe" -> {
                     val direction = toolCall.input["direction"] as? String
                         ?: throw IllegalArgumentException("swipe requires direction (up/down/left/right)")
@@ -604,13 +1425,10 @@ open class PhoneAgentApi(
                         else -> throw IllegalArgumentException("Invalid direction \"$direction\" - use up/down/left/right")
                     }
                     
-                    if (ScreenReader.swipe(startX, startY, endX, endY, durationMs = 500)) {
-                        "Swiped $direction"
-                    } else {
-                        "Failed: swipe: gesture not dispatched"
-                    }
+                    if (ScreenReader.swipe(startX, startY, endX, endY, durationMs = 500)) ToolResult("Swiped $direction")
+                    else executionFailedResult("Failed: swipe: gesture not dispatched")
                 }
-                
+
                 "scroll" -> {
                     val direction = toolCall.input["direction"] as? String
                         ?: throw IllegalArgumentException("scroll requires direction (up/down)")
@@ -628,53 +1446,41 @@ open class PhoneAgentApi(
                         else -> throw IllegalArgumentException("Invalid direction \"$direction\" - use up/down")
                     }
                     
-                    if (ScreenReader.swipe(startX, startY, endX, endY, durationMs = 500)) {
-                        "Scrolled $direction"
-                    } else {
-                        "Failed: scroll: gesture not dispatched"
-                    }
+                    if (ScreenReader.swipe(startX, startY, endX, endY, durationMs = 500)) ToolResult("Scrolled $direction")
+                    else executionFailedResult("Failed: scroll: gesture not dispatched")
                 }
-                
+
                 "press_back" -> {
-                    if (ScreenReader.pressBack()) {
-                        "Pressed back"
-                    } else {
-                        "Failed: press_back: gesture not dispatched"
-                    }
+                    if (ScreenReader.pressBack()) ToolResult("Pressed back")
+                    else executionFailedResult("Failed: press_back: gesture not dispatched")
                 }
-                
+
                 "press_home" -> {
-                    if (ScreenReader.pressHome()) {
-                        "Pressed home"
-                    } else {
-                        "Failed: press_home: gesture not dispatched"
-                    }
+                    if (ScreenReader.pressHome()) ToolResult("Pressed home")
+                    else executionFailedResult("Failed: press_home: gesture not dispatched")
                 }
-                
+
                 "open_app" -> {
                     val appName = toolCall.input["app_name"] as? String
                         ?: throw IllegalArgumentException("open_app requires app_name (string)")
-                    
+
                     if (ScreenReader.launchApp(appName)) {
-                        "Opened $appName"
+                        ToolResult("Opened $appName")
                     } else {
                         ScreenReader.pressHome()
-                        "Failed: open_app: $appName not found — returned to home"
+                        executionFailedResult("Failed: open_app: $appName not found — returned to home")
                     }
                 }
-                
+
                 "open_notifications" -> {
-                    if (ScreenReader.openNotifications()) {
-                        "Opened notifications"
-                    } else {
-                        "Failed: open_notifications: could not expand status bar"
-                    }
+                    if (ScreenReader.openNotifications()) ToolResult("Opened notifications")
+                    else executionFailedResult("Failed: open_notifications: could not expand status bar")
                 }
-                
+
                 "think" -> {
                     val thought = (toolCall.input["thought"] as? String)?.takeIf { it.isNotEmpty() }
                         ?: throw IllegalArgumentException("think requires non-empty thought (string)")
-                    "Thought: $thought"
+                    ToolResult("Thought: $thought")
                 }
 
                 "wait" -> {
@@ -682,32 +1488,42 @@ open class PhoneAgentApi(
                     kotlinx.coroutines.delay(seconds * 1000L)
                     if (ScreenReader.isAttached()) {
                         val content = ScreenReader.getScreenContent()
-                        "Waited ${seconds}s. Screen:\n${content.toPromptText()}"
+                        ToolResult("Waited ${seconds}s. Screen:\n${content.toPromptText()}")
                     } else {
-                        "Waited ${seconds}s"
+                        ToolResult("Waited ${seconds}s")
                     }
                 }
 
                 "long_press" -> {
                     val elementId = (toolCall.input["element_id"] as? Number)?.toInt()
                         ?: throw IllegalArgumentException("long_press requires element_id (integer)")
-                    
-                    if (ScreenReader.longPressElement(elementId)) {
-                        "Long-pressed element $elementId"
-                    } else {
-                        "Failed: long_press: could not long-press element $elementId"
+
+                    when (longPressElement(elementId)) {
+                        is ScreenReader.ElementActionResult.Success -> ToolResult("Long-pressed element $elementId")
+                        is ScreenReader.ElementActionResult.PrivacyBlocked ->
+                            privacyBlockedResult("long_press")
+                        ScreenReader.ElementActionResult.ServiceUnavailable ->
+                            executionFailedResult("Failed: long_press: accessibility service unavailable")
+                        ScreenReader.ElementActionResult.GestureDispatchFailed ->
+                            executionFailedResult("Failed: long_press: gesture dispatch failed")
+                        ScreenReader.ElementActionResult.ElementNotFound ->
+                            executionFailedResult("Failed: long_press: element $elementId not found")
                     }
                 }
 
                 "copy" -> {
                     if (!ClipboardHelper.isAttached()) {
-                        CLIPBOARD_NOT_ATTACHED
+                        ToolResult(
+                            CLIPBOARD_NOT_ATTACHED,
+                            isError = true,
+                            errorCode = ToolErrorCode.SERVICE_UNAVAILABLE
+                        )
                     } else {
                         val text = ClipboardHelper.read()
                         if (text != null) {
-                            "Clipboard content: $text"
+                            ToolResult("Clipboard content: $text")
                         } else {
-                            "Clipboard is empty or access denied (Android 13+ may restrict clipboard reading)"
+                            ToolResult("Clipboard is empty or access denied (Android 13+ may restrict clipboard reading)")
                         }
                     }
                 }
@@ -716,11 +1532,15 @@ open class PhoneAgentApi(
                     val text = (toolCall.input["text"] as? String)?.takeIf { it.isNotEmpty() }
                         ?: throw IllegalArgumentException("set_clipboard requires non-empty text (string)")
                     if (!ClipboardHelper.isAttached()) {
-                        CLIPBOARD_NOT_ATTACHED
+                        ToolResult(
+                            CLIPBOARD_NOT_ATTACHED,
+                            isError = true,
+                            errorCode = ToolErrorCode.SERVICE_UNAVAILABLE
+                        )
                     } else if (ClipboardHelper.write(text)) {
-                        "Copied to clipboard (${text.length} chars): \"${text.take(50)}${if (text.length > 50) "…" else ""}\""
+                        ToolResult("Copied to clipboard (${text.length} chars): \"${text.take(50)}${if (text.length > 50) "…" else ""}\"")
                     } else {
-                        "Failed: set_clipboard: clipboard write denied"
+                        executionFailedResult("Failed: set_clipboard: clipboard write denied")
                     }
                 }
 
@@ -728,24 +1548,36 @@ open class PhoneAgentApi(
                     val text = (toolCall.input["text"] as? String)?.takeIf { it.isNotEmpty() }
                         ?: throw IllegalArgumentException("paste requires non-empty text (string)")
                     if (!ClipboardHelper.isAttached()) {
-                        CLIPBOARD_NOT_ATTACHED
+                        ToolResult(
+                            CLIPBOARD_NOT_ATTACHED,
+                            isError = true,
+                            errorCode = ToolErrorCode.SERVICE_UNAVAILABLE
+                        )
                     } else if (ClipboardHelper.writeAndPaste(text)) {
-                        "Pasted (${text.length} chars): \"${text.take(50)}${if (text.length > 50) "…" else ""}\""
+                        ToolResult("Pasted (${text.length} chars): \"${text.take(50)}${if (text.length > 50) "…" else ""}\"")
                     } else {
-                        "Failed: paste: no focused input field or clipboard write failed"
+                        executionFailedResult("Failed: paste: no focused input field or clipboard write failed")
                     }
                 }
 
                 "read_notifications" -> {
                     if (!NotificationHelper.isAttached()) {
-                        NOTIFICATION_NOT_ATTACHED
+                        ToolResult(
+                            NOTIFICATION_NOT_ATTACHED,
+                            isError = true,
+                            errorCode = ToolErrorCode.SERVICE_UNAVAILABLE
+                        )
                     } else {
                         try {
                             val includeOngoing = toolCall.input["include_ongoing"] as? Boolean ?: false
                             val notifications = NotificationHelper.getActiveNotifications(includeOngoing)
-                            NotificationHelper.formatForPrompt(notifications)
+                            ToolResult(NotificationHelper.formatForPrompt(notifications))
                         } catch (e: NotificationAccessDeniedException) {
-                            e.message ?: "Notification access denied"
+                            ToolResult(
+                                e.message ?: "Notification access denied",
+                                isError = true,
+                                errorCode = ToolErrorCode.ACCESS_DENIED
+                            )
                         }
                     }
                 }
@@ -753,22 +1585,30 @@ open class PhoneAgentApi(
                 "tap_notification" -> {
                     val key = requireValidNotificationKey(toolCall, "tap_notification")
                     if (!NotificationHelper.isAttached()) {
-                        NOTIFICATION_NOT_ATTACHED
+                        ToolResult(
+                            NOTIFICATION_NOT_ATTACHED,
+                            isError = true,
+                            errorCode = ToolErrorCode.SERVICE_UNAVAILABLE
+                        )
                     } else if (NotificationHelper.tapNotification(key)) {
-                        "Opened notification"
+                        ToolResult("Opened notification")
                     } else {
-                        "Failed: tap_notification: notification may have been dismissed or has no content intent"
+                        executionFailedResult("Failed: tap_notification: notification may have been dismissed or has no content intent")
                     }
                 }
 
                 "dismiss_notification" -> {
                     val key = requireValidNotificationKey(toolCall, "dismiss_notification")
                     if (!NotificationHelper.isAttached()) {
-                        NOTIFICATION_NOT_ATTACHED
+                        ToolResult(
+                            NOTIFICATION_NOT_ATTACHED,
+                            isError = true,
+                            errorCode = ToolErrorCode.SERVICE_UNAVAILABLE
+                        )
                     } else if (NotificationHelper.dismissNotification(key)) {
-                        "Dismissed notification"
+                        ToolResult("Dismissed notification")
                     } else {
-                        "Failed: dismiss_notification: notification may be ongoing or already dismissed"
+                        executionFailedResult("Failed: dismiss_notification: notification may be ongoing or already dismissed")
                     }
                 }
 
@@ -777,36 +1617,62 @@ open class PhoneAgentApi(
                     val text = (toolCall.input["text"] as? String)?.takeIf { it.isNotEmpty() }
                         ?: throw IllegalArgumentException("reply_notification requires non-empty text (string)")
                     if (!NotificationHelper.isAttached()) {
-                        NOTIFICATION_NOT_ATTACHED
+                        ToolResult(
+                            NOTIFICATION_NOT_ATTACHED,
+                            isError = true,
+                            errorCode = ToolErrorCode.SERVICE_UNAVAILABLE
+                        )
                     } else if (NotificationHelper.replyToNotification(key, text)) {
-                        "Replied to notification"
+                        ToolResult("Replied to notification")
                     } else {
-                        "Failed: reply_notification: notification may not support inline reply or was dismissed"
+                        executionFailedResult("Failed: reply_notification: notification may not support inline reply or was dismissed")
                     }
                 }
 
                 "read_screen" -> {
-                    if (ScreenReader.isAttached()) {
-                        val content = ScreenReader.getScreenContent()
-                        "Screen refreshed:\n${content.toPromptText()}"
+                    if (isScreenReaderAttached()) {
+                        val content = getScreenContent()
+                        if (content.privacyMode) {
+                            ToolResult(
+                                "Screen refreshed:\n${content.toToolResult()}",
+                                isError = true,
+                                errorCode = ToolErrorCode.PRIVACY_BLOCKED
+                            )
+                        } else {
+                            ToolResult("Screen refreshed:\n${content.toToolResult()}")
+                        }
                     } else {
-                        "Accessibility service not attached"
+                        ToolResult(
+                            "Accessibility service not attached",
+                            isError = true,
+                            errorCode = ToolErrorCode.SERVICE_UNAVAILABLE
+                        )
                     }
                 }
 
                 "screenshot" -> {
-                    if (!ScreenReader.isAttached()) {
-                        "Accessibility service not attached"
+                    if (!isScreenReaderAttached()) {
+                        ToolResult(
+                            "Accessibility service not attached",
+                            isError = true,
+                            errorCode = ToolErrorCode.SERVICE_UNAVAILABLE
+                        )
                     } else {
-                        val base64 = ScreenReader.takeScreenshot()
-                            ?: return ToolResult("Failed: screenshot: requires Android 11+", isError = true)
+                        val screenshot = takeScreenshot()
+                        val base64 = when (screenshot) {
+                            is ScreenshotResult.Success -> screenshot.base64
+                            is ScreenshotResult.PrivacyBlocked -> return privacyBlockedResult("screenshot")
+                            is ScreenshotResult.Failed -> return executionFailedResult(
+                                "Failed: screenshot: ${screenshot.reason ?: "requires Android 11+"}"
+                            )
+                        }
                         val prompt = (toolCall.input["prompt"] as? String)?.takeIf { it.isNotBlank() }
                             ?: PhoneAgentPrompts.DEFAULT_VISION_PROMPT
                         // Use chat model (vision-capable) for screenshot description
                         val result = chatClient.describeImage(base64, prompt)
                         result.fold(
-                            onSuccess = { description -> "Screenshot description:\n$description" },
-                            onFailure = { error -> "Screenshot captured but vision failed: ${error.message}" }
+                            onSuccess = { description -> ToolResult("Screenshot description:\n$description") },
+                            onFailure = { error -> executionFailedResult("Screenshot captured but vision failed: ${error.message}") }
                         )
                     }
                 }
@@ -898,44 +1764,44 @@ open class PhoneAgentApi(
 
                 "web_search" -> {
                     val query = toolCall.input["query"]?.toString()
-                        ?: return ToolResult("Missing required parameter: query", isError = true)
+                        ?: return invalidInputResult("Missing required parameter: query")
                     val count = (toolCall.input["count"] as? Number)?.toInt() ?: 3
                     searchClient.search(query, count)
                 }
 
                 "web_fetch" -> {
                     val url = toolCall.input["url"]?.toString()
-                        ?: return ToolResult("Missing required parameter: url", isError = true)
+                        ?: return invalidInputResult("Missing required parameter: url")
                     val maxChars = (toolCall.input["max_chars"] as? Number)?.toInt() ?: 5000
                     fetchClient.fetch(url, maxChars)
                 }
 
                 "web_browse" -> {
                     val client = tinyFishClient
-                        ?: return ToolResult("Web browse not available: TinyFish API key not configured", isError = true)
+                        ?: return ToolResult(
+                            "Web browse not available: TinyFish API key not configured",
+                            isError = true,
+                            errorCode = ToolErrorCode.NOT_CONFIGURED
+                        )
                     val url = toolCall.input["url"]?.toString()
-                        ?: return ToolResult("Missing required parameter: url", isError = true)
+                        ?: return invalidInputResult("Missing required parameter: url")
                     val goal = toolCall.input["goal"]?.toString()
-                        ?: return ToolResult("Missing required parameter: goal", isError = true)
+                        ?: return invalidInputResult("Missing required parameter: goal")
                     val stealth = toolCall.input["stealth"] as? Boolean ?: false
                     client.browse(url = url, goal = goal, stealth = stealth, onProgress = onToolProgress)
                 }
 
                 "request_tools" -> {
                     val rawCategories = toolCall.input["categories"] as? List<*>
-                        ?: return ToolResult(
-                            "Missing required parameter: categories (array of strings)",
-                            isError = true
-                        )
+                        ?: return invalidInputResult("Missing required parameter: categories (array of strings)")
                     val validCategories = ToolCategory.entries
                         .filter { it != ToolCategory.CORE }
                         .map { it.name.lowercase() }
                         .sorted()
 
                     if (rawCategories.isEmpty()) {
-                        return ToolResult(
+                        return invalidInputResult(
                             "categories must contain at least one category. Available: ${validCategories.joinToString(", ")}",
-                            isError = true
                         )
                     }
 
@@ -960,73 +1826,219 @@ open class PhoneAgentApi(
                     }
 
                     if (invalidCategories.isNotEmpty()) {
-                        return ToolResult(
+                        return invalidInputResult(
                             "Invalid categories: ${invalidCategories.joinToString(", ")}. Available: ${validCategories.joinToString(", ")}",
-                            isError = true
                         )
                     }
 
                     if (requested.isEmpty()) {
-                        return ToolResult(
+                        return invalidInputResult(
                             "No valid categories requested. Available: ${validCategories.joinToString(", ")}",
-                            isError = true
                         )
                     }
 
-                    val tools = PhoneTools.getToolsForCategories(requested, currentExecutionModelTier())
-                        .filter { tinyFishApiKey != null || it.name != "web_browse" }
-                        .sortedBy { it.name }
-
-                    val text = buildString {
-                        append("Requested categories: ")
-                        append(requested.joinToString(", ") { it.name.lowercase() })
-                        append('\n')
-                        append("Available tools:\n")
-                        tools.forEach { tool ->
-                            append("- ")
-                            append(tool.name)
-                            append(": ")
-                            append(tool.description)
-                            append('\n')
+                    // Tool grouping: intersect with policy allow_set, cap repeated identical requests
+                    if (FeatureFlags.toolGroupingV1Enabled) {
+                        val tier = currentExecutionModelTier()
+                        val capabilities = ToolGroupingPolicy.Capabilities(
+                            accessibilityAttached = phoneControlOverride ?: isScreenReaderAttached(),
+                            hasTinyFishKey = tinyFishApiKey != null
+                        )
+                        // Compute allow_set inline (same logic as policy)
+                        val allowSet = ToolCategory.entries.toMutableSet()
+                        if (tier == ModelTier.SMALL) allowSet -= ToolCategory.RESEARCH
+                        if (!capabilities.accessibilityAttached) {
+                            allowSet -= setOf(ToolCategory.NAVIGATION, ToolCategory.INTERACTION, ToolCategory.OBSERVATION)
                         }
-                    }.trimEnd()
+                        allowSet -= userToolCategorySettings.disabledCategories()
+                        allowSet += ToolCategory.CORE
 
-                    ToolResult(text)
+                        val allowed = requested.filter { it in allowSet }.toSet()
+                        val blocked = requested - allowed
+
+                        // Cap repeated identical requests at 2
+                        val requestKey = requested.sortedBy { it.ordinal }.joinToString(",") { it.name }
+                        val callCount = requestToolsCallCounts.getOrDefault(requestKey, 0) + 1
+                        requestToolsCallCounts[requestKey] = callCount
+
+                        if (callCount > 2) {
+                            requestToolsCappedThisTask = true
+                            Log.d(TAG, "request_tools: capped repeated request ($callCount) for $requestKey")
+                            return ToolResult(
+                                "Request capped: identical request_tools call repeated $callCount times (max 2). " +
+                                    "These categories are already available in the next tool step.",
+                            )
+                        }
+
+                        // Add allowed categories to expanded set for next turn
+                        requestToolsExpandedCategories.addAll(allowed)
+                        Log.d(TAG, "request_tools: expanded=${allowed.map { it.name.lowercase() }}, blocked=${blocked.map { it.name.lowercase() }}")
+
+                        val tools = PhoneTools.getToolsForCategories(allowed, tier)
+                            .filter { tinyFishApiKey != null || it.name != "web_browse" }
+                            .sortedBy { it.name }
+
+                        val text = buildString {
+                            append("Expanded categories: ")
+                            append(allowed.joinToString(", ") { it.name.lowercase() })
+                            if (blocked.isNotEmpty()) {
+                                append("\nBlocked categories (policy/settings): ")
+                                append(blocked.joinToString(", ") { it.name.lowercase() })
+                            }
+                            append("\nTools now available in next step:\n")
+                            tools.forEach { tool ->
+                                append("- ")
+                                append(tool.name)
+                                append(": ")
+                                append(tool.description)
+                                append('\n')
+                            }
+                        }.trimEnd()
+
+                        ToolResult(text)
+                    } else {
+                        // Legacy behavior: no policy filtering
+                        val tools = PhoneTools.getToolsForCategories(requested, currentExecutionModelTier())
+                            .filter { tinyFishApiKey != null || it.name != "web_browse" }
+                            .sortedBy { it.name }
+
+                        val text = buildString {
+                            append("Requested categories: ")
+                            append(requested.joinToString(", ") { it.name.lowercase() })
+                            append('\n')
+                            append("Available tools:\n")
+                            tools.forEach { tool ->
+                                append("- ")
+                                append(tool.name)
+                                append(": ")
+                                append(tool.description)
+                                append('\n')
+                            }
+                        }.trimEnd()
+
+                        ToolResult(text)
+                    }
+                }
+
+                "offer_choices" -> {
+                    ToolResult(
+                        "offer_choices requires runtime UI delegate handling",
+                        isError = true,
+                        errorCode = ToolErrorCode.NOT_CONFIGURED
+                    )
                 }
 
                 else -> {
-                    "Failed: unknown tool \"${toolCall.name}\""
+                    ToolResult(
+                        "Failed: unknown tool \"${toolCall.name}\"",
+                        isError = true,
+                        errorCode = ToolErrorCode.TOOL_NOT_FOUND
+                    )
                 }
             }
             val elapsedMs = System.currentTimeMillis() - startMs
-            if (result is ToolResult) {
-                Log.d(TAG, "executeToolCall: name=${toolCall.name} done in ${elapsedMs}ms, result='${result.text.take(120)}'")
-                result
-            } else {
-                val text = result as String
-                Log.d(TAG, "executeToolCall: name=${toolCall.name} done in ${elapsedMs}ms, result='${text.take(120)}'")
-                ToolResult(text)
-            }
+            Log.d(TAG, "executeToolCall: name=${toolCall.name} done in ${elapsedMs}ms, result='${result.text.take(120)}'")
+            result
+        } catch (e: IllegalArgumentException) {
+            val elapsedMs = System.currentTimeMillis() - startMs
+            Log.e(TAG, "executeToolCall: name=${toolCall.name} INVALID_INPUT in ${elapsedMs}ms: ${e.message}")
+            ToolResult(
+                "Failed: ${toolCall.name}: ${e.message?.take(100)}",
+                isError = true,
+                errorCode = ToolErrorCode.INVALID_INPUT
+            )
+        } catch (e: NotificationAccessDeniedException) {
+            val elapsedMs = System.currentTimeMillis() - startMs
+            Log.e(TAG, "executeToolCall: name=${toolCall.name} ACCESS_DENIED in ${elapsedMs}ms: ${e.message}")
+            ToolResult(
+                e.message ?: "Notification access denied",
+                isError = true,
+                errorCode = ToolErrorCode.ACCESS_DENIED
+            )
         } catch (e: Exception) {
             val elapsedMs = System.currentTimeMillis() - startMs
             Log.e(TAG, "executeToolCall: name=${toolCall.name} FAILED in ${elapsedMs}ms: ${e.message}")
-            ToolResult("Failed: ${toolCall.name}: ${e.message?.take(100)}", isError = true)
+            ToolResult(
+                "Failed: ${toolCall.name}: ${e.message?.take(100)}",
+                isError = true,
+                errorCode = ToolErrorCode.EXECUTION_FAILED
+            )
         }
     }
-    
+
+    /**
+     * Runs Maps-specific suggestion handling after `type_text` only when Google Maps is foreground.
+     *
+     * This avoids generic Enter/tap behavior that can dismiss Maps suggestions and miss the intended
+     * destination selection flow.
+     */
+    internal fun executeMapsSuggestionStrategyIfApplicable(query: String): Boolean {
+        val service = ScreenReader.getService() ?: return false
+        val screen = getScreenContent()
+        if (screen.privacyMode) return false
+        if (screen.packageName != MapsSuggestionStrategy.GOOGLE_MAPS_PACKAGE) return false
+
+        val root = ScreenReader.findAppWindowRoot(service) ?: return false
+        return try {
+            val searchField = root.findFocus(android.view.accessibility.AccessibilityNodeInfo.FOCUS_INPUT)
+                ?: return false
+            try {
+                val result = MapsSuggestionStrategy(
+                    resources = service.resources,
+                    readScreen = getScreenContent,
+                    tapAt = { x, y -> ScreenReader.clickAt(x, y) },
+                    pressEnterKey = { MapsSuggestionStrategy.defaultEnterKeyPress() }
+                ).handleMapsSuggestion(searchField, query)
+                result.success
+            } finally {
+                searchField.recycle()
+            }
+        } finally {
+            root.recycle()
+        }
+    }
+
+    private fun executionFailedResult(text: String): ToolResult =
+        ToolResult(text, isError = true, errorCode = ToolErrorCode.EXECUTION_FAILED)
+
+    private fun invalidInputResult(text: String): ToolResult =
+        ToolResult(text, isError = true, errorCode = ToolErrorCode.INVALID_INPUT)
+
+    private fun privacyBlockedResult(toolName: String): ToolResult =
+        ToolResult(privacyBlockedByMode(toolName), isError = true, errorCode = ToolErrorCode.PRIVACY_BLOCKED)
+
     private inline fun fileToolResult(toolName: String, block: () -> String): ToolResult {
         return try {
             ToolResult(block())
         } catch (e: SecurityException) {
-            ToolResult(fileToolError(toolName, "Access denied: ${e.message}"), isError = true)
+            ToolResult(
+                fileToolError(toolName, "Access denied: ${e.message}"),
+                isError = true,
+                errorCode = ToolErrorCode.ACCESS_DENIED
+            )
         } catch (e: IllegalArgumentException) {
-            ToolResult(fileToolError(toolName, "Invalid input: ${e.message}"), isError = true)
+            ToolResult(
+                fileToolError(toolName, "Invalid input: ${e.message}"),
+                isError = true,
+                errorCode = ToolErrorCode.INVALID_INPUT
+            )
         } catch (e: IllegalStateException) {
-            ToolResult(fileToolError(toolName, "Tool not configured: ${e.message}"), isError = true)
+            ToolResult(
+                fileToolError(toolName, "Tool not configured: ${e.message}"),
+                isError = true,
+                errorCode = ToolErrorCode.NOT_CONFIGURED
+            )
         } catch (e: Exception) {
-            ToolResult(fileToolError(toolName, e.message ?: "Unknown error"), isError = true)
+            ToolResult(
+                fileToolError(toolName, e.message ?: "Unknown error"),
+                isError = true,
+                errorCode = ToolErrorCode.EXECUTION_FAILED
+            )
         }
     }
+
+    private fun privacyBlockedByMode(toolName: String): String =
+        "Failed: $toolName: blocked by privacy mode for ${PrivacyRedaction.APP_PLACEHOLDER}"
 
     private fun currentExecutionModelTier(): ModelTier =
         actionClient.modelId?.let { ModelClassifier.classify(it) } ?: ModelTier.STANDARD
@@ -1060,11 +2072,23 @@ open class PhoneAgentApi(
         return try {
             ToolResult(block())
         } catch (e: IllegalArgumentException) {
-            ToolResult(memoryToolError(toolName, "Invalid input: ${e.message}"), isError = true)
+            ToolResult(
+                memoryToolError(toolName, "Invalid input: ${e.message}"),
+                isError = true,
+                errorCode = ToolErrorCode.INVALID_INPUT
+            )
         } catch (e: IllegalStateException) {
-            ToolResult(memoryToolError(toolName, "Tool not configured: ${e.message}"), isError = true)
+            ToolResult(
+                memoryToolError(toolName, "Tool not configured: ${e.message}"),
+                isError = true,
+                errorCode = ToolErrorCode.NOT_CONFIGURED
+            )
         } catch (e: Exception) {
-            ToolResult(memoryToolError(toolName, e.message ?: "Unknown error"), isError = true)
+            ToolResult(
+                memoryToolError(toolName, e.message ?: "Unknown error"),
+                isError = true,
+                errorCode = ToolErrorCode.EXECUTION_FAILED
+            )
         }
     }
 
@@ -1182,6 +2206,205 @@ open class PhoneAgentApi(
     }
 
     /**
+     * Determine whether the user is asking to continue/resume a paused task.
+     *
+     * Keeps matching intentionally narrow: short "continue/resume/proceed" variants.
+     */
+    private fun isResumeIntent(userMessage: String): Boolean {
+        val normalized = userMessage
+            .trim()
+            .lowercase()
+            .replace(Regex("[^a-z0-9\\s]"), "")
+            .replace(Regex("\\s+"), " ")
+        return normalized in setOf(
+            "continue",
+            "continue please",
+            "resume",
+            "resume please",
+            "proceed",
+            "proceed please",
+            "go on",
+            "keep going"
+        )
+    }
+
+    /**
+     * True when recent conversation history contains an interruption pause marker.
+     *
+     * This marker is injected by UserInterruptionCheck and signals that a short
+     * follow-up like "continue" should re-enter actionable mode.
+     */
+    private fun hasRecentInterruptionPauseContext(windowSize: Int = 10): Boolean {
+        val recent = messages.takeLast(windowSize)
+        val markerIndex = recent.indexOfLast { msg ->
+            msg.role == Message.ROLE_USER && msg.content.contains(INTERRUPTION_RESUME_MARKER)
+        }
+        if (markerIndex < 0) return false
+
+        val trailing = recent.drop(markerIndex + 1)
+        if (trailing.none { it.role == Message.ROLE_ASSISTANT }) return false
+
+        // Resume window closes once any subsequent user turn occurs
+        // (e.g. user canceled, asked something else, or moved on).
+        if (trailing.any { it.role == Message.ROLE_USER }) return false
+
+        return true
+    }
+
+    @androidx.annotation.VisibleForTesting
+    internal fun resolveExplicitToolConstraint(userMessage: String): Set<String>? {
+        if (WEB_SEARCH_ONLY_REGEXES.any { it.containsMatchIn(userMessage) }) {
+            return WEB_SEARCH_ONLY_ALLOWED_TOOLS
+        }
+
+        val normalized = userMessage.lowercase()
+        val mentionsWebSearch = normalized.contains("web_search")
+        val blocksBrowserOpen =
+            normalized.contains("do not open") && normalized.contains("browser")
+        if (mentionsWebSearch && blocksBrowserOpen) {
+            return WEB_SEARCH_ONLY_ALLOWED_TOOLS
+        }
+        return null
+    }
+
+    /**
+     * Applies the active constraint to the tool list advertised to the model.
+     *
+     * If filtering would remove every tool, we intentionally keep the original list.
+     * Runtime enforcement still happens in [enforceActiveToolConstraintOnResponse]
+     * and [executeToolCall], which prevents disallowed execution while avoiding a
+     * zero-tool dead-end if capability discovery and constraints drift.
+     */
+    private fun applyActiveToolConstraintToToolList(tools: List<Tool>): List<Tool> {
+        val constraint = activeToolConstraint ?: return tools
+        val filtered = tools.filter { it.name in constraint.allowedToolNames }
+        if (filtered.isEmpty()) {
+            Log.w(
+                TAG,
+                "tool constraint produced empty advertised list; keeping original tools and relying on response/execution guards"
+            )
+            return tools
+        }
+        if (filtered.size != tools.size) {
+            Log.d(
+                TAG,
+                "active tool constraint applied: allowed=${constraint.allowedToolNames.joinToString(",")}, " +
+                    "before=${tools.size}, after=${filtered.size}, reason=${constraint.reason}"
+            )
+        }
+        return filtered
+    }
+
+    @androidx.annotation.VisibleForTesting
+    internal fun enforceActiveToolConstraintOnResponse(response: ChatResponse): ChatResponse {
+        val constraint = activeToolConstraint ?: return response
+        if (response.toolCalls.isEmpty()) return response
+
+        val allowedToolCalls = response.toolCalls.filter { it.name in constraint.allowedToolNames }
+        if (allowedToolCalls.size == response.toolCalls.size) return response
+
+        val blockedToolNames = response.toolCalls
+            .filter { it.name !in constraint.allowedToolNames }
+            .map { it.name }
+            .distinct()
+
+        Log.w(
+            TAG,
+            "blocked tool calls by active constraint: blocked=${blockedToolNames.joinToString(",")}, " +
+                "allowed=${constraint.allowedToolNames.joinToString(",")}, reason=${constraint.reason}"
+        )
+
+        if (allowedToolCalls.isNotEmpty()) {
+            return response.copy(toolCalls = allowedToolCalls, stopReason = "tool_use")
+        }
+
+        val text = response.text?.takeIf { it.isNotBlank() }
+            ?: "Tool selection blocked by constraint (${constraint.reason}). Use only ${constraint.allowedToolNames.joinToString(", ")}."
+        return response.copy(text = text, toolCalls = emptyList(), stopReason = "end_turn")
+    }
+
+    @androidx.annotation.VisibleForTesting
+    internal fun extractExplicitWebFetchUrl(userMessage: String): String? {
+        val normalized = userMessage.trim().lowercase()
+        if (normalized.isEmpty()) return null
+        if (!EXPLICIT_WEB_FETCH_HINTS.any { normalized.contains(it) }) return null
+
+        val urlMatch = EXPLICIT_WEB_FETCH_URL_REGEX.find(userMessage) ?: return null
+        val rawUrl = urlMatch.value
+
+        val preContext = normalized.substring(0, urlMatch.range.first)
+            .takeLast(120)
+            .trim()
+        val postContext = normalized.substring(urlMatch.range.last + 1)
+            .take(120)
+            .trim()
+
+        val hasExplicitVerbBeforeUrl =
+            preContext.matches(Regex(""".*\b(fetch|summari[sz]e|extract)\b.*""")) ||
+                preContext.matches(Regex(""".*\bread\b(?:\s+(?:this|that|the))?\s+(url|link|page|article|website|webpage|site)\b.*"""))
+
+        val hasExplicitVerbAfterUrl =
+            postContext.matches(Regex("""^(?:,|\.|;|:|\)|\]|\s)*(and\s+)?(fetch|summari[sz]e|extract)\b.*""")) ||
+                postContext.matches(Regex("""^(?:,|\.|;|:|\)|\]|\s)*(and\s+)?read\s+(it|this|that|the\s+(url|link|page|article|website|webpage|site))\b.*"""))
+
+        if (!hasExplicitVerbBeforeUrl && !hasExplicitVerbAfterUrl) return null
+
+        return rawUrl.trimEnd('.', ',', ';', ':', ')', ']', '>')
+    }
+
+    @androidx.annotation.VisibleForTesting
+    internal fun enforceExplicitWebFetchIntent(
+        userMessage: String,
+        response: ChatResponse,
+        isActionLoop: Boolean,
+        modelId: String?
+    ): ChatResponse {
+        if (isActionLoop) return response
+        val requestedUrl = extractExplicitWebFetchUrl(userMessage) ?: return response
+        val constraint = activeToolConstraint
+        // Explicit per-turn tool constraints take precedence over fetch-intent auto injection.
+        if (constraint != null && "web_fetch" !in constraint.allowedToolNames) return response
+        if (response.toolCalls.any { it.name == "web_fetch" }) return response
+
+        val tools = getToolsForModel(modelId)
+        if (tools.none { it.name == "web_fetch" }) return response
+
+        val noActionableToolSelection =
+            response.toolCalls.isEmpty() || response.toolCalls.all { it.name == "think" }
+        if (!noActionableToolSelection) return response
+
+        val forcedToolCall = ToolCall(
+            id = buildForcedWebFetchToolCallId(requestedUrl),
+            name = "web_fetch",
+            input = mapOf("url" to requestedUrl)
+        )
+        val mergedToolCalls = if (response.toolCalls.isEmpty()) {
+            listOf(forcedToolCall)
+        } else {
+            response.toolCalls + forcedToolCall
+        }
+
+        Log.d(
+            TAG,
+            "enforceExplicitWebFetchIntent: injecting web_fetch for explicit fetch URL " +
+                "(url=$requestedUrl, originalStopReason=${response.stopReason}, originalTools=${response.toolCalls.map { it.name }})"
+        )
+
+        return response.copy(
+            text = response.text?.takeIf { it.isNotBlank() } ?: "Fetching requested URL.",
+            toolCalls = mergedToolCalls,
+            stopReason = "tool_use"
+        )
+    }
+
+    private fun buildForcedWebFetchToolCallId(requestedUrl: String): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+            .digest(requestedUrl.toByteArray(StandardCharsets.UTF_8))
+        val suffix = digest.joinToString("") { "%02x".format(it) }.take(24)
+        return "forced_web_fetch_$suffix"
+    }
+
+    /**
      * Add a tool result to the conversation.
      * 
      * @param toolCallId The tool call ID this result corresponds to
@@ -1201,14 +2424,345 @@ open class PhoneAgentApi(
     /**
      * Clear the conversation history.
      *
-     * Thread-safe: synchronized to prevent races with [seedConversationHistory].
-     * Note: if an API call is in-flight, it already has a snapshot of messages
-     * (via `toList()` / `toMutableList()`), so clearing won't corrupt it.
+     * Thread-safe and non-blocking for callers:
+     * - If no request is active, clears immediately.
+     * - If a request is active, defers clear until lock release.
      */
-    @Synchronized
     fun clearConversation() {
+        clearRequested.set(true)
+        if (!requestFlowMutex.tryLock()) {
+            return
+        }
+        try {
+            applyDeferredClearIfRequested()
+        } finally {
+            requestFlowMutex.unlock()
+        }
+    }
+
+    private suspend inline fun <T> withRequestFlowLock(block: suspend () -> T): T {
+        return requestFlowMutex.withLock {
+            deferredSeedBootstrapEligibleInActiveFlow.set(messages.isEmpty())
+            try {
+                block()
+            } finally {
+                onBeforeDeferredMaintenanceInActiveFlow?.invoke()
+                applyDeferredMaintenance()
+                deferredSeedBootstrapEligibleInActiveFlow.set(false)
+            }
+        }
+    }
+
+    private fun applyDeferredMaintenance() {
+        if (applyDeferredClearIfRequested()) {
+            deferredSeedMessages.set(null)
+            return
+        }
+        applyDeferredSeedIfRequested()
+    }
+
+    private fun applyDeferredClearIfRequested(): Boolean {
+        if (clearRequested.getAndSet(false)) {
+            clearConversationUnlocked()
+            return true
+        }
+        return false
+    }
+
+    private fun applyDeferredSeedIfRequested() {
+        val pending = deferredSeedMessages.getAndSet(null) ?: return
+        // Invariant: deferred prepend is only valid for bootstrap restore when the live
+        // in-memory history was empty at deferral time. Otherwise the seed may be stale
+        // and must never be prepended to an already-populated conversation.
+        if (!pending.liveHistoryWasEmptyAtDeferral) {
+            emitDeferredSeedSignal(
+                action = DeferredSeedAction.SKIPPED,
+                reason = DeferredSeedReason.NON_EMPTY_LIVE_HISTORY_AT_DEFERRAL,
+                seedMessageCount = pending.uiMessages.size,
+                liveMessageCount = messages.size
+            )
+            return
+        }
+        val applied = applySeedConversationHistoryUnlocked(
+            pending.uiMessages,
+            allowPrependToExisting = true
+        )
+        emitDeferredSeedSignal(
+            action = if (applied) DeferredSeedAction.APPLIED else DeferredSeedAction.SKIPPED,
+            reason = if (applied) {
+                DeferredSeedReason.BOOTSTRAP_EMPTY_HISTORY
+            } else {
+                DeferredSeedReason.EMPTY_AFTER_NORMALIZATION
+            },
+            seedMessageCount = pending.uiMessages.size,
+            liveMessageCount = messages.size
+        )
+    }
+
+    private fun clearConversationUnlocked() {
         messages.clear()
+        deferredSeedMessages.set(null)
+        activeToolConstraint = null
         currentToolStep = 0
+        executionConstraintSnapshot = null
+        isTaskInProgress = false
+        taskSensorSnapshotEpoch.incrementAndGet()
+        synchronized(taskSensorSnapshotLock) {
+            taskSensorSnapshot = null
+            taskSensorSnapshotInitialized = false
+        }
+        resetTaskCostTracking()
+    }
+
+    @Synchronized
+    private fun resetTaskCostTracking() {
+        taskTokenAccumulator.reset()
+        taskEstimatedCostNanodollars = 0L
+        taskEstimatedCostMicrodollars = 0L
+        lastTaskCostSummary = TaskCostSummary.EMPTY
+    }
+
+    private fun checkBudgetBeforeApiCall() {
+        budgetGuard?.checkTaskLimitDecisionMicrodollars(taskEstimatedCostMicrodollars)?.let { error ->
+            throw BudgetExceededException(error.message, error.code)
+        }
+        budgetGuard?.checkWouldExceedBudgetWithoutSpendingDecision()?.let { error ->
+            throw BudgetExceededException(error.message, error.code)
+        }
+    }
+
+    @Synchronized
+    private fun recordUsageAndCheckBudgets(usage: TokenUsage, modelId: String?) {
+        val callCost = CostEstimator.estimate(usage, modelId)
+        recordEstimatedCost(usage, callCost)
+
+        when (val decision = budgetGuard?.trySpendDecision(callCost)) {
+            null, BudgetDecision.Allowed -> Unit
+            is BudgetDecision.OverLimit -> throw BudgetExceededException(decision.message, decision.code)
+            is BudgetDecision.MissingUsageMetadata -> {
+                decision.overLimitMessage?.let { throw BudgetExceededException(it, decision.overLimitCode) }
+            }
+        }
+        budgetGuard?.checkTaskLimitDecisionMicrodollars(taskEstimatedCostMicrodollars)?.let { error ->
+            throw BudgetExceededException(error.message, error.code)
+        }
+    }
+
+    private fun recordUsageOutcomeAndCheckBudgets(
+        usage: TokenUsage?,
+        modelId: String?,
+        promptChars: Int,
+        responseChars: Int,
+        systemPromptChars: Int,
+        toolSchemaChars: Int
+    ) {
+        if (usage != null) {
+            recordUsageAndCheckBudgets(usage, modelId)
+            return
+        }
+
+        val fallbackUsage = estimateFallbackUsage(
+            promptChars = promptChars,
+            responseChars = responseChars,
+            systemPromptChars = systemPromptChars,
+            toolSchemaChars = toolSchemaChars
+        )
+        val fallbackCost = max(CostEstimator.estimate(fallbackUsage, modelId), 0.000001)
+        recordEstimatedCost(fallbackUsage, fallbackCost)
+
+        val fallbackDecision = budgetGuard?.recordFallbackSpendForMissingUsage(fallbackCost)
+        if (fallbackDecision?.overLimitMessage != null) {
+            throw BudgetExceededException(
+                fallbackDecision.overLimitMessage,
+                fallbackDecision.overLimitCode ?: BudgetErrorCode.MISSING_USAGE_FALLBACK
+            )
+        }
+        budgetGuard?.checkTaskLimitDecisionMicrodollars(taskEstimatedCostMicrodollars)?.let { error ->
+            throw BudgetExceededException(error.message, error.code)
+        }
+    }
+
+    private fun estimateFallbackUsage(
+        promptChars: Int,
+        responseChars: Int,
+        systemPromptChars: Int,
+        toolSchemaChars: Int
+    ): TokenUsage {
+        val estimatedInputChars =
+            promptChars + systemPromptChars + toolSchemaChars + FALLBACK_PROVIDER_FRAMING_CHARS
+        val estimatedOutputChars = responseChars + FALLBACK_PROVIDER_FRAMING_CHARS
+        val estimatedInputTokens = max(
+            1,
+            ceil((estimatedInputChars * FALLBACK_INPUT_CONSERVATISM_FACTOR) / 4.0).toInt()
+        )
+        val estimatedOutputTokens = max(
+            1,
+            ceil((estimatedOutputChars * FALLBACK_OUTPUT_CONSERVATISM_FACTOR) / 4.0).toInt()
+        )
+        return TokenUsage(inputTokens = estimatedInputTokens, outputTokens = estimatedOutputTokens)
+    }
+
+    private fun approximateConversationChars(messages: List<Message>): Int = approximateMessageChars(messages)
+
+    private fun approximateMessageChars(messages: List<Message>): Int {
+        return messages.sumOf { msg ->
+            msg.content.length + msg.role.length + (msg.toolCallsJson?.length ?: 0) + (msg.toolCallId?.length ?: 0)
+        }
+    }
+
+    private fun approximateResponseChars(response: ChatResponse): Int {
+        val toolCallChars = response.toolCalls.sumOf { call ->
+            call.id.length + call.name.length + stableSerializedLength(call.input)
+        }
+        return (response.text?.length ?: 0) + toolCallChars
+    }
+
+    private fun approximateToolSchemaChars(tools: List<Tool>): Int {
+        if (tools.isEmpty()) return 0
+        return tools.sumOf { tool ->
+            tool.name.length +
+                tool.description.length +
+                stableSerializedLength(tool.inputSchema)
+        }
+    }
+
+    private fun applySeedConversationHistoryUnlocked(
+        uiMessages: List<Message>,
+        allowPrependToExisting: Boolean
+    ): Boolean {
+        if (uiMessages.isEmpty()) return false
+        if (messages.isNotEmpty() && !allowPrependToExisting) return false
+
+        val seeded = uiMessages.mapNotNull { msg ->
+            when {
+                msg.role == Message.ROLE_USER -> Message(role = "user", content = msg.content)
+                msg.role == Message.ROLE_ASSISTANT && msg.content.isNotBlank() -> {
+                    val textOnly = msg.content
+                        .replace(Regex("""\s*\[Tools:.*?]"""), "")
+                        .trim()
+                    if (textOnly.isNotEmpty()) Message(role = "assistant", content = textOnly) else null
+                }
+                else -> null
+            }
+        }
+
+        val dedupedSeed = dedupeConsecutiveRoles(seeded)
+        if (dedupedSeed.isEmpty()) return false
+
+        val merged = if (messages.isEmpty()) {
+            dedupedSeed
+        } else {
+            if (!allowPrependToExisting) return false
+            mergeSeedWithLiveMessages(dedupedSeed, messages.toList())
+        }
+
+        messages.clear()
+        messages.addAll(merged)
+        Log.d(
+            TAG,
+            "seedConversationHistory: applied ${merged.size} messages from UI (${seeded.size - dedupedSeed.size} consecutive dupes removed)"
+        )
+        return true
+    }
+
+    private data class DeferredSeedRequest(
+        val uiMessages: List<Message>,
+        val liveHistoryWasEmptyAtDeferral: Boolean
+    )
+
+    private enum class DeferredSeedAction(val value: String) {
+        APPLIED("applied"),
+        SKIPPED("skipped")
+    }
+
+    private enum class DeferredSeedReason(val value: String) {
+        BOOTSTRAP_EMPTY_HISTORY("bootstrap_empty_history"),
+        EMPTY_AFTER_NORMALIZATION("empty_after_normalization"),
+        NON_EMPTY_LIVE_HISTORY_AT_DEFERRAL("non_empty_live_history_at_deferral")
+    }
+
+    private fun emitDeferredSeedSignal(
+        action: DeferredSeedAction,
+        reason: DeferredSeedReason,
+        seedMessageCount: Int,
+        liveMessageCount: Int
+    ) {
+        Log.d(
+            TAG,
+            "deferred_seed action=${action.value} reason=${reason.value} seedCount=$seedMessageCount liveCount=$liveMessageCount"
+        )
+        onDeferredSeedSignal?.invoke(
+            DeferredSeedSignal(
+                action = action.value,
+                reason = reason.value,
+                seedMessageCount = seedMessageCount,
+                liveMessageCount = liveMessageCount
+            )
+        )
+    }
+
+    private fun dedupeConsecutiveRoles(source: List<Message>): List<Message> {
+        if (source.isEmpty()) return emptyList()
+        val deduped = mutableListOf<Message>()
+        source.forEach { msg ->
+            if (deduped.isEmpty() || deduped.last().role != msg.role) {
+                deduped += msg
+            }
+        }
+        return deduped
+    }
+
+    private fun mergeSeedWithLiveMessages(seed: List<Message>, live: List<Message>): List<Message> {
+        if (seed.isEmpty()) return live
+        if (live.isEmpty()) return seed
+        return if (seed.last().role == live.first().role) {
+            seed.dropLast(1) + live
+        } else {
+            seed + live
+        }
+    }
+
+    private fun stableSerializedLength(value: Any?): Int {
+        val json = JsonUtils.anyToJsonElement(value)
+        return canonicalizeJsonObjectOrder(json).toString().length
+    }
+
+    private fun canonicalizeJsonObjectOrder(element: JsonElement): JsonElement {
+        return when (element) {
+            is JsonObject -> buildJsonObject {
+                element.entries
+                    .sortedBy { it.key }
+                    .forEach { (key, value) -> put(key, canonicalizeJsonObjectOrder(value)) }
+            }
+            is JsonArray -> buildJsonArray {
+                element.forEach { add(canonicalizeJsonObjectOrder(it)) }
+            }
+            else -> element
+        }
+    }
+
+    @Synchronized
+    private fun recordEstimatedCost(usage: TokenUsage, estimatedCostUsd: Double) {
+        taskTokenAccumulator.record(usage)
+        taskEstimatedCostNanodollars += usdToNanodollars(estimatedCostUsd)
+        taskEstimatedCostMicrodollars = taskEstimatedCostNanodollars / NANODOLLARS_PER_MICRODOLLAR
+        lastTaskCostSummary = TaskCostSummary(
+            totalTokens = taskTokenAccumulator.totalTokens,
+            inputTokens = taskTokenAccumulator.totalInputTokens,
+            outputTokens = taskTokenAccumulator.totalOutputTokens,
+            apiCalls = taskTokenAccumulator.callCount,
+            estimatedCostUsd = taskEstimatedCostNanodollars / NANODOLLARS_PER_USD.toDouble()
+        )
+    }
+
+    private fun usdToNanodollars(usd: Double): Long = (usd * NANODOLLARS_PER_USD).roundToLong()
+
+    private fun appendAssistantResponse(response: ChatResponse) {
+        if (response.toolCalls.isNotEmpty()) {
+            messages.add(Message.assistantWithTools(response.text, response.toolCalls))
+        } else if (response.text != null) {
+            messages.add(Message(role = "assistant", content = response.text))
+        }
     }
     
     // ========== Legacy compatibility methods ==========

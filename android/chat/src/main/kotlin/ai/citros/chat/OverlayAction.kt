@@ -1,5 +1,7 @@
 package ai.citros.chat
 
+import ai.citros.core.PillAction
+
 /**
  * Actions dispatched from the overlay UI (OverlayService) to be handled
  * by the mediator (ChatActivity).
@@ -29,4 +31,7 @@ sealed class OverlayAction {
 
     /** User tapped search bar to expand — switches to PANEL and resets unread count. */
     data object ExpandFromSearchBar : OverlayAction()
+
+    /** User tapped a runtime action pill in overlay UI. */
+    data class RuntimePillTapped(val action: PillAction) : OverlayAction()
 }

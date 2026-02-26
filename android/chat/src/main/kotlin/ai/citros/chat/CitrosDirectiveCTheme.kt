@@ -104,8 +104,8 @@ internal fun citrosDirectiveSurfaces(isDark: Boolean): CitrosDirectiveSurfaces {
             labelQuaternary = Color(0x2EEBEBF5),
             separator = Color(0x5C545458),
             separatorLight = Color(0x33545458),
-            green = Color(0xFF30D158),
-            red = Color(0xFFFF453A),
+            green = CitrosFlavor.LIME.primary,
+            red = CitrosFlavor.BLOOD_ORANGE.primary,
             orange = Color(0xFFFF9F0A),
             blue = Color(0xFF0A84FF)
         )
@@ -122,8 +122,8 @@ internal fun citrosDirectiveSurfaces(isDark: Boolean): CitrosDirectiveSurfaces {
             labelQuaternary = Color(0x2E3C3C43),
             separator = Color(0x1F3C3C43),
             separatorLight = Color(0x0F3C3C43),
-            green = Color(0xFF34C759),
-            red = Color(0xFFFF3B30),
+            green = CitrosFlavor.LIME.primary,
+            red = CitrosFlavor.BLOOD_ORANGE.primary,
             orange = Color(0xFFFF9500),
             blue = Color(0xFF007AFF)
         )

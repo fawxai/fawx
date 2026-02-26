@@ -157,6 +157,133 @@ class OrphanedToolResultTest {
         assertNull(converted.contentBlocks)
     }
 
+    @Test
+    fun `sanitizeMessages converts incomplete assistant tool_use batch to plain assistant text`() {
+        val messages = listOf(
+            Message(role = Message.ROLE_USER, content = "Open settings"),
+            Message.assistantWithTools(
+                text = "Tapping settings",
+                toolCalls = listOf(ToolCall("t1", "tap", mapOf("element_id" to 1)))
+            ),
+            Message(role = Message.ROLE_USER, content = "Actually stop")
+        )
+
+        val result = client.sanitizeMessages(messages)
+
+        assertEquals(Message.ROLE_ASSISTANT, result[1].role)
+        assertTrue(result[1].content.contains("Tapping settings"))
+        assertFalse(result[1].content.contains("[Tools:"))
+        assertNull(result[1].contentBlocks)
+    }
+
+    @Test
+    fun `buildToolRequest removes unmatched tool_use ids from interrupted batches`() {
+        val messages = listOf(
+            Message(role = Message.ROLE_USER, content = "Open settings"),
+            Message.assistantWithTools(
+                text = "Executing tools",
+                toolCalls = listOf(
+                    ToolCall("t1", "tap", mapOf("element_id" to 1)),
+                    ToolCall("t2", "tap", mapOf("element_id" to 2))
+                )
+            ),
+            // Partial completion only: t1 has a result, t2 never did.
+            Message.toolResult("t1", "Tapped first item", toolName = "tap"),
+            Message(role = Message.ROLE_USER, content = "continue")
+        )
+
+        val request = client.buildToolRequest(messages, "system", testTools, 4096)
+        val apiMessages = extractMessages(request)
+
+        assertNoOrphanedToolResults(apiMessages)
+        assertNoUnmatchedToolUses(apiMessages)
+
+        val assistantToolBatch = apiMessages[1].jsonObject["content"]!!.jsonArray
+        val toolUseIds = assistantToolBatch
+            .filter { it.jsonObject["type"]!!.jsonPrimitive.content == "tool_use" }
+            .map { it.jsonObject["id"]!!.jsonPrimitive.content }
+        assertEquals(listOf("t1"), toolUseIds)
+    }
+
+    @Test
+    fun `sanitizeMessages preserves matched tool_result content in partial completion`() {
+        val messages = listOf(
+            Message(role = Message.ROLE_USER, content = "Open settings"),
+            Message.assistantWithTools(
+                text = "Executing tools",
+                toolCalls = listOf(
+                    ToolCall("t1", "tap", mapOf("element_id" to 1)),
+                    ToolCall("t2", "tap", mapOf("element_id" to 2))
+                )
+            ),
+            Message.toolResult("t1", "Tapped first item", toolName = "tap"),
+            Message(role = Message.ROLE_USER, content = "continue")
+        )
+
+        val sanitized = client.sanitizeMessages(messages)
+        val preservedToolResult = sanitized.firstOrNull { it.role == Message.ROLE_TOOL && it.toolCallId == "t1" }
+
+        assertNotNull("matched tool_result should be preserved through sanitize path", preservedToolResult)
+        assertEquals("Tapped first item", preservedToolResult!!.content)
+
+        val sanitizedAssistant = sanitized[1]
+        assertEquals(Message.ROLE_ASSISTANT, sanitizedAssistant.role)
+        assertNotNull("partial completion keeps matched tool_use blocks", sanitizedAssistant.contentBlocks)
+        val toolUseIds = sanitizedAssistant.contentBlocks!!
+            .filter { it["type"] == "tool_use" }
+            .mapNotNull { it["id"] as? String }
+        assertEquals(listOf("t1"), toolUseIds)
+    }
+
+    @Test
+    fun `sanitizeMessages fallback extraction keeps assistant text when no tools marker`() {
+        val staleToolJson = """
+            [
+              {"id":"t1","name":"tap","input":{"element_id":1}},
+              {"id":"t2","name":"tap","input":{"element_id":2}}
+            ]
+        """.trimIndent()
+        val assistantWithStaleToolJson = Message(
+            role = Message.ROLE_ASSISTANT,
+            content = "Retrying from interrupted state",
+            toolCallsJson = staleToolJson
+        )
+
+        val messages = listOf(
+            Message(role = Message.ROLE_USER, content = "open settings"),
+            assistantWithStaleToolJson,
+            Message.toolResult("t1", "Tapped first item", toolName = "tap"),
+            Message(role = Message.ROLE_USER, content = "continue")
+        )
+
+        val sanitized = client.sanitizeMessages(messages)
+        val sanitizedAssistant = sanitized[1]
+
+        assertEquals("Retrying from interrupted state", sanitizedAssistant.content.substringBefore(Message.TOOL_CALLS_MARKER))
+        assertNotNull("matched tool_use should be reconstructed from fallback text path", sanitizedAssistant.contentBlocks)
+
+        val toolUseIds = sanitizedAssistant.contentBlocks!!
+            .filter { it["type"] == "tool_use" }
+            .mapNotNull { it["id"] as? String }
+        assertEquals(listOf("t1"), toolUseIds)
+    }
+
+    @Test
+    fun `sanitizeMessages degraded assistant cannot resurrect stale tool metadata`() {
+        val staleToolJson = "[{\"id\":\"t1\",\"name\":\"tap\",\"input\":{\"element_id\":1}}]"
+        val messages = listOf(
+            Message(role = Message.ROLE_USER, content = "open settings"),
+            Message(role = Message.ROLE_ASSISTANT, content = "Retrying", toolCallsJson = staleToolJson),
+            Message(role = Message.ROLE_USER, content = "stop")
+        )
+
+        val sanitized = client.sanitizeMessages(messages)
+        val degradedAssistant = sanitized[1]
+
+        assertNull("degraded assistant must not keep stale toolCallsJson", degradedAssistant.toolCallsJson)
+        assertNull("degraded assistant must not keep stale contentBlocks", degradedAssistant.contentBlocks)
+    }
+
     // ==================== Long tool loop + follow-up ====================
 
     @Test
@@ -170,6 +297,7 @@ class OrphanedToolResultTest {
 
         // Validate: no consecutive same-role, every tool_result has matching tool_use
         assertNoOrphanedToolResults(apiMessages)
+        assertNoUnmatchedToolUses(apiMessages)
         assertAlternatingRoles(apiMessages)
         assertEquals("user", apiMessages[0].jsonObject["role"]!!.jsonPrimitive.content)
     }
@@ -188,6 +316,7 @@ class OrphanedToolResultTest {
         val apiMessages = extractMessages(request)
 
         assertNoOrphanedToolResults(apiMessages)
+        assertNoUnmatchedToolUses(apiMessages)
         assertAlternatingRoles(apiMessages)
     }
 
@@ -287,6 +416,67 @@ class OrphanedToolResultTest {
             } else {
                 if (role != "assistant") lastAssistantToolIds = emptySet()
             }
+        }
+    }
+
+    /**
+     * Verifies every assistant tool_use batch is fully satisfied by immediately
+     * following role="user" messages that contain tool_result blocks.
+     *
+     * Role expectation: once a non-tool-result user message or any non-user role
+     * is encountered, the scan stops for that batch (adjacent batch semantics).
+     */
+    private fun assertNoUnmatchedToolUses(apiMessages: JsonArray) {
+        for (i in 0 until apiMessages.size) {
+            val assistantMsg = apiMessages[i].jsonObject
+            val role = assistantMsg["role"]!!.jsonPrimitive.content
+            val content = assistantMsg["content"]
+            if (role != Message.ROLE_ASSISTANT || content !is JsonArray) continue
+
+            val expected = content.mapNotNull { block ->
+                val obj = block.jsonObject
+                if (obj["type"]?.jsonPrimitive?.content == "tool_use") {
+                    obj["id"]?.jsonPrimitive?.content
+                } else {
+                    null
+                }
+            }.toSet()
+
+            if (expected.isEmpty()) continue
+
+            val observed = mutableSetOf<String>()
+            var j = i + 1
+            while (j < apiMessages.size) {
+                val nextMsg = apiMessages[j].jsonObject
+                val nextRole = nextMsg["role"]!!.jsonPrimitive.content
+                if (nextRole != Message.ROLE_USER) break
+
+                val nextContent = nextMsg["content"]
+                if (nextContent !is JsonArray) {
+                    j++
+                    continue
+                }
+
+                var sawToolResult = false
+                for (block in nextContent) {
+                    val obj = block.jsonObject
+                    if (obj["type"]?.jsonPrimitive?.content == "tool_result") {
+                        sawToolResult = true
+                        obj["tool_use_id"]?.jsonPrimitive?.content?.let { observed.add(it) }
+                    }
+                }
+
+                if (sawToolResult) {
+                    j++
+                } else {
+                    break
+                }
+            }
+
+            assertTrue(
+                "Unmatched tool_use ids at API msg[$i]: expected=$expected observed=$observed",
+                observed.containsAll(expected)
+            )
         }
     }
 

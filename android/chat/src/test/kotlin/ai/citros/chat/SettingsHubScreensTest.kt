@@ -1,15 +1,28 @@
 package ai.citros.chat
 
 import android.content.Context
-import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertHasClickAction
+import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performSemanticsAction
+import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.test.performScrollTo
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.LifecycleRegistry
 import androidx.test.core.app.ApplicationProvider
+import ai.citros.core.FeatureFlags
 import ai.citros.core.Provider
+import ai.citros.core.ToolCategory
 import ai.citros.core.WalletKey
 import ai.citros.core.WalletManager
 import ai.citros.core.WalletState
@@ -17,6 +30,7 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /**
@@ -137,6 +151,62 @@ class SettingsHubScreensTest {
         assertTrue(backClicked, "Expected back callback to fire when Back button clicked")
     }
 
+
+
+    @Test
+    fun `ModelsSettingsScreen sections expand and collapse to show and hide model rows`() {
+        val walletManager = createTestWalletManager()
+        val firstModel = shortModelName(ai.citros.core.ModelConfig.runtimeChatModels(Provider.ANTHROPIC).first())
+
+        composeRule.setContent {
+            ModelsSettingsScreen(
+                walletManager = walletManager,
+                onBack = {}
+            )
+        }
+
+        composeRule.onNodeWithContentDescription("CHAT MODEL expanded").assertHasClickAction()
+        composeRule.onNodeWithContentDescription("ACTION MODEL expanded").assertHasClickAction()
+        composeRule.onAllNodesWithText(firstModel, useUnmergedTree = true).assertCountEquals(2)
+
+        composeRule.onNodeWithContentDescription("CHAT MODEL expanded").performClick()
+        composeRule.onNodeWithContentDescription("CHAT MODEL collapsed").assertExists()
+        composeRule.onAllNodesWithText(firstModel, useUnmergedTree = true).assertCountEquals(1)
+
+        composeRule.onNodeWithContentDescription("ACTION MODEL expanded").performClick()
+        composeRule.onNodeWithContentDescription("ACTION MODEL collapsed").assertExists()
+        composeRule.onAllNodesWithText(firstModel, useUnmergedTree = true).assertCountEquals(0)
+
+        composeRule.onNodeWithContentDescription("CHAT MODEL collapsed").performClick()
+        composeRule.onNodeWithContentDescription("ACTION MODEL collapsed").performClick()
+        composeRule.onAllNodesWithText(firstModel, useUnmergedTree = true).assertCountEquals(2)
+    }
+
+    @Test
+    fun `ModelsSettingsScreen collapsed section state survives recomposition`() {
+        val walletManager = createTestWalletManager()
+        val firstModel = shortModelName(ai.citros.core.ModelConfig.runtimeChatModels(Provider.ANTHROPIC).first())
+        val recomposeTrigger = androidx.compose.runtime.mutableStateOf(0)
+
+        composeRule.setContent {
+            recomposeTrigger.value
+            ModelsSettingsScreen(
+                walletManager = walletManager,
+                onBack = {}
+            )
+        }
+
+        composeRule.onAllNodesWithText(firstModel, useUnmergedTree = true).assertCountEquals(2)
+        composeRule.onNodeWithContentDescription("CHAT MODEL expanded").performClick()
+        composeRule.onNodeWithContentDescription("CHAT MODEL collapsed").assertExists()
+        composeRule.onAllNodesWithText(firstModel, useUnmergedTree = true).assertCountEquals(1)
+
+        composeRule.runOnIdle { recomposeTrigger.value += 1 }
+        composeRule.waitForIdle()
+
+        composeRule.onNodeWithContentDescription("CHAT MODEL collapsed").assertExists()
+        composeRule.onAllNodesWithText(firstModel, useUnmergedTree = true).assertCountEquals(1)
+    }
     /** Verifies ModelsSettingsScreen shows "No API Key Active" when wallet has no key. */
     @Test
     fun `ModelsSettingsScreen without active key shows no key message`() {
@@ -168,7 +238,8 @@ class SettingsHubScreensTest {
         composeRule.setContent {
             TrustSettingsScreen(
                 context = context,
-                onBack = { backClicked = true }
+                onBack = { backClicked = true },
+                locationPermissionChecker = { false }
             )
         }
 
@@ -180,9 +251,89 @@ class SettingsHubScreensTest {
         composeRule.onNodeWithText("Confirm every action before Citros acts.", useUnmergedTree = true).assertExists()
         composeRule.onNodeWithText("Auto-run safe actions, confirm sensitive actions.", useUnmergedTree = true).assertExists()
         composeRule.onNodeWithText("Citros acts independently.", useUnmergedTree = true).assertExists()
+        composeRule.onNodeWithText("Send device context to cloud models", useUnmergedTree = true).assertExists()
+        composeRule.onNodeWithText("Includes battery, network, local time, and location when permission is granted.", useUnmergedTree = true).assertExists()
+        composeRule.onNodeWithText("Off by default. Citros only sends this metadata to cloud prompts when enabled and data is available.", useUnmergedTree = true).assertExists()
+        composeRule.onNodeWithText(
+            "Location permission is optional and only used when device context sharing is enabled.",
+            useUnmergedTree = true
+        ).assertExists()
+        composeRule.onAllNodesWithText("Request location permission", useUnmergedTree = true).assertCountEquals(0)
+        composeRule.onNodeWithText("Open app permissions", useUnmergedTree = true).assertExists()
 
         composeRule.onNodeWithContentDescription("Back").performClick()
         assertTrue(backClicked, "Expected back callback to fire when Back button clicked")
+    }
+
+    @Test
+    fun `TrustSettingsScreen sensor toggle updates shared preferences`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val chatPrefs = context.getSharedPreferences(CITROS_PREFS, Context.MODE_PRIVATE)
+        chatPrefs.edit().putBoolean(PREF_SENSOR_CONTEXT_ENABLED, false).commit()
+
+        composeRule.setContent {
+            TrustSettingsScreen(
+                context = context,
+                onBack = {},
+                locationPermissionChecker = { false }
+            )
+        }
+
+        composeRule.onNodeWithTag("trust_sensor_context_toggle", useUnmergedTree = true).performSemanticsAction(SemanticsActions.OnClick)
+        composeRule.runOnIdle {
+            assertTrue(chatPrefs.getBoolean(PREF_SENSOR_CONTEXT_ENABLED, false))
+        }
+
+        composeRule.onNodeWithTag("trust_sensor_context_toggle", useUnmergedTree = true).performSemanticsAction(SemanticsActions.OnClick)
+        composeRule.runOnIdle {
+            assertFalse(chatPrefs.getBoolean(PREF_SENSOR_CONTEXT_ENABLED, true))
+        }
+    }
+
+    @Test
+    fun `TrustSettingsScreen shows location permission request only when sensor context is enabled`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val chatPrefs = context.getSharedPreferences(CITROS_PREFS, Context.MODE_PRIVATE)
+        chatPrefs.edit().putBoolean(PREF_SENSOR_CONTEXT_ENABLED, false).commit()
+
+        composeRule.setContent {
+            TrustSettingsScreen(
+                context = context,
+                onBack = {},
+                locationPermissionChecker = { false }
+            )
+        }
+
+        composeRule.onAllNodesWithText("Request location permission", useUnmergedTree = true).assertCountEquals(0)
+        composeRule.onNodeWithTag("trust_sensor_context_toggle", useUnmergedTree = true).performSemanticsAction(SemanticsActions.OnClick)
+        composeRule.onNodeWithText("Request location permission", useUnmergedTree = true).assertExists()
+    }
+
+    @Test
+    fun `TrustSettingsScreen refreshes location permission state on resume`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val chatPrefs = context.getSharedPreferences(CITROS_PREFS, Context.MODE_PRIVATE)
+        chatPrefs.edit().putBoolean(PREF_SENSOR_CONTEXT_ENABLED, true).commit()
+
+        val lifecycleOwner = ManualLifecycleOwner()
+        var permissionGranted = false
+
+        composeRule.setContent {
+            CompositionLocalProvider(LocalLifecycleOwner provides lifecycleOwner) {
+                TrustSettingsScreen(
+                    context = context,
+                    onBack = {},
+                    locationPermissionChecker = { permissionGranted }
+                )
+            }
+        }
+
+        composeRule.onNodeWithText("Request location permission", useUnmergedTree = true).assertExists()
+        composeRule.runOnIdle {
+            permissionGranted = true
+            lifecycleOwner.handleEvent(Lifecycle.Event.ON_RESUME)
+        }
+        composeRule.onNodeWithText("Location permission granted", useUnmergedTree = true).assertExists()
     }
 
     /** Verifies AppearanceSettingsScreen displays flavor section, theme section, and mode options. */
@@ -248,6 +399,7 @@ class SettingsHubScreensTest {
                 onOpenPhoneControl = {},
                 onOpenSound = {},
                 onOpenAppearance = {},
+                onOpenToolCategories = {},
                 onOpenAbout = {}
             )
         }
@@ -278,6 +430,7 @@ class SettingsHubScreensTest {
                 onOpenPhoneControl = {},
                 onOpenSound = {},
                 onOpenAppearance = {},
+                onOpenToolCategories = {},
                 onOpenAbout = {}
             )
         }
@@ -289,6 +442,100 @@ class SettingsHubScreensTest {
         composeRule.onNodeWithText("Accessibility & overlay", useUnmergedTree = true).assertExists()
         composeRule.onNodeWithText("Theme & flavor settings", useUnmergedTree = true).assertExists()
         composeRule.onNodeWithText("Version, licenses", useUnmergedTree = true).assertExists()
+    }
+
+    @Test
+    fun `SettingsHubScreen shows Tool Categories card when feature flag is enabled`() {
+        FeatureFlags.toolGroupingV1Enabled = true
+        try {
+            val context = ApplicationProvider.getApplicationContext<Context>()
+            val walletManager = createEmptyWalletManager()
+
+            composeRule.setContent {
+                SettingsHubScreen(
+                    context = context,
+                    walletManager = walletManager,
+                    onBack = {},
+                    onOpenWallet = {},
+                    onOpenModels = {},
+                    onOpenTrust = {},
+                    onOpenPhoneControl = {},
+                    onOpenSound = {},
+                    onOpenAppearance = {},
+                    onOpenToolCategories = {},
+                    onOpenAbout = {}
+                )
+            }
+
+            composeRule.onNodeWithText("Tool Categories", useUnmergedTree = true).performScrollTo().assertExists()
+            composeRule.onNodeWithText("Enable/disable tool groups", useUnmergedTree = true).assertExists()
+        } finally {
+            FeatureFlags.toolGroupingV1Enabled = false
+        }
+    }
+
+    @Test
+    fun `SettingsHubScreen hides Tool Categories card when feature flag is disabled`() {
+        FeatureFlags.toolGroupingV1Enabled = false
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val walletManager = createEmptyWalletManager()
+
+        composeRule.setContent {
+            SettingsHubScreen(
+                context = context,
+                walletManager = walletManager,
+                onBack = {},
+                onOpenWallet = {},
+                onOpenModels = {},
+                onOpenTrust = {},
+                onOpenPhoneControl = {},
+                onOpenSound = {},
+                onOpenAppearance = {},
+                onOpenToolCategories = {},
+                onOpenAbout = {}
+            )
+        }
+
+        composeRule.onAllNodesWithText("Tool Categories", useUnmergedTree = true).assertCountEquals(0)
+    }
+
+    @Test
+    fun `ToolCategoriesSettingsScreen keeps CORE forced on and non-toggleable`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val prefs = context.getSharedPreferences(CITROS_PREFS, Context.MODE_PRIVATE)
+        prefs.edit().putBoolean("tool_category_core", false).commit()
+
+        composeRule.setContent {
+            ToolCategoriesSettingsScreen(onBack = {})
+        }
+
+        composeRule.onNodeWithTag("tool_category_toggle_core", useUnmergedTree = true)
+            .assertIsNotEnabled()
+        composeRule.runOnIdle {
+            val loaded = loadToolCategorySettings(prefs)
+            assertTrue(loaded.isEnabled(ToolCategory.CORE))
+        }
+    }
+
+    @Test
+    fun `loadToolCategorySettings round-trips SharedPreferences values with defaults`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val prefs = context.getSharedPreferences(CITROS_PREFS, Context.MODE_PRIVATE)
+        prefs.edit().clear().commit()
+        prefs.edit()
+            .putBoolean("tool_category_navigation", false)
+            .putBoolean("tool_category_memory", false)
+            .putBoolean("tool_category_interaction", true)
+            .putBoolean("tool_category_core", false)
+            .commit()
+
+        val loaded = loadToolCategorySettings(prefs)
+        assertTrue(loaded.isEnabled(ToolCategory.CORE))
+        assertFalse(loaded.isEnabled(ToolCategory.NAVIGATION))
+        assertFalse(loaded.isEnabled(ToolCategory.MEMORY))
+        assertTrue(loaded.isEnabled(ToolCategory.INTERACTION))
+        assertTrue(loaded.isEnabled(ToolCategory.RESEARCH)) // default true when missing
+        assertTrue(loaded.disabledCategories().containsAll(listOf(ToolCategory.NAVIGATION, ToolCategory.MEMORY)))
     }
 
     /** Verifies the Sound & Haptics card renders and its subtitle is correct. */
@@ -309,6 +556,7 @@ class SettingsHubScreensTest {
                 onOpenPhoneControl = {},
                 onOpenSound = { soundClicked = true },
                 onOpenAppearance = {},
+                onOpenToolCategories = {},
                 onOpenAbout = {}
             )
         }
@@ -337,6 +585,7 @@ class SettingsHubScreensTest {
                 onOpenPhoneControl = {},
                 onOpenSound = {},
                 onOpenAppearance = {},
+                onOpenToolCategories = {},
                 onOpenAbout = {}
             )
         }
@@ -366,6 +615,7 @@ class SettingsHubScreensTest {
                 onOpenPhoneControl = {},
                 onOpenSound = {},
                 onOpenAppearance = {},
+                onOpenToolCategories = {},
                 onOpenAbout = {}
             )
         }
@@ -392,6 +642,7 @@ class SettingsHubScreensTest {
                 onOpenPhoneControl = {},
                 onOpenSound = {},
                 onOpenAppearance = {},
+                onOpenToolCategories = {},
                 onOpenAbout = {}
             )
         }
@@ -420,6 +671,7 @@ class SettingsHubScreensTest {
                 onOpenPhoneControl = {},
                 onOpenSound = {},
                 onOpenAppearance = {},
+                onOpenToolCategories = {},
                 onOpenAbout = {}
             )
         }
@@ -447,6 +699,7 @@ class SettingsHubScreensTest {
                 onOpenPhoneControl = { phoneControlClicked = true },
                 onOpenSound = {},
                 onOpenAppearance = {},
+                onOpenToolCategories = {},
                 onOpenAbout = {}
             )
         }
@@ -473,6 +726,7 @@ class SettingsHubScreensTest {
                 onOpenPhoneControl = {},
                 onOpenSound = {},
                 onOpenAppearance = { appearanceClicked = true },
+                onOpenToolCategories = {},
                 onOpenAbout = {}
             )
         }
@@ -499,6 +753,7 @@ class SettingsHubScreensTest {
                 onOpenPhoneControl = {},
                 onOpenSound = {},
                 onOpenAppearance = {},
+                onOpenToolCategories = {},
                 onOpenAbout = { aboutClicked = true }
             )
         }
@@ -572,6 +827,22 @@ class SettingsHubScreensTest {
         private var state: ai.citros.core.WalletState? = null
         override fun loadState(): ai.citros.core.WalletState? = state
         override fun saveState(state: ai.citros.core.WalletState) { this.state = state }
+    }
+
+    private class ManualLifecycleOwner : LifecycleOwner {
+        private val registry = LifecycleRegistry(this)
+
+        init {
+            registry.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
+            registry.handleLifecycleEvent(Lifecycle.Event.ON_START)
+        }
+
+        override val lifecycle: Lifecycle
+            get() = registry
+
+        fun handleEvent(event: Lifecycle.Event) {
+            registry.handleLifecycleEvent(event)
+        }
     }
 
     private class InMemoryKeyStore : ai.citros.core.KeyStore {

@@ -195,6 +195,112 @@ class ProviderClientTest {
         assertEquals("Bearer sk-or-test", request.getHeader("Authorization"))
     }
 
+    @Test
+    fun `Anthropic chatWithUsage parses usage from provider payload`() = runTest {
+        server.enqueue(
+            MockResponse()
+                .setBody(
+                    """{"content":[{"type":"text","text":"hello usage"}],"usage":{"input_tokens":120,"output_tokens":30},"stop_reason":"end_turn"}"""
+                )
+                .setResponseCode(200)
+                .addHeader("Content-Type", "application/json")
+        )
+
+        val client = AnthropicClient(
+            apiKey = "sk-ant-api03-test-key",
+            baseUrl = server.url("/v1/messages").toString(),
+            maxAttempts = 1
+        )
+        val conversation = Conversation().apply { addUser("hi") }
+
+        val result = client.chatWithUsage(conversation)
+
+        assertTrue(result.isSuccess, "expected success, got: ${result.exceptionOrNull()?.message}")
+        val (text, usage) = result.getOrThrow()
+        assertEquals("hello usage", text)
+        assertNotNull(usage)
+        assertEquals(120, usage.inputTokens)
+        assertEquals(30, usage.outputTokens)
+    }
+
+    @Test
+    fun `Anthropic chatWithUsage fails when response has no text blocks`() = runTest {
+        server.enqueue(
+            MockResponse()
+                .setBody(
+                    """{"content":[{"type":"tool_use","id":"toolu_1","name":"tap","input":{"element_id":1}}],"usage":{"input_tokens":120,"output_tokens":30},"stop_reason":"tool_use"}"""
+                )
+                .setResponseCode(200)
+                .addHeader("Content-Type", "application/json")
+        )
+
+        val client = AnthropicClient(
+            apiKey = "sk-ant-api03-test-key",
+            baseUrl = server.url("/v1/messages").toString(),
+            maxAttempts = 1
+        )
+        val conversation = Conversation().apply { addUser("hi") }
+
+        val result = client.chatWithUsage(conversation)
+
+        assertTrue(result.isFailure)
+        assertTrue(result.exceptionOrNull()?.message?.contains("no text content") == true)
+    }
+
+    @Test
+    fun `OpenAI chatWithUsage parses usage from provider payload`() = runTest {
+        server.enqueue(
+            MockResponse()
+                .setBody(
+                    """{"choices":[{"message":{"role":"assistant","content":"hello usage"},"finish_reason":"stop"}],"usage":{"prompt_tokens":44,"completion_tokens":11,"total_tokens":55}}"""
+                )
+                .setResponseCode(200)
+                .addHeader("Content-Type", "application/json")
+        )
+
+        val client = OpenAiClient(
+            config = ProviderConfig.openAi("test-key").copy(
+                baseUrl = server.url("/v1/chat/completions").toString()
+            ),
+            maxAttempts = 1
+        )
+        val conversation = Conversation().apply { addUser("ping") }
+
+        val result = client.chatWithUsage(conversation)
+
+        assertTrue(result.isSuccess, "expected success, got: ${result.exceptionOrNull()?.message}")
+        val (text, usage) = result.getOrThrow()
+        assertEquals("hello usage", text)
+        assertNotNull(usage)
+        assertEquals(44, usage.inputTokens)
+        assertEquals(11, usage.outputTokens)
+    }
+
+    @Test
+    fun `OpenAI chatWithUsage fails when assistant content is null`() = runTest {
+        server.enqueue(
+            MockResponse()
+                .setBody(
+                    """{"choices":[{"message":{"role":"assistant","content":null},"finish_reason":"stop"}],"usage":{"prompt_tokens":44,"completion_tokens":11,"total_tokens":55}}"""
+                )
+                .setResponseCode(200)
+                .addHeader("Content-Type", "application/json")
+        )
+
+        val client = OpenAiClient(
+            config = ProviderConfig.openAi("test-key").copy(
+                baseUrl = server.url("/v1/chat/completions").toString()
+            ),
+            maxAttempts = 1
+        )
+        val conversation = Conversation().apply { addUser("ping") }
+
+        val result = client.chatWithUsage(conversation)
+
+        assertTrue(result.isFailure)
+        assertTrue(result.exceptionOrNull()?.message?.contains("no text content") == true)
+    }
+
     // ========== Tool Calling Tests ==========
 
     @Test

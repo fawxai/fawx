@@ -62,7 +62,7 @@ data class Message(
         // Add text block if content is not just tool names
         val textContent = content.takeIf { 
             !it.startsWith("[Tools:") && it.isNotEmpty() 
-        }?.substringBefore(" [Tools:")
+        }?.substringBefore(TOOL_CALLS_MARKER)
         
         if (!textContent.isNullOrEmpty()) {
             blocks.add(mapOf("type" to "text", "text" to textContent))
@@ -121,6 +121,9 @@ data class Message(
     )
 
     companion object {
+        /** Marker prefix appended to assistant.content when tool calls are present. */
+        const val TOOL_CALLS_MARKER = " [Tools:"
+
         /** Standard message roles for API compatibility. */
         const val ROLE_USER = "user"
         const val ROLE_ASSISTANT = "assistant"
@@ -205,8 +208,9 @@ data class Message(
             val contentStr = buildString {
                 if (!text.isNullOrBlank()) append(text)
                 if (toolCalls.isNotEmpty()) {
-                    if (isNotEmpty()) append(" ")
-                    append("[Tools: ${toolCalls.joinToString { it.name }}]")
+                    append(TOOL_CALLS_MARKER)
+                    append(toolCalls.joinToString { it.name })
+                    append("]")
                 }
             }
             
@@ -286,7 +290,7 @@ data class Conversation(
                     // Extract text portion from "text [Tools: tap, type]" format
                     // Strip tool metadata suffix: whitespace + "[Tools: ...]"
                     val textOnly = msg.content
-                        .replace(Regex("""\s*\[Tools:.*?]"""), "")
+                        .replace(Regex("""${Regex.escape(Message.TOOL_CALLS_MARKER)}.*?]"""), "")
                         .trim()
                     if (textOnly.isNotEmpty()) {
                         msg.copy(content = textOnly)

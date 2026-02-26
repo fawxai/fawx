@@ -99,4 +99,48 @@ class InterruptionClassifierTest {
         ) as InterruptionEvent.ExternalInterrupt
         assertTrue(result.description.contains("system", ignoreCase = true))
     }
+
+    @Test
+    fun `classifyWindowChange returns null for all known keyboard packages`() {
+        val keyboardPackages = listOf(
+            "com.google.android.inputmethod.latin",
+            "com.samsung.android.honeyboard",
+            "com.swiftkey",
+            "com.touchtype.swiftkey",
+            "com.baidu.input",
+            "com.iflytek.inputmethod",
+            "com.android.inputmethod.latin"
+        )
+
+        keyboardPackages.forEach { pkg ->
+            val result = InterruptionClassifier.classifyWindowChange(
+                newPackage = pkg,
+                expectedPackage = "com.google.android.gm",
+                isAgentAction = false
+            )
+            assertNull("Expected no interruption for keyboard package $pkg", result)
+        }
+    }
+
+    @Test
+    fun `classifyWindowChange returns null for keyboard package when expectedPackage is null`() {
+        val result = InterruptionClassifier.classifyWindowChange(
+            newPackage = "com.google.android.inputmethod.latin",
+            expectedPackage = null,
+            isAgentAction = false
+        )
+
+        assertNull(result)
+    }
+
+    @Test
+    fun `classifyWindowChange prioritizes agent actions over keyboard package checks`() {
+        val result = InterruptionClassifier.classifyWindowChange(
+            newPackage = "com.google.android.inputmethod.latin",
+            expectedPackage = "com.google.android.gm",
+            isAgentAction = true
+        )
+
+        assertNull(result)
+    }
 }

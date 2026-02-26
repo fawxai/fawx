@@ -15,6 +15,26 @@ object InterruptionClassifier {
     private val SYSTEM_PACKAGES = setOf("android", "com.android.systemui")
 
     /**
+     * Keyboard / IME packages that should NOT be treated as app switches.
+     *
+     * Keyboard windows can emit window-state events with the IME package even
+     * while the user is still in the same target app (e.g. Gmail compose).
+     * Treating these as AppSwitch causes false interruption pauses.
+     *
+     * TODO(#734): Replace this allowlist with runtime IME detection
+     * (InputMethodManager/window type) so unknown keyboards are also suppressed.
+     */
+    private val KEYBOARD_PACKAGES = setOf(
+        "com.google.android.inputmethod.latin",   // Gboard
+        "com.samsung.android.honeyboard",         // Samsung Keyboard
+        "com.swiftkey",                           // Microsoft SwiftKey
+        "com.touchtype.swiftkey",                 // SwiftKey legacy package
+        "com.baidu.input",                        // Baidu input
+        "com.iflytek.inputmethod",                // iFlytek input
+        "com.android.inputmethod.latin"           // AOSP LatinIME
+    )
+
+    /**
      * Classify a window state change into an InterruptionEvent.
      *
      * Note: If the user opens Citros itself (e.g., chat overlay), it will be
@@ -33,6 +53,7 @@ object InterruptionClassifier {
     ): InterruptionEvent? {
         if (isAgentAction) return null
         if (expectedPackage != null && newPackage == expectedPackage) return null
+        if (KEYBOARD_PACKAGES.contains(newPackage)) return null
 
         return when {
             PHONE_PACKAGES.contains(newPackage) ->

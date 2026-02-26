@@ -68,8 +68,13 @@ class WebFetchClient {
 
                 val response = httpClient.newCall(request).execute()
                 if (!response.isSuccessful) {
+                    val prefix = if (isLikelyDynamicTravelUrl(url)) {
+                        "Fetch failed (${response.code}) on a dynamic content page"
+                    } else {
+                        "Fetch failed (${response.code})"
+                    }
                     return@withContext ToolResult(
-                        "Fetch failed (${response.code}): ${response.message}",
+                        "$prefix: ${response.message}",
                         isError = true
                     )
                 }
@@ -88,9 +93,25 @@ class WebFetchClient {
                 }
 
                 if (text.isBlank()) {
+                    if (isLikelyDynamicTravelUrl(url)) {
+                        // Intentionally non-error: the request succeeded, but the page is
+                        // likely a dynamic shell. Runtime fallback guidance is appended by
+                        // AgentExecutor from deterministic signal classification.
+                        return@withContext ToolResult(
+                            "Fetched dynamic page shell with limited static content."
+                        )
+                    }
                     return@withContext ToolResult(
                         "Page at $url returned no readable content",
                         isError = true
+                    )
+                }
+
+                if (isLikelyDynamicTravelShell(url, text)) {
+                    // Intentionally non-error: partial signal from a shell page.
+                    // Runtime fallback guidance is appended by deterministic signal class.
+                    return@withContext ToolResult(
+                        "Fetched dynamic page shell with limited static content."
                     )
                 }
 
@@ -111,6 +132,12 @@ class WebFetchClient {
             }
         }
     }
+
+    internal fun isLikelyDynamicTravelUrl(url: String): Boolean =
+        TravelSignalCompatibility.isLikelyDynamicTravelUrl(url)
+
+    internal fun isLikelyDynamicTravelShell(url: String, extractedText: String): Boolean =
+        TravelSignalCompatibility.isLikelyDynamicTravelShell(url, extractedText)
 
     /**
      * Extract readable text from HTML using Jsoup.

@@ -364,7 +364,7 @@ class ToolUseTest {
 
         val request = server.takeRequest()
         val body = request.body.readUtf8()
-        
+
         // Verify tool result is sent as user message with content blocks
         assertTrue(body.contains("\"type\":\"tool_result\""))
         assertTrue(body.contains("\"tool_use_id\":\"toolu_123\""))
@@ -487,7 +487,7 @@ class ToolUseTest {
             "read_notifications", "tap_notification", "dismiss_notification", "reply_notification",
             "read_file", "write_file", "list_files",
             "remember", "recall", "list_memories", "learn",
-            "think", "wait", "long_press", "request_tools"
+            "think", "subtask", "wait", "long_press", "request_tools", "offer_choices"
         )
         assertEquals(expectedTools, toolNames.toSet(), "PhoneTools.ALL should contain exactly the expected tools")
     }

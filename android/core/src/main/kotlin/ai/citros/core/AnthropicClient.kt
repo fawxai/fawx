@@ -60,19 +60,11 @@ class AnthropicClient : BaseProviderClient {
     }
 
     override suspend fun chat(conversation: Conversation): Result<String> {
-        return executeRequest(
-            requestBody = buildChatRequest(conversation),
-            parseResponse = { jsonResponse ->
-                val text = parseChatResponse(jsonResponse)
-                    ?: throw ProviderException(
-                        provider = provider,
-                        statusCode = null,
-                        message = "API returned no text content in response",
-                        isAuthFailure = false
-                    )
-                ChatResponse(text, emptyList(), null, parseUsage(jsonResponse))
-            }
-        ).map { it.text!! }
+        return executeTextChat(conversation).map { it.text!! }
+    }
+
+    override suspend fun chatWithUsage(conversation: Conversation): Result<Pair<String, TokenUsage?>> {
+        return executeTextChat(conversation).map { response -> response.text!! to response.usage }
     }
 
     /**
@@ -119,6 +111,8 @@ class AnthropicClient : BaseProviderClient {
      * Format: system as top-level field, messages array with user/assistant roles.
      */
     override fun buildChatRequest(conversation: Conversation): JsonObject {
+        val sanitizedChatMessages = sanitizeChatMessagesForApi(conversation.toApiMessages())
+
         return buildJsonObject {
             put("model", config.chatModelId)
             put("max_tokens", maxTokens)
@@ -130,10 +124,10 @@ class AnthropicClient : BaseProviderClient {
                 }
             }
             putJsonArray("messages") {
-                conversation.toApiMessages().forEach { msg ->
+                sanitizedChatMessages.forEach { msg ->
                     addJsonObject {
-                        put("role", msg["role"])
-                        put("content", msg["content"])
+                        put("role", msg.getValue("role"))
+                        put("content", msg.getValue("content"))
                     }
                 }
             }
@@ -153,9 +147,13 @@ class AnthropicClient : BaseProviderClient {
     /**
      * Sanitize messages before sending to the API.
      *
-     * Validates that every tool_result block references a tool_use in the
-     * immediately preceding assistant message. Orphaned tool_results are
-     * converted to plain text messages to prevent API rejection.
+     * Enforces Anthropic tool-call invariants in both directions:
+     * - every tool_result must reference a tool_use in the immediately
+     *   preceding assistant message
+     * - every assistant tool_use must have a corresponding subsequent tool_result
+     *
+     * Invalid tool state is degraded to plain text context to prevent API
+     * rejection while preserving conversational continuity.
      *
      * Also ensures the first message is role="user" (not a tool message).
      *
@@ -165,21 +163,26 @@ class AnthropicClient : BaseProviderClient {
     internal fun sanitizeMessages(messages: List<Message>): List<Message> {
         if (messages.isEmpty()) return messages
 
+        // First pass: if an assistant tool batch is incomplete (missing tool_result
+        // for one or more tool_use IDs), degrade that assistant message to plain
+        // text so the unmatched tool_use blocks are never sent to Anthropic.
+        val toolUseSanitized = sanitizeIncompleteAssistantToolUse(messages)
+
         val result = mutableListOf<Message>()
 
         // Drop leading tool messages (they have no preceding assistant)
         var startIdx = 0
-        while (startIdx < messages.size && messages[startIdx].role == Message.ROLE_TOOL) {
-            Log.w("CitrosAPI", "sanitizeMessages: dropping leading tool message at index $startIdx (toolCallId=${messages[startIdx].toolCallId})")
+        while (startIdx < toolUseSanitized.size && toolUseSanitized[startIdx].role == Message.ROLE_TOOL) {
+            Log.w("CitrosAPI", "sanitizeMessages: dropping leading tool message at index $startIdx (toolCallId=${toolUseSanitized[startIdx].toolCallId})")
             // Convert to plain user text so context isn't lost
-            result.add(Message(role = Message.ROLE_USER, content = "[tool result] ${messages[startIdx].content.take(200)}"))
+            result.add(Message(role = Message.ROLE_USER, content = "[tool result] ${toolUseSanitized[startIdx].content.take(200)}"))
             startIdx++
         }
 
         // Process remaining messages, checking tool_result/tool_use pairing
         var lastAssistantToolIds: Set<String> = emptySet()
-        for (i in startIdx until messages.size) {
-            val msg = messages[i]
+        for (i in startIdx until toolUseSanitized.size) {
+            val msg = toolUseSanitized[i]
             when (msg.role) {
                 Message.ROLE_ASSISTANT -> {
                     // Extract tool_use IDs from this assistant message
@@ -220,6 +223,147 @@ class AnthropicClient : BaseProviderClient {
         }
 
         return merged
+    }
+
+    /**
+     * Sanitize assistant tool-use messages when a tool batch is partially completed.
+     *
+     * Assumption (documented): Anthropic pairing is evaluated against immediately
+     * adjacent ROLE_TOOL messages that follow the assistant tool batch. Any
+     * non-tool gap ends that batch; later tool results are treated as unrelated.
+     *
+     * Behavior:
+     * - complete batch: keep unchanged
+     * - partial batch: preserve only matched tool_use blocks; degrade only unmatched
+     *   tool_use blocks by rebuilding assistant message with surviving tool calls
+     * - no matched results: fully degrade assistant message to plain text
+     */
+    private fun sanitizeIncompleteAssistantToolUse(messages: List<Message>): List<Message> {
+        val sanitized = messages.toMutableList()
+
+        for (index in sanitized.indices) {
+            val message = sanitized[index]
+            if (message.role != Message.ROLE_ASSISTANT) continue
+
+            val toolUseBlocks = message.contentBlocks
+                ?.filter { it["type"] == "tool_use" }
+                .orEmpty()
+            val expectedToolIds = toolUseBlocks
+                .mapNotNull { it["id"] as? String }
+                .toSet()
+
+            if (expectedToolIds.isEmpty()) continue
+
+            val observedToolResultIds = mutableSetOf<String>()
+            var cursor = index + 1
+            while (cursor < sanitized.size && sanitized[cursor].role == Message.ROLE_TOOL) {
+                sanitized[cursor].toolCallId?.let { observedToolResultIds.add(it) }
+                cursor++
+            }
+
+            if (observedToolResultIds.containsAll(expectedToolIds)) continue
+
+            val preservedIds = expectedToolIds.intersect(observedToolResultIds)
+            val missingIds = expectedToolIds - observedToolResultIds
+            val fallbackText = message.content
+                .substringBefore(Message.TOOL_CALLS_MARKER)
+                .ifBlank { "Previous tool request was interrupted." }
+
+            if (preservedIds.isEmpty()) {
+                Log.w(
+                    "CitrosAPI",
+                    "sanitizeMessages: assistant tool_use without tool_result at index $index " +
+                        "(missing=$missingIds, preservedTextLen=0, fallbackTextLen=${fallbackText.length}). " +
+                        "Converting assistant tool batch to text."
+                )
+                sanitized[index] = Message(
+                    role = Message.ROLE_ASSISTANT,
+                    content = fallbackText,
+                    timestamp = message.timestamp
+                )
+                continue
+            }
+
+            val preservedToolCalls = toolUseBlocks.mapNotNull { block ->
+                val id = block["id"] as? String ?: return@mapNotNull null
+                if (id !in preservedIds) return@mapNotNull null
+                val name = block["name"] as? String ?: return@mapNotNull null
+                @Suppress("UNCHECKED_CAST")
+                val input = (block["input"] as? Map<String, Any>).orEmpty()
+                ToolCall(id = id, name = name, input = input)
+            }
+
+            val rebuilt = Message.assistantWithTools(
+                text = fallbackText.takeIf { it.isNotBlank() },
+                toolCalls = preservedToolCalls
+            )
+                // Keep original timestamp while preserving assistantWithTools-built _contentBlocks.
+                .copy(timestamp = message.timestamp)
+
+            Log.w(
+                "CitrosAPI",
+                "sanitizeMessages: partial assistant tool_use at index $index " +
+                    "(preserved=$preservedIds, missing=$missingIds, preservedTextLen=${rebuilt.content.length}, fallbackTextLen=${fallbackText.length}). " +
+                    "Dropping unmatched tool_use blocks."
+            )
+
+            sanitized[index] = rebuilt
+        }
+
+        return sanitized
+    }
+
+    /**
+     * Anthropic rejects assistant text that ends with trailing whitespace.
+     *
+     * We intentionally use [trimEnd] (not [trim]) so we preserve leading
+     * whitespace/indentation (for example Markdown/code formatting) while
+     * removing the API-invalid suffix.
+     */
+    private fun sanitizeAssistantTextForApi(text: String): String = text.trimEnd()
+
+    /**
+     * Return sanitized assistant text or null when trimming would produce empty content.
+     *
+     * Anthropic rejects empty assistant text payloads, so callers should drop
+     * assistant messages/blocks that become empty after sanitization.
+     */
+    private fun sanitizeAssistantTextForApiOrNull(text: String): String? =
+        sanitizeAssistantTextForApi(text).takeIf { it.isNotEmpty() }
+
+    /**
+     * Apply Anthropic assistant-text sanitization to chat-mode API messages.
+     *
+     * This keeps sanitization centralized for both [buildChatRequest] and
+     * [buildToolRequest] and drops assistant messages that would serialize as
+     * empty strings.
+     */
+    private fun sanitizeChatMessagesForApi(messages: List<Map<String, String>>): List<Map<String, String>> {
+        return messages.mapNotNull { message ->
+            if (message["role"] != Message.ROLE_ASSISTANT) {
+                return@mapNotNull message
+            }
+
+            val rawContent = message["content"] ?: return@mapNotNull null
+            val sanitizedContent = sanitizeAssistantTextForApiOrNull(rawContent)
+                ?: return@mapNotNull null
+
+            message + ("content" to sanitizedContent)
+        }
+    }
+
+    private fun sanitizeAssistantContentBlocksForApi(blocks: List<Map<String, Any>>): List<Map<String, Any>> {
+        return blocks.mapNotNull { block ->
+            if (block["type"] != "text") {
+                return@mapNotNull block
+            }
+
+            val rawText = block["text"] as? String ?: return@mapNotNull block
+            val sanitizedText = sanitizeAssistantTextForApiOrNull(rawText)
+                ?: return@mapNotNull null
+
+            block + ("text" to sanitizedText)
+        }
     }
 
     internal override fun buildToolRequest(
@@ -304,13 +448,21 @@ class AnthropicClient : BaseProviderClient {
                         }
                         // Assistant message with tool calls: role="assistant" with content blocks
                         msg.role == "assistant" && blocks != null -> {
-                            addJsonObject {
-                                put("role", "assistant")
-                                putJsonArray("content") {
-                                    blocks.forEach { block ->
-                                        addJsonObject {
-                                            block.forEach { (key, value) ->
-                                                put(key, anyToJsonElement(value))
+                            val sanitizedBlocks = sanitizeAssistantContentBlocksForApi(blocks)
+                            if (sanitizedBlocks.isEmpty()) {
+                                Log.w(
+                                    "CitrosAPI",
+                                    "buildToolRequest: dropping assistant content-block message with empty text after sanitization"
+                                )
+                            } else {
+                                addJsonObject {
+                                    put("role", "assistant")
+                                    putJsonArray("content") {
+                                        sanitizedBlocks.forEach { block ->
+                                            addJsonObject {
+                                                block.forEach { (key, value) ->
+                                                    put(key, anyToJsonElement(value))
+                                                }
                                             }
                                         }
                                     }
@@ -319,9 +471,22 @@ class AnthropicClient : BaseProviderClient {
                         }
                         // Regular text message
                         else -> {
-                            addJsonObject {
-                                put("role", msg.role)
-                                put("content", msg.content)
+                            val content = if (msg.role == Message.ROLE_ASSISTANT) {
+                                sanitizeAssistantTextForApiOrNull(msg.content)
+                            } else {
+                                msg.content
+                            }
+
+                            if (content == null) {
+                                Log.w(
+                                    "CitrosAPI",
+                                    "buildToolRequest: dropping assistant text message with empty content after sanitization"
+                                )
+                            } else {
+                                addJsonObject {
+                                    put("role", msg.role)
+                                    put("content", content)
+                                }
                             }
                         }
                     }

@@ -1,6 +1,8 @@
 package ai.citros.chat
 
+import android.app.Application
 import android.content.Context
+import android.content.Intent
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
@@ -20,7 +22,10 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.Shadows.shadowOf
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 @RunWith(RobolectricTestRunner::class)
@@ -155,6 +160,48 @@ class SettingsScreenTest {
     }
 
     @Test
+    fun `add key bottom sheet updates API key management link when provider changes`() {
+        composeRule.setContent {
+            SettingsScreen(
+                walletManager = testWalletManager,
+                keyStore = InMemoryKeyStore(),
+                onBack = {}
+            )
+        }
+
+        composeRule.onNodeWithContentDescription("Add Key").performClick()
+        composeRule.onNodeWithText("Manage API keys at console.anthropic.com/settings/keys").assertExists()
+
+        composeRule.onNodeWithText("OpenAI").performClick()
+        composeRule.onNodeWithText("Manage API keys at platform.openai.com/api-keys").assertExists()
+
+        composeRule.onNodeWithText("OpenRouter").performClick()
+        composeRule.onNodeWithText("Manage API keys at openrouter.ai/keys").assertExists()
+    }
+
+    @Test
+    fun `add key bottom sheet opens selected provider API key URL`() {
+        val application = ApplicationProvider.getApplicationContext<Application>()
+
+        composeRule.setContent {
+            SettingsScreen(
+                walletManager = testWalletManager,
+                keyStore = InMemoryKeyStore(),
+                onBack = {}
+            )
+        }
+
+        composeRule.onNodeWithContentDescription("Add Key").performClick()
+        composeRule.onNodeWithText("OpenAI").performClick()
+        composeRule.onNodeWithText("Manage API keys at platform.openai.com/api-keys").performClick()
+
+        val startedIntent = shadowOf(application).nextStartedActivity
+        assertNotNull(startedIntent)
+        assertEquals(Intent.ACTION_VIEW, startedIntent.action)
+        assertEquals("https://platform.openai.com/api-keys", startedIntent.dataString)
+    }
+
+    @Test
     @org.junit.Ignore("performTouchInput swipeLeft broken under Robolectric 4.14 (#361)")
     fun `swipe to delete opens confirmation and deletes key`() {
         val keyStore = InMemoryKeyStore()
@@ -195,6 +242,7 @@ class SettingsScreenTest {
                 onOpenPhoneControl = {},
                 onOpenSound = {},
                 onOpenAppearance = {},
+                onOpenToolCategories = {},
                 onOpenAbout = {}
             )
         }
@@ -214,6 +262,7 @@ class SettingsScreenTest {
                 onOpenPhoneControl = {},
                 onOpenSound = {},
                 onOpenAppearance = {},
+                onOpenToolCategories = {},
                 onOpenAbout = {}
             )
         }
@@ -233,6 +282,7 @@ class SettingsScreenTest {
                 onOpenPhoneControl = {},
                 onOpenSound = {},
                 onOpenAppearance = {},
+                onOpenToolCategories = {},
                 onOpenAbout = {}
             )
         }
@@ -252,6 +302,7 @@ class SettingsScreenTest {
                 onOpenPhoneControl = {},
                 onOpenSound = {},
                 onOpenAppearance = {},
+                onOpenToolCategories = {},
                 onOpenAbout = {}
             )
         }
@@ -271,10 +322,41 @@ class SettingsScreenTest {
                 onOpenPhoneControl = {},
                 onOpenSound = {},
                 onOpenAppearance = {},
+                onOpenToolCategories = {},
                 onOpenAbout = {}
             )
         }
         composeRule.onNodeWithText("Version, licenses", useUnmergedTree = true).assertExists()
+    }
+
+    @Test
+    fun `computeRuntimeModelSelectionCorrection applies deterministic fallbacks and notices`() {
+        val correction = computeRuntimeModelSelectionCorrection(
+            provider = Provider.OPENAI,
+            selectedChatModelId = "missing-chat",
+            selectedActionModelId = "gpt-4o-mini",
+            chatModels = listOf("o3", "gpt-4o"),
+            actionModels = listOf("o3", "gpt-4o")
+        )
+
+        assertEquals("o3", correction.chatModelId)
+        assertEquals("o3", correction.actionModelId)
+        assertEquals(2, correction.notices.size)
+    }
+
+    @Test
+    fun `computeRuntimeModelSelectionCorrection keeps valid selections unchanged`() {
+        val correction = computeRuntimeModelSelectionCorrection(
+            provider = Provider.ANTHROPIC,
+            selectedChatModelId = "claude-opus-4-6",
+            selectedActionModelId = "claude-sonnet-4-5-20250929",
+            chatModels = listOf("claude-opus-4-6", "claude-sonnet-4-5-20250929"),
+            actionModels = listOf("claude-sonnet-4-5-20250929")
+        )
+
+        assertEquals("claude-opus-4-6", correction.chatModelId)
+        assertEquals("claude-sonnet-4-5-20250929", correction.actionModelId)
+        assertFalse(correction.notices.isNotEmpty())
     }
 
     private class InMemoryWalletStorage : ai.citros.core.WalletStorage {

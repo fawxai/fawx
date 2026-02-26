@@ -27,6 +27,11 @@ package ai.citros.core
 class AgentExecutor(
     private val delegate: ToolExecutionDelegate,
     private val progressListener: LoopProgressListener,
+    private val actionPolicy: ActionPolicy = PermissiveActionPolicy,
+    private val policyAuditLogger: PolicyAuditLogger = NoopPolicyAuditLogger,
+    /** Optional rollout hook: when true, emit audit records for allow decisions too. */
+    private val auditAllowDecisions: Boolean = false,
+    private val rolloutTelemetry: PolicyRolloutTelemetry = PolicyRolloutTelemetry(),
     private val boundaryChecks: List<BoundaryCheck> = defaultBoundaryChecks(),
     private val maxToolSteps: Int = DEFAULT_MAX_TOOL_STEPS,
     /**
@@ -73,7 +78,16 @@ class AgentExecutor(
      *
      * Defaults to `null` (no transformation). Required for H2 context trimming.
      */
-    private val transformContext: (suspend () -> Unit)? = null
+    private val transformContext: (suspend () -> Unit)? = null,
+    /** Deterministic recovery strategy manager (advisory guidance injection). */
+    private val recoveryManager: RecoveryManager = RecoveryManager(),
+    /**
+     * Optional hook invoked after each tool boundary with checkpoint metadata.
+     * Used by service architecture to persist durable recovery state.
+     */
+    private val checkpointCallback: (suspend (LoopCheckpoint) -> Unit)? = null,
+    /** Domain-agnostic source-quality classifier for runtime fallback signaling. */
+    private val toolSignalClassifier: ToolSignalClassifier = ToolSignalClassifier()
 ) {
     private val completionGate = TaskCompletionGate()
 
@@ -87,6 +101,10 @@ class AgentExecutor(
 
         /** Maximum length for error messages in tool results and loop results. */
         const val ERROR_MESSAGE_MAX_LENGTH = 100
+        const val CONFIRM_TIMEOUT_MS = 60_000L
+
+        /** Tool names currently covered by runtime research signal classification. */
+        private val RESEARCH_SIGNAL_TOOL_NAMES = setOf("web_search", "web_fetch")
 
         /**
          * Default boundary checks (without accessibility gating).
@@ -101,16 +119,20 @@ class AgentExecutor(
          * 1. [CancellationCheck] — highest priority, exits immediately
          * 2. [StepLimitCheck] — hard ceiling on loop iterations
          * 3. [StuckDetectionCheck] — injects warning when screen is unchanged
-         * 4. [SteerCheck] — injects user messages (last: stop should short-circuit first)
+         * 4. [ActionVerificationCheck] — warns when UI-mutating actions appear ineffective
+         * 5. [UserInterruptionCheck] — optional (feature-flagged)
+         * 6. [SteerCheck] — injects user messages (last: stop should short-circuit first)
          */
-        fun defaultBoundaryChecks(): List<BoundaryCheck> = listOf(
-            CancellationCheck(),
-            StepLimitCheck(),
-            StuckDetectionCheck.withDefaults(),
-            ActionVerificationCheck(),
-            UserInterruptionCheck(),
-            SteerCheck()
-        )
+        fun defaultBoundaryChecks(): List<BoundaryCheck> = buildList {
+            add(CancellationCheck())
+            add(StepLimitCheck())
+            add(StuckDetectionCheck.withDefaults())
+            add(ActionVerificationCheck())
+            if (FeatureFlags.userInterruptionCheckEnabled) {
+                add(UserInterruptionCheck())
+            }
+            add(SteerCheck())
+        }
 
         /**
          * Default boundary checks including accessibility gating.
@@ -120,7 +142,9 @@ class AgentExecutor(
          * 2. [AccessibilityGateCheck] — gate on service availability
          * 3. [StepLimitCheck] — hard ceiling
          * 4. [StuckDetectionCheck] — injects warning when screen is unchanged
-         * 5. [SteerCheck] — injects user messages (last: stop should short-circuit first)
+         * 5. [ActionVerificationCheck] — warns when UI-mutating actions appear ineffective
+         * 6. [UserInterruptionCheck] — optional (feature-flagged)
+         * 7. [SteerCheck] — injects user messages (last: stop should short-circuit first)
          */
         fun defaultBoundaryChecksWithAccessibility(
             isAvailable: () -> Boolean,
@@ -129,15 +153,17 @@ class AgentExecutor(
             onLost: () -> Unit,
             baseTimeoutMs: Long = AccessibilityGateCheck.DEFAULT_BASE_TIMEOUT_MS,
             maxRetries: Int = AccessibilityGateCheck.DEFAULT_MAX_RETRIES
-        ): List<BoundaryCheck> = listOf(
-            CancellationCheck(),
-            AccessibilityGateCheck(isAvailable, waitForReconnect, onReconnected, onLost, baseTimeoutMs, maxRetries),
-            StepLimitCheck(),
-            StuckDetectionCheck.withDefaults(),
-            ActionVerificationCheck(),
-            UserInterruptionCheck(),
-            SteerCheck()
-        )
+        ): List<BoundaryCheck> = buildList {
+            add(CancellationCheck())
+            add(AccessibilityGateCheck(isAvailable, waitForReconnect, onReconnected, onLost, baseTimeoutMs, maxRetries))
+            add(StepLimitCheck())
+            add(StuckDetectionCheck.withDefaults())
+            add(ActionVerificationCheck())
+            if (FeatureFlags.userInterruptionCheckEnabled) {
+                add(UserInterruptionCheck())
+            }
+            add(SteerCheck())
+        }
     }
 
     /**
@@ -154,6 +180,49 @@ class AgentExecutor(
      * @param continueAfterTools Lambda to get the next model response after tool results
      * @return Structured [LoopResult] describing what happened
      */
+    private fun extractEgressUrl(toolCall: ToolCall): String? = when (toolCall.name) {
+        "web_fetch", "web_browse" -> toolCall.input["url"] as? String
+        else -> null
+    }
+
+    private fun extractPolicyEndpointHost(toolCall: ToolCall): String? {
+        val rawUrl = extractEgressUrl(toolCall) ?: return null
+        val uri = kotlin.runCatching { java.net.URI(rawUrl) }.getOrNull() ?: return null
+        val host = uri.host ?: return null
+        return kotlin.runCatching { java.net.IDN.toASCII(host.trim().trimEnd('.').lowercase()) }.getOrNull()
+    }
+
+    /**
+     * Classify runtime source quality for research tools.
+     *
+     * Slice-1 intentionally scopes this to `web_search` and `web_fetch` so rollout
+     * remains low-risk while fallback hint behavior is validated. Future slices can
+     * extend [RESEARCH_SIGNAL_TOOL_NAMES] as additional tools adopt signal semantics.
+     */
+    private fun classifyResearchSignal(toolCall: ToolCall, actionResult: ToolResult): ToolSignalClass? {
+        if (toolCall.name !in RESEARCH_SIGNAL_TOOL_NAMES) return null
+        return toolSignalClassifier.classify(toolCall, actionResult)
+    }
+
+    private fun annotateResultWithSignal(toolResult: String, signalClass: ToolSignalClass?): String {
+        val annotation = signalClass?.let { ToolSignalFallbackHints.annotationFor(it) } ?: return toolResult
+        return buildString {
+            append(toolResult.trimEnd())
+            appendLine()
+            appendLine()
+            append(annotation)
+        }
+    }
+
+    private suspend fun emitRequiredPolicyAudit(event: PolicyAuditEvent, toolCall: ToolCall): Boolean {
+        val writeResult = policyAuditLogger.emit(event)
+        rolloutTelemetry.recordRequiredAuditEmission(writeResult.isSuccess)
+        if (writeResult.isSuccess) return true
+        val errorSummary = writeResult.exceptionOrNull()?.message ?: "unknown write failure"
+        delegate.addToolResult(toolCall.id, "Policy audit write failed (${event.decision}); action not executed. error=$errorSummary", toolCall.name, isError = true)
+        return false
+    }
+
     suspend fun run(
         initialResponse: ChatResponse,
         initialScreenContent: ScreenContent?,
@@ -166,6 +235,12 @@ class AgentExecutor(
         var response: ChatResponse? = initialResponse
         var screenContent = initialScreenContent
         var toolSteps = 0
+        // Recovery-level streak across tool calls in this run (global, not per tool name).
+        // Distinct from `failureCounts`, which tracks per-tool retries for error severity escalation.
+        var consecutiveFailures = 0
+        var loopStateContext = LoopStateContext()
+        val taskStartMs = System.currentTimeMillis()
+        val taskId = java.util.UUID.randomUUID().toString()
 
         // If no tool calls in initial response, return immediately
         if (response == null || response.toolCalls.isEmpty()) {
@@ -232,8 +307,161 @@ class AgentExecutor(
 
             var steered = false
             for ((toolIndex, toolCall) in response.toolCalls.withIndex()) {
-                val preActionHash = screenContent?.hashCode()
+                val preActionScreen = screenContent
+                val preActionHash = preActionScreen?.hashCode()
                 progressListener.onToolStarted(toolCall.name, toolIndex, response.toolCalls.size)
+
+                val policyContext = PolicyContext(
+                    foregroundApp = screenContent?.packageName,
+                    appIdentifier = ActionPolicyNormalizer.normalizeAppIdentifier(
+                        contextAppIdentifier = toolCall.input["app_package"] as? String,
+                        fallbackDisplayName = toolCall.input["app_name"] as? String
+                    ),
+                    screenContentSummary = PolicySummarySanitizer.sanitize(screenContent?.toToolResult())?.take(200),
+                    targetNodeHints = listOfNotNull(
+                        toolCall.input["text"] as? String,
+                        toolCall.input["content_desc"] as? String,
+                        toolCall.input["resource_id"] as? String,
+                        toolCall.input["hint"] as? String
+                    ),
+                    recentActionCount = toolSteps,
+                    taskElapsedMs = System.currentTimeMillis() - taskStartMs
+                )
+
+                val evaluation = try {
+                    actionPolicy.evaluate(toolCall, policyContext)
+                } catch (_: Exception) {
+                    PolicyEvaluation(
+                        decision = PolicyDecision.Deny(
+                            reasonCode = PolicyReasonCode.DENY_POLICY_EVAL_EXCEPTION,
+                            reason = "Policy evaluation failed; action blocked"
+                        )
+                    )
+                }
+                rolloutTelemetry.recordEvaluation(evaluation)
+
+                when (val decision = evaluation.decision) {
+                    is PolicyDecision.Allow -> {
+                        if (auditAllowDecisions) {
+                            val emitted = emitRequiredPolicyAudit(
+                                PolicyAuditEvent(
+                                    eventId = java.util.UUID.randomUUID().toString(),
+                                    tsUtc = java.time.Instant.now().toString(),
+                                    taskId = taskId,
+                                    toolCallId = toolCall.id,
+                                    toolName = toolCall.name,
+                                    decision = PolicyAuditDecision.ALLOW,
+                                    reasonCode = evaluation.reasonCode ?: PolicyReasonCode.ALLOW_DEFAULT,
+                                    reasonText = null,
+                                    foregroundApp = policyContext.foregroundApp,
+                                    appIdentifier = policyContext.appIdentifier,
+                                    endpointHost = extractPolicyEndpointHost(toolCall),
+                                    firstUseObserved = evaluation.firstUseObserved,
+                                    overrideApplied = false,
+                                    confirmOutcome = PolicyConfirmOutcome.NA,
+                                    confirmationRequestId = null
+                                ),
+                                toolCall
+                            )
+                            if (!emitted) continue
+                        }
+                    }
+                    is PolicyDecision.Confirm -> {
+                        val requestId = java.util.UUID.randomUUID().toString()
+                        val approved = kotlinx.coroutines.withTimeoutOrNull(CONFIRM_TIMEOUT_MS) {
+                            delegate.requestUserConfirmation(
+                                toolCall = toolCall,
+                                requestId = requestId,
+                                reason = decision.reason,
+                                timeoutMs = CONFIRM_TIMEOUT_MS,
+                                reasonCode = decision.reasonCode
+                            )
+                        }
+                        val outcome = when (approved) {
+                            true -> PolicyConfirmOutcome.APPROVED
+                            false -> PolicyConfirmOutcome.DENIED
+                            null -> PolicyConfirmOutcome.TIMEOUT
+                        }
+                        rolloutTelemetry.recordConfirmationOutcome(outcome)
+                        val emitted = emitRequiredPolicyAudit(
+                            PolicyAuditEvent(
+                                eventId = java.util.UUID.randomUUID().toString(),
+                                tsUtc = java.time.Instant.now().toString(),
+                                taskId = taskId,
+                                toolCallId = toolCall.id,
+                                toolName = toolCall.name,
+                                decision = PolicyAuditDecision.CONFIRM,
+                                reasonCode = decision.reasonCode,
+                                reasonText = decision.reason,
+                                foregroundApp = policyContext.foregroundApp,
+                                appIdentifier = policyContext.appIdentifier,
+                                endpointHost = extractPolicyEndpointHost(toolCall),
+                                firstUseObserved = evaluation.firstUseObserved,
+                                overrideApplied = decision.reasonCode == PolicyReasonCode.CONFIRM_USER_OVERRIDE,
+                                confirmOutcome = outcome,
+                                confirmationRequestId = requestId
+                            ),
+                            toolCall
+                        )
+                        if (!emitted) continue
+                        if (approved != true) {
+                            val message = if (approved == null) "User confirmation timed out after ${CONFIRM_TIMEOUT_MS}ms" else "User denied: ${decision.reason}"
+                            delegate.addToolResult(toolCall.id, message, toolCall.name, isError = true)
+                            continue
+                        }
+                    }
+                    is PolicyDecision.Deny -> {
+                        val emitted = emitRequiredPolicyAudit(
+                            PolicyAuditEvent(
+                                eventId = java.util.UUID.randomUUID().toString(),
+                                tsUtc = java.time.Instant.now().toString(),
+                                taskId = taskId,
+                                toolCallId = toolCall.id,
+                                toolName = toolCall.name,
+                                decision = PolicyAuditDecision.DENY,
+                                reasonCode = decision.reasonCode,
+                                reasonText = decision.reason,
+                                foregroundApp = policyContext.foregroundApp,
+                                appIdentifier = policyContext.appIdentifier,
+                                endpointHost = extractPolicyEndpointHost(toolCall),
+                                firstUseObserved = evaluation.firstUseObserved,
+                                overrideApplied = decision.reasonCode == PolicyReasonCode.DENY_USER_OVERRIDE,
+                                confirmOutcome = PolicyConfirmOutcome.NA,
+                                confirmationRequestId = null
+                            ),
+                            toolCall
+                        )
+                        if (!emitted) continue
+                        delegate.addToolResult(toolCall.id, "Action blocked by policy: ${decision.reason}", toolCall.name, isError = true)
+                        continue
+                    }
+                    is PolicyDecision.RateLimited -> {
+                        val emitted = emitRequiredPolicyAudit(
+                            PolicyAuditEvent(
+                                eventId = java.util.UUID.randomUUID().toString(),
+                                tsUtc = java.time.Instant.now().toString(),
+                                taskId = taskId,
+                                toolCallId = toolCall.id,
+                                toolName = toolCall.name,
+                                decision = PolicyAuditDecision.RATE_LIMITED,
+                                reasonCode = decision.reasonCode,
+                                reasonText = decision.reason,
+                                foregroundApp = policyContext.foregroundApp,
+                                appIdentifier = policyContext.appIdentifier,
+                                endpointHost = extractPolicyEndpointHost(toolCall),
+                                firstUseObserved = evaluation.firstUseObserved,
+                                overrideApplied = false,
+                                confirmOutcome = PolicyConfirmOutcome.NA,
+                                confirmationRequestId = null
+                            ),
+                            toolCall
+                        )
+                        if (!emitted) continue
+                        kotlinx.coroutines.delay(decision.cooldownMs)
+                        delegate.addToolResult(toolCall.id, decision.reason, toolCall.name, isError = true)
+                        continue
+                    }
+                }
 
                 // Execute the tool
                 val actionResult = try {
@@ -294,6 +522,35 @@ class AgentExecutor(
                     isUiMutatingTool = isUiMutatingTool
                 )
 
+                val failure = detectFailure(
+                    toolCall = toolCall,
+                    result = actionResult,
+                    screenBefore = preActionScreen.toFingerprint(),
+                    // Shared across sequential tool calls (including calls in the same model batch).
+                    // A success resets this streak, so recovery escalation reflects the current run's
+                    // contiguous failure streak rather than lifetime failures.
+                    screenAfter = screenContent.toFingerprint(),
+                    consecutiveFailures = consecutiveFailures
+                )
+
+                val recoveryGuidance = failure?.let { recoveryManager.evaluateFailure(it) }
+                if (failure != null) consecutiveFailures++ else consecutiveFailures = 0
+
+                val signalClass = classifyResearchSignal(toolCall, actionResult)
+                if (signalClass != null) {
+                    loopStateContext = loopStateContext.withLatestSignal(toolCall.name, signalClass)
+                }
+
+                val resultWithSignal = annotateResultWithSignal(toolResult, signalClass)
+                val toolResultWithRecovery = if (recoveryGuidance != null) {
+                    // Keep deterministic signal annotation attached to the raw tool output first,
+                    // then append optional recovery guidance. This preserves stable signal parsing
+                    // while allowing recovery scaffolds to evolve independently.
+                    resultWithSignal + recoveryGuidance
+                } else {
+                    resultWithSignal
+                }
+
                 // === POST-TOOL BOUNDARY CHECK POINT ===
                 // Drain steer messages at each tool boundary so SteerCheck can see them.
                 val steerMessages = steerMessageSource()
@@ -306,7 +563,8 @@ class AgentExecutor(
                     pendingSteerMessages = steerMessages,
                     lastToolWasUiMutating = isUiMutatingTool,
                     preActionScreenHash = preActionHash,
-                    pendingInterruption = interruptionSource()
+                    pendingInterruption = interruptionSource(),
+                    context = loopStateContext
                 )
                 val checkResult = evaluateBoundaryChecks(loopState)
 
@@ -317,7 +575,11 @@ class AgentExecutor(
                     fallbackStateMachine.reset()
                     ""
                 }
-                val toolResultWithFallback = toolResult + fallbackDirective
+                val toolResultWithFallback = toolResultWithRecovery + fallbackDirective
+
+                var pendingForCheckpoint = response.toolCalls.drop(toolIndex + 1)
+                var stopReason: String? = null
+                var shouldBreakToolBatch = false
 
                 when (checkResult) {
                     is CheckResult.Steer -> {
@@ -335,23 +597,51 @@ class AgentExecutor(
                         for (msg in checkResult.userMessages) {
                             delegate.addSteerMessage(msg)
                         }
+                        pendingForCheckpoint = emptyList()
                         steered = true
-                        break  // Skip remaining tool calls in this batch
+                        shouldBreakToolBatch = true
                     }
+
                     is CheckResult.Stop -> {
                         delegate.addToolResult(toolCall.id, toolResultWithFallback, toolCall.name, actionResult.isError)
-                        return LoopResult.Completed(
-                            text = null,
-                            steps = toolSteps,
-                            exitReason = checkResult.reason
+                        pendingForCheckpoint = emptyList()
+                        stopReason = checkResult.reason
+                    }
+
+                    is CheckResult.Inject -> {
+                        delegate.addToolResult(
+                            toolCall.id,
+                            toolResultWithFallback + checkResult.message,
+                            toolCall.name,
+                            actionResult.isError
                         )
                     }
-                    is CheckResult.Inject -> {
-                        delegate.addToolResult(toolCall.id, toolResultWithFallback + checkResult.message, toolCall.name, actionResult.isError)
-                    }
+
                     CheckResult.Continue -> {
                         delegate.addToolResult(toolCall.id, toolResultWithFallback, toolCall.name, actionResult.isError)
                     }
+                }
+
+                checkpointCallback?.invoke(
+                    LoopCheckpoint(
+                        step = toolSteps,
+                        maxSteps = maxToolSteps,
+                        lastToolName = toolCall.name,
+                        pendingToolCalls = pendingForCheckpoint,
+                        context = loopStateContext
+                    )
+                )
+
+                if (stopReason != null) {
+                    return LoopResult.Completed(
+                        text = null,
+                        steps = toolSteps,
+                        exitReason = stopReason ?: "stopped"
+                    )
+                }
+
+                if (shouldBreakToolBatch) {
+                    break // Skip remaining tool calls in this batch
                 }
             }
 
@@ -390,7 +680,6 @@ class AgentExecutor(
             exitReason = exitReason
         )
     }
-
 
     private fun classifyFailureClass(
         actionResult: ToolResult,
@@ -432,7 +721,20 @@ class AgentExecutor(
         return if (injections.isEmpty()) CheckResult.Continue
         else CheckResult.Inject(injections.joinToString(""))
     }
+    internal fun policyRolloutTelemetrySnapshot(): PolicyRolloutTelemetry.Snapshot = rolloutTelemetry.snapshot()
+
 }
+
+/**
+ * Minimal persisted checkpoint metadata emitted by [AgentExecutor] after each tool boundary.
+ */
+data class LoopCheckpoint(
+    val step: Int,
+    val maxSteps: Int,
+    val lastToolName: String,
+    val pendingToolCalls: List<ToolCall>,
+    val context: LoopStateContext = LoopStateContext()
+)
 
 /**
  * Structured result from [AgentExecutor.run].
@@ -520,6 +822,15 @@ interface ToolExecutionDelegate {
 
     /** Called when a new tool step starts (for syncing step counters). */
     fun onStepStarted(step: Int, maxSteps: Int)
+
+    /** Request runtime user confirmation for a gated tool action. */
+    suspend fun requestUserConfirmation(
+        toolCall: ToolCall,
+        requestId: String,
+        reason: String,
+        timeoutMs: Long,
+        reasonCode: String? = null
+    ): Boolean = false
 }
 
 /**

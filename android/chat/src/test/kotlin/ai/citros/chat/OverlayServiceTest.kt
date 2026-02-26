@@ -2,6 +2,7 @@ package ai.citros.chat
 
 import android.content.Context
 import android.content.Intent
+import androidx.compose.ui.unit.dp
 import org.junit.After
 import org.junit.Before
 import org.junit.Test
@@ -13,6 +14,7 @@ import org.robolectric.RobolectricTestRunner
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
+import kotlin.test.assertFalse
 
 /**
  * Unit tests for OverlayService intents, OverlayController state,
@@ -76,6 +78,11 @@ class OverlayServiceTest {
     }
 
     @Test
+    fun `MiniChatMaxHeight is pinned to 340 dp`() {
+        assertEquals(340.dp, OverlayUiConstants.MiniChatMaxHeight)
+    }
+
+    @Test
     fun `overlay controller mode transitions are reflected correctly`() {
         // Simulate what the service observes
         OverlayController.activateOverlay()
@@ -89,7 +96,7 @@ class OverlayServiceTest {
         // FULL_APP should signal the service to stop
         OverlayController.updateSurfaceMode(OverlaySurfaceMode.FULL_APP)
         assertEquals(OverlaySurfaceMode.FULL_APP, OverlayController.surfaceMode.value)
-        assertTrue(!OverlayController.isOverlayActive.value)
+        assertFalse(OverlayController.isOverlayActive.value)
     }
 
     @Test
@@ -98,7 +105,7 @@ class OverlayServiceTest {
         assertTrue(OverlayController.isOverlayActive.value)
 
         OverlayController.deactivateOverlay()
-        assertTrue(!OverlayController.isOverlayActive.value)
+        assertFalse(OverlayController.isOverlayActive.value)
         assertEquals(OverlaySurfaceMode.FULL_APP, OverlayController.surfaceMode.value)
     }
 
@@ -110,6 +117,85 @@ class OverlayServiceTest {
     @Test
     fun `ACTION_EXPAND constant is correct`() {
         assertEquals("ai.citros.chat.ACTION_EXPAND_OVERLAY", OverlayService.ACTION_EXPAND)
+    }
+
+    @Test
+    fun `FULL_APP transition launches chat only when explicit launch request is pending`() {
+        assertTrue(
+            OverlayService.shouldLaunchChatActivityOnSurfaceTransition(
+                mode = OverlaySurfaceMode.FULL_APP,
+                pendingChatLaunchRequest = true
+            )
+        )
+        assertFalse(
+            OverlayService.shouldLaunchChatActivityOnSurfaceTransition(
+                mode = OverlaySurfaceMode.FULL_APP,
+                pendingChatLaunchRequest = false
+            )
+        )
+    }
+
+    @Test
+    fun `SEARCH_BAR transition never launches chat even with pending request`() {
+        assertFalse(
+            OverlayService.shouldLaunchChatActivityOnSurfaceTransition(
+                mode = OverlaySurfaceMode.SEARCH_BAR,
+                pendingChatLaunchRequest = true
+            )
+        )
+        assertFalse(
+            OverlayService.shouldLaunchChatActivityOnSurfaceTransition(
+                mode = OverlaySurfaceMode.SEARCH_BAR,
+                pendingChatLaunchRequest = false
+            )
+        )
+    }
+
+    @Test
+    fun `DYNAMIC_ISLAND transition never launches chat even with pending request`() {
+        assertFalse(
+            OverlayService.shouldLaunchChatActivityOnSurfaceTransition(
+                mode = OverlaySurfaceMode.DYNAMIC_ISLAND,
+                pendingChatLaunchRequest = true
+            )
+        )
+        assertFalse(
+            OverlayService.shouldLaunchChatActivityOnSurfaceTransition(
+                mode = OverlaySurfaceMode.DYNAMIC_ISLAND,
+                pendingChatLaunchRequest = false
+            )
+        )
+    }
+
+    @Test
+    fun `surface transition launch guard matrix matches expected mode request combinations`() {
+        data class Case(
+            val mode: OverlaySurfaceMode,
+            val pendingChatLaunchRequest: Boolean,
+            val expectedLaunch: Boolean
+        )
+
+        val cases = listOf(
+            Case(OverlaySurfaceMode.FULL_APP, true, true),
+            Case(OverlaySurfaceMode.FULL_APP, false, false),
+            Case(OverlaySurfaceMode.PANEL, true, false),
+            Case(OverlaySurfaceMode.PANEL, false, false),
+            Case(OverlaySurfaceMode.SEARCH_BAR, true, false),
+            Case(OverlaySurfaceMode.SEARCH_BAR, false, false),
+            Case(OverlaySurfaceMode.DYNAMIC_ISLAND, true, false),
+            Case(OverlaySurfaceMode.DYNAMIC_ISLAND, false, false),
+        )
+
+        cases.forEach { case ->
+            assertEquals(
+                case.expectedLaunch,
+                OverlayService.shouldLaunchChatActivityOnSurfaceTransition(
+                    mode = case.mode,
+                    pendingChatLaunchRequest = case.pendingChatLaunchRequest
+                ),
+                "Expected launch=${case.expectedLaunch} for mode=${case.mode} pending=${case.pendingChatLaunchRequest}"
+            )
+        }
     }
 
     @Test
@@ -126,6 +212,182 @@ class OverlayServiceTest {
         assertEquals(0, OverlayService.calculateSearchBarBaseY(screenHeight, 1f))
         assertEquals(0, OverlayService.calculateSearchBarBaseY(screenHeight, 2.5f))
         assertEquals(0, OverlayService.calculateSearchBarBaseY(screenHeight, 3f))
+    }
+
+    @Test
+    fun `calculateDynamicIslandFallbackTopY converts dp to px`() {
+        assertEquals(12, OverlayService.calculateDynamicIslandFallbackTopY(1f))
+        assertEquals(24, OverlayService.calculateDynamicIslandFallbackTopY(2f))
+    }
+
+    @Test
+    fun `expectedCameraEdgeForRotation maps all rotations`() {
+        assertEquals(
+            OverlayService.CutoutEdge.TOP,
+            OverlayService.expectedCameraEdgeForRotation(android.view.Surface.ROTATION_0)
+        )
+        assertEquals(
+            OverlayService.CutoutEdge.RIGHT,
+            OverlayService.expectedCameraEdgeForRotation(android.view.Surface.ROTATION_90)
+        )
+        assertEquals(
+            OverlayService.CutoutEdge.BOTTOM,
+            OverlayService.expectedCameraEdgeForRotation(android.view.Surface.ROTATION_180)
+        )
+        assertEquals(
+            OverlayService.CutoutEdge.LEFT,
+            OverlayService.expectedCameraEdgeForRotation(android.view.Surface.ROTATION_270)
+        )
+    }
+
+    @Test
+    fun `detectCutoutEdge returns closest touched edge within tolerance`() {
+        val topCutout = android.graphics.Rect(490, 0, 590, 48)
+        val detected = OverlayService.detectCutoutEdge(
+            cutout = topCutout,
+            screenWidth = 1080,
+            screenHeight = 2400,
+            tolerancePx = 4
+        )
+        assertEquals(OverlayService.CutoutEdge.TOP, detected)
+    }
+
+    @Test
+    fun `selectFrontCameraCutout prefers top center cutout`() {
+        val leftTop = android.graphics.Rect(0, 0, 120, 48)
+        val centerTop = android.graphics.Rect(490, 0, 590, 48)
+        val lowerCenter = android.graphics.Rect(490, 40, 590, 88)
+
+        val selected = OverlayService.selectFrontCameraCutout(
+            cutoutBounds = listOf(leftTop, centerTop, lowerCenter),
+            screenWidth = 1080,
+            screenHeight = 2400,
+            expectedEdge = OverlayService.CutoutEdge.TOP,
+            edgeTolerancePx = 4
+        )
+
+        assertEquals(centerTop, selected)
+    }
+
+    @Test
+    fun `selectFrontCameraCutout returns null for empty bounds`() {
+        val selected = OverlayService.selectFrontCameraCutout(
+            cutoutBounds = emptyList(),
+            screenWidth = 1080,
+            screenHeight = 2400,
+            expectedEdge = OverlayService.CutoutEdge.TOP,
+            edgeTolerancePx = 4
+        )
+        assertEquals(null, selected)
+    }
+
+    @Test
+    fun `selectFrontCameraCutout prefers expected edge in landscape`() {
+        val topCenter = android.graphics.Rect(490, 0, 590, 48)
+        val rightCenter = android.graphics.Rect(1032, 1160, 1080, 1240)
+
+        val selected = OverlayService.selectFrontCameraCutout(
+            cutoutBounds = listOf(topCenter, rightCenter),
+            screenWidth = 1080,
+            screenHeight = 2400,
+            expectedEdge = OverlayService.CutoutEdge.RIGHT,
+            edgeTolerancePx = 4
+        )
+
+        assertEquals(rightCenter, selected)
+    }
+
+    @Test
+    fun `calculateDynamicIslandCenterOffsetX aligns window center to camera center`() {
+        val offset = OverlayService.calculateDynamicIslandCenterOffsetX(
+            cutoutCenterX = 600,
+            screenWidth = 1080
+        )
+        assertEquals(60, offset)
+    }
+
+    @Test
+    fun `calculateDynamicIslandTopYForCameraCenter aligns island center Y to camera center`() {
+        val topY = OverlayService.calculateDynamicIslandTopYForCameraCenter(
+            cutoutCenterY = 42,
+            islandHeight = 30
+        )
+        assertEquals(27, topY)
+    }
+
+    @Test
+    fun `calculateDynamicIslandRestrictedTopInset uses conservative clamp pre Android 15`() {
+        val restrictedTop = OverlayService.calculateDynamicIslandRestrictedTopInset(
+            sdkInt = 34,
+            statusBarInsetTop = 64,
+            cutoutSafeInsetTop = 52,
+            tappableInsetTop = 0
+        )
+        assertEquals(64, restrictedTop)
+    }
+
+    @Test
+    fun `calculateDynamicIslandRestrictedTopInset uses tappable inset on Android 15 plus`() {
+        val restrictedTop = OverlayService.calculateDynamicIslandRestrictedTopInset(
+            sdkInt = 35,
+            statusBarInsetTop = 64,
+            cutoutSafeInsetTop = 52,
+            tappableInsetTop = 0
+        )
+        assertEquals(0, restrictedTop)
+    }
+
+    @Test
+    fun `calculateDynamicIslandRestrictedTopInset uses tappable inset on Android 16 plus`() {
+        val restrictedTop = OverlayService.calculateDynamicIslandRestrictedTopInset(
+            sdkInt = 36,
+            statusBarInsetTop = 64,
+            cutoutSafeInsetTop = 52,
+            tappableInsetTop = 0
+        )
+        assertEquals(0, restrictedTop)
+    }
+
+    @Test
+    fun `shouldUseCameraCenteredIslandTouchProxy enabled on Android 15 plus`() {
+        assertFalse(OverlayService.shouldUseCameraCenteredIslandTouchProxy(34))
+        assertTrue(OverlayService.shouldUseCameraCenteredIslandTouchProxy(35))
+        assertTrue(OverlayService.shouldUseCameraCenteredIslandTouchProxy(36))
+    }
+
+    @Test
+    fun `calculateDynamicIslandTouchProxyBounds matches visible island when fully tappable`() {
+        val bounds = OverlayService.calculateDynamicIslandTouchProxyBounds(
+            screenHeightPx = 2400,
+            islandTopY = 100,
+            islandHeightPx = 40,
+            tappableInsetTop = 0
+        )
+        assertEquals(100, bounds?.topY)
+        assertEquals(40, bounds?.heightPx)
+    }
+
+    @Test
+    fun `calculateDynamicIslandTouchProxyBounds trims untappable top without extending height`() {
+        val bounds = OverlayService.calculateDynamicIslandTouchProxyBounds(
+            screenHeightPx = 2400,
+            islandTopY = 20,
+            islandHeightPx = 40,
+            tappableInsetTop = 36
+        )
+        assertEquals(36, bounds?.topY)
+        assertEquals(24, bounds?.heightPx)
+    }
+
+    @Test
+    fun `calculateDynamicIslandTouchProxyBounds returns null when island has no tappable overlap`() {
+        val bounds = OverlayService.calculateDynamicIslandTouchProxyBounds(
+            screenHeightPx = 2400,
+            islandTopY = 10,
+            islandHeightPx = 16,
+            tappableInsetTop = 32
+        )
+        assertEquals(null, bounds)
     }
 
     @Test
@@ -169,7 +431,7 @@ class OverlayServiceTest {
         val surfaceMode = OverlayController.surfaceMode.value
 
         // Not executing, but in SEARCH_BAR mode — should preserve
-        assertTrue(!isExecuting)
+        assertFalse(isExecuting)
         assertEquals(OverlaySurfaceMode.SEARCH_BAR, surfaceMode)
         assertTrue(surfaceMode != OverlaySurfaceMode.FULL_APP)
     }
@@ -194,11 +456,11 @@ class OverlayServiceTest {
         val surfaceMode = OverlayController.surfaceMode.value
 
         // Not executing and in FULL_APP → should stop
-        assertTrue(!isExecuting)
+        assertFalse(isExecuting)
         assertEquals(OverlaySurfaceMode.FULL_APP, surfaceMode)
         // ChatActivity logic: preserve if isExecuting || surfaceMode != FULL_APP
         // Neither is true → service should be stopped
-        assertTrue(!(isExecuting || surfaceMode != OverlaySurfaceMode.FULL_APP))
+        assertFalse(isExecuting || surfaceMode != OverlaySurfaceMode.FULL_APP)
     }
 
     // --- FULL_APP transition tests (#432) ---
@@ -214,20 +476,16 @@ class OverlayServiceTest {
 
         // Service should observe: mode=FULL_APP, active=false → launch activity + stop
         assertEquals(OverlaySurfaceMode.FULL_APP, OverlayController.surfaceMode.value)
-        assertTrue(!OverlayController.isOverlayActive.value)
+        assertFalse(OverlayController.isOverlayActive.value)
     }
 
     @Test
     fun `launchChatActivity intent has correct flags`() {
-        // Verify the intent constructed by launchChatActivity() has the right flags.
-        // We can't call the private method directly, but we can verify the intent
-        // construction pattern used in the service.
+        // Verify build helper used by launchChatActivity().
         val context = mock(Context::class.java)
         `when`(context.packageName).thenReturn("ai.citros.chat")
 
-        val intent = Intent(context, ChatActivity::class.java).apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-        }
+        val intent = OverlayService.buildChatActivityLaunchIntent(context)
 
         assertTrue(
             intent.flags and Intent.FLAG_ACTIVITY_NEW_TASK != 0,
@@ -241,13 +499,25 @@ class OverlayServiceTest {
     }
 
     @Test
+    fun `launchChatActivity intent includes voice start extra when requested`() {
+        val context = mock(Context::class.java)
+        `when`(context.packageName).thenReturn("ai.citros.chat")
+
+        val voiceIntent = OverlayService.buildChatActivityLaunchIntent(context, startVoiceInput = true)
+        val normalIntent = OverlayService.buildChatActivityLaunchIntent(context, startVoiceInput = false)
+
+        assertTrue(voiceIntent.getBooleanExtra(EXTRA_START_VOICE_INPUT, false))
+        assertFalse(normalIntent.getBooleanExtra(EXTRA_START_VOICE_INPUT, false))
+    }
+
+    @Test
     fun `FULL_APP mode from SEARCH_BAR also deactivates overlay`() {
         OverlayController.activateOverlay()
         OverlayController.updateSurfaceMode(OverlaySurfaceMode.SEARCH_BAR)
         assertTrue(OverlayController.isOverlayActive.value)
 
         OverlayController.updateSurfaceMode(OverlaySurfaceMode.FULL_APP)
-        assertTrue(!OverlayController.isOverlayActive.value)
+        assertFalse(OverlayController.isOverlayActive.value)
         assertEquals(OverlaySurfaceMode.FULL_APP, OverlayController.surfaceMode.value)
     }
 

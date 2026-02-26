@@ -1,5 +1,6 @@
 package ai.citros.core
 
+import androidx.annotation.VisibleForTesting
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.*
@@ -239,7 +240,16 @@ object ModelCatalog {
     /**
      * Clear all caches. Exposed for testing.
      */
-    internal fun clearCache() {
+    @VisibleForTesting
+    fun clearCache() {
         synchronized(cache) { cache.clear() }
+    }
+
+    /** Inject cache for deterministic unit tests without network fetches. */
+    @VisibleForTesting
+    fun setCachedModelsForTesting(provider: Provider, models: List<CachedModel>) {
+        synchronized(cache) {
+            cache[provider] = CacheEntry(models = models)
+        }
     }
 }

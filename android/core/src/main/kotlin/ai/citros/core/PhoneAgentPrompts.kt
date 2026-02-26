@@ -1,5 +1,7 @@
 package ai.citros.core
 
+import android.util.Log
+import androidx.annotation.VisibleForTesting
 import java.time.Instant
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
@@ -20,6 +22,7 @@ object PhoneAgentPrompts {
 
     /** Default prompt for vision-based screenshot description. */
     const val DEFAULT_VISION_PROMPT = "Describe what you see on this phone screen in detail. Include all visible text, UI elements, and their layout."
+    private const val LOW_BATTERY_THRESHOLD_PERCENT = 15
 
     // ── Section 1: Identity ─────────────────────────────────────────────
 
@@ -96,6 +99,14 @@ When they're just chatting, respond naturally without using tools."""
             return LEGACY_SECTION_TOOLS
         }
         return buildToolsSectionDynamic(activeCategories, modelTier)
+    }
+
+    /**
+     * Build tools section from a [ResolvedToolPlan].
+     * Shows summary listing for all tools, detailed descriptions only for active categories.
+     */
+    fun buildToolsSection(plan: ResolvedToolPlan, modelTier: ModelTier = ModelTier.STANDARD): String {
+        return buildToolsSectionDynamic(plan.activeCategories.toSet(), modelTier)
     }
 
     internal fun buildToolsSectionDynamic(
@@ -235,7 +246,12 @@ Pick the right tool for the job:
 2. Read the screen to find what you need
 3. Act on it — tap, type, scroll
 4. Check the result in the tool response (screen state comes automatically)
-5. Repeat until done, then tell the user what you accomplished"""
+5. Repeat until the user's full goal is done, then tell the user what you accomplished
+
+Multi-step requests are not complete after just opening an app.
+Example: "Open Gmail and start a draft" means open Gmail, enter compose, focus the message field, and begin drafting.
+If the keyboard appears while you're still in the same app/task flow, treat it as normal progress — not an app switch and not completion."""
+
 
     private const val STRATEGY_EXECUTION = """### Execution — Act, Don't Announce
 - **Never announce an action without doing it.** "Let me open Settings" as a text-only response is useless — call the tool in the same turn.
@@ -377,6 +393,26 @@ When executing tools, follow these guidelines for what to communicate to the use
 - Your internal debate about which approach to take
 - The word "error" for routine exploration failures"""
 
+    internal const val SECTION_VERBOSE_EXAMPLES = """## Verbose Examples
+
+- User: "Open Gmail and draft an email to Sam about tomorrow's meeting."
+  Assistant behavior: open Gmail, enter compose, set recipient, draft text, confirm completion briefly.
+- User: "What's the weather in Denver?"
+  Assistant behavior: use web_search for the answer directly; don't open Chrome unless explicitly requested."""
+
+    internal const val SECTION_TOOL_PARAMETER_DETAIL = """## Tool Parameter Detail
+
+- Always supply exact, current arguments from the latest screen state.
+- For tap/tap_text, prefer stable element IDs from the newest observation.
+- For type_text, provide only the intended input text; submission is a separate action.
+- For wait, keep delays short (1-5s) and re-check state after waiting."""
+
+    internal const val SECTION_TOOL_PARAMETER_DETAIL_SMALL = """## Tool Parameter Detail
+
+- Use exact, current element IDs from the latest screen state.
+- type_text enters text only; tap submit separately.
+- wait: 1-5s, then re-check."""
+
     // ── Section 6: Disambiguation ───────────────────────────────────────
 
     internal const val SECTION_DISAMBIGUATION = """## Disambiguation
@@ -402,6 +438,8 @@ When executing tools, follow these guidelines for what to communicate to the use
 - type_text only enters text. It does NOT submit. Tap the send/submit/search button separately.
 - After open_app, type the user's actual query — not the app name you just opened. E.g. open_app("Google") then type_text("weather in Denver"), NOT type_text("Google").
 - One action per step. You'll see the updated screen before your next move.
+- For multi-step tasks, continue executing until the user's stated goal is satisfied — opening the app alone is not completion unless that was the entire request.
+- If the keyboard appears but you're still in the same app flow, continue the task; do not treat it as an app switch.
 - If you're unsure what the user wants, use your think() tool to reason through it. Act if confident; ask if not — especially for high-stakes actions like messaging or deleting. Never open apps to "figure out" an ambiguous request; ask the user instead."""
 
     // ── Sections: dynamic builders ──────────────────────────────────────
@@ -421,9 +459,15 @@ When executing tools, follow these guidelines for what to communicate to the use
         }
     }
 
-    private fun buildToolsSection(phoneControlAvailable: Boolean, mode: PromptMode, tier: ModelTier): String? {
+    private fun buildToolsSection(
+        phoneControlAvailable: Boolean,
+        mode: PromptMode,
+        tier: ModelTier,
+        resolvedToolPlan: ResolvedToolPlan? = null
+    ): String? {
         if (mode == PromptMode.NONE || mode == PromptMode.MINIMAL || !phoneControlAvailable) return null
-        return if (tier == ModelTier.SMALL) SECTION_TOOLS_SMALL else SECTION_TOOLS
+        return resolvedToolPlan?.let { buildToolsSection(it, tier) }
+            ?: if (tier == ModelTier.SMALL) SECTION_TOOLS_SMALL else SECTION_TOOLS
     }
 
     private fun buildMinimalReminders(phoneControlAvailable: Boolean): String {
@@ -438,6 +482,7 @@ When executing tools, follow these guidelines for what to communicate to the use
             lines.add("- type_text does NOT submit — tap the send/submit button separately.")
             lines.add("- After open_app, type the user's actual query — not the app name you just opened.")
             lines.add("- If the screen hasn't changed after 2 actions, you're stuck — try a different approach.")
+            lines.add("- Keyboard appearing in the same app is usually a continuation point for typing, not a task-complete signal.")
             lines.add("- Stay silent about tap/swipe failures — just try a different approach. Only alert the user if you're stuck after 3 attempts or something needs their action.")
             lines.add("- If you discover ambiguity mid-task (e.g. two matching contacts), stop and ask the user. Don't try to resolve it by navigating.")
         }
@@ -487,6 +532,14 @@ When executing tools, follow these guidelines for what to communicate to the use
     private fun buildCommunicationSection(phoneControlAvailable: Boolean, mode: PromptMode): String? =
         if (mode == PromptMode.FULL && phoneControlAvailable) SECTION_COMMUNICATION else null
 
+    private fun buildVerboseExamplesSection(phoneControlAvailable: Boolean, mode: PromptMode): String? =
+        if (mode == PromptMode.FULL && phoneControlAvailable) SECTION_VERBOSE_EXAMPLES else null
+
+    private fun buildToolParameterDetailSection(phoneControlAvailable: Boolean, mode: PromptMode, tier: ModelTier): String? {
+        if (mode != PromptMode.FULL || !phoneControlAvailable) return null
+        return if (tier == ModelTier.SMALL) SECTION_TOOL_PARAMETER_DETAIL_SMALL else SECTION_TOOL_PARAMETER_DETAIL
+    }
+
     private fun buildDisambiguationSection(mode: PromptMode): String? =
         if (mode == PromptMode.FULL) SECTION_DISAMBIGUATION else null
 
@@ -521,15 +574,72 @@ Respond conversationally. If the user asks you to do something on their phone,
 tell them to enable the Citros accessibility service in Android Settings → Accessibility."""
     }
 
-    private fun buildRuntimeSection(phoneControlAvailable: Boolean, modelName: String?, modelTier: ModelTier, mode: PromptMode): String? {
+    private fun buildRuntimeSection(
+        phoneControlAvailable: Boolean,
+        modelName: String?,
+        modelTier: ModelTier,
+        mode: PromptMode,
+        sensorContext: SensorContext?
+    ): String? {
         if (mode == PromptMode.NONE) return null
         val modelId = modelName?.takeIf { it.isNotBlank() } ?: "unknown"
         val accessibility = if (phoneControlAvailable) "enabled" else "disabled"
         val timestamp = Instant.now().atOffset(ZoneOffset.UTC).format(DateTimeFormatter.ISO_OFFSET_DATE_TIME)
-        return "Runtime: model=$modelId | tier=$modelTier | accessibility=$accessibility | time=$timestamp"
+        val runtimeParts = mutableListOf(
+            "Runtime: model=$modelId",
+            "tier=$modelTier",
+            "accessibility=$accessibility",
+            "time=$timestamp"
+        )
+
+        val sensorLine = sensorContext?.toPromptLine()?.takeIf { it.isNotBlank() }
+        if (sensorLine != null) {
+            runtimeParts.add(sensorLine)
+            sensorContext.localTime?.toInstant()?.let { capturedAt ->
+                val ageSeconds = (Instant.now().epochSecond - capturedAt.epochSecond).coerceAtLeast(0)
+                runtimeParts.add("sensor_age_sec=$ageSeconds")
+            }
+        }
+
+        return runtimeParts.joinToString(" | ")
+    }
+
+    private fun buildDeviceAwarenessSection(sensorContext: SensorContext?, mode: PromptMode): String? {
+        if (mode != PromptMode.FULL) return null
+        if (sensorContext == null) return null
+        val line = sensorContext.toPromptLine()
+        if (line.isBlank()) return null
+        return """## Device Awareness
+$line
+- If battery is below $LOW_BATTERY_THRESHOLD_PERCENT%, warn the user before starting multi-step tasks.
+- If offline, do not attempt web_search, web_fetch, or web_browse.
+- Use location context to enhance local queries ("nearby", "around here").
+- Respect local time for time-sensitive queries.
+- Do not proactively tell the user their device state unless they ask or it's directly relevant to the task."""
     }
 
     // ── Prompt builders ─────────────────────────────────────────────────
+
+    /**
+     * Mode-selection guard (INV-003): reject NONE for tool-capable turns.
+     * @throws IllegalArgumentException if NONE is used with tools enabled
+     */
+    internal fun guardModeSelection(mode: PromptMode, toolCapable: Boolean) {
+        require(!(mode == PromptMode.NONE && toolCapable)) {
+            "INV-003: NONE mode must not be used for tool-capable turns"
+        }
+    }
+
+    /**
+     * Resolve the tool policy ID for runtime line telemetry.
+     */
+    internal fun resolveToolPolicy(tier: ModelTier, phoneControlAvailable: Boolean): String {
+        if (!phoneControlAvailable) return "none"
+        return when (tier) {
+            ModelTier.SMALL -> "small_restricted"
+            else -> "full"
+        }
+    }
 
     /**
      * Build the system prompt from modular sections.
@@ -537,6 +647,10 @@ tell them to enable the Citros accessibility service in Android Settings → Acc
      * Identity files from the agent directory SUPPLEMENT the phone prompt.
      * They replace the generic identity section but never displace tools,
      * strategy, recovery, communication, or rules.
+     *
+     * When [FeatureFlags.promptTuningV1Enabled] is true, delegates to
+     * [buildTunedSystemPrompt] for budget enforcement, safety contract
+     * validation, and structured runtime line.
      */
     fun buildSystemPrompt(
         phoneControlAvailable: Boolean = true,
@@ -548,14 +662,34 @@ tell them to enable the Citros accessibility service in Android Settings → Acc
         securityContent: String? = null,
         mode: PromptMode = PromptMode.FULL,
         modelTier: ModelTier? = null,
-        domainGuardrailMode: DomainGuardrailMode = DomainGuardrailMode.GENERIC
+        domainGuardrailMode: DomainGuardrailMode = DomainGuardrailMode.GENERIC,
+        sensorContext: SensorContext? = null,
+        resolvedToolPlan: ResolvedToolPlan? = null
     ): String {
+        if (FeatureFlags.promptTuningV1Enabled) {
+            return buildTunedSystemPrompt(
+                phoneControlAvailable = phoneControlAvailable,
+                modelName = modelName,
+                identityContent = identityContent,
+                userContent = userContent,
+                agentsContent = agentsContent,
+                memoryContent = memoryContent,
+                securityContent = securityContent,
+                mode = mode,
+                modelTier = modelTier,
+                domainGuardrailMode = domainGuardrailMode,
+                sensorContext = sensorContext,
+                resolvedToolPlan = resolvedToolPlan
+            ).finalPrompt
+        }
+
         val tier = resolveTier(modelName, modelTier)
 
         val sections = listOfNotNull(
             buildIdentitySection(identityContent, mode),
-            buildToolsSection(phoneControlAvailable, mode, tier),
+            buildToolsSection(phoneControlAvailable, mode, tier, resolvedToolPlan),
             buildStrategySection(mode, tier, phoneControlAvailable, domainGuardrailMode),
+            buildDeviceAwarenessSection(sensorContext, mode),
             buildRecoverySection(mode, tier, domainGuardrailMode),
             buildCommunicationSection(phoneControlAvailable, mode),
             buildDisambiguationSection(mode),
@@ -565,10 +699,114 @@ tell them to enable the Citros accessibility service in Android Settings → Acc
             buildUserContextSection(userContent, mode),
             buildMemorySection(memoryContent, mode),
             buildAccessibilityWarningSection(phoneControlAvailable, mode),
-            buildRuntimeSection(phoneControlAvailable, modelName, tier, mode)
+            buildRuntimeSection(phoneControlAvailable, modelName, tier, mode, sensorContext)
         )
 
         return sections.joinToString("\n\n")
+    }
+
+    /**
+     * Build a budget-enforced, safety-validated system prompt with structured runtime line.
+     *
+     * This is the H2.4 prompt tuning path, active when [FeatureFlags.promptTuningV1Enabled] is true.
+     * All prompt assembly uses thread-local buffers (no shared mutable state — INV-007).
+     */
+    @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
+    internal fun buildTunedSystemPrompt(
+        phoneControlAvailable: Boolean = true,
+        modelName: String? = null,
+        identityContent: String? = null,
+        userContent: String? = null,
+        agentsContent: String? = null,
+        memoryContent: String? = null,
+        securityContent: String? = null,
+        mode: PromptMode = PromptMode.FULL,
+        modelTier: ModelTier? = null,
+        domainGuardrailMode: DomainGuardrailMode = DomainGuardrailMode.GENERIC,
+        sensorContext: SensorContext? = null,
+        resolvedToolPlan: ResolvedToolPlan? = null,
+        timestamp: java.time.Instant = java.time.Instant.now()
+    ): PromptBudget.BudgetResult {
+        val tier = resolveTier(modelName, modelTier)
+        guardModeSelection(mode, toolCapable = phoneControlAvailable)
+
+        // Build labeled sections (all thread-local, no shared state)
+        val labeledSections = mutableListOf<PromptBudget.LabeledSection>()
+
+        fun addSection(id: String, content: String?) {
+            if (content != null && content.isNotBlank()) {
+                labeledSections.add(PromptBudget.LabeledSection(id, content))
+            }
+        }
+
+        // Build security section with canonical safety clauses injected
+        val securityWithSafety = buildSecurityWithSafetyClauses(securityContent, mode)
+
+        addSection(PromptBudget.SectionId.IDENTITY_BASELINE, buildIdentitySection(identityContent, mode))
+        addSection(PromptBudget.SectionId.TOOLS, buildToolsSection(phoneControlAvailable, mode, tier, resolvedToolPlan))
+        addSection(
+            PromptBudget.SectionId.STRATEGY_DETAIL,
+            buildStrategySection(mode, tier, phoneControlAvailable, domainGuardrailMode)
+        )
+        addSection(PromptBudget.SectionId.DEVICE_AWARENESS, buildDeviceAwarenessSection(sensorContext, mode))
+        addSection(PromptBudget.SectionId.RECOVERY_ELABORATION, buildRecoverySection(mode, tier, domainGuardrailMode))
+        addSection(PromptBudget.SectionId.COMMUNICATION_STYLE, buildCommunicationSection(phoneControlAvailable, mode))
+        addSection(PromptBudget.SectionId.VERBOSE_EXAMPLES, buildVerboseExamplesSection(phoneControlAvailable, mode))
+        addSection(PromptBudget.SectionId.TOOL_PARAMETER_DETAIL, buildToolParameterDetailSection(phoneControlAvailable, mode, tier))
+        addSection(PromptBudget.SectionId.DISAMBIGUATION, buildDisambiguationSection(mode))
+        addSection(PromptBudget.SectionId.AGENT_DIRECTIVES, buildAgentDirectivesSection(agentsContent, mode))
+        addSection(PromptBudget.SectionId.SECURITY_BLOCK, securityWithSafety)
+        addSection(PromptBudget.SectionId.CRITICAL_EXECUTION_RULES, buildRulesSection(mode))
+        addSection(PromptBudget.SectionId.USER_CONTEXT, buildUserContextSection(userContent, mode))
+        addSection(PromptBudget.SectionId.MEMORY_CONTEXT, buildMemorySection(memoryContent, mode))
+        addSection(PromptBudget.SectionId.CAPABILITY_WARNING, buildAccessibilityWarningSection(phoneControlAvailable, mode))
+
+        // Enforce budget (trims as needed)
+        val budgetResult = PromptBudget.enforce(labeledSections, mode)
+
+        if (budgetResult.softBudgetExceeded) {
+            Log.w(
+                "PhoneAgentPrompts",
+                "Prompt exceeded soft budget: mode=$mode tier=$tier chars=${budgetResult.charCount} tokens=${budgetResult.tokenEstimate}"
+            )
+        }
+
+        // Safety-presence guard: verify canonical clauses survive trimming (INV-002)
+        if (mode != PromptMode.NONE) {
+            PromptSafetyContract.assertAllPresent(budgetResult.finalPrompt)
+        }
+
+        // Build runtime line with final metrics
+        val accessibility = if (phoneControlAvailable) "attached" else "detached"
+        val toolPolicy = resolveToolPolicy(tier, phoneControlAvailable)
+        val runtimeLine = RuntimeLine.build(
+            modelName = modelName,
+            tier = tier,
+            mode = mode,
+            accessibility = accessibility,
+            toolPolicy = toolPolicy,
+            promptChars = budgetResult.charCount,
+            promptTokensEst = budgetResult.tokenEstimate,
+            trimmed = budgetResult.trimmed,
+            trimmedSections = budgetResult.trimmedSections,
+            timestamp = timestamp
+        )
+
+        // Append runtime line to final prompt
+        return budgetResult.withAppendedContent(runtimeLine)
+    }
+
+    /**
+     * Build security section with canonical safety clauses injected.
+     */
+    private fun buildSecurityWithSafetyClauses(securityContent: String?, mode: PromptMode): String? {
+        if (mode == PromptMode.NONE) return null
+        val base = buildSecuritySection(securityContent, mode) ?: return null
+        // Inject canonical safety clauses if not already present
+        val clauseBlock = PromptSafetyContract.ALL_CLAUSES.joinToString("\n") { (id, text) ->
+            "- [$id] $text"
+        }
+        return "$base\n\n### Canonical Safety Clauses\n$clauseBlock"
     }
 
     /**
@@ -580,7 +818,9 @@ tell them to enable the Citros accessibility service in Android Settings → Acc
         modelName: String? = null,
         securityContent: String? = null,
         modelTier: ModelTier? = null,
-        domainGuardrailMode: DomainGuardrailMode = DomainGuardrailMode.GENERIC
+        domainGuardrailMode: DomainGuardrailMode = DomainGuardrailMode.GENERIC,
+        sensorContext: SensorContext? = null,
+        resolvedToolPlan: ResolvedToolPlan? = null
     ): String {
         return buildSystemPrompt(
             phoneControlAvailable = phoneControlAvailable,
@@ -588,7 +828,9 @@ tell them to enable the Citros accessibility service in Android Settings → Acc
             securityContent = securityContent,
             mode = PromptMode.MINIMAL,
             modelTier = modelTier,
-            domainGuardrailMode = domainGuardrailMode
+            domainGuardrailMode = domainGuardrailMode,
+            sensorContext = sensorContext,
+            resolvedToolPlan = resolvedToolPlan
         )
     }
 

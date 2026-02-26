@@ -531,6 +531,26 @@ You can help with questions, tasks, and conversations. Be direct and useful."""
         }
     }
 
+    /**
+     * Shared text-only chat execution for providers whose chat endpoints return
+     * plain assistant text plus optional usage.
+     */
+    protected suspend fun executeTextChat(conversation: Conversation): Result<ChatResponse> {
+        return executeRequest(
+            requestBody = buildChatRequest(conversation),
+            parseResponse = { jsonResponse ->
+                val text = parseChatResponse(jsonResponse)
+                    ?: throw ProviderException(
+                        provider = provider,
+                        statusCode = null,
+                        message = "API returned no text content in response",
+                        isAuthFailure = false
+                    )
+                ChatResponse(text, emptyList(), null, parseUsage(jsonResponse))
+            }
+        )
+    }
+
     // Abstract methods that subclasses must implement
     protected abstract fun buildChatRequest(conversation: Conversation): JsonObject
     internal abstract fun buildToolRequest(

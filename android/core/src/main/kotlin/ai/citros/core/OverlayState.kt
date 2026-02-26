@@ -11,7 +11,8 @@ data class OverlayState(
     val steps: List<OverlayStep>,
     val lines: List<OverlayLine>,
     val currentStepIndex: Int,
-    val totalSteps: Int
+    val totalSteps: Int,
+    val actionPills: List<ActionPill> = emptyList()
 ) {
     companion object {
         /**
@@ -22,7 +23,8 @@ data class OverlayState(
             steps = emptyList(),
             lines = emptyList(),
             currentStepIndex = 0,
-            totalSteps = 0
+            totalSteps = 0,
+            actionPills = emptyList()
         )
     }
 }

@@ -1,4 +1,5 @@
 package ai.citros.chat
+
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -8,21 +9,31 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ChevronRight
+import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material3.Icon
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -36,12 +47,19 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import ai.citros.core.ModelConfig
+import ai.citros.core.ActionPill
 import ai.citros.core.Message
+import ai.citros.core.PillStyle
 import ai.citros.core.Provider
 import ai.citros.core.WalletState
 import android.content.Context
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 @Composable
 internal fun ProviderModelChip(
     walletState: WalletState,
@@ -73,11 +91,11 @@ internal fun ProviderModelChip(
             fontWeight = FontWeight.SemiBold,
             color = accent
         )
-        Text(
-            text = "▾",
-            style = CitrosTypography.titleLarge,
-            fontWeight = FontWeight.Bold,
-            color = surfaces.labelPrimary
+        Icon(
+            imageVector = Icons.Default.ExpandMore,
+            contentDescription = null,
+            tint = surfaces.labelPrimary,
+            modifier = Modifier.size(18.dp)
         )
     }
 }
@@ -115,9 +133,60 @@ internal fun ChatEmptyState(
         }
     }
 }
+
+@Composable
+internal fun RuntimeActionPillRow(
+    pills: List<ActionPill>,
+    flavor: CitrosFlavor = CitrosFlavor.TANGERINE,
+    onPillTapped: (ActionPill) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    if (pills.isEmpty()) return
+    val isDarkTheme = LocalCitrosIsDark.current
+    val surfaces = remember(isDarkTheme) { citrosDirectiveSurfaces(isDarkTheme) }
+
+    LazyRow(
+        modifier = modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        contentPadding = PaddingValues(vertical = 2.dp)
+    ) {
+        items(items = pills, key = { it.id }) { pill ->
+            val (containerColor, borderColor, textColor) = when (pill.style) {
+                PillStyle.PRIMARY -> Triple(surfaces.green, Color.Transparent, contrastOn(surfaces.green))
+                PillStyle.DANGER -> Triple(surfaces.red, Color.Transparent, contrastOn(surfaces.red))
+                PillStyle.SUBTLE -> Triple(Color.Transparent, Color.Transparent, surfaces.labelSecondary)
+                PillStyle.DEFAULT -> Triple(surfaces.surface2, surfaces.separatorLight, surfaces.labelPrimary)
+            }
+
+            Surface(
+                shape = RoundedCornerShape(999.dp),
+                color = containerColor,
+                border = BorderStroke(
+                    width = if (borderColor == Color.Transparent) 0.dp else 1.dp,
+                    color = borderColor
+                ),
+                modifier = Modifier
+                    .heightIn(min = 48.dp)
+                    .clip(RoundedCornerShape(999.dp))
+                    .semantics { contentDescription = "Action ${pill.label}" }
+                    .testTag("runtime_pill_${pill.id}")
+                    .clickable(role = Role.Button) { onPillTapped(pill) }
+            ) {
+                Text(
+                    text = pill.label,
+                    style = CitrosTypography.labelMedium,
+                    color = textColor,
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 11.dp)
+                )
+            }
+        }
+    }
+}
+
 @Composable
 internal fun QuickSwitcherSheet(
     walletState: WalletState,
+    activeConfig: ai.citros.core.ProviderConfig? = null,
     flavor: CitrosFlavor = CitrosFlavor.TANGERINE,
     onDismiss: () -> Unit,
     onSelectKey: (String) -> Unit,
@@ -137,10 +206,17 @@ internal fun QuickSwitcherSheet(
     val localModelId = remember(prefs) {
         prefs.getString("local_model", "qwen2.5:3b") ?: "qwen2.5:3b"
     }
-    val cloudModels = remember(provider) {
-        provider?.let { ModelConfig.chatModelsForProvider(it) } ?: emptyList()
+    val modelCatalogRefreshTick = rememberModelCatalogRefreshTick(
+        activeConfig = activeConfig,
+        logTag = "QuickSwitcherSheet"
+    )
+    val chatCloudModels = remember(provider, modelCatalogRefreshTick) {
+        provider?.let { ModelConfig.runtimeChatModels(it) } ?: emptyList()
     }
-    val modelRows = remember(cloudModels, localModelId) {
+    val actionCloudModels = remember(provider, modelCatalogRefreshTick) {
+        provider?.let { ModelConfig.runtimeActionModels(it) } ?: emptyList()
+    }
+    val chatModelRows = remember(chatCloudModels, localModelId, surfaces.blue) {
         buildList {
             add(
                 QuickSwitcherModelRow(
@@ -152,7 +228,7 @@ internal fun QuickSwitcherSheet(
                     tier = QuickSwitcherModelTier.FAST
                 )
             )
-            cloudModels.forEach { modelId ->
+            chatCloudModels.forEach { modelId ->
                 add(
                     QuickSwitcherModelRow(
                         modelId = modelId,
@@ -166,11 +242,25 @@ internal fun QuickSwitcherSheet(
             }
         }
     }
+    val actionModelRows = remember(actionCloudModels, surfaces.blue) {
+        actionCloudModels.map { modelId ->
+            QuickSwitcherModelRow(
+                modelId = modelId,
+                title = quickSwitcherModelTitle(modelId),
+                subtitle = quickSwitcherModelSubtitle(modelId),
+                badgeLabel = "Cloud",
+                badgeColor = surfaces.blue,
+                tier = quickSwitcherModelTier(modelId)
+            )
+        }
+    }
     val selectedAccent = if (flavor == CitrosFlavor.NONE) {
         surfaces.labelSecondary
     } else {
         flavor.primary
     }
+    var chatSectionExpanded by rememberSaveable { mutableStateOf(false) }
+    var actionSectionExpanded by rememberSaveable { mutableStateOf(false) }
 
     Box(modifier = Modifier.fillMaxSize()) {
         Box(
@@ -189,6 +279,7 @@ internal fun QuickSwitcherSheet(
                 .padding(top = 96.dp, start = 16.dp, end = 16.dp)
                 .fillMaxWidth()
                 .widthIn(max = 428.dp)
+                .heightIn(max = 560.dp)
                 .testTag(TEST_TAG_QUICK_SWITCHER_SHEET)
                 .clip(RoundedCornerShape(20.dp))
                 .background(
@@ -240,66 +331,68 @@ internal fun QuickSwitcherSheet(
                 }
             }
 
-            Column(
+            LazyColumn(
                 modifier = Modifier
                     .fillMaxWidth()
+                    .heightIn(max = 360.dp)
                     .padding(horizontal = 8.dp, vertical = 4.dp),
                 verticalArrangement = Arrangement.spacedBy(2.dp)
             ) {
-                modelRows.forEach { row ->
-                    val selected = row.modelId == walletState.chatModelId
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(16.dp))
-                            .background(if (selected) surfaces.surface2 else Color.Transparent)
-                            .clickable {
+                item(key = "chat_section_header") {
+                    QuickSwitcherSectionLabel(
+                        text = "CHAT MODEL",
+                        surfaces = surfaces,
+                        expanded = chatSectionExpanded,
+                        onToggle = { chatSectionExpanded = !chatSectionExpanded }
+                    )
+                }
+                if (chatSectionExpanded) {
+                    items(
+                        items = chatModelRows,
+                        key = { row -> "chat_${row.modelId}" }
+                    ) { row ->
+                        QuickSwitcherModelOptionRow(
+                            row = row,
+                            selected = row.modelId == walletState.chatModelId,
+                            selectedAccent = selectedAccent,
+                            surfaces = surfaces,
+                            testTag = "quick_switcher_chat_model_${row.modelId}",
+                            onClick = {
                                 if (activeKey != null) {
                                     onSelectKey(activeKey.id)
                                 }
                                 onSelectChatModel(row.modelId)
                             }
-                            .padding(horizontal = 10.dp, vertical = 10.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .size(36.dp)
-                                .clip(RoundedCornerShape(12.dp))
-                                .background(if (selected) surfaces.surface3 else surfaces.surface1),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            QuickSwitcherTierIcon(
-                                tier = row.tier,
-                                tint = if (selected) selectedAccent else surfaces.labelSecondary
-                            )
-                        }
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = row.title,
-                                style = CitrosTypography.titleLarge,
-                                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
-                                color = surfaces.labelPrimary
-                            )
-                            Text(
-                                text = row.subtitle,
-                                style = CitrosTypography.bodyMedium,
-                                color = surfaces.labelTertiary
-                            )
-                        }
-                        Box(
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(8.dp))
-                                .background((row.badgeColor ?: surfaces.green).copy(alpha = 0.17f))
-                                .padding(horizontal = 10.dp, vertical = 3.dp)
-                        ) {
-                            Text(
-                                text = row.badgeLabel,
-                                style = CitrosTypography.labelLarge,
-                                color = row.badgeColor ?: surfaces.green
-                            )
-                        }
+                        )
+                    }
+                }
+
+                item(key = "action_section_header") {
+                    QuickSwitcherSectionLabel(
+                        text = "ACTION MODEL",
+                        surfaces = surfaces,
+                        expanded = actionSectionExpanded,
+                        onToggle = { actionSectionExpanded = !actionSectionExpanded }
+                    )
+                }
+                if (actionSectionExpanded) {
+                    items(
+                        items = actionModelRows,
+                        key = { row -> "action_${row.modelId}" }
+                    ) { row ->
+                        QuickSwitcherModelOptionRow(
+                            row = row,
+                            selected = row.modelId == walletState.actionModelId,
+                            selectedAccent = selectedAccent,
+                            surfaces = surfaces,
+                            testTag = "quick_switcher_action_model_${row.modelId}",
+                            onClick = {
+                                if (activeKey != null) {
+                                    onSelectKey(activeKey.id)
+                                }
+                                onSelectActionModel(row.modelId)
+                            }
+                        )
                     }
                 }
             }
@@ -344,6 +437,99 @@ private data class QuickSwitcherModelRow(
     val badgeColor: Color?,
     val tier: QuickSwitcherModelTier
 )
+
+@Composable
+private fun QuickSwitcherSectionLabel(
+    text: String,
+    surfaces: CitrosDirectiveSurfaces,
+    expanded: Boolean,
+    onToggle: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(onClick = onToggle)
+            .semantics {
+                role = Role.Button
+                stateDescription = if (expanded) "expanded" else "collapsed"
+            }
+            .padding(horizontal = 10.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = text,
+            style = CitrosTypography.labelLarge,
+            color = surfaces.labelSecondary,
+            modifier = Modifier.weight(1f)
+        )
+        Icon(
+            imageVector = if (expanded) Icons.Default.ExpandMore else Icons.Default.ChevronRight,
+            contentDescription = if (expanded) "expanded" else "collapsed",
+            tint = surfaces.labelSecondary
+        )
+    }
+}
+
+@Composable
+private fun QuickSwitcherModelOptionRow(
+    row: QuickSwitcherModelRow,
+    selected: Boolean,
+    selectedAccent: Color,
+    surfaces: CitrosDirectiveSurfaces,
+    testTag: String,
+    onClick: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag(testTag)
+            .clip(RoundedCornerShape(16.dp))
+            .background(if (selected) surfaces.surface2 else Color.Transparent)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 10.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Box(
+            modifier = Modifier
+                .size(36.dp)
+                .clip(RoundedCornerShape(12.dp))
+                .background(if (selected) surfaces.surface3 else surfaces.surface1),
+            contentAlignment = Alignment.Center
+        ) {
+            QuickSwitcherTierIcon(
+                tier = row.tier,
+                tint = if (selected) selectedAccent else surfaces.labelSecondary
+            )
+        }
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = row.title,
+                style = CitrosTypography.titleLarge,
+                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                color = surfaces.labelPrimary
+            )
+            Text(
+                text = row.subtitle,
+                style = CitrosTypography.bodyMedium,
+                color = surfaces.labelTertiary
+            )
+        }
+        Box(
+            modifier = Modifier
+                .clip(RoundedCornerShape(8.dp))
+                .background((row.badgeColor ?: surfaces.green).copy(alpha = 0.17f))
+                .padding(horizontal = 10.dp, vertical = 3.dp)
+        ) {
+            Text(
+                text = row.badgeLabel,
+                style = CitrosTypography.labelLarge,
+                color = row.badgeColor ?: surfaces.green
+            )
+        }
+    }
+}
 
 private enum class QuickSwitcherModelTier {
     FAST,

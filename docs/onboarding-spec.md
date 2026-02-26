@@ -48,6 +48,17 @@ Three cards:
 ### Screen 5: Ready
 - "Start using Citros" → main chat
 
+### Runtime Gating Notes (Current Behavior)
+- Effective onboarding/runtime state sequence is `WELCOME -> FLAVOR -> PERSONALITY -> ACQUAINTED -> PERMISSIONS -> TRUST -> PAYWALL -> API_KEY -> READY`.
+- Back-navigation sequence (from `onboardingBackTarget`) is `API_KEY -> PAYWALL -> TRUST -> PERMISSIONS -> ACQUAINTED -> PERSONALITY -> FLAVOR -> WELCOME`.
+- `WELCOME`, `ONBOARD_CHAT`, and `READY` have no back target in the current flow helper.
+- `ONBOARD_CHAT` exists in `OnboardingStep` but is optional and not part of the current default path.
+- Chat header is always visible; model switching is enabled only when both an active wallet key and a configured backend exist.
+- If no key is connected, chat shows `No provider connected` and header taps route to API key settings.
+- Blocked send behavior (no key connected): modal title `Add an API key to start chatting.`, body `Connect an Anthropic, OpenAI, or OpenRouter key in Settings.`, primary CTA `Open Settings` routes to API key setup (`onOpenApiKeys`), secondary CTA `Not now` dismisses.
+- Blocked send behavior (key exists but provider/model setup incomplete): modal title `Complete provider setup to continue chatting.`, body `Open Settings to review your provider and model configuration.`, primary CTA `Open Settings` routes to provider settings (`onOpenSettings`), secondary CTA `Not now` dismisses.
+- If a key exists but backend configuration is incomplete, chat shows `Provider setup required`; header taps route to Settings so users can review provider/model configuration.
+
 ---
 
 ## Tier Architecture

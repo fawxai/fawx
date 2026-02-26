@@ -9,5 +9,6 @@ class ChatActivityPrefsKeyConstantsTest {
     fun `search provider preference keys remain stable`() {
         assertEquals("search_base_url", PREF_SEARCH_BASE_URL)
         assertEquals("brave_api_key", PREF_BRAVE_API_KEY)
+        assertEquals("sensor_context_enabled", PREF_SENSOR_CONTEXT_ENABLED)
     }
 }

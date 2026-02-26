@@ -23,7 +23,9 @@ class AgentPromptBuilder(
         phoneControlAvailable: Boolean = true,
         modelName: String? = null,
         domainGuardrailMode: PhoneAgentPrompts.DomainGuardrailMode =
-            PhoneAgentPrompts.DomainGuardrailMode.GENERIC
+            PhoneAgentPrompts.DomainGuardrailMode.GENERIC,
+        sensorContext: SensorContext? = null,
+        resolvedToolPlan: ResolvedToolPlan? = null
     ): String {
         val soulContent = readFileOrNull(AgentFileManager.SOUL_FILE)
         val identityContent = readFileOrNull(AgentFileManager.IDENTITY_FILE)
@@ -43,7 +45,9 @@ class AgentPromptBuilder(
             agentsContent = agentsContent,
             memoryContent = memoryContent,
             securityContent = securityContent,
-            domainGuardrailMode = domainGuardrailMode
+            domainGuardrailMode = domainGuardrailMode,
+            sensorContext = sensorContext,
+            resolvedToolPlan = resolvedToolPlan
         )
     }
 
@@ -55,14 +59,18 @@ class AgentPromptBuilder(
         phoneControlAvailable: Boolean = true,
         modelName: String? = null,
         domainGuardrailMode: PhoneAgentPrompts.DomainGuardrailMode =
-            PhoneAgentPrompts.DomainGuardrailMode.GENERIC
+            PhoneAgentPrompts.DomainGuardrailMode.GENERIC,
+        sensorContext: SensorContext? = null,
+        resolvedToolPlan: ResolvedToolPlan? = null
     ): String {
         val securityContent = readFileOrNull(AgentFileManager.SECURITY_FILE)
         return PhoneAgentPrompts.buildActionPrompt(
             phoneControlAvailable = phoneControlAvailable,
             modelName = modelName,
             securityContent = securityContent,
-            domainGuardrailMode = domainGuardrailMode
+            domainGuardrailMode = domainGuardrailMode,
+            sensorContext = sensorContext,
+            resolvedToolPlan = resolvedToolPlan
         )
     }
 

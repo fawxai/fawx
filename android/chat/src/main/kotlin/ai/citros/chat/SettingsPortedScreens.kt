@@ -1,9 +1,13 @@
 package ai.citros.chat
+import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -26,6 +30,9 @@ import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ChevronRight
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -37,6 +44,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
@@ -48,6 +56,7 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.role
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
@@ -60,6 +69,7 @@ import ai.citros.core.WalletManager
 import ai.citros.core.Provider
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.view.accessibility.AccessibilityManager
+import androidx.core.content.ContextCompat
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 /**
@@ -70,6 +80,12 @@ private fun isAccessibilityServiceEnabled(context: Context): Boolean {
     val enabledServices = accessibilityManager.getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK)
     val packageName = context.packageName
     return enabledServices.any { it.resolveInfo.serviceInfo.packageName == packageName }
+}
+
+private fun isLocationPermissionGranted(context: Context): Boolean {
+    val coarse = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION)
+    val fine = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION)
+    return coarse == PackageManager.PERMISSION_GRANTED || fine == PackageManager.PERMISSION_GRANTED
 }
 @Composable
 private fun SettingsSubPageScaffold(
@@ -321,6 +337,41 @@ private fun SettingsSectionHeader(
         color = surfaces.labelSecondary
     )
 }
+
+@Composable
+private fun SettingsCollapsibleSectionHeader(
+    text: String,
+    expanded: Boolean,
+    onToggle: () -> Unit
+) {
+    val isDarkTheme = LocalCitrosIsDark.current
+    val surfaces = remember(isDarkTheme) { citrosDirectiveSurfaces(isDarkTheme) }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .clickable(onClick = onToggle)
+            .padding(vertical = 2.dp)
+            .semantics {
+                role = Role.Button
+                contentDescription = "${text.uppercase()} ${if (expanded) "expanded" else "collapsed"}"
+            },
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = text.uppercase(),
+            style = CitrosTypography.labelSmall,
+            color = surfaces.labelSecondary,
+            modifier = Modifier.weight(1f)
+        )
+        CitrosIcon(
+            imageVector = if (expanded) Icons.Default.ExpandMore else Icons.Default.ChevronRight,
+            contentDescription = null,
+            tint = surfaces.labelSecondary,
+            modifier = Modifier.size(16.dp)
+        )
+    }
+}
 @Composable
 private fun SettingsGroupedSurface(
     modifier: Modifier = Modifier,
@@ -341,6 +392,7 @@ private fun SettingsGroupedSurface(
 private fun SettingsListRow(
     title: String,
     subtitle: String? = null,
+    modifier: Modifier = Modifier,
     onClick: (() -> Unit)? = null,
     showDivider: Boolean = true,
     trailing: @Composable (() -> Unit)? = null
@@ -348,7 +400,7 @@ private fun SettingsListRow(
     val isDarkTheme = LocalCitrosIsDark.current
     val surfaces = remember(isDarkTheme) { citrosDirectiveSurfaces(isDarkTheme) }
     Column(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .semantics(mergeDescendants = true) {}
             .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
@@ -392,6 +444,7 @@ internal fun SettingsHubScreen(
     onOpenModels: () -> Unit,
     onOpenTrust: () -> Unit,
     onOpenPhoneControl: () -> Unit,
+    onOpenToolCategories: () -> Unit,
     onOpenSound: () -> Unit,
     onOpenAppearance: () -> Unit,
     onOpenAbout: () -> Unit
@@ -546,6 +599,15 @@ internal fun SettingsHubScreen(
                     flavor = flavor,
                     onClick = onOpenPhoneControl
                 )
+                if (ai.citros.core.FeatureFlags.toolGroupingV1Enabled) {
+                    SettingsNavCard(
+                        icon = CitrosIcons.Tune,
+                        title = "Tool Categories",
+                        subtitle = "Enable/disable tool groups",
+                        flavor = flavor,
+                        onClick = onOpenToolCategories
+                    )
+                }
                 Spacer(Modifier.height(16.dp))
             }
         }
@@ -554,12 +616,37 @@ internal fun SettingsHubScreen(
 @Composable
 internal fun TrustSettingsScreen(
     context: Context,
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    locationPermissionChecker: (Context) -> Boolean = ::isLocationPermissionGranted
 ) {
     val prefs = remember(context) { context.getSharedPreferences(ONBOARDING_PREFS, Context.MODE_PRIVATE) }
+    val chatPrefs = remember(context) { context.getSharedPreferences(CITROS_PREFS, Context.MODE_PRIVATE) }
     val flavor = remember { readSelectedFlavor(context) }
     var selected by rememberSaveable {
         mutableStateOf(prefs.getString(PREF_PERSONALITY_TRUST, "Ask for risky stuff") ?: "Ask for risky stuff")
+    }
+    var sensorContextEnabled by rememberSaveable {
+        mutableStateOf(chatPrefs.getBoolean(PREF_SENSOR_CONTEXT_ENABLED, PREF_SENSOR_CONTEXT_ENABLED_DEFAULT))
+    }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var locationPermissionGranted by rememberSaveable { mutableStateOf(locationPermissionChecker(context)) }
+    var locationPermissionDenied by rememberSaveable { mutableStateOf(false) }
+    DisposableEffect(lifecycleOwner, context) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                val granted = locationPermissionChecker(context)
+                locationPermissionGranted = granted
+                if (granted) locationPermissionDenied = false
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    val locationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        locationPermissionGranted = granted || locationPermissionChecker(context)
+        locationPermissionDenied = !locationPermissionGranted
     }
     val options = listOf(
         "Ask before everything",
@@ -601,6 +688,83 @@ internal fun TrustSettingsScreen(
             "Trust level controls how much confirmation Citros requires before taking actions on your phone.",
             style = CitrosTypography.bodySmall,
             color = surfaces.labelTertiary
+        )
+        SettingsSectionHeader("Prompt privacy")
+
+        fun updateSensorContextEnabled(enabled: Boolean) {
+            sensorContextEnabled = enabled
+            if (!enabled) {
+                // Hide stale denial warning while sensor sharing is disabled.
+                locationPermissionDenied = false
+            }
+            chatPrefs.edit().putBoolean(PREF_SENSOR_CONTEXT_ENABLED, enabled).apply()
+        }
+
+        SettingsGroupedSurface {
+            SettingsListRow(
+                title = "Send device context to cloud models",
+                subtitle = "Includes battery, network, local time, and location when permission is granted.",
+                showDivider = false,
+                modifier = Modifier.testTag("trust_sensor_context_row"),
+                onClick = { updateSensorContextEnabled(!sensorContextEnabled) },
+                trailing = {
+                    Box(modifier = Modifier.padding(start = 12.dp)) {
+                        Switch(
+                            checked = sensorContextEnabled,
+                            onCheckedChange = { updateSensorContextEnabled(it) },
+                            modifier = Modifier.testTag("trust_sensor_context_toggle"),
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = Color.White,
+                                checkedTrackColor = surfaces.green,
+                                uncheckedThumbColor = surfaces.surface4,
+                                uncheckedTrackColor = surfaces.surface3
+                            )
+                        )
+                    }
+                }
+            )
+        }
+        Text(
+            "Off by default. Citros only sends this metadata to cloud prompts when enabled and data is available.",
+            style = CitrosTypography.bodySmall,
+            color = surfaces.labelTertiary
+        )
+        if (sensorContextEnabled || locationPermissionGranted) {
+            SettingsGlassPillButton(
+                text = if (locationPermissionGranted) "Location permission granted" else "Request location permission",
+                tint = surfaces.green,
+                modifier = Modifier.padding(top = 6.dp),
+                onClick = {
+                    if (locationPermissionGranted || !sensorContextEnabled) return@SettingsGlassPillButton
+                    locationPermissionDenied = false
+                    locationPermissionLauncher.launch(Manifest.permission.ACCESS_COARSE_LOCATION)
+                }
+            )
+        } else {
+            Text(
+                "Location permission is optional and only used when device context sharing is enabled.",
+                style = CitrosTypography.bodySmall,
+                color = surfaces.labelTertiary
+            )
+        }
+        if (sensorContextEnabled && locationPermissionDenied) {
+            Text(
+                "Location permission denied. You can grant it anytime in App Info.",
+                style = CitrosTypography.bodySmall,
+                color = surfaces.labelTertiary
+            )
+        }
+        SettingsGlassPillButton(
+            text = "Open app permissions",
+            tint = surfaces.labelSecondary,
+            modifier = Modifier.padding(top = 6.dp),
+            onClick = {
+                val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                    data = Uri.fromParts("package", context.packageName, null)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                context.startActivity(intent)
+            }
         )
         Spacer(Modifier.height(6.dp))
     }
@@ -1094,6 +1258,15 @@ internal fun PhoneControlSettingsScreen(
             )
         )
     }
+    var showDynamicIslandDebugBadge by rememberSaveable {
+        mutableStateOf(
+            chatPrefs.getBoolean(
+                PREF_OVERLAY_DYNAMIC_ISLAND_DEBUG_BADGE,
+                PREF_OVERLAY_DYNAMIC_ISLAND_DEBUG_BADGE_DEFAULT
+            )
+        )
+    }
+    val showDebugToggle = BuildConfig.DEBUG
     val okColor = Color(0xFF88F5B4)
     val warningColor = Color(0xFFFF8A8A)
     fun refreshPermissionStatus() {
@@ -1197,7 +1370,7 @@ internal fun PhoneControlSettingsScreen(
             SettingsListRow(
                 title = "Show search bar when idle",
                 subtitle = "Turn off to hide idle overlay when island idle mode is disabled.",
-                showDivider = false,
+                showDivider = showDebugToggle,
                 trailing = {
                     Box(modifier = Modifier.padding(start = 12.dp)) {
                         Switch(
@@ -1217,6 +1390,32 @@ internal fun PhoneControlSettingsScreen(
                     }
                 }
             )
+            if (showDebugToggle) {
+                SettingsListRow(
+                    title = "Show dynamic island debug badge",
+                    subtitle = "Developer debug overlay for camera alignment diagnostics.",
+                    showDivider = false,
+                    trailing = {
+                        Box(modifier = Modifier.padding(start = 12.dp)) {
+                            Switch(
+                                checked = showDynamicIslandDebugBadge,
+                                onCheckedChange = {
+                                    showDynamicIslandDebugBadge = it
+                                    chatPrefs.edit()
+                                        .putBoolean(PREF_OVERLAY_DYNAMIC_ISLAND_DEBUG_BADGE, it)
+                                        .apply()
+                                },
+                                colors = SwitchDefaults.colors(
+                                    checkedThumbColor = Color.White,
+                                    checkedTrackColor = surfaces.green,
+                                    uncheckedThumbColor = surfaces.surface4,
+                                    uncheckedTrackColor = surfaces.surface3
+                                )
+                            )
+                        }
+                    }
+                )
+            }
         }
     }
 }
@@ -1237,6 +1436,8 @@ internal fun ModelsSettingsScreen(
     var useLocalFallback by rememberSaveable {
         mutableStateOf(chatPrefs.getBoolean("models_use_local_offline", true))
     }
+    var chatModelsExpanded by rememberSaveable { mutableStateOf(true) }
+    var actionModelsExpanded by rememberSaveable { mutableStateOf(true) }
     fun modelSubtitle(modelId: String): String = when {
         modelId.contains("llama", ignoreCase = true) -> "On-device fallback model"
         modelId.contains("sonnet", ignoreCase = true) -> "Balanced speed and capability"
@@ -1250,46 +1451,58 @@ internal fun ModelsSettingsScreen(
         onBack = onBack
     ) {
         if (activeProvider != null) {
-            val chatModels = ai.citros.core.ModelConfig.chatModelsForProvider(activeProvider)
-            val actionModels = ai.citros.core.ModelConfig.actionModelsForProvider(activeProvider)
-            SettingsSectionHeader("Chat Model")
-            SettingsGroupedSurface {
-                chatModels.forEachIndexed { index, modelId ->
-                    val selected = modelId == walletState.chatModelId
-                    SettingsListRow(
-                        title = shortModelName(modelId),
-                        subtitle = modelSubtitle(modelId),
-                        onClick = {
-                            walletManager.setChatModel(modelId)
-                            walletState = walletManager.loadOrDefault()
-                        },
-                        showDivider = index < chatModels.lastIndex,
-                        trailing = {
-                            if (selected) {
-                                SettingsSelectionCheck()
+            val chatModels = ai.citros.core.ModelConfig.runtimeChatModels(activeProvider)
+            val actionModels = ai.citros.core.ModelConfig.runtimeActionModels(activeProvider)
+            SettingsCollapsibleSectionHeader(
+                text = "Chat Model",
+                expanded = chatModelsExpanded,
+                onToggle = { chatModelsExpanded = !chatModelsExpanded }
+            )
+            if (chatModelsExpanded) {
+                SettingsGroupedSurface {
+                    chatModels.forEachIndexed { index, modelId ->
+                        val selected = modelId == walletState.chatModelId
+                        SettingsListRow(
+                            title = shortModelName(modelId),
+                            subtitle = modelSubtitle(modelId),
+                            onClick = {
+                                walletManager.setChatModel(modelId)
+                                walletState = walletManager.loadOrDefault()
+                            },
+                            showDivider = index < chatModels.lastIndex,
+                            trailing = {
+                                if (selected) {
+                                    SettingsSelectionCheck()
+                                }
                             }
-                        }
-                    )
+                        )
+                    }
                 }
             }
-            SettingsSectionHeader("Action Model")
-            SettingsGroupedSurface {
-                actionModels.forEachIndexed { index, modelId ->
-                    val selected = modelId == walletState.actionModelId
-                    SettingsListRow(
-                        title = shortModelName(modelId),
-                        subtitle = modelSubtitle(modelId),
-                        onClick = {
-                            walletManager.setActionModel(modelId)
-                            walletState = walletManager.loadOrDefault()
-                        },
-                        showDivider = index < actionModels.lastIndex,
-                        trailing = {
-                            if (selected) {
-                                SettingsSelectionCheck()
+            SettingsCollapsibleSectionHeader(
+                text = "Action Model",
+                expanded = actionModelsExpanded,
+                onToggle = { actionModelsExpanded = !actionModelsExpanded }
+            )
+            if (actionModelsExpanded) {
+                SettingsGroupedSurface {
+                    actionModels.forEachIndexed { index, modelId ->
+                        val selected = modelId == walletState.actionModelId
+                        SettingsListRow(
+                            title = shortModelName(modelId),
+                            subtitle = modelSubtitle(modelId),
+                            onClick = {
+                                walletManager.setActionModel(modelId)
+                                walletState = walletManager.loadOrDefault()
+                            },
+                            showDivider = index < actionModels.lastIndex,
+                            trailing = {
+                                if (selected) {
+                                    SettingsSelectionCheck()
+                                }
                             }
-                        }
-                    )
+                        )
+                    }
                 }
             }
             SettingsSectionHeader("Fallback")
@@ -1591,4 +1804,98 @@ private fun SettingsNavCard(
             Text("›", color = surfaces.labelTertiary)
         }
     }
+}
+
+/**
+ * Settings screen for enabling/disabling tool categories.
+ * CORE category is always on and cannot be toggled.
+ * Persists via SharedPreferences under CITROS_PREFS with key prefix "tool_category_".
+ */
+@Composable
+internal fun ToolCategoriesSettingsScreen(onBack: () -> Unit) {
+    val context = LocalContext.current
+    val flavor = remember { readSelectedFlavor(context) }
+    val isDarkTheme = LocalCitrosIsDark.current
+    val surfaces = remember(isDarkTheme) { citrosDirectiveSurfaces(isDarkTheme) }
+    val prefs = remember(context) { context.getSharedPreferences(CITROS_PREFS, Context.MODE_PRIVATE) }
+
+    // Load initial state from prefs
+    val categoryStates = remember {
+        ai.citros.core.ToolCategory.entries.associateWith { category ->
+            mutableStateOf(
+                if (category == ai.citros.core.ToolCategory.CORE) true
+                else prefs.getBoolean("tool_category_${category.name.lowercase()}", true)
+            )
+        }
+    }
+
+    SettingsSubPageScaffold(flavor = flavor, title = "Tool Categories", onBack = onBack) {
+        Text(
+            text = "Control which tool categories are available to the AI. " +
+                "Core tools are always enabled. Disabling a category removes those tools from all turns.",
+            style = CitrosTypography.bodyMedium,
+            color = surfaces.labelSecondary,
+            modifier = Modifier.padding(vertical = 8.dp)
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+        SettingsGroupedSurface {
+            ai.citros.core.ToolCategory.entries.forEachIndexed { index, category ->
+                val isCore = category == ai.citros.core.ToolCategory.CORE
+                val state = categoryStates[category]!!
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 14.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = category.name.lowercase()
+                                .replaceFirstChar { it.uppercase() },
+                            style = CitrosTypography.bodyLarge,
+                            color = surfaces.labelPrimary
+                        )
+                        if (isCore) {
+                            Text(
+                                text = "Always enabled",
+                                style = CitrosTypography.bodySmall,
+                                color = surfaces.labelTertiary
+                            )
+                        }
+                    }
+                    Switch(
+                        checked = state.value,
+                        onCheckedChange = if (isCore) null else { enabled ->
+                            state.value = enabled
+                            prefs.edit()
+                                .putBoolean("tool_category_${category.name.lowercase()}", enabled)
+                                .apply()
+                        },
+                        enabled = !isCore,
+                        modifier = Modifier.testTag("tool_category_toggle_${category.name.lowercase()}")
+                    )
+                }
+                if (index < ai.citros.core.ToolCategory.entries.lastIndex) {
+                    HorizontalDivider(
+                        color = surfaces.separatorLight,
+                        thickness = 0.5.dp
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Load [ai.citros.core.UserToolCategorySettings] from SharedPreferences.
+ */
+fun loadToolCategorySettings(prefs: android.content.SharedPreferences): ai.citros.core.UserToolCategorySettings {
+    val builder = ai.citros.core.UserToolCategorySettings.builder()
+    ai.citros.core.ToolCategory.entries
+        .filter { it != ai.citros.core.ToolCategory.CORE }
+        .forEach { category ->
+            val enabled = prefs.getBoolean("tool_category_${category.name.lowercase()}", true)
+            builder.setEnabled(category, enabled)
+        }
+    return builder.build()
 }

@@ -75,8 +75,8 @@ private object OverlayColors {
     val FakePhoneTextDim = Color(0xFFBBBBBB)
     val FakePhoneAccent = Color(0xFFFFD600)
     val FakePhoneChevron = Color(0xFF6B7280)
-    val Success = Color(0xFF22C55E)
-    val Error = Color(0xFFEF4444)
+    val Success = CitrosFlavor.LIME.primary
+    val Error = CitrosFlavor.BLOOD_ORANGE.primary
 }
 // Preview-only demo strings/data. These stay local for fast UI iteration and are not production i18n resources.
 private val overlaySteps = listOf(
@@ -101,7 +101,8 @@ internal fun OverlayPreviewScreen(
     onBack: () -> Unit,
     viewModel: ChatViewModel? = null, // Optional: connect to live ChatViewModel
     onOverlayMinimized: (() -> Unit)? = null,
-    onNavigateToChat: (() -> Unit)? = null
+    onNavigateToChat: (() -> Unit)? = null,
+    onRequestVoiceInput: (() -> Unit)? = null
 ) {
     val onboardingPrefs = remember(context) {
         context.getSharedPreferences(ONBOARDING_PREFS, Context.MODE_PRIVATE)
@@ -141,7 +142,8 @@ internal fun OverlayPreviewScreen(
             androidx.compose.runtime.derivedStateOf {
                 OverlayStateMapper.mapToOverlayState(
                     messages = viewModel.messages.toList(),
-                    isLoading = viewModel.isLoading.value
+                    isLoading = viewModel.isLoading.value,
+                    actionPills = viewModel.runtimeActionPills.value
                 )
             }
         }.value
@@ -161,6 +163,7 @@ internal fun OverlayPreviewScreen(
     }
     val activeRunState = liveOverlayState?.runState ?: runState
     val activeStepIndex = liveOverlayState?.currentStepIndex ?: stepIndex
+    val activeActionPills = liveOverlayState?.actionPills ?: emptyList()
     val currentStep = if (activeSteps.isEmpty()) {
         overlaySteps.first()
     } else {
@@ -366,6 +369,7 @@ internal fun OverlayPreviewScreen(
                                 runState = activeRunState,
                                 currentStep = currentStep,
                                 lines = activeLines,
+                                actionPills = activeActionPills,
                                 queuedMessageDraft = queuedMessageDraft,
                                 onQueuedDraftChange = {
                                     queuedMessageDraft = it
@@ -402,7 +406,15 @@ internal fun OverlayPreviewScreen(
                                 onStopAction = stopAction,
                                 onOpenFull = { if (viewModel != null) onNavigateToChat?.invoke() else surfaceMode = OverlaySurfaceMode.FULL_APP },
                                 onOpenIsland = { surfaceMode = OverlaySurfaceMode.DYNAMIC_ISLAND },
-                                onMinimize = { surfaceMode = OverlaySurfaceMode.SEARCH_BAR }
+                                onMinimize = { surfaceMode = OverlaySurfaceMode.SEARCH_BAR },
+                                onActionPillTap = { pill ->
+                                    viewModel?.onRuntimePillTapped(pill.action)
+                                },
+                                onVoiceInput = {
+                                    if (viewModel != null) {
+                                        onRequestVoiceInput?.invoke() ?: onNavigateToChat?.invoke()
+                                    }
+                                }
                             )
                         }
                         if (surfaceMode == OverlaySurfaceMode.SEARCH_BAR) {
@@ -786,6 +798,7 @@ internal fun MiniChatOverlayCard(
     runState: OverlayRunState,
     currentStep: OverlayStep,
     lines: List<OverlayLine>,
+    actionPills: List<ActionPill> = emptyList(),
     queuedMessageDraft: String,
     onQueuedDraftChange: (String) -> Unit,
     onSubmitQueuedMessage: () -> Unit,
@@ -794,12 +807,17 @@ internal fun MiniChatOverlayCard(
     onStopAction: () -> Unit,
     onOpenFull: () -> Unit,
     onOpenIsland: () -> Unit,
+    onActionPillTap: (ActionPill) -> Unit = {},
+    onVoiceInput: () -> Unit = {},
     onMinimize: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val scrollState = rememberScrollState()
     val isDarkTheme = LocalCitrosIsDark.current
     val surfaces = remember(isDarkTheme) { citrosDirectiveSurfaces(isDarkTheme) }
+    val flavorTokens = remember(flavor, surfaces) {
+        citrosDirectiveFlavorTokens(flavor, surfaces)
+    }
     val panelColor = if (isDarkTheme) {
         Color(0xEB1C1C1E)
     } else {
@@ -949,37 +967,12 @@ internal fun MiniChatOverlayCard(
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 lines.forEach { line ->
-                    val bubbleColor = when (line.type) {
-                        OverlayLineType.SYSTEM -> surfaces.surface2
-                        OverlayLineType.USER -> surfaces.surface1
-                        OverlayLineType.QUEUED -> flavor.primary.copy(alpha = 0.14f)
-                    }
-                    val bubbleBorder = when (line.type) {
-                        OverlayLineType.QUEUED -> flavor.primary.copy(alpha = 0.34f)
-                        else -> surfaces.separatorLight
-                    }
-                    Surface(
-                        modifier = if (line.type == OverlayLineType.QUEUED) Modifier.testTag(TEST_TAG_OVERLAY_QUEUED_LINE) else Modifier,
-                        shape = RoundedCornerShape(
-                            topStart = 14.dp,
-                            topEnd = 14.dp,
-                            bottomStart = if (line.type == OverlayLineType.SYSTEM) 6.dp else 14.dp,
-                            bottomEnd = 14.dp
-                        ),
-                        color = bubbleColor,
-                        border = BorderStroke(1.dp, bubbleBorder)
-                    ) {
-                        MarkdownText(
-                            text = line.text,
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
-                            style = CitrosTypography.bodySmall,
-                            color = if (line.type == OverlayLineType.QUEUED) {
-                                surfaces.labelSecondary
-                            } else {
-                                surfaces.labelPrimary
-                            }
-                        )
-                    }
+                    OverlayLineBubble(
+                        line = line,
+                        flavor = flavor,
+                        surfaces = surfaces,
+                        flavorTokens = flavorTokens
+                    )
                 }
                 if (runState == OverlayRunState.EXECUTING) {
                     // Preview status chip (read-only in demo mode).
@@ -1050,6 +1043,15 @@ internal fun MiniChatOverlayCard(
                         )
                     }
                 }
+            }
+            if (actionPills.isNotEmpty()) {
+                RuntimeActionPillRow(
+                    pills = actionPills,
+                    onPillTapped = onActionPillTap,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 10.dp)
+                )
             }
             // Input row — always visible (#473)
             val isExecuting = runState == OverlayRunState.EXECUTING
@@ -1129,8 +1131,13 @@ internal fun MiniChatOverlayCard(
                                 .clip(CircleShape)
                                 .background(if (hasInputText) surfaces.surface3 else Color.Transparent)
                                 .clickable(
-                                    enabled = hasInputText,
-                                    onClick = { onQueuedDraftChange("") }
+                                    onClick = {
+                                        if (hasInputText) {
+                                            onQueuedDraftChange("")
+                                        } else {
+                                            onVoiceInput()
+                                        }
+                                    }
                                 ),
                             contentAlignment = Alignment.Center
                         ) {

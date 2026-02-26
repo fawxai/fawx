@@ -142,23 +142,68 @@ object ModelConfig {
 
     /**
      * All known model IDs across all providers, for validation.
-     * This is the hardcoded fallback catalog; prefer [ModelCatalog] for live data.
+     * This is the hardcoded fallback catalog; prefer [runtimeKnownModels] for
+     * live+cached provider-aware validation.
      */
     fun allKnownModels(provider: Provider): Set<String> =
         (chatModelsForProvider(provider) + actionModelsForProvider(provider)).toSet()
 
     /**
-     * Validate a model ID against the known catalog for a provider.
+     * Runtime-resolved chat model IDs for a provider.
+     *
+     * Uses cached live catalog when present; otherwise falls back to static
+     * curated defaults.
+     */
+    fun runtimeChatModels(provider: Provider): List<String> {
+        val cached = ModelCatalog.getCachedModels(provider)
+            ?.map { it.id }
+            ?.distinct()
+            .orEmpty()
+        if (cached.isEmpty()) return chatModelsForProvider(provider)
+
+        // Keep curated models first (stable UX), then append additional runtime models.
+        val curated = chatModelsForProvider(provider)
+        val runtimeOrdered = (curated + cached).distinct()
+        val cap = if (provider == Provider.OPENROUTER) 24 else 12
+        return runtimeOrdered.take(cap)
+    }
+
+    /**
+     * Runtime-resolved action model IDs for a provider.
+     *
+     * Uses cached live catalog when present and enforces the model floor. If no
+     * cached options remain, falls back to curated static action models.
+     */
+    fun runtimeActionModels(provider: Provider): List<String> {
+        val cached = ModelCatalog.getCachedModels(provider)
+            ?.filter { isModelAboveFloor(provider, it.id) }
+            ?.map { it.id }
+            ?.distinct()
+            .orEmpty()
+        return if (cached.isNotEmpty()) cached else actionModelsForProvider(provider)
+    }
+
+    /** Runtime-known model IDs for validation (chat + action). */
+    fun runtimeKnownModels(provider: Provider): Set<String> =
+        (runtimeChatModels(provider) + runtimeActionModels(provider)).toSet()
+
+    /**
+     * Validate a model ID against a catalog for a provider.
      *
      * @param provider The API provider
      * @param modelId The model ID to validate
+     * @param knownModels Allowed model IDs for this provider. Defaults to static known models.
      * @return A validation result with suggestion if invalid
      */
-    fun validateModel(provider: Provider, modelId: String): ModelValidation {
+    fun validateModel(
+        provider: Provider,
+        modelId: String,
+        knownModels: Set<String> = allKnownModels(provider)
+    ): ModelValidation {
         if (modelId.isBlank()) {
             return ModelValidation(valid = false, message = "Model ID cannot be blank.")
         }
-        val known = allKnownModels(provider)
+        val known = if (knownModels.isNotEmpty()) knownModels else allKnownModels(provider)
         if (modelId in known) return ModelValidation(valid = true)
 
         val suggestion = known.minByOrNull { levenshtein(it, modelId) }

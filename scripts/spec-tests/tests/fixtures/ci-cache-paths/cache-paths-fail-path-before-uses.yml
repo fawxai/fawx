@@ -1,0 +1,10 @@
+name: CI
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cache with path before uses
+        with:
+          path: /usr/local/cache
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+        uses: actions/cache@v4

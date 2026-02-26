@@ -9,7 +9,8 @@ import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.onAllNodesWithText
-import androidx.compose.ui.test.assertCountEquals
+import androidx.compose.ui.test.onRoot
+import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performImeAction
@@ -361,6 +362,111 @@ class OverlayPortedScreenTest {
         composeRule.onNodeWithContentDescription("Message input")
             .performTextInput("test message")
         assertEquals("test message", capturedDraft)
+    }
+
+    @Test
+    fun `mini chat assigns line-type tags for system user and queued bubbles`() {
+        composeRule.setContent {
+            MiniChatOverlayCard(
+                flavor = CitrosFlavor.LIME,
+                runState = OverlayRunState.EXECUTING,
+                currentStep = defaultStep,
+                lines = listOf(
+                    ai.citros.core.OverlayLine(id = 1, type = ai.citros.core.OverlayLineType.SYSTEM, text = "system"),
+                    ai.citros.core.OverlayLine(id = 2, type = ai.citros.core.OverlayLineType.USER, text = "user"),
+                    ai.citros.core.OverlayLine(id = 3, type = ai.citros.core.OverlayLineType.QUEUED, text = "queued")
+                ),
+                queuedMessageDraft = "",
+                onQueuedDraftChange = {},
+                onSubmitQueuedMessage = {},
+                isUndoStopVisible = false,
+                onResumeOrRetry = {},
+                onStopAction = {},
+                onOpenFull = {},
+                onOpenIsland = {}
+            )
+        }
+
+        composeRule.onNodeWithTag(overlayLineTestTag(ai.citros.core.OverlayLineType.SYSTEM, 1)).assertExists()
+        composeRule.onNodeWithTag(overlayLineTestTag(ai.citros.core.OverlayLineType.USER, 2)).assertExists()
+        composeRule.onNodeWithTag(overlayLineTestTag(ai.citros.core.OverlayLineType.QUEUED, 3)).assertExists()
+    }
+
+    @Test
+    fun `mini chat user bubble aligns toward end`() {
+        val flavor = CitrosFlavor.LIME
+
+        composeRule.setContent {
+            MiniChatOverlayCard(
+                flavor = flavor,
+                runState = OverlayRunState.EXECUTING,
+                currentStep = defaultStep,
+                lines = listOf(
+                    ai.citros.core.OverlayLine(id = 1, type = ai.citros.core.OverlayLineType.USER, text = "user")
+                ),
+                queuedMessageDraft = "",
+                onQueuedDraftChange = {},
+                onSubmitQueuedMessage = {},
+                isUndoStopVisible = false,
+                onResumeOrRetry = {},
+                onStopAction = {},
+                onOpenFull = {},
+                onOpenIsland = {}
+            )
+        }
+
+        val userBubbleBounds = composeRule
+            .onNodeWithTag(overlayLineTestTag(ai.citros.core.OverlayLineType.USER, 1))
+            .fetchSemanticsNode()
+            .boundsInRoot
+        val rootBounds = composeRule.onRoot().fetchSemanticsNode().boundsInRoot
+        assertTrue(
+            userBubbleBounds.center.x > rootBounds.center.x,
+            "Expected user bubble to render on the end/right side of the row"
+        )
+    }
+
+    @Test
+    fun `mini chat system and queued bubbles align toward start`() {
+        val flavor = CitrosFlavor.LIME
+
+        composeRule.setContent {
+            MiniChatOverlayCard(
+                flavor = flavor,
+                runState = OverlayRunState.EXECUTING,
+                currentStep = defaultStep,
+                lines = listOf(
+                    ai.citros.core.OverlayLine(id = 1, type = ai.citros.core.OverlayLineType.SYSTEM, text = "system"),
+                    ai.citros.core.OverlayLine(id = 2, type = ai.citros.core.OverlayLineType.QUEUED, text = "queued")
+                ),
+                queuedMessageDraft = "",
+                onQueuedDraftChange = {},
+                onSubmitQueuedMessage = {},
+                isUndoStopVisible = false,
+                onResumeOrRetry = {},
+                onStopAction = {},
+                onOpenFull = {},
+                onOpenIsland = {}
+            )
+        }
+
+        val systemBubbleBounds = composeRule
+            .onNodeWithTag(overlayLineTestTag(ai.citros.core.OverlayLineType.SYSTEM, 1))
+            .fetchSemanticsNode()
+            .boundsInRoot
+        val queuedBubbleBounds = composeRule
+            .onNodeWithTag(overlayLineTestTag(ai.citros.core.OverlayLineType.QUEUED, 2))
+            .fetchSemanticsNode()
+            .boundsInRoot
+        val rootBounds = composeRule.onRoot().fetchSemanticsNode().boundsInRoot
+        assertTrue(
+            systemBubbleBounds.center.x < rootBounds.center.x,
+            "Expected system bubble to render on the start/left side of the row"
+        )
+        assertTrue(
+            queuedBubbleBounds.center.x < rootBounds.center.x,
+            "Expected queued bubble to render on the start/left side of the row"
+        )
     }
 
     // ========== FullApp Rendering ==========
