@@ -51,14 +51,18 @@ impl PerceptionAssembler {
         depth: u32,
         parent: Option<Box<ReasoningContext>>,
     ) -> ReasoningContext {
-        working_memory.sort_by(|left, right| right.relevance.total_cmp(&left.relevance));
-        working_memory.truncate(self.max_working_memory);
+        working_memory = retain_top_by_score_preserving_order(
+            working_memory,
+            self.max_working_memory,
+            |entry| entry.relevance,
+        );
 
         episodic.sort_by(|left, right| right.relevance.total_cmp(&left.relevance));
         episodic.truncate(self.max_episodic);
 
-        semantic.sort_by(|left, right| right.confidence.total_cmp(&left.confidence));
-        semantic.truncate(self.max_semantic);
+        semantic = retain_top_by_score_preserving_order(semantic, self.max_semantic, |entry| {
+            entry.confidence
+        });
 
         let mut context = ReasoningContext {
             perception,
@@ -247,6 +251,35 @@ fn estimate_text_tokens(text: &str) -> usize {
     char_estimate.max(word_estimate).max(1)
 }
 
+fn retain_top_by_score_preserving_order<T, F>(entries: Vec<T>, limit: usize, score: F) -> Vec<T>
+where
+    F: Fn(&T) -> f32,
+{
+    if entries.len() <= limit {
+        return entries;
+    }
+
+    let mut indexed = entries
+        .into_iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let entry_score = score(&entry);
+            (index, entry, entry_score)
+        })
+        .collect::<Vec<_>>();
+
+    indexed.sort_by(|left, right| {
+        right
+            .2
+            .total_cmp(&left.2)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    indexed.truncate(limit);
+    indexed.sort_by_key(|(index, _, _)| *index);
+
+    indexed.into_iter().map(|(_, entry, _)| entry).collect()
+}
+
 fn remove_next_memory_entry(context: &mut ReasoningContext, policy: TrimmingPolicy) -> bool {
     match policy {
         TrimmingPolicy::ByRelevance => remove_by_relevance(context),
@@ -263,7 +296,6 @@ enum EntryKind {
 }
 
 fn remove_by_relevance(context: &mut ReasoningContext) -> bool {
-
     let working = context
         .working_memory
         .iter()
@@ -308,21 +340,23 @@ fn remove_by_relevance(context: &mut ReasoningContext) -> bool {
 }
 
 fn remove_by_recency(context: &mut ReasoningContext) -> bool {
-    if let Some((oldest_idx, _)) = context
-        .relevant_episodic
-        .iter()
-        .enumerate()
-        .min_by_key(|(_, entry)| entry.timestamp_ms)
-    {
-        context.relevant_episodic.remove(oldest_idx);
+    if !context.relevant_episodic.is_empty() {
+        context
+            .relevant_episodic
+            .sort_by_key(|entry| entry.timestamp_ms);
+        context.relevant_episodic.remove(0);
         return true;
     }
 
+    // Working-memory entries do not carry timestamps; preserve insertion order
+    // during assembly so index 0 remains the oldest retained entry.
     if !context.working_memory.is_empty() {
         context.working_memory.remove(0);
         return true;
     }
 
+    // Semantic entries also lack explicit timestamps; insertion order is used as
+    // the recency proxy.
     if !context.relevant_semantic.is_empty() {
         context.relevant_semantic.remove(0);
         return true;
@@ -612,5 +646,141 @@ mod tests {
             + context.relevant_episodic.len()
             + context.relevant_semantic.len();
         assert!(retained_entries < 16);
+    }
+
+    #[test]
+    fn by_recency_removes_oldest_working_memory_entry() {
+        let assembler = PerceptionAssembler::new(3, 0, 0, 10_000);
+
+        let mut context = assembler.assemble(
+            sample_perception("Chat"),
+            vec![
+                WorkingMemoryEntry {
+                    key: "oldest".to_owned(),
+                    value: "first inserted".to_owned(),
+                    relevance: 0.20,
+                },
+                WorkingMemoryEntry {
+                    key: "newest_high".to_owned(),
+                    value: "most relevant but newest".to_owned(),
+                    relevance: 0.99,
+                },
+                WorkingMemoryEntry {
+                    key: "middle".to_owned(),
+                    value: "middle inserted".to_owned(),
+                    relevance: 0.70,
+                },
+            ],
+            vec![],
+            vec![],
+            vec![],
+            sample_identity(),
+            sample_goal(),
+            0,
+            None,
+        );
+
+        assert!(remove_next_memory_entry(&mut context, TrimmingPolicy::ByRecency));
+        assert_eq!(context.working_memory.len(), 2);
+        assert!(context
+            .working_memory
+            .iter()
+            .all(|entry| entry.key != "oldest"));
+        assert!(context
+            .working_memory
+            .iter()
+            .any(|entry| entry.key == "newest_high"));
+    }
+
+    #[test]
+    fn by_goal_distance_removes_least_goal_aligned_entry() {
+        let mut context = ReasoningContext {
+            perception: sample_perception("Messages"),
+            working_memory: vec![
+                WorkingMemoryEntry {
+                    key: "goal_related".to_owned(),
+                    value: "reply to alex about calendar".to_owned(),
+                    relevance: 0.10,
+                },
+                WorkingMemoryEntry {
+                    key: "unrelated_low".to_owned(),
+                    value: "buy milk at grocery".to_owned(),
+                    relevance: 0.20,
+                },
+                WorkingMemoryEntry {
+                    key: "unrelated_high".to_owned(),
+                    value: "sports scoreboard".to_owned(),
+                    relevance: 0.90,
+                },
+            ],
+            relevant_episodic: vec![],
+            relevant_semantic: vec![],
+            active_procedures: vec![],
+            identity_context: sample_identity(),
+            goal: Goal::new(
+                "reply to alex about calendar",
+                vec!["sent calendar reply".to_owned()],
+                Some(2),
+            ),
+            depth: 0,
+            parent_context: None,
+        };
+
+        assert!(remove_next_memory_entry(
+            &mut context,
+            TrimmingPolicy::ByGoalDistance
+        ));
+
+        assert_eq!(context.working_memory.len(), 2);
+        assert!(context
+            .working_memory
+            .iter()
+            .all(|entry| entry.key != "unrelated_low"));
+        assert!(context
+            .working_memory
+            .iter()
+            .any(|entry| entry.key == "goal_related"));
+    }
+
+    #[test]
+    fn assemble_handles_zero_token_budget_without_panicking() {
+        let assembler = PerceptionAssembler::new(4, 4, 4, 0);
+
+        let context = assembler.assemble(
+            sample_perception("Chat"),
+            vec![WorkingMemoryEntry {
+                key: "wm".to_owned(),
+                value: "value".to_owned(),
+                relevance: 0.9,
+            }],
+            vec![EpisodicMemoryRef {
+                id: 1,
+                summary: "episode".to_owned(),
+                relevance: 0.8,
+                timestamp_ms: 123,
+            }],
+            vec![SemanticMemoryRef {
+                id: 1,
+                fact: "fact".to_owned(),
+                confidence: 0.7,
+            }],
+            vec![ProcedureRef {
+                id: "reply".to_owned(),
+                name: "Reply".to_owned(),
+                version: 1,
+            }],
+            sample_identity(),
+            sample_goal(),
+            0,
+            None,
+        );
+
+        assert!(context.working_memory.is_empty());
+        assert!(context.relevant_episodic.is_empty());
+        assert!(context.relevant_semantic.is_empty());
+        assert!(context.active_procedures.is_empty());
+        assert!(context.goal.success_criteria.is_empty());
+        assert!(context.identity_context.preferences.is_empty());
+        assert!(context.identity_context.personality_traits.is_empty());
     }
 }
