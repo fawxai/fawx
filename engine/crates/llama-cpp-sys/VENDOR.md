@@ -15,8 +15,8 @@ This document describes how to vendor llama.cpp source code for compilation.
 ### Option 1: Git Submodule (Recommended)
 
 ```bash
-# From nova-agent1 root
-cd ffi/llama-cpp-sys
+# From citros repo root
+cd engine/crates/llama-cpp-sys
 git submodule add -b b1696 https://github.com/ggerganov/llama.cpp vendor/llama.cpp
 git submodule update --init --recursive
 ```
@@ -24,7 +24,7 @@ git submodule update --init --recursive
 ### Option 2: Manual Download
 
 ```bash
-cd ffi/llama-cpp-sys
+cd engine/crates/llama-cpp-sys
 mkdir -p vendor
 cd vendor
 wget https://github.com/ggerganov/llama.cpp/archive/refs/tags/b1696.tar.gz
