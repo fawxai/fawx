@@ -1,8 +1,9 @@
 //! Anthropic Messages API provider.
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures::{stream, Stream, StreamExt};
-use reqwest::{bytes::Bytes, StatusCode};
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::VecDeque, time::Duration};

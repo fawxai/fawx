@@ -3,8 +3,9 @@
 //! Supports OpenAI and OpenRouter style APIs via configurable `base_url`.
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures::{stream, Stream, StreamExt};
-use reqwest::{bytes::Bytes, StatusCode};
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::VecDeque, time::Duration};
@@ -840,7 +841,12 @@ mod tests {
         assert_eq!(mapped.len(), 1);
         assert_eq!(mapped[0].role, "tool");
         assert_eq!(mapped[0].tool_call_id.as_deref(), Some("call_1"));
-        assert_eq!(mapped[0].content.as_deref(), Some(r#"{"ok":true,"items":[1,2]}"#));
+
+        let expected: serde_json::Value =
+            serde_json::from_str(r#"{"ok": true, "items": [1,2]}"#).unwrap();
+        let actual_content = mapped[0].content.as_ref().unwrap();
+        let actual: serde_json::Value = serde_json::from_str(actual_content).unwrap();
+        assert_eq!(expected, actual);
     }
 
     #[test]

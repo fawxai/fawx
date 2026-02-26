@@ -11,6 +11,7 @@ llama-cpp = ["llama-cpp-sys/llama-cpp"]  # Enable llama.cpp integration
 
 [dependencies]
 async-trait.workspace = true
+bytes = "1"
 ct-core.workspace = true
 futures.workspace = true
 llama-cpp-sys = { path = "../llama-cpp-sys", optional = true }
