@@ -1,6 +1,8 @@
 //! Agentic loop orchestrator.
 
-use crate::act::{ActionResult, TokenUsage, ToolResult};
+use crate::act::{
+    ActionResult, StubToolExecutor, TokenUsage, ToolExecutor, ToolResult,
+};
 use crate::budget::{ActionCost, BudgetRemaining, BudgetTracker};
 use crate::context_manager::ContextCompactor;
 use crate::continuation::Continuation;
@@ -16,6 +18,7 @@ use ct_core::types::{InputSource, UserInput};
 use ct_llm::Message;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Re-exported LLM provider trait used by the loop.
@@ -82,6 +85,7 @@ pub enum LoopResult {
 pub struct LoopEngine {
     budget: BudgetTracker,
     context: ContextCompactor,
+    tool_executor: Arc<dyn ToolExecutor>,
     max_iterations: u32,
     iteration_count: u32,
 }
@@ -120,9 +124,25 @@ const VERIFICATION_CONFIDENCE_MULTIPLE_DISCREPANCIES: f64 = 0.25;
 impl LoopEngine {
     /// Create a new loop engine with budget + context managers.
     pub fn new(budget: BudgetTracker, context: ContextCompactor, max_iterations: u32) -> Self {
+        Self::new_with_executor(
+            budget,
+            context,
+            max_iterations,
+            Arc::new(StubToolExecutor),
+        )
+    }
+
+    /// Create a loop engine with an injected tool executor.
+    pub fn new_with_executor(
+        budget: BudgetTracker,
+        context: ContextCompactor,
+        max_iterations: u32,
+        tool_executor: Arc<dyn ToolExecutor>,
+    ) -> Self {
         Self {
             budget,
             context,
+            tool_executor,
             max_iterations: max_iterations.max(1),
             iteration_count: 0,
         }
@@ -493,7 +513,13 @@ impl LoopEngine {
         calls: &[ct_llm::ToolCall],
         llm: &dyn LlmProvider,
     ) -> Result<ActionResult, LoopError> {
-        let tool_results = stub_tool_results(calls);
+        let tool_results = self.tool_executor.execute_tools(calls).await.map_err(|error| {
+            loop_error(
+                "act",
+                &format!("tool execution failed: {}", error.message),
+                error.recoverable,
+            )
+        })?;
         let synthesis_prompt = tool_synthesis_prompt(&tool_results);
         let llm_text = self.generate_tool_summary(&synthesis_prompt, llm).await?;
         let usage = synthesis_usage(&synthesis_prompt, &llm_text);
@@ -511,7 +537,16 @@ impl LoopEngine {
         synthesis_prompt: &str,
         llm: &dyn LlmProvider,
     ) -> Result<String, LoopError> {
-        llm.generate(synthesis_prompt, TOOL_SYNTHESIS_MAX_OUTPUT_TOKENS)
+        let chunks = Arc::new(Mutex::new(Vec::new()));
+        let callback_chunks = Arc::clone(&chunks);
+        let callback = Box::new(move |chunk: String| {
+            if let Ok(mut guard) = callback_chunks.lock() {
+                guard.push(chunk);
+            }
+        });
+
+        let fallback = llm
+            .generate_streaming(synthesis_prompt, TOOL_SYNTHESIS_MAX_OUTPUT_TOKENS, callback)
             .await
             .map_err(|error| {
                 loop_error(
@@ -519,7 +554,14 @@ impl LoopEngine {
                     &format!("tool synthesis generation failed: {error}"),
                     true,
                 )
-            })
+            })?;
+
+        let assembled = join_streamed_chunks(&chunks)?;
+        if assembled.trim().is_empty() {
+            Ok(fallback)
+        } else {
+            Ok(assembled)
+        }
     }
 
     fn estimate_reasoning_cost(&self, perception: &ProcessedPerception) -> ActionCost {
@@ -642,20 +684,6 @@ fn compacted_context_summary(context: &ReasoningContext) -> Option<&str> {
         .map(|entry| entry.value.as_str())
 }
 
-fn stub_tool_results(calls: &[ct_llm::ToolCall]) -> Vec<ToolResult> {
-    calls
-        .iter()
-        .map(|call| ToolResult {
-            tool_name: call.name.clone(),
-            success: true,
-            output: format!(
-                "Stub tool execution for '{}' with args {}",
-                call.name, call.arguments
-            ),
-        })
-        .collect::<Vec<_>>()
-}
-
 fn tool_synthesis_prompt(tool_results: &[ToolResult]) -> String {
     let tool_summary = tool_results
         .iter()
@@ -664,8 +692,16 @@ fn tool_synthesis_prompt(tool_results: &[ToolResult]) -> String {
         .join("\n");
 
     format!(
-        "You are Citros. Summarize the following tool activity for the user in concise text:\n{tool_summary}\n\nNote: tool execution is stubbed in this build."
+        "You are Citros. Summarize the following tool activity for the user in concise text:\n{tool_summary}\n\nTool outputs are authoritative; summarize clearly and concisely."
     )
+}
+
+
+fn join_streamed_chunks(chunks: &Arc<Mutex<Vec<String>>>) -> Result<String, LoopError> {
+    let parts = chunks.lock().map_err(|_| {
+        loop_error("act", "tool synthesis stream collection failed", true)
+    })?;
+    Ok(parts.join(""))
 }
 
 fn synthesis_usage(prompt: &str, response: &str) -> TokenUsage {
@@ -915,6 +951,12 @@ mod tests {
         delay_ms: u64,
     }
 
+    #[derive(Debug)]
+    struct ChunkedMockLlm {
+        chunks: Vec<String>,
+        fallback: String,
+    }
+
     #[async_trait]
     impl LlmProvider for SlowMockLlm {
         async fn generate(&self, prompt: &str, max_tokens: u32) -> Result<String, CoreLlmError> {
@@ -962,6 +1004,29 @@ mod tests {
 
         fn model_name(&self) -> &str {
             &self.name
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for ChunkedMockLlm {
+        async fn generate(&self, _prompt: &str, _max_tokens: u32) -> Result<String, CoreLlmError> {
+            Ok(self.fallback.clone())
+        }
+
+        async fn generate_streaming(
+            &self,
+            _prompt: &str,
+            _max_tokens: u32,
+            callback: Box<dyn Fn(String) + Send + 'static>,
+        ) -> Result<String, CoreLlmError> {
+            for chunk in &self.chunks {
+                callback(chunk.clone());
+            }
+            Ok(self.fallback.clone())
+        }
+
+        fn model_name(&self) -> &str {
+            "chunked-mock"
         }
     }
 
@@ -1252,19 +1317,37 @@ mod tests {
         assert!(matches!(result, Err(error) if error.stage == "perceive"));
     }
 
-    #[test]
-    fn stub_tool_results_preserve_requested_tool_names() {
+    #[tokio::test]
+    async fn stub_tool_executor_preserves_requested_tool_names() {
         let calls = vec![ct_llm::ToolCall {
             id: "tool-1".to_string(),
             name: "search".to_string(),
             arguments: serde_json::json!({"q":"citros"}),
         }];
 
-        let results = stub_tool_results(&calls);
+        let executor = StubToolExecutor;
+        let results = executor.execute_tools(&calls).await.expect("tool results");
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].tool_name, "search");
         assert!(results[0].success);
+    }
+
+    #[tokio::test]
+    async fn act_with_tools_assembles_streaming_chunks() {
+        let engine = default_engine(3);
+        let llm = ChunkedMockLlm {
+            chunks: vec!["Tool ".to_string(), "summary".to_string()],
+            fallback: "fallback".to_string(),
+        };
+        let decision = Decision::UseTools(vec![ct_llm::ToolCall {
+            id: "tool-1".to_string(),
+            name: "search".to_string(),
+            arguments: serde_json::json!({"q":"citros"}),
+        }]);
+
+        let result = engine.act(&decision, &llm).await.expect("action result");
+        assert_eq!(result.response_text, "Tool summary");
     }
 
     #[test]
