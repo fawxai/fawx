@@ -26,8 +26,8 @@ fi
 
 # Find repo root (script must be in repo root)
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-if [[ ! -f "$SCRIPT_DIR/engine/Cargo.toml" ]]; then
-    error "Can't find engine/Cargo.toml. Run this script from the citros repo root."
+if [[ ! -f "$SCRIPT_DIR/Cargo.toml" ]] || [[ ! -d "$SCRIPT_DIR/engine/crates" ]]; then
+    error "Can't find Cargo.toml or engine/crates/. Run this script from the citros repo root."
     exit 1
 fi
 
