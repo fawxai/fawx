@@ -13,6 +13,7 @@ use ct_llm::{
     AnthropicProvider, CompletionRequest, ContentBlock, Message, ModelCatalog, ModelRouter,
     OpenAiProvider, OpenAiResponsesProvider,
 };
+use futures::StreamExt;
 use std::fmt;
 use std::io::{self, Write};
 #[cfg(unix)]
@@ -610,13 +611,28 @@ impl LoopLlmProvider for RouterLoopLlmProvider<'_> {
             system_prompt: None,
         };
 
-        let response = self
+        let mut stream = self
             .router
-            .complete(request)
+            .complete_stream(request)
             .await
             .map_err(|error| CoreLlmError::Inference(error.to_string()))?;
 
-        let rendered = render_completion_blocks(&response.content);
+        let mut rendered = String::new();
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(chunk) => {
+                    if let Some(delta) = &chunk.delta_content {
+                        print!("{delta}");
+                        io::stdout()
+                            .flush()
+                            .map_err(|error| CoreLlmError::Inference(error.to_string()))?;
+                        rendered.push_str(delta);
+                    }
+                }
+                Err(error) => return Err(CoreLlmError::Inference(error.to_string())),
+            }
+        }
+
         if rendered.trim().is_empty() {
             Err(CoreLlmError::InvalidResponse(
                 "provider returned an empty completion".to_string(),
