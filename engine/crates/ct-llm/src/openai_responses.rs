@@ -220,9 +220,19 @@ impl OpenAiResponsesProvider {
                         Some(Ok(bytes)) => {
                             buffer.push_str(&String::from_utf8_lossy(&bytes));
 
-                            while let Some(event_end) = buffer.find("\n\n") {
+                            while let Some((event_end, delimiter_len)) = {
+                                let lf_delim = buffer.find("\n\n").map(|idx| (idx, 2));
+                                let crlf_delim = buffer.find("\r\n\r\n").map(|idx| (idx, 4));
+
+                                match (lf_delim, crlf_delim) {
+                                    (Some(lf), Some(crlf)) => Some(if lf.0 <= crlf.0 { lf } else { crlf }),
+                                    (Some(lf), None) => Some(lf),
+                                    (None, Some(crlf)) => Some(crlf),
+                                    (None, None) => None,
+                                }
+                            } {
                                 let event_str = buffer[..event_end].to_string();
-                                buffer = buffer[event_end + 2..].to_string();
+                                buffer = buffer[event_end + delimiter_len..].to_string();
 
                                 let mut event_type = String::new();
                                 let mut data = String::new();
