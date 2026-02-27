@@ -98,4 +98,37 @@ Technology changes rapidly. Assumptions from last month may be wrong today. Read
 
 ---
 
+## Runtime — Self-Development Preferences
+
+These govern how the Fawx orchestrator decomposes and executes work. The available roles and their permissions are doctrine (see `DOCTRINE.md`). How the orchestrator uses them is taste.
+
+### Task Decomposition
+- Default to the simplest composition that fits the change. Don't spawn a full review cycle for a typo fix.
+- When in doubt, over-decompose rather than under-decompose. Three small PRs are better than one large PR.
+- Independent subtasks should be parallelized. Don't serialize work that has no dependencies.
+
+### Complexity Assessment
+- **Trivial** (typo, formatting, one-liner bug): Implementer only. Tests are the review.
+- **Standard** (single-feature, <500 lines, clear scope): Implementer → Reviewer → Fixer if needed.
+- **Complex** (multi-crate refactor, architectural change, >500 lines): Full cycle with possible parallel implementers. May need multiple review rounds.
+- **Critical** (security, kernel changes, doctrine-adjacent): Full cycle + mandatory second reviewer.
+
+### Prompt Templates
+- Every worker prompt includes: task description, relevant file paths, and ENGINEERING.md rules.
+- Implementer prompts include: acceptance criteria, test expectations, scope boundaries ("do NOT touch X").
+- Reviewer prompts include: the diff or branch, specific areas of concern, and what the previous review found (if re-review).
+- Fixer prompts include: the review findings verbatim, mapping of each finding to required action, and explicit instruction to not defer any finding.
+
+### Worker Pool Sizing
+- Default: 1 worker per task. Parallel workers only for clearly independent subtasks.
+- Maximum concurrent workers: governed by kernel budget gate, but prefer 3-4 for manageable orchestration.
+- If a worker times out, retry once with longer timeout. If still failing, flag as infra-blocked and continue other work.
+
+### Orchestration Cadence
+- On worker completion: orchestrate next stage FIRST, then status update.
+- On watchdog/reminder: check orchestration state FIRST, spawn next stage if needed, then respond.
+- Don't wait for user acknowledgment between stages unless blocked by a decision or merge gate.
+
+---
+
 *This file is living taste. It evolves as we learn what works. Propose changes through the standard development lifecycle — the agent can update this file, with review.*
