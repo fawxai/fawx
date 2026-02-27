@@ -273,6 +273,23 @@ fn build_tui_prompt() -> String {
     format!("\x01{PROMPT_COLOR_START}\x02you › \x01{PROMPT_COLOR_END}\x02")
 }
 
+fn load_history_with_warning(
+    editor: &mut Editor<FawxReadlineHelper, DefaultHistory>,
+    path: &Path,
+) -> bool {
+    match editor.load_history(path) {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!(
+                "warning: failed to load command history from {}: {}",
+                path.display(),
+                error
+            );
+            false
+        }
+    }
+}
+
 fn configure_line_editor() -> Result<Editor<FawxReadlineHelper, DefaultHistory>, TuiError> {
     let mut editor = Editor::new().map_err(|error| TuiError::Auth(error.to_string()))?;
     editor.set_helper(Some(FawxReadlineHelper::default()));
@@ -282,7 +299,7 @@ fn configure_line_editor() -> Result<Editor<FawxReadlineHelper, DefaultHistory>,
             std::fs::create_dir_all(parent).map_err(TuiError::Io)?;
         }
         if path.exists() {
-            let _ = editor.load_history(&path);
+            load_history_with_warning(&mut editor, &path);
         }
     }
 
@@ -3076,7 +3093,21 @@ mod tests {
     }
 
     #[test]
-    fn test_build_tui_prompt_readline_brackets() {
+    fn load_history_with_warning_returns_false_for_unreadable_history_path() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let history_path = tempdir.path().join("history-as-directory");
+        std::fs::create_dir(&history_path).expect("history path directory should be created");
+
+        let mut editor = Editor::new().expect("editor should be created");
+        editor.set_helper(Some(FawxReadlineHelper::default()));
+
+        let loaded = load_history_with_warning(&mut editor, &history_path);
+
+        assert!(!loaded);
+    }
+
+    #[test]
+    fn tui_prompt_contains_readline_cursor_width_markers() {
         let prompt = build_tui_prompt();
         assert!(prompt.contains("\x01"));
         assert!(prompt.contains("\x02"));

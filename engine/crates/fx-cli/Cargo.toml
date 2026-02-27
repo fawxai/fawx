@@ -41,6 +41,9 @@ sha2 = "0.10"
 base64 = "0.22"
 dirs = "6.0"
 chrono = "0.4"
+# rustyline: readline with history, completion, and key bindings. Rolling our own
+# would be 1000+ lines for equivalent quality. Audited dependency: pure Rust,
+# no unsafe, actively maintained.
 rustyline = "15"
 subtle = "2.6"
 urlencoding = "2.1"
