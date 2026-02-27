@@ -55,6 +55,7 @@ const SENSOR_BASE_OVERHEAD_TOKENS: usize = 6;
 const SENSOR_LOCATION_TOKENS: usize = 8;
 const SENSOR_BATTERY_TOKENS: usize = 2;
 const USER_INPUT_OVERHEAD_TOKENS: usize = 4;
+const CONVERSATION_MESSAGE_OVERHEAD_TOKENS: usize = 4;
 const MEMORY_ENTRY_OVERHEAD_TOKENS: usize = 3;
 const GOAL_OVERHEAD_TOKENS: usize = 4;
 const PREFERENCE_ENTRY_OVERHEAD_TOKENS: usize = 2;
@@ -185,6 +186,7 @@ fn estimate_perception_tokens(perception: &PerceptionSnapshot) -> usize {
     total += estimate_notification_tokens(&perception.notifications);
     total += estimate_sensor_tokens(&perception.sensor_data);
     total += estimate_user_input_tokens(&perception.user_input);
+    total += estimate_conversation_history_tokens(&perception.conversation_history);
     total
 }
 
@@ -232,6 +234,26 @@ fn estimate_user_input_tokens(user_input: &Option<UserInput>) -> usize {
         total += estimate_text_tokens(ctx_id);
     }
     total
+}
+
+fn estimate_conversation_history_tokens(history: &[Message]) -> usize {
+    history
+        .iter()
+        .map(|message| {
+            CONVERSATION_MESSAGE_OVERHEAD_TOKENS
+                + message
+                    .content
+                    .iter()
+                    .map(|content| match content {
+                        fx_llm::ContentBlock::Text { text } => estimate_text_tokens(text),
+                        fx_llm::ContentBlock::ToolUse { name, .. } => estimate_text_tokens(name),
+                        fx_llm::ContentBlock::ToolResult { tool_use_id, .. } => {
+                            estimate_text_tokens(tool_use_id)
+                        }
+                    })
+                    .sum::<usize>()
+        })
+        .sum()
 }
 
 fn estimate_memory_tokens(
@@ -553,6 +575,7 @@ mod tests {
             timestamp_ms: 1_700_000_000_000,
             sensor_data: None,
             user_input: None,
+            conversation_history: Vec::new(),
         }
     }
 
