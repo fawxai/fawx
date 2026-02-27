@@ -27,10 +27,10 @@ use sparx::{render_file, RenderConfig};
 use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::future::Future;
+use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -343,7 +343,6 @@ impl TuiApp {
                 }
                 Err(ReadlineError::Eof) => break,
                 Err(error) => return Err(TuiError::Auth(error.to_string())),
-            }
             }
         }
 
@@ -2180,8 +2179,7 @@ mod tests {
     use async_trait::async_trait;
     use fx_llm::ContentBlock;
     use std::ffi::OsString;
-    use std::hash::{Hash, Hasher};
-use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use tempfile::TempDir;
@@ -3069,7 +3067,11 @@ use std::path::{Path, PathBuf};
             .and_then(|value| value.to_str())
             .expect("history filename should be valid utf-8");
 
-        assert!(path.starts_with(dirs::home_dir().expect("home directory should exist").join(".fawx")));
+        assert!(path.starts_with(
+            dirs::home_dir()
+                .expect("home directory should exist")
+                .join(".fawx")
+        ));
         assert!(file_name == "history.txt" || file_name.starts_with("history-"));
     }
 
