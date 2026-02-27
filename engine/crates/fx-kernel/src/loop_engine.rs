@@ -153,12 +153,7 @@ const REASONING_MAX_OUTPUT_TOKENS: u32 = 768;
 const TOOL_SYNTHESIS_MAX_OUTPUT_TOKENS: u32 = 384;
 const DEFAULT_LLM_ACTION_COST_CENTS: u64 = 2;
 const SAFE_FALLBACK_RESPONSE: &str = "I wasn't able to process that. Could you try rephrasing?";
-const REASONING_SYSTEM_PROMPT: &str = "You are Fawx, an autonomous assistant. \
-Always use the emit_intent tool to respond. \
-For simple responses, you only need: {\"action\": {\"Respond\": {\"text\": \"your answer\"}}}. \
-For complex decisions, include rationale and confidence. \
-The action field must use exactly one of: Respond or Delegate. \
-For direct answers, use Respond. For tool use, use Delegate.";
+const REASONING_SYSTEM_PROMPT: &str = "You are Fawx, an autonomous assistant. You MUST call the emit_intent tool for EVERY response and never reply with plain text. For simple answers call emit_intent({\"action\":{\"Respond\":{\"text\":\"your answer\"}}}). For tool use call emit_intent({\"action\":{\"Delegate\":{\"skill_id\":\"tool_name\",\"params\":{\"key\":\"value\"}}}}). Do not describe what you would do; call emit_intent.";
 
 const VERIFICATION_CONFIDENCE_CLEAN: f64 = 0.9;
 const VERIFICATION_CONFIDENCE_SINGLE_DISCREPANCY: f64 = 0.45;
@@ -889,7 +884,7 @@ fn build_reasoning_request(
     let context = perception.context_window.clone();
     let user_prompt = reasoning_user_prompt(perception);
     let system_prompt = build_reasoning_system_prompt(&tool_definitions);
-    let emit_intent_tool = emit_intent_tool_definition(&tool_definitions);
+    let emit_intent_tool = emit_intent_tool_definition();
 
     CompletionRequest {
         model: model.to_string(),
@@ -903,7 +898,7 @@ fn build_reasoning_request(
 
 fn reasoning_user_prompt(perception: &ProcessedPerception) -> String {
     format!(
-        "Active goals:\n- {}\n\nBudget remaining: {} tokens, {} llm calls\n\nUser message:\n{}",
+        "Active goals:\n- {}\n\nBudget remaining: {} tokens, {} llm calls\n\nUser message:\n{}\n\nRemember: call emit_intent, do not reply with plain text.",
         perception.active_goals.join("\n- "),
         perception.budget_remaining.tokens,
         perception.budget_remaining.llm_calls,
@@ -943,15 +938,9 @@ fn tool_param_summary(parameters: &serde_json::Value) -> String {
     serde_json::to_string(parameters).unwrap_or_else(|_| "{}".to_string())
 }
 
-fn emit_intent_tool_definition(tool_definitions: &[ToolDefinition]) -> ToolDefinition {
-    let delegate_description = format!(
-        "IntendedAction variant object. Allowed variants: Respond, Tap, Type, Swipe, LaunchApp, Navigate, Wait, Delegate, Composite. Available Delegate tools:\n{}\nUse Delegate as {{\"Delegate\": {{\"skill_id\": \"<tool_name>\", \"params\": {{\"key\": \"value\"}}}}}}.",
-        tool_definitions
-            .iter()
-            .map(format_tool_instruction_line)
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
+fn emit_intent_tool_definition() -> ToolDefinition {
+    let delegate_description =
+        "IntendedAction variant object. Use exactly one variant: Respond, Tap, Type, Swipe, LaunchApp, Navigate, Wait, Delegate, Composite, or UseTools. For Delegate use {\"Delegate\":{\"skill_id\":\"<tool_name>\",\"params\":{...}}}. Tools are documented in the system prompt.";
 
     ToolDefinition {
         name: "emit_intent".to_string(),
@@ -2215,6 +2204,26 @@ line three"
         assert!(system_prompt.contains("Available tools (use via Delegate intent):"));
         assert!(system_prompt.contains("read_file: Read a UTF-8 text file from disk"));
         assert!(system_prompt.contains("list_directory: List files and directories"));
+    }
+
+    #[test]
+    fn emit_intent_system_prompt_contains_must_call_directive() {
+        assert!(
+            REASONING_SYSTEM_PROMPT.contains("MUST call the emit_intent tool for EVERY response")
+        );
+        assert!(REASONING_SYSTEM_PROMPT.contains("never reply with plain text"));
+        assert!(REASONING_SYSTEM_PROMPT.len() < 500);
+    }
+
+    #[test]
+    fn emit_intent_tool_description_is_concise() {
+        let emit_tool = emit_intent_tool_definition();
+        let description = emit_tool.parameters["properties"]["action"]["description"]
+            .as_str()
+            .expect("action description string");
+
+        assert!(description.contains("Use exactly one variant"));
+        assert!(description.len() < 500);
     }
 
     #[tokio::test]
