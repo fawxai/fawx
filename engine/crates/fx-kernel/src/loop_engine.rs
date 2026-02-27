@@ -163,6 +163,8 @@ For direct answers, use Respond. For tool use, use Delegate.";
 const VERIFICATION_CONFIDENCE_CLEAN: f64 = 0.9;
 const VERIFICATION_CONFIDENCE_SINGLE_DISCREPANCY: f64 = 0.45;
 const VERIFICATION_CONFIDENCE_MULTIPLE_DISCREPANCIES: f64 = 0.25;
+const DEFAULT_INTENT_RATIONALE: &str = "(not provided)";
+const DEFAULT_INTENT_CONFIDENCE: f32 = 0.8;
 
 impl LoopEngine {
     /// Create a loop engine with an injected tool executor.
@@ -1021,12 +1023,12 @@ fn parse_emit_intent_call(call: &ToolCall) -> Option<ReasonedIntent> {
     let rationale = args
         .get("rationale")
         .and_then(|v| v.as_str())
-        .unwrap_or("(not provided)")
+        .unwrap_or(DEFAULT_INTENT_RATIONALE)
         .to_string();
     let confidence = args
         .get("confidence")
         .and_then(|v| v.as_f64())
-        .unwrap_or(0.8) as f32;
+        .unwrap_or(DEFAULT_INTENT_CONFIDENCE as f64) as f32;
     let expected_outcome = parse_expected_outcome(args.get("expected_outcome"));
     let sub_goals = parse_sub_goals(args.get("sub_goals"));
 
