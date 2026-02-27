@@ -16,13 +16,22 @@ use fx_llm::{
     AnthropicProvider, CompletionRequest, Message, ModelCatalog, ModelRouter, OpenAiProvider,
     OpenAiResponsesProvider, ProviderError, RouterError, StreamChunk,
 };
+use rustyline::completion::{Completer, Pair};
+use rustyline::error::ReadlineError;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::{Hinter, HistoryHinter};
+use rustyline::history::DefaultHistory;
+use rustyline::validate::Validator;
+use rustyline::{Context, Editor, Helper};
 use sparx::{render_file, RenderConfig};
+use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::future::Future;
+use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
@@ -174,6 +183,137 @@ fn version_parts(model_id: &str) -> Vec<u32> {
         .collect()
 }
 
+const TUI_COMMANDS: &[&str] = &[
+    "/help",
+    "/quit",
+    "/clear",
+    "/status",
+    "/model",
+    "/auth",
+    "/loop",
+    "/budget",
+    "/synthesis",
+];
+
+const PROMPT_COLOR_START: &str = "\x1b[38;2;255;204;0m";
+const PROMPT_COLOR_END: &str = "\x1b[0m";
+
+#[derive(Default)]
+struct FawxReadlineHelper {
+    hinter: HistoryHinter,
+}
+
+impl Helper for FawxReadlineHelper {}
+impl Highlighter for FawxReadlineHelper {}
+impl Validator for FawxReadlineHelper {}
+
+impl Hinter for FawxReadlineHelper {
+    type Hint = String;
+
+    fn hint(&self, line: &str, pos: usize, context: &Context<'_>) -> Option<String> {
+        self.hinter.hint(line, pos, context)
+    }
+}
+
+impl Completer for FawxReadlineHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        _pos: usize,
+        _context: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        Ok((0, command_completion_matches(line)))
+    }
+}
+
+fn command_completion_matches(line: &str) -> Vec<Pair> {
+    if !line.starts_with('/') {
+        return Vec::new();
+    }
+
+    TUI_COMMANDS
+        .iter()
+        .filter(|command| command.starts_with(line))
+        .map(|command| Pair {
+            display: (*command).to_string(),
+            replacement: (*command).to_string(),
+        })
+        .collect()
+}
+
+fn history_path() -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    let fawx_dir = home.join(".fawx");
+
+    let history_file = history_namespace(&home)
+        .map(|namespace| format!("history-{namespace}.txt"))
+        .unwrap_or_else(|| "history.txt".to_string());
+
+    Some(fawx_dir.join(history_file))
+}
+
+fn history_namespace(home: &Path) -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    history_namespace_for_cwd(home, &cwd)
+}
+
+fn history_namespace_for_cwd(home: &Path, cwd: &Path) -> Option<String> {
+    if cwd == home {
+        return None;
+    }
+
+    let mut hasher = DefaultHasher::new();
+    cwd.hash(&mut hasher);
+    Some(format!("{:016x}", hasher.finish()))
+}
+
+fn build_tui_prompt() -> String {
+    format!("\x01{PROMPT_COLOR_START}\x02you › \x01{PROMPT_COLOR_END}\x02")
+}
+
+fn load_history_with_warning(
+    editor: &mut Editor<FawxReadlineHelper, DefaultHistory>,
+    path: &Path,
+) -> bool {
+    match editor.load_history(path) {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!(
+                "warning: failed to load command history from {}: {}",
+                path.display(),
+                error
+            );
+            false
+        }
+    }
+}
+
+fn configure_line_editor() -> Result<Editor<FawxReadlineHelper, DefaultHistory>, TuiError> {
+    let mut editor = Editor::new().map_err(|error| TuiError::Auth(error.to_string()))?;
+    editor.set_helper(Some(FawxReadlineHelper::default()));
+
+    if let Some(path) = history_path() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(TuiError::Io)?;
+        }
+        if path.exists() {
+            load_history_with_warning(&mut editor, &path);
+        }
+    }
+
+    Ok(editor)
+}
+
+fn save_line_editor_history(editor: &mut Editor<FawxReadlineHelper, DefaultHistory>) {
+    if let Some(path) = history_path() {
+        if let Err(error) = editor.save_history(&path) {
+            eprintln!("failed to save command history: {error}");
+        }
+    }
+}
+
 /// The main TUI application loop.
 pub struct TuiApp {
     router: ModelRouter,
@@ -201,20 +341,29 @@ impl TuiApp {
     pub async fn run(&mut self) -> Result<(), TuiError> {
         self.show_welcome();
 
-        let mut line = String::new();
+        let mut editor = configure_line_editor()?;
+        let prompt = build_tui_prompt();
         while self.running {
-            print!("{}", "you \u{203a} ".with(theme_color(255, 204, 0, 220)));
-            io::stdout().flush().map_err(TuiError::Io)?;
-
-            line.clear();
-            let bytes = io::stdin().read_line(&mut line).map_err(TuiError::Io)?;
-            if bytes == 0 {
-                break;
+            match editor.readline(&prompt) {
+                Ok(line) => {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    if let Err(error) = editor.add_history_entry(trimmed) {
+                        eprintln!("failed to add command history entry: {error}");
+                    }
+                    self.process_input_line(trimmed).await?;
+                }
+                Err(ReadlineError::Interrupted) => {
+                    println!("^C");
+                }
+                Err(ReadlineError::Eof) => break,
+                Err(error) => return Err(TuiError::Auth(error.to_string())),
             }
-
-            self.process_input_line(line.trim()).await?;
         }
 
+        save_line_editor_history(&mut editor);
         Ok(())
     }
 
@@ -2047,6 +2196,7 @@ mod tests {
     use async_trait::async_trait;
     use fx_llm::ContentBlock;
     use std::ffi::OsString;
+    use std::path::PathBuf;
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use tempfile::TempDir;
@@ -2894,6 +3044,75 @@ mod tests {
         assert_eq!(parse_command("/cls"), ParsedCommand::Clear);
         assert_eq!(parse_command("/quit"), ParsedCommand::Quit);
         assert_eq!(parse_command("/exit"), ParsedCommand::Quit);
+    }
+
+    #[test]
+    fn command_completer_matches_slash_commands() {
+        let matches = command_completion_matches("/st");
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].replacement, "/status");
+    }
+
+    #[test]
+    fn command_completer_empty_for_non_slash() {
+        let matches = command_completion_matches("hello");
+
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn history_namespace_returns_none_for_home_directory() {
+        let home = PathBuf::from("/tmp/home");
+        assert_eq!(history_namespace_for_cwd(&home, &home), None);
+    }
+
+    #[test]
+    fn history_namespace_hashes_non_home_directory() {
+        let home = PathBuf::from("/tmp/home");
+        let cwd = PathBuf::from("/tmp/home/project");
+
+        let namespace = history_namespace_for_cwd(&home, &cwd);
+        assert!(namespace.is_some());
+    }
+
+    #[test]
+    fn history_path_uses_fawx_dir() {
+        let path = history_path().expect("home directory should exist for tests");
+        let file_name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .expect("history filename should be valid utf-8");
+
+        assert!(path.starts_with(
+            dirs::home_dir()
+                .expect("home directory should exist")
+                .join(".fawx")
+        ));
+        assert!(file_name == "history.txt" || file_name.starts_with("history-"));
+    }
+
+    #[test]
+    fn load_history_with_warning_returns_false_for_unreadable_history_path() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let history_path = tempdir.path().join("history-as-directory");
+        std::fs::create_dir(&history_path).expect("history path directory should be created");
+
+        let mut editor = Editor::new().expect("editor should be created");
+        editor.set_helper(Some(FawxReadlineHelper::default()));
+
+        let loaded = load_history_with_warning(&mut editor, &history_path);
+
+        assert!(!loaded);
+    }
+
+    #[test]
+    fn tui_prompt_contains_readline_cursor_width_markers() {
+        let prompt = build_tui_prompt();
+        assert!(prompt.contains("\x01"));
+        assert!(prompt.contains("\x02"));
+        assert!(prompt.contains(PROMPT_COLOR_START));
+        assert!(prompt.contains(PROMPT_COLOR_END));
     }
 
     #[tokio::test]
