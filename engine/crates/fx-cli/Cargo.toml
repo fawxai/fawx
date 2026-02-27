@@ -47,10 +47,6 @@ chrono = "0.4"
 rustyline = "15"
 subtle = "2.6"
 urlencoding = "2.1"
-# sparx: in-house image-to-terminal renderer (braille + truecolor).
-# Replaces external ascii-image-converter binary to eliminate process-spawn attack surface.
-# Pinned to audited rev for supply-chain safety.
-sparx = { git = "https://github.com/abbudjoe/sparx.git", rev = "528fe569d2f7c3093ba27dd6915125489750039f" }
 
 [dev-dependencies]
 tempfile = "3.14"

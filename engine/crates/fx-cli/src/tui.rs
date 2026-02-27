@@ -23,7 +23,6 @@ use rustyline::hint::{Hinter, HistoryHinter};
 use rustyline::history::DefaultHistory;
 use rustyline::validate::Validator;
 use rustyline::{Context, Editor, Helper};
-use sparx::{render_file, RenderConfig};
 use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::future::Future;
@@ -42,7 +41,8 @@ const BANNER_ART: &str = r#"   ___
  / _/ _ `/ |/|/ /\ \/ /
 /_/ \_,_/|__,__/ /_/\_\"#;
 #[allow(dead_code)]
-const FAWX_LOGO: &[u8] = include_bytes!("../../../../scripts/fawx.png");
+/// Pre-rendered braille+truecolor ANSI banner (via ascii-image-converter).
+const FAWX_BANNER_ANSI: &str = include_str!("../../../../scripts/fawx-banner.ans");
 
 const DEFAULT_AUTH_FILE: &str = ".fawx/auth.json";
 const DEFAULT_OPENAI_TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
@@ -419,8 +419,8 @@ impl TuiApp {
         let burnt = theme_color(210, 112, 10, 166);
 
         println!();
-        if let Some(rendered) = try_render_logo() {
-            print!("{rendered}");
+        if supports_truecolor() {
+            print!("{FAWX_BANNER_ANSI}");
         } else {
             for line in BANNER_ART.lines() {
                 println!("{}", line.bold().with(amber));
@@ -964,87 +964,6 @@ impl TuiApp {
             .push(Message::assistant(clean_assistant_text));
         trim_history(&mut self.conversation_history);
     }
-}
-
-/// Try to render the Fawx logo using native sparx rendering.
-fn try_render_logo() -> Option<String> {
-    let logo_path = find_logo_path()?;
-    render_logo_at_path(&logo_path)
-}
-
-fn render_logo_at_path(path: &std::path::Path) -> Option<String> {
-    let cols = terminal_cols().unwrap_or(80);
-    let width = cols.saturating_sub(4).clamp(20, 120);
-    let config = RenderConfig {
-        width: Some(width),
-        threshold: 28,
-        color: supports_truecolor(),
-    };
-
-    render_file(path.to_string_lossy().as_ref(), &config).ok()
-}
-
-/// Find the fawx.png logo in common locations.
-fn find_logo_path() -> Option<std::path::PathBuf> {
-    // Relative to the executable
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            // Check alongside binary
-            let candidate = dir.join("fawx.png");
-            if candidate.exists() {
-                return Some(candidate);
-            }
-            // Check ../../scripts/fawx.png (dev layout)
-            let candidate = dir.join("..").join("..").join("scripts").join("fawx.png");
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-    }
-    // Check relative to cwd
-    let candidate = std::path::PathBuf::from("scripts/fawx.png");
-    if candidate.exists() {
-        return Some(candidate);
-    }
-    None
-}
-
-/// Get terminal column count via ioctl.
-fn terminal_cols() -> Option<u32> {
-    #[cfg(unix)]
-    {
-        #[repr(C)]
-        struct WinSize {
-            ws_row: u16,
-            ws_col: u16,
-            ws_xpixel: u16,
-            ws_ypixel: u16,
-        }
-
-        #[cfg(target_os = "linux")]
-        const TIOCGWINSZ_VAL: u64 = 0x5413;
-        #[cfg(target_os = "macos")]
-        const TIOCGWINSZ_VAL: u64 = 0x40087468;
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        const TIOCGWINSZ_VAL: u64 = 0x5413;
-
-        unsafe extern "C" {
-            fn ioctl(fd: i32, request: u64, ...) -> i32;
-        }
-
-        use std::mem::MaybeUninit;
-        // SAFETY: valid pointer, only read on success
-        unsafe {
-            let mut ws = MaybeUninit::<WinSize>::uninit();
-            if ioctl(1, TIOCGWINSZ_VAL, ws.as_mut_ptr()) == 0 {
-                let ws = ws.assume_init();
-                if ws.ws_col > 0 {
-                    return Some(ws.ws_col as u32);
-                }
-            }
-        }
-    }
-    None
 }
 
 /// Build a loop engine with sensible defaults for the TUI shell.
@@ -2613,24 +2532,12 @@ mod tests {
     }
 
     #[test]
-    fn fawx_logo_renders_without_error() {
-        let result = sparx::render_image(
-            FAWX_LOGO,
-            &sparx::RenderConfig {
-                width: Some(40),
-                threshold: 28,
-                color: true,
-            },
+    fn embedded_banner_is_non_empty() {
+        assert!(!FAWX_BANNER_ANSI.is_empty());
+        assert!(
+            FAWX_BANNER_ANSI.contains("["),
+            "banner should contain ANSI escapes"
         );
-
-        assert!(result.is_ok());
-        assert!(!result.expect("embedded fawx logo should render").is_empty());
-    }
-
-    #[test]
-    fn try_render_logo_returns_none_for_missing_file() {
-        let missing = std::path::Path::new("/definitely/missing/fawx-logo.png");
-        assert!(render_logo_at_path(missing).is_none());
     }
 
     fn app_with_mock_model(response: &str) -> TuiApp {
