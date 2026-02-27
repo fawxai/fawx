@@ -146,20 +146,8 @@ impl TuiApp {
         };
 
         println!();
-        match sparx::render_image(
-            FAWX_LOGO,
-            &sparx::RenderConfig {
-                width: Some(40),
-                threshold: 128,
-                color: true,
-            },
-        ) {
-            Ok(rendered) => print!("{rendered}"),
-            Err(_) => {
-                for line in BANNER_ART.lines() {
-                    println!("{}", line.bold().with(amber));
-                }
-            }
+        for line in BANNER_ART.lines() {
+            println!("{}", line.bold().with(amber));
         }
         println!();
         println!(
