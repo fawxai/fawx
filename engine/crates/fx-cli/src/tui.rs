@@ -17,6 +17,7 @@ use fx_llm::{
     OpenAiResponsesProvider, ProviderError, RouterError, StreamChunk,
 };
 use rustyline::completion::{Completer, Pair};
+use rustyline::config::CompletionType;
 use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
 use rustyline::hint::{Hinter, HistoryHinter};
@@ -185,6 +186,7 @@ fn version_parts(model_id: &str) -> Vec<u32> {
 const TUI_COMMANDS: &[&str] = &[
     "/help",
     "/quit",
+    "/exit",
     "/clear",
     "/status",
     "/model",
@@ -264,6 +266,16 @@ fn command_completion_matches(prefix: &str) -> Vec<Pair> {
         .collect()
 }
 
+/// Only add recognized commands and chat messages to history.
+/// Rejects mistyped slash commands (e.g. `/ex`) to prevent history pollution.
+fn should_add_to_history(line: &str) -> bool {
+    if !line.starts_with('/') {
+        return true; // regular chat message
+    }
+    let command_token = line.split_whitespace().next().unwrap_or(line);
+    TUI_COMMANDS.contains(&command_token)
+}
+
 fn history_path() -> Option<PathBuf> {
     let home = dirs::home_dir()?;
     let fawx_dir = home.join(".fawx");
@@ -312,7 +324,11 @@ fn load_history_with_warning(
 }
 
 fn configure_line_editor() -> Result<Editor<FawxReadlineHelper, DefaultHistory>, TuiError> {
-    let mut editor = Editor::new().map_err(|error| TuiError::Auth(error.to_string()))?;
+    let config = rustyline::Config::builder()
+        .completion_type(CompletionType::List)
+        .build();
+    let mut editor =
+        Editor::with_config(config).map_err(|error| TuiError::Auth(error.to_string()))?;
     editor.set_helper(Some(FawxReadlineHelper::default()));
 
     if let Some(path) = history_path() {
@@ -371,8 +387,13 @@ impl TuiApp {
                     if trimmed.is_empty() {
                         continue;
                     }
-                    if let Err(error) = editor.add_history_entry(trimmed) {
-                        eprintln!("failed to add command history entry: {error}");
+                    // Only persist recognized slash commands and chat messages in history.
+                    // Mistyped commands (e.g. /ex, /halp) are excluded to keep the
+                    // HistoryHinter from suggesting invalid completions.
+                    if should_add_to_history(trimmed) {
+                        if let Err(error) = editor.add_history_entry(trimmed) {
+                            eprintln!("failed to add command history entry: {error}");
+                        }
                     }
                     self.process_input_line(trimmed).await?;
                 }
@@ -3209,6 +3230,41 @@ mod tests {
         assert_eq!(token_start("/help arg", 9), 6);
         assert_eq!(token_start("a b c", 5), 4);
         assert_eq!(token_start("hello  world", 12), 7);
+    }
+    #[test]
+    fn should_add_to_history_accepts_valid_commands() {
+        assert!(should_add_to_history("/help"));
+        assert!(should_add_to_history("/quit"));
+        assert!(should_add_to_history("/model list"));
+        assert!(should_add_to_history("/clear"));
+    }
+
+    #[test]
+    fn should_add_to_history_rejects_invalid_commands() {
+        assert!(!should_add_to_history("/ex"));
+        assert!(!should_add_to_history("/halp"));
+        assert!(should_add_to_history("/exit"));
+        assert!(!should_add_to_history("/q"));
+    }
+
+    #[test]
+    fn should_add_to_history_rejects_bare_slash() {
+        assert!(!should_add_to_history("/"));
+    }
+
+    #[test]
+    fn should_add_to_history_accepts_commands_with_trailing_whitespace() {
+        // Inputs are trimmed before reaching should_add_to_history,
+        // but test the function directly with trailing space just in case.
+        assert!(should_add_to_history("/help "));
+        assert!(should_add_to_history("/model   "));
+    }
+
+    #[test]
+    fn should_add_to_history_accepts_chat_messages() {
+        assert!(should_add_to_history("hello world"));
+        assert!(should_add_to_history("what is 2+2?"));
+        assert!(should_add_to_history("tell me about rust"));
     }
 
     #[test]
