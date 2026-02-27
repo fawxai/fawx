@@ -155,9 +155,10 @@ const DEFAULT_LLM_ACTION_COST_CENTS: u64 = 2;
 const SAFE_FALLBACK_RESPONSE: &str = "I wasn't able to process that. Could you try rephrasing?";
 const REASONING_SYSTEM_PROMPT: &str = "You are Fawx, an autonomous assistant. \
 Always use the emit_intent tool to respond. \
-The action field must deserialize to IntendedAction and use exactly one of these variants: \
-Respond, Tap, Type, Swipe, LaunchApp, Navigate, Wait, Delegate, or Composite. \
-For TUI-first conversations, prefer Respond for direct user answers and Delegate for tool use.";
+For simple responses, you only need: {\"action\": {\"Respond\": {\"text\": \"your answer\"}}}. \
+For complex decisions, include rationale and confidence. \
+The action field must use exactly one of: Respond or Delegate. \
+For direct answers, use Respond. For tool use, use Delegate.";
 
 const VERIFICATION_CONFIDENCE_CLEAN: f64 = 0.9;
 const VERIFICATION_CONFIDENCE_SINGLE_DISCREPANCY: f64 = 0.45;
@@ -966,7 +967,7 @@ fn emit_intent_tool_definition(tool_definitions: &[ToolDefinition]) -> ToolDefin
                 "expected_outcome": {"type": "string"},
                 "sub_goals": {"type": "array", "items": {"type": "string"}}
             },
-            "required": ["action", "rationale", "confidence"]
+            "required": ["action"]
         }),
     }
 }
@@ -1017,8 +1018,15 @@ fn wrap_direct_tool_call_as_intent(call: &ToolCall) -> ReasonedIntent {
 fn parse_emit_intent_call(call: &ToolCall) -> Option<ReasonedIntent> {
     let args = call.arguments.as_object()?;
     let action = parse_tool_action(args.get("action")?)?;
-    let rationale = args.get("rationale")?.as_str()?.to_string();
-    let confidence = args.get("confidence")?.as_f64()? as f32;
+    let rationale = args
+        .get("rationale")
+        .and_then(|v| v.as_str())
+        .unwrap_or("(not provided)")
+        .to_string();
+    let confidence = args
+        .get("confidence")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.8) as f32;
     let expected_outcome = parse_expected_outcome(args.get("expected_outcome"));
     let sub_goals = parse_sub_goals(args.get("sub_goals"));
 
