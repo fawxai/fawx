@@ -9,7 +9,9 @@ use fx_kernel::act::TokenUsage;
 use fx_kernel::auth::{AuthManager, AuthMethod};
 use fx_kernel::budget::{BudgetConfig, BudgetTracker};
 use fx_kernel::context_manager::ContextCompactor;
-use fx_kernel::loop_engine::{LlmProvider as LoopLlmProvider, LoopEngine, LoopResult};
+use fx_kernel::loop_engine::{
+    LlmProvider as LoopLlmProvider, LoopEngine, LoopResult, DEFAULT_SYNTHESIS_INSTRUCTION,
+};
 use fx_kernel::oauth::{PkceFlow, TokenExchangeRequest, TokenResponse};
 use fx_kernel::types::PerceptionSnapshot;
 use fx_llm::{
@@ -327,6 +329,9 @@ impl TuiApp {
             ParsedCommand::Budget => self.show_budget_status(),
             ParsedCommand::Loop => self.show_loop_status(),
             ParsedCommand::Status => self.show_status(),
+            ParsedCommand::Synthesis(instruction) => {
+                self.update_synthesis_instruction(instruction);
+            }
             ParsedCommand::Clear => {
                 self.conversation_history.clear();
                 self.clear_screen()?;
@@ -400,6 +405,21 @@ impl TuiApp {
                     return Err(initial_error);
                 }
                 self.set_active_model_from_selector(selector)
+            }
+        }
+    }
+
+    fn update_synthesis_instruction(&mut self, instruction: Option<String>) {
+        match instruction {
+            None => println!("Usage: /synthesis <instruction> or /synthesis reset"),
+            Some(value) if value.eq_ignore_ascii_case("reset") => {
+                self.loop_engine
+                    .set_synthesis_instruction(DEFAULT_SYNTHESIS_INSTRUCTION.to_string());
+                println!("Synthesis instruction reset to default.");
+            }
+            Some(value) => {
+                self.loop_engine.set_synthesis_instruction(value.clone());
+                println!("Synthesis instruction updated: {value}");
             }
         }
     }
@@ -530,6 +550,7 @@ impl TuiApp {
         println!("  /status        Show model, tokens, budget summary");
         println!("  /budget        Show detailed budget usage");
         println!("  /loop          Show loop iteration details");
+        println!("  /synthesis     Set or reset synthesis instruction");
         println!("  /clear         Clear the screen");
         println!("  /help          Show this help");
         println!("  /quit          Exit");
@@ -777,6 +798,7 @@ pub fn build_loop_engine() -> LoopEngine {
         context,
         DEFAULT_MAX_LOOP_ITERATIONS,
         std::sync::Arc::new(executor),
+        DEFAULT_SYNTHESIS_INSTRUCTION.to_string(),
     )
 }
 
@@ -1849,6 +1871,7 @@ enum ParsedCommand {
     Budget,
     Loop,
     Status,
+    Synthesis(Option<String>),
     Clear,
     Help,
     Quit,
@@ -1872,6 +1895,14 @@ fn parse_command(value: &str) -> ParsedCommand {
         "budget" => ParsedCommand::Budget,
         "loop" => ParsedCommand::Loop,
         "status" => ParsedCommand::Status,
+        "synthesis" => {
+            let instruction = parts.collect::<Vec<_>>().join(" ");
+            if instruction.is_empty() {
+                ParsedCommand::Synthesis(None)
+            } else {
+                ParsedCommand::Synthesis(Some(instruction))
+            }
+        }
         "clear" | "cls" => ParsedCommand::Clear,
         "help" => ParsedCommand::Help,
         "quit" | "exit" => ParsedCommand::Quit,
@@ -2594,6 +2625,11 @@ mod tests {
         assert_eq!(parse_command("/help"), ParsedCommand::Help);
         assert_eq!(parse_command("/loop"), ParsedCommand::Loop);
         assert_eq!(parse_command("/status"), ParsedCommand::Status);
+        assert_eq!(
+            parse_command("/synthesis Show raw output"),
+            ParsedCommand::Synthesis(Some("Show raw output".to_string()))
+        );
+        assert_eq!(parse_command("/synthesis"), ParsedCommand::Synthesis(None));
         assert_eq!(parse_command("/clear"), ParsedCommand::Clear);
         assert_eq!(parse_command("/cls"), ParsedCommand::Clear);
         assert_eq!(parse_command("/quit"), ParsedCommand::Quit);
@@ -2789,6 +2825,27 @@ mod tests {
         assert_eq!(
             app.conversation_history[0],
             Message::user("msg-5".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn synthesis_command_updates_instruction() {
+        let mut app = new_test_app();
+
+        app.handle_command("/synthesis Show raw output verbatim")
+            .await
+            .expect("synthesis command");
+        assert_eq!(
+            app.loop_engine.synthesis_instruction(),
+            "Show raw output verbatim"
+        );
+
+        app.handle_command("/synthesis reset")
+            .await
+            .expect("synthesis reset");
+        assert_eq!(
+            app.loop_engine.synthesis_instruction(),
+            DEFAULT_SYNTHESIS_INSTRUCTION
         );
     }
 

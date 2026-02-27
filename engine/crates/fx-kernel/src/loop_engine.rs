@@ -124,6 +124,7 @@ pub struct LoopEngine {
     tool_executor: Arc<dyn ToolExecutor>,
     max_iterations: u32,
     iteration_count: u32,
+    synthesis_instruction: String,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -152,6 +153,10 @@ const REASONING_MAX_OUTPUT_TOKENS: u32 = 768;
 const TOOL_SYNTHESIS_MAX_OUTPUT_TOKENS: u32 = 384;
 const DEFAULT_LLM_ACTION_COST_CENTS: u64 = 2;
 const SAFE_FALLBACK_RESPONSE: &str = "I wasn't able to process that. Could you try rephrasing?";
+pub const DEFAULT_SYNTHESIS_INSTRUCTION: &str =
+    "Present the tool output to the user. Show the actual data returned by the tools. \
+Be direct and factual. Do not paraphrase or summarize unless the output is very long \
+(over 100 lines), in which case provide a summary with key highlights.";
 const REASONING_SYSTEM_PROMPT: &str = "You are Fawx, an autonomous assistant. \
 Always use the emit_intent tool to respond. \
 The action field must deserialize to IntendedAction and use exactly one of these variants: \
@@ -169,6 +174,7 @@ impl LoopEngine {
         context: ContextCompactor,
         max_iterations: u32,
         tool_executor: Arc<dyn ToolExecutor>,
+        synthesis_instruction: String,
     ) -> Self {
         Self {
             budget,
@@ -176,7 +182,16 @@ impl LoopEngine {
             tool_executor,
             max_iterations: max_iterations.max(1),
             iteration_count: 0,
+            synthesis_instruction,
         }
+    }
+
+    pub fn set_synthesis_instruction(&mut self, instruction: String) {
+        self.synthesis_instruction = instruction;
+    }
+
+    pub fn synthesis_instruction(&self) -> &str {
+        &self.synthesis_instruction
     }
 
     /// Return status metrics for loop diagnostics.
@@ -551,7 +566,7 @@ impl LoopEngine {
                     error.recoverable,
                 )
             })?;
-        let synthesis_prompt = tool_synthesis_prompt(&tool_results);
+        let synthesis_prompt = tool_synthesis_prompt(&tool_results, &self.synthesis_instruction);
         let llm_text = self.generate_tool_summary(&synthesis_prompt, llm).await?;
         let usage = synthesis_usage(&synthesis_prompt, &llm_text);
 
@@ -715,16 +730,14 @@ fn compacted_context_summary(context: &ReasoningContext) -> Option<&str> {
         .map(|entry| entry.value.as_str())
 }
 
-fn tool_synthesis_prompt(tool_results: &[ToolResult]) -> String {
+fn tool_synthesis_prompt(tool_results: &[ToolResult], instruction: &str) -> String {
     let tool_summary = tool_results
         .iter()
         .map(|result| format!("- {}: {}", result.tool_name, result.output))
         .collect::<Vec<_>>()
         .join("\n");
 
-    format!(
-        "You are Fawx. Summarize the following tool activity for the user in concise text:\n{tool_summary}\n\nTool outputs are authoritative; summarize clearly and concisely."
-    )
+    format!("You are Fawx. {instruction}\n\nTool results:\n{tool_summary}")
 }
 
 fn join_streamed_chunks(chunks: &Arc<Mutex<Vec<String>>>) -> Result<String, LoopError> {
@@ -1519,7 +1532,51 @@ mod tests {
             context,
             max_iterations,
             Arc::new(TestStubToolExecutor),
+            DEFAULT_SYNTHESIS_INSTRUCTION.to_string(),
         )
+    }
+
+    #[test]
+    fn synthesis_prompt_uses_custom_instruction() {
+        let tool_results = vec![ToolResult {
+            tool_name: "search".to_string(),
+            success: true,
+            output: "result".to_string(),
+        }];
+
+        let prompt = tool_synthesis_prompt(&tool_results, "Return raw output.");
+
+        assert!(prompt.contains("You are Fawx. Return raw output."));
+        assert!(prompt.contains(
+            "Tool results:
+- search: result"
+        ));
+    }
+
+    #[test]
+    fn synthesis_prompt_uses_default_instruction() {
+        let tool_results = vec![ToolResult {
+            tool_name: "weather".to_string(),
+            success: true,
+            output: "72F".to_string(),
+        }];
+
+        let prompt = tool_synthesis_prompt(&tool_results, DEFAULT_SYNTHESIS_INSTRUCTION);
+
+        assert!(prompt.contains(DEFAULT_SYNTHESIS_INSTRUCTION));
+        assert!(prompt.contains(
+            "Tool results:
+- weather: 72F"
+        ));
+    }
+
+    #[test]
+    fn set_synthesis_instruction_updates_engine() {
+        let mut engine = default_engine(3);
+
+        engine.set_synthesis_instruction("Use exact tool output.".to_string());
+
+        assert_eq!(engine.synthesis_instruction, "Use exact tool output.");
     }
 
     #[test]
@@ -1595,7 +1652,13 @@ mod tests {
         };
         let budget = BudgetTracker::new(config, current_time_ms(), 0);
         let context = ContextCompactor::new(4_000, 3_000);
-        let mut engine = LoopEngine::new(budget, context, 10, Arc::new(TestStubToolExecutor));
+        let mut engine = LoopEngine::new(
+            budget,
+            context,
+            10,
+            Arc::new(TestStubToolExecutor),
+            DEFAULT_SYNTHESIS_INSTRUCTION.to_string(),
+        );
 
         let llm = MockLlm::with_responses(vec![
             r#"{"action":{"Respond":{"text":"never used"}},"rationale":"n/a","confidence":0.9,"expected_outcome":null,"sub_goals":[]}"#,
@@ -1620,7 +1683,13 @@ mod tests {
 
         let budget = BudgetTracker::new(config, current_time_ms(), 0);
         let context = ContextCompactor::new(4_000, 3_000);
-        let mut engine = LoopEngine::new(budget, context, 10, Arc::new(TestStubToolExecutor));
+        let mut engine = LoopEngine::new(
+            budget,
+            context,
+            10,
+            Arc::new(TestStubToolExecutor),
+            DEFAULT_SYNTHESIS_INSTRUCTION.to_string(),
+        );
 
         let llm = SlowMockLlm {
             inner: MockLlm::with_responses(vec![
@@ -1648,7 +1717,13 @@ mod tests {
 
         let budget = BudgetTracker::new(config, current_time_ms(), 0);
         let context = ContextCompactor::new(4_000, 3_000);
-        let mut engine = LoopEngine::new(budget, context, 5, Arc::new(TestStubToolExecutor));
+        let mut engine = LoopEngine::new(
+            budget,
+            context,
+            5,
+            Arc::new(TestStubToolExecutor),
+            DEFAULT_SYNTHESIS_INSTRUCTION.to_string(),
+        );
 
         let llm = MockLlm::with_responses(vec![
             r#"{"action":{"Respond":{"text":"first"}},"rationale":"r1","confidence":0.9,"expected_outcome":null,"sub_goals":[]}"#,
