@@ -2079,10 +2079,7 @@ mod tests {
         let intent = ReasonedIntent {
             action: IntendedAction::Delegate {
                 skill_id: "search".to_string(),
-                params: HashMap::from([(
-                    String::from("q"),
-                    String::from("delegate intent"),
-                )]),
+                params: HashMap::from([(String::from("q"), String::from("delegate intent"))]),
             },
             rationale: "delegate and summarize".to_string(),
             confidence: 0.9,
