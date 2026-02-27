@@ -210,6 +210,9 @@ impl Hinter for FawxReadlineHelper {
     type Hint = String;
 
     fn hint(&self, line: &str, pos: usize, context: &Context<'_>) -> Option<String> {
+        if line.len() < 2 {
+            return None;
+        }
         self.hinter.hint(line, pos, context)
     }
 }
@@ -220,21 +223,40 @@ impl Completer for FawxReadlineHelper {
     fn complete(
         &self,
         line: &str,
-        _pos: usize,
+        pos: usize,
         _context: &Context<'_>,
     ) -> rustyline::Result<(usize, Vec<Pair>)> {
-        Ok((0, command_completion_matches(line)))
+        let line_end = pos.min(line.len());
+        let start = token_start(line, line_end);
+        if start != 0 {
+            return Ok((start, Vec::new()));
+        }
+
+        let prefix = &line[start..line_end];
+        if !prefix.starts_with('/') {
+            return Ok((start, Vec::new()));
+        }
+
+        Ok((start, command_completion_matches(prefix)))
     }
 }
 
-fn command_completion_matches(line: &str) -> Vec<Pair> {
-    if !line.starts_with('/') {
+fn token_start(line: &str, cursor: usize) -> usize {
+    line[..cursor]
+        .char_indices()
+        .rev()
+        .find_map(|(idx, ch)| ch.is_whitespace().then_some(idx + ch.len_utf8()))
+        .unwrap_or(0)
+}
+
+fn command_completion_matches(prefix: &str) -> Vec<Pair> {
+    if !prefix.starts_with('/') {
         return Vec::new();
     }
 
     TUI_COMMANDS
         .iter()
-        .filter(|command| command.starts_with(line))
+        .filter(|command| command.starts_with(prefix))
         .map(|command| Pair {
             display: (*command).to_string(),
             replacement: (*command).to_string(),
@@ -269,7 +291,7 @@ fn history_namespace_for_cwd(home: &Path, cwd: &Path) -> Option<String> {
 }
 
 fn build_tui_prompt() -> String {
-    format!("\x01{PROMPT_COLOR_START}\x02you › \x01{PROMPT_COLOR_END}\x02")
+    format!("{PROMPT_COLOR_START}you › {PROMPT_COLOR_END}")
 }
 
 fn load_history_with_warning(
@@ -3109,6 +3131,92 @@ mod tests {
     }
 
     #[test]
+    fn readline_completer_matches_first_token_prefix() {
+        let helper = FawxReadlineHelper::default();
+        let history = DefaultHistory::new();
+        let context = rustyline::Context::new(&history);
+
+        let (start, matches) = helper
+            .complete("/h", 2, &context)
+            .expect("completion should succeed");
+
+        assert_eq!(start, 0);
+        assert!(matches.iter().any(|pair| pair.replacement == "/help"));
+    }
+
+    #[test]
+    fn readline_completer_returns_no_matches_after_first_token() {
+        let helper = FawxReadlineHelper::default();
+        let history = DefaultHistory::new();
+        let context = rustyline::Context::new(&history);
+        let line = "/help arg";
+
+        let (start, matches) = helper
+            .complete(line, line.len(), &context)
+            .expect("completion should succeed");
+
+        assert_eq!(start, 6);
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn readline_completer_keeps_start_at_zero_inside_first_token() {
+        let helper = FawxReadlineHelper::default();
+        let history = DefaultHistory::new();
+        let context = rustyline::Context::new(&history);
+
+        let (start, matches) = helper
+            .complete("/help", 2, &context)
+            .expect("completion should succeed");
+
+        assert_eq!(start, 0);
+        assert!(matches.iter().any(|pair| pair.replacement == "/help"));
+    }
+
+    #[test]
+    fn hinter_suppresses_hints_for_single_char_input() {
+        let helper = FawxReadlineHelper::default();
+        let history = DefaultHistory::new();
+        let context = rustyline::Context::new(&history);
+
+        assert!(
+            helper.hint("/", 1, &context).is_none(),
+            "single char should not trigger hint"
+        );
+        assert!(
+            helper.hint("", 0, &context).is_none(),
+            "empty input should not trigger hint"
+        );
+    }
+
+    #[test]
+    fn hinter_allows_hints_for_two_or_more_chars() {
+        let helper = FawxReadlineHelper::default();
+        let history = DefaultHistory::new();
+        let context = rustyline::Context::new(&history);
+
+        // With no history loaded, hint returns None regardless,
+        // but the gate should not block the call.
+        let _ = helper.hint("/h", 2, &context);
+        let _ = helper.hint("/he", 3, &context);
+        // No panic = gate allows through.
+    }
+
+    #[test]
+    fn token_start_returns_zero_for_first_token() {
+        assert_eq!(token_start("/help", 5), 0);
+        assert_eq!(token_start("/h", 2), 0);
+        assert_eq!(token_start("", 0), 0);
+    }
+
+    #[test]
+    fn token_start_returns_position_after_whitespace() {
+        assert_eq!(token_start("/help arg", 9), 6);
+        assert_eq!(token_start("a b c", 5), 4);
+        assert_eq!(token_start("hello  world", 12), 7);
+    }
+
+    #[test]
     fn history_namespace_returns_none_for_home_directory() {
         let home = PathBuf::from("/tmp/home");
         assert_eq!(history_namespace_for_cwd(&home, &home), None);
@@ -3154,10 +3262,16 @@ mod tests {
     }
 
     #[test]
-    fn tui_prompt_contains_readline_cursor_width_markers() {
+    fn tui_prompt_contains_ansi_color_codes() {
         let prompt = build_tui_prompt();
-        assert!(prompt.contains("\x01"));
-        assert!(prompt.contains("\x02"));
+        assert!(
+            !prompt.contains("\x01"),
+            "prompt should not contain readline markers"
+        );
+        assert!(
+            !prompt.contains("\x02"),
+            "prompt should not contain readline markers"
+        );
         assert!(prompt.contains(PROMPT_COLOR_START));
         assert!(prompt.contains(PROMPT_COLOR_END));
     }
