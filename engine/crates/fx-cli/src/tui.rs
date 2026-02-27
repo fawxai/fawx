@@ -23,6 +23,12 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const BANNER_ART: &str = "\
+   ___
+  / _/__ __    ____  __
+ / _/ _ `/ |/|/ /\\ \\/ /
+/_/ \\_,_/|__,__/ /_/\\_\\";
+
 const DEFAULT_AUTH_FILE: &str = ".fawx/auth.json";
 const DEFAULT_OPENAI_TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
 const MAX_PROMPT_RETRIES: usize = 10;
@@ -78,7 +84,14 @@ impl TuiApp {
 
         let mut line = String::new();
         while self.running {
-            print!("{}", "you \u{203a} ".with(style::Color::Green));
+            print!(
+                "{}",
+                "you \u{203a} ".with(style::Color::Rgb {
+                    r: 255,
+                    g: 204,
+                    b: 0,
+                })
+            );
             io::stdout().flush().map_err(TuiError::Io)?;
 
             line.clear();
@@ -120,16 +133,27 @@ impl TuiApp {
             eprintln!("failed to clear terminal line: {error}");
         }
 
-        let width = terminal::size().map(|(w, _)| w).unwrap_or(80);
-        let banner = "Fawx";
-        let padding = usize::from(width.saturating_sub(banner.len() as u16) / 2);
+        let amber = style::Color::Rgb {
+            r: 255,
+            g: 165,
+            b: 0,
+        };
+        let burnt = style::Color::Rgb {
+            r: 210,
+            g: 112,
+            b: 10,
+        };
 
         println!();
-        println!("{:padding$}{}", "", banner.bold().with(style::Color::Cyan));
+        for line in BANNER_ART.lines() {
+            println!("{}", line.bold().with(amber));
+        }
+        println!();
         println!(
-            "{:padding$}{}",
-            "",
-            "Agentic engine - type /help for commands".with(style::Color::DarkGrey)
+            "  {}",
+            "agentic engine \u{00b7} type /help for commands"
+                .with(burnt)
+                .attribute(style::Attribute::Dim)
         );
         println!();
     }
@@ -339,7 +363,14 @@ impl TuiApp {
         move_cursor_to_start(&mut stdout)?;
 
         println!();
-        print!("{} ", "assistant \u{203a}".bold().with(style::Color::Cyan));
+        print!(
+            "{} ",
+            "assistant \u{203a}".bold().with(style::Color::Rgb {
+                r: 255,
+                g: 165,
+                b: 0,
+            })
+        );
         println!("{response}");
         println!();
 
@@ -438,7 +469,14 @@ impl TuiApp {
     }
 
     fn show_help(&self) {
-        println!("{}", "Commands".bold().with(style::Color::Cyan));
+        println!(
+            "{}",
+            "Commands".bold().with(style::Color::Rgb {
+                r: 255,
+                g: 165,
+                b: 0,
+            })
+        );
         println!("  /model         List models and switch active model");
         println!("  /model <name>  Switch to a specific model");
         println!("  /auth          Show credentials / run auth wizard");
@@ -514,7 +552,14 @@ impl TuiApp {
         let model = self.router.active_model().unwrap_or_default();
         let status = self.loop_engine.status(current_time_ms());
         let providers = self.auth_manager.providers();
-        println!("{}", "Fawx Status".bold().with(style::Color::Cyan));
+        println!(
+            "{}",
+            "Fawx Status".bold().with(style::Color::Rgb {
+                r: 255,
+                g: 165,
+                b: 0,
+            })
+        );
         println!("  model:     {model}");
         println!("  providers: {}", providers.join(", "));
         println!("  tokens:    {} used", status.tokens_used);
@@ -665,7 +710,7 @@ fn format_loop_metadata(iterations: u32, tokens: &TokenUsage) -> String {
         format!("{iterations} iterations")
     };
     format!(
-        "\x1b[2m  \u{21b3} {iter_text} \u{00b7} {} in / {} out tokens\x1b[0m",
+        "\x1b[2m\x1b[38;2;210;112;10m  \u{21b3} {iter_text} \u{00b7} {} in / {} out tokens\x1b[0m",
         tokens.input_tokens, tokens.output_tokens,
     )
 }
