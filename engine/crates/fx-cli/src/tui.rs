@@ -1157,7 +1157,7 @@ where
             "Couldn't open browser automatically ({error}). Open this URL manually:\n{auth_url}"
         );
     }
-    println!("Waiting for callback on http://127.0.0.1:1455/auth/callback...");
+    println!("Waiting for callback on http://localhost:1455/auth/callback...");
     println!("(Or paste the redirect URL/code below if browser didn't work)\n");
 
     tokio::select! {
@@ -1188,7 +1188,7 @@ fn prompt_for_oauth_code(flow: &PkceFlow) -> Result<String, TuiError> {
 async fn start_oauth_callback_server(
     expected_state: &str,
 ) -> Result<impl std::future::Future<Output = Result<String, TuiError>>, TuiError> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:1455")
+    let listener = tokio::net::TcpListener::bind("localhost:1455")
         .await
         .map_err(|e| TuiError::Auth(format!("failed to bind port 1455: {e}")))?;
 
@@ -1371,7 +1371,18 @@ async fn exchange_oauth_code_for_tokens(
 }
 
 fn parse_token_error_response(status: reqwest::StatusCode, body: &str) -> TuiError {
-    let reason = serde_json::from_str::<serde_json::Value>(body)
+    let reason = parse_oauth_error_reason(body)
+        .unwrap_or_else(|| "token endpoint request failed".to_string());
+    let raw_body = format_oauth_error_body(body);
+
+    TuiError::Auth(format!(
+        "oauth token exchange failed ({}): {reason}. response_body={raw_body}",
+        status.as_u16()
+    ))
+}
+
+fn parse_oauth_error_reason(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
         .ok()
         .and_then(|json| {
             json.get("error_description")
@@ -1379,12 +1390,20 @@ fn parse_token_error_response(status: reqwest::StatusCode, body: &str) -> TuiErr
                 .and_then(|value| value.as_str())
                 .map(ToString::to_string)
         })
-        .unwrap_or_else(|| "token endpoint request failed".to_string());
+}
 
-    TuiError::Auth(format!(
-        "oauth token exchange failed ({}): {reason}",
-        status.as_u16()
-    ))
+fn format_oauth_error_body(body: &str) -> String {
+    const MAX_ERROR_BODY_CHARS: usize = 300;
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return "<empty>".to_string();
+    }
+
+    let mut out: String = trimmed.chars().take(MAX_ERROR_BODY_CHARS).collect();
+    if trimmed.chars().count() > MAX_ERROR_BODY_CHARS {
+        out.push('…');
+    }
+    out
 }
 
 async fn catalog_models_for_auth(
@@ -2582,6 +2601,25 @@ mod tests {
         );
 
         assert!(matches!(error, TuiError::Auth(message) if message.contains("bad code")));
+    }
+
+    #[test]
+    fn parse_token_error_response_includes_raw_response_body() {
+        let status = reqwest::StatusCode::BAD_REQUEST;
+        let error = parse_token_error_response(status, "<html>gateway denied</html>");
+
+        assert!(
+            matches!(error, TuiError::Auth(message) if message.contains("response_body=<html>gateway denied</html>"))
+        );
+    }
+
+    #[test]
+    fn format_oauth_error_body_truncates_long_payloads() {
+        let long_payload = "x".repeat(450);
+        let body = format_oauth_error_body(&long_payload);
+
+        assert_eq!(body.chars().count(), 301);
+        assert!(body.ends_with('…'));
     }
 
     #[test]

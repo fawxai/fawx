@@ -12,7 +12,8 @@ pub const OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OPENAI_OAUTH_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 /// OpenAI OAuth token endpoint.
 pub const OPENAI_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
-const DEFAULT_REDIRECT_URI: &str = "http://127.0.0.1:1455/auth/callback";
+const DEFAULT_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
+const DEFAULT_ORIGINATOR: &str = "codex_cli_rs";
 const DEFAULT_SCOPE: &str = "openid profile email offline_access";
 /// JWT claim path for extracting account ID from OpenAI access tokens.
 pub const OPENAI_JWT_CLAIM_PATH: &str = "https://api.openai.com/auth";
@@ -56,13 +57,14 @@ impl PkceFlow {
     /// Build the authorization URL with all required OAuth + OpenAI params.
     pub fn authorization_url(&self, client_id: &str) -> String {
         format!(
-            "{base}?response_type=code&client_id={client_id}&redirect_uri={redirect_uri}&scope={scope}&code_challenge={code_challenge}&code_challenge_method=S256&state={state}&id_token_add_organizations=true&codex_cli_simplified_flow=true&originator=fawx",
+            "{base}?response_type=code&client_id={client_id}&redirect_uri={redirect_uri}&scope={scope}&code_challenge={code_challenge}&code_challenge_method=S256&state={state}&id_token_add_organizations=true&codex_cli_simplified_flow=true&originator={originator}",
             base = OPENAI_OAUTH_AUTHORIZE_URL,
             client_id = percent_encode(client_id),
             redirect_uri = percent_encode(&self.redirect_uri),
             scope = percent_encode(DEFAULT_SCOPE),
             code_challenge = percent_encode(&self.code_challenge),
             state = percent_encode(&self.state),
+            originator = percent_encode(DEFAULT_ORIGINATOR),
         )
     }
 
@@ -425,6 +427,7 @@ mod tests {
         assert!(url.contains(&format!("state={}", percent_encode(flow.state()))));
         assert!(url.contains("response_type=code"));
         assert!(url.contains("scope="));
+        assert!(url.contains("originator=codex_cli_rs"));
     }
 
     #[test]
