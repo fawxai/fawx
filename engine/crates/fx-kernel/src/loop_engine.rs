@@ -365,7 +365,8 @@ impl LoopEngine {
         snapshot: &PerceptionSnapshot,
     ) -> Result<ProcessedPerception, LoopError> {
         let user_message = extract_user_message(snapshot)?;
-        let mut context_window = vec![Message::user(user_message.clone())];
+        let mut context_window = snapshot.conversation_history.clone();
+        context_window.push(Message::user(user_message.clone()));
 
         self.append_compacted_summary(snapshot, &user_message, &mut context_window);
 
@@ -1254,7 +1255,7 @@ mod tests {
     use async_trait::async_trait;
     use fx_core::error::LlmError as CoreLlmError;
     use fx_core::types::ScreenState;
-    use fx_llm::{CompletionResponse, ContentBlock, ProviderError};
+    use fx_llm::{CompletionResponse, ContentBlock, Message, ProviderError};
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
@@ -1505,6 +1506,7 @@ mod tests {
                 timestamp: timestamp_ms,
                 context_id: None,
             }),
+            conversation_history: Vec::new(),
         }
     }
 
@@ -1691,6 +1693,35 @@ mod tests {
         assert_eq!(processed.user_message, "What time is it?");
         assert!(!processed.context_window.is_empty());
         assert!(!processed.active_goals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn conversation_history_included_in_perception_context() {
+        let engine = default_engine(3);
+        let mut snapshot = base_snapshot("current message");
+        snapshot.conversation_history = vec![
+            Message::user("my name is Alice"),
+            Message::assistant("Nice to meet you, Alice!"),
+        ];
+
+        let processed = engine
+            .perceive(&snapshot)
+            .await
+            .expect("processed perception");
+
+        assert_eq!(processed.context_window.len(), 3);
+        assert_eq!(
+            processed.context_window[0],
+            Message::user("my name is Alice")
+        );
+        assert_eq!(
+            processed.context_window[1],
+            Message::assistant("Nice to meet you, Alice!")
+        );
+        assert_eq!(
+            processed.context_window[2],
+            Message::user("current message")
+        );
     }
 
     #[tokio::test]

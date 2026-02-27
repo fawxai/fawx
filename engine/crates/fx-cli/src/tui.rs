@@ -14,7 +14,7 @@ use fx_kernel::oauth::{PkceFlow, TokenExchangeRequest, TokenResponse};
 use fx_kernel::types::PerceptionSnapshot;
 use fx_llm::{
     AnthropicProvider, CompletionRequest, Message, ModelCatalog, ModelRouter, OpenAiProvider,
-    OpenAiResponsesProvider, ProviderError, StreamChunk,
+    OpenAiResponsesProvider, ProviderError, RouterError, StreamChunk,
 };
 use std::fmt;
 use std::io::{self, Write};
@@ -37,6 +37,7 @@ const MAX_PROMPT_RETRIES: usize = 10;
 const DEFAULT_CONTEXT_MAX_TOKENS: usize = 8_000;
 const DEFAULT_CONTEXT_COMPACT_TARGET: usize = 6_000;
 const DEFAULT_MAX_LOOP_ITERATIONS: u32 = 10;
+const MAX_HISTORY_MESSAGES: usize = 20;
 
 const DEFAULT_ANTHROPIC_MODELS: &[&str] = &[
     "claude-sonnet-4-20250514",
@@ -59,6 +60,7 @@ pub struct TuiApp {
     catalog: ModelCatalog,
     loop_engine: LoopEngine,
     running: bool,
+    conversation_history: Vec<Message>,
 }
 
 impl TuiApp {
@@ -70,19 +72,13 @@ impl TuiApp {
             catalog: ModelCatalog::new(),
             loop_engine,
             running: true,
+            conversation_history: Vec::new(),
         }
     }
 
     /// Run the TUI main loop.
     pub async fn run(&mut self) -> Result<(), TuiError> {
         self.show_welcome();
-
-        if !self.auth_manager.has_any() {
-            self.auth_wizard().await?;
-        } else {
-            self.refresh_router_models().await?;
-            self.select_first_available_model();
-        }
 
         let mut line = String::new();
         while self.running {
@@ -159,6 +155,14 @@ impl TuiApp {
                 .with(burnt)
                 .attribute(style::Attribute::Dim)
         );
+        if !self.auth_manager.has_any() {
+            println!(
+                "  {}",
+                "Not authenticated · /auth to set up or just send a message"
+                    .with(burnt)
+                    .attribute(style::Attribute::Dim)
+            );
+        }
         println!();
     }
 
@@ -305,9 +309,8 @@ impl TuiApp {
                 self.show_model_menu();
             }
             ParsedCommand::Model(Some(model)) => {
-                self.refresh_router_models().await?;
-                match self.router.set_active(&model) {
-                    Ok(()) => println!("Active model set to: {model}"),
+                match self.set_active_model_with_refresh(&model).await {
+                    Ok(resolved_model) => println!("Active model set to: {resolved_model}"),
                     Err(error) => {
                         println!("Couldn't select model: {error}");
                         self.show_model_menu();
@@ -324,7 +327,10 @@ impl TuiApp {
             ParsedCommand::Budget => self.show_budget_status(),
             ParsedCommand::Loop => self.show_loop_status(),
             ParsedCommand::Status => self.show_status(),
-            ParsedCommand::Clear => self.clear_screen()?,
+            ParsedCommand::Clear => {
+                self.conversation_history.clear();
+                self.clear_screen()?;
+            }
             ParsedCommand::Help => self.show_help(),
             ParsedCommand::Quit => {
                 self.running = false;
@@ -341,6 +347,8 @@ impl TuiApp {
 
     /// Process a user message by running the full loop engine.
     async fn handle_message(&mut self, input: &str) -> Result<String, TuiError> {
+        self.ensure_message_auth().await?;
+
         let active_model = self
             .router
             .active_model()
@@ -358,7 +366,42 @@ impl TuiApp {
                 .map_err(|error| TuiError::Loop(error.reason))?
         };
 
-        Ok(render_loop_result(loop_result))
+        let response = render_loop_result(loop_result.clone());
+        self.record_conversation_turn(input, loop_result_response_text(&loop_result));
+        Ok(response)
+    }
+
+    async fn ensure_message_auth(&mut self) -> Result<(), TuiError> {
+        if !self.auth_manager.has_any() {
+            self.auth_wizard().await?;
+        }
+
+        if self.router.active_model().is_none() {
+            self.refresh_router_models().await?;
+            self.select_first_available_model();
+        }
+
+        Ok(())
+    }
+
+    fn set_active_model_from_selector(&mut self, selector: &str) -> Result<String, RouterError> {
+        self.router.set_active(selector)?;
+        Ok(self.router.active_model().unwrap_or(selector).to_string())
+    }
+
+    async fn set_active_model_with_refresh(
+        &mut self,
+        selector: &str,
+    ) -> Result<String, RouterError> {
+        match self.set_active_model_from_selector(selector) {
+            Ok(model) => Ok(model),
+            Err(initial_error) => {
+                if self.refresh_router_models().await.is_err() {
+                    return Err(initial_error);
+                }
+                self.set_active_model_from_selector(selector)
+            }
+        }
     }
 
     /// Display formatted output to the terminal.
@@ -553,7 +596,7 @@ impl TuiApp {
     }
 
     fn show_status(&self) {
-        let model = self.router.active_model().unwrap_or_default();
+        let model = self.current_model();
         let status = self.loop_engine.status(current_time_ms());
         let providers = self.auth_manager.providers();
         println!(
@@ -568,6 +611,10 @@ impl TuiApp {
         println!("  providers: {}", providers.join(", "));
         println!("  tokens:    {} used", status.tokens_used);
         println!("  budget:    {} tokens remaining", status.remaining.tokens);
+    }
+
+    fn current_model(&self) -> &str {
+        self.router.active_model().unwrap_or_default()
     }
 
     fn clear_screen(&self) -> Result<(), TuiError> {
@@ -598,7 +645,17 @@ impl TuiApp {
                 timestamp: timestamp_ms,
                 context_id: None,
             }),
+            conversation_history: self.conversation_history.clone(),
         }
+    }
+
+    fn record_conversation_turn(&mut self, user_text: &str, assistant_text: String) {
+        let clean_assistant_text = sanitize_history_text(&assistant_text);
+        self.conversation_history
+            .push(Message::user(user_text.to_string()));
+        self.conversation_history
+            .push(Message::assistant(clean_assistant_text));
+        trim_history(&mut self.conversation_history);
     }
 }
 
@@ -794,6 +851,67 @@ impl LoopLlmProvider for RouterLoopLlmProvider<'_> {
     fn model_name(&self) -> &str {
         &self.active_model
     }
+}
+
+fn loop_result_response_text(result: &LoopResult) -> String {
+    match result {
+        LoopResult::Complete { response, .. } => response.clone(),
+        LoopResult::BudgetExhausted {
+            partial_response,
+            iterations,
+        } => render_budget_exhausted(partial_response.clone(), *iterations),
+        LoopResult::NeedsInput { prompt, iterations } => {
+            let meta =
+                format!("\x1b[2m  \u{21b3} {iterations} iteration(s) \u{00b7} needs input\x1b[0m");
+            format!("{prompt}\n{meta}")
+        }
+        LoopResult::Error {
+            message,
+            recoverable,
+        } => render_loop_error(message, *recoverable),
+    }
+}
+
+fn sanitize_history_text(text: &str) -> String {
+    let stripped = strip_ansi_csi_sequences(text);
+    stripped
+        .lines()
+        .filter(|line| !line.contains('\u{21b3}'))
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+fn strip_ansi_csi_sequences(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for code in chars.by_ref() {
+                if ('@'..='~').contains(&code) {
+                    break;
+                }
+            }
+            continue;
+        }
+
+        output.push(ch);
+    }
+
+    output
+}
+
+fn trim_history(history: &mut Vec<Message>) {
+    if history.len() <= MAX_HISTORY_MESSAGES {
+        return;
+    }
+
+    let remove_count = history.len() - MAX_HISTORY_MESSAGES;
+    history.drain(0..remove_count);
 }
 
 fn render_loop_result(result: LoopResult) -> String {
@@ -1905,6 +2023,12 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct ModelEchoProvider {
+        provider_name: String,
+        models: Vec<String>,
+    }
+
+    #[derive(Debug)]
     struct StreamingTestProvider {
         provider_name: String,
         model: String,
@@ -1922,6 +2046,53 @@ mod tests {
     struct FailingCompletionProvider {
         provider_name: String,
         model: String,
+    }
+
+    #[async_trait]
+    impl fx_llm::CompletionProvider for ModelEchoProvider {
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> Result<fx_llm::CompletionResponse, fx_llm::ProviderError> {
+            let response = format!(
+                "{{\"action\":{{\"Respond\":{{\"text\":\"{}\"}}}},\"rationale\":\"echo\",\"confidence\":0.9,\"expected_outcome\":null,\"sub_goals\":[]}}",
+                request.model
+            );
+            Ok(fx_llm::CompletionResponse {
+                content: vec![ContentBlock::Text { text: response }],
+                tool_calls: Vec::new(),
+                usage: None,
+                stop_reason: Some("end_turn".to_string()),
+            })
+        }
+
+        async fn complete_stream(
+            &self,
+            request: CompletionRequest,
+        ) -> Result<fx_llm::CompletionStream, fx_llm::ProviderError> {
+            let chunk = Ok(fx_llm::StreamChunk {
+                delta_content: Some(format!(
+                    "{{\"action\":{{\"Respond\":{{\"text\":\"{}\"}}}},\"rationale\":\"echo\",\"confidence\":0.9,\"expected_outcome\":null,\"sub_goals\":[]}}",
+                    request.model
+                )),
+                tool_use_deltas: Vec::new(),
+                usage: None,
+                stop_reason: Some("end_turn".to_string()),
+            });
+            Ok(Box::pin(futures::stream::iter(vec![chunk])))
+        }
+
+        fn name(&self) -> &str {
+            &self.provider_name
+        }
+
+        fn supported_models(&self) -> Vec<String> {
+            self.models.clone()
+        }
+
+        fn capabilities(&self) -> fx_llm::ProviderCapabilities {
+            mock_provider_capabilities()
+        }
     }
 
     #[async_trait]
@@ -2062,7 +2233,38 @@ mod tests {
             .set_active("mock-loop-model")
             .expect("set active mock model");
 
-        TuiApp::new(AuthManager::new(), router, build_loop_engine())
+        TuiApp::new(test_provider_auth_manager(), router, build_loop_engine())
+    }
+
+    fn test_provider_auth_manager() -> AuthManager {
+        let mut auth_manager = AuthManager::new();
+        auth_manager.store(
+            "test-provider",
+            AuthMethod::ApiKey {
+                provider: "test-provider".to_string(),
+                key: "test-key".to_string(),
+            },
+        );
+        auth_manager
+    }
+
+    fn app_with_two_models() -> TuiApp {
+        let mut router = ModelRouter::new();
+        router.register_provider_with_auth(
+            Box::new(ModelEchoProvider {
+                provider_name: "echo-provider".to_string(),
+                models: vec![
+                    "claude-sonnet-4-6-20250929".to_string(),
+                    "gpt-5-mini".to_string(),
+                ],
+            }),
+            "test",
+        );
+        router
+            .set_active("gpt-5-mini")
+            .expect("set initial active model");
+
+        TuiApp::new(test_provider_auth_manager(), router, build_loop_engine())
     }
 
     fn router_with_completion_response(
@@ -2099,6 +2301,7 @@ mod tests {
                 timestamp: 1,
                 context_id: None,
             }),
+            conversation_history: Vec::new(),
         }
     }
 
@@ -2407,6 +2610,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tui_runs_without_auth_configured() {
+        let mut app = new_test_app();
+
+        app.process_input_line("/help").await.unwrap();
+        app.process_input_line("/status").await.unwrap();
+
+        assert!(app.running);
+        assert!(!app.auth_manager.has_any());
+    }
+
+    #[tokio::test]
+    async fn help_command_works_without_auth() {
+        let mut app = new_test_app();
+
+        app.process_input_line("/help").await.unwrap();
+
+        assert!(app.running);
+        assert!(!app.auth_manager.has_any());
+    }
+
+    #[tokio::test]
+    async fn quit_command_works_without_auth() {
+        let mut app = new_test_app();
+
+        app.process_input_line("/quit").await.unwrap();
+
+        assert!(!app.running);
+        assert!(!app.auth_manager.has_any());
+    }
+
+    #[tokio::test]
     async fn run_exits_immediately_when_not_running() {
         let mut app = TuiApp::new(test_auth_manager(), ModelRouter::new(), build_loop_engine());
         app.running = false;
@@ -2426,6 +2660,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn message_triggers_auth_when_not_configured() {
+        let mut app = new_test_app();
+
+        let error = app
+            .handle_message("hello")
+            .await
+            .expect_err("message should trigger auth wizard without configured credentials");
+
+        assert!(
+            matches!(error, TuiError::Auth(message) if message.contains("stdin closed unexpectedly"))
+        );
+    }
+
+    #[tokio::test]
+    async fn status_reflects_switched_model() {
+        let mut app = app_with_two_models();
+
+        app.handle_command("/model claude-sonnet-4-6")
+            .await
+            .unwrap();
+
+        assert_eq!(app.current_model(), "claude-sonnet-4-6-20250929");
+    }
+
+    #[tokio::test]
+    async fn model_command_resolves_prefix_to_full_model_id() {
+        let mut app = app_with_two_models();
+
+        let resolved = app
+            .set_active_model_from_selector("claude-sonnet-4-6")
+            .expect("model selector should resolve");
+
+        assert_eq!(resolved, "claude-sonnet-4-6-20250929");
+    }
+
+    #[tokio::test]
+    async fn handle_message_uses_current_active_model() {
+        let mut app = app_with_two_models();
+
+        app.handle_command("/model claude-sonnet-4-6")
+            .await
+            .unwrap();
+        let rendered = app.handle_message("hello").await.expect("loop response");
+
+        assert!(rendered.contains("claude-sonnet-4-6-20250929"));
+    }
+
+    #[tokio::test]
     async fn handle_message_returns_loop_result_not_raw_completion_payload() {
         let mut app = app_with_mock_model(
             r#"{"action":{"Respond":{"text":"Loop-integrated reply"}},"rationale":"direct","confidence":0.91,"expected_outcome":null,"sub_goals":[]}"#,
@@ -2438,6 +2720,90 @@ mod tests {
 
         assert!(rendered.contains("Loop-integrated reply"));
         assert!(rendered.contains("1 iteration"));
+    }
+
+    #[tokio::test]
+    async fn conversation_history_accumulates_across_messages() {
+        let mut app = app_with_mock_model(
+            r#"{"action":{"Respond":{"text":"hello"}},"rationale":"r","confidence":0.9,"expected_outcome":null,"sub_goals":[]}"#,
+        );
+
+        let _ = app.handle_message("my name is Alice").await.expect("first");
+        let _ = app
+            .handle_message("what is my name?")
+            .await
+            .expect("second");
+
+        assert_eq!(app.conversation_history.len(), 4);
+        assert_eq!(
+            app.conversation_history[0],
+            Message::user("my name is Alice")
+        );
+        assert_eq!(
+            app.conversation_history[2],
+            Message::user("what is my name?")
+        );
+    }
+
+    #[tokio::test]
+    async fn model_switch_preserves_conversation_history() {
+        let mut app = app_with_two_models();
+
+        app.handle_message("remember the launch code")
+            .await
+            .expect("first response");
+        app.handle_command("/model claude-sonnet-4-6")
+            .await
+            .expect("model switch command");
+        app.handle_message("what model are you using now?")
+            .await
+            .expect("second response");
+
+        assert_eq!(app.current_model(), "claude-sonnet-4-6-20250929");
+        assert_eq!(app.conversation_history.len(), 4);
+        assert_eq!(
+            app.conversation_history[0],
+            Message::user("remember the launch code".to_string())
+        );
+        assert_eq!(
+            app.conversation_history[2],
+            Message::user("what model are you using now?".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn conversation_history_respects_max_limit() {
+        let mut app = app_with_mock_model(
+            r#"{"action":{"Respond":{"text":"ok"}},"rationale":"r","confidence":0.9,"expected_outcome":null,"sub_goals":[]}"#,
+        );
+
+        for i in 0..15 {
+            let message = format!("msg-{i}");
+            let _ = app
+                .handle_message(&message)
+                .await
+                .expect("message response");
+        }
+
+        assert_eq!(app.conversation_history.len(), MAX_HISTORY_MESSAGES);
+        assert_eq!(
+            app.conversation_history[0],
+            Message::user("msg-5".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_command_resets_conversation_history() {
+        let mut app = app_with_mock_model(
+            r#"{"action":{"Respond":{"text":"ok"}},"rationale":"r","confidence":0.9,"expected_outcome":null,"sub_goals":[]}"#,
+        );
+
+        let _ = app.handle_message("remember this").await.expect("message");
+        assert!(!app.conversation_history.is_empty());
+
+        app.handle_command("/clear").await.expect("clear command");
+
+        assert!(app.conversation_history.is_empty());
     }
 
     #[tokio::test]
@@ -2645,6 +3011,15 @@ mod tests {
         });
         assert!(result.contains("\u{2717} timeout"));
         assert!(result.contains("recoverable"));
+    }
+
+    #[test]
+    fn sanitize_history_text_removes_ansi_and_loop_metadata() {
+        let text = "Answer\n\x1b[2m  ↳ 2 iterations · 50 in / 12 out tokens\x1b[0m\n\x1b[33mwarning\x1b[0m";
+
+        let sanitized = sanitize_history_text(text);
+
+        assert_eq!(sanitized, "Answer\nwarning");
     }
 
     #[tokio::test]

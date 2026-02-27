@@ -52,12 +52,34 @@ impl ModelRouter {
 
     /// Set the active model.
     pub fn set_active(&mut self, model: &str) -> Result<(), RouterError> {
-        if !self.model_to_provider.contains_key(model) {
-            return Err(RouterError::ModelNotFound(model.to_string()));
+        if model.trim().is_empty() {
+            return Err(RouterError::EmptyModelSelector);
         }
 
-        self.active_model = Some(model.to_string());
+        let resolved_model = self.resolve_model(model)?;
+        self.active_model = Some(resolved_model);
         Ok(())
+    }
+
+    fn resolve_model(&self, model: &str) -> Result<String, RouterError> {
+        if self.model_to_provider.contains_key(model) {
+            return Ok(model.to_string());
+        }
+
+        let mut prefix_matches = self
+            .model_to_provider
+            .keys()
+            .filter(|candidate| candidate.starts_with(model));
+
+        let Some(first_match) = prefix_matches.next() else {
+            return Err(RouterError::ModelNotFound(model.to_string()));
+        };
+
+        if prefix_matches.next().is_some() {
+            return Err(RouterError::AmbiguousModel(model.to_string()));
+        }
+
+        Ok(first_match.to_string())
     }
 
     /// Return the active model identifier, if any.
@@ -152,6 +174,12 @@ pub enum RouterError {
     /// The requested model identifier is unknown.
     #[error("model not found: {0}")]
     ModelNotFound(String),
+    /// The model selector matches multiple registered models.
+    #[error("ambiguous model selector: {0}")]
+    AmbiguousModel(String),
+    /// The model selector is empty.
+    #[error("model selector cannot be empty")]
+    EmptyModelSelector,
     /// Provider-level request failure.
     #[error("provider error: {0}")]
     ProviderError(crate::types::LlmError),
@@ -657,6 +685,15 @@ mod model_router_tests {
     }
 
     #[test]
+    fn set_active_rejects_empty_selector() {
+        let mut router = ModelRouter::new();
+
+        let result = router.set_active("");
+
+        assert!(matches!(result, Err(RouterError::EmptyModelSelector)));
+    }
+
+    #[test]
     fn set_active_returns_error_for_unknown_model() {
         let mut router = ModelRouter::new();
         let result = router.set_active("missing-model");
@@ -668,7 +705,54 @@ mod model_router_tests {
     }
 
     #[test]
-    fn active_model_returns_selected_model() {
+    fn set_active_accepts_unique_model_prefix() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let temperatures = Arc::new(Mutex::new(Vec::new()));
+        let provider = MockCompletionProvider::new(
+            "anthropic",
+            vec!["claude-sonnet-4-6-20250929"],
+            "from anthropic",
+            captured,
+            temperatures,
+            default_capabilities(),
+        );
+
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(provider));
+
+        router
+            .set_active("claude-sonnet-4-6")
+            .expect("prefix should resolve to the full model id");
+
+        assert_eq!(router.active_model(), Some("claude-sonnet-4-6-20250929"));
+    }
+
+    #[test]
+    fn set_active_returns_error_for_ambiguous_model_prefix() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let temperatures = Arc::new(Mutex::new(Vec::new()));
+        let provider = MockCompletionProvider::new(
+            "anthropic",
+            vec!["claude-sonnet-4-6-20250929", "claude-sonnet-4-6-20251001"],
+            "from anthropic",
+            captured,
+            temperatures,
+            default_capabilities(),
+        );
+
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(provider));
+
+        let result = router.set_active("claude-sonnet-4-6");
+
+        assert!(matches!(
+            result,
+            Err(RouterError::AmbiguousModel(model)) if model == "claude-sonnet-4-6"
+        ));
+    }
+
+    #[test]
+    fn model_switch_updates_active_model() {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let temperatures = Arc::new(Mutex::new(Vec::new()));
         let provider = MockCompletionProvider::new(
