@@ -1,6 +1,6 @@
 # JNI Bindings (UniFFI-generated)
 
-UniFFI-generated Kotlin bindings for the Citros engine.
+UniFFI-generated Kotlin bindings for the Fawx engine.
 
 **Status:** Stub. Will be generated once the kernel crate has a public API.
 

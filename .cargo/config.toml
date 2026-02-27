@@ -1,4 +1,4 @@
-# Cargo configuration for Citros
+# Cargo configuration for Fawx
 
 [build]
 # Default to native target

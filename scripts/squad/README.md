@@ -23,7 +23,7 @@ Utilities for `docs/runbooks/squad-v2.md`.
 One JSON object per line, e.g.:
 
 ```json
-{"id":"704","branch":"fix/704-focus-steal-cli","worktree":"/Users/clawdiobot/citros-squad-cli-704","log":"/tmp/codex-704.log","pid":48452,"state":"running","startedAt":"2026-02-23T02:16:00Z","restarts":0}
+{"id":"704","branch":"fix/704-focus-steal-cli","worktree":"/Users/clawdiobot/fawx-squad-cli-704","log":"/tmp/codex-704.log","pid":48452,"state":"running","startedAt":"2026-02-23T02:16:00Z","restarts":0}
 ```
 
 Required keys:
@@ -61,7 +61,7 @@ scripts/squad/manifest-upsert.sh \
   --manifest /tmp/squad-manifest.jsonl \
   --id 704 \
   --branch fix/704-focus-steal-cli \
-  --worktree /Users/clawdiobot/citros-squad-cli-704 \
+  --worktree /Users/clawdiobot/fawx-squad-cli-704 \
   --log /tmp/codex-704.log \
   --state queued
 
@@ -70,7 +70,7 @@ scripts/squad/manifest-upsert.sh \
   --manifest /tmp/squad-manifest.jsonl \
   --id 704 \
   --branch fix/704-focus-steal-cli \
-  --worktree /Users/clawdiobot/citros-squad-cli-704 \
+  --worktree /Users/clawdiobot/fawx-squad-cli-704 \
   --log /tmp/codex-704.log \
   --state running \
   --pid "$PID" \
@@ -89,7 +89,7 @@ Monitor behavior notes:
 Machine-readable output:
 
 ```bash
-scripts/squad/manifest-upsert.sh --manifest /tmp/squad-manifest.jsonl --id 704 --branch fix/704-focus-steal-cli --worktree /Users/clawdiobot/citros-squad-cli-704 --log /tmp/codex-704.log --state queued --json
+scripts/squad/manifest-upsert.sh --manifest /tmp/squad-manifest.jsonl --id 704 --branch fix/704-focus-steal-cli --worktree /Users/clawdiobot/fawx-squad-cli-704 --log /tmp/codex-704.log --state queued --json
 scripts/squad/manifest-check.sh --manifest /tmp/squad-manifest.jsonl --json
 scripts/squad/monitor.sh --manifest /tmp/squad-manifest.jsonl --json
 ```
