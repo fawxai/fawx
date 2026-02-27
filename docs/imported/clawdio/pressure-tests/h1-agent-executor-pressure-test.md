@@ -1,7 +1,7 @@
 # Retroactive Pressure Test: AgentExecutor Loop vs OpenClaw Agent Loop
 
 *Pressure test for #478 — Tier 1 retroactive audit*
-*Citros: `AgentExecutor` (PR #476) | OpenClaw: `pi-agent-core` Agent + `agent-loop.ts` + `AgentSession`*
+*Fawx: `AgentExecutor` (PR #476) | OpenClaw: `pi-agent-core` Agent + `agent-loop.ts` + `AgentSession`*
 
 ---
 
@@ -94,11 +94,11 @@ The OpenClaw-specific wrapper that adds:
 
 ---
 
-## 2. Citros's Architecture
+## 2. Fawx's Architecture
 
 ### `AgentExecutor` — Single class, ~220 lines
 
-Citros combines elements from all three OpenClaw layers into one class:
+Fawx combines elements from all three OpenClaw layers into one class:
 
 **Structure:**
 
@@ -136,39 +136,39 @@ run(initialResponse, screenContent, isCancelled, continueAfterTools):
 
 ### 3.1 Loop Structure
 
-| Aspect | OpenClaw | Citros | Assessment |
+| Aspect | OpenClaw | Fawx | Assessment |
 |--------|----------|--------|------------|
-| Entry point | `agentLoop()` with user messages → builds first response internally | `run()` with **pre-built** initial response | **Gap**: Citros skips the "intake" phase. The LLM call that produces the initial response happens outside AgentExecutor, in ChatViewModel. This means the executor doesn't control the first API call or its error handling. |
+| Entry point | `agentLoop()` with user messages → builds first response internally | `run()` with **pre-built** initial response | **Gap**: Fawx skips the "intake" phase. The LLM call that produces the initial response happens outside AgentExecutor, in ChatViewModel. This means the executor doesn't control the first API call or its error handling. |
 | Outer loop | Explicit follow-up message loop | None — follow-up handled outside | **Intentional**: Single-user phone agent doesn't need the outer follow-up loop. ChatViewModel handles sequencing. |
-| Inner loop | `while(hasMoreToolCalls \|\| pendingMessages)` | `while(response has tool calls)` + pre-batch steer check | **Equivalent**: Both continue while tools are requested. Citros's pre-batch steer effectively handles the `pendingMessages` case. |
-| Step counting | None in core loop | Built-in `toolSteps` counter + `StepLimitCheck` | **Citros is more restrictive**: Phone agent needs hard limits (tools are real-world actions). OpenClaw delegates this to higher layers. |
+| Inner loop | `while(hasMoreToolCalls \|\| pendingMessages)` | `while(response has tool calls)` + pre-batch steer check | **Equivalent**: Both continue while tools are requested. Fawx's pre-batch steer effectively handles the `pendingMessages` case. |
+| Step counting | None in core loop | Built-in `toolSteps` counter + `StepLimitCheck` | **Fawx is more restrictive**: Phone agent needs hard limits (tools are real-world actions). OpenClaw delegates this to higher layers. |
 | Tool execution | Sequential with per-tool steer check | Sequential with per-tool boundary check | **Equivalent pattern** |
-| Batch skip on steer | Remaining tools get `"Skipped due to queued user message."` | Remaining tools simply not executed (break) | **Gap**: OpenClaw provides skip results for every tool call in the batch, maintaining API contract (every tool_use gets a tool_result). Citros breaks the loop — skipped tool calls have no result. **Need to verify**: Does the Anthropic API require results for all tool calls in a batch? If yes, this is a bug. |
+| Batch skip on steer | Remaining tools get `"Skipped due to queued user message."` | Remaining tools simply not executed (break) | **Gap**: OpenClaw provides skip results for every tool call in the batch, maintaining API contract (every tool_use gets a tool_result). Fawx breaks the loop — skipped tool calls have no result. **Need to verify**: Does the Anthropic API require results for all tool calls in a batch? If yes, this is a bug. |
 
 ### 3.2 Event System vs Return Values
 
-| Aspect | OpenClaw | Citros |
+| Aspect | OpenClaw | Fawx |
 |--------|----------|--------|
 | Communication | `EventStream<AgentEvent>` with 12 event types | `LoopResult` return value + `LoopProgressListener` callbacks |
 | Streaming | Events emitted during LLM streaming (`message_update`) | No streaming within executor — streaming happens in ChatViewModel |
 | Granularity | Per-token streaming events, per-tool events, turn boundaries | Tool result events only |
 
-**Assessment**: OpenClaw's event stream is designed for a CLI/web UI that needs real-time updates. Citros's simpler callback model is appropriate for a phone UI where the overlay shows minimal status. **Not a gap** — different requirements.
+**Assessment**: OpenClaw's event stream is designed for a CLI/web UI that needs real-time updates. Fawx's simpler callback model is appropriate for a phone UI where the overlay shows minimal status. **Not a gap** — different requirements.
 
 ### 3.3 Message & Context Handling
 
-| Aspect | OpenClaw | Citros |
+| Aspect | OpenClaw | Fawx |
 |--------|----------|--------|
 | Context mutation | In-place mutation of `currentContext.messages` | Delegate methods (`addToolResult`, `addSteerMessage`) |
 | Message types | `AgentMessage` union (user, assistant, toolResult, custom) | Tool results as strings, steer as separate user messages |
 | `transformContext` | Runs before every LLM call — pruning/injection point | No equivalent in executor — context management is external |
 | `convertToLlm` | Filters non-LLM messages before API call | No equivalent — all messages assumed LLM-compatible |
 
-**Assessment**: OpenClaw's `transformContext` hook is powerful — it's where context window management happens automatically. Citros has no equivalent inside the executor loop. Context trimming will need to be added for H1.4 (Smart Context Trimming). **Gap — deferred to H1.4**: The executor should have a pre-LLM-call hook for context transformation.
+**Assessment**: OpenClaw's `transformContext` hook is powerful — it's where context window management happens automatically. Fawx has no equivalent inside the executor loop. Context trimming will need to be added for H1.4 (Smart Context Trimming). **Gap — deferred to H1.4**: The executor should have a pre-LLM-call hook for context transformation.
 
 ### 3.4 Steer Implementation
 
-| Aspect | OpenClaw | Citros |
+| Aspect | OpenClaw | Fawx |
 |--------|----------|--------|
 | Steer delivery | After each tool execution via `getSteeringMessages()` | Two checkpoints: pre-batch + post-tool via `SteerCheck` |
 | Steer as user messages | Yes — steering messages are `AgentMessage` with `role: "user"` | Yes — `addSteerMessage()` adds as user turn |
@@ -176,18 +176,18 @@ run(initialResponse, screenContent, isCancelled, continueAfterTools):
 | Steer modes | `"all"` or `"one-at-a-time"` (configurable drain) | Always drains all pending messages |
 | Follow-up queue | Separate `getFollowUpMessages()` checked at outer loop boundary | No follow-up queue in executor |
 
-**Assessment**: Pre-batch steer (Citros) is a good addition that OpenClaw doesn't have — it catches steers that arrive during the API call, before ANY tools execute (zero wasted actions). The missing skip results for batch cancellation is the only concrete gap.
+**Assessment**: Pre-batch steer (Fawx) is a good addition that OpenClaw doesn't have — it catches steers that arrive during the API call, before ANY tools execute (zero wasted actions). The missing skip results for batch cancellation is the only concrete gap.
 
 ### 3.5 Error Handling
 
-| Aspect | OpenClaw | Citros |
+| Aspect | OpenClaw | Fawx |
 |--------|----------|--------|
 | Tool execution errors | Caught, result becomes error content (`isError: true`) | Caught, error message truncated to 100 chars |
 | API call errors | Caught at stream level, `stopReason: "error"` | Pre-batch steer: explicit `api_error_after_steer`. End-of-loop: error becomes a `ChatResponse` with error text |
 | Abort/cancel | `AbortController` signal propagated to LLM call | `isCancelled()` lambda checked at boundaries |
 | Auto-retry | In `AgentSession` layer — configurable attempts with backoff | None |
 
-**Assessment**: OpenClaw's auto-retry is valuable for transient errors (rate limits, 503s). Citros has no retry mechanism — errors surface to the user immediately. **Gap — deferred to H3**: Auto-retry should be added when model failover ships.
+**Assessment**: OpenClaw's auto-retry is valuable for transient errors (rate limits, 503s). Fawx has no retry mechanism — errors surface to the user immediately. **Gap — deferred to H3**: Auto-retry should be added when model failover ships.
 
 ### 3.6 Lifecycle Phases
 
@@ -203,7 +203,7 @@ OpenClaw's full lifecycle (across all three layers):
 7. COMPACTION  — auto-compact if context threshold exceeded
 ```
 
-Citros's lifecycle:
+Fawx's lifecycle:
 
 ```
 1. (External)  — ChatViewModel receives message, builds prompt, makes first API call
@@ -211,7 +211,7 @@ Citros's lifecycle:
 3. (External)  — ChatViewModel handles response display and state updates
 ```
 
-**Assessment**: Citros's executor handles only phase 4 of OpenClaw's 7-phase lifecycle. Phases 1-3 and 5-7 live in ChatViewModel. This is fine for now — the executor boundary is at the right place. But as features grow (context trimming, compaction, retry), more logic will need to move into or adjacent to the executor.
+**Assessment**: Fawx's executor handles only phase 4 of OpenClaw's 7-phase lifecycle. Phases 1-3 and 5-7 live in ChatViewModel. This is fine for now — the executor boundary is at the right place. But as features grow (context trimming, compaction, retry), more logic will need to move into or adjacent to the executor.
 
 ---
 
@@ -220,7 +220,7 @@ Citros's lifecycle:
 ### Critical (must address before shipping more features)
 
 1. **Skipped tool calls have no result on steer**
-   - When steer fires mid-batch, Citros `break`s the for loop — remaining tool calls get no result
+   - When steer fires mid-batch, Fawx `break`s the for loop — remaining tool calls get no result
    - OpenClaw explicitly generates skip results: `"Skipped due to queued user message."`
    - **Risk**: Some LLM providers may reject the next request if tool_use blocks lack corresponding tool_result blocks
    - **Fix**: Add skip results for remaining tool calls after steer break
@@ -288,4 +288,4 @@ Either a lambda on AgentExecutor or a new delegate method called before `continu
 
 *Pressure test completed 2026-02-16*
 *Reference: pi-agent-core `agent-loop.ts` (418 lines), `agent.ts` (560 lines), `types.ts` (195 lines); pi-coding-agent `agent-session.ts` (2865 lines) — all extracted from sourcemaps*
-*Citros: `AgentExecutor.kt` (~220 lines), `BoundaryCheck.kt` (~170 lines)*
+*Fawx: `AgentExecutor.kt` (~220 lines), `BoundaryCheck.kt` (~170 lines)*

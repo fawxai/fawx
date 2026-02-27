@@ -48,7 +48,7 @@ activeSession.steer(text)
   ↓ [Anthropic SDK level — injects user message into streaming conversation]
 ```
 
-Key detail: OpenClaw's steer operates at the **API streaming level**, not at tool boundaries. The Anthropic SDK's `activeSession.steer()` interrupts the current streaming response and injects a user turn. Citros's `SteerCheck` at tool boundaries is a coarser-grained but functionally equivalent approach.
+Key detail: OpenClaw's steer operates at the **API streaming level**, not at tool boundaries. The Anthropic SDK's `activeSession.steer()` interrupts the current streaming response and injects a user turn. Fawx's `SteerCheck` at tool boundaries is a coarser-grained but functionally equivalent approach.
 
 ### OpenClaw's followup queue (source-level)
 
@@ -76,7 +76,7 @@ scheduleFollowupDrain(key, runFollowup)
 
 ---
 
-## 2. How Citros Currently Works
+## 2. How Fawx Currently Works
 
 ### Three send paths (current state)
 
@@ -110,7 +110,7 @@ This fires at tool loop completion in the `finally` block. It works, but:
 
 ### Same as OpenClaw
 
-| Feature | OpenClaw | Citros |
+| Feature | OpenClaw | Fawx |
 |---------|----------|--------|
 | Mid-run message injection | `activeSession.steer()` (API-level) | `SteerCheck` at tool boundaries |
 | Message buffering during run | `enqueueFollowupRun()` | `queuedMessage` in ChatViewModel |
@@ -119,9 +119,9 @@ This fires at tool loop completion in the `finally` block. It works, but:
 
 ### Different from OpenClaw (intentional)
 
-| Feature | OpenClaw | Citros | Why different |
+| Feature | OpenClaw | Fawx | Why different |
 |---------|----------|--------|---------------|
-| Queue granularity | 5 modes, per-session config | Single mode (steer + post-loop queue) | Citros has one user, one device — complexity not needed |
+| Queue granularity | 5 modes, per-session config | Single mode (steer + post-loop queue) | Fawx has one user, one device — complexity not needed |
 | Multi-message coalescing | `collect` mode batches all queued | Single `queuedMessage` (one at a time) | Phone UX is simpler — user sends one follow-up, not bursts |
 | Debounce | Configurable per-channel | None | No multi-channel routing needed |
 | Drop policy | `old`/`new`/`summarize` | Last write wins (new message overwrites `queuedMessage`) | Acceptable for single-user phone agent |
@@ -132,7 +132,7 @@ This fires at tool loop completion in the `finally` block. It works, but:
 |-----|----------|-------------|
 | **Full-screen has no post-loop queue** | Medium | Steered messages are consumed mid-loop. If the user wants "do X next" (after completion), there's no mechanism in full-screen. |
 | **OverlayService doesn't steer** | Medium | Messages from the old overlay are invisible to the agent during the loop. Inconsistent with OverlayPortedScreen. |
-| **No "anything else?" check-in** | New feature | Neither OpenClaw nor Citros has this. This is a Citros-specific enhancement — makes sense for a phone agent that executes multi-step physical tasks. |
+| **No "anything else?" check-in** | New feature | Neither OpenClaw nor Fawx has this. This is a Fawx-specific enhancement — makes sense for a phone agent that executes multi-step physical tasks. |
 | **Queue only holds one message** | Low | If user sends multiple messages during a loop, only the last one survives in `queuedMessage`. Acceptable for v1. |
 
 ---
@@ -350,7 +350,7 @@ The `queuedMessage` mechanism exists and works for the OverlayService path. If w
 ### What we're NOT building
 
 - Multi-message coalescing (OpenClaw's `collect` mode) — overkill for single-user phone agent
-- Configurable queue modes — one behavior fits all for Citros v1
+- Configurable queue modes — one behavior fits all for Fawx v1
 - Debounce/cap/drop policies — no multi-channel routing needed
 - Full-screen "queue instead of steer" toggle — steer is the right default for phone UX
 
@@ -366,12 +366,12 @@ The `queuedMessage` mechanism exists and works for the OverlayService path. If w
 
 ### ✅ Intentional divergences (documented)
 
-- **No multi-mode queue** — Citros doesn't need `collect`/`interrupt` modes. Single user, single device, one message at a time.
+- **No multi-mode queue** — Fawx doesn't need `collect`/`interrupt` modes. Single user, single device, one message at a time.
 - **Single-message queue** — `queuedMessage` holds one string. OpenClaw's `FOLLOWUP_QUEUES` holds arrays. Acceptable for phone UX where users don't send bursts during tool loops.
 
-### 🆕 Citros-specific enhancement
+### 🆕 Fawx-specific enhancement
 
-- **Post-action check-in** — OpenClaw doesn't have this. It's a UX enhancement specific to Citros's phone-agent context where the agent performs physical multi-step tasks. The system message approach is lightweight and preserves agent personality.
+- **Post-action check-in** — OpenClaw doesn't have this. It's a UX enhancement specific to Fawx's phone-agent context where the agent performs physical multi-step tasks. The system message approach is lightweight and preserves agent personality.
 
 ### ⚠️ Potential concern: check-in token cost
 

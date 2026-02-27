@@ -3,7 +3,7 @@
 **Date:** 2026-02-17
 **Feature:** Voice Input (STT) + Voice Output (TTS) with interchangeable providers
 **Reference:** OpenClaw TTS/STT (`tts-core.ts`, `runner.ts` media-understanding providers)
-**Issue:** https://github.com/abbudjoe/citros/issues/556
+**Issue:** https://github.com/abbudjoe/fawx/issues/556
 
 ---
 
@@ -66,17 +66,17 @@ Voice note → download attachment → enforce maxBytes → try provider[0]
 
 ### 2.1 Architecture
 
-| Aspect | OpenClaw | Citros | Why different |
+| Aspect | OpenClaw | Fawx | Why different |
 |--------|----------|--------|--------------|
 | **Language** | TypeScript (Node.js) | Kotlin (Android) | Platform |
 | **Provider abstraction** | Standalone functions | Kotlin interfaces + implementations | Android needs lifecycle management (init/release, Activity binding, permissions). Functions aren't enough. |
-| **STT input source** | File-based (downloaded voice note) | Real-time microphone stream | OpenClaw processes pre-recorded files. Citros needs live mic input with partial results. |
-| **TTS output destination** | File → send as attachment | AudioTrack/MediaPlayer playback | OpenClaw sends audio files over messaging. Citros plays audio locally on the device. |
+| **STT input source** | File-based (downloaded voice note) | Real-time microphone stream | OpenClaw processes pre-recorded files. Fawx needs live mic input with partial results. |
+| **TTS output destination** | File → send as attachment | AudioTrack/MediaPlayer playback | OpenClaw sends audio files over messaging. Fawx plays audio locally on the device. |
 | **Lifecycle** | Stateless (per-request) | Stateful (Android lifecycle-bound) | `SpeechRecognizer` must be created on main thread, released on destroy. `TextToSpeech` needs async init callback. |
 | **Permissions** | N/A (server-side) | `RECORD_AUDIO` runtime permission | Must handle grant/deny/rationale UI flow |
 | **Offline capability** | Edge TTS only (needs network for synthesis) | Android built-in APIs work fully offline | On-device = zero latency, zero cost, works in airplane mode |
 
-### 2.2 Proposed Citros Interfaces
+### 2.2 Proposed Fawx Interfaces
 
 ```kotlin
 // ── STT ──────────────────────────────────────────────
@@ -221,10 +221,10 @@ class VoiceManager(
 
 ### 2.5 What's Different (Intentional Divergences)
 
-| Divergence | OpenClaw | Citros | Reasoning |
+| Divergence | OpenClaw | Fawx | Reasoning |
 |-----------|----------|--------|-----------|
 | Interface vs functions | Functions | Kotlin interfaces | Android lifecycle requires init/release. `SpeechRecognizer` must be on main thread. Object lifecycle is mandatory. |
-| Real-time vs file-based STT | Process files | Live mic stream with partials | Citros is a local app — users talk to it, not send voice files |
+| Real-time vs file-based STT | Process files | Live mic stream with partials | Fawx is a local app — users talk to it, not send voice files |
 | Local playback vs file output | Generate file → send | Play audio on device speaker | The phone IS the output device |
 | On-device first | Cloud-first (Edge TTS is the free fallback) | Android built-in first (cloud is the upgrade) | Phone-native philosophy. Zero dependency, works offline |
 | No directive system (v1) | `[[tts:...]]` model overrides | Not in v1 | Agent doesn't need to control voice yet. Add later if multi-persona needed |
@@ -306,7 +306,7 @@ Android's `SpeechRecognizer` is notoriously fragile:
 - File issue: "Auto-summarize long responses before TTS"
 
 **D5: Wake Word Detection**
-- Always-on listening for "Hey Citros" (or configurable trigger)
+- Always-on listening for "Hey Fawx" (or configurable trigger)
 - Significant battery/privacy implications
 - Original spec mentions Porcupine for wake words
 - File issue: "Wake word detection for hands-free activation"
@@ -327,18 +327,18 @@ Android's `SpeechRecognizer` is notoriously fragile:
 
 **ID1: No `[[tts:...]]` directive system in v1**
 OpenClaw lets the LLM control voice parameters per-reply. We skip this because:
-- Citros v1 has a single agent voice, not multi-persona
+- Fawx v1 has a single agent voice, not multi-persona
 - Adding directive parsing adds prompt complexity
 - Can revisit if we add personality/character features
 
 **ID2: No channel-aware format negotiation**
-OpenClaw picks Opus/MP3 based on delivery channel. Citros doesn't need this because:
+OpenClaw picks Opus/MP3 based on delivery channel. Fawx doesn't need this because:
 - Output is always local device speaker
 - Android handles audio format internally
 - If we ever add "share voice reply" (e.g., send audio to messaging), we'd add format negotiation then
 
 **ID3: On-device priority over cloud**
-OpenClaw defaults to cloud (OpenAI/ElevenLabs) with Edge TTS as fallback. Citros inverts this:
+OpenClaw defaults to cloud (OpenAI/ElevenLabs) with Edge TTS as fallback. Fawx inverts this:
 - Default = Android built-in (zero latency, zero cost, offline)
 - Cloud = opt-in upgrade for quality
 - This matches the phone-native philosophy from SPEC.md
@@ -389,7 +389,7 @@ OpenClaw defaults to cloud (OpenAI/ElevenLabs) with Edge TTS as fallback. Citros
 **Voice settings to add:**
 - **Voice Input** section: STT provider dropdown, tap-to-toggle vs hold-to-talk
 - **Voice Output** section: TTS provider dropdown, speed slider, pitch slider, auto-speak toggle
-- **Test** button: "Test voice output" → `activeTts.speak("Hello, I'm Citros")` (works with PR #1 infrastructure). "Test microphone" (record + playback) deferred to PR #3 (requires `MediaRecorder`).
+- **Test** button: "Test voice output" → `activeTts.speak("Hello, I'm Fawx")` (works with PR #1 infrastructure). "Test microphone" (record + playback) deferred to PR #3 (requires `MediaRecorder`).
 
 ### 4.5 ChatViewModel Integration
 

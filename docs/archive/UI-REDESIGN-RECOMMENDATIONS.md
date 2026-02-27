@@ -1,8 +1,8 @@
-# Citros UI Redesign Recommendations
+# Fawx UI Redesign Recommendations
 
 ## Executive Summary
 
-The current Citros UI has a strong visual identity — the flavor system, glass morphism, and animated orb are distinctive. But for users who prefer **minimal, modern, iOS-aligned design**, the current approach creates tension: 56-particle hero spheres, multi-layer glass gradients, and warm glow shadows on every surface push the aesthetic toward sci-fi dashboard rather than refined tool.
+The current Fawx UI has a strong visual identity — the flavor system, glass morphism, and animated orb are distinctive. But for users who prefer **minimal, modern, iOS-aligned design**, the current approach creates tension: 56-particle hero spheres, multi-layer glass gradients, and warm glow shadows on every surface push the aesthetic toward sci-fi dashboard rather than refined tool.
 
 This document proposes a design direction shift: **keep the flavor identity, strip the ornamentation.**
 
@@ -23,7 +23,7 @@ Four React artifacts are included in this repo. Open them to toggle between curr
 
 ## Core Design Principles (Proposed)
 
-1. **Flat over frosted** — Replace `CitrosLiquidGlassSurface` with opaque `Surface` composables using iOS system colors (`#1C1C1E`, `#2C2C2E`, `#3A3A3C`)
+1. **Flat over frosted** — Replace `FawxLiquidGlassSurface` with opaque `Surface` composables using iOS system colors (`#1C1C1E`, `#2C2C2E`, `#3A3A3C`)
 2. **Flavor as accent, not atmosphere** — The flavor color should appear on user bubbles, send buttons, and interactive elements. It should NOT tint borders, glow, or backdrop particles
 3. **iOS system vocabulary** — Grouped table views for settings, SF Pro metrics, 0.5px separators, large title navigation, standard toggle switches
 4. **Content density over visual density** — More whitespace, fewer layers, tighter line-height (1.48 instead of 1.5+), negative letter-spacing (-0.2 to -0.5)
@@ -36,7 +36,7 @@ Four React artifacts are included in this repo. Open them to toggle between curr
 ### 1. Chat Screen
 
 **Current issues:**
-- Top bar has animated particle backdrop (`CitrosFloatingSpriteBackdrop` with 12-84 sprites), animated icon (72s loop), glass model chip, and 3 glass toolbar buttons — too much visual weight for a nav bar
+- Top bar has animated particle backdrop (`FawxFloatingSpriteBackdrop` with 12-84 sprites), animated icon (72s loop), glass model chip, and 3 glass toolbar buttons — too much visual weight for a nav bar
 - Message bubbles use 3 gradient layers + border glow + backdrop blur
 - Two separate buttons (mic + send) when one adaptive button suffices
 
@@ -63,7 +63,7 @@ Four React artifacts are included in this repo. Open them to toggle between curr
 ### 3. Overlay System
 
 **Current issues:**
-- Bubble uses full `CitrosHeroShaderSphere` (26-56 particles, 3 rotating rings, 120s animation loop) — massive rendering cost for a 56dp circle floating over other apps
+- Bubble uses full `FawxHeroShaderSphere` (26-56 particles, 3 rotating rings, 120s animation loop) — massive rendering cost for a 56dp circle floating over other apps
 - Mini-chat header has glass orb + "Full"/"Bubble" buttons — two mode-switch buttons feels indecisive
 
 **Proposed three-tier system:**
@@ -107,7 +107,7 @@ These M3 components would align well with your design goals:
 7. **`LinearProgressIndicator`** — For execution progress, a thin M3 progress bar at the top of the chat (or overlay) would replace the heavy SVG progress ring
 8. **`Badge`** — M3 badges for unread counts on the overlay bubble, replacing the custom positioned circle
 9. **`RichTooltip`** — For model switcher details on long-press
-10. **`DatePicker` / `TimePicker`** — If Citros ever needs date/time input for reminders, use M3 pickers instead of custom UI
+10. **`DatePicker` / `TimePicker`** — If Fawx ever needs date/time input for reminders, use M3 pickers instead of custom UI
 
 ---
 

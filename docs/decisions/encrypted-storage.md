@@ -6,11 +6,11 @@
 
 ## Decision
 
-**SharedPreferences + Android Keystore AES is the permanent solution** for credential storage in Citros. Encrypted DataStore migration is not planned.
+**SharedPreferences + Android Keystore AES is the permanent solution** for credential storage in Fawx. Encrypted DataStore migration is not planned.
 
 ## Context
 
-During the Key Wallet implementation ([#233](https://github.com/abbudjoe/citros/issues/233)), we chose `EncryptedSharedPreferences` (backed by Android Keystore AES-256-GCM) for storing API keys and wallet state. [PR #239](https://github.com/abbudjoe/citros/pull/239) raised the question of whether this should migrate to Encrypted DataStore.
+During the Key Wallet implementation ([#233](https://github.com/abbudjoe/fawx/issues/233)), we chose `EncryptedSharedPreferences` (backed by Android Keystore AES-256-GCM) for storing API keys and wallet state. [PR #239](https://github.com/abbudjoe/fawx/pull/239) raised the question of whether this should migrate to Encrypted DataStore.
 
 ## Rationale
 

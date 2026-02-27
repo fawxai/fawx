@@ -53,7 +53,7 @@ const WelcomeStep = ({ t, flavor, onNext }) => (
   <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: `0 ${g(8)}px`, gap: g(5) }}>
     <Orb color={orbClr(flavor, t)} inner={orbInn(flavor, t)} size={g(20)} />
     <div style={{ textAlign: "center" }}>
-      <div style={{ fontSize: 28, fontWeight: 700, letterSpacing: -0.8, color: t.labelPrimary, marginBottom: g(2) }}>Citros</div>
+      <div style={{ fontSize: 28, fontWeight: 700, letterSpacing: -0.8, color: t.labelPrimary, marginBottom: g(2) }}>Fawx</div>
       <div style={{ fontSize: 17, color: t.labelSecondary, lineHeight: "24px", letterSpacing: -0.2 }}>
         Your phone, thinking ahead.
       </div>
@@ -72,7 +72,7 @@ const ApiKeyStep = ({ t, flavor, onNext }) => (
     </div>
     <div style={{ fontSize: 24, fontWeight: 700, letterSpacing: -0.6, color: t.labelPrimary, textAlign: "center", marginBottom: g(2) }}>Connect a Provider</div>
     <div style={{ fontSize: 15, color: t.labelSecondary, textAlign: "center", lineHeight: "22px", letterSpacing: -0.2, marginBottom: g(6) }}>
-      Citros needs an API key to connect to a language model.
+      Fawx needs an API key to connect to a language model.
     </div>
     {/* Provider options */}
     <div style={{ display: "flex", flexDirection: "column", gap: g(2), marginBottom: g(6) }}>
@@ -107,12 +107,12 @@ const PermissionsStep = ({ t, flavor, onNext }) => (
     </div>
     <div style={{ fontSize: 24, fontWeight: 700, letterSpacing: -0.6, color: t.labelPrimary, textAlign: "center", marginBottom: g(2) }}>Permissions</div>
     <div style={{ fontSize: 15, color: t.labelSecondary, textAlign: "center", lineHeight: "22px", letterSpacing: -0.2, marginBottom: g(6) }}>
-      Citros needs these to act on your behalf.
+      Fawx needs these to act on your behalf.
     </div>
     <div style={{ display: "flex", flexDirection: "column", gap: g(2), marginBottom: g(6) }}>
       {[
         ["Accessibility Service", "Read and interact with screen content", true],
-        ["Overlay Permission", "Show Citros over other apps", true],
+        ["Overlay Permission", "Show Fawx over other apps", true],
         ["Notification Access", "Read and manage notifications", false],
       ].map(([name, desc, granted], i) => (
         <div key={i} style={{ display: "flex", alignItems: "center", gap: g(3), padding: `${g(3)}px ${g(4)}px`, borderRadius: g(3), background: t.surface1 }}>
@@ -148,7 +148,7 @@ const TrustStep = ({ t, flavor, onNext }) => {
       </div>
       <div style={{ fontSize: 24, fontWeight: 700, letterSpacing: -0.6, color: t.labelPrimary, textAlign: "center", marginBottom: g(2) }}>Choose Trust Level</div>
       <div style={{ fontSize: 15, color: t.labelSecondary, textAlign: "center", lineHeight: "22px", letterSpacing: -0.2, marginBottom: g(6) }}>
-        How much should Citros ask before acting?
+        How much should Fawx ask before acting?
       </div>
       <div style={{ display: "flex", flexDirection: "column", gap: g(2), marginBottom: g(6) }}>
         {[
@@ -186,7 +186,7 @@ const DoneStep = ({ t, flavor }) => (
     <div style={{ textAlign: "center" }}>
       <div style={{ fontSize: 24, fontWeight: 700, letterSpacing: -0.6, color: t.labelPrimary, marginBottom: g(2) }}>You're all set</div>
       <div style={{ fontSize: 15, color: t.labelSecondary, lineHeight: "22px", letterSpacing: -0.2 }}>
-        Citros is ready. Say something or tap the orb to get started.
+        Fawx is ready. Say something or tap the orb to get started.
       </div>
     </div>
   </div>

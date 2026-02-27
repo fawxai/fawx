@@ -1,6 +1,6 @@
 # Squad Constitution (No-Slop, Non-Negotiable)
 
-This constitution governs all parallel roadmap execution ("Squad") for Citros.
+This constitution governs all parallel roadmap execution ("Squad") for Fawx.
 
 ## Core Rule: No-Slop Quality Gate
 

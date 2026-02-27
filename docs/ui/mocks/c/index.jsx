@@ -44,7 +44,7 @@ export default function MockIndex() {
       <div style={{ display: "inline-block", padding: `${g(1)}px ${g(3)}px`, borderRadius: g(1.5), background: "rgba(255,140,0,0.12)", color: "#FF8C00", fontSize: 12, fontWeight: 600, letterSpacing: 0.5, marginBottom: g(3) }}>DIRECTIVE C</div>
 
       <h1 style={{ fontSize: 28, fontWeight: 800, letterSpacing: -0.8, margin: 0 }}>
-        Citros UI Mockups
+        Fawx UI Mockups
       </h1>
       <p style={{ fontSize: 15, color: "rgba(235,235,245,0.60)", letterSpacing: -0.2, margin: `${g(1.5)}px 0 ${g(3)}px`, lineHeight: "22px" }}>
         iOS-Minimal + Orb Presence. The current three-touch-point approach with two additions: orb glow via box-shadow, and a 3% flavor wash on empty/welcome states.

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Citros — Give Your Phone Agency</title>
+<title>Fawx — Give Your Phone Agency</title>
 
 <!-- Favicon & Icons -->
 <link rel="icon" type="image/x-icon" href="/favicon.ico">
@@ -13,16 +13,16 @@
 
 <!-- Open Graph / Link Preview -->
 <meta property="og:type" content="website">
-<meta property="og:url" content="https://citros.ai/">
-<meta property="og:title" content="Citros — Give Your Phone Agency">
+<meta property="og:url" content="https://fawx.ai/">
+<meta property="og:title" content="Fawx — Give Your Phone Agency">
 <meta property="og:description" content="An AI agent that lives on your Android phone. Controls any app. Speaks and listens. Try the alpha.">
-<meta property="og:image" content="https://citros.ai/og-image.jpg">
+<meta property="og:image" content="https://fawx.ai/og-image.jpg">
 
 <!-- Twitter Card -->
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="Citros — Give Your Phone Agency">
+<meta name="twitter:title" content="Fawx — Give Your Phone Agency">
 <meta name="twitter:description" content="An AI agent that lives on your Android phone. Controls any app. Speaks and listens. Try the alpha.">
-<meta name="twitter:image" content="https://citros.ai/og-image.jpg">
+<meta name="twitter:image" content="https://fawx.ai/og-image.jpg">
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
@@ -221,7 +221,7 @@ nav.scrolled {
 .reveal-delay-2 { transition-delay: 0.3s; }
 .reveal-delay-3 { transition-delay: 0.45s; }
 
-/* ── WHAT IS CITROS ── */
+/* ── WHAT IS FAWX ── */
 .about-section {
   padding: 200px 48px;
   max-width: 900px;
@@ -665,7 +665,7 @@ footer {
 <section id="hero">
   <div id="canvas-container"></div>
   <div class="hero-content">
-    <h1 class="hero-title">citros</h1>
+    <h1 class="hero-title">fawx</h1>
     <p class="hero-subtitle">Give your phone agency.</p>
   </div>
   <div class="scroll-indicator">
@@ -674,14 +674,14 @@ footer {
   </div>
 </section>
 
-<!-- WHAT IS CITROS -->
+<!-- WHAT IS FAWX -->
 <section class="about-section">
   <div class="reveal">
-    <h2 class="about-headline">What is <span class="highlight">Citros</span>?</h2>
+    <h2 class="about-headline">What is <span class="highlight">Fawx</span>?</h2>
   </div>
   <div class="reveal reveal-delay-1">
     <p class="about-body">
-      Citros is an AI agent that lives on your Android phone. It can see your screen, control any app, and talk to you.
+      Fawx is an AI agent that lives on your Android phone. It can see your screen, control any app, and talk to you.
     </p>
   </div>
 </section>
@@ -695,19 +695,19 @@ footer {
   </div>
   <div class="screenshots-grid">
     <div class="screenshot-card reveal reveal-delay-1">
-      <img src="screenshots/welcome.jpg" alt="Citros welcome screen" loading="lazy">
+      <img src="screenshots/welcome.jpg" alt="Fawx welcome screen" loading="lazy">
       <p class="screenshot-label">Welcome</p>
     </div>
     <div class="screenshot-card reveal reveal-delay-1">
-      <img src="screenshots/chat.jpg" alt="Citros chat interface" loading="lazy">
+      <img src="screenshots/chat.jpg" alt="Fawx chat interface" loading="lazy">
       <p class="screenshot-label">Chat</p>
     </div>
     <div class="screenshot-card reveal reveal-delay-2">
-      <img src="screenshots/style.jpg" alt="Citros style picker" loading="lazy">
+      <img src="screenshots/style.jpg" alt="Fawx style picker" loading="lazy">
       <p class="screenshot-label">Style</p>
     </div>
     <div class="screenshot-card reveal reveal-delay-2">
-      <img src="screenshots/onboarding.jpg" alt="Citros onboarding" loading="lazy">
+      <img src="screenshots/onboarding.jpg" alt="Fawx onboarding" loading="lazy">
       <p class="screenshot-label">Onboarding</p>
     </div>
   </div>
@@ -755,14 +755,14 @@ footer {
   <!-- DOWNLOAD (shown after email) -->
   <div class="download-section" id="downloadSection">
     <p class="download-success-msg">You're in. Download the APK below.</p>
-    <a href="https://vd3n81y03t20vpea.public.blob.vercel-storage.com/citros-v0.1.0.apk" class="download-btn">Download Citros APK</a>
+    <a href="https://vd3n81y03t20vpea.public.blob.vercel-storage.com/fawx-v0.1.0.apk" class="download-btn">Download Fawx APK</a>
     <div class="sideload-guide">
       <h3>How to install</h3>
       <ol class="sideload-steps">
         <li>Download the APK file</li>
         <li>Open it on your Android device (or transfer from computer)</li>
         <li>Tap "Install" — Android will ask to allow installs from this source, tap "Allow"</li>
-        <li>Open Citros and follow the onboarding</li>
+        <li>Open Fawx and follow the onboarding</li>
       </ol>
       <div class="sideload-note">
         Requires Android 12 or later. The app uses the Accessibility Service to control your phone — you'll be prompted to enable it during setup.
@@ -820,10 +820,10 @@ footer {
     btn.textContent = 'Sending...';
     btn.disabled = true;
 
-    fetch('https://formsubmit.co/ajax/joe@citros.ai', {
+    fetch('https://formsubmit.co/ajax/joe@fawx.ai', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-      body: JSON.stringify({ email: email, _subject: 'Citros Alpha Signup', _template: 'table' })
+      body: JSON.stringify({ email: email, _subject: 'Fawx Alpha Signup', _template: 'table' })
     })
     .then(r => r.json())
     .then(() => {

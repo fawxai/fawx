@@ -345,7 +345,7 @@ val executor = AgentExecutor(
 
 ## Pressure Test Summary
 
-| Aspect | OpenClaw | Citros Design | Delta |
+| Aspect | OpenClaw | Fawx Design | Delta |
 |--------|----------|---------------|-------|
 | History limiting | Turn-counting from end | Category-aware result trimming from end | ✅ More granular |
 | Tool result pruning | `stripToolResultDetails` (generic) | Screen-content-aware per-category | ✅ Phone-optimized |

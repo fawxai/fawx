@@ -1,12 +1,12 @@
 # Testing Patterns
 
-Reusable patterns and conventions for Citros Android tests.
+Reusable patterns and conventions for Fawx Android tests.
 
 ## ScriptedProviderClient
 
 A test fake that returns pre-defined responses in sequence, useful for multi-turn conversation tests.
 
-**Location:** `chat/src/test/kotlin/ai/citros/chat/ChatViewModelTest.kt`
+**Location:** `chat/src/test/kotlin/ai/fawx/chat/ChatViewModelTest.kt`
 
 ### Usage
 
@@ -37,7 +37,7 @@ val scripted = ScriptedProviderClient(
 
 ## Shared Test Fixtures
 
-Common test fakes live in `chat/src/test/kotlin/ai/citros/chat/TestFixtures.kt`:
+Common test fakes live in `chat/src/test/kotlin/ai/fawx/chat/TestFixtures.kt`:
 
 - **`InMemoryKeyStore`** — in-memory `KeyStore` implementation
 - **`InMemoryCredentialStore`** — in-memory `CredentialStore` implementation

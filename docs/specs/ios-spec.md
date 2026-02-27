@@ -1,7 +1,7 @@
 # iOS MVP Specification
 
 Status: Draft v1  
-Owner: Citros Core Team  
+Owner: Fawx Core Team  
 Date: 2026-02-24
 
 ## 1. Purpose

@@ -1,7 +1,7 @@
 # Retroactive Pressure Test: Tool Schema Design
 
 *Pressure test for #478 — Tier 2 retroactive audit*
-*Citros: `PhoneTools.kt` (530 lines, 27 tools) | OpenClaw: `types.ts` (`AgentTool`), extension tool registration*
+*Fawx: `PhoneTools.kt` (530 lines, 27 tools) | OpenClaw: `types.ts` (`AgentTool`), extension tool registration*
 
 ---
 
@@ -41,11 +41,11 @@ Tools are registered via extensions (plugins). Each extension provides tool defi
 
 ---
 
-## 2. Citros's Architecture
+## 2. Fawx's Architecture
 
 ### Tool Definition
 
-Citros defines tools as static `Tool` objects in `PhoneTools.kt`:
+Fawx defines tools as static `Tool` objects in `PhoneTools.kt`:
 
 ```kotlin
 data class Tool(
@@ -128,7 +128,7 @@ No explicit `task_complete` tool. When the model returns `stopReason: "end_turn"
 
 ## 3. Comparison Table
 
-| Aspect | OpenClaw | Citros | Notes |
+| Aspect | OpenClaw | Fawx | Notes |
 |--------|----------|--------|-------|
 | **Schema format** | TypeBox (compile-time typed) | Raw `Map<String, Any>` (runtime JSON Schema) | OpenClaw has static type safety |
 | **Schema validation** | `validateToolArguments()` pre-execution | Inline during execution (cast + null check) | OpenClaw validates before execute |
@@ -154,17 +154,17 @@ No explicit `task_complete` tool. When the model returns `stopReason: "end_turn"
 ### Deferred
 
 #### D1: No Per-Tool Cancellation
-**Gap:** OpenClaw threads `AbortSignal` to every tool execution. Citros tools run to completion — there's no way to cancel a long-running tool (e.g., `screenshot` with slow vision API call).
+**Gap:** OpenClaw threads `AbortSignal` to every tool execution. Fawx tools run to completion — there's no way to cancel a long-running tool (e.g., `screenshot` with slow vision API call).
 **Impact:** User pressing "Stop" during a screenshot's vision call must wait for completion. Currently mitigated by the cancellation check at the next boundary.
 **Recommendation:** H3 — add `Job` cancellation to `executeToolCall()` for long-running tools. Low priority since most phone tools complete in <500ms.
 
 #### D2: No Pre-Execution Schema Validation
-**Gap:** OpenClaw validates tool arguments against the schema before execution. Citros validates inline, meaning invalid params may cause partial execution (e.g., a tool that does side effects before hitting the invalid param).
+**Gap:** OpenClaw validates tool arguments against the schema before execution. Fawx validates inline, meaning invalid params may cause partial execution (e.g., a tool that does side effects before hitting the invalid param).
 **Impact:** Low for current tools — parameter extraction happens at the top of each `when` branch before any side effects. But fragile if new tools are added carelessly.
 **Recommendation:** H3 — consider adding a `validateParams(tool, input)` step before the `when` dispatch. Can be derived from existing `inputSchema` definitions.
 
 #### D3: Raw Map Schema Definition
-**Gap:** Citros schemas are `Map<String, Any>` — no compile-time validation that schemas are well-formed. A typo in a property name or type string is only caught at runtime (when the LLM tries to use the tool).
+**Gap:** Fawx schemas are `Map<String, Any>` — no compile-time validation that schemas are well-formed. A typo in a property name or type string is only caught at runtime (when the LLM tries to use the tool).
 **Impact:** Low — 27 tools are static and tested. But any new tool addition risks silent schema errors.
 **Recommendation:** H3 — consider a schema builder DSL:
 ```kotlin
@@ -180,12 +180,12 @@ fun tool(name: String, description: String, block: SchemaBuilder.() -> Unit): To
 ### Intentional Divergences
 
 #### I1: Central Dispatch vs Self-Executing Tools
-Citros uses a `when` dispatch in `PhoneAgentApi.executeToolCall()` because tools need Android platform APIs (ScreenReader, ClipboardHelper, NotificationHelper) that aren't available in `:core`. The dispatch acts as a bridge between the pure tool definitions and the platform layer. This is a valid architectural choice for Android.
+Fawx uses a `when` dispatch in `PhoneAgentApi.executeToolCall()` because tools need Android platform APIs (ScreenReader, ClipboardHelper, NotificationHelper) that aren't available in `:core`. The dispatch acts as a bridge between the pure tool definitions and the platform layer. This is a valid architectural choice for Android.
 
 OpenClaw's self-executing tools work because each tool is a Node.js function with direct access to its dependencies via closure/injection.
 
 #### I2: Fixed Tool Set
-Citros has 27 static tools. OpenClaw's tool set is dynamic (extension-dependent). The phone agent domain is bounded — the set of phone interactions is finite and well-known. A dynamic tool registry adds complexity without benefit here.
+Fawx has 27 static tools. OpenClaw's tool set is dynamic (extension-dependent). The phone agent domain is bounded — the set of phone interactions is finite and well-known. A dynamic tool registry adds complexity without benefit here.
 
 #### I3: No Tool Streaming
 OpenClaw supports progressive tool results via `onUpdate`. Phone tools are fast (<500ms typical) and don't benefit from streaming. The `screenshot` tool (which calls vision API) could benefit, but the description is short enough to return atomically.

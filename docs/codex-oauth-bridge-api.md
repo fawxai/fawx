@@ -1,20 +1,20 @@
 # Codex OAuth Bridge API Spec
 
-Status: Draft (implemented by Citros Android client)  
+Status: Draft (implemented by Fawx Android client)  
 Last updated: 2026-02-11
 
 ## 1. Purpose
 
 This document defines the HTTP API contract between:
 
-- Citros Android client (`chat` module)
+- Fawx Android client (`chat` module)
 - A local/remote OAuth bridge service that starts OpenAI browser login and exchanges callback codes for OAuth tokens
 
 The bridge exists because Android client code should not embed provider OAuth client secrets or custom app-server logic.
 
 ## 2. Base URL
 
-Bridge base URL is configurable in the Citros UI.
+Bridge base URL is configurable in the Fawx UI.
 
 - Default: `http://127.0.0.1:4318`
 - Android app expects JSON over HTTP(S)
@@ -26,15 +26,15 @@ Reference implementation is available in this repo via:
 
 Configuration (CLI flag or env var):
 
-- `--auth-url` or `CITROS_OPENAI_AUTH_URL`
-- `--token-url` or `CITROS_OPENAI_TOKEN_URL`
-- `--client-id` or `CITROS_OPENAI_CLIENT_ID`
-- `--client-secret` or `CITROS_OPENAI_CLIENT_SECRET` (optional)
-- `--scope` or `CITROS_OPENAI_SCOPE` (optional)
+- `--auth-url` or `FAWX_OPENAI_AUTH_URL`
+- `--token-url` or `FAWX_OPENAI_TOKEN_URL`
+- `--client-id` or `FAWX_OPENAI_CLIENT_ID`
+- `--client-secret` or `FAWX_OPENAI_CLIENT_SECRET` (optional)
+- `--scope` or `FAWX_OPENAI_SCOPE` (optional)
 
 ## 3. Endpoint Discovery Order
 
-Citros tries endpoints in this exact order and stops on first success:
+Fawx tries endpoints in this exact order and stops on first success:
 
 ### 3.1 Start Login
 
@@ -58,8 +58,8 @@ Any non-2xx response is treated as a failed attempt and the next path is tried.
 
 ```json
 {
-  "redirect_uri": "citros://oauth/callback",
-  "redirectUri": "citros://oauth/callback",
+  "redirect_uri": "fawx://oauth/callback",
+  "redirectUri": "fawx://oauth/callback",
   "state": "random-state"
 }
 ```
@@ -139,9 +139,9 @@ Example:
 
 ## 6. OAuth Callback Contract
 
-Citros Android deep link:
+Fawx Android deep link:
 
-- `citros://oauth/callback`
+- `fawx://oauth/callback`
 
 Bridge/provider redirect should include:
 
@@ -176,7 +176,7 @@ Bridge implementation SHOULD:
 - avoid logging full tokens/codes in plaintext
 - use HTTPS for non-local deployments
 
-Citros client currently validates `state` on callback and stores resulting token in app prefs.
+Fawx client currently validates `state` on callback and stores resulting token in app prefs.
 
 ## 9. Field Naming Convention
 
@@ -200,5 +200,5 @@ Citros client currently validates `state` on callback and stores resulting token
 
 Client implementation:
 
-- `android/core/src/main/kotlin/ai/citros/core/CodexOauthBridgeClient.kt`
-- `android/chat/src/main/kotlin/ai/citros/chat/ChatActivity.kt`
+- `android/core/src/main/kotlin/ai/fawx/core/CodexOauthBridgeClient.kt`
+- `android/chat/src/main/kotlin/ai/fawx/chat/ChatActivity.kt`

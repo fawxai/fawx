@@ -15,7 +15,7 @@
 Stored in SharedPreferences as a set of Android package names.
 
 ```kotlin
-package ai.citros.core
+package ai.fawx.core
 
 /**
  * Manages the set of apps whose screen content should be hidden from the agent.
@@ -157,9 +157,9 @@ The agent should recognize the privacy message and ask the user what to do rathe
 ### Edge Cases
 1. **Empty privacy list**: No apps blocked. Zero behavioral change from today.
 2. **System UI package**: `com.android.systemui` — when any privacy apps are configured, `systemui` is intentionally blocked as a conservative policy because notification shade content can contain private-app text while obscuring the source package.
-3. **Citros itself**: `ai.citros.chat` on privacy list → agent can't see its own UI. Unusual but allowed.
+3. **Fawx itself**: `ai.fawx.chat` on privacy list → agent can't see its own UI. Unusual but allowed.
 4. **Multiple windows**: Split-screen with one private and one public app. Privacy mode blocks if **any visible application window** is private (fail-secure), even when focus is on a public window.
-5. **Overlay apps**: Privacy-listed app under Citros overlay. `findAppWindowRoot()` already selects the best non-overlay window. Privacy check applies to that window's package.
+5. **Overlay apps**: Privacy-listed app under Fawx overlay. `findAppWindowRoot()` already selects the best non-overlay window. Privacy check applies to that window's package.
 6. **Notification from private app**: Notifications appear in system UI, not the app's window. When privacy list is non-empty, `com.android.systemui` is blocked so notification text from private apps is not exposed.
 7. **App with no package name**: Extremely rare. `packageName = null` → not matched → screen readable. Correct.
 8. **WebView inside private app**: WebView elements belong to the app's package. Privacy mode blocks them too. Correct.

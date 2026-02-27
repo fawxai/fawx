@@ -1,11 +1,11 @@
 # Android Troubleshooting FAQ
 
-> Issue: [#253](https://github.com/abbudjoe/citros/issues/253)  
-> Audience: developers and testers setting up Citros on Android
+> Issue: [#253](https://github.com/abbudjoe/fawx/issues/253)  
+> Audience: developers and testers setting up Fawx on Android
 
-Common issues and solutions for Citros Android development and testing.
+Common issues and solutions for Fawx Android development and testing.
 
-**Package name:** The installable Citros APK uses `ai.citros.app`. The `:chat` library module uses namespace `ai.citros.chat`.
+**Package name:** The installable Fawx APK uses `ai.fawx.app`. The `:chat` library module uses namespace `ai.fawx.chat`.
 
 ## Quick Reference
 
@@ -57,9 +57,9 @@ Common issues and solutions for Citros Android development and testing.
 
 ## Accessibility Service Issues
 
-### Citros Accessibility Service not showing in Settings
+### Fawx Accessibility Service not showing in Settings
 
-**Symptoms:** The "Citros Phone Control" option doesn't appear under Settings → Accessibility → Downloaded services.
+**Symptoms:** The "Fawx Phone Control" option doesn't appear under Settings → Accessibility → Downloaded services.
 
 **Solutions:**
 1. Ensure the app is fully installed — not just side-loaded as an APK but launched at least once
@@ -73,7 +73,7 @@ Common issues and solutions for Citros Android development and testing.
    ```
 4. Check if the service is declared in the manifest:
    ```bash
-   adb shell dumpsys package ai.citros.app | grep -A5 "accessibility"
+   adb shell dumpsys package ai.fawx.app | grep -A5 "accessibility"
    ```
 
 ### Accessibility Service keeps disabling itself
@@ -81,9 +81,9 @@ Common issues and solutions for Citros Android development and testing.
 **Cause:** Android's battery optimization or "restricted app" settings may kill the service.
 
 **Fix:**
-1. Settings → Battery → Unrestricted for Citros
-2. Settings → Apps → Citros → Battery → Unrestricted
-3. On some OEMs (Samsung, Xiaomi), also disable "adaptive battery" for Citros
+1. Settings → Battery → Unrestricted for Fawx
+2. Settings → Apps → Fawx → Battery → Unrestricted
+3. On some OEMs (Samsung, Xiaomi), also disable "adaptive battery" for Fawx
 
 ---
 
@@ -95,7 +95,7 @@ Common issues and solutions for Citros Android development and testing.
 
 **Fix:**
 ```bash
-adb uninstall ai.citros.app
+adb uninstall ai.fawx.app
 # Then reinstall
 cd android && ./gradlew :app:installDebug
 ```
@@ -113,7 +113,7 @@ adb install -t path/to/app-debug.apk
 
 **Fix:** Free space on the device or clear app caches:
 ```bash
-adb shell pm clear ai.citros.app
+adb shell pm clear ai.fawx.app
 ```
 
 ### APK installs but app crashes on launch
@@ -134,7 +134,7 @@ adb shell pm clear ai.citros.app
 
 ### "Could not detect provider" error
 
-**Cause:** The API key format isn't recognized by Citros's auto-detection.
+**Cause:** The API key format isn't recognized by Fawx's auto-detection.
 
 **Fix:**
 - Anthropic keys start with `sk-ant-api03-`
@@ -180,10 +180,10 @@ Model IDs are configured in Settings → Models. The default models are set per-
 **Cause:** `SYSTEM_ALERT_WINDOW` permission not granted.
 
 **Fix:**
-1. Settings → Apps → Citros → Display over other apps → Allow
+1. Settings → Apps → Fawx → Display over other apps → Allow
 2. Or via ADB:
    ```bash
-   adb shell appops set ai.citros.app SYSTEM_ALERT_WINDOW allow
+   adb shell appops set ai.fawx.app SYSTEM_ALERT_WINDOW allow
    ```
 
 ### Overlay appears but is blank/black
@@ -220,10 +220,10 @@ sdk.dir=/path/to/your/Android/Sdk
 
 ## Logcat Filtering
 
-For efficient debugging, filter logcat to Citros-specific tags:
+For efficient debugging, filter logcat to Fawx-specific tags:
 
 ```bash
-adb logcat -s CitrosAccessibility:* ChatViewModel:* PhoneAgentApi:* OverlayService:* SqliteMemoryProvider:*
+adb logcat -s FawxAccessibility:* ChatViewModel:* PhoneAgentApi:* OverlayService:* SqliteMemoryProvider:*
 ```
 
 See also:

@@ -26,10 +26,10 @@
 2. **Streaming wrapping**: `streamFn` can be wrapped for logging, extra params, error handling
 3. **No streaming for tool calls**: When model returns tool_use, the full response is parsed after streaming completes (SDK handles this internally)
 
-## 2. How Citros Should Implement Streaming
+## 2. How Fawx Should Implement Streaming
 
 ### Architecture Differences
-| Aspect | OpenClaw | Citros |
+| Aspect | OpenClaw | Fawx |
 |--------|----------|--------|
 | HTTP client | Vercel AI SDK / `fetch` | OkHttp (Android) |
 | SSE parsing | SDK handles internally | Must implement ourselves |

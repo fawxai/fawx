@@ -187,7 +187,7 @@ const ChatColumn = ({ strategy, flavor, t }) => {
           <div style={{
             fontSize: 16, fontWeight: 600, letterSpacing: -0.3,
             color: t.labelPrimary, lineHeight: "20px",
-          }}>Citros</div>
+          }}>Fawx</div>
           <div style={{
             fontSize: 12, letterSpacing: -0.1,
             color: r.subtitleColor, lineHeight: "16px",

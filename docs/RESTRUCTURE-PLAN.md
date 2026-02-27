@@ -1,4 +1,4 @@
-# Citros Restructure Plan
+# Fawx Restructure Plan
 
 **Status**: Draft — ready for review  
 **Date**: 2026-02-26  
@@ -11,7 +11,7 @@
 ### What exists
 
 ```
-citros/
+fawx/
 ├── android/                    ← Kotlin Android app
 │   ├── core/ (122 .kt, 23k lines)   ← ALL business logic lives here
 │   ├── chat/ (62 .kt)               ← UI, services, overlays
@@ -35,7 +35,7 @@ citros/
 
 ### The problem
 
-1. **`android/core/` is a 23k-line monolith.** Everything is in one flat package: provider clients, agent executor, screen reader, phone tools, budget system, policy engine, prompt builder, recovery manager, context compaction, model catalog, task state, wallet, TTS/STT, web search — all in `ai.citros.core`.
+1. **`android/core/` is a 23k-line monolith.** Everything is in one flat package: provider clients, agent executor, screen reader, phone tools, budget system, policy engine, prompt builder, recovery manager, context compaction, model catalog, task state, wallet, TTS/STT, web search — all in `ai.fawx.core`.
 
 2. **Kotlin and Rust are duplicating work.** The Rust crates implement agent logic, security, storage, and skills. The Kotlin `core/` implements much of the same. Neither is authoritative.
 
@@ -46,7 +46,7 @@ citros/
 ## Target State
 
 ```
-citros/
+fawx/
 ├── engine/                          ← Rust shared core (THE authority)
 │   ├── Cargo.toml                   ← Workspace root
 │   └── crates/
@@ -108,7 +108,7 @@ citros/
 | Item | Reason |
 |---|---|
 | `scratch/`, `tmp/` | Junk |
-| `citros-ui-mocks.html` | Obsolete |
+| `fawx-ui-mocks.html` | Obsolete |
 | `h1-pr5-tool-gating-pressure-test.md` | One-off test doc, archive or delete |
 | `UI-REDESIGN-RECOMMENDATIONS.md` | Move to `docs/` or archive |
 | `AGENTS.md`, `CLAUDE.md`, `CODEX.md` | AI agent config files, don't belong in repo root |

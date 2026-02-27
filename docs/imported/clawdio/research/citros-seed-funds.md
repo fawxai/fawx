@@ -1,11 +1,11 @@
-# Citros Research: Seed-Stage Investor Targets
+# Fawx Research: Seed-Stage Investor Targets
 
 **Research Date:** February 11, 2026  
-**Target:** Seed-stage investors for Citros — a consumer AI phone agent for Android
+**Target:** Seed-stage investors for Fawx — a consumer AI phone agent for Android
 
 ---
 
-## About Citros
+## About Fawx
 
 **What:** Native Android app that gives AI (Claude, GPT, local models) actual control of your phone via Accessibility Services  
 **Stage:** Working MVP, pre-revenue, pre-launch  
@@ -246,7 +246,7 @@
 2. **Target 3-5 firms per category** based on thesis fit and portfolio alignment
 3. **Emphasize technical moats** — AI models, accessibility service integration, multi-provider architecture
 4. **Address distribution challenge upfront** — sideload-only may concern some VCs, but others will see it as avoiding platform risk
-5. **Highlight consumer defensibility** — why users will stick with Citros vs competitors
+5. **Highlight consumer defensibility** — why users will stick with Fawx vs competitors
 6. **Consider accelerators first** (YC, Techstars) for credibility + network if pre-revenue
 
 **Red Flags to Address:**
@@ -305,7 +305,7 @@
 
 2. **Map warm intro paths** to top 10 funds above
 
-3. **Prepare demo video** showing Citros in action (crucial for consumer product)
+3. **Prepare demo video** showing Fawx in action (crucial for consumer product)
 
 4. **Build founder network connections** through:
    - YC founder communities

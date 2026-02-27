@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Citros — Complete Architecture Specification</title>
+<title>Fawx — Complete Architecture Specification</title>
 <style>
   /* ============ RESET & BASE ============ */
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -440,7 +440,7 @@
 </head>
 <body id="top">
 
-<h1 class="master-title">Citros Architecture</h1>
+<h1 class="master-title">Fawx Architecture</h1>
 <p class="subtitle">
   An AI-native phone agent that knows its human — designed around a recursive agentic loop,
   structured memory, strict safety kernel, and deep personalization.
@@ -477,7 +477,7 @@
     <div class="doc-num">00</div>
     <div class="doc-body">
       <h3>Foundation Decisions</h3>
-      <p>The five structural decisions that must be locked before the Citros restructure begins.
+      <p>The five structural decisions that must be locked before the Fawx restructure begins.
   Everything else evolves as we build.</p>
       <span class="status status-draft">DRAFT</span>
     </div>
@@ -485,7 +485,7 @@
   <a class="doc-card n-core" href="#kernel">
     <div class="doc-num">01</div>
     <div class="doc-body">
-      <h3>Citros Kernel Architecture</h3>
+      <h3>Fawx Kernel Architecture</h3>
       <p>Kernel + Loadable Layers + Platform Shell — designed for self-reconfiguration with strict safety</p>
       <span class="status status-draft">DRAFT</span>
     </div>
@@ -573,7 +573,7 @@
   <div class="section-badge">00</div>
   <h1>Foundation Decisions</h1>
 <p class="subtitle">
-  The five structural decisions that must be locked before the Citros restructure begins.
+  The five structural decisions that must be locked before the Fawx restructure begins.
   Everything else evolves as we build.
 </p>
 
@@ -821,7 +821,7 @@ fn run_loop_cycle(perception: PerceptionSnapshot) → LoopResult
 <p>The five decisions above produce this directory layout:</p>
 
 <div class="crate-map">
-  <span class="dir">citros/</span><br>
+  <span class="dir">fawx/</span><br>
   ├── <span class="dir">engine/</span> <span class="note">← Rust. The brain.</span><br>
   │   ├── <span class="dir">crates/</span><br>
   │   │   ├── <span class="dir">ct-kernel/</span> <span class="note">← Loop orchestrator, policy, permissions, state machine, verification</span><br>
@@ -907,7 +907,7 @@ fn run_loop_cycle(perception: PerceptionSnapshot) → LoopResult
     <a href="#top" class="back-to-top">↑ Back to Index</a>
   </div>
   <div class="section-badge">01</div>
-  <h1>Citros Kernel Architecture</h1>
+  <h1>Fawx Kernel Architecture</h1>
 <p class="subtitle">Kernel + Loadable Layers + Platform Shell — designed for self-reconfiguration with strict safety</p>
 
 <!-- ============ LAYER STACK ============ -->
@@ -1354,7 +1354,7 @@ fn run_loop_cycle(perception: PerceptionSnapshot) → LoopResult
 
 <h2>Extensibility: Agent Identity Primitives</h2>
 
-<p>Emerging patterns — agent-owned email addresses (agentmail), on-chain wallets, and machine-to-machine payment protocols (x402) — are gaining traction. Citros does not implement these today, but the four-layer architecture accommodates them without kernel changes:</p>
+<p>Emerging patterns — agent-owned email addresses (agentmail), on-chain wallets, and machine-to-machine payment protocols (x402) — are gaining traction. Fawx does not implement these today, but the four-layer architecture accommodates them without kernel changes:</p>
 
 <div style="background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 16px 20px; margin: 16px 0; font-size: 0.82em;">
   <div style="display: grid; grid-template-columns: auto 1fr; gap: 8px 16px;">
@@ -2641,7 +2641,7 @@ Relationship {
 </p>
 
 <div class="callout">
-  <strong>Why "dreaming":</strong> Human memory consolidation happens primarily during sleep — the brain replays experiences, strengthens important connections, and prunes noise. Citros does the same during idle time. The agent doesn't just accumulate data; it processes experience into intelligence. But unlike human sleep, every consolidation cycle is checkpointed and reversible.
+  <strong>Why "dreaming":</strong> Human memory consolidation happens primarily during sleep — the brain replays experiences, strengthens important connections, and prunes noise. Fawx does the same during idle time. The agent doesn't just accumulate data; it processes experience into intelligence. But unlike human sleep, every consolidation cycle is checkpointed and reversible.
 </div>
 
 <!-- ============ TRIGGERS ============ -->

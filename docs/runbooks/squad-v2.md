@@ -1,6 +1,6 @@
 # Squad v2 Runbook (CLI Swarm)
 
-This runbook defines the repeatable process for parallel issue-fix and PR-review swarms in Citros.
+This runbook defines the repeatable process for parallel issue-fix and PR-review swarms in Fawx.
 
 ## Scope
 
@@ -20,7 +20,7 @@ ps -axo pid=,command= | grep -E 'codex exec --full-auto' | grep -v grep
 ```
 2. Ensure repo is current:
 ```bash
-cd ~/citros-staging
+cd ~/fawx-staging
 git fetch origin --prune
 ```
 3. Prepare issue/review matrix (issue id, branch name, worktree path, log path).

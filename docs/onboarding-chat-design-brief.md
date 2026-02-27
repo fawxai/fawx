@@ -1,11 +1,11 @@
-# Citros Onboarding Chat — Design Brief
+# Fawx Onboarding Chat — Design Brief
 
 > Onboarding step after plan selection and before API key setup.
-> Feed this to Claude Cowork to generate interactive Jetpack Compose mockups that match the existing Citros visual language.
+> Feed this to Claude Cowork to generate interactive Jetpack Compose mockups that match the existing Fawx visual language.
 
 ## Context
 
-This screen is a conversational bootstrap. Instead of another form, the user and Citros establish identity, tone, and boundaries through a short real chat.
+This screen is a conversational bootstrap. Instead of another form, the user and Fawx establish identity, tone, and boundaries through a short real chat.
 
 It should feel alive and personal, but still deterministic enough to extract structured onboarding data and continue the flow safely.
 
@@ -156,7 +156,7 @@ Minimum completion gate: all required fields are non-null and extraction confide
 
 If user taps `Skip`:
 - Persist defaults:
-  - `agent_name = "Citros"`
+  - `agent_name = "Fawx"`
   - `agent_emoji = "🍊"`
   - `agent_nature = "citrus guide"`
   - `agent_vibe = "friendly and helpful"`
@@ -165,7 +165,7 @@ If user taps `Skip`:
 
 ## Persistence (Mock)
 
-Store in onboarding preferences (`citros_onboarding`) for now:
+Store in onboarding preferences (`fawx_onboarding`) for now:
 
 ```kotlin
 "onboarding_chat_seen" -> true
@@ -242,7 +242,7 @@ data class OnboardingChatUiState(
 - [ ] Skip applies documented defaults, captures user name, and proceeds without dead ends
 - [ ] Transcript and partial extraction state survive process death/app restart
 - [ ] Touch targets, contrast, dynamic type, and reduced-motion behaviors meet guardrails
-- [ ] Mock aligns visually with existing Citros chat + flavor system (not a separate design language)
+- [ ] Mock aligns visually with existing Fawx chat + flavor system (not a separate design language)
 
 ## Related Docs
 

@@ -1,6 +1,6 @@
 @file:OptIn(ExperimentalMaterial3Api::class)
 
-package com.citros.app.ui.preview
+package com.fawx.app.ui.preview
 
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material.icons.Icons
@@ -12,37 +12,37 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.tooling.preview.Preview
 
 // ─── Theme ───
-import com.citros.app.ui.theme.CitrosTheme
+import com.fawx.app.ui.theme.FawxTheme
 
 // ─── Flavor (NOTE: consolidate to one canonical location in your project) ───
-import com.citros.app.ui.onboarding.CitrosFlavor
+import com.fawx.app.ui.onboarding.FawxFlavor
 
 // ─── Components ───
-import com.citros.app.ui.components.*
+import com.fawx.app.ui.components.*
 
 // ─── Onboarding ───
-import com.citros.app.ui.onboarding.*
+import com.fawx.app.ui.onboarding.*
 
 // ─── Chat ───
-import com.citros.app.ui.chat.*
+import com.fawx.app.ui.chat.*
 
 // ─── Overlay ───
-import com.citros.app.ui.overlay.*
+import com.fawx.app.ui.overlay.*
 
 // ─── Settings ───
-import com.citros.app.ui.settings.*
+import com.fawx.app.ui.settings.*
 
 
 // ╔══════════════════════════════════════════════════════════════════╗
 // ║  INTEGRATION NOTE                                               ║
 // ║                                                                  ║
-// ║  CitrosFlavor is defined in 3 places right now:                  ║
-// ║    - onboarding/CitrosFlavor.kt                                 ║
+// ║  FawxFlavor is defined in 3 places right now:                  ║
+// ║    - onboarding/FawxFlavor.kt                                 ║
 // ║    - overlay/OverlayBubble.kt (local copy)                      ║
 // ║    - settings imports from theme package                        ║
 // ║                                                                  ║
-// ║  Before compiling: move CitrosFlavor to one canonical package   ║
-// ║  (e.g., com.citros.app.ui.theme.CitrosFlavor) and update all   ║
+// ║  Before compiling: move FawxFlavor to one canonical package   ║
+// ║  (e.g., com.fawx.app.ui.theme.FawxFlavor) and update all   ║
 // ║  imports. Same for the Message data class (components vs        ║
 // ║  overlay have different definitions).                            ║
 // ╚══════════════════════════════════════════════════════════════════╝
@@ -61,9 +61,9 @@ import com.citros.app.ui.settings.*
 )
 @Composable
 private fun PreviewHeroSphere() {
-    CitrosTheme {
-        CitrosHeroSphere(
-            flavor = CitrosFlavor.TANGERINE,
+    FawxTheme {
+        FawxHeroSphere(
+            flavor = FawxFlavor.TANGERINE,
             size = androidx.compose.ui.unit.Dp(200f)
         )
     }
@@ -78,8 +78,8 @@ private fun PreviewHeroSphere() {
 )
 @Composable
 private fun PreviewHeroBadge() {
-    CitrosTheme {
-        CitrusHeroBadge(flavor = CitrosFlavor.TANGERINE, size = 68)
+    FawxTheme {
+        CitrusHeroBadge(flavor = FawxFlavor.TANGERINE, size = 68)
     }
 }
 
@@ -92,11 +92,11 @@ private fun PreviewHeroBadge() {
 )
 @Composable
 private fun PreviewPrimaryButton() {
-    CitrosTheme {
-        CitrosPrimaryButton(
+    FawxTheme {
+        FawxPrimaryButton(
             text = "Get Started",
             onClick = {},
-            flavor = CitrosFlavor.TANGERINE,
+            flavor = FawxFlavor.TANGERINE,
             modifier = Modifier
         )
     }
@@ -111,11 +111,11 @@ private fun PreviewPrimaryButton() {
 )
 @Composable
 private fun PreviewSecondaryButton() {
-    CitrosTheme {
-        CitrosSecondaryButton(
+    FawxTheme {
+        FawxSecondaryButton(
             text = "Skip for now",
             onClick = {},
-            flavor = CitrosFlavor.TANGERINE,
+            flavor = FawxFlavor.TANGERINE,
             modifier = Modifier
         )
     }
@@ -130,8 +130,8 @@ private fun PreviewSecondaryButton() {
 )
 @Composable
 private fun PreviewStepHeader() {
-    CitrosTheme {
-        CitrosStepHeader(
+    FawxTheme {
+        FawxStepHeader(
             title = "Choose Your Flavor",
             stepIndex = 2,
             totalSteps = 7,
@@ -149,7 +149,7 @@ private fun PreviewStepHeader() {
 )
 @Composable
 private fun PreviewPersonalityChips() {
-    CitrosTheme {
+    FawxTheme {
         androidx.compose.foundation.layout.Row(
             horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(
                 androidx.compose.ui.unit.dp(8)
@@ -172,9 +172,9 @@ private fun PreviewPersonalityChips() {
 )
 @Composable
 private fun PreviewFlavorCard() {
-    CitrosTheme {
+    FawxTheme {
         FlavorOptionCard(
-            flavor = CitrosFlavor.TANGERINE,
+            flavor = FawxFlavor.TANGERINE,
             selected = true,
             onClick = {},
             modifier = Modifier.padding(horizontal = androidx.compose.ui.unit.dp(16))
@@ -191,9 +191,9 @@ private fun PreviewFlavorCard() {
 )
 @Composable
 private fun PreviewPlanCard() {
-    CitrosTheme {
+    FawxTheme {
         PlanCard(
-            plan = CitrosPlanSpec(
+            plan = FawxPlanSpec(
                 title = "Bring Your Own Key",
                 subtitle = "Use your API key",
                 details = listOf(
@@ -219,7 +219,7 @@ private fun PreviewPlanCard() {
 )
 @Composable
 private fun PreviewMessageBubbles() {
-    CitrosTheme {
+    FawxTheme {
         androidx.compose.foundation.layout.Column(
             modifier = Modifier.padding(androidx.compose.ui.unit.dp(16)),
             verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(
@@ -232,7 +232,7 @@ private fun PreviewMessageBubbles() {
                     role = MessageRole.USER,
                     timestamp = 1L
                 ),
-                flavor = CitrosFlavor.TANGERINE
+                flavor = FawxFlavor.TANGERINE
             )
             PortedMessageBubble(
                 message = Message(
@@ -240,7 +240,7 @@ private fun PreviewMessageBubbles() {
                     role = MessageRole.ASSISTANT,
                     timestamp = 2L
                 ),
-                flavor = CitrosFlavor.TANGERINE
+                flavor = FawxFlavor.TANGERINE
             )
             PortedMessageBubble(
                 message = Message(
@@ -248,7 +248,7 @@ private fun PreviewMessageBubbles() {
                     role = MessageRole.ACTION,
                     timestamp = 3L
                 ),
-                flavor = CitrosFlavor.TANGERINE
+                flavor = FawxFlavor.TANGERINE
             )
         }
     }
@@ -263,9 +263,9 @@ private fun PreviewMessageBubbles() {
 )
 @Composable
 private fun PreviewLoadingIndicator() {
-    CitrosTheme {
+    FawxTheme {
         PortedLoadingIndicator(
-            flavor = CitrosFlavor.TANGERINE,
+            flavor = FawxFlavor.TANGERINE,
             label = "Thinking"
         )
     }
@@ -280,9 +280,9 @@ private fun PreviewLoadingIndicator() {
 )
 @Composable
 private fun PreviewChatEmptyState() {
-    CitrosTheme {
+    FawxTheme {
         ChatEmptyState(
-            flavor = CitrosFlavor.TANGERINE,
+            flavor = FawxFlavor.TANGERINE,
             onSuggestion = {}
         )
     }
@@ -302,9 +302,9 @@ private fun PreviewChatEmptyState() {
 )
 @Composable
 private fun PreviewWelcomeScreen() {
-    CitrosTheme {
+    FawxTheme {
         WelcomeScreen(
-            flavor = CitrosFlavor.TANGERINE,
+            flavor = FawxFlavor.TANGERINE,
             onGetStarted = {}
         )
     }
@@ -319,9 +319,9 @@ private fun PreviewWelcomeScreen() {
 )
 @Composable
 private fun PreviewFlavorScreen() {
-    CitrosTheme {
+    FawxTheme {
         FlavorScreen(
-            selectedFlavor = CitrosFlavor.TANGERINE,
+            selectedFlavor = FawxFlavor.TANGERINE,
             onFlavorSelected = {},
             onContinue = {},
             onBack = {}
@@ -338,9 +338,9 @@ private fun PreviewFlavorScreen() {
 )
 @Composable
 private fun PreviewConversationStyleScreen() {
-    CitrosTheme {
+    FawxTheme {
         ConversationStyleScreen(
-            flavor = CitrosFlavor.TANGERINE,
+            flavor = FawxFlavor.TANGERINE,
             selectedTone = "Casual",
             selectedDetail = null,
             selectedAutonomy = null,
@@ -362,9 +362,9 @@ private fun PreviewConversationStyleScreen() {
 )
 @Composable
 private fun PreviewPaywallScreen() {
-    CitrosTheme {
+    FawxTheme {
         PaywallScreen(
-            flavor = CitrosFlavor.TANGERINE,
+            flavor = FawxFlavor.TANGERINE,
             onPlanSelected = {},
             onBack = {}
         )
@@ -380,9 +380,9 @@ private fun PreviewPaywallScreen() {
 )
 @Composable
 private fun PreviewApiKeyScreen() {
-    CitrosTheme {
+    FawxTheme {
         ApiKeyScreen(
-            flavor = CitrosFlavor.TANGERINE,
+            flavor = FawxFlavor.TANGERINE,
             selectedProvider = "Anthropic",
             apiKey = "",
             validationState = ValidationState.Idle,
@@ -405,9 +405,9 @@ private fun PreviewApiKeyScreen() {
 )
 @Composable
 private fun PreviewPermissionsScreen() {
-    CitrosTheme {
+    FawxTheme {
         PermissionsScreen(
-            flavor = CitrosFlavor.TANGERINE,
+            flavor = FawxFlavor.TANGERINE,
             accessibilityGranted = true,
             notificationsGranted = false,
             overlayGranted = false,
@@ -429,9 +429,9 @@ private fun PreviewPermissionsScreen() {
 )
 @Composable
 private fun PreviewReadyScreen() {
-    CitrosTheme {
+    FawxTheme {
         ReadyScreen(
-            flavor = CitrosFlavor.TANGERINE,
+            flavor = FawxFlavor.TANGERINE,
             onStartChatting = {}
         )
     }
@@ -451,9 +451,9 @@ private fun PreviewReadyScreen() {
 )
 @Composable
 private fun PreviewChatScreenEmpty() {
-    CitrosTheme {
+    FawxTheme {
         ChatScreen(
-            flavor = CitrosFlavor.TANGERINE,
+            flavor = FawxFlavor.TANGERINE,
             messages = emptyList(),
             isLoading = false,
             inputText = "",
@@ -480,9 +480,9 @@ private fun PreviewChatScreenEmpty() {
 )
 @Composable
 private fun PreviewChatScreenWithMessages() {
-    CitrosTheme {
+    FawxTheme {
         ChatScreen(
-            flavor = CitrosFlavor.TANGERINE,
+            flavor = FawxFlavor.TANGERINE,
             messages = listOf(
                 Message(
                     content = "Check my calendar for tomorrow",
@@ -530,10 +530,10 @@ private fun PreviewChatScreenWithMessages() {
 )
 @Composable
 private fun PreviewChatInputBar() {
-    CitrosTheme {
+    FawxTheme {
         ChatInputBar(
             inputText = "Open my email",
-            flavor = CitrosFlavor.TANGERINE,
+            flavor = FawxFlavor.TANGERINE,
             onInputChanged = {},
             onSend = {}
         )
@@ -549,7 +549,7 @@ private fun PreviewChatInputBar() {
 )
 @Composable
 private fun PreviewChatTopBar() {
-    CitrosTheme {
+    FawxTheme {
         ChatTopBar(
             walletState = WalletState(
                 providerIcon = Icons.Default.SmartToy,
@@ -576,11 +576,11 @@ private fun PreviewChatTopBar() {
 )
 @Composable
 private fun PreviewOverlayMiniChat() {
-    CitrosTheme {
-        // Note: OverlayMiniChat uses its own CitrosFlavor from overlay package.
+    FawxTheme {
+        // Note: OverlayMiniChat uses its own FawxFlavor from overlay package.
         // You'll need to consolidate the flavor enum before this compiles.
         OverlayMiniChat(
-            flavor = com.citros.app.ui.overlay.CitrosFlavor.TANGERINE,
+            flavor = com.fawx.app.ui.overlay.FawxFlavor.TANGERINE,
             logLines = listOf(
                 OverlayLogLine("Open Gmail", LogLineType.USER),
                 OverlayLogLine("Launching Gmail app...", LogLineType.SYSTEM),
@@ -612,9 +612,9 @@ private fun PreviewOverlayMiniChat() {
 )
 @Composable
 private fun PreviewOverlayMiniChatPaused() {
-    CitrosTheme {
+    FawxTheme {
         OverlayMiniChat(
-            flavor = com.citros.app.ui.overlay.CitrosFlavor.TANGERINE,
+            flavor = com.fawx.app.ui.overlay.FawxFlavor.TANGERINE,
             logLines = listOf(
                 OverlayLogLine("Set a timer for 5 minutes", LogLineType.USER),
                 OverlayLogLine("Opening Clock app...", LogLineType.SYSTEM)
@@ -643,9 +643,9 @@ private fun PreviewOverlayMiniChatPaused() {
 )
 @Composable
 private fun PreviewOverlayBubbleIdle() {
-    CitrosTheme {
+    FawxTheme {
         OverlayBubble(
-            flavor = com.citros.app.ui.overlay.CitrosFlavor.TANGERINE,
+            flavor = com.fawx.app.ui.overlay.FawxFlavor.TANGERINE,
             isExecuting = false,
             unreadCount = 0,
             onClick = {},
@@ -663,9 +663,9 @@ private fun PreviewOverlayBubbleIdle() {
 )
 @Composable
 private fun PreviewOverlayBubbleExecuting() {
-    CitrosTheme {
+    FawxTheme {
         OverlayBubble(
-            flavor = com.citros.app.ui.overlay.CitrosFlavor.TANGERINE,
+            flavor = com.fawx.app.ui.overlay.FawxFlavor.TANGERINE,
             isExecuting = true,
             unreadCount = 3,
             onClick = {},
@@ -683,9 +683,9 @@ private fun PreviewOverlayBubbleExecuting() {
 )
 @Composable
 private fun PreviewOverlayPreviewScreen() {
-    CitrosTheme {
+    FawxTheme {
         OverlayPreviewScreen(
-            flavor = com.citros.app.ui.overlay.CitrosFlavor.TANGERINE,
+            flavor = com.fawx.app.ui.overlay.FawxFlavor.TANGERINE,
             selectedMode = OverlayMode.MINI_CHAT,
             onModeSelected = {},
             onBack = {}
@@ -707,9 +707,9 @@ private fun PreviewOverlayPreviewScreen() {
 )
 @Composable
 private fun PreviewSettingsHub() {
-    CitrosTheme {
+    FawxTheme {
         SettingsHubScreen(
-            flavor = com.citros.app.ui.theme.CitrosFlavor.TANGERINE,
+            flavor = com.fawx.app.ui.theme.FawxFlavor.TANGERINE,
             activeKeyLabel = "My Anthropic Key",
             activeModelName = "claude-3.5-sonnet",
             onBack = {},
@@ -727,9 +727,9 @@ private fun PreviewSettingsHub() {
 )
 @Composable
 private fun PreviewApiKeysSettings() {
-    CitrosTheme {
+    FawxTheme {
         ApiKeysSettingsScreen(
-            flavor = com.citros.app.ui.theme.CitrosFlavor.TANGERINE,
+            flavor = com.fawx.app.ui.theme.FawxFlavor.TANGERINE,
             keys = listOf(
                 ApiKeyEntry(
                     id = "1",
@@ -772,9 +772,9 @@ private fun PreviewApiKeysSettings() {
 )
 @Composable
 private fun PreviewApiKeysSettingsEmpty() {
-    CitrosTheme {
+    FawxTheme {
         ApiKeysSettingsScreen(
-            flavor = com.citros.app.ui.theme.CitrosFlavor.TANGERINE,
+            flavor = com.fawx.app.ui.theme.FawxFlavor.TANGERINE,
             keys = emptyList(),
             activeKeyId = null,
             selectedChatModel = null,
@@ -800,9 +800,9 @@ private fun PreviewApiKeysSettingsEmpty() {
 )
 @Composable
 private fun PreviewModelsSettings() {
-    CitrosTheme {
+    FawxTheme {
         ModelsSettingsScreen(
-            flavor = com.citros.app.ui.theme.CitrosFlavor.TANGERINE,
+            flavor = com.fawx.app.ui.theme.FawxFlavor.TANGERINE,
             hasActiveKey = true,
             chatModels = listOf("claude-3.5-sonnet", "claude-3-opus", "claude-3.5-haiku", "gpt-4o"),
             actionModels = listOf("claude-3.5-haiku", "claude-3.5-sonnet", "gpt-4o-mini"),
@@ -824,9 +824,9 @@ private fun PreviewModelsSettings() {
 )
 @Composable
 private fun PreviewTrustSettings() {
-    CitrosTheme {
+    FawxTheme {
         TrustSettingsScreen(
-            flavor = com.citros.app.ui.theme.CitrosFlavor.TANGERINE,
+            flavor = com.fawx.app.ui.theme.FawxFlavor.TANGERINE,
             selectedLevel = TrustLevel.ASK_RISKY,
             onLevelSelected = {},
             onBack = {}
@@ -843,10 +843,10 @@ private fun PreviewTrustSettings() {
 )
 @Composable
 private fun PreviewAppearanceSettings() {
-    CitrosTheme {
+    FawxTheme {
         AppearanceSettingsScreen(
-            flavor = com.citros.app.ui.theme.CitrosFlavor.TANGERINE,
-            selectedFlavor = com.citros.app.ui.theme.CitrosFlavor.TANGERINE,
+            flavor = com.fawx.app.ui.theme.FawxFlavor.TANGERINE,
+            selectedFlavor = com.fawx.app.ui.theme.FawxFlavor.TANGERINE,
             autoClearTimeout = AutoClearTimeout.NEVER,
             themeMode = ThemeMode.DARK,
             onFlavorSelected = {},
@@ -866,12 +866,12 @@ private fun PreviewAppearanceSettings() {
 )
 @Composable
 private fun PreviewPhoneControlSettings() {
-    CitrosTheme {
+    FawxTheme {
         PhoneControlSettingsScreen(
-            flavor = com.citros.app.ui.theme.CitrosFlavor.TANGERINE,
+            flavor = com.fawx.app.ui.theme.FawxFlavor.TANGERINE,
             accessibilityGranted = true,
             overlayGranted = false,
-            defaultOverlayMode = com.citros.app.ui.settings.OverlayMode.MINI_CHAT,
+            defaultOverlayMode = com.fawx.app.ui.settings.OverlayMode.MINI_CHAT,
             onRequestAccessibility = {},
             onRequestOverlay = {},
             onOverlayModeSelected = {},
@@ -889,9 +889,9 @@ private fun PreviewPhoneControlSettings() {
 )
 @Composable
 private fun PreviewAboutSettings() {
-    CitrosTheme {
+    FawxTheme {
         AboutSettingsScreen(
-            flavor = com.citros.app.ui.theme.CitrosFlavor.TANGERINE,
+            flavor = com.fawx.app.ui.theme.FawxFlavor.TANGERINE,
             onBack = {}
         )
     }
@@ -911,8 +911,8 @@ private fun PreviewAboutSettings() {
 )
 @Composable
 private fun PreviewWelcomeLemon() {
-    CitrosTheme {
-        WelcomeScreen(flavor = CitrosFlavor.LEMON, onGetStarted = {})
+    FawxTheme {
+        WelcomeScreen(flavor = FawxFlavor.LEMON, onGetStarted = {})
     }
 }
 
@@ -925,8 +925,8 @@ private fun PreviewWelcomeLemon() {
 )
 @Composable
 private fun PreviewWelcomeLime() {
-    CitrosTheme {
-        WelcomeScreen(flavor = CitrosFlavor.LIME, onGetStarted = {})
+    FawxTheme {
+        WelcomeScreen(flavor = FawxFlavor.LIME, onGetStarted = {})
     }
 }
 
@@ -939,8 +939,8 @@ private fun PreviewWelcomeLime() {
 )
 @Composable
 private fun PreviewWelcomeBloodOrange() {
-    CitrosTheme {
-        WelcomeScreen(flavor = CitrosFlavor.BLOOD_ORANGE, onGetStarted = {})
+    FawxTheme {
+        WelcomeScreen(flavor = FawxFlavor.BLOOD_ORANGE, onGetStarted = {})
     }
 }
 
@@ -953,7 +953,7 @@ private fun PreviewWelcomeBloodOrange() {
 )
 @Composable
 private fun PreviewWelcomeGrapefruit() {
-    CitrosTheme {
-        WelcomeScreen(flavor = CitrosFlavor.GRAPEFRUIT, onGetStarted = {})
+    FawxTheme {
+        WelcomeScreen(flavor = FawxFlavor.GRAPEFRUIT, onGetStarted = {})
     }
 }

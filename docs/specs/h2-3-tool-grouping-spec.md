@@ -11,7 +11,7 @@
 
 Issue #557 asks for category-based tool sets with conditional inclusion by context, model tier, and user preference to reduce prompt/tool overhead.
 
-Citros already has foundational grouping primitives in `PhoneTools.kt`, `ToolCategory.kt`, `PhoneAgentPrompts.kt`, and `ToolCategoryTest.kt`. The remaining gap is not category definition; it is orchestration: deciding *which* categories are active each turn and honoring user-level enable/disable settings safely.
+Fawx already has foundational grouping primitives in `PhoneTools.kt`, `ToolCategory.kt`, `PhoneAgentPrompts.kt`, and `ToolCategoryTest.kt`. The remaining gap is not category definition; it is orchestration: deciding *which* categories are active each turn and honoring user-level enable/disable settings safely.
 
 ---
 
@@ -62,16 +62,16 @@ Citros already has foundational grouping primitives in `PhoneTools.kt`, `ToolCat
 
 ---
 
-## 4. OpenClaw Pattern Comparison (Applied to Citros)
+## 4. OpenClaw Pattern Comparison (Applied to Fawx)
 
 ### Pattern A: Two-tier tool context (compact listing + detailed on demand)
 - OpenClaw: compact skill listing in prompt, detailed SKILL.md loaded only when needed.
-- Citros H2.3 adaptation: keep compact summary of all available tools, but only provide detailed category sections and API `tools` schemas for active groups.
-- Why adapted, not copied: Citros does not have filesystem skill plugins; categories are static code constructs.
+- Fawx H2.3 adaptation: keep compact summary of all available tools, but only provide detailed category sections and API `tools` schemas for active groups.
+- Why adapted, not copied: Fawx does not have filesystem skill plugins; categories are static code constructs.
 
 ### Pattern B: Multi-layer policy pipeline
 - OpenClaw: profile/provider/agent/group policy stacking.
-- Citros H2.3 adaptation: minimal precedence stack:
+- Fawx H2.3 adaptation: minimal precedence stack:
   1. hard security floor (model tier, capability availability),
   2. user category settings,
   3. runtime context resolver,
@@ -80,11 +80,11 @@ Citros already has foundational grouping primitives in `PhoneTools.kt`, `ToolCat
 
 ### Pattern C: Explicit budget controls
 - OpenClaw: prompt char-budget clipping for skill section.
-- Citros H2.3 adaptation: add per-turn tool-count/token telemetry and budget threshold alarms before hard clipping logic.
+- Fawx H2.3 adaptation: add per-turn tool-count/token telemetry and budget threshold alarms before hard clipping logic.
 
 ### Pattern D: Failure-safe behavior
 - OpenClaw: conservative defaults + explicit filtering.
-- Citros H2.3 adaptation: fail closed on non-core categories, fail open for core categories only.
+- Fawx H2.3 adaptation: fail closed on non-core categories, fail open for core categories only.
 
 ---
 
@@ -276,12 +276,12 @@ return ResolvedToolPlan(activeCategories=active_ordered, toolNames=tools, reason
 
 ### 7.1 Files likely touched in IMPLEMENT stage
 
-1. `android/core/src/main/kotlin/ai/citros/core/PhoneAgentApi.kt`
-2. `android/core/src/main/kotlin/ai/citros/core/PhoneAgentPrompts.kt`
-3. `android/core/src/main/kotlin/ai/citros/core/PhoneTools.kt` (minimal, if needed)
-4. New policy/settings classes under `android/core/src/main/kotlin/ai/citros/core/`
+1. `android/core/src/main/kotlin/ai/fawx/core/PhoneAgentApi.kt`
+2. `android/core/src/main/kotlin/ai/fawx/core/PhoneAgentPrompts.kt`
+3. `android/core/src/main/kotlin/ai/fawx/core/PhoneTools.kt` (minimal, if needed)
+4. New policy/settings classes under `android/core/src/main/kotlin/ai/fawx/core/`
 5. Settings integration (chat/UI module) for user category toggles.
-6. Tests in `android/core/src/test/kotlin/ai/citros/core/` plus settings tests.
+6. Tests in `android/core/src/test/kotlin/ai/fawx/core/` plus settings tests.
 
 ### 7.2 Data contract
 

@@ -1,12 +1,12 @@
-# Citros — Directive C Design System Prompt
+# Fawx — Directive C Design System Prompt
 
-> Paste this prompt before any Composable generation task. It ensures every screen, component, and overlay follows the Citros Directive C visual language exactly.
+> Paste this prompt before any Composable generation task. It ensures every screen, component, and overlay follows the Fawx Directive C visual language exactly.
 
 ---
 
 ## Role
 
-You are implementing the UI layer of Citros, an AI phone agent for Android (Pixel 10 Pro). Every `@Composable` you write must follow the Directive C design system described below. Do not deviate. Do not invent new tokens. Do not use Material You theming, dynamic color, or `MaterialTheme`. Citros owns its own design language.
+You are implementing the UI layer of Fawx, an AI phone agent for Android (Pixel 10 Pro). Every `@Composable` you write must follow the Directive C design system described below. Do not deviate. Do not invent new tokens. Do not use Material You theming, dynamic color, or `MaterialTheme`. Fawx owns its own design language.
 
 ---
 
@@ -104,7 +104,7 @@ Separators are always 0.5dp (`Dp.Hairline` or `0.5.dp`).
 
 ## 7. Flavor System
 
-Citros has 6 flavors. Flavor color appears in **exactly three places**: the Orb, user message bubbles, and the send button. Nowhere else.
+Fawx has 6 flavors. Flavor color appears in **exactly three places**: the Orb, user message bubbles, and the send button. Nowhere else.
 
 ### Flavor Palette
 
@@ -159,14 +159,14 @@ When flavor is set:
 
 ## 8. The Orb
 
-The Orb is the Citros brand mark. It appears in the nav bar, overlays, onboarding, settings profile, and empty states at various sizes.
+The Orb is the Fawx brand mark. It appears in the nav bar, overlays, onboarding, settings profile, and empty states at various sizes.
 
 ### Structure
 A circle with a concentric inner circle at 38% of the outer diameter.
 
 ```kotlin
 @Composable
-fun CitrosOrb(
+fun FawxOrb(
     color: Color,
     innerColor: Color,
     glowColor: Color?,
@@ -398,7 +398,7 @@ Fill: `none` (stroke only). Color: passed as parameter, typically `labelSecondar
 ## 19. Overlay Modes
 
 ### Search Bar (replaces Pixel's Google bar)
-Citros overrides the bottom search bar on the Pixel home screen. Same position, same pill shape, but it's the Citros ambient bar.
+Fawx overrides the bottom search bar on the Pixel home screen. Same position, same pill shape, but it's the Fawx ambient bar.
 
 - **Position:** Docked at bottom of home screen, above gesture handle, below dock row. Replaces the Google search bar 1:1.
 - **Shape:** Full-width pill, horizontal margin `g(5)`, height `g(13)` (52dp), radius `g(7)` (full pill)
@@ -409,7 +409,7 @@ Citros overrides the bottom search bar on the Pixel home screen. Same position, 
 - **Layout:** `[Orb g(9)] [g(2.5) gap] [center content flex] [mic button g(9)]`
 - **Orb:** `g(9)` (36dp), with glow, left-aligned (where the Google G logo sits)
 - **Center content by state:**
-  - *Idle:* `"Ask Citros anything..."` — callout, `labelTertiary`
+  - *Idle:* `"Ask Fawx anything..."` — callout, `labelTertiary`
   - *Executing:* pulsing dot (6dp, `orbColor`, 0.7 opacity) + italic status text (`labelSecondary`) + Stop button (`red` bg, white text, `g(2.5)` radius)
   - *Completed:* bold status text (`labelPrimary`) + green check circle (`g(5)`, `green` at 20% alpha bg, green checkmark)
   - *Failed:* bold status text (`red`) + red alert circle (`g(5)`, `red` at 18% alpha bg, red "!")
@@ -431,7 +431,7 @@ Citros overrides the bottom search bar on the Pixel home screen. Same position, 
 - Light: `rgba(242,242,247,0.92)`, shadow `0 4dp 20dp rgba(0,0,0,0.10)`, border `1dp separator`
 - Both: `backdrop-filter: blur(40dp)`
 - Radius: `g(7)` (28dp, full pill)
-- Idle: compact — Orb `g(7)` + "Citros" label, min-width 120dp
+- Idle: compact — Orb `g(7)` + "Fawx" label, min-width 120dp
 - Expanded: Orb `g(8)` + content + action, min-width 240dp
 - Failed state: Orb turns `red`, glow becomes `rgba(255,69,58,0.15)`
 - Transition: 250ms ease on all properties

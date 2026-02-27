@@ -1,8 +1,8 @@
-# Citros Architecture
+# Fawx Architecture
 
 ## Overview
 
-Citros is an AI-native phone agent designed across three horizons:
+Fawx is an AI-native phone agent designed across three horizons:
 - **Phase 0.5**: Mac Mini pre-PoC (validate cognitive pipeline)
 - **Horizon 1**: Android PoC (Rust daemon on rooted Pixel 8a)
 - **Horizon 2**: AI-Native OS (custom Linux-based operating system)
@@ -12,10 +12,10 @@ This document describes the crate architecture for Phase 0.5 and Horizon 1. For 
 
 ## Workspace Structure
 
-Citros is organized as a Cargo workspace with 12 crates:
+Fawx is organized as a Cargo workspace with 12 crates:
 
 ```
-citros/
+fawx/
 ├── Cargo.toml                 # Workspace root
 ├── crates/
 │   ├── ct-core/              # [100% reuse] Core types, config, event bus, errors
@@ -235,13 +235,13 @@ citros/
 **Purpose**: Command-line management interface.
 
 **Commands**:
-- `citros start` / `citros stop` - Daemon control
-- `citros chat` - Interactive REPL
-- `citros doctor` - Diagnostics
-- `citros config show` - Display config
-- `citros skill install/remove/list` - Skill management
-- `citros audit show/verify` - Audit log access
-- `citros sim status/reset` - Simulator control (pre-PoC)
+- `fawx start` / `fawx stop` - Daemon control
+- `fawx chat` - Interactive REPL
+- `fawx doctor` - Diagnostics
+- `fawx config show` - Display config
+- `fawx skill install/remove/list` - Skill management
+- `fawx audit show/verify` - Audit log access
+- `fawx sim status/reset` - Simulator control (pre-PoC)
 
 **Dependencies**: `ct-core`, `clap`, `tokio`, `tracing`
 

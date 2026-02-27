@@ -2,13 +2,13 @@
 
 ## What you're changing
 
-The Citros overlay system currently has a **Bubble** mode — a floating orb (FAB-style) that hovers over the home screen. Replace it entirely with a **Search Bar** that docks into the exact slot where the Pixel's Google search bar sits at the bottom of the home screen.
+The Fawx overlay system currently has a **Bubble** mode — a floating orb (FAB-style) that hovers over the home screen. Replace it entirely with a **Search Bar** that docks into the exact slot where the Pixel's Google search bar sits at the bottom of the home screen.
 
-The attached images show the Pixel Google search bar for reference. Match its position, proportions, and role — but make it Citros.
+The attached images show the Pixel Google search bar for reference. Match its position, proportions, and role — but make it Fawx.
 
 ## Why
 
-Citros runs on a rooted Pixel 10 Pro. As a system-level agent with Accessibility Service and overlay permissions, it can override the home screen search bar widget. Sitting in the Google bar slot feels native — like the phone itself is thinking — rather than a third-party FAB floating on top.
+Fawx runs on a rooted Pixel 10 Pro. As a system-level agent with Accessibility Service and overlay permissions, it can override the home screen search bar widget. Sitting in the Google bar slot feels native — like the phone itself is thinking — rather than a third-party FAB floating on top.
 
 ## What the Search Bar replaces
 
@@ -39,11 +39,11 @@ Left to right:
 
 | State | Content |
 |-------|---------|
-| **Idle** | `"Ask Citros anything..."` — 14sp, `labelTertiary`. The resting/ambient state. |
+| **Idle** | `"Ask Fawx anything..."` — 14sp, `labelTertiary`. The resting/ambient state. |
 | **Executing** | Pulsing dot (6dp circle, `orbColor`, 0.7 opacity) + italic status text (14sp `labelSecondary`, e.g. "Opening calendar...") + **Stop** button (right-aligned, `red` bg, white 12sp bold text, `g(2.5)` radius) |
 | **Completed** | Bold status text (14sp/500 `labelPrimary`, e.g. "Reminder set — 3:00 PM") + green check circle (20dp, `green` at 20% alpha bg, 10dp green checkmark SVG) |
 | **Failed** | Bold status text (14sp/500, `red`, e.g. "Calendar access denied") + red alert circle (20dp, `red` at 18% alpha bg, "!" in 11sp/700 `red`) |
-| **Unread** | `"Ask Citros anything..."` placeholder + red badge pill (min 20dp wide, `red` bg, "2" in 11sp/700 white) + small red dot on the Orb itself (10dp, top-right, absolute positioned) |
+| **Unread** | `"Ask Fawx anything..."` placeholder + red badge pill (min 20dp wide, `red` bg, "2" in 11sp/700 white) + small red dot on the Orb itself (10dp, top-right, absolute positioned) |
 
 ### Orb State Variants
 - Default: standard `orbColor` / `orbInner` / `orbGlow` per the active flavor

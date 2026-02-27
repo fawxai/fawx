@@ -7,7 +7,7 @@ Replace monolithic, long-running Android test gates with small deterministic buc
 - **Atomic buckets:** one concern per bucket, independently runnable.
 - **Fail fast for merge blockers:** only P0 blocks PRs.
 - **Broader confidence off critical path:** P1 runs observationally in PR CI; P2 runs in nightly/workflow-dispatch lanes.
-- **Deterministic defaults:** skip `@Flaky` in P0/P1 (`-PcitrosRunFlakyTests=false`).
+- **Deterministic defaults:** skip `@Flaky` in P0/P1 (`-PfawxRunFlakyTests=false`).
 - **Escalate with explicit ownership:** every failing bucket has an owner and SLA.
 
 ## Gate Model
@@ -49,7 +49,7 @@ Used to detect intermittent behavior and regression drift.
 
 ### Quarantine policy
 - Tests proven flaky are annotated with `@Flaky(issue = "#...")` and tracked with an issue.
-- Quarantined tests are excluded from P0/P1 by running with `-PcitrosRunFlakyTests=false`.
+- Quarantined tests are excluded from P0/P1 by running with `-PfawxRunFlakyTests=false`.
 - Quarantined coverage remains visible via P2 (`p2.flaky-audit`).
 
 ### Escalation policy on failure

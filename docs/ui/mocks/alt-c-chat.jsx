@@ -200,7 +200,7 @@ export default function DirectiveCChat() {
       <nav style={{ display: "flex", alignItems: "center", padding: `${g(3)}px ${g(4)}px`, gap: g(3), borderBottom: `0.5px solid ${t.separator}`, height: g(11), flexShrink: 0 }}>
         <Orb color={r.orbColor} inner={r.orbInner} glow={r.orbGlow} size={g(8)} />
         <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ fontSize: 17, fontWeight: 600, letterSpacing: -0.4, color: t.labelPrimary, lineHeight: "22px" }}>Citros</div>
+          <div style={{ fontSize: 17, fontWeight: 600, letterSpacing: -0.4, color: t.labelPrimary, lineHeight: "22px" }}>Fawx</div>
           <div style={{ fontSize: 13, letterSpacing: -0.1, color: t.labelTertiary, lineHeight: "18px" }}>Claude Sonnet 4.5</div>
         </div>
         <button style={{ width: g(11), height: g(11), display: "grid", placeItems: "center", background: "none", border: "none", cursor: "pointer", borderRadius: g(3) }} aria-label="Settings">

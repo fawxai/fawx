@@ -148,7 +148,7 @@ export default function SettingsRedesign() {
         background: `${t.surfaceElevated}88`, border: `1px solid ${t.separator}`,
         fontSize: 13, color: t.labelTertiary,
       }}>
-        About Citros · v0.1
+        About Fawx · v0.1
       </div>
     </div>
   );
@@ -167,7 +167,7 @@ export default function SettingsRedesign() {
           <div style={{ width: 26, height: 26, borderRadius: "50%", background: "rgba(0,0,0,0.15)" }} />
         </div>
         <div>
-          <div style={{ fontSize: 22, fontWeight: 700, letterSpacing: -0.5 }}>Citros</div>
+          <div style={{ fontSize: 22, fontWeight: 700, letterSpacing: -0.5 }}>Fawx</div>
           <div style={{ fontSize: 14, color: t.labelSecondary }}>2 providers connected</div>
         </div>
       </div>
@@ -256,9 +256,9 @@ export default function SettingsRedesign() {
     <div style={{ overflowY: "auto", flex: 1, padding: "8px 0" }}>
       <GroupedSection title="Autonomy Level">
         {[
-          { label: "Ask before everything", desc: "Confirm every action before Citros takes it", icon: "🔒" },
+          { label: "Ask before everything", desc: "Confirm every action before Fawx takes it", icon: "🔒" },
           { label: "Ask for risky actions", desc: "Auto-approve safe actions, ask for sensitive ones", icon: "⚖️", selected: true },
-          { label: "Full autonomy", desc: "Citros acts independently on your behalf", icon: "🚀" },
+          { label: "Full autonomy", desc: "Fawx acts independently on your behalf", icon: "🚀" },
         ].map((item, i) => (
           <GroupedRow
             key={i}
@@ -277,7 +277,7 @@ export default function SettingsRedesign() {
       <div style={{
         padding: "0 16px", fontSize: 13, color: t.labelTertiary, lineHeight: 1.5,
       }}>
-        Trust level controls how much confirmation Citros requires before taking actions on your phone. Higher autonomy means faster execution but less oversight.
+        Trust level controls how much confirmation Fawx requires before taking actions on your phone. Higher autonomy means faster execution but less oversight.
       </div>
     </div>
   );

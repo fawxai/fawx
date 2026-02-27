@@ -26,7 +26,7 @@ export default async function handler(req: Request) {
     .process?.env ?? {};
 
   // App token auth — same as /api/keys
-  const appToken = env.CITROS_APP_TOKEN;
+  const appToken = env.FAWX_APP_TOKEN;
   if (appToken) {
     const auth = req.headers.get('Authorization');
     if (auth !== `Bearer ${appToken}`) {

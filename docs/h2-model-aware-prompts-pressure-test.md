@@ -1,6 +1,6 @@
 # Pressure Test: Model-Aware Prompt Tuning (#558)
 
-**Issue:** [#558](https://github.com/abbudjoe/citros/issues/558)
+**Issue:** [#558](https://github.com/abbudjoe/fawx/issues/558)
 **Date:** 2026-02-21
 **Reference Implementation:** OpenClaw v0.x (reverse-engineered from minified dist)
 
@@ -109,7 +109,7 @@ This tells the model what it's running as, but the model doesn't use this to sel
 
 ---
 
-## 2. Citros Current Design
+## 2. Fawx Current Design
 
 ### 2.1 Current State
 - `buildSystemPrompt()` in `PhoneAgentPrompts.kt` (398 lines, ~2-3K tokens output)
@@ -129,7 +129,7 @@ This tells the model what it's running as, but the model doesn't use this to sel
 
 ## 3. Comparison
 
-| Dimension | OpenClaw | Citros Current | Citros #558 Plan |
+| Dimension | OpenClaw | Fawx Current | Fawx #558 Plan |
 |---|---|---|---|
 | **Prompt modes** | 3 modes (full/minimal/none) by session type | 1 mode for all | Model-tier based |
 | **Model-specific prompts** | Minimal — tool schemas vary, prompt text doesn't | None (except tool filtering) | Planned |
@@ -145,9 +145,9 @@ This tells the model what it's running as, but the model doesn't use this to sel
 
 ### 4.1 Critical (Must Address Before Implementation)
 
-1. **Formalize existing session-type prompting.** Citros already has a dual-model architecture (`chatClient` for conversations, `actionClient` for phone actions) with different tool access per tier. This is session-type prompting in practice. However, it lacks a formal `PromptMode` enum and the prompt text itself doesn't vary between chat and action contexts. **Recommendation:** Formalize the existing split into `PromptMode.FULL` (chat) and `PromptMode.MINIMAL` (action loop), and strip irrelevant sections (memory instructions, personality, verbose tool descriptions) from action loop prompts. Extend to future delegation modes.
+1. **Formalize existing session-type prompting.** Fawx already has a dual-model architecture (`chatClient` for conversations, `actionClient` for phone actions) with different tool access per tier. This is session-type prompting in practice. However, it lacks a formal `PromptMode` enum and the prompt text itself doesn't vary between chat and action contexts. **Recommendation:** Formalize the existing split into `PromptMode.FULL` (chat) and `PromptMode.MINIMAL` (action loop), and strip irrelevant sections (memory instructions, personality, verbose tool descriptions) from action loop prompts. Extend to future delegation modes.
 
-2. **No conditional section architecture.** Citros has a monolithic `buildSystemPrompt()`. To support model-aware prompting, the prompt must be decomposed into independently toggleable sections. **Recommendation:** Refactor `buildSystemPrompt()` into a section-based builder:
+2. **No conditional section architecture.** Fawx has a monolithic `buildSystemPrompt()`. To support model-aware prompting, the prompt must be decomposed into independently toggleable sections. **Recommendation:** Refactor `buildSystemPrompt()` into a section-based builder:
    ```kotlin
    fun buildSystemPrompt(config: PromptConfig): String {
      return listOfNotNull(
@@ -166,27 +166,27 @@ This tells the model what it's running as, but the model doesn't use this to sel
 
 ### 4.2 Deferred (File as Issues)
 
-4. **Model-specific instruction tuning.** OpenClaw deliberately avoids this — same instructions regardless of model. If Citros wants to go further (e.g., simpler instructions for Haiku), it should be done carefully with A/B testing. Risk: maintaining N prompt variants is expensive and error-prone.
+4. **Model-specific instruction tuning.** OpenClaw deliberately avoids this — same instructions regardless of model. If Fawx wants to go further (e.g., simpler instructions for Haiku), it should be done carefully with A/B testing. Risk: maintaining N prompt variants is expensive and error-prone.
 
 5. **Prompt budget enforcement.** As prompt sections grow, smaller models may hit context limits. Implement a total prompt char budget with priority-based truncation (safety > tooling > skills > memory > docs).
 
-6. **Provider-specific tool schema normalization.** OpenClaw adjusts tool parameter formats per provider (OpenAI vs Anthropic). Citros should handle this when supporting multiple providers.
+6. **Provider-specific tool schema normalization.** OpenClaw adjusts tool parameter formats per provider (OpenAI vs Anthropic). Fawx should handle this when supporting multiple providers.
 
 ### 4.3 Intentional Divergences
 
-7. **Model-tier prompting (Citros) vs. session-type prompting (OpenClaw).** Citros already has implicit session-type prompting via the dual-model chat/action split. OpenClaw doesn't vary prompts by model capability. Both approaches are valid and solve different problems:
+7. **Model-tier prompting (Fawx) vs. session-type prompting (OpenClaw).** Fawx already has implicit session-type prompting via the dual-model chat/action split. OpenClaw doesn't vary prompts by model capability. Both approaches are valid and solve different problems:
    - Session-type: reduces irrelevant context (action loop doesn't need memory/personality)
    - Model-tier: reduces complexity for weaker models
    
-   **These are complementary, not competing.** Citros should formalize the existing session-type split first, then add model-tier as a secondary axis.
+   **These are complementary, not competing.** Fawx should formalize the existing session-type split first, then add model-tier as a secondary axis.
 
-8. **No plugin/skill system to strip.** Citros doesn't have skills, so the biggest win from OpenClaw's `minimal` mode (stripping `<available_skills>`) doesn't apply. But the principle — strip sections that aren't relevant to the current task — absolutely applies to any future feature additions.
+8. **No plugin/skill system to strip.** Fawx doesn't have skills, so the biggest win from OpenClaw's `minimal` mode (stripping `<available_skills>`) doesn't apply. But the principle — strip sections that aren't relevant to the current task — absolutely applies to any future feature additions.
 
 ---
 
 ## 5. Recommendations
 
-1. **Formalize session-type modes.** Citros's dual-model chat/action split already provides implicit session-type prompting. Create a `PromptMode.FULL` and `PromptMode.MINIMAL` enum to make this explicit, and vary prompt sections based on mode. The action loop doesn't need memory instructions, personality sections, or verbose tool descriptions — strip them for token savings and focus.
+1. **Formalize session-type modes.** Fawx's dual-model chat/action split already provides implicit session-type prompting. Create a `PromptMode.FULL` and `PromptMode.MINIMAL` enum to make this explicit, and vary prompt sections based on mode. The action loop doesn't need memory instructions, personality sections, or verbose tool descriptions — strip them for token savings and focus.
 
 2. **Decompose into sections.** Refactor `buildSystemPrompt()` into a section-based builder where each section can be independently included/excluded. This is a prerequisite for both session-type and model-tier tuning.
 
@@ -201,4 +201,4 @@ This tells the model what it's running as, but the model doesn't use this to sel
 
 5. **Prompt size telemetry.** Log prompt size (chars and estimated tokens) per model per session type. This data will guide optimization decisions and catch prompt bloat early.
 
-6. **Subagent `extraSystemPrompt` pattern.** The existing `chatClient`/`actionClient` split is a natural extension point. When Citros adds explicit task delegation, inject task-specific context via a dedicated field (like OpenClaw's `extraSystemPrompt`) rather than modifying the base prompt. This keeps the base prompt stable and testable.
+6. **Subagent `extraSystemPrompt` pattern.** The existing `chatClient`/`actionClient` split is a natural extension point. When Fawx adds explicit task delegation, inject task-specific context via a dedicated field (like OpenClaw's `extraSystemPrompt`) rather than modifying the base prompt. This keeps the base prompt stable and testable.

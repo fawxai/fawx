@@ -10,7 +10,7 @@
 
 ### 1. WalletManager thread safety (#506)
 
-**File:** `core/src/main/kotlin/ai/citros/core/WalletManager.kt`
+**File:** `core/src/main/kotlin/ai/fawx/core/WalletManager.kt`
 
 Add `@Synchronized` to ALL public methods. No signature changes needed.
 
@@ -20,7 +20,7 @@ Update class KDoc: "Thread-safe via synchronized methods" (was "NOT thread-safe"
 
 ### 2. Atomic key operations (#505)
 
-**File:** `core/src/main/kotlin/ai/citros/core/WalletManager.kt`
+**File:** `core/src/main/kotlin/ai/fawx/core/WalletManager.kt`
 
 **In `addKey()`:** Reorder — save state FIRST, then keyStore.put(). If keyStore fails, loadOrDefault() cleans up. If we stored key first and saveState failed, orphaned key forever.
 
@@ -41,7 +41,7 @@ Remove "Phase 2" notes from KDoc.
 
 ### 3. Idempotent migration (#507)
 
-**File:** `core/src/main/kotlin/ai/citros/core/WalletManager.kt`
+**File:** `core/src/main/kotlin/ai/fawx/core/WalletManager.kt`
 
 Add early return in `migrateFromLegacy()` if wallet already has keys:
 ```kotlin
@@ -60,7 +60,7 @@ Update KDoc: remove "NOT idempotent", add "Idempotent: returns existing key if w
 
 ### 5. Retry on 529 Overloaded (#511)
 
-**File:** `core/src/main/kotlin/ai/citros/core/BaseProviderClient.kt`
+**File:** `core/src/main/kotlin/ai/fawx/core/BaseProviderClient.kt`
 
 Add helper after `shouldRetryRateLimit()`:
 ```kotlin
@@ -73,7 +73,7 @@ Update class and method KDocs to mention 529/503.
 
 ## Tests to Add
 
-**File:** `core/src/test/kotlin/ai/citros/core/WalletManagerTest.kt`
+**File:** `core/src/test/kotlin/ai/fawx/core/WalletManagerTest.kt`
 
 1. `loadOrDefault cleans up orphaned key entries missing from KeyStore` — simulate state entry with no keyStore match
 2. `migrateFromLegacy is idempotent - returns existing key if wallet non-empty` — double migration returns same key
@@ -81,11 +81,11 @@ Update class and method KDocs to mention 529/503.
 ## Build & Verify
 
 ```bash
-cd ~/citros/android
+cd ~/fawx/android
 git checkout feat/android-mvp && git pull
 git checkout -b fix/wallet-hardening
 # Make changes
-./gradlew :core:testDebugUnitTest --tests "ai.citros.core.WalletManagerTest"
+./gradlew :core:testDebugUnitTest --tests "ai.fawx.core.WalletManagerTest"
 ./gradlew :core:compileDebugKotlin
 git add -A && git commit && git push -u origin fix/wallet-hardening
 gh pr create --base feat/android-mvp

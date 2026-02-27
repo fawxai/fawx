@@ -1,6 +1,6 @@
-# ENGINEERING.md — Code Standards (Citros + Krust)
+# ENGINEERING.md — Code Standards (Fawx + Krust)
 
-Effective 2026-02-26. These standards apply to all work in `abbudjoe/citros` and `abbudjoe/krust`.
+Effective 2026-02-26. These standards apply to all work in `abbudjoe/fawx` and `abbudjoe/krust`.
 
 ---
 
@@ -12,9 +12,9 @@ Effective 2026-02-26. These standards apply to all work in `abbudjoe/citros` and
 - Tests mirror source structure. `src/foo/Bar.kt` → `test/foo/BarTest.kt`. No exceptions.
 - Dead code, unused files, and orphaned configs get removed in the same PR that makes them obsolete. Don't leave cleanup for later.
 
-### Citros repo structure (target)
+### Fawx repo structure (target)
 ```
-citros/
+fawx/
 ├── engine/          ← Rust shared core
 ├── android/         ← Kotlin UI shell
 ├── ios/             ← Swift UI shell (future)
@@ -161,7 +161,7 @@ Authors must not merge with unresolved blocking issues. No exceptions.
 
 ## 6. The Restructure Contract
 
-The current Citros restructure is not just moving files around. It's an opportunity to:
+The current Fawx restructure is not just moving files around. It's an opportunity to:
 1. **Eliminate accumulated complexity** — every module re-earns its place in the new structure.
 2. **Establish clean interfaces** — Kotlin ↔ Rust boundary is defined by contracts, not convenience.
 3. **Set the foundation for the OS transition** — nothing we build now should need to be thrown away when Kotlin/Swift shells drop.

@@ -4,7 +4,7 @@
 **Related PR:** #302  
 **Status:** Snapshot as of `fix/ui-mock-text-conformance` branch
 
-Comparing `citros-ui-mocks.html` against the current implementation.
+Comparing `fawx-ui-mocks.html` against the current implementation.
 
 ---
 
@@ -15,7 +15,7 @@ The mock defines an **8-step onboarding** (tabs: Welcome → Flavor → Personal
 
 **Missing screens:**
 - **API Key** — In the mock, this is a dedicated onboarding step ("Connect an AI Provider") with provider tabs (Anthropic/OpenAI/OpenRouter), key input, label field, "Test Connection", and "Start Chatting" button. In the code, the API key screen exists **outside** onboarding as a separate `WelcomeConnectScreen` in `ChatActivity.kt` — it shows after onboarding completes, not as part of the flow.
-- **Permissions** — Mock has a step showing Accessibility Service + Overlay Permission toggles with "Enable phone control to let Citros interact with your screen" and "You can enable these later in Settings → Phone Control" skip text. Code has **no permissions onboarding step** — just a purple banner in the main chat.
+- **Permissions** — Mock has a step showing Accessibility Service + Overlay Permission toggles with "Enable phone control to let Fawx interact with your screen" and "You can enable these later in Settings → Phone Control" skip text. Code has **no permissions onboarding step** — just a purple banner in the main chat.
 - **Ready** — Mock has a celebratory "You're all set! Your AI phone agent is ready to go" screen with "Start Chatting" button. Code has **no ready screen** — goes straight from Paywall to the API key screen.
 
 ### 1B. Step Counter
@@ -29,7 +29,7 @@ The mock defines an **8-step onboarding** (tabs: Welcome → Flavor → Personal
 
 | Element | Mock | Code | Deviation |
 |---------|------|------|-----------|
-| Title | "Welcome to Citros" | "Welcome to Citros" | ✅ Match |
+| Title | "Welcome to Fawx" | "Welcome to Fawx" | ✅ Match |
 | Subtitle | "AI that uses your phone" | "AI that can use your phone for you. Set up your style, choose your plan, and connect your provider." | ❌ Different — mock is short/punchy, code is wordy |
 | Hero element | Citrus orb/badge | CitrusHeroBadge | ✅ Likely match |
 | CTA button | "Get Started" | "Get Started" | ✅ Match |
@@ -44,7 +44,7 @@ The mock defines an **8-step onboarding** (tabs: Welcome → Flavor → Personal
 | Element | Mock | Code | Deviation |
 |---------|------|------|-----------|
 | Title | "Choose Your Flavor" | "Choose Your Flavor" | ✅ Match |
-| Subtitle | "This sets your personal color theme" | "Pick the accent style for Citros. You can change it later in Settings." | ❌ Different wording |
+| Subtitle | "This sets your personal color theme" | "Pick the accent style for Fawx. You can change it later in Settings." | ❌ Different wording |
 | Flavor options | 5 flavors | 5 flavors | ✅ Match |
 | Step counter | "1/7" | "1/4" | ❌ Wrong total |
 | CTA | "Continue" | "Continue" | ✅ Match |
@@ -57,7 +57,7 @@ The mock defines an **8-step onboarding** (tabs: Welcome → Flavor → Personal
 
 | Element | Mock | Code | Deviation |
 |---------|------|------|-----------|
-| Title | "Personalize Citros" | "Conversation Style" | ❌ Different title |
+| Title | "Personalize Fawx" | "Conversation Style" | ❌ Different title |
 | Subtitle | "Tell me how you like things" | (none) | ❌ Missing subtitle |
 | Question 1 | "How should I talk to you?" | "How should I talk to you?" | ✅ Match |
 | Question 2 | "How much should I explain?" | "How much should I explain?" | ✅ Match |
@@ -66,7 +66,7 @@ The mock defines an **8-step onboarding** (tabs: Welcome → Flavor → Personal
 | Step counter | "2/7" | "2/4" | ❌ Wrong total |
 
 **Actions**: 
-- Change title to "Personalize Citros"
+- Change title to "Personalize Fawx"
 - Add subtitle "Tell me how you like things"
 - Change Q3 to "What's your comfort level?"
 - Change button to "Save & Continue"
@@ -91,8 +91,8 @@ The mock defines an **8-step onboarding** (tabs: Welcome → Flavor → Personal
 |---------|------|------|-----------|
 | Title | "Choose Your Plan" | "Choose Your Plan" | ✅ Match |
 | Plan 1 | "Bring Your Own Key" — Free | "Bring Your Own Key - Free" | ✅ Approximate match |
-| Plan 2 | "Citros Base" — $9/mo | "Citros Base - $9/mo" | ✅ Approximate match |
-| Plan 3 | "Citros Super" — $29/mo | "Citros Super - $29/mo" | ✅ Approximate match |
+| Plan 2 | "Fawx Base" — $9/mo | "Fawx Base - $9/mo" | ✅ Approximate match |
+| Plan 3 | "Fawx Super" — $29/mo | "Fawx Super - $29/mo" | ✅ Approximate match |
 | Skip | "I'll decide later →" | "I'll decide later" (TextButton) | ⚠️ Missing arrow |
 | Coming Soon badge | On Base and Super | On Base and Super | ✅ Match |
 | BYO subtitle | "All models, no limits — you pay your provider directly" | "Use your own Anthropic, OpenAI, or OpenRouter key" | ❌ Different |
@@ -118,7 +118,7 @@ The mock defines an **8-step onboarding** (tabs: Welcome → Flavor → Personal
 - "Start Chatting" button
 
 ### Code design (post-onboarding):
-- Title: "Welcome to Citros"
+- Title: "Welcome to Fawx"
 - 5 stacked buttons: Sign in with OpenAI, Anthropic Key, OpenAI API Key, OpenRouter API Key, Local LLM
 - No label field
 - "Test Connection" + "Connect" buttons (after selecting provider)
@@ -137,13 +137,13 @@ The mock defines an **8-step onboarding** (tabs: Welcome → Flavor → Personal
 
 **Entirely missing from onboarding.** Mock shows:
 - Title: "Phone Control"
-- "Enable phone control to let Citros interact with your screen"
+- "Enable phone control to let Fawx interact with your screen"
 - Accessibility Service toggle with description
 - Overlay Permission toggle with description  
 - "You can enable these later in Settings → Phone Control"
 - "Continue" button
 
-Code: Only has a purple banner in the main chat screen ("Enable phone control / Let Citros see and control your screen")
+Code: Only has a purple banner in the main chat screen ("Enable phone control / Let Fawx see and control your screen")
 
 ---
 
@@ -164,9 +164,9 @@ Code: Only has a purple banner in the main chat screen ("Enable phone control / 
 | Empty state text | "Hey there! What can I help you with?" | "What can I help you with?" | ❌ Missing "Hey there!" |
 | Suggestion chips | Present | Present (4 chips) | ✅ Match |
 | Model selector pill | "Sonnet 4.5" in header | Shows full model ID "Sonnet 4 5 20250514" | ❌ Too verbose — should be friendly name |
-| Input placeholder | "Message Citros..." | "Message Citros..." | ✅ Match |
+| Input placeholder | "Message Fawx..." | "Message Fawx..." | ✅ Match |
 | Phone control banner | Purple banner with "Enable" | Purple banner with "Enable" | ✅ Match |
-| Header layout | Citros name + model pill + settings gear | "Citros" + model pill + settings/delete/export icons | ⚠️ Mock may have fewer header icons |
+| Header layout | Fawx name + model pill + settings gear | "Fawx" + model pill + settings/delete/export icons | ⚠️ Mock may have fewer header icons |
 
 ---
 
@@ -176,7 +176,7 @@ Code: Only has a purple banner in the main chat screen ("Enable phone control / 
 |---------|---------------|---------------|--------|
 | API Keys | "Manage your provider keys" | "Manage provider keys and active account" | ❌ |
 | Models | "Chat & action model selection" | "Configure chat and action model defaults" | ❌ |
-| Trust Level | "Permission tier settings" | "Control how often Citros asks before actions" | ❌ |
+| Trust Level | "Permission tier settings" | "Control how often Fawx asks before actions" | ❌ |
 | Appearance | "Theme & flavor settings" | "Flavor and theme preferences" | ❌ |
 | Sound & Haptics | "Voice, sounds, haptic feedback" | **MISSING ENTIRELY** | ❌ |
 | Phone Control | "Accessibility & overlay" | **MISSING ENTIRELY** | ❌ |
@@ -223,7 +223,7 @@ This is pending the current PR and will need separate audit.
 ### P1 — Text/Title mismatches
 5. Welcome subtitle: "AI that uses your phone"
 6. Flavor subtitle: "This sets your personal color theme"
-7. Personality title: "Personalize Citros" + subtitle "Tell me how you like things"
+7. Personality title: "Personalize Fawx" + subtitle "Tell me how you like things"
 8. Personality Q3: "What's your comfort level?"
 9. Personality CTA: "Save & Continue"
 10. Chat empty state: "Hey there! What can I help you with?"

@@ -111,7 +111,7 @@ adb shell /data/local/tmp/android-hello
 Expected output:
 
 ```text
-hello from citros android (aarch64-linux-android)
+hello from fawx android (aarch64-linux-android)
 ```
 
 ### 6.5) Validation checklist
@@ -127,7 +127,7 @@ After running the binary, verify:
 2. Output exactly matches:
 
    ```text
-   hello from citros android (aarch64-linux-android)
+   hello from fawx android (aarch64-linux-android)
    ```
 
 3. Artifact format on host confirms arm64 ELF:

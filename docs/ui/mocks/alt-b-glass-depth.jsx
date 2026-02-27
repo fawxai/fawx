@@ -224,7 +224,7 @@ export default function GlassDepthChat() {
       }}>
         <Orb color={rv.orbColor} glow={rv.orbGlow} size={g(8)} />
         <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ fontSize: 17, fontWeight: 600, letterSpacing: -0.4, color: t.textPrimary, lineHeight: "22px" }}>Citros</div>
+          <div style={{ fontSize: 17, fontWeight: 600, letterSpacing: -0.4, color: t.textPrimary, lineHeight: "22px" }}>Fawx</div>
           <div style={{ fontSize: 13, letterSpacing: -0.1, color: t.textTertiary, lineHeight: "18px" }}>Claude Sonnet 4.5</div>
         </div>
         <button style={{ width: g(11), height: g(11), display: "grid", placeItems: "center", background: "none", border: "none", cursor: "pointer", borderRadius: g(3) }} aria-label="Settings">

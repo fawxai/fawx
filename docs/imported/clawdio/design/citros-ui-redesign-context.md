@@ -1,12 +1,12 @@
-# Citros Android App — Full UI Redesign Context Bundle
+# Fawx Android App — Full UI Redesign Context Bundle
 
-Use this to redesign the entire Citros app UI in Jetpack Compose. The goal is to match the aesthetic of the Citros landing page (https://citros.ai) — dark, orange/amber glowing sphere, elegant and minimal.
+Use this to redesign the entire Fawx app UI in Jetpack Compose. The goal is to match the aesthetic of the Fawx landing page (https://fawx.ai) — dark, orange/amber glowing sphere, elegant and minimal.
 
 ---
 
 ## What This App Is
 
-Citros is an AI phone agent — an Android app that can use your phone for you. It has:
+Fawx is an AI phone agent — an Android app that can use your phone for you. It has:
 - **Onboarding flow** (Welcome → Flavor → Conversation Style → Paywall → API Key → Permissions → Ready → Chat)
 - **Main chat screen** (message bubbles, suggestion chips, quick switcher, input bar)
 - **Overlay system** (mini-chat card, floating bubble, full-app mode — shown over other apps during phone control)
@@ -16,17 +16,17 @@ Citros is an AI phone agent — an Android app that can use your phone for you. 
 
 ## Design Direction
 
-**Reference:** https://citros.ai — study this page and use its color scheme, typography feel, and visual language as the source of truth for the redesign.
+**Reference:** https://fawx.ai — study this page and use its color scheme, typography feel, and visual language as the source of truth for the redesign.
 
 **Target aesthetic:**
-- Match the citros.ai landing page colors exactly — background, text, muted text, accent, card backgrounds, borders
+- Match the fawx.ai landing page colors exactly — background, text, muted text, accent, card backgrounds, borders
 - Glowing sphere hero graphic with subtle animation
 - Clean, minimal, premium feel
 - Large rounded pill buttons with accent fill
 - Generous spacing, vertically centered content where appropriate
 - Cards with subtle borders and translucent backgrounds
 
-**Do NOT invent a new color scheme.** Extract colors from the citros.ai landing page and translate them to Compose.
+**Do NOT invent a new color scheme.** Extract colors from the fawx.ai landing page and translate them to Compose.
 
 ---
 
@@ -35,7 +35,7 @@ Citros is an AI phone agent — an Android app that can use your phone for you. 
 The app has 5 "flavors" (color themes). All UI should be flavor-aware — use `flavor.primary`, `flavor.glow`, `flavor.tint` instead of hardcoded accent colors where possible.
 
 ```kotlin
-enum class CitrosFlavor(
+enum class FawxFlavor(
     val storageValue: String,
     val displayName: String,
     val primary: Color,    // Main accent color
@@ -56,11 +56,11 @@ enum class CitrosFlavor(
 
 These are the existing reusable Composables. You can modify them or create new ones.
 
-### CitrosHeroSphere (animated hero graphic)
+### FawxHeroSphere (animated hero graphic)
 ```kotlin
 @Composable
-internal fun CitrosHeroSphere(
-    flavor: CitrosFlavor,
+internal fun FawxHeroSphere(
+    flavor: FawxFlavor,
     size: Dp = 200.dp,
     modifier: Modifier = Modifier
 )
@@ -71,7 +71,7 @@ internal fun CitrosHeroSphere(
 ### CitrusHeroBadge (small static badge)
 ```kotlin
 @Composable
-internal fun CitrusHeroBadge(flavor: CitrosFlavor, size: Int = 68)
+internal fun CitrusHeroBadge(flavor: FawxFlavor, size: Int = 68)
 // Simple radial gradient circle — used in flavor selection cards, settings hub, chat empty state, overlay bubble
 ```
 
@@ -80,15 +80,15 @@ internal fun CitrusHeroBadge(flavor: CitrosFlavor, size: Int = 68)
 @Composable
 internal fun CitrusPrimaryButton(
     text: String, onClick: () -> Unit, enabled: Boolean = true,
-    modifier: Modifier = Modifier, flavor: CitrosFlavor = CitrosFlavor.TANGERINE
+    modifier: Modifier = Modifier, flavor: FawxFlavor = FawxFlavor.TANGERINE
 )
 // Rounded pill button (999.dp radius), flavor.primary bg, flavor.tint text
 ```
 
-### CitrosStepHeader
+### FawxStepHeader
 ```kotlin
 @Composable
-internal fun CitrosStepHeader(
+internal fun FawxStepHeader(
     title: String, stepIndex: Int, totalSteps: Int,
     onBack: (() -> Unit)? = null, modifier: Modifier = Modifier
 )
@@ -106,7 +106,7 @@ internal fun PersonalityOptionChip(text: String, selected: Boolean, onClick: () 
 ```kotlin
 @Composable
 internal fun FlavorOptionCard(
-    flavor: CitrosFlavor, selected: Boolean, onClick: () -> Unit, modifier: Modifier = Modifier
+    flavor: FawxFlavor, selected: Boolean, onClick: () -> Unit, modifier: Modifier = Modifier
 )
 // Full-width card with CitrusHeroBadge + flavor name + "Selected" label
 ```
@@ -114,14 +114,14 @@ internal fun FlavorOptionCard(
 ### PlanCard
 ```kotlin
 @Composable
-internal fun PlanCard(plan: CitrosPlanSpec, onSelect: () -> Unit, modifier: Modifier = Modifier, testTag: String? = null)
+internal fun PlanCard(plan: FawxPlanSpec, onSelect: () -> Unit, modifier: Modifier = Modifier, testTag: String? = null)
 // Plan selection card with title, subtitle, details, CTA button. Recommended variant has accent border.
 ```
 
 ### PortedMessageBubble
 ```kotlin
 @Composable
-internal fun PortedMessageBubble(message: Message, flavor: CitrosFlavor)
+internal fun PortedMessageBubble(message: Message, flavor: FawxFlavor)
 // Chat message bubble. User messages right-aligned with flavor.tint bg.
 // Assistant messages left-aligned. Steer messages have dashed border + lower alpha.
 // Action messages (🤖/📱/👁 prefixed) get secondaryContainer bg.
@@ -130,14 +130,14 @@ internal fun PortedMessageBubble(message: Message, flavor: CitrosFlavor)
 ### PortedLoadingIndicator
 ```kotlin
 @Composable
-internal fun PortedLoadingIndicator(flavor: CitrosFlavor = CitrosFlavor.TANGERINE, label: String = "Thinking")
+internal fun PortedLoadingIndicator(flavor: FawxFlavor = FawxFlavor.TANGERINE, label: String = "Thinking")
 // 3 animated dots + label, left-aligned
 ```
 
 ### ChatEmptyState
 ```kotlin
 @Composable
-internal fun ChatEmptyState(flavor: CitrosFlavor, onSuggestion: (String) -> Unit)
+internal fun ChatEmptyState(flavor: FawxFlavor, onSuggestion: (String) -> Unit)
 // Hero badge (56dp) + "Hey there! What can I help you with?" + suggestion AssistChips
 // (Set a timer, Open my email, Calendar, Screenshot)
 ```
@@ -165,7 +165,7 @@ internal fun QuickSwitcherSheet(...)
 
 #### 1a. WELCOME
 - Hero sphere (200dp, animated)
-- "Citros" title
+- "Fawx" title
 - "AI that uses your phone" subtitle
 - Page indicator dots
 - "Get Started" button
@@ -184,7 +184,7 @@ internal fun QuickSwitcherSheet(...)
 
 #### 1d. PAYWALL (Choose Your Plan)
 - Step header (3/7)
-- 3 PlanCards: Free Trial, Bring Your Own Key (recommended), Citros Pro (coming soon)
+- 3 PlanCards: Free Trial, Bring Your Own Key (recommended), Fawx Pro (coming soon)
 
 #### 1e. API_KEY (Enter API Key)
 - Step header (4/7)
@@ -248,11 +248,11 @@ object OverlayColors {
     // ... etc
 }
 ```
-These should be updated to match the citros.ai palette.
+These should be updated to match the fawx.ai palette.
 
 ### 4. SETTINGS HUB (`SettingsHubScreen`)
 - Top bar with "Settings" title and "Back" text button
-- Profile card: CitrusHeroBadge (42dp) + "Citros" + active key/model info
+- Profile card: CitrusHeroBadge (42dp) + "Fawx" + active key/model info
 - Navigation cards (7): API Keys, Models, Sound & Haptics, Trust Level, Phone Control, Appearance, About
 - Each card: icon in tinted box + title + subtitle + chevron
 
@@ -289,7 +289,7 @@ These should be updated to match the citros.ai palette.
 - Placeholder: icon + "Coming soon" text
 
 #### 5g. About (`AboutSettingsScreen`)
-- "Citros" heading + tagline
+- "Fawx" heading + tagline
 - Version info card (Version, Runtime, UI framework, Min SDK)
 - "Made with citrus intent." footer
 
@@ -305,13 +305,13 @@ These should be updated to match the citros.ai palette.
 - **Keep component signatures compatible** — modify internals freely but keep the function names/parameters
 - **All text must have explicit `color`** — don't rely on default text color (it doesn't always pick up `onBackground` in our setup)
 - **Root containers need explicit `background(MaterialTheme.colorScheme.background)`** — the window background is XML-based and may not match
-- **Use the citros.ai landing page as the color reference** — extract its palette and translate to Compose color values. Do not invent new colors.
+- **Use the fawx.ai landing page as the color reference** — extract its palette and translate to Compose color values. Do not invent new colors.
 
 ---
 
 ## What I Want You to Redesign
 
-Make the **entire app** look premium and cohesive, matching the citros.ai landing page vibe. Every screen should feel like it belongs to the same brand.
+Make the **entire app** look premium and cohesive, matching the fawx.ai landing page vibe. Every screen should feel like it belongs to the same brand.
 
 ### Onboarding
 1. **Welcome screen** — Hero sphere, typography, button styling, spacing
@@ -342,7 +342,7 @@ Make the **entire app** look premium and cohesive, matching the citros.ai landin
 20. **About screen** — Version card, branding treatment
 
 ### Global
-21. **Color scheme** — darkColorScheme values derived from citros.ai landing page
+21. **Color scheme** — darkColorScheme values derived from fawx.ai landing page
 22. **Typography** — Font sizes, weights, letter spacing throughout
 23. **Spacing & layout** — Consistent padding, card corner radii, surface elevations
 24. **Buttons** — Primary and secondary button styling (consistent pill shape, colors)

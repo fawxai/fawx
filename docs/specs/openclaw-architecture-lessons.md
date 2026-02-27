@@ -1,6 +1,6 @@
-# OpenClaw Architecture Deep Dive — Lessons for Citros
+# OpenClaw Architecture Deep Dive — Lessons for Fawx
 
-## What OpenClaw Gets Right (and Citros Should Learn From)
+## What OpenClaw Gets Right (and Fawx Should Learn From)
 
 ### 1. The Agent Loop is Not Just "Call LLM → Execute Tool → Repeat"
 
@@ -12,7 +12,7 @@ Intake → Context Assembly → Model Inference → Tool Execution → Streaming
 
 Each phase has hook points (`before_agent_start`, `before_tool_call`, `after_tool_call`, `agent_end`). This means any component can intercept and modify behavior without touching the core loop.
 
-**Citros today:** The loop in `ChatViewModel.sendMessage()` is a monolithic `while` loop. There are no hook points. Adding stuck detection, overlay hide/show, logging, and compaction all require editing the same function. This doesn't scale.
+**Fawx today:** The loop in `ChatViewModel.sendMessage()` is a monolithic `while` loop. There are no hook points. Adding stuck detection, overlay hide/show, logging, and compaction all require editing the same function. This doesn't scale.
 
 **What to do:** Extract the tool loop into its own class (`ToolLoop` or `AgentExecutor`) with defined lifecycle callbacks. The `ChatViewModel` should orchestrate, not implement.
 
@@ -20,7 +20,7 @@ Each phase has hook points (`before_agent_start`, `before_tool_call`, `after_too
 
 OpenClaw guarantees **one active run per session** through a lane-aware queue. Messages arriving during an active run are queued (with configurable modes: `collect`, `steer`, `followup`).
 
-**Citros today:** The "Queue" button exists but doesn't work (#445). If a user sends a message during tool execution, it's unclear what happens. There's a `queuedMessage` field but the dispatch logic is fragile.
+**Fawx today:** The "Queue" button exists but doesn't work (#445). If a user sends a message during tool execution, it's unclear what happens. There's a `queuedMessage` field but the dispatch logic is fragile.
 
 **What to do:** Implement proper run serialization. When a tool loop is active:
 - New messages go to a queue
@@ -41,7 +41,7 @@ OpenClaw builds the system prompt from discrete, labeled sections:
 
 Each section is separate, can be toggled, and the user can inspect what's injected via `/context list` and `/context detail`.
 
-**Citros today:** The system prompt is a single hardcoded string in `PhoneAgentPrompts.kt`. There's no way to inspect it, no modularity, and no way to add/remove sections based on context (e.g., different prompts for different models, or different capabilities based on what's enabled).
+**Fawx today:** The system prompt is a single hardcoded string in `PhoneAgentPrompts.kt`. There's no way to inspect it, no modularity, and no way to add/remove sections based on context (e.g., different prompts for different models, or different capabilities based on what's enabled).
 
 **What to do:**
 - Build the system prompt from composable sections (a `PromptBuilder` pattern)
@@ -53,7 +53,7 @@ Each section is separate, can be toggled, and the user can inspect what's inject
 
 OpenClaw has **session pruning** that trims old tool results from the in-memory context before LLM calls. This is separate from compaction (which summarizes). Pruning keeps the context window manageable without losing conversation structure.
 
-**Citros today:** Every tool result (including full screen dumps) stays in the conversation history. By step 10, the context is enormous — full of redundant screen content from 8 steps ago.
+**Fawx today:** Every tool result (including full screen dumps) stays in the conversation history. By step 10, the context is enormous — full of redundant screen content from 8 steps ago.
 
 **What to do:**
 - **Prune old screen content.** After step N, screen content from step N-3 and earlier should be summarized or removed from the conversation sent to the model.
@@ -68,7 +68,7 @@ OpenClaw's queue modes (`collect`, `steer`, `followup`, `steer-backlog`) solve a
 - **Steer**: inject into the current run (cancel pending tool calls at next boundary)
 - **Followup**: queue for next turn after current run ends
 
-**Citros today:** Has `queuedMessage` (singular) that dispatches after the loop ends. No coalescing, no steering, no cancel-and-redirect.
+**Fawx today:** Has `queuedMessage` (singular) that dispatches after the loop ends. No coalescing, no steering, no cancel-and-redirect.
 
 **What to do (MVP):**
 - Fix #445 (queue button works)
@@ -79,7 +79,7 @@ OpenClaw's queue modes (`collect`, `steer`, `followup`, `steer-backlog`) solve a
 
 OpenClaw spawns sub-agents in isolated sessions with their own context, model, and tool policy. The result is announced back to the main session.
 
-**Citros implication:** For complex multi-app tasks ("send an email about tomorrow's calendar"), the on-device agent could:
+**Fawx implication:** For complex multi-app tasks ("send an email about tomorrow's calendar"), the on-device agent could:
 1. Main agent plans the task
 2. Spawn a "sub-task" for each app interaction (open Calendar, read events → open Gmail, compose with that info)
 3. Sub-tasks share results via a lightweight context
@@ -90,7 +90,7 @@ This is Horizon 2, but the architecture should allow it.
 
 OpenClaw's memory is Markdown files on disk + optional vector search on top. This is simple, inspectable, and portable.
 
-**Citros today:** No persistent memory at all. Conversations vanish.
+**Fawx today:** No persistent memory at all. Conversations vanish.
 
 **What to do (MVP):**
 - Store conversation summaries in a local file (app-internal storage)
@@ -105,7 +105,7 @@ OpenClaw's memory is Markdown files on disk + optional vector search on top. Thi
 
 OpenClaw injects real-time state into the prompt: current time, timezone, model name, thinking level, OS, host. This means the model knows what it's working with.
 
-**Citros should inject:**
+**Fawx should inject:**
 - Current model (Opus vs Sonnet — the agent should know its own capability level)
 - Screen reader status (attached/detached)
 - Current foreground app (if known)
@@ -120,7 +120,7 @@ OpenClaw's `before_tool_call` / `after_tool_call` hooks allow plugins to:
 - Transform tool results before they're sent to the model
 - Log/observe every tool call
 
-**Citros today:** Tool execution is inline in the `while` loop. Adding stuck detection requires modifying the loop directly.
+**Fawx today:** Tool execution is inline in the `while` loop. Adding stuck detection requires modifying the loop directly.
 
 **What to do:** Add pre/post tool execution hooks:
 ```kotlin
@@ -130,14 +130,14 @@ interface ToolExecutionHook {
 }
 ```
 - `StuckDetectionHook` tracks screen hashes and injects warnings
-- `LoggingHook` logs structured data (already done via CitrosLoop/CitrosAgent tags)
+- `LoggingHook` logs structured data (already done via FawxLoop/FawxAgent tags)
 - `OverlayHook` manages hide/show (already partially done)
 
 ### 10. Streaming and Typing Indicators
 
 OpenClaw streams assistant responses and shows typing indicators immediately when a message is queued. This gives the user instant feedback.
 
-**Citros today:** No streaming. The user sees nothing until the full response comes back. With Opus taking 3-16 seconds per API call, this means the user stares at "Thinking..." for long periods.
+**Fawx today:** No streaming. The user sees nothing until the full response comes back. With Opus taking 3-16 seconds per API call, this means the user stares at "Thinking..." for long periods.
 
 **What to do (MVP):**
 - Show step-by-step progress in the overlay: "Opening Gmail... Tapping Compose... Typing email..."
@@ -148,7 +148,7 @@ OpenClaw streams assistant responses and shows typing indicators immediately whe
 
 ---
 
-## Architectural Recommendations for Citros MVP
+## Architectural Recommendations for Fawx MVP
 
 ### Extract the Agent Loop
 

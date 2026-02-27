@@ -250,7 +250,7 @@ export default function ComponentsRedesign() {
                 padding: "6px 6px 6px 18px", borderRadius: 28,
                 background: t.surface, border: `1px solid ${t.separatorLight}`,
               }}>
-                <span style={{ flex: 1, fontSize: 14, color: t.labelTertiary }}>Ask Citros...</span>
+                <span style={{ flex: 1, fontSize: 14, color: t.labelTertiary }}>Ask Fawx...</span>
                 <div style={{
                   width: 38, height: 38, borderRadius: "50%", background: f.primary,
                   display: "flex", alignItems: "center", justifyContent: "center",
@@ -294,7 +294,7 @@ export default function ComponentsRedesign() {
       {/* 3. Action/Tool Indicators */}
       <Section
         title="3. Tool Action Indicators"
-        description="When Citros executes a phone action (calendar, settings, messages), how should it appear in the chat?"
+        description="When Fawx executes a phone action (calendar, settings, messages), how should it appear in the chat?"
       >
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
           {/* Current: bubble */}
@@ -456,7 +456,7 @@ export default function ComponentsRedesign() {
                 padding: "8px 14px", borderRadius: 16, background: t.elevated,
               }}>
                 <div style={{ width: 6, height: 6, borderRadius: "50%", background: f.primary }} />
-                <span style={{ fontSize: 13, color: t.secondary }}>Citros is thinking...</span>
+                <span style={{ fontSize: 13, color: t.secondary }}>Fawx is thinking...</span>
               </div>
             </div>
           </div>

@@ -1,6 +1,6 @@
 # H2 Voice I/O Design Notes
 
-*Created 2026-02-17. Joe wants voice in Citros MVP v2.*
+*Created 2026-02-17. Joe wants voice in Fawx MVP v2.*
 
 ## Decision
 
@@ -63,9 +63,9 @@ Mic → SpeechRecognizer → text → AgentExecutor (existing) → response text
 - Locks you into one model for reasoning (can't use Claude/GPT)
 - Tools don't work through speech-to-speech models
 - The hybrid adds ~300-500ms latency from chaining two models
-- Building/hosting that infra is a separate product, not a Citros feature
+- Building/hosting that infra is a separate product, not a Fawx feature
 
-## Citros Integration Points
+## Fawx Integration Points
 
 - **`:chat` module**: Voice button UI, SpeechRecognizer/TextToSpeech lifecycle
 - **`ChatViewModel`**: Voice state management (listening, processing, speaking)

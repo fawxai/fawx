@@ -62,7 +62,7 @@ jobs:
 
       - name: Run eval harness
         run: |
-          cargo run -p ct-cli --bin citros -- eval-determinism \
+          cargo run -p ct-cli --bin fawx -- eval-determinism \
             --mode ${{ steps.mode.outputs.value }} \
             --output ${{ steps.mode.outputs.output }} \
             --baseline ${{ steps.mode.outputs.baseline }}

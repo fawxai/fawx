@@ -1,7 +1,7 @@
 # Retroactive Pressure Test: Conversation History & Context Management
 
 *Pressure test for #478 — Tier 1 retroactive audit*
-*Citros: `Message`, `Conversation`, `ContextCompactor`, `ContextManager` | OpenClaw: `AgentMessage`, `AgentContext`, `compaction/` module, `transformContext` hook*
+*Fawx: `Message`, `Conversation`, `ContextCompactor`, `ContextManager` | OpenClaw: `AgentMessage`, `AgentContext`, `compaction/` module, `transformContext` hook*
 
 ---
 
@@ -120,7 +120,7 @@ type SessionEntry =
 
 ---
 
-## 2. Citros's Architecture
+## 2. Fawx's Architecture
 
 ### Message Model
 
@@ -178,19 +178,19 @@ data class Conversation(
 
 ### 3.1 Message Model
 
-| Aspect | OpenClaw | Citros | Assessment |
+| Aspect | OpenClaw | Fawx | Assessment |
 |--------|----------|--------|------------|
-| Type safety | Discriminated union (4 types) | Single data class with nullable fields | **Gap**: Citros uses role string + nullable fields instead of type-safe union. Kotlin sealed classes would be idiomatic |
+| Type safety | Discriminated union (4 types) | Single data class with nullable fields | **Gap**: Fawx uses role string + nullable fields instead of type-safe union. Kotlin sealed classes would be idiomatic |
 | Usage tracking | `usage: Usage` on AssistantMessage | Not tracked | **Gap — H2**: Token usage is essential for cost tracking, compaction triggers, and model tier decisions |
 | Stop reason | `stopReason` on AssistantMessage | Not stored | **Deferred**: Needed for retry logic (H3) |
 | Model/provider | Stored on AssistantMessage | Not stored | **Deferred**: Needed for multi-model sessions |
-| Content blocks | Native `ContentBlock[]` | Transient `_contentBlocks` reconstructed from JSON | **Adequate**: Citros's approach works, avoids complex serialization. Trade-off: reconstruction logic is fragile |
+| Content blocks | Native `ContentBlock[]` | Transient `_contentBlocks` reconstructed from JSON | **Adequate**: Fawx's approach works, avoids complex serialization. Trade-off: reconstruction logic is fragile |
 | Custom messages | Dedicated `role: "custom"` type | Not supported | **Intentional**: No need for bash history or branch summaries on phone |
 | Serialization | Full serialization of all fields | `@Transient` blocks + `toolCallsJson` string | **Risk**: If `toolCallsJson` parsing fails, blocks can't be reconstructed. No fallback |
 
 ### 3.2 Context Trimming Strategy
 
-| Aspect | OpenClaw | Citros |
+| Aspect | OpenClaw | Fawx |
 |--------|----------|--------|
 | When to trim | Based on actual token usage from API response | Based on char/3 estimate OR step count |
 | How to trim | LLM-powered summarization (new API call) | Rule-based: regex stripping + bracket format replacement |
@@ -201,34 +201,34 @@ data class Conversation(
 | First message | Not special-cased (included in summarization) | Always preserved (task description) |
 | Recovery | Auto-retry after overflow compaction | No overflow detection or recovery |
 
-**Assessment**: OpenClaw's LLM-powered compaction is overkill for a phone agent's ~25-step tasks. Citros's rule-based approach is the right call:
+**Assessment**: OpenClaw's LLM-powered compaction is overkill for a phone agent's ~25-step tasks. Fawx's rule-based approach is the right call:
 
 1. **Phone tasks are short**: 5-25 steps vs potentially hundreds for coding tasks
 2. **Screen dumps are the main bloat**: SCREEN sections are large and become useless after one step (IDs change). Stripping them is the 80/20 solution
 3. **No LLM cost**: Each compaction in OpenClaw costs tokens. Phone agents are already expensive per-step (vision, tool calls)
 4. **Deterministic**: Rule-based compaction is predictable and testable
 
-**However**, Citros's approach has gaps:
+**However**, Fawx's approach has gaps:
 
 ### 3.3 Token Estimation
 
-| Aspect | OpenClaw | Citros |
+| Aspect | OpenClaw | Fawx |
 |--------|----------|--------|
 | Primary signal | `usage.totalTokens` from API response | `chars / 3` or `chars / 4` |
 | Accuracy | Exact (from API) | Approximate (~25% error margin) |
 | Used for | Compaction trigger, threshold check | Compaction trigger only |
 
-**Gap — Critical for H2**: Without actual token usage tracking, Citros can't:
+**Gap — Critical for H2**: Without actual token usage tracking, Fawx can't:
 - Know when it's approaching context window limits
 - Make intelligent compaction decisions
 - Report cost to users
 - Implement per-step cost budgeting
 
-The Anthropic API returns `usage` in every response. Citros should store this in `ChatResponse` and `Message`.
+The Anthropic API returns `usage` in every response. Fawx should store this in `ChatResponse` and `Message`.
 
 ### 3.4 Turn-Aware Trimming
 
-| Aspect | OpenClaw | Citros |
+| Aspect | OpenClaw | Fawx |
 |--------|----------|--------|
 | Turn boundaries | Tracked via session entries, respected by cut point detection | Not tracked — `toApiMessages()` trims at message index |
 | Mid-turn split | Can split a long turn (prefix summarized, suffix kept) | Cannot — either keeps or drops entire messages |
@@ -248,7 +248,7 @@ If `maxMessages=20` cuts between an `assistant+tool_use` and its `tool_result`, 
 
 ### 3.5 Pre-LLM Context Hook
 
-| Aspect | OpenClaw | Citros |
+| Aspect | OpenClaw | Fawx |
 |--------|----------|--------|
 | Hook | `transformContext: (AgentMessage[], signal) => AgentMessage[]` | None (see #483) |
 | Runs | Before every LLM call (both first turn and continuations) | N/A |
@@ -258,7 +258,7 @@ If `maxMessages=20` cuts between an `assistant+tool_use` and its `tool_result`, 
 
 ### 3.6 Overflow Recovery
 
-| Aspect | OpenClaw | Citros |
+| Aspect | OpenClaw | Fawx |
 |--------|----------|--------|
 | Detection | Checks assistant message for context overflow indicators | No overflow detection |
 | Recovery | Remove error message → compact → auto-retry | API error surfaces to user |
@@ -366,4 +366,4 @@ data class ChatResponse(
 
 *Pressure test completed 2026-02-16*
 *Reference: pi-agent-core `agent-loop.ts` (418 lines), pi-coding-agent `compaction/compaction.ts` (800+ lines), `agent-session.ts` (compaction trigger logic)*
-*Citros: `Message.kt` (~170 lines), `ContextCompactor.kt` (~65 lines), `ContextManager.kt` (~150 lines)*
+*Fawx: `Message.kt` (~170 lines), `ContextCompactor.kt` (~65 lines), `ContextManager.kt` (~150 lines)*

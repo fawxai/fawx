@@ -102,8 +102,8 @@ internal fun MessageInput(
     onSteer: (String) -> Unit,  // NEW
     onCancel: () -> Unit,       // NEW
     isLoading: Boolean,
-    flavor: CitrosFlavor = CitrosFlavor.TANGERINE,
-    placeholder: String = "Message Citros..."
+    flavor: FawxFlavor = FawxFlavor.TANGERINE,
+    placeholder: String = "Message Fawx..."
 )
 ```
 
@@ -121,7 +121,7 @@ MessageInput(
     } else if (viewModel.accessibilityEnabled.value) {
         "Ask me to do something..."
     } else {
-        "Message Citros..."
+        "Message Fawx..."
     }
 )
 ```

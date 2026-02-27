@@ -1,11 +1,11 @@
 # Wallet & Storage File Paths
 
-> Issue: [#250](https://github.com/abbudjoe/citros/issues/250)  
+> Issue: [#250](https://github.com/abbudjoe/fawx/issues/250)  
 > Audience: developers working on credential storage and migration
 
 ## Android (Kotlin) — Wallet Storage
 
-Citros Android stores credentials and wallet state in two locations:
+Fawx Android stores credentials and wallet state in two locations:
 
 ### Encrypted Key Store
 - **Implementation:** `EncryptedKeyStore` (wraps Android Keystore / EncryptedSharedPreferences)
@@ -14,7 +14,7 @@ Citros Android stores credentials and wallet state in two locations:
 
 ### Wallet Metadata
 - **Implementation:** `SharedPreferencesWalletStorage`
-- **Path:** `/data/data/ai.citros.app/shared_prefs/citros_wallet.xml`
+- **Path:** `/data/data/ai.fawx.app/shared_prefs/fawx_wallet.xml`
 - **Contents:** `WalletState` JSON — key metadata (provider, label, addedAt), active key ID, model selections
 - **Does NOT contain:** Raw API key values (those are in the encrypted key store)
 - **Example structure:**
@@ -36,7 +36,7 @@ Citros Android stores credentials and wallet state in two locations:
   ```
 
 ### Legacy Storage (pre-wallet)
-- **SharedPreferences:** `/data/data/ai.citros.app/shared_prefs/citros.xml`
+- **SharedPreferences:** `/data/data/ai.fawx.app/shared_prefs/fawx.xml`
   - `cloud_token` — plaintext API key (migrated to encrypted store on first launch)
   - `cloud_provider` — provider enum name
   - `cloud_auth_kind` — auth method enum name
@@ -63,7 +63,7 @@ The Rust daemon (binary name: `ct-cli`) uses redb for persistent encrypted stora
 ### Storage Path
 - **Config field:** `storage_path` in the daemon config JSON
 - **Default location:** Specified at startup — no hardcoded default
-- **Example:** `/data/local/tmp/citros-storage.redb`
+- **Example:** `/data/local/tmp/fawx-storage.redb`
 
 ### Contents
 - Conversation history
@@ -75,7 +75,7 @@ The Rust daemon (binary name: `ct-cli`) uses redb for persistent encrypted stora
 {
   "model_path": "/data/local/tmp/model.gguf",
   "api_key_path": "/data/local/tmp/keys.enc",
-  "storage_path": "/data/local/tmp/citros-storage.redb",
+  "storage_path": "/data/local/tmp/fawx-storage.redb",
   "policy_path": "/data/local/tmp/policy.json",
   "log_level": "info"
 }
@@ -87,8 +87,8 @@ The Rust daemon (binary name: `ct-cli`) uses redb for persistent encrypted stora
 
 | ❌ Wrong | ✅ Correct |
 |---|---|
-| `citros_vault.redb` | `citros-storage.redb` (or whatever `storage_path` is set to) |
-| `/sdcard/citros/vault` | `/data/local/tmp/citros-storage.redb` (or app-private storage) |
-| `shared_prefs/vault.xml` | `shared_prefs/citros_wallet.xml` (wallet metadata) |
+| `fawx_vault.redb` | `fawx-storage.redb` (or whatever `storage_path` is set to) |
+| `/sdcard/fawx/vault` | `/data/local/tmp/fawx-storage.redb` (or app-private storage) |
+| `shared_prefs/vault.xml` | `shared_prefs/fawx_wallet.xml` (wallet metadata) |
 
 The Rust daemon does not use the term "vault" — it uses `storage_path` pointing to a redb database file. The Android side uses "wallet" for the credential management system.
