@@ -23,11 +23,10 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const BANNER_ART: &str = "\
-   ___
+const BANNER_ART: &str = r#"   ___
   / _/__ __    ____  __
- / _/ _ `/ |/|/ /\\ \\/ /
-/_/ \\_,_/|__,__/ /_/\\_\\";
+ / _/ _ `/ |/|/ /\ \/ /
+/_/ \_,_/|__,__/ /_/\_\"#;
 
 const DEFAULT_AUTH_FILE: &str = ".fawx/auth.json";
 const DEFAULT_OPENAI_TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
