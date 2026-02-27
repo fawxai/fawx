@@ -1,4 +1,4 @@
-# Citros — Pitch Deck
+# Fawx — Pitch Deck
 ### For: Chris Saum, Active Capital
 ### Date: February 2026
 
@@ -6,10 +6,10 @@
 
 ## SLIDE 1: Title
 
-**Citros**
+**Fawx**
 *AI that uses your phone.*
 
-[Citros logo / animated sphere visual from citros.ai]
+[Fawx logo / animated sphere visual from fawx.ai]
 
 ---
 
@@ -29,7 +29,7 @@ Every app is a silo. Every task requires you to be the glue between them.
 
 ## SLIDE 3: The Solution
 
-**Citros is a phone agent. You talk. It does.**
+**Fawx is a phone agent. You talk. It does.**
 
 "Send an email to Sarah about tomorrow's meeting"
 → Opens Gmail → Composes → Types → Sends
@@ -55,7 +55,7 @@ Voice → On-Device STT → AI Reasoning → Phone Actions → Done
 - **Accessibility Service** — taps, types, swipes, reads screens, takes screenshots
 - **Works with every app** — no per-app integrations needed
 
-> *Speaker note: This is the key architectural insight. Instead of building integrations with every app (the way Siri/Google Assistant work), Citros operates at the OS level. It can use ANY app because it interacts the same way a human does. New app? Already works.*
+> *Speaker note: This is the key architectural insight. Instead of building integrations with every app (the way Siri/Google Assistant work), Fawx operates at the OS level. It can use ANY app because it interacts the same way a human does. New app? Already works.*
 
 ---
 
@@ -115,7 +115,7 @@ Four things that didn't exist 18 months ago:
 
 - Voice AI agents market: **$4.7B** today → **$47.5B by 2034** (34.8% CAGR)
 - Voice assistant market: **$7.4B** → **$33.7B by 2030**
-- Every Android user is a potential Citros user
+- Every Android user is a potential Fawx user
 
 **Wedge:** Power users and accessibility-first users who need hands-free phone operation.
 
@@ -130,20 +130,20 @@ Four things that didn't exist 18 months ago:
 | Tier | Price | What you get |
 |------|-------|-------------|
 | **BYO** (Bring Your Own Key) | Free | Full app, use your own AI API keys |
-| **Citros Base** | $9.99/mo | Included AI usage, all models, usage-capped |
-| **Citros Super** | $24.99/mo | Higher usage limits, priority, premium models |
+| **Fawx Base** | $9.99/mo | Included AI usage, all models, usage-capped |
+| **Fawx Super** | $24.99/mo | Higher usage limits, priority, premium models |
 
 - **BYO tier drives adoption** — zero friction, power users onboard themselves
 - **Managed tiers capture value** — most users don't want to manage API keys
 - **Usage-capped, NOT model-restricted** — all tiers get all models (Joe's key insight: don't gate features, gate volume)
 
-> *Speaker note: The BYO tier is the growth hack. Enthusiasts install it, show friends, friends want the easy version. The monetization is making AI usage invisible — you just pay Citros, not Anthropic.*
+> *Speaker note: The BYO tier is the growth hack. Enthusiasts install it, show friends, friends want the easy version. The monetization is making AI usage invisible — you just pay Fawx, not Anthropic.*
 
 ---
 
 ## SLIDE 10: Competitive Landscape
 
-| | Citros | Google Assistant | Siri | Rabbit R1 / Humane Pin |
+| | Fawx | Google Assistant | Siri | Rabbit R1 / Humane Pin |
 |---|---|---|---|---|
 | Controls any app | ✅ | ❌ (only integrated apps) | ❌ (only integrated apps) | ❌ (cloud proxy) |
 | On-device voice | ✅ | Partial | Partial | ❌ |
@@ -153,7 +153,7 @@ Four things that didn't exist 18 months ago:
 | Multi-step tasks | ✅ | ❌ | ❌ | Limited |
 | No infrastructure | ✅ | ❌ (Google servers) | ❌ (Apple servers) | ❌ (cloud) |
 
-**Google and Apple can't do this.** Their assistants are integration-based — they negotiate deals with every app developer. Citros bypasses the entire integration model by operating at the OS layer.
+**Google and Apple can't do this.** Their assistants are integration-based — they negotiate deals with every app developer. Fawx bypasses the entire integration model by operating at the OS layer.
 
 Rabbit and Humane tried to sell new hardware. The hardware is already in everyone's pocket.
 
@@ -169,7 +169,7 @@ Rabbit and Humane tried to sell new hardware. The hardware is already in everyon
 - **7 structured tools** — tap, type, swipe, press_key, open_app, read_screen, scroll
 - **Onboarding flow** — install APK, paste key, go
 
-**Distribution:** Sideload via citros.ai (Play Store won't allow Accessibility Service automation apps — this is a feature, not a bug. It's a barrier to entry for competitors too.)
+**Distribution:** Sideload via fawx.ai (Play Store won't allow Accessibility Service automation apps — this is a feature, not a bug. It's a barrier to entry for competitors too.)
 
 ---
 
@@ -200,7 +200,7 @@ Founder & CEO
 
 **Milestones this capital gets to:**
 - 1,000 active sideload users
-- Managed tier launch (Citros Base/Super)
+- Managed tier launch (Fawx Base/Super)
 - TTS integration (full voice-in, voice-out loop)
 - 3 key use-case demos polished (email, messaging, calendar)
 
@@ -212,7 +212,7 @@ Founder & CEO
 
 Every phone becomes a personal agent. You don't open apps. You don't tap buttons. You say what you want and it happens.
 
-Citros isn't an assistant that answers questions. It's an agent that takes action.
+Fawx isn't an assistant that answers questions. It's an agent that takes action.
 
 *"No start menu, no app icons. Just a blank screen and a text box."*
 — Chris Saum, Active Capital
@@ -224,7 +224,7 @@ Citros isn't an assistant that answers questions. It's an agent that takes actio
 # APPENDIX (don't present, have ready for questions)
 
 ## Technical Deep Dive
-- **Accessibility Service**: Android platform API, used by screen readers. Citros uses it to read UI trees, perform gestures, capture screenshots. No root required.
+- **Accessibility Service**: Android platform API, used by screen readers. Fawx uses it to read UI trees, perform gestures, capture screenshots. No root required.
 - **sherpa-onnx**: C++ inference engine for on-device speech models. Parakeet TDT 0.6B (int8 quantized) for STT. Piper VITS for TTS (in progress).
 - **Structured Tool Use**: AI model receives 7 tools (tap, type_text, swipe, press_key, open_app, read_screen, scroll) as structured function calls. Each action is verified before proceeding.
 - **Dual-model architecture**: Opus/GPT-4 for reasoning, Haiku for action loop execution. Optimizes cost without sacrificing quality.
@@ -236,7 +236,7 @@ Google Play's Accessibility Service policy explicitly prohibits "automating user
 3. Sideload distribution gives us direct customer relationship (no 30% cut)
 
 ## iOS Path
-iOS has limited accessibility automation (UI testing frameworks, Shortcuts). A full Citros-equivalent would likely require:
+iOS has limited accessibility automation (UI testing frameworks, Shortcuts). A full Fawx-equivalent would likely require:
 - Jailbreak (small market)
 - Apple partnership (long-term play)
 - Limited "Shortcuts-based" version (near-term)

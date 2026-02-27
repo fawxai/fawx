@@ -39,7 +39,7 @@
 - `memory/YYYY-MM-DD.md` = daily raw logs
 - Memory files are workspace files the agent reads/writes via file tools
 
-### How Citros Currently Works
+### How Fawx Currently Works
 
 **File System** (`AgentFileManager.kt`):
 - Manages `agent/` directory: SOUL.md, USER.md, AGENTS.md, SECURITY.md, TOOLS.md, MEMORY.md
@@ -75,7 +75,7 @@
 
 ### Critical (must fix before shipping)
 
-| # | Gap | OpenClaw | Citros | Impact |
+| # | Gap | OpenClaw | Fawx | Impact |
 |---|-----|----------|--------|--------|
 | 1 | **Prompt composition** | Workspace files supplement platform prompt | Workspace files REPLACE platform prompt | Agent loses phone tools after onboarding |
 | 2 | **SOUL.md depth** | Rich persona doc (tone, boundaries, philosophy) | 5-line bullet list (name, vibe, emoji) | Agent has no real personality |
@@ -83,7 +83,7 @@
 
 ### Important (should fix)
 
-| # | Gap | OpenClaw | Citros | Impact |
+| # | Gap | OpenClaw | Fawx | Impact |
 |---|-----|----------|--------|--------|
 | 4 | **IDENTITY.md** | Separate from SOUL.md — factual identity (name, creature, avatar) | Missing — identity crammed into SOUL.md | Conflates who-you-are with how-you-behave |
 | 5 | **BOOTSTRAP.md lifecycle** | Exists → triggers onboarding → deleted when done | Missing entirely | No self-healing onboarding state |
@@ -92,7 +92,7 @@
 
 ### Deferred (nice to have)
 
-| # | Gap | OpenClaw | Citros | Impact |
+| # | Gap | OpenClaw | Fawx | Impact |
 |---|-----|----------|--------|--------|
 | 8 | **HEARTBEAT.md** | Drives periodic proactive checks | Missing — no heartbeat concept on phone | No proactive behavior |
 | 9 | **Subagent filtering** | Only AGENTS.md + TOOLS.md for background tasks | No subagents on device | N/A for now |
@@ -100,13 +100,13 @@
 
 ---
 
-## Design: Where Citros Should Diverge from OpenClaw
+## Design: Where Fawx Should Diverge from OpenClaw
 
 ### 1. Prompt Composition — Merge, Don't Replace
 
 OpenClaw appends workspace files as "Project Context" after platform instructions. This works because OpenClaw's platform sections are about tool availability and coding patterns — generic enough that persona files don't conflict.
 
-**Citros is different.** The phone agent prompt has highly specific sections (tool docs, tap strategy, recovery patterns, communication policy) that are critical for phone control. We can't just append identity files — we need to **weave them in**.
+**Fawx is different.** The phone agent prompt has highly specific sections (tool docs, tap strategy, recovery patterns, communication policy) that are critical for phone control. We can't just append identity files — we need to **weave them in**.
 
 **Proposed architecture:**
 ```
@@ -123,7 +123,7 @@ System prompt =
   10. Runtime section (hardcoded + dynamic — stays as-is)
 ```
 
-**Key difference from OpenClaw:** Identity files don't just get appended — they replace or augment specific sections. SOUL.md replaces the generic "You are Citros" identity. USER.md adds user context. AGENTS.md adds behavioral directives. The phone-specific sections (tools, strategy, recovery) are NEVER replaced by file content.
+**Key difference from OpenClaw:** Identity files don't just get appended — they replace or augment specific sections. SOUL.md replaces the generic "You are Fawx" identity. USER.md adds user context. AGENTS.md adds behavioral directives. The phone-specific sections (tools, strategy, recovery) are NEVER replaced by file content.
 
 ### 2. SOUL.md — Richer by Default, But Appropriate for Phone
 
@@ -158,7 +158,7 @@ A phone agent's SOUL.md should be different:
 
 ### 3. Memory — SQLite Stays, Bridge to Markdown
 
-OpenClaw uses markdown files as THE memory store. Citros already has SQLite with FTS5, which is actually better for search. We shouldn't throw that away.
+OpenClaw uses markdown files as THE memory store. Fawx already has SQLite with FTS5, which is actually better for search. We shouldn't throw that away.
 
 **Proposed approach:**
 - `remember` / `recall` / `list_memories` continue using SQLite (fast, searchable)
@@ -168,7 +168,7 @@ OpenClaw uses markdown files as THE memory store. Citros already has SQLite with
 - Daily memory: agent can `write_file("memory/2026-02-18.md", ...)` for raw logs if it wants
 - SQLite = operational memory (fast recall). MEMORY.md = curated context (shapes behavior).
 
-**Divergence from OpenClaw:** OpenClaw's memory is pure markdown + semantic search. Citros uses SQLite for operations but bridges to markdown for prompt injection. Best of both worlds.
+**Divergence from OpenClaw:** OpenClaw's memory is pure markdown + semantic search. Fawx uses SQLite for operations but bridges to markdown for prompt injection. Best of both worlds.
 
 ### 4. IDENTITY.md — Keep It, Adapt It
 
@@ -176,12 +176,12 @@ OpenClaw separates IDENTITY.md (factual: name, creature, avatar, API keys) from 
 
 **Decision: Keep both SOUL.md and IDENTITY.md.** Port OpenClaw's templates as starting points, remove OpenClaw-specific content (ClikClawk bot creds, workspace paths), but preserve everything else. These two files are the agent's core — don't throw anything away unless it only applies to OpenClaw.
 
-**IDENTITY.md for Citros:**
+**IDENTITY.md for Fawx:**
 - Name, creature/nature, vibe, emoji (factual identity)
 - Device-specific info (phone model, Android version — populated at runtime)
 - Any user-granted credentials or API keys the agent uses
 
-**SOUL.md for Citros:**
+**SOUL.md for Fawx:**
 - Personality, tone, communication style, boundaries
 - Behavioral philosophy (be resourceful, have opinions, earn trust)
 - Relationship dynamics with the user
@@ -189,7 +189,7 @@ OpenClaw separates IDENTITY.md (factual: name, creature, avatar, API keys) from 
 
 ### 5. BOOTSTRAP.md — Yes, But Simpler
 
-OpenClaw's bootstrap is elaborate (conversational onboarding, then delete). Citros already has a scripted onboarding UI flow.
+OpenClaw's bootstrap is elaborate (conversational onboarding, then delete). Fawx already has a scripted onboarding UI flow.
 
 **Proposed approach:**
 - BOOTSTRAP.md is a signal file, not an instruction file
@@ -257,7 +257,7 @@ When the agent (or user) edits SOUL.md via `write_file`, the system prompt shoul
 
 ~~Phone LLM calls are expensive in latency with local models.~~
 
-**Update:** Citros is cloud-model-first now. Local models (qwen2.5:3b) are no longer the target. Users bring their own API keys (Anthropic, OpenAI, OpenRouter, etc.), so token budget is not a meaningful constraint. Don't artificially compress identity files to save tokens — richness > brevity for personality.
+**Update:** Fawx is cloud-model-first now. Local models (qwen2.5:3b) are no longer the target. Users bring their own API keys (Anthropic, OpenAI, OpenRouter, etc.), so token budget is not a meaningful constraint. Don't artificially compress identity files to save tokens — richness > brevity for personality.
 
 The existing `MAX_READ_SIZE_BYTES` (256KB) is fine as a safety guard against accidentally injecting huge files, but we shouldn't cap SOUL.md at 300 tokens. Let it be as rich as it needs to be.
 
@@ -265,7 +265,7 @@ The existing `MAX_READ_SIZE_BYTES` (256KB) is fine as a safety guard against acc
 
 ## Summary of Divergences from OpenClaw
 
-| Aspect | OpenClaw | Citros (proposed) | Why different |
+| Aspect | OpenClaw | Fawx (proposed) | Why different |
 |--------|----------|-------------------|---------------|
 | Prompt composition | Files appended as "Project Context" | Files woven into specific sections | Phone tools must never be displaced |
 | Memory | Pure markdown + semantic search | SQLite ops + markdown bridge | SQLite already built, better for mobile |

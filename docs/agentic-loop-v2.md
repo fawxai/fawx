@@ -4,13 +4,13 @@
 > **Authors:** Joe, Clawdio
 > **Date:** 2026-02-13
 > **Supersedes:** `agentic-loop-audit.md`
-> **Roadmap:** `docs/specs/citros-architecture-roadmap.md` (tracks status; this spec has implementation details)
+> **Roadmap:** `docs/specs/fawx-architecture-roadmap.md` (tracks status; this spec has implementation details)
 
 ---
 
 ## 1. Vision
 
-Citros is an autonomous phone agent. The agentic loop is its core — the system
+Fawx is an autonomous phone agent. The agentic loop is its core — the system
 that turns a user's intent into a sequence of actions on the device.
 
 v1 works but has structural limitations: synthetic user messages pollute context,
@@ -624,7 +624,7 @@ bluetooth, brightness) in addition to action verbs.
 **Goal:** Fix the structural issues. Remove synthetic messages. Get the basic
 loop right.
 
-> **Shipped across H0+H1+H2:** PRs #459, #460, #458, #476, #477, #479, #481, #487, #489, #496, #504, #540, #670, #671. See `citros-architecture-roadmap.md` for full status.
+> **Shipped across H0+H1+H2:** PRs #459, #460, #458, #476, #477, #479, #481, #487, #489, #496, #504, #540, #670, #671. See `fawx-architecture-roadmap.md` for full status.
 
 **Scope:**
 - [x] `PhoneAgentApi.continueAfterTools()` — new method, no user message injection
@@ -705,7 +705,7 @@ loop right.
 ## 12. Integration with SPEC.md Architecture
 
 The agentic loop does not exist in isolation. It must integrate cleanly with
-the broader Citros architecture defined in `SPEC.md`. This section addresses
+the broader Fawx architecture defined in `SPEC.md`. This section addresses
 the touchpoints.
 
 ### 12.1 Action Policy Engine (SPEC §3.5.3)

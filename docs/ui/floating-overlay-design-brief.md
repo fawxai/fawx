@@ -1,10 +1,10 @@
-# Citros Floating Overlay - Design Brief
+# Fawx Floating Overlay - Design Brief
 
 > Overlay mode for in-progress phone actions so users can monitor, interrupt, and queue follow-up instructions without losing context.
 
 ## Context
 
-When Citros is executing phone actions (navigation, taps, typing), the full app should not disappear. Instead, it should transition to a compact floating overlay that keeps users informed and in control while the underlying app remains visible.
+When Fawx is executing phone actions (navigation, taps, typing), the full app should not disappear. Instead, it should transition to a compact floating overlay that keeps users informed and in control while the underlying app remains visible.
 
 This brief is optimized for mock generation and implementation handoff.
 
@@ -30,7 +30,7 @@ Main Chat -> User sends phone-action request -> Mini-Chat Overlay (default)
 
 ## Experience Goals
 
-- `Always visible state`: users can always tell what Citros is doing.
+- `Always visible state`: users can always tell what Fawx is doing.
 - `Low obstruction`: overlay should not block core app content more than necessary.
 - `Fast interruption`: stopping or pausing an action should be one step.
 - `Continuity`: moving between mini, bubble, and full app should preserve chat/action context.
@@ -43,7 +43,7 @@ Main Chat -> User sends phone-action request -> Mini-Chat Overlay (default)
 - Container: rounded rectangle, ~36-42% screen height, bottom anchored on entry.
 - Visual style: dark frosted surface with citrus accents; subtle active glow while executing.
 - Header row:
-  - left: Citros avatar
+  - left: Fawx avatar
   - center: current step text (`Opening Settings...`, `Scrolling Wi-Fi list...`)
   - right: `Expand` and `Minimize` icon buttons
 - Body:
@@ -59,7 +59,7 @@ Main Chat -> User sends phone-action request -> Mini-Chat Overlay (default)
 ### 2) Floating Status Bubble (minimized)
 
 - Size: ~56dp circular bubble.
-- Content: Citros avatar with activity ring when executing.
+- Content: Fawx avatar with activity ring when executing.
 - Badge: unread count or dot if new status/messages arrive while minimized.
 - Interactions:
   - tap: expand to Mini-Chat
@@ -70,7 +70,7 @@ Main Chat -> User sends phone-action request -> Mini-Chat Overlay (default)
 
 - Existing full-screen chat UI.
 - Persistent in-progress banner pinned near top:
-  - `Citros is executing actions`
+  - `Fawx is executing actions`
   - primary action: `Return to Overlay`
   - secondary action: `Stop`
 - Action stream and queued messages remain visible and synchronized with overlay state.
@@ -166,7 +166,7 @@ For each screen, provide mobile frame variants at `360x800` and `412x915`.
 
 ## Acceptance Checklist
 
-- [ ] Three surfaces are visually cohesive and preserve Citros branding.
+- [ ] Three surfaces are visually cohesive and preserve Fawx branding.
 - [ ] Core behavior is unambiguous: execution continues unless explicitly paused/stopped.
 - [ ] Drag, tap, and long-press gesture precedence is clear and conflict-free.
 - [ ] `Stop Action` is obvious, immediate, and has undo protection.
@@ -180,9 +180,9 @@ For each screen, provide mobile frame variants at `360x800` and `412x915`.
 Use this exact prompt with your design/mock tool:
 
 ```text
-Design a production-ready Android floating overlay system for Citros (AI phone agent) with three synchronized surfaces: Mini-Chat Overlay, Status Bubble, and Full App.
+Design a production-ready Android floating overlay system for Fawx (AI phone agent) with three synchronized surfaces: Mini-Chat Overlay, Status Bubble, and Full App.
 
-Goal: while Citros executes phone actions, users can monitor progress, queue follow-up instructions, and interrupt instantly without losing context.
+Goal: while Fawx executes phone actions, users can monitor progress, queue follow-up instructions, and interrupt instantly without losing context.
 
 Canonical behavior:
 - Execution continues across all surfaces unless user explicitly pauses/stops.

@@ -1,9 +1,9 @@
-# Citros UI Spec — The Floating Fruit
+# Fawx UI Spec — The Floating Fruit
 
 *Horizon 1: Android PoC Primary UI Surface*
 
 > **Purpose:** This spec defines the visual design, interaction model,
-> animation behavior, and 3D rendering approach for Citros's floating
+> animation behavior, and 3D rendering approach for Fawx's floating
 > bubble — a **3D citrus fruit** that serves as the always-present
 > interface element on the user's Android phone. Hand this to a UI
 > designer or 3D artist to produce high-fidelity mockups, shader
@@ -15,7 +15,7 @@
 
 ### 1.1 Visual Identity
 
-Citros's icon is a **3D citrus fruit** — a whole, spherical piece of
+Fawx's icon is a **3D citrus fruit** — a whole, spherical piece of
 fruit rendered with realistic peel texture (dimpled pores, subtle
 surface irregularities) and an inner glow effect that makes it look
 lit from within. Think of holding a real lime up to a bright light —
@@ -40,9 +40,9 @@ It IS:
 
 ### 1.2 Personality
 
-Citros's voice, verbosity, and vibe are **not preset**. They are
+Fawx's voice, verbosity, and vibe are **not preset**. They are
 determined through an interview during the user's first-run onboarding
-flow. The user shapes Citros's personality before they've used it —
+flow. The user shapes Fawx's personality before they've used it —
 building a relationship from the first interaction.
 
 The chosen **flavor** subtly inflects personality defaults (a Blood
@@ -53,14 +53,14 @@ chill) — but the user always has the final say.
 
 ### 1.3 Design Principles
 
-- **Alive, not intrusive** — Citros should feel like a living thing
+- **Alive, not intrusive** — Fawx should feel like a living thing
   resting on your screen, not a notification badge. The slow idle spin
   and soft glow give it organic presence.
 - **State is always visible** — the fruit's glow intensity, spin speed,
-  and color shifts tell the user what Citros is doing without requiring
+  and color shifts tell the user what Fawx is doing without requiring
   interaction.
 - **Personal** — the user's chosen flavor (fruit type + color + texture)
-  makes Citros feel like *theirs*. No two setups feel the same.
+  makes Fawx feel like *theirs*. No two setups feel the same.
 - **Trustworthy** — confirmation moments are clear, unhurried, and
   never sneaky.
 - **Tactile** — everything should feel like it has weight, texture,
@@ -89,7 +89,7 @@ at small sizes, and differentiates flavors from each other.
 
 ### 2.2 Idle State
 
-The default, resting state. Citros is available but not active.
+The default, resting state. Fawx is available but not active.
 
 | Property | Value |
 |----------|-------|
@@ -101,28 +101,28 @@ The default, resting state. Citros is available but not active.
 | **Presence** | Calm, alive, breathing. Like a fruit sitting on your desk that happens to glow faintly. |
 
 **Variant — Pending Action:**
-When Citros timed out waiting for confirmation (see §2.5) or has an
+When Fawx timed out waiting for confirmation (see §2.5) or has an
 undelivered notification, the fruit's inner glow pulses with a slow
 heartbeat rhythm (~1 pulse per 3 seconds). The glow color shifts
 slightly warmer (toward amber) to signal "I have something for you."
 
 **Interaction:**
 - **Tap-hold** (default) or **3D press** (on supported devices) to
-  wake Citros → transitions to Listening state
+  wake Fawx → transitions to Listening state
 - Simple tap → haptic feedback (acknowledgment) + brief glow flash,
-  but does NOT wake Citros — prevents accidental activation
+  but does NOT wake Fawx — prevents accidental activation
 - 3D press is a bonus on supported hardware; tap-hold is the
   universal fallback
 
 ### 2.3 Listening State
 
-Citros has been woken and is ready to receive input.
+Fawx has been woken and is ready to receive input.
 
 | Property | Value |
 |----------|-------|
 | **Inner glow** | Brightens from core outward, ~60% intensity. Light bleeds through peel pores like backlit skin. |
 | **Scale** | Fruit subtly swells ~10% over 300ms (ease-out). Like it just took a breath. |
-| **Rotation** | Pauses or slows to near-stop — Citros is paying attention, holding still. |
+| **Rotation** | Pauses or slows to near-stop — Fawx is paying attention, holding still. |
 | **Color** | Flavor's full saturated hue. Vivid. Juicy. |
 | **Surface** | Peel pores become more visible as light pushes through them from inside — each dimple becomes a tiny point of light. |
 
@@ -134,10 +134,10 @@ Citros has been woken and is ready to receive input.
 4. Text bubble inherits flavor colorway for accent elements
 
 **Audio feedback (personality-dependent cascade):**
-- **Screen off:** Citros speaks an acknowledgment phrase, AI-generated
+- **Screen off:** Fawx speaks an acknowledgment phrase, AI-generated
   based on personality (e.g., "Listening", "What's up?", "Hit me",
   "How can I help?")
-- **Screen on, verbose setting:** Citros speaks
+- **Screen on, verbose setting:** Fawx speaks
 - **Screen on, moderate setting:** Fresh, bright tone — a crisp
   citrusy "pop" sound (see §5 Sound Design)
 - **Screen on, minimal setting / volume off:** Haptic feedback only
@@ -148,7 +148,7 @@ Citros has been woken and is ready to receive input.
 
 ### 2.4 Thinking State
 
-Citros is processing the user's request.
+Fawx is processing the user's request.
 
 | Property | Value |
 |----------|-------|
@@ -166,7 +166,7 @@ Citros is processing the user's request.
 
 ### 2.5 Speaking / Active State
 
-Citros is responding verbally or executing actions on the phone.
+Fawx is responding verbally or executing actions on the phone.
 
 | Property | Value |
 |----------|-------|
@@ -174,20 +174,20 @@ Citros is responding verbally or executing actions on the phone.
 | **Rotation** | Moderate steady spin. Confident, not frantic. |
 | **Color** | Peak saturation of flavor hue. This is the fruit at its most vivid. |
 | **Surface** | Fully illuminated — every pore visible, specular highlights dance across the peel. |
-| **Haptics** | Rhythmic haptic feedback pattern — indicates Citros is actively working |
+| **Haptics** | Rhythmic haptic feedback pattern — indicates Fawx is actively working |
 
 **Speaking sub-state:**
-When Citros is talking, the glow intensity subtly modulates with the
+When Fawx is talking, the glow intensity subtly modulates with the
 audio waveform — brighter on emphasized syllables, dimmer on pauses.
 The fruit appears to pulse with its own voice.
 
 **Acting sub-state (executing phone actions):**
-- Haptic: subtle rhythmic pulses while Citros works
+- Haptic: subtle rhythmic pulses while Fawx works
 - Visual: context-dependent (see §3 Action Visualization)
 
 ### 2.6 Waiting for Confirmation State
 
-Citros needs the user's approval before proceeding. This is the
+Fawx needs the user's approval before proceeding. This is the
 **trust moment** — the most important state to get right.
 
 | Property | Value |
@@ -213,18 +213,18 @@ Citros needs the user's approval before proceeding. This is the
 - Slider color matches risk level (green/amber/red)
 
 **Timeout behavior:**
-- After **60 seconds** with no response, Citros returns to idle
+- After **60 seconds** with no response, Fawx returns to idle
 - The pending action is saved in the text prompt window with a note:
   *"Do you still want me to..."*
 - Idle fruit shows pending-action heartbeat glow (see §2.2 Variant)
 
 **Batch confirmations:**
 - Both **one-by-one** and **approve all** options available
-- "Approve all" shown when Citros has multiple related actions queued
+- "Approve all" shown when Fawx has multiple related actions queued
 
 ### 2.7 Needs Attention State
 
-Citros has a notification, completed background task, or information
+Fawx has a notification, completed background task, or information
 the user should see — but it's not an error or confirmation request.
 
 | Property | Value |
@@ -296,26 +296,26 @@ maximum expressiveness:
 
 ## 3. Action Visualization
 
-When Citros executes actions on the phone, the visual feedback depends
-on context. Citros **auto-selects the appropriate mode** based on action
+When Fawx executes actions on the phone, the visual feedback depends
+on context. Fawx **auto-selects the appropriate mode** based on action
 type, with the user able to override defaults in onboarding and
 settings.
 
 ### 3.1 Highlighted Touches (Default for On-Screen Interactions)
 
-Used when Citros interacts with visible app UI elements (tapping buttons,
+Used when Fawx interacts with visible app UI elements (tapping buttons,
 typing, scrolling).
 
 | Element | Behavior |
 |---------|----------|
-| Citros fruit | Hovers over / near the tap target — still glowing, still textured |
+| Fawx fruit | Hovers over / near the tap target — still glowing, still textured |
 | Tap indicator | Ripple at each touch point, colored in user's flavor |
-| Haptics | Subtle tap at each "press" by Citros |
+| Haptics | Subtle tap at each "press" by Fawx |
 | Text input | Light tapping sensation as characters are entered |
 
 **Design goals:**
 - Feel intentional, not ghostly
-- The user can see WHERE Citros is interacting
+- The user can see WHERE Fawx is interacting
 - Haptic feedback makes each action tangible
 - Should feel like watching a skilled hand work, not a haunted phone
 
@@ -338,7 +338,7 @@ Used when the action can happen via API calls or in the background
 
 ### 3.3 Narrated Overlay (Opt-In, Off by Default)
 
-Real-time text narration of Citros's actions.
+Real-time text narration of Fawx's actions.
 
 | Element | Behavior |
 |---------|----------|
@@ -369,12 +369,12 @@ Users can change defaults in:
 Four tiers, selected by the user during mandatory onboarding.
 Editable anytime in settings.
 
-| Tier | Name | Citros asks before... |
+| Tier | Name | Fawx asks before... |
 |------|------|---------------------|
 | 1 | **Full control** | Everything — every action requires approval |
 | 2 | **External + destructive** (recommended default) | Sending messages/emails/tweets, deleting files/data |
 | 3 | **Financial + destructive only** | Purchases, accessing finances, deleting files |
-| 4 | **Autonomous** | Nothing — Citros acts freely (expert mode) |
+| 4 | **Autonomous** | Nothing — Fawx acts freely (expert mode) |
 
 The default tier is determined during onboarding based on the user's
 comfort level.
@@ -395,10 +395,10 @@ reflect the risk color during the confirmation state.
 
 ### 4.3 Confirmation Interaction
 
-1. Citros enters Confirmation state (slow brightness oscillation +
+1. Fawx enters Confirmation state (slow brightness oscillation +
    haptic taps, fruit stops spinning)
 2. Confirmation card appears showing:
-   - What Citros wants to do (action description)
+   - What Fawx wants to do (action description)
    - Risk level indicator (color coded)
 3. User **swipes the slider at the bottom of the screen** to approve
 4. Or taps "Cancel" / waits 60 seconds for auto-dismiss
@@ -409,7 +409,7 @@ reflect the risk color during the confirmation state.
 
 ### 5.1 Sound Character
 
-Citros sounds are **fresh, bright, and crisp** — inspired by the
+Fawx sounds are **fresh, bright, and crisp** — inspired by the
 sensory experience of citrus. Think of the *pop* of puncturing an
 orange peel, the *fizz* of sparkling citrus water, the *snap* of
 breaking a lemon off a branch.
@@ -446,7 +446,7 @@ to compensate for no visual feedback.
 
 ### 5.4 AI-Generated Speech
 
-Spoken responses are **generated in real-time by Citros's LLM**, not
+Spoken responses are **generated in real-time by Fawx's LLM**, not
 pre-recorded or from a fixed set. This means:
 - Phrases match the user's chosen personality and verbosity
 - Responses are contextually appropriate (not the same thing every time)
@@ -480,16 +480,16 @@ pre-recorded or from a fixed set. This means:
 
 ## 7. Interaction Model
 
-### 7.1 Waking Citros
+### 7.1 Waking Fawx
 
 | Gesture | Behavior |
 |---------|----------|
 | Tap-hold on fruit | Wake → Listening state (default on all devices) |
 | 3D press on fruit | Wake → Listening state (supported devices only) |
 | Simple tap on fruit | Haptic acknowledgment + brief glow flash — does NOT wake (prevents accidental activation) |
-| Wake word ("Hey Citros") | Wake → Listening state (no touch required) |
+| Wake word ("Hey Fawx") | Wake → Listening state (no touch required) |
 
-### 7.2 Dismissing / Minimizing Citros
+### 7.2 Dismissing / Minimizing Fawx
 
 | Gesture | Behavior |
 |---------|----------|
@@ -498,16 +498,16 @@ pre-recorded or from a fixed set. This means:
 The dismiss gesture mirrors Android's chat head pattern — familiar
 to users.
 
-### 7.3 Interrupting Citros Mid-Action
+### 7.3 Interrupting Fawx Mid-Action
 
 | Gesture | Behavior |
 |---------|----------|
-| Touch and hold **anywhere on screen** for **2 seconds** | Citros immediately pauses/stops current action |
+| Touch and hold **anywhere on screen** for **2 seconds** | Fawx immediately pauses/stops current action |
 
 **Design considerations:**
 - 2-second hold prevents accidental interrupts from normal phone use
-- Citros acknowledges: fruit shakes briefly, glow dims, haptic feedback
-- After interrupt, Citros enters a "paused" state where user can
+- Fawx acknowledges: fruit shakes briefly, glow dims, haptic feedback
+- After interrupt, Fawx enters a "paused" state where user can
   choose to resume, cancel, or give new instructions
 
 ### 7.4 Moving the Fruit
@@ -522,7 +522,7 @@ to users.
 ## 8. State Transition Map
 
 ```
-                    tap-hold / 3D press / "Hey Citros"
+                    tap-hold / 3D press / "Hey Fawx"
             ┌──────────────────────────────────────┐
             │                                      ▼
          ┌──────┐                           ┌───────────┐
@@ -565,7 +565,7 @@ Note: CONFIRMING → IDLE after 60s timeout (saves pending action)
 
 ## 9. Flavors — The Personalization System
 
-Flavors are Citros's personalization mechanic. Choosing a flavor sets
+Flavors are Fawx's personalization mechanic. Choosing a flavor sets
 your **color**, **peel texture**, **shape**, and **personality vibe**.
 This isn't a color picker — it's choosing your fruit.
 
@@ -604,7 +604,7 @@ At 48–56dp, subtle texture differences must still read clearly:
    glows from within (preview of the Listening state)
 3. Each fruit plays its unique sound on selection (a signature "pop")
 4. Selected fruit does a satisfying wobble-settle
-5. "This is your Citros" confirmation — the fruit is now yours
+5. "This is your Fawx" confirmation — the fruit is now yours
 
 ---
 
@@ -631,8 +631,8 @@ At 48–56dp, subtle texture differences must still read clearly:
 |-------|---------------|
 | Tap idle fruit (no wake) | Single short tap — acknowledgment |
 | Wake (tap-hold complete) | Distinct "click" — state changed |
-| Each Citros tap during action | Subtle tap — mirroring the action |
-| Text input by Citros | Light rapid tapping — typing sensation |
+| Each Fawx tap during action | Subtle tap — mirroring the action |
+| Text input by Fawx | Light rapid tapping — typing sensation |
 | Working rhythm (active state) | Steady rhythmic pulse |
 | Confirmation needed | Single tap every 2 seconds |
 | Error | Sharp double-tap |
@@ -708,7 +708,7 @@ A hybrid approach that balances visual quality with runtime performance:
 - Cons: Battery drain, GPU wake-lock, complex implementation,
   overkill for a 56dp element. Would need a textured sphere mesh +
   PBR shader + subsurface scattering approximation.
-- Verdict: **Not recommended for Horizon 1.** Revisit for CitrosOS
+- Verdict: **Not recommended for Horizon 1.** Revisit for FawxOS
   full-screen modes.
 
 **Lottie / Rive animation:**
@@ -794,12 +794,12 @@ and affect all UI behavior:
 
 1. **Flavor Picker** — 3D fruits in carousel, spinning, interactive
    (see §9.3)
-2. **Personality Interview** — conversational, Citros asks questions in
+2. **Personality Interview** — conversational, Fawx asks questions in
    text + voice. The fruit is present and alive during this process —
    glowing, spinning, reacting to the user's answers.
 3. **Permission Setup** — clear visual explanation of each tier with
    examples. User picks their comfort level.
-4. **"Your Citros is ready"** — the fruit does a triumphant glow
+4. **"Your Fawx is ready"** — the fruit does a triumphant glow
    burst + wobble-settle. It's alive. It's yours.
 
 ---
@@ -812,7 +812,7 @@ and affect all UI behavior:
 - Text interface always available (not voice-only)
 - Error messages available as text regardless of voice mode setting
 - Screen reader compatibility for all interactive elements —
-  announces state changes ("Citros is listening", "Citros needs
+  announces state changes ("Fawx is listening", "Fawx needs
   confirmation")
 - Confirmation state perceivable through multiple channels
   (visual + haptic + optional sound)
@@ -826,7 +826,7 @@ and affect all UI behavior:
 
 ## 16. Open Questions
 
-### Horizon 2 — CitrosOS Modes
+### Horizon 2 — FawxOS Modes
 *Deferred — Joe wants to think more before committing to full-screen
 modes (ambient/active/immersive/review). When this lands, consider
 upgrading from sprite-sheet to real-time 3D for immersive mode.*
@@ -848,5 +848,5 @@ flavors a design-only task — no code changes needed.*
 ---
 
 *Spec version: 3.0 — 2026-02-10*
-*Rethemed for Citros 3D citrus fruit design*
+*Rethemed for Fawx 3D citrus fruit design*
 *Based on UX interview with Joe (Topics 1-5, Topic 6 deferred)*

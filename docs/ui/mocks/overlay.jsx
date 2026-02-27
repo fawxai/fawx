@@ -106,7 +106,7 @@ const PanelOverlay = ({ state, flavor, t }) => (
     {/* Header */}
     <div style={{ display: "flex", alignItems: "center", gap: g(2.5), padding: `${g(1.5)}px ${g(4)}px ${g(2.5)}px` }}>
       <Orb color={orbClr(flavor, t)} inner={orbInn(flavor, t)} size={g(7)} />
-      <span style={{ fontSize: 15, fontWeight: 600, flex: 1, letterSpacing: -0.2, color: t.labelPrimary }}>Citros</span>
+      <span style={{ fontSize: 15, fontWeight: 600, flex: 1, letterSpacing: -0.2, color: t.labelPrimary }}>Fawx</span>
       <button style={{ background: t.surface2, border: "none", borderRadius: g(3.5), padding: `${g(1.25)}px ${g(3)}px`, fontSize: 13, color: t.labelSecondary, cursor: "pointer" }}>Expand</button>
     </div>
     {/* Message */}
@@ -166,7 +166,7 @@ const IslandOverlay = ({ state, flavor, t }) => {
         size={isExpanded ? g(8) : g(7)}
       />
       {state === "idle" && (
-        <span style={{ fontSize: 14, fontWeight: 500, color: "#fff", letterSpacing: -0.2 }}>Citros</span>
+        <span style={{ fontSize: 14, fontWeight: 500, color: "#fff", letterSpacing: -0.2 }}>Fawx</span>
       )}
       {state === "executing" && (
         <>
@@ -211,7 +211,7 @@ export default function OverlayScreen() {
       <div style={{ width: "100%", maxWidth: 460, marginBottom: g(5) }}>
         <h1 style={{ fontSize: 24, fontWeight: 700, letterSpacing: -0.6, margin: 0 }}>Overlay Modes</h1>
         <p style={{ fontSize: 15, color: ct.labelSecondary, letterSpacing: -0.2, margin: `${g(1.5)}px 0 ${g(5)}px`, lineHeight: "22px" }}>
-          How Citros appears floating over other apps.
+          How Fawx appears floating over other apps.
         </p>
 
         {/* Controls */}

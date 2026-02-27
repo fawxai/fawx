@@ -102,7 +102,7 @@ The sensor provider follows a **request-on-first-use** model:
 4. **If denied/restricted**, return a `ToolResult` with:
    - `isError: true`
    - `errorCode: .privacyBlocked`
-   - Actionable message: "Location access denied. Open Settings > Citros > Location to enable."
+   - Actionable message: "Location access denied. Open Settings > Fawx > Location to enable."
 5. **Never silently fail** — every denied sensor read must produce an explicit
    result that the agent can reason about.
 
@@ -297,7 +297,7 @@ extension IOSSensorProvider {
         case .denied:
             return .failure(.permissionDenied(
                 sensor,
-                guidance: "Open Settings > Citros > \(sensor.permissionDomain?.rawValue ?? "Privacy") to enable access."
+                guidance: "Open Settings > Fawx > \(sensor.permissionDomain?.rawValue ?? "Privacy") to enable access."
             ))
         case .restricted:
             return .failure(.permissionRestricted(sensor))

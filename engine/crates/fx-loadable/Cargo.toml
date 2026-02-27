@@ -1,0 +1,15 @@
+[package]
+name = "fx-loadable"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Fawx loadable layer — WASM skill runtime, strategy management, config, prompt templates, A/B slot lifecycle. Hot-swappable at runtime."
+
+[dependencies]
+fx-core = { workspace = true }
+
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

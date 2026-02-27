@@ -1,11 +1,11 @@
 # Health Check & Hardening: Costs and Risks
 
-> Issue: [#248](https://github.com/abbudjoe/citros/issues/248)  
-> Audience: developers and operators running Citros health checks
+> Issue: [#248](https://github.com/abbudjoe/fawx/issues/248)  
+> Audience: developers and operators running Fawx health checks
 
 ## Overview
 
-Citros health checks and hardening routines may invoke LLM API calls to validate configuration, test connectivity, and verify agent functionality. This document discloses the associated costs and risks.
+Fawx health checks and hardening routines may invoke LLM API calls to validate configuration, test connectivity, and verify agent functionality. This document discloses the associated costs and risks.
 
 ---
 
@@ -57,7 +57,7 @@ Frequent health checks against cloud providers may trigger rate limits, especial
 
 ### Key exposure during validation
 
-Health check API calls use your configured API keys. The same security considerations apply as for normal Citros usage:
+Health check API calls use your configured API keys. The same security considerations apply as for normal Fawx usage:
 
 - Keys are stored in Android Keystore (encrypted at rest)
 - Validation requests are minimal (`"ping"` message)

@@ -1,12 +1,12 @@
-# Citros: AI-Native Phone Agent
+# Fawx: AI-Native Phone Agent
 
-[![Build Status](https://github.com/abbudjoe/citros/actions/workflows/ci.yml/badge.svg)](https://github.com/abbudjoe/citros/actions/workflows/ci.yml)
+[![Build Status](https://github.com/abbudjoe/fawx/actions/workflows/ci.yml/badge.svg)](https://github.com/abbudjoe/fawx/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.83%2B-orange.svg)](https://www.rust-lang.org/)
 
-**Citros** is an AI-native phone agent designed to run locally on Android devices. Unlike cloud-based assistants, Citros lives on your phone, escalating to cloud LLMs for complex reasoning. It's the foundation for a future where the agent *is* the interface, not just a feature bolted onto an app-centric OS.
+**Fawx** is an AI-native phone agent designed to run locally on Android devices. Unlike cloud-based assistants, Fawx lives on your phone, escalating to cloud LLMs for complex reasoning. It's the foundation for a future where the agent *is* the interface, not just a feature bolted onto an app-centric OS.
 
-**⚠️ Status: Early Development** — Citros is under active development. Core infrastructure (Epics 1-6) is complete, with 225+ tests and a clean Rust codebase. See [Project Status](#project-status) below for details.
+**⚠️ Status: Early Development** — Fawx is under active development. Core infrastructure (Epics 1-6) is complete, with 225+ tests and a clean Rust codebase. See [Project Status](#project-status) below for details.
 
 ---
 
@@ -31,7 +31,7 @@
 Smartphones haven't fundamentally changed since 2007. Users navigate grids of siloed apps, manually orchestrating multi-step tasks across different UIs. AI assistants (Siri, Google Assistant) failed to fix this because they're constrained by OS limitations and predefined app "intents."
 
 ### The Solution
-**Citros puts the agent on the phone, not in the cloud.** It perceives (voice, screen, sensors), thinks (local LLM for speed, cloud for complexity), and acts (direct device control). The phone becomes an *awareness surface* where you glance to see what the agent is doing, not an *input surface* where you tap 47 times to book a flight.
+**Fawx puts the agent on the phone, not in the cloud.** It perceives (voice, screen, sensors), thinks (local LLM for speed, cloud for complexity), and acts (direct device control). The phone becomes an *awareness surface* where you glance to see what the agent is doing, not an *input surface* where you tap 47 times to book a flight.
 
 ### Design Principles
 1. **Phone-native, not server-first** — No gateway, no open ports, no inbound connections
@@ -71,10 +71,10 @@ For the full vision and three-horizon roadmap, see [`docs/SPEC.md`](docs/SPEC.md
 
 ## Architecture
 
-Citros is a Rust workspace organized into four architectural layers:
+Fawx is a Rust workspace organized into four architectural layers:
 
 ```
-citros/
+fawx/
 ├── engine/
 │   └── crates/
 │       ├── ct-kernel/       # Loop orchestration, policy, permissions, verification, rollback
@@ -161,8 +161,8 @@ Device (Android UI, Apps, Sensors)
 ### Clone and Build
 ```bash
 # Clone the repository
-git clone https://github.com/abbudjoe/citros.git
-cd citros
+git clone https://github.com/abbudjoe/fawx.git
+cd fawx
 
 # Build all crates
 cargo build --workspace
@@ -207,7 +207,7 @@ export CLAUDE_SDK_URL="ws://127.0.0.1:4242"
 To enable browser-based OpenAI login in the Android app:
 
 1. Start an OAuth bridge service (see `docs/codex-oauth-bridge-api.md` for implementation spec)
-2. In Citros Android app, select **"🧪 Codex OAuth (Browser Redirect)"**
+2. In Fawx Android app, select **"🧪 Codex OAuth (Browser Redirect)"**
 3. Enter bridge URL (default: `http://127.0.0.1:4318`)
 4. Complete sign-in in browser, app will auto-detect the redirect and exchange the code
 
@@ -215,12 +215,12 @@ To enable browser-based OpenAI login in the Android app:
 
 To run a local OAuth bridge server for Android Codex sign-in:
 ```bash
-export CITROS_OPENAI_AUTH_URL="https://<provider-authorize-endpoint>"
-export CITROS_OPENAI_TOKEN_URL="https://<provider-token-endpoint>"
-export CITROS_OPENAI_CLIENT_ID="<oauth-client-id>"
+export FAWX_OPENAI_AUTH_URL="https://<provider-authorize-endpoint>"
+export FAWX_OPENAI_TOKEN_URL="https://<provider-token-endpoint>"
+export FAWX_OPENAI_CLIENT_ID="<oauth-client-id>"
 # Optional for confidential clients:
-export CITROS_OPENAI_CLIENT_SECRET="<oauth-client-secret>"
-export CITROS_OPENAI_SCOPE="openid profile email offline_access"
+export FAWX_OPENAI_CLIENT_SECRET="<oauth-client-secret>"
+export FAWX_OPENAI_SCOPE="openid profile email offline_access"
 
 # Start bridge (default listen: 127.0.0.1:4318)
 cargo run -p ct-cli -- oauth-bridge
@@ -242,7 +242,7 @@ adb reverse tcp:4318 tcp:4318
 
 ## Testing
 
-Citros has extensive test coverage across all crates:
+Fawx has extensive test coverage across all crates:
 
 ```bash
 # Run all tests
@@ -273,7 +273,7 @@ cargo fmt --check
 
 ## Security
 
-Citros takes security seriously. The agent runs with elevated privileges on the phone, so the security model must be proportionally rigorous.
+Fawx takes security seriously. The agent runs with elevated privileges on the phone, so the security model must be proportionally rigorous.
 
 ### Threat Model
 1. **Malicious WASM skills** — Sandboxed with restricted host API, policy validation
@@ -296,7 +296,7 @@ Please **do not** open public GitHub issues for security vulnerabilities. Contac
 
 ## Contributing
 
-Citros is in early development and not yet accepting external contributions. Once the core architecture stabilizes (post-Epic 9), we'll publish contribution guidelines and open the project to community involvement.
+Fawx is in early development and not yet accepting external contributions. Once the core architecture stabilizes (post-Epic 9), we'll publish contribution guidelines and open the project to community involvement.
 
 ### For Now
 - **Star the repo** if you're interested in the project
@@ -354,7 +354,7 @@ ODM partnership or custom board design. Hardware trust button, NPU-optimized SoC
 ## Project Structure
 
 ```
-citros/
+fawx/
 ├── crates/              # Rust workspace crates
 ├── docs/                # Design docs, specs, architecture diagrams
 ├── ffi/                 # FFI bindings (llama.cpp)

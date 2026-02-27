@@ -4,7 +4,7 @@
 
 ## Context
 
-These three areas are Citros-specific patterns with no direct OpenClaw equivalent. OpenClaw is a desktop CLI/web tool — no overlays, no Android accessibility APIs, no phone-specific screen reading. Pressure-tested against Android platform best practices and general architecture principles.
+These three areas are Fawx-specific patterns with no direct OpenClaw equivalent. OpenClaw is a desktop CLI/web tool — no overlays, no Android accessibility APIs, no phone-specific screen reading. Pressure-tested against Android platform best practices and general architecture principles.
 
 ---
 
@@ -45,7 +45,7 @@ The pattern works correctly for the current single-Activity architecture. The do
 - `ScreenContent(elements: List<ScreenElement>, packageName: String?)`
 - `ScreenElement`: id, text, contentDescription, className, isClickable, isEditable, bounds
 - `getScreenContent()`: Window-aware approach via `findAppWindowRoot()` → `pickBestWindow()`, falls back to `rootInActiveWindow`
-- Self-package filtering prevents reading Citros's own overlay
+- Self-package filtering prevents reading Fawx's own overlay
 - `toPromptText()`: prioritizes interactive elements (scoring: editable +4, clickable +3, text +2, desc +1), caps at 40, restores visual order
 
 ### Findings

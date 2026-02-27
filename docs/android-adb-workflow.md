@@ -1,6 +1,6 @@
-# ADB Development Workflow for Citros
+# ADB Development Workflow for Fawx
 
-> Issue: [#132](https://github.com/abbudjoe/citros/issues/132)  
+> Issue: [#132](https://github.com/abbudjoe/fawx/issues/132)  
 > Audience: developers iterating on Android app + Rust binary integration
 
 This document defines the standard ADB loop for fast, reproducible Android development.
@@ -48,19 +48,19 @@ cd android
 Launch app manually, or via ADB:
 
 ```bash
-adb shell monkey -p ai.citros.app -c android.intent.category.LAUNCHER 1
+adb shell monkey -p ai.fawx.app -c android.intent.category.LAUNCHER 1
 ```
 
 Clear app data (clean-state testing):
 
 ```bash
-adb shell pm clear ai.citros.app
+adb shell pm clear ai.fawx.app
 ```
 
 Uninstall app:
 
 ```bash
-adb uninstall ai.citros.app
+adb uninstall ai.fawx.app
 ```
 
 ---
@@ -76,27 +76,27 @@ cargo build --target aarch64-linux-android --release -p ct-cli
 Push binary to device:
 
 ```bash
-adb push target/aarch64-linux-android/release/citros /data/local/tmp/citros
-adb shell chmod 755 /data/local/tmp/citros
+adb push target/aarch64-linux-android/release/fawx /data/local/tmp/fawx
+adb shell chmod 755 /data/local/tmp/fawx
 ```
 
 Run doctor command:
 
 ```bash
-adb shell /data/local/tmp/citros doctor
+adb shell /data/local/tmp/fawx doctor
 ```
 
 If root shell is required:
 
 ```bash
-adb shell su -c '/data/local/tmp/citros doctor'
+adb shell su -c '/data/local/tmp/fawx doctor'
 ```
 
 ---
 
 ## 4) Port Forwarding / Reverse Tunnels
 
-Citros Android OAuth bridge defaults to host port `4318`.
+Fawx Android OAuth bridge defaults to host port `4318`.
 
 For physical devices:
 
@@ -116,7 +116,7 @@ Remove mapping:
 adb reverse --remove tcp:4318
 ```
 
-For emulator, use `10.0.2.2` to reach host services from the app. (Note: Citros is primarily tested on physical devices — emulator support is experimental.)
+For emulator, use `10.0.2.2` to reach host services from the app. (Note: Fawx is primarily tested on physical devices — emulator support is experimental.)
 
 ---
 
@@ -131,19 +131,19 @@ adb logcat
 Filter by app package (common pattern):
 
 ```bash
-adb logcat | grep -i "ai.citros"
+adb logcat | grep -i "ai.fawx"
 ```
 
 ### Tag-Based Filtering (Recommended)
 
-Filter logcat to Citros-specific tags for cleaner output:
+Filter logcat to Fawx-specific tags for cleaner output:
 
 ```bash
-adb logcat -s CitrosAccessibility:* ChatViewModel:* PhoneAgentApi:* OverlayService:* SqliteMemoryProvider:*
+adb logcat -s FawxAccessibility:* ChatViewModel:* PhoneAgentApi:* OverlayService:* SqliteMemoryProvider:*
 ```
 
-Common Citros tags:
-- `CitrosAccessibility` — Accessibility service events, screen reads, actions
+Common Fawx tags:
+- `FawxAccessibility` — Accessibility service events, screen reads, actions
 - `ChatViewModel` — Message flow, tool loop, loading state
 - `PhoneAgentApi` — Tool execution, API calls, agent responses
 - `OverlayService` — Overlay lifecycle, mode transitions, WindowManager
@@ -180,13 +180,13 @@ adb shell
 Pull artifacts from device:
 
 ```bash
-adb pull /data/local/tmp/citros ./artifacts/citros-device
+adb pull /data/local/tmp/fawx ./artifacts/fawx-device
 ```
 
 Inspect process list:
 
 ```bash
-adb shell ps -A | grep -i citros
+adb shell ps -A | grep -i fawx
 ```
 
 Check socket listeners:
@@ -224,7 +224,7 @@ Security note: only use wireless ADB on trusted networks. Disable when done.
 adb -s <serial> shell getprop ro.product.model
 ```
 
-### `Permission denied` running `/data/local/tmp/citros`
+### `Permission denied` running `/data/local/tmp/fawx`
 - Ensure executable bit set: `chmod 755`
 - If root-only paths/capabilities are used, run via `su -c`
 
@@ -243,7 +243,7 @@ For fastest iteration:
 
 1. Build/install app (`./gradlew :app:installDebug`)
 2. Build/push Rust binary (`cargo build ... && adb push ...`)
-3. Run smoke check (`adb shell /data/local/tmp/citros doctor`)
+3. Run smoke check (`adb shell /data/local/tmp/fawx doctor`)
 4. Validate app behavior + collect logs (`adb logcat`)
 5. Repeat
 

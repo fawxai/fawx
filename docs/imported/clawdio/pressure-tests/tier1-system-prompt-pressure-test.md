@@ -1,7 +1,7 @@
 # Retroactive Pressure Test: System Prompt Architecture
 
 *Pressure test for #478 — Tier 1 retroactive audit*
-*Citros: `PhoneAgentPrompts` | OpenClaw: `system-prompt.ts` + `AgentSession._rebuildSystemPrompt()`*
+*Fawx: `PhoneAgentPrompts` | OpenClaw: `system-prompt.ts` + `AgentSession._rebuildSystemPrompt()`*
 
 ---
 
@@ -86,7 +86,7 @@ private _rebuildSystemPrompt(toolNames: string[]): string {
 
 ---
 
-## 2. Citros's Architecture
+## 2. Fawx's Architecture
 
 ### `PhoneAgentPrompts` — Single object, ~220 lines
 
@@ -109,17 +109,17 @@ private _rebuildSystemPrompt(toolNames: string[]): string {
 
 ### 3.1 Section Modularity
 
-| Aspect | OpenClaw | Citros | Assessment |
+| Aspect | OpenClaw | Fawx | Assessment |
 |--------|----------|--------|------------|
 | Section count | 8-9 (identity, tools, guidelines, docs, append, context files, skills, date/time) | 7 (identity, tools, strategy, recovery, disambiguation, rules, runtime) | **Comparable** |
-| Dynamic sections | Tools list, guidelines, context files, skills — all computed at runtime | Only runtime section is dynamic; tools section is static markdown | **Gap**: Citros tools are hardcoded in the prompt. Adding/removing a tool requires code change |
+| Dynamic sections | Tools list, guidelines, context files, skills — all computed at runtime | Only runtime section is dynamic; tools section is static markdown | **Gap**: Fawx tools are hardcoded in the prompt. Adding/removing a tool requires code change |
 | Custom prompt override | `customPrompt` replaces entire default | No equivalent | **Intentional**: Phone agent has one persona |
-| Append mechanism | `appendSystemPrompt` for gateway/channel additions | No equivalent | **Gap — deferred**: When Citros adds gateway-style configuration |
+| Append mechanism | `appendSystemPrompt` for gateway/channel additions | No equivalent | **Gap — deferred**: When Fawx adds gateway-style configuration |
 | Context files | Dynamic injection of AGENTS.md, SOUL.md etc. | None | **Intentional**: Phone agent is self-contained, no workspace files |
 
 ### 3.2 Tool-Prompt Coupling
 
-| Aspect | OpenClaw | Citros |
+| Aspect | OpenClaw | Fawx |
 |--------|----------|--------|
 | Tool list in prompt | Generated from `selectedTools` + `toolDescriptions` map | Hardcoded markdown in `SECTION_TOOLS` |
 | Tool descriptions | Map: `{read: "Read file contents", ...}` | Inline markdown: `- tap(element_id) — tap by numeric ID` |
@@ -127,7 +127,7 @@ private _rebuildSystemPrompt(toolNames: string[]): string {
 | Removing a tool | Remove from `selectedTools` | Remove from markdown (or leave stale) |
 | Guidelines match tools | Guidelines dynamically change based on available tools | Strategy section is static regardless of tool set |
 
-**Assessment**: OpenClaw's approach prevents prompt-tool desync — if a tool is gated, its description and guidelines automatically disappear from the prompt. Citros's hardcoded approach means the prompt always lists all 27 tools even if some are unavailable. For the current phone agent (single tool set), this is fine. It becomes a problem when:
+**Assessment**: OpenClaw's approach prevents prompt-tool desync — if a tool is gated, its description and guidelines automatically disappear from the prompt. Fawx's hardcoded approach means the prompt always lists all 27 tools even if some are unavailable. For the current phone agent (single tool set), this is fine. It becomes a problem when:
 - Model-tier-based tool gating is added (H2) — small models shouldn't see API tools
 - User-configurable tool sets are added
 
@@ -135,26 +135,26 @@ private _rebuildSystemPrompt(toolNames: string[]): string {
 
 ### 3.3 Prompt Rebuild on State Changes
 
-| Trigger | OpenClaw | Citros |
+| Trigger | OpenClaw | Fawx |
 |---------|----------|--------|
 | Tool set changes | Rebuilds system prompt with new tool names | `buildSystemPrompt(phoneControlAvailable=false)` hides entire tools section |
 | Model changes | Can change tools based on model capabilities | No model-aware prompt adaptation |
 | Skill activation | Rebuilds with new skill entries | N/A (no skills) |
 | Session changes | Rebuilds from scratch | N/A |
 
-**Assessment**: Citros has binary tool presence (all or nothing based on accessibility). OpenClaw has granular per-tool control. For H2 (API tools + model tier gating), Citros will need more granular prompt adaptation.
+**Assessment**: Fawx has binary tool presence (all or nothing based on accessibility). OpenClaw has granular per-tool control. For H2 (API tools + model tier gating), Fawx will need more granular prompt adaptation.
 
 ### 3.4 Prompt Content Quality
 
-| Aspect | OpenClaw | Citros | Assessment |
+| Aspect | OpenClaw | Fawx | Assessment |
 |--------|----------|--------|------------|
-| Task-specific guidance | Generic coding guidelines | Phone-specific strategy (direct commands vs tasks, recovery, disambiguation) | **Citros is better here** — domain-specific prompts outperform generic ones |
-| Error recovery | None in prompt (relies on model's training) | Detailed recovery section with specific failure patterns | **Citros is better** — phone UI actions need explicit recovery guidance |
+| Task-specific guidance | Generic coding guidelines | Phone-specific strategy (direct commands vs tasks, recovery, disambiguation) | **Fawx is better here** — domain-specific prompts outperform generic ones |
+| Error recovery | None in prompt (relies on model's training) | Detailed recovery section with specific failure patterns | **Fawx is better** — phone UI actions need explicit recovery guidance |
 | Action prompt | N/A (no separate continuation prompt) | Concise reminders for continuation turns | **Good pattern** — reduces token usage on continuation turns |
 
 ### 3.5 Architecture Patterns
 
-| Pattern | OpenClaw | Citros |
+| Pattern | OpenClaw | Fawx |
 |---------|----------|--------|
 | Prompt immutability | System prompt rebuilt and SET once per trigger | System prompt built fresh on each call to `buildSystemPrompt()` |
 | Separation of concerns | ResourceLoader gathers inputs → builder assembles → agent consumes | Single object does both content and assembly |
@@ -176,7 +176,7 @@ private _rebuildSystemPrompt(toolNames: string[]): string {
 2. **No model-aware prompt adaptation** (H2)
    - Different models may need different prompt styles (Opus vs Sonnet vs smaller models)
    - OpenClaw handles this via `customPrompt` in configuration
-   - Citros should consider prompt variants per model tier (at minimum: detailed for large models, compressed for small)
+   - Fawx should consider prompt variants per model tier (at minimum: detailed for large models, compressed for small)
 
 3. **No prompt rebuild on tool set changes** (H2)
    - When tool gating becomes granular (not just all-or-nothing), the prompt needs to reflect which tools are actually available
@@ -243,4 +243,4 @@ fun buildSystemPrompt(
 
 *Pressure test completed 2026-02-16*
 *Reference: pi-coding-agent `system-prompt.ts` (190 lines), `AgentSession._rebuildSystemPrompt()` in `agent-session.ts`*
-*Citros: `PhoneAgentPrompts.kt` (~220 lines)*
+*Fawx: `PhoneAgentPrompts.kt` (~220 lines)*

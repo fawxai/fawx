@@ -12,7 +12,7 @@
 
 ## Problem
 
-Citros's current first-run experience is hostile:
+Fawx's current first-run experience is hostile:
 
 1. **Install the APK.** (Sideload only — no Play Store.)
 2. **Open the app.** See a blank chat screen.
@@ -20,7 +20,7 @@ Citros's current first-run experience is hostile:
 4. **Figure out API keys.** Which provider? Where do I get a key? What format? What's OpenRouter?
 5. **Enter a key.** Hope you got it right. No validation feedback.
 6. **Select a model.** From a list of IDs that mean nothing to a non-technical user.
-7. **Grant accessibility.** System Settings → Accessibility → find Citros → toggle.
+7. **Grant accessibility.** System Settings → Accessibility → find Fawx → toggle.
 8. **Maybe it works now?**
 
 That's 8 steps, ~5 minutes, zero guidance. Every step is a drop-off point. The "zero-infra" promise — no VPS, no gateway, just a phone — is true architecturally but false experientially.
@@ -29,7 +29,7 @@ That's 8 steps, ~5 minutes, zero guidance. Every step is a drop-off point. The "
 
 - **OpenClaw:** Requires a VPS + config file + Telegram bot, but once set up, the assistant guides you through everything conversationally.
 - **ChatGPT mobile:** Open app → sign in → chat. Three steps. (No phone control, but the onboarding bar is set.)
-- **Citros target:** Open app → guided setup → first task. Three steps, with phone control.
+- **Fawx target:** Open app → guided setup → first task. Three steps, with phone control.
 
 ---
 
@@ -44,7 +44,7 @@ App Launch (first run detected)
   ↓
 Onboarding Agent activates
   ↓
-"Hey! I'm Citros — I can control your phone to help you get things done.
+"Hey! I'm Fawx — I can control your phone to help you get things done.
  Let's get set up. It'll take about a minute."
   ↓
 Step 1: API Key
@@ -294,7 +294,7 @@ class ModelRecommender {
 ```kotlin
 class AccessibilitySetupHelper(private val context: Context) {
     /**
-     * Open accessibility settings with Citros pre-selected if possible.
+     * Open accessibility settings with Fawx pre-selected if possible.
      */
     /**
      * Open accessibility settings using the standard system intent.
@@ -308,7 +308,7 @@ class AccessibilitySetupHelper(private val context: Context) {
         }
         context.startActivity(intent)
         // The onboarding agent shows a text instruction:
-        // "Look for 'Citros' in the list and toggle it on."
+        // "Look for 'Fawx' in the list and toggle it on."
     }
 
     /**
@@ -438,7 +438,7 @@ Stored locally in SharedPreferences. No network telemetry. Used for future funne
 
 If time allows after the core PRs:
 
-- **Animated welcome:** Brief animation showing the Citros logo + tagline on first launch (Compose Canvas, not a static image)
+- **Animated welcome:** Brief animation showing the Fawx logo + tagline on first launch (Compose Canvas, not a static image)
 - **Key paste detection:** Auto-detect when user pastes an API key from clipboard, skip manual entry
 - **Permission re-prompt:** If user backs out of accessibility settings without granting, offer to try again with a clearer explanation of why it's needed
 - **Model preview:** "Try a free model first" option for users without API keys (route through free OpenRouter models)
@@ -457,14 +457,14 @@ The onboarding agent's tone should match SOUL.md:
 
 ## Out of Scope
 
-1. **Account system.** No Citros accounts, no server-side auth. BYO keys only.
-2. **Payment/billing.** No Citros-managed API proxying. Users pay their provider directly.
+1. **Account system.** No Fawx accounts, no server-side auth. BYO keys only.
+2. **Payment/billing.** No Fawx-managed API proxying. Users pay their provider directly.
 3. **Play Store.** Still sideload-only. The onboarding assumes the user already has the APK.
 4. **Multi-device sync.** Onboarding state is local to the device.
 
 ## Blindspots
 
-1. **Accessibility settings vary by OEM.** Samsung, Xiaomi, and others put accessibility settings in different places or rename/reorganize the list. We use only `ACTION_ACCESSIBILITY_SETTINGS` (no undocumented OEM extras) and add a text instruction ("Look for 'Citros' in the list"). Some OEMs may bury accessibility under additional menus.
+1. **Accessibility settings vary by OEM.** Samsung, Xiaomi, and others put accessibility settings in different places or rename/reorganize the list. We use only `ACTION_ACCESSIBILITY_SETTINGS` (no undocumented OEM extras) and add a text instruction ("Look for 'Fawx' in the list"). Some OEMs may bury accessibility under additional menus.
 
 2. **Key validation requires network.** If the user is offline, we can detect the provider from key format but can't verify it works. We should allow proceeding with a warning.
 

@@ -14,7 +14,7 @@ The error surfaces raw to the user as "Action failed" even for simple chat messa
 
 ## Changes Required
 
-### File: `core/src/main/kotlin/ai/citros/core/BaseProviderClient.kt`
+### File: `core/src/main/kotlin/ai/fawx/core/BaseProviderClient.kt`
 
 **1. Add helper method** after `shouldRetryRateLimit()` (~line 111):
 
@@ -78,7 +78,7 @@ if (attempt < maxAttempts) {
 ## Build & Verify
 
 ```bash
-cd ~/citros/android
+cd ~/fawx/android
 git checkout feat/android-mvp && git pull
 git checkout -b fix/retry-529
 # Make changes

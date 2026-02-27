@@ -2,7 +2,7 @@
 
 Date captured: 2026-02-22
 Source type: repository-stable excerpt for spec review reproducibility
-Related roadmap anchor: `docs/specs/citros-architecture-roadmap.md` section 2.10
+Related roadmap anchor: `docs/specs/fawx-architecture-roadmap.md` section 2.10
 
 ## Problem Statement
 

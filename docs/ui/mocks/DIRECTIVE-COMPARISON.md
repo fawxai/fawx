@@ -1,6 +1,6 @@
 # Design Directive Pressure Test
 
-Three competing design philosophies applied to the same Citros chat screen. Each is a real, actively-shipping approach used by major platforms in 2025–2026.
+Three competing design philosophies applied to the same Fawx chat screen. Each is a real, actively-shipping approach used by major platforms in 2025–2026.
 
 ---
 
@@ -116,7 +116,7 @@ Three competing design philosophies applied to the same Citros chat screen. Each
 
 The current iOS-Minimal approach is the strongest choice for this specific product, for three reasons:
 
-1. **Citros is a daemon.** It runs 24/7 on a phone. GPU budget matters. The overlay (bubble/panel/dynamic island) needs to composite efficiently over any background app. Opaque surfaces are the cheapest to render. Glass blur is the most expensive — and the overlay is where it matters most.
+1. **Fawx is a daemon.** It runs 24/7 on a phone. GPU budget matters. The overlay (bubble/panel/dynamic island) needs to composite efficiently over any background app. Opaque surfaces are the cheapest to render. Glass blur is the most expensive — and the overlay is where it matters most.
 
 2. **The target user.** "Discerning users with good taste who prefer iOS design standards" — this audience will read Material You as Android-native and Glass Depth as either "trying too hard" or "macOS not phone." The iOS-Minimal approach is native to their expectations.
 

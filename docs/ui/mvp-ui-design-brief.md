@@ -1,10 +1,10 @@
-# Citros MVP UI Design Brief
+# Fawx MVP UI Design Brief
 
 > Feed this to Claude Cowork to generate interactive Compose UI prototypes for the complete MVP.
 
-## What is Citros?
+## What is Fawx?
 
-Citros is an AI phone agent for Android. Users chat with an AI that can physically interact with their phone — tap buttons, type text, launch apps, read screens, navigate UIs. Think of it as an AI assistant that doesn't just answer questions but actually *does things* on your phone.
+Fawx is an AI phone agent for Android. Users chat with an AI that can physically interact with their phone — tap buttons, type text, launch apps, read screens, navigate UIs. Think of it as an AI assistant that doesn't just answer questions but actually *does things* on your phone.
 
 **Brand:** 3D citrus fruit. The app icon is a whole citrus fruit (not a slice) that glows from within. Users pick a "flavor" during onboarding (Lime, Tangerine, Lemon, Blood Orange, Grapefruit) which sets their color theme.
 
@@ -58,7 +58,7 @@ Design all screens below as a connected interactive prototype with realistic dat
   - 🟡 **Grapefruit** — pink-coral `#E91E63`
 - Each fruit is a 3D-rendered sphere with realistic peel texture
 - Tapping a fruit applies that color theme in real-time (background, accents shift)
-- "This is your Citros" confirmation text
+- "This is your Fawx" confirmation text
 - Continue button
 
 **1c. Personality Interview**
@@ -66,7 +66,7 @@ Design all screens below as a connected interactive prototype with realistic dat
   - "How should I talk to you?" → Casual / Professional / Playful
   - "How much should I explain?" → Brief / Balanced / Detailed
   - "What's your comfort level?" → Ask before everything / Ask for risky stuff / Full autonomy
-- Each question is a chat-style bubble from Citros, with tap-to-select option chips below
+- Each question is a chat-style bubble from Fawx, with tap-to-select option chips below
 - The selected option fades into a "your choice" style, then next question slides in
 - Progress dots at bottom
 - Show global progress ("Step X of 6") and allow Back navigation after the welcome screen
@@ -77,14 +77,14 @@ Design all screens below as a connected interactive prototype with realistic dat
 - Paste field with auto-detection (chip lights up as user pastes)
 - "Test Connection" → animated spinner → checkmark or error shake
 - Helper text: "Get a key from [provider]" with Chrome Custom Tab link
-- Citros Base/Super tiers show "Coming Soon — Join Waitlist" with email capture
+- Fawx Base/Super tiers show "Coming Soon — Join Waitlist" with email capture
 
 **1e. Permissions**
 - Two permission cards stacked vertically:
-  - **Accessibility Service** — "Let Citros see and interact with your screen"
-    - Phone illustration showing Citros tapping a button
+  - **Accessibility Service** — "Let Fawx see and interact with your screen"
+    - Phone illustration showing Fawx tapping a button
     - "Enable" button → opens Android settings
-  - **Overlay Permission** — "Show Citros as a floating bubble"
+  - **Overlay Permission** — "Show Fawx as a floating bubble"
     - Bubble preview illustration
     - "Enable" button
 - Each card has a green checkmark when granted, gray when pending
@@ -103,7 +103,7 @@ Design all screens below as a connected interactive prototype with realistic dat
 This is where users spend 90% of their time. It needs to be beautiful.
 
 **Top Bar:**
-- App name "Citros" (left)
+- App name "Fawx" (left)
 - Active provider icon + model name as a tappable chip (center-right) — opens quick switcher
 - Settings gear icon (right)
 - Subtle gradient or blur behind the top bar
@@ -111,7 +111,7 @@ This is where users spend 90% of their time. It needs to be beautiful.
 **Chat Messages:**
 - **User messages:** Right-aligned bubbles on `Flavor Tint` surfaces with a `Flavor Primary` accent border; avoid placing small text directly on raw `Flavor Primary` fills
 - **AI messages:** Left-aligned bubbles in elevated surface color with subtle border
-- **Action messages** (when Citros does something on the phone):
+- **Action messages** (when Fawx does something on the phone):
   - Different visual treatment — maybe a card with an icon (🤖 + action description)
   - "Opened Settings app" / "Tapped 'Wi-Fi' toggle" 
   - Subtle animation or icon indicating physical phone interaction
@@ -121,7 +121,7 @@ This is where users spend 90% of their time. It needs to be beautiful.
 - Generous spacing between message groups
 
 **Message Input:**
-- Rounded text field with ghost text "Message Citros..."
+- Rounded text field with ghost text "Message Fawx..."
 - Send button (citrus-colored filled circle with arrow)
 - Voice input button (microphone icon, left of text field)
 - Text field expands vertically for multi-line input
@@ -135,7 +135,7 @@ This is where users spend 90% of their time. It needs to be beautiful.
 
 **Accessibility Banner (when not enabled):**
 - Compact banner at top (below toolbar)
-- "Enable phone control to let Citros interact with your screen"
+- "Enable phone control to let Fawx interact with your screen"
 - "Enable" button + dismiss X
 - Non-intrusive but visible
 
@@ -193,7 +193,7 @@ Accessible via gear icon in chat toolbar.
   - ⚡ **Relaxed** — "Asks before purchases and deletions only"
   - 🚀 **Autonomous** — "Never asks (expert mode)"
 - Current selection has accent border + checkmark
-- Brief warning text on Autonomous: "Citros will act without asking. You can always interrupt by holding the screen."
+- Brief warning text on Autonomous: "Fawx will act without asking. You can always interrupt by holding the screen."
 
 **4e. Appearance**
 - Flavor carousel (same as onboarding but horizontal scroll)
@@ -204,7 +204,7 @@ Accessible via gear icon in chat toolbar.
 
 ### 5. Action Confirmation Dialog
 
-When Citros needs permission to do something (based on trust level):
+When Fawx needs permission to do something (based on trust level):
 
 - **Overlay card** that slides up from bottom (not a system dialog)
 - Color-coded border by risk:
@@ -212,7 +212,7 @@ When Citros needs permission to do something (based on trust level):
   - 🟡 Yellow — medium risk ("Send a message to Mom")
   - 🔴 Red — high risk ("Delete all photos", "Purchase $49.99 item")
 - Content:
-  - Citros icon + "Citros wants to:" heading
+  - Fawx icon + "Fawx wants to:" heading
   - Action description in plain language
   - App icon if relevant
 - **Swipe-to-confirm slider** at bottom (intentional gesture, prevents accidental approval)
@@ -231,7 +231,7 @@ When Citros needs permission to do something (based on trust level):
 - "Couldn't reach [Provider]. Check your connection."
 
 **Invalid API Key:**
-- Chat bubble from Citros: "I can't connect with this API key. It might be expired or invalid."
+- Chat bubble from Fawx: "I can't connect with this API key. It might be expired or invalid."
 - Inline "Update Key" button within the bubble
 - Key health badge switches to `Invalid` (icon + label + red accent) in quick switcher
 
@@ -339,14 +339,14 @@ When Citros needs permission to do something (based on trust level):
 
 **User:** "Hey, can you check my email and tell me if anything's urgent?"
 
-**Citros (thinking):** [pulsing animation]
+**Fawx (thinking):** [pulsing animation]
 
-**Citros:** "I'll open Gmail and check your inbox. One moment..."
+**Fawx:** "I'll open Gmail and check your inbox. One moment..."
 
-**Citros (action):** 📱 Opened Gmail
-**Citros (action):** 👁️ Reading inbox — 12 unread messages
+**Fawx (action):** 📱 Opened Gmail
+**Fawx (action):** 👁️ Reading inbox — 12 unread messages
 
-**Citros:** "You have 12 unread emails. Three look urgent:
+**Fawx:** "You have 12 unread emails. Three look urgent:
 1. **Meeting moved to 3pm** — from Sarah (30 min ago)
 2. **Invoice overdue** — from Quickbooks (2 hours ago)  
 3. **Flight confirmation** — from Delta (needs action by tonight)

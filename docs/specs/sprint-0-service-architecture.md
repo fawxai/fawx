@@ -6,7 +6,7 @@
 **Prerequisite:** None
 **Depends on:** Nothing — this is the foundation
 **Estimated PRs:** 3-4
-**Interim architecture:** This spec defines a Kotlin foreground service as the brain host. Per SPEC.md §3.5.2, the long-term architecture is a Rust daemon (`citros-daemon`) with the Kotlin app as a sensor/display adapter. This foreground service is the pragmatic Horizon 1 implementation that will be replaced by the Rust daemon in Horizon 3. The service interface (`AgentState`, `TaskStateManager`) is designed to be portable — the Rust daemon can expose the same contracts over Unix socket IPC.
+**Interim architecture:** This spec defines a Kotlin foreground service as the brain host. Per SPEC.md §3.5.2, the long-term architecture is a Rust daemon (`fawx-daemon`) with the Kotlin app as a sensor/display adapter. This foreground service is the pragmatic Horizon 1 implementation that will be replaced by the Rust daemon in Horizon 3. The service interface (`AgentState`, `TaskStateManager`) is designed to be portable — the Rust daemon can expose the same contracts over Unix socket IPC.
 
 ---
 
@@ -14,7 +14,7 @@
 
 The agent loop runs in `ChatViewModel`, which is scoped to `ChatActivity`'s lifecycle. When Android destroys the activity — memory pressure, user switches apps, screen off timeout, system rotation — the coroutine scope cancels and the loop dies mid-execution.
 
-This is the single biggest reliability ceiling in Citros. No amount of loop intelligence fixes a process that gets killed during step 5 of a 10-step task.
+This is the single biggest reliability ceiling in Fawx. No amount of loop intelligence fixes a process that gets killed during step 5 of a 10-step task.
 
 **Current architecture:**
 ```
@@ -72,7 +72,7 @@ AccessibilityService (phone control, unchanged)
 ### 1. AgentService — Foreground Service
 
 ```kotlin
-package ai.citros.chat
+package ai.fawx.chat
 
 /**
  * Foreground service that owns the agent execution loop.
@@ -88,14 +88,14 @@ class AgentService : Service() {
 
     companion object {
         const val NOTIFICATION_ID = 1001
-        const val CHANNEL_ID = "citros_agent"
+        const val CHANNEL_ID = "fawx_agent"
         const val IDLE_TIMEOUT_MS = 5 * 60 * 1000L  // 5 minutes
 
         // Actions
-        const val ACTION_START_TASK = "ai.citros.action.START_TASK"
-        const val ACTION_STEER = "ai.citros.action.STEER"
-        const val ACTION_CANCEL = "ai.citros.action.CANCEL"
-        const val ACTION_STOP = "ai.citros.action.STOP"
+        const val ACTION_START_TASK = "ai.fawx.action.START_TASK"
+        const val ACTION_STEER = "ai.fawx.action.STEER"
+        const val ACTION_CANCEL = "ai.fawx.action.CANCEL"
+        const val ACTION_STOP = "ai.fawx.action.STOP"
     }
 
     // --- Core Components ---
@@ -154,7 +154,7 @@ This matches the current `ChatViewModel` behavior (steer on message during execu
 ### 2. AgentState — Observable Lifecycle
 
 ```kotlin
-package ai.citros.core
+package ai.fawx.core
 
 /**
  * Observable state of the agent, exposed by AgentService.
@@ -197,7 +197,7 @@ sealed class AgentState {
 ### 3. TaskStateManager — Durable Persistence
 
 ```kotlin
-package ai.citros.core
+package ai.fawx.core
 
 /**
  * Persists task state to survive process death.
@@ -271,7 +271,7 @@ enum class TaskStatus {
 ### 4. WakeLockManager — Power Management
 
 ```kotlin
-package ai.citros.chat
+package ai.fawx.chat
 
 /**
  * Manages partial wake lock during active agent execution.
@@ -289,7 +289,7 @@ package ai.citros.chat
 class WakeLockManager(context: Context) {
 
     companion object {
-        const val TAG = "citros:agent-execution"
+        const val TAG = "fawx:agent-execution"
         const val MAX_WAKE_LOCK_MS = 10 * 60 * 1000L  // 10 minutes max
         const val IDLE_RELEASE_MS = 30_000L             // Release after 30s idle
     }
@@ -319,7 +319,7 @@ class WakeLockManager(context: Context) {
 ### 5. Service Binding — UI Connection
 
 ```kotlin
-package ai.citros.chat
+package ai.fawx.chat
 
 /**
  * Binder that exposes AgentService state to ChatActivity.
@@ -384,20 +384,20 @@ override fun onStop() {
  * Shows current agent state and provides quick actions.
  *
  * States:
- * - Idle: "Citros is ready" (minimal, low priority)
+ * - Idle: "Fawx is ready" (minimal, low priority)
  * - Executing: "Working on: {task summary}" with cancel action
  * - Waiting: "Needs your approval" with approve/deny actions
  * - Complete: "Finished: {result summary}" (auto-dismiss after 10s)
  */
 private fun buildNotification(state: AgentState): Notification {
     val builder = NotificationCompat.Builder(this, CHANNEL_ID)
-        .setSmallIcon(R.drawable.ic_citros_notification)
+        .setSmallIcon(R.drawable.ic_fawx_notification)
         .setOngoing(true)
         .setForegroundServiceBehavior(FOREGROUND_SERVICE_IMMEDIATE)
 
     when (state) {
         is AgentState.Idle -> {
-            builder.setContentTitle("Citros")
+            builder.setContentTitle("Fawx")
                 .setContentText("Ready")
                 .setPriority(NotificationCompat.PRIORITY_LOW)
                 .addAction(R.drawable.ic_stop, "Stop", stopPendingIntent())
@@ -423,7 +423,7 @@ private fun buildNotification(state: AgentState): Notification {
                 .setTimeoutAfter(10_000)
         }
         else -> {
-            builder.setContentTitle("Citros")
+            builder.setContentTitle("Fawx")
                 .setContentText("Active")
         }
     }
@@ -536,7 +536,7 @@ Add `WakeLockManager`. Acquire during active execution, release on idle.
 
 ### Battery Optimization
 
-Android's battery optimization can still affect foreground services on some devices. The onboarding flow should prompt the user to exempt Citros from battery optimization:
+Android's battery optimization can still affect foreground services on some devices. The onboarding flow should prompt the user to exempt Fawx from battery optimization:
 
 ```kotlin
 if (!powerManager.isIgnoringBatteryOptimizations(packageName)) {
@@ -608,7 +608,7 @@ Android Doze restricts network access and defers jobs when the device is idle. F
 
 8. **Accessibility service reconnection after service restart.** If `AgentService` is killed and restarted via `START_STICKY`, the `AccessibilityService` may still be running but the communication channel (static reference) is stale. On service creation, re-establish the reference by querying `AccessibilityService.getInstance()` or using a `ServiceConnection`-style handshake. Test this explicitly.
 
-9. **Non-Pixel OEM battery killers.** Samsung "Deep Sleep," Xiaomi "Battery Saver," and Huawei EMUI can kill foreground services regardless of wake locks. Our primary target is Pixel (stock Android), but if Citros expands to other devices, OEM-specific workarounds (e.g., `dontkillmyapp.com` guidance) will be needed.
+9. **Non-Pixel OEM battery killers.** Samsung "Deep Sleep," Xiaomi "Battery Saver," and Huawei EMUI can kill foreground services regardless of wake locks. Our primary target is Pixel (stock Android), but if Fawx expands to other devices, OEM-specific workarounds (e.g., `dontkillmyapp.com` guidance) will be needed.
 
 10. **Rollback strategy.** The migration from `ChatViewModel` → `AgentService` is a major architectural change. Rollback plan: keep `AgentExecutor` constructable from both `ChatViewModel` and `AgentService` behind a feature flag (`USE_SERVICE_ARCHITECTURE`). During development, the flag defaults to `true` on debug builds and can be toggled. If the service architecture causes regressions, flipping the flag reverts to the `ChatViewModel` path without code changes. Remove the flag and legacy path once the service architecture is stable (1-2 releases).
 

@@ -1,10 +1,10 @@
-# Citros Paywall Screen — Design Brief
+# Fawx Paywall Screen — Design Brief
 
 > Onboarding step between Personality selection → API Key setup
 
 ## Context
 
-This is a mock paywall for the Citros MVP. No real payment processing yet — Base/Super tiers show a "Coming Soon" waitlist. BYO tier is fully functional.
+This is a mock paywall for the Fawx MVP. No real payment processing yet — Base/Super tiers show a "Coming Soon" waitlist. BYO tier is fully functional.
 
 ## Canonical Interaction Decisions (must follow)
 
@@ -17,7 +17,7 @@ This is a mock paywall for the Citros MVP. No real payment processing yet — Ba
 
 ## Brand
 
-- **App:** Citros — AI phone agent with 3D citrus fruit aesthetic
+- **App:** Fawx — AI phone agent with 3D citrus fruit aesthetic
 - **Palette:** Lime (#32CD32), Tangerine (#FF6F00), Lemon (#FFD600), Blood Orange (#FF3D00)
 - **Background:** Dark (#121212)
 - **Tech:** Jetpack Compose, Material 3, dark theme
@@ -37,7 +37,7 @@ This is a mock paywall for the Citros MVP. No real payment processing yet — Ba
 - **Subtext:** "Then enter your API key to continue"
 - **CTA:** "Select" (outlined, Lime border)
 
-#### 🍊 Citros Base — $9/mo *(highlighted / recommended)*
+#### 🍊 Fawx Base — $9/mo *(highlighted / recommended)*
 - "All models included — Haiku, Sonnet, Opus, GPT, Gemini"
 - "$5 monthly usage cap • Perfect for getting started"
 - **Badge:** "$5 free to start" (Tangerine accent)
@@ -45,7 +45,7 @@ This is a mock paywall for the Citros MVP. No real payment processing yet — Ba
 - **State hint:** "Coming Soon" helper text below CTA
 - This card should feel elevated — slightly larger, subtle glow or border highlight
 
-#### 🚀 Citros Super — $29/mo
+#### 🚀 Fawx Super — $29/mo
 - "All models included — same full catalog, higher caps"
 - "$50 monthly usage cap • For power users"
 - **Badge:** "$5 free to start" (Blood Orange accent)

@@ -3,7 +3,7 @@
 **Date:** 2026-02-16
 **Audit scope:** Key storage, credential lifecycle, thread safety, backup exposure, migration
 **Reference:** OpenClaw `auth-profiles-BWqNRMgG.js` (auth-profiles store, file-lock, json-file), `auth-CjzSe-Vc.js` (rate limiting, timing-safe comparison)
-**Citros files:** `WalletManager.kt`, `WalletStorage.kt`, `KeyStore.kt`, `WalletKey.kt`, `WalletState.kt`, `Provider.kt`, `SharedPreferencesWalletStorage.kt`, `EncryptedKeyStore.kt`, `SettingsScreen.kt` (key masking/health), `network_security_config.xml`
+**Fawx files:** `WalletManager.kt`, `WalletStorage.kt`, `KeyStore.kt`, `WalletKey.kt`, `WalletState.kt`, `Provider.kt`, `SharedPreferencesWalletStorage.kt`, `EncryptedKeyStore.kt`, `SettingsScreen.kt` (key masking/health), `network_security_config.xml`
 
 ---
 
@@ -24,7 +24,7 @@
 - **Usage tracking:** `usageStats` per profile — tracks last-used, success count
 - **Last-known-good:** `lastGood` record — can fall back to last working profile
 
-### Citros WalletManager Model
+### Fawx WalletManager Model
 - **Storage split:**
   - `WalletStorage` interface (`loadState()`/`saveState()`) → `SharedPreferencesWalletStorage` (Android SharedPrefs + kotlinx.serialization JSON)
   - `KeyStore` interface (`put()`/`get()`/`delete()`) → `EncryptedKeyStore` (Android EncryptedSharedPreferences, backed by Android Keystore)
@@ -92,7 +92,7 @@
 
 **OpenClaw comparison:** OpenClaw tracks `lastGood` per profile and `KeyHealth` (VALID/INVALID/UNKNOWN). The settings screen shows `maskApiKey` + `KeyHealth` status. But OpenClaw also doesn't validate at add-time in the store layer.
 
-**Citros does have:** `KeyHealth` enum and `maskApiKey()` in `SettingsScreen.kt` — so UI health display exists. But the health check appears to be UI-level only, not wired to actual validation.
+**Fawx does have:** `KeyHealth` enum and `maskApiKey()` in `SettingsScreen.kt` — so UI health display exists. But the health check appears to be UI-level only, not wired to actual validation.
 
 **Fix:** Add optional async validation in `addKey()` — fire a lightweight API request (e.g., Anthropic: `POST /v1/messages` with 1 token maxTokens). Return `KeyHealth.VALID`/`INVALID`. Don't block on it — validate async and update UI.
 
@@ -130,16 +130,16 @@
 
 ### INTENTIONAL DIVERGENCE — Documented, acceptable
 
-#### D1: Encrypted key storage (Citros) vs plaintext (OpenClaw)
-Citros uses `EncryptedSharedPreferences` backed by Android Keystore — hardware-backed encryption on most devices. This is **strictly better** than OpenClaw's plaintext JSON with file permissions. On a phone, the threat model (device theft, app extraction) justifies encryption. On a server (OpenClaw), file permissions + OS-level access control is standard.
+#### D1: Encrypted key storage (Fawx) vs plaintext (OpenClaw)
+Fawx uses `EncryptedSharedPreferences` backed by Android Keystore — hardware-backed encryption on most devices. This is **strictly better** than OpenClaw's plaintext JSON with file permissions. On a phone, the threat model (device theft, app extraction) justifies encryption. On a server (OpenClaw), file permissions + OS-level access control is standard.
 
 #### D2: Split storage (KeyStore + WalletStorage) vs unified (auth-profiles.json)
-Citros separates key material (encrypted) from metadata (serializable state). This is a **better security design** — metadata can be backed up/synced without exposing keys. The downside is the atomicity gap (C1), which should be fixed.
+Fawx separates key material (encrypted) from metadata (serializable state). This is a **better security design** — metadata can be backed up/synced without exposing keys. The downside is the atomicity gap (C1), which should be fixed.
 
-#### D3: No rate limiting (Citros) vs rate limiter (OpenClaw)
-OpenClaw rate-limits authentication because it accepts inbound network connections (gateway). Citros is a local phone agent — no inbound auth. Rate limiting is N/A.
+#### D3: No rate limiting (Fawx) vs rate limiter (OpenClaw)
+OpenClaw rate-limits authentication because it accepts inbound network connections (gateway). Fawx is a local phone agent — no inbound auth. Rate limiting is N/A.
 
-#### D4: No timing-safe comparison (Citros) vs timingSafeEqual (OpenClaw)
+#### D4: No timing-safe comparison (Fawx) vs timingSafeEqual (OpenClaw)
 Same reasoning as D3 — no inbound auth means no timing attack vector.
 
 ---
@@ -153,21 +153,21 @@ Same reasoning as D3 — no inbound auth means no timing attack vector.
 | MEDIUM | 3 | M1 (backup/recovery), M2 (cleartext localhost), M3 (usage stats) |
 | INTENTIONAL | 4 | D1-D4 (all justified, documented) |
 
-### Citros vs OpenClaw Scorecard
+### Fawx vs OpenClaw Scorecard
 
-| Aspect | OpenClaw | Citros | Winner |
+| Aspect | OpenClaw | Fawx | Winner |
 |--------|----------|--------|--------|
-| Encryption at rest | ❌ Plaintext | ✅ Android Keystore | **Citros** |
+| Encryption at rest | ❌ Plaintext | ✅ Android Keystore | **Fawx** |
 | Thread safety | ✅ File locking | ❌ None | **OpenClaw** |
 | Atomicity | ✅ Single-file atomic | ❌ Two-phase non-atomic | **OpenClaw** |
 | Migration safety | ✅ Idempotent + cleanup | ❌ Not idempotent | **OpenClaw** |
 | Backup exposure | N/A (server) | ❌ allowBackup=true | **OpenClaw** |
-| Key metadata separation | ❌ Keys inline | ✅ Separate encrypted store | **Citros** |
+| Key metadata separation | ❌ Keys inline | ✅ Separate encrypted store | **Fawx** |
 | Rate limiting | ✅ Sliding window | N/A (no inbound) | Tie |
 | Recovery | ✅ 5 backup rotation | ❌ None | **OpenClaw** |
 | Usage tracking | ✅ Per-profile stats | ❌ None | **OpenClaw** |
 
-**Verdict:** Citros wins on encryption design (D1, D2) but loses on operational robustness (thread safety, atomicity, migration, backup, recovery). The critical fixes (C1-C3) are foundational — they affect correctness, not just polish.
+**Verdict:** Fawx wins on encryption design (D1, D2) but loses on operational robustness (thread safety, atomicity, migration, backup, recovery). The critical fixes (C1-C3) are foundational — they affect correctness, not just polish.
 
 ---
 
@@ -187,7 +187,7 @@ Same reasoning as D3 — no inbound auth means no timing attack vector.
 
 ---
 
-## 5. Comparison Detail: File Locking (OpenClaw) vs Needed Mutex (Citros)
+## 5. Comparison Detail: File Locking (OpenClaw) vs Needed Mutex (Fawx)
 
 ### OpenClaw's `acquireFileLock()`
 ```
@@ -202,7 +202,7 @@ Same reasoning as D3 — no inbound auth means no timing attack vector.
 7. 10 retries, 100ms min / 10s max timeout, randomized
 ```
 
-### What Citros needs
+### What Fawx needs
 ```kotlin
 class WalletManager(
     private val storage: WalletStorage,
@@ -231,6 +231,6 @@ class WalletManager(
 ```
 
 This is simpler than OpenClaw's file locking because:
-1. Citros is single-process (Android app) — no cross-process contention
+1. Fawx is single-process (Android app) — no cross-process contention
 2. `Mutex` is coroutine-native — no file system overhead
 3. No stale-lock detection needed (no PID coordination)

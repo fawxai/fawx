@@ -6,7 +6,7 @@ import { useState } from "react";
  * 1. Welcome          — Hero orb with glow + wash
  * 2. Appearance       — Flavor picker + theme (dark/light)
  * 3. Conversation     — Pick a conversation style / personality
- * 4. Getting to Know  — Name, pronouns, interests — so Citros adapts
+ * 4. Getting to Know  — Name, pronouns, interests — so Fawx adapts
  * 5. API Key          — Connect a provider
  * 6. Permissions      — Accessibility, overlay, notifications
  * 7. Trust Level      — Autonomy slider
@@ -99,7 +99,7 @@ const WelcomeStep = ({ t, flavor, onNext }) => {
     }}>
       <Orb color={orbClr(flavor, t)} inner={orbInn(flavor, t)} glow={orbGlw(flavor, t)} size={g(20)} />
       <div style={{ textAlign: "center" }}>
-        <div style={{ fontSize: 28, fontWeight: 700, letterSpacing: -0.8, color: t.labelPrimary, marginBottom: g(2) }}>Citros</div>
+        <div style={{ fontSize: 28, fontWeight: 700, letterSpacing: -0.8, color: t.labelPrimary, marginBottom: g(2) }}>Fawx</div>
         <div style={{ fontSize: 17, color: t.labelSecondary, lineHeight: "24px", letterSpacing: -0.2 }}>
           Your phone, thinking ahead.
         </div>
@@ -208,7 +208,7 @@ const ConversationStyleStep = ({ t, flavor, onNext }) => {
       </div>
       <div style={{ fontSize: 24, fontWeight: 700, letterSpacing: -0.6, color: t.labelPrimary, textAlign: "center", marginBottom: g(2) }}>How Should I Talk?</div>
       <div style={{ fontSize: 15, color: t.labelSecondary, textAlign: "center", lineHeight: "22px", letterSpacing: -0.2, marginBottom: g(6) }}>
-        Choose how Citros communicates with you.
+        Choose how Fawx communicates with you.
       </div>
 
       <div style={{ display: "flex", flexDirection: "column", gap: g(2), marginBottom: g(4) }}>
@@ -267,7 +267,7 @@ const KnowYouStep = ({ t, flavor, onNext }) => {
       </div>
       <div style={{ fontSize: 24, fontWeight: 700, letterSpacing: -0.6, color: t.labelPrimary, textAlign: "center", marginBottom: g(2) }}>Let's Get Acquainted</div>
       <div style={{ fontSize: 15, color: t.labelSecondary, textAlign: "center", lineHeight: "22px", letterSpacing: -0.2, marginBottom: g(6) }}>
-        Help Citros understand you so it can be more helpful.
+        Help Fawx understand you so it can be more helpful.
       </div>
 
       {/* Name input */}
@@ -315,7 +315,7 @@ const KnowYouStep = ({ t, flavor, onNext }) => {
             ? `I'll keep an eye on ${selectedInterests.slice(0, 2).join(" and ").toLowerCase()}${selectedInterests.length > 2 ? ` and ${selectedInterests.length - 2} more` : ""} for you."`
             : `I'll learn what matters to you as we go."`}
         </div>
-        <div style={{ fontSize: 11, color: t.labelTertiary, marginTop: g(1) }}>— How Citros will greet you</div>
+        <div style={{ fontSize: 11, color: t.labelTertiary, marginTop: g(1) }}>— How Fawx will greet you</div>
       </div>
 
       <div style={{ flex: 1 }} />
@@ -513,12 +513,12 @@ const PermissionsStep = ({ t, flavor, onNext }) => (
     </div>
     <div style={{ fontSize: 24, fontWeight: 700, letterSpacing: -0.6, color: t.labelPrimary, textAlign: "center", marginBottom: g(2) }}>Permissions</div>
     <div style={{ fontSize: 15, color: t.labelSecondary, textAlign: "center", lineHeight: "22px", letterSpacing: -0.2, marginBottom: g(6) }}>
-      Citros needs these to act on your behalf.
+      Fawx needs these to act on your behalf.
     </div>
     <div style={{ display: "flex", flexDirection: "column", gap: g(2), marginBottom: g(6) }}>
       {[
         ["Accessibility Service", "Read and interact with screen content", true],
-        ["Overlay Permission", "Show Citros over other apps", true],
+        ["Overlay Permission", "Show Fawx over other apps", true],
         ["Notification Access", "Read and manage notifications", false],
       ].map(([name, desc, granted], i) => (
         <div key={i} style={{ display: "flex", alignItems: "center", gap: g(3), padding: `${g(3)}px ${g(4)}px`, borderRadius: g(3), background: t.surface1 }}>
@@ -556,7 +556,7 @@ const TrustStep = ({ t, flavor, onNext }) => {
       </div>
       <div style={{ fontSize: 24, fontWeight: 700, letterSpacing: -0.6, color: t.labelPrimary, textAlign: "center", marginBottom: g(2) }}>Choose Trust Level</div>
       <div style={{ fontSize: 15, color: t.labelSecondary, textAlign: "center", lineHeight: "22px", letterSpacing: -0.2, marginBottom: g(6) }}>
-        How much should Citros ask before acting?
+        How much should Fawx ask before acting?
       </div>
       <div style={{ display: "flex", flexDirection: "column", gap: g(2), marginBottom: g(6) }}>
         {[
@@ -624,7 +624,7 @@ const PlanStep = ({ t, flavor, onNext }) => {
       </div>
       <div style={{ fontSize: 24, fontWeight: 700, letterSpacing: -0.6, color: t.labelPrimary, textAlign: "center", marginBottom: g(2) }}>Choose Your Plan</div>
       <div style={{ fontSize: 15, color: t.labelSecondary, textAlign: "center", lineHeight: "22px", letterSpacing: -0.2, marginBottom: g(5) }}>
-        Unlock the full power of Citros.
+        Unlock the full power of Fawx.
       </div>
 
       <div style={{ display: "flex", flexDirection: "column", gap: g(2.5), marginBottom: g(4) }}>
@@ -717,7 +717,7 @@ const DoneStep = ({ t, flavor }) => {
       <div style={{ textAlign: "center" }}>
         <div style={{ fontSize: 24, fontWeight: 700, letterSpacing: -0.6, color: t.labelPrimary, marginBottom: g(2) }}>You're all set</div>
         <div style={{ fontSize: 15, color: t.labelSecondary, lineHeight: "22px", letterSpacing: -0.2 }}>
-          Citros is ready. Say something or tap the orb to get started.
+          Fawx is ready. Say something or tap the orb to get started.
         </div>
       </div>
     </div>

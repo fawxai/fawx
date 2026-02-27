@@ -249,7 +249,7 @@ export default function ChatRefined() {
           <div style={{
             fontSize: 17, fontWeight: 600, letterSpacing: -0.4,
             color: t.labelPrimary, lineHeight: "22px",
-          }}>Citros</div>
+          }}>Fawx</div>
           <div style={{
             fontSize: 13, letterSpacing: -0.1,
             color: t.labelTertiary, lineHeight: "18px",

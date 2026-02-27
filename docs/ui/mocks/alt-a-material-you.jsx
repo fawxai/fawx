@@ -229,7 +229,7 @@ export default function MaterialYouChat() {
       }}>
         <Orb color={m.primary} size={40} />
         <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ fontSize: 22, fontWeight: 400, letterSpacing: 0, color: m.onSurface, lineHeight: "28px" }}>Citros</div>
+          <div style={{ fontSize: 22, fontWeight: 400, letterSpacing: 0, color: m.onSurface, lineHeight: "28px" }}>Fawx</div>
           <div style={{ fontSize: 14, letterSpacing: 0.25, color: m.onSurfaceVariant, lineHeight: "20px" }}>Claude Sonnet 4.5</div>
         </div>
         <button style={{ width: 48, height: 48, display: "grid", placeItems: "center", background: "none", border: "none", cursor: "pointer", borderRadius: 24 }} aria-label="Settings">

@@ -1,12 +1,12 @@
 # OpenAI API Key Hardening and Reliability Proposal (Android)
 
 Status: Proposal
-Owner: Citros Android
+Owner: Fawx Android
 Last updated: 2026-02-11
 
 ## 1. Context
 
-Citros Android currently supports OpenAI API key and OAuth-based sign-in paths. Recent device testing showed a common failure mode:
+Fawx Android currently supports OpenAI API key and OAuth-based sign-in paths. Recent device testing showed a common failure mode:
 
 - OAuth login can succeed
 - Token persists locally
@@ -177,9 +177,9 @@ Legacy keys (`cloud_token`) retained read-only for migration window, then remove
 
 ### 5.3 Existing touch points
 
-- `android/chat/src/main/kotlin/ai/citros/chat/ChatActivity.kt`
-- `android/chat/src/main/kotlin/ai/citros/chat/ChatViewModel.kt`
-- `android/core/src/main/kotlin/ai/citros/core/BaseProviderClient.kt`
+- `android/chat/src/main/kotlin/ai/fawx/chat/ChatActivity.kt`
+- `android/chat/src/main/kotlin/ai/fawx/chat/ChatViewModel.kt`
+- `android/core/src/main/kotlin/ai/fawx/core/BaseProviderClient.kt`
 - Shared prefs auth keys + restore path
 
 ## 6. Implementation Plan

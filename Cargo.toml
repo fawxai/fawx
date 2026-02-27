@@ -1,14 +1,14 @@
 [workspace]
 members = [
-    "engine/crates/ct-core",
-    "engine/crates/ct-kernel",
-    "engine/crates/ct-loadable",
-    "engine/crates/ct-agent",
-    "engine/crates/ct-llm",
-    "engine/crates/ct-security",
-    "engine/crates/ct-skills",
-    "engine/crates/ct-storage",
-    "engine/crates/ct-cli",
+    "engine/crates/fx-core",
+    "engine/crates/fx-kernel",
+    "engine/crates/fx-loadable",
+    "engine/crates/fx-agent",
+    "engine/crates/fx-llm",
+    "engine/crates/fx-security",
+    "engine/crates/fx-skills",
+    "engine/crates/fx-storage",
+    "engine/crates/fx-cli",
     "engine/crates/llama-cpp-sys",
 ]
 resolver = "2"
@@ -59,10 +59,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 futures = "0.3"
 
 # Shared crates
-ct-core = { path = "engine/crates/ct-core" }
-ct-kernel = { path = "engine/crates/ct-kernel" }
-ct-loadable = { path = "engine/crates/ct-loadable" }
-ct-agent = { path = "engine/crates/ct-agent" }
-ct-security = { path = "engine/crates/ct-security" }
-ct-skills = { path = "engine/crates/ct-skills" }
-ct-storage = { path = "engine/crates/ct-storage" }
+fx-core = { path = "engine/crates/fx-core" }
+fx-kernel = { path = "engine/crates/fx-kernel" }
+fx-loadable = { path = "engine/crates/fx-loadable" }
+fx-agent = { path = "engine/crates/fx-agent" }
+fx-security = { path = "engine/crates/fx-security" }
+fx-skills = { path = "engine/crates/fx-skills" }
+fx-storage = { path = "engine/crates/fx-storage" }

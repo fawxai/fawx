@@ -3,7 +3,7 @@
 **Stage:** SPEC  
 **Issue:** #558  
 **Issue context source:** `docs/specs/h2-4-issue-558-context.md`  
-**Roadmap anchor:** `docs/specs/citros-architecture-roadmap.md` section 2.10  
+**Roadmap anchor:** `docs/specs/fawx-architecture-roadmap.md` section 2.10  
 **Date:** 2026-02-22
 
 ## 1. Scope
@@ -55,11 +55,11 @@ Remaining H2.4 value is hardening and operationalization: explicit contracts, bu
 3. Runtime metadata injected into prompt for model self-awareness.
 4. Treat prompt size as a resource with hard limits and deterministic trimming.
 
-### 3.2 What to Adapt (Citros-Specific)
+### 3.2 What to Adapt (Fawx-Specific)
 
-1. OpenClaw is session-type first; Citros needs both session-type and model-tier behavior.
-2. OpenClaw skill loading is filesystem/plugin oriented; Citros is fixed-tool mobile architecture.
-3. Citros must prioritize mobile latency and token cost more aggressively on `SMALL` tier.
+1. OpenClaw is session-type first; Fawx needs both session-type and model-tier behavior.
+2. OpenClaw skill loading is filesystem/plugin oriented; Fawx is fixed-tool mobile architecture.
+3. Fawx must prioritize mobile latency and token cost more aggressively on `SMALL` tier.
 
 ### 3.3 What Not to Copy
 

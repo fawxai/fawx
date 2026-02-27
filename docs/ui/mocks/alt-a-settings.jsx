@@ -191,7 +191,7 @@ const HubPage = ({ m, flavor, navigate }) => (
     <div style={{ display: "flex", alignItems: "center", gap: g(2), padding: `${g(2)}px ${g(2)}px ${g(3)}px` }}>
       <Orb color={m.primary} size={g(7)} />
       <div>
-        <div style={{ fontSize: 22, fontWeight: 400, color: m.onSurface }}>Citros</div>
+        <div style={{ fontSize: 22, fontWeight: 400, color: m.onSurface }}>Fawx</div>
         <div style={{ fontSize: 14, color: m.onSurfaceVariant, letterSpacing: 0.25 }}>2 providers connected</div>
       </div>
     </div>
@@ -279,9 +279,9 @@ const ModelsPage = ({ m, onBack }) => {
 const TrustPage = ({ m, onBack }) => {
   const [level, setLevel] = useState(1);
   const items = [
-    { label: "Ask before everything", desc: "Confirm every action before Citros takes it" },
+    { label: "Ask before everything", desc: "Confirm every action before Fawx takes it" },
     { label: "Ask for risky actions", desc: "Auto-approve safe, ask for sensitive" },
-    { label: "Full autonomy", desc: "Citros acts independently on your behalf" },
+    { label: "Full autonomy", desc: "Fawx acts independently on your behalf" },
   ];
   return (
     <SubPage title="Trust Level" onBack={onBack} m={m}>
@@ -292,7 +292,7 @@ const TrustPage = ({ m, onBack }) => {
         ))}
       </Section>
       <div style={{ padding: `${g(1)}px ${g(4)}px`, fontSize: 14, color: m.onSurfaceVariant, lineHeight: "20px", letterSpacing: 0.25 }}>
-        Controls how much confirmation Citros requires before taking actions on your phone.
+        Controls how much confirmation Fawx requires before taking actions on your phone.
       </div>
     </SubPage>
   );

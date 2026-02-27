@@ -1,4 +1,4 @@
-# Citros Onboarding & Tier Spec
+# Fawx Onboarding & Tier Spec
 
 ## Overview
 
@@ -9,7 +9,7 @@ Single onboarding flow for both `:chat` and `:app` modules. User picks a tier, e
 ## Onboarding Flow
 
 ### Screen 1: Welcome
-- Citros logo + tagline ("AI that uses your phone")
+- Fawx logo + tagline ("AI that uses your phone")
 - "Get Started" button
 
 ### Screen 2: Choose Your Plan
@@ -19,8 +19,8 @@ Three cards:
 | Tier | Name | Backend | Models | Price |
 |------|------|---------|--------|-------|
 | 🔧 | **Bring Your Own** | User's own key | Any supported | Free (user pays provider) |
-| 🍊 | **Citros Base** | OpenRouter (Citros account) | All models (Haiku, Sonnet, Opus, GPT-5, etc.) | $X/mo — usage-capped |
-| 🚀 | **Citros Super** | OpenRouter (Citros account) | All models (same catalog, higher caps) | $Y/mo — higher usage cap |
+| 🍊 | **Fawx Base** | OpenRouter (Fawx account) | All models (Haiku, Sonnet, Opus, GPT-5, etc.) | $X/mo — usage-capped |
+| 🚀 | **Fawx Super** | OpenRouter (Fawx account) | All models (same catalog, higher caps) | $Y/mo — higher usage cap |
 
 ### Screen 3a: BYO Key Setup
 - Dropdown: Anthropic / OpenAI / OpenRouter
@@ -33,7 +33,7 @@ Three cards:
 - "Test Connection" button + status indicator (valid / invalid / expired)
 - On success → Screen 4
 
-### Screen 3b: Citros Tier Setup (Base or Super)
+### Screen 3b: Fawx Tier Setup (Base or Super)
 - "Create Account" or "Sign In" (email + password, or Google OAuth)
 - Payment method (Stripe)
 - On success → provision OpenRouter API key server-side, inject into app
@@ -46,7 +46,7 @@ Three cards:
 - Brief explainer of why each is needed
 
 ### Screen 5: Ready
-- "Start using Citros" → main chat
+- "Start using Fawx" → main chat
 
 ### Runtime Gating Notes (Current Behavior)
 - Effective onboarding/runtime state sequence is `WELCOME -> FLAVOR -> PERSONALITY -> ACQUAINTED -> PERMISSIONS -> TRUST -> PAYWALL -> API_KEY -> READY`.
@@ -69,16 +69,16 @@ Three cards:
 - Provider auto-detected from key prefix, or manually selected
 - Models: provider defaults from `ModelConfig`
 
-### Citros Base
-- Backend: OpenRouter with Citros-owned API key
+### Fawx Base
+- Backend: OpenRouter with Fawx-owned API key
 - **All models available** — same catalog as BYO (Haiku, Sonnet, Opus, GPT-5, Gemini, etc.)
 - Differentiated by **usage cap**, not model access
 - Default model: Haiku 4.5 (cheapest, user can switch)
 - Monthly cap: e.g. $10 worth of OpenRouter credits
 - Key provisioned server-side, delivered to app via authenticated API call
 
-### Citros Super
-- Backend: OpenRouter with Citros-owned API key
+### Fawx Super
+- Backend: OpenRouter with Fawx-owned API key
 - **All models available** — same catalog
 - Higher usage cap: e.g. $50 worth of OpenRouter credits
 - Default model: Sonnet 4.5 chat + Haiku actions (user can switch)
@@ -91,7 +91,7 @@ Three cards:
 - Smart defaults: Base defaults to Haiku (stretches cap), Super defaults to Sonnet
 
 ### Server-Side (Future)
-- Citros API server (TBD — could be simple Express/FastAPI)
+- Fawx API server (TBD — could be simple Express/FastAPI)
 - User accounts + Stripe billing
 - OpenRouter key pool management (per-user provisioned keys or single key with user tracking)
 - Per-user usage tracking against monthly cap
@@ -229,4 +229,4 @@ fun WalletState.activeConfig(keyStore: EncryptedKeyStore): ProviderConfig? {
 
 3. Sign-in flow (BYO) writes to wallet instead of `cloud_token`
 
-4. Citros tier (future) injects a managed key into the wallet with `label: "Citros Base"` / `"Citros Super"`
+4. Fawx tier (future) injects a managed key into the wallet with `label: "Fawx Base"` / `"Fawx Super"`

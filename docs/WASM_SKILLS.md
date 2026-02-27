@@ -1,6 +1,6 @@
 # WASM Skills System
 
-Citros's WASM skills system provides a secure, sandboxed environment for extending agent capabilities through WebAssembly modules.
+Fawx's WASM skills system provides a secure, sandboxed environment for extending agent capabilities through WebAssembly modules.
 
 ## Architecture
 
@@ -31,12 +31,12 @@ Citros's WASM skills system provides a secure, sandboxed environment for extendi
    - Manages execution lifecycle
 
 5. **Registry**
-   - Discovers installed skills from `~/.citros/skills/`
+   - Discovers installed skills from `~/.fawx/skills/`
    - Loads skills on demand
    - Provides metadata for agent planning
 
 6. **Cache**
-   - Caches compiled modules at `~/.citros/cache/skills/`
+   - Caches compiled modules at `~/.fawx/cache/skills/`
    - Invalidates on WASM file hash change
    - Speeds up repeated skill loads
 
@@ -65,22 +65,22 @@ Capabilities are enforced at runtime. Skills cannot access resources they haven'
 ### Installation
 
 ```bash
-citros skill install path/to/skill-directory
+fawx skill install path/to/skill-directory
 # or
-citros skill install path/to/skill.wasm
+fawx skill install path/to/skill.wasm
 ```
 
 Installation:
 - Validates manifest
 - Verifies WASM module compiles
-- Copies to `~/.citros/skills/{skill-name}/`
+- Copies to `~/.fawx/skills/{skill-name}/`
 - Optionally verifies signature
 
 ### Discovery
 
 The agent automatically discovers installed skills at startup:
 
-1. Registry scans `~/.citros/skills/`
+1. Registry scans `~/.fawx/skills/`
 2. Loads all manifests
 3. Converts skills to Claude tool definitions
 4. Includes in planning context
@@ -105,7 +105,7 @@ When the agent invokes a skill:
 name = "calculator"
 version = "1.0.0"
 description = "Evaluates mathematical expressions"
-author = "Citros Team"
+author = "Fawx Team"
 api_version = "host_api_v1"
 capabilities = []
 entry_point = "run"
@@ -173,7 +173,7 @@ cargo build --target wasm32-wasi --release
 ### Install
 
 ```bash
-citros skill install target/wasm32-wasi/release/calculator_skill.wasm
+fawx skill install target/wasm32-wasi/release/calculator_skill.wasm
 ```
 
 ### Use
@@ -272,7 +272,7 @@ When the agent decides to use a skill:
 ### List Skills
 
 ```bash
-citros skill list
+fawx skill list
 ```
 
 Output:
@@ -290,21 +290,21 @@ Installed skills:
 ### Install Skill
 
 ```bash
-citros skill install skills/calculator-skill
-citros skill install skills/calculator-skill/calculator.wasm
+fawx skill install skills/calculator-skill
+fawx skill install skills/calculator-skill/calculator.wasm
 ```
 
 ### Remove Skill
 
 ```bash
-citros skill remove calculator
+fawx skill remove calculator
 ```
 
 ## Performance
 
 ### Module Caching
 
-- Compiled modules cached at `~/.citros/cache/skills/`
+- Compiled modules cached at `~/.fawx/cache/skills/`
 - Cache keyed by WASM file SHA-256 hash
 - First load: ~100ms compile time
 - Cached load: ~1ms deserialize time
@@ -335,7 +335,7 @@ citros skill remove calculator
 
 ### Performance Issues
 
-- Clear cache: `rm -rf ~/.citros/cache/skills/`
+- Clear cache: `rm -rf ~/.fawx/cache/skills/`
 - Check skill doesn't have infinite loops
 - Profile skill execution time
 - Consider optimizing WASM binary size

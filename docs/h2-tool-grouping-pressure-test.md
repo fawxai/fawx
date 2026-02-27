@@ -1,6 +1,6 @@
 # Pressure Test: Tool Grouping (#557)
 
-**Issue:** [#557](https://github.com/abbudjoe/citros/issues/557)
+**Issue:** [#557](https://github.com/abbudjoe/fawx/issues/557)
 **Date:** 2026-02-21
 **Reference Implementation:** OpenClaw v0.x (reverse-engineered from minified dist)
 
@@ -149,7 +149,7 @@ Subagents get `promptMode = "minimal"`:
 
 ---
 
-## 2. Citros Current Design
+## 2. Fawx Current Design
 
 ### 2.1 Current State
 - **31 tools** across `PhoneTools.kt` (28 in `ALL` + 3 in `API_TOOLS`), all sent every turn
@@ -171,7 +171,7 @@ Subagents get `promptMode = "minimal"`:
 
 ## 3. Comparison
 
-| Dimension | OpenClaw | Citros Current | Citros #557 Plan |
+| Dimension | OpenClaw | Fawx Current | Fawx #557 Plan |
 |---|---|---|---|
 | **Discovery** | Plugin-based, filesystem scan, frontmatter metadata | Hardcoded in `PhoneAgentApi.kt` | TBD |
 | **Prompt injection** | Compact XML listing (~100-200 chars/skill) + on-demand `read` | Full JSON schemas every turn (~3-4K tokens) | Group-based subset |
@@ -187,23 +187,23 @@ Subagents get `promptMode = "minimal"`:
 
 ### 4.1 Critical (Must Address Before Implementation)
 
-1. **No on-demand tool description loading.** OpenClaw's key insight is separating the *listing* (compact, always present) from the *instructions* (loaded on demand via `read`). Citros sends full schemas every turn. Even with grouping, if you send full schemas for a group, you're still burning tokens unnecessarily. **Recommendation:** Consider a two-tier approach where tool summaries are always present but detailed parameter schemas are loaded on demand or deferred.
+1. **No on-demand tool description loading.** OpenClaw's key insight is separating the *listing* (compact, always present) from the *instructions* (loaded on demand via `read`). Fawx sends full schemas every turn. Even with grouping, if you send full schemas for a group, you're still burning tokens unnecessarily. **Recommendation:** Consider a two-tier approach where tool summaries are always present but detailed parameter schemas are loaded on demand or deferred.
 
-2. **No tool policy pipeline.** OpenClaw has 7+ configurable policy layers that can restrict tools per provider, per agent, per group, and per session type. Citros has a single `getToolsForModel()` binary filter. Tool grouping without policy layering means you can't restrict tools for safety contexts (e.g., group chats, automated sessions). **Recommendation:** Design at minimum a 3-layer policy: global → model-tier → context (main/subagent/automation).
+2. **No tool policy pipeline.** OpenClaw has 7+ configurable policy layers that can restrict tools per provider, per agent, per group, and per session type. Fawx has a single `getToolsForModel()` binary filter. Tool grouping without policy layering means you can't restrict tools for safety contexts (e.g., group chats, automated sessions). **Recommendation:** Design at minimum a 3-layer policy: global → model-tier → context (main/subagent/automation).
 
-3. **Soft dangerous tool gating.** OpenClaw explicitly hard-gates `exec`, `fs_write`, `fs_delete` for ACP surfaces. Citros has `ActionVerifier` with `VerificationMode` (NEVER/ALWAYS/etc.) which provides per-action confirmation — a natural extension point for soft gating. **Recommendation:** Define a dangerous tools list (e.g., `write_file` to system paths, `open_app` on sensitive apps) and route through `ActionVerifier` with user confirmation prompts. Soft gating (confirm before execute) fits the single-user phone context better than hard deny lists.
+3. **Soft dangerous tool gating.** OpenClaw explicitly hard-gates `exec`, `fs_write`, `fs_delete` for ACP surfaces. Fawx has `ActionVerifier` with `VerificationMode` (NEVER/ALWAYS/etc.) which provides per-action confirmation — a natural extension point for soft gating. **Recommendation:** Define a dangerous tools list (e.g., `write_file` to system paths, `open_app` on sensitive apps) and route through `ActionVerifier` with user confirmation prompts. Soft gating (confirm before execute) fits the single-user phone context better than hard deny lists.
 
 ### 4.2 Deferred (File as Issues)
 
-4. **No plugin/skill architecture.** OpenClaw's filesystem-based skill discovery enables third-party extensions without code changes. Citros's hardcoded tools require app releases for new capabilities. This is fine for a mobile app MVP but should be planned for H3+.
+4. **No plugin/skill architecture.** OpenClaw's filesystem-based skill discovery enables third-party extensions without code changes. Fawx's hardcoded tools require app releases for new capabilities. This is fine for a mobile app MVP but should be planned for H3+.
 
-5. **No skill source scanning.** OpenClaw scans skill code for dangerous patterns (eval, exfiltration, crypto mining). Not relevant until Citros has a plugin system, but should be designed alongside it.
+5. **No skill source scanning.** OpenClaw scans skill code for dangerous patterns (eval, exfiltration, crypto mining). Not relevant until Fawx has a plugin system, but should be designed alongside it.
 
-6. **No prompt budget control.** OpenClaw binary-searches to fit skills within a char budget. Citros should have a similar mechanism to prevent tool descriptions from consuming too much of the context window, especially on smaller models.
+6. **No prompt budget control.** OpenClaw binary-searches to fit skills within a char budget. Fawx should have a similar mechanism to prevent tool descriptions from consuming too much of the context window, especially on smaller models.
 
 ### 4.3 Intentional Divergences
 
-7. **All tools every turn vs. grouped subsets.** Citros's plan to send *subsets* per turn based on context is actually more aggressive optimization than OpenClaw, which sends all tool schemas every turn. This is a valid design choice for a mobile app with tighter token budgets, but carries risk: if the model needs a tool that wasn't included in the current group, it can't use it. **Mitigation:** Include a "request more tools" meta-tool or always include a core set.
+7. **All tools every turn vs. grouped subsets.** Fawx's plan to send *subsets* per turn based on context is actually more aggressive optimization than OpenClaw, which sends all tool schemas every turn. This is a valid design choice for a mobile app with tighter token budgets, but carries risk: if the model needs a tool that wasn't included in the current group, it can't use it. **Mitigation:** Include a "request more tools" meta-tool or always include a core set.
 
 8. **No filesystem-based skills.** Mobile app can't have filesystem plugins. The grouping mechanism in code serves the same purpose. This is intentional and correct for the platform.
 

@@ -15,7 +15,7 @@ This document describes how to vendor llama.cpp source code for compilation.
 ### Option 1: Git Submodule (Recommended)
 
 ```bash
-# From citros repo root
+# From fawx repo root
 cd engine/crates/llama-cpp-sys
 git submodule add -b b1696 https://github.com/ggerganov/llama.cpp vendor/llama.cpp
 git submodule update --init --recursive

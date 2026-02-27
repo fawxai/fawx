@@ -31,7 +31,7 @@ export default function MockIndex() {
       maxWidth: 640, margin: "0 auto",
     }}>
       <h1 style={{ fontSize: 28, fontWeight: 800, letterSpacing: -0.8, margin: 0 }}>
-        Citros UI Mockups
+        Fawx UI Mockups
       </h1>
       <p style={{ fontSize: 15, color: "rgba(235,235,245,0.60)", letterSpacing: -0.2, margin: `${g(1.5)}px 0 ${g(8)}px`, lineHeight: "22px" }}>
         Every screen in the app, rebuilt with consistent design rules. Each mockup supports dark/light theme switching, all 5 flavor options, and the "No Flavor" monochrome mode.

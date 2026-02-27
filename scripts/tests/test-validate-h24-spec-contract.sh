@@ -218,13 +218,13 @@ make_variant() {
       sed_inplace 's/\*\*Baseline evidence snapshot commit:\*\* `9af3ce894999`/**Baseline evidence snapshot commit:** `111111111111`/' "$to"
       ;;
     fail-missing-adapt-heading)
-      awk '$0 != "### 3.2 What to Adapt (Citros-Specific)"' "$to" >"$to.tmp" && mv "$to.tmp" "$to"
+      awk '$0 != "### 3.2 What to Adapt (Fawx-Specific)"' "$to" >"$to.tmp" && mv "$to.tmp" "$to"
       ;;
     fail-missing-do-not-copy-heading)
       awk '$0 != "### 3.3 What Not to Copy"' "$to" >"$to.tmp" && mv "$to.tmp" "$to"
       ;;
     fail-missing-adapt-bullet)
-      awk '$0 != "1. OpenClaw is session-type first; Citros needs both session-type and model-tier behavior."' "$to" >"$to.tmp" && mv "$to.tmp" "$to"
+      awk '$0 != "1. OpenClaw is session-type first; Fawx needs both session-type and model-tier behavior."' "$to" >"$to.tmp" && mv "$to.tmp" "$to"
       ;;
     fail-missing-do-not-copy-bullet)
       awk '$0 != "1. Weakening safety text for smaller models."' "$to" >"$to.tmp" && mv "$to.tmp" "$to"
@@ -300,9 +300,9 @@ copy-bullet-1	missing section 3.1 required bullet	1. Prompt modes as an explicit
 copy-bullet-2	missing section 3.1 required bullet	2. Conditional section inclusion as policy, not ad hoc string editing.	2. Conditional section inclusion as policy.
 copy-bullet-3	missing section 3.1 required bullet	3. Runtime metadata injected into prompt for model self-awareness.	3. Runtime metadata injected for model self-awareness.
 copy-bullet-4	missing section 3.1 required bullet	4. Treat prompt size as a resource with hard limits and deterministic trimming.	4. Treat prompt size as a resource with hard limits.
-adapt-bullet-1	missing section 3.2 required bullet	1. OpenClaw is session-type first; Citros needs both session-type and model-tier behavior.	1. OpenClaw is session-type first; Citros needs model-tier behavior.
-adapt-bullet-2	missing section 3.2 required bullet	2. OpenClaw skill loading is filesystem/plugin oriented; Citros is fixed-tool mobile architecture.	2. OpenClaw skill loading is plugin oriented; Citros is mobile architecture.
-adapt-bullet-3	missing section 3.2 required bullet	3. Citros must prioritize mobile latency and token cost more aggressively on `SMALL` tier.	3. Citros must prioritize latency on `SMALL` tier.
+adapt-bullet-1	missing section 3.2 required bullet	1. OpenClaw is session-type first; Fawx needs both session-type and model-tier behavior.	1. OpenClaw is session-type first; Fawx needs model-tier behavior.
+adapt-bullet-2	missing section 3.2 required bullet	2. OpenClaw skill loading is filesystem/plugin oriented; Fawx is fixed-tool mobile architecture.	2. OpenClaw skill loading is plugin oriented; Fawx is mobile architecture.
+adapt-bullet-3	missing section 3.2 required bullet	3. Fawx must prioritize mobile latency and token cost more aggressively on `SMALL` tier.	3. Fawx must prioritize latency on `SMALL` tier.
 do-not-copy-bullet-1	missing section 3.3 required bullet	1. Weakening safety text for smaller models.	1. Weakening safety text.
 do-not-copy-bullet-2	missing section 3.3 required bullet	2. Adding large plugin/skills complexity into H2 prompt tuning scope.	2. Adding plugin complexity into H2 scope.
 do-not-copy-bullet-3	missing section 3.3 required bullet	3. Overfitting to provider-specific quirks in this H2.4 slice.	3. Overfitting to provider quirks in this H2.4 slice.
@@ -468,7 +468,7 @@ assert_fail_contains \
   run_validator "$BASELINE_COMMIT_DRIFT_FILE"
 assert_fail_contains \
   "missing adapt heading is rejected" \
-  "missing required line: ### 3.2 What to Adapt (Citros-Specific)" \
+  "missing required line: ### 3.2 What to Adapt (Fawx-Specific)" \
   run_validator "$MISSING_ADAPT_HEADING_FILE"
 assert_fail_contains \
   "missing do-not-copy heading is rejected" \

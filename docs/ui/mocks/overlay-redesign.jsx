@@ -78,7 +78,7 @@ export default function OverlayRedesign() {
           Overlay Modes Comparison
         </h2>
         <p style={{ fontSize: 14, color: t.secondary, margin: "0 0 16px" }}>
-          How Citros appears over other apps — current vs proposed alternatives
+          How Fawx appears over other apps — current vs proposed alternatives
         </p>
 
         <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center", marginBottom: 12 }}>
@@ -273,7 +273,7 @@ export default function OverlayRedesign() {
                       }}>
                         <div style={{ width: 12, height: 12, borderRadius: "50%", background: "rgba(0,0,0,0.15)" }} />
                       </div>
-                      <span style={{ fontSize: 15, fontWeight: 600, flex: 1, letterSpacing: -0.2 }}>Citros</span>
+                      <span style={{ fontSize: 15, fontWeight: 600, flex: 1, letterSpacing: -0.2 }}>Fawx</span>
                       <button style={{
                         background: t.elevated, border: "none", borderRadius: 14,
                         padding: "5px 12px", fontSize: 13, color: t.secondary, cursor: "pointer",
@@ -376,7 +376,7 @@ export default function OverlayRedesign() {
                       display: "flex", alignItems: "center", justifyContent: "center" }}>
                       <div style={{ width: 12, height: 12, borderRadius: "50%", background: "rgba(0,0,0,0.15)" }} />
                     </div>
-                    <span style={{ fontSize: 14, fontWeight: 500, color: "#fff" }}>Citros</span>
+                    <span style={{ fontSize: 14, fontWeight: 500, color: "#fff" }}>Fawx</span>
                   </div>
                 </div>
 
@@ -473,7 +473,7 @@ export default function OverlayRedesign() {
           <div>
             <div style={{ fontWeight: 600, color: f.primary, marginBottom: 4, fontSize: 13 }}>Dynamic Island (New)</div>
             <p style={{ margin: 0 }}>
-              Inspired by the iPhone's Dynamic Island. Citros lives at the top of the screen as a compact pill that expands contextually — showing status during execution, results on completion, and collapsing to minimal when idle. Feels native to iOS users.
+              Inspired by the iPhone's Dynamic Island. Fawx lives at the top of the screen as a compact pill that expands contextually — showing status during execution, results on completion, and collapsing to minimal when idle. Feels native to iOS users.
             </p>
           </div>
           <div>

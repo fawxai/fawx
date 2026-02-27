@@ -6,7 +6,7 @@ import { useState } from "react";
  * Search Bar, Slide-up Panel, Dynamic Island — with orb glow.
  *
  * The Search Bar overlay replaces the Pixel's bottom Google bar.
- * Same position, same pill shape, but it's Citros. The orb sits
+ * Same position, same pill shape, but it's Fawx. The orb sits
  * where the G logo would be, and the bar shows live status,
  * a quick-ask hint, and a mic button. Tapping expands to panel.
  *
@@ -196,7 +196,7 @@ const SearchBarOverlay = ({ state, flavor, t }) => {
     );
     if (state === "unread") return (
       <div style={{ flex: 1, display: "flex", alignItems: "center", gap: g(2), minWidth: 0 }}>
-        <span style={{ fontSize: 14, color: t.labelTertiary, letterSpacing: -0.15 }}>Ask Citros anything...</span>
+        <span style={{ fontSize: 14, color: t.labelTertiary, letterSpacing: -0.15 }}>Ask Fawx anything...</span>
         <div style={{ flex: 1 }} />
         <div style={{
           minWidth: g(5), height: g(5), borderRadius: g(2.5), background: t.red,
@@ -210,7 +210,7 @@ const SearchBarOverlay = ({ state, flavor, t }) => {
     /* idle */
     return (
       <div style={{ flex: 1, display: "flex", alignItems: "center", minWidth: 0 }}>
-        <span style={{ fontSize: 14, color: t.labelTertiary, letterSpacing: -0.15 }}>Ask Citros anything...</span>
+        <span style={{ fontSize: 14, color: t.labelTertiary, letterSpacing: -0.15 }}>Ask Fawx anything...</span>
       </div>
     );
   };
@@ -273,7 +273,7 @@ const PanelOverlay = ({ state, flavor, t }) => (
     </div>
     <div style={{ display: "flex", alignItems: "center", gap: g(2.5), padding: `${g(1.5)}px ${g(4)}px ${g(2.5)}px` }}>
       <Orb color={orbClr(flavor, t)} inner={orbInn(flavor, t)} glow={orbGlw(flavor, t)} size={g(7)} />
-      <span style={{ fontSize: 15, fontWeight: 600, flex: 1, letterSpacing: -0.2, color: t.labelPrimary }}>Citros</span>
+      <span style={{ fontSize: 15, fontWeight: 600, flex: 1, letterSpacing: -0.2, color: t.labelPrimary }}>Fawx</span>
       <button style={{ background: t.surface2, border: "none", borderRadius: g(3.5), padding: `${g(1.25)}px ${g(3)}px`, fontSize: 13, color: t.labelSecondary, cursor: "pointer" }}>Expand</button>
     </div>
     <div style={{ padding: `0 ${g(4)}px ${g(2)}px` }}>
@@ -341,7 +341,7 @@ const IslandOverlay = ({ state, flavor, t }) => {
         size={isExpanded ? g(8) : g(7)}
       />
       {state === "idle" && (
-        <span style={{ fontSize: 14, fontWeight: 500, color: titleColor, letterSpacing: -0.2 }}>Citros</span>
+        <span style={{ fontSize: 14, fontWeight: 500, color: titleColor, letterSpacing: -0.2 }}>Fawx</span>
       )}
       {state === "executing" && (
         <>
@@ -386,7 +386,7 @@ export default function OverlayScreen() {
       <div style={{ width: "100%", maxWidth: 460, marginBottom: g(5) }}>
         <h1 style={{ fontSize: 24, fontWeight: 700, letterSpacing: -0.6, margin: 0 }}>Overlay Modes</h1>
         <p style={{ fontSize: 15, color: ct.labelSecondary, letterSpacing: -0.2, margin: `${g(1.5)}px 0 ${g(5)}px`, lineHeight: "22px" }}>
-          How Citros appears over other apps. The search bar replaces the Pixel's Google bar.
+          How Fawx appears over other apps. The search bar replaces the Pixel's Google bar.
         </p>
 
         <div style={{ display: "flex", gap: g(4), flexWrap: "wrap", marginBottom: g(5) }}>

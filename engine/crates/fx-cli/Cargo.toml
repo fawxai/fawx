@@ -1,0 +1,51 @@
+[package]
+name = "fx-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "fawx"
+path = "src/main.rs"
+
+# Hello-world binary used to validate Android NDK cross-compilation setup (issue #118).
+# Toolchain verification only; not part of production agent runtime.
+[[bin]]
+name = "android-hello"
+path = "src/bin/android_hello.rs"
+
+[dependencies]
+fx-core.workspace = true
+fx-kernel.workspace = true
+fx-llm = { path = "../fx-llm" }
+fx-security.workspace = true
+fx-skills = { path = "../fx-skills" }
+fx-storage.workspace = true
+clap.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+crossterm.workspace = true
+futures.workspace = true
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+reqwest.workspace = true
+axum = "0.8"
+uuid = { version = "1.13", features = ["v4"] }
+rand = "0.8"
+sha2 = "0.10"
+base64 = "0.22"
+dirs = "6.0"
+chrono = "0.4"
+subtle = "2.6"
+urlencoding = "2.1"
+
+[dev-dependencies]
+tempfile = "3.14"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+hyper = "1.0"

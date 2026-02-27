@@ -113,7 +113,7 @@ These are **not** pre-execution gates — they're runtime errors that become too
 
 ---
 
-## Citros Current State
+## Fawx Current State
 
 ### What we have:
 1. **Inline pre-tool accessibility check** in AgentExecutor (Layer 2 equivalent):
@@ -138,16 +138,16 @@ These are **not** pre-execution gates — they're runtime errors that become too
 
 ## Comparison & Design Decisions
 
-### OpenClaw Pattern → Citros Equivalent
+### OpenClaw Pattern → Fawx Equivalent
 
-| OpenClaw Layer | Mechanism | Citros Equivalent | Status |
+| OpenClaw Layer | Mechanism | Fawx Equivalent | Status |
 |---|---|---|---|
 | Session init policy | `filterToolsByPolicy()` pipeline | `buildSystemPrompt(phoneControlAvailable)` | ✅ Done (prompt-level) |
 | Per-tool-call hook | `wrapToolWithBeforeToolCallHook()` | **Boundary check + pre-batch check** | 🔧 PR 5 |
 | Skill eligibility | `shouldIncludeSkill()` + `hasBinary()` | N/A (single app, no skill system yet) | Deferred to H2 |
 | Runtime error | `throw new Error("node unavailable")` | `"Failed: accessibility service detached..."` | ✅ Done (inline) |
 
-### Key Difference: OpenClaw wraps tools, Citros checks at boundaries
+### Key Difference: OpenClaw wraps tools, Fawx checks at boundaries
 
 OpenClaw's `wrapToolWithBeforeToolCallHook` wraps each tool's `execute` function with a pre-check. The gate is per-tool, per-call, with full access to the tool name and parameters.
 
@@ -156,7 +156,7 @@ Our boundary check system runs between tools, not wrapping individual tool execu
 - We don't have access to tool N+1's name/params at the boundary check point
 - First tool in a batch needs a separate pre-batch check
 
-### Why boundary checks are the right fit for Citros (for now)
+### Why boundary checks are the right fit for Fawx (for now)
 
 1. **We have exactly one gating concern:** accessibility. OpenClaw has dozens (node availability, sandbox state, plugin hooks, policy matching). Their `wrapToolWithBeforeToolCallHook` pattern makes sense for a plugin ecosystem. We don't have plugins.
 
@@ -166,7 +166,7 @@ Our boundary check system runs between tools, not wrapping individual tool execu
 
 4. **The wait/retry mechanism fits suspend checks:** Making `BoundaryCheck.check` a `suspend fun` lets AccessibilityGateCheck do the wait/reconnect logic cleanly. Existing checks don't suspend, so backward compatible.
 
-### What Citros should adopt from OpenClaw (future):
+### What Fawx should adopt from OpenClaw (future):
 
 1. **`wrapToolWithBeforeToolCallHook` pattern** — when we add the WASM skill system (H3) or MCP tools, we'll need per-tool pre-execution hooks. The boundary check system won't be enough for per-tool parameter inspection.
 

@@ -1,7 +1,7 @@
 # Retroactive Pressure Test: Provider Abstraction
 
 *Pressure test for #478 — Tier 2 retroactive audit*
-*Citros: `BaseProviderClient.kt`, `AnthropicClient.kt`, `OpenAiClientImpl.kt`, `OpenRouterClientImpl.kt`, `PhoneAgentApi.kt` | OpenClaw: `types.ts` (Model/StreamFn), pi-ai streaming layer*
+*Fawx: `BaseProviderClient.kt`, `AnthropicClient.kt`, `OpenAiClientImpl.kt`, `OpenRouterClientImpl.kt`, `PhoneAgentApi.kt` | OpenClaw: `types.ts` (Model/StreamFn), pi-ai streaming layer*
 
 ---
 
@@ -40,11 +40,11 @@ Errors from the streaming layer surface as `stopReason: "error"` on the assistan
 
 ---
 
-## 2. Citros's Architecture
+## 2. Fawx's Architecture
 
 ### Provider Abstraction
 
-Citros uses an explicit class hierarchy:
+Fawx uses an explicit class hierarchy:
 
 ```
 ProviderClient (interface)
@@ -145,15 +145,15 @@ data class ProviderConfig(
 
 ## 3. Comparison Table
 
-| Aspect | OpenClaw | Citros | Notes |
+| Aspect | OpenClaw | Fawx | Notes |
 |--------|----------|--------|-------|
 | **Abstraction style** | Function-based (`streamSimple`) | Class hierarchy (inheritance) | Different paradigms |
-| **Provider count** | Many (via pi-ai) | 3 (Anthropic, OpenAI, OpenRouter) | Citros can add more |
-| **Dual-model** | ❌ Single model per loop | ✅ chatClient + actionClient | Citros advantage for cost |
+| **Provider count** | Many (via pi-ai) | 3 (Anthropic, OpenAI, OpenRouter) | Fawx can add more |
+| **Dual-model** | ❌ Single model per loop | ✅ chatClient + actionClient | Fawx advantage for cost |
 | **Model floor** | Not in core | ✅ `ModelConfig.isModelAboveFloor()` | Security measure |
 | **Retry policy** | Not in core loop | ✅ 429-only with exponential backoff | Well-designed |
 | **Daily limit detection** | Unknown | ✅ Detects OpenAI/OpenRouter daily caps | Avoids pointless retries |
-| **Error messages** | Stream-level error | Per-status-code human-readable messages | Citros better UX |
+| **Error messages** | Stream-level error | Per-status-code human-readable messages | Fawx better UX |
 | **Prompt caching** | Via pi-ai | ✅ Anthropic `cache_control` explicit | -90% cost on cache hits |
 | **Dynamic API keys** | ✅ `getApiKey()` per call | ❌ Static keys at construction | See D1 |
 | **Streaming** | ✅ Token-level streaming | ❌ Request/response (non-streaming) | See D2 |
@@ -174,12 +174,12 @@ data class ProviderConfig(
 ### Deferred
 
 #### D1: No Dynamic API Key Resolution
-**Gap:** OpenClaw supports `getApiKey()` per LLM call for expiring tokens (OAuth). Citros passes API keys at construction time.
+**Gap:** OpenClaw supports `getApiKey()` per LLM call for expiring tokens (OAuth). Fawx passes API keys at construction time.
 **Impact:** Can't support OAuth-based providers (e.g., future GitHub Copilot integration) or key rotation during long-running sessions.
 **Recommendation:** H3 — add optional `apiKeyResolver: suspend (Provider) -> String?` to `ProviderConfig` or `PhoneAgentApi`. Low priority unless OAuth providers are planned.
 
 #### D2: No Streaming Support
-**Gap:** OpenClaw streams tokens as they arrive. Citros waits for the complete response.
+**Gap:** OpenClaw streams tokens as they arrive. Fawx waits for the complete response.
 **Impact:** Perceived latency — user sees nothing during model thinking (can be 5-15 seconds for complex queries). Especially noticeable for the chat client (Sonnet).
 **Recommendation:** H2 — streaming for the chat path would significantly improve UX. The action loop (Haiku) is fast enough that streaming is less critical.
 **File as issue:** Yes.
@@ -198,16 +198,16 @@ data class ProviderConfig(
 ### Intentional Divergences
 
 #### I1: Class Hierarchy vs Function-Based
-Citros uses OOP class hierarchy; OpenClaw uses function composition. Both are valid. The class hierarchy maps naturally to Kotlin/Android patterns and provides clear extension points via template methods.
+Fawx uses OOP class hierarchy; OpenClaw uses function composition. Both are valid. The class hierarchy maps naturally to Kotlin/Android patterns and provides clear extension points via template methods.
 
 #### I2: Dual-Model Architecture
-Citros's chatClient/actionClient split enables cost optimization (expensive model for planning, cheap model for action execution). OpenClaw uses a single model. This is a Citros advantage — important for mobile where API costs matter more (user-funded vs developer-funded).
+Fawx's chatClient/actionClient split enables cost optimization (expensive model for planning, cheap model for action execution). OpenClaw uses a single model. This is a Fawx advantage — important for mobile where API costs matter more (user-funded vs developer-funded).
 
 #### I3: Non-Streaming (Current)
 Streaming is deferred, not omitted by design. The action loop (Haiku) has sub-second response times where streaming adds complexity without perceived benefit. The chat path would benefit, hence D2.
 
 #### I4: Prompt Caching (Anthropic-Specific)
-Citros explicitly manages Anthropic's prompt caching headers. OpenClaw handles this inside pi-ai. Both achieve the same -90% cost benefit. Citros's explicit approach gives more control over what gets cached (system prompt + last tool definition).
+Fawx explicitly manages Anthropic's prompt caching headers. OpenClaw handles this inside pi-ai. Both achieve the same -90% cost benefit. Fawx's explicit approach gives more control over what gets cached (system prompt + last tool definition).
 
 ---
 

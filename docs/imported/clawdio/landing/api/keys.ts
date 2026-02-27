@@ -24,7 +24,7 @@ export default async function handler(req: Request) {
     .process?.env ?? {};
 
   // Require Bearer auth with the compiled app token.
-  const appToken = env.CITROS_APP_TOKEN;
+  const appToken = env.FAWX_APP_TOKEN;
   if (!appToken) {
     return jsonError('Service not configured', 503);
   }

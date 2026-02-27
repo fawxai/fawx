@@ -1,9 +1,9 @@
-# Android Root Setup (Magisk) for Citros
+# Android Root Setup (Magisk) for Fawx
 
-> Issue: [#131](https://github.com/abbudjoe/citros/issues/131)  
+> Issue: [#131](https://github.com/abbudjoe/fawx/issues/131)  
 > Audience: developers preparing a dedicated test device for Horizon 1
 
-This guide documents a **repeatable, safety-first** process for preparing a rooted Android device (Pixel recommended) for Citros development.
+This guide documents a **repeatable, safety-first** process for preparing a rooted Android device (Pixel recommended) for Fawx development.
 
 ## Read This First (Safety + Risk)
 
@@ -138,7 +138,7 @@ adb shell su -c id
 
 Expected output includes `uid=0(root)`.
 
-Optional checks relevant for Citros bring-up:
+Optional checks relevant for Fawx bring-up:
 
 ```bash
 adb shell getenforce  # Should output "Enforcing"
@@ -151,27 +151,27 @@ adb shell getenforce  # Should output "Enforcing"
 
 ## 7) Magisk Hide / SafetyNet Compatibility
 
-### Does Citros require root?
+### Does Fawx require root?
 
-**No.** Citros uses Android's Accessibility Service API for screen reading and phone control — this is a standard, non-root Android API. Root is only needed for the optional Rust daemon (`ct-cli`) component.
+**No.** Fawx uses Android's Accessibility Service API for screen reading and phone control — this is a standard, non-root Android API. Root is only needed for the optional Rust daemon (`ct-cli`) component.
 
 ### SafetyNet / Play Integrity
 
-Since Citros's core phone control runs through Accessibility Service (not root), Magisk Hide / Zygisk DenyList should not affect Citros functionality. Banking apps and other SafetyNet-dependent apps can coexist with Citros on the same device.
+Since Fawx's core phone control runs through Accessibility Service (not root), Magisk Hide / Zygisk DenyList should not affect Fawx functionality. Banking apps and other SafetyNet-dependent apps can coexist with Fawx on the same device.
 
 ### Edge cases with Magisk
 
-If you **are** running Citros on a rooted device with Magisk:
+If you **are** running Fawx on a rooted device with Magisk:
 
-- **Do NOT add Citros to the Magisk DenyList** — this would prevent the optional Rust daemon from accessing root if needed
-- **Magisk modules that modify the accessibility framework** (e.g., Xposed modules targeting `AccessibilityService`) may interfere with Citros — disable them if you encounter issues
-- **SELinux policy modules** — keep SELinux in Enforcing mode. If a Magisk module switches to Permissive, revert it. Citros doesn't need Permissive mode.
-- **App cloning / dual-space modules** — Citros is not tested in cloned app environments and may not function correctly
+- **Do NOT add Fawx to the Magisk DenyList** — this would prevent the optional Rust daemon from accessing root if needed
+- **Magisk modules that modify the accessibility framework** (e.g., Xposed modules targeting `AccessibilityService`) may interfere with Fawx — disable them if you encounter issues
+- **SELinux policy modules** — keep SELinux in Enforcing mode. If a Magisk module switches to Permissive, revert it. Fawx doesn't need Permissive mode.
+- **App cloning / dual-space modules** — Fawx is not tested in cloned app environments and may not function correctly
 
-### Recommended Magisk configuration for Citros development
+### Recommended Magisk configuration for Fawx development
 
 1. Keep Magisk DenyList **enabled** for banking/payment apps only
-2. Do **not** add Citros to the DenyList
+2. Do **not** add Fawx to the DenyList
 3. Avoid broad SELinux policy modules during testing
 4. If issues arise, test with all Magisk modules disabled to isolate the cause
 
@@ -198,7 +198,7 @@ fastboot reboot
 
 ---
 
-## 9) Citros Next Steps After Root
+## 9) Fawx Next Steps After Root
 
 Once rooted, continue with:
 

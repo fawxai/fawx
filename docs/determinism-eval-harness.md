@@ -17,7 +17,7 @@ Domains covered in both modes:
 ## Command
 
 ```bash
-citros eval-determinism \
+fawx eval-determinism \
   --mode ci-lite \
   --output .ci/determinism/latest-report.json \
   --baseline .ci/determinism/baseline-ci-lite.json
@@ -26,7 +26,7 @@ citros eval-determinism \
 Nightly/manual full run:
 
 ```bash
-citros eval-determinism \
+fawx eval-determinism \
   --mode full \
   --output .ci/determinism/latest-full-report.json \
   --baseline .ci/determinism/baseline-full.json
@@ -35,7 +35,7 @@ citros eval-determinism \
 Update baseline snapshot:
 
 ```bash
-citros eval-determinism --mode full --update-baseline
+fawx eval-determinism --mode full --update-baseline
 ```
 
 ## CI automation

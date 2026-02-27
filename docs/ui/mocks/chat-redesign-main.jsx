@@ -130,7 +130,7 @@ const SUGGESTIONS = [
   "Set my phone to DND",
 ];
 
-export default function CitrosChatRedesign() {
+export default function FawxChatRedesign() {
   const [design, setDesign] = useState("proposed");
   const [flavor, setFlavor] = useState("tangerine");
   const [inputText, setInputText] = useState("");
@@ -267,7 +267,7 @@ export default function CitrosChatRedesign() {
               <div style={{ width: 16, height: 16, borderRadius: "50%", background: "rgba(0,0,0,0.2)" }} />
             </div>
             <div style={{ flex: 1 }}>
-              <div style={{ fontSize: 16, fontWeight: 600, letterSpacing: -0.3 }}>Citros</div>
+              <div style={{ fontSize: 16, fontWeight: 600, letterSpacing: -0.3 }}>Fawx</div>
               <div style={{ fontSize: 12, color: tokens.labelTertiary, marginTop: -1 }}>Claude Sonnet</div>
             </div>
             <button style={{

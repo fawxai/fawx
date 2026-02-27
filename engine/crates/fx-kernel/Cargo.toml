@@ -1,0 +1,24 @@
+[package]
+name = "fx-kernel"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Fawx kernel — loop orchestration, policy engine, permissions, budget enforcement, verification, rollback, watchdog. Immutable at runtime."
+
+[dependencies]
+fx-core = { workspace = true }
+fx-storage = { workspace = true }
+fx-loadable = { workspace = true }
+fx-llm = { path = "../fx-llm" }
+
+async-trait.workspace = true
+base64 = "0.22"
+ring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

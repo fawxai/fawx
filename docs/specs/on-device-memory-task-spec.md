@@ -55,7 +55,7 @@ You need to:
 ```kotlin
 // In ChatActivity or ChatViewModel initialization:
 val memoryDb = SQLiteDatabase.openOrCreateDatabase(
-    context.getDatabasePath("citros_memories.db"),
+    context.getDatabasePath("fawx_memories.db"),
     null
 )
 val memoryProvider = SqliteMemoryProvider(memoryDb)
@@ -92,7 +92,7 @@ The SQLiteDatabase needs to be:
 ```kotlin
 // ChatActivity.onCreate:
 val memoryDb = SQLiteDatabase.openOrCreateDatabase(
-    getDatabasePath("citros_memories.db"), null
+    getDatabasePath("fawx_memories.db"), null
 )
 viewModel.setMemoryProvider(SqliteMemoryProvider(memoryDb))
 
@@ -103,7 +103,7 @@ memoryDb.close()
 **Option B (cleaner):** Use Android's `SQLiteOpenHelper` for version management:  
 ```kotlin
 class MemoryDatabaseHelper(context: Context) : SQLiteOpenHelper(
-    context, "citros_memories.db", null, 1
+    context, "fawx_memories.db", null, 1
 ) {
     override fun onCreate(db: SQLiteDatabase) {
         // SqliteMemoryProvider.init handles table creation

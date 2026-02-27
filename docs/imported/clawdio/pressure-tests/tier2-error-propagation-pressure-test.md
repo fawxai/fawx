@@ -1,7 +1,7 @@
 # Retroactive Pressure Test: Error Propagation & Visibility
 
 *Pressure test for #478 — Tier 2 retroactive audit (#480)*
-*Citros: `AgentExecutor.kt`, `PhoneAgentApi.kt`, `BaseProviderClient.kt`, `OutputClassifier.kt` | OpenClaw: `agent-loop-core.ts`, `ext-wrapper.ts`*
+*Fawx: `AgentExecutor.kt`, `PhoneAgentApi.kt`, `BaseProviderClient.kt`, `OutputClassifier.kt` | OpenClaw: `agent-loop-core.ts`, `ext-wrapper.ts`*
 
 ---
 
@@ -48,11 +48,11 @@ try {
 
 ---
 
-## 2. Citros's Architecture
+## 2. Fawx's Architecture
 
 ### Error Propagation Paths
 
-Citros has **five** error propagation layers:
+Fawx has **five** error propagation layers:
 
 **1. Tool Execution Errors** (`AgentExecutor.kt` line ~160):
 ```kotlin
@@ -187,18 +187,18 @@ API failures are converted to ChatResponse with `stopReason = "error"` and the e
 
 ## 3. Comparison Table
 
-| Aspect | OpenClaw | Citros | Notes |
+| Aspect | OpenClaw | Fawx | Notes |
 |--------|----------|--------|-------|
 | **Tool error → model** | ✅ isError flag + error text | ✅ "Failed:/Error:" prefix string | Both let model see errors |
 | **Tool error → UI** | isError on event | OutputClassifier: errors always SHOW | Both surface errors |
 | **API error handling** | stopReason: "error" → loop exit | Result.failure → ChatResponse(error) | Both exit cleanly |
-| **Retry policy** | None in core | 429-only exponential backoff | Citros more resilient |
-| **Error message format** | Raw exception message | Human-readable per status code | Citros better UX |
+| **Retry policy** | None in core | 429-only exponential backoff | Fawx more resilient |
+| **Error message format** | Raw exception message | Human-readable per status code | Fawx better UX |
 | **Error truncation** | No | 100 char limit | Prevents context pollution |
 | **Typed error flag** | ✅ `isError: boolean` | ❌ String prefix convention | See D1 |
-| **Output visibility** | Application layer | ✅ `OutputClassifier` in core | Citros baked-in |
+| **Output visibility** | Application layer | ✅ `OutputClassifier` in core | Fawx baked-in |
 | **Accessibility loss** | N/A | ✅ Graceful gate with timeout | Phone-specific |
-| **Auth failure detection** | Not explicit | ✅ `isAuthFailure` on ProviderException | Citros can prompt re-auth |
+| **Auth failure detection** | Not explicit | ✅ `isAuthFailure` on ProviderException | Fawx can prompt re-auth |
 | **Daily limit detection** | Unknown | ✅ Detects and skips retry | Smart optimization |
 | **Schema validation errors** | Pre-execution throw | Inline during execution | See D2 |
 | **Tool artifact stripping** | N/A | ✅ Regex defense-in-depth | Chat mode safety |
@@ -216,7 +216,7 @@ API failures are converted to ChatResponse with `stopReason = "error"` and the e
 ### Deferred
 
 #### D1: String-Based Error Detection
-**Gap:** Citros detects errors by string prefix (`result.startsWith("Failed")` or `result.startsWith("Error:")`). OpenClaw uses a typed `isError: boolean` flag on tool results.
+**Gap:** Fawx detects errors by string prefix (`result.startsWith("Failed")` or `result.startsWith("Error:")`). OpenClaw uses a typed `isError: boolean` flag on tool results.
 **Impact:** Fragile — if a tool legitimately returns text starting with "Failed" or "Error:", it would be misclassified as an error. Also, `OutputClassifier` is coupled to the string format.
 **Recommendation:** H2 — consider adding an `isError` flag to tool results alongside the string. Could be a simple `Pair<String, Boolean>` or a sealed class `ToolResult(text, isError)`. This decouples error detection from string content.
 **File as issue:** Yes.
@@ -239,13 +239,13 @@ API failures are converted to ChatResponse with `stopReason = "error"` and the e
 ### Intentional Divergences
 
 #### I1: Output Classification in Core
-Citros classifies tool output visibility in the executor loop. OpenClaw defers this to the application layer. Citros's approach is pragmatic — the phone UI needs real-time visibility decisions during the loop, not after.
+Fawx classifies tool output visibility in the executor loop. OpenClaw defers this to the application layer. Fawx's approach is pragmatic — the phone UI needs real-time visibility decisions during the loop, not after.
 
 #### I2: Error Message Truncation
-Citros truncates error messages to 100 characters in the executor. This prevents verbose stack traces from consuming context window tokens. OpenClaw doesn't truncate, relying on the error itself being concise.
+Fawx truncates error messages to 100 characters in the executor. This prevents verbose stack traces from consuming context window tokens. OpenClaw doesn't truncate, relying on the error itself being concise.
 
 #### I3: Human-Readable API Errors
-Citros's `formatApiErrorMessage()` converts HTTP status codes and provider-specific error bodies into user-friendly messages (e.g., "Rate limited: ... Please wait and try again" vs raw JSON). This is important for a consumer mobile app where users aren't developers.
+Fawx's `formatApiErrorMessage()` converts HTTP status codes and provider-specific error bodies into user-friendly messages (e.g., "Rate limited: ... Please wait and try again" vs raw JSON). This is important for a consumer mobile app where users aren't developers.
 
 #### I4: Auth Failure Flag
 `ProviderException.isAuthFailure` enables the UI to prompt for credential re-entry on 401/403 errors rather than showing a generic error. Good UX pattern for mobile.

@@ -9,7 +9,7 @@
 
 Key detail: if no allowlist is configured (`rawAllowlist.length === 0`), ALL catalog models are allowed (`allowAny: true`). The allowlist is opt-in restrictive, not opt-in permissive.
 
-**Citros equivalent:** We have `chatModelsForProvider()` and `actionModelsForProvider()` — hardcoded lists. No user-configurable allowlist yet. Not needed for single-user phone agent (H1), but will matter when we add the model picker UI.
+**Fawx equivalent:** We have `chatModelsForProvider()` and `actionModelsForProvider()` — hardcoded lists. No user-configurable allowlist yet. Not needed for single-user phone agent (H1), but will matter when we add the model picker UI.
 
 ### Layer 2: Per-Session Model Override Validation
 **What:** When a user overrides the model for a session, the override is validated against the allowlist.
@@ -26,7 +26,7 @@ if (allowedModelKeys.size > 0 && !allowedModelKeys.has(key)) {
 }
 ```
 
-**Citros equivalent:** We have SharedPreferences model selection per-provider. No validation on load — stale model IDs persist (known issue, filed as #391). This is a **gap**.
+**Fawx equivalent:** We have SharedPreferences model selection per-provider. No validation on load — stale model IDs persist (known issue, filed as #391). This is a **gap**.
 
 ### Layer 3: Security Audit (Advisory, Not Enforcement)
 **What:** Three audit checks warn about model security risks:
@@ -48,7 +48,7 @@ if (allowedModelKeys.size > 0 && !allowedModelKeys.has(key)) {
 
 **Key insight:** OpenClaw does NOT hard-block small models. It **warns** operators and escalates to critical when the combination is dangerous (small model + untrusted input tools). The enforcement is advisory — operators choose whether to act.
 
-**Citros equivalent:** Our `ModelClassifier` hard-blocks SMALL tier at `PhoneAgentApi` construction time. **We're actually MORE restrictive than OpenClaw** on this. We reject the model entirely; they audit and warn.
+**Fawx equivalent:** Our `ModelClassifier` hard-blocks SMALL tier at `PhoneAgentApi` construction time. **We're actually MORE restrictive than OpenClaw** on this. We reject the model entirely; they audit and warn.
 
 ### Layer 4: Model Failover Chain
 **What:** When an API call fails (rate limit, auth, timeout, billing), automatically rotate to the next model/provider.
@@ -57,7 +57,7 @@ if (allowedModelKeys.size > 0 && !allowedModelKeys.has(key)) {
 
 Each auth profile gets a cooldown on failure. The system tries the next profile/model in the chain until one succeeds or all are exhausted.
 
-**Citros equivalent:** **None.** When our API call fails, the loop catches the exception and returns an error. No retry with different auth, no model fallback. This is a **significant gap for H2/H3** (roadmap §3.1).
+**Fawx equivalent:** **None.** When our API call fails, the loop catches the exception and returns an error. No retry with different auth, no model fallback. This is a **significant gap for H2/H3** (roadmap §3.1).
 
 ### Layer 5: Prompt Mode Adaptation
 **What:** System prompt adapts based on context:
@@ -67,13 +67,13 @@ Each auth profile gets a cooldown on failure. The system tries the next profile/
 
 **NOT the same as model-aware prompting:** Prompt mode is based on session type, not model capability. All models get the same prompt mode for a given session type. The H2 "Model-Aware Prompt Tuning" from our roadmap is something OpenClaw does NOT do — they don't adjust prompt complexity based on whether the model is Opus vs Sonnet.
 
-**Citros equivalent:** We have `buildSystemPrompt()` with conditional sections based on `phoneControlAvailable` and `modelName`, but prompt content doesn't vary by model tier. The H2 roadmap item (different prompts for Opus/Sonnet/Haiku) goes BEYOND what OpenClaw does.
+**Fawx equivalent:** We have `buildSystemPrompt()` with conditional sections based on `phoneControlAvailable` and `modelName`, but prompt content doesn't vary by model tier. The H2 roadmap item (different prompts for Opus/Sonnet/Haiku) goes BEYOND what OpenClaw does.
 
 ---
 
 ## Comparison Matrix
 
-| Concern | OpenClaw | Citros | Gap? |
+| Concern | OpenClaw | Fawx | Gap? |
 |---|---|---|---|
 | **Hard model blocking** | No — advisory audit warnings only | Yes — `ModelClassifier` rejects SMALL tier at construction | We're MORE restrictive ✅ |
 | **Model allowlist** | Config-driven, validated at selection | Hardcoded lists in `ModelConfig` | Minor — OK for single-user H1 |

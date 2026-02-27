@@ -73,7 +73,7 @@ The core challenge: screens that are "the same" (same app, same page) have diffe
 #### 1.1 ScreenFingerprint
 
 ```kotlin
-package ai.citros.core
+package ai.fawx.core
 
 /**
  * Structural fingerprint of a screen state.
@@ -359,7 +359,7 @@ data class ResolvedTemplate(
 #### 3.1 ExecutionRecorder
 
 ```kotlin
-package ai.citros.core
+package ai.fawx.core
 
 /**
  * Records successful task executions into playbooks.
@@ -475,7 +475,7 @@ class ExecutionRecorder(
 #### 3.2 ParameterExtractor
 
 ```kotlin
-package ai.citros.core
+package ai.fawx.core
 
 /**
  * Extracts task parameters from the user message and maps them to
@@ -634,7 +634,7 @@ data class ExtractedParameters(
 #### 4.1 PlaybookMatcher
 
 ```kotlin
-package ai.citros.core
+package ai.fawx.core
 
 /**
  * Matches incoming tasks to stored playbooks.
@@ -691,7 +691,7 @@ data class PlaybookMatch(
 #### 4.2 PlaybookExecutor
 
 ```kotlin
-package ai.citros.core
+package ai.fawx.core
 
 /**
  * Executes a task using a matched playbook.

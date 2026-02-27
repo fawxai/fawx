@@ -25,9 +25,9 @@ SECTION_3_1_REQUIRED_BULLETS=(
   '4. Treat prompt size as a resource with hard limits and deterministic trimming.'
 )
 SECTION_3_2_REQUIRED_BULLETS=(
-  '1. OpenClaw is session-type first; Citros needs both session-type and model-tier behavior.'
-  '2. OpenClaw skill loading is filesystem/plugin oriented; Citros is fixed-tool mobile architecture.'
-  '3. Citros must prioritize mobile latency and token cost more aggressively on `SMALL` tier.'
+  '1. OpenClaw is session-type first; Fawx needs both session-type and model-tier behavior.'
+  '2. OpenClaw skill loading is filesystem/plugin oriented; Fawx is fixed-tool mobile architecture.'
+  '3. Fawx must prioritize mobile latency and token cost more aggressively on `SMALL` tier.'
 )
 SECTION_3_3_REQUIRED_BULLETS=(
   '1. Weakening safety text for smaller models.'
@@ -335,14 +335,14 @@ require_pattern "$BASELINE_COMMIT_PATTERN" "baseline evidence snapshot commit fo
 require_exact_baseline_commit
 
 require_line "### 3.1 What to Copy" "openclaw comparison section"
-require_line "### 3.2 What to Adapt (Citros-Specific)" "openclaw adapt section"
+require_line "### 3.2 What to Adapt (Fawx-Specific)" "openclaw adapt section"
 require_line "### 3.3 What Not to Copy" "openclaw do-not-copy section"
 require_line "### 4.1 Required Invariants" "required invariants section"
 require_line "### 4.2 Mode x Tier Matrix" "mode-tier matrix section"
 require_line "### 4.3 Prompt Budget Policy" "prompt budget policy section"
 
-store_section "SECTION_OPENCLAW_ADAPT" "### 3.2 What to Adapt (Citros-Specific)" "### 3.3 What Not to Copy"
-store_section "SECTION_OPENCLAW_COPY" "### 3.1 What to Copy" "### 3.2 What to Adapt (Citros-Specific)"
+store_section "SECTION_OPENCLAW_ADAPT" "### 3.2 What to Adapt (Fawx-Specific)" "### 3.3 What Not to Copy"
+store_section "SECTION_OPENCLAW_COPY" "### 3.1 What to Copy" "### 3.2 What to Adapt (Fawx-Specific)"
 store_section "SECTION_OPENCLAW_NOT_COPY" "### 3.3 What Not to Copy" "## 4. Proposed Prompt Policy Contract"
 for i in "${!SECTION_3_1_REQUIRED_BULLETS[@]}"; do
   require_line_in_section \

@@ -147,7 +147,7 @@ Then measure: test on 10 real-world tasks, track success rate. Only move to Phas
 
 ### 1. Update `PhoneAgentPrompts.SYSTEM_PROMPT`
 ```
-You are Citros, an AI phone agent. You control the user's Android phone.
+You are Fawx, an AI phone agent. You control the user's Android phone.
 
 APPROACH:
 1. OBSERVE: Read the current screen carefully

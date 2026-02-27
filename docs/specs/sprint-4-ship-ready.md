@@ -11,7 +11,7 @@
 
 ## Thesis
 
-Citros has a working phone agent with durable execution, loop tuning, action playbooks, and a safety layer. Four sprints of architecture — done. But there's a gap between "works on Joe's phone" and "works on anyone's phone":
+Fawx has a working phone agent with durable execution, loop tuning, action playbooks, and a safety layer. Four sprints of architecture — done. But there's a gap between "works on Joe's phone" and "works on anyone's phone":
 
 1. **Token bloat kills cheaper models.** Every turn sends all tools and full prompts regardless of context. Haiku chokes on the payload. Sonnet wastes tokens on irrelevant tool descriptions. The agent is expensive to run and can't scale down to budget-friendly models.
 

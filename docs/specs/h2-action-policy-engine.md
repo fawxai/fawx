@@ -58,7 +58,7 @@ To reduce implementation ambiguity, Phase 1 rollout must include explicit safety
 ### 1. PolicyDecision — Sealed Class
 
 ```kotlin
-package ai.citros.core
+package ai.fawx.core
 
 /**
  * Result of evaluating a tool call against the action policy.
@@ -100,7 +100,7 @@ sealed class PolicyDecision {
 ### 1a. PolicyReasonCode — Canonical Contract (Required)
 
 ```kotlin
-package ai.citros.core
+package ai.fawx.core
 
 /**
  * Canonical reason codes emitted by policy decisions and audit records.
@@ -131,7 +131,7 @@ object PolicyReasonCode {
 ### 2. ActionPolicy — Interface
 
 ```kotlin
-package ai.citros.core
+package ai.fawx.core
 
 /**
  * Evaluates tool calls against the action policy before execution.
@@ -233,7 +233,7 @@ extractEndpointHost(toolCall):
 ### 3. DefaultActionPolicy — Production Implementation
 
 ```kotlin
-package ai.citros.core
+package ai.fawx.core
 
 import android.util.Log
 
@@ -257,7 +257,7 @@ class DefaultActionPolicy(
 ) : ActionPolicy {
 
     companion object {
-        private const val TAG = "CitrosPolicy"
+        private const val TAG = "FawxPolicy"
 
         /** Maximum tool calls per minute before rate limiting kicks in. */
         const val RATE_LIMIT_PER_MINUTE = 30
@@ -739,7 +739,7 @@ class DefaultActionPolicy(
 ### 3a. Egress Allowlist Provider — Runtime Contract
 
 ```kotlin
-package ai.citros.core
+package ai.fawx.core
 
 /**
  * Runtime source for approved egress hosts.
@@ -789,7 +789,7 @@ Required provider semantics for U24:
 `AgentExecutor` owns mandatory Phase 1 emission for `confirm`, `deny`, and `rate_limited` outcomes via this dependency.
 
 ```kotlin
-package ai.citros.core
+package ai.fawx.core
 
 enum class PolicyAuditDecision { ALLOW, CONFIRM, DENY, RATE_LIMITED }
 enum class PolicyConfirmOutcome { APPROVED, DENIED, TIMEOUT, NA }
@@ -842,7 +842,7 @@ Required audit-loss handling contract:
 ### 4. ActionPolicyStore — Persistence Interface
 
 ```kotlin
-package ai.citros.core
+package ai.fawx.core
 
 /**
  * Persistence interface for user-configured policy overrides.
@@ -1125,7 +1125,7 @@ for ((toolIndex, toolCall) in response.toolCalls.withIndex()) {
 ### 5a. Screen Summary Redaction Contract (Required)
 
 ```kotlin
-package ai.citros.core
+package ai.fawx.core
 
 object PolicySummarySanitizer {
     /**
@@ -1334,7 +1334,7 @@ Agent calls tap_text("Send $500") in Venmo
   → Policy: CONFIRM (financial context)
     → AgentService emits WaitingConfirmation with pills:
         [Authenticate & allow 🔐, Deny ❌]
-      → Notification shows: "Citros wants to tap 'Send $500' in Venmo"
+      → Notification shows: "Fawx wants to tap 'Send $500' in Venmo"
         Actions: [Authenticate & allow] [Deny]
       → Overlay shows: same pills
       → Activity shows: same pills in chat
@@ -1764,20 +1764,20 @@ These are target files for the follow-up implementation PR (not changed by this 
 
 | File | Planned change |
 |------|--------|
-| `android/core/src/main/kotlin/ai/citros/core/PolicyDecision.kt` | NEW — sealed class for policy outcomes |
-| `android/core/src/main/kotlin/ai/citros/core/ActionPolicy.kt` | NEW — policy evaluation interface + `PolicyContext` |
-| `android/core/src/main/kotlin/ai/citros/core/ActionPolicyNormalizer.kt` | NEW — shared normalization helper for `PolicyContext.appIdentifier` and policy fallback |
-| `android/core/src/main/kotlin/ai/citros/core/EgressAllowlistProvider.kt` | NEW — signed/atomic egress host provider contract |
-| `android/core/src/main/kotlin/ai/citros/core/DefaultActionPolicy.kt` | NEW — production implementation with defaults |
-| `android/core/src/main/kotlin/ai/citros/core/ActionPolicyStore.kt` | NEW — persistence interface for typed user overrides (`PolicyOverrideLevel`) |
-| `android/core/src/main/kotlin/ai/citros/core/PolicyAuditLogger.kt` | NEW — required Phase 1 audit sink for confirm/deny/rate-limited decisions |
-| `android/core/src/main/kotlin/ai/citros/core/AgentExecutor.kt` | Add `actionPolicy` param, pre-execution policy check in tool loop |
-| `android/core/src/main/kotlin/ai/citros/core/AgentExecutor.kt` | Add enforced confirmation timeout and fail-secure exception fallback |
-| `android/core/src/main/kotlin/ai/citros/core/AgentExecutor.kt` | Ensure policy-generated tool results call `addToolResult(toolCallId, result, toolName, isError)` |
-| `android/core/src/main/kotlin/ai/citros/core/AgentExecutor.kt` | Add/extend unit tests for policy decision outcomes |
-| `android/chat/src/main/kotlin/ai/citros/chat/ChatViewModel.kt` | Implement `requestUserConfirmation(...)` UI callback contract |
-| `android/core/src/test/kotlin/ai/citros/core/DefaultActionPolicyTest.kt` | NEW — policy unit tests |
-| `android/core/src/test/kotlin/ai/citros/core/AgentExecutorTest.kt` | Add policy integration/contract tests |
+| `android/core/src/main/kotlin/ai/fawx/core/PolicyDecision.kt` | NEW — sealed class for policy outcomes |
+| `android/core/src/main/kotlin/ai/fawx/core/ActionPolicy.kt` | NEW — policy evaluation interface + `PolicyContext` |
+| `android/core/src/main/kotlin/ai/fawx/core/ActionPolicyNormalizer.kt` | NEW — shared normalization helper for `PolicyContext.appIdentifier` and policy fallback |
+| `android/core/src/main/kotlin/ai/fawx/core/EgressAllowlistProvider.kt` | NEW — signed/atomic egress host provider contract |
+| `android/core/src/main/kotlin/ai/fawx/core/DefaultActionPolicy.kt` | NEW — production implementation with defaults |
+| `android/core/src/main/kotlin/ai/fawx/core/ActionPolicyStore.kt` | NEW — persistence interface for typed user overrides (`PolicyOverrideLevel`) |
+| `android/core/src/main/kotlin/ai/fawx/core/PolicyAuditLogger.kt` | NEW — required Phase 1 audit sink for confirm/deny/rate-limited decisions |
+| `android/core/src/main/kotlin/ai/fawx/core/AgentExecutor.kt` | Add `actionPolicy` param, pre-execution policy check in tool loop |
+| `android/core/src/main/kotlin/ai/fawx/core/AgentExecutor.kt` | Add enforced confirmation timeout and fail-secure exception fallback |
+| `android/core/src/main/kotlin/ai/fawx/core/AgentExecutor.kt` | Ensure policy-generated tool results call `addToolResult(toolCallId, result, toolName, isError)` |
+| `android/core/src/main/kotlin/ai/fawx/core/AgentExecutor.kt` | Add/extend unit tests for policy decision outcomes |
+| `android/chat/src/main/kotlin/ai/fawx/chat/ChatViewModel.kt` | Implement `requestUserConfirmation(...)` UI callback contract |
+| `android/core/src/test/kotlin/ai/fawx/core/DefaultActionPolicyTest.kt` | NEW — policy unit tests |
+| `android/core/src/test/kotlin/ai/fawx/core/AgentExecutorTest.kt` | Add policy integration/contract tests |
 
 ## OpenClaw Comparison
 
@@ -1787,7 +1787,7 @@ OpenClaw has `tools.allow` (tool allowlist) and `exec.security` (deny/allowlist/
 - Rate limiting on tool execution frequency
 - Sensitive app detection / context-aware escalation
 
-Citros goes further because phone control is higher-risk than CLI tool execution — the agent can interact with any app on the device, including financial and messaging apps.
+Fawx goes further because phone control is higher-risk than CLI tool execution — the agent can interact with any app on the device, including financial and messaging apps.
 
 ---
 

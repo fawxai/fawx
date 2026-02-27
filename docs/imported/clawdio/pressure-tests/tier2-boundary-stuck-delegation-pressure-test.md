@@ -1,7 +1,7 @@
 # Retroactive Pressure Test: Boundary Checks, Stuck Detection & Tool Execution Delegation
 
 *Pressure test for #478 — Tier 2 retroactive audit (Group A: Executor Infrastructure)*
-*Citros: `BoundaryCheck.kt`, `StuckDetector.kt`, `AgentExecutor.kt` | OpenClaw: `agent-loop-core.ts`, `types.ts`*
+*Fawx: `BoundaryCheck.kt`, `StuckDetector.kt`, `AgentExecutor.kt` | OpenClaw: `agent-loop-core.ts`, `types.ts`*
 
 ---
 
@@ -58,11 +58,11 @@ interface AgentTool<TParameters, TDetails> extends Tool<TParameters> {
 
 ---
 
-## 2. Citros's Architecture
+## 2. Fawx's Architecture
 
 ### Boundary Checks
 
-Citros formalizes loop control as a **BoundaryCheck pipeline** (`BoundaryCheck.kt`):
+Fawx formalizes loop control as a **BoundaryCheck pipeline** (`BoundaryCheck.kt`):
 
 **CheckResult sealed class** — four outcomes with explicit priority:
 - `Continue` — no issue
@@ -164,7 +164,7 @@ interface ToolExecutionDelegate {
 
 ### Steering Implementation
 
-Citros has **two steer checkpoints** (more than OpenClaw):
+Fawx has **two steer checkpoints** (more than OpenClaw):
 
 1. **Pre-batch** (`AgentExecutor.run()` line ~115): After API returns but before ANY tool executes. Zero wasted actions.
 2. **Post-tool** (line ~165): After each tool, via `SteerCheck` in the boundary check pipeline.
@@ -178,21 +178,21 @@ Steer semantics:
 
 ## 3. Comparison Table
 
-| Aspect | OpenClaw | Citros | Notes |
+| Aspect | OpenClaw | Fawx | Notes |
 |--------|----------|--------|-------|
-| **Boundary check formalism** | None — ad-hoc loop control | `BoundaryCheck` interface + `CheckResult` sealed class | Citros more structured |
+| **Boundary check formalism** | None — ad-hoc loop control | `BoundaryCheck` interface + `CheckResult` sealed class | Fawx more structured |
 | **Check ordering** | N/A | Explicit: Cancel → A11y → StepLimit → Stuck → Steer | Configurable via constructor |
 | **Step limit** | Not in core loop | `StepLimitCheck` (default 25) | OpenClaw may enforce elsewhere |
 | **Cancellation** | `AbortSignal` propagation | `CancellationCheck` + inline guards | Both effective, different idioms |
 | **Stuck detection** | None | `StuckDetector` with screen hash + wait tracking | Phone-specific, N/A for CLI |
-| **Steer: pre-batch** | ❌ Not present | ✅ Zero-waste steer before tool execution | Citros advantage |
+| **Steer: pre-batch** | ❌ Not present | ✅ Zero-waste steer before tool execution | Fawx advantage |
 | **Steer: post-tool** | ✅ After each tool | ✅ After each tool via SteerCheck | Equivalent |
 | **Steer: follow-up** | ✅ `getFollowUpMessages()` | ❌ Not present | OpenClaw advantage |
 | **Tool skip on steer** | ✅ "Skipped due to queued user message" | ✅ "Skipped: user sent a new message" | Equivalent |
 | **Tool execution model** | Self-executing `AgentTool.execute()` | Delegate pattern (`ToolExecutionDelegate`) | Different but valid |
 | **Tool extension hooks** | ✅ `ext-wrapper.ts` pre/post hooks | ❌ Not present | Extension system not needed yet |
-| **Tool result type** | `AgentToolResult<T>` (typed content+details) | `String` | Citros simpler but less structured |
-| **Output classification** | Not in core | `OutputClassifier` (SHOW/SHOW_DIMMED/HIDE) | Citros has built-in UI visibility |
+| **Tool result type** | `AgentToolResult<T>` (typed content+details) | `String` | Fawx simpler but less structured |
+| **Output classification** | Not in core | `OutputClassifier` (SHOW/SHOW_DIMMED/HIDE) | Fawx has built-in UI visibility |
 | **Event stream** | ✅ Rich event types | `LoopProgressListener` (2 events) | OpenClaw more granular |
 | **Screen refresh after tools** | N/A (no screen) | `refreshScreenAfterTool()` + `isUiMutatingTool()` | Phone-specific |
 | **Accessibility gating** | N/A | `AccessibilityGateCheck` with timeout+reconnect | Phone-specific |
@@ -205,37 +205,37 @@ Steer semantics:
 
 ### Critical (Fix Before H2)
 
-**None.** Citros's boundary check system is more formalized than OpenClaw's equivalent. The architecture is sound and well-documented.
+**None.** Fawx's boundary check system is more formalized than OpenClaw's equivalent. The architecture is sound and well-documented.
 
 ### Deferred
 
 #### D1: No Follow-Up Message Support
-**Gap:** OpenClaw has `getFollowUpMessages()` for messages that arrive after the agent finishes but should trigger continuation. Citros has no equivalent.
+**Gap:** OpenClaw has `getFollowUpMessages()` for messages that arrive after the agent finishes but should trigger continuation. Fawx has no equivalent.
 **Impact:** If a user sends a message right as the loop ends, it becomes a new conversation turn rather than seamlessly continuing.
 **Recommendation:** H3 — low priority, current UX handles this naturally via new `sendMessage()` calls.
 
 #### D2: Tool Result Type is String
-**Gap:** OpenClaw uses typed `AgentToolResult<T>` with structured content blocks (text + images) and typed details. Citros uses plain `String` for all tool results.
+**Gap:** OpenClaw uses typed `AgentToolResult<T>` with structured content blocks (text + images) and typed details. Fawx uses plain `String` for all tool results.
 **Impact:** Limits structured tool output (e.g., returning images inline, typed metadata for UI rendering). Currently fine because screen content is appended as text.
 **Recommendation:** H3 — revisit if tools need to return structured data (images, JSON objects) directly.
 
 #### D3: Limited Event Granularity
-**Gap:** OpenClaw emits ~10 event types (agent_start/end, turn_start/end, message_start/update/end, tool_execution_start/update/end). Citros has `LoopProgressListener` with only `onToolResult()` and `onAccessibilityLost()`.
+**Gap:** OpenClaw emits ~10 event types (agent_start/end, turn_start/end, message_start/update/end, tool_execution_start/update/end). Fawx has `LoopProgressListener` with only `onToolResult()` and `onAccessibilityLost()`.
 **Impact:** Limits UI reactivity (e.g., can't show tool execution in progress, can't animate per-turn).
 **Recommendation:** H3 — expand `LoopProgressListener` when UI needs more granularity.
 
 #### D4: No Tool Extension/Hook System
-**Gap:** OpenClaw's `ext-wrapper.ts` allows extensions to intercept tool calls (block) and modify results. Citros has no equivalent.
+**Gap:** OpenClaw's `ext-wrapper.ts` allows extensions to intercept tool calls (block) and modify results. Fawx has no equivalent.
 **Impact:** Can't build plugin-style extensions that modify tool behavior. Not needed now.
 **Recommendation:** H3+ — only if extension/plugin architecture is planned.
 
 ### Intentional Divergences
 
-#### I1: Formalized BoundaryCheck Pipeline (Citros > OpenClaw)
-Citros's `BoundaryCheck` interface with `CheckResult` sealed class is MORE structured than OpenClaw's ad-hoc loop control. This is intentional — the phone agent domain has more boundary conditions (accessibility, stuck detection, screen state) that benefit from a pluggable pipeline.
+#### I1: Formalized BoundaryCheck Pipeline (Fawx > OpenClaw)
+Fawx's `BoundaryCheck` interface with `CheckResult` sealed class is MORE structured than OpenClaw's ad-hoc loop control. This is intentional — the phone agent domain has more boundary conditions (accessibility, stuck detection, screen state) that benefit from a pluggable pipeline.
 
-#### I2: Pre-Batch Steer Checkpoint (Citros > OpenClaw)
-Citros checks for steer messages BEFORE executing any tools in a batch. OpenClaw only checks after each tool execution. This means Citros can redirect with zero wasted actions when the user sends a message during model thinking.
+#### I2: Pre-Batch Steer Checkpoint (Fawx > OpenClaw)
+Fawx checks for steer messages BEFORE executing any tools in a batch. OpenClaw only checks after each tool execution. This means Fawx can redirect with zero wasted actions when the user sends a message during model thinking.
 
 #### I3: Stuck Detection (Phone-Specific)
 OpenClaw has no stuck detection because CLI tools always produce different output. Screen hash repetition and consecutive wait detection are phone-agent-specific concerns.
@@ -244,10 +244,10 @@ OpenClaw has no stuck detection because CLI tools always produce different outpu
 The accessibility service can disconnect mid-loop on Android. `AccessibilityGateCheck` with wait-for-reconnect is a phone-specific concern with no OpenClaw equivalent.
 
 #### I5: Delegate Pattern vs Self-Executing Tools
-Citros uses `ToolExecutionDelegate` (bridge pattern) because execution requires Android platform APIs (ScreenReader, ClipboardHelper, etc.) that live outside `:core`. OpenClaw uses self-executing tools because tool implementations are self-contained Node.js functions. Both are correct for their platforms.
+Fawx uses `ToolExecutionDelegate` (bridge pattern) because execution requires Android platform APIs (ScreenReader, ClipboardHelper, etc.) that live outside `:core`. OpenClaw uses self-executing tools because tool implementations are self-contained Node.js functions. Both are correct for their platforms.
 
 #### I6: Output Classification in Core
-Citros includes `OutputClassifier` in the executor loop for UI visibility control. OpenClaw handles this at the application layer. Citros's approach is pragmatic — the phone UI needs to differentiate mechanical taps from meaningful results during the loop, not after.
+Fawx includes `OutputClassifier` in the executor loop for UI visibility control. OpenClaw handles this at the application layer. Fawx's approach is pragmatic — the phone UI needs to differentiate mechanical taps from meaningful results during the loop, not after.
 
 ---
 

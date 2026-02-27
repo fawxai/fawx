@@ -1,6 +1,6 @@
-# Citros Skills
+# Fawx Skills
 
-Example WASM skills for the Citros AI agent.
+Example WASM skills for the Fawx AI agent.
 
 ## Available Skills
 
@@ -70,11 +70,11 @@ The compiled WASM binary will be at `target/wasm32-wasi/release/weather_skill.wa
 
 ## Installing Skills
 
-Use the Citros CLI to install skills:
+Use the Fawx CLI to install skills:
 
 ```bash
-citros skill install skills/weather-skill/weather.wasm
-citros skill install skills/calculator-skill/calculator.wasm
+fawx skill install skills/weather-skill/weather.wasm
+fawx skill install skills/calculator-skill/calculator.wasm
 ```
 
 ## Manifest Format
@@ -158,8 +158,8 @@ See format above.
 ### 7. Install and test
 
 ```bash
-citros skill install target/wasm32-wasi/release/my_skill.wasm
-citros skill list
+fawx skill install target/wasm32-wasi/release/my_skill.wasm
+fawx skill list
 ```
 
 ## Host API Reference

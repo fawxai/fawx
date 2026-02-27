@@ -1,4 +1,4 @@
-# Citros Architecture Roadmap
+# Fawx Architecture Roadmap
 
 *From "demo that sometimes works" to "phone agent that just works."*
 *Synthesized from OpenClaw architecture deep dive + gap analysis + MVP sprint spec.*
@@ -16,7 +16,7 @@ Horizons 0 and 1 are **COMPLETE**. Horizon 2 is **~60% complete** (7/12 items sh
 - **Context trimming** (category-aware ContextCompactor, transformContext hook)
 - **Steer UI** — user can redirect mid-task via message injection at tool boundaries
 - **Per-action verification** — catches failed UI actions on first attempt
-- **API tools** (web_search, web_fetch via Citros proxy + Brave), **TinyFish web_browse** for browser automation
+- **API tools** (web_search, web_fetch via Fawx proxy + Brave), **TinyFish web_browse** for browser automation
 - **SSE streaming**, **wallet hardening**, **persona files** (SOUL.md/USER.md/IDENTITY.md in prompt)
 - **Confidence-gated disambiguation** — think before asking, calibrate by stakes
 - **Progressive status updates** — human-readable tool output in chat/overlay
@@ -77,11 +77,11 @@ Replace the generic tool-listing prompt with a structured, strategy-focused prom
 
 | Section | Purpose | Conditional? |
 |---------|---------|-------------|
-| Identity | "You are Citros, an AI agent that controls this Android phone" | No |
+| Identity | "You are Fawx, an AI agent that controls this Android phone" | No |
 | Tools | Organized by category (navigation, interaction, observation, memory) | Yes — skip phone tools when accessibility detached |
 | Strategy | The "always do this" pattern: open app → read screen → act → verify from results | No |
 | Recovery | What to do when tap fails, when stuck, when "No target app visible" | No |
-| Disambiguation | "Open settings" = Android Settings, not Citros settings | No |
+| Disambiguation | "Open settings" = Android Settings, not Fawx settings | No |
 | Rules | type_text doesn't submit, element IDs are ephemeral, be concise | No |
 | Runtime | Model name, screen reader status, current time | Yes — assembled at call time |
 
@@ -110,7 +110,7 @@ Already implemented. Hides overlay for entire tool loop duration, not just scree
 #### MVP Success Criteria
 After all 3 PRs, these work on first try with Opus or Sonnet:
 - ✅ "What's on my calendar tomorrow?" — < 8 steps
-- ✅ "Send a test email to joe@citros.ai" — < 10 steps  
+- ✅ "Send a test email to joe@fawx.ai" — < 10 steps  
 - ✅ "Open Settings" — 1 step
 - ✅ "Set a timer for 5 minutes" — < 6 steps
 - ✅ "Hey, how are you?" — text response, 0 tools
@@ -255,7 +255,7 @@ This is the single highest-leverage reliability improvement. Stuck detection cat
 
 | PR | Feature |
 |----|---------|
-| #497 | API Tools (web_search + web_fetch via Citros proxy) |
+| #497 | API Tools (web_search + web_fetch via Fawx proxy) |
 | #501 | Client deduplication |
 | #503 | SSE streaming |
 | #514, #516 | Wallet hardening |
@@ -269,7 +269,7 @@ This is the single highest-leverage reliability improvement. Stuck detection cat
 | #602 | UX polish batch (API key masking, markdown rendering, voice-steer) |
 | #607 | Confidence-gated disambiguation |
 | #654 | Voice silence threshold + VoiceAccumulator extraction |
-| #656 | Citros search proxy (zero-config web search) |
+| #656 | Fawx search proxy (zero-config web search) |
 | #662 | Ghost input fix (accessibility eventTypes) |
 | #666 | Orphaned tool_result fix (Message.copy() stale blocks) |
 | #667 | JSON tool display verbosity |
@@ -504,7 +504,7 @@ The scaling flywheel: every user's agent improves every other user's agent.
 
 **The problem:** Individual agents learn slowly. One user discovers that "Google Flights date picker needs a scroll before the date is visible" — that insight dies on their device. Next user hits the same wall.
 
-**The solution:** Anonymous, versioned pattern sharing across the Citros user base.
+**The solution:** Anonymous, versioned pattern sharing across the Fawx user base.
 
 ```
 User A's agent learns pattern → upload to community pool (anonymous)
@@ -589,7 +589,7 @@ User Message
 
 ## What NOT To Build (Now)
 
-Things OpenClaw does that Citros doesn't need in the same form:
+Things OpenClaw does that Fawx doesn't need in the same form:
 
 1. **Multi-agent routing** — one user, one phone, one agent. No bindings/routing rules.
 2. **Cron/webhook infrastructure** — phone agent is reactive to user input, not scheduled.
@@ -638,7 +638,7 @@ These were initially descoped but have since been addressed:
 
 6. **WASM skill/plugin system** — RESOLVED. Already fully spec'd in `docs/SPEC.md` §3.5.4 and Decision #5/#6. WASM binaries with capability manifests (network domain allowlists, storage caps, phone action grants, sensor access). Ed25519 signed, verified on load. wasmtime host-level capability enforcement. `ct-skills` crate already has working implementation (wasmtime runtime, capability enforcement, module compilation/caching, loader/registry/installer with signature verification). Distribution: private skill hub first (Decision #6), vetted public registry when community grows. The Kotlin MVP doesn't have this yet — it's in the Rust crate stack. Bridge plan: expose `ct-skills` via the Unix socket IPC to the Kotlin app, or port the capability manifest + WASM runtime to Android via JNI when the Rust daemon ships.
 
-7. **Scoped agent knowledge (replaces session key hierarchies)** — RESOLVED. Instead of user-managed named sessions, Citros builds an **automatic knowledge base indexed by scope**. Three scope types:
+7. **Scoped agent knowledge (replaces session key hierarchies)** — RESOLVED. Instead of user-managed named sessions, Fawx builds an **automatic knowledge base indexed by scope**. Three scope types:
    - `app:<package_name>` — learned navigation patterns, UI quirks, user preferences per Android app. Built automatically from tool interactions (ScreenContent.packageName tags every interaction). Gets injected into system prompt when agent is about to interact with that app.
    - `api:<provider>` — API-specific knowledge (rate limits, model quirks, pricing notes). Built from API interaction history.
    - `mcp:<server>` — MCP server capabilities, tool behavior, user workflow preferences. Built from MCP tool invocations.
@@ -657,5 +657,5 @@ These were initially descoped but have since been addressed:
 ---
 
 *Last updated: 2026-02-21 (v2 spec integration + gap closure)*
-*Sources: OpenClaw docs (17 files), Citros codebase, agentic-loop-v2.md, SPEC.md, real-world Pixel testing*
+*Sources: OpenClaw docs (17 files), Fawx codebase, agentic-loop-v2.md, SPEC.md, real-world Pixel testing*
 *Supersedes: `docs/specs/openclaw-architecture-lessons.md` and `docs/specs/mvp-sprint-spec.md`*

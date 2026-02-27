@@ -1,4 +1,4 @@
-# Citros MVP — End-to-End Test Plan
+# Fawx MVP — End-to-End Test Plan
 
 ## Test Environment
 - **Device:** Pixel 10 Pro (blazer), Android 16

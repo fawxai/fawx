@@ -170,7 +170,7 @@ Example: "Send Sarah the weather forecast"
 #### 2.1 Recovery Strategy Interface
 
 ```kotlin
-package ai.citros.core
+package ai.fawx.core
 
 /**
  * A concrete recovery strategy that can be attempted when an action fails.
@@ -359,7 +359,7 @@ class GracefulCancelStrategy : RecoveryStrategy {
 #### 2.3 RecoveryManager — Orchestration
 
 ```kotlin
-package ai.citros.core
+package ai.fawx.core
 
 /**
  * Manages recovery strategy selection and execution.
@@ -510,7 +510,7 @@ fun detectFailure(
 An automated framework for running predefined tasks and verifying outcomes. This is the skeleton — full coverage is built up over time.
 
 ```kotlin
-package ai.citros.test
+package ai.fawx.test
 
 /**
  * A regression test case for end-to-end agent task execution.

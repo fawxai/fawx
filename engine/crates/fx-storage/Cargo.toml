@@ -1,0 +1,17 @@
+[package]
+name = "fx-storage"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+fx-core.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+ring.workspace = true
+redb.workspace = true
+zeroize.workspace = true
+tokio.workspace = true

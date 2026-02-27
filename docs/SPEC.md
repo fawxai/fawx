@@ -1,4 +1,4 @@
-# Citros: AI-Native Phone Agent
+# Fawx: AI-Native Phone Agent
 ## Three-Horizon Product & Technical Specification
 
 **Version**: 0.1 — February 7, 2026
@@ -163,7 +163,7 @@ A Rust daemon that runs on a rooted Android phone (Pixel 10 Pro), controlled by 
 ### 3.4 Crate Architecture
 
 ```
-citros/
+fawx/
 ├── Cargo.toml                      # Workspace root
 ├── crates/
 │   ├── ct-core/                    # Types, config, event bus, errors
@@ -288,7 +288,7 @@ citros/
 │   └── android/                    # Companion app (Kotlin/Compose)
 │       ├── app/src/main/
 │       │   ├── AndroidManifest.xml
-│       │   └── java/ai/citros/
+│       │   └── java/ai/fawx/
 │       │       ├── MainActivity.kt
 │       │       ├── service/
 │       │       │   ├── DaemonHostService.kt    # Foreground service, wake lock
@@ -331,12 +331,12 @@ The Kotlin companion app hosts all of these and pipes data to the Rust daemon ov
 ```
 init (PID 1)
 ├── zygote → Android framework
-│   └── ai.citros.app (companion app)
+│   └── ai.fawx.app (companion app)
 │       ├── DaemonHostService (foreground service, holds wake lock)
 │       ├── AgentAccessibility (accessibility service)
 │       └── NotificationListener
 │
-└── citros-daemon (Rust binary, launched by init.d or Magisk service)
+└── fawx-daemon (Rust binary, launched by init.d or Magisk service)
     ├── Agent thread (tokio runtime, main logic)
     ├── LLM inference thread (CPU-bound, separate from async runtime)
     ├── Voice listener thread (audio capture → wake word → STT)
@@ -460,11 +460,11 @@ Push notification alternative (for low-latency remote commands):
 
 #### 3.5.6 Key Agent (Credential Broker)
 
-API keys are the most sensitive data Citros handles. The Key Agent isolates them from the main daemon using the same pattern as `ssh-agent`:
+API keys are the most sensitive data Fawx handles. The Key Agent isolates them from the main daemon using the same pattern as `ssh-agent`:
 
 ```
 ┌─────────────────────┐     ┌──────────────────────┐
-│   Citros Daemon        │     │   Key Agent           │
+│   Fawx Daemon        │     │   Key Agent           │
 │                      │     │   (separate process)  │
 │  LLM routing         │     │                       │
 │  Prompt building ──────────→ "send this prompt     │
@@ -491,11 +491,11 @@ API keys are the most sensitive data Citros handles. The Key Agent isolates them
 
 #### 3.5.7 LLM Provider Architecture
 
-Citros defines its own LLM interface. Providers adapt to Citros, not the other way around.
+Fawx defines its own LLM interface. Providers adapt to Fawx, not the other way around.
 
 ```
                     ┌─────────────────┐
-                    │  Citros LLM Trait  │
+                    │  Fawx LLM Trait  │
                     │                  │
                     │  generate()      │
                     │  stream()        │
@@ -522,7 +522,7 @@ Citros defines its own LLM interface. Providers adapt to Citros, not the other w
 - **Capability-based routing:** Provider declares supported modalities (text, vision, voice, audio) and features (streaming, tool use, max context). Routing layer picks provider per request type.
 - **Mix-and-match:** User can set Claude for text reasoning, OpenAI for voice/TTS, local for intent classification. Or use one provider for everything.
 - **Graceful fallback:** If primary provider fails, route to next capable provider. Local model is always-available fallback for basic tasks.
-- **Adding a provider** means writing one adapter file. Zero changes to Citros core.
+- **Adding a provider** means writing one adapter file. Zero changes to Fawx core.
 
 #### 3.5.8 Graceful Degradation
 
@@ -548,13 +548,13 @@ The system must handle failure at every level:
 **Deliverables:**
 - Cargo workspace with all 11 crates stubbed
 - ct-core: config loading (JSON5), internal message types, event bus, error types
-- ct-cli: `citros start`, `citros config show`, `citros doctor`
+- ct-cli: `fawx start`, `fawx config show`, `fawx doctor`
 - ffi/llama-cpp-sys: builds and links against vendored llama.cpp for aarch64-android
 - ffi/whisper-cpp-sys: builds and links for aarch64-android
 - CI pipeline: cross-compilation for x86_64-unknown-linux-gnu and aarch64-linux-android
 - Binary deploys to phone via ADB and runs in shell
 
-**Milestone**: `adb push citros /data/local/tmp/ && adb shell /data/local/tmp/citros doctor` prints system info.
+**Milestone**: `adb push fawx /data/local/tmp/ && adb shell /data/local/tmp/fawx doctor` prints system info.
 
 **Hurdles & Blind Spots:**
 
@@ -587,7 +587,7 @@ The following is a snapshot of what exists versus what is planned, to set realis
 - ct-llm: local model stub (llama.cpp integration not yet functional), Claude API client with streaming/tool use, confidence-based routing with fallback
 - ct-security: encrypted KV store (redb + AES-256-GCM), audit log with HMAC-SHA256 hash chain, intent classification (regex + LLM hybrid), policy engine with rules/capabilities/rate limiting
 - ct-skills: WASM runtime (wasmtime), capability enforcement at host boundary, module compilation + caching, skill loader/registry/installer with signature verification, async skill execution
-- ct-cli: `citros doctor`, `citros config show`, `citros audit` commands
+- ct-cli: `fawx doctor`, `fawx config show`, `fawx audit` commands
 - ct-security/oauth: OAuth bridge with PKCE, CSRF, constant-time state comparison, redirect URI validation (20 tests)
 - 400+ tests across all crates
 
@@ -609,7 +609,7 @@ The immediate next milestone is deploying the Rust daemon on the rooted Pixel 10
 - **Phase B (JNI, future):** Same Rust code compiled as `.so`, loaded into app process via JNI. Sub-microsecond call overhead. The IPC API contract from Phase A becomes the JNI interface — no throwaway work.
 
 **Onboarding & Monetization (spec'd, not built):**
-- Three tiers: BYO (paste key), Citros Base (OpenRouter, usage-capped), Citros Super (higher cap)
+- Three tiers: BYO (paste key), Fawx Base (OpenRouter, usage-capped), Fawx Super (higher cap)
 - All tiers access all models — tiers differ by usage cap, not model restrictions
 - Key wallet: store multiple API keys, switch providers/models instantly
 - See `docs/onboarding-spec.md` for full spec
@@ -637,9 +637,9 @@ The immediate next milestone is deploying the Rust daemon on the rooted Pixel 10
 - `cargo test` passes with `--strict` enabled in all integration tests
 - No `todo!()` in any security-critical path (loader, policy eval, audit open/query)
 - Time-based policy rules have integration tests proving they fire correctly
-- `citros doctor` reports signature enforcement status
+- `fawx doctor` reports signature enforcement status
 
-**Milestone**: `citros doctor --strict` passes all security checks. Unsigned skill install is rejected. Unsigned policy load fails. Audit chain corruption is detected on open.
+**Milestone**: `fawx doctor --strict` passes all security checks. Unsigned skill install is rejected. Unsigned policy load fails. Audit chain corruption is detected on open.
 
 ---
 
@@ -652,13 +652,13 @@ The immediate next milestone is deploying the Rust daemon on the rooted Pixel 10
 - ct-agent: core orchestrator loop (receive → classify → route → plan → respond)
 - ct-storage: encrypted KV store (redb + ring AES-256-GCM)
 - ct-security: capability dropping after init, basic audit log
-- ct-cli: `citros chat` — interactive text chat via CLI over ADB
+- ct-cli: `fawx chat` — interactive text chat via CLI over ADB
 
 **Milestone**: ADB shell, type "what time is it in Tokyo," get a response from local LLM. Type "plan a three-day trip to Kyoto," get a response from Claude.
 
 **Hurdles & Blind Spots:**
 
-- **Model loading time.** First-time mmap of a 1.5GB model file on eMMC/UFS storage takes 2-5 seconds. Subsequent loads from page cache are near-instant, but after a phone restart or memory pressure event, the cache is cold. The user says "hey citros" and waits 5 seconds before anything happens. *Mitigation*: Keep a tiny model (< 200MB) always resident for instant intent classification. Load the larger model on-demand and in the background after wake word detection. Provide immediate audio feedback ("I'm thinking...") before the model is ready.
+- **Model loading time.** First-time mmap of a 1.5GB model file on eMMC/UFS storage takes 2-5 seconds. Subsequent loads from page cache are near-instant, but after a phone restart or memory pressure event, the cache is cold. The user says "hey fawx" and waits 5 seconds before anything happens. *Mitigation*: Keep a tiny model (< 200MB) always resident for instant intent classification. Load the larger model on-demand and in the background after wake word detection. Provide immediate audio feedback ("I'm thinking...") before the model is ready.
 
 - **Quantization quality.** Q4_K_M quantization at 1.7B parameters loses meaningful capability versus the full-precision model. Intent classification accuracy may drop from 95% to 85%, causing more misroutes. *Mitigation*: Build a test suite of 200+ intent classification examples. Benchmark accuracy at different quantization levels. If Q4 isn't good enough, try Q5 or Q6 (larger but more accurate) or use a different architecture (Qwen3-1.7B may classify better than Gemma 3n at the same size).
 
@@ -707,9 +707,9 @@ The immediate next milestone is deploying the Rust daemon on the rooted Pixel 10
 
 - **wasmtime binary size.** wasmtime adds ~10-15MB to the final binary. On a phone with 128GB+ storage this isn't a problem, but it's worth knowing. There are lighter alternatives (wasmi, wasm3) that are smaller but slower and lack some features (WASI support, async host functions). *Mitigation*: Start with wasmtime. If size is a concern, evaluate wasmi for skills that don't need high performance.
 
-- **Skill debugging is painful.** When a WASM skill fails, the error is typically an opaque trap with a memory address. Mapping that back to source code requires DWARF debug info in the WASM, which not all languages emit cleanly. Skill authors need a good development experience or nobody will write skills. *Mitigation*: Ship a `citros skill dev` command that runs skills locally on the Mac/PC with full debugging, logging, and capability simulation. The phone runtime is production; the dev loop happens on a desktop.
+- **Skill debugging is painful.** When a WASM skill fails, the error is typically an opaque trap with a memory address. Mapping that back to source code requires DWARF debug info in the WASM, which not all languages emit cleanly. Skill authors need a good development experience or nobody will write skills. *Mitigation*: Ship a `fawx skill dev` command that runs skills locally on the Mac/PC with full debugging, logging, and capability simulation. The phone runtime is production; the dev loop happens on a desktop.
 
-- **Signed skill bootstrapping.** You need a key management story. Who generates keys? Where are public keys stored? How does the phone know which keys to trust? If you lose your signing key, can you still update skills? *Mitigation*: Ed25519 key pair generated during `citros setup`. Public key embedded in the daemon's config (signed config file). Private key stored in the cloud instance's encrypted storage. Skill signing happens on the cloud instance or on a trusted development machine. Device trusts keys in its config. Adding a new trusted key requires re-signing the config with an existing trusted key. Emergency recovery: if all keys lost, factory reset + re-setup (the nuclear option, but honest about the tradeoff).
+- **Signed skill bootstrapping.** You need a key management story. Who generates keys? Where are public keys stored? How does the phone know which keys to trust? If you lose your signing key, can you still update skills? *Mitigation*: Ed25519 key pair generated during `fawx setup`. Public key embedded in the daemon's config (signed config file). Private key stored in the cloud instance's encrypted storage. Skill signing happens on the cloud instance or on a trusted development machine. Device trusts keys in its config. Adding a new trusted key requires re-signing the config with an existing trusted key. Emergency recovery: if all keys lost, factory reset + re-setup (the nuclear option, but honest about the tradeoff).
 
 - **Built-in skills need to interact with Android apps.** The "contacts" skill needs to read the phone's contacts database. On Android, this is a content provider (content://com.android.contacts). Accessing it from a Rust daemon requires either: (a) calling Android framework APIs via JNI, (b) reading the SQLite database directly (possible with root, but fragile across Android versions), or (c) having the companion app serve as a bridge (query content provider, pipe results to daemon). *Mitigation*: Option (c) for the PoC. The companion app exposes a local API that the daemon can call for Android-specific data (contacts, calendar, media store). This is PoC-specific scaffolding that goes away in Horizon 2 where services access data directly.
 
@@ -746,7 +746,7 @@ The immediate next milestone is deploying the Rust daemon on the rooted Pixel 10
 The PoC runs on top of Android, puppeting its UI. The OS *replaces* Android's userspace while keeping the Linux kernel and hardware abstraction layer.
 
 ```
-Android stack:                    CitrosOS stack:
+Android stack:                    FawxOS stack:
 ┌──────────────┐                 ┌──────────────┐
 │ Apps (APKs)  │                 │ WASM Services│  ← Skills become services
 ├──────────────┤                 ├──────────────┤
@@ -981,7 +981,7 @@ Decisions that have been made, with rationale, to avoid revisiting them.
 | 15 | Hardening phase before production paths | Security primitives exist (Epics 1-8) but aren't mandatory. Adding features on top of optional security creates tech debt. Harden first, then build. | All enforcement gaps are closed and we're confident in the defaults |
 | 16 | Dual-tier distribution: non-root (standard) + root (pro) | Non-root covers 90% of capability via Accessibility Service. Root unlocks /dev/input, screen capture, SELinux mods. Sideload SaaS, no Play Store dependency — avoids policy risk and 30% cut. | Play Store policy becomes favorable, or root becomes mainstream |
 | 17 | User-selected cloud LLM as primary driver | Users BYOK (OpenRouter/Claude/ChatGPT). Local model is fallback/offline/intent classification. Cloud models are dramatically more capable — don't handicap the product by forcing local-only. Managed proxy option for users who don't want API keys. | Local models become good enough for complex reasoning (years away) |
-| 18 | Unified LLM provider trait with multimodal capabilities | Citros defines its own interface; adapters translate per-provider. Each provider declares capabilities by modality (text/vision/voice). No LocalModel vs CloudModel split — local is just another provider. Future-proofs for any new provider or modality. | A provider requires fundamentally different interaction patterns that can't be adapted |
+| 18 | Unified LLM provider trait with multimodal capabilities | Fawx defines its own interface; adapters translate per-provider. Each provider declares capabilities by modality (text/vision/voice). No LocalModel vs CloudModel split — local is just another provider. Future-proofs for any new provider or modality. | A provider requires fundamentally different interaction patterns that can't be adapted |
 | 19 | API keys encrypted on-device, never in LLM context | Keys decrypted only in HTTP adapter layer, injected as auth headers. LLM prompt/context never contains keys. Separate code paths for credentials and inference. Marketable security guarantee. | Hardware secure enclave becomes accessible from Rust (then move keys there) |
 | 20 | Key Agent process design (ssh-agent pattern) | Design IPC interface now for a separate credential broker process. Daemon proxies API calls through key agent, never holds plaintext keys. Process isolation is OS-enforced — even memory exploits in the daemon can't reach keys. Build same-process module first, split to separate process when ready. | Performance profiling shows IPC overhead is unacceptable (unlikely — ~0.1ms vs network RTT) |
 | 21 | Provider capability matrix for routing | Each provider declares: streaming, tool use, vision, voice, max context, etc. Routing layer picks best provider per modality. Users can mix-and-match (Claude for text, OpenAI for voice, local for classification). | All providers converge to identical capabilities (unlikely) |

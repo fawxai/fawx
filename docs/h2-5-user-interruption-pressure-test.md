@@ -3,7 +3,7 @@
 > **Date:** 2026-02-21
 > **Author:** Clawdio
 > **Reference implementation:** OpenClaw steer system (pi-embedded-runner, reply module)
-> **Citros baseline:** BoundaryCheck + SteerCheck (H1.2)
+> **Fawx baseline:** BoundaryCheck + SteerCheck (H1.2)
 
 ## 1. How OpenClaw Handles Mid-Task User Input
 
@@ -38,11 +38,11 @@ OpenClaw has a **queue mode system** with 5 modes for handling inbound messages 
 - **Rate limiting on subagent steer** — prevents rapid-fire steer flooding
 - **Steer restarts suppress announces** — when a session is steered, pending sub-agent announcements are suppressed to avoid confusion
 
-## 2. How Citros Currently Handles Mid-Task User Input
+## 2. How Fawx Currently Handles Mid-Task User Input
 
 ### Architecture (H1.2 — BoundaryCheck + SteerCheck)
 
-Citros already has a steer system built during H1:
+Fawx already has a steer system built during H1:
 
 1. **User types message** in chat UI during active tool loop
 2. `ChatViewModel` adds message to a pending queue
@@ -54,12 +54,12 @@ Citros already has a steer system built during H1:
 
 ### Early Steer (during API call)
 
-Citros also handles messages that arrive DURING the API call (lines 162-202 of AgentExecutor.kt):
+Fawx also handles messages that arrive DURING the API call (lines 162-202 of AgentExecutor.kt):
 - After each API call returns, `steerMessageSource()` is drained
 - If messages arrived during the call, they're delivered before tool execution begins
 - The model gets a fresh API call with the steer messages visible
 
-### What Citros Does NOT Have (the H2.5 gap)
+### What Fawx Does NOT Have (the H2.5 gap)
 
 The current steer system only handles **explicit text messages** typed by the user. It does NOT detect:
 
@@ -69,9 +69,9 @@ The current steer system only handles **explicit text messages** typed by the us
 
 These are all forms of **implicit interruption** — the user is taking control without typing a message.
 
-## 3. Gap Analysis: Citros vs OpenClaw
+## 3. Gap Analysis: Fawx vs OpenClaw
 
-| Aspect | OpenClaw | Citros (current) | Citros (H2.5 target) |
+| Aspect | OpenClaw | Fawx (current) | Fawx (H2.5 target) |
 |--------|----------|-------------------|----------------------|
 | Explicit text steer | \u2705 steer mode | \u2705 SteerCheck | \u2705 (already done) |
 | Touch/gesture interrupt | N/A (no physical screen) | \u274c Not detected | \u2705 Detect + pause |
@@ -81,7 +81,7 @@ These are all forms of **implicit interruption** — the user is taking control 
 | Resume after pause | N/A | N/A | \u2705 Resume protocol |
 | Rate limiting | \u2705 On subagents | \u274c | \u2705 Debounce rapid events |
 
-**Key insight:** OpenClaw's steer is entirely text-based because it operates over messaging channels. Citros needs to handle the same problem PLUS physical interaction detection — a harder problem with no direct reference implementation.
+**Key insight:** OpenClaw's steer is entirely text-based because it operates over messaging channels. Fawx needs to handle the same problem PLUS physical interaction detection — a harder problem with no direct reference implementation.
 
 ## 4. Design Proposal
 
@@ -194,9 +194,9 @@ No special resume mechanism needed — conversation history IS the state. The mo
 
 ### Intentional Divergences from OpenClaw
 
-5. **Steer injection vs loop pause** — OpenClaw injects steer text and lets the model decide. Citros does the same architecturally (uses `CheckResult.Steer`), but the *content* of the steer message asks the model to pause. This is an intentional UX decision: physical device control is higher stakes than text chat, so we default to "ask before continuing" rather than "silently incorporate."
+5. **Steer injection vs loop pause** — OpenClaw injects steer text and lets the model decide. Fawx does the same architecturally (uses `CheckResult.Steer`), but the *content* of the steer message asks the model to pause. This is an intentional UX decision: physical device control is higher stakes than text chat, so we default to "ask before continuing" rather than "silently incorporate."
 
-6. **No compaction blocking** — OpenClaw blocks steer during compaction. Citros doesn't have mid-loop compaction (compaction happens between turns in `transformContext`). Not applicable.
+6. **No compaction blocking** — OpenClaw blocks steer during compaction. Fawx doesn't have mid-loop compaction (compaction happens between turns in `transformContext`). Not applicable.
 
 ## 6. Implementation Plan
 
@@ -220,4 +220,4 @@ No special resume mechanism needed — conversation history IS the state. The mo
 
 ---
 
-*Sources: OpenClaw dist (pi-embedded-CHb5giY2.js, reply-B4B0jUCM.js, subagent-registry-DOZpiiys.js), Citros BoundaryCheck.kt, AgentExecutor.kt*
+*Sources: OpenClaw dist (pi-embedded-CHb5giY2.js, reply-B4B0jUCM.js, subagent-registry-DOZpiiys.js), Fawx BoundaryCheck.kt, AgentExecutor.kt*

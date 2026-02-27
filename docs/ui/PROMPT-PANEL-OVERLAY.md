@@ -8,7 +8,7 @@ The attached images show the panel in context on the Pixel home screen. Match th
 
 ## Why
 
-Citros runs on a rooted Pixel 10 Pro with Accessibility Service and overlay permissions. The panel slides up over whatever app is currently active, giving the user a fast way to interact with Citros without leaving their context. It sits between the ambient Search Bar (always visible, status-only) and the full Chat screen (immersive conversation).
+Fawx runs on a rooted Pixel 10 Pro with Accessibility Service and overlay permissions. The panel slides up over whatever app is currently active, giving the user a fast way to interact with Fawx without leaving their context. It sits between the ambient Search Bar (always visible, status-only) and the full Chat screen (immersive conversation).
 
 ## Panel Spec
 
@@ -31,11 +31,11 @@ Citros runs on a rooted Pixel 10 Pro with Accessibility Service and overlay perm
 
 ### Header Row
 ```
-[Orb g(7)] — [g(2.5) gap] — [Title "Citros", flex] — [Expand chip]
+[Orb g(7)] — [g(2.5) gap] — [Title "Fawx", flex] — [Expand chip]
 ```
 - Padding: `g(1.5)` top, `g(2.5)` bottom, `g(4)` horizontal
 - **Orb:** `g(7)` = 28dp with standard glow. Uses active flavor color/glow/inner tokens.
-- **Title:** "Citros" — 15sp, weight 600, tracking -0.2, color `labelPrimary`, flex = 1
+- **Title:** "Fawx" — 15sp, weight 600, tracking -0.2, color `labelPrimary`, flex = 1
 - **Expand chip:** Background `surface2`, radius `g(3.5)` = 14dp, padding `g(1.25)` vertical × `g(3)` horizontal, text "Expand" in 13sp `labelSecondary`. Tapping opens the full Chat screen.
 
 ### Content Area

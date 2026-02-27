@@ -10,7 +10,7 @@
 
 ## Thesis
 
-Citros has a working phone agent. The agentic loop executes tasks, voice I/O works, memory persists, the UI is polished. But it's a demo, not a product. Three structural gaps prevent it from being something you'd hand to another human:
+Fawx has a working phone agent. The agentic loop executes tasks, voice I/O works, memory persists, the UI is polished. But it's a demo, not a product. Three structural gaps prevent it from being something you'd hand to another human:
 
 1. **The brain dies when the activity dies.** The agent loop runs in `ChatViewModel`, scoped to `ChatActivity`. Switch apps, screen off too long, memory pressure — the loop dies mid-task with no recovery. No amount of loop tuning fixes this if the process hosting the loop gets killed.
 
@@ -77,10 +77,10 @@ Survive app switches + screen off.   Better first-execution success.
 
 ## Moat Analysis
 
-After all four sprints, Citros has three compounding moats:
+After all four sprints, Fawx has three compounding moats:
 
 1. **Playbook library** — every successful execution makes the next one faster and cheaper. Scales to community sharing (H3.7). Cold-start advantage grows with time.
-2. **HITL policy engine** — per-invocation context-aware safety that no other phone agent has. OpenClaw has static tool allowlists; Citros has runtime policy evaluation with screen context, sensitive app detection, and financial submit blocking.
+2. **HITL policy engine** — per-invocation context-aware safety that no other phone agent has. OpenClaw has static tool allowlists; Fawx has runtime policy evaluation with screen context, sensitive app detection, and financial submit blocking.
 3. **Service persistence** — the agent survives real-world Android lifecycle events. It's not a demo that works when you're watching — it works when you're not.
 
 ---

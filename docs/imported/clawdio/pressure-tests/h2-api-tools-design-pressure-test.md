@@ -6,7 +6,7 @@
 
 ## 1. Overview
 
-Add two built-in API tools to Citros:
+Add two built-in API tools to Fawx:
 - **`web_search`** — Search the web via Brave Search API
 - **`web_fetch`** — Fetch and extract readable content from a URL
 
@@ -133,7 +133,7 @@ ALL policies must agree (AND logic via `isToolAllowedByPolicies`).
 
 ---
 
-## 3. Citros Design
+## 3. Fawx Design
 
 ### 3.1 Architecture
 
@@ -149,8 +149,8 @@ ToolResult(text, isError)  — Typed result
 ```
 
 New files:
-- `core/src/main/kotlin/ai/citros/core/WebSearchClient.kt`
-- `core/src/main/kotlin/ai/citros/core/WebFetchClient.kt`
+- `core/src/main/kotlin/ai/fawx/core/WebSearchClient.kt`
+- `core/src/main/kotlin/ai/fawx/core/WebFetchClient.kt`
 
 ### 3.2 Tool Definitions
 
@@ -202,7 +202,7 @@ val WEB_FETCH = Tool(
 
 ### 3.3 Intentional Divergences from OpenClaw
 
-| Aspect | OpenClaw | Citros | Rationale |
+| Aspect | OpenClaw | Fawx | Rationale |
 |--------|----------|--------|-----------|
 | Search count | 1-10, default 5 | 1-5, default 3 | Phone context window is smaller; 3 results is enough for most queries |
 | Search providers | Brave, Perplexity, Grok | Brave only (H2) | YAGNI — add providers when needed |
@@ -337,7 +337,7 @@ class WebFetchClient(
             try {
                 val request = Request.Builder()
                     .url(url)
-                    .header("User-Agent", "Citros/1.0")
+                    .header("User-Agent", "Fawx/1.0")
                     .get()
                     .build()
 

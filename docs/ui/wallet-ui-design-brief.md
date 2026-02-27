@@ -4,7 +4,7 @@
 
 ## App Context
 
-Citros is an AI phone agent — users chat with an AI that can physically interact with their Android phone (tap, type, launch apps, read screens). The brand identity is 3D citrus fruit with a warm, premium feel. Think: a luxury tool that feels friendly, not enterprise-y.
+Fawx is an AI phone agent — users chat with an AI that can physically interact with their Android phone (tap, type, launch apps, read screens). The brand identity is 3D citrus fruit with a warm, premium feel. Think: a luxury tool that feels friendly, not enterprise-y.
 
 ## What to Design
 

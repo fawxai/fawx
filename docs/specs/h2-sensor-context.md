@@ -15,7 +15,7 @@
 A lightweight snapshot of device state, gathered once per task start (not per tool call).
 
 ```kotlin
-package ai.citros.core
+package ai.fawx.core
 
 /**
  * Device network connectivity type.
@@ -73,7 +73,7 @@ data class SensorContext(
 Abstraction layer so tests can mock sensor data and production code uses Android APIs.
 
 ```kotlin
-package ai.citros.core
+package ai.fawx.core
 
 /**
  * Device network connectivity type.

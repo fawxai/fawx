@@ -6,7 +6,7 @@ Defer privacy-list backup/restore + first-run recovery prompt from PR #688.
 
 ## Tracking
 
-- GitHub issue: https://github.com/abbudjoe/citros/issues/697
+- GitHub issue: https://github.com/abbudjoe/fawx/issues/697
 - Status: tracked for post-PR #688 follow-up (explicitly out-of-scope for runtime enforcement changes).
 - PR comment draft with rationale: `docs/backlog/pr688-r24-defer-comment.md`
 - Local reference: `docs/backlog/privacy-list-persistence.md`

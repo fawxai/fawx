@@ -493,7 +493,7 @@ const ChatNavAndBackground = ({ t, flavor }) => (
     }}>
       <Orb color={orbClr(flavor, t)} inner={orbInn(flavor, t)} glow={orbGlw(flavor, t)} size={g(8)} />
       <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ fontSize: 17, fontWeight: 600, letterSpacing: -0.4, color: t.labelPrimary, lineHeight: "22px" }}>Citros</div>
+        <div style={{ fontSize: 17, fontWeight: 600, letterSpacing: -0.4, color: t.labelPrimary, lineHeight: "22px" }}>Fawx</div>
         <div style={{ fontSize: 13, letterSpacing: -0.1, color: accent(flavor, t), lineHeight: "18px", textDecoration: "underline", textDecorationStyle: "dotted", textUnderlineOffset: 2 }}>
           Claude Sonnet 4.5 ▾
         </div>

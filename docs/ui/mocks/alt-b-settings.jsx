@@ -146,7 +146,7 @@ const HubPage = ({ t, rv, flavor, navigate }) => (
     <div style={{ display: "flex", alignItems: "center", gap: g(3.5), padding: `${g(3)}px ${g(4)}px ${g(5)}px` }}>
       <Orb color={rv.orbColor} glow={rv.orbGlow} size={g(14)} />
       <div>
-        <div style={{ fontSize: 22, fontWeight: 700, letterSpacing: -0.5, color: t.textPrimary }}>Citros</div>
+        <div style={{ fontSize: 22, fontWeight: 700, letterSpacing: -0.5, color: t.textPrimary }}>Fawx</div>
         <div style={{ fontSize: 14, color: t.textSecondary, marginTop: 2 }}>2 providers connected</div>
       </div>
     </div>
@@ -211,9 +211,9 @@ const AppearancePage = ({ t, rv, flavor, setFlavor, theme, setTheme, onBack }) =
 const TrustPage = ({ t, rv, onBack }) => {
   const [level, setLevel] = useState(1);
   const items = [
-    { label: "Ask before everything", desc: "Confirm every action before Citros takes it" },
+    { label: "Ask before everything", desc: "Confirm every action before Fawx takes it" },
     { label: "Ask for risky actions", desc: "Auto-approve safe actions, ask for sensitive ones" },
-    { label: "Full autonomy", desc: "Citros acts independently on your behalf" },
+    { label: "Full autonomy", desc: "Fawx acts independently on your behalf" },
   ];
   return (
     <SubPage title="Trust Level" onBack={onBack} t={t} rv={rv}>
@@ -225,7 +225,7 @@ const TrustPage = ({ t, rv, onBack }) => {
         ))}
       </Section>
       <div style={{ padding: `0 ${g(8)}px`, fontSize: 13, color: t.textTertiary, lineHeight: "18px", letterSpacing: -0.1 }}>
-        Trust level controls how much confirmation Citros requires before taking actions on your phone.
+        Trust level controls how much confirmation Fawx requires before taking actions on your phone.
       </div>
     </SubPage>
   );
