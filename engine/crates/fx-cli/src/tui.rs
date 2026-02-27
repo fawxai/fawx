@@ -17,12 +17,15 @@ use fx_llm::{
     OpenAiResponsesProvider, ProviderError, RouterError, StreamChunk,
 };
 use std::fmt;
+use std::future::Future;
 use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::oneshot;
+use tokio::time::{sleep, Duration};
 
 const BANNER_ART: &str = r#"   ___
   / _/__ __    ____  __
@@ -38,6 +41,7 @@ const DEFAULT_CONTEXT_MAX_TOKENS: usize = 8_000;
 const DEFAULT_CONTEXT_COMPACT_TARGET: usize = 6_000;
 const DEFAULT_MAX_LOOP_ITERATIONS: u32 = 10;
 const MAX_HISTORY_MESSAGES: usize = 20;
+const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 const DEFAULT_ANTHROPIC_MODELS: &[&str] = &[
     "claude-sonnet-4-20250514",
@@ -65,6 +69,44 @@ fn theme_color(r: u8, g: u8, b: u8, fallback_256: u8) -> style::Color {
     } else {
         style::Color::AnsiValue(fallback_256)
     }
+}
+
+fn spinner_frame(index: usize) -> char {
+    SPINNER_FRAMES[index % SPINNER_FRAMES.len()]
+}
+
+fn clear_spinner_line() {
+    eprint!("\r\x1b[2K");
+    let _ = io::stderr().flush();
+}
+
+async fn run_thinking_spinner(mut stop_signal: oneshot::Receiver<()>) {
+    let mut frame_index = 0;
+    loop {
+        tokio::select! {
+            _ = &mut stop_signal => {
+                clear_spinner_line();
+                break;
+            }
+            _ = sleep(Duration::from_millis(80)) => {
+                eprint!("\r\x1b[2K{} thinking...", spinner_frame(frame_index));
+                let _ = io::stderr().flush();
+                frame_index += 1;
+            }
+        }
+    }
+}
+
+async fn run_with_thinking_spinner<F, T>(future: F) -> T
+where
+    F: Future<Output = T>,
+{
+    let (stop_tx, stop_rx) = oneshot::channel();
+    let spinner_task = tokio::spawn(run_thinking_spinner(stop_rx));
+    let result = future.await;
+    let _ = stop_tx.send(());
+    let _ = spinner_task.await;
+    result
 }
 
 /// The main TUI application loop.
@@ -355,15 +397,16 @@ impl TuiApp {
             .to_string();
 
         let snapshot = self.build_perception_snapshot(input);
-        let loop_result = {
+        let loop_result = run_with_thinking_spinner(async {
             let router = &self.router;
             let llm = RouterLoopLlmProvider::new(router, active_model);
             let loop_engine = &mut self.loop_engine;
             loop_engine
                 .run_cycle(snapshot, &llm)
                 .await
-                .map_err(|error| TuiError::Loop(error.reason))?
-        };
+                .map_err(|error| TuiError::Loop(error.reason))
+        })
+        .await?;
 
         let response = render_loop_result(loop_result.clone());
         self.record_conversation_turn(input, loop_result_response_text(&loop_result));
@@ -2556,6 +2599,19 @@ mod tests {
         let _color_term = ScopedEnvVar::set("COLORTERM", "ansi");
 
         assert_eq!(theme_color(255, 204, 0, 220), style::Color::AnsiValue(220));
+    }
+
+    #[tokio::test]
+    async fn spinner_stops_when_signaled() {
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let spinner = tokio::spawn(run_thinking_spinner(stop_rx));
+
+        let _ = stop_tx.send(());
+
+        tokio::time::timeout(Duration::from_millis(200), spinner)
+            .await
+            .expect("spinner should stop quickly")
+            .expect("spinner task should join");
     }
 
     #[test]
