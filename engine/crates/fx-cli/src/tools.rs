@@ -6,7 +6,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
 
 const MAX_RECURSION_DEPTH: usize = 5;
@@ -55,6 +55,7 @@ impl FawxToolExecutor {
             "list_directory" => self.handle_list_directory(&call.arguments),
             "run_command" => self.handle_run_command(&call.arguments).await,
             "search_text" => self.handle_search_text(&call.arguments),
+            "current_time" => self.handle_current_time(),
             _ => Err(format!("unknown tool: {}", call.name)),
         };
         to_tool_result(&call.name, output)
@@ -178,6 +179,19 @@ impl FawxToolExecutor {
         let mut results = Vec::new();
         self.search_path(&root, &parsed, &mut results)?;
         Ok(results.join("\n"))
+    }
+
+    fn handle_current_time(&self) -> Result<String, String> {
+        let now = SystemTime::now();
+        let duration = now
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| format!("system time before Unix epoch: {error}"))?;
+        let epoch = duration.as_secs();
+        let iso = iso8601_utc_from_epoch(epoch);
+        let day_of_week = day_of_week_from_epoch(epoch);
+        Ok(format!(
+            "iso8601_utc: {iso}\nepoch: {epoch}\nday_of_week: {day_of_week}"
+        ))
     }
 
     fn resolve_search_root(&self, requested: Option<&str>) -> Result<PathBuf, String> {
@@ -348,6 +362,12 @@ pub fn fawx_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["pattern"]
             }),
         },
+        ToolDefinition {
+            name: "current_time".to_string(),
+            description: "Get the current date, time, timezone, and Unix epoch timestamp"
+                .to_string(),
+            parameters: serde_json::json!({"type": "object", "properties": {}, "required": []}),
+        },
     ]
 }
 
@@ -491,6 +511,47 @@ fn simple_glob_match(name: &str, pattern: &str) -> bool {
         return name.starts_with(parts[0]) && name.ends_with(parts[1]);
     }
     name.contains(&pattern.replace('*', ""))
+}
+
+fn day_of_week_from_epoch(epoch: u64) -> &'static str {
+    let days_since_epoch = (epoch / 86_400) as i64;
+    let weekday_index = (days_since_epoch + 4).rem_euclid(7);
+    match weekday_index {
+        0 => "Sunday",
+        1 => "Monday",
+        2 => "Tuesday",
+        3 => "Wednesday",
+        4 => "Thursday",
+        5 => "Friday",
+        _ => "Saturday",
+    }
+}
+
+fn iso8601_utc_from_epoch(epoch: u64) -> String {
+    let days_since_epoch = (epoch / 86_400) as i64;
+    let seconds_of_day = epoch % 86_400;
+    let (year, month, day) = civil_from_days(days_since_epoch);
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    let second = seconds_of_day % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    if month <= 2 {
+        year += 1;
+    }
+    (year, month as u32, day as u32)
 }
 
 fn parse_args<T: for<'de> Deserialize<'de>>(value: &serde_json::Value) -> Result<T, String> {
@@ -896,6 +957,65 @@ mod tests {
             .handle_search_text(&serde_json::json!({"pattern": "needle"}))
             .expect("search");
         assert!(output.contains("skipped (file exceeds max_file_size)"));
+    }
+
+    #[test]
+    fn current_time_returns_epoch_and_date() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let output = executor.handle_current_time().expect("current_time");
+        assert!(output.contains("epoch:"));
+        assert!(output.contains("iso8601_utc:"));
+
+        let epoch_line = output
+            .lines()
+            .find(|line| line.starts_with("epoch:"))
+            .expect("epoch line");
+        let epoch = epoch_line
+            .split(':')
+            .nth(1)
+            .expect("epoch value")
+            .trim()
+            .parse::<u64>()
+            .expect("parse epoch");
+        assert!(epoch > 1_577_836_800);
+    }
+
+    #[test]
+    fn time_format_helpers_format_epoch_zero_deterministically() {
+        let epoch = 0;
+
+        assert_eq!(iso8601_utc_from_epoch(epoch), "1970-01-01T00:00:00Z");
+        assert_eq!(day_of_week_from_epoch(epoch), "Thursday");
+    }
+
+    #[test]
+    fn time_format_helpers_format_known_friday_deterministically() {
+        let epoch = 1_709_251_200;
+
+        assert_eq!(iso8601_utc_from_epoch(epoch), "2024-03-01T00:00:00Z");
+        assert_eq!(day_of_week_from_epoch(epoch), "Friday");
+    }
+
+    #[tokio::test]
+    async fn current_time_tool_dispatch() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let calls = vec![ToolCall {
+            id: "1".to_string(),
+            name: "current_time".to_string(),
+            arguments: serde_json::json!({}),
+        }];
+
+        let results = executor.execute_tools(&calls).await.expect("results");
+        assert!(results[0].success);
+        assert!(results[0].output.contains("day_of_week:"));
+    }
+
+    #[test]
+    fn current_time_appears_in_definitions() {
+        let definitions = fawx_tool_definitions();
+        assert!(definitions.iter().any(|tool| tool.name == "current_time"));
     }
 
     #[tokio::test]
