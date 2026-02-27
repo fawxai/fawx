@@ -4,6 +4,7 @@
 //! perceive → reason → decide → act → verify → learn → continue.
 
 use fx_core::types::{Notification, ScreenState, SwipeDirection, UserInput};
+use fx_llm::Message;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -22,6 +23,9 @@ pub struct PerceptionSnapshot {
     pub sensor_data: Option<SensorData>,
     /// User-initiated input that triggered this cycle (if any).
     pub user_input: Option<UserInput>,
+    /// Prior conversation turns retained for context-window construction.
+    #[serde(default)]
+    pub conversation_history: Vec<Message>,
 }
 
 /// Sensor data captured alongside perception.
@@ -458,6 +462,7 @@ mod tests {
                 timestamp: 1_700_000_000_122,
                 context_id: Some("ctx-123".to_owned()),
             }),
+            conversation_history: Vec::new(),
         };
 
         let encoded = serde_json::to_string(&snapshot).expect("serialize snapshot");
@@ -615,6 +620,7 @@ mod tests {
                 timestamp_ms: 1_700_000_000_001,
                 sensor_data: None,
                 user_input: None,
+                conversation_history: Vec::new(),
             },
             working_memory: vec![WorkingMemoryEntry {
                 key: "thread_id".to_owned(),
@@ -653,6 +659,7 @@ mod tests {
                 timestamp_ms: 1_700_000_000_123,
                 sensor_data: None,
                 user_input: None,
+                conversation_history: Vec::new(),
             },
             working_memory: vec![],
             relevant_episodic: vec![],

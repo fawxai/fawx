@@ -37,6 +37,7 @@ const MAX_PROMPT_RETRIES: usize = 10;
 const DEFAULT_CONTEXT_MAX_TOKENS: usize = 8_000;
 const DEFAULT_CONTEXT_COMPACT_TARGET: usize = 6_000;
 const DEFAULT_MAX_LOOP_ITERATIONS: u32 = 10;
+const MAX_HISTORY_MESSAGES: usize = 20;
 
 const DEFAULT_ANTHROPIC_MODELS: &[&str] = &[
     "claude-sonnet-4-20250514",
@@ -59,6 +60,7 @@ pub struct TuiApp {
     catalog: ModelCatalog,
     loop_engine: LoopEngine,
     running: bool,
+    conversation_history: Vec<Message>,
 }
 
 impl TuiApp {
@@ -70,6 +72,7 @@ impl TuiApp {
             catalog: ModelCatalog::new(),
             loop_engine,
             running: true,
+            conversation_history: Vec::new(),
         }
     }
 
@@ -325,7 +328,10 @@ impl TuiApp {
             ParsedCommand::Budget => self.show_budget_status(),
             ParsedCommand::Loop => self.show_loop_status(),
             ParsedCommand::Status => self.show_status(),
-            ParsedCommand::Clear => self.clear_screen()?,
+            ParsedCommand::Clear => {
+                self.conversation_history.clear();
+                self.clear_screen()?;
+            }
             ParsedCommand::Help => self.show_help(),
             ParsedCommand::Quit => {
                 self.running = false;
@@ -361,7 +367,9 @@ impl TuiApp {
                 .map_err(|error| TuiError::Loop(error.reason))?
         };
 
-        Ok(render_loop_result(loop_result))
+        let response = render_loop_result(loop_result.clone());
+        self.record_conversation_turn(input, loop_result_response_text(&loop_result));
+        Ok(response)
     }
 
     async fn ensure_message_auth(&mut self) -> Result<(), TuiError> {
@@ -618,7 +626,15 @@ impl TuiApp {
                 timestamp: timestamp_ms,
                 context_id: None,
             }),
+            conversation_history: self.conversation_history.clone(),
         }
+    }
+
+    fn record_conversation_turn(&mut self, user_text: &str, assistant_text: String) {
+        self.conversation_history.push(Message::user(user_text.to_string()));
+        self.conversation_history
+            .push(Message::assistant(assistant_text));
+        trim_history(&mut self.conversation_history);
     }
 }
 
@@ -814,6 +830,33 @@ impl LoopLlmProvider for RouterLoopLlmProvider<'_> {
     fn model_name(&self) -> &str {
         &self.active_model
     }
+}
+
+fn loop_result_response_text(result: &LoopResult) -> String {
+    match result {
+        LoopResult::Complete { response, .. } => response.clone(),
+        LoopResult::BudgetExhausted {
+            partial_response,
+            iterations,
+        } => render_budget_exhausted(partial_response.clone(), *iterations),
+        LoopResult::NeedsInput { prompt, iterations } => {
+            let meta = format!("\x1b[2m  \u{21b3} {iterations} iteration(s) \u{00b7} needs input\x1b[0m");
+            format!("{prompt}\n{meta}")
+        }
+        LoopResult::Error {
+            message,
+            recoverable,
+        } => render_loop_error(message, *recoverable),
+    }
+}
+
+fn trim_history(history: &mut Vec<Message>) {
+    if history.len() <= MAX_HISTORY_MESSAGES {
+        return;
+    }
+
+    let remove_count = history.len() - MAX_HISTORY_MESSAGES;
+    history.drain(0..remove_count);
 }
 
 fn render_loop_result(result: LoopResult) -> String {
@@ -2200,6 +2243,7 @@ mod tests {
                 timestamp: 1,
                 context_id: None,
             }),
+            conversation_history: Vec::new(),
         }
     }
 
@@ -2603,6 +2647,52 @@ mod tests {
 
         assert!(rendered.contains("Loop-integrated reply"));
         assert!(rendered.contains("1 iteration"));
+    }
+
+    #[tokio::test]
+    async fn conversation_history_accumulates_across_messages() {
+        let mut app = app_with_mock_model(
+            r#"{"action":{"Respond":{"text":"hello"}},"rationale":"r","confidence":0.9,"expected_outcome":null,"sub_goals":[]}"#,
+        );
+
+        let _ = app.handle_message("my name is Alice").await.expect("first");
+        let _ = app.handle_message("what is my name?").await.expect("second");
+
+        assert_eq!(app.conversation_history.len(), 4);
+        assert_eq!(app.conversation_history[0], Message::user("my name is Alice"));
+        assert_eq!(app.conversation_history[2], Message::user("what is my name?"));
+    }
+
+    #[tokio::test]
+    async fn conversation_history_respects_max_limit() {
+        let mut app = app_with_mock_model(
+            r#"{"action":{"Respond":{"text":"ok"}},"rationale":"r","confidence":0.9,"expected_outcome":null,"sub_goals":[]}"#,
+        );
+
+        for i in 0..15 {
+            let message = format!("msg-{i}");
+            let _ = app.handle_message(&message).await.expect("message response");
+        }
+
+        assert_eq!(app.conversation_history.len(), MAX_HISTORY_MESSAGES);
+        assert_eq!(
+            app.conversation_history[0],
+            Message::user("msg-5".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_command_resets_conversation_history() {
+        let mut app = app_with_mock_model(
+            r#"{"action":{"Respond":{"text":"ok"}},"rationale":"r","confidence":0.9,"expected_outcome":null,"sub_goals":[]}"#,
+        );
+
+        let _ = app.handle_message("remember this").await.expect("message");
+        assert!(!app.conversation_history.is_empty());
+
+        app.handle_command("/clear").await.expect("clear command");
+
+        assert!(app.conversation_history.is_empty());
     }
 
     #[tokio::test]
