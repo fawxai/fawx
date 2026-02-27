@@ -52,6 +52,10 @@ impl ModelRouter {
 
     /// Set the active model.
     pub fn set_active(&mut self, model: &str) -> Result<(), RouterError> {
+        if model.trim().is_empty() {
+            return Err(RouterError::EmptyModelSelector);
+        }
+
         let resolved_model = self.resolve_model(model)?;
         self.active_model = Some(resolved_model);
         Ok(())
@@ -173,6 +177,9 @@ pub enum RouterError {
     /// The model selector matches multiple registered models.
     #[error("ambiguous model selector: {0}")]
     AmbiguousModel(String),
+    /// The model selector is empty.
+    #[error("model selector cannot be empty")]
+    EmptyModelSelector,
     /// Provider-level request failure.
     #[error("provider error: {0}")]
     ProviderError(crate::types::LlmError),
@@ -675,6 +682,15 @@ mod model_router_tests {
         let models = router.available_models();
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].auth_method, "api_key");
+    }
+
+    #[test]
+    fn set_active_rejects_empty_selector() {
+        let mut router = ModelRouter::new();
+
+        let result = router.set_active("");
+
+        assert!(matches!(result, Err(RouterError::EmptyModelSelector)));
     }
 
     #[test]

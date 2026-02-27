@@ -14,7 +14,7 @@ use fx_kernel::oauth::{PkceFlow, TokenExchangeRequest, TokenResponse};
 use fx_kernel::types::PerceptionSnapshot;
 use fx_llm::{
     AnthropicProvider, CompletionRequest, Message, ModelCatalog, ModelRouter, OpenAiProvider,
-    OpenAiResponsesProvider, ProviderError, StreamChunk,
+    OpenAiResponsesProvider, ProviderError, RouterError, StreamChunk,
 };
 use std::fmt;
 use std::io::{self, Write};
@@ -310,8 +310,8 @@ impl TuiApp {
             }
             ParsedCommand::Model(Some(model)) => {
                 self.refresh_router_models().await?;
-                match self.router.set_active(&model) {
-                    Ok(()) => println!("Active model set to: {model}"),
+                match self.set_active_model_from_selector(&model) {
+                    Ok(resolved_model) => println!("Active model set to: {resolved_model}"),
                     Err(error) => {
                         println!("Couldn't select model: {error}");
                         self.show_model_menu();
@@ -383,6 +383,15 @@ impl TuiApp {
         }
 
         Ok(())
+    }
+
+    fn set_active_model_from_selector(&mut self, selector: &str) -> Result<String, RouterError> {
+        self.router.set_active(selector)?;
+        Ok(self
+            .router
+            .active_model()
+            .unwrap_or(selector)
+            .to_string())
     }
 
     /// Display formatted output to the terminal.
@@ -631,10 +640,11 @@ impl TuiApp {
     }
 
     fn record_conversation_turn(&mut self, user_text: &str, assistant_text: String) {
+        let clean_assistant_text = sanitize_history_text(&assistant_text);
         self.conversation_history
             .push(Message::user(user_text.to_string()));
         self.conversation_history
-            .push(Message::assistant(assistant_text));
+            .push(Message::assistant(clean_assistant_text));
         trim_history(&mut self.conversation_history);
     }
 }
@@ -850,6 +860,39 @@ fn loop_result_response_text(result: &LoopResult) -> String {
             recoverable,
         } => render_loop_error(message, *recoverable),
     }
+}
+
+fn sanitize_history_text(text: &str) -> String {
+    let stripped = strip_ansi_csi_sequences(text);
+    stripped
+        .lines()
+        .filter(|line| !line.contains('\u{21b3}'))
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+fn strip_ansi_csi_sequences(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for code in chars.by_ref() {
+                if ('@'..='~').contains(&code) {
+                    break;
+                }
+            }
+            continue;
+        }
+
+        output.push(ch);
+    }
+
+    output
 }
 
 fn trim_history(history: &mut Vec<Message>) {
@@ -2629,6 +2672,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_command_resolves_prefix_to_full_model_id() {
+        let mut app = app_with_two_models();
+
+        let resolved = app
+            .set_active_model_from_selector("claude-sonnet-4-6")
+            .expect("model selector should resolve");
+
+        assert_eq!(resolved, "claude-sonnet-4-6-20250929");
+    }
+
+    #[tokio::test]
     async fn handle_message_uses_current_active_model() {
         let mut app = app_with_two_models();
 
@@ -2675,6 +2729,32 @@ mod tests {
         assert_eq!(
             app.conversation_history[2],
             Message::user("what is my name?")
+        );
+    }
+
+    #[tokio::test]
+    async fn model_switch_preserves_conversation_history() {
+        let mut app = app_with_two_models();
+
+        app.handle_message("remember the launch code")
+            .await
+            .expect("first response");
+        app.handle_command("/model claude-sonnet-4-6")
+            .await
+            .expect("model switch command");
+        app.handle_message("what model are you using now?")
+            .await
+            .expect("second response");
+
+        assert_eq!(app.current_model(), "claude-sonnet-4-6-20250929");
+        assert_eq!(app.conversation_history.len(), 4);
+        assert_eq!(
+            app.conversation_history[0],
+            Message::user("remember the launch code".to_string())
+        );
+        assert_eq!(
+            app.conversation_history[2],
+            Message::user("what model are you using now?".to_string())
         );
     }
 
@@ -2918,6 +2998,15 @@ mod tests {
         });
         assert!(result.contains("\u{2717} timeout"));
         assert!(result.contains("recoverable"));
+    }
+
+    #[test]
+    fn sanitize_history_text_removes_ansi_and_loop_metadata() {
+        let text = "Answer\n\x1b[2m  ↳ 2 iterations · 50 in / 12 out tokens\x1b[0m\n\x1b[33mwarning\x1b[0m";
+
+        let sanitized = sanitize_history_text(text);
+
+        assert_eq!(sanitized, "Answer\nwarning");
     }
 
     #[tokio::test]
