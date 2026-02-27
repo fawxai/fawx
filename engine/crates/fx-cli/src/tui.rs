@@ -136,28 +136,27 @@ where
     result
 }
 
+/// Curated preference order — newest capable model first.
+const PREFERRED_MODEL_PATTERNS: &[&str] = &[
+    "sonnet-4.6",
+    "sonnet-4.5",
+    "sonnet-4",
+    "opus-4",
+    "gpt-4o",
+    "sonnet",
+];
+
 fn preferred_default_model(model_ids: &[String]) -> Option<&str> {
-    preferred_sonnet_four(model_ids)
-        .or_else(|| preferred_sonnet(model_ids))
-        .or_else(|| highest_version_model(model_ids))
-        .or_else(|| model_ids.first().map(String::as_str))
-}
+    for pattern in PREFERRED_MODEL_PATTERNS {
+        if let Some(model) = model_ids
+            .iter()
+            .find(|id| id.to_ascii_lowercase().contains(pattern))
+        {
+            return Some(model.as_str());
+        }
+    }
 
-fn preferred_sonnet_four(model_ids: &[String]) -> Option<&str> {
-    model_ids
-        .iter()
-        .find(|id| {
-            let lower = id.to_ascii_lowercase();
-            lower.contains("sonnet") && lower.contains('4')
-        })
-        .map(String::as_str)
-}
-
-fn preferred_sonnet(model_ids: &[String]) -> Option<&str> {
-    model_ids
-        .iter()
-        .find(|id| id.to_ascii_lowercase().contains("sonnet"))
-        .map(String::as_str)
+    highest_version_model(model_ids).or_else(|| model_ids.first().map(String::as_str))
 }
 
 fn highest_version_model(model_ids: &[String]) -> Option<&str> {
@@ -2899,36 +2898,84 @@ mod tests {
     }
 
     #[test]
-    fn default_model_prefers_sonnet_4() {
+    fn default_model_prefers_newest_sonnet() {
         let model_ids = vec![
-            "claude-3-haiku".to_string(),
-            "claude-3-7-sonnet-latest".to_string(),
-            "claude-sonnet-4-20250514".to_string(),
-            "gpt-5.3-codex".to_string(),
+            "anthropic/claude-3-haiku".to_string(),
+            "anthropic/claude-3.5-haiku".to_string(),
+            "anthropic/claude-3.5-sonnet".to_string(),
+            "anthropic/claude-sonnet-4".to_string(),
+            "anthropic/claude-sonnet-4.5".to_string(),
+            "anthropic/claude-sonnet-4.6".to_string(),
         ];
 
         assert_eq!(
             preferred_default_model(&model_ids),
-            Some("claude-sonnet-4-20250514")
+            Some("anthropic/claude-sonnet-4.6")
         );
     }
 
     #[test]
-    fn default_model_falls_back_when_no_sonnet_models_exist() {
+    fn default_model_falls_back_to_older_sonnet() {
         let model_ids = vec![
-            "llama-3".to_string(),
-            "gpt-3.5-turbo".to_string(),
-            "gpt-4o".to_string(),
+            "anthropic/claude-3-haiku".to_string(),
+            "anthropic/claude-3.5-haiku".to_string(),
+            "anthropic/claude-3.5-sonnet".to_string(),
         ];
 
-        assert_eq!(preferred_default_model(&model_ids), Some("gpt-4o"));
+        assert_eq!(
+            preferred_default_model(&model_ids),
+            Some("anthropic/claude-3.5-sonnet")
+        );
     }
 
     #[test]
-    fn default_model_falls_back_to_first_when_versions_are_missing() {
+    fn default_model_prefers_opus_when_no_sonnet() {
+        let model_ids = vec![
+            "anthropic/claude-3-haiku".to_string(),
+            "anthropic/claude-opus-4".to_string(),
+            "openai/gpt-4o".to_string(),
+        ];
+
+        assert_eq!(
+            preferred_default_model(&model_ids),
+            Some("anthropic/claude-opus-4")
+        );
+    }
+
+    #[test]
+    fn default_model_prefers_gpt4o_over_old_sonnet() {
+        let model_ids = vec![
+            "anthropic/claude-3-haiku".to_string(),
+            "openai/gpt-4o".to_string(),
+            "anthropic/claude-3.5-sonnet".to_string(),
+        ];
+        // gpt-4o pattern comes before generic "sonnet" in PREFERRED_MODEL_PATTERNS
+        assert_eq!(preferred_default_model(&model_ids), Some("openai/gpt-4o"));
+    }
+
+    #[test]
+    fn default_model_falls_back_to_highest_version() {
+        let model_ids = vec![
+            "llama-3".to_string(),
+            "gpt-3.5-turbo".to_string(),
+            "gpt-4.1-mini".to_string(),
+        ];
+
+        assert_eq!(preferred_default_model(&model_ids), Some("gpt-4.1-mini"));
+    }
+
+    #[test]
+    fn default_model_falls_back_to_first() {
         let model_ids = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
 
         assert_eq!(preferred_default_model(&model_ids), Some("alpha"));
+    }
+
+    #[test]
+    fn default_model_handles_empty_list() {
+        let model_ids = Vec::new();
+
+        assert_eq!(preferred_default_model(&model_ids), None);
     }
 
     #[tokio::test]
