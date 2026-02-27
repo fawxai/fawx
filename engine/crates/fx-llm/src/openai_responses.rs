@@ -13,7 +13,8 @@ use std::{collections::VecDeque, time::Duration};
 
 use crate::provider::{CompletionStream, LlmProvider, ProviderCapabilities};
 use crate::types::{
-    CompletionRequest, CompletionResponse, ContentBlock, LlmError, MessageRole, StreamChunk, Usage,
+    CompletionRequest, CompletionResponse, ContentBlock, LlmError, MessageRole, StreamChunk,
+    ToolCall, ToolUseDelta, Usage,
 };
 
 const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
@@ -128,10 +129,22 @@ impl OpenAiResponsesProvider {
             }
         }
 
+        let tools = request
+            .tools
+            .iter()
+            .map(|tool| ResponsesTool {
+                r#type: "function".to_string(),
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                parameters: tool.parameters.clone(),
+            })
+            .collect();
+
         Ok(ResponsesRequestBody {
             model: request.model.clone(),
             instructions: request.system_prompt.clone(),
             input,
+            tools,
             stream,
             store: false,
             temperature: request.temperature,
@@ -164,24 +177,8 @@ impl OpenAiResponsesProvider {
     }
 
     fn parse_response(body: ResponsesResponseBody) -> CompletionResponse {
-        let mut text_parts = Vec::new();
-
-        for item in &body.output {
-            if let Some(content) = &item.content {
-                for part in content {
-                    if part.r#type == "output_text" {
-                        if let Some(text) = &part.text {
-                            text_parts.push(text.clone());
-                        }
-                    }
-                }
-            }
-            if let Some(text) = &item.text {
-                text_parts.push(text.clone());
-            }
-        }
-
-        let response_text = text_parts.join("");
+        let response_text = collect_output_text(&body.output);
+        let tool_calls = collect_tool_calls(&body.output);
 
         CompletionResponse {
             content: vec![ContentBlock::Text {
@@ -192,7 +189,80 @@ impl OpenAiResponsesProvider {
                 output_tokens: u.output_tokens.unwrap_or(0) as u32,
             }),
             stop_reason: body.status,
-            tool_calls: Vec::new(),
+            tool_calls,
+        }
+    }
+
+    fn find_event_delimiter(buffer: &str) -> Option<(usize, usize)> {
+        let lf_delim = buffer.find("\n\n").map(|idx| (idx, 2));
+        let crlf_delim = buffer.find("\r\n\r\n").map(|idx| (idx, 4));
+        match (lf_delim, crlf_delim) {
+            (Some(lf), Some(crlf)) => Some(if lf.0 <= crlf.0 { lf } else { crlf }),
+            (Some(lf), None) => Some(lf),
+            (None, Some(crlf)) => Some(crlf),
+            (None, None) => None,
+        }
+    }
+
+    fn parse_event_and_data(event_str: &str) -> (String, String) {
+        let mut event_type = String::new();
+        let mut data = String::new();
+        for line in event_str.lines() {
+            if let Some(val) = line.strip_prefix("event:") {
+                event_type = val.trim().to_string();
+            } else if let Some(val) = line.strip_prefix("data:") {
+                data = val.trim().to_string();
+            }
+        }
+        (event_type, data)
+    }
+
+    fn chunk_from_event(event_type: &str, data: &str) -> Option<StreamChunk> {
+        match event_type {
+            "response.output_text.delta" => {
+                serde_json::from_str::<SseTextDelta>(data)
+                    .ok()
+                    .map(|parsed| StreamChunk {
+                        delta_content: Some(parsed.delta),
+                        ..Default::default()
+                    })
+            }
+            "response.function_call_arguments.delta" => {
+                serde_json::from_str::<SseFunctionCallArgsDelta>(data)
+                    .ok()
+                    .map(|parsed| StreamChunk {
+                        tool_use_deltas: vec![ToolUseDelta {
+                            id: parsed.item_id,
+                            name: parsed.name,
+                            arguments_delta: Some(parsed.delta),
+                        }],
+                        ..Default::default()
+                    })
+            }
+            "response.function_call_arguments.done" => {
+                serde_json::from_str::<SseFunctionCallArgsDone>(data)
+                    .ok()
+                    .map(|parsed| StreamChunk {
+                        tool_use_deltas: vec![ToolUseDelta {
+                            id: parsed.item_id,
+                            name: parsed.name,
+                            arguments_delta: parsed.arguments,
+                        }],
+                        ..Default::default()
+                    })
+            }
+            "response.completed" | "response.done" => serde_json::from_str::<SseResponseDone>(data)
+                .ok()
+                .and_then(|parsed| parsed.response.and_then(|r| r.usage))
+                .map(|usage| StreamChunk {
+                    usage: Some(Usage {
+                        input_tokens: usage.input_tokens.unwrap_or(0) as u32,
+                        output_tokens: usage.output_tokens.unwrap_or(0) as u32,
+                    }),
+                    stop_reason: Some("stop".to_string()),
+                    ..Default::default()
+                }),
+            _ => None,
         }
     }
 
@@ -220,31 +290,13 @@ impl OpenAiResponsesProvider {
                         Some(Ok(bytes)) => {
                             buffer.push_str(&String::from_utf8_lossy(&bytes));
 
-                            while let Some((event_end, delimiter_len)) = {
-                                let lf_delim = buffer.find("\n\n").map(|idx| (idx, 2));
-                                let crlf_delim = buffer.find("\r\n\r\n").map(|idx| (idx, 4));
-
-                                match (lf_delim, crlf_delim) {
-                                    (Some(lf), Some(crlf)) => {
-                                        Some(if lf.0 <= crlf.0 { lf } else { crlf })
-                                    }
-                                    (Some(lf), None) => Some(lf),
-                                    (None, Some(crlf)) => Some(crlf),
-                                    (None, None) => None,
-                                }
-                            } {
+                            while let Some((event_end, delimiter_len)) =
+                                Self::find_event_delimiter(&buffer)
+                            {
                                 let event_str = buffer[..event_end].to_string();
                                 buffer = buffer[event_end + delimiter_len..].to_string();
 
-                                let mut event_type = String::new();
-                                let mut data = String::new();
-                                for line in event_str.lines() {
-                                    if let Some(val) = line.strip_prefix("event:") {
-                                        event_type = val.trim().to_string();
-                                    } else if let Some(val) = line.strip_prefix("data:") {
-                                        data = val.trim().to_string();
-                                    }
-                                }
+                                let (event_type, data) = Self::parse_event_and_data(&event_str);
 
                                 if data == "[DONE]" {
                                     done = true;
@@ -255,40 +307,12 @@ impl OpenAiResponsesProvider {
                                     continue;
                                 }
 
+                                if let Some(chunk) = Self::chunk_from_event(&event_type, &data) {
+                                    pending.push_back(Ok(chunk));
+                                }
+
                                 match event_type.as_str() {
-                                    "response.output_text.delta" => {
-                                        if let Ok(parsed) =
-                                            serde_json::from_str::<SseTextDelta>(&data)
-                                        {
-                                            pending.push_back(Ok(StreamChunk {
-                                                delta_content: Some(parsed.delta),
-                                                ..Default::default()
-                                            }));
-                                        }
-                                    }
                                     "response.completed" | "response.done" => {
-                                        if let Ok(parsed) =
-                                            serde_json::from_str::<SseResponseDone>(&data)
-                                        {
-                                            if let Some(usage) =
-                                                parsed.response.and_then(|r| r.usage)
-                                            {
-                                                pending.push_back(Ok(StreamChunk {
-                                                    usage: Some(Usage {
-                                                        input_tokens: usage
-                                                            .input_tokens
-                                                            .unwrap_or(0)
-                                                            as u32,
-                                                        output_tokens: usage
-                                                            .output_tokens
-                                                            .unwrap_or(0)
-                                                            as u32,
-                                                    }),
-                                                    stop_reason: Some("stop".to_string()),
-                                                    ..Default::default()
-                                                }));
-                                            }
-                                        }
                                         done = true;
                                     }
                                     "response.failed" => {
@@ -405,6 +429,8 @@ struct ResponsesRequestBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     instructions: Option<String>,
     input: Vec<ResponsesMessage>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<ResponsesTool>,
     stream: bool,
     store: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -415,6 +441,18 @@ struct ResponsesRequestBody {
 struct ResponsesMessage {
     role: String,
     content: String,
+}
+
+/// Maps a Fawx ToolDefinition to the OpenAI Responses API function tool format.
+/// Note: the Responses API also accepts a `strict` field for strict JSON schema
+/// validation, but we omit it — emit_intent uses dynamic sub-schemas (tool lists
+/// vary at runtime) which are not compatible with strict mode.
+#[derive(Serialize)]
+struct ResponsesTool {
+    r#type: String,
+    name: String,
+    description: String,
+    parameters: Value,
 }
 
 #[derive(Deserialize)]
@@ -429,6 +467,14 @@ struct ResponsesResponseBody {
 
 #[derive(Deserialize)]
 struct ResponsesOutputItem {
+    #[serde(default)]
+    r#type: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
     #[serde(default)]
     content: Option<Vec<ResponsesContentPart>>,
     #[serde(default)]
@@ -464,6 +510,25 @@ struct SseResponseBody {
     usage: Option<ResponsesUsage>,
 }
 
+#[derive(Deserialize)]
+struct SseFunctionCallArgsDelta {
+    #[serde(default)]
+    item_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    delta: String,
+}
+
+#[derive(Deserialize)]
+struct SseFunctionCallArgsDone {
+    #[serde(default)]
+    item_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
 // ============================================================================
 // Helpers
 // ============================================================================
@@ -477,6 +542,52 @@ fn extract_text(content: &[ContentBlock]) -> String {
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+fn collect_output_text(output: &[ResponsesOutputItem]) -> String {
+    let mut text_parts = Vec::new();
+
+    for item in output {
+        if let Some(content) = &item.content {
+            for part in content {
+                if part.r#type == "output_text" {
+                    if let Some(text) = &part.text {
+                        text_parts.push(text.clone());
+                    }
+                }
+            }
+        }
+        if let Some(text) = &item.text {
+            text_parts.push(text.clone());
+        }
+    }
+
+    text_parts.join("")
+}
+
+fn collect_tool_calls(output: &[ResponsesOutputItem]) -> Vec<ToolCall> {
+    let mut tool_calls = Vec::new();
+
+    for item in output {
+        if item.r#type.as_deref() != Some("function_call") {
+            continue;
+        }
+
+        if let (Some(id), Some(name), Some(arguments)) = (&item.id, &item.name, &item.arguments) {
+            let arguments_value = match serde_json::from_str::<Value>(arguments) {
+                Ok(value) => value,
+                Err(_) => Value::String(arguments.clone()),
+            };
+
+            tool_calls.push(ToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                arguments: arguments_value,
+            });
+        }
+    }
+
+    tool_calls
 }
 
 #[cfg(test)]
@@ -507,6 +618,10 @@ mod tests {
     fn parse_response_extracts_text() {
         let body = ResponsesResponseBody {
             output: vec![ResponsesOutputItem {
+                r#type: None,
+                id: None,
+                name: None,
+                arguments: None,
                 content: Some(vec![ResponsesContentPart {
                     r#type: "output_text".to_string(),
                     text: Some("Hello from ChatGPT!".to_string()),
@@ -559,6 +674,69 @@ mod tests {
     }
 
     #[test]
+    fn build_request_body_includes_tools() {
+        let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
+
+        let request = CompletionRequest {
+            model: "gpt-4.1".to_string(),
+            messages: vec![crate::types::Message::user("hi")],
+            system_prompt: None,
+            tools: vec![crate::types::ToolDefinition {
+                name: "emit_intent".to_string(),
+                description: "Emit intent".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+            }],
+            temperature: None,
+            max_tokens: None,
+        };
+
+        let body = provider.build_request_body(&request, false).unwrap();
+        let serialized = serde_json::to_value(&body).unwrap();
+        assert_eq!(serialized["tools"][0]["type"], "function");
+        assert_eq!(serialized["tools"][0]["name"], "emit_intent");
+    }
+
+    #[test]
+    fn build_request_body_omits_empty_tools() {
+        let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
+
+        let request = CompletionRequest {
+            model: "gpt-4.1".to_string(),
+            messages: vec![crate::types::Message::user("hi")],
+            system_prompt: None,
+            tools: vec![],
+            temperature: None,
+            max_tokens: None,
+        };
+
+        let body = provider.build_request_body(&request, false).unwrap();
+        let serialized = serde_json::to_value(&body).unwrap();
+        assert!(serialized.get("tools").is_none());
+    }
+
+    #[test]
+    fn parse_response_extracts_tool_calls() {
+        let body = ResponsesResponseBody {
+            output: vec![ResponsesOutputItem {
+                r#type: Some("function_call".to_string()),
+                id: Some("call_123".to_string()),
+                name: Some("emit_intent".to_string()),
+                arguments: Some("{\"intent\":\"open\"}".to_string()),
+                content: None,
+                text: None,
+            }],
+            status: Some("completed".to_string()),
+            usage: None,
+        };
+
+        let response = OpenAiResponsesProvider::parse_response(body);
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].id, "call_123");
+        assert_eq!(response.tool_calls[0].name, "emit_intent");
+        assert_eq!(response.tool_calls[0].arguments["intent"], "open");
+    }
+
+    #[test]
     fn empty_credentials_rejected() {
         assert!(OpenAiResponsesProvider::new("", "account").is_err());
         assert!(OpenAiResponsesProvider::new("token", "").is_err());
@@ -582,5 +760,80 @@ mod tests {
 
         assert!(!capabilities.supports_temperature);
         assert!(!capabilities.requires_streaming);
+    }
+
+    fn parse_test_sse_payload(payload: &str) -> Vec<StreamChunk> {
+        let mut buffer = payload.to_string();
+        let mut chunks = Vec::new();
+
+        while let Some((event_end, delimiter_len)) =
+            OpenAiResponsesProvider::find_event_delimiter(&buffer)
+        {
+            let event_str = buffer[..event_end].to_string();
+            buffer = buffer[event_end + delimiter_len..].to_string();
+
+            let (event_type, data) = OpenAiResponsesProvider::parse_event_and_data(&event_str);
+            if data == "[DONE]" || data.is_empty() {
+                continue;
+            }
+
+            if let Some(chunk) = OpenAiResponsesProvider::chunk_from_event(&event_type, &data) {
+                chunks.push(chunk);
+            }
+        }
+
+        chunks
+    }
+
+    #[test]
+    fn stream_emits_tool_use_delta_on_function_call_arguments_delta() {
+        let payload = r#"event: response.function_call_arguments.delta
+data: {"item_id":"call_123","name":"emit_intent","delta":"{\"intent\":\"o"}
+
+event: response.done
+data: {"response":{"usage":{"input_tokens":1,"output_tokens":1}}}
+
+data: [DONE]
+
+"#;
+
+        let chunks = parse_test_sse_payload(payload);
+
+        assert_eq!(chunks[0].tool_use_deltas.len(), 1);
+        assert_eq!(chunks[0].tool_use_deltas[0].id.as_deref(), Some("call_123"));
+        assert_eq!(
+            chunks[0].tool_use_deltas[0].name.as_deref(),
+            Some("emit_intent")
+        );
+        assert_eq!(
+            chunks[0].tool_use_deltas[0].arguments_delta.as_deref(),
+            Some("{\"intent\":\"o")
+        );
+    }
+
+    #[test]
+    fn stream_emits_tool_use_done_on_function_call_arguments_done() {
+        let payload = r#"event: response.function_call_arguments.done
+data: {"item_id":"call_456","name":"emit_intent","arguments":"{\"intent\":\"open\"}"}
+
+event: response.done
+data: {"response":{"usage":{"input_tokens":1,"output_tokens":1}}}
+
+data: [DONE]
+
+"#;
+
+        let chunks = parse_test_sse_payload(payload);
+
+        assert_eq!(chunks[0].tool_use_deltas.len(), 1);
+        assert_eq!(chunks[0].tool_use_deltas[0].id.as_deref(), Some("call_456"));
+        assert_eq!(
+            chunks[0].tool_use_deltas[0].name.as_deref(),
+            Some("emit_intent")
+        );
+        assert_eq!(
+            chunks[0].tool_use_deltas[0].arguments_delta.as_deref(),
+            Some("{\"intent\":\"open\"}")
+        );
     }
 }
