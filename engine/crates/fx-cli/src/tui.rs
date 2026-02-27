@@ -813,15 +813,6 @@ fn render_logo_at_path(path: &std::path::Path) -> Option<String> {
     render_file(path.to_string_lossy().as_ref(), &config).ok()
 }
 
-fn supports_truecolor() -> bool {
-    std::env::var("COLORTERM")
-        .map(|value| {
-            let lowered = value.to_ascii_lowercase();
-            lowered.contains("truecolor") || lowered.contains("24bit")
-        })
-        .unwrap_or(false)
-}
-
 /// Find the fawx.png logo in common locations.
 fn find_logo_path() -> Option<std::path::PathBuf> {
     // Relative to the executable
