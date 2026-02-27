@@ -2049,16 +2049,21 @@ mod tests {
 
     fn terminal_snapshot(text: &str) -> PerceptionSnapshot {
         PerceptionSnapshot {
-            timestamp_ms: 1,
-            source: InputSource::Terminal,
-            raw_input: UserInput {
-                text: text.to_string(),
-                source: InputSource::Terminal,
-            },
             screen: ScreenState {
-                description: "tui".to_string(),
+                current_app: "fawx.tui".to_string(),
+                elements: Vec::new(),
+                text_content: text.to_string(),
             },
-            extras: std::collections::HashMap::new(),
+            notifications: Vec::new(),
+            active_app: "fawx.tui".to_string(),
+            timestamp_ms: 1,
+            sensor_data: None,
+            user_input: Some(UserInput {
+                text: text.to_string(),
+                source: InputSource::Text,
+                timestamp: 1,
+                context_id: None,
+            }),
         }
     }
 
@@ -2180,7 +2185,10 @@ mod tests {
             system_prompt: None,
         };
 
-        let response = provider.complete(request).await.expect("completion response");
+        let response = provider
+            .complete(request)
+            .await
+            .expect("completion response");
 
         assert_eq!(response.tool_calls, vec![expected_tool_call]);
         assert_eq!(response.usage, Some(expected_usage));
