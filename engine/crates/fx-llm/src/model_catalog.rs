@@ -251,12 +251,13 @@ impl ModelCatalog {
             "openrouter" => {
                 id.contains("claude")
                     || id.contains("gpt-")
-                    || id.contains("o1")
-                    || id.contains("o3")
-                    || id.contains("gemini")
-                    || id.contains("llama")
-                    || id.contains("mistral")
-                    || id.contains("command")
+                    || id.contains("o4")
+                    || id.contains("grok")
+                    || id.contains("qwen")
+                    || id.contains("minimax")
+                    || id.contains("liquidai")
+                    || id.contains("lfm")
+                    || id.contains("deepseek")
             }
             _ => false,
         }
@@ -275,7 +276,13 @@ impl ModelCatalog {
                 "claude-3-7-sonnet-latest",
             ],
             "openai" => vec!["gpt-4.1", "gpt-4o", "gpt-4o-mini"],
-            "openrouter" => vec!["openai/gpt-4o-mini", "anthropic/claude-3.5-sonnet"],
+            "openrouter" => vec![
+                "anthropic/claude-sonnet-4",
+                "openai/gpt-4o",
+                "x-ai/grok-3",
+                "qwen/qwen-2.5-72b-instruct",
+                "deepseek/deepseek-chat-v3",
+            ],
             _ => vec!["gpt-4o-mini"],
         };
 
@@ -375,8 +382,8 @@ mod tests {
     fn parse_models_supports_openrouter_payload_shape() {
         let json = r#"{
             "data": [
-                {"id": "anthropic/claude-3.5-sonnet"},
-                {"id": "openai/gpt-4o-mini"},
+                {"id": "anthropic/claude-sonnet-4"},
+                {"id": "x-ai/grok-3"},
                 {"id": "openai/text-embedding-3-large"}
             ]
         }"#;
@@ -386,8 +393,41 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         assert!(parsed
             .iter()
-            .any(|model| model.id == "anthropic/claude-3.5-sonnet"));
-        assert!(parsed.iter().any(|model| model.id == "openai/gpt-4o-mini"));
+            .any(|model| model.id == "anthropic/claude-sonnet-4"));
+        assert!(parsed.iter().any(|model| model.id == "x-ai/grok-3"));
+    }
+
+    #[test]
+    fn is_chat_model_accepts_openrouter_xai() {
+        assert!(ModelCatalog::is_chat_capable("openrouter", "x-ai/grok-3"));
+        assert!(ModelCatalog::is_chat_capable(
+            "openrouter",
+            "x-ai/grok-3-mini"
+        ));
+    }
+
+    #[test]
+    fn is_chat_model_accepts_openrouter_qwen() {
+        assert!(ModelCatalog::is_chat_capable(
+            "openrouter",
+            "qwen/qwen-2.5-72b-instruct"
+        ));
+    }
+
+    #[test]
+    fn is_chat_model_accepts_openrouter_deepseek() {
+        assert!(ModelCatalog::is_chat_capable(
+            "openrouter",
+            "deepseek/deepseek-chat-v3"
+        ));
+    }
+
+    #[test]
+    fn is_chat_model_accepts_openrouter_o4() {
+        assert!(ModelCatalog::is_chat_capable(
+            "openrouter",
+            "openai/o4-mini"
+        ));
     }
 
     #[test]
@@ -416,10 +456,7 @@ mod tests {
             "gpt-4o-audio-preview"
         ));
 
-        assert!(ModelCatalog::is_chat_capable(
-            "openrouter",
-            "meta-llama/llama-3.3-70b-instruct"
-        ));
+        assert!(ModelCatalog::is_chat_capable("openrouter", "x-ai/grok-3"));
         assert!(!ModelCatalog::is_chat_capable(
             "openrouter",
             "openai/text-embedding-3-large"
@@ -491,10 +528,23 @@ mod tests {
         assert_eq!(
             openrouter,
             vec![
-                "openai/gpt-4o-mini".to_string(),
-                "anthropic/claude-3.5-sonnet".to_string(),
+                "anthropic/claude-sonnet-4".to_string(),
+                "openai/gpt-4o".to_string(),
+                "x-ai/grok-3".to_string(),
+                "qwen/qwen-2.5-72b-instruct".to_string(),
+                "deepseek/deepseek-chat-v3".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn hardcoded_fallback_openrouter_includes_new_providers() {
+        let fallback = ModelCatalog::hardcoded_fallback("openrouter");
+        let ids: Vec<&str> = fallback.iter().map(|model| model.id.as_str()).collect();
+
+        assert!(ids.iter().any(|id| id.contains("grok")));
+        assert!(ids.iter().any(|id| id.contains("qwen")));
+        assert!(ids.iter().any(|id| id.contains("deepseek")));
     }
 
     #[test]

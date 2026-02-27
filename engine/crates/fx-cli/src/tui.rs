@@ -144,6 +144,9 @@ const PREFERRED_MODEL_PATTERNS: &[&str] = &[
     "sonnet-4",
     "opus-4",
     "gpt-4o",
+    "grok-3",
+    "qwen-2.5",
+    "deepseek-chat",
     "sonnet",
 ];
 
@@ -2989,6 +2992,17 @@ mod tests {
         ];
         // gpt-4o pattern comes before generic "sonnet" in PREFERRED_MODEL_PATTERNS
         assert_eq!(preferred_default_model(&model_ids), Some("openai/gpt-4o"));
+    }
+
+    #[test]
+    fn preferred_default_model_picks_grok_over_generic() {
+        let models = vec![
+            "meta-llama/llama-4-maverick".to_string(),
+            "x-ai/grok-3".to_string(),
+        ];
+
+        let picked = preferred_default_model(&models);
+        assert_eq!(picked, Some("x-ai/grok-3"));
     }
 
     #[test]
