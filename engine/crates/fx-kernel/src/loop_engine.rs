@@ -2053,9 +2053,10 @@ mod tests {
 
         let verification = engine.verify(&action, &intent).await.expect("verification");
         assert!(!verification.outcome_matches_intent);
-        assert!(verification.discrepancies.iter().any(|item| {
-            item.contains("expected outcome not reflected in action response")
-        }));
+        assert!(verification
+            .discrepancies
+            .iter()
+            .any(|item| { item.contains("expected outcome not reflected in action response") }));
     }
 
     #[test]
