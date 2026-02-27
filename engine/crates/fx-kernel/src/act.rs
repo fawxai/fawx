@@ -61,30 +61,6 @@ pub trait ToolExecutor: Send + Sync + std::fmt::Debug {
     }
 }
 
-/// Default in-kernel tool executor for environments without real tool wiring.
-#[derive(Debug, Default)]
-pub struct StubToolExecutor;
-
-#[async_trait]
-impl ToolExecutor for StubToolExecutor {
-    async fn execute_tools(
-        &self,
-        calls: &[fx_llm::ToolCall],
-    ) -> Result<Vec<ToolResult>, ToolExecutorError> {
-        Ok(calls
-            .iter()
-            .map(|call| ToolResult {
-                tool_name: call.name.clone(),
-                success: true,
-                output: format!(
-                    "Stub tool execution for '{}' with args {}",
-                    call.name, call.arguments
-                ),
-            })
-            .collect::<Vec<_>>())
-    }
-}
-
 /// Result of the Act step.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ActionResult {

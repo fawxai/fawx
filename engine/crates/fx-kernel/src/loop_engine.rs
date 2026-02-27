@@ -1,6 +1,6 @@
 //! Agentic loop orchestrator.
 
-use crate::act::{ActionResult, StubToolExecutor, TokenUsage, ToolExecutor, ToolResult};
+use crate::act::{ActionResult, TokenUsage, ToolExecutor, ToolResult};
 use crate::budget::{ActionCost, BudgetRemaining, BudgetTracker};
 use crate::context_manager::ContextCompactor;
 use crate::continuation::Continuation;
@@ -163,13 +163,8 @@ const VERIFICATION_CONFIDENCE_SINGLE_DISCREPANCY: f64 = 0.45;
 const VERIFICATION_CONFIDENCE_MULTIPLE_DISCREPANCIES: f64 = 0.25;
 
 impl LoopEngine {
-    /// Create a new loop engine with budget + context managers.
-    pub fn new(budget: BudgetTracker, context: ContextCompactor, max_iterations: u32) -> Self {
-        Self::new_with_executor(budget, context, max_iterations, Arc::new(StubToolExecutor))
-    }
-
     /// Create a loop engine with an injected tool executor.
-    pub fn new_with_executor(
+    pub fn new(
         budget: BudgetTracker,
         context: ContextCompactor,
         max_iterations: u32,
@@ -1182,7 +1177,27 @@ mod tests {
     use fx_core::types::ScreenState;
     use fx_llm::{CompletionResponse, ContentBlock, ProviderError};
     use std::collections::VecDeque;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug, Default)]
+    struct TestStubToolExecutor;
+
+    #[async_trait]
+    impl ToolExecutor for TestStubToolExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[fx_llm::ToolCall],
+        ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+            Ok(calls
+                .iter()
+                .map(|call| ToolResult {
+                    tool_name: call.name.clone(),
+                    success: true,
+                    output: format!("Stub tool execution for '{}'", call.name),
+                })
+                .collect::<Vec<_>>())
+        }
+    }
 
     #[derive(Debug)]
     struct MockLlm {
@@ -1395,7 +1410,12 @@ mod tests {
         let budget =
             BudgetTracker::new(crate::budget::BudgetConfig::default(), current_time_ms(), 0);
         let context = ContextCompactor::new(4_000, 3_000);
-        LoopEngine::new(budget, context, max_iterations)
+        LoopEngine::new(
+            budget,
+            context,
+            max_iterations,
+            Arc::new(TestStubToolExecutor),
+        )
     }
 
     #[test]
@@ -1471,7 +1491,7 @@ mod tests {
         };
         let budget = BudgetTracker::new(config, current_time_ms(), 0);
         let context = ContextCompactor::new(4_000, 3_000);
-        let mut engine = LoopEngine::new(budget, context, 10);
+        let mut engine = LoopEngine::new(budget, context, 10, Arc::new(TestStubToolExecutor));
 
         let llm = MockLlm::with_responses(vec![
             r#"{"action":{"Respond":{"text":"never used"}},"rationale":"n/a","confidence":0.9,"expected_outcome":null,"sub_goals":[]}"#,
@@ -1496,7 +1516,7 @@ mod tests {
 
         let budget = BudgetTracker::new(config, current_time_ms(), 0);
         let context = ContextCompactor::new(4_000, 3_000);
-        let mut engine = LoopEngine::new(budget, context, 10);
+        let mut engine = LoopEngine::new(budget, context, 10, Arc::new(TestStubToolExecutor));
 
         let llm = SlowMockLlm {
             inner: MockLlm::with_responses(vec![
@@ -1524,7 +1544,7 @@ mod tests {
 
         let budget = BudgetTracker::new(config, current_time_ms(), 0);
         let context = ContextCompactor::new(4_000, 3_000);
-        let mut engine = LoopEngine::new(budget, context, 5);
+        let mut engine = LoopEngine::new(budget, context, 5, Arc::new(TestStubToolExecutor));
 
         let llm = MockLlm::with_responses(vec![
             r#"{"action":{"Respond":{"text":"first"}},"rationale":"r1","confidence":0.9,"expected_outcome":null,"sub_goals":[]}"#,
@@ -1956,7 +1976,7 @@ mod tests {
             arguments: serde_json::json!({"q":"fawx"}),
         }];
 
-        let executor = StubToolExecutor;
+        let executor = TestStubToolExecutor;
         let results = executor.execute_tools(&calls).await.expect("tool results");
 
         assert_eq!(results.len(), 1);

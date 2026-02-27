@@ -605,7 +605,7 @@ pub fn build_loop_engine() -> LoopEngine {
     let working_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let executor = FawxToolExecutor::new(working_dir, ToolConfig::default());
 
-    LoopEngine::new_with_executor(
+    LoopEngine::new(
         budget,
         context,
         DEFAULT_MAX_LOOP_ITERATIONS,

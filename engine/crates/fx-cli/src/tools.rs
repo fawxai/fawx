@@ -67,6 +67,17 @@ impl FawxToolExecutor {
         validate_path(&self.working_dir, requested)
     }
 
+    fn validated_existing_entry(&self, path: &Path) -> Result<Option<PathBuf>, String> {
+        if !self.config.jail_to_working_dir {
+            return Ok(Some(path.to_path_buf()));
+        }
+        let requested = path.to_string_lossy().to_string();
+        match validate_path(&self.working_dir, &requested) {
+            Ok(validated) => Ok(Some(validated)),
+            Err(_) => Ok(None),
+        }
+    }
+
     fn handle_read_file(&self, args: &serde_json::Value) -> Result<String, String> {
         let parsed: ReadFileArgs = parse_args(args)?;
         let path = self.jailed_path(&parsed.path)?;
@@ -121,11 +132,14 @@ impl FawxToolExecutor {
         for entry in fs::read_dir(path).map_err(|error| error.to_string())? {
             let entry = entry.map_err(|error| error.to_string())?;
             let entry_path = entry.path();
+            let Some(validated) = self.validated_existing_entry(&entry_path)? else {
+                continue;
+            };
             let name = entry.file_name().to_string_lossy().to_string();
             let kind = entry_kind(&entry_path)?;
             lines.push(format!("{}[{}] {}", "  ".repeat(depth), kind, name));
             if kind == "dir" {
-                let nested = self.list_recursive(&entry_path, depth + 1)?;
+                let nested = self.list_recursive(&validated, depth + 1)?;
                 if !nested.is_empty() {
                     lines.push(nested);
                 }
@@ -202,12 +216,15 @@ impl FawxToolExecutor {
             if out.len() >= MAX_SEARCH_MATCHES {
                 break;
             }
-            let path = entry.map_err(|error| error.to_string())?.path();
-            if path.is_dir() {
-                self.search_directory(&path, args, out)?;
+            let entry_path = entry.map_err(|error| error.to_string())?.path();
+            let Some(validated) = self.validated_existing_entry(&entry_path)? else {
+                continue;
+            };
+            if validated.is_dir() {
+                self.search_directory(&validated, args, out)?;
                 continue;
             }
-            self.search_file(&path, args, out)?;
+            self.search_file(&validated, args, out)?;
         }
         Ok(())
     }
@@ -219,6 +236,14 @@ impl FawxToolExecutor {
         out: &mut Vec<String>,
     ) -> Result<(), String> {
         if !matches_glob(file, args.file_glob.as_deref()) {
+            return Ok(());
+        }
+        let metadata = fs::metadata(file).map_err(|error| error.to_string())?;
+        if metadata.len() > self.config.max_file_size {
+            out.push(format!(
+                "{}: skipped (file exceeds max_file_size)",
+                file.display()
+            ));
             return Ok(());
         }
         let mut bytes = Vec::new();
@@ -327,6 +352,9 @@ pub fn fawx_tool_definitions() -> Vec<ToolDefinition> {
 }
 
 pub fn validate_path(base: &Path, requested: &str) -> Result<PathBuf, String> {
+    // NOTE: There is an unavoidable TOCTOU window between this validation and later
+    // open/read/write calls that operate by path. Tightening this fully requires
+    // fd-based operations end-to-end, which is not currently practical across all tools.
     let base_canon = fs::canonicalize(base).map_err(|error| error.to_string())?;
     let candidate = resolve_candidate(&base_canon, requested);
     let requested_canon = canonicalize_existing_or_parent(&candidate)?;
@@ -605,6 +633,22 @@ mod tests {
         assert!(output.is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn read_file_rejects_symlink_pointing_outside_jail() {
+        use std::os::unix::fs::symlink;
+
+        let jail = TempDir::new().expect("jail");
+        let outside = TempDir::new().expect("outside");
+        let outside_file = outside.path().join("secret.txt");
+        fs::write(&outside_file, "secret").expect("write");
+        symlink(&outside_file, jail.path().join("escape.txt")).expect("symlink");
+
+        let executor = test_executor(jail.path());
+        let output = executor.handle_read_file(&serde_json::json!({"path": "escape.txt"}));
+        assert!(output.is_err());
+    }
+
     #[test]
     fn write_file_creates_file_with_content() {
         let temp = TempDir::new().expect("temp");
@@ -703,6 +747,26 @@ mod tests {
         assert!(!output.contains("d7"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn list_directory_recursive_skips_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let jail = TempDir::new().expect("jail");
+        let outside = TempDir::new().expect("outside");
+        let outside_dir = outside.path().join("secret-dir");
+        fs::create_dir_all(&outside_dir).expect("mkdir");
+        fs::write(outside_dir.join("secret.txt"), "secret").expect("write");
+        symlink(&outside_dir, jail.path().join("escape")).expect("symlink");
+
+        let executor = test_executor(jail.path());
+        let output = executor
+            .handle_list_directory(&serde_json::json!({"path": ".", "recursive": true}))
+            .expect("recursive list");
+        assert!(!output.contains("escape"));
+        assert!(!output.contains("secret.txt"));
+    }
+
     #[tokio::test]
     async fn run_command_captures_stdout() {
         let temp = TempDir::new().expect("temp");
@@ -796,6 +860,42 @@ mod tests {
         let output =
             executor.handle_search_text(&serde_json::json!({"pattern": "needle", "path": "../"}));
         assert!(output.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_text_recursive_skips_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let jail = TempDir::new().expect("jail");
+        let outside = TempDir::new().expect("outside");
+        let outside_file = outside.path().join("secret.txt");
+        fs::write(&outside_file, "needle").expect("write");
+        symlink(&outside_file, jail.path().join("escape.txt")).expect("symlink");
+
+        let executor = test_executor(jail.path());
+        let output = executor
+            .handle_search_text(&serde_json::json!({"pattern": "needle", "path": "."}))
+            .expect("search");
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn search_text_skips_files_over_max_file_size() {
+        let temp = TempDir::new().expect("temp");
+        fs::write(temp.path().join("big.txt"), "needle\nneedle").expect("write");
+        let executor = FawxToolExecutor::new(
+            temp.path().to_path_buf(),
+            ToolConfig {
+                max_file_size: 4,
+                ..ToolConfig::default()
+            },
+        );
+
+        let output = executor
+            .handle_search_text(&serde_json::json!({"pattern": "needle"}))
+            .expect("search");
+        assert!(output.contains("skipped (file exceeds max_file_size)"));
     }
 
     #[tokio::test]
