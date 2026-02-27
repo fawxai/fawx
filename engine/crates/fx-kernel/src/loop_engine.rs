@@ -153,10 +153,6 @@ const REASONING_MAX_OUTPUT_TOKENS: u32 = 768;
 const TOOL_SYNTHESIS_MAX_OUTPUT_TOKENS: u32 = 384;
 const DEFAULT_LLM_ACTION_COST_CENTS: u64 = 2;
 const SAFE_FALLBACK_RESPONSE: &str = "I wasn't able to process that. Could you try rephrasing?";
-pub const DEFAULT_SYNTHESIS_INSTRUCTION: &str =
-    "Present the tool output to the user. Show the actual data returned by the tools. \
-Be direct and factual. Do not paraphrase or summarize unless the output is very long \
-(over 100 lines), in which case provide a summary with key highlights.";
 const REASONING_SYSTEM_PROMPT: &str = "You are Fawx, an autonomous assistant. \
 Always use the emit_intent tool to respond. \
 The action field must deserialize to IntendedAction and use exactly one of these variants: \
@@ -1272,6 +1268,8 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
+    const TEST_SYNTHESIS_INSTRUCTION: &str = "Present tool output verbatim.";
+
     #[derive(Debug, Default)]
     struct TestStubToolExecutor;
 
@@ -1532,7 +1530,7 @@ mod tests {
             context,
             max_iterations,
             Arc::new(TestStubToolExecutor),
-            DEFAULT_SYNTHESIS_INSTRUCTION.to_string(),
+            TEST_SYNTHESIS_INSTRUCTION.to_string(),
         )
     }
 
@@ -1554,20 +1552,34 @@ mod tests {
     }
 
     #[test]
-    fn synthesis_prompt_uses_default_instruction() {
+    fn synthesis_prompt_uses_provided_instruction_only() {
         let tool_results = vec![ToolResult {
             tool_name: "weather".to_string(),
             success: true,
             output: "72F".to_string(),
         }];
 
-        let prompt = tool_synthesis_prompt(&tool_results, DEFAULT_SYNTHESIS_INSTRUCTION);
+        let prompt = tool_synthesis_prompt(&tool_results, TEST_SYNTHESIS_INSTRUCTION);
 
-        assert!(prompt.contains(DEFAULT_SYNTHESIS_INSTRUCTION));
+        assert!(prompt.contains(TEST_SYNTHESIS_INSTRUCTION));
         assert!(prompt.contains(
             "Tool results:
 - weather: 72F"
         ));
+    }
+
+    #[test]
+    fn synthesis_prompt_has_no_kernel_fallback_instruction() {
+        let tool_results = vec![ToolResult {
+            tool_name: "weather".to_string(),
+            success: true,
+            output: "72F".to_string(),
+        }];
+
+        let prompt = tool_synthesis_prompt(&tool_results, "");
+
+        assert!(prompt.contains("You are Fawx. "));
+        assert!(!prompt.contains("Do not paraphrase or summarize"));
     }
 
     #[test]
@@ -1657,7 +1669,7 @@ mod tests {
             context,
             10,
             Arc::new(TestStubToolExecutor),
-            DEFAULT_SYNTHESIS_INSTRUCTION.to_string(),
+            TEST_SYNTHESIS_INSTRUCTION.to_string(),
         );
 
         let llm = MockLlm::with_responses(vec![
@@ -1688,7 +1700,7 @@ mod tests {
             context,
             10,
             Arc::new(TestStubToolExecutor),
-            DEFAULT_SYNTHESIS_INSTRUCTION.to_string(),
+            TEST_SYNTHESIS_INSTRUCTION.to_string(),
         );
 
         let llm = SlowMockLlm {
@@ -1722,7 +1734,7 @@ mod tests {
             context,
             5,
             Arc::new(TestStubToolExecutor),
-            DEFAULT_SYNTHESIS_INSTRUCTION.to_string(),
+            TEST_SYNTHESIS_INSTRUCTION.to_string(),
         );
 
         let llm = MockLlm::with_responses(vec![

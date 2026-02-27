@@ -9,9 +9,7 @@ use fx_kernel::act::TokenUsage;
 use fx_kernel::auth::{AuthManager, AuthMethod};
 use fx_kernel::budget::{BudgetConfig, BudgetTracker};
 use fx_kernel::context_manager::ContextCompactor;
-use fx_kernel::loop_engine::{
-    LlmProvider as LoopLlmProvider, LoopEngine, LoopResult, DEFAULT_SYNTHESIS_INSTRUCTION,
-};
+use fx_kernel::loop_engine::{LlmProvider as LoopLlmProvider, LoopEngine, LoopResult};
 use fx_kernel::oauth::{PkceFlow, TokenExchangeRequest, TokenResponse};
 use fx_kernel::types::PerceptionSnapshot;
 use fx_llm::{
@@ -38,6 +36,10 @@ const DEFAULT_OPENAI_TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token
 const MAX_PROMPT_RETRIES: usize = 10;
 const DEFAULT_CONTEXT_MAX_TOKENS: usize = 8_000;
 const DEFAULT_CONTEXT_COMPACT_TARGET: usize = 6_000;
+const DEFAULT_SYNTHESIS_INSTRUCTION: &str =
+    "Present the tool output to the user. Show the actual data returned by the tools. \
+Be direct and factual. Do not paraphrase or summarize unless the output is very long \
+(over 100 lines), in which case provide a summary with key highlights.";
 const DEFAULT_MAX_LOOP_ITERATIONS: u32 = 10;
 const MAX_HISTORY_MESSAGES: usize = 20;
 
