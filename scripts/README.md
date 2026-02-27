@@ -12,6 +12,8 @@ This directory contains the H2.4 spec contract validator and its mutation-heavy 
   - `scripts/tests/test-validate-h24-spec-contract.sh`
 - Force fallback backend coverage (no `rg` path) deterministically:
   - `FORCE_NO_RG=1 scripts/tests/test-validate-h24-spec-contract.sh`
+- Run rename regression checks for CI workflow + validator literals:
+  - `scripts/tests/test-rename-regressions.sh`
 
 Both scripts are plain Bash and can be run from repo root.
 
