@@ -309,8 +309,7 @@ impl TuiApp {
                 self.show_model_menu();
             }
             ParsedCommand::Model(Some(model)) => {
-                self.refresh_router_models().await?;
-                match self.set_active_model_from_selector(&model) {
+                match self.set_active_model_with_refresh(&model).await {
                     Ok(resolved_model) => println!("Active model set to: {resolved_model}"),
                     Err(error) => {
                         println!("Couldn't select model: {error}");
@@ -387,11 +386,22 @@ impl TuiApp {
 
     fn set_active_model_from_selector(&mut self, selector: &str) -> Result<String, RouterError> {
         self.router.set_active(selector)?;
-        Ok(self
-            .router
-            .active_model()
-            .unwrap_or(selector)
-            .to_string())
+        Ok(self.router.active_model().unwrap_or(selector).to_string())
+    }
+
+    async fn set_active_model_with_refresh(
+        &mut self,
+        selector: &str,
+    ) -> Result<String, RouterError> {
+        match self.set_active_model_from_selector(selector) {
+            Ok(model) => Ok(model),
+            Err(initial_error) => {
+                if self.refresh_router_models().await.is_err() {
+                    return Err(initial_error);
+                }
+                self.set_active_model_from_selector(selector)
+            }
+        }
     }
 
     /// Display formatted output to the terminal.
@@ -2223,6 +2233,10 @@ mod tests {
             .set_active("mock-loop-model")
             .expect("set active mock model");
 
+        TuiApp::new(test_provider_auth_manager(), router, build_loop_engine())
+    }
+
+    fn test_provider_auth_manager() -> AuthManager {
         let mut auth_manager = AuthManager::new();
         auth_manager.store(
             "test-provider",
@@ -2231,8 +2245,7 @@ mod tests {
                 key: "test-key".to_string(),
             },
         );
-
-        TuiApp::new(auth_manager, router, build_loop_engine())
+        auth_manager
     }
 
     fn app_with_two_models() -> TuiApp {
@@ -2251,7 +2264,7 @@ mod tests {
             .set_active("gpt-5-mini")
             .expect("set initial active model");
 
-        TuiApp::new(AuthManager::new(), router, build_loop_engine())
+        TuiApp::new(test_provider_auth_manager(), router, build_loop_engine())
     }
 
     fn router_with_completion_response(
