@@ -2928,7 +2928,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn default_model_prefers_opus_when_no_sonnet() {
         let model_ids = vec![
@@ -2951,10 +2950,7 @@ mod tests {
             "anthropic/claude-3.5-sonnet".to_string(),
         ];
         // gpt-4o pattern comes before generic "sonnet" in PREFERRED_MODEL_PATTERNS
-        assert_eq!(
-            preferred_default_model(&model_ids),
-            Some("openai/gpt-4o")
-        );
+        assert_eq!(preferred_default_model(&model_ids), Some("openai/gpt-4o"));
     }
 
     #[test]
