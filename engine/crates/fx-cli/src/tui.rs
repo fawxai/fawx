@@ -57,6 +57,10 @@ const DEFAULT_OPENROUTER_MODELS: &[&str] = &[
     "google/gemini-2.0-flash-001",
 ];
 
+fn term_indicates_truecolor(term: &str) -> bool {
+    term.ends_with("-direct") || term == "xterm-direct" || term.contains("truecolor")
+}
+
 fn supports_truecolor() -> bool {
     if let Ok(value) = std::env::var("COLORTERM") {
         if value == "truecolor" || value == "24bit" {
@@ -65,9 +69,7 @@ fn supports_truecolor() -> bool {
     }
 
     if let Ok(term) = std::env::var("TERM") {
-        if term.contains("direct") || term.contains("truecolor") {
-            return true;
-        }
+        return term_indicates_truecolor(&term);
     }
 
     false
@@ -146,8 +148,16 @@ fn preferred_sonnet(model_ids: &[String]) -> Option<&str> {
 fn highest_version_model(model_ids: &[String]) -> Option<&str> {
     model_ids
         .iter()
-        .max_by(|left, right| version_parts(left).cmp(&version_parts(right)))
-        .map(String::as_str)
+        .filter_map(|id| {
+            let parts = version_parts(id);
+            if parts.is_empty() {
+                None
+            } else {
+                Some((id, parts))
+            }
+        })
+        .max_by(|(_, left), (_, right)| left.cmp(right))
+        .map(|(id, _)| id.as_str())
 }
 
 fn version_parts(model_id: &str) -> Vec<u32> {
@@ -2633,6 +2643,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn term_direct_suffix_detected() {
+        assert!(term_indicates_truecolor("xterm-direct"));
+    }
+
+    #[test]
+    fn term_containing_direct_not_falsely_detected() {
+        assert!(!term_indicates_truecolor("my-indirect-term"));
+    }
+
     #[tokio::test]
     async fn supports_truecolor_detects_term_direct() {
         let _env_lock = ENV_LOCK.lock().await;
@@ -2684,12 +2704,19 @@ mod tests {
     #[test]
     fn default_model_falls_back_when_no_sonnet_models_exist() {
         let model_ids = vec![
-            "gpt-4o".to_string(),
-            "gpt-3.5-turbo".to_string(),
             "llama-3".to_string(),
+            "gpt-3.5-turbo".to_string(),
+            "gpt-4o".to_string(),
         ];
 
         assert_eq!(preferred_default_model(&model_ids), Some("gpt-4o"));
+    }
+
+    #[test]
+    fn default_model_falls_back_to_first_when_versions_are_missing() {
+        let model_ids = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
+
+        assert_eq!(preferred_default_model(&model_ids), Some("alpha"));
     }
 
     #[tokio::test]
