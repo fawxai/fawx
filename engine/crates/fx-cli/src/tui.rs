@@ -33,7 +33,14 @@ use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::LazyLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use syntect::easy::HighlightLines;
+use syntect::highlighting::{Style as SyntectStyle, Theme, ThemeSet};
+use syntect::parsing::SyntaxSet;
+use syntect::util::as_24_bit_terminal_escaped;
+use termimad::crossterm::style::{Attribute as MadAttribute, Color as MadColor};
+use termimad::{MadSkin, StyledChar};
 use tokio::sync::oneshot;
 use tokio::time::{sleep, Duration};
 
@@ -97,6 +104,169 @@ fn theme_color(r: u8, g: u8, b: u8, fallback_256: u8) -> style::Color {
     } else {
         style::Color::AnsiValue(fallback_256)
     }
+}
+
+fn markdown_color(r: u8, g: u8, b: u8, fallback_256: u8) -> MadColor {
+    if supports_truecolor() {
+        MadColor::Rgb { r, g, b }
+    } else {
+        MadColor::AnsiValue(fallback_256)
+    }
+}
+
+fn build_markdown_skin() -> MadSkin {
+    let amber = markdown_color(255, 165, 0, 214);
+    let gold = markdown_color(255, 204, 0, 220);
+    let burnt = markdown_color(210, 112, 10, 166);
+    let dim_white = markdown_color(230, 230, 230, 252);
+    let code_bg = markdown_color(26, 26, 26, 235);
+
+    let mut skin = MadSkin::default();
+    skin.set_headers_fg(amber);
+    skin.headers[0].add_attr(MadAttribute::Bold);
+    skin.bold.set_fg(gold);
+    skin.bold.add_attr(MadAttribute::Bold);
+    skin.italic.set_fg(burnt);
+    skin.italic.add_attr(MadAttribute::Italic);
+    skin.inline_code.set_fgbg(dim_white, code_bg);
+    skin.inline_code.add_attr(MadAttribute::Dim);
+    skin.code_block.set_fgbg(dim_white, code_bg);
+    skin.code_block.add_attr(MadAttribute::Dim);
+    skin.bullet = StyledChar::from_fg_char(amber, '•');
+    skin.paragraph.set_fg(dim_white);
+    skin
+}
+
+struct SyntectAssets {
+    syntax_set: SyntaxSet,
+    theme: Theme,
+}
+
+static SYNTECT_ASSETS: LazyLock<SyntectAssets> = LazyLock::new(|| {
+    let syntax_set = SyntaxSet::load_defaults_newlines();
+    let themes = ThemeSet::load_defaults();
+    let theme = themes
+        .themes
+        .get("base16-ocean.dark")
+        .cloned()
+        .or_else(|| themes.themes.values().next().cloned())
+        .unwrap_or_default();
+    SyntectAssets { syntax_set, theme }
+});
+
+fn normalize_lang_tag(lang: &str) -> &str {
+    let tag = lang.split_whitespace().next().unwrap_or(lang);
+    let tag = tag.split(',').next().unwrap_or(tag);
+    tag.trim()
+}
+
+fn highlight_code(code: &str, lang: &str) -> String {
+    let dim = "\x1b[2m";
+    let reset = "\x1b[0m";
+    let lang = normalize_lang_tag(lang);
+    let assets = &*SYNTECT_ASSETS;
+    let syntax = assets
+        .syntax_set
+        .find_syntax_by_token(lang)
+        .or_else(|| assets.syntax_set.find_syntax_by_extension(lang));
+    let Some(syntax) = syntax else {
+        return format!("{dim}{code}{reset}");
+    };
+
+    let mut highlighter = HighlightLines::new(syntax, &assets.theme);
+    code.lines()
+        .map(|line| highlighter.highlight_line(line, &assets.syntax_set))
+        .map(|ranges| ranges.unwrap_or_else(|_| vec![(SyntectStyle::default(), "")]))
+        .map(|ranges| format!("{}\n", as_24_bit_terminal_escaped(&ranges, false)))
+        .collect()
+}
+
+enum FenceLine {
+    Open { backtick_count: usize, lang: String },
+    Close,
+    Content,
+}
+
+fn parse_fence_line(line: &str, fence_state: &Option<usize>) -> FenceLine {
+    let indent = line.chars().take_while(|ch| *ch == ' ').count();
+    if indent >= 4 {
+        return FenceLine::Content;
+    }
+
+    let trimmed = line.trim();
+    let backtick_count = trimmed.chars().take_while(|ch| *ch == '`').count();
+    if backtick_count < 3 {
+        return FenceLine::Content;
+    }
+
+    if let Some(open_count) = fence_state {
+        let after_backticks = &trimmed[backtick_count..];
+        if backtick_count >= *open_count && after_backticks.trim().is_empty() {
+            return FenceLine::Close;
+        }
+        FenceLine::Content
+    } else {
+        let lang = trimmed[backtick_count..].trim().to_string();
+        FenceLine::Open {
+            backtick_count,
+            lang,
+        }
+    }
+}
+
+fn flush_markdown_prose(output: &mut String, prose: &mut String, skin: &MadSkin) {
+    if prose.is_empty() {
+        return;
+    }
+    output.push_str(&format!("{}", skin.term_text(prose)));
+    prose.clear();
+}
+
+fn render_markdown(text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+
+    let skin = build_markdown_skin();
+    let mut output = String::new();
+    let mut prose = String::new();
+    let mut code = String::new();
+    let mut fence = None;
+    let mut lang = String::new();
+
+    for line in text.lines() {
+        match parse_fence_line(line, &fence) {
+            FenceLine::Open {
+                backtick_count,
+                lang: parsed_lang,
+            } => {
+                flush_markdown_prose(&mut output, &mut prose, &skin);
+                fence = Some(backtick_count);
+                lang = parsed_lang;
+            }
+            FenceLine::Close => {
+                output.push_str(&highlight_code(&code, &lang));
+                output.push('\n');
+                code.clear();
+                fence = None;
+            }
+            FenceLine::Content => {
+                if fence.is_some() {
+                    code.push_str(line);
+                    code.push('\n');
+                } else {
+                    prose.push_str(line);
+                    prose.push('\n');
+                }
+            }
+        }
+    }
+
+    if fence.is_some() {
+        output.push_str(&highlight_code(&code, &lang));
+    }
+    flush_markdown_prose(&mut output, &mut prose, &skin);
+    output.trim_end_matches('\n').to_string()
 }
 
 fn spinner_frame(index: usize) -> char {
@@ -758,7 +928,8 @@ impl TuiApp {
                 .bold()
                 .with(theme_color(255, 165, 0, 214))
         );
-        println!("{response}");
+        let rendered = render_markdown(response);
+        println!("{rendered}");
         println!();
 
         Ok(())
@@ -2936,6 +3107,89 @@ mod tests {
         let _term = ScopedEnvVar::set("TERM", "xterm-256color");
 
         assert_eq!(theme_color(255, 204, 0, 220), style::Color::AnsiValue(220));
+    }
+
+    #[test]
+    fn render_markdown_handles_bold_and_italic() {
+        let result = render_markdown("**bold** and *italic*");
+
+        assert!(!result.is_empty());
+        assert!(result.contains("\x1b["));
+    }
+
+    #[test]
+    fn render_markdown_handles_code_blocks() {
+        let result = render_markdown("```rust\nfn main() {}\n```");
+
+        assert!(!result.is_empty());
+        assert!(result.contains("\x1b["));
+    }
+
+    #[test]
+    fn render_markdown_handles_unclosed_fence() {
+        let result = render_markdown("```rust\nfn main() {}");
+
+        assert!(!result.is_empty());
+        assert!(result.contains("main"));
+    }
+
+    #[test]
+    fn render_markdown_handles_empty_code_block() {
+        let result = render_markdown("```\n```");
+
+        assert!(result.is_empty() || !result.contains("```"));
+    }
+
+    #[test]
+    fn render_markdown_handles_nested_fences() {
+        let input = "````markdown\nHere's an example:\n```rust\nfn foo() {}\n```\n````";
+        let result = render_markdown(input);
+
+        assert!(result.contains("foo"));
+    }
+
+    #[test]
+    fn render_markdown_indented_backticks_not_fence() {
+        let result = render_markdown("    ```\n    code here\n    ```");
+
+        assert!(result.contains("```"));
+    }
+
+    #[test]
+    fn highlight_code_unknown_lang_still_renders() {
+        let result = highlight_code("hello world", "nonexistent-lang-xyz");
+
+        assert!(result.contains("hello world"));
+        assert!(result.contains("\x1b["), "should contain ANSI dim escape");
+    }
+
+    #[test]
+    fn render_markdown_handles_inline_code() {
+        let result = render_markdown("Use `cargo build` to compile");
+
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn render_markdown_handles_plain_text() {
+        let result = render_markdown("Just plain text");
+
+        assert!(result.contains("Just plain text"));
+    }
+
+    #[test]
+    fn render_markdown_handles_empty_input() {
+        let result = render_markdown("");
+
+        assert!(result.is_empty() || result.chars().all(|c| c.is_whitespace()));
+    }
+
+    #[test]
+    fn build_markdown_skin_returns_valid_skin() {
+        let skin = build_markdown_skin();
+        let text = skin.term_text("**test**");
+
+        assert!(!format!("{text}").is_empty());
     }
 
     #[test]

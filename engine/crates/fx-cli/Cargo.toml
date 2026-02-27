@@ -47,6 +47,13 @@ chrono = "0.4"
 rustyline = "15"
 subtle = "2.6"
 urlencoding = "2.1"
+# termimad: markdown rendering for terminal output.
+# Forked to abbudjoe/termimad for supply-chain safety. MIT licensed.
+termimad = { git = "https://github.com/abbudjoe/termimad.git", rev = "f93824f3010e8f7b2650973a2723dd6d36a2f0db" }
+
+# syntect: syntax highlighting for code blocks.
+# Forked to abbudjoe/syntect for supply-chain safety. MIT licensed.
+syntect = { git = "https://github.com/abbudjoe/syntect.git", rev = "6271d7dd8a63f13df08c151840f2358bf116cdcc", default-features = false, features = ["default-fancy"] }
 
 [dev-dependencies]
 tempfile = "3.14"
