@@ -40,6 +40,7 @@ const DEFAULT_SYNTHESIS_INSTRUCTION: &str =
     "Present the tool output to the user. Show the actual data returned by the tools. \
 Be direct and factual. Do not paraphrase or summarize unless the output is very long \
 (over 100 lines), in which case provide a summary with key highlights.";
+const MAX_SYNTHESIS_INSTRUCTION_LENGTH: usize = 500;
 const DEFAULT_MAX_LOOP_ITERATIONS: u32 = 10;
 const MAX_HISTORY_MESSAGES: usize = 20;
 
@@ -414,14 +415,34 @@ impl TuiApp {
     fn update_synthesis_instruction(&mut self, instruction: Option<String>) {
         match instruction {
             None => println!("Usage: /synthesis <instruction> or /synthesis reset"),
+            Some(value) if value.trim().is_empty() => {
+                println!("Synthesis instruction cannot be empty.");
+            }
             Some(value) if value.eq_ignore_ascii_case("reset") => {
-                self.loop_engine
-                    .set_synthesis_instruction(DEFAULT_SYNTHESIS_INSTRUCTION.to_string());
+                if let Err(error) = self
+                    .loop_engine
+                    .set_synthesis_instruction(DEFAULT_SYNTHESIS_INSTRUCTION.to_string())
+                {
+                    println!("Failed to reset synthesis instruction: {}", error.reason);
+                    return;
+                }
                 println!("Synthesis instruction reset to default.");
             }
             Some(value) => {
-                self.loop_engine.set_synthesis_instruction(value.clone());
-                println!("Synthesis instruction updated: {value}");
+                if value.len() > MAX_SYNTHESIS_INSTRUCTION_LENGTH {
+                    println!(
+                        "Synthesis instruction exceeds {} characters.",
+                        MAX_SYNTHESIS_INSTRUCTION_LENGTH
+                    );
+                    return;
+                }
+
+                match self.loop_engine.set_synthesis_instruction(value.clone()) {
+                    Ok(()) => println!("Synthesis instruction updated: {}", value.trim()),
+                    Err(error) => {
+                        println!("Failed to update synthesis instruction: {}", error.reason)
+                    }
+                }
             }
         }
     }
@@ -1881,7 +1902,7 @@ enum ParsedCommand {
 }
 
 fn parse_command(value: &str) -> ParsedCommand {
-    let input = value.trim();
+    let input = value.trim_start();
     let Some(input) = input.strip_prefix('/') else {
         return ParsedCommand::Unknown(input.to_string());
     };
@@ -1898,11 +1919,11 @@ fn parse_command(value: &str) -> ParsedCommand {
         "loop" => ParsedCommand::Loop,
         "status" => ParsedCommand::Status,
         "synthesis" => {
-            let instruction = parts.collect::<Vec<_>>().join(" ");
-            if instruction.is_empty() {
-                ParsedCommand::Synthesis(None)
-            } else {
-                ParsedCommand::Synthesis(Some(instruction))
+            let remainder = input[command.len()..].strip_prefix(' ');
+            match remainder {
+                None => ParsedCommand::Synthesis(None),
+                Some(raw) if raw.trim().is_empty() => ParsedCommand::Synthesis(Some(String::new())),
+                Some(raw) => ParsedCommand::Synthesis(Some(raw.trim().to_string())),
             }
         }
         "clear" | "cls" => ParsedCommand::Clear,
@@ -2632,6 +2653,10 @@ mod tests {
             ParsedCommand::Synthesis(Some("Show raw output".to_string()))
         );
         assert_eq!(parse_command("/synthesis"), ParsedCommand::Synthesis(None));
+        assert_eq!(
+            parse_command("/synthesis    "),
+            ParsedCommand::Synthesis(Some(String::new()))
+        );
         assert_eq!(parse_command("/clear"), ParsedCommand::Clear);
         assert_eq!(parse_command("/cls"), ParsedCommand::Clear);
         assert_eq!(parse_command("/quit"), ParsedCommand::Quit);
@@ -2842,9 +2867,38 @@ mod tests {
             "Show raw output verbatim"
         );
 
-        app.handle_command("/synthesis reset")
+        app.handle_command("/synthesis ReSeT")
             .await
             .expect("synthesis reset");
+        assert_eq!(
+            app.loop_engine.synthesis_instruction(),
+            DEFAULT_SYNTHESIS_INSTRUCTION
+        );
+    }
+
+    #[tokio::test]
+    async fn synthesis_command_rejects_whitespace_only_instruction() {
+        let mut app = new_test_app();
+
+        app.handle_command("/synthesis    ")
+            .await
+            .expect("synthesis whitespace command");
+
+        assert_eq!(
+            app.loop_engine.synthesis_instruction(),
+            DEFAULT_SYNTHESIS_INSTRUCTION
+        );
+    }
+
+    #[tokio::test]
+    async fn synthesis_command_rejects_instruction_over_max_length() {
+        let mut app = new_test_app();
+        let long_value = "x".repeat(MAX_SYNTHESIS_INSTRUCTION_LENGTH + 1);
+
+        app.handle_command(&format!("/synthesis {long_value}"))
+            .await
+            .expect("synthesis long command");
+
         assert_eq!(
             app.loop_engine.synthesis_instruction(),
             DEFAULT_SYNTHESIS_INSTRUCTION

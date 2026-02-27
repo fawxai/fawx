@@ -182,8 +182,18 @@ impl LoopEngine {
         }
     }
 
-    pub fn set_synthesis_instruction(&mut self, instruction: String) {
-        self.synthesis_instruction = instruction;
+    pub fn set_synthesis_instruction(&mut self, instruction: String) -> Result<(), LoopError> {
+        let trimmed = instruction.trim();
+        if trimmed.is_empty() {
+            return Err(loop_error(
+                "configure",
+                "synthesis instruction cannot be empty",
+                true,
+            ));
+        }
+
+        self.synthesis_instruction = trimmed.to_string();
+        Ok(())
     }
 
     pub fn synthesis_instruction(&self) -> &str {
@@ -1583,12 +1593,46 @@ mod tests {
     }
 
     #[test]
+    fn synthesis_prompt_preserves_multiline_tool_output() {
+        let tool_results = vec![ToolResult {
+            tool_name: "shell".to_string(),
+            success: true,
+            output: "line one
+line two
+line three"
+                .to_string(),
+        }];
+
+        let prompt = tool_synthesis_prompt(&tool_results, TEST_SYNTHESIS_INSTRUCTION);
+
+        assert!(prompt.contains(
+            "Tool results:
+- shell: line one
+line two
+line three"
+        ));
+    }
+
+    #[test]
     fn set_synthesis_instruction_updates_engine() {
         let mut engine = default_engine(3);
 
-        engine.set_synthesis_instruction("Use exact tool output.".to_string());
+        engine
+            .set_synthesis_instruction("Use exact tool output.".to_string())
+            .expect("instruction should update");
 
         assert_eq!(engine.synthesis_instruction, "Use exact tool output.");
+    }
+
+    #[test]
+    fn set_synthesis_instruction_rejects_empty_after_trim() {
+        let mut engine = default_engine(3);
+
+        let error = engine
+            .set_synthesis_instruction("   ".to_string())
+            .expect_err("empty instruction should fail");
+
+        assert!(error.reason.contains("cannot be empty"));
     }
 
     #[test]
