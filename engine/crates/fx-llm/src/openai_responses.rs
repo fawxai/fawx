@@ -176,6 +176,7 @@ impl OpenAiResponsesProvider {
         }
     }
 
+    #[cfg(test)]
     fn parse_response(body: ResponsesResponseBody) -> CompletionResponse {
         let response_text = collect_output_text(&body.output);
         let tool_calls = collect_tool_calls(&body.output);
@@ -191,6 +192,39 @@ impl OpenAiResponsesProvider {
             stop_reason: body.status,
             tool_calls,
         }
+    }
+
+    fn build_streaming_request_body(
+        &self,
+        request: &CompletionRequest,
+    ) -> Result<ResponsesRequestBody, LlmError> {
+        self.build_request_body(request, true)
+    }
+
+    async fn complete_via_stream(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<CompletionResponse, LlmError> {
+        let mut stream = self.complete_stream(request).await?;
+        let mut text = String::new();
+        let mut usage = None;
+        let mut stop_reason = None;
+        let mut pending_tool_calls = Vec::new();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            text.push_str(chunk.delta_content.as_deref().unwrap_or_default());
+            usage = chunk.usage.or(usage);
+            stop_reason = chunk.stop_reason.or(stop_reason);
+            merge_tool_use_deltas(&mut pending_tool_calls, chunk.tool_use_deltas);
+        }
+
+        Ok(CompletionResponse {
+            content: vec![ContentBlock::Text { text }],
+            tool_calls: finalize_tool_calls(pending_tool_calls),
+            usage,
+            stop_reason,
+        })
     }
 
     fn find_event_delimiter(buffer: &str) -> Option<(usize, usize)> {
@@ -351,39 +385,14 @@ impl LlmProvider for OpenAiResponsesProvider {
     }
 
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
-        let body = self.build_request_body(&request, false)?;
-
-        let response = self
-            .client
-            .post(self.endpoint())
-            .bearer_auth(&self.access_token)
-            .headers(self.build_headers())
-            .json(&body)
-            .send()
-            .await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|e| format!("unable to read error body: {e}"));
-            return Err(Self::map_http_error(status, body));
-        }
-
-        let parsed: ResponsesResponseBody = response
-            .json()
-            .await
-            .map_err(|e| LlmError::InvalidResponse(e.to_string()))?;
-
-        Ok(Self::parse_response(parsed))
+        self.complete_via_stream(request).await
     }
 
     async fn complete_stream(
         &self,
         request: CompletionRequest,
     ) -> Result<CompletionStream, LlmError> {
-        let body = self.build_request_body(&request, true)?;
+        let body = self.build_streaming_request_body(&request)?;
 
         let response = self
             .client
@@ -414,7 +423,7 @@ impl LlmProvider for OpenAiResponsesProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             supports_temperature: false,
-            requires_streaming: false,
+            requires_streaming: true,
         }
     }
 }
@@ -456,6 +465,7 @@ struct ResponsesTool {
 }
 
 #[derive(Deserialize)]
+#[cfg(test)]
 struct ResponsesResponseBody {
     #[serde(default)]
     output: Vec<ResponsesOutputItem>,
@@ -466,6 +476,7 @@ struct ResponsesResponseBody {
 }
 
 #[derive(Deserialize)]
+#[cfg(test)]
 struct ResponsesOutputItem {
     #[serde(default)]
     r#type: Option<String>,
@@ -482,6 +493,7 @@ struct ResponsesOutputItem {
 }
 
 #[derive(Deserialize)]
+#[cfg(test)]
 struct ResponsesContentPart {
     r#type: String,
     #[serde(default)]
@@ -544,6 +556,7 @@ fn extract_text(content: &[ContentBlock]) -> String {
         .join("")
 }
 
+#[cfg(test)]
 fn collect_output_text(output: &[ResponsesOutputItem]) -> String {
     let mut text_parts = Vec::new();
 
@@ -565,6 +578,7 @@ fn collect_output_text(output: &[ResponsesOutputItem]) -> String {
     text_parts.join("")
 }
 
+#[cfg(test)]
 fn collect_tool_calls(output: &[ResponsesOutputItem]) -> Vec<ToolCall> {
     let mut tool_calls = Vec::new();
 
@@ -588,6 +602,63 @@ fn collect_tool_calls(output: &[ResponsesOutputItem]) -> Vec<ToolCall> {
     }
 
     tool_calls
+}
+
+#[derive(Default)]
+struct PendingToolCall {
+    id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+}
+
+fn merge_tool_use_deltas(pending: &mut Vec<PendingToolCall>, deltas: Vec<ToolUseDelta>) {
+    for delta in deltas {
+        let index = delta
+            .id
+            .as_ref()
+            .and_then(|item_id| {
+                pending
+                    .iter()
+                    .position(|call| call.id.as_ref() == Some(item_id))
+            })
+            .unwrap_or_else(|| {
+                pending.push(PendingToolCall {
+                    id: delta.id.clone(),
+                    name: delta.name.clone(),
+                    arguments: String::new(),
+                });
+                pending.len() - 1
+            });
+
+        if pending[index].id.is_none() {
+            pending[index].id = delta.id.clone();
+        }
+        if pending[index].name.is_none() {
+            pending[index].name = delta.name.clone();
+        }
+
+        if let Some(arguments_delta) = delta.arguments_delta {
+            pending[index].arguments.push_str(&arguments_delta);
+        }
+    }
+}
+
+fn finalize_tool_calls(pending: Vec<PendingToolCall>) -> Vec<ToolCall> {
+    pending
+        .into_iter()
+        .filter_map(|call| {
+            let id = call.id?;
+            let name = call.name?;
+            let arguments = serde_json::from_str::<Value>(&call.arguments)
+                .unwrap_or(Value::String(call.arguments));
+
+            Some(ToolCall {
+                id,
+                name,
+                arguments,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -715,6 +786,23 @@ mod tests {
     }
 
     #[test]
+    fn streaming_request_body_always_sets_stream_true() {
+        let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
+        let request = CompletionRequest {
+            model: "gpt-5.3-codex".to_string(),
+            messages: vec![crate::types::Message::user("hi")],
+            system_prompt: None,
+            tools: vec![],
+            temperature: None,
+            max_tokens: None,
+        };
+
+        let body = provider.build_streaming_request_body(&request).unwrap();
+        let serialized = serde_json::to_value(&body).unwrap();
+        assert_eq!(serialized["stream"], true);
+    }
+
+    #[test]
     fn parse_response_extracts_tool_calls() {
         let body = ResponsesResponseBody {
             output: vec![ResponsesOutputItem {
@@ -759,7 +847,61 @@ mod tests {
         let capabilities = provider.capabilities();
 
         assert!(!capabilities.supports_temperature);
-        assert!(!capabilities.requires_streaming);
+        assert!(capabilities.requires_streaming);
+    }
+
+    #[test]
+    fn merge_tool_use_deltas_collects_complete_tool_call() {
+        let mut pending = Vec::new();
+        merge_tool_use_deltas(
+            &mut pending,
+            vec![ToolUseDelta {
+                id: Some("call_1".to_string()),
+                name: Some("emit_intent".to_string()),
+                arguments_delta: Some("{\"intent\":\"op".to_string()),
+            }],
+        );
+        merge_tool_use_deltas(
+            &mut pending,
+            vec![ToolUseDelta {
+                id: Some("call_1".to_string()),
+                name: Some("emit_intent".to_string()),
+                arguments_delta: Some("en\"}".to_string()),
+            }],
+        );
+
+        let tool_calls = finalize_tool_calls(pending);
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_1");
+        assert_eq!(tool_calls[0].name, "emit_intent");
+        assert_eq!(tool_calls[0].arguments["intent"], "open");
+    }
+
+    #[test]
+    fn merge_tool_use_deltas_merges_when_name_arrives_later() {
+        let mut pending = Vec::new();
+        merge_tool_use_deltas(
+            &mut pending,
+            vec![ToolUseDelta {
+                id: Some("call_1".to_string()),
+                name: None,
+                arguments_delta: Some("{\"intent\":\"op".to_string()),
+            }],
+        );
+        merge_tool_use_deltas(
+            &mut pending,
+            vec![ToolUseDelta {
+                id: Some("call_1".to_string()),
+                name: Some("emit_intent".to_string()),
+                arguments_delta: Some("en\"}".to_string()),
+            }],
+        );
+
+        let tool_calls = finalize_tool_calls(pending);
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_1");
+        assert_eq!(tool_calls[0].name, "emit_intent");
+        assert_eq!(tool_calls[0].arguments["intent"], "open");
     }
 
     fn parse_test_sse_payload(payload: &str) -> Vec<StreamChunk> {
