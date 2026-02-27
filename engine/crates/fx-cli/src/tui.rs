@@ -784,6 +784,13 @@ impl LoopLlmProvider for RouterLoopLlmProvider<'_> {
         Ok(rendered)
     }
 
+    async fn complete(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<fx_llm::CompletionResponse, ProviderError> {
+        self.router.complete(request).await
+    }
+
     fn model_name(&self) -> &str {
         &self.active_model
     }
@@ -1904,6 +1911,19 @@ mod tests {
         chunks: Vec<Result<fx_llm::StreamChunk, fx_llm::ProviderError>>,
     }
 
+    #[derive(Debug)]
+    struct CompletionTestProvider {
+        provider_name: String,
+        model: String,
+        completion: fx_llm::CompletionResponse,
+    }
+
+    #[derive(Debug)]
+    struct FailingCompletionProvider {
+        provider_name: String,
+        model: String,
+    }
+
     #[async_trait]
     impl fx_llm::CompletionProvider for StreamingTestProvider {
         async fn complete(
@@ -1925,6 +1945,64 @@ mod tests {
             _request: CompletionRequest,
         ) -> Result<fx_llm::CompletionStream, fx_llm::ProviderError> {
             Ok(Box::pin(futures::stream::iter(self.chunks.clone())))
+        }
+
+        fn name(&self) -> &str {
+            &self.provider_name
+        }
+
+        fn supported_models(&self) -> Vec<String> {
+            vec![self.model.clone()]
+        }
+
+        fn capabilities(&self) -> fx_llm::ProviderCapabilities {
+            mock_provider_capabilities()
+        }
+    }
+
+    #[async_trait]
+    impl fx_llm::CompletionProvider for CompletionTestProvider {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<fx_llm::CompletionResponse, fx_llm::ProviderError> {
+            Ok(self.completion.clone())
+        }
+
+        async fn complete_stream(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<fx_llm::CompletionStream, fx_llm::ProviderError> {
+            Ok(Box::pin(futures::stream::iter(vec![])))
+        }
+
+        fn name(&self) -> &str {
+            &self.provider_name
+        }
+
+        fn supported_models(&self) -> Vec<String> {
+            vec![self.model.clone()]
+        }
+
+        fn capabilities(&self) -> fx_llm::ProviderCapabilities {
+            mock_provider_capabilities()
+        }
+    }
+
+    #[async_trait]
+    impl fx_llm::CompletionProvider for FailingCompletionProvider {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<fx_llm::CompletionResponse, fx_llm::ProviderError> {
+            Err(fx_llm::ProviderError::Provider("test error".to_string()))
+        }
+
+        async fn complete_stream(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<fx_llm::CompletionStream, fx_llm::ProviderError> {
+            Ok(Box::pin(futures::stream::iter(vec![])))
         }
 
         fn name(&self) -> &str {
@@ -1985,6 +2063,43 @@ mod tests {
             .expect("set active mock model");
 
         TuiApp::new(AuthManager::new(), router, build_loop_engine())
+    }
+
+    fn router_with_completion_response(
+        model: &str,
+        completion: fx_llm::CompletionResponse,
+    ) -> ModelRouter {
+        let mut router = ModelRouter::new();
+        router.register_provider_with_auth(
+            Box::new(CompletionTestProvider {
+                provider_name: "complete-test".to_string(),
+                model: model.to_string(),
+                completion,
+            }),
+            "test",
+        );
+        router.set_active(model).expect("set active model");
+        router
+    }
+
+    fn terminal_snapshot(text: &str) -> PerceptionSnapshot {
+        PerceptionSnapshot {
+            screen: ScreenState {
+                current_app: "fawx.tui".to_string(),
+                elements: Vec::new(),
+                text_content: text.to_string(),
+            },
+            notifications: Vec::new(),
+            active_app: "fawx.tui".to_string(),
+            timestamp_ms: 1,
+            sensor_data: None,
+            user_input: Some(UserInput {
+                text: text.to_string(),
+                source: InputSource::Text,
+                timestamp: 1,
+                context_id: None,
+            }),
+        }
     }
 
     #[derive(Debug, Default)]
@@ -2069,6 +2184,120 @@ mod tests {
         assert!(
             matches!(result, Err(CoreLlmError::InvalidResponse(message)) if message.contains("empty completion"))
         );
+    }
+
+    #[tokio::test]
+    async fn router_loop_llm_provider_complete_preserves_tool_calls_and_usage() {
+        let expected_tool_call = fx_llm::ToolCall {
+            id: "call-1".to_string(),
+            name: "emit_intent".to_string(),
+            arguments: serde_json::json!({
+                "action": {"Respond": {"text": "done"}},
+                "rationale": "tool call response",
+                "confidence": 0.9
+            }),
+        };
+        let expected_usage = fx_llm::Usage {
+            input_tokens: 123,
+            output_tokens: 45,
+        };
+        let router = router_with_completion_response(
+            "complete-model",
+            fx_llm::CompletionResponse {
+                content: Vec::new(),
+                tool_calls: vec![expected_tool_call.clone()],
+                usage: Some(expected_usage),
+                stop_reason: Some("tool_use".to_string()),
+            },
+        );
+        let provider = RouterLoopLlmProvider::new(&router, "complete-model".to_string());
+        let request = CompletionRequest {
+            model: "complete-model".to_string(),
+            messages: vec![Message::user("hi")],
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: Some(32),
+            system_prompt: None,
+        };
+
+        let response = provider
+            .complete(request)
+            .await
+            .expect("completion response");
+
+        assert_eq!(response.tool_calls, vec![expected_tool_call]);
+        assert_eq!(response.usage, Some(expected_usage));
+    }
+
+    #[tokio::test]
+    async fn router_loop_llm_provider_complete_propagates_provider_error() {
+        let mut router = ModelRouter::new();
+        router.register_provider_with_auth(
+            Box::new(FailingCompletionProvider {
+                provider_name: "failing-complete-test".to_string(),
+                model: "failing-complete-model".to_string(),
+            }),
+            "test",
+        );
+        router
+            .set_active("failing-complete-model")
+            .expect("set active failing model");
+
+        let provider = RouterLoopLlmProvider::new(&router, "failing-complete-model".to_string());
+        let request = CompletionRequest {
+            model: "failing-complete-model".to_string(),
+            messages: vec![Message::user("hi")],
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: Some(32),
+            system_prompt: None,
+        };
+
+        let error = provider
+            .complete(request)
+            .await
+            .expect_err("provider error should bubble up");
+
+        assert_eq!(
+            error,
+            fx_llm::ProviderError::Provider("test error".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn router_loop_llm_provider_complete_drives_loop_engine_emit_intent_flow() {
+        let router = router_with_completion_response(
+            "complete-loop-model",
+            fx_llm::CompletionResponse {
+                content: Vec::new(),
+                tool_calls: vec![fx_llm::ToolCall {
+                    id: "call-loop-1".to_string(),
+                    name: "emit_intent".to_string(),
+                    arguments: serde_json::json!({
+                        "action": {"Respond": {"text": "Tool path works"}},
+                        "rationale": "structured output",
+                        "confidence": 0.98
+                    }),
+                }],
+                usage: Some(fx_llm::Usage {
+                    input_tokens: 17,
+                    output_tokens: 9,
+                }),
+                stop_reason: Some("tool_use".to_string()),
+            },
+        );
+
+        let mut loop_engine = build_loop_engine();
+        let llm = RouterLoopLlmProvider::new(&router, "complete-loop-model".to_string());
+        let result = loop_engine
+            .run_cycle(terminal_snapshot("trigger emit intent"), &llm)
+            .await
+            .expect("loop result");
+
+        assert!(matches!(
+            result,
+            LoopResult::Complete { response, .. } if response == "Tool path works"
+        ));
     }
 
     #[test]
