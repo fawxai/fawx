@@ -106,6 +106,23 @@ fn theme_color(r: u8, g: u8, b: u8, fallback_256: u8) -> style::Color {
     }
 }
 
+/// Render the startup banner: ANSI art for truecolor terminals, text fallback otherwise.
+fn render_banner(truecolor: bool, amber: style::Color) -> String {
+    if truecolor {
+        FAWX_BANNER_ANSI.to_string()
+    } else {
+        BANNER_ART
+            .lines()
+            .map(|line| {
+                format!(
+                    "{}
+",
+                    line.bold().with(amber)
+                )
+            })
+            .collect()
+    }
+}
 fn markdown_color(r: u8, g: u8, b: u8, fallback_256: u8) -> MadColor {
     if supports_truecolor() {
         MadColor::Rgb { r, g, b }
@@ -613,13 +630,7 @@ impl TuiApp {
         let burnt = theme_color(210, 112, 10, 166);
 
         println!();
-        if supports_truecolor() {
-            print!("{FAWX_BANNER_ANSI}");
-        } else {
-            for line in BANNER_ART.lines() {
-                println!("{}", line.bold().with(amber));
-            }
-        }
+        print!("{}", render_banner(supports_truecolor(), amber));
         println!();
         println!(
             "  {}",
@@ -2732,6 +2743,54 @@ mod tests {
         assert!(
             FAWX_BANNER_ANSI.contains("["),
             "banner should contain ANSI escapes"
+        );
+    }
+
+    #[test]
+    fn render_banner_truecolor_returns_ansi_art() {
+        let amber = style::Color::Rgb {
+            r: 255,
+            g: 165,
+            b: 0,
+        };
+        let result = render_banner(true, amber);
+        assert_eq!(result, FAWX_BANNER_ANSI);
+        assert!(
+            result.contains("["),
+            "truecolor banner should contain ANSI escapes"
+        );
+    }
+
+    #[test]
+    fn render_banner_no_truecolor_returns_text_art() {
+        let amber = style::Color::Rgb {
+            r: 255,
+            g: 165,
+            b: 0,
+        };
+        let result = render_banner(false, amber);
+        assert!(
+            !result.contains("⠀"),
+            "fallback should not contain braille characters"
+        );
+        assert!(
+            result.contains("/ _/"),
+            "fallback should contain ASCII art from BANNER_ART"
+        );
+    }
+
+    #[test]
+    fn render_banner_branches_are_distinct() {
+        let amber = style::Color::Rgb {
+            r: 255,
+            g: 165,
+            b: 0,
+        };
+        let truecolor = render_banner(true, amber);
+        let fallback = render_banner(false, amber);
+        assert_ne!(
+            truecolor, fallback,
+            "truecolor and fallback banners should differ"
         );
     }
 
