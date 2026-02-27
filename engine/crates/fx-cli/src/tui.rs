@@ -1918,6 +1918,12 @@ mod tests {
         completion: fx_llm::CompletionResponse,
     }
 
+    #[derive(Debug)]
+    struct FailingCompletionProvider {
+        provider_name: String,
+        model: String,
+    }
+
     #[async_trait]
     impl fx_llm::CompletionProvider for StreamingTestProvider {
         async fn complete(
@@ -1961,6 +1967,35 @@ mod tests {
             _request: CompletionRequest,
         ) -> Result<fx_llm::CompletionResponse, fx_llm::ProviderError> {
             Ok(self.completion.clone())
+        }
+
+        async fn complete_stream(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<fx_llm::CompletionStream, fx_llm::ProviderError> {
+            Ok(Box::pin(futures::stream::iter(vec![])))
+        }
+
+        fn name(&self) -> &str {
+            &self.provider_name
+        }
+
+        fn supported_models(&self) -> Vec<String> {
+            vec![self.model.clone()]
+        }
+
+        fn capabilities(&self) -> fx_llm::ProviderCapabilities {
+            mock_provider_capabilities()
+        }
+    }
+
+    #[async_trait]
+    impl fx_llm::CompletionProvider for FailingCompletionProvider {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<fx_llm::CompletionResponse, fx_llm::ProviderError> {
+            Err(fx_llm::ProviderError::Provider("test error".to_string()))
         }
 
         async fn complete_stream(
@@ -2171,7 +2206,7 @@ mod tests {
             fx_llm::CompletionResponse {
                 content: Vec::new(),
                 tool_calls: vec![expected_tool_call.clone()],
-                usage: Some(expected_usage.clone()),
+                usage: Some(expected_usage),
                 stop_reason: Some("tool_use".to_string()),
             },
         );
@@ -2192,6 +2227,41 @@ mod tests {
 
         assert_eq!(response.tool_calls, vec![expected_tool_call]);
         assert_eq!(response.usage, Some(expected_usage));
+    }
+
+    #[tokio::test]
+    async fn router_loop_llm_provider_complete_propagates_provider_error() {
+        let mut router = ModelRouter::new();
+        router.register_provider_with_auth(
+            Box::new(FailingCompletionProvider {
+                provider_name: "failing-complete-test".to_string(),
+                model: "failing-complete-model".to_string(),
+            }),
+            "test",
+        );
+        router
+            .set_active("failing-complete-model")
+            .expect("set active failing model");
+
+        let provider = RouterLoopLlmProvider::new(&router, "failing-complete-model".to_string());
+        let request = CompletionRequest {
+            model: "failing-complete-model".to_string(),
+            messages: vec![Message::user("hi")],
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: Some(32),
+            system_prompt: None,
+        };
+
+        let error = provider
+            .complete(request)
+            .await
+            .expect_err("provider error should bubble up");
+
+        assert_eq!(
+            error,
+            fx_llm::ProviderError::Provider("test error".to_string())
+        );
     }
 
     #[tokio::test]
