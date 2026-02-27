@@ -12,15 +12,53 @@ use crate::types::{
     ReasoningContext, WorkingMemoryEntry,
 };
 use crate::verify::Verification;
+use async_trait::async_trait;
 use fx_core::types::{InputSource, UserInput};
-use fx_llm::Message;
+use fx_llm::{
+    CompletionRequest, CompletionResponse, Message, ProviderError, ToolCall, ToolDefinition,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Re-exported LLM provider trait used by the loop.
-pub use fx_llm::LlmProvider;
+/// LLM provider trait used by the loop.
+#[async_trait]
+pub trait LlmProvider: Send + Sync + std::fmt::Debug {
+    async fn generate(
+        &self,
+        prompt: &str,
+        max_tokens: u32,
+    ) -> Result<String, fx_core::error::LlmError>;
+
+    async fn generate_streaming(
+        &self,
+        prompt: &str,
+        max_tokens: u32,
+        callback: Box<dyn Fn(String) + Send + 'static>,
+    ) -> Result<String, fx_core::error::LlmError>;
+
+    fn model_name(&self) -> &str;
+
+    async fn complete(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<CompletionResponse, ProviderError> {
+        let prompt = completion_request_to_prompt(&request);
+        let max_tokens = request.max_tokens.unwrap_or(REASONING_MAX_OUTPUT_TOKENS);
+        let generated = self
+            .generate(&prompt, max_tokens)
+            .await
+            .map_err(|error| ProviderError::Provider(error.to_string()))?;
+
+        Ok(CompletionResponse {
+            content: vec![fx_llm::ContentBlock::Text { text: generated }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        })
+    }
+}
 
 /// Runtime loop status for `/loop` diagnostics.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -113,15 +151,9 @@ const TOOL_SYNTHESIS_TOKEN_HEURISTIC: u64 = 320;
 const REASONING_MAX_OUTPUT_TOKENS: u32 = 768;
 const TOOL_SYNTHESIS_MAX_OUTPUT_TOKENS: u32 = 384;
 const DEFAULT_LLM_ACTION_COST_CENTS: u64 = 2;
-const REASONING_SYSTEM_PROMPT: &str = "You are Fawx, an autonomous assistant kernel. \
-Reason step output MUST be valid JSON matching this schema: \
-{\"action\": <IntendedAction>, \"rationale\": \"...\", \"confidence\": 0.0-1.0, \
-\"expected_outcome\": \"...\" or null, \"sub_goals\": []}. \
-IntendedAction variants: {\"Respond\": {\"text\": \"your answer\"}} for direct replies, \
-{\"UseTools\": {\"tool_calls\": [{\"tool\": \"name\", \"args\": {}}]}} for tool use, \
-{\"Clarify\": {\"question\": \"what to ask\"}} when the request is ambiguous, \
-{\"Defer\": {\"reason\": \"why\"}} when you cannot help. \
-For simple questions, use Respond with your answer in the text field.";
+const REASONING_SYSTEM_PROMPT: &str = "You are Fawx, an autonomous assistant. \
+Always use the emit_intent tool to respond. \
+For simple questions, emit a Respond action with your answer.";
 
 const VERIFICATION_CONFIDENCE_CLEAN: f64 = 0.9;
 const VERIFICATION_CONFIDENCE_SINGLE_DISCREPANCY: f64 = 0.45;
@@ -353,29 +385,18 @@ impl LoopEngine {
         perception: &ProcessedPerception,
         llm: &dyn LlmProvider,
     ) -> Result<ReasonedIntent, LoopError> {
-        let system_prompt = REASONING_SYSTEM_PROMPT;
-        let context_messages = perception
-            .context_window
-            .iter()
-            .map(message_to_text)
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let prompt = format!(
-            "{system_prompt}\n\nActive goals:\n- {}\n\nBudget remaining: {} tokens, {} llm calls\n\nContext:\n{context_messages}\n\nUser message:\n{}\n\nRespond with JSON only.",
-            perception.active_goals.join("\n- "),
-            perception.budget_remaining.tokens,
-            perception.budget_remaining.llm_calls,
-            perception.user_message,
-        );
-
-        let raw = llm
-            .generate(&prompt, REASONING_MAX_OUTPUT_TOKENS)
+        let request = build_reasoning_request(perception, llm.model_name());
+        let response = llm
+            .complete(request)
             .await
-            .map_err(|error| {
-                loop_error("reason", &format!("llm generation failed: {error}"), true)
-            })?;
+            .map_err(|error| loop_error("reason", &format!("completion failed: {error}"), true))?;
 
+        if let Some(intent) = parse_tool_call_intent(&response) {
+            return Ok(intent);
+        }
+
+        eprintln!("reason: falling back to text parsing (emit_intent tool call missing/invalid)");
+        let raw = extract_response_text(&response);
         Ok(parse_reasoned_intent(&raw, &perception.user_message))
     }
 
@@ -817,6 +838,171 @@ fn message_to_text(message: &Message) -> String {
     format!("{role}: {content}")
 }
 
+fn completion_request_to_prompt(request: &CompletionRequest) -> String {
+    let system = request
+        .system_prompt
+        .as_deref()
+        .map(|prompt| format!("System:\n{prompt}\n\n"))
+        .unwrap_or_default();
+    let messages = request
+        .messages
+        .iter()
+        .map(message_to_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!("{system}{messages}")
+}
+
+fn build_reasoning_request(perception: &ProcessedPerception, model: &str) -> CompletionRequest {
+    let context = perception.context_window.clone();
+    let user_prompt = reasoning_user_prompt(perception);
+
+    CompletionRequest {
+        model: model.to_string(),
+        messages: [context, vec![Message::user(user_prompt)]].concat(),
+        tools: vec![emit_intent_tool_definition()],
+        temperature: Some(0.2),
+        max_tokens: Some(REASONING_MAX_OUTPUT_TOKENS),
+        system_prompt: Some(REASONING_SYSTEM_PROMPT.to_string()),
+    }
+}
+
+fn reasoning_user_prompt(perception: &ProcessedPerception) -> String {
+    format!(
+        "Active goals:\n- {}\n\nBudget remaining: {} tokens, {} llm calls\n\nUser message:\n{}",
+        perception.active_goals.join("\n- "),
+        perception.budget_remaining.tokens,
+        perception.budget_remaining.llm_calls,
+        perception.user_message,
+    )
+}
+
+fn emit_intent_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "emit_intent".to_string(),
+        description: "Emit a structured intent. ALWAYS call this tool with your response."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "object",
+                    "description": "IntendedAction: use {\"Respond\": {\"text\": \"your answer\"}} for direct replies, {\"UseTools\": {\"tool_calls\": [...]}} for tool use, {\"Clarify\": {\"question\": \"...\"}} for clarification, {\"Defer\": {\"reason\": \"...\"}} to decline"
+                },
+                "rationale": {"type": "string"},
+                "confidence": {"type": "number"},
+                "expected_outcome": {"type": "string"},
+                "sub_goals": {"type": "array", "items": {"type": "string"}}
+            },
+            "required": ["action", "rationale", "confidence"]
+        }),
+    }
+}
+
+fn parse_tool_call_intent(response: &CompletionResponse) -> Option<ReasonedIntent> {
+    response
+        .tool_calls
+        .iter()
+        .find(|call| call.name == "emit_intent")
+        .and_then(parse_emit_intent_call)
+}
+
+fn parse_emit_intent_call(call: &ToolCall) -> Option<ReasonedIntent> {
+    let args = call.arguments.as_object()?;
+    let action = parse_tool_action(args.get("action")?)?;
+    let rationale = args.get("rationale")?.as_str()?.to_string();
+    let confidence = args.get("confidence")?.as_f64()? as f32;
+    let expected_outcome = parse_expected_outcome(args.get("expected_outcome"));
+    let sub_goals = parse_sub_goals(args.get("sub_goals"));
+
+    Some(sanitize_intent(ReasonedIntent {
+        action,
+        rationale,
+        confidence,
+        expected_outcome,
+        sub_goals,
+    }))
+}
+
+fn parse_tool_action(value: &serde_json::Value) -> Option<IntendedAction> {
+    if let Ok(action) = serde_json::from_value::<IntendedAction>(value.clone()) {
+        return Some(action);
+    }
+
+    parse_tool_use_action(value)
+}
+
+fn parse_tool_use_action(value: &serde_json::Value) -> Option<IntendedAction> {
+    let calls = value.get("UseTools")?.get("tool_calls")?.as_array()?;
+    let delegates = calls
+        .iter()
+        .map(delegate_from_tool_call)
+        .collect::<Option<Vec<_>>>()?;
+    Some(IntendedAction::Composite(delegates))
+}
+
+fn delegate_from_tool_call(call: &serde_json::Value) -> Option<IntendedAction> {
+    let tool = call.get("tool")?.as_str()?.to_string();
+    let args = call
+        .get("args")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let params = args
+        .into_iter()
+        .map(|(key, value)| (key, value_to_param_string(value)))
+        .collect::<HashMap<_, _>>();
+
+    Some(IntendedAction::Delegate {
+        skill_id: tool,
+        params,
+    })
+}
+
+fn value_to_param_string(value: serde_json::Value) -> String {
+    value
+        .as_str()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn parse_expected_outcome(
+    value: Option<&serde_json::Value>,
+) -> Option<crate::types::ExpectedOutcome> {
+    value
+        .and_then(serde_json::Value::as_str)
+        .map(|description| crate::types::ExpectedOutcome {
+            description: description.to_string(),
+            artifact_checks: Vec::new(),
+        })
+}
+
+fn parse_sub_goals(value: Option<&serde_json::Value>) -> Vec<Goal> {
+    value
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(|text| Goal::new(text, vec!["Complete the sub-goal".to_string()], Some(1)))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn extract_response_text(response: &CompletionResponse) -> String {
+    response
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            fx_llm::ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn parse_reasoned_intent(raw: &str, fallback_user_message: &str) -> ReasonedIntent {
     parse_reasoned_intent_inner(raw)
         .unwrap_or_else(|| build_fallback_intent(raw, fallback_user_message))
@@ -971,6 +1157,7 @@ mod tests {
     use async_trait::async_trait;
     use fx_core::error::LlmError as CoreLlmError;
     use fx_core::types::ScreenState;
+    use fx_llm::{CompletionResponse, ContentBlock, ProviderError};
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
@@ -978,6 +1165,8 @@ mod tests {
     struct MockLlm {
         name: String,
         responses: Mutex<VecDeque<String>>,
+        completion_responses: Mutex<VecDeque<CompletionResponse>>,
+        captured_requests: Mutex<Vec<CompletionRequest>>,
     }
 
     impl MockLlm {
@@ -990,7 +1179,37 @@ mod tests {
                         .map(ToString::to_string)
                         .collect::<VecDeque<_>>(),
                 ),
+                completion_responses: Mutex::new(VecDeque::new()),
+                captured_requests: Mutex::new(Vec::new()),
             }
+        }
+
+        fn with_completion_responses(responses: Vec<CompletionResponse>) -> Self {
+            Self {
+                name: "mock-llm".to_string(),
+                responses: Mutex::new(VecDeque::new()),
+                completion_responses: Mutex::new(responses.into_iter().collect()),
+                captured_requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn capture_count(&self) -> usize {
+            self.captured_requests
+                .lock()
+                .expect("request capture lock")
+                .len()
+        }
+
+        fn captured_request(&self, index: usize) -> CompletionRequest {
+            self.captured_requests.lock().expect("request capture lock")[index].clone()
+        }
+
+        fn pop_text_response(&self) -> Result<String, CoreLlmError> {
+            self.responses
+                .lock()
+                .expect("responses lock")
+                .pop_front()
+                .ok_or_else(|| CoreLlmError::Inference("no mock response available".to_string()))
         }
     }
 
@@ -1026,6 +1245,14 @@ mod tests {
                 .await
         }
 
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+            self.inner.complete(request).await
+        }
+
         fn model_name(&self) -> &str {
             self.inner.model_name()
         }
@@ -1034,11 +1261,7 @@ mod tests {
     #[async_trait]
     impl LlmProvider for MockLlm {
         async fn generate(&self, _prompt: &str, _max_tokens: u32) -> Result<String, CoreLlmError> {
-            self.responses
-                .lock()
-                .expect("responses lock")
-                .pop_front()
-                .ok_or_else(|| CoreLlmError::Inference("no mock response available".to_string()))
+            self.pop_text_response()
         }
 
         async fn generate_streaming(
@@ -1050,6 +1273,36 @@ mod tests {
             let text = self.generate(prompt, max_tokens).await?;
             callback(text.clone());
             Ok(text)
+        }
+
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            self.captured_requests
+                .lock()
+                .expect("request capture lock")
+                .push(request);
+
+            if let Some(response) = self
+                .completion_responses
+                .lock()
+                .expect("completion responses lock")
+                .pop_front()
+            {
+                return Ok(response);
+            }
+
+            let text = self.pop_text_response().map_err(|error| {
+                ProviderError::Provider(format!("mock completion fallback failed: {error}"))
+            })?;
+
+            Ok(CompletionResponse {
+                content: vec![ContentBlock::Text { text }],
+                tool_calls: Vec::new(),
+                usage: None,
+                stop_reason: None,
+            })
         }
 
         fn model_name(&self) -> &str {
@@ -1073,6 +1326,20 @@ mod tests {
                 callback(chunk.clone());
             }
             Ok(self.fallback.clone())
+        }
+
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            Ok(CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: self.fallback.clone(),
+                }],
+                tool_calls: Vec::new(),
+                usage: None,
+                stop_reason: None,
+            })
         }
 
         fn model_name(&self) -> &str {
@@ -1297,6 +1564,144 @@ mod tests {
         assert!(matches!(
             intent.action,
             IntendedAction::Respond { ref text } if text == "Sure"
+        ));
+    }
+
+    #[tokio::test]
+    async fn reason_prefers_emit_intent_tool_call_for_structured_intent() {
+        let mut engine = default_engine(3);
+        let llm = MockLlm::with_completion_responses(vec![CompletionResponse {
+            content: Vec::new(),
+            tool_calls: vec![ToolCall {
+                id: "call-1".to_string(),
+                name: "emit_intent".to_string(),
+                arguments: serde_json::json!({
+                    "action": {"Respond": {"text": "Paris is the capital of France"}},
+                    "rationale": "direct known fact",
+                    "confidence": 0.95
+                }),
+            }],
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let result = engine
+            .run_cycle(base_snapshot("What is the capital of France?"), &llm)
+            .await
+            .expect("loop result");
+
+        assert!(matches!(
+            result,
+            LoopResult::Complete { response, .. } if response == "Paris is the capital of France"
+        ));
+    }
+
+    #[tokio::test]
+    async fn reason_falls_back_to_plain_text_json_when_tool_call_missing() {
+        let mut engine = default_engine(3);
+        let llm = MockLlm::with_responses(vec![
+            r#"{"action":{"Respond":{"text":"Fallback works"}},"rationale":"json text","confidence":0.9,"expected_outcome":null,"sub_goals":[]}"#,
+        ]);
+
+        let result = engine
+            .run_cycle(base_snapshot("fallback please"), &llm)
+            .await
+            .expect("loop result");
+
+        assert!(matches!(
+            result,
+            LoopResult::Complete { response, .. } if response == "Fallback works"
+        ));
+    }
+
+    #[tokio::test]
+    async fn reason_falls_back_to_text_extraction_when_tool_call_is_malformed() {
+        let mut engine = default_engine(3);
+        let llm = MockLlm::with_completion_responses(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "Plain fallback answer".to_string(),
+            }],
+            tool_calls: vec![ToolCall {
+                id: "call-1".to_string(),
+                name: "emit_intent".to_string(),
+                arguments: serde_json::json!({"action": "not-an-object"}),
+            }],
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let result = engine
+            .run_cycle(base_snapshot("malformed tool call"), &llm)
+            .await
+            .expect("loop result");
+
+        assert!(matches!(
+            result,
+            LoopResult::Complete { response, .. } if response == "Plain fallback answer"
+        ));
+    }
+
+    #[tokio::test]
+    async fn reason_includes_emit_intent_tool_definition_in_request() {
+        let engine = default_engine(3);
+        let llm = MockLlm::with_completion_responses(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: r#"{"action":{"Respond":{"text":"ok"}},"rationale":"r","confidence":0.9}"#
+                    .to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let perception = engine
+            .perceive(&base_snapshot("check request tools"))
+            .await
+            .expect("perception");
+        let _ = engine.reason(&perception, &llm).await.expect("intent");
+
+        assert_eq!(llm.capture_count(), 1);
+        let request = llm.captured_request(0);
+        assert!(request.tools.iter().any(|tool| tool.name == "emit_intent"));
+    }
+
+    #[tokio::test]
+    async fn reason_maps_use_tools_action_from_emit_intent_into_decision_use_tools() {
+        let engine = default_engine(3);
+        let llm = MockLlm::with_completion_responses(vec![CompletionResponse {
+            content: Vec::new(),
+            tool_calls: vec![ToolCall {
+                id: "call-1".to_string(),
+                name: "emit_intent".to_string(),
+                arguments: serde_json::json!({
+                    "action": {
+                        "UseTools": {
+                            "tool_calls": [
+                                {"tool": "read_file", "args": {"path": "src/main.rs"}}
+                            ]
+                        }
+                    },
+                    "rationale": "need file context",
+                    "confidence": 0.95
+                }),
+            }],
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let perception = engine
+            .perceive(&base_snapshot("read the file"))
+            .await
+            .expect("perception");
+        let intent = engine.reason(&perception, &llm).await.expect("intent");
+        let decision = engine.decide(&intent).await.expect("decision");
+
+        assert!(matches!(
+            decision,
+            Decision::UseTools(ref calls)
+                if calls.len() == 1
+                && calls[0].name == "read_file"
+                && calls[0].arguments == serde_json::json!({"path":"src/main.rs"})
         ));
     }
 
