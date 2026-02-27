@@ -631,7 +631,8 @@ impl TuiApp {
     }
 
     fn record_conversation_turn(&mut self, user_text: &str, assistant_text: String) {
-        self.conversation_history.push(Message::user(user_text.to_string()));
+        self.conversation_history
+            .push(Message::user(user_text.to_string()));
         self.conversation_history
             .push(Message::assistant(assistant_text));
         trim_history(&mut self.conversation_history);
@@ -840,7 +841,8 @@ fn loop_result_response_text(result: &LoopResult) -> String {
             iterations,
         } => render_budget_exhausted(partial_response.clone(), *iterations),
         LoopResult::NeedsInput { prompt, iterations } => {
-            let meta = format!("\x1b[2m  \u{21b3} {iterations} iteration(s) \u{00b7} needs input\x1b[0m");
+            let meta =
+                format!("\x1b[2m  \u{21b3} {iterations} iteration(s) \u{00b7} needs input\x1b[0m");
             format!("{prompt}\n{meta}")
         }
         LoopResult::Error {
@@ -2619,7 +2621,9 @@ mod tests {
     async fn status_reflects_switched_model() {
         let mut app = app_with_two_models();
 
-        app.handle_command("/model claude-sonnet-4-6").await.unwrap();
+        app.handle_command("/model claude-sonnet-4-6")
+            .await
+            .unwrap();
 
         assert_eq!(app.current_model(), "claude-sonnet-4-6-20250929");
     }
@@ -2628,7 +2632,9 @@ mod tests {
     async fn handle_message_uses_current_active_model() {
         let mut app = app_with_two_models();
 
-        app.handle_command("/model claude-sonnet-4-6").await.unwrap();
+        app.handle_command("/model claude-sonnet-4-6")
+            .await
+            .unwrap();
         let rendered = app.handle_message("hello").await.expect("loop response");
 
         assert!(rendered.contains("claude-sonnet-4-6-20250929"));
@@ -2656,11 +2662,20 @@ mod tests {
         );
 
         let _ = app.handle_message("my name is Alice").await.expect("first");
-        let _ = app.handle_message("what is my name?").await.expect("second");
+        let _ = app
+            .handle_message("what is my name?")
+            .await
+            .expect("second");
 
         assert_eq!(app.conversation_history.len(), 4);
-        assert_eq!(app.conversation_history[0], Message::user("my name is Alice"));
-        assert_eq!(app.conversation_history[2], Message::user("what is my name?"));
+        assert_eq!(
+            app.conversation_history[0],
+            Message::user("my name is Alice")
+        );
+        assert_eq!(
+            app.conversation_history[2],
+            Message::user("what is my name?")
+        );
     }
 
     #[tokio::test]
@@ -2671,7 +2686,10 @@ mod tests {
 
         for i in 0..15 {
             let message = format!("msg-{i}");
-            let _ = app.handle_message(&message).await.expect("message response");
+            let _ = app
+                .handle_message(&message)
+                .await
+                .expect("message response");
         }
 
         assert_eq!(app.conversation_history.len(), MAX_HISTORY_MESSAGES);

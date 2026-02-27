@@ -1604,15 +1604,24 @@ mod tests {
             Message::assistant("Nice to meet you, Alice!"),
         ];
 
-        let processed = engine.perceive(&snapshot).await.expect("processed perception");
+        let processed = engine
+            .perceive(&snapshot)
+            .await
+            .expect("processed perception");
 
         assert_eq!(processed.context_window.len(), 3);
-        assert_eq!(processed.context_window[0], Message::user("my name is Alice"));
+        assert_eq!(
+            processed.context_window[0],
+            Message::user("my name is Alice")
+        );
         assert_eq!(
             processed.context_window[1],
             Message::assistant("Nice to meet you, Alice!")
         );
-        assert_eq!(processed.context_window[2], Message::user("current message"));
+        assert_eq!(
+            processed.context_window[2],
+            Message::user("current message")
+        );
     }
 
     #[tokio::test]
