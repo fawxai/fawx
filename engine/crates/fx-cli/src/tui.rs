@@ -77,13 +77,6 @@ impl TuiApp {
     pub async fn run(&mut self) -> Result<(), TuiError> {
         self.show_welcome();
 
-        if !self.auth_manager.has_any() {
-            self.auth_wizard().await?;
-        } else {
-            self.refresh_router_models().await?;
-            self.select_first_available_model();
-        }
-
         let mut line = String::new();
         while self.running {
             print!(
@@ -159,6 +152,14 @@ impl TuiApp {
                 .with(burnt)
                 .attribute(style::Attribute::Dim)
         );
+        if !self.auth_manager.has_any() {
+            println!(
+                "  {}",
+                "Not authenticated · /auth to set up or just send a message"
+                    .with(burnt)
+                    .attribute(style::Attribute::Dim)
+            );
+        }
         println!();
     }
 
@@ -341,6 +342,8 @@ impl TuiApp {
 
     /// Process a user message by running the full loop engine.
     async fn handle_message(&mut self, input: &str) -> Result<String, TuiError> {
+        self.ensure_message_auth().await?;
+
         let active_model = self
             .router
             .active_model()
@@ -359,6 +362,19 @@ impl TuiApp {
         };
 
         Ok(render_loop_result(loop_result))
+    }
+
+    async fn ensure_message_auth(&mut self) -> Result<(), TuiError> {
+        if !self.auth_manager.has_any() {
+            self.auth_wizard().await?;
+        }
+
+        if self.router.active_model().is_none() {
+            self.refresh_router_models().await?;
+            self.select_first_available_model();
+        }
+
+        Ok(())
     }
 
     /// Display formatted output to the terminal.
@@ -2062,7 +2078,16 @@ mod tests {
             .set_active("mock-loop-model")
             .expect("set active mock model");
 
-        TuiApp::new(AuthManager::new(), router, build_loop_engine())
+        let mut auth_manager = AuthManager::new();
+        auth_manager.store(
+            "test-provider",
+            AuthMethod::ApiKey {
+                provider: "test-provider".to_string(),
+                key: "test-key".to_string(),
+            },
+        );
+
+        TuiApp::new(auth_manager, router, build_loop_engine())
     }
 
     fn router_with_completion_response(
@@ -2407,6 +2432,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tui_runs_without_auth_configured() {
+        let mut app = new_test_app();
+
+        app.process_input_line("/help").await.unwrap();
+        app.process_input_line("/status").await.unwrap();
+
+        assert!(app.running);
+        assert!(!app.auth_manager.has_any());
+    }
+
+    #[tokio::test]
+    async fn help_command_works_without_auth() {
+        let mut app = new_test_app();
+
+        app.process_input_line("/help").await.unwrap();
+
+        assert!(app.running);
+        assert!(!app.auth_manager.has_any());
+    }
+
+    #[tokio::test]
+    async fn quit_command_works_without_auth() {
+        let mut app = new_test_app();
+
+        app.process_input_line("/quit").await.unwrap();
+
+        assert!(!app.running);
+        assert!(!app.auth_manager.has_any());
+    }
+
+    #[tokio::test]
     async fn run_exits_immediately_when_not_running() {
         let mut app = TuiApp::new(test_auth_manager(), ModelRouter::new(), build_loop_engine());
         app.running = false;
@@ -2423,6 +2479,20 @@ mod tests {
         app.handle_command("/quit").await.unwrap();
 
         assert!(!app.running);
+    }
+
+    #[tokio::test]
+    async fn message_triggers_auth_when_not_configured() {
+        let mut app = new_test_app();
+
+        let error = app
+            .handle_message("hello")
+            .await
+            .expect_err("message should trigger auth wizard without configured credentials");
+
+        assert!(
+            matches!(error, TuiError::Auth(message) if message.contains("stdin closed unexpectedly"))
+        );
     }
 
     #[tokio::test]
