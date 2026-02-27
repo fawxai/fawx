@@ -59,9 +59,8 @@
 
 <h1>Fawx Architecture</h1>
 <p class="subtitle">
-  An AI-native phone agent that knows its human — designed around a recursive agentic loop,
-  structured memory, strict safety kernel, and deep personalization.
-  Built to become an operating system.
+  A personal agentic engine — designed around a recursive agentic loop, structured memory, strict safety kernel,
+  and deep personalization. TUI-first. Desktop-first with GPU. Shells are replaceable.
 </p>
 
 <!-- ============ CORE THESIS ============ -->
@@ -84,7 +83,7 @@
   </div>
   <div class="principle">
     <span class="icon">🦀</span>
-    <span class="text"><strong>The kernel becomes the OS.</strong> Everything built today — Rust engine, protocol layer, memory system, skill runtime — runs unchanged when the Kotlin/Swift shells fall away. No throwaway work.</span>
+    <span class="text"><strong>Desktop-first with GPU.</strong> Everything built today — engine, memory, skills — runs unchanged as new shells appear. TUI validates the loop; Android/iOS/desktop render UISpec. No throwaway work.</span>
   </div>
 </div>
 
@@ -96,7 +95,7 @@
     <div class="doc-body">
       <h3>Foundation Decisions</h3>
       <p>The 5 structural decisions that must be locked before the restructure begins, 3 open questions for Joe, and what we're explicitly NOT locking. Start here.</p>
-      <span class="status status-stub">NEEDS SIGN-OFF</span>
+      <span class="status status-complete">COMPLETE</span>
     </div>
   </a>
 </div>
@@ -190,9 +189,9 @@
   <a class="doc-card n-impl" href="../RESTRUCTURE-PLAN.md">
     <div class="doc-num">10</div>
     <div class="doc-body">
-      <h3>Restructure Plan</h3>
-      <p>12 incremental PRs to transform the repo from Android monolith to engine + shell architecture. File-by-file migration manifest, PR dependencies, risk mitigation.</p>
-      <span class="status status-draft">DRAFT</span>
+      <h3>Roadmap</h3>
+      <p>Current state (9 crates, 726 tests, TUI running), completed work, and forward plan: tool execution, memory persistence, UISpec, future shells.</p>
+      <span class="status status-complete">COMPLETE</span>
     </div>
   </a>
   <a class="doc-card n-impl" href="../../ENGINEERING.md">
