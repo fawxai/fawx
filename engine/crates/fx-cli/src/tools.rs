@@ -254,10 +254,6 @@ impl FawxToolExecutor {
         }
         let metadata = fs::metadata(file).map_err(|error| error.to_string())?;
         if metadata.len() > self.config.max_file_size {
-            out.push(format!(
-                "{}: skipped (file exceeds max_file_size)",
-                file.display()
-            ));
             return Ok(());
         }
         let mut bytes = Vec::new();
@@ -942,7 +938,7 @@ mod tests {
     }
 
     #[test]
-    fn search_text_skips_files_over_max_file_size() {
+    fn search_text_ignores_files_over_max_file_size() {
         let temp = TempDir::new().expect("temp");
         fs::write(temp.path().join("big.txt"), "needle\nneedle").expect("write");
         let executor = FawxToolExecutor::new(
@@ -956,7 +952,48 @@ mod tests {
         let output = executor
             .handle_search_text(&serde_json::json!({"pattern": "needle"}))
             .expect("search");
-        assert!(output.contains("skipped (file exceeds max_file_size)"));
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn search_text_finds_nested_rust_and_markdown_when_large_files_exist() {
+        let temp = TempDir::new().expect("temp");
+        for index in 0..MAX_SEARCH_MATCHES {
+            let path = temp.path().join(format!("large-{index}.bin"));
+            fs::write(path, "x".repeat(64)).expect("write");
+        }
+
+        let nested = temp.path().join("engine/crates/fx-foo/src");
+        fs::create_dir_all(&nested).expect("mkdir");
+        let rust_file = nested.join("lib.rs");
+        let markdown_file = temp.path().join("DOCTRINE.md");
+        fs::write(&rust_file, "pub struct ToolExecutor;\n").expect("write");
+        fs::write(&markdown_file, "ToolExecutor reference\n").expect("write");
+
+        let executor = FawxToolExecutor::new(
+            temp.path().to_path_buf(),
+            ToolConfig {
+                max_file_size: 32,
+                ..ToolConfig::default()
+            },
+        );
+
+        let output = executor
+            .handle_search_text(&serde_json::json!({"pattern": "ToolExecutor"}))
+            .expect("search");
+        let matches = output.lines().collect::<Vec<_>>();
+
+        assert_eq!(
+            matches.len(),
+            2,
+            "oversized files must not consume match budget"
+        );
+        assert!(matches
+            .iter()
+            .any(|line| line.contains("lib.rs:1:pub struct ToolExecutor;")));
+        assert!(matches
+            .iter()
+            .any(|line| line.contains("DOCTRINE.md:1:ToolExecutor reference")));
     }
 
     #[test]
