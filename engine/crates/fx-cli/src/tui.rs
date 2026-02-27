@@ -28,6 +28,7 @@ const BANNER_ART: &str = r#"   ___
   / _/__ __    ____  __
  / _/ _ `/ |/|/ /\ \/ /
 /_/ \_,_/|__,__/ /_/\_\"#;
+const FAWX_LOGO: &[u8] = include_bytes!("../../../../scripts/fawx.png");
 
 const DEFAULT_AUTH_FILE: &str = ".fawx/auth.json";
 const DEFAULT_OPENAI_TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
@@ -145,13 +146,25 @@ impl TuiApp {
         };
 
         println!();
-        for line in BANNER_ART.lines() {
-            println!("{}", line.bold().with(amber));
+        match sparx::render_image(
+            FAWX_LOGO,
+            &sparx::RenderConfig {
+                width: Some(40),
+                threshold: 128,
+                color: true,
+            },
+        ) {
+            Ok(rendered) => print!("{rendered}"),
+            Err(_) => {
+                for line in BANNER_ART.lines() {
+                    println!("{}", line.bold().with(amber));
+                }
+            }
         }
         println!();
         println!(
             "  {}",
-            "agentic engine \u{00b7} type /help for commands"
+            "fawx \u{00b7} agentic engine \u{00b7} type /help for commands"
                 .with(burnt)
                 .attribute(style::Attribute::Dim)
         );
@@ -1847,6 +1860,21 @@ mod tests {
             fx_llm::CompletionProvider::capabilities(&streaming_provider),
             mock_provider_capabilities()
         );
+    }
+
+    #[test]
+    fn fawx_logo_renders_without_error() {
+        let result = sparx::render_image(
+            FAWX_LOGO,
+            &sparx::RenderConfig {
+                width: Some(40),
+                threshold: 128,
+                color: true,
+            },
+        );
+
+        assert!(result.is_ok());
+        assert!(!result.expect("embedded fawx logo should render").is_empty());
     }
 
     fn app_with_mock_model(response: &str) -> TuiApp {
