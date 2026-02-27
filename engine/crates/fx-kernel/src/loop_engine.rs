@@ -2059,6 +2059,48 @@ mod tests {
             .any(|item| { item.contains("expected outcome not reflected in action response") }));
     }
 
+    #[tokio::test]
+    async fn step_verify_checks_expected_outcome_for_delegate_with_tool_synthesis() {
+        let engine = default_engine(3);
+        let action = ActionResult {
+            decision: Decision::UseTools(vec![ToolCall {
+                id: "tool-1".to_string(),
+                name: "search".to_string(),
+                arguments: serde_json::json!({"q": "delegate intent"}),
+            }]),
+            tool_results: vec![ToolResult {
+                tool_name: "search".to_string(),
+                success: true,
+                output: "delegate tool output".to_string(),
+            }],
+            response_text: "Synthesized summary without the expected marker".to_string(),
+            tokens_used: TokenUsage::default(),
+        };
+        let intent = ReasonedIntent {
+            action: IntendedAction::Delegate {
+                skill_id: "search".to_string(),
+                params: HashMap::from([(
+                    String::from("q"),
+                    String::from("delegate intent"),
+                )]),
+            },
+            rationale: "delegate and summarize".to_string(),
+            confidence: 0.9,
+            expected_outcome: Some(crate::types::ExpectedOutcome {
+                description: "contains NEVER_PRESENT_EXPECTED_OUTCOME".to_string(),
+                artifact_checks: Vec::new(),
+            }),
+            sub_goals: Vec::new(),
+        };
+
+        let verification = engine.verify(&action, &intent).await.expect("verification");
+        assert!(!verification.outcome_matches_intent);
+        assert!(verification
+            .discrepancies
+            .iter()
+            .any(|item| { item.contains("expected outcome not reflected in action response") }));
+    }
+
     #[test]
     fn extract_user_message_returns_error_when_all_input_is_empty() {
         let mut snapshot = base_snapshot("   ");
