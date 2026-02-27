@@ -33,7 +33,7 @@ use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
 use tokio::time::{sleep, Duration};
 
@@ -637,6 +637,7 @@ impl TuiApp {
             .to_string();
 
         let snapshot = self.build_perception_snapshot(input);
+        let started = Instant::now();
         let loop_result = run_with_thinking_spinner(async {
             let router = &self.router;
             let llm = RouterLoopLlmProvider::new(router, active_model);
@@ -648,7 +649,7 @@ impl TuiApp {
         })
         .await?;
 
-        let response = render_loop_result(loop_result.clone());
+        let response = render_loop_result(loop_result.clone(), started.elapsed());
         self.record_conversation_turn(input, loop_result_response_text(&loop_result));
         Ok(response)
     }
@@ -1118,9 +1119,31 @@ impl LoopLlmProvider for RouterLoopLlmProvider<'_> {
         max_tokens: u32,
         callback: Box<dyn Fn(String) + Send + 'static>,
     ) -> Result<String, CoreLlmError> {
-        let rendered = self.generate(prompt, max_tokens).await?;
-        callback(rendered.clone());
-        Ok(rendered)
+        let request = CompletionRequest {
+            model: self.active_model.clone(),
+            messages: vec![Message::user(prompt)],
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: Some(max_tokens),
+            system_prompt: None,
+        };
+
+        let mut stream = self
+            .router
+            .complete_stream(request)
+            .await
+            .map_err(|error| CoreLlmError::Inference(error.to_string()))?;
+        let mut stdout = io::stdout();
+        let collected = consume_stream_with_writer(&mut stream, &mut stdout).await?;
+
+        if collected.trim().is_empty() {
+            return Err(CoreLlmError::InvalidResponse(
+                "provider returned an empty completion".to_string(),
+            ));
+        }
+
+        callback(collected.clone());
+        Ok(collected)
     }
 
     async fn complete(
@@ -1196,7 +1219,7 @@ fn trim_history(history: &mut Vec<Message>) {
     history.drain(0..remove_count);
 }
 
-fn render_loop_result(result: LoopResult) -> String {
+fn render_loop_result(result: LoopResult, wall_time: std::time::Duration) -> String {
     match result {
         LoopResult::Complete {
             response,
@@ -1204,13 +1227,22 @@ fn render_loop_result(result: LoopResult) -> String {
             tokens_used,
             ..
         } => {
-            let meta = format_loop_metadata(iterations, &tokens_used);
+            let meta = format_loop_metadata(iterations, &tokens_used, wall_time);
             format!("{response}\n{meta}")
         }
         LoopResult::BudgetExhausted {
             partial_response,
             iterations,
-        } => render_budget_exhausted(partial_response, iterations),
+        } => {
+            let wall = format_wall_time(wall_time);
+            let meta = format!(
+                "\x1b[33m  \u{2717} budget exhausted after {iterations} iteration(s) \u{00b7} {wall}\x1b[0m"
+            );
+            match partial_response {
+                Some(text) if !text.is_empty() => format!("{text}\n{meta}"),
+                _ => meta,
+            }
+        }
         LoopResult::NeedsInput { prompt, iterations } => {
             let meta =
                 format!("\x1b[2m  \u{21b3} {iterations} iteration(s) \u{00b7} needs input\x1b[0m");
@@ -1219,19 +1251,29 @@ fn render_loop_result(result: LoopResult) -> String {
         LoopResult::Error {
             message,
             recoverable,
-        } => render_loop_error(&message, recoverable),
+        } => {
+            let suffix = if recoverable { " (recoverable)" } else { "" };
+            let wall = format_wall_time(wall_time);
+            format!("\x1b[31m  \u{2717} {message}{suffix} \u{00b7} {wall}\x1b[0m")
+        }
     }
 }
 
-fn format_loop_metadata(iterations: u32, tokens: &TokenUsage) -> String {
+fn format_loop_metadata(
+    iterations: u32,
+    tokens: &TokenUsage,
+    wall_time: std::time::Duration,
+) -> String {
     let iter_text = if iterations == 1 {
         "1 iteration".to_string()
     } else {
         format!("{iterations} iterations")
     };
     format!(
-        "\x1b[2m\x1b[38;2;210;112;10m  \u{21b3} {iter_text} \u{00b7} {} in / {} out tokens\x1b[0m",
-        tokens.input_tokens, tokens.output_tokens,
+        "\x1b[2m\x1b[38;2;210;112;10m  \u{21b3} {iter_text} \u{00b7} {} in / {} out tokens \u{00b7} {}\x1b[0m",
+        tokens.input_tokens,
+        tokens.output_tokens,
+        format_wall_time(wall_time),
     )
 }
 
@@ -1257,11 +1299,20 @@ fn render_loop_error(message: &str, recoverable: bool) -> String {
 async fn consume_stream_silent(
     stream: &mut (impl futures::Stream<Item = Result<StreamChunk, ProviderError>> + Unpin),
 ) -> Result<String, CoreLlmError> {
+    let mut sink = io::sink();
+    consume_stream_with_writer(stream, &mut sink).await
+}
+
+async fn consume_stream_with_writer(
+    stream: &mut (impl futures::Stream<Item = Result<StreamChunk, ProviderError>> + Unpin),
+    writer: &mut impl Write,
+) -> Result<String, CoreLlmError> {
     let mut collected = String::new();
     while let Some(chunk) = stream.next().await {
         match chunk {
             Ok(chunk) => {
                 if let Some(delta) = &chunk.delta_content {
+                    write_stream_delta(writer, delta)?;
                     collected.push_str(delta);
                 }
             }
@@ -1269,6 +1320,23 @@ async fn consume_stream_silent(
         }
     }
     Ok(collected)
+}
+
+fn write_stream_delta(writer: &mut impl Write, delta: &str) -> Result<(), CoreLlmError> {
+    writer
+        .write_all(delta.as_bytes())
+        .map_err(|error| CoreLlmError::Inference(error.to_string()))?;
+    writer
+        .flush()
+        .map_err(|error| CoreLlmError::Inference(error.to_string()))
+}
+
+fn format_wall_time(wall_time: std::time::Duration) -> String {
+    if wall_time.as_secs_f64() >= 1.0 {
+        format!("{:.1}s", wall_time.as_secs_f64())
+    } else {
+        format!("{}ms", wall_time.as_millis())
+    }
 }
 
 fn format_error_message(error: &str) -> String {
@@ -2349,6 +2417,26 @@ mod tests {
         provider_name: String,
         model: String,
         chunks: Vec<Result<fx_llm::StreamChunk, fx_llm::ProviderError>>,
+    }
+
+    #[derive(Default)]
+    struct RecordingWriter {
+        writes: Vec<String>,
+        flush_count: usize,
+    }
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let text = std::str::from_utf8(buf)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+            self.writes.push(text.to_string());
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flush_count += 1;
+            Ok(())
+        }
     }
 
     #[derive(Debug)]
@@ -3705,38 +3793,83 @@ mod tests {
     #[test]
     fn render_loop_complete_shows_styled_metadata() {
         use fx_kernel::act::TokenUsage;
-        let result = render_loop_result(LoopResult::Complete {
-            response: "Paris".to_string(),
-            iterations: 1,
-            tokens_used: TokenUsage {
-                input_tokens: 50,
-                output_tokens: 12,
+        let result = render_loop_result(
+            LoopResult::Complete {
+                response: "Paris".to_string(),
+                iterations: 1,
+                tokens_used: TokenUsage {
+                    input_tokens: 50,
+                    output_tokens: 12,
+                },
+                learnings: Vec::new(),
             },
-            learnings: Vec::new(),
-        });
+            std::time::Duration::from_millis(250),
+        );
         assert!(result.contains("Paris"));
         assert!(result.contains("1 iteration"));
         assert!(result.contains("50 in / 12 out tokens"));
     }
 
     #[test]
+    fn loop_metadata_includes_wall_time() {
+        let meta = format_loop_metadata(
+            2,
+            &TokenUsage {
+                input_tokens: 50,
+                output_tokens: 12,
+            },
+            std::time::Duration::from_millis(480),
+        );
+
+        assert!(meta.contains("480ms"));
+    }
+
+    #[test]
     fn render_loop_budget_exhausted_shows_warning() {
-        let result = render_loop_result(LoopResult::BudgetExhausted {
-            partial_response: Some("partial".to_string()),
-            iterations: 3,
-        });
+        let result = render_loop_result(
+            LoopResult::BudgetExhausted {
+                partial_response: Some("partial".to_string()),
+                iterations: 3,
+            },
+            std::time::Duration::from_millis(250),
+        );
         assert!(result.contains("partial"));
         assert!(result.contains("budget exhausted"));
+        assert!(result.contains("250ms"));
     }
 
     #[test]
     fn render_loop_error_shows_marker() {
-        let result = render_loop_result(LoopResult::Error {
-            message: "timeout".to_string(),
-            recoverable: true,
-        });
+        let result = render_loop_result(
+            LoopResult::Error {
+                message: "timeout".to_string(),
+                recoverable: true,
+            },
+            std::time::Duration::from_millis(250),
+        );
         assert!(result.contains("\u{2717} timeout"));
         assert!(result.contains("recoverable"));
+        assert!(result.contains("250ms"));
+    }
+
+    #[test]
+    fn format_wall_time_boundary_at_one_second() {
+        assert_eq!(
+            format_wall_time(std::time::Duration::from_millis(999)),
+            "999ms"
+        );
+        assert_eq!(
+            format_wall_time(std::time::Duration::from_millis(1000)),
+            "1.0s"
+        );
+        assert_eq!(
+            format_wall_time(std::time::Duration::from_millis(1500)),
+            "1.5s"
+        );
+        assert_eq!(
+            format_wall_time(std::time::Duration::from_millis(100)),
+            "100ms"
+        );
     }
 
     #[test]
@@ -3746,6 +3879,37 @@ mod tests {
         let sanitized = sanitize_history_text(text);
 
         assert_eq!(sanitized, "Answer\nwarning");
+    }
+
+    #[tokio::test]
+    async fn generate_streaming_prints_tokens_incrementally() {
+        let chunks = vec![
+            Ok(StreamChunk {
+                delta_content: Some("Hello".to_string()),
+                tool_use_deltas: Vec::new(),
+                usage: None,
+                stop_reason: None,
+            }),
+            Ok(StreamChunk {
+                delta_content: Some(" world".to_string()),
+                tool_use_deltas: Vec::new(),
+                usage: None,
+                stop_reason: Some("end_turn".to_string()),
+            }),
+        ];
+        let mut stream = futures::stream::iter(chunks);
+        let mut writer = RecordingWriter::default();
+
+        let result = consume_stream_with_writer(&mut stream, &mut writer)
+            .await
+            .expect("stream output");
+
+        assert_eq!(result, "Hello world");
+        assert_eq!(
+            writer.writes,
+            vec!["Hello".to_string(), " world".to_string()]
+        );
+        assert_eq!(writer.flush_count, 2);
     }
 
     #[tokio::test]
