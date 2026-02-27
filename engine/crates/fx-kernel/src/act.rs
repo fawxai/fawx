@@ -54,6 +54,11 @@ pub trait ToolExecutor: Send + Sync + std::fmt::Debug {
         &self,
         calls: &[fx_llm::ToolCall],
     ) -> Result<Vec<ToolResult>, ToolExecutorError>;
+
+    /// Tool definitions exposed to the reasoning model.
+    fn tool_definitions(&self) -> Vec<fx_llm::ToolDefinition> {
+        Vec::new()
+    }
 }
 
 /// Default in-kernel tool executor for environments without real tool wiring.

@@ -2,6 +2,7 @@
 
 mod commands;
 mod confirmation;
+mod tools;
 mod tui;
 
 use clap::{Parser, Subcommand, ValueEnum};

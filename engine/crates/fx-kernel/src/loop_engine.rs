@@ -388,7 +388,11 @@ impl LoopEngine {
         perception: &ProcessedPerception,
         llm: &dyn LlmProvider,
     ) -> Result<ReasonedIntent, LoopError> {
-        let request = build_reasoning_request(perception, llm.model_name());
+        let request = build_reasoning_request(
+            perception,
+            llm.model_name(),
+            self.tool_executor.tool_definitions(),
+        );
         let response = llm
             .complete(request)
             .await
@@ -857,14 +861,19 @@ fn completion_request_to_prompt(request: &CompletionRequest) -> String {
     format!("{system}{messages}")
 }
 
-fn build_reasoning_request(perception: &ProcessedPerception, model: &str) -> CompletionRequest {
+fn build_reasoning_request(
+    perception: &ProcessedPerception,
+    model: &str,
+    mut tool_definitions: Vec<ToolDefinition>,
+) -> CompletionRequest {
     let context = perception.context_window.clone();
     let user_prompt = reasoning_user_prompt(perception);
+    tool_definitions.push(emit_intent_tool_definition());
 
     CompletionRequest {
         model: model.to_string(),
         messages: [context, vec![Message::user(user_prompt)]].concat(),
-        tools: vec![emit_intent_tool_definition()],
+        tools: tool_definitions,
         temperature: Some(0.2),
         max_tokens: Some(REASONING_MAX_OUTPUT_TOKENS),
         system_prompt: Some(REASONING_SYSTEM_PROMPT.to_string()),
