@@ -2150,10 +2150,11 @@ mod tests {
             .await
             .expect("loop result");
 
+        assert_eq!(llm.capture_count(), 1);
         assert!(matches!(
             result,
             LoopResult::Complete { response, .. }
-                if response.contains("Stub tool execution for 'read_file'")
+                if response == "Tool executed successfully."
         ));
     }
 
