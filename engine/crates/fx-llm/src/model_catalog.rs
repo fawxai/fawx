@@ -6,8 +6,8 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
-/// Maximum model age in seconds (~90 days). Models older than this are filtered out.
-const MODEL_AGE_CUTOFF_SECS: u64 = 90 * 24 * 60 * 60;
+/// Maximum model age in seconds (~180 days). Models older than this are filtered out.
+const MODEL_AGE_CUTOFF_SECS: u64 = 180 * 24 * 60 * 60;
 /// Minimum input price per token (USD) to filter out weak-tier models.
 /// $3/M tokens = 0.000003 per token. Roughly sonnet-tier floor.
 const MIN_INPUT_PRICE_PER_TOKEN: f64 = 0.000003;
@@ -710,8 +710,8 @@ mod tests {
 
     #[test]
     fn is_model_recent_enough_filters_old_models() {
-        let now_secs = (120 * 24 * 60 * 60) + 1_000;
-        let old = now_secs - (120 * 24 * 60 * 60);
+        let now_secs = (MODEL_AGE_CUTOFF_SECS + (2 * 24 * 60 * 60)) + 1_000;
+        let old = now_secs - (181 * 24 * 60 * 60);
         assert!(!is_model_recent_enough(Some(old), now_secs));
     }
 
@@ -725,6 +725,34 @@ mod tests {
         let now_secs = MODEL_AGE_CUTOFF_SECS + 42;
         let at_cutoff = now_secs - MODEL_AGE_CUTOFF_SECS;
         assert!(is_model_recent_enough(Some(at_cutoff), now_secs));
+    }
+
+    #[test]
+    fn parse_models_openrouter_enforces_180_day_age_boundary() {
+        let now_secs = 1_900_000_000_u64;
+        let within_cutoff = now_secs - (179 * 24 * 60 * 60);
+        let beyond_cutoff = now_secs - (181 * 24 * 60 * 60);
+        let json = format!(
+            r#"{{
+                "data": [
+                    {{
+                        "id": "anthropic/claude-sonnet-within-cutoff",
+                        "created": {within_cutoff},
+                        "pricing": {{"prompt": "0.000006"}}
+                    }},
+                    {{
+                        "id": "anthropic/claude-sonnet-beyond-cutoff",
+                        "created": {beyond_cutoff},
+                        "pricing": {{"prompt": "0.000006"}}
+                    }}
+                ]
+            }}"#
+        );
+
+        let parsed = ModelCatalog::parse_models_with_now("openrouter", &json, now_secs).unwrap();
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].id, "anthropic/claude-sonnet-within-cutoff");
     }
 
     #[test]
@@ -793,7 +821,7 @@ mod tests {
     fn parse_models_openrouter_filters_old_and_cheap_models() {
         let now_secs = 1_900_000_000_u64;
         let recent = now_secs - (30 * 24 * 60 * 60);
-        let old = now_secs - (120 * 24 * 60 * 60);
+        let old = now_secs - (181 * 24 * 60 * 60);
         let json = format!(
             r#"{{
                 "data": [
