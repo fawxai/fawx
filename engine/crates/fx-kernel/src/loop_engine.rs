@@ -2125,20 +2125,25 @@ mod tests {
     #[tokio::test]
     async fn run_cycle_with_delegate_intent_executes_tool() {
         let mut engine = default_engine(3);
-        let llm = MockLlm::with_completion_responses(vec![CompletionResponse {
-            content: Vec::new(),
-            tool_calls: vec![ToolCall {
-                id: "call-1".to_string(),
-                name: "emit_intent".to_string(),
-                arguments: serde_json::json!({
-                    "action": {"Delegate": {"skill_id": "read_file", "params": {"path": "Cargo.toml"}}},
-                    "rationale": "need file content",
-                    "confidence": 0.95
-                }),
-            }],
-            usage: None,
-            stop_reason: None,
-        }]);
+        let llm = MockLlm {
+            name: "mock-llm".to_string(),
+            responses: Mutex::new(VecDeque::from(["Tool executed successfully.".to_string()])),
+            completion_responses: Mutex::new(VecDeque::from([CompletionResponse {
+                content: Vec::new(),
+                tool_calls: vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "emit_intent".to_string(),
+                    arguments: serde_json::json!({
+                        "action": {"Delegate": {"skill_id": "read_file", "params": {"path": "Cargo.toml"}}},
+                        "rationale": "need file content",
+                        "confidence": 0.95
+                    }),
+                }],
+                usage: None,
+                stop_reason: None,
+            }])),
+            captured_requests: Mutex::new(Vec::new()),
+        };
 
         let result = engine
             .run_cycle(base_snapshot("inspect cargo"), &llm)
