@@ -861,19 +861,20 @@ fn completion_request_to_prompt(request: &CompletionRequest) -> String {
 fn build_reasoning_request(
     perception: &ProcessedPerception,
     model: &str,
-    mut tool_definitions: Vec<ToolDefinition>,
+    tool_definitions: Vec<ToolDefinition>,
 ) -> CompletionRequest {
     let context = perception.context_window.clone();
     let user_prompt = reasoning_user_prompt(perception);
-    tool_definitions.push(emit_intent_tool_definition());
+    let system_prompt = build_reasoning_system_prompt(&tool_definitions);
+    let emit_intent_tool = emit_intent_tool_definition(&tool_definitions);
 
     CompletionRequest {
         model: model.to_string(),
         messages: [context, vec![Message::user(user_prompt)]].concat(),
-        tools: tool_definitions,
+        tools: vec![emit_intent_tool],
         temperature: Some(0.2),
         max_tokens: Some(REASONING_MAX_OUTPUT_TOKENS),
-        system_prompt: Some(REASONING_SYSTEM_PROMPT.to_string()),
+        system_prompt: Some(system_prompt),
     }
 }
 
@@ -887,7 +888,48 @@ fn reasoning_user_prompt(perception: &ProcessedPerception) -> String {
     )
 }
 
-fn emit_intent_tool_definition() -> ToolDefinition {
+fn build_reasoning_system_prompt(tool_definitions: &[ToolDefinition]) -> String {
+    format!(
+        "{REASONING_SYSTEM_PROMPT}\n\n{}",
+        available_tools_instructions(tool_definitions)
+    )
+}
+
+fn available_tools_instructions(tool_definitions: &[ToolDefinition]) -> String {
+    let tools = tool_definitions
+        .iter()
+        .map(format_tool_instruction_line)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "Available tools (use via Delegate intent):\n{tools}\n\nTo use a tool, call emit_intent with: {{\"action\": {{\"Delegate\": {{\"skill_id\": \"<tool_name>\", \"params\": {{\"param\": \"value\"}}}}}}, \"rationale\": \"...\", \"confidence\": 0.9}}"
+    )
+}
+
+fn format_tool_instruction_line(tool: &ToolDefinition) -> String {
+    format!(
+        "- {}: {}. Params: {}",
+        tool.name,
+        tool.description,
+        tool_param_summary(&tool.parameters)
+    )
+}
+
+fn tool_param_summary(parameters: &serde_json::Value) -> String {
+    serde_json::to_string(parameters).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn emit_intent_tool_definition(tool_definitions: &[ToolDefinition]) -> ToolDefinition {
+    let delegate_description = format!(
+        "IntendedAction variant object. Allowed variants: Respond, Tap, Type, Swipe, LaunchApp, Navigate, Wait, Delegate, Composite. Available Delegate tools:\n{}\nUse Delegate as {{\"Delegate\": {{\"skill_id\": \"<tool_name>\", \"params\": {{\"key\": \"value\"}}}}}}.",
+        tool_definitions
+            .iter()
+            .map(format_tool_instruction_line)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
     ToolDefinition {
         name: "emit_intent".to_string(),
         description: "Emit a structured intent. ALWAYS call this tool with your response."
@@ -897,7 +939,7 @@ fn emit_intent_tool_definition() -> ToolDefinition {
             "properties": {
                 "action": {
                     "type": "object",
-                    "description": "IntendedAction variant object. Allowed variants: Respond, Tap, Type, Swipe, LaunchApp, Navigate, Wait, Delegate, Composite. Examples: {\"Respond\": {\"text\": \"your answer\"}} or {\"Delegate\": {\"skill_id\": \"search\", \"params\": {\"q\": \"rust async\"}}}."
+                    "description": delegate_description
                 },
                 "rationale": {"type": "string"},
                 "confidence": {"type": "number"},
@@ -910,11 +952,46 @@ fn emit_intent_tool_definition() -> ToolDefinition {
 }
 
 fn parse_tool_call_intent(response: &CompletionResponse) -> Option<ReasonedIntent> {
-    response
+    if let Some(intent) = response
         .tool_calls
         .iter()
         .find(|call| call.name == "emit_intent")
         .and_then(parse_emit_intent_call)
+    {
+        return Some(intent);
+    }
+
+    let direct_call = response
+        .tool_calls
+        .iter()
+        .find(|call| call.name != "emit_intent")?;
+    eprintln!(
+        "reason: wrapping direct tool call '{}' in Delegate intent",
+        direct_call.name
+    );
+    Some(wrap_direct_tool_call_as_intent(direct_call))
+}
+
+fn wrap_direct_tool_call_as_intent(call: &ToolCall) -> ReasonedIntent {
+    let params = call
+        .arguments
+        .as_object()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(key, value)| (key, value_to_param_string(value)))
+        .collect::<HashMap<_, _>>();
+
+    ReasonedIntent {
+        action: IntendedAction::Delegate {
+            skill_id: call.name.clone(),
+            params,
+        },
+        rationale: "direct tool call (auto-wrapped)".to_string(),
+        confidence: 0.7,
+        expected_outcome: None,
+        sub_goals: Vec::new(),
+    }
 }
 
 fn parse_emit_intent_call(call: &ToolCall) -> Option<ReasonedIntent> {
@@ -1198,6 +1275,29 @@ mod tests {
                     output: format!("Stub tool execution for '{}'", call.name),
                 })
                 .collect::<Vec<_>>())
+        }
+
+        fn tool_definitions(&self) -> Vec<fx_llm::ToolDefinition> {
+            vec![
+                fx_llm::ToolDefinition {
+                    name: "read_file".to_string(),
+                    description: "Read a UTF-8 text file from disk".to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"]
+                    }),
+                },
+                fx_llm::ToolDefinition {
+                    name: "list_directory".to_string(),
+                    description: "List files and directories, optionally recursively".to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"]
+                    }),
+                },
+            ]
         }
     }
 
@@ -1898,6 +1998,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn build_reasoning_request_only_includes_emit_intent_tool() {
+        let engine = default_engine(3);
+        let llm = MockLlm::with_completion_responses(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "fallback".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let perception = engine
+            .perceive(&base_snapshot("verify tool exposure"))
+            .await
+            .expect("perception");
+        let _ = engine.reason(&perception, &llm).await.expect("intent");
+
+        let request = llm.captured_request(0);
+        assert_eq!(request.tools.len(), 1);
+        assert_eq!(request.tools[0].name, "emit_intent");
+    }
+
+    #[tokio::test]
+    async fn build_reasoning_request_includes_tool_docs_in_system_prompt() {
+        let engine = default_engine(3);
+        let llm = MockLlm::with_completion_responses(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "fallback".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let perception = engine
+            .perceive(&base_snapshot("verify prompt docs"))
+            .await
+            .expect("perception");
+        let _ = engine.reason(&perception, &llm).await.expect("intent");
+
+        let request = llm.captured_request(0);
+        let system_prompt = request.system_prompt.expect("system prompt");
+        assert!(system_prompt.contains("Available tools (use via Delegate intent):"));
+        assert!(system_prompt.contains("read_file: Read a UTF-8 text file from disk"));
+        assert!(system_prompt.contains("list_directory: List files and directories"));
+    }
+
+    #[tokio::test]
     async fn reason_maps_use_tools_action_from_emit_intent_into_decision_use_tools() {
         let engine = default_engine(3);
         let llm = MockLlm::with_completion_responses(vec![CompletionResponse {
@@ -1934,6 +2082,73 @@ mod tests {
                 if calls.len() == 1
                 && calls[0].name == "read_file"
                 && calls[0].arguments == serde_json::json!({"path":"src/main.rs"})
+        ));
+    }
+
+    #[test]
+    fn parse_tool_call_wraps_direct_tool_call_in_delegate() {
+        let response = CompletionResponse {
+            content: Vec::new(),
+            tool_calls: vec![ToolCall {
+                id: "call-1".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "src/main.rs"}),
+            }],
+            usage: None,
+            stop_reason: None,
+        };
+
+        let intent = parse_tool_call_intent(&response).expect("wrapped intent");
+        assert!(matches!(
+            intent.action,
+            IntendedAction::Delegate { ref skill_id, .. } if skill_id == "read_file"
+        ));
+    }
+
+    #[test]
+    fn direct_tool_call_fallback_sets_lower_confidence() {
+        let response = CompletionResponse {
+            content: Vec::new(),
+            tool_calls: vec![ToolCall {
+                id: "call-1".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "src/main.rs"}),
+            }],
+            usage: None,
+            stop_reason: None,
+        };
+
+        let intent = parse_tool_call_intent(&response).expect("wrapped intent");
+        assert!(intent.confidence < 0.8);
+    }
+
+    #[tokio::test]
+    async fn run_cycle_with_delegate_intent_executes_tool() {
+        let mut engine = default_engine(3);
+        let llm = MockLlm::with_completion_responses(vec![CompletionResponse {
+            content: Vec::new(),
+            tool_calls: vec![ToolCall {
+                id: "call-1".to_string(),
+                name: "emit_intent".to_string(),
+                arguments: serde_json::json!({
+                    "action": {"Delegate": {"skill_id": "read_file", "params": {"path": "Cargo.toml"}}},
+                    "rationale": "need file content",
+                    "confidence": 0.95
+                }),
+            }],
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let result = engine
+            .run_cycle(base_snapshot("inspect cargo"), &llm)
+            .await
+            .expect("loop result");
+
+        assert!(matches!(
+            result,
+            LoopResult::Complete { response, .. }
+                if response.contains("Stub tool execution for 'read_file'")
         ));
     }
 
