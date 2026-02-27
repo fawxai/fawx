@@ -1,10 +1,11 @@
+use crate::tools::{FawxToolExecutor, ToolConfig};
 use async_trait::async_trait;
 use crossterm::style::Stylize;
 use crossterm::{cursor, event, style, terminal, ExecutableCommand};
 use futures::StreamExt;
 use fx_core::error::LlmError as CoreLlmError;
 use fx_core::types::{InputSource, ScreenState, UserInput};
-use fx_kernel::act::{StubToolExecutor, TokenUsage};
+use fx_kernel::act::TokenUsage;
 use fx_kernel::auth::{AuthManager, AuthMethod};
 use fx_kernel::budget::{BudgetConfig, BudgetTracker};
 use fx_kernel::context_manager::ContextCompactor;
@@ -601,11 +602,14 @@ impl TuiApp {
 pub fn build_loop_engine() -> LoopEngine {
     let budget = BudgetTracker::new(BudgetConfig::default(), current_time_ms(), 0);
     let context = ContextCompactor::new(DEFAULT_CONTEXT_MAX_TOKENS, DEFAULT_CONTEXT_COMPACT_TARGET);
-    LoopEngine::new_with_executor(
+    let working_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let executor = FawxToolExecutor::new(working_dir, ToolConfig::default());
+
+    LoopEngine::new(
         budget,
         context,
         DEFAULT_MAX_LOOP_ITERATIONS,
-        std::sync::Arc::new(StubToolExecutor),
+        std::sync::Arc::new(executor),
     )
 }
 
