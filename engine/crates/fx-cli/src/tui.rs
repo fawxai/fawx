@@ -16,6 +16,7 @@ use fx_llm::{
     AnthropicProvider, CompletionRequest, Message, ModelCatalog, ModelRouter, OpenAiProvider,
     OpenAiResponsesProvider, ProviderError, RouterError, StreamChunk,
 };
+use sparx::{render_file, RenderConfig};
 use std::fmt;
 use std::future::Future;
 use std::io::{self, Write};
@@ -248,7 +249,9 @@ impl TuiApp {
         let burnt = theme_color(210, 112, 10, 166);
 
         println!();
-        if !try_render_logo_external() {
+        if let Some(rendered) = try_render_logo() {
+            print!("{rendered}");
+        } else {
             for line in BANNER_ART.lines() {
                 println!("{}", line.bold().with(amber));
             }
@@ -792,47 +795,22 @@ impl TuiApp {
     }
 }
 
-/// Try to render the Fawx logo using ascii-image-converter.
-/// Returns true if successful, false if the tool isn't available or fails.
-fn try_render_logo_external() -> bool {
-    use std::process::Command;
+/// Try to render the Fawx logo using native sparx rendering.
+fn try_render_logo() -> Option<String> {
+    let logo_path = find_logo_path()?;
+    render_logo_at_path(&logo_path)
+}
 
-    // Check if ascii-image-converter is available
-    let which = Command::new("which").arg("ascii-image-converter").output();
-    if !which.as_ref().is_ok_and(|o| o.status.success()) {
-        return false;
-    }
-
-    // Find the logo: check relative to executable, then common paths
-    let logo_path = find_logo_path();
-    let path = match logo_path {
-        Some(p) => p,
-        None => return false,
-    };
-
-    // Detect terminal width for sizing
+fn render_logo_at_path(path: &std::path::Path) -> Option<String> {
     let cols = terminal_cols().unwrap_or(80);
     let width = cols.saturating_sub(4).clamp(20, 120);
+    let config = RenderConfig {
+        width: Some(width),
+        threshold: 28,
+        color: supports_truecolor(),
+    };
 
-    let result = Command::new("ascii-image-converter")
-        .arg(&path)
-        .arg("-C") // color
-        .arg("-b") // braille mode
-        .arg("--dither")
-        .arg("--threshold")
-        .arg("28")
-        .arg("-W")
-        .arg(width.to_string())
-        .output();
-
-    match result {
-        Ok(output) if output.status.success() => {
-            let rendered = String::from_utf8_lossy(&output.stdout);
-            print!("{rendered}");
-            true
-        }
-        _ => false,
-    }
+    render_file(path.to_string_lossy().as_ref(), &config).ok()
 }
 
 /// Find the fawx.png logo in common locations.
@@ -2381,13 +2359,19 @@ mod tests {
             FAWX_LOGO,
             &sparx::RenderConfig {
                 width: Some(40),
-                threshold: 128,
+                threshold: 28,
                 color: true,
             },
         );
 
         assert!(result.is_ok());
         assert!(!result.expect("embedded fawx logo should render").is_empty());
+    }
+
+    #[test]
+    fn try_render_logo_returns_none_for_missing_file() {
+        let missing = std::path::Path::new("/definitely/missing/fawx-logo.png");
+        assert!(render_logo_at_path(missing).is_none());
     }
 
     fn app_with_mock_model(response: &str) -> TuiApp {
