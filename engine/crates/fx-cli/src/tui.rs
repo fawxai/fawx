@@ -109,6 +109,45 @@ where
     result
 }
 
+fn preferred_default_model(model_ids: &[String]) -> Option<&str> {
+    preferred_sonnet_four(model_ids)
+        .or_else(|| preferred_sonnet(model_ids))
+        .or_else(|| highest_version_model(model_ids))
+        .or_else(|| model_ids.first().map(String::as_str))
+}
+
+fn preferred_sonnet_four(model_ids: &[String]) -> Option<&str> {
+    model_ids
+        .iter()
+        .find(|id| {
+            let lower = id.to_ascii_lowercase();
+            lower.contains("sonnet") && lower.contains('4')
+        })
+        .map(String::as_str)
+}
+
+fn preferred_sonnet(model_ids: &[String]) -> Option<&str> {
+    model_ids
+        .iter()
+        .find(|id| id.to_ascii_lowercase().contains("sonnet"))
+        .map(String::as_str)
+}
+
+fn highest_version_model(model_ids: &[String]) -> Option<&str> {
+    model_ids
+        .iter()
+        .max_by(|left, right| version_parts(left).cmp(&version_parts(right)))
+        .map(String::as_str)
+}
+
+fn version_parts(model_id: &str) -> Vec<u32> {
+    model_id
+        .split(|ch: char| !ch.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<u32>().ok())
+        .collect()
+}
+
 /// The main TUI application loop.
 pub struct TuiApp {
     router: ModelRouter,
@@ -494,14 +533,15 @@ impl TuiApp {
             return;
         }
 
-        if let Some(model) = self
+        let model_ids = self
             .router
             .available_models()
             .into_iter()
-            .next()
             .map(|model| model.model_id)
-        {
-            if let Err(error) = self.router.set_active(&model) {
+            .collect::<Vec<_>>();
+
+        if let Some(model) = preferred_default_model(&model_ids) {
+            if let Err(error) = self.router.set_active(model) {
                 eprintln!("failed to set initial model {model}: {error}");
             }
         }
@@ -2599,6 +2639,21 @@ mod tests {
         let _color_term = ScopedEnvVar::set("COLORTERM", "ansi");
 
         assert_eq!(theme_color(255, 204, 0, 220), style::Color::AnsiValue(220));
+    }
+
+    #[test]
+    fn default_model_prefers_sonnet_4() {
+        let model_ids = vec![
+            "claude-3-haiku".to_string(),
+            "claude-3-7-sonnet-latest".to_string(),
+            "claude-sonnet-4-20250514".to_string(),
+            "gpt-5.3-codex".to_string(),
+        ];
+
+        assert_eq!(
+            preferred_default_model(&model_ids),
+            Some("claude-sonnet-4-20250514")
+        );
     }
 
     #[tokio::test]
