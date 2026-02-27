@@ -608,9 +608,7 @@ fn try_render_logo_external() -> bool {
     use std::process::Command;
 
     // Check if ascii-image-converter is available
-    let which = Command::new("which")
-        .arg("ascii-image-converter")
-        .output();
+    let which = Command::new("which").arg("ascii-image-converter").output();
     if !which.as_ref().is_ok_and(|o| o.status.success()) {
         return false;
     }
@@ -628,8 +626,8 @@ fn try_render_logo_external() -> bool {
 
     let result = Command::new("ascii-image-converter")
         .arg(&path)
-        .arg("-C")      // color
-        .arg("-b")      // braille mode
+        .arg("-C") // color
+        .arg("-b") // braille mode
         .arg("--dither")
         .arg("--threshold")
         .arg("28")
@@ -658,11 +656,7 @@ fn find_logo_path() -> Option<std::path::PathBuf> {
                 return Some(candidate);
             }
             // Check ../../scripts/fawx.png (dev layout)
-            let candidate = dir
-                .join("..")
-                .join("..")
-                .join("scripts")
-                .join("fawx.png");
+            let candidate = dir.join("..").join("..").join("scripts").join("fawx.png");
             if candidate.exists() {
                 return Some(candidate);
             }
