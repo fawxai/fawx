@@ -443,6 +443,10 @@ struct ResponsesMessage {
     content: String,
 }
 
+/// Maps a Fawx ToolDefinition to the OpenAI Responses API function tool format.
+/// Note: the Responses API also accepts a `strict` field for strict JSON schema
+/// validation, but we omit it — emit_intent uses dynamic sub-schemas (tool lists
+/// vary at runtime) which are not compatible with strict mode.
 #[derive(Serialize)]
 struct ResponsesTool {
     r#type: String,
