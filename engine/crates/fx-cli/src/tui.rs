@@ -58,9 +58,19 @@ const DEFAULT_OPENROUTER_MODELS: &[&str] = &[
 ];
 
 fn supports_truecolor() -> bool {
-    std::env::var("COLORTERM")
-        .map(|value| value == "truecolor" || value == "24bit")
-        .unwrap_or(false)
+    if let Ok(value) = std::env::var("COLORTERM") {
+        if value == "truecolor" || value == "24bit" {
+            return true;
+        }
+    }
+
+    if let Ok(term) = std::env::var("TERM") {
+        if term.contains("direct") || term.contains("truecolor") {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn theme_color(r: u8, g: u8, b: u8, fallback_256: u8) -> style::Color {
@@ -2608,14 +2618,28 @@ mod tests {
     #[tokio::test]
     async fn supports_truecolor_returns_false_without_env() {
         let _env_lock = ENV_LOCK.lock().await;
-        let previous = std::env::var_os("COLORTERM");
+        let previous_colorterm = std::env::var_os("COLORTERM");
+        let previous_term = std::env::var_os("TERM");
         std::env::remove_var("COLORTERM");
+        std::env::remove_var("TERM");
 
         assert!(!supports_truecolor());
 
-        if let Some(value) = previous {
+        if let Some(value) = previous_colorterm {
             std::env::set_var("COLORTERM", value);
         }
+        if let Some(value) = previous_term {
+            std::env::set_var("TERM", value);
+        }
+    }
+
+    #[tokio::test]
+    async fn supports_truecolor_detects_term_direct() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let _color_term = ScopedEnvVar::set("COLORTERM", "ansi");
+        let _term = ScopedEnvVar::set("TERM", "xterm-direct");
+
+        assert!(supports_truecolor());
     }
 
     #[tokio::test]
@@ -2637,6 +2661,7 @@ mod tests {
     async fn theme_color_uses_256_fallback() {
         let _env_lock = ENV_LOCK.lock().await;
         let _color_term = ScopedEnvVar::set("COLORTERM", "ansi");
+        let _term = ScopedEnvVar::set("TERM", "xterm-256color");
 
         assert_eq!(theme_color(255, 204, 0, 220), style::Color::AnsiValue(220));
     }
@@ -2654,6 +2679,17 @@ mod tests {
             preferred_default_model(&model_ids),
             Some("claude-sonnet-4-20250514")
         );
+    }
+
+    #[test]
+    fn default_model_falls_back_when_no_sonnet_models_exist() {
+        let model_ids = vec![
+            "gpt-4o".to_string(),
+            "gpt-3.5-turbo".to_string(),
+            "llama-3".to_string(),
+        ];
+
+        assert_eq!(preferred_default_model(&model_ids), Some("gpt-4o"));
     }
 
     #[tokio::test]
