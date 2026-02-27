@@ -111,7 +111,7 @@
 
 <p>The <strong>engine IS the OS kernel</strong>. Traditional shells (TUI, desktop GUI, mobile app) are just peripherals — different ways to interface with the same underlying agentic system. The agent's identity and relationship exist at the kernel level, not at the shell level.</p>
 
-<p>This simplifies security enormously. There are no privilege escalation attacks because there are no privilege boundaries. There are no authorization bypasses because there is no authorization — just the owner and their agent.</p>
+<p>This simplifies the <em>user-facing</em> security model enormously. There are no user-to-user authorization bypasses because there is only one user. However, <strong>internal privilege boundaries exist and are critical</strong> — the self-development lifecycle enforces typed, locked subagent roles (implementer, reviewer, fixer) with distinct permissions, and git authorization tiers separate what the agent can do (branches, staging) from what only the owner can do (main). These are not user-facing auth — they are kernel-enforced architectural constraints that prevent the agent's own subsystems from escalating beyond their designated roles.</p>
 
 <h2>Network Posture</h2>
 
@@ -429,7 +429,7 @@
   <li><strong>Network isolation:</strong> Overlay network is isolated from untrusted networks</li>
 </ul>
 
-<p>The tailnet becomes the "trusted network" boundary — but only for remote access, never for assumptions about content security. External content is still treated as untrusted even when accessed over the tailnet.</p>
+<p>The tailnet provides an <strong>authenticated private overlay for transport access</strong> — but it is not a "trusted network." It reduces the network attack surface for remote shell connections. External content is still treated as untrusted even when accessed over the tailnet, and zero-trust principles apply to all layers above transport.</p>
 
 <h2>Cloud / SuperFawx (Future)</h2>
 
@@ -448,19 +448,23 @@
     <li><strong>No listening ports on public internet</strong> — Zero network services exposed to untrusted networks</li>
     <li><strong>All external content treated as untrusted</strong> — Never elevated to system instruction level</li>
     <li><strong>Messaging channels have sender allowlists</strong> — No anonymous inbound communication</li>
-    <li><strong>Memory writes from external-triggered actions are flagged/quarantined</strong> — External input cannot directly poison persistent memory</li>
+    <li><strong>Memory writes from external-triggered actions are flagged with provenance</strong> — Tagged with source channel, sender, and trigger context</li>
     <li><strong>Self-modification requires test gate + user merge gate</strong> — Agent cannot deploy its own code without validation</li>
     <li><strong>Subagent permissions are typed and locked</strong> — Cannot self-escalate or modify permission system</li>
     <li><strong>LLM API connections use certificate pinning on mobile</strong> — Prevent MITM on the agent's "brain" connection</li>
     <li><strong>No "trusted LAN"</strong> — Zero-trust at every network boundary</li>
     <li><strong>Tool sandbox cannot be disabled by the agent</strong> — Safety constraints are architectural, not configurable</li>
     <li><strong>DNS resolution hardened against poisoning</strong> — DNS-over-HTTPS or pinned resolvers required</li>
+    <li><strong>Kernel is immutable at runtime</strong> — Cannot be modified by the agent, loadable modules, or any external input</li>
+    <li><strong>Scheduled tasks from externally-triggered sessions require user confirmation</strong> — Cron jobs and delayed tasks created during external input processing are quarantined until approved</li>
   </ol>
 </div>
 
+<p>The canonical invariant list is maintained in <a href="../../DOCTRINE.md">DOCTRINE.md §10</a>. This security model provides the threat context; DOCTRINE.md is the enforceable source of truth.</p>
+
 <h3>Enforcement</h3>
 
-<p>These invariants are <strong>wired into the system programming</strong> — they become the actual rules the Fawx kernel enforces at runtime, not just documentation that developers read. The agent cannot modify these constraints through any combination of self-modification, memory manipulation, or subagent coordination.</p>
+<p>These invariants are <strong>compiled doctrine</strong> — enforced by the Fawx kernel at runtime, not by convention or documentation. The agent cannot modify these constraints through any combination of self-modification, memory manipulation, or subagent coordination. See <a href="../../DOCTRINE.md">DOCTRINE.md</a> for the canonical enforcement specification.</p>
 
 <p>Violation of any invariant triggers system-level protection mechanisms: operation blocking, session termination, memory quarantine, or complete system isolation depending on the severity and context of the violation.</p>
 
