@@ -798,15 +798,19 @@ impl TuiApp {
 /// Try to render the Fawx logo using native sparx rendering.
 fn try_render_logo() -> Option<String> {
     let logo_path = find_logo_path()?;
+    render_logo_at_path(&logo_path)
+}
+
+fn render_logo_at_path(path: &std::path::Path) -> Option<String> {
     let cols = terminal_cols().unwrap_or(80);
     let width = cols.saturating_sub(4).clamp(20, 120);
     let config = RenderConfig {
         width: Some(width),
-        threshold: 128,
+        threshold: 28,
         color: supports_truecolor(),
     };
 
-    render_file(logo_path.to_string_lossy().as_ref(), &config).ok()
+    render_file(path.to_string_lossy().as_ref(), &config).ok()
 }
 
 fn supports_truecolor() -> bool {
@@ -2364,13 +2368,19 @@ mod tests {
             FAWX_LOGO,
             &sparx::RenderConfig {
                 width: Some(40),
-                threshold: 128,
+                threshold: 28,
                 color: true,
             },
         );
 
         assert!(result.is_ok());
         assert!(!result.expect("embedded fawx logo should render").is_empty());
+    }
+
+    #[test]
+    fn try_render_logo_returns_none_for_missing_file() {
+        let missing = std::path::Path::new("/definitely/missing/fawx-logo.png");
+        assert!(render_logo_at_path(missing).is_none());
     }
 
     fn app_with_mock_model(response: &str) -> TuiApp {
