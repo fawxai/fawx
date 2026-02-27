@@ -151,9 +151,12 @@ const TOOL_SYNTHESIS_TOKEN_HEURISTIC: u64 = 320;
 const REASONING_MAX_OUTPUT_TOKENS: u32 = 768;
 const TOOL_SYNTHESIS_MAX_OUTPUT_TOKENS: u32 = 384;
 const DEFAULT_LLM_ACTION_COST_CENTS: u64 = 2;
+const SAFE_FALLBACK_RESPONSE: &str = "I wasn't able to process that. Could you try rephrasing?";
 const REASONING_SYSTEM_PROMPT: &str = "You are Fawx, an autonomous assistant. \
 Always use the emit_intent tool to respond. \
-For simple questions, emit a Respond action with your answer.";
+The action field must deserialize to IntendedAction and use exactly one of these variants: \
+Respond, Tap, Type, Swipe, LaunchApp, Navigate, Wait, Delegate, or Composite. \
+For TUI-first conversations, prefer Respond for direct user answers and Delegate for tool use.";
 
 const VERIFICATION_CONFIDENCE_CLEAN: f64 = 0.9;
 const VERIFICATION_CONFIDENCE_SINGLE_DISCREPANCY: f64 = 0.45;
@@ -524,7 +527,7 @@ impl LoopEngine {
         ActionResult {
             decision: decision.clone(),
             tool_results: Vec::new(),
-            response_text: text.to_string(),
+            response_text: ensure_non_empty_response(text),
             tokens_used: TokenUsage::default(),
         }
     }
@@ -553,7 +556,7 @@ impl LoopEngine {
         Ok(ActionResult {
             decision: decision.clone(),
             tool_results,
-            response_text: llm_text,
+            response_text: ensure_non_empty_response(&llm_text),
             tokens_used: usage,
         })
     }
@@ -888,7 +891,7 @@ fn emit_intent_tool_definition() -> ToolDefinition {
             "properties": {
                 "action": {
                     "type": "object",
-                    "description": "IntendedAction: use {\"Respond\": {\"text\": \"your answer\"}} for direct replies, {\"UseTools\": {\"tool_calls\": [...]}} for tool use, {\"Clarify\": {\"question\": \"...\"}} for clarification, {\"Defer\": {\"reason\": \"...\"}} to decline"
+                    "description": "IntendedAction variant object. Allowed variants: Respond, Tap, Type, Swipe, LaunchApp, Navigate, Wait, Delegate, Composite. Examples: {\"Respond\": {\"text\": \"your answer\"}} or {\"Delegate\": {\"skill_id\": \"search\", \"params\": {\"q\": \"rust async\"}}}."
                 },
                 "rationale": {"type": "string"},
                 "confidence": {"type": "number"},
@@ -1009,7 +1012,7 @@ fn parse_reasoned_intent(raw: &str, fallback_user_message: &str) -> ReasonedInte
 }
 
 fn build_fallback_intent(raw: &str, fallback_user_message: &str) -> ReasonedIntent {
-    let text = extract_fallback_text(raw);
+    let text = ensure_non_empty_response(&extract_fallback_text(raw));
     ReasonedIntent {
         action: IntendedAction::Respond { text },
         rationale: "Fallback: model output did not match schema".to_string(),
@@ -1133,7 +1136,18 @@ fn sanitize_intent(mut intent: ReasonedIntent) -> ReasonedIntent {
     }
 
     intent.confidence = intent.confidence.clamp(0.0, 1.0);
+    if let IntendedAction::Respond { text } = &mut intent.action {
+        *text = ensure_non_empty_response(text);
+    }
     intent
+}
+
+fn ensure_non_empty_response(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return SAFE_FALLBACK_RESPONSE.to_string();
+    }
+    trimmed.to_string()
 }
 
 fn loop_error(stage: &str, reason: &str, recoverable: bool) -> LoopError {
@@ -1597,6 +1611,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reason_parses_emit_intent_respond_and_delegate_variants() {
+        let engine = default_engine(3);
+        let respond_call = ToolCall {
+            id: "call-respond".to_string(),
+            name: "emit_intent".to_string(),
+            arguments: serde_json::json!({
+                "action": {"Respond": {"text": "Hi"}},
+                "rationale": "direct",
+                "confidence": 0.9
+            }),
+        };
+        let delegate_call = ToolCall {
+            id: "call-delegate".to_string(),
+            name: "emit_intent".to_string(),
+            arguments: serde_json::json!({
+                "action": {"Delegate": {"skill_id": "search", "params": {"q": "fawx"}}},
+                "rationale": "lookup",
+                "confidence": 0.9
+            }),
+        };
+
+        let respond_intent = parse_emit_intent_call(&respond_call).expect("respond intent");
+        let delegate_intent = parse_emit_intent_call(&delegate_call).expect("delegate intent");
+        let delegate_decision = engine
+            .decide(&delegate_intent)
+            .await
+            .expect("delegate decision");
+
+        assert!(matches!(
+            respond_intent.action,
+            IntendedAction::Respond { ref text } if text == "Hi"
+        ));
+        assert!(matches!(
+            delegate_decision,
+            Decision::UseTools(ref calls) if calls.len() == 1 && calls[0].name == "search"
+        ));
+    }
+
+    #[tokio::test]
     async fn reason_falls_back_to_plain_text_json_when_tool_call_missing() {
         let mut engine = default_engine(3);
         let llm = MockLlm::with_responses(vec![
@@ -1639,6 +1692,120 @@ mod tests {
             result,
             LoopResult::Complete { response, .. } if response == "Plain fallback answer"
         ));
+    }
+
+    #[tokio::test]
+    async fn reason_returns_safe_fallback_for_malformed_tool_call_without_text() {
+        let mut engine = default_engine(3);
+        let llm = MockLlm::with_completion_responses(vec![CompletionResponse {
+            content: Vec::new(),
+            tool_calls: vec![ToolCall {
+                id: "call-1".to_string(),
+                name: "emit_intent".to_string(),
+                arguments: serde_json::json!({"action": "invalid"}),
+            }],
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let result = engine
+            .run_cycle(base_snapshot("bad args"), &llm)
+            .await
+            .expect("loop result");
+
+        assert!(matches!(
+            result,
+            LoopResult::Complete { response, .. } if response == SAFE_FALLBACK_RESPONSE
+        ));
+    }
+
+    #[tokio::test]
+    async fn reason_missing_required_action_field_falls_back_gracefully() {
+        let mut engine = default_engine(3);
+        let llm = MockLlm::with_completion_responses(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "".to_string(),
+            }],
+            tool_calls: vec![ToolCall {
+                id: "call-1".to_string(),
+                name: "emit_intent".to_string(),
+                arguments: serde_json::json!({
+                    "rationale": "missing action",
+                    "confidence": 0.8
+                }),
+            }],
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let result = engine
+            .run_cycle(base_snapshot("missing action"), &llm)
+            .await
+            .expect("loop result");
+
+        assert!(matches!(
+            result,
+            LoopResult::Complete { response, .. } if response == SAFE_FALLBACK_RESPONSE
+        ));
+    }
+
+    #[tokio::test]
+    async fn reason_empty_tool_calls_and_empty_content_return_safe_fallback() {
+        let mut engine = default_engine(3);
+        let llm = MockLlm::with_completion_responses(vec![CompletionResponse {
+            content: Vec::new(),
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let result = engine
+            .run_cycle(base_snapshot("empty response"), &llm)
+            .await
+            .expect("loop result");
+
+        assert!(matches!(
+            result,
+            LoopResult::Complete { response, .. } if response == SAFE_FALLBACK_RESPONSE
+        ));
+    }
+
+    #[tokio::test]
+    async fn reason_extracts_expected_outcome_and_sub_goals_from_tool_call() {
+        let engine = default_engine(3);
+        let llm = MockLlm::with_completion_responses(vec![CompletionResponse {
+            content: Vec::new(),
+            tool_calls: vec![ToolCall {
+                id: "call-1".to_string(),
+                name: "emit_intent".to_string(),
+                arguments: serde_json::json!({
+                    "action": {"Respond": {"text": "Done"}},
+                    "rationale": "all optional fields",
+                    "confidence": 0.95,
+                    "expected_outcome": "User sees completion confirmation",
+                    "sub_goals": ["Summarize result", "Offer next step"]
+                }),
+            }],
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let perception = engine
+            .perceive(&base_snapshot("optional fields"))
+            .await
+            .expect("perception");
+        let intent = engine.reason(&perception, &llm).await.expect("intent");
+
+        assert_eq!(
+            intent
+                .expected_outcome
+                .as_ref()
+                .map(|outcome| outcome.description.as_str()),
+            Some("User sees completion confirmation")
+        );
+        assert_eq!(intent.sub_goals.len(), 2);
+        assert_eq!(intent.sub_goals[0].description, "Summarize result");
+        assert_eq!(intent.sub_goals[1].description, "Offer next step");
     }
 
     #[tokio::test]
