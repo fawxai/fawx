@@ -1,6 +1,34 @@
-# ENGINEERING.md — Code Standards (Fawx + Krust)
+# ENGINEERING.md — Immutable Doctrine (Fawx + Ember)
 
-Effective 2026-02-26. These standards apply to all work in `abbudjoe/fawx` and `abbudjoe/krust`.
+Effective 2026-02-27. These standards apply to all work in `abbudjoe/fawx` and `abbudjoe/ember`.
+
+This file is **immutable doctrine**. These rules are machine-enforceable, non-negotiable, and cannot be weakened by the agent. They are the compiled invariants of the development process.
+
+For judgment-based preferences, style conventions, and evolving design taste, see `TASTE.md`.
+
+---
+
+## 0. Core Doctrine
+
+These principles are the foundation. Every rule below derives from them.
+
+### YAGNI — You Aren't Gonna Need It
+Do not build functionality until it is necessary. Speculative code is dead weight that must be tested, maintained, and understood by everyone who touches the codebase. If a reviewer can say "we don't need this yet," the code gets removed.
+
+### DRY — Don't Repeat Yourself
+Reuse components, functions, and modules to minimize duplication. If the same logic exists in two places, extract it. If extraction is hard, the abstraction is wrong — fix the abstraction.
+
+### Fail Fast and Loudly
+Errors must be caught and reported immediately, not hidden. No silent catches, no swallowed exceptions, no error paths that return default values and hope for the best. If something goes wrong, the system tells you what, where, and why.
+
+### Fix Root Causes, Not Symptoms
+Address the underlying issue rather than applying a temporary patch. If a fix requires understanding 3 other workarounds, the fix is wrong — remove the workarounds. If the same bug pattern exists elsewhere, fix all instances, not just the one you found.
+
+### Every Dependency Is a Liability
+Minimize external dependencies. Every crate, package, or library you add is code you don't control — it can break, become unmaintained, introduce vulnerabilities, or bloat your binary. New dependencies require explicit justification in the PR description: what it provides, why we can't build it in <100 lines, and what the maintenance/security risk is.
+
+### Measure Before Optimizing
+Do not optimize code without evidence that it's a bottleneck. Premature optimization adds complexity for no measurable gain. Profile first, identify the hotspot, then optimize — and include the benchmark results in the PR.
 
 ---
 
@@ -12,28 +40,25 @@ Effective 2026-02-26. These standards apply to all work in `abbudjoe/fawx` and `
 - Tests mirror source structure. `src/foo/Bar.kt` → `test/foo/BarTest.kt`. No exceptions.
 - Dead code, unused files, and orphaned configs get removed in the same PR that makes them obsolete. Don't leave cleanup for later.
 
-### Fawx repo structure (target)
+### Fawx repo structure
 ```
 fawx/
-├── engine/          ← Rust shared core
-├── android/         ← Kotlin UI shell
-├── ios/             ← Swift UI shell (future)
-├── bindings/
-│   ├── jni/         ← Rust → Kotlin
-│   └── swift/       ← Rust → Swift (future)
+├── engine/crates/   ← Rust shared core (fx-* crates)
+├── android/         ← Kotlin UI shell (frozen, future)
 ├── docs/            ← Architecture, specs, decisions
+├── scripts/         ← Build, test, validation scripts
 └── .github/         ← CI, templates
 ```
 
-### Krust repo structure (target)
+### Ember repo structure
 ```
-stateful-protocols/  (or krust/)
+ember/
 ├── crates/
 │   ├── protocol-core/
 │   ├── agent-web/
 │   ├── agent-tools/
 │   ├── agent-eval/
-│   └── krust-mcp/
+│   └── ember-mcp/
 ├── docs/
 ├── scripts/
 └── .github/
@@ -159,14 +184,17 @@ Authors must not merge with unresolved blocking issues. No exceptions.
 
 ---
 
-## 6. The Restructure Contract
+## 6. The Architecture Contract
 
-The current Fawx restructure is not just moving files around. It's an opportunity to:
-1. **Eliminate accumulated complexity** — every module re-earns its place in the new structure.
-2. **Establish clean interfaces** — Kotlin ↔ Rust boundary is defined by contracts, not convenience.
-3. **Set the foundation for the OS transition** — nothing we build now should need to be thrown away when Kotlin/Swift shells drop.
+Fawx is a TUI-first agentic engine with pluggable shells. The engine is the authority; shells are replaceable.
 
-Code that doesn't meet the standards above doesn't get moved to the new structure. It gets rewritten or removed.
+1. **Eliminate accumulated complexity** — every module re-earns its place.
+2. **Establish clean interfaces** — shell ↔ engine boundary is defined by contracts (UISpec), not convenience.
+3. **Set the foundation for the OS transition** — nothing we build now should need to be thrown away when new shells are added.
+4. **Kernel is immutable at runtime** — the loop orchestrator, policy engine, and enforcement mechanisms cannot be modified by the agent.
+5. **Tools belong in the loadable layer** — not hardcoded in the kernel. The kernel provides the `ToolExecutor` trait; implementations live outside.
+
+Code that doesn't meet the standards above gets rewritten or removed.
 
 ---
 
@@ -190,4 +218,4 @@ Code that doesn't meet the standards above doesn't get moved to the new structur
 
 ---
 
-*This file is the engineering constitution. Cite it in PR reviews. Update it when standards evolve.*
+*This file is immutable doctrine. Cite it in PR reviews. Changes require explicit user approval. For evolving preferences and style, see `TASTE.md`.*

@@ -260,7 +260,7 @@ Anticipator {
   </tbody>
 </table>
 
-<p><strong>Integration with OS power management:</strong> The Anticipator registers with Android's <code>WorkManager</code> / iOS's <code>BGTaskScheduler</code> for background execution. It respects doze mode, app standby buckets, and battery optimization settings. The user can always disable background activity entirely.</p>
+<p><strong>Integration with platform scheduling:</strong> The Anticipator uses the shell's background execution mechanism — cron/timers on desktop/TUI, Android's <code>WorkManager</code> on mobile, iOS's <code>BGTaskScheduler</code> on Apple devices. It respects platform power constraints. The user can always disable background activity entirely.</p>
 
 <!-- ============ FATIGUE PREVENTION ============ -->
 <h2>Fatigue Prevention</h2>

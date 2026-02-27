@@ -119,7 +119,7 @@
 <div class="layer-stack">
   <div class="layer platform">
     <h4>Platform Shell</h4>
-    <p>Native UI rendering + device APIs. Kotlin (Android) / Swift (iOS). Renders declarative UI specs from the engine. Provides perception data upward.</p>
+    <p>UI rendering + platform APIs. TUI (terminal), Android, iOS, desktop. Renders declarative UI specs from the engine. Provides perception data upward.</p>
     <div class="modules">
       <span class="mod">Screen Reader</span>
       <span class="mod">Touch Injection</span>
@@ -260,7 +260,7 @@
 
 <!-- ============ A/B SLOTS ============ -->
 <h2>Self-Modification Lifecycle (A/B Slots)</h2>
-<p>Every change to the loadable layer follows this lifecycle. If validation or health check fails, the system rolls back automatically. The phone never bricks.</p>
+<p>Every change to the loadable layer follows this lifecycle. If validation or health check fails, the system rolls back automatically. The system never bricks.</p>
 
 <div class="ab-flow">
   <div class="ab-step">
@@ -512,7 +512,7 @@
    • <strong>Storage integrity</strong> — checksums on all encrypted stores match expected values.</p>
 
 <div class="note">
-  <strong>Design principle:</strong> A/B slots protect the loadable layer (config, skills, strategies). The checkpoint protocol protects the storage layer (memories, identity, learned knowledge). Together they guarantee: <em>any self-modification the system performs is recoverable.</em> The phone never bricks. The agent never forgets — unless the user tells it to.
+  <strong>Design principle:</strong> A/B slots protect the loadable layer (config, skills, strategies). The checkpoint protocol protects the storage layer (memories, identity, learned knowledge). Together they guarantee: <em>any self-modification the system performs is recoverable.</em> The system never bricks. The agent never forgets — unless the user tells it to.
 </div>
 
 <!-- ============ KERNEL INVARIANTS ============ -->
