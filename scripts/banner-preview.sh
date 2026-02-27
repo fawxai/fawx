@@ -17,7 +17,7 @@ clear
 
 echo ""
 echo -e "${BOLD}${AMBER}   ___                  ${RESET}"
-echo -e "${BOLD}${AMBER}  / _/__ __    __ _  _  ${RESET}"
+echo -e "${BOLD}${AMBER}  / _/__ __    ___  __  ${RESET}"
 echo -e "${BOLD}${AMBER} / _/ _ \`/ |/|/ /\\ \\/ / ${RESET}"
 echo -e "${BOLD}${AMBER}/_/ \\_,_/|__,__/ /_/\\_\\ ${RESET}"
 echo ""
