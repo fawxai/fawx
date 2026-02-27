@@ -453,4 +453,410 @@ mod tests {
             "expected either summary entry or reduced working memory"
         );
     }
+
+    #[test]
+    fn compact_by_recency_removes_oldest_episodic_first() {
+        let mut context = sample_context();
+        context.relevant_episodic = vec![
+            EpisodicMemoryRef {
+                id: 1,
+                summary: "newer".to_owned(),
+                relevance: 0.8,
+                timestamp_ms: 200,
+            },
+            EpisodicMemoryRef {
+                id: 2,
+                summary: "oldest".to_owned(),
+                relevance: 0.7,
+                timestamp_ms: 100,
+            },
+        ];
+
+        let removed = remove_by_recency(&mut context);
+
+        assert_eq!(removed.as_deref(), Some("Episodic(old): oldest"));
+        assert_eq!(context.relevant_episodic.len(), 1);
+        assert_eq!(context.relevant_episodic[0].summary, "newer");
+    }
+
+    #[test]
+    fn compact_by_goal_distance_removes_least_related() {
+        let mut context = sample_context();
+        context.relevant_episodic.clear();
+        context.relevant_semantic.clear();
+        context.goal.description = "Reply to email".to_owned();
+        context.working_memory = vec![
+            WorkingMemoryEntry {
+                key: "email".to_owned(),
+                value: "reply drafted".to_owned(),
+                relevance: 0.9,
+            },
+            WorkingMemoryEntry {
+                key: "weather".to_owned(),
+                value: "forecast tomorrow".to_owned(),
+                relevance: 0.9,
+            },
+        ];
+
+        let removed = remove_by_goal_distance(&mut context);
+
+        assert_eq!(
+            removed.as_deref(),
+            Some("WM(goal-distance): weather=forecast tomorrow")
+        );
+        assert_eq!(context.working_memory.len(), 1);
+        assert_eq!(context.working_memory[0].key, "email");
+    }
+
+    #[test]
+    fn compact_by_relevance_removes_lowest_relevance() {
+        let mut context = sample_context();
+        context.relevant_episodic.clear();
+        context.relevant_semantic.clear();
+        context.working_memory = vec![
+            WorkingMemoryEntry {
+                key: "high".to_owned(),
+                value: "keep".to_owned(),
+                relevance: 0.9,
+            },
+            WorkingMemoryEntry {
+                key: "low".to_owned(),
+                value: "drop".to_owned(),
+                relevance: 0.1,
+            },
+        ];
+
+        let removed = remove_by_relevance(&mut context);
+
+        assert_eq!(removed.as_deref(), Some("WM: low=drop"));
+        assert_eq!(context.working_memory.len(), 1);
+        assert_eq!(context.working_memory[0].key, "high");
+    }
+
+    #[test]
+    fn compact_below_target_is_noop() {
+        let context = sample_context();
+        let before = PerceptionAssembler::estimate_tokens(&context);
+        let compactor = ContextCompactor::new(before + 100, before + 10);
+
+        let compacted = compactor.compact(context.clone(), TrimmingPolicy::ByRelevance);
+
+        assert_eq!(PerceptionAssembler::estimate_tokens(&compacted), before);
+        assert_eq!(compacted.working_memory.len(), context.working_memory.len());
+        assert_eq!(
+            compacted.relevant_episodic.len(),
+            context.relevant_episodic.len()
+        );
+        assert_eq!(
+            compacted.relevant_semantic.len(),
+            context.relevant_semantic.len()
+        );
+    }
+
+    #[test]
+    fn compact_empty_memory_does_not_panic() {
+        let mut context = sample_context();
+        context.working_memory.clear();
+        context.relevant_episodic.clear();
+        context.relevant_semantic.clear();
+        context.active_procedures.clear();
+        context.goal.success_criteria.clear();
+        context.identity_context.personality_traits.clear();
+        context.identity_context.preferences.clear();
+        context.parent_context = None;
+
+        let expected_tokens = PerceptionAssembler::estimate_tokens(&context);
+        let compactor = ContextCompactor::new(1, 1);
+        let compacted = compactor.compact(context.clone(), TrimmingPolicy::ByRelevance);
+
+        assert!(compacted.working_memory.is_empty());
+        assert!(compacted.relevant_episodic.is_empty());
+        assert!(compacted.relevant_semantic.is_empty());
+        assert!(compacted.active_procedures.is_empty());
+        assert!(compacted.goal.success_criteria.is_empty());
+        assert!(compacted.identity_context.personality_traits.is_empty());
+        assert!(compacted.identity_context.preferences.is_empty());
+        assert!(compacted.parent_context.is_none());
+        assert_eq!(
+            PerceptionAssembler::estimate_tokens(&compacted),
+            expected_tokens
+        );
+    }
+
+    #[test]
+    fn compact_exhausts_full_cascade_in_order_and_stops_when_empty() {
+        let mut context = sample_context();
+        context.working_memory = vec![WorkingMemoryEntry {
+            key: "wm".to_owned(),
+            value: "value".to_owned(),
+            relevance: 0.1,
+        }];
+        context.relevant_episodic = vec![EpisodicMemoryRef {
+            id: 1,
+            summary: "episode".to_owned(),
+            relevance: 0.2,
+            timestamp_ms: 1,
+        }];
+        context.relevant_semantic = vec![SemanticMemoryRef {
+            id: 1,
+            fact: "fact".to_owned(),
+            confidence: 0.3,
+        }];
+        context.active_procedures = vec![ProcedureRef {
+            id: "p1".to_owned(),
+            name: "Procedure".to_owned(),
+            version: 1,
+        }];
+        context.goal.success_criteria = vec!["criterion".to_owned()];
+        context.identity_context.personality_traits = vec!["focused".to_owned()];
+        context.identity_context.preferences =
+            HashMap::from([("tone".to_owned(), "concise".to_owned())]);
+        context.parent_context = Some(Box::new(sample_context()));
+
+        let target_size = 0;
+        assert!(PerceptionAssembler::estimate_tokens(&context) > target_size);
+
+        let mut removed_stages = Vec::new();
+        loop {
+            if let Some(fragment) = remove_for_compaction(&mut context, TrimmingPolicy::ByRelevance)
+            {
+                let stage = if fragment.starts_with("WM:") {
+                    "working_memory"
+                } else if fragment.starts_with("Episodic:") {
+                    "episodic"
+                } else {
+                    "semantic"
+                };
+                removed_stages.push(stage);
+                continue;
+            }
+            if !context.active_procedures.is_empty() {
+                context.active_procedures.remove(0);
+                removed_stages.push("procedures");
+                continue;
+            }
+            if !context.goal.success_criteria.is_empty() {
+                context.goal.success_criteria.remove(0);
+                removed_stages.push("success_criteria");
+                continue;
+            }
+            if !context.identity_context.personality_traits.is_empty() {
+                context.identity_context.personality_traits.remove(0);
+                removed_stages.push("personality_traits");
+                continue;
+            }
+            if let Some((key, _)) = context
+                .identity_context
+                .preferences
+                .iter()
+                .next()
+                .map(|(key, value)| (key.clone(), value.clone()))
+            {
+                context.identity_context.preferences.remove(&key);
+                removed_stages.push("preferences");
+                continue;
+            }
+            if context.parent_context.is_some() {
+                context.parent_context = None;
+                removed_stages.push("parent_context");
+                continue;
+            }
+            break;
+        }
+
+        assert_eq!(
+            removed_stages,
+            vec![
+                "working_memory",
+                "episodic",
+                "semantic",
+                "procedures",
+                "success_criteria",
+                "personality_traits",
+                "preferences",
+                "parent_context",
+            ]
+        );
+        assert!(remove_for_compaction(&mut context, TrimmingPolicy::ByRelevance).is_none());
+        assert!(context.working_memory.is_empty());
+        assert!(context.relevant_episodic.is_empty());
+        assert!(context.relevant_semantic.is_empty());
+        assert!(context.active_procedures.is_empty());
+        assert!(context.goal.success_criteria.is_empty());
+        assert!(context.identity_context.personality_traits.is_empty());
+        assert!(context.identity_context.preferences.is_empty());
+        assert!(context.parent_context.is_none());
+        assert!(PerceptionAssembler::estimate_tokens(&context) > target_size);
+    }
+
+    #[test]
+    fn compact_removes_procedures_after_memory() {
+        let mut context = sample_context();
+        context.working_memory.clear();
+        context.relevant_episodic.clear();
+        context.relevant_semantic.clear();
+        context.active_procedures = vec![ProcedureRef {
+            id: "p1".to_owned(),
+            name: "Procedure".to_owned(),
+            version: 1,
+        }];
+
+        let before = PerceptionAssembler::estimate_tokens(&context);
+        let compactor = ContextCompactor::new(before.saturating_sub(1), before.saturating_sub(1));
+        let compacted = compactor.compact(context, TrimmingPolicy::ByRelevance);
+
+        assert!(compacted.active_procedures.is_empty());
+    }
+
+    #[test]
+    fn compact_removes_success_criteria_after_procedures() {
+        let mut context = sample_context();
+        context.working_memory.clear();
+        context.relevant_episodic.clear();
+        context.relevant_semantic.clear();
+        context.active_procedures.clear();
+        context.goal.success_criteria = vec!["criterion".to_owned()];
+
+        let before = PerceptionAssembler::estimate_tokens(&context);
+        let compactor = ContextCompactor::new(before.saturating_sub(1), before.saturating_sub(1));
+        let compacted = compactor.compact(context, TrimmingPolicy::ByRelevance);
+
+        assert!(compacted.goal.success_criteria.is_empty());
+    }
+
+    #[test]
+    fn compact_removes_personality_traits_after_criteria() {
+        let mut context = sample_context();
+        context.working_memory.clear();
+        context.relevant_episodic.clear();
+        context.relevant_semantic.clear();
+        context.active_procedures.clear();
+        context.goal.success_criteria.clear();
+        context.identity_context.personality_traits = vec!["focused".to_owned()];
+
+        let before = PerceptionAssembler::estimate_tokens(&context);
+        let compactor = ContextCompactor::new(before.saturating_sub(1), before.saturating_sub(1));
+        let compacted = compactor.compact(context, TrimmingPolicy::ByRelevance);
+
+        assert!(compacted.identity_context.personality_traits.is_empty());
+    }
+
+    #[test]
+    fn compact_removes_preferences_after_traits() {
+        let mut context = sample_context();
+        context.working_memory.clear();
+        context.relevant_episodic.clear();
+        context.relevant_semantic.clear();
+        context.active_procedures.clear();
+        context.goal.success_criteria.clear();
+        context.identity_context.personality_traits.clear();
+
+        let before = PerceptionAssembler::estimate_tokens(&context);
+        let compactor = ContextCompactor::new(before.saturating_sub(1), before.saturating_sub(1));
+        let compacted = compactor.compact(context, TrimmingPolicy::ByRelevance);
+
+        assert!(compacted.identity_context.preferences.is_empty());
+    }
+
+    #[test]
+    fn compact_drops_parent_context_last() {
+        let mut context = sample_context();
+        context.working_memory.clear();
+        context.relevant_episodic.clear();
+        context.relevant_semantic.clear();
+        context.active_procedures.clear();
+        context.goal.success_criteria.clear();
+        context.identity_context.personality_traits.clear();
+        context.identity_context.preferences.clear();
+        context.parent_context = Some(Box::new(sample_context()));
+
+        let before = PerceptionAssembler::estimate_tokens(&context);
+        let compactor = ContextCompactor::new(before.saturating_sub(1), before.saturating_sub(1));
+        let compacted = compactor.compact(context, TrimmingPolicy::ByRelevance);
+
+        assert!(compacted.parent_context.is_none());
+    }
+
+    #[test]
+    fn compact_creates_summary_entry() {
+        let mut context = sample_context();
+        context.relevant_episodic.clear();
+        context.relevant_semantic.clear();
+        context.working_memory = vec![
+            WorkingMemoryEntry {
+                key: "large".to_owned(),
+                value: "x".repeat(2_000),
+                relevance: 0.1,
+            },
+            WorkingMemoryEntry {
+                key: "keep".to_owned(),
+                value: "small".to_owned(),
+                relevance: 0.9,
+            },
+        ];
+
+        let before = PerceptionAssembler::estimate_tokens(&context);
+        let compactor = ContextCompactor::new(before.saturating_sub(1), before / 2);
+        let compacted = compactor.compact(context, TrimmingPolicy::ByRelevance);
+
+        assert!(compacted
+            .working_memory
+            .iter()
+            .any(|entry| entry.key == "compacted_context_summary"));
+    }
+
+    #[test]
+    fn compact_limits_summary_fragments() {
+        let mut context = sample_context();
+        let removed: Vec<String> = (0..10).map(|index| format!("removed-{index}")).collect();
+
+        upsert_summary_entry(&mut context, &removed);
+
+        let summary = context
+            .working_memory
+            .iter()
+            .find(|entry| entry.key == "compacted_context_summary")
+            .expect("summary exists")
+            .value
+            .clone();
+        assert!(summary.contains("removed-0"));
+        assert!(summary.contains("removed-5"));
+        assert!(summary.contains("...and 4 more entries"));
+        assert!(!summary.contains("removed-9"));
+    }
+
+    #[test]
+    fn shrink_summary_truncates_long_summary() {
+        let mut context = sample_context();
+        context.working_memory = vec![WorkingMemoryEntry {
+            key: "compacted_context_summary".to_owned(),
+            value: "x".repeat(120),
+            relevance: 0.35,
+        }];
+
+        let shrunk = shrink_summary_entry(&mut context);
+
+        assert!(shrunk);
+        assert_eq!(context.working_memory[0].value.len(), 80);
+    }
+
+    #[test]
+    fn keyword_overlap_counts_matching_terms() {
+        assert_eq!(keyword_overlap("reply to email", "email reply sent"), 2);
+        assert_eq!(keyword_overlap("reply to email", "weather forecast"), 0);
+    }
+
+    #[test]
+    fn keyword_overlap_handles_empty_strings() {
+        assert_eq!(keyword_overlap("", "anything"), 0);
+        assert_eq!(keyword_overlap("something", ""), 0);
+    }
+
+    #[test]
+    fn normalized_terms_strips_punctuation() {
+        let mut terms = normalized_terms("Hello, World! foo-bar");
+        terms.sort();
+
+        assert_eq!(terms, vec!["foobar", "hello", "world"]);
+    }
 }
