@@ -569,7 +569,7 @@ impl TuiApp {
     }
 
     fn show_status(&self) {
-        let model = self.router.active_model().unwrap_or_default();
+        let model = self.current_model();
         let status = self.loop_engine.status(current_time_ms());
         let providers = self.auth_manager.providers();
         println!(
@@ -584,6 +584,10 @@ impl TuiApp {
         println!("  providers: {}", providers.join(", "));
         println!("  tokens:    {} used", status.tokens_used);
         println!("  budget:    {} tokens remaining", status.remaining.tokens);
+    }
+
+    fn current_model(&self) -> &str {
+        self.router.active_model().unwrap_or_default()
     }
 
     fn clear_screen(&self) -> Result<(), TuiError> {
@@ -1921,6 +1925,12 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct ModelEchoProvider {
+        provider_name: String,
+        models: Vec<String>,
+    }
+
+    #[derive(Debug)]
     struct StreamingTestProvider {
         provider_name: String,
         model: String,
@@ -1938,6 +1948,53 @@ mod tests {
     struct FailingCompletionProvider {
         provider_name: String,
         model: String,
+    }
+
+    #[async_trait]
+    impl fx_llm::CompletionProvider for ModelEchoProvider {
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> Result<fx_llm::CompletionResponse, fx_llm::ProviderError> {
+            let response = format!(
+                "{{\"action\":{{\"Respond\":{{\"text\":\"{}\"}}}},\"rationale\":\"echo\",\"confidence\":0.9,\"expected_outcome\":null,\"sub_goals\":[]}}",
+                request.model
+            );
+            Ok(fx_llm::CompletionResponse {
+                content: vec![ContentBlock::Text { text: response }],
+                tool_calls: Vec::new(),
+                usage: None,
+                stop_reason: Some("end_turn".to_string()),
+            })
+        }
+
+        async fn complete_stream(
+            &self,
+            request: CompletionRequest,
+        ) -> Result<fx_llm::CompletionStream, fx_llm::ProviderError> {
+            let chunk = Ok(fx_llm::StreamChunk {
+                delta_content: Some(format!(
+                    "{{\"action\":{{\"Respond\":{{\"text\":\"{}\"}}}},\"rationale\":\"echo\",\"confidence\":0.9,\"expected_outcome\":null,\"sub_goals\":[]}}",
+                    request.model
+                )),
+                tool_use_deltas: Vec::new(),
+                usage: None,
+                stop_reason: Some("end_turn".to_string()),
+            });
+            Ok(Box::pin(futures::stream::iter(vec![chunk])))
+        }
+
+        fn name(&self) -> &str {
+            &self.provider_name
+        }
+
+        fn supported_models(&self) -> Vec<String> {
+            self.models.clone()
+        }
+
+        fn capabilities(&self) -> fx_llm::ProviderCapabilities {
+            mock_provider_capabilities()
+        }
     }
 
     #[async_trait]
@@ -2088,6 +2145,25 @@ mod tests {
         );
 
         TuiApp::new(auth_manager, router, build_loop_engine())
+    }
+
+    fn app_with_two_models() -> TuiApp {
+        let mut router = ModelRouter::new();
+        router.register_provider_with_auth(
+            Box::new(ModelEchoProvider {
+                provider_name: "echo-provider".to_string(),
+                models: vec![
+                    "claude-sonnet-4-6-20250929".to_string(),
+                    "gpt-5-mini".to_string(),
+                ],
+            }),
+            "test",
+        );
+        router
+            .set_active("gpt-5-mini")
+            .expect("set initial active model");
+
+        TuiApp::new(AuthManager::new(), router, build_loop_engine())
     }
 
     fn router_with_completion_response(
@@ -2493,6 +2569,25 @@ mod tests {
         assert!(
             matches!(error, TuiError::Auth(message) if message.contains("stdin closed unexpectedly"))
         );
+    }
+
+    #[tokio::test]
+    async fn status_reflects_switched_model() {
+        let mut app = app_with_two_models();
+
+        app.handle_command("/model claude-sonnet-4-6").await.unwrap();
+
+        assert_eq!(app.current_model(), "claude-sonnet-4-6-20250929");
+    }
+
+    #[tokio::test]
+    async fn handle_message_uses_current_active_model() {
+        let mut app = app_with_two_models();
+
+        app.handle_command("/model claude-sonnet-4-6").await.unwrap();
+        let rendered = app.handle_message("hello").await.expect("loop response");
+
+        assert!(rendered.contains("claude-sonnet-4-6-20250929"));
     }
 
     #[tokio::test]
