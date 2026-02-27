@@ -2928,6 +2928,35 @@ mod tests {
         );
     }
 
+
+    #[test]
+    fn default_model_prefers_opus_when_no_sonnet() {
+        let model_ids = vec![
+            "anthropic/claude-3-haiku".to_string(),
+            "anthropic/claude-opus-4".to_string(),
+            "openai/gpt-4o".to_string(),
+        ];
+
+        assert_eq!(
+            preferred_default_model(&model_ids),
+            Some("anthropic/claude-opus-4")
+        );
+    }
+
+    #[test]
+    fn default_model_prefers_gpt4o_over_old_sonnet() {
+        let model_ids = vec![
+            "anthropic/claude-3-haiku".to_string(),
+            "openai/gpt-4o".to_string(),
+            "anthropic/claude-3.5-sonnet".to_string(),
+        ];
+        // gpt-4o pattern comes before generic "sonnet" in PREFERRED_MODEL_PATTERNS
+        assert_eq!(
+            preferred_default_model(&model_ids),
+            Some("openai/gpt-4o")
+        );
+    }
+
     #[test]
     fn default_model_falls_back_to_highest_version() {
         let model_ids = vec![
