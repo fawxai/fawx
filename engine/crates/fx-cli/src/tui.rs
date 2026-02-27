@@ -53,6 +53,20 @@ const DEFAULT_OPENROUTER_MODELS: &[&str] = &[
     "google/gemini-2.0-flash-001",
 ];
 
+fn supports_truecolor() -> bool {
+    std::env::var("COLORTERM")
+        .map(|value| value == "truecolor" || value == "24bit")
+        .unwrap_or(false)
+}
+
+fn theme_color(r: u8, g: u8, b: u8, fallback_256: u8) -> style::Color {
+    if supports_truecolor() {
+        style::Color::Rgb { r, g, b }
+    } else {
+        style::Color::AnsiValue(fallback_256)
+    }
+}
+
 /// The main TUI application loop.
 pub struct TuiApp {
     router: ModelRouter,
@@ -82,14 +96,7 @@ impl TuiApp {
 
         let mut line = String::new();
         while self.running {
-            print!(
-                "{}",
-                "you \u{203a} ".with(style::Color::Rgb {
-                    r: 255,
-                    g: 204,
-                    b: 0,
-                })
-            );
+            print!("{}", "you \u{203a} ".with(theme_color(255, 204, 0, 220)));
             io::stdout().flush().map_err(TuiError::Io)?;
 
             line.clear();
@@ -131,16 +138,8 @@ impl TuiApp {
             eprintln!("failed to clear terminal line: {error}");
         }
 
-        let amber = style::Color::Rgb {
-            r: 255,
-            g: 165,
-            b: 0,
-        };
-        let burnt = style::Color::Rgb {
-            r: 210,
-            g: 112,
-            b: 10,
-        };
+        let amber = theme_color(255, 165, 0, 214);
+        let burnt = theme_color(210, 112, 10, 166);
 
         println!();
         if !try_render_logo_external() {
@@ -412,11 +411,9 @@ impl TuiApp {
         println!();
         print!(
             "{} ",
-            "assistant \u{203a}".bold().with(style::Color::Rgb {
-                r: 255,
-                g: 165,
-                b: 0,
-            })
+            "assistant \u{203a}"
+                .bold()
+                .with(theme_color(255, 165, 0, 214))
         );
         println!("{response}");
         println!();
@@ -516,14 +513,7 @@ impl TuiApp {
     }
 
     fn show_help(&self) {
-        println!(
-            "{}",
-            "Commands".bold().with(style::Color::Rgb {
-                r: 255,
-                g: 165,
-                b: 0,
-            })
-        );
+        println!("{}", "Commands".bold().with(theme_color(255, 165, 0, 214)));
         println!("  /model         List models and switch active model");
         println!("  /model <name>  Switch to a specific model");
         println!("  /auth          Show credentials / run auth wizard");
@@ -601,11 +591,7 @@ impl TuiApp {
         let providers = self.auth_manager.providers();
         println!(
             "{}",
-            "Fawx Status".bold().with(style::Color::Rgb {
-                r: 255,
-                g: 165,
-                b: 0,
-            })
+            "Fawx Status".bold().with(theme_color(255, 165, 0, 214))
         );
         println!("  model:     {model}");
         println!("  providers: {}", providers.join(", "));
@@ -2534,6 +2520,42 @@ mod tests {
         let _client_id = ScopedEnvVar::set("FAWX_OPENAI_CLIENT_ID", "   ");
 
         assert_eq!(openai_oauth_client_id(), fx_kernel::oauth::OPENAI_CLIENT_ID);
+    }
+
+    #[tokio::test]
+    async fn supports_truecolor_returns_false_without_env() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let previous = std::env::var_os("COLORTERM");
+        std::env::remove_var("COLORTERM");
+
+        assert!(!supports_truecolor());
+
+        if let Some(value) = previous {
+            std::env::set_var("COLORTERM", value);
+        }
+    }
+
+    #[tokio::test]
+    async fn theme_color_uses_rgb_when_truecolor() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let _color_term = ScopedEnvVar::set("COLORTERM", "truecolor");
+
+        assert_eq!(
+            theme_color(255, 204, 0, 220),
+            style::Color::Rgb {
+                r: 255,
+                g: 204,
+                b: 0
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn theme_color_uses_256_fallback() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let _color_term = ScopedEnvVar::set("COLORTERM", "ansi");
+
+        assert_eq!(theme_color(255, 204, 0, 220), style::Color::AnsiValue(220));
     }
 
     #[test]
