@@ -2056,7 +2056,7 @@ mod tests {
         assert!(verification
             .discrepancies
             .iter()
-            .any(|item| { item.contains("expected outcome not reflected in action response") }));
+            .any(|item| item.contains("expected outcome not reflected in action response")));
     }
 
     #[tokio::test]
@@ -2098,7 +2098,7 @@ mod tests {
         assert!(verification
             .discrepancies
             .iter()
-            .any(|item| { item.contains("expected outcome not reflected in action response") }));
+            .any(|item| item.contains("expected outcome not reflected in action response")));
     }
 
     #[test]
