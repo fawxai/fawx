@@ -3,9 +3,14 @@
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Maximum model age in seconds (~90 days). Models older than this are filtered out.
+const MODEL_AGE_CUTOFF_SECS: u64 = 90 * 24 * 60 * 60;
+/// Minimum input price per token (USD) to filter out weak-tier models.
+/// $3/M tokens = 0.000003 per token. Roughly sonnet-tier floor.
+const MIN_INPUT_PRICE_PER_TOKEN: f64 = 0.000003;
 const ANTHROPIC_MODELS_ENDPOINT: &str = "https://api.anthropic.com/v1/models";
 const OPENAI_MODELS_ENDPOINT: &str = "https://api.openai.com/v1/models";
 const OPENROUTER_MODELS_ENDPOINT: &str = "https://openrouter.ai/api/v1/models";
@@ -194,6 +199,18 @@ impl ModelCatalog {
     }
 
     fn parse_models(provider: &str, json_body: &str) -> Result<Vec<CatalogModel>, String> {
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        Self::parse_models_with_now(provider, json_body, now_secs)
+    }
+
+    fn parse_models_with_now(
+        provider: &str,
+        json_body: &str,
+        now_secs: u64,
+    ) -> Result<Vec<CatalogModel>, String> {
         let provider = normalize_provider(provider);
         let parsed = serde_json::from_str::<ModelsEnvelope>(json_body)
             .map_err(|error| format!("invalid models payload: {error}"))?;
@@ -208,6 +225,15 @@ impl ModelCatalog {
 
             if !Self::is_chat_capable(provider.as_str(), &id) {
                 continue;
+            }
+
+            if provider == "openrouter" {
+                if !is_model_recent_enough(model.created, now_secs) {
+                    continue;
+                }
+                if !is_model_capable_enough(&model.pricing) {
+                    continue;
+                }
             }
 
             if !seen.insert(id.clone()) {
@@ -302,6 +328,24 @@ impl Default for ModelCatalog {
     }
 }
 
+fn is_model_recent_enough(created: Option<u64>, now_secs: u64) -> bool {
+    let Some(created) = created else {
+        return true; // No timestamp = allow (don't block on missing metadata)
+    };
+    let age_secs = now_secs.saturating_sub(created);
+    age_secs <= MODEL_AGE_CUTOFF_SECS
+}
+
+fn is_model_capable_enough(pricing: &Option<ModelPricing>) -> bool {
+    let Some(pricing) = pricing else {
+        return true; // No pricing = allow (direct providers don't have pricing)
+    };
+    let Some(prompt_price) = pricing.prompt else {
+        return true; // No prompt price = allow
+    };
+    prompt_price >= MIN_INPUT_PRICE_PER_TOKEN
+}
+
 fn normalize_provider(provider: &str) -> String {
     provider.trim().to_ascii_lowercase()
 }
@@ -329,6 +373,44 @@ struct ModelEntry {
     display_name: Option<String>,
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    created: Option<u64>,
+    #[serde(default)]
+    pricing: Option<ModelPricing>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelPricing {
+    #[serde(default, deserialize_with = "deserialize_price_value")]
+    prompt: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum PriceValue {
+    String(String),
+    Number(f64),
+}
+
+fn deserialize_price_value<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: Option<PriceValue> = Option::deserialize(deserializer)?;
+    Ok(value.and_then(parse_price_value))
+}
+
+fn parse_price_value(value: PriceValue) -> Option<f64> {
+    match value {
+        PriceValue::Number(num) => Some(num),
+        PriceValue::String(raw) => match raw.parse::<f64>() {
+            Ok(parsed) => Some(parsed),
+            Err(error) => {
+                eprintln!("warning: malformed model pricing '{}': {error}", raw);
+                None
+            }
+        },
+    }
 }
 
 #[cfg(test)]
@@ -617,5 +699,163 @@ mod tests {
         assert!(models.is_empty());
         let cached = catalog.cache.get("openai").expect("cache entry");
         assert!(cached.models.is_empty());
+    }
+
+    #[test]
+    fn is_model_recent_enough_allows_recent_models() {
+        let now_secs = MODEL_AGE_CUTOFF_SECS + 1_000;
+        let recent = now_secs - (30 * 24 * 60 * 60);
+        assert!(is_model_recent_enough(Some(recent), now_secs));
+    }
+
+    #[test]
+    fn is_model_recent_enough_filters_old_models() {
+        let now_secs = (120 * 24 * 60 * 60) + 1_000;
+        let old = now_secs - (120 * 24 * 60 * 60);
+        assert!(!is_model_recent_enough(Some(old), now_secs));
+    }
+
+    #[test]
+    fn is_model_recent_enough_allows_missing_timestamp() {
+        assert!(is_model_recent_enough(None, 123));
+    }
+
+    #[test]
+    fn is_model_recent_enough_allows_age_exactly_at_cutoff() {
+        let now_secs = MODEL_AGE_CUTOFF_SECS + 42;
+        let at_cutoff = now_secs - MODEL_AGE_CUTOFF_SECS;
+        assert!(is_model_recent_enough(Some(at_cutoff), now_secs));
+    }
+
+    #[test]
+    fn is_model_recent_enough_allows_future_timestamp() {
+        let now_secs = 1_000;
+        let future = now_secs + 500;
+        assert!(is_model_recent_enough(Some(future), now_secs));
+    }
+
+    #[test]
+    fn is_model_capable_enough_allows_sonnet_tier() {
+        let pricing = ModelPricing {
+            prompt: Some(0.000006), // $6/M — sonnet tier
+        };
+        assert!(is_model_capable_enough(&Some(pricing)));
+    }
+
+    #[test]
+    fn is_model_capable_enough_filters_cheap_models() {
+        let pricing = ModelPricing {
+            prompt: Some(0.0000005), // $0.50/M — below threshold
+        };
+        assert!(!is_model_capable_enough(&Some(pricing)));
+    }
+
+    #[test]
+    fn is_model_capable_enough_allows_price_exactly_at_threshold() {
+        let pricing = ModelPricing {
+            prompt: Some(MIN_INPUT_PRICE_PER_TOKEN),
+        };
+        assert!(is_model_capable_enough(&Some(pricing)));
+    }
+
+    #[test]
+    fn is_model_capable_enough_allows_missing_pricing() {
+        assert!(is_model_capable_enough(&None));
+    }
+
+    #[test]
+    fn is_model_capable_enough_allows_missing_prompt_price() {
+        let pricing = ModelPricing { prompt: None };
+        assert!(is_model_capable_enough(&Some(pricing)));
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct PricingEnvelope {
+        pricing: ModelPricing,
+    }
+
+    #[test]
+    fn deserialize_price_value_supports_string_numeric_and_malformed_inputs() {
+        let from_string: PricingEnvelope =
+            serde_json::from_str(r#"{"pricing":{"prompt":"0.000006"}}"#).unwrap();
+        assert_eq!(from_string.pricing.prompt, Some(0.000006));
+
+        let from_number: PricingEnvelope =
+            serde_json::from_str(r#"{"pricing":{"prompt":0.000007}}"#).unwrap();
+        assert_eq!(from_number.pricing.prompt, Some(0.000007));
+
+        let malformed: PricingEnvelope =
+            serde_json::from_str(r#"{"pricing":{"prompt":"not-a-number"}}"#).unwrap();
+        assert_eq!(malformed.pricing.prompt, None);
+    }
+
+    #[test]
+    fn parse_models_openrouter_filters_old_and_cheap_models() {
+        let now_secs = 1_900_000_000_u64;
+        let recent = now_secs - (30 * 24 * 60 * 60);
+        let old = now_secs - (120 * 24 * 60 * 60);
+        let json = format!(
+            r#"{{
+                "data": [
+                    {{
+                        "id": "anthropic/claude-sonnet-4",
+                        "created": {recent},
+                        "pricing": {{"prompt": "0.000006"}}
+                    }},
+                    {{
+                        "id": "anthropic/claude-3.5-sonnet",
+                        "created": {old},
+                        "pricing": {{"prompt": "0.000006"}}
+                    }},
+                    {{
+                        "id": "some-provider/cheap-model",
+                        "created": {recent},
+                        "pricing": {{"prompt": "0.0000001"}}
+                    }}
+                ]
+            }}"#
+        );
+
+        let parsed = ModelCatalog::parse_models_with_now("openrouter", &json, now_secs).unwrap();
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].id, "anthropic/claude-sonnet-4");
+    }
+
+    #[test]
+    fn parse_models_openrouter_allows_model_with_malformed_price() {
+        let now_secs = 1_900_000_000_u64;
+        let created_recent = now_secs - (30 * 24 * 60 * 60);
+        let json = format!(
+            r#"{{
+                "data": [
+                    {{
+                        "id": "anthropic/claude-sonnet-4",
+                        "created": {created_recent},
+                        "pricing": {{"prompt": "bad-number"}}
+                    }}
+                ]
+            }}"#
+        );
+
+        let parsed = ModelCatalog::parse_models_with_now("openrouter", &json, now_secs).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].id, "anthropic/claude-sonnet-4");
+    }
+
+    #[test]
+    fn parse_models_anthropic_ignores_age_and_pricing_filters() {
+        // Anthropic direct API models should not be filtered by age/pricing
+        let json = r#"{
+            "data": [
+                {
+                    "id": "claude-sonnet-4-20250514",
+                    "display_name": "Claude Sonnet 4"
+                }
+            ]
+        }"#;
+
+        let parsed = ModelCatalog::parse_models("anthropic", json).unwrap();
+        assert_eq!(parsed.len(), 1);
     }
 }
