@@ -17,12 +17,15 @@ use fx_llm::{
     OpenAiResponsesProvider, ProviderError, RouterError, StreamChunk,
 };
 use std::fmt;
+use std::future::Future;
 use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::oneshot;
+use tokio::time::{sleep, Duration};
 
 const BANNER_ART: &str = r#"   ___
   / _/__ __    ____  __
@@ -43,6 +46,7 @@ Be direct and factual. Do not paraphrase or summarize unless the output is very 
 const MAX_SYNTHESIS_INSTRUCTION_LENGTH: usize = 500;
 const DEFAULT_MAX_LOOP_ITERATIONS: u32 = 10;
 const MAX_HISTORY_MESSAGES: usize = 20;
+const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 const DEFAULT_ANTHROPIC_MODELS: &[&str] = &[
     "claude-sonnet-4-20250514",
@@ -57,6 +61,117 @@ const DEFAULT_OPENROUTER_MODELS: &[&str] = &[
     "anthropic/claude-3.5-sonnet",
     "google/gemini-2.0-flash-001",
 ];
+
+fn term_indicates_truecolor(term: &str) -> bool {
+    term.ends_with("-direct") || term == "xterm-direct" || term.contains("truecolor")
+}
+
+fn supports_truecolor() -> bool {
+    if let Ok(value) = std::env::var("COLORTERM") {
+        if value == "truecolor" || value == "24bit" {
+            return true;
+        }
+    }
+
+    if let Ok(term) = std::env::var("TERM") {
+        return term_indicates_truecolor(&term);
+    }
+
+    false
+}
+
+fn theme_color(r: u8, g: u8, b: u8, fallback_256: u8) -> style::Color {
+    if supports_truecolor() {
+        style::Color::Rgb { r, g, b }
+    } else {
+        style::Color::AnsiValue(fallback_256)
+    }
+}
+
+fn spinner_frame(index: usize) -> char {
+    SPINNER_FRAMES[index % SPINNER_FRAMES.len()]
+}
+
+fn clear_spinner_line() {
+    eprint!("\r\x1b[2K");
+    let _ = io::stderr().flush();
+}
+
+async fn run_thinking_spinner(mut stop_signal: oneshot::Receiver<()>) {
+    let mut frame_index = 0;
+    loop {
+        tokio::select! {
+            _ = &mut stop_signal => {
+                clear_spinner_line();
+                break;
+            }
+            _ = sleep(Duration::from_millis(80)) => {
+                eprint!("\r\x1b[2K{} thinking...", spinner_frame(frame_index));
+                let _ = io::stderr().flush();
+                frame_index += 1;
+            }
+        }
+    }
+}
+
+async fn run_with_thinking_spinner<F, T>(future: F) -> T
+where
+    F: Future<Output = T>,
+{
+    let (stop_tx, stop_rx) = oneshot::channel();
+    let spinner_task = tokio::spawn(run_thinking_spinner(stop_rx));
+    let result = future.await;
+    let _ = stop_tx.send(());
+    let _ = spinner_task.await;
+    result
+}
+
+fn preferred_default_model(model_ids: &[String]) -> Option<&str> {
+    preferred_sonnet_four(model_ids)
+        .or_else(|| preferred_sonnet(model_ids))
+        .or_else(|| highest_version_model(model_ids))
+        .or_else(|| model_ids.first().map(String::as_str))
+}
+
+fn preferred_sonnet_four(model_ids: &[String]) -> Option<&str> {
+    model_ids
+        .iter()
+        .find(|id| {
+            let lower = id.to_ascii_lowercase();
+            lower.contains("sonnet") && lower.contains('4')
+        })
+        .map(String::as_str)
+}
+
+fn preferred_sonnet(model_ids: &[String]) -> Option<&str> {
+    model_ids
+        .iter()
+        .find(|id| id.to_ascii_lowercase().contains("sonnet"))
+        .map(String::as_str)
+}
+
+fn highest_version_model(model_ids: &[String]) -> Option<&str> {
+    model_ids
+        .iter()
+        .filter_map(|id| {
+            let parts = version_parts(id);
+            if parts.is_empty() {
+                None
+            } else {
+                Some((id, parts))
+            }
+        })
+        .max_by(|(_, left), (_, right)| left.cmp(right))
+        .map(|(id, _)| id.as_str())
+}
+
+fn version_parts(model_id: &str) -> Vec<u32> {
+    model_id
+        .split(|ch: char| !ch.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<u32>().ok())
+        .collect()
+}
 
 /// The main TUI application loop.
 pub struct TuiApp {
@@ -87,14 +202,7 @@ impl TuiApp {
 
         let mut line = String::new();
         while self.running {
-            print!(
-                "{}",
-                "you \u{203a} ".with(style::Color::Rgb {
-                    r: 255,
-                    g: 204,
-                    b: 0,
-                })
-            );
+            print!("{}", "you \u{203a} ".with(theme_color(255, 204, 0, 220)));
             io::stdout().flush().map_err(TuiError::Io)?;
 
             line.clear();
@@ -136,16 +244,8 @@ impl TuiApp {
             eprintln!("failed to clear terminal line: {error}");
         }
 
-        let amber = style::Color::Rgb {
-            r: 255,
-            g: 165,
-            b: 0,
-        };
-        let burnt = style::Color::Rgb {
-            r: 210,
-            g: 112,
-            b: 10,
-        };
+        let amber = theme_color(255, 165, 0, 214);
+        let burnt = theme_color(210, 112, 10, 166);
 
         println!();
         if !try_render_logo_external() {
@@ -364,15 +464,16 @@ impl TuiApp {
             .to_string();
 
         let snapshot = self.build_perception_snapshot(input);
-        let loop_result = {
+        let loop_result = run_with_thinking_spinner(async {
             let router = &self.router;
             let llm = RouterLoopLlmProvider::new(router, active_model);
             let loop_engine = &mut self.loop_engine;
             loop_engine
                 .run_cycle(snapshot, &llm)
                 .await
-                .map_err(|error| TuiError::Loop(error.reason))?
-        };
+                .map_err(|error| TuiError::Loop(error.reason))
+        })
+        .await?;
 
         let response = render_loop_result(loop_result.clone());
         self.record_conversation_turn(input, loop_result_response_text(&loop_result));
@@ -455,11 +556,9 @@ impl TuiApp {
         println!();
         print!(
             "{} ",
-            "assistant \u{203a}".bold().with(style::Color::Rgb {
-                r: 255,
-                g: 165,
-                b: 0,
-            })
+            "assistant \u{203a}"
+                .bold()
+                .with(theme_color(255, 165, 0, 214))
         );
         println!("{response}");
         println!();
@@ -497,14 +596,15 @@ impl TuiApp {
             return;
         }
 
-        if let Some(model) = self
+        let model_ids = self
             .router
             .available_models()
             .into_iter()
-            .next()
             .map(|model| model.model_id)
-        {
-            if let Err(error) = self.router.set_active(&model) {
+            .collect::<Vec<_>>();
+
+        if let Some(model) = preferred_default_model(&model_ids) {
+            if let Err(error) = self.router.set_active(model) {
                 eprintln!("failed to set initial model {model}: {error}");
             }
         }
@@ -559,14 +659,7 @@ impl TuiApp {
     }
 
     fn show_help(&self) {
-        println!(
-            "{}",
-            "Commands".bold().with(style::Color::Rgb {
-                r: 255,
-                g: 165,
-                b: 0,
-            })
-        );
+        println!("{}", "Commands".bold().with(theme_color(255, 165, 0, 214)));
         println!("  /model         List models and switch active model");
         println!("  /model <name>  Switch to a specific model");
         println!("  /auth          Show credentials / run auth wizard");
@@ -645,11 +738,7 @@ impl TuiApp {
         let providers = self.auth_manager.providers();
         println!(
             "{}",
-            "Fawx Status".bold().with(style::Color::Rgb {
-                r: 255,
-                g: 165,
-                b: 0,
-            })
+            "Fawx Status".bold().with(theme_color(255, 165, 0, 214))
         );
         println!("  model:     {model}");
         println!("  providers: {}", providers.join(", "));
@@ -2612,6 +2701,113 @@ mod tests {
         let _client_id = ScopedEnvVar::set("FAWX_OPENAI_CLIENT_ID", "   ");
 
         assert_eq!(openai_oauth_client_id(), fx_kernel::oauth::OPENAI_CLIENT_ID);
+    }
+
+    #[tokio::test]
+    async fn supports_truecolor_returns_false_without_env() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let previous_colorterm = std::env::var_os("COLORTERM");
+        let previous_term = std::env::var_os("TERM");
+        std::env::remove_var("COLORTERM");
+        std::env::remove_var("TERM");
+
+        assert!(!supports_truecolor());
+
+        if let Some(value) = previous_colorterm {
+            std::env::set_var("COLORTERM", value);
+        }
+        if let Some(value) = previous_term {
+            std::env::set_var("TERM", value);
+        }
+    }
+
+    #[test]
+    fn term_direct_suffix_detected() {
+        assert!(term_indicates_truecolor("xterm-direct"));
+    }
+
+    #[test]
+    fn term_containing_direct_not_falsely_detected() {
+        assert!(!term_indicates_truecolor("my-indirect-term"));
+    }
+
+    #[tokio::test]
+    async fn supports_truecolor_detects_term_direct() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let _color_term = ScopedEnvVar::set("COLORTERM", "ansi");
+        let _term = ScopedEnvVar::set("TERM", "xterm-direct");
+
+        assert!(supports_truecolor());
+    }
+
+    #[tokio::test]
+    async fn theme_color_uses_rgb_when_truecolor() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let _color_term = ScopedEnvVar::set("COLORTERM", "truecolor");
+
+        assert_eq!(
+            theme_color(255, 204, 0, 220),
+            style::Color::Rgb {
+                r: 255,
+                g: 204,
+                b: 0
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn theme_color_uses_256_fallback() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let _color_term = ScopedEnvVar::set("COLORTERM", "ansi");
+        let _term = ScopedEnvVar::set("TERM", "xterm-256color");
+
+        assert_eq!(theme_color(255, 204, 0, 220), style::Color::AnsiValue(220));
+    }
+
+    #[test]
+    fn default_model_prefers_sonnet_4() {
+        let model_ids = vec![
+            "claude-3-haiku".to_string(),
+            "claude-3-7-sonnet-latest".to_string(),
+            "claude-sonnet-4-20250514".to_string(),
+            "gpt-5.3-codex".to_string(),
+        ];
+
+        assert_eq!(
+            preferred_default_model(&model_ids),
+            Some("claude-sonnet-4-20250514")
+        );
+    }
+
+    #[test]
+    fn default_model_falls_back_when_no_sonnet_models_exist() {
+        let model_ids = vec![
+            "llama-3".to_string(),
+            "gpt-3.5-turbo".to_string(),
+            "gpt-4o".to_string(),
+        ];
+
+        assert_eq!(preferred_default_model(&model_ids), Some("gpt-4o"));
+    }
+
+    #[test]
+    fn default_model_falls_back_to_first_when_versions_are_missing() {
+        let model_ids = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
+
+        assert_eq!(preferred_default_model(&model_ids), Some("alpha"));
+    }
+
+    #[tokio::test]
+    async fn spinner_stops_when_signaled() {
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let spinner = tokio::spawn(run_thinking_spinner(stop_rx));
+
+        let _ = stop_tx.send(());
+
+        tokio::time::timeout(Duration::from_millis(200), spinner)
+            .await
+            .expect("spinner should stop quickly")
+            .expect("spinner task should join");
     }
 
     #[test]
