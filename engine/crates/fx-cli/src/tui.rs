@@ -1394,13 +1394,18 @@ fn parse_oauth_error_reason(body: &str) -> Option<String> {
 
 fn format_oauth_error_body(body: &str) -> String {
     const MAX_ERROR_BODY_CHARS: usize = 300;
+    format_oauth_error_body_with_limit(body, MAX_ERROR_BODY_CHARS)
+}
+
+fn format_oauth_error_body_with_limit(body: &str, max_chars: usize) -> String {
     let trimmed = body.trim();
     if trimmed.is_empty() {
         return "<empty>".to_string();
     }
 
-    let mut out: String = trimmed.chars().take(MAX_ERROR_BODY_CHARS).collect();
-    if trimmed.chars().count() > MAX_ERROR_BODY_CHARS {
+    let mut chars = trimmed.chars();
+    let mut out: String = (&mut chars).take(max_chars).collect();
+    if chars.next().is_some() {
         out.push('…');
     }
     out
@@ -2610,6 +2615,16 @@ mod tests {
 
         assert!(
             matches!(error, TuiError::Auth(message) if message.contains("response_body=<html>gateway denied</html>"))
+        );
+    }
+
+    #[test]
+    fn parse_token_error_response_empty_body_reports_empty_marker() {
+        let status = reqwest::StatusCode::BAD_REQUEST;
+        let error = parse_token_error_response(status, "");
+
+        assert!(
+            matches!(error, TuiError::Auth(message) if message.contains("response_body=<empty>"))
         );
     }
 
