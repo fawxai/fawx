@@ -439,8 +439,10 @@ impl LoopEngine {
             discrepancies.push("action response does not align with intent action".to_string());
         }
 
-        if let Some(mismatch) = expected_outcome_mismatch(action, intent) {
-            discrepancies.push(mismatch);
+        if matches!(action.decision, Decision::UseTools(_)) {
+            if let Some(mismatch) = expected_outcome_mismatch(action, intent) {
+                discrepancies.push(mismatch);
+            }
         }
 
         Ok(build_verification(discrepancies))
@@ -1640,6 +1642,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_cycle_respond_with_expected_outcome_completes_in_single_iteration() {
+        let mut engine = default_engine(10);
+        let llm = MockLlm::with_completion_responses(vec![CompletionResponse {
+            content: Vec::new(),
+            tool_calls: vec![ToolCall {
+                id: "call-1".to_string(),
+                name: "emit_intent".to_string(),
+                arguments: serde_json::json!({
+                    "action": {"Respond": {"text": "4"}},
+                    "rationale": "compute simple arithmetic",
+                    "confidence": 0.98,
+                    "expected_outcome": "user receives the answer"
+                }),
+            }],
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let result = engine
+            .run_cycle(base_snapshot("what's 2+2?"), &llm)
+            .await
+            .expect("loop result");
+
+        assert!(matches!(
+            result,
+            LoopResult::Complete {
+                response,
+                iterations,
+                ..
+            } if response == "4" && iterations == 1
+        ));
+    }
+
+    #[tokio::test]
     async fn reason_parses_emit_intent_respond_and_delegate_variants() {
         let engine = default_engine(3);
         let respond_call = ToolCall {
@@ -1955,6 +1991,111 @@ mod tests {
         let verification = engine.verify(&action, &intent).await.expect("verification");
         assert!(!verification.outcome_matches_intent);
         assert!(!verification.discrepancies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn step_verify_ignores_expected_outcome_for_respond_decision() {
+        let engine = default_engine(3);
+        let action = ActionResult {
+            decision: Decision::Respond("4".to_string()),
+            tool_results: Vec::new(),
+            response_text: "4".to_string(),
+            tokens_used: TokenUsage::default(),
+        };
+        let intent = ReasonedIntent {
+            action: IntendedAction::Respond {
+                text: "4".to_string(),
+            },
+            rationale: "math answer".to_string(),
+            confidence: 0.99,
+            expected_outcome: Some(crate::types::ExpectedOutcome {
+                description: "user receives the answer".to_string(),
+                artifact_checks: Vec::new(),
+            }),
+            sub_goals: Vec::new(),
+        };
+
+        let verification = engine.verify(&action, &intent).await.expect("verification");
+        assert!(verification.outcome_matches_intent);
+        assert!(verification.discrepancies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn step_verify_checks_expected_outcome_for_use_tools_decision() {
+        let engine = default_engine(3);
+        let action = ActionResult {
+            decision: Decision::UseTools(vec![ToolCall {
+                id: "tool-1".to_string(),
+                name: "search".to_string(),
+                arguments: serde_json::json!({"q": "fawx"}),
+            }]),
+            tool_results: vec![ToolResult {
+                tool_name: "search".to_string(),
+                success: true,
+                output: "result".to_string(),
+            }],
+            response_text: "Tool run complete".to_string(),
+            tokens_used: TokenUsage::default(),
+        };
+        let intent = ReasonedIntent {
+            action: IntendedAction::Delegate {
+                skill_id: "search".to_string(),
+                params: HashMap::from([(String::from("q"), String::from("fawx"))]),
+            },
+            rationale: "need data".to_string(),
+            confidence: 0.9,
+            expected_outcome: Some(crate::types::ExpectedOutcome {
+                description: "contains MAGIC_OUTCOME".to_string(),
+                artifact_checks: Vec::new(),
+            }),
+            sub_goals: Vec::new(),
+        };
+
+        let verification = engine.verify(&action, &intent).await.expect("verification");
+        assert!(!verification.outcome_matches_intent);
+        assert!(verification
+            .discrepancies
+            .iter()
+            .any(|item| item.contains("expected outcome not reflected in action response")));
+    }
+
+    #[tokio::test]
+    async fn step_verify_checks_expected_outcome_for_delegate_with_tool_synthesis() {
+        let engine = default_engine(3);
+        let action = ActionResult {
+            decision: Decision::UseTools(vec![ToolCall {
+                id: "tool-1".to_string(),
+                name: "search".to_string(),
+                arguments: serde_json::json!({"q": "delegate intent"}),
+            }]),
+            tool_results: vec![ToolResult {
+                tool_name: "search".to_string(),
+                success: true,
+                output: "delegate tool output".to_string(),
+            }],
+            response_text: "Synthesized summary without the expected marker".to_string(),
+            tokens_used: TokenUsage::default(),
+        };
+        let intent = ReasonedIntent {
+            action: IntendedAction::Delegate {
+                skill_id: "search".to_string(),
+                params: HashMap::from([(String::from("q"), String::from("delegate intent"))]),
+            },
+            rationale: "delegate and summarize".to_string(),
+            confidence: 0.9,
+            expected_outcome: Some(crate::types::ExpectedOutcome {
+                description: "contains NEVER_PRESENT_EXPECTED_OUTCOME".to_string(),
+                artifact_checks: Vec::new(),
+            }),
+            sub_goals: Vec::new(),
+        };
+
+        let verification = engine.verify(&action, &intent).await.expect("verification");
+        assert!(!verification.outcome_matches_intent);
+        assert!(verification
+            .discrepancies
+            .iter()
+            .any(|item| item.contains("expected outcome not reflected in action response")));
     }
 
     #[test]
