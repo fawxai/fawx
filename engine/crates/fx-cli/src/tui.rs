@@ -28,6 +28,7 @@ const BANNER_ART: &str = r#"   ___
   / _/__ __    ____  __
  / _/ _ `/ |/|/ /\ \/ /
 /_/ \_,_/|__,__/ /_/\_\"#;
+#[allow(dead_code)]
 const FAWX_LOGO: &[u8] = include_bytes!("../../../../scripts/fawx.png");
 
 const DEFAULT_AUTH_FILE: &str = ".fawx/auth.json";
@@ -146,8 +147,10 @@ impl TuiApp {
         };
 
         println!();
-        for line in BANNER_ART.lines() {
-            println!("{}", line.bold().with(amber));
+        if !try_render_logo_external() {
+            for line in BANNER_ART.lines() {
+                println!("{}", line.bold().with(amber));
+            }
         }
         println!();
         println!(
@@ -597,6 +600,118 @@ impl TuiApp {
             }),
         }
     }
+}
+
+/// Try to render the Fawx logo using ascii-image-converter.
+/// Returns true if successful, false if the tool isn't available or fails.
+fn try_render_logo_external() -> bool {
+    use std::process::Command;
+
+    // Check if ascii-image-converter is available
+    let which = Command::new("which")
+        .arg("ascii-image-converter")
+        .output();
+    if !which.as_ref().is_ok_and(|o| o.status.success()) {
+        return false;
+    }
+
+    // Find the logo: check relative to executable, then common paths
+    let logo_path = find_logo_path();
+    let path = match logo_path {
+        Some(p) => p,
+        None => return false,
+    };
+
+    // Detect terminal width for sizing
+    let cols = terminal_cols().unwrap_or(80);
+    let width = cols.saturating_sub(4).clamp(20, 120);
+
+    let result = Command::new("ascii-image-converter")
+        .arg(&path)
+        .arg("-C")      // color
+        .arg("-b")      // braille mode
+        .arg("--dither")
+        .arg("--threshold")
+        .arg("28")
+        .arg("-W")
+        .arg(width.to_string())
+        .output();
+
+    match result {
+        Ok(output) if output.status.success() => {
+            let rendered = String::from_utf8_lossy(&output.stdout);
+            print!("{rendered}");
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Find the fawx.png logo in common locations.
+fn find_logo_path() -> Option<std::path::PathBuf> {
+    // Relative to the executable
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            // Check alongside binary
+            let candidate = dir.join("fawx.png");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+            // Check ../../scripts/fawx.png (dev layout)
+            let candidate = dir
+                .join("..")
+                .join("..")
+                .join("scripts")
+                .join("fawx.png");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    // Check relative to cwd
+    let candidate = std::path::PathBuf::from("scripts/fawx.png");
+    if candidate.exists() {
+        return Some(candidate);
+    }
+    None
+}
+
+/// Get terminal column count via ioctl.
+fn terminal_cols() -> Option<u32> {
+    #[cfg(unix)]
+    {
+        #[repr(C)]
+        struct WinSize {
+            ws_row: u16,
+            ws_col: u16,
+            ws_xpixel: u16,
+            ws_ypixel: u16,
+        }
+
+        #[cfg(target_os = "linux")]
+        const TIOCGWINSZ_VAL: u64 = 0x5413;
+        #[cfg(target_os = "macos")]
+        const TIOCGWINSZ_VAL: u64 = 0x40087468;
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        const TIOCGWINSZ_VAL: u64 = 0x5413;
+
+        unsafe extern "C" {
+            fn ioctl(fd: i32, request: u64, ...) -> i32;
+        }
+
+        use std::mem::MaybeUninit;
+        // SAFETY: valid pointer, only read on success
+        unsafe {
+            let mut ws = MaybeUninit::<WinSize>::uninit();
+            if ioctl(1, TIOCGWINSZ_VAL, ws.as_mut_ptr()) == 0 {
+                let ws = ws.assume_init();
+                if ws.ws_col > 0 {
+                    return Some(ws.ws_col as u32);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Build a loop engine with sensible defaults for the TUI shell.
