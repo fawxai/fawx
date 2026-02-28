@@ -25,8 +25,8 @@ use fx_kernel::oauth::{PkceFlow, TokenExchangeRequest, TokenResponse};
 use fx_kernel::signals::{LoopStep, Signal, SignalCollector};
 use fx_kernel::types::PerceptionSnapshot;
 use fx_llm::{
-    AnthropicProvider, CompletionRequest, Message, ModelCatalog, ModelRouter, OpenAiProvider,
-    OpenAiResponsesProvider, ProviderError, RouterError, StreamChunk,
+    AnthropicProvider, CompletionRequest, Message, ModelCatalog, ModelInfo, ModelRouter,
+    OpenAiProvider, OpenAiResponsesProvider, ProviderError, RouterError, StreamChunk,
 };
 use fx_loadable::SkillRegistry;
 use rustyline::completion::{Completer, Pair};
@@ -404,9 +404,18 @@ const TUI_COMMANDS: &[&str] = &[
 const PROMPT_COLOR_START: &str = "\x1b[38;2;255;204;0m";
 const PROMPT_COLOR_END: &str = "\x1b[0m";
 
-#[derive(Default)]
 struct FawxReadlineHelper {
     hinter: HistoryHinter,
+    model_ids: Arc<Mutex<Vec<String>>>,
+}
+
+impl Default for FawxReadlineHelper {
+    fn default() -> Self {
+        Self {
+            hinter: HistoryHinter {},
+            model_ids: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
 }
 
 impl Helper for FawxReadlineHelper {}
@@ -434,6 +443,15 @@ impl Completer for FawxReadlineHelper {
         _context: &Context<'_>,
     ) -> rustyline::Result<(usize, Vec<Pair>)> {
         let line_end = pos.min(line.len());
+
+        // Complete model IDs after "/model "
+        if let Some(model_prefix) = line[..line_end].strip_prefix("/model ") {
+            return Ok((
+                "/model ".len(),
+                model_completion_matches(model_prefix, &self.model_ids),
+            ));
+        }
+
         let start = token_start(line, line_end);
         if start != 0 {
             return Ok((start, Vec::new()));
@@ -469,6 +487,40 @@ fn command_completion_matches(prefix: &str) -> Vec<Pair> {
             replacement: (*command).to_string(),
         })
         .collect()
+}
+
+fn model_completion_matches(prefix: &str, model_ids: &Arc<Mutex<Vec<String>>>) -> Vec<Pair> {
+    let ids = match model_ids.lock() {
+        Ok(guard) => guard.clone(),
+        Err(_) => {
+            eprintln!("warning: model completion list mutex poisoned; returning no suggestions");
+            return Vec::new();
+        }
+    };
+    let normalized_prefix = prefix.to_lowercase();
+    ids.iter()
+        .filter(|id| id.to_lowercase().starts_with(&normalized_prefix))
+        .map(|id| Pair {
+            display: id.clone(),
+            replacement: id.clone(),
+        })
+        .collect()
+}
+
+/// Group models by provider name, preserving insertion order.
+fn group_models_by_provider(models: &[ModelInfo]) -> Vec<(String, Vec<&ModelInfo>)> {
+    let mut groups: Vec<(String, Vec<&ModelInfo>)> = Vec::new();
+    for model in models {
+        if let Some(existing) = groups
+            .iter_mut()
+            .find(|(name, _)| *name == model.provider_name)
+        {
+            existing.1.push(model);
+        } else {
+            groups.push((model.provider_name.clone(), vec![model]));
+        }
+    }
+    groups
 }
 
 /// Only add recognized commands and chat messages to history.
@@ -528,13 +580,18 @@ fn load_history_with_warning(
     }
 }
 
-fn configure_line_editor() -> Result<Editor<FawxReadlineHelper, DefaultHistory>, TuiError> {
+fn configure_line_editor(
+    model_ids: Arc<Mutex<Vec<String>>>,
+) -> Result<Editor<FawxReadlineHelper, DefaultHistory>, TuiError> {
     let config = rustyline::Config::builder()
         .completion_type(CompletionType::List)
         .build();
     let mut editor =
         Editor::with_config(config).map_err(|error| TuiError::Auth(error.to_string()))?;
-    editor.set_helper(Some(FawxReadlineHelper::default()));
+    editor.set_helper(Some(FawxReadlineHelper {
+        hinter: HistoryHinter {},
+        model_ids,
+    }));
 
     if let Some(path) = history_path() {
         if let Some(parent) = path.parent() {
@@ -583,6 +640,8 @@ pub struct TuiApp {
     config: FawxConfig,
     config_path: PathBuf,
     max_history: usize,
+    /// Shared model ID list for readline tab-completion.
+    completer_model_ids: Arc<Mutex<Vec<String>>>,
 }
 
 impl TuiApp {
@@ -619,6 +678,7 @@ impl TuiApp {
             config,
             config_path: base_data_dir.join("config.toml"),
             max_history,
+            completer_model_ids: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -642,7 +702,8 @@ impl TuiApp {
         // Wire the cancellation token into the loop engine.
         self.loop_engine.set_cancel_token(self.cancel_token.clone());
 
-        let mut editor = configure_line_editor()?;
+        self.sync_completer_model_ids();
+        let mut editor = configure_line_editor(Arc::clone(&self.completer_model_ids))?;
         let prompt = build_tui_prompt();
         while self.running {
             match editor.readline(&prompt) {
@@ -1187,7 +1248,7 @@ impl TuiApp {
         Ok(())
     }
 
-    /// Display the model selection menu.
+    /// Display the model selection menu grouped by provider.
     fn show_model_menu(&self) {
         let active = self.router.active_model();
         let models = self.router.available_models();
@@ -1197,18 +1258,20 @@ impl TuiApp {
             return;
         }
 
-        println!("Available models:");
-        for model in models {
-            let marker = if Some(model.model_id.as_str()) == active {
-                "*"
-            } else {
-                " "
-            };
+        let grouped = group_models_by_provider(&models);
 
-            println!(
-                "  {marker} {} ({}, {})",
-                model.model_id, model.provider_name, model.auth_method
-            );
+        println!("Available models:");
+        for (provider, group) in &grouped {
+            println!();
+            println!("{provider}:");
+            for model in group {
+                let marker = if Some(model.model_id.as_str()) == active {
+                    "*"
+                } else {
+                    " "
+                };
+                println!("  {marker} {} ({})", model.model_id, model.auth_method);
+            }
         }
     }
 
@@ -1276,7 +1339,21 @@ impl TuiApp {
         }
 
         self.router = refreshed;
+        self.sync_completer_model_ids();
         Ok(())
+    }
+
+    /// Push current model IDs into the shared completer list.
+    fn sync_completer_model_ids(&self) {
+        let ids: Vec<String> = self
+            .router
+            .available_models()
+            .into_iter()
+            .map(|m| m.model_id)
+            .collect();
+        if let Ok(mut locked) = self.completer_model_ids.lock() {
+            *locked = ids;
+        }
     }
 
     fn show_help(&self) {
@@ -4862,5 +4939,112 @@ mod tests {
             parse_command("/config unknown"),
             ParsedCommand::Config(Some("unknown".to_string()))
         );
+    }
+
+    #[test]
+    fn completer_returns_model_matches() {
+        let ids = Arc::new(Mutex::new(vec![
+            "Claude-sonnet-4-20260514".to_string(),
+            "Claude-opus-4-20260514".to_string(),
+            "gpt-4o".to_string(),
+        ]));
+        let helper = FawxReadlineHelper {
+            hinter: HistoryHinter {},
+            model_ids: Arc::clone(&ids),
+        };
+        let history = DefaultHistory::new();
+        let ctx = rustyline::Context::new(&history);
+        let (pos, matches) = helper.complete("/model clau", 11, &ctx).unwrap();
+        assert_eq!(pos, "/model ".len());
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].replacement, "Claude-sonnet-4-20260514");
+        assert_eq!(matches[1].replacement, "Claude-opus-4-20260514");
+    }
+
+    #[test]
+    fn completer_returns_empty_for_no_model_match() {
+        let ids = Arc::new(Mutex::new(vec![
+            "claude-sonnet-4-20260514".to_string(),
+            "gpt-4o".to_string(),
+        ]));
+        let helper = FawxReadlineHelper {
+            hinter: HistoryHinter {},
+            model_ids: Arc::clone(&ids),
+        };
+        let history = DefaultHistory::new();
+        let ctx = rustyline::Context::new(&history);
+        let (pos, matches) = helper.complete("/model xyz", 10, &ctx).unwrap();
+        assert_eq!(pos, "/model ".len());
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn completer_returns_all_models_for_empty_model_prefix() {
+        let ids = Arc::new(Mutex::new(vec![
+            "claude-sonnet-4-20260514".to_string(),
+            "gpt-4o".to_string(),
+        ]));
+        let helper = FawxReadlineHelper {
+            hinter: HistoryHinter {},
+            model_ids: Arc::clone(&ids),
+        };
+        let history = DefaultHistory::new();
+        let ctx = rustyline::Context::new(&history);
+        let (pos, matches) = helper.complete("/model ", 7, &ctx).unwrap();
+        assert_eq!(pos, "/model ".len());
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].replacement, "claude-sonnet-4-20260514");
+        assert_eq!(matches[1].replacement, "gpt-4o");
+    }
+
+    #[test]
+    fn completer_returns_empty_when_no_models_registered() {
+        let ids = Arc::new(Mutex::new(Vec::new()));
+        let helper = FawxReadlineHelper {
+            hinter: HistoryHinter {},
+            model_ids: Arc::clone(&ids),
+        };
+        let history = DefaultHistory::new();
+        let ctx = rustyline::Context::new(&history);
+        let (pos, matches) = helper.complete("/model ", 7, &ctx).unwrap();
+        assert_eq!(pos, "/model ".len());
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn completer_still_completes_slash_commands() {
+        let helper = FawxReadlineHelper::default();
+        let history = DefaultHistory::new();
+        let ctx = rustyline::Context::new(&history);
+        let (pos, matches) = helper.complete("/mo", 3, &ctx).unwrap();
+        assert_eq!(pos, 0);
+        assert!(matches.iter().any(|m| m.replacement == "/model"));
+    }
+
+    #[test]
+    fn group_models_by_provider_groups_correctly() {
+        let models = vec![
+            ModelInfo {
+                model_id: "claude-sonnet-4-20260514".to_string(),
+                provider_name: "Anthropic".to_string(),
+                auth_method: "subscription".to_string(),
+            },
+            ModelInfo {
+                model_id: "claude-opus-4-20260514".to_string(),
+                provider_name: "Anthropic".to_string(),
+                auth_method: "subscription".to_string(),
+            },
+            ModelInfo {
+                model_id: "gpt-4o".to_string(),
+                provider_name: "OpenAI".to_string(),
+                auth_method: "api_key".to_string(),
+            },
+        ];
+        let grouped = group_models_by_provider(&models);
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped[0].0, "Anthropic");
+        assert_eq!(grouped[0].1.len(), 2);
+        assert_eq!(grouped[1].0, "OpenAI");
+        assert_eq!(grouped[1].1.len(), 1);
     }
 }
