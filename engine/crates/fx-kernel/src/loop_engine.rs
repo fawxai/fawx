@@ -1532,6 +1532,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn synthesis_includes_all_results() {
+        let results = vec![
+            ToolResult {
+                tool_name: "read_file".to_string(),
+                output: "alpha".to_string(),
+                success: true,
+            },
+            ToolResult {
+                tool_name: "search".to_string(),
+                output: "beta".to_string(),
+                success: true,
+            },
+        ];
+
+        let prompt = tool_synthesis_prompt(&results, "Combine outputs");
+
+        assert!(prompt.contains("read_file: alpha"));
+        assert!(prompt.contains("search: beta"));
+
+        let tool_results_section = prompt
+            .split("Tool results:\n")
+            .nth(1)
+            .expect("prompt should include tool results section");
+        let result_count = tool_results_section
+            .lines()
+            .take_while(|line| !line.trim().is_empty())
+            .filter(|line| line.starts_with("- "))
+            .count();
+        assert_eq!(
+            result_count, 2,
+            "prompt should include exactly 2 tool results"
+        );
+    }
+
+    #[test]
+    fn synthesis_includes_failed_tool_results() {
+        let results = vec![
+            ToolResult {
+                tool_name: "read_file".to_string(),
+                output: "alpha".to_string(),
+                success: true,
+            },
+            ToolResult {
+                tool_name: "run_command".to_string(),
+                output: "permission denied".to_string(),
+                success: false,
+            },
+        ];
+
+        let prompt = tool_synthesis_prompt(&results, "Combine outputs");
+
+        assert!(prompt.contains("read_file: alpha"));
+        assert!(prompt.contains("run_command: permission denied"));
+    }
+
     #[tokio::test]
     async fn reason_returns_completion_response_with_tool_calls() {
         let mut engine = default_engine();
@@ -1570,7 +1626,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn decide_maps_tool_calls_to_use_tools_decision() {
+    async fn decide_extracts_single_tool_call() {
         let mut engine = default_engine();
         let response = CompletionResponse {
             content: vec![ContentBlock::Text {
@@ -1589,7 +1645,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn decide_maps_empty_response_to_safe_fallback() {
+    async fn decide_no_tool_calls_returns_safe_fallback() {
         let mut engine = default_engine();
         let response = CompletionResponse {
             content: Vec::new(),
@@ -1811,9 +1867,9 @@ mod phase2_tests {
         );
     }
 
-    // NB2-3: decide handles multiple tool calls
+    // NB2-3: decide extracts multiple tool calls
     #[tokio::test]
-    async fn decide_handles_multiple_tool_calls() {
+    async fn decide_extracts_multiple_tool_calls() {
         let mut engine = test_engine();
         let response = CompletionResponse {
             content: Vec::new(),
@@ -2299,9 +2355,50 @@ mod phase4_tests {
         }
     }
 
-    // P4-1: tool_executor_checks_cancellation_between_calls
     #[tokio::test]
-    async fn tool_executor_checks_cancellation_between_calls() {
+    async fn act_with_tools_executes_all_calls_and_synthesizes_response() {
+        let engine = p4_engine();
+        let decision = Decision::UseTools(vec![
+            ToolCall {
+                id: "1".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "a.txt"}),
+            },
+            ToolCall {
+                id: "2".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "b.txt"}),
+            },
+        ]);
+
+        let calls = match &decision {
+            Decision::UseTools(calls) => calls.as_slice(),
+            _ => unreachable!("decision should contain tool calls"),
+        };
+
+        let llm = Phase4MockLlm::new(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "combined tool output".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let action = engine
+            .act_with_tools(&decision, calls, &llm)
+            .await
+            .expect("act_with_tools");
+
+        assert_eq!(action.tool_results.len(), 2);
+        assert_eq!(action.tool_results[0].tool_name, "read_file");
+        assert_eq!(action.tool_results[1].tool_name, "read_file");
+        assert_eq!(action.response_text, "summary");
+    }
+
+    // P4-1: execute_tools_cancellation_between_calls
+    #[tokio::test]
+    async fn execute_tools_cancellation_between_calls() {
         let count = Arc::new(AtomicU32::new(0));
         let executor = CountingToolExecutor {
             executed_count: Arc::clone(&count),
