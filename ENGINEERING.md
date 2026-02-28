@@ -203,17 +203,26 @@ Code that doesn't meet the standards above gets rewritten or removed.
 - **Clawdio main session** is the lead. Orchestrates, designs, reviews results, makes architectural calls. Does NOT write code unless absolutely necessary (e.g., a one-line config fix or emergency hotfix with no time to spawn).
 - **Subagents** do all implementation, review, and fix work.
 
-### Model allocation (cost discipline)
-- **Codex xhigh**: Default for everything — implementations, reviews, fixes, quick patches.
-- **Opus high**: Reserved for highly technical work only — complex architectural decisions, subtle concurrency/ownership bugs, novel algorithm design. If in doubt, use Codex xhigh.
+### Model allocation
+- **Reviews/re-reviews**: Opus high (always). Reviews catch real architectural bugs.
+- **Implementation/fixes**: Clawdio's judgment — Codex xhigh for straightforward work, Opus high when the problem demands deeper reasoning (complex architecture, subtle concurrency/ownership bugs, novel design). Justify Opus in the spawn prompt when chosen.
+- **Fixer**: Codex xhigh (default). Opus high if the review findings are architecturally complex.
+
+### Concurrency model
+Work is classified by complexity tier:
+- **Simple** (< 50 lines): Direct N+1 worker, no review pipeline. CI (tests, clippy, fmt) is the quality gate. If CI fails, escalate to standard tier (gets a reviewer).
+- **Standard** (single-PR features): N+1 orchestrator spawns N+2 workers (implementer, reviewer, fixer). Orchestrator manages the full PR lifecycle and only announces terminal status to main. Parallel orchestrators OK (max 2-3).
+- **Complex** (multi-crate, architectural): Single N+1 agent with full context. **Sequential only — one PR at a time.** Review/fix cycles may use N+2 workers since they're more mechanical.
+
+N+2 completions announce only to their parent N+1 (structural filtering). The main session stays free for conversation and high-level decisions.
 
 ### Rules
 1. Main session delegates code work to subagents. No inline code writing in the main chat except trivial edits.
-2. Quick fixes (formatting, one-liner bugs, test updates) → Codex xhigh subagent.
-3. Feature implementation → Codex xhigh subagent.
-4. Code review → Codex xhigh subagent.
-5. Review fix cycles → Codex xhigh subagent.
-6. Opus high subagent only when the problem genuinely requires deeper reasoning (justify in the spawn).
+2. Quick fixes → direct N+1 worker (Codex xhigh).
+3. Standard features → N+1 orchestrator with N+2 workers.
+4. Complex/architectural → single N+1 agent (Opus high), sequential pipeline.
+5. Code review → always Opus high.
+6. All review findings (blocking, non-blocking, nice-to-have) must be fixed. Fresh reviewer for R2.
 
 ---
 
