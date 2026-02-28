@@ -153,7 +153,7 @@ const REASONING_MAX_OUTPUT_TOKENS: u32 = 768;
 const TOOL_SYNTHESIS_MAX_OUTPUT_TOKENS: u32 = 384;
 const DEFAULT_LLM_ACTION_COST_CENTS: u64 = 2;
 const SAFE_FALLBACK_RESPONSE: &str = "I wasn't able to process that. Could you try rephrasing?";
-const REASONING_SYSTEM_PROMPT: &str = "You are Fawx, an autonomous assistant. You MUST call the emit_intent tool for EVERY response and never reply with plain text. For simple answers call emit_intent({\"action\":{\"Respond\":{\"text\":\"your answer\"}}}). For tool use call emit_intent({\"action\":{\"Delegate\":{\"skill_id\":\"tool_name\",\"params\":{\"key\":\"value\"}}}}). Do not describe what you would do; call emit_intent.";
+const REASONING_SYSTEM_PROMPT: &str = "You are Fawx, an autonomous assistant. Use the available tools to help the user. For simple responses that don't need tools, reply with plain text. For tasks that require reading files, running commands, or searching, call the appropriate tool directly.";
 
 const VERIFICATION_CONFIDENCE_CLEAN: f64 = 0.9;
 const VERIFICATION_CONFIDENCE_SINGLE_DISCREPANCY: f64 = 0.45;
@@ -893,7 +893,12 @@ fn build_reasoning_request(
     CompletionRequest {
         model: model.to_string(),
         messages: [context, vec![Message::user(user_prompt)]].concat(),
-        tools: vec![emit_intent_tool],
+        tools: {
+            let mut tools = vec![emit_intent_tool];
+            // Phase 2: consider taking tool_definitions by value to avoid clone
+            tools.extend(tool_definitions.clone());
+            tools
+        },
         temperature: Some(0.2),
         max_tokens: Some(REASONING_MAX_OUTPUT_TOKENS),
         system_prompt: Some(system_prompt),
@@ -902,7 +907,7 @@ fn build_reasoning_request(
 
 fn reasoning_user_prompt(perception: &ProcessedPerception) -> String {
     format!(
-        "Active goals:\n- {}\n\nBudget remaining: {} tokens, {} llm calls\n\nUser message:\n{}\n\nRemember: call emit_intent, do not reply with plain text.",
+        "Active goals:\n- {}\n\nBudget remaining: {} tokens, {} llm calls\n\nUser message:\n{}",
         perception.active_goals.join("\n- "),
         perception.budget_remaining.tokens,
         perception.budget_remaining.llm_calls,
@@ -924,9 +929,7 @@ fn available_tools_instructions(tool_definitions: &[ToolDefinition]) -> String {
         .collect::<Vec<_>>()
         .join("\n");
 
-    format!(
-        "Available tools (use via Delegate intent):\n{tools}\n\nTo use a tool, call emit_intent with: {{\"action\": {{\"Delegate\": {{\"skill_id\": \"<tool_name>\", \"params\": {{\"param\": \"value\"}}}}}}, \"rationale\": \"...\", \"confidence\": 0.9}}"
-    )
+    format!("Available tools:\n{tools}")
 }
 
 fn format_tool_instruction_line(tool: &ToolDefinition) -> String {
@@ -980,6 +983,8 @@ fn parse_tool_call_intent(response: &CompletionResponse) -> Option<ReasonedInten
     let direct_call = response
         .tool_calls
         .iter()
+        // TODO(#931): Phase 2 — handle multiple direct tool calls, not just the first.
+        // Currently silently drops additional tool calls when model returns multiple.
         .find(|call| call.name != "emit_intent")?;
     eprintln!(
         "reason: wrapping direct tool call '{}' in Delegate intent",
@@ -2162,7 +2167,7 @@ line three"
     }
 
     #[tokio::test]
-    async fn build_reasoning_request_only_includes_emit_intent_tool() {
+    async fn build_reasoning_request_includes_real_tools_and_emit_intent() {
         let engine = default_engine(3);
         let llm = MockLlm::with_completion_responses(vec![CompletionResponse {
             content: vec![ContentBlock::Text {
@@ -2180,8 +2185,9 @@ line three"
         let _ = engine.reason(&perception, &llm).await.expect("intent");
 
         let request = llm.captured_request(0);
-        assert_eq!(request.tools.len(), 1);
-        assert_eq!(request.tools[0].name, "emit_intent");
+        assert!(request.tools.len() > 1);
+        assert!(request.tools.iter().any(|tool| tool.name == "emit_intent"));
+        assert!(request.tools.iter().any(|tool| tool.name == "read_file"));
     }
 
     #[tokio::test]
@@ -2204,17 +2210,17 @@ line three"
 
         let request = llm.captured_request(0);
         let system_prompt = request.system_prompt.expect("system prompt");
-        assert!(system_prompt.contains("Available tools (use via Delegate intent):"));
+        assert!(system_prompt.contains("Available tools:"));
         assert!(system_prompt.contains("read_file: Read a UTF-8 text file from disk"));
         assert!(system_prompt.contains("list_directory: List files and directories"));
+        assert!(!system_prompt.contains("To use a tool, call emit_intent with:"));
     }
 
     #[test]
-    fn emit_intent_system_prompt_contains_must_call_directive() {
-        assert!(
-            REASONING_SYSTEM_PROMPT.contains("MUST call the emit_intent tool for EVERY response")
-        );
-        assert!(REASONING_SYSTEM_PROMPT.contains("never reply with plain text"));
+    fn system_prompt_describes_tools_naturally() {
+        assert!(REASONING_SYSTEM_PROMPT.contains("Use the available tools"));
+        assert!(!REASONING_SYSTEM_PROMPT.contains("MUST call emit_intent"));
+        assert!(!REASONING_SYSTEM_PROMPT.contains("never reply with plain text"));
         assert!(REASONING_SYSTEM_PROMPT.len() < 500);
     }
 
@@ -2266,6 +2272,60 @@ line three"
                 if calls.len() == 1
                 && calls[0].name == "read_file"
                 && calls[0].arguments == serde_json::json!({"path":"src/main.rs"})
+        ));
+    }
+
+    #[tokio::test]
+    async fn direct_tool_call_completes_without_emit_intent() {
+        let engine = default_engine(3);
+        let llm = MockLlm::with_completion_responses(vec![CompletionResponse {
+            content: Vec::new(),
+            tool_calls: vec![ToolCall {
+                id: "call-1".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "Cargo.toml"}),
+            }],
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let perception = engine
+            .perceive(&base_snapshot("open Cargo"))
+            .await
+            .expect("perception");
+        let intent = engine.reason(&perception, &llm).await.expect("intent");
+        let decision = engine.decide(&intent).await.expect("decision");
+
+        assert!(matches!(
+            decision,
+            Decision::UseTools(ref calls)
+                if calls.len() == 1
+                && calls[0].name == "read_file"
+                && calls[0].arguments == serde_json::json!({"path":"Cargo.toml"})
+        ));
+    }
+
+    #[tokio::test]
+    async fn text_only_response_completes_via_text_fallback() {
+        let mut engine = default_engine(3);
+        let llm = MockLlm::with_completion_responses(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "Plain response without tools".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let result = engine
+            .run_cycle(base_snapshot("just answer"), &llm)
+            .await
+            .expect("loop result");
+
+        assert!(matches!(
+            result,
+            LoopResult::Complete { response, .. }
+                if response == "Plain response without tools"
         ));
     }
 
