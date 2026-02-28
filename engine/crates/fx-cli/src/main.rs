@@ -5,6 +5,7 @@ mod commands;
 mod config;
 mod confirmation;
 mod conversation_store;
+mod git_skill;
 mod json_memory;
 mod skill_bridge;
 mod tools;

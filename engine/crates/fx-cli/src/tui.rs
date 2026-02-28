@@ -3,6 +3,7 @@ use crate::config::FawxConfig;
 use crate::conversation_store::{
     ConversationMessage, ConversationStore, TokenUsage as ConversationTokenUsage,
 };
+use crate::git_skill::GitSkill;
 use crate::json_memory::{JsonFileMemory, JsonMemoryConfig};
 use crate::skill_bridge::BuiltinToolsSkill;
 use crate::tools::{FawxToolExecutor, ToolConfig};
@@ -1477,7 +1478,7 @@ fn build_skill_registry(
         search_exclude: config.tools.search_exclude.clone(),
         ..ToolConfig::default()
     };
-    let mut executor = FawxToolExecutor::new(working_dir, tool_config);
+    let mut executor = FawxToolExecutor::new(working_dir.clone(), tool_config);
 
     let memory_config = JsonMemoryConfig {
         max_entries: config.memory.max_entries,
@@ -1499,6 +1500,8 @@ fn build_skill_registry(
     };
     let mut registry = SkillRegistry::new();
     registry.register(Box::new(BuiltinToolsSkill::new(executor)));
+    let git_skill = GitSkill::new(working_dir.clone());
+    registry.register(Box::new(git_skill));
     (registry, snapshot_text)
 }
 
