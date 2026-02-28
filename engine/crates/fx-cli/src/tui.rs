@@ -1,12 +1,14 @@
 use crate::conversation_store::{
     ConversationMessage, ConversationStore, TokenUsage as ConversationTokenUsage, MAX_BUFFER_SIZE,
 };
+use crate::json_memory::JsonFileMemory;
 use crate::tools::{FawxToolExecutor, ToolConfig};
 use async_trait::async_trait;
 use crossterm::style::Stylize;
 use crossterm::{cursor, event, style, terminal, ExecutableCommand};
 use futures::StreamExt;
 use fx_core::error::LlmError as CoreLlmError;
+use fx_core::memory::MemoryProvider;
 use fx_core::types::{InputSource, ScreenState, UserInput};
 use fx_kernel::act::TokenUsage;
 use fx_kernel::auth::{AuthManager, AuthMethod};
@@ -40,6 +42,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::LazyLock;
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Style as SyntectStyle, Theme, ThemeSet};
@@ -71,6 +74,7 @@ for a listing or search results, present it cleanly formatted.";
 const MAX_SYNTHESIS_INSTRUCTION_LENGTH: usize = 500;
 const DEFAULT_MAX_LOOP_ITERATIONS: u32 = 10;
 const MAX_HISTORY_MESSAGES: usize = 20;
+const MAX_MEMORY_SNAPSHOT_CHARS: usize = 2000;
 const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 const DEFAULT_ANTHROPIC_MODELS: &[&str] = &[
@@ -1320,15 +1324,62 @@ pub fn build_loop_engine() -> LoopEngine {
     let budget = BudgetTracker::new(BudgetConfig::default(), current_time_ms(), 0);
     let context = ContextCompactor::new(DEFAULT_CONTEXT_MAX_TOKENS, DEFAULT_CONTEXT_COMPACT_TARGET);
     let working_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let executor = FawxToolExecutor::new(working_dir, ToolConfig::default());
+    let data_dir = fawx_data_dir();
+    let (executor, memory_snapshot) = build_tool_executor(working_dir, &data_dir);
 
-    LoopEngine::new(
+    let mut engine = LoopEngine::new(
         budget,
         context,
         DEFAULT_MAX_LOOP_ITERATIONS,
         std::sync::Arc::new(executor),
         DEFAULT_SYNTHESIS_INSTRUCTION.to_string(),
-    )
+    );
+    if let Some(snapshot_text) = memory_snapshot {
+        engine.set_memory_context(snapshot_text);
+    }
+    engine
+}
+
+fn build_tool_executor(
+    working_dir: PathBuf,
+    data_dir: &Path,
+) -> (FawxToolExecutor, Option<String>) {
+    let mut executor = FawxToolExecutor::new(working_dir, ToolConfig::default());
+    let snapshot_text = match JsonFileMemory::new(data_dir) {
+        Ok(memory) => {
+            let snapshot = memory.snapshot();
+            let text = format_memory_for_prompt(&snapshot);
+            let memory: Arc<Mutex<dyn fx_core::memory::MemoryProvider>> =
+                Arc::new(Mutex::new(memory));
+            executor = executor.with_memory(memory);
+            text
+        }
+        Err(e) => {
+            eprintln!("warning: failed to initialize memory: {e}");
+            None
+        }
+    };
+    (executor, snapshot_text)
+}
+
+fn format_memory_for_prompt(entries: &[(String, String)]) -> Option<String> {
+    if entries.is_empty() {
+        return None;
+    }
+    let mut text = String::from("What you remember from previous sessions:\n");
+    for (key, value) in entries {
+        let line = format!("- {key}: {value}\n");
+        if text.len() + line.len() > MAX_MEMORY_SNAPSHOT_CHARS {
+            text.push_str("(truncated)\n");
+            break;
+        }
+        text.push_str(&line);
+    }
+    text.push_str(
+        "(Use memory_read for details. \
+        Use memory_write to update or add memories.)",
+    );
+    Some(text)
 }
 
 impl<'a> fmt::Debug for RouterLoopLlmProvider<'a> {

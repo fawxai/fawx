@@ -3,6 +3,7 @@
 mod commands;
 mod confirmation;
 mod conversation_store;
+mod json_memory;
 mod tools;
 mod tui;
 

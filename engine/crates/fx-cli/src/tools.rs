@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use fx_core::memory::MemoryProvider;
 use fx_kernel::act::{ToolExecutor, ToolExecutorError, ToolResult};
 use fx_kernel::cancellation::CancellationToken;
 use fx_llm::{ToolCall, ToolDefinition};
@@ -7,6 +8,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
 
@@ -19,6 +21,7 @@ const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 30;
 pub struct FawxToolExecutor {
     working_dir: PathBuf,
     config: ToolConfig,
+    memory: Option<Arc<Mutex<dyn MemoryProvider>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -46,7 +49,14 @@ impl FawxToolExecutor {
         Self {
             working_dir,
             config,
+            memory: None,
         }
+    }
+
+    /// Attach a persistent memory provider.
+    pub fn with_memory(mut self, memory: Arc<Mutex<dyn MemoryProvider>>) -> Self {
+        self.memory = Some(memory);
+        self
     }
 
     async fn execute_call(&self, call: &ToolCall) -> ToolResult {
@@ -57,6 +67,10 @@ impl FawxToolExecutor {
             "run_command" => self.handle_run_command(&call.arguments).await,
             "search_text" => self.handle_search_text(&call.arguments),
             "current_time" => self.handle_current_time(),
+            "memory_write" => self.handle_memory_write(&call.arguments),
+            "memory_read" => self.handle_memory_read(&call.arguments),
+            "memory_list" => self.handle_memory_list(),
+            "memory_delete" => self.handle_memory_delete(&call.arguments),
             _ => Err(format!("unknown tool: {}", call.name)),
         };
         to_tool_result(&call.name, output)
@@ -291,6 +305,45 @@ impl FawxToolExecutor {
         }
         Ok(())
     }
+    fn handle_memory_write(&self, args: &serde_json::Value) -> Result<String, String> {
+        let parsed: MemoryWriteArgs = parse_args(args)?;
+        let memory = self.memory.as_ref().ok_or("memory not configured")?;
+        let mut guard = memory.lock().map_err(|e| format!("{e}"))?;
+        guard.write(&parsed.key, &parsed.value)?;
+        Ok(format!("stored key '{}'", parsed.key))
+    }
+
+    fn handle_memory_read(&self, args: &serde_json::Value) -> Result<String, String> {
+        let parsed: MemoryReadArgs = parse_args(args)?;
+        let memory = self.memory.as_ref().ok_or("memory not configured")?;
+        let guard = memory.lock().map_err(|e| format!("{e}"))?;
+        match guard.read(&parsed.key) {
+            Some(value) => Ok(value),
+            None => Ok(format!("key '{}' not found", parsed.key)),
+        }
+    }
+
+    fn handle_memory_list(&self) -> Result<String, String> {
+        let memory = self.memory.as_ref().ok_or("memory not configured")?;
+        let guard = memory.lock().map_err(|e| format!("{e}"))?;
+        let entries = guard.list();
+        if entries.is_empty() {
+            return Ok("no memories stored".to_string());
+        }
+        let lines = format_memory_list(&entries);
+        Ok(lines)
+    }
+
+    fn handle_memory_delete(&self, args: &serde_json::Value) -> Result<String, String> {
+        let parsed: MemoryDeleteArgs = parse_args(args)?;
+        let memory = self.memory.as_ref().ok_or("memory not configured")?;
+        let mut guard = memory.lock().map_err(|e| format!("{e}"))?;
+        if guard.delete(&parsed.key) {
+            Ok(format!("deleted key '{}'", parsed.key))
+        } else {
+            Ok(format!("key '{}' not found", parsed.key))
+        }
+    }
 }
 
 #[async_trait]
@@ -313,7 +366,11 @@ impl ToolExecutor for FawxToolExecutor {
     }
 
     fn tool_definitions(&self) -> Vec<ToolDefinition> {
-        fawx_tool_definitions()
+        let mut defs = fawx_tool_definitions();
+        if self.memory.is_some() {
+            defs.extend(memory_tool_definitions());
+        }
+        defs
     }
 }
 
@@ -387,6 +444,81 @@ pub fn fawx_tool_definitions() -> Vec<ToolDefinition> {
             parameters: serde_json::json!({"type": "object", "properties": {}, "required": []}),
         },
     ]
+}
+
+pub fn memory_tool_definitions() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: "memory_write".to_string(),
+            description: "Store a fact in persistent memory. Use for user preferences, project context, important decisions, or anything worth remembering across sessions."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string" },
+                    "value": { "type": "string" }
+                },
+                "required": ["key", "value"]
+            }),
+        },
+        ToolDefinition {
+            name: "memory_read".to_string(),
+            description: "Retrieve a stored fact from persistent memory.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string" }
+                },
+                "required": ["key"]
+            }),
+        },
+        ToolDefinition {
+            name: "memory_list".to_string(),
+            description: "List all stored memory keys with value previews."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        },
+        ToolDefinition {
+            name: "memory_delete".to_string(),
+            description: "Remove a stored fact from persistent memory.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string" }
+                },
+                "required": ["key"]
+            }),
+        },
+    ]
+}
+
+fn format_memory_list(entries: &[(String, String)]) -> String {
+    entries
+        .iter()
+        .map(|(k, v)| {
+            let preview = truncate_preview(v, 80);
+            format!("- {k}: {preview}")
+        })
+        .collect::<Vec<_>>()
+        .join(
+            "
+",
+        )
+}
+
+fn truncate_preview(value: &str, max_len: usize) -> String {
+    if value.len() <= max_len {
+        return value.to_string();
+    }
+    let mut end = max_len;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &value[..end])
 }
 
 pub fn validate_path(base: &Path, requested: &str) -> Result<PathBuf, String> {
@@ -624,6 +756,22 @@ struct SearchTextArgs {
     pattern: String,
     path: Option<String>,
     file_glob: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MemoryWriteArgs {
+    key: String,
+    value: String,
+}
+
+#[derive(Deserialize)]
+struct MemoryReadArgs {
+    key: String,
+}
+
+#[derive(Deserialize)]
+struct MemoryDeleteArgs {
+    key: String,
 }
 
 #[cfg(test)]
@@ -1198,5 +1346,149 @@ mod tests {
         let results = executor.execute_tools(&calls, None).await.expect("results");
         assert!(!results[0].success);
         assert!(results[0].output.contains("unknown tool"));
+    }
+
+    #[test]
+    fn memory_tools_appear_in_definitions_when_memory_configured() {
+        let temp = TempDir::new().expect("temp");
+        let memory = Arc::new(Mutex::new(
+            crate::json_memory::JsonFileMemory::new(temp.path()).expect("memory"),
+        ));
+        let executor = FawxToolExecutor::new(temp.path().to_path_buf(), ToolConfig::default())
+            .with_memory(memory);
+        let defs = executor.tool_definitions();
+        let names: Vec<_> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"memory_write"));
+        assert!(names.contains(&"memory_read"));
+        assert!(names.contains(&"memory_list"));
+        assert!(names.contains(&"memory_delete"));
+    }
+
+    #[test]
+    fn memory_tools_absent_when_no_memory() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let defs = executor.tool_definitions();
+        let names: Vec<_> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert!(!names.contains(&"memory_write"));
+    }
+
+    #[test]
+    fn memory_write_tool_stores_value() {
+        let temp = TempDir::new().expect("temp");
+        let memory = Arc::new(Mutex::new(
+            crate::json_memory::JsonFileMemory::new(temp.path()).expect("memory"),
+        ));
+        let executor = FawxToolExecutor::new(temp.path().to_path_buf(), ToolConfig::default())
+            .with_memory(memory.clone());
+        let result = executor
+            .handle_memory_write(&serde_json::json!({"key": "name", "value": "Alice"}))
+            .expect("write");
+        assert!(result.contains("stored"));
+        let guard = memory.lock().expect("lock");
+        assert_eq!(guard.read("name"), Some("Alice".to_string()));
+    }
+
+    #[test]
+    fn memory_read_tool_retrieves_value() {
+        let temp = TempDir::new().expect("temp");
+        let memory = Arc::new(Mutex::new(
+            crate::json_memory::JsonFileMemory::new(temp.path()).expect("memory"),
+        ));
+        {
+            let mut guard = memory.lock().expect("lock");
+            guard.write("city", "Paris").expect("write");
+        }
+        let executor = FawxToolExecutor::new(temp.path().to_path_buf(), ToolConfig::default())
+            .with_memory(memory);
+        let result = executor
+            .handle_memory_read(&serde_json::json!({"key": "city"}))
+            .expect("read");
+        assert_eq!(result, "Paris");
+    }
+
+    #[test]
+    fn memory_list_tool_returns_entries() {
+        let temp = TempDir::new().expect("temp");
+        let memory = Arc::new(Mutex::new(
+            crate::json_memory::JsonFileMemory::new(temp.path()).expect("memory"),
+        ));
+        {
+            let mut guard = memory.lock().expect("lock");
+            guard.write("name", "Alice").expect("write");
+            guard.write("color", "blue").expect("write");
+        }
+        let executor = FawxToolExecutor::new(temp.path().to_path_buf(), ToolConfig::default())
+            .with_memory(memory);
+        let result = executor.handle_memory_list().expect("list");
+        assert!(
+            result.contains("name"),
+            "list should contain key 'name', got: {result}"
+        );
+        assert!(
+            result.contains("color"),
+            "list should contain key 'color', got: {result}"
+        );
+        assert!(
+            result.contains("Alice"),
+            "list should contain value 'Alice', got: {result}"
+        );
+    }
+
+    #[test]
+    fn memory_delete_tool_removes_entry() {
+        let temp = TempDir::new().expect("temp");
+        let memory = Arc::new(Mutex::new(
+            crate::json_memory::JsonFileMemory::new(temp.path()).expect("memory"),
+        ));
+        {
+            let mut guard = memory.lock().expect("lock");
+            guard.write("temp_key", "temp_value").expect("write");
+        }
+        let executor = FawxToolExecutor::new(temp.path().to_path_buf(), ToolConfig::default())
+            .with_memory(memory.clone());
+        let result = executor
+            .handle_memory_delete(&serde_json::json!({"key": "temp_key"}))
+            .expect("delete");
+        assert!(
+            result.contains("deleted"),
+            "should confirm deletion, got: {result}"
+        );
+        // Verify it's actually gone
+        let guard = memory.lock().expect("lock");
+        assert_eq!(
+            guard.read("temp_key"),
+            None,
+            "key should be deleted from memory"
+        );
+    }
+
+    #[test]
+    fn memory_list_tool_returns_empty_message() {
+        let temp = TempDir::new().expect("temp");
+        let memory = Arc::new(Mutex::new(
+            crate::json_memory::JsonFileMemory::new(temp.path()).expect("memory"),
+        ));
+        let executor = FawxToolExecutor::new(temp.path().to_path_buf(), ToolConfig::default())
+            .with_memory(memory);
+        let result = executor.handle_memory_list().expect("list");
+        assert_eq!(result, "no memories stored");
+    }
+
+    #[test]
+    fn memory_delete_tool_returns_not_found() {
+        let temp = TempDir::new().expect("temp");
+        let memory = Arc::new(Mutex::new(
+            crate::json_memory::JsonFileMemory::new(temp.path()).expect("memory"),
+        ));
+        let executor = FawxToolExecutor::new(temp.path().to_path_buf(), ToolConfig::default())
+            .with_memory(memory);
+        let result = executor
+            .handle_memory_delete(&serde_json::json!({"key": "nonexistent"}))
+            .expect("delete");
+        assert!(
+            result.contains("not found"),
+            "should say not found, got: {result}"
+        );
     }
 }

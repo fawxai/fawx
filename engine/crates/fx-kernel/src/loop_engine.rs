@@ -146,6 +146,7 @@ pub struct LoopEngine {
     max_iterations: u32,
     iteration_count: u32,
     synthesis_instruction: String,
+    memory_context: Option<String>,
     signals: SignalCollector,
     cancel_token: Option<CancellationToken>,
     input_channel: Option<LoopInputChannel>,
@@ -179,6 +180,11 @@ const DEFAULT_LLM_ACTION_COST_CENTS: u64 = 2;
 const SAFE_FALLBACK_RESPONSE: &str = "I wasn't able to process that. Could you try rephrasing?";
 const REASONING_SYSTEM_PROMPT: &str = "You are Fawx, an autonomous assistant. Use the available tools to help the user. Always use tools when the user asks for information you cannot know from conversation context alone (current time, file contents, directory listings, search results, etc.). Only reply with plain text for conversational responses, opinions, or explanations of information already in the conversation.";
 
+const MEMORY_INSTRUCTION: &str = "\n\nYou have persistent memory across sessions. \
+Use memory_write to save important facts about the user, their preferences, \
+and project context. Use memory_read to recall specific details. \
+Memories survive restart \u{2014} write anything worth remembering.";
+
 const VERIFICATION_CONFIDENCE_CLEAN: f64 = 0.9;
 const VERIFICATION_CONFIDENCE_SINGLE_DISCREPANCY: f64 = 0.45;
 const VERIFICATION_CONFIDENCE_MULTIPLE_DISCREPANCIES: f64 = 0.25;
@@ -199,6 +205,7 @@ impl LoopEngine {
             max_iterations: max_iterations.max(1),
             iteration_count: 0,
             synthesis_instruction,
+            memory_context: None,
             signals: SignalCollector::default(),
             cancel_token: None,
             input_channel: None,
@@ -227,6 +234,15 @@ impl LoopEngine {
 
         self.synthesis_instruction = trimmed.to_string();
         Ok(())
+    }
+
+    /// Set memory context for system prompt injection.
+    pub fn set_memory_context(&mut self, context: String) {
+        if context.trim().is_empty() {
+            self.memory_context = None;
+        } else {
+            self.memory_context = Some(context);
+        }
     }
 
     pub fn synthesis_instruction(&self) -> &str {
@@ -550,6 +566,7 @@ impl LoopEngine {
             perception,
             llm.model_name(),
             self.tool_executor.tool_definitions(),
+            self.memory_context.as_deref(),
         );
         let started = current_time_ms();
         let response = llm
@@ -1185,10 +1202,11 @@ fn build_reasoning_request(
     perception: &ProcessedPerception,
     model: &str,
     tool_definitions: Vec<ToolDefinition>,
+    memory_context: Option<&str>,
 ) -> CompletionRequest {
     let context = perception.context_window.clone();
     let user_prompt = reasoning_user_prompt(perception);
-    let system_prompt = build_reasoning_system_prompt(&tool_definitions);
+    let system_prompt = build_reasoning_system_prompt(&tool_definitions, memory_context);
 
     CompletionRequest {
         model: model.to_string(),
@@ -1219,13 +1237,22 @@ User message:
     )
 }
 
-fn build_reasoning_system_prompt(tool_definitions: &[ToolDefinition]) -> String {
-    format!(
+fn build_reasoning_system_prompt(
+    tool_definitions: &[ToolDefinition],
+    memory_context: Option<&str>,
+) -> String {
+    let mut prompt = format!(
         "{REASONING_SYSTEM_PROMPT}
 
 {}",
         available_tools_instructions(tool_definitions)
-    )
+    );
+    if let Some(mem) = memory_context {
+        prompt.push_str("\n\n");
+        prompt.push_str(mem);
+        prompt.push_str(MEMORY_INSTRUCTION);
+    }
+    prompt
 }
 
 fn available_tools_instructions(tool_definitions: &[ToolDefinition]) -> String {
@@ -1422,11 +1449,43 @@ mod tests {
             description: "Get the current time".to_string(),
             parameters: serde_json::json!({"type": "object", "properties": {}, "required": []}),
         }];
-        let prompt = build_reasoning_system_prompt(&defs);
+        let prompt = build_reasoning_system_prompt(&defs, None);
         assert!(prompt.contains(
             "Always use tools when the user asks for information you cannot know from conversation context alone"
         ));
         assert!(prompt.contains("current time"));
+    }
+
+    #[test]
+    fn system_prompt_without_memory_omits_memory_instruction() {
+        let defs = vec![ToolDefinition {
+            name: "current_time".to_string(),
+            description: "Get the current time".to_string(),
+            parameters: serde_json::json!({"type": "object", "properties": {}, "required": []}),
+        }];
+        let prompt = build_reasoning_system_prompt(&defs, None);
+        assert!(
+            !prompt.contains("memory_write"),
+            "system prompt without memory context should NOT mention memory_write"
+        );
+    }
+
+    #[test]
+    fn system_prompt_with_memory_includes_memory_instruction() {
+        let defs = vec![ToolDefinition {
+            name: "memory_write".to_string(),
+            description: "Store a fact".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+        let prompt = build_reasoning_system_prompt(&defs, Some("user prefers dark mode"));
+        assert!(
+            prompt.contains("memory_write"),
+            "system prompt with memory context should mention memory_write"
+        );
+        assert!(
+            prompt.contains("user prefers dark mode"),
+            "system prompt should include the memory context"
+        );
     }
 
     #[tokio::test]
