@@ -1,8 +1,9 @@
 use crate::auth_store::{migrate_if_needed, AuthStore};
+use crate::config::FawxConfig;
 use crate::conversation_store::{
-    ConversationMessage, ConversationStore, TokenUsage as ConversationTokenUsage, MAX_BUFFER_SIZE,
+    ConversationMessage, ConversationStore, TokenUsage as ConversationTokenUsage,
 };
-use crate::json_memory::JsonFileMemory;
+use crate::json_memory::{JsonFileMemory, JsonMemoryConfig};
 use crate::tools::{FawxToolExecutor, ToolConfig};
 use async_trait::async_trait;
 use crossterm::style::Stylize;
@@ -70,9 +71,6 @@ don't dump raw tool output, but don't hide data either. Match your response form
 the user asked for. If they asked a simple question, give a simple answer. If they asked \
 for a listing or search results, present it cleanly formatted.";
 const MAX_SYNTHESIS_INSTRUCTION_LENGTH: usize = 500;
-const DEFAULT_MAX_LOOP_ITERATIONS: u32 = 10;
-const MAX_HISTORY_MESSAGES: usize = 20;
-const MAX_MEMORY_SNAPSHOT_CHARS: usize = 2000;
 const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 const DEFAULT_ANTHROPIC_MODELS: &[&str] = &[
@@ -389,6 +387,7 @@ const TUI_COMMANDS: &[&str] = &[
     "/clear",
     "/new",
     "/history",
+    "/config",
     "/status",
     "/model",
     "/auth",
@@ -578,6 +577,9 @@ pub struct TuiApp {
     conversation_store: ConversationStore,
     last_signals: Vec<Signal>,
     cancel_token: CancellationToken,
+    config: FawxConfig,
+    config_path: PathBuf,
+    max_history: usize,
 }
 
 impl TuiApp {
@@ -586,16 +588,19 @@ impl TuiApp {
         auth_manager: AuthManager,
         router: ModelRouter,
         loop_engine: LoopEngine,
+        config: FawxConfig,
     ) -> Result<Self, TuiError> {
-        let data_dir = fawx_data_dir();
+        let base_data_dir = fawx_data_dir();
+        let data_dir = configured_data_dir(&base_data_dir, &config);
         let mut conversation_store = ConversationStore::new(&data_dir).map_err(TuiError::Store)?;
         conversation_store
             .ensure_active()
             .map_err(TuiError::Store)?;
+        let max_history = config.general.max_history;
         let conversation_history = if cfg!(test) {
             Vec::new()
         } else {
-            load_conversation_history(&conversation_store)
+            load_conversation_history(&conversation_store, max_history)
         };
 
         Ok(Self {
@@ -608,6 +613,9 @@ impl TuiApp {
             conversation_store,
             last_signals: Vec::new(),
             cancel_token: CancellationToken::new(),
+            config,
+            config_path: base_data_dir.join("config.toml"),
+            max_history,
         })
     }
 
@@ -894,6 +902,7 @@ impl TuiApp {
                 println!("Started new conversation: {id}");
             }
             ParsedCommand::History => self.show_conversation_history(),
+            ParsedCommand::Config(action) => self.handle_config_command(action)?,
             ParsedCommand::Help => self.show_help(),
             ParsedCommand::Quit => {
                 self.running = false;
@@ -947,7 +956,13 @@ impl TuiApp {
 
         if self.router.active_model().is_none() {
             self.refresh_router_models().await?;
-            self.select_first_available_model();
+            if let Some(model) = self.config.model.default_model.as_deref() {
+                if self.router.set_active(model).is_err() {
+                    self.select_first_available_model();
+                }
+            } else {
+                self.select_first_available_model();
+            }
         }
 
         Ok(())
@@ -1053,6 +1068,88 @@ impl TuiApp {
             token_usage: token_usage(loop_result),
         };
         self.conversation_store.save_message(&assistant_message)
+    }
+
+    fn handle_config_command(&mut self, action: Option<String>) -> Result<(), TuiError> {
+        match action.as_deref() {
+            None => self.show_config(),
+            Some("init") => self.init_config_file()?,
+            Some(other) => {
+                println!("Unknown /config action: {other}. Use /config or /config init.")
+            }
+        }
+        Ok(())
+    }
+
+    fn show_config(&self) {
+        let fields: &[(&str, String)] = &[
+            (
+                "general.max_iterations",
+                self.config.general.max_iterations.to_string(),
+            ),
+            (
+                "general.max_history",
+                self.config.general.max_history.to_string(),
+            ),
+            (
+                "model.default_model",
+                format!("{:?}", self.config.model.default_model),
+            ),
+            (
+                "model.synthesis_instruction",
+                format!("{:?}", self.config.model.synthesis_instruction),
+            ),
+            (
+                "tools.working_dir",
+                format!("{:?}", self.config.tools.working_dir),
+            ),
+            (
+                "tools.search_exclude",
+                format!("{:?}", self.config.tools.search_exclude),
+            ),
+            (
+                "tools.max_read_size",
+                self.config.tools.max_read_size.to_string(),
+            ),
+            (
+                "memory.max_entries",
+                self.config.memory.max_entries.to_string(),
+            ),
+            (
+                "memory.max_value_size",
+                self.config.memory.max_value_size.to_string(),
+            ),
+            (
+                "memory.max_snapshot_chars",
+                self.config.memory.max_snapshot_chars.to_string(),
+            ),
+        ];
+        let mut output = format!(
+            "Config path: {}\nRuntime data dir: {}\nLoaded values:\n",
+            self.config_path.display(),
+            self.data_dir_display(),
+        );
+        for (key, value) in fields {
+            output.push_str(&format!("  {key} = {value}\n"));
+        }
+        print!("{output}");
+    }
+
+    fn init_config_file(&mut self) -> Result<(), TuiError> {
+        let base_data_dir = fawx_data_dir();
+        let created = FawxConfig::write_default(&base_data_dir).map_err(TuiError::Store)?;
+        println!("Created default config at {}", created.display());
+        Ok(())
+    }
+
+    fn data_dir_display(&self) -> String {
+        self.config
+            .general
+            .data_dir
+            .clone()
+            .unwrap_or_else(fawx_data_dir)
+            .display()
+            .to_string()
     }
 
     fn show_conversation_history(&self) {
@@ -1193,6 +1290,8 @@ impl TuiApp {
         println!("  /clear         Clear the screen and active conversation");
         println!("  /new           Start a new conversation");
         println!("  /history       List saved conversations");
+        println!("  /config        Show loaded config values");
+        println!("  /config init   Create ~/.fawx/config.toml template");
         println!("  /help          Show this help");
         println!("  /quit          Exit");
     }
@@ -1313,24 +1412,52 @@ impl TuiApp {
             .push(Message::user(user_text.to_string()));
         self.conversation_history
             .push(Message::assistant(clean_assistant_text));
-        trim_history(&mut self.conversation_history);
+        trim_history(&mut self.conversation_history, self.max_history);
     }
 }
 
+/// Load the user config from ~/.fawx/config.toml (or return defaults).
+pub fn load_config() -> Result<FawxConfig, TuiError> {
+    let base_data_dir = fawx_data_dir();
+    FawxConfig::load(&base_data_dir).map_err(TuiError::Store)
+}
+
 /// Build a loop engine with sensible defaults for the TUI shell.
-pub fn build_loop_engine() -> LoopEngine {
+/// Convenience wrapper used by tests; production code uses
+/// [`build_loop_engine_from_config`] for single-load consistency.
+#[cfg(test)]
+fn build_loop_engine() -> LoopEngine {
+    let config = load_config().unwrap_or_else(|error| {
+        eprintln!("warning: failed to load config: {error}");
+        FawxConfig::default()
+    });
+    build_loop_engine_from_config(&config)
+}
+
+/// Build a loop engine from an already-loaded config.
+pub fn build_loop_engine_from_config(config: &FawxConfig) -> LoopEngine {
+    let base_data_dir = fawx_data_dir();
+    let data_dir = configured_data_dir(&base_data_dir, config);
+    build_loop_engine_with_config(data_dir, config.clone())
+}
+
+fn build_loop_engine_with_config(data_dir: PathBuf, config: FawxConfig) -> LoopEngine {
     let budget = BudgetTracker::new(BudgetConfig::default(), current_time_ms(), 0);
     let context = ContextCompactor::new(DEFAULT_CONTEXT_MAX_TOKENS, DEFAULT_CONTEXT_COMPACT_TARGET);
-    let working_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let data_dir = fawx_data_dir();
-    let (executor, memory_snapshot) = build_tool_executor(working_dir, &data_dir);
+    let working_dir = configured_working_dir(&config);
+    let (executor, memory_snapshot) = build_tool_executor(working_dir, &data_dir, &config);
+    let synthesis = config
+        .model
+        .synthesis_instruction
+        .clone()
+        .unwrap_or_else(|| DEFAULT_SYNTHESIS_INSTRUCTION.to_string());
 
     let mut engine = LoopEngine::new(
         budget,
         context,
-        DEFAULT_MAX_LOOP_ITERATIONS,
+        config.general.max_iterations,
         std::sync::Arc::new(executor),
-        DEFAULT_SYNTHESIS_INSTRUCTION.to_string(),
+        synthesis,
     );
     if let Some(snapshot_text) = memory_snapshot {
         engine.set_memory_context(snapshot_text);
@@ -1341,12 +1468,23 @@ pub fn build_loop_engine() -> LoopEngine {
 fn build_tool_executor(
     working_dir: PathBuf,
     data_dir: &Path,
+    config: &FawxConfig,
 ) -> (FawxToolExecutor, Option<String>) {
-    let mut executor = FawxToolExecutor::new(working_dir, ToolConfig::default());
-    let snapshot_text = match JsonFileMemory::new(data_dir) {
+    let tool_config = ToolConfig {
+        max_read_size: config.tools.max_read_size,
+        search_exclude: config.tools.search_exclude.clone(),
+        ..ToolConfig::default()
+    };
+    let mut executor = FawxToolExecutor::new(working_dir, tool_config);
+
+    let memory_config = JsonMemoryConfig {
+        max_entries: config.memory.max_entries,
+        max_value_size: config.memory.max_value_size,
+    };
+    let snapshot_text = match JsonFileMemory::new_with_config(data_dir, memory_config) {
         Ok(memory) => {
             let snapshot = memory.snapshot();
-            let text = format_memory_for_prompt(&snapshot);
+            let text = format_memory_for_prompt(&snapshot, config.memory.max_snapshot_chars);
             let memory: Arc<Mutex<dyn fx_core::memory::MemoryProvider>> =
                 Arc::new(Mutex::new(memory));
             executor = executor.with_memory(memory);
@@ -1360,14 +1498,14 @@ fn build_tool_executor(
     (executor, snapshot_text)
 }
 
-fn format_memory_for_prompt(entries: &[(String, String)]) -> Option<String> {
+fn format_memory_for_prompt(entries: &[(String, String)], max_chars: usize) -> Option<String> {
     if entries.is_empty() {
         return None;
     }
     let mut text = String::from("What you remember from previous sessions:\n");
     for (key, value) in entries {
         let line = format!("- {key}: {value}\n");
-        if text.len() + line.len() > MAX_MEMORY_SNAPSHOT_CHARS {
+        if text.len() + line.len() > max_chars {
             text.push_str("(truncated)\n");
             break;
         }
@@ -1546,12 +1684,12 @@ fn strip_ansi_csi_sequences(text: &str) -> String {
     output
 }
 
-fn trim_history(history: &mut Vec<Message>) {
-    if history.len() <= MAX_HISTORY_MESSAGES {
+fn trim_history(history: &mut Vec<Message>, max_history: usize) {
+    if history.len() <= max_history {
         return;
     }
 
-    let remove_count = history.len() - MAX_HISTORY_MESSAGES;
+    let remove_count = history.len() - max_history;
     history.drain(0..remove_count);
 }
 
@@ -1561,13 +1699,28 @@ fn fawx_data_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".fawx"))
 }
 
-fn load_conversation_history(store: &ConversationStore) -> Vec<Message> {
+fn configured_data_dir(base_data_dir: &Path, config: &FawxConfig) -> PathBuf {
+    config
+        .general
+        .data_dir
+        .clone()
+        .unwrap_or_else(|| base_data_dir.to_path_buf())
+}
+
+fn configured_working_dir(config: &FawxConfig) -> PathBuf {
+    if let Some(path) = &config.tools.working_dir {
+        return path.clone();
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn load_conversation_history(store: &ConversationStore, max_history: usize) -> Vec<Message> {
     let mut history = store
-        .load_recent(MAX_BUFFER_SIZE)
+        .load_recent(max_history)
         .into_iter()
         .filter_map(message_from_store)
         .collect::<Vec<_>>();
-    trim_history(&mut history);
+    trim_history(&mut history, max_history);
     history
 }
 
@@ -2627,6 +2780,7 @@ enum ParsedCommand {
     Clear,
     New,
     History,
+    Config(Option<String>),
     Help,
     Quit,
     Unknown(String),
@@ -2662,6 +2816,7 @@ fn parse_command(value: &str) -> ParsedCommand {
         "clear" | "cls" => ParsedCommand::Clear,
         "new" => ParsedCommand::New,
         "history" => ParsedCommand::History,
+        "config" => ParsedCommand::Config(parts.next().map(ToString::to_string)),
         "help" => ParsedCommand::Help,
         "quit" | "exit" => ParsedCommand::Quit,
         other => ParsedCommand::Unknown(other.to_string()),
@@ -2725,8 +2880,13 @@ mod tests {
     }
 
     fn new_test_app() -> TuiApp {
-        TuiApp::new(AuthManager::new(), ModelRouter::new(), build_loop_engine())
-            .expect("new test app")
+        TuiApp::new(
+            AuthManager::new(),
+            ModelRouter::new(),
+            build_loop_engine(),
+            FawxConfig::default(),
+        )
+        .expect("new test app")
     }
 
     fn test_auth_manager() -> AuthManager {
@@ -3086,7 +3246,13 @@ mod tests {
             .set_active("mock-loop-model")
             .expect("set active mock model");
 
-        TuiApp::new(test_provider_auth_manager(), router, build_loop_engine()).expect("mock app")
+        TuiApp::new(
+            test_provider_auth_manager(),
+            router,
+            build_loop_engine(),
+            FawxConfig::default(),
+        )
+        .expect("mock app")
     }
 
     fn test_provider_auth_manager() -> AuthManager {
@@ -3117,7 +3283,13 @@ mod tests {
             .set_active("gpt-5-mini")
             .expect("set initial active model");
 
-        TuiApp::new(test_provider_auth_manager(), router, build_loop_engine()).expect("mock app")
+        TuiApp::new(
+            test_provider_auth_manager(),
+            router,
+            build_loop_engine(),
+            FawxConfig::default(),
+        )
+        .expect("mock app")
     }
 
     fn router_with_completion_response(
@@ -3980,8 +4152,13 @@ mod tests {
 
     #[tokio::test]
     async fn run_exits_immediately_when_not_running() {
-        let mut app =
-            TuiApp::new(test_auth_manager(), ModelRouter::new(), build_loop_engine()).expect("app");
+        let mut app = TuiApp::new(
+            test_auth_manager(),
+            ModelRouter::new(),
+            build_loop_engine(),
+            FawxConfig::default(),
+        )
+        .expect("app");
         app.running = false;
 
         let result = app.run().await;
@@ -4124,7 +4301,7 @@ mod tests {
                 .expect("message response");
         }
 
-        assert_eq!(app.conversation_history.len(), MAX_HISTORY_MESSAGES);
+        assert_eq!(app.conversation_history.len(), 20);
         assert_eq!(
             app.conversation_history[0],
             Message::user("msg-5".to_string())
@@ -4665,5 +4842,18 @@ mod tests {
         assert!(result.contains("partial"));
         assert!(result.contains("Stopped by user"));
         assert!(result.contains("500ms"));
+    }
+
+    #[test]
+    fn command_parsing_recognizes_config_and_config_init() {
+        assert_eq!(parse_command("/config"), ParsedCommand::Config(None));
+        assert_eq!(
+            parse_command("/config init"),
+            ParsedCommand::Config(Some("init".to_string()))
+        );
+        assert_eq!(
+            parse_command("/config unknown"),
+            ParsedCommand::Config(Some("unknown".to_string()))
+        );
     }
 }

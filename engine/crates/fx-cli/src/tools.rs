@@ -15,6 +15,7 @@ use tokio::process::Command;
 const MAX_RECURSION_DEPTH: usize = 5;
 const MAX_SEARCH_MATCHES: usize = 100;
 const DEFAULT_MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+const DEFAULT_MAX_READ_SIZE: u64 = 1024 * 1024;
 const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Debug, Clone)]
@@ -26,8 +27,12 @@ pub struct FawxToolExecutor {
 
 #[derive(Debug, Clone)]
 pub struct ToolConfig {
-    /// Maximum file size for read/write operations (bytes)
+    /// Maximum file size for write operations (bytes)
     pub max_file_size: u64,
+    /// Maximum file size for read_file operations (bytes)
+    pub max_read_size: u64,
+    /// Additional directories to exclude from search
+    pub search_exclude: Vec<String>,
     /// Command execution timeout
     pub command_timeout: Duration,
     /// Whether to allow commands outside working_dir
@@ -38,6 +43,8 @@ impl Default for ToolConfig {
     fn default() -> Self {
         Self {
             max_file_size: DEFAULT_MAX_FILE_SIZE,
+            max_read_size: DEFAULT_MAX_READ_SIZE,
+            search_exclude: Vec::new(),
             command_timeout: Duration::from_secs(DEFAULT_COMMAND_TIMEOUT_SECS),
             jail_to_working_dir: true,
         }
@@ -98,7 +105,7 @@ impl FawxToolExecutor {
         let parsed: ReadFileArgs = parse_args(args)?;
         let path = self.jailed_path(&parsed.path)?;
         let metadata = fs::metadata(&path).map_err(|error| error.to_string())?;
-        if metadata.len() > self.config.max_file_size {
+        if metadata.len() > self.config.max_read_size {
             return Err("file exceeds maximum allowed size".to_string());
         }
         let bytes = fs::read(&path).map_err(|error| error.to_string())?;
@@ -150,7 +157,7 @@ impl FawxToolExecutor {
             let entry_path = entry.path();
 
             if let Some(name) = entry_path.file_name().and_then(|n| n.to_str()) {
-                if is_ignored_directory(name) && entry_path.is_dir() {
+                if self.is_ignored_directory(name) && entry_path.is_dir() {
                     continue;
                 }
             }
@@ -216,6 +223,13 @@ impl FawxToolExecutor {
         ))
     }
 
+    fn is_ignored_directory(&self, name: &str) -> bool {
+        if is_builtin_ignored_directory(name) {
+            return true;
+        }
+        self.config.search_exclude.iter().any(|item| item == name)
+    }
+
     fn resolve_search_root(&self, requested: Option<&str>) -> Result<PathBuf, String> {
         let default_root = self.working_dir.to_string_lossy().to_string();
         let requested = requested.unwrap_or(&default_root);
@@ -256,7 +270,7 @@ impl FawxToolExecutor {
 
             // Skip build artifacts, VCS, and dependency directories
             if let Some(name) = entry_path.file_name().and_then(|n| n.to_str()) {
-                if is_ignored_directory(name) && entry_path.is_dir() {
+                if self.is_ignored_directory(name) && entry_path.is_dir() {
                     continue;
                 }
             }
@@ -283,7 +297,7 @@ impl FawxToolExecutor {
             return Ok(());
         }
         let metadata = fs::metadata(file).map_err(|error| error.to_string())?;
-        if metadata.len() > self.config.max_file_size {
+        if metadata.len() > self.config.max_read_size {
             return Ok(());
         }
         let mut bytes = Vec::new();
@@ -650,7 +664,7 @@ fn matches_glob(path: &Path, file_glob: Option<&str>) -> bool {
 }
 
 /// Directories that should never be searched — build artifacts, VCS, dependencies.
-fn is_ignored_directory(name: &str) -> bool {
+fn is_builtin_ignored_directory(name: &str) -> bool {
     matches!(
         name,
         "target"
@@ -853,7 +867,7 @@ mod tests {
         let executor = FawxToolExecutor::new(
             temp.path().to_path_buf(),
             ToolConfig {
-                max_file_size: 4,
+                max_read_size: 4,
                 ..ToolConfig::default()
             },
         );
@@ -1193,13 +1207,13 @@ mod tests {
 
     #[test]
     fn is_ignored_directory_covers_known_dirs() {
-        assert!(is_ignored_directory("target"));
-        assert!(is_ignored_directory(".git"));
-        assert!(is_ignored_directory("node_modules"));
-        assert!(is_ignored_directory(".build"));
-        assert!(!is_ignored_directory("src"));
-        assert!(!is_ignored_directory("engine"));
-        assert!(!is_ignored_directory("docs"));
+        assert!(is_builtin_ignored_directory("target"));
+        assert!(is_builtin_ignored_directory(".git"));
+        assert!(is_builtin_ignored_directory("node_modules"));
+        assert!(is_builtin_ignored_directory(".build"));
+        assert!(!is_builtin_ignored_directory("src"));
+        assert!(!is_builtin_ignored_directory("engine"));
+        assert!(!is_builtin_ignored_directory("docs"));
     }
 
     #[test]
@@ -1209,7 +1223,7 @@ mod tests {
         let executor = FawxToolExecutor::new(
             temp.path().to_path_buf(),
             ToolConfig {
-                max_file_size: 4,
+                max_read_size: 4,
                 ..ToolConfig::default()
             },
         );
@@ -1238,7 +1252,7 @@ mod tests {
         let executor = FawxToolExecutor::new(
             temp.path().to_path_buf(),
             ToolConfig {
-                max_file_size: 32,
+                max_read_size: 32,
                 ..ToolConfig::default()
             },
         );
@@ -1489,6 +1503,36 @@ mod tests {
         assert!(
             result.contains("not found"),
             "should say not found, got: {result}"
+        );
+    }
+
+    #[test]
+    fn search_exclude_config_excludes_custom_directories() {
+        let temp = TempDir::new().expect("temp");
+        // Create a custom-excluded directory with a matching file
+        let vendor = temp.path().join("vendor");
+        fs::create_dir(&vendor).expect("create vendor");
+        fs::write(vendor.join("lib.rs"), "fn needle() {}").expect("write vendor");
+        // Create a normal directory with a matching file
+        let src = temp.path().join("src");
+        fs::create_dir(&src).expect("create src");
+        fs::write(src.join("main.rs"), "fn needle() {}").expect("write src");
+
+        let executor = FawxToolExecutor::new(
+            temp.path().to_path_buf(),
+            ToolConfig {
+                search_exclude: vec!["vendor".to_string()],
+                ..ToolConfig::default()
+            },
+        );
+
+        let output = executor
+            .handle_search_text(&serde_json::json!({"pattern": "needle"}))
+            .expect("search");
+        assert!(output.contains("main.rs"), "src/main.rs should match");
+        assert!(
+            !output.contains("vendor"),
+            "vendor dir should be excluded, got: {output}"
         );
     }
 }

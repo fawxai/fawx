@@ -5,23 +5,43 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const MAX_ENTRIES: usize = 1000;
-const MAX_VALUE_SIZE: usize = 10240; // 10 KB
+const DEFAULT_MAX_ENTRIES: usize = 1000;
+const DEFAULT_MAX_VALUE_SIZE: usize = 10240; // 10 KB
+
+#[derive(Debug, Clone)]
+pub struct JsonMemoryConfig {
+    pub max_entries: usize,
+    pub max_value_size: usize,
+}
+
+impl Default for JsonMemoryConfig {
+    fn default() -> Self {
+        Self {
+            max_entries: DEFAULT_MAX_ENTRIES,
+            max_value_size: DEFAULT_MAX_VALUE_SIZE,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct JsonFileMemory {
     path: PathBuf,
     data: HashMap<String, String>,
+    config: JsonMemoryConfig,
 }
 
 impl JsonFileMemory {
-    /// Create a new memory store rooted at `data_dir/memory/memory.json`.
+    #[cfg(test)]
     pub fn new(data_dir: &Path) -> Result<Self, String> {
+        Self::new_with_config(data_dir, JsonMemoryConfig::default())
+    }
+
+    pub fn new_with_config(data_dir: &Path, config: JsonMemoryConfig) -> Result<Self, String> {
         let memory_dir = data_dir.join("memory");
         fs::create_dir_all(&memory_dir).map_err(|e| e.to_string())?;
         let path = memory_dir.join("memory.json");
         let data = Self::load_existing(&path)?;
-        Ok(Self { path, data })
+        Ok(Self { path, data, config })
     }
 
     fn load_existing(path: &Path) -> Result<HashMap<String, String>, String> {
@@ -52,11 +72,17 @@ impl MemoryProvider for JsonFileMemory {
     }
 
     fn write(&mut self, key: &str, value: &str) -> Result<(), String> {
-        if value.len() > MAX_VALUE_SIZE {
-            return Err(format!("value exceeds max size ({MAX_VALUE_SIZE} bytes)"));
+        if value.len() > self.config.max_value_size {
+            return Err(format!(
+                "value exceeds max size ({} bytes)",
+                self.config.max_value_size
+            ));
         }
-        if self.data.len() >= MAX_ENTRIES && !self.data.contains_key(key) {
-            return Err(format!("memory full ({MAX_ENTRIES} entries max)"));
+        if self.data.len() >= self.config.max_entries && !self.data.contains_key(key) {
+            return Err(format!(
+                "memory full ({} entries max)",
+                self.config.max_entries
+            ));
         }
         self.data.insert(key.to_string(), value.to_string());
         self.persist()
@@ -109,14 +135,16 @@ mod tests {
     use tempfile::TempDir;
 
     fn test_memory(dir: &Path) -> JsonFileMemory {
-        JsonFileMemory::new(dir).expect("create test memory")
+        JsonFileMemory::new_with_config(dir, JsonMemoryConfig::default())
+            .expect("create test memory")
     }
 
     #[test]
     fn new_creates_directory() {
         let temp = TempDir::new().expect("tempdir");
         let data_dir = temp.path().join("nonexistent");
-        let _memory = JsonFileMemory::new(&data_dir).expect("new");
+        let _memory =
+            JsonFileMemory::new_with_config(&data_dir, JsonMemoryConfig::default()).expect("new");
         assert!(data_dir.join("memory").exists());
     }
 
@@ -181,32 +209,31 @@ mod tests {
     fn write_rejects_oversized_value() {
         let temp = TempDir::new().expect("tempdir");
         let mut memory = test_memory(temp.path());
-        let big = "x".repeat(MAX_VALUE_SIZE + 1);
+        let big = "x".repeat(DEFAULT_MAX_VALUE_SIZE + 1);
         let result = memory.write("k", &big);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("max size"));
+        assert!(result.expect_err("oversize").contains("max size"));
     }
 
     #[test]
     fn write_rejects_when_full() {
         let temp = TempDir::new().expect("tempdir");
         let mut memory = test_memory(temp.path());
-        for i in 0..MAX_ENTRIES {
+        for i in 0..DEFAULT_MAX_ENTRIES {
             memory.write(&format!("key-{i}"), "v").expect("write");
         }
         let result = memory.write("overflow", "v");
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("full"));
+        assert!(result.expect_err("overflow").contains("full"));
     }
 
     #[test]
     fn write_allows_overwrite_when_full() {
         let temp = TempDir::new().expect("tempdir");
         let mut memory = test_memory(temp.path());
-        for i in 0..MAX_ENTRIES {
+        for i in 0..DEFAULT_MAX_ENTRIES {
             memory.write(&format!("key-{i}"), "v").expect("write");
         }
-        // Overwriting existing key should succeed even at capacity
         memory.write("key-0", "updated").expect("overwrite");
         assert_eq!(memory.read("key-0"), Some("updated".to_string()));
     }
@@ -228,9 +255,9 @@ mod tests {
         let memory_dir = temp.path().join("memory");
         fs::create_dir_all(&memory_dir).expect("create dir");
         fs::write(memory_dir.join("memory.json"), "{not valid json").expect("write");
-        let result = JsonFileMemory::new(temp.path());
+        let result = JsonFileMemory::new_with_config(temp.path(), JsonMemoryConfig::default());
         assert!(result.is_err());
-        let err = result.unwrap_err();
+        let err = result.expect_err("corrupt");
         assert!(
             err.contains("corrupt memory file"),
             "error should mention corruption, got: {err}"
@@ -243,7 +270,8 @@ mod tests {
         let memory_dir = temp.path().join("memory");
         fs::create_dir_all(&memory_dir).expect("create dir");
         fs::write(memory_dir.join("memory.json"), "  ").expect("write");
-        let memory = JsonFileMemory::new(temp.path()).expect("should succeed for empty file");
+        let memory = JsonFileMemory::new_with_config(temp.path(), JsonMemoryConfig::default())
+            .expect("should succeed for empty file");
         assert!(memory.list().is_empty());
     }
 

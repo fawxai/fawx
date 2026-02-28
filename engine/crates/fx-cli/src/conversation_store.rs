@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-pub const MAX_BUFFER_SIZE: usize = 20;
+#[cfg(test)]
+pub(crate) const MAX_BUFFER_SIZE: usize = 20;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConversationMessage {
