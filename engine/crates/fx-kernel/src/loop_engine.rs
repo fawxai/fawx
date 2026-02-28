@@ -1247,9 +1247,7 @@ fn reasoning_user_prompt(perception: &ProcessedPerception) -> String {
 Budget remaining: {} tokens, {} llm calls
 
 User message:
-{}
-
-Focus primarily on the current user message. Avoid repeating information from previous turns unless relevant to the current request.",
+{}",
         perception.active_goals.join(
             "
 - "
@@ -1351,7 +1349,6 @@ fn current_time_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::budget::BudgetSnapshot;
     use async_trait::async_trait;
     use fx_core::error::LlmError as CoreLlmError;
     use fx_core::types::{InputSource, ScreenState, UserInput};
@@ -1668,26 +1665,6 @@ mod tests {
 
         assert!(!prompt.contains("If any tool returned an error, tell the user exactly what went wrong — include the actual error message. Do not soften, hedge, or paraphrase errors."));
         assert!(prompt.contains("Tool results:\n"));
-    }
-
-    #[test]
-    fn reasoning_prompt_includes_focus_instruction() {
-        let perception = ProcessedPerception {
-            user_message: "What is 2+2?".to_string(),
-            active_goals: vec!["Help the user".to_string()],
-            budget_remaining: BudgetSnapshot {
-                tokens: 500,
-                llm_calls: 3,
-                tool_invocations: 0,
-                wall_time_ms: 0,
-                cost_cents: 0,
-            },
-            context_window: vec![Message::user("older context")],
-        };
-
-        let prompt = reasoning_user_prompt(&perception);
-
-        assert!(prompt.contains("Focus primarily on the current user message. Avoid repeating information from previous turns unless relevant to the current request."));
     }
 
     #[tokio::test]
