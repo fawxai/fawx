@@ -178,7 +178,17 @@ const REASONING_MAX_OUTPUT_TOKENS: u32 = 768;
 const TOOL_SYNTHESIS_MAX_OUTPUT_TOKENS: u32 = 384;
 const DEFAULT_LLM_ACTION_COST_CENTS: u64 = 2;
 const SAFE_FALLBACK_RESPONSE: &str = "I wasn't able to process that. Could you try rephrasing?";
-const REASONING_SYSTEM_PROMPT: &str = "You are Fawx, an autonomous assistant. Use the available tools to help the user. Always use tools when the user asks for information you cannot know from conversation context alone (current time, file contents, directory listings, search results, etc.). Only reply with plain text for conversational responses, opinions, or explanations of information already in the conversation.";
+const REASONING_SYSTEM_PROMPT: &str = "You are Fawx, a capable personal assistant. \
+Answer the user directly and concisely. \
+Use tools when you need information not already in the conversation \
+(current time, file contents, directory listings, search results, memory, etc.). \
+After using tools, respond with the answer — never narrate what tools you used, \
+describe the process, or comment on tool output metadata. \
+Never narrate your process, hedge with qualifiers, or reference tool mechanics. \
+Avoid filler openers like \"I notice\", \"I can see that\", \"Based on the results\", \
+\"It appears that\", \"Let me\", or \"I aim to\". Just answer the question. \
+If the user makes a statement (not a question), acknowledge it naturally and briefly. \
+If a tool call stores data (like memory_write), confirm the action in one short sentence.";
 
 const MEMORY_INSTRUCTION: &str = "\n\nYou have persistent memory across sessions. \
 Use memory_write to save important facts about the user, their preferences, \
@@ -1087,7 +1097,11 @@ fn tool_synthesis_prompt(tool_results: &[ToolResult], instruction: &str) -> Stri
         .collect::<Vec<_>>()
         .join("\n");
 
-    format!("You are Fawx. {instruction}\n\nTool results:\n{tool_summary}")
+    format!("You are Fawx. Answer the user's question using these tool results. \
+Do NOT describe what tools were called, narrate the process, or comment on how you got the information. \
+Just provide the answer directly.\n\n\
+{instruction}\n\n\
+Tool results:\n{tool_summary}")
 }
 
 fn join_streamed_chunks(chunks: &Arc<Mutex<Vec<String>>>) -> Result<String, LoopError> {
@@ -1443,21 +1457,7 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_instructs_tool_use_for_unknown_information() {
-        let defs = vec![ToolDefinition {
-            name: "current_time".to_string(),
-            description: "Get the current time".to_string(),
-            parameters: serde_json::json!({"type": "object", "properties": {}, "required": []}),
-        }];
-        let prompt = build_reasoning_system_prompt(&defs, None);
-        assert!(prompt.contains(
-            "Always use tools when the user asks for information you cannot know from conversation context alone"
-        ));
-        assert!(prompt.contains("current time"));
-    }
-
-    #[test]
-    fn system_prompt_without_memory_omits_memory_instruction() {
+    fn system_prompt_includes_tool_use_guidance() {
         let defs = vec![ToolDefinition {
             name: "current_time".to_string(),
             description: "Get the current time".to_string(),
@@ -1465,8 +1465,22 @@ mod tests {
         }];
         let prompt = build_reasoning_system_prompt(&defs, None);
         assert!(
-            !prompt.contains("memory_write"),
-            "system prompt without memory context should NOT mention memory_write"
+            prompt.contains("Use tools when you need information not already in the conversation")
+        );
+        assert!(prompt.contains("current time"));
+    }
+
+    #[test]
+    fn system_prompt_without_memory_omits_persistent_memory_block() {
+        let defs = vec![ToolDefinition {
+            name: "current_time".to_string(),
+            description: "Get the current time".to_string(),
+            parameters: serde_json::json!({"type": "object", "properties": {}, "required": []}),
+        }];
+        let prompt = build_reasoning_system_prompt(&defs, None);
+        assert!(
+            !prompt.contains("You have persistent memory across sessions"),
+            "system prompt without memory context should NOT include the persistent memory block"
         );
     }
 
@@ -1485,6 +1499,36 @@ mod tests {
         assert!(
             prompt.contains("user prefers dark mode"),
             "system prompt should include the memory context"
+        );
+    }
+
+    #[test]
+    fn tool_synthesis_prompt_includes_direct_answer_instruction_and_identity() {
+        let results = vec![ToolResult {
+            tool_name: "current_time".to_string(),
+            output: "2026-02-28T14:00:00Z".to_string(),
+            success: true,
+        }];
+        let prompt = tool_synthesis_prompt(&results, "Tell the user the time.");
+        assert!(
+            prompt.contains("You are Fawx"),
+            "synthesis prompt must include assistant identity"
+        );
+        assert!(
+            prompt.contains("Answer the user's question using these tool results"),
+            "synthesis prompt must instruct direct answering"
+        );
+        assert!(
+            prompt.contains("Do NOT describe what tools were called"),
+            "synthesis prompt must block meta-narration"
+        );
+        assert!(
+            prompt.contains("Tell the user the time."),
+            "synthesis prompt must include the instruction"
+        );
+        assert!(
+            prompt.contains("current_time: 2026-02-28T14:00:00Z"),
+            "synthesis prompt must include tool results"
         );
     }
 
