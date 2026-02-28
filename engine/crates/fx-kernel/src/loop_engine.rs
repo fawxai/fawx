@@ -629,12 +629,17 @@ impl LoopEngine {
     async fn verify(&mut self, action: &ActionResult) -> Result<Verification, LoopError> {
         let mut discrepancies = Vec::new();
         let has_tool_failure = action.tool_results.iter().any(|result| !result.success);
+        let has_response = !action.response_text.trim().is_empty();
 
-        if has_tool_failure {
-            discrepancies.push("one or more tool calls failed".to_string());
+        // Tool errors are informational when synthesis already produced a response.
+        // The synthesis prompt includes the error and the error relay instruction
+        // guides the LLM to surface it directly. Retrying blindly produces worse
+        // results because the continuation message confuses the model.
+        if has_tool_failure && !has_response {
+            discrepancies.push("tool calls failed and produced no response".to_string());
         }
 
-        if action.response_text.trim().is_empty() {
+        if !has_response && !has_tool_failure {
             discrepancies.push("action produced an empty response".to_string());
         }
 
@@ -708,7 +713,8 @@ impl LoopEngine {
         }
 
         let continuation = Continuation::Continue(
-            "Refine the response using tighter intent alignment.".to_string(),
+            "The previous attempt produced no response. Try a different approach to answer the user's question."
+                .to_string(),
         );
         self.emit_continue_signal(&continuation);
         Ok(continuation)
@@ -1800,6 +1806,35 @@ mod phase2_tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct FailingToolExecutor;
+
+    #[async_trait]
+    impl ToolExecutor for FailingToolExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+            Ok(calls
+                .iter()
+                .map(|call| ToolResult {
+                    tool_name: call.name.clone(),
+                    success: false,
+                    output: "path escapes working directory".to_string(),
+                })
+                .collect())
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition {
+                name: "read_file".to_string(),
+                description: "Read a file".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+            }]
+        }
+    }
+
     #[derive(Debug)]
     struct SequentialMockLlm {
         responses: Mutex<VecDeque<CompletionResponse>>,
@@ -1855,6 +1890,16 @@ mod phase2_tests {
         )
     }
 
+    fn failing_tool_engine() -> LoopEngine {
+        LoopEngine::new(
+            BudgetTracker::new(crate::budget::BudgetConfig::default(), 0, 0),
+            ContextCompactor::new(2048, 256),
+            3,
+            Arc::new(FailingToolExecutor),
+            "Summarize tool output".to_string(),
+        )
+    }
+
     fn test_snapshot(text: &str) -> PerceptionSnapshot {
         PerceptionSnapshot {
             timestamp_ms: 1,
@@ -1876,73 +1921,82 @@ mod phase2_tests {
         }
     }
 
-    // NB2-1: verify flags discrepancy when a tool fails
     #[tokio::test]
-    async fn verify_flags_discrepancy_when_tool_fails() {
+    async fn verify_passes_when_tool_fails_but_synthesis_produced_response() {
         let mut engine = test_engine();
         let action = ActionResult {
-            decision: Decision::UseTools(vec![
-                ToolCall {
-                    id: "1".to_string(),
-                    name: "read_file".to_string(),
-                    arguments: serde_json::json!({"path":"a.txt"}),
-                },
-                ToolCall {
-                    id: "2".to_string(),
-                    name: "write_file".to_string(),
-                    arguments: serde_json::json!({"path":"b.txt"}),
-                },
-            ]),
-            tool_results: vec![
-                ToolResult {
-                    tool_name: "read_file".to_string(),
-                    success: true,
-                    output: "ok".to_string(),
-                },
-                ToolResult {
-                    tool_name: "write_file".to_string(),
-                    success: false,
-                    output: "permission denied".to_string(),
-                },
-            ],
-            response_text: "partial result".to_string(),
-            tokens_used: TokenUsage::default(),
+            decision: Decision::UseTools(vec![]),
+            tool_results: vec![ToolResult {
+                tool_name: "read_file".to_string(),
+                output: "path escapes working directory".to_string(),
+                success: false,
+            }],
+            response_text: "The file could not be read: path escapes working directory."
+                .to_string(),
+            tokens_used: TokenUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+            },
         };
 
-        let verification = engine.verify(&action).await.expect("verification");
-
-        assert!(!verification.outcome_satisfactory);
+        let verification = engine.verify(&action).await.expect("verify");
         assert!(
-            verification
-                .discrepancies
-                .iter()
-                .any(|d| d.contains("tool calls failed")),
-            "expected tool failure discrepancy, got: {:?}",
-            verification.discrepancies
+            verification.outcome_satisfactory,
+            "tool error with synthesis should pass verification"
         );
+        assert!(verification.discrepancies.is_empty());
     }
 
-    // NB2-2: verify flags discrepancy when response is empty
     #[tokio::test]
-    async fn verify_flags_discrepancy_when_response_empty() {
+    async fn verify_fails_when_tool_fails_and_response_is_empty() {
         let mut engine = test_engine();
         let action = ActionResult {
-            decision: Decision::Respond("ignored".to_string()),
-            tool_results: Vec::new(),
-            response_text: "   ".to_string(),
-            tokens_used: TokenUsage::default(),
+            decision: Decision::UseTools(vec![]),
+            tool_results: vec![ToolResult {
+                tool_name: "read_file".to_string(),
+                output: "path escapes working directory".to_string(),
+                success: false,
+            }],
+            response_text: "".to_string(),
+            tokens_used: TokenUsage {
+                input_tokens: 100,
+                output_tokens: 0,
+            },
         };
 
-        let verification = engine.verify(&action).await.expect("verification");
-
-        assert!(!verification.outcome_satisfactory);
+        let verification = engine.verify(&action).await.expect("verify");
         assert!(
-            verification
-                .discrepancies
-                .iter()
-                .any(|d| d.contains("empty response")),
-            "expected empty response discrepancy, got: {:?}",
-            verification.discrepancies
+            !verification.outcome_satisfactory,
+            "tool error with empty response should fail"
+        );
+        assert!(!verification.discrepancies.is_empty());
+        assert!(verification
+            .discrepancies
+            .iter()
+            .any(|d| d.contains("tool calls failed and produced no response")));
+    }
+
+    #[tokio::test]
+    async fn verify_fails_when_response_is_empty_without_tool_failure() {
+        let mut engine = test_engine();
+        let action = ActionResult {
+            decision: Decision::UseTools(vec![]),
+            tool_results: vec![ToolResult {
+                tool_name: "read_file".to_string(),
+                output: "file contents here".to_string(),
+                success: true,
+            }],
+            response_text: "   ".to_string(),
+            tokens_used: TokenUsage {
+                input_tokens: 100,
+                output_tokens: 5,
+            },
+        };
+
+        let verification = engine.verify(&action).await.expect("verify");
+        assert!(
+            !verification.outcome_satisfactory,
+            "empty response should still fail"
         );
     }
 
@@ -2013,6 +2067,39 @@ mod phase2_tests {
             matches!(result, LoopResult::Complete { .. }),
             "expected LoopResult::Complete, got: {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn run_cycle_completes_in_one_iteration_when_tool_fails_but_synthesis_exists() {
+        let mut engine = failing_tool_engine();
+
+        let llm = SequentialMockLlm::new(vec![CompletionResponse {
+            content: Vec::new(),
+            tool_calls: vec![ToolCall {
+                id: "call-1".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path":"README.md"}),
+            }],
+            usage: None,
+            stop_reason: Some("tool_use".to_string()),
+        }]);
+
+        let result = engine
+            .run_cycle(test_snapshot("read the readme"), &llm)
+            .await
+            .expect("run_cycle");
+
+        match result {
+            LoopResult::Complete {
+                response,
+                iterations,
+                ..
+            } => {
+                assert_eq!(iterations, 1, "expected exactly one iteration");
+                assert_eq!(response, "summary");
+            }
+            other => panic!("expected LoopResult::Complete, got: {other:?}"),
+        }
     }
 
     // NB2-5: run_cycle returns budget exhausted when budget is 0
