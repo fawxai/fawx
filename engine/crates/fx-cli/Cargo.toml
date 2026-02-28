@@ -9,12 +9,6 @@ license.workspace = true
 name = "fawx"
 path = "src/main.rs"
 
-# Hello-world binary used to validate Android NDK cross-compilation setup (issue #118).
-# Toolchain verification only; not part of production agent runtime.
-[[bin]]
-name = "android-hello"
-path = "src/bin/android_hello.rs"
-
 [dependencies]
 fx-core.workspace = true
 fx-kernel.workspace = true

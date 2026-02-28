@@ -44,7 +44,6 @@ Do not optimize code without evidence that it's a bottleneck. Premature optimiza
 ```
 fawx/
 ├── engine/crates/   ← Rust shared core (fx-* crates)
-├── android/         ← Kotlin UI shell (frozen, future)
 ├── docs/            ← Architecture, specs, decisions
 ├── scripts/         ← Build, test, validation scripts
 └── .github/         ← CI, templates
