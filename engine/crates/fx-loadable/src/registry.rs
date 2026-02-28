@@ -62,14 +62,14 @@ impl SkillRegistry {
     }
 
     /// Execute a single tool call by finding the first skill that handles it.
-    fn dispatch_call(
+    async fn dispatch_call(
         &self,
         tool_name: &str,
         arguments: &str,
         cancel: Option<&CancellationToken>,
     ) -> ToolResult {
         for skill in &self.skills {
-            if let Some(result) = skill.execute(tool_name, arguments, cancel) {
+            if let Some(result) = skill.execute(tool_name, arguments, cancel).await {
                 return match result {
                     Ok(output) => ToolResult {
                         tool_name: tool_name.to_string(),
@@ -113,7 +113,7 @@ impl ToolExecutor for SkillRegistry {
                 }
             }
             let args = call.arguments.to_string();
-            results.push(self.dispatch_call(&call.name, &args, cancel));
+            results.push(self.dispatch_call(&call.name, &args, cancel).await);
         }
         Ok(results)
     }
@@ -152,6 +152,7 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl Skill for MockSkill {
         fn name(&self) -> &str {
             &self.skill_name
@@ -161,7 +162,7 @@ mod tests {
             self.tools.clone()
         }
 
-        fn execute(
+        async fn execute(
             &self,
             tool_name: &str,
             _arguments: &str,
@@ -179,6 +180,7 @@ mod tests {
     #[derive(Debug)]
     struct FailingSkill;
 
+    #[async_trait]
     impl Skill for FailingSkill {
         fn name(&self) -> &str {
             "failing"
@@ -192,7 +194,7 @@ mod tests {
             }]
         }
 
-        fn execute(
+        async fn execute(
             &self,
             tool_name: &str,
             _arguments: &str,
@@ -297,8 +299,8 @@ mod tests {
         assert!(results.is_empty());
     }
 
-    #[test]
-    fn register_warns_on_tool_name_collision() {
+    #[tokio::test]
+    async fn register_warns_on_tool_name_collision() {
         // Collision detection is verified structurally: registering two skills
         // with the same tool name still works (first-wins dispatch), but the
         // warning is emitted. We verify first-wins dispatch behavior here.
@@ -310,7 +312,7 @@ mod tests {
         assert_eq!(reg.all_tool_definitions().len(), 2);
 
         // Dispatch goes to first-registered skill
-        let result = reg.dispatch_call("read_file", "{}", None);
+        let result = reg.dispatch_call("read_file", "{}", None).await;
         assert!(result.success);
         assert_eq!(result.output, "fs:read_file");
     }

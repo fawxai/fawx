@@ -66,7 +66,14 @@ impl FawxToolExecutor {
         self
     }
 
-    pub(crate) async fn execute_call(&self, call: &ToolCall) -> ToolResult {
+    pub(crate) async fn execute_call(
+        &self,
+        call: &ToolCall,
+        cancel: Option<&CancellationToken>,
+    ) -> ToolResult {
+        if is_cancelled(cancel) {
+            return cancelled_result(&call.name);
+        }
         let output = match call.name.as_str() {
             "read_file" => self.handle_read_file(&call.arguments),
             "write_file" => self.handle_write_file(&call.arguments),
@@ -374,7 +381,7 @@ impl ToolExecutor for FawxToolExecutor {
                     break;
                 }
             }
-            results.push(self.execute_call(call).await);
+            results.push(self.execute_call(call, cancel).await);
         }
         Ok(results)
     }
@@ -593,6 +600,18 @@ fn to_tool_result(tool_name: &str, output: Result<String, String>) -> ToolResult
             success: false,
             output: error,
         },
+    }
+}
+
+fn is_cancelled(cancel: Option<&CancellationToken>) -> bool {
+    cancel.is_some_and(CancellationToken::is_cancelled)
+}
+
+fn cancelled_result(tool_name: &str) -> ToolResult {
+    ToolResult {
+        tool_name: tool_name.to_string(),
+        success: false,
+        output: "tool execution cancelled".to_string(),
     }
 }
 
@@ -1311,6 +1330,23 @@ mod tests {
 
         assert_eq!(iso8601_utc_from_epoch(epoch), "2024-03-01T00:00:00Z");
         assert_eq!(day_of_week_from_epoch(epoch), "Friday");
+    }
+
+    #[tokio::test]
+    async fn execute_call_returns_cancelled_when_token_is_pre_cancelled() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "current_time".to_string(),
+            arguments: serde_json::json!({}),
+        };
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let result = executor.execute_call(&call, Some(&cancel)).await;
+        assert!(!result.success);
+        assert_eq!(result.output, "tool execution cancelled");
     }
 
     #[tokio::test]

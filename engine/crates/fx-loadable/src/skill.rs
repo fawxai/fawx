@@ -4,6 +4,7 @@
 //! for those tools. Skills are registered into a [`super::registry::SkillRegistry`]
 //! which dispatches tool calls to the appropriate skill.
 
+use async_trait::async_trait;
 use fx_kernel::cancellation::CancellationToken;
 use fx_llm::ToolDefinition;
 
@@ -22,6 +23,7 @@ pub type SkillError = String;
 /// Each skill has a unique name, exposes one or more tool definitions to the
 /// reasoning model, and can execute tool calls by name. If a skill does not
 /// handle a particular tool, its `execute` method returns `None`.
+#[async_trait]
 pub trait Skill: Send + Sync + std::fmt::Debug {
     /// Unique name identifying this skill.
     fn name(&self) -> &str;
@@ -45,7 +47,7 @@ pub trait Skill: Send + Sync + std::fmt::Debug {
     ///
     /// Returns `Some(Ok(output))` on success, `Some(Err(message))` on failure,
     /// or `None` if this skill does not handle the given tool.
-    fn execute(
+    async fn execute(
         &self,
         tool_name: &str,
         arguments: &str,
@@ -60,6 +62,7 @@ mod tests {
     #[derive(Debug)]
     struct TestSkill;
 
+    #[async_trait]
     impl Skill for TestSkill {
         fn name(&self) -> &str {
             "test_skill"
@@ -73,7 +76,7 @@ mod tests {
             }]
         }
 
-        fn execute(
+        async fn execute(
             &self,
             tool_name: &str,
             _arguments: &str,
@@ -95,18 +98,18 @@ mod tests {
         assert_eq!(skill.name(), "test_skill");
     }
 
-    #[test]
-    fn mock_skill_handles_known_call() {
+    #[tokio::test]
+    async fn mock_skill_handles_known_call() {
         let skill = TestSkill;
-        let result = skill.execute("greet", "{}", None);
+        let result = skill.execute("greet", "{}", None).await;
         assert!(result.is_some());
         assert_eq!(result.unwrap(), Ok("hello".to_string()));
     }
 
-    #[test]
-    fn mock_skill_returns_none_for_unknown_call() {
+    #[tokio::test]
+    async fn mock_skill_returns_none_for_unknown_call() {
         let skill = TestSkill;
-        let result = skill.execute("unknown", "{}", None);
+        let result = skill.execute("unknown", "{}", None).await;
         assert!(result.is_none());
     }
 }

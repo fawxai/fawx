@@ -4,6 +4,7 @@
 //! into the skill registry. It holds tool definitions and a handler function
 //! that executes tool calls.
 
+use async_trait::async_trait;
 use fx_kernel::cancellation::CancellationToken;
 use fx_llm::ToolDefinition;
 use std::fmt;
@@ -51,6 +52,7 @@ impl BuiltinSkill {
     }
 }
 
+#[async_trait]
 impl Skill for BuiltinSkill {
     fn name(&self) -> &str {
         &self.name
@@ -60,7 +62,7 @@ impl Skill for BuiltinSkill {
         self.definitions.clone()
     }
 
-    fn execute(
+    async fn execute(
         &self,
         tool_name: &str,
         arguments: &str,
@@ -109,19 +111,19 @@ mod tests {
         assert!(names.contains(&"write_file"));
     }
 
-    #[test]
-    fn builtin_skill_executes_known_tool() {
+    #[tokio::test]
+    async fn builtin_skill_executes_known_tool() {
         let skill = BuiltinSkill::new("builtin".to_string(), test_definitions(), test_handler());
 
-        let result = skill.execute("read_file", "{}", None);
+        let result = skill.execute("read_file", "{}", None).await;
         assert_eq!(result, Some(Ok("file contents".to_string())));
     }
 
-    #[test]
-    fn builtin_skill_returns_none_for_unknown_tool() {
+    #[tokio::test]
+    async fn builtin_skill_returns_none_for_unknown_tool() {
         let skill = BuiltinSkill::new("builtin".to_string(), test_definitions(), test_handler());
 
-        let result = skill.execute("nonexistent", "{}", None);
+        let result = skill.execute("nonexistent", "{}", None).await;
         assert!(result.is_none());
     }
 

@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use fx_kernel::cancellation::CancellationToken;
 use fx_llm::ToolDefinition;
 use fx_loadable::{Skill, SkillError};
@@ -81,6 +82,7 @@ impl GitSkill {
     }
 }
 
+#[async_trait]
 impl Skill for GitSkill {
     fn name(&self) -> &str {
         "git"
@@ -94,7 +96,10 @@ impl Skill for GitSkill {
         ]
     }
 
-    fn execute(
+    /// Uses `std::process::Command` via `spawn_and_wait`, which is acceptable for
+    /// these short-lived git operations. For longer-running commands we should migrate
+    /// to `tokio::process::Command` (tracked in #969).
+    async fn execute(
         &self,
         tool_name: &str,
         arguments: &str,
@@ -305,47 +310,48 @@ mod tests {
     use tempfile::TempDir;
 
     fn init_test_repo() -> TempDir {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new().expect("tempdir should be created");
         Command::new("git")
             .args(["init"])
             .current_dir(tmp.path())
             .output()
-            .unwrap();
+            .expect("git command should run in test setup");
         Command::new("git")
             .args(["config", "user.email", "test@test.com"])
             .current_dir(tmp.path())
             .output()
-            .unwrap();
+            .expect("git command should run in test setup");
         Command::new("git")
             .args(["config", "user.name", "Test"])
             .current_dir(tmp.path())
             .output()
-            .unwrap();
+            .expect("git command should run in test setup");
         tmp
     }
 
-    fn run_tool(
+    async fn run_tool(
         skill: &GitSkill,
         tool_name: &str,
         args: serde_json::Value,
     ) -> Result<String, String> {
         skill
             .execute(tool_name, &args.to_string(), None)
+            .await
             .expect("known tool should return Some")
     }
 
     fn seed_initial_commit(repo: &TempDir, file: &str, content: &str) {
-        fs::write(repo.path().join(file), content).unwrap();
+        fs::write(repo.path().join(file), content).expect("seed file should be written");
         Command::new("git")
             .args(["add", file])
             .current_dir(repo.path())
             .output()
-            .unwrap();
+            .expect("git command should run in test setup");
         Command::new("git")
             .args(["commit", "-m", "initial"])
             .current_dir(repo.path())
             .output()
-            .unwrap();
+            .expect("git command should run in test setup");
     }
 
     #[test]
@@ -368,58 +374,64 @@ mod tests {
         assert_eq!(skill.name(), "git");
     }
 
-    #[test]
-    fn git_skill_returns_none_for_unknown_tool() {
+    #[tokio::test]
+    async fn git_skill_returns_none_for_unknown_tool() {
         let skill = GitSkill::new(PathBuf::from("."));
-        let result = skill.execute("unknown_tool", "{}", None);
+        let result = skill.execute("unknown_tool", "{}", None).await;
         assert!(result.is_none());
     }
 
-    #[test]
-    fn git_status_in_git_repo() {
+    #[tokio::test]
+    async fn git_status_in_git_repo() {
         let repo = init_test_repo();
         let skill = GitSkill::new(repo.path().to_path_buf());
-        let output =
-            run_tool(&skill, "git_status", serde_json::json!({})).expect("status should work");
+        let output = run_tool(&skill, "git_status", serde_json::json!({}))
+            .await
+            .expect("status should work");
         assert!(output.contains("##"));
     }
 
-    #[test]
-    fn git_status_outside_git_repo() {
-        let dir = TempDir::new().unwrap();
+    #[tokio::test]
+    async fn git_status_outside_git_repo() {
+        let dir = TempDir::new().expect("tempdir should be created");
         let skill = GitSkill::new(dir.path().to_path_buf());
-        let error =
-            run_tool(&skill, "git_status", serde_json::json!({})).expect_err("status should fail");
+        let error = run_tool(&skill, "git_status", serde_json::json!({}))
+            .await
+            .expect_err("status should fail");
         assert!(error.contains("not a git repository"));
     }
 
-    #[test]
-    fn git_diff_shows_changes() {
+    #[tokio::test]
+    async fn git_diff_shows_changes() {
         let repo = init_test_repo();
         seed_initial_commit(&repo, "notes.txt", "before\nafter\n");
-        fs::write(repo.path().join("notes.txt"), "before\nchanged\n").unwrap();
+        fs::write(repo.path().join("notes.txt"), "before\nchanged\n")
+            .expect("notes file should be updated");
 
         let skill = GitSkill::new(repo.path().to_path_buf());
-        let output = run_tool(&skill, "git_diff", serde_json::json!({})).expect("diff should work");
+        let output = run_tool(&skill, "git_diff", serde_json::json!({}))
+            .await
+            .expect("diff should work");
 
         assert!(output.contains("diff --git"));
         assert!(output.contains("-after"));
         assert!(output.contains("+changed"));
     }
 
-    #[test]
-    fn git_diff_staged() {
+    #[tokio::test]
+    async fn git_diff_staged() {
         let repo = init_test_repo();
         seed_initial_commit(&repo, "file.txt", "one\n");
-        fs::write(repo.path().join("file.txt"), "two\n").unwrap();
+        fs::write(repo.path().join("file.txt"), "two\n").expect("file should be updated");
         Command::new("git")
             .args(["add", "file.txt"])
             .current_dir(repo.path())
             .output()
-            .unwrap();
+            .expect("git command should run in test setup");
 
         let skill = GitSkill::new(repo.path().to_path_buf());
         let output = run_tool(&skill, "git_diff", serde_json::json!({ "staged": true }))
+            .await
             .expect("staged diff should work");
 
         assert!(output.contains("diff --git"));
@@ -427,10 +439,11 @@ mod tests {
         assert!(output.contains("+two"));
     }
 
-    #[test]
-    fn git_checkpoint_creates_commit() {
+    #[tokio::test]
+    async fn git_checkpoint_creates_commit() {
         let repo = init_test_repo();
-        fs::write(repo.path().join("checkpoint.txt"), "saved\n").unwrap();
+        fs::write(repo.path().join("checkpoint.txt"), "saved\n")
+            .expect("checkpoint file should be written");
         let skill = GitSkill::new(repo.path().to_path_buf());
 
         let output = run_tool(
@@ -438,6 +451,7 @@ mod tests {
             "git_checkpoint",
             serde_json::json!({ "message": "checkpoint commit" }),
         )
+        .await
         .expect("checkpoint should succeed");
 
         assert!(output.contains("checkpoint commit"));
@@ -445,13 +459,13 @@ mod tests {
             .args(["log", "--oneline", "-1"])
             .current_dir(repo.path())
             .output()
-            .unwrap();
-        let log_text = String::from_utf8(log.stdout).unwrap();
+            .expect("git command should run in test setup");
+        let log_text = String::from_utf8(log.stdout).expect("git log output should be valid UTF-8");
         assert!(log_text.contains("checkpoint commit"));
     }
 
-    #[test]
-    fn git_checkpoint_nothing_to_commit() {
+    #[tokio::test]
+    async fn git_checkpoint_nothing_to_commit() {
         let repo = init_test_repo();
         seed_initial_commit(&repo, "clean.txt", "clean\n");
         let skill = GitSkill::new(repo.path().to_path_buf());
@@ -461,22 +475,24 @@ mod tests {
             "git_checkpoint",
             serde_json::json!({ "message": "no-op" }),
         )
+        .await
         .expect("checkpoint should return a clean message");
 
         assert_eq!(output, "nothing to commit, working tree clean");
     }
 
-    #[test]
-    fn git_checkpoint_requires_message() {
+    #[tokio::test]
+    async fn git_checkpoint_requires_message() {
         let repo = init_test_repo();
         let skill = GitSkill::new(repo.path().to_path_buf());
         let error = run_tool(&skill, "git_checkpoint", serde_json::json!({}))
+            .await
             .expect_err("missing message should fail");
         assert!(error.contains("missing field `message`"));
     }
 
-    #[test]
-    fn git_checkpoint_rejects_whitespace_only_message() {
+    #[tokio::test]
+    async fn git_checkpoint_rejects_whitespace_only_message() {
         let repo = init_test_repo();
         let skill = GitSkill::new(repo.path().to_path_buf());
         let error = run_tool(
@@ -484,20 +500,22 @@ mod tests {
             "git_checkpoint",
             serde_json::json!({ "message": "   " }),
         )
+        .await
         .expect_err("whitespace-only message should fail");
         assert!(error.contains("missing required field: message"));
     }
 
-    #[test]
-    fn git_diff_ref_injection_prevented() {
+    #[tokio::test]
+    async fn git_diff_ref_injection_prevented() {
         let repo = init_test_repo();
         seed_initial_commit(&repo, "safe.txt", "one\n");
-        fs::write(repo.path().join("safe.txt"), "two\n").unwrap();
+        fs::write(repo.path().join("safe.txt"), "two\n").expect("safe file should be updated");
 
         let evil_output = repo.path().join("evil.patch");
         let reference = format!("--output={}", evil_output.display());
         let skill = GitSkill::new(repo.path().to_path_buf());
         let error = run_tool(&skill, "git_diff", serde_json::json!({ "ref": reference }))
+            .await
             .expect_err("dash-prefixed ref should fail");
 
         assert!(error.contains("invalid ref: refs cannot start with '-'"));
@@ -507,24 +525,25 @@ mod tests {
         );
     }
 
-    #[test]
-    fn git_diff_with_valid_ref_compares_against_main() {
+    #[tokio::test]
+    async fn git_diff_with_valid_ref_compares_against_main() {
         let repo = init_test_repo();
         seed_initial_commit(&repo, "safe.txt", "one\n");
         Command::new("git")
             .args(["branch", "-M", "main"])
             .current_dir(repo.path())
             .output()
-            .unwrap();
+            .expect("git command should run in test setup");
         Command::new("git")
             .args(["checkout", "-b", "feature"])
             .current_dir(repo.path())
             .output()
-            .unwrap();
-        fs::write(repo.path().join("safe.txt"), "two\n").unwrap();
+            .expect("git command should run in test setup");
+        fs::write(repo.path().join("safe.txt"), "two\n").expect("safe file should be updated");
 
         let skill = GitSkill::new(repo.path().to_path_buf());
         let output = run_tool(&skill, "git_diff", serde_json::json!({ "ref": "main" }))
+            .await
             .expect("valid ref diff should succeed");
 
         assert!(output.contains("diff --git"));
@@ -532,8 +551,8 @@ mod tests {
         assert!(output.contains("+two"));
     }
 
-    #[test]
-    fn git_diff_truncates_large_output() {
+    #[tokio::test]
+    async fn git_diff_truncates_large_output() {
         let repo = init_test_repo();
         let large_old = (0..7000)
             .map(|idx| format!("old-line-{idx}"))
@@ -544,10 +563,12 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         seed_initial_commit(&repo, "huge.txt", &large_old);
-        fs::write(repo.path().join("huge.txt"), &large_new).unwrap();
+        fs::write(repo.path().join("huge.txt"), &large_new).expect("large file should be updated");
 
         let skill = GitSkill::new(repo.path().to_path_buf());
-        let output = run_tool(&skill, "git_diff", serde_json::json!({})).expect("diff should work");
+        let output = run_tool(&skill, "git_diff", serde_json::json!({}))
+            .await
+            .expect("diff should work");
 
         assert!(output.ends_with("(truncated)"));
         assert!(output.chars().count() > MAX_DIFF_OUTPUT_CHARS);
