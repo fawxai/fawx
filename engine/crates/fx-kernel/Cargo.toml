@@ -9,7 +9,6 @@ description = "Fawx kernel — loop orchestration, policy engine, permissions, b
 [dependencies]
 fx-core = { workspace = true }
 fx-storage = { workspace = true }
-fx-loadable = { workspace = true }
 fx-llm = { path = "../fx-llm" }
 
 async-trait.workspace = true

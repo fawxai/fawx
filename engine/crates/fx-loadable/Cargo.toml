@@ -4,12 +4,20 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Fawx loadable layer — WASM skill runtime, strategy management, config, prompt templates, A/B slot lifecycle. Hot-swappable at runtime."
+description = "Fawx loadable layer — skill registry, plugin loading, built-in tool adapters. Hot-swappable at runtime."
 
 [dependencies]
 fx-core = { workspace = true }
+fx-kernel = { workspace = true }
+fx-llm = { path = "../fx-llm" }
 
+async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+toml.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio.workspace = true

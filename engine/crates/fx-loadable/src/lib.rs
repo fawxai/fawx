@@ -1,22 +1,39 @@
 //! # fx-loadable — Fawx Loadable Layer
 //!
-//! The hot-swappable intelligence layer: WASM skill runtime, strategy management,
-//! configuration, prompt templates, and A/B slot lifecycle. Everything that makes
-//! the agent smart (as opposed to safe — that's the kernel's job).
+//! The hot-swappable intelligence layer: skill registry, plugin loading,
+//! strategy management, configuration, prompt templates, and A/B slot lifecycle.
+//! Everything that makes the agent smart (as opposed to safe — that’s the
+//! kernel’s job).
 //!
-//! ## Modules (planned)
+//! ## Modules
 //!
-//! - **skills** — WASM skill loading, sandboxing, capability enforcement
+//! - **skill** — `Skill` trait: tool definitions + execution
+//! - **registry** — `SkillRegistry`: aggregates skills, implements `ToolExecutor`
+//! - **loader** — `SkillLoader`: discovers skill manifests from directory
+//! - **builtin** — `BuiltinSkill`: wraps existing tools for registry compatibility
+//!
+//! ## Stub modules (planned)
+//!
 //! - **strategies** — reasoning strategies, recovery strategies, compaction strategies
 //! - **config** — runtime configuration management
 //! - **templates** — prompt template management
 //! - **ab_slots** — A/B slot lifecycle (pending → active → fallback)
+
+pub mod builtin;
+pub mod loader;
+pub mod registry;
+pub mod skill;
 
 pub(crate) mod ab_slots;
 pub(crate) mod config;
 pub(crate) mod skills;
 pub(crate) mod strategies;
 pub(crate) mod templates;
+
+pub use builtin::BuiltinSkill;
+pub use loader::{SkillLoader, SkillManifest};
+pub use registry::SkillRegistry;
+pub use skill::{Skill, SkillError};
 
 /// A strategy identifier for A/B slot management.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
