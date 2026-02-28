@@ -1,3 +1,6 @@
+use crate::conversation_store::{
+    ConversationMessage, ConversationStore, TokenUsage as ConversationTokenUsage, MAX_BUFFER_SIZE,
+};
 use crate::tools::{FawxToolExecutor, ToolConfig};
 use async_trait::async_trait;
 use crossterm::style::Stylize;
@@ -11,7 +14,7 @@ use fx_kernel::budget::{BudgetConfig, BudgetTracker};
 use fx_kernel::context_manager::ContextCompactor;
 use fx_kernel::loop_engine::{LlmProvider as LoopLlmProvider, LoopEngine, LoopResult};
 use fx_kernel::oauth::{PkceFlow, TokenExchangeRequest, TokenResponse};
-use fx_kernel::signals::{Signal, SignalCollector};
+use fx_kernel::signals::{LoopStep, Signal, SignalCollector};
 use fx_kernel::types::PerceptionSnapshot;
 use fx_llm::{
     AnthropicProvider, CompletionRequest, Message, ModelCatalog, ModelRouter, OpenAiProvider,
@@ -380,6 +383,8 @@ const TUI_COMMANDS: &[&str] = &[
     "/quit",
     "/exit",
     "/clear",
+    "/new",
+    "/history",
     "/status",
     "/model",
     "/auth",
@@ -553,21 +558,38 @@ pub struct TuiApp {
     loop_engine: LoopEngine,
     running: bool,
     conversation_history: Vec<Message>,
+    conversation_store: ConversationStore,
     last_signals: Vec<Signal>,
 }
 
 impl TuiApp {
     /// Create a new TUI application.
-    pub fn new(auth_manager: AuthManager, router: ModelRouter, loop_engine: LoopEngine) -> Self {
-        Self {
+    pub fn new(
+        auth_manager: AuthManager,
+        router: ModelRouter,
+        loop_engine: LoopEngine,
+    ) -> Result<Self, TuiError> {
+        let data_dir = fawx_data_dir();
+        let mut conversation_store = ConversationStore::new(&data_dir).map_err(TuiError::Store)?;
+        conversation_store
+            .ensure_active()
+            .map_err(TuiError::Store)?;
+        let conversation_history = if cfg!(test) {
+            Vec::new()
+        } else {
+            load_conversation_history(&conversation_store)
+        };
+
+        Ok(Self {
             router,
             auth_manager,
             catalog: ModelCatalog::new(),
             loop_engine,
             running: true,
-            conversation_history: Vec::new(),
+            conversation_history,
+            conversation_store,
             last_signals: Vec::new(),
-        }
+        })
     }
 
     /// Run the TUI main loop.
@@ -822,9 +844,21 @@ impl TuiApp {
                 self.update_synthesis_instruction(instruction);
             }
             ParsedCommand::Clear => {
+                self.conversation_store
+                    .clear_active()
+                    .map_err(TuiError::Store)?;
                 self.conversation_history.clear();
                 self.clear_screen()?;
             }
+            ParsedCommand::New => {
+                let id = self
+                    .conversation_store
+                    .create_new()
+                    .map_err(TuiError::Store)?;
+                self.conversation_history.clear();
+                println!("Started new conversation: {id}");
+            }
+            ParsedCommand::History => self.show_conversation_history(),
             ParsedCommand::Help => self.show_help(),
             ParsedCommand::Quit => {
                 self.running = false;
@@ -863,8 +897,11 @@ impl TuiApp {
         .await?;
 
         self.last_signals = loop_result_signals(&loop_result).to_vec();
+        let response_text = loop_result_response_text(&loop_result);
         let response = render_loop_result(loop_result.clone(), started.elapsed());
-        self.record_conversation_turn(input, loop_result_response_text(&loop_result));
+        self.record_conversation_turn(input, response_text.clone());
+        self.persist_turn(input, &response_text, &loop_result)
+            .map_err(TuiError::Store)?;
         Ok(response)
     }
 
@@ -953,6 +990,46 @@ impl TuiApp {
                     }
                 }
             }
+        }
+    }
+
+    fn persist_turn(
+        &self,
+        user_input: &str,
+        response: &str,
+        loop_result: &LoopResult,
+    ) -> Result<(), String> {
+        let user_message = ConversationMessage {
+            role: "user".to_string(),
+            content: user_input.to_string(),
+            timestamp_ms: current_time_ms(),
+            signals: None,
+            tool_calls: None,
+            token_usage: None,
+        };
+        self.conversation_store.save_message(&user_message)?;
+
+        let assistant_message = ConversationMessage {
+            role: "assistant".to_string(),
+            content: response.to_string(),
+            timestamp_ms: current_time_ms(),
+            signals: Some(signal_labels(loop_result_signals(loop_result))),
+            tool_calls: Some(tool_names(loop_result_signals(loop_result))),
+            token_usage: token_usage(loop_result),
+        };
+        self.conversation_store.save_message(&assistant_message)
+    }
+
+    fn show_conversation_history(&self) {
+        let conversations = self.conversation_store.list_conversations();
+        if conversations.is_empty() {
+            println!("No saved conversations yet.");
+            return;
+        }
+
+        println!("Saved conversations:");
+        for (id, count) in conversations {
+            println!("  - {id}: {count} messages");
         }
     }
 
@@ -1078,7 +1155,9 @@ impl TuiApp {
         println!("  /signals       Show condensed signal summary for last turn");
         println!("  /debug         Show full signal dump for last turn");
         println!("  /synthesis     Set or reset synthesis instruction");
-        println!("  /clear         Clear the screen");
+        println!("  /clear         Clear the screen and active conversation");
+        println!("  /new           Start a new conversation");
+        println!("  /history       List saved conversations");
         println!("  /help          Show this help");
         println!("  /quit          Exit");
     }
@@ -1388,6 +1467,63 @@ fn trim_history(history: &mut Vec<Message>) {
     history.drain(0..remove_count);
 }
 
+fn fawx_data_dir() -> PathBuf {
+    dirs::home_dir()
+        .map(|home| home.join(".fawx"))
+        .unwrap_or_else(|| PathBuf::from(".fawx"))
+}
+
+fn load_conversation_history(store: &ConversationStore) -> Vec<Message> {
+    let mut history = store
+        .load_recent(MAX_BUFFER_SIZE)
+        .into_iter()
+        .filter_map(message_from_store)
+        .collect::<Vec<_>>();
+    trim_history(&mut history);
+    history
+}
+
+fn message_from_store(message: ConversationMessage) -> Option<Message> {
+    match message.role.as_str() {
+        "user" => Some(Message::user(message.content)),
+        "assistant" => Some(Message::assistant(message.content)),
+        _ => None,
+    }
+}
+
+fn signal_labels(signals: &[Signal]) -> Vec<String> {
+    signals
+        .iter()
+        .map(|signal| format!("{}:{}", signal.step.to_label(), signal.kind.to_label()))
+        .collect()
+}
+
+fn tool_names(signals: &[Signal]) -> Vec<String> {
+    signals.iter().filter_map(extract_tool_name).collect()
+}
+
+fn extract_tool_name(signal: &Signal) -> Option<String> {
+    if signal.step != LoopStep::Act {
+        return None;
+    }
+
+    signal
+        .message
+        .strip_prefix("tool ")
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+}
+
+fn token_usage(result: &LoopResult) -> Option<ConversationTokenUsage> {
+    match result {
+        LoopResult::Complete { tokens_used, .. } => Some(ConversationTokenUsage {
+            input: tokens_used.input_tokens,
+            output: tokens_used.output_tokens,
+        }),
+        _ => None,
+    }
+}
+
 fn render_loop_result(result: LoopResult, wall_time: std::time::Duration) -> String {
     match result {
         LoopResult::Complete {
@@ -1530,6 +1666,8 @@ pub enum TuiError {
     Io(io::Error),
     /// Authentication flow error.
     Auth(String),
+    /// Conversation store/persistence error.
+    Store(String),
     /// Model routing error.
     Router(String),
     /// Request execution error.
@@ -1541,6 +1679,7 @@ impl fmt::Display for TuiError {
         match self {
             Self::Io(error) => write!(f, "io error: {error}"),
             Self::Auth(message) => write!(f, "auth error: {message}"),
+            Self::Store(message) => write!(f, "store error: {message}"),
             Self::Router(message) => write!(f, "router error: {message}"),
             Self::Loop(message) => write!(f, "loop error: {message}"),
         }
@@ -2400,6 +2539,8 @@ enum ParsedCommand {
     Debug,
     Synthesis(Option<String>),
     Clear,
+    New,
+    History,
     Help,
     Quit,
     Unknown(String),
@@ -2433,6 +2574,8 @@ fn parse_command(value: &str) -> ParsedCommand {
             }
         }
         "clear" | "cls" => ParsedCommand::Clear,
+        "new" => ParsedCommand::New,
+        "history" => ParsedCommand::History,
         "help" => ParsedCommand::Help,
         "quit" | "exit" => ParsedCommand::Quit,
         other => ParsedCommand::Unknown(other.to_string()),
@@ -2497,6 +2640,7 @@ mod tests {
 
     fn new_test_app() -> TuiApp {
         TuiApp::new(AuthManager::new(), ModelRouter::new(), build_loop_engine())
+            .expect("new test app")
     }
 
     fn test_auth_manager() -> AuthManager {
@@ -2856,7 +3000,7 @@ mod tests {
             .set_active("mock-loop-model")
             .expect("set active mock model");
 
-        TuiApp::new(test_provider_auth_manager(), router, build_loop_engine())
+        TuiApp::new(test_provider_auth_manager(), router, build_loop_engine()).expect("mock app")
     }
 
     fn test_provider_auth_manager() -> AuthManager {
@@ -2887,7 +3031,7 @@ mod tests {
             .set_active("gpt-5-mini")
             .expect("set initial active model");
 
-        TuiApp::new(test_provider_auth_manager(), router, build_loop_engine())
+        TuiApp::new(test_provider_auth_manager(), router, build_loop_engine()).expect("mock app")
     }
 
     fn router_with_completion_response(
@@ -3503,6 +3647,8 @@ mod tests {
             ParsedCommand::Synthesis(Some(String::new()))
         );
         assert_eq!(parse_command("/clear"), ParsedCommand::Clear);
+        assert_eq!(parse_command("/new"), ParsedCommand::New);
+        assert_eq!(parse_command("/history"), ParsedCommand::History);
         assert_eq!(parse_command("/cls"), ParsedCommand::Clear);
         assert_eq!(parse_command("/quit"), ParsedCommand::Quit);
         assert_eq!(parse_command("/exit"), ParsedCommand::Quit);
@@ -3614,6 +3760,8 @@ mod tests {
         assert!(should_add_to_history("/quit"));
         assert!(should_add_to_history("/model list"));
         assert!(should_add_to_history("/clear"));
+        assert!(should_add_to_history("/new"));
+        assert!(should_add_to_history("/history"));
     }
 
     #[test]
@@ -3746,7 +3894,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_exits_immediately_when_not_running() {
-        let mut app = TuiApp::new(test_auth_manager(), ModelRouter::new(), build_loop_engine());
+        let mut app =
+            TuiApp::new(test_auth_manager(), ModelRouter::new(), build_loop_engine()).expect("app");
         app.running = false;
 
         let result = app.run().await;
@@ -4317,6 +4466,51 @@ mod tests {
         assert!(
             rendered.contains("Hey there! How can I help?"),
             "expected parsed response text, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn signal_labels_use_stable_text_labels() {
+        let signals = vec![Signal {
+            step: LoopStep::Act,
+            kind: fx_kernel::signals::SignalKind::Success,
+            message: "tool read_file".to_string(),
+            metadata: serde_json::json!({}),
+            timestamp_ms: 1,
+        }];
+
+        assert_eq!(signal_labels(&signals), vec!["act:success".to_string()]);
+    }
+
+    #[test]
+    fn tool_names_extracts_only_tool_names_from_act_signals() {
+        let signals = vec![
+            Signal {
+                step: LoopStep::Act,
+                kind: fx_kernel::signals::SignalKind::Success,
+                message: "tool read_file".to_string(),
+                metadata: serde_json::json!({}),
+                timestamp_ms: 1,
+            },
+            Signal {
+                step: LoopStep::Reason,
+                kind: fx_kernel::signals::SignalKind::Thinking,
+                message: "thinking".to_string(),
+                metadata: serde_json::json!({}),
+                timestamp_ms: 2,
+            },
+            Signal {
+                step: LoopStep::Act,
+                kind: fx_kernel::signals::SignalKind::Friction,
+                message: "tool write_file".to_string(),
+                metadata: serde_json::json!({}),
+                timestamp_ms: 3,
+            },
+        ];
+
+        assert_eq!(
+            tool_names(&signals),
+            vec!["read_file".to_string(), "write_file".to_string()]
         );
     }
 }

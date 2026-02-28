@@ -2,6 +2,7 @@
 
 mod commands;
 mod confirmation;
+mod conversation_store;
 mod tools;
 mod tui;
 
@@ -150,7 +151,7 @@ async fn run_tui() -> anyhow::Result<i32> {
     let auth_manager = tui::load_auth_manager().await?;
     let router = tui::build_router(&auth_manager)?;
     let loop_engine = tui::build_loop_engine();
-    let mut app = tui::TuiApp::new(auth_manager, router, loop_engine);
+    let mut app = tui::TuiApp::new(auth_manager, router, loop_engine)?;
     app.run().await?;
     Ok(0)
 }

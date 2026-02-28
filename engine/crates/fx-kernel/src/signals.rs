@@ -12,6 +12,20 @@ pub enum LoopStep {
     Continue,
 }
 
+impl LoopStep {
+    pub fn to_label(self) -> &'static str {
+        match self {
+            Self::Perceive => "perceive",
+            Self::Reason => "reason",
+            Self::Decide => "decide",
+            Self::Act => "act",
+            Self::Synthesize => "synthesize",
+            Self::Verify => "verify",
+            Self::Continue => "continue",
+        }
+    }
+}
+
 /// Signal category.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SignalKind {
@@ -25,6 +39,23 @@ pub enum SignalKind {
     UserInput,
     UserFeedback,
     Decision,
+}
+
+impl SignalKind {
+    pub fn to_label(self) -> &'static str {
+        match self {
+            Self::Trace => "trace",
+            Self::Thinking => "thinking",
+            Self::Friction => "friction",
+            Self::Success => "success",
+            Self::Blocked => "blocked",
+            Self::Performance => "performance",
+            Self::UserIntervention => "user_intervention",
+            Self::UserInput => "user_input",
+            Self::UserFeedback => "user_feedback",
+            Self::Decision => "decision",
+        }
+    }
 }
 
 /// A structured observation emitted by a loop step.
@@ -316,5 +347,17 @@ mod tests {
         assert!(dump.contains("[Reason/Trace]"));
         assert!(dump.contains("llm done"));
         assert!(dump.contains("(42)"));
+    }
+
+    #[test]
+    fn loop_step_to_label_is_stable() {
+        assert_eq!(LoopStep::Perceive.to_label(), "perceive");
+        assert_eq!(LoopStep::Act.to_label(), "act");
+    }
+
+    #[test]
+    fn signal_kind_to_label_is_stable() {
+        assert_eq!(SignalKind::UserIntervention.to_label(), "user_intervention");
+        assert_eq!(SignalKind::Success.to_label(), "success");
     }
 }
