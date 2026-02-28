@@ -133,6 +133,13 @@ impl FawxToolExecutor {
         for entry in fs::read_dir(path).map_err(|error| error.to_string())? {
             let entry = entry.map_err(|error| error.to_string())?;
             let entry_path = entry.path();
+
+            if let Some(name) = entry_path.file_name().and_then(|n| n.to_str()) {
+                if is_ignored_directory(name) && entry_path.is_dir() {
+                    continue;
+                }
+            }
+
             let Some(validated) = self.validated_existing_entry(&entry_path)? else {
                 continue;
             };
@@ -231,6 +238,14 @@ impl FawxToolExecutor {
                 break;
             }
             let entry_path = entry.map_err(|error| error.to_string())?.path();
+
+            // Skip build artifacts, VCS, and dependency directories
+            if let Some(name) = entry_path.file_name().and_then(|n| n.to_str()) {
+                if is_ignored_directory(name) && entry_path.is_dir() {
+                    continue;
+                }
+            }
+
             let Some(validated) = self.validated_existing_entry(&entry_path)? else {
                 continue;
             };
@@ -493,6 +508,25 @@ fn matches_glob(path: &Path, file_glob: Option<&str>) -> bool {
         .and_then(|value| value.to_str())
         .unwrap_or("");
     simple_glob_match(name, pattern)
+}
+
+/// Directories that should never be searched — build artifacts, VCS, dependencies.
+fn is_ignored_directory(name: &str) -> bool {
+    matches!(
+        name,
+        "target"
+            | ".git"
+            | "node_modules"
+            | ".build"
+            | "build"
+            | ".gradle"
+            | "__pycache__"
+            | ".mypy_cache"
+            | ".pytest_cache"
+            | "dist"
+            | ".next"
+            | ".turbo"
+    )
 }
 
 fn simple_glob_match(name: &str, pattern: &str) -> bool {
@@ -935,6 +969,82 @@ mod tests {
             .handle_search_text(&serde_json::json!({"pattern": "needle", "path": "."}))
             .expect("search");
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn search_text_skips_target_directory() {
+        let dir = TempDir::new().expect("tempdir");
+        let target_dir = dir.path().join("target").join("debug");
+        fs::create_dir_all(&target_dir).expect("mkdir target");
+        fs::write(target_dir.join("foo.rs"), "needle in target").expect("write target");
+        fs::write(dir.path().join("src.rs"), "needle in source").expect("write source");
+
+        let executor = FawxToolExecutor::new(dir.path().to_path_buf(), ToolConfig::default());
+        let result = executor
+            .handle_search_text(&serde_json::json!({"pattern": "needle"}))
+            .expect("search");
+
+        assert!(result.contains("src.rs"), "should find needle in source");
+        assert!(!result.contains("target"), "should skip target directory");
+    }
+
+    #[test]
+    fn search_text_skips_git_directory() {
+        let dir = TempDir::new().expect("tempdir");
+        let git_dir = dir.path().join(".git").join("objects");
+        fs::create_dir_all(&git_dir).expect("mkdir git");
+        fs::write(git_dir.join("pack"), "needle in git").expect("write git");
+        fs::write(dir.path().join("main.rs"), "needle in main").expect("write main");
+
+        let executor = FawxToolExecutor::new(dir.path().to_path_buf(), ToolConfig::default());
+        let result = executor
+            .handle_search_text(&serde_json::json!({"pattern": "needle"}))
+            .expect("search");
+
+        assert!(result.contains("main.rs"), "should find needle in main");
+        assert!(!result.contains(".git"), "should skip .git directory");
+    }
+
+    #[test]
+    fn search_text_does_not_skip_file_named_target() {
+        let dir = TempDir::new().expect("tempdir");
+        fs::write(dir.path().join("target"), "needle in file named target")
+            .expect("write target file");
+
+        let executor = FawxToolExecutor::new(dir.path().to_path_buf(), ToolConfig::default());
+        let result = executor
+            .handle_search_text(&serde_json::json!({"pattern": "needle"}))
+            .expect("search");
+
+        assert!(result.contains("target"), "should search file named target");
+    }
+
+    #[test]
+    fn search_text_skips_node_modules() {
+        let dir = TempDir::new().expect("tempdir");
+        let nm_dir = dir.path().join("node_modules").join("lodash");
+        fs::create_dir_all(&nm_dir).expect("mkdir node_modules");
+        fs::write(nm_dir.join("index.js"), "needle in node_modules").expect("write node_modules");
+        fs::write(dir.path().join("app.rs"), "needle in app").expect("write app");
+
+        let executor = FawxToolExecutor::new(dir.path().to_path_buf(), ToolConfig::default());
+        let result = executor
+            .handle_search_text(&serde_json::json!({"pattern": "needle"}))
+            .expect("search");
+
+        assert!(result.contains("app.rs"), "should find needle in app");
+        assert!(!result.contains("node_modules"), "should skip node_modules");
+    }
+
+    #[test]
+    fn is_ignored_directory_covers_known_dirs() {
+        assert!(is_ignored_directory("target"));
+        assert!(is_ignored_directory(".git"));
+        assert!(is_ignored_directory("node_modules"));
+        assert!(is_ignored_directory(".build"));
+        assert!(!is_ignored_directory("src"));
+        assert!(!is_ignored_directory("engine"));
+        assert!(!is_ignored_directory("docs"));
     }
 
     #[test]
