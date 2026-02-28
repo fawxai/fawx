@@ -180,6 +180,7 @@ const DEFAULT_LLM_ACTION_COST_CENTS: u64 = 2;
 const SAFE_FALLBACK_RESPONSE: &str = "I wasn't able to process that. Could you try rephrasing?";
 const REASONING_SYSTEM_PROMPT: &str = "You are Fawx, a capable personal assistant. \
 Answer the user directly and concisely. \
+Never introduce yourself, greet the user, or add preamble — just answer. \
 Use tools when you need information not already in the conversation \
 (current time, file contents, directory listings, search results, memory, etc.). \
 After using tools, respond with the answer — never narrate what tools you used, \
@@ -1468,6 +1469,24 @@ mod tests {
             prompt.contains("Use tools when you need information not already in the conversation")
         );
         assert!(prompt.contains("current time"));
+    }
+
+    #[test]
+    fn system_prompt_prohibits_greeting_and_preamble() {
+        let defs = vec![ToolDefinition {
+            name: "current_time".to_string(),
+            description: "Get the current time".to_string(),
+            parameters: serde_json::json!({"type": "object", "properties": {}, "required": []}),
+        }];
+        let prompt = build_reasoning_system_prompt(&defs, None);
+        assert!(
+            prompt.contains("Never introduce yourself"),
+            "system prompt must prohibit self-introduction (issue #959)"
+        );
+        assert!(
+            prompt.contains("greet the user"),
+            "system prompt must prohibit greeting (issue #959)"
+        );
     }
 
     #[test]
