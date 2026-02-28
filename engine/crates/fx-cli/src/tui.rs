@@ -4,6 +4,7 @@ use crate::conversation_store::{
     ConversationMessage, ConversationStore, TokenUsage as ConversationTokenUsage,
 };
 use crate::json_memory::{JsonFileMemory, JsonMemoryConfig};
+use crate::skill_bridge::BuiltinToolsSkill;
 use crate::tools::{FawxToolExecutor, ToolConfig};
 use async_trait::async_trait;
 use crossterm::style::Stylize;
@@ -26,6 +27,7 @@ use fx_llm::{
     AnthropicProvider, CompletionRequest, Message, ModelCatalog, ModelRouter, OpenAiProvider,
     OpenAiResponsesProvider, ProviderError, RouterError, StreamChunk,
 };
+use fx_loadable::SkillRegistry;
 use rustyline::completion::{Completer, Pair};
 use rustyline::config::CompletionType;
 use rustyline::error::ReadlineError;
@@ -1445,7 +1447,7 @@ fn build_loop_engine_with_config(data_dir: PathBuf, config: FawxConfig) -> LoopE
     let budget = BudgetTracker::new(BudgetConfig::default(), current_time_ms(), 0);
     let context = ContextCompactor::new(DEFAULT_CONTEXT_MAX_TOKENS, DEFAULT_CONTEXT_COMPACT_TARGET);
     let working_dir = configured_working_dir(&config);
-    let (executor, memory_snapshot) = build_tool_executor(working_dir, &data_dir, &config);
+    let (registry, memory_snapshot) = build_skill_registry(working_dir, &data_dir, &config);
     let synthesis = config
         .model
         .synthesis_instruction
@@ -1456,7 +1458,7 @@ fn build_loop_engine_with_config(data_dir: PathBuf, config: FawxConfig) -> LoopE
         budget,
         context,
         config.general.max_iterations,
-        std::sync::Arc::new(executor),
+        std::sync::Arc::new(registry),
         synthesis,
     );
     if let Some(snapshot_text) = memory_snapshot {
@@ -1465,11 +1467,11 @@ fn build_loop_engine_with_config(data_dir: PathBuf, config: FawxConfig) -> LoopE
     engine
 }
 
-fn build_tool_executor(
+fn build_skill_registry(
     working_dir: PathBuf,
     data_dir: &Path,
     config: &FawxConfig,
-) -> (FawxToolExecutor, Option<String>) {
+) -> (SkillRegistry, Option<String>) {
     let tool_config = ToolConfig {
         max_read_size: config.tools.max_read_size,
         search_exclude: config.tools.search_exclude.clone(),
@@ -1495,7 +1497,9 @@ fn build_tool_executor(
             None
         }
     };
-    (executor, snapshot_text)
+    let mut registry = SkillRegistry::new();
+    registry.register(Box::new(BuiltinToolsSkill::new(executor)));
+    (registry, snapshot_text)
 }
 
 fn format_memory_for_prompt(entries: &[(String, String)], max_chars: usize) -> Option<String> {

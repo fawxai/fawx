@@ -66,7 +66,7 @@ impl FawxToolExecutor {
         self
     }
 
-    async fn execute_call(&self, call: &ToolCall) -> ToolResult {
+    pub(crate) async fn execute_call(&self, call: &ToolCall) -> ToolResult {
         let output = match call.name.as_str() {
             "read_file" => self.handle_read_file(&call.arguments),
             "write_file" => self.handle_write_file(&call.arguments),

@@ -13,6 +13,7 @@ path = "src/main.rs"
 fx-core.workspace = true
 fx-kernel.workspace = true
 fx-llm = { path = "../fx-llm" }
+fx-loadable = { path = "../fx-loadable" }
 fx-security.workspace = true
 fx-skills = { path = "../fx-skills" }
 fx-storage.workspace = true

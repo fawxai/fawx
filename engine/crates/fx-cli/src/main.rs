@@ -6,6 +6,7 @@ mod config;
 mod confirmation;
 mod conversation_store;
 mod json_memory;
+mod skill_bridge;
 mod tools;
 mod tui;
 
