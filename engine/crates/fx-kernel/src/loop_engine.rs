@@ -150,7 +150,7 @@ const REASONING_MAX_OUTPUT_TOKENS: u32 = 768;
 const TOOL_SYNTHESIS_MAX_OUTPUT_TOKENS: u32 = 384;
 const DEFAULT_LLM_ACTION_COST_CENTS: u64 = 2;
 const SAFE_FALLBACK_RESPONSE: &str = "I wasn't able to process that. Could you try rephrasing?";
-const REASONING_SYSTEM_PROMPT: &str = "You are Fawx, an autonomous assistant. Use the available tools to help the user. For simple responses that don't need tools, reply with plain text. For tasks that require reading files, running commands, or searching, call the appropriate tool directly.";
+const REASONING_SYSTEM_PROMPT: &str = "You are Fawx, an autonomous assistant. Use the available tools to help the user. Always use tools when the user asks for information you cannot know from conversation context alone (current time, file contents, directory listings, search results, etc.). Only reply with plain text for conversational responses, opinions, or explanations of information already in the conversation.";
 
 const VERIFICATION_CONFIDENCE_CLEAN: f64 = 0.9;
 const VERIFICATION_CONFIDENCE_SINGLE_DISCREPANCY: f64 = 0.45;
@@ -1071,6 +1071,20 @@ mod tests {
             sensor_data: None,
             conversation_history: vec![Message::user(text)],
         }
+    }
+
+    #[test]
+    fn system_prompt_instructs_tool_use_for_unknown_information() {
+        let defs = vec![ToolDefinition {
+            name: "current_time".to_string(),
+            description: "Get the current time".to_string(),
+            parameters: serde_json::json!({"type": "object", "properties": {}, "required": []}),
+        }];
+        let prompt = build_reasoning_system_prompt(&defs);
+        assert!(prompt.contains(
+            "Always use tools when the user asks for information you cannot know from conversation context alone"
+        ));
+        assert!(prompt.contains("current time"));
     }
 
     #[tokio::test]
