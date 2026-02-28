@@ -7,6 +7,7 @@ use crate::continuation::Continuation;
 use crate::decide::{Decision, CONFIDENCE_CLARIFY_THRESHOLD};
 use crate::learn::Learning;
 use crate::perceive::{ProcessedPerception, TrimmingPolicy};
+use crate::signals::{LoopStep, Signal, SignalCollector, SignalKind};
 use crate::types::{
     Goal, IdentityContext, LoopError, PerceptionSnapshot, ReasoningContext, WorkingMemoryEntry,
 };
@@ -89,6 +90,8 @@ pub enum LoopResult {
         tokens_used: TokenUsage,
         /// Learning artifacts produced across iterations.
         learnings: Vec<Learning>,
+        /// Signals emitted during the cycle.
+        signals: Vec<Signal>,
     },
     /// Loop exited because budget limits were reached.
     BudgetExhausted {
@@ -96,6 +99,8 @@ pub enum LoopResult {
         partial_response: Option<String>,
         /// Iterations completed before exhaustion.
         iterations: u32,
+        /// Signals emitted during the cycle.
+        signals: Vec<Signal>,
     },
     /// Loop requires additional user input.
     NeedsInput {
@@ -103,6 +108,8 @@ pub enum LoopResult {
         prompt: String,
         /// Iterations completed before requesting input.
         iterations: u32,
+        /// Signals emitted during the cycle.
+        signals: Vec<Signal>,
     },
     /// Loop ended with a recoverable or non-recoverable runtime error.
     Error {
@@ -110,6 +117,8 @@ pub enum LoopResult {
         message: String,
         /// Whether retrying may succeed.
         recoverable: bool,
+        /// Signals emitted during the cycle.
+        signals: Vec<Signal>,
     },
 }
 
@@ -122,6 +131,7 @@ pub struct LoopEngine {
     max_iterations: u32,
     iteration_count: u32,
     synthesis_instruction: String,
+    signals: SignalCollector,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -172,6 +182,7 @@ impl LoopEngine {
             max_iterations: max_iterations.max(1),
             iteration_count: 0,
             synthesis_instruction,
+            signals: SignalCollector::default(),
         }
     }
 
@@ -206,6 +217,27 @@ impl LoopEngine {
         }
     }
 
+    fn emit_signal(
+        &mut self,
+        step: LoopStep,
+        kind: SignalKind,
+        message: impl Into<String>,
+        metadata: serde_json::Value,
+    ) {
+        self.signals.emit(Signal {
+            step,
+            kind,
+            message: message.into(),
+            metadata,
+            timestamp_ms: current_time_ms(),
+        });
+    }
+
+    fn finalize_result(&mut self, result: LoopResult) -> LoopResult {
+        let signals = self.signals.drain_all();
+        attach_signals(result, signals)
+    }
+
     /// Run one full loop cycle.
     pub async fn run_cycle(
         &mut self,
@@ -218,7 +250,7 @@ impl LoopEngine {
         while self.iteration_count < self.max_iterations {
             self.iteration_count = self.iteration_count.saturating_add(1);
             match self.execute_iteration(&perception, llm, &mut state).await? {
-                IterationStep::Terminal(result) => return Ok(result),
+                IterationStep::Terminal(result) => return Ok(self.finalize_result(result)),
                 IterationStep::Progress(outcome) => {
                     let IterationOutcome {
                         response_text,
@@ -232,24 +264,26 @@ impl LoopEngine {
                         &mut perception,
                         &mut state,
                     ) {
-                        return Ok(result);
+                        return Ok(self.finalize_result(result));
                     }
                 }
             }
         }
 
-        Ok(LoopResult::Error {
+        Ok(self.finalize_result(LoopResult::Error {
             message: format!(
                 "Loop reached safety limit of {} iterations without completion.",
                 self.max_iterations
             ),
             recoverable: true,
-        })
+            signals: Vec::new(),
+        }))
     }
 
     fn prepare_cycle(&mut self) {
         self.iteration_count = 0;
         self.budget.reset(current_time_ms());
+        self.signals.clear();
     }
 
     async fn execute_iteration(
@@ -322,7 +356,7 @@ impl LoopEngine {
     }
 
     fn budget_terminal(
-        &self,
+        &mut self,
         cost: ActionCost,
         partial_response: Option<String>,
     ) -> Option<IterationStep> {
@@ -331,7 +365,7 @@ impl LoopEngine {
     }
 
     fn handle_budget_check(
-        &self,
+        &mut self,
         cost: ActionCost,
         partial_response: Option<String>,
     ) -> Option<LoopResult> {
@@ -339,14 +373,22 @@ impl LoopEngine {
             return None;
         }
 
+        self.emit_signal(
+            LoopStep::Continue,
+            SignalKind::Blocked,
+            "budget exhausted",
+            serde_json::json!({"iterations": self.iteration_count}),
+        );
+
         Some(LoopResult::BudgetExhausted {
             partial_response,
             iterations: self.iteration_count,
+            signals: Vec::new(),
         })
     }
 
     fn handle_continuation(
-        &self,
+        &mut self,
         continuation: Continuation,
         response_text: String,
         learning: Learning,
@@ -360,10 +402,12 @@ impl LoopEngine {
                 iterations: self.iteration_count,
                 tokens_used: state.tokens,
                 learnings: state.learnings.clone(),
+                signals: Vec::new(),
             }),
             Continuation::NeedsInput(prompt) => Some(LoopResult::NeedsInput {
                 prompt,
                 iterations: self.iteration_count,
+                signals: Vec::new(),
             }),
             Continuation::Continue(sub_goal) => {
                 *perception = next_perception_from_sub_goal(perception, &sub_goal);
@@ -374,10 +418,16 @@ impl LoopEngine {
 
     /// Perceive step.
     async fn perceive(
-        &self,
+        &mut self,
         snapshot: &PerceptionSnapshot,
     ) -> Result<ProcessedPerception, LoopError> {
         let user_message = extract_user_message(snapshot)?;
+        self.emit_signal(
+            LoopStep::Perceive,
+            SignalKind::Trace,
+            "processing user input",
+            serde_json::json!({"input_length": user_message.len()}),
+        );
         let mut context_window = snapshot.conversation_history.clone();
         context_window.push(Message::user(user_message.clone()));
 
@@ -393,7 +443,7 @@ impl LoopEngine {
 
     /// Reason step.
     async fn reason(
-        &self,
+        &mut self,
         perception: &ProcessedPerception,
         llm: &dyn LlmProvider,
     ) -> Result<CompletionResponse, LoopError> {
@@ -402,25 +452,35 @@ impl LoopEngine {
             llm.model_name(),
             self.tool_executor.tool_definitions(),
         );
-        llm.complete(request)
+        let started = current_time_ms();
+        let response = llm
+            .complete(request)
             .await
-            .map_err(|error| loop_error("reason", &format!("completion failed: {error}"), true))
+            .map_err(|error| loop_error("reason", &format!("completion failed: {error}"), true))?;
+        let latency_ms = current_time_ms().saturating_sub(started);
+        let usage = response.usage;
+        self.emit_reason_trace_and_perf(latency_ms, usage.as_ref());
+        Ok(response)
     }
 
     /// Decide step.
-    async fn decide(&self, response: &CompletionResponse) -> Result<Decision, LoopError> {
+    async fn decide(&mut self, response: &CompletionResponse) -> Result<Decision, LoopError> {
         if !response.tool_calls.is_empty() {
-            return Ok(Decision::UseTools(response.tool_calls.clone()));
+            let decision = Decision::UseTools(response.tool_calls.clone());
+            self.emit_decision_signals(&decision);
+            return Ok(decision);
         }
 
         let raw = extract_response_text(response);
         let text = extract_readable_text(&raw);
-        Ok(Decision::Respond(ensure_non_empty_response(&text)))
+        let decision = Decision::Respond(ensure_non_empty_response(&text));
+        self.emit_decision_signals(&decision);
+        Ok(decision)
     }
 
     /// Act step.
     async fn act(
-        &self,
+        &mut self,
         decision: &Decision,
         llm: &dyn LlmProvider,
     ) -> Result<ActionResult, LoopError> {
@@ -430,12 +490,16 @@ impl LoopEngine {
             Decision::Respond(text) | Decision::Clarify(text) | Decision::Defer(text) => {
                 Ok(self.text_action_result(decision, text))
             }
-            Decision::UseTools(calls) => self.act_with_tools(decision, calls, llm).await,
+            Decision::UseTools(calls) => {
+                let action = self.act_with_tools(decision, calls, llm).await?;
+                self.emit_action_signals(&action.tool_results);
+                Ok(action)
+            }
         }
     }
 
     /// Verify step.
-    async fn verify(&self, action: &ActionResult) -> Result<Verification, LoopError> {
+    async fn verify(&mut self, action: &ActionResult) -> Result<Verification, LoopError> {
         let mut discrepancies = Vec::new();
         let has_tool_failure = action.tool_results.iter().any(|result| !result.success);
 
@@ -447,7 +511,9 @@ impl LoopEngine {
             discrepancies.push("action produced an empty response".to_string());
         }
 
-        Ok(build_verification(discrepancies))
+        let verification = build_verification(discrepancies);
+        self.emit_verification_signals(&verification);
+        Ok(verification)
     }
 
     /// Learn step.
@@ -482,7 +548,7 @@ impl LoopEngine {
 
     /// Continue step.
     async fn should_continue(
-        &self,
+        &mut self,
         decision: &Decision,
         verification: &Verification,
         _learning: &Learning,
@@ -490,11 +556,15 @@ impl LoopEngine {
         // Note: Clarify and Defer are not produced by decide() in the current
         // loop engine flow, but are kept for external callers (Decision is pub).
         if let Decision::Clarify(prompt) | Decision::Defer(prompt) = decision {
-            return Ok(Continuation::NeedsInput(prompt.clone()));
+            let continuation = Continuation::NeedsInput(prompt.clone());
+            self.emit_continue_signal(&continuation);
+            return Ok(continuation);
         }
 
         if verification.outcome_satisfactory {
-            return Ok(Continuation::Complete);
+            let continuation = Continuation::Complete;
+            self.emit_continue_signal(&continuation);
+            return Ok(continuation);
         }
 
         // Post-Phase-2: CONFIDENCE_CLARIFY_THRESHOLD gates whether a
@@ -502,15 +572,118 @@ impl LoopEngine {
         // request. This keeps the verify→continue safety net independent
         // of the removed ReasonedIntent confidence gates.
         if verification.confidence < CONFIDENCE_CLARIFY_THRESHOLD {
-            return Ok(Continuation::NeedsInput(
+            let continuation = Continuation::NeedsInput(
                 "I need a bit more detail to continue safely. Could you clarify your goal?"
                     .to_string(),
-            ));
+            );
+            self.emit_continue_signal(&continuation);
+            return Ok(continuation);
         }
 
-        Ok(Continuation::Continue(
+        let continuation = Continuation::Continue(
             "Refine the response using tighter intent alignment.".to_string(),
-        ))
+        );
+        self.emit_continue_signal(&continuation);
+        Ok(continuation)
+    }
+
+    fn emit_reason_trace_and_perf(&mut self, latency_ms: u64, usage: Option<&fx_llm::Usage>) {
+        let metadata = usage
+            .map(|u| {
+                serde_json::json!({
+                    "input_tokens": u.input_tokens,
+                    "output_tokens": u.output_tokens,
+                })
+            })
+            .unwrap_or_else(|| serde_json::json!({"usage": "unavailable"}));
+        self.emit_signal(
+            LoopStep::Reason,
+            SignalKind::Trace,
+            "LLM call completed",
+            metadata,
+        );
+        self.emit_signal(
+            LoopStep::Reason,
+            SignalKind::Performance,
+            "LLM latency",
+            serde_json::json!({"latency_ms": latency_ms}),
+        );
+    }
+
+    fn emit_decision_signals(&mut self, decision: &Decision) {
+        let variant = decision_variant(decision);
+        self.emit_signal(
+            LoopStep::Decide,
+            SignalKind::Decision,
+            "decision made",
+            serde_json::json!({"variant": variant}),
+        );
+        if let Decision::UseTools(calls) = decision {
+            if calls.len() > 1 {
+                let tools = calls
+                    .iter()
+                    .map(|call| call.name.clone())
+                    .collect::<Vec<_>>();
+                self.emit_signal(
+                    LoopStep::Decide,
+                    SignalKind::Trace,
+                    "multiple tools selected",
+                    serde_json::json!({"tools": tools}),
+                );
+            }
+        }
+    }
+
+    fn emit_action_signals(&mut self, results: &[ToolResult]) {
+        for result in results {
+            let kind = if result.success {
+                SignalKind::Success
+            } else {
+                SignalKind::Friction
+            };
+            let output_chars = result.output.chars().count();
+            let truncated_output = if output_chars > 500 {
+                let prefix = result.output.chars().take(500).collect::<String>();
+                format!("{prefix}… ({} bytes total)", result.output.len())
+            } else {
+                result.output.clone()
+            };
+            self.emit_signal(
+                LoopStep::Act,
+                kind,
+                format!("tool {}", result.tool_name),
+                serde_json::json!({"success": result.success, "output": truncated_output}),
+            );
+        }
+    }
+
+    fn emit_verification_signals(&mut self, verification: &Verification) {
+        self.emit_signal(
+            LoopStep::Verify,
+            SignalKind::Decision,
+            "verification evaluated",
+            serde_json::json!({
+                "outcome_satisfactory": verification.outcome_satisfactory,
+                "confidence": verification.confidence,
+            }),
+        );
+        if !verification.discrepancies.is_empty() {
+            self.emit_signal(
+                LoopStep::Verify,
+                SignalKind::Friction,
+                "verification discrepancy found",
+                serde_json::json!({"discrepancies": verification.discrepancies}),
+            );
+        }
+    }
+
+    fn emit_continue_signal(&mut self, continuation: &Continuation) {
+        self.emit_signal(
+            LoopStep::Continue,
+            SignalKind::Decision,
+            "continuation decided",
+            serde_json::json!({"continuation": continuation_label(continuation)}),
+        );
     }
 
     fn append_compacted_summary(
@@ -692,6 +865,66 @@ impl LoopEngine {
             depth: 0,
             parent_context: None,
         }
+    }
+}
+
+fn decision_variant(decision: &Decision) -> &'static str {
+    match decision {
+        Decision::Respond(_) => "Respond",
+        Decision::UseTools(_) => "UseTools",
+        Decision::Clarify(_) => "Clarify",
+        Decision::Defer(_) => "Defer",
+    }
+}
+
+fn continuation_label(continuation: &Continuation) -> &'static str {
+    match continuation {
+        Continuation::Complete => "complete",
+        Continuation::NeedsInput(_) => "needs_input",
+        Continuation::Continue(_) => "continue",
+    }
+}
+
+fn attach_signals(result: LoopResult, signals: Vec<Signal>) -> LoopResult {
+    match result {
+        LoopResult::Complete {
+            response,
+            iterations,
+            tokens_used,
+            learnings,
+            ..
+        } => LoopResult::Complete {
+            response,
+            iterations,
+            tokens_used,
+            learnings,
+            signals,
+        },
+        LoopResult::BudgetExhausted {
+            partial_response,
+            iterations,
+            ..
+        } => LoopResult::BudgetExhausted {
+            partial_response,
+            iterations,
+            signals,
+        },
+        LoopResult::NeedsInput {
+            prompt, iterations, ..
+        } => LoopResult::NeedsInput {
+            prompt,
+            iterations,
+            signals,
+        },
+        LoopResult::Error {
+            message,
+            recoverable,
+            ..
+        } => LoopResult::Error {
+            message,
+            recoverable,
+            signals,
+        },
     }
 }
 
@@ -1089,7 +1322,7 @@ mod tests {
 
     #[tokio::test]
     async fn reason_returns_completion_response_with_tool_calls() {
-        let engine = default_engine();
+        let mut engine = default_engine();
         let llm = MockLlm::new(vec![CompletionResponse {
             content: Vec::new(),
             tool_calls: vec![ToolCall {
@@ -1111,7 +1344,7 @@ mod tests {
 
     #[tokio::test]
     async fn decide_maps_text_response_to_respond_decision() {
-        let engine = default_engine();
+        let mut engine = default_engine();
         let response = CompletionResponse {
             content: vec![ContentBlock::Text {
                 text: "hello".to_string(),
@@ -1126,7 +1359,7 @@ mod tests {
 
     #[tokio::test]
     async fn decide_maps_tool_calls_to_use_tools_decision() {
-        let engine = default_engine();
+        let mut engine = default_engine();
         let response = CompletionResponse {
             content: vec![ContentBlock::Text {
                 text: "ignore me".to_string(),
@@ -1145,7 +1378,7 @@ mod tests {
 
     #[tokio::test]
     async fn decide_maps_empty_response_to_safe_fallback() {
-        let engine = default_engine();
+        let mut engine = default_engine();
         let response = CompletionResponse {
             content: Vec::new(),
             tool_calls: Vec::new(),
@@ -1158,7 +1391,7 @@ mod tests {
 
     #[tokio::test]
     async fn verify_passes_when_tools_succeed_without_intent() {
-        let engine = default_engine();
+        let mut engine = default_engine();
         let action = ActionResult {
             decision: Decision::UseTools(vec![ToolCall {
                 id: "1".to_string(),
@@ -1298,7 +1531,7 @@ mod phase2_tests {
     // NB2-1: verify flags discrepancy when a tool fails
     #[tokio::test]
     async fn verify_flags_discrepancy_when_tool_fails() {
-        let engine = test_engine();
+        let mut engine = test_engine();
         let action = ActionResult {
             decision: Decision::UseTools(vec![
                 ToolCall {
@@ -1344,7 +1577,7 @@ mod phase2_tests {
     // NB2-2: verify flags discrepancy when response is empty
     #[tokio::test]
     async fn verify_flags_discrepancy_when_response_empty() {
-        let engine = test_engine();
+        let mut engine = test_engine();
         let action = ActionResult {
             decision: Decision::Respond("ignored".to_string()),
             tool_results: Vec::new(),
@@ -1368,7 +1601,7 @@ mod phase2_tests {
     // NB2-3: decide handles multiple tool calls
     #[tokio::test]
     async fn decide_handles_multiple_tool_calls() {
-        let engine = test_engine();
+        let mut engine = test_engine();
         let response = CompletionResponse {
             content: Vec::new(),
             tool_calls: vec![
@@ -1471,6 +1704,132 @@ mod phase2_tests {
             matches!(result, LoopResult::BudgetExhausted { .. }),
             "expected LoopResult::BudgetExhausted, got: {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn budget_exhaustion_emits_blocked_signal() {
+        let zero_budget = crate::budget::BudgetConfig {
+            max_llm_calls: 0,
+            max_tool_invocations: 0,
+            max_tokens: 0,
+            max_cost_cents: 0,
+            max_wall_time_ms: 0,
+            max_recursion_depth: 0,
+        };
+        let mut engine = LoopEngine::new(
+            BudgetTracker::new(zero_budget, 0, 0),
+            ContextCompactor::new(2048, 256),
+            3,
+            Arc::new(StubToolExecutor),
+            "Summarize tool output".to_string(),
+        );
+
+        let llm = SequentialMockLlm::new(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "hello".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let result = engine
+            .run_cycle(test_snapshot("hello"), &llm)
+            .await
+            .expect("run_cycle");
+
+        let signals = match result {
+            LoopResult::Complete { signals, .. }
+            | LoopResult::BudgetExhausted { signals, .. }
+            | LoopResult::NeedsInput { signals, .. }
+            | LoopResult::Error { signals, .. } => signals,
+        };
+
+        assert!(signals
+            .iter()
+            .any(|s| s.step == LoopStep::Continue && s.kind == SignalKind::Blocked));
+    }
+
+    #[tokio::test]
+    async fn run_cycle_emits_signals() {
+        let mut engine = test_engine();
+        let llm = SequentialMockLlm::new(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "hello".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: Some(fx_llm::Usage {
+                input_tokens: 8,
+                output_tokens: 4,
+            }),
+            stop_reason: None,
+        }]);
+
+        let result = engine
+            .run_cycle(test_snapshot("hello"), &llm)
+            .await
+            .expect("run_cycle");
+
+        let signals = match result {
+            LoopResult::Complete { signals, .. }
+            | LoopResult::BudgetExhausted { signals, .. }
+            | LoopResult::NeedsInput { signals, .. }
+            | LoopResult::Error { signals, .. } => signals,
+        };
+
+        // Verify expected signal types for a text-response cycle.
+        assert!(signals
+            .iter()
+            .any(|s| s.step == LoopStep::Perceive && s.kind == SignalKind::Trace));
+        assert!(signals
+            .iter()
+            .any(|s| s.step == LoopStep::Reason && s.kind == SignalKind::Trace));
+        assert!(signals
+            .iter()
+            .any(|s| s.step == LoopStep::Reason && s.kind == SignalKind::Performance));
+        assert!(signals
+            .iter()
+            .any(|s| s.step == LoopStep::Decide && s.kind == SignalKind::Decision));
+        assert!(signals
+            .iter()
+            .any(|s| s.step == LoopStep::Verify && s.kind == SignalKind::Decision));
+        assert!(signals
+            .iter()
+            .any(|s| s.step == LoopStep::Continue && s.kind == SignalKind::Decision));
+    }
+
+    #[tokio::test]
+    async fn signals_include_decision_on_tool_call() {
+        let mut engine = test_engine();
+        let llm = SequentialMockLlm::new(vec![CompletionResponse {
+            content: Vec::new(),
+            tool_calls: vec![ToolCall {
+                id: "call-1".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path":"README.md"}),
+            }],
+            usage: Some(fx_llm::Usage {
+                input_tokens: 10,
+                output_tokens: 2,
+            }),
+            stop_reason: Some("tool_use".to_string()),
+        }]);
+
+        let result = engine
+            .run_cycle(test_snapshot("read the readme"), &llm)
+            .await
+            .expect("run_cycle");
+
+        let signals = match result {
+            LoopResult::Complete { signals, .. }
+            | LoopResult::BudgetExhausted { signals, .. }
+            | LoopResult::NeedsInput { signals, .. }
+            | LoopResult::Error { signals, .. } => signals,
+        };
+
+        assert!(signals.iter().any(|signal| {
+            signal.step == LoopStep::Decide && signal.kind == SignalKind::Decision
+        }));
     }
 
     // B2: extract_readable_text unit tests

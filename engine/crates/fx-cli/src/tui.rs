@@ -11,6 +11,7 @@ use fx_kernel::budget::{BudgetConfig, BudgetTracker};
 use fx_kernel::context_manager::ContextCompactor;
 use fx_kernel::loop_engine::{LlmProvider as LoopLlmProvider, LoopEngine, LoopResult};
 use fx_kernel::oauth::{PkceFlow, TokenExchangeRequest, TokenResponse};
+use fx_kernel::signals::{Signal, SignalCollector};
 use fx_kernel::types::PerceptionSnapshot;
 use fx_llm::{
     AnthropicProvider, CompletionRequest, Message, ModelCatalog, ModelRouter, OpenAiProvider,
@@ -384,6 +385,8 @@ const TUI_COMMANDS: &[&str] = &[
     "/auth",
     "/loop",
     "/budget",
+    "/signals",
+    "/debug",
     "/synthesis",
 ];
 
@@ -550,6 +553,7 @@ pub struct TuiApp {
     loop_engine: LoopEngine,
     running: bool,
     conversation_history: Vec<Message>,
+    last_signals: Vec<Signal>,
 }
 
 impl TuiApp {
@@ -562,6 +566,7 @@ impl TuiApp {
             loop_engine,
             running: true,
             conversation_history: Vec::new(),
+            last_signals: Vec::new(),
         }
     }
 
@@ -811,6 +816,8 @@ impl TuiApp {
             ParsedCommand::Budget => self.show_budget_status(),
             ParsedCommand::Loop => self.show_loop_status(),
             ParsedCommand::Status => self.show_status(),
+            ParsedCommand::Signals => self.show_signals_summary(),
+            ParsedCommand::Debug => self.show_signals_debug(),
             ParsedCommand::Synthesis(instruction) => {
                 self.update_synthesis_instruction(instruction);
             }
@@ -855,6 +862,7 @@ impl TuiApp {
         })
         .await?;
 
+        self.last_signals = loop_result_signals(&loop_result).to_vec();
         let response = render_loop_result(loop_result.clone(), started.elapsed());
         self.record_conversation_turn(input, loop_result_response_text(&loop_result));
         Ok(response)
@@ -891,6 +899,26 @@ impl TuiApp {
                 self.set_active_model_from_selector(selector)
             }
         }
+    }
+
+    fn show_signals_summary(&self) {
+        if self.last_signals.is_empty() {
+            println!("No signals from last turn.");
+            return;
+        }
+
+        let collector = SignalCollector::from_signals(self.last_signals.clone());
+        println!("{}", collector.summary());
+    }
+
+    fn show_signals_debug(&self) {
+        if self.last_signals.is_empty() {
+            println!("No signals from last turn.");
+            return;
+        }
+
+        let collector = SignalCollector::from_signals(self.last_signals.clone());
+        println!("{}", collector.debug_dump());
     }
 
     fn update_synthesis_instruction(&mut self, instruction: Option<String>) {
@@ -1047,6 +1075,8 @@ impl TuiApp {
         println!("  /status        Show model, tokens, budget summary");
         println!("  /budget        Show detailed budget usage");
         println!("  /loop          Show loop iteration details");
+        println!("  /signals       Show condensed signal summary for last turn");
+        println!("  /debug         Show full signal dump for last turn");
         println!("  /synthesis     Set or reset synthesis instruction");
         println!("  /clear         Clear the screen");
         println!("  /help          Show this help");
@@ -1284,14 +1314,26 @@ impl LoopLlmProvider for RouterLoopLlmProvider<'_> {
     }
 }
 
+fn loop_result_signals(result: &LoopResult) -> &[Signal] {
+    match result {
+        LoopResult::Complete { signals, .. }
+        | LoopResult::BudgetExhausted { signals, .. }
+        | LoopResult::NeedsInput { signals, .. }
+        | LoopResult::Error { signals, .. } => signals,
+    }
+}
+
 fn loop_result_response_text(result: &LoopResult) -> String {
     match result {
         LoopResult::Complete { response, .. } => response.clone(),
         LoopResult::BudgetExhausted {
             partial_response,
             iterations,
+            ..
         } => render_budget_exhausted(partial_response.clone(), *iterations),
-        LoopResult::NeedsInput { prompt, iterations } => {
+        LoopResult::NeedsInput {
+            prompt, iterations, ..
+        } => {
             let meta =
                 format!("\x1b[2m  \u{21b3} {iterations} iteration(s) \u{00b7} needs input\x1b[0m");
             format!("{prompt}\n{meta}")
@@ -1299,6 +1341,7 @@ fn loop_result_response_text(result: &LoopResult) -> String {
         LoopResult::Error {
             message,
             recoverable,
+            ..
         } => render_loop_error(message, *recoverable),
     }
 }
@@ -1359,6 +1402,7 @@ fn render_loop_result(result: LoopResult, wall_time: std::time::Duration) -> Str
         LoopResult::BudgetExhausted {
             partial_response,
             iterations,
+            ..
         } => {
             let wall = format_wall_time(wall_time);
             let meta = format!(
@@ -1369,7 +1413,9 @@ fn render_loop_result(result: LoopResult, wall_time: std::time::Duration) -> Str
                 _ => meta,
             }
         }
-        LoopResult::NeedsInput { prompt, iterations } => {
+        LoopResult::NeedsInput {
+            prompt, iterations, ..
+        } => {
             let meta =
                 format!("\x1b[2m  \u{21b3} {iterations} iteration(s) \u{00b7} needs input\x1b[0m");
             format!("{prompt}\n{meta}")
@@ -1377,6 +1423,7 @@ fn render_loop_result(result: LoopResult, wall_time: std::time::Duration) -> Str
         LoopResult::Error {
             message,
             recoverable,
+            ..
         } => {
             let suffix = if recoverable { " (recoverable)" } else { "" };
             let wall = format_wall_time(wall_time);
@@ -2349,6 +2396,8 @@ enum ParsedCommand {
     Budget,
     Loop,
     Status,
+    Signals,
+    Debug,
     Synthesis(Option<String>),
     Clear,
     Help,
@@ -2373,6 +2422,8 @@ fn parse_command(value: &str) -> ParsedCommand {
         "budget" => ParsedCommand::Budget,
         "loop" => ParsedCommand::Loop,
         "status" => ParsedCommand::Status,
+        "signals" => ParsedCommand::Signals,
+        "debug" => ParsedCommand::Debug,
         "synthesis" => {
             let remainder = input[command.len()..].strip_prefix(' ');
             match remainder {
@@ -4091,6 +4142,7 @@ mod tests {
                     output_tokens: 12,
                 },
                 learnings: Vec::new(),
+                signals: Vec::new(),
             },
             std::time::Duration::from_millis(250),
         );
@@ -4119,6 +4171,7 @@ mod tests {
             LoopResult::BudgetExhausted {
                 partial_response: Some("partial".to_string()),
                 iterations: 3,
+                signals: Vec::new(),
             },
             std::time::Duration::from_millis(250),
         );
@@ -4133,6 +4186,7 @@ mod tests {
             LoopResult::Error {
                 message: "timeout".to_string(),
                 recoverable: true,
+                signals: Vec::new(),
             },
             std::time::Duration::from_millis(250),
         );
