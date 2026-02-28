@@ -138,6 +138,16 @@ impl FawxConfig {
         Ok(())
     }
 
+    pub fn save(&self, data_dir: &Path) -> Result<(), String> {
+        let config_path = data_dir.join("config.toml");
+        let content = toml::to_string_pretty(self)
+            .map_err(|error| format!("failed to serialize config: {error}"))?;
+        fs::create_dir_all(data_dir).map_err(|error| format!("failed to write config: {error}"))?;
+        fs::write(&config_path, content)
+            .map_err(|error| format!("failed to write config: {error}"))?;
+        Ok(())
+    }
+
     pub fn write_default(data_dir: &Path) -> Result<PathBuf, String> {
         let config_path = data_dir.join("config.toml");
         if config_path.exists() {
@@ -274,6 +284,21 @@ max_snapshot_chars = 777
         let encoded = toml::to_string(&original).expect("serialize");
         let decoded: FawxConfig = toml::from_str(&encoded).expect("deserialize");
         assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn config_save_and_reload_preserves_model() {
+        let temp = TempDir::new().expect("tempdir");
+        let mut config = FawxConfig::default();
+        config.model.default_model = Some("claude-sonnet-4-6-20250929".to_string());
+
+        config.save(temp.path()).expect("save config");
+
+        let loaded = FawxConfig::load(temp.path()).expect("reload config");
+        assert_eq!(
+            loaded.model.default_model.as_deref(),
+            Some("claude-sonnet-4-6-20250929")
+        );
     }
 
     #[test]

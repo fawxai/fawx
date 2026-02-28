@@ -340,16 +340,27 @@ where
 
 /// Curated preference order — newest capable model first.
 const PREFERRED_MODEL_PATTERNS: &[&str] = &[
+    "opus-4-6",
+    "opus-4.6",
+    "opus-4-5",
+    "opus-4.5",
+    "sonnet-4-6",
     "sonnet-4.6",
+    "sonnet-4-5",
     "sonnet-4.5",
     "sonnet-4",
     "opus-4",
+    "gpt-5",
     "gpt-4o",
     "grok-3",
     "qwen-2.5",
     "deepseek-chat",
     "sonnet",
+    "opus",
 ];
+
+/// Never auto-default to small models.
+const DEPRIORITIZED_PATTERNS: &[&str] = &["haiku", "mini", "flash", "nano"];
 
 fn preferred_default_model(model_ids: &[String]) -> Option<&str> {
     for pattern in PREFERRED_MODEL_PATTERNS {
@@ -361,7 +372,20 @@ fn preferred_default_model(model_ids: &[String]) -> Option<&str> {
         }
     }
 
-    highest_version_model(model_ids).or_else(|| model_ids.first().map(String::as_str))
+    highest_version_model(model_ids).or_else(|| {
+        model_ids
+            .iter()
+            .find(|id| !is_deprioritized_model(id))
+            .or_else(|| model_ids.first())
+            .map(String::as_str)
+    })
+}
+
+fn is_deprioritized_model(model_id: &str) -> bool {
+    let lower = model_id.to_ascii_lowercase();
+    DEPRIORITIZED_PATTERNS
+        .iter()
+        .any(|pattern| lower.contains(pattern))
 }
 
 fn highest_version_model(model_ids: &[String]) -> Option<&str> {
@@ -938,7 +962,13 @@ impl TuiApp {
             }
             ParsedCommand::Model(Some(model)) => {
                 match self.set_active_model_with_refresh(&model).await {
-                    Ok(resolved_model) => println!("Active model set to: {resolved_model}"),
+                    Ok(resolved_model) => {
+                        self.config.model.default_model = Some(resolved_model.clone());
+                        if let Err(error) = self.config.save(&fawx_data_dir()) {
+                            eprintln!("Warning: couldn't save model preference: {error}");
+                        }
+                        println!("Active model set to: {resolved_model}");
+                    }
                     Err(error) => {
                         println!("Couldn't select model: {error}");
                         self.show_model_menu();
@@ -1030,13 +1060,7 @@ impl TuiApp {
 
         if self.router.active_model().is_none() {
             self.refresh_router_models().await?;
-            if let Some(model) = self.config.model.default_model.as_deref() {
-                if self.router.set_active(model).is_err() {
-                    self.select_first_available_model();
-                }
-            } else {
-                self.select_first_available_model();
-            }
+            self.select_first_available_model();
         }
 
         Ok(())
@@ -1288,6 +1312,13 @@ impl TuiApp {
     fn select_first_available_model(&mut self) {
         if self.router.active_model().is_some() {
             return;
+        }
+
+        if let Some(saved) = self.config.model.default_model.as_deref() {
+            if self.router.set_active(saved).is_ok() {
+                return;
+            }
+            eprintln!("Saved model '{saved}' no longer available, selecting default");
         }
 
         let model_ids = self
@@ -3815,6 +3846,70 @@ mod tests {
     }
 
     #[test]
+    fn preferred_default_picks_opus_over_sonnet() {
+        let models = vec![
+            "claude-sonnet-4-6-20250929".to_string(),
+            "claude-opus-4-6-20250929".to_string(),
+        ];
+
+        assert_eq!(
+            preferred_default_model(&models),
+            Some("claude-opus-4-6-20250929")
+        );
+    }
+
+    #[test]
+    fn preferred_default_matches_hyphenated_anthropic_ids() {
+        let models = vec!["claude-sonnet-4-6-20250929".to_string()];
+
+        assert_eq!(
+            preferred_default_model(&models),
+            Some("claude-sonnet-4-6-20250929")
+        );
+    }
+
+    #[test]
+    fn preferred_default_matches_openrouter_slash_prefixed_ids() {
+        let models = vec![
+            "anthropic/claude-opus-4.6".to_string(),
+            "anthropic/claude-sonnet-4.5".to_string(),
+            "openai/gpt-5-pro".to_string(),
+        ];
+        let picked = preferred_default_model(&models);
+        assert_eq!(picked, Some("anthropic/claude-opus-4.6"));
+    }
+
+    #[test]
+    fn preferred_default_picks_codex_over_mini() {
+        let models = vec!["o4-mini".to_string(), "gpt-5.3-codex".to_string()];
+        let picked = preferred_default_model(&models);
+        assert_eq!(picked, Some("gpt-5.3-codex"));
+    }
+
+    #[test]
+    fn preferred_default_deprioritizes_haiku() {
+        let models = vec![
+            "claude-3-haiku-20240307".to_string(),
+            "claude-sonnet-4-6-20250929".to_string(),
+        ];
+
+        assert_eq!(
+            preferred_default_model(&models),
+            Some("claude-sonnet-4-6-20250929")
+        );
+    }
+
+    #[test]
+    fn preferred_default_avoids_haiku_as_last_resort() {
+        let models = vec!["claude-3-haiku-20240307".to_string()];
+
+        assert_eq!(
+            preferred_default_model(&models),
+            Some("claude-3-haiku-20240307")
+        );
+    }
+
+    #[test]
     fn default_model_falls_back_to_older_sonnet() {
         let model_ids = vec![
             "anthropic/claude-3-haiku".to_string(),
@@ -3877,9 +3972,13 @@ mod tests {
 
     #[test]
     fn default_model_falls_back_to_first() {
-        let model_ids = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
+        let model_ids = vec![
+            "alpha-mini".to_string(),
+            "beta".to_string(),
+            "gamma".to_string(),
+        ];
 
-        assert_eq!(preferred_default_model(&model_ids), Some("alpha"));
+        assert_eq!(preferred_default_model(&model_ids), Some("beta"));
     }
 
     #[test]
@@ -4281,6 +4380,36 @@ mod tests {
         assert!(
             matches!(error, TuiError::Auth(message) if message.contains("stdin closed unexpectedly"))
         );
+    }
+
+    #[test]
+    fn persisted_model_used_on_startup() {
+        let mut router = ModelRouter::new();
+        router.register_provider_with_auth(
+            Box::new(ModelEchoProvider {
+                provider_name: "echo-provider".to_string(),
+                models: vec![
+                    "claude-opus-4-6-20250929".to_string(),
+                    "claude-sonnet-4-6-20250929".to_string(),
+                ],
+            }),
+            "test",
+        );
+
+        let mut config = FawxConfig::default();
+        config.model.default_model = Some("claude-sonnet-4-6-20250929".to_string());
+
+        let mut app = TuiApp::new(
+            test_provider_auth_manager(),
+            router,
+            build_loop_engine(),
+            config,
+        )
+        .expect("mock app");
+
+        app.select_first_available_model();
+
+        assert_eq!(app.current_model(), "claude-sonnet-4-6-20250929");
     }
 
     #[tokio::test]
