@@ -16,6 +16,7 @@ fx-llm = { path = "../fx-llm" }
 fx-security.workspace = true
 fx-skills = { path = "../fx-skills" }
 fx-storage.workspace = true
+ring.workspace = true
 clap.workspace = true
 tokio.workspace = true
 async-trait.workspace = true

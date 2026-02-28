@@ -1,3 +1,4 @@
+use crate::auth_store::{migrate_if_needed, AuthStore};
 use crate::conversation_store::{
     ConversationMessage, ConversationStore, TokenUsage as ConversationTokenUsage, MAX_BUFFER_SIZE,
 };
@@ -37,8 +38,6 @@ use std::fmt;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::LazyLock;
@@ -61,7 +60,6 @@ const BANNER_ART: &str = r#"   ___
 /// Pre-rendered braille+truecolor ANSI banner (via ascii-image-converter).
 const FAWX_BANNER_ANSI: &str = include_str!("../../../../scripts/fawx-banner.ans");
 
-const DEFAULT_AUTH_FILE: &str = ".fawx/auth.json";
 const DEFAULT_OPENAI_TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
 const MAX_PROMPT_RETRIES: usize = 10;
 const DEFAULT_CONTEXT_MAX_TOKENS: usize = 8_000;
@@ -820,7 +818,7 @@ impl TuiApp {
         &mut self,
         preferred_provider: &str,
     ) -> Result<(), TuiError> {
-        persist_auth_manager(&self.auth_manager).await?;
+        persist_auth_manager(&self.auth_manager)?;
 
         let preferred_models = self.get_models_for_provider(preferred_provider).await;
         self.refresh_router_models().await?;
@@ -1806,23 +1804,23 @@ impl From<io::Error> for TuiError {
     }
 }
 
-/// Load the persisted auth manager from disk, if present.
-pub async fn load_auth_manager() -> Result<AuthManager, TuiError> {
-    let auth_path = auth_file_path()?;
-
-    if !auth_path.exists() {
-        return Ok(AuthManager::new());
+/// Load the persisted auth manager from the encrypted store.
+pub fn load_auth_manager() -> Result<AuthManager, TuiError> {
+    // NB2: Warn if the removed FAWX_AUTH_FILE env var is still set.
+    if std::env::var("FAWX_AUTH_FILE").is_ok() {
+        eprintln!(
+            "warning: FAWX_AUTH_FILE is deprecated; \
+             credentials now stored encrypted in ~/.fawx/auth.db"
+        );
     }
-
-    let raw = tokio::fs::read_to_string(&auth_path)
-        .await
-        .map_err(TuiError::Io)?;
-    AuthManager::from_json(&raw).map_err(|error| {
-        TuiError::Auth(format!(
-            "failed to parse auth file {}: {error}",
-            auth_path.display()
-        ))
-    })
+    let data_dir = fawx_data_dir();
+    let store = AuthStore::open(&data_dir)
+        .map_err(|e| TuiError::Auth(format!("failed to open auth store: {e}")))?;
+    migrate_if_needed(&data_dir, &store)
+        .map_err(|e| TuiError::Auth(format!("auth migration failed: {e}")))?;
+    store
+        .load_auth_manager()
+        .map_err(|e| TuiError::Auth(format!("failed to load credentials: {e}")))
 }
 
 /// Build a model router from stored authentication credentials.
@@ -1876,31 +1874,21 @@ async fn build_router_with_catalog(
     Ok(router)
 }
 
-async fn persist_auth_manager(auth_manager: &AuthManager) -> Result<(), TuiError> {
-    let auth_path = auth_file_path()?;
-
-    if let Some(parent) = auth_path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(TuiError::Io)?;
-    }
-
-    let payload = auth_manager
-        .to_json()
-        .map_err(|error| TuiError::Auth(format!("failed to serialize auth manager: {error}")))?;
-
-    tokio::fs::write(&auth_path, payload)
-        .await
-        .map_err(TuiError::Io)?;
-
-    #[cfg(unix)]
-    {
-        tokio::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600))
-            .await
-            .map_err(TuiError::Io)?;
-    }
-
-    Ok(())
+/// Persist the auth manager to the encrypted store.
+///
+/// ## Optimization opportunity (NH8)
+///
+/// Each call re-opens `AuthStore` (new SQLite connection, re-reads salt,
+/// re-derives key).  For a TUI that saves auth multiple times per session
+/// this is wasteful.  A future improvement could keep the `AuthStore` in
+/// `TuiApp` state alongside `auth_manager` and reuse it across saves.
+fn persist_auth_manager(auth_manager: &AuthManager) -> Result<(), TuiError> {
+    let data_dir = fawx_data_dir();
+    let store = AuthStore::open(&data_dir)
+        .map_err(|e| TuiError::Auth(format!("failed to open auth store: {e}")))?;
+    store
+        .save_auth_manager(auth_manager)
+        .map_err(|e| TuiError::Auth(format!("failed to persist credentials: {e}")))
 }
 
 const OAUTH_SUCCESS_HTML: &str = r#"<!doctype html>
@@ -2370,20 +2358,6 @@ fn default_supported_models(auth_method: &AuthMethod) -> Vec<String> {
             }
         }
     }
-}
-
-fn auth_file_path() -> Result<PathBuf, TuiError> {
-    if let Ok(path) = std::env::var("FAWX_AUTH_FILE") {
-        let path = path.trim();
-        if !path.is_empty() {
-            return Ok(PathBuf::from(path));
-        }
-    }
-
-    let home = dirs::home_dir()
-        .ok_or_else(|| TuiError::Auth("unable to determine home directory".to_string()))?;
-
-    Ok(home.join(DEFAULT_AUTH_FILE))
 }
 
 fn base_url_for_provider(provider: &str) -> String {
@@ -4222,67 +4196,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_auth_manager_loads_expected_auth_manager_from_temp_file() {
+    async fn load_auth_manager_returns_stored_credentials() {
         let _env_lock = ENV_LOCK.lock().await;
         let temp_dir = TempDir::new().unwrap();
-        let auth_path = temp_dir.path().join("auth.json");
+        let _home = ScopedEnvVar::set("HOME", temp_dir.path().to_str().unwrap());
+
+        // Pre-populate the encrypted store so load finds data.
+        let data_dir = temp_dir.path().join(".fawx");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let store = crate::auth_store::AuthStore::open(&data_dir).unwrap();
         let expected = test_auth_manager();
+        store.save_auth_manager(&expected).unwrap();
+        drop(store);
 
-        tokio::fs::write(&auth_path, expected.to_json().unwrap())
-            .await
-            .unwrap();
-        let _auth_path_env = ScopedEnvVar::set("FAWX_AUTH_FILE", auth_path.to_str().unwrap());
-
-        let loaded = load_auth_manager().await.unwrap();
+        let loaded = load_auth_manager().unwrap();
 
         assert_eq!(loaded, expected);
     }
 
     #[tokio::test]
-    async fn persist_auth_manager_writes_expected_json_to_temp_file() {
+    async fn persist_auth_manager_writes_to_encrypted_store() {
         let _env_lock = ENV_LOCK.lock().await;
         let temp_dir = TempDir::new().unwrap();
-        let auth_path = temp_dir.path().join("nested").join("auth.json");
+        let _home = ScopedEnvVar::set("HOME", temp_dir.path().to_str().unwrap());
+
+        let data_dir = temp_dir.path().join(".fawx");
+        std::fs::create_dir_all(&data_dir).unwrap();
         let auth_manager = test_auth_manager();
-        let _auth_path_env = ScopedEnvVar::set("FAWX_AUTH_FILE", auth_path.to_str().unwrap());
 
-        persist_auth_manager(&auth_manager).await.unwrap();
+        persist_auth_manager(&auth_manager).unwrap();
 
-        assert!(auth_path.exists());
-
-        let persisted = tokio::fs::read_to_string(&auth_path).await.unwrap();
-        let persisted_json: serde_json::Value = serde_json::from_str(&persisted).unwrap();
-        let expected_json: serde_json::Value =
-            serde_json::from_str(&auth_manager.to_json().unwrap()).unwrap();
-
-        assert_eq!(persisted_json, expected_json);
+        // Verify by reading back through AuthStore.
+        let store = crate::auth_store::AuthStore::open(&data_dir).unwrap();
+        let loaded = store.load_auth_manager().unwrap();
+        assert_eq!(loaded, auth_manager);
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn persist_auth_manager_sets_0600_permissions_on_unix() {
-        let _env_lock = ENV_LOCK.lock().await;
+    #[test]
+    fn persist_auth_manager_creates_salt_with_0600_permissions() {
         let temp_dir = TempDir::new().unwrap();
-        let auth_path = temp_dir.path().join("auth.json");
-        let auth_manager = test_auth_manager();
-        let _auth_path_env = ScopedEnvVar::set("FAWX_AUTH_FILE", auth_path.to_str().unwrap());
+        let data_dir = temp_dir.path().join(".fawx");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let store = crate::auth_store::AuthStore::open(&data_dir).unwrap();
+        store.save_auth_manager(&test_auth_manager()).unwrap();
 
-        persist_auth_manager(&auth_manager).await.unwrap();
-
-        let mode = tokio::fs::metadata(&auth_path)
-            .await
+        let salt_mode = std::fs::metadata(data_dir.join(".auth-salt"))
             .unwrap()
             .permissions()
             .mode()
             & 0o777;
-        assert_eq!(mode, 0o600);
+        assert_eq!(salt_mode, 0o600);
     }
 
     #[tokio::test]
     async fn persist_then_load_round_trip_returns_equivalent_auth_manager() {
         let _env_lock = ENV_LOCK.lock().await;
         let temp_dir = TempDir::new().unwrap();
-        let auth_path = temp_dir.path().join("auth.json");
+        let _home = ScopedEnvVar::set("HOME", temp_dir.path().to_str().unwrap());
+
+        let data_dir = temp_dir.path().join(".fawx");
+        std::fs::create_dir_all(&data_dir).unwrap();
 
         let mut expected = AuthManager::new();
         expected.store(
@@ -4302,10 +4276,8 @@ mod tests {
             },
         );
 
-        let _auth_path_env = ScopedEnvVar::set("FAWX_AUTH_FILE", auth_path.to_str().unwrap());
-
-        persist_auth_manager(&expected).await.unwrap();
-        let loaded = load_auth_manager().await.unwrap();
+        persist_auth_manager(&expected).unwrap();
+        let loaded = load_auth_manager().unwrap();
 
         assert_eq!(loaded, expected);
     }

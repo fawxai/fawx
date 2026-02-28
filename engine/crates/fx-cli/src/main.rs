@@ -1,5 +1,6 @@
 //! Fawx CLI - Management interface for the Fawx agent.
 
+mod auth_store;
 mod commands;
 mod confirmation;
 mod conversation_store;
@@ -149,7 +150,7 @@ enum SkillCommands {
 }
 
 async fn run_tui() -> anyhow::Result<i32> {
-    let auth_manager = tui::load_auth_manager().await?;
+    let auth_manager = tui::load_auth_manager()?;
     let router = tui::build_router(&auth_manager)?;
     let loop_engine = tui::build_loop_engine();
     let mut app = tui::TuiApp::new(auth_manager, router, loop_engine)?;
