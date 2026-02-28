@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use fx_kernel::act::{ToolExecutor, ToolExecutorError, ToolResult};
+use fx_kernel::cancellation::CancellationToken;
 use fx_llm::{ToolCall, ToolDefinition};
 use serde::Deserialize;
 use std::fs;
@@ -297,9 +298,15 @@ impl ToolExecutor for FawxToolExecutor {
     async fn execute_tools(
         &self,
         calls: &[ToolCall],
+        cancel: Option<&CancellationToken>,
     ) -> Result<Vec<ToolResult>, ToolExecutorError> {
         let mut results = Vec::with_capacity(calls.len());
         for call in calls {
+            if let Some(token) = cancel {
+                if token.is_cancelled() {
+                    break;
+                }
+            }
             results.push(self.execute_call(call).await);
         }
         Ok(results)
@@ -1154,7 +1161,7 @@ mod tests {
             arguments: serde_json::json!({}),
         }];
 
-        let results = executor.execute_tools(&calls).await.expect("results");
+        let results = executor.execute_tools(&calls, None).await.expect("results");
         assert!(results[0].success);
         assert!(results[0].output.contains("day_of_week:"));
     }
@@ -1175,7 +1182,7 @@ mod tests {
             name: "read_file".to_string(),
             arguments: serde_json::json!({"path": "a.txt"}),
         }];
-        let results = executor.execute_tools(&calls).await.expect("results");
+        let results = executor.execute_tools(&calls, None).await.expect("results");
         assert!(results[0].success);
     }
 
@@ -1188,7 +1195,7 @@ mod tests {
             name: "missing_tool".to_string(),
             arguments: serde_json::json!({}),
         }];
-        let results = executor.execute_tools(&calls).await.expect("results");
+        let results = executor.execute_tools(&calls, None).await.expect("results");
         assert!(!results[0].success);
         assert!(results[0].output.contains("unknown tool"));
     }

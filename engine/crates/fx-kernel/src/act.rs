@@ -1,5 +1,6 @@
 //! Act-step execution result types.
 
+use crate::cancellation::CancellationToken;
 use crate::decide::Decision;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -50,9 +51,14 @@ pub struct ToolResult {
 #[async_trait]
 pub trait ToolExecutor: Send + Sync + std::fmt::Debug {
     /// Execute requested tool calls and return tool results.
+    ///
+    /// When `cancel` is `Some`, implementations should check
+    /// [`CancellationToken::is_cancelled`] between individual tool calls
+    /// and return early (with partial results) if cancellation is observed.
     async fn execute_tools(
         &self,
         calls: &[fx_llm::ToolCall],
+        cancel: Option<&CancellationToken>,
     ) -> Result<Vec<ToolResult>, ToolExecutorError>;
 
     /// Tool definitions exposed to the reasoning model.

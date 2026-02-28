@@ -11,7 +11,9 @@ use fx_core::types::{InputSource, ScreenState, UserInput};
 use fx_kernel::act::TokenUsage;
 use fx_kernel::auth::{AuthManager, AuthMethod};
 use fx_kernel::budget::{BudgetConfig, BudgetTracker};
+use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::context_manager::ContextCompactor;
+use fx_kernel::input::LoopCommand;
 use fx_kernel::loop_engine::{LlmProvider as LoopLlmProvider, LoopEngine, LoopResult};
 use fx_kernel::oauth::{PkceFlow, TokenExchangeRequest, TokenResponse};
 use fx_kernel::signals::{LoopStep, Signal, SignalCollector};
@@ -550,6 +552,19 @@ fn save_line_editor_history(editor: &mut Editor<FawxReadlineHelper, DefaultHisto
     }
 }
 
+/// Parse a bare-word command typed during spinner/thinking phase.
+#[allow(dead_code)] // Wired into readline handoff in a follow-up.
+pub(crate) fn parse_bare_command(input: &str) -> Option<LoopCommand> {
+    match input.trim().to_lowercase().as_str() {
+        "stop" | "s" => Some(LoopCommand::Stop),
+        "abort" | "a" | "cancel" => Some(LoopCommand::Abort),
+        "no" => Some(LoopCommand::Stop),
+        "wait" | "pause" | "w" => Some(LoopCommand::Wait),
+        "go" | "resume" | "continue" => Some(LoopCommand::Resume),
+        _ => None,
+    }
+}
+
 /// The main TUI application loop.
 pub struct TuiApp {
     router: ModelRouter,
@@ -560,6 +575,7 @@ pub struct TuiApp {
     conversation_history: Vec<Message>,
     conversation_store: ConversationStore,
     last_signals: Vec<Signal>,
+    cancel_token: CancellationToken,
 }
 
 impl TuiApp {
@@ -589,12 +605,29 @@ impl TuiApp {
             conversation_history,
             conversation_store,
             last_signals: Vec::new(),
+            cancel_token: CancellationToken::new(),
         })
     }
 
     /// Run the TUI main loop.
     pub async fn run(&mut self) -> Result<(), TuiError> {
         self.show_welcome();
+
+        // Ctrl+C signals cancellation instead of killing the process.
+        // First press: graceful cancel. Second press: force exit (NB1).
+        let cancel_for_signal = self.cancel_token.clone();
+        tokio::spawn(async move {
+            // First Ctrl+C: graceful cancel
+            tokio::signal::ctrl_c().await.ok();
+            cancel_for_signal.cancel();
+            // Second Ctrl+C: force exit
+            tokio::signal::ctrl_c().await.ok();
+            eprintln!("\n⏹ Force quit.");
+            std::process::exit(130);
+        });
+
+        // Wire the cancellation token into the loop engine.
+        self.loop_engine.set_cancel_token(self.cancel_token.clone());
 
         let mut editor = configure_line_editor()?;
         let prompt = build_tui_prompt();
@@ -1398,6 +1431,7 @@ fn loop_result_signals(result: &LoopResult) -> &[Signal] {
         LoopResult::Complete { signals, .. }
         | LoopResult::BudgetExhausted { signals, .. }
         | LoopResult::NeedsInput { signals, .. }
+        | LoopResult::UserStopped { signals, .. }
         | LoopResult::Error { signals, .. } => signals,
     }
 }
@@ -1405,6 +1439,11 @@ fn loop_result_signals(result: &LoopResult) -> &[Signal] {
 fn loop_result_response_text(result: &LoopResult) -> String {
     match result {
         LoopResult::Complete { response, .. } => response.clone(),
+        LoopResult::UserStopped {
+            partial_response,
+            iterations,
+            ..
+        } => render_user_stopped(partial_response.clone(), *iterations),
         LoopResult::BudgetExhausted {
             partial_response,
             iterations,
@@ -1526,6 +1565,20 @@ fn token_usage(result: &LoopResult) -> Option<ConversationTokenUsage> {
 
 fn render_loop_result(result: LoopResult, wall_time: std::time::Duration) -> String {
     match result {
+        LoopResult::UserStopped {
+            partial_response,
+            iterations,
+            ..
+        } => {
+            let wall = format_wall_time(wall_time);
+            let meta = format!(
+                "\x1b[33m  ⏹ Stopped by user after {iterations} iteration(s) · {wall}\x1b[0m"
+            );
+            match partial_response {
+                Some(text) if !text.is_empty() => format!("{text}\n{meta}"),
+                _ => meta,
+            }
+        }
         LoopResult::Complete {
             response,
             iterations,
@@ -1584,6 +1637,14 @@ fn format_loop_metadata(
         tokens.output_tokens,
         format_wall_time(wall_time),
     )
+}
+
+fn render_user_stopped(partial: Option<String>, iterations: u32) -> String {
+    let meta = format!("\x1b[33m  ⏹ Stopped by user after {iterations} iteration(s)\x1b[0m");
+    match partial {
+        Some(text) if !text.is_empty() => format!("{text}\n{meta}"),
+        _ => meta,
+    }
 }
 
 fn render_budget_exhausted(partial: Option<String>, iterations: u32) -> String {
@@ -4512,5 +4573,74 @@ mod tests {
             tool_names(&signals),
             vec!["read_file".to_string(), "write_file".to_string()]
         );
+    }
+    #[test]
+    fn parse_bare_command_recognizes_stop_variants() {
+        use fx_kernel::input::LoopCommand;
+
+        assert_eq!(parse_bare_command("stop"), Some(LoopCommand::Stop));
+        assert_eq!(parse_bare_command("s"), Some(LoopCommand::Stop));
+        assert_eq!(parse_bare_command("STOP"), Some(LoopCommand::Stop));
+        assert_eq!(parse_bare_command("no"), Some(LoopCommand::Stop));
+        assert_eq!(parse_bare_command("abort"), Some(LoopCommand::Abort));
+        assert_eq!(parse_bare_command("a"), Some(LoopCommand::Abort));
+        assert_eq!(parse_bare_command("cancel"), Some(LoopCommand::Abort));
+        assert_eq!(parse_bare_command("ABORT"), Some(LoopCommand::Abort));
+        assert_eq!(parse_bare_command("wait"), Some(LoopCommand::Wait));
+        assert_eq!(parse_bare_command("pause"), Some(LoopCommand::Wait));
+        assert_eq!(parse_bare_command("w"), Some(LoopCommand::Wait));
+        assert_eq!(parse_bare_command("go"), Some(LoopCommand::Resume));
+        assert_eq!(parse_bare_command("resume"), Some(LoopCommand::Resume));
+        assert_eq!(parse_bare_command("continue"), Some(LoopCommand::Resume));
+    }
+
+    #[test]
+    fn parse_bare_command_returns_none_for_unknown() {
+        assert_eq!(parse_bare_command("hello world"), None);
+        assert_eq!(parse_bare_command("run tests"), None);
+        assert_eq!(parse_bare_command(""), None);
+        assert_eq!(parse_bare_command("   "), None);
+    }
+
+    #[test]
+    fn parse_bare_command_trims_whitespace() {
+        use fx_kernel::input::LoopCommand;
+
+        assert_eq!(parse_bare_command("  stop  "), Some(LoopCommand::Stop));
+        assert_eq!(
+            parse_bare_command(
+                "  abort
+"
+            ),
+            Some(LoopCommand::Abort)
+        );
+    }
+
+    #[test]
+    fn render_user_stopped_with_partial() {
+        let rendered = render_user_stopped(Some("partial answer".to_string()), 2);
+        assert!(rendered.contains("partial answer"));
+        assert!(rendered.contains("Stopped by user"));
+    }
+
+    #[test]
+    fn render_user_stopped_without_partial() {
+        let rendered = render_user_stopped(None, 1);
+        assert!(rendered.contains("Stopped by user"));
+    }
+
+    #[test]
+    fn render_loop_result_user_stopped_shows_message() {
+        let result = render_loop_result(
+            LoopResult::UserStopped {
+                partial_response: Some("partial".to_string()),
+                iterations: 2,
+                signals: Vec::new(),
+            },
+            std::time::Duration::from_millis(500),
+        );
+        assert!(result.contains("partial"));
+        assert!(result.contains("Stopped by user"));
+        assert!(result.contains("500ms"));
     }
 }

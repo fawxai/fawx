@@ -2,9 +2,11 @@
 
 use crate::act::{ActionResult, TokenUsage, ToolExecutor, ToolResult};
 use crate::budget::{ActionCost, BudgetRemaining, BudgetTracker};
+use crate::cancellation::CancellationToken;
 use crate::context_manager::ContextCompactor;
 use crate::continuation::Continuation;
 use crate::decide::{Decision, CONFIDENCE_CLARIFY_THRESHOLD};
+use crate::input::{LoopCommand, LoopInputChannel};
 use crate::learn::Learning;
 use crate::perceive::{ProcessedPerception, TrimmingPolicy};
 use crate::signals::{LoopStep, Signal, SignalCollector, SignalKind};
@@ -111,6 +113,15 @@ pub enum LoopResult {
         /// Signals emitted during the cycle.
         signals: Vec<Signal>,
     },
+    /// Loop was stopped by the user (stop, abort, or Ctrl+C).
+    UserStopped {
+        /// Best-effort partial response text.
+        partial_response: Option<String>,
+        /// Iterations completed before the user stopped.
+        iterations: u32,
+        /// Signals emitted during the cycle.
+        signals: Vec<Signal>,
+    },
     /// Loop ended with a recoverable or non-recoverable runtime error.
     Error {
         /// Error message to surface to the caller.
@@ -123,7 +134,11 @@ pub enum LoopResult {
 }
 
 /// Core orchestrator for the 7-step agentic loop.
-#[derive(Debug, Clone)]
+///
+/// Note: `LoopEngine` previously derived `Clone`, but Phase 4 added
+/// `LoopInputChannel` which contains `mpsc::Receiver` (not `Clone`).
+/// No existing code clones `LoopEngine`, so this is a safe change.
+#[derive(Debug)]
 pub struct LoopEngine {
     budget: BudgetTracker,
     context: ContextCompactor,
@@ -132,6 +147,8 @@ pub struct LoopEngine {
     iteration_count: u32,
     synthesis_instruction: String,
     signals: SignalCollector,
+    cancel_token: Option<CancellationToken>,
+    input_channel: Option<LoopInputChannel>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -183,7 +200,19 @@ impl LoopEngine {
             iteration_count: 0,
             synthesis_instruction,
             signals: SignalCollector::default(),
+            cancel_token: None,
+            input_channel: None,
         }
+    }
+
+    /// Attach a cancellation token for cooperative cancellation.
+    pub fn set_cancel_token(&mut self, token: CancellationToken) {
+        self.cancel_token = Some(token);
+    }
+
+    /// Attach a user-input channel for bare-word commands.
+    pub fn set_input_channel(&mut self, channel: LoopInputChannel) {
+        self.input_channel = Some(channel);
     }
 
     pub fn set_synthesis_instruction(&mut self, instruction: String) -> Result<(), LoopError> {
@@ -280,10 +309,72 @@ impl LoopEngine {
         }))
     }
 
+    /// Drain the input channel and return the highest-priority command.
+    ///
+    /// Priority ordering: `Abort` always wins. For other commands (`Stop`,
+    /// `Wait`, `Resume`), the last received command takes precedence.
+    /// In practice this is fine — users cannot queue multiple commands in
+    /// the microsecond window between drain calls.
+    fn check_user_input(&mut self) -> Option<LoopCommand> {
+        let channel = self.input_channel.as_mut()?;
+        let mut highest: Option<LoopCommand> = None;
+        while let Some(cmd) = channel.try_recv() {
+            highest = Some(match (&highest, cmd) {
+                (Some(LoopCommand::Abort), _) => LoopCommand::Abort,
+                (_, LoopCommand::Abort) => LoopCommand::Abort,
+                _ => cmd,
+            });
+        }
+        highest
+    }
+
+    /// Check both the cancellation token and input channel.
+    fn check_cancellation(&mut self, partial: Option<String>) -> Option<IterationStep> {
+        // Check CancellationToken (Ctrl+C)
+        if let Some(token) = &self.cancel_token {
+            if token.is_cancelled() {
+                self.emit_signal(
+                    LoopStep::Act,
+                    SignalKind::Blocked,
+                    "user cancelled",
+                    serde_json::json!({"source": "cancellation_token"}),
+                );
+                return Some(IterationStep::Terminal(LoopResult::UserStopped {
+                    partial_response: partial,
+                    iterations: self.iteration_count,
+                    signals: Vec::new(),
+                }));
+            }
+        }
+
+        // Check LoopInputChannel (bare-word commands)
+        match self.check_user_input() {
+            Some(LoopCommand::Stop | LoopCommand::Abort) => {
+                self.emit_signal(
+                    LoopStep::Act,
+                    SignalKind::Blocked,
+                    "user stopped",
+                    serde_json::json!({"source": "input_channel"}),
+                );
+                Some(IterationStep::Terminal(LoopResult::UserStopped {
+                    partial_response: partial,
+                    iterations: self.iteration_count,
+                    signals: Vec::new(),
+                }))
+            }
+            // Wait/Resume are noted but do not stop the loop
+            // (full pause logic can be added later).
+            _ => None,
+        }
+    }
+
     fn prepare_cycle(&mut self) {
         self.iteration_count = 0;
         self.budget.reset(current_time_ms());
         self.signals.clear();
+        if let Some(token) = &self.cancel_token {
+            token.reset();
+        }
     }
 
     async fn execute_iteration(
@@ -295,6 +386,10 @@ impl LoopEngine {
         if let Some(step) =
             self.budget_terminal(ActionCost::default(), state.partial_response.clone())
         {
+            return Ok(step);
+        }
+
+        if let Some(step) = self.check_cancellation(state.partial_response.clone()) {
             return Ok(step);
         }
 
@@ -334,6 +429,10 @@ impl LoopEngine {
         self.budget.record(&action_cost);
         state.tokens.accumulate(action.tokens_used);
         state.partial_response = Some(action.response_text.clone());
+
+        if let Some(step) = self.check_cancellation(state.partial_response.clone()) {
+            return Ok(step);
+        }
 
         let verification = self.verify(&action).await?;
         let learning = self.learn(&verification).await?;
@@ -722,7 +821,7 @@ impl LoopEngine {
     ) -> Result<ActionResult, LoopError> {
         let tool_results = self
             .tool_executor
-            .execute_tools(calls)
+            .execute_tools(calls, self.cancel_token.as_ref())
             .await
             .map_err(|error| {
                 loop_error(
@@ -913,6 +1012,15 @@ fn attach_signals(result: LoopResult, signals: Vec<Signal>) -> LoopResult {
             prompt, iterations, ..
         } => LoopResult::NeedsInput {
             prompt,
+            iterations,
+            signals,
+        },
+        LoopResult::UserStopped {
+            partial_response,
+            iterations,
+            ..
+        } => LoopResult::UserStopped {
+            partial_response,
             iterations,
             signals,
         },
@@ -1210,6 +1318,7 @@ mod tests {
         async fn execute_tools(
             &self,
             calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
         ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
             Ok(calls
                 .iter()
@@ -1432,6 +1541,7 @@ mod phase2_tests {
         async fn execute_tools(
             &self,
             calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
         ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
             Ok(calls
                 .iter()
@@ -1742,6 +1852,7 @@ mod phase2_tests {
             LoopResult::Complete { signals, .. }
             | LoopResult::BudgetExhausted { signals, .. }
             | LoopResult::NeedsInput { signals, .. }
+            | LoopResult::UserStopped { signals, .. }
             | LoopResult::Error { signals, .. } => signals,
         };
 
@@ -1774,6 +1885,7 @@ mod phase2_tests {
             LoopResult::Complete { signals, .. }
             | LoopResult::BudgetExhausted { signals, .. }
             | LoopResult::NeedsInput { signals, .. }
+            | LoopResult::UserStopped { signals, .. }
             | LoopResult::Error { signals, .. } => signals,
         };
 
@@ -1824,6 +1936,7 @@ mod phase2_tests {
             LoopResult::Complete { signals, .. }
             | LoopResult::BudgetExhausted { signals, .. }
             | LoopResult::NeedsInput { signals, .. }
+            | LoopResult::UserStopped { signals, .. }
             | LoopResult::Error { signals, .. } => signals,
         };
 
@@ -1860,5 +1973,446 @@ mod phase2_tests {
     fn extract_readable_text_handles_invalid_json() {
         let broken = r#"{not valid json"#;
         assert_eq!(extract_readable_text(broken), broken);
+    }
+}
+
+#[cfg(test)]
+mod phase4_tests {
+    use super::*;
+    use crate::cancellation::CancellationToken;
+    use crate::input::{loop_input_channel, LoopCommand};
+    use async_trait::async_trait;
+    use fx_core::error::LlmError as CoreLlmError;
+    use fx_core::types::{InputSource, ScreenState, UserInput};
+    use fx_llm::{
+        CompletionResponse, ContentBlock, Message, ProviderError, ToolCall, ToolDefinition,
+    };
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// Tool executor that tracks how many calls were actually executed
+    /// and supports cooperative cancellation.
+    #[derive(Debug)]
+    struct CountingToolExecutor {
+        executed_count: Arc<AtomicU32>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for CountingToolExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+            let mut results = Vec::new();
+            for call in calls {
+                if let Some(token) = cancel {
+                    if token.is_cancelled() {
+                        break;
+                    }
+                }
+                self.executed_count.fetch_add(1, Ordering::SeqCst);
+                results.push(ToolResult {
+                    tool_name: call.name.clone(),
+                    success: true,
+                    output: "ok".to_string(),
+                });
+                // Cancel after first tool call to test partial execution
+                if let Some(token) = cancel {
+                    token.cancel();
+                }
+            }
+            Ok(results)
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition {
+                name: "read_file".to_string(),
+                description: "Read a file".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                }),
+            }]
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct Phase4StubToolExecutor;
+
+    #[async_trait]
+    impl ToolExecutor for Phase4StubToolExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+            Ok(calls
+                .iter()
+                .map(|call| ToolResult {
+                    tool_name: call.name.clone(),
+                    success: true,
+                    output: "ok".to_string(),
+                })
+                .collect())
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition {
+                name: "read_file".to_string(),
+                description: "Read a file".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+            }]
+        }
+    }
+
+    #[derive(Debug)]
+    struct Phase4MockLlm {
+        responses: Mutex<VecDeque<CompletionResponse>>,
+    }
+
+    impl Phase4MockLlm {
+        fn new(responses: Vec<CompletionResponse>) -> Self {
+            Self {
+                responses: Mutex::new(VecDeque::from(responses)),
+            }
+        }
+    }
+
+    /// Mock LLM that cancels a token during `complete()` to simulate
+    /// mid-cycle cancellation (e.g. user pressing Ctrl+C while the LLM
+    /// is generating a response).
+    #[derive(Debug)]
+    struct CancellingMockLlm {
+        token: CancellationToken,
+        responses: Mutex<VecDeque<CompletionResponse>>,
+    }
+
+    impl CancellingMockLlm {
+        fn new(token: CancellationToken, responses: Vec<CompletionResponse>) -> Self {
+            Self {
+                token,
+                responses: Mutex::new(VecDeque::from(responses)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for CancellingMockLlm {
+        async fn generate(&self, _: &str, _: u32) -> Result<String, CoreLlmError> {
+            Ok("summary".to_string())
+        }
+
+        async fn generate_streaming(
+            &self,
+            _: &str,
+            _: u32,
+            callback: Box<dyn Fn(String) + Send + 'static>,
+        ) -> Result<String, CoreLlmError> {
+            callback("summary".to_string());
+            Ok("summary".to_string())
+        }
+
+        fn model_name(&self) -> &str {
+            "mock-cancelling"
+        }
+
+        async fn complete(
+            &self,
+            _: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            // Cancel the token mid-cycle (simulates Ctrl+C during LLM call)
+            self.token.cancel();
+            self.responses
+                .lock()
+                .expect("lock")
+                .pop_front()
+                .ok_or_else(|| ProviderError::Provider("no response".to_string()))
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for Phase4MockLlm {
+        async fn generate(&self, _: &str, _: u32) -> Result<String, CoreLlmError> {
+            Ok("summary".to_string())
+        }
+
+        async fn generate_streaming(
+            &self,
+            _: &str,
+            _: u32,
+            callback: Box<dyn Fn(String) + Send + 'static>,
+        ) -> Result<String, CoreLlmError> {
+            callback("summary".to_string());
+            Ok("summary".to_string())
+        }
+
+        fn model_name(&self) -> &str {
+            "mock"
+        }
+
+        async fn complete(
+            &self,
+            _: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            self.responses
+                .lock()
+                .expect("lock")
+                .pop_front()
+                .ok_or_else(|| ProviderError::Provider("no response".to_string()))
+        }
+    }
+
+    fn p4_engine() -> LoopEngine {
+        LoopEngine::new(
+            BudgetTracker::new(crate::budget::BudgetConfig::default(), 0, 0),
+            ContextCompactor::new(2048, 256),
+            3,
+            Arc::new(Phase4StubToolExecutor),
+            "Summarize tool output".to_string(),
+        )
+    }
+
+    fn p4_snapshot(text: &str) -> PerceptionSnapshot {
+        PerceptionSnapshot {
+            timestamp_ms: 1,
+            screen: ScreenState {
+                current_app: "terminal".to_string(),
+                elements: Vec::new(),
+                text_content: text.to_string(),
+            },
+            notifications: Vec::new(),
+            active_app: "terminal".to_string(),
+            user_input: Some(UserInput {
+                text: text.to_string(),
+                source: InputSource::Text,
+                timestamp: 1,
+                context_id: None,
+            }),
+            sensor_data: None,
+            conversation_history: vec![Message::user(text)],
+        }
+    }
+
+    // P4-1: tool_executor_checks_cancellation_between_calls
+    #[tokio::test]
+    async fn tool_executor_checks_cancellation_between_calls() {
+        let count = Arc::new(AtomicU32::new(0));
+        let executor = CountingToolExecutor {
+            executed_count: Arc::clone(&count),
+        };
+        let token = CancellationToken::new();
+
+        // 3 tool calls — executor cancels after the first
+        let calls = vec![
+            ToolCall {
+                id: "1".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "a.txt"}),
+            },
+            ToolCall {
+                id: "2".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "b.txt"}),
+            },
+            ToolCall {
+                id: "3".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "c.txt"}),
+            },
+        ];
+
+        let results = executor
+            .execute_tools(&calls, Some(&token))
+            .await
+            .expect("execute_tools");
+
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "only the first call should execute before cancellation"
+        );
+        assert_eq!(results.len(), 1);
+    }
+
+    // P4-2: loop_command_stop_ends_cycle
+    #[tokio::test]
+    async fn loop_command_stop_ends_cycle() {
+        let mut engine = p4_engine();
+        let (sender, channel) = loop_input_channel();
+        engine.set_input_channel(channel);
+
+        // Pre-send Stop before the cycle runs
+        sender.send(LoopCommand::Stop).expect("send Stop");
+
+        let llm = Phase4MockLlm::new(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "hello".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let result = engine
+            .run_cycle(p4_snapshot("hello"), &llm)
+            .await
+            .expect("run_cycle");
+
+        assert!(
+            matches!(result, LoopResult::UserStopped { .. }),
+            "expected LoopResult::UserStopped, got: {result:?}"
+        );
+    }
+
+    // P4-3: loop_command_abort_ends_immediately
+    #[tokio::test]
+    async fn loop_command_abort_ends_immediately() {
+        let mut engine = p4_engine();
+        let (sender, channel) = loop_input_channel();
+        engine.set_input_channel(channel);
+
+        sender.send(LoopCommand::Abort).expect("send Abort");
+
+        let llm = Phase4MockLlm::new(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "hello".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let result = engine
+            .run_cycle(p4_snapshot("hello"), &llm)
+            .await
+            .expect("run_cycle");
+
+        assert!(
+            matches!(result, LoopResult::UserStopped { .. }),
+            "expected LoopResult::UserStopped, got: {result:?}"
+        );
+    }
+
+    // P4-4: cancellation token stops the cycle (cancelled mid-cycle)
+    #[tokio::test]
+    async fn cancel_token_stops_cycle() {
+        let mut engine = p4_engine();
+        let token = CancellationToken::new();
+        engine.set_cancel_token(token.clone());
+
+        // LLM cancels the token during complete() to simulate mid-cycle Ctrl+C
+        let llm = CancellingMockLlm::new(
+            token,
+            vec![CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "hello".to_string(),
+                }],
+                tool_calls: Vec::new(),
+                usage: None,
+                stop_reason: None,
+            }],
+        );
+
+        let result = engine
+            .run_cycle(p4_snapshot("hello"), &llm)
+            .await
+            .expect("run_cycle");
+
+        assert!(
+            matches!(result, LoopResult::UserStopped { .. }),
+            "expected LoopResult::UserStopped, got: {result:?}"
+        );
+    }
+
+    // P4-5: UserStopped signals are attached
+    #[tokio::test]
+    async fn user_stopped_includes_signals() {
+        let mut engine = p4_engine();
+        let token = CancellationToken::new();
+        engine.set_cancel_token(token.clone());
+
+        // LLM cancels mid-cycle to produce a UserStopped
+        let llm = CancellingMockLlm::new(
+            token,
+            vec![CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "hello".to_string(),
+                }],
+                tool_calls: Vec::new(),
+                usage: None,
+                stop_reason: None,
+            }],
+        );
+
+        let result = engine
+            .run_cycle(p4_snapshot("hello"), &llm)
+            .await
+            .expect("run_cycle");
+
+        match result {
+            LoopResult::UserStopped { signals, .. } => {
+                assert!(
+                    signals.iter().any(|s| s.kind == SignalKind::Blocked),
+                    "UserStopped should include a Blocked signal"
+                );
+            }
+            other => panic!("expected UserStopped, got: {other:?}"),
+        }
+    }
+
+    // B1: Integration test — verify cancellation resets between cycles
+    #[tokio::test]
+    async fn run_cycle_resets_cancellation_between_cycles() {
+        let mut engine = p4_engine();
+        let token = CancellationToken::new();
+        engine.set_cancel_token(token.clone());
+
+        // First cycle: LLM cancels mid-cycle -> UserStopped
+        let llm = CancellingMockLlm::new(
+            token.clone(),
+            vec![
+                // First cycle: LLM response (cancelled during complete())
+                CompletionResponse {
+                    content: vec![ContentBlock::Text {
+                        text: "first response".to_string(),
+                    }],
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    stop_reason: None,
+                },
+            ],
+        );
+
+        let result1 = engine
+            .run_cycle(p4_snapshot("first"), &llm)
+            .await
+            .expect("first run_cycle");
+        assert!(
+            matches!(result1, LoopResult::UserStopped { .. }),
+            "first cycle should be UserStopped, got: {result1:?}"
+        );
+
+        // Second cycle: prepare_cycle() should have reset the token.
+        // Use a normal (non-cancelling) LLM to verify the cycle runs clean.
+        let llm2 = Phase4MockLlm::new(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "second cycle response".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let result2 = engine
+            .run_cycle(p4_snapshot("second"), &llm2)
+            .await
+            .expect("second run_cycle");
+        assert!(
+            matches!(result2, LoopResult::Complete { .. }),
+            "second cycle should Complete (token was reset), got: {result2:?}"
+        );
     }
 }
