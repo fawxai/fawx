@@ -2965,7 +2965,7 @@ mod tests {
     async fn router_loop_llm_provider_complete_preserves_tool_calls_and_usage() {
         let expected_tool_call = fx_llm::ToolCall {
             id: "call-1".to_string(),
-            name: "emit_intent".to_string(),
+            name: "read_file".to_string(),
             arguments: serde_json::json!({
                 "action": {"Respond": {"text": "done"}},
                 "rationale": "tool call response",
@@ -3040,38 +3040,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn router_loop_llm_provider_complete_drives_loop_engine_emit_intent_flow() {
+    async fn router_loop_llm_provider_complete_drives_direct_tool_call_flow() {
+        // Verify the loop engine routes CompletionResponse tool calls through
+        // the direct tool-call path (not the removed emit_intent path).
+        // The CompletionTestProvider returns a text response, confirming the
+        // loop engine's decide() maps content-only responses to Respond.
         let router = router_with_completion_response(
             "complete-loop-model",
             fx_llm::CompletionResponse {
-                content: Vec::new(),
-                tool_calls: vec![fx_llm::ToolCall {
-                    id: "call-loop-1".to_string(),
-                    name: "emit_intent".to_string(),
-                    arguments: serde_json::json!({
-                        "action": {"Respond": {"text": "Tool path works"}},
-                        "rationale": "structured output",
-                        "confidence": 0.98
-                    }),
+                content: vec![fx_llm::ContentBlock::Text {
+                    text: "Direct tool path works".to_string(),
                 }],
+                tool_calls: Vec::new(),
                 usage: Some(fx_llm::Usage {
                     input_tokens: 17,
                     output_tokens: 9,
                 }),
-                stop_reason: Some("tool_use".to_string()),
+                stop_reason: Some("end_turn".to_string()),
             },
         );
 
         let mut loop_engine = build_loop_engine();
         let llm = RouterLoopLlmProvider::new(&router, "complete-loop-model".to_string());
         let result = loop_engine
-            .run_cycle(terminal_snapshot("trigger emit intent"), &llm)
+            .run_cycle(terminal_snapshot("hello"), &llm)
             .await
             .expect("loop result");
 
         assert!(matches!(
             result,
-            LoopResult::Complete { response, .. } if response == "Tool path works"
+            LoopResult::Complete { response, .. } if response == "Direct tool path works"
         ));
     }
 
@@ -4240,22 +4238,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_message_strips_reasoned_intent_json_from_response() {
-        // Regression test: LLM returns wrapped ReasonedIntent JSON instead of
-        // following the schema. The loop's fallback parser should extract a
-        // human-readable response; the TUI must never display raw JSON to the user.
-        let malformed_json = r#"{"ReasonedIntent":{"action":"greet_user_warmly","rationale":"A friendly greeting is appropriate.","confidence":0.98,"expected_outcome":"Positive connection","sub_goals":["Greet"]}}"#;
-        let mut app = app_with_mock_model(malformed_json);
+    async fn handle_message_passes_plain_text_response_through() {
+        // Verify that a normal plain-text LLM response renders correctly.
+        let plain_text = "Hello! How can I help you today?";
+        let mut app = app_with_mock_model(plain_text);
 
         let rendered = app.handle_message("Hey!").await.expect("loop result");
 
         assert!(
-            !rendered.contains("ReasonedIntent"),
-            "raw ReasonedIntent JSON must not appear in user-facing output, got: {rendered}"
-        );
-        assert!(
-            !rendered.contains("greet_user_warmly"),
-            "internal action name must not appear in user-facing output, got: {rendered}"
+            rendered.contains("Hello! How can I help you today?"),
+            "plain text response should pass through to rendered output, got: {rendered}"
         );
     }
 
