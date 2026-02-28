@@ -1092,6 +1092,12 @@ fn compacted_context_summary(context: &ReasoningContext) -> Option<&str> {
 }
 
 fn tool_synthesis_prompt(tool_results: &[ToolResult], instruction: &str) -> String {
+    let has_tool_error = tool_results.iter().any(|result| !result.success);
+    let error_relay_instruction = if has_tool_error {
+        "\nIf any tool returned an error, tell the user exactly what went wrong — include the actual error message. Do not soften, hedge, or paraphrase errors."
+    } else {
+        ""
+    };
     let tool_summary = tool_results
         .iter()
         .map(|result| format!("- {}: {}", result.tool_name, result.output))
@@ -1100,7 +1106,7 @@ fn tool_synthesis_prompt(tool_results: &[ToolResult], instruction: &str) -> Stri
 
     format!("You are Fawx. Answer the user's question using these tool results. \
 Do NOT describe what tools were called, narrate the process, or comment on how you got the information. \
-Just provide the answer directly.\n\n\
+Just provide the answer directly.{error_relay_instruction}\n\n\
 {instruction}\n\n\
 Tool results:\n{tool_summary}")
 }
@@ -1241,7 +1247,9 @@ fn reasoning_user_prompt(perception: &ProcessedPerception) -> String {
 Budget remaining: {} tokens, {} llm calls
 
 User message:
-{}",
+{}
+
+Focus primarily on the current user message. Avoid repeating information from previous turns unless relevant to the current request.",
         perception.active_goals.join(
             "
 - "
@@ -1343,6 +1351,7 @@ fn current_time_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::budget::BudgetSnapshot;
     use async_trait::async_trait;
     use fx_core::error::LlmError as CoreLlmError;
     use fx_core::types::{InputSource, ScreenState, UserInput};
@@ -1605,6 +1614,80 @@ mod tests {
 
         assert!(prompt.contains("read_file: alpha"));
         assert!(prompt.contains("run_command: permission denied"));
+    }
+
+    #[test]
+    fn synthesis_prompt_includes_error_relay_instruction_when_tool_failed() {
+        let results = vec![ToolResult {
+            tool_name: "read_file".to_string(),
+            output: "file not found: /foo/bar".to_string(),
+            success: false,
+        }];
+
+        let prompt = tool_synthesis_prompt(&results, "Combine outputs");
+
+        assert!(prompt.contains("If any tool returned an error, tell the user exactly what went wrong — include the actual error message. Do not soften, hedge, or paraphrase errors."));
+    }
+
+    #[test]
+    fn synthesis_prompt_omits_error_relay_when_all_tools_succeed() {
+        let results = vec![ToolResult {
+            tool_name: "read_file".to_string(),
+            output: "alpha".to_string(),
+            success: true,
+        }];
+
+        let prompt = tool_synthesis_prompt(&results, "Combine outputs");
+
+        assert!(!prompt.contains("If any tool returned an error, tell the user exactly what went wrong — include the actual error message. Do not soften, hedge, or paraphrase errors."));
+    }
+
+    #[test]
+    fn synthesis_prompt_error_relay_with_mixed_results() {
+        let results = vec![
+            ToolResult {
+                tool_name: "read_file".to_string(),
+                output: "alpha".to_string(),
+                success: true,
+            },
+            ToolResult {
+                tool_name: "run_command".to_string(),
+                output: "permission denied".to_string(),
+                success: false,
+            },
+        ];
+
+        let prompt = tool_synthesis_prompt(&results, "Combine outputs");
+
+        assert!(prompt.contains("If any tool returned an error, tell the user exactly what went wrong — include the actual error message. Do not soften, hedge, or paraphrase errors."));
+    }
+
+    #[test]
+    fn synthesis_prompt_handles_empty_tool_results() {
+        let prompt = tool_synthesis_prompt(&[], "Combine outputs");
+
+        assert!(!prompt.contains("If any tool returned an error, tell the user exactly what went wrong — include the actual error message. Do not soften, hedge, or paraphrase errors."));
+        assert!(prompt.contains("Tool results:\n"));
+    }
+
+    #[test]
+    fn reasoning_prompt_includes_focus_instruction() {
+        let perception = ProcessedPerception {
+            user_message: "What is 2+2?".to_string(),
+            active_goals: vec!["Help the user".to_string()],
+            budget_remaining: BudgetSnapshot {
+                tokens: 500,
+                llm_calls: 3,
+                tool_invocations: 0,
+                wall_time_ms: 0,
+                cost_cents: 0,
+            },
+            context_window: vec![Message::user("older context")],
+        };
+
+        let prompt = reasoning_user_prompt(&perception);
+
+        assert!(prompt.contains("Focus primarily on the current user message. Avoid repeating information from previous turns unless relevant to the current request."));
     }
 
     #[tokio::test]

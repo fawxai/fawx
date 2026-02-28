@@ -66,6 +66,10 @@ const FAWX_BANNER_ANSI: &str = include_str!("../../../../scripts/fawx-banner.ans
 
 const DEFAULT_OPENAI_TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
 const MAX_PROMPT_RETRIES: usize = 10;
+/// Cap conversation history to limit context bleed between unrelated turns.
+/// Higher values increase the chance of the model referencing stale context;
+/// lower values lose multi-turn continuity. 10 balances both concerns.
+const MAX_CONVERSATION_HISTORY: usize = 10;
 const DEFAULT_CONTEXT_MAX_TOKENS: usize = 8_000;
 const DEFAULT_CONTEXT_COMPACT_TARGET: usize = 6_000;
 const DEFAULT_SYNTHESIS_INSTRUCTION: &str =
@@ -658,7 +662,13 @@ impl TuiApp {
         conversation_store
             .ensure_active()
             .map_err(TuiError::Store)?;
-        let max_history = config.general.max_history;
+        if config.general.max_history > MAX_CONVERSATION_HISTORY {
+            eprintln!(
+                "Note: conversation history capped at {MAX_CONVERSATION_HISTORY} entries (configured: {})",
+                config.general.max_history
+            );
+        }
+        let max_history = config.general.max_history.min(MAX_CONVERSATION_HISTORY);
         let conversation_history = if cfg!(test) {
             Vec::new()
         } else {
@@ -4385,10 +4395,10 @@ mod tests {
                 .expect("message response");
         }
 
-        assert_eq!(app.conversation_history.len(), 20);
+        assert_eq!(app.conversation_history.len(), MAX_CONVERSATION_HISTORY);
         assert_eq!(
             app.conversation_history[0],
-            Message::user("msg-5".to_string())
+            Message::user("msg-10".to_string())
         );
     }
 

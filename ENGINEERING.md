@@ -210,7 +210,7 @@ Code that doesn't meet the standards above gets rewritten or removed.
 
 ### Concurrency model
 Work is classified by complexity tier:
-- **Simple** (< 50 lines): Direct N+1 worker, no review pipeline. CI (tests, clippy, fmt) is the quality gate. If CI fails, escalate to standard tier (gets a reviewer).
+- **Simple** (< 50 lines): Direct N+1 worker. Still gets Opus review unless Joe explicitly waives it. CI + review as quality gate.
 - **Standard** (single-PR features): N+1 orchestrator spawns N+2 workers (implementer, reviewer, fixer). Orchestrator manages the full PR lifecycle and only announces terminal status to main. Parallel orchestrators OK (max 2-3).
 - **Complex** (multi-crate, architectural): Single N+1 agent with full context. **Sequential only — one PR at a time.** Review/fix cycles may use N+2 workers since they're more mechanical.
 
