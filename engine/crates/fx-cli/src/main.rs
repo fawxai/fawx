@@ -2,7 +2,7 @@
 
 mod auth_store;
 mod commands;
-mod config;
+mod config_bridge;
 mod confirmation;
 mod conversation_store;
 mod git_skill;

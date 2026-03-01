@@ -10,6 +10,7 @@ name = "fawx"
 path = "src/main.rs"
 
 [dependencies]
+fx-config.workspace = true
 fx-core.workspace = true
 fx-kernel.workspace = true
 fx-auth.workspace = true

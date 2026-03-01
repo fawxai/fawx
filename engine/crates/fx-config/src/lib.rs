@@ -5,6 +5,13 @@ const MIN_MAX_READ_SIZE: u64 = 1024;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Default deny patterns for self-modification path enforcement.
+///
+/// These patterns are duplicated from `fx_core::self_modify::DEFAULT_DENY_PATHS`
+/// to keep fx-config independent of fx-core. If these defaults change, update
+/// both locations.
+pub(crate) const DEFAULT_DENY_PATHS: &[&str] = &[".git/**", "*.key", "*.pem", "credentials.*"];
+
 pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Fawx Configuration
 # Location: ~/.fawx/config.toml
 
@@ -141,29 +148,7 @@ impl Default for SelfModifyPathsCliConfig {
         Self {
             allow: Vec::new(),
             propose: Vec::new(),
-            deny: fx_core::self_modify::DEFAULT_DENY_PATHS
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-        }
-    }
-}
-
-impl From<&SelfModifyCliConfig> for fx_core::self_modify::SelfModifyConfig {
-    fn from(cli: &SelfModifyCliConfig) -> Self {
-        let SelfModifyCliConfig {
-            enabled,
-            branch_prefix,
-            require_tests,
-            paths,
-        } = cli;
-        Self {
-            enabled: *enabled,
-            branch_prefix: branch_prefix.clone(),
-            require_tests: *require_tests,
-            allow_paths: paths.allow.clone(),
-            propose_paths: paths.propose.clone(),
-            deny_paths: paths.deny.clone(),
+            deny: DEFAULT_DENY_PATHS.iter().map(|s| s.to_string()).collect(),
         }
     }
 }
@@ -205,9 +190,7 @@ impl FawxConfig {
                 ));
             }
         }
-        let core_sm = fx_core::self_modify::SelfModifyConfig::from(&self.self_modify);
-        fx_core::self_modify::validate_glob_patterns(&core_sm)?;
-        Ok(())
+        validate_glob_patterns(&self.self_modify)
     }
 
     pub fn save(&self, data_dir: &Path) -> Result<(), String> {
@@ -230,6 +213,22 @@ impl FawxConfig {
             .map_err(|error| format!("failed to write config: {error}"))?;
         Ok(config_path)
     }
+}
+
+fn validate_glob_patterns(self_modify: &SelfModifyCliConfig) -> Result<(), String> {
+    let all_fields = [
+        ("paths.allow", &self_modify.paths.allow),
+        ("paths.propose", &self_modify.paths.propose),
+        ("paths.deny", &self_modify.paths.deny),
+    ];
+    for (field, patterns) in all_fields {
+        for pattern in patterns {
+            glob::Pattern::new(pattern).map_err(|error| {
+                format!("invalid glob in self_modify.{field}: '{pattern}': {error}")
+            })?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -446,6 +445,7 @@ max_snapshot_chars = 777
         let config = FawxConfig::load(temp.path()).expect("should accept 500 chars");
         assert_eq!(config.model.synthesis_instruction.unwrap().len(), 500);
     }
+
     #[test]
     fn load_config_with_self_modify_section() {
         let temp = TempDir::new().expect("tempdir");
@@ -471,26 +471,6 @@ deny = [".git/**", "*.key"]
         assert_eq!(loaded.self_modify.paths.deny, vec![".git/**", "*.key"]);
     }
 
-    #[test]
-    fn self_modify_cli_config_converts_to_core_config() {
-        let cli = SelfModifyCliConfig {
-            enabled: true,
-            branch_prefix: "test/prefix".to_string(),
-            require_tests: false,
-            paths: SelfModifyPathsCliConfig {
-                allow: vec!["src/**".to_string()],
-                propose: vec!["kernel/**".to_string()],
-                deny: vec!["*.key".to_string()],
-            },
-        };
-        let core = fx_core::self_modify::SelfModifyConfig::from(&cli);
-        assert!(core.enabled);
-        assert_eq!(core.branch_prefix, "test/prefix");
-        assert!(!core.require_tests);
-        assert_eq!(core.allow_paths, vec!["src/**"]);
-        assert_eq!(core.propose_paths, vec!["kernel/**"]);
-        assert_eq!(core.deny_paths, vec!["*.key"]);
-    }
     #[test]
     fn load_rejects_invalid_glob_pattern() {
         let temp = TempDir::new().expect("tempdir");

@@ -1,5 +1,4 @@
 use crate::auth_store::{migrate_if_needed, AuthStore};
-use crate::config::FawxConfig;
 use crate::conversation_store::{
     ConversationMessage, ConversationStore, TokenUsage as ConversationTokenUsage,
 };
@@ -14,6 +13,7 @@ use crossterm::{cursor, event, style, terminal, ExecutableCommand};
 use futures::StreamExt;
 use fx_auth::auth::{AuthManager, AuthMethod};
 use fx_auth::oauth::{PkceFlow, TokenExchangeRequest, TokenResponse};
+use fx_config::FawxConfig;
 use fx_core::error::LlmError as CoreLlmError;
 use fx_core::memory::MemoryProvider;
 use fx_core::types::{InputSource, ScreenState, UserInput};
@@ -1673,7 +1673,7 @@ fn build_skill_registry(
             None
         }
     };
-    let self_modify_config = fx_core::self_modify::SelfModifyConfig::from(&config.self_modify);
+    let self_modify_config = crate::config_bridge::to_core_self_modify(&config.self_modify);
     let sm = self_modify_config.enabled.then_some(self_modify_config);
     if let Some(ref smc) = sm {
         executor = executor.with_self_modify(smc.clone());
