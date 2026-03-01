@@ -863,6 +863,78 @@ mod tests {
         );
     }
 
+    fn continuation_assistant_message() -> Message {
+        Message {
+            role: MessageRole::Assistant,
+            content: vec![
+                ContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "lookup".to_string(),
+                    input: json!({"q": "first"}),
+                },
+                ContentBlock::ToolUse {
+                    id: "call_2".to_string(),
+                    name: "lookup".to_string(),
+                    input: json!({"q": "second"}),
+                },
+            ],
+        }
+    }
+
+    fn continuation_tool_message() -> Message {
+        Message {
+            role: MessageRole::Tool,
+            content: vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: Value::String("first result".to_string()),
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: "call_2".to_string(),
+                    content: Value::String("second result".to_string()),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn test_map_messages_handles_tool_continuation_pair() {
+        let messages = vec![
+            continuation_assistant_message(),
+            continuation_tool_message(),
+        ];
+        let mapped = map_messages_to_openai(&messages).unwrap();
+        let assistant_calls = mapped[0].tool_calls.as_ref().expect("assistant tool calls");
+        let tool_messages = mapped[1..]
+            .iter()
+            .map(|message| {
+                (
+                    message.role.as_str(),
+                    message.tool_call_id.as_deref(),
+                    message.content.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(mapped.len(), 3);
+        assert_eq!(mapped[0].role, "assistant");
+        assert!(mapped[0].content.is_none());
+        assert_eq!(
+            assistant_calls
+                .iter()
+                .map(|call| call.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["call_1", "call_2"]
+        );
+        assert_eq!(
+            tool_messages,
+            vec![
+                ("tool", Some("call_1"), Some("first result")),
+                ("tool", Some("call_2"), Some("second result"))
+            ]
+        );
+    }
+
     #[test]
     fn test_build_request_rejects_unsupported_model() {
         let provider = OpenAiProvider::new("http://localhost:8080", "test-key")

@@ -14,10 +14,12 @@ async-trait.workspace = true
 bytes = "1"
 fx-core.workspace = true
 futures.workspace = true
+http.workspace = true
 llama-cpp-sys = { path = "../llama-cpp-sys", optional = true }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-tungstenite.workspace = true
 tracing.workspace = true

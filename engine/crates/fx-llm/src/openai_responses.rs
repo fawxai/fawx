@@ -5,16 +5,16 @@
 //! This is the wire format used by ChatGPT Plus/Pro subscriptions via OAuth tokens.
 
 use async_trait::async_trait;
-use futures::{stream, StreamExt};
-use reqwest::StatusCode;
+use futures::{stream, SinkExt, StreamExt};
+use http::{header::HeaderValue, Request};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::{collections::VecDeque, time::Duration};
+use serde_json::{json, Value};
+use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest, Message as WsMessage};
 
 use crate::provider::{CompletionStream, LlmProvider, ProviderCapabilities};
 use crate::types::{
-    CompletionRequest, CompletionResponse, ContentBlock, LlmError, MessageRole, StreamChunk,
-    ToolCall, ToolUseDelta, Usage,
+    CompletionRequest, CompletionResponse, ContentBlock, LlmError, Message, MessageRole,
+    StreamChunk, ToolCall, ToolUseDelta, Usage,
 };
 
 const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
@@ -27,7 +27,6 @@ pub struct OpenAiResponsesProvider {
     account_id: String,
     provider_name: String,
     supported_models: Vec<String>,
-    client: reqwest::Client,
 }
 
 impl OpenAiResponsesProvider {
@@ -50,18 +49,12 @@ impl OpenAiResponsesProvider {
             return Err(LlmError::Config("account_id cannot be empty".to_string()));
         }
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
-            .build()
-            .map_err(|e| LlmError::Config(format!("failed to build HTTP client: {e}")))?;
-
         Ok(Self {
             base_url: DEFAULT_CODEX_BASE_URL.to_string(),
             access_token,
             account_id,
             provider_name: "openai".to_string(),
             supported_models: Vec::new(),
-            client,
         })
     }
 
@@ -79,7 +72,7 @@ impl OpenAiResponsesProvider {
 
     fn endpoint(&self) -> String {
         let base = self.base_url.trim_end_matches('/');
-        if base.ends_with("/codex/responses") {
+        if base.ends_with("/responses") {
             base.to_string()
         } else if base.ends_with("/codex") {
             format!("{base}/responses")
@@ -104,29 +97,7 @@ impl OpenAiResponsesProvider {
 
         let mut input = Vec::new();
         for message in &request.messages {
-            match message.role {
-                MessageRole::System => {
-                    // System messages go into instructions, skip here
-                }
-                MessageRole::User | MessageRole::Tool => {
-                    let text = extract_text(&message.content);
-                    if !text.is_empty() {
-                        input.push(ResponsesMessage {
-                            role: "user".to_string(),
-                            content: text,
-                        });
-                    }
-                }
-                MessageRole::Assistant => {
-                    let text = extract_text(&message.content);
-                    if !text.is_empty() {
-                        input.push(ResponsesMessage {
-                            role: "assistant".to_string(),
-                            content: text,
-                        });
-                    }
-                }
-            }
+            map_message_to_responses_input(&mut input, message)?;
         }
 
         let tools = request
@@ -151,29 +122,51 @@ impl OpenAiResponsesProvider {
         })
     }
 
-    fn build_headers(&self) -> reqwest::header::HeaderMap {
-        use reqwest::header::HeaderValue;
-        let mut headers = reqwest::header::HeaderMap::new();
-        if let Ok(val) = HeaderValue::from_str(&self.account_id) {
-            headers.insert("chatgpt-account-id", val);
+    fn ws_endpoint(&self) -> String {
+        let http_url = self.endpoint();
+        if let Some(stripped) = http_url.strip_prefix("https://") {
+            format!("wss://{stripped}")
+        } else if let Some(stripped) = http_url.strip_prefix("http://") {
+            format!("ws://{stripped}")
+        } else {
+            http_url
         }
+    }
+
+    fn build_ws_create_payload(&self, request: &CompletionRequest) -> Result<Value, LlmError> {
+        let body = self.build_request_body(request, false)?;
+        let mut payload = serde_json::to_value(body).map_err(|error| {
+            LlmError::InvalidResponse(format!("failed to serialize request: {error}"))
+        })?;
+        let payload_object = payload.as_object_mut().ok_or_else(|| {
+            LlmError::InvalidResponse("request body is not an object".to_string())
+        })?;
+        payload_object.insert(
+            "type".to_string(),
+            Value::String("response.create".to_string()),
+        );
+        payload_object.remove("stream");
+        Ok(payload)
+    }
+
+    fn build_ws_request(&self, ws_url: &str) -> Result<Request<()>, LlmError> {
+        let mut request = ws_url.into_client_request().map_err(|error| {
+            LlmError::Config(format!("failed to build WebSocket request: {error}"))
+        })?;
+        let headers = request.headers_mut();
+        insert_header(
+            headers,
+            "authorization",
+            &format!("Bearer {}", self.access_token),
+        )?;
+        insert_header(headers, "chatgpt-account-id", &self.account_id)?;
         headers.insert(
             "openai-beta",
             HeaderValue::from_static("responses=experimental"),
         );
         headers.insert("originator", HeaderValue::from_static("fawx"));
-        headers
-    }
-
-    fn map_http_error(status: StatusCode, body: String) -> LlmError {
-        match status.as_u16() {
-            401 => LlmError::Authentication(format!("authentication failed: {body}")),
-            403 => LlmError::Authentication(format!("forbidden: {body}")),
-            404 => LlmError::Config(format!("endpoint not found: {body}")),
-            429 => LlmError::RateLimited(format!("rate limited: {body}")),
-            500..=599 => LlmError::Provider(format!("server error {}: {body}", status.as_u16())),
-            _ => LlmError::Request(format!("http {}: {body}", status.as_u16())),
-        }
+        insert_header(headers, "host", &extract_host_from_url(ws_url))?;
+        Ok(request)
     }
 
     #[cfg(test)]
@@ -192,13 +185,6 @@ impl OpenAiResponsesProvider {
             stop_reason: body.status,
             tool_calls,
         }
-    }
-
-    fn build_streaming_request_body(
-        &self,
-        request: &CompletionRequest,
-    ) -> Result<ResponsesRequestBody, LlmError> {
-        self.build_request_body(request, true)
     }
 
     async fn complete_via_stream(
@@ -227,30 +213,6 @@ impl OpenAiResponsesProvider {
         })
     }
 
-    fn find_event_delimiter(buffer: &str) -> Option<(usize, usize)> {
-        let lf_delim = buffer.find("\n\n").map(|idx| (idx, 2));
-        let crlf_delim = buffer.find("\r\n\r\n").map(|idx| (idx, 4));
-        match (lf_delim, crlf_delim) {
-            (Some(lf), Some(crlf)) => Some(if lf.0 <= crlf.0 { lf } else { crlf }),
-            (Some(lf), None) => Some(lf),
-            (None, Some(crlf)) => Some(crlf),
-            (None, None) => None,
-        }
-    }
-
-    fn parse_event_and_data(event_str: &str) -> (String, String) {
-        let mut event_type = String::new();
-        let mut data = String::new();
-        for line in event_str.lines() {
-            if let Some(val) = line.strip_prefix("event:") {
-                event_type = val.trim().to_string();
-            } else if let Some(val) = line.strip_prefix("data:") {
-                data = val.trim().to_string();
-            }
-        }
-        (event_type, data)
-    }
-
     fn chunk_from_event(event_type: &str, data: &str) -> Option<StreamChunk> {
         match event_type {
             "response.output_text.delta" => {
@@ -262,119 +224,272 @@ impl OpenAiResponsesProvider {
                     })
             }
             "response.function_call_arguments.delta" => {
-                serde_json::from_str::<SseFunctionCallArgsDelta>(data)
-                    .ok()
-                    .map(|parsed| StreamChunk {
-                        tool_use_deltas: vec![ToolUseDelta {
-                            id: parsed.item_id,
-                            name: parsed.name,
-                            arguments_delta: Some(parsed.delta),
-                        }],
-                        ..Default::default()
-                    })
+                tool_delta_from_arguments_event(data, false).map(chunk_from_tool_delta)
             }
             "response.function_call_arguments.done" => {
-                serde_json::from_str::<SseFunctionCallArgsDone>(data)
-                    .ok()
-                    .map(|parsed| StreamChunk {
-                        tool_use_deltas: vec![ToolUseDelta {
-                            id: parsed.item_id,
-                            name: parsed.name,
-                            arguments_delta: parsed.arguments,
-                        }],
-                        ..Default::default()
-                    })
+                tool_delta_from_arguments_event(data, true).map(chunk_from_tool_delta)
             }
-            "response.completed" | "response.done" => serde_json::from_str::<SseResponseDone>(data)
-                .ok()
-                .and_then(|parsed| parsed.response.and_then(|r| r.usage))
-                .map(|usage| StreamChunk {
-                    usage: Some(Usage {
-                        input_tokens: usage.input_tokens.unwrap_or(0) as u32,
-                        output_tokens: usage.output_tokens.unwrap_or(0) as u32,
-                    }),
-                    stop_reason: Some("stop".to_string()),
-                    ..Default::default()
-                }),
+            "response.output_item.added" | "response.output_item.done" => {
+                tool_delta_from_output_item_event(data).map(chunk_from_tool_delta)
+            }
+            "response.completed" | "response.done" => usage_chunk_from_done_event(data),
             _ => None,
         }
     }
 
-    fn stream_from_sse(
-        response: reqwest::Response,
-    ) -> impl futures::Stream<Item = Result<StreamChunk, LlmError>> {
-        let byte_stream = response.bytes_stream();
-        let buffer = String::new();
-        let pending: VecDeque<Result<StreamChunk, LlmError>> = VecDeque::new();
-        let done = false;
+    fn stream_from_ws<S>(
+        read: futures::stream::SplitStream<S>,
+    ) -> impl futures::Stream<Item = Result<StreamChunk, LlmError>> + Send
+    where
+        S: futures::Stream<Item = Result<WsMessage, tungstenite::Error>> + Unpin + Send + 'static,
+    {
+        stream::unfold((read, false), |(mut read, terminal_seen)| async move {
+            if terminal_seen {
+                return None;
+            }
 
-        stream::unfold(
-            (byte_stream, buffer, pending, done),
-            move |(mut byte_stream, mut buffer, mut pending, mut done)| async move {
-                loop {
-                    if let Some(item) = pending.pop_front() {
-                        return Some((item, (byte_stream, buffer, pending, done)));
+            loop {
+                match read.next().await {
+                    Some(Ok(WsMessage::Text(text))) => {
+                        let frame = text.to_string();
+                        let Some(parsed) = parse_ws_frame(&frame) else {
+                            continue;
+                        };
+                        let Some(event_type) = parsed.get("type").and_then(Value::as_str) else {
+                            continue;
+                        };
+
+                        if event_type == "error" || event_type == "response.failed" {
+                            return Some((
+                                Err(LlmError::Provider(ws_error_message(&parsed))),
+                                (read, true),
+                            ));
+                        }
+
+                        let is_terminal = is_terminal_ws_event(event_type);
+                        if let Some(chunk) = Self::chunk_from_event(event_type, &frame) {
+                            return Some((Ok(chunk), (read, is_terminal)));
+                        }
+
+                        if is_terminal {
+                            return None;
+                        }
                     }
-
-                    if done {
-                        return None;
-                    }
-
-                    match byte_stream.next().await {
-                        Some(Ok(bytes)) => {
-                            buffer.push_str(&String::from_utf8_lossy(&bytes));
-
-                            while let Some((event_end, delimiter_len)) =
-                                Self::find_event_delimiter(&buffer)
-                            {
-                                let event_str = buffer[..event_end].to_string();
-                                buffer = buffer[event_end + delimiter_len..].to_string();
-
-                                let (event_type, data) = Self::parse_event_and_data(&event_str);
-
-                                if data == "[DONE]" {
-                                    done = true;
-                                    break;
-                                }
-
-                                if data.is_empty() {
-                                    continue;
-                                }
-
-                                if let Some(chunk) = Self::chunk_from_event(&event_type, &data) {
-                                    pending.push_back(Ok(chunk));
-                                }
-
-                                match event_type.as_str() {
-                                    "response.completed" | "response.done" => {
-                                        done = true;
-                                    }
-                                    "response.failed" => {
-                                        if let Ok(parsed) = serde_json::from_str::<Value>(&data) {
-                                            let msg = parsed
-                                                .pointer("/response/error/message")
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or("response failed")
-                                                .to_string();
-                                            pending.push_back(Err(LlmError::Provider(msg)));
-                                        }
-                                        done = true;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                        Some(Err(e)) => {
-                            pending.push_back(Err(LlmError::Request(e.to_string())));
-                            done = true;
-                        }
-                        None => {
-                            done = true;
-                        }
+                    Some(Ok(WsMessage::Close(_))) | None => return None,
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => {
+                        let message = format!("websocket receive failed: {error}");
+                        return Some((Err(LlmError::Provider(message)), (read, true)));
                     }
                 }
-            },
-        )
+            }
+        })
+    }
+}
+
+fn chunk_from_tool_delta(delta: ToolUseDelta) -> StreamChunk {
+    StreamChunk {
+        tool_use_deltas: vec![delta],
+        ..Default::default()
+    }
+}
+
+fn tool_delta_from_arguments_event(data: &str, is_done_event: bool) -> Option<ToolUseDelta> {
+    let parsed = serde_json::from_str::<SseFunctionCallArgsEvent>(data).ok()?;
+    let arguments_delta = if is_done_event {
+        parsed.arguments
+    } else {
+        parsed.delta
+    };
+    let id = parsed.item_id.or(parsed.call_id);
+
+    if id.is_none() && parsed.name.is_none() && arguments_delta.is_none() {
+        return None;
+    }
+
+    Some(ToolUseDelta {
+        id,
+        name: parsed.name,
+        arguments_delta,
+    })
+}
+
+fn tool_delta_from_output_item_event(data: &str) -> Option<ToolUseDelta> {
+    let parsed = serde_json::from_str::<SseOutputItemEvent>(data).ok()?;
+    let item = parsed.item?;
+    if item.r#type.as_deref() != Some("function_call") {
+        return None;
+    }
+
+    let arguments_delta = item.arguments.filter(|arguments| !arguments.is_empty());
+    let id = item.id.or(item.call_id).or(parsed.item_id);
+    let name = item.name;
+    if id.is_none() && name.is_none() && arguments_delta.is_none() {
+        return None;
+    }
+
+    Some(ToolUseDelta {
+        id,
+        name,
+        arguments_delta,
+    })
+}
+
+fn usage_chunk_from_done_event(data: &str) -> Option<StreamChunk> {
+    let parsed = serde_json::from_str::<SseResponseDone>(data).ok()?;
+    let SseResponseDone { response, usage } = parsed;
+    let usage = response.and_then(|response| response.usage).or(usage)?;
+
+    Some(StreamChunk {
+        usage: Some(responses_usage_to_usage(usage)),
+        stop_reason: Some("stop".to_string()),
+        ..Default::default()
+    })
+}
+
+fn responses_usage_to_usage(usage: ResponsesUsage) -> Usage {
+    Usage {
+        input_tokens: usage.input_tokens.unwrap_or(0) as u32,
+        output_tokens: usage.output_tokens.unwrap_or(0) as u32,
+    }
+}
+
+fn insert_header(
+    headers: &mut http::HeaderMap,
+    key: &'static str,
+    value: &str,
+) -> Result<(), LlmError> {
+    let header_value = HeaderValue::from_str(value)
+        .map_err(|error| LlmError::Config(format!("invalid {key} header: {error}")))?;
+    headers.insert(key, header_value);
+    Ok(())
+}
+
+fn extract_host_from_url(url: &str) -> String {
+    url.split("://")
+        .nth(1)
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or("chatgpt.com")
+        .to_string()
+}
+
+fn parse_ws_frame(frame: &str) -> Option<Value> {
+    serde_json::from_str::<Value>(frame).ok()
+}
+
+fn ws_error_message(frame: &Value) -> String {
+    frame
+        .pointer("/error/message")
+        .or_else(|| frame.pointer("/response/error/message"))
+        .and_then(Value::as_str)
+        .unwrap_or("websocket error")
+        .to_string()
+}
+
+fn is_terminal_ws_event(event_type: &str) -> bool {
+    matches!(event_type, "response.completed" | "response.done")
+}
+
+fn map_message_to_responses_input(
+    input: &mut Vec<Value>,
+    message: &Message,
+) -> Result<(), LlmError> {
+    match message.role {
+        MessageRole::System => {
+            // System messages go into instructions, skip here.
+        }
+        MessageRole::User => push_text_input(input, "user", &message.content),
+        MessageRole::Assistant => push_assistant_input(input, &message.content)?,
+        MessageRole::Tool => push_tool_result_input(input, &message.content),
+    }
+
+    Ok(())
+}
+
+fn push_text_input(input: &mut Vec<Value>, role: &str, blocks: &[ContentBlock]) {
+    let text = extract_text(blocks);
+    if !text.is_empty() {
+        input.push(json!({"role": role, "content": text}));
+    }
+}
+
+fn push_assistant_input(input: &mut Vec<Value>, blocks: &[ContentBlock]) -> Result<(), LlmError> {
+    push_text_input(input, "assistant", blocks);
+
+    for block in blocks {
+        if let ContentBlock::ToolUse {
+            id,
+            name,
+            input: tool_input,
+        } = block
+        {
+            let arguments = serde_json::to_string(tool_input)
+                .map_err(|error| LlmError::Serialization(error.to_string()))?;
+            input.push(json!({
+                "type": "function_call",
+                "id": id,
+                "call_id": id,
+                "name": name,
+                "arguments": arguments,
+            }));
+        }
+    }
+
+    Ok(())
+}
+
+fn push_tool_result_input(input: &mut Vec<Value>, blocks: &[ContentBlock]) {
+    let fallback_text = extract_text(blocks);
+    let mut appended_tool_result = false;
+
+    for block in blocks {
+        if let ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+        } = block
+        {
+            if tool_use_id.trim().is_empty() {
+                continue;
+            }
+
+            appended_tool_result = true;
+            input.push(json!({
+                "type": "function_call_output",
+                "call_id": tool_use_id,
+                "output": tool_result_output(content, &fallback_text),
+            }));
+        }
+    }
+
+    if !appended_tool_result {
+        push_text_input(input, "user", blocks);
+    }
+}
+
+fn tool_result_output(content: &Value, fallback_text: &str) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Object(object) => object
+            .get("output")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .or_else(|| {
+                if fallback_text.is_empty() {
+                    None
+                } else {
+                    Some(fallback_text.to_string())
+                }
+            })
+            .unwrap_or_else(|| Value::Object(object.clone()).to_string()),
+        other => {
+            if fallback_text.is_empty() {
+                other.to_string()
+            } else {
+                fallback_text.to_string()
+            }
+        }
     }
 }
 
@@ -392,28 +507,21 @@ impl LlmProvider for OpenAiResponsesProvider {
         &self,
         request: CompletionRequest,
     ) -> Result<CompletionStream, LlmError> {
-        let body = self.build_streaming_request_body(&request)?;
+        let ws_payload = self.build_ws_create_payload(&request)?;
+        let ws_request = self.build_ws_request(&self.ws_endpoint())?;
+        let (ws_stream, _) = tokio_tungstenite::connect_async(ws_request)
+            .await
+            .map_err(|error| LlmError::Provider(format!("websocket connection failed: {error}")))?;
+        let (mut write, read) = ws_stream.split();
+        let ws_message = serde_json::to_string(&ws_payload).map_err(|error| {
+            LlmError::InvalidResponse(format!("failed to serialize message: {error}"))
+        })?;
+        write
+            .send(WsMessage::Text(ws_message.into()))
+            .await
+            .map_err(|error| LlmError::Provider(format!("websocket send failed: {error}")))?;
 
-        let response = self
-            .client
-            .post(self.endpoint())
-            .bearer_auth(&self.access_token)
-            .headers(self.build_headers())
-            .header("accept", "text/event-stream")
-            .json(&body)
-            .send()
-            .await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|e| format!("unable to read error body: {e}"));
-            return Err(Self::map_http_error(status, body));
-        }
-
-        Ok(Box::pin(Self::stream_from_sse(response)))
+        Ok(Box::pin(Self::stream_from_ws(read)))
     }
 
     fn supported_models(&self) -> Vec<String> {
@@ -437,19 +545,13 @@ struct ResponsesRequestBody {
     model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     instructions: Option<String>,
-    input: Vec<ResponsesMessage>,
+    input: Vec<Value>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<ResponsesTool>,
     stream: bool,
     store: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
-}
-
-#[derive(Serialize)]
-struct ResponsesMessage {
-    role: String,
-    content: String,
 }
 
 /// Maps a Fawx ToolDefinition to the OpenAI Responses API function tool format.
@@ -514,27 +616,48 @@ struct SseTextDelta {
 
 #[derive(Deserialize)]
 struct SseResponseDone {
+    #[serde(default)]
     response: Option<SseResponseBody>,
-}
-
-#[derive(Deserialize)]
-struct SseResponseBody {
+    #[serde(default)]
     usage: Option<ResponsesUsage>,
 }
 
 #[derive(Deserialize)]
-struct SseFunctionCallArgsDelta {
+struct SseResponseBody {
     #[serde(default)]
-    item_id: Option<String>,
-    #[serde(default)]
-    name: Option<String>,
-    delta: String,
+    usage: Option<ResponsesUsage>,
 }
 
 #[derive(Deserialize)]
-struct SseFunctionCallArgsDone {
+struct SseFunctionCallArgsEvent {
     #[serde(default)]
     item_id: Option<String>,
+    #[serde(default)]
+    call_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    delta: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SseOutputItemEvent {
+    #[serde(default)]
+    item_id: Option<String>,
+    #[serde(default)]
+    item: Option<SseOutputItem>,
+}
+
+#[derive(Deserialize)]
+struct SseOutputItem {
+    #[serde(default)]
+    r#type: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    call_id: Option<String>,
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
@@ -613,42 +736,104 @@ struct PendingToolCall {
 
 fn merge_tool_use_deltas(pending: &mut Vec<PendingToolCall>, deltas: Vec<ToolUseDelta>) {
     for delta in deltas {
-        let index = delta
-            .id
-            .as_ref()
-            .and_then(|item_id| {
-                pending
-                    .iter()
-                    .position(|call| call.id.as_ref() == Some(item_id))
-            })
-            .unwrap_or_else(|| {
-                pending.push(PendingToolCall {
-                    id: delta.id.clone(),
-                    name: delta.name.clone(),
-                    arguments: String::new(),
-                });
-                pending.len() - 1
-            });
-
-        if pending[index].id.is_none() {
-            pending[index].id = delta.id.clone();
-        }
-        if pending[index].name.is_none() {
-            pending[index].name = delta.name.clone();
-        }
-
-        if let Some(arguments_delta) = delta.arguments_delta {
-            pending[index].arguments.push_str(&arguments_delta);
-        }
+        let index = pending_tool_call_index(pending, &delta);
+        apply_tool_use_delta(&mut pending[index], delta);
     }
+}
+
+fn pending_tool_call_index(pending: &mut Vec<PendingToolCall>, delta: &ToolUseDelta) -> usize {
+    if let Some(index) = pending_index_by_id(pending, delta.id.as_deref()) {
+        return index;
+    }
+
+    if let Some(index) = pending_index_without_id(pending, delta) {
+        return index;
+    }
+
+    pending.push(PendingToolCall::default());
+    pending.len() - 1
+}
+
+fn pending_index_by_id(pending: &[PendingToolCall], id: Option<&str>) -> Option<usize> {
+    let id = id?;
+    pending
+        .iter()
+        .position(|call| call.id.as_deref() == Some(id))
+}
+
+fn pending_index_without_id(pending: &[PendingToolCall], delta: &ToolUseDelta) -> Option<usize> {
+    if delta.id.is_some() {
+        return pending.iter().rposition(|call| {
+            call.id.is_none() && same_or_unknown_name(call.name.as_deref(), delta.name.as_deref())
+        });
+    }
+
+    if let Some(name) = delta.name.as_deref() {
+        return pending.iter().rposition(|call| {
+            call.id.is_none() && same_or_unknown_name(call.name.as_deref(), Some(name))
+        });
+    }
+
+    pending
+        .iter()
+        .enumerate()
+        .filter(|(_, call)| call.id.is_none() || call.name.is_none())
+        .map(|(index, _)| index)
+        .last()
+}
+
+fn same_or_unknown_name(left: Option<&str>, right: Option<&str>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left == right,
+        _ => true,
+    }
+}
+
+fn apply_tool_use_delta(call: &mut PendingToolCall, delta: ToolUseDelta) {
+    if call.id.is_none() {
+        call.id = delta.id;
+    }
+
+    if call.name.is_none() {
+        call.name = delta.name;
+    }
+
+    if let Some(arguments_delta) = delta.arguments_delta {
+        merge_arguments(&mut call.arguments, &arguments_delta);
+    }
+}
+
+fn merge_arguments(arguments: &mut String, incoming: &str) {
+    if incoming.is_empty() {
+        return;
+    }
+
+    if arguments.is_empty() {
+        arguments.push_str(incoming);
+        return;
+    }
+
+    if incoming.starts_with(arguments.as_str()) {
+        *arguments = incoming.to_string();
+        return;
+    }
+
+    if arguments.starts_with(incoming) {
+        return;
+    }
+
+    arguments.push_str(incoming);
 }
 
 fn finalize_tool_calls(pending: Vec<PendingToolCall>) -> Vec<ToolCall> {
     pending
         .into_iter()
         .filter_map(|call| {
-            let id = call.id?;
-            let name = call.name?;
+            let id = call.id?.trim().to_string();
+            let name = call.name?.trim().to_string();
+            if id.is_empty() || name.is_empty() {
+                return None;
+            }
             let arguments = serde_json::from_str::<Value>(&call.arguments)
                 .unwrap_or(Value::String(call.arguments));
 
@@ -718,6 +903,55 @@ mod tests {
         assert_eq!(usage.output_tokens, 5);
     }
 
+    fn continuation_assistant_message() -> crate::types::Message {
+        crate::types::Message {
+            role: MessageRole::Assistant,
+            content: vec![
+                ContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "lookup".to_string(),
+                    input: serde_json::json!({"q": "first"}),
+                },
+                ContentBlock::ToolUse {
+                    id: "call_2".to_string(),
+                    name: "lookup".to_string(),
+                    input: serde_json::json!({"q": "second"}),
+                },
+            ],
+        }
+    }
+
+    fn continuation_tool_message() -> crate::types::Message {
+        crate::types::Message {
+            role: MessageRole::Tool,
+            content: vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: Value::String("first result".to_string()),
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: "call_2".to_string(),
+                    content: serde_json::json!({"output": "second result"}),
+                },
+            ],
+        }
+    }
+
+    fn continuation_request() -> CompletionRequest {
+        CompletionRequest {
+            model: "gpt-4.1".to_string(),
+            messages: vec![
+                crate::types::Message::user("Find weather"),
+                continuation_assistant_message(),
+                continuation_tool_message(),
+            ],
+            system_prompt: None,
+            tools: vec![],
+            temperature: None,
+            max_tokens: None,
+        }
+    }
+
     #[test]
     fn build_request_body_maps_messages() {
         let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
@@ -737,11 +971,113 @@ mod tests {
         };
 
         let body = provider.build_request_body(&request, false).unwrap();
+        let serialized = serde_json::to_value(&body).unwrap();
+        let input = serialized["input"].as_array().unwrap();
+
         assert_eq!(body.model, "gpt-4.1");
         assert_eq!(body.instructions, Some("You are helpful.".to_string()));
-        assert_eq!(body.input.len(), 1);
-        assert_eq!(body.input[0].role, "user");
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"], "Hello");
         assert!(!body.stream);
+    }
+
+    #[test]
+    fn test_build_request_body_maps_tool_continuation_to_function_call_output() {
+        let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
+        let body = provider
+            .build_request_body(&continuation_request(), false)
+            .unwrap();
+        let serialized = serde_json::to_value(&body).unwrap();
+        let input = serialized["input"].as_array().unwrap();
+
+        assert_eq!(input.len(), 5);
+        assert_eq!(
+            input[0],
+            serde_json::json!({"role": "user", "content": "Find weather"})
+        );
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[1]["id"], "call_1");
+        assert_eq!(input[1]["call_id"], "call_1");
+        assert_eq!(input[1]["name"], "lookup");
+        assert_eq!(input[1]["arguments"], "{\"q\":\"first\"}");
+        assert_eq!(input[2]["type"], "function_call");
+        assert_eq!(input[2]["id"], "call_2");
+        assert_eq!(input[2]["call_id"], "call_2");
+        assert_eq!(input[2]["name"], "lookup");
+        assert_eq!(input[2]["arguments"], "{\"q\":\"second\"}");
+        assert_eq!(
+            input[3],
+            serde_json::json!({
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "first result"
+            })
+        );
+        assert_eq!(
+            input[4],
+            serde_json::json!({
+                "type": "function_call_output",
+                "call_id": "call_2",
+                "output": "second result"
+            })
+        );
+    }
+
+    #[test]
+    fn test_build_request_body_maps_tool_result_string_content() {
+        let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
+        let request = CompletionRequest {
+            model: "gpt-4.1".to_string(),
+            messages: vec![crate::types::Message {
+                role: MessageRole::Tool,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: Value::String("tool output".to_string()),
+                }],
+            }],
+            system_prompt: None,
+            tools: vec![],
+            temperature: None,
+            max_tokens: None,
+        };
+
+        let body = provider.build_request_body(&request, false).unwrap();
+        let serialized = serde_json::to_value(&body).unwrap();
+        let input = serialized["input"].as_array().unwrap();
+
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "function_call_output");
+        assert_eq!(input[0]["call_id"], "call_1");
+        assert_eq!(input[0]["output"], "tool output");
+    }
+
+    #[test]
+    fn test_build_request_body_maps_tool_result_error_prefix() {
+        let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
+        let request = CompletionRequest {
+            model: "gpt-4.1".to_string(),
+            messages: vec![crate::types::Message {
+                role: MessageRole::Tool,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: Value::String("[ERROR] permission denied".to_string()),
+                }],
+            }],
+            system_prompt: None,
+            tools: vec![],
+            temperature: None,
+            max_tokens: None,
+        };
+
+        let body = provider.build_request_body(&request, false).unwrap();
+        let serialized = serde_json::to_value(&body).unwrap();
+        let input = serialized["input"].as_array().unwrap();
+
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "function_call_output");
+        assert_eq!(input[0]["call_id"], "call_1");
+        assert_eq!(input[0]["output"], "[ERROR] permission denied");
     }
 
     #[test]
@@ -786,7 +1122,37 @@ mod tests {
     }
 
     #[test]
-    fn streaming_request_body_always_sets_stream_true() {
+    fn test_ws_endpoint_converts_https_to_wss() {
+        let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
+        assert_eq!(
+            provider.ws_endpoint(),
+            "wss://chatgpt.com/backend-api/codex/responses"
+        );
+    }
+
+    #[test]
+    fn test_ws_endpoint_converts_http_to_ws() {
+        let provider = OpenAiResponsesProvider::new("token", "account")
+            .unwrap()
+            .with_base_url("http://localhost:8080/responses");
+        assert_eq!(provider.ws_endpoint(), "ws://localhost:8080/responses");
+    }
+
+    #[test]
+    fn test_extract_host_from_url() {
+        assert_eq!(
+            extract_host_from_url("wss://chatgpt.com/backend-api/codex/responses"),
+            "chatgpt.com"
+        );
+        assert_eq!(
+            extract_host_from_url("ws://localhost:8080/responses"),
+            "localhost:8080"
+        );
+        assert_eq!(extract_host_from_url("chatgpt.com/path"), "chatgpt.com");
+    }
+
+    #[test]
+    fn test_ws_request_body_wraps_in_response_create() {
         let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
         let request = CompletionRequest {
             model: "gpt-5.3-codex".to_string(),
@@ -797,9 +1163,10 @@ mod tests {
             max_tokens: None,
         };
 
-        let body = provider.build_streaming_request_body(&request).unwrap();
-        let serialized = serde_json::to_value(&body).unwrap();
-        assert_eq!(serialized["stream"], true);
+        let payload = provider.build_ws_create_payload(&request).unwrap();
+
+        assert_eq!(payload["type"], "response.create");
+        assert!(payload.get("stream").is_none());
     }
 
     #[test]
@@ -831,14 +1198,38 @@ mod tests {
     }
 
     #[test]
-    fn headers_include_account_id_and_beta() {
-        let provider = OpenAiResponsesProvider::new("token", "acct_123").unwrap();
-        let headers = provider.build_headers();
-        assert_eq!(headers.get("chatgpt-account-id").unwrap(), "acct_123");
-        assert_eq!(
-            headers.get("openai-beta").unwrap(),
-            "responses=experimental"
-        );
+    fn test_chunk_from_event_handles_ws_frame_with_type_field() {
+        let text_delta = r#"{"type":"response.output_text.delta","delta":"hello"}"#;
+        let text_chunk =
+            OpenAiResponsesProvider::chunk_from_event("response.output_text.delta", text_delta)
+                .unwrap();
+        assert_eq!(text_chunk.delta_content.as_deref(), Some("hello"));
+
+        let args_delta = r#"{"type":"response.function_call_arguments.delta","item_id":"call_1","name":"emit_intent","delta":"{\"intent\":\"op"}"#;
+        let args_chunk = OpenAiResponsesProvider::chunk_from_event(
+            "response.function_call_arguments.delta",
+            args_delta,
+        )
+        .unwrap();
+        assert_eq!(args_chunk.tool_use_deltas.len(), 1);
+        assert_eq!(args_chunk.tool_use_deltas[0].id.as_deref(), Some("call_1"));
+
+        let done_event =
+            r#"{"type":"response.done","response":{"usage":{"input_tokens":5,"output_tokens":2}}}"#;
+        let done_chunk =
+            OpenAiResponsesProvider::chunk_from_event("response.done", done_event).unwrap();
+        let usage = done_chunk.usage.unwrap();
+        assert_eq!(usage.input_tokens, 5);
+        assert_eq!(usage.output_tokens, 2);
+
+        let completed_event =
+            r#"{"type":"response.completed","usage":{"input_tokens":3,"output_tokens":1}}"#;
+        let completed_chunk =
+            OpenAiResponsesProvider::chunk_from_event("response.completed", completed_event)
+                .unwrap();
+        let completed_usage = completed_chunk.usage.unwrap();
+        assert_eq!(completed_usage.input_tokens, 3);
+        assert_eq!(completed_usage.output_tokens, 1);
     }
 
     #[test]
@@ -848,6 +1239,132 @@ mod tests {
 
         assert!(!capabilities.supports_temperature);
         assert!(capabilities.requires_streaming);
+    }
+
+    fn reconstructed_tool_calls(events: &[(&str, &str)]) -> Vec<ToolCall> {
+        let mut pending = Vec::new();
+        for (event_type, frame) in events {
+            if let Some(chunk) = OpenAiResponsesProvider::chunk_from_event(event_type, frame) {
+                merge_tool_use_deltas(&mut pending, chunk.tool_use_deltas);
+            }
+        }
+        finalize_tool_calls(pending)
+    }
+
+    #[test]
+    fn chunk_from_event_maps_function_call_output_item_done() {
+        let item_done = r#"{"type":"response.output_item.done","item":{"type":"function_call","id":"call_99","name":"lookup","arguments":"{\"q\":\"weather\"}"}}"#;
+        let chunk =
+            OpenAiResponsesProvider::chunk_from_event("response.output_item.done", item_done)
+                .unwrap();
+
+        assert_eq!(chunk.tool_use_deltas.len(), 1);
+        assert_eq!(chunk.tool_use_deltas[0].id.as_deref(), Some("call_99"));
+        assert_eq!(chunk.tool_use_deltas[0].name.as_deref(), Some("lookup"));
+    }
+
+    #[test]
+    fn chunk_from_event_maps_function_call_output_item_call_id() {
+        let item_done = r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_77","name":"lookup","arguments":"{\"q\":\"weather\"}"}}"#;
+        let chunk =
+            OpenAiResponsesProvider::chunk_from_event("response.output_item.done", item_done)
+                .unwrap();
+
+        assert_eq!(chunk.tool_use_deltas.len(), 1);
+        assert_eq!(chunk.tool_use_deltas[0].id.as_deref(), Some("call_77"));
+        assert_eq!(chunk.tool_use_deltas[0].name.as_deref(), Some("lookup"));
+    }
+
+    #[test]
+    fn tool_required_stream_events_preserve_tool_call_for_continuation() {
+        let events = vec![
+            (
+                "response.output_item.added",
+                r#"{"type":"response.output_item.added","item":{"type":"function_call","id":"call_1","name":"emit_intent","arguments":""}}"#,
+            ),
+            (
+                "response.function_call_arguments.delta",
+                r#"{"type":"response.function_call_arguments.delta","item_id":"call_1","delta":"{\"intent\":\"op"}"#,
+            ),
+            (
+                "response.function_call_arguments.done",
+                r#"{"type":"response.function_call_arguments.done","item_id":"call_1","arguments":"{\"intent\":\"open\"}"}"#,
+            ),
+        ];
+
+        let tool_calls = reconstructed_tool_calls(&events);
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_1");
+        assert_eq!(tool_calls[0].name, "emit_intent");
+        assert_eq!(tool_calls[0].arguments["intent"], "open");
+    }
+
+    #[test]
+    fn merge_tool_use_deltas_handles_id_arriving_after_arguments() {
+        let events = vec![
+            (
+                "response.function_call_arguments.delta",
+                r#"{"type":"response.function_call_arguments.delta","name":"emit_intent","delta":"{\"intent\":\"o"}"#,
+            ),
+            (
+                "response.output_item.added",
+                r#"{"type":"response.output_item.added","item":{"type":"function_call","id":"call_2","name":"emit_intent","arguments":""}}"#,
+            ),
+            (
+                "response.function_call_arguments.done",
+                r#"{"type":"response.function_call_arguments.done","item_id":"call_2","arguments":"{\"intent\":\"open\"}"}"#,
+            ),
+        ];
+
+        let tool_calls = reconstructed_tool_calls(&events);
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_2");
+        assert_eq!(tool_calls[0].name, "emit_intent");
+        assert_eq!(tool_calls[0].arguments["intent"], "open");
+    }
+
+    #[test]
+    fn merge_tool_use_deltas_accepts_call_id_argument_events() {
+        let events = vec![
+            (
+                "response.output_item.added",
+                r#"{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_3","name":"emit_intent","arguments":""}}"#,
+            ),
+            (
+                "response.function_call_arguments.done",
+                r#"{"type":"response.function_call_arguments.done","call_id":"call_3","arguments":"{\"intent\":\"open\"}"}"#,
+            ),
+        ];
+
+        let tool_calls = reconstructed_tool_calls(&events);
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_3");
+        assert_eq!(tool_calls[0].name, "emit_intent");
+        assert_eq!(tool_calls[0].arguments["intent"], "open");
+    }
+
+    #[test]
+    fn build_request_body_skips_empty_tool_result_call_id() {
+        let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
+        let request = CompletionRequest {
+            model: "gpt-4.1".to_string(),
+            messages: vec![crate::types::Message {
+                role: MessageRole::Tool,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "".to_string(),
+                    content: Value::String("tool output".to_string()),
+                }],
+            }],
+            system_prompt: None,
+            tools: vec![],
+            temperature: None,
+            max_tokens: None,
+        };
+
+        let body = provider.build_request_body(&request, false).unwrap();
+        let serialized = serde_json::to_value(&body).unwrap();
+        let input = serialized["input"].as_array().unwrap();
+        assert!(input.is_empty());
     }
 
     #[test]
@@ -902,80 +1419,5 @@ mod tests {
         assert_eq!(tool_calls[0].id, "call_1");
         assert_eq!(tool_calls[0].name, "emit_intent");
         assert_eq!(tool_calls[0].arguments["intent"], "open");
-    }
-
-    fn parse_test_sse_payload(payload: &str) -> Vec<StreamChunk> {
-        let mut buffer = payload.to_string();
-        let mut chunks = Vec::new();
-
-        while let Some((event_end, delimiter_len)) =
-            OpenAiResponsesProvider::find_event_delimiter(&buffer)
-        {
-            let event_str = buffer[..event_end].to_string();
-            buffer = buffer[event_end + delimiter_len..].to_string();
-
-            let (event_type, data) = OpenAiResponsesProvider::parse_event_and_data(&event_str);
-            if data == "[DONE]" || data.is_empty() {
-                continue;
-            }
-
-            if let Some(chunk) = OpenAiResponsesProvider::chunk_from_event(&event_type, &data) {
-                chunks.push(chunk);
-            }
-        }
-
-        chunks
-    }
-
-    #[test]
-    fn stream_emits_tool_use_delta_on_function_call_arguments_delta() {
-        let payload = r#"event: response.function_call_arguments.delta
-data: {"item_id":"call_123","name":"emit_intent","delta":"{\"intent\":\"o"}
-
-event: response.done
-data: {"response":{"usage":{"input_tokens":1,"output_tokens":1}}}
-
-data: [DONE]
-
-"#;
-
-        let chunks = parse_test_sse_payload(payload);
-
-        assert_eq!(chunks[0].tool_use_deltas.len(), 1);
-        assert_eq!(chunks[0].tool_use_deltas[0].id.as_deref(), Some("call_123"));
-        assert_eq!(
-            chunks[0].tool_use_deltas[0].name.as_deref(),
-            Some("emit_intent")
-        );
-        assert_eq!(
-            chunks[0].tool_use_deltas[0].arguments_delta.as_deref(),
-            Some("{\"intent\":\"o")
-        );
-    }
-
-    #[test]
-    fn stream_emits_tool_use_done_on_function_call_arguments_done() {
-        let payload = r#"event: response.function_call_arguments.done
-data: {"item_id":"call_456","name":"emit_intent","arguments":"{\"intent\":\"open\"}"}
-
-event: response.done
-data: {"response":{"usage":{"input_tokens":1,"output_tokens":1}}}
-
-data: [DONE]
-
-"#;
-
-        let chunks = parse_test_sse_payload(payload);
-
-        assert_eq!(chunks[0].tool_use_deltas.len(), 1);
-        assert_eq!(chunks[0].tool_use_deltas[0].id.as_deref(), Some("call_456"));
-        assert_eq!(
-            chunks[0].tool_use_deltas[0].name.as_deref(),
-            Some("emit_intent")
-        );
-        assert_eq!(
-            chunks[0].tool_use_deltas[0].arguments_delta.as_deref(),
-            Some("{\"intent\":\"open\"}")
-        );
     }
 }

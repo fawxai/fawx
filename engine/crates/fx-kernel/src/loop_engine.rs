@@ -1406,7 +1406,7 @@ fn build_tool_use_assistant_message(calls: &[ToolCall]) -> Message {
     }
 }
 
-/// Build a user message containing ToolResult content blocks.
+/// Build a tool message containing ToolResult content blocks.
 ///
 /// Returns an error if any result has a `tool_call_id` not found in `calls`.
 fn build_tool_result_message(
@@ -1432,7 +1432,7 @@ fn build_tool_result_message(
         })
         .collect();
     Ok(Message {
-        role: MessageRole::User,
+        role: MessageRole::Tool,
         content,
     })
 }
@@ -3289,6 +3289,25 @@ mod phase4_tests {
     }
 
     #[test]
+    fn append_tool_round_messages_appends_assistant_then_tool_messages() {
+        let calls = vec![read_file_call("call-1", "a.txt")];
+        let results = vec![ToolResult {
+            tool_call_id: "call-1".to_string(),
+            tool_name: "read_file".to_string(),
+            success: true,
+            output: "ok".to_string(),
+        }];
+        let mut messages = vec![Message::user("prompt")];
+
+        append_tool_round_messages(&mut messages, &calls, &results)
+            .expect("append_tool_round_messages");
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1].role, fx_llm::MessageRole::Assistant);
+        assert_eq!(messages[2].role, fx_llm::MessageRole::Tool);
+    }
+
+    #[test]
     fn build_tool_result_message_creates_correct_blocks() {
         let calls = vec![
             read_file_call("call-1", "a.txt"),
@@ -3316,10 +3335,26 @@ mod phase4_tests {
         let message =
             build_tool_result_message(&calls, &results).expect("build_tool_result_message");
 
-        assert_eq!(message.role, fx_llm::MessageRole::User);
+        assert_eq!(message.role, fx_llm::MessageRole::Tool);
         assert_eq!(message.content.len(), 2);
         assert_tool_result_block(&message.content[0], "call-1", "ok");
         assert_tool_result_block(&message.content[1], "call-2", "[ERROR] permission denied");
+    }
+
+    #[test]
+    fn build_tool_result_message_uses_tool_role() {
+        let calls = vec![read_file_call("call-1", "a.txt")];
+        let results = vec![ToolResult {
+            tool_call_id: "call-1".to_string(),
+            tool_name: "read_file".to_string(),
+            success: true,
+            output: "ok".to_string(),
+        }];
+
+        let message =
+            build_tool_result_message(&calls, &results).expect("build_tool_result_message");
+
+        assert_eq!(message.role, fx_llm::MessageRole::Tool);
     }
 
     #[test]
