@@ -278,6 +278,30 @@ mod tests {
     }
 
     #[test]
+    fn auth_manager_remove_provider_flow_removes_it_from_state() {
+        let mut manager = AuthManager::new();
+        manager.store(
+            "anthropic",
+            AuthMethod::SetupToken {
+                token: "token-1".to_string(),
+            },
+        );
+        manager.store(
+            "openai",
+            AuthMethod::ApiKey {
+                provider: "openai".to_string(),
+                key: "key-2".to_string(),
+            },
+        );
+
+        let removed = manager.remove("openai");
+
+        assert!(matches!(removed, Some(AuthMethod::ApiKey { .. })));
+        assert!(manager.get("openai").is_none());
+        assert_eq!(manager.providers(), vec!["anthropic".to_string()]);
+    }
+
+    #[test]
     fn auth_manager_oauth_storage_exposes_bearer_and_expired_refresh_state() {
         let mut manager = AuthManager::new();
         manager.store(

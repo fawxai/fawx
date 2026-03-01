@@ -79,6 +79,7 @@ the user asked for. If they asked a simple question, give a simple answer. If th
 for a listing or search results, present it cleanly formatted.";
 const MAX_SYNTHESIS_INSTRUCTION_LENGTH: usize = 500;
 const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const CANCELLED_INPUT_MESSAGE: &str = "input cancelled";
 
 const DEFAULT_ANTHROPIC_MODELS: &[&str] = &[
     "claude-sonnet-4-20250514",
@@ -827,6 +828,11 @@ impl TuiApp {
             println!("Add another provider.\n");
         }
 
+        let result = self.run_auth_wizard_flow().await;
+        finalize_auth_wizard_result(result)
+    }
+
+    async fn run_auth_wizard_flow(&mut self) -> Result<(), TuiError> {
         let selection = self.run_auth_selection()?;
         let preferred_provider = match selection {
             AuthSelection::ClaudeSubscription => self.auth_wizard_claude_subscription()?,
@@ -975,13 +981,7 @@ impl TuiApp {
                     }
                 }
             }
-            ParsedCommand::Auth => {
-                self.show_auth_status();
-                let add_more = prompt_line("Run auth wizard to add/update credentials? [y/N]: ")?;
-                if is_yes(&add_more) {
-                    self.auth_wizard().await?;
-                }
-            }
+            ParsedCommand::Auth => self.handle_auth_command().await?,
             ParsedCommand::Budget => self.show_budget_status(),
             ParsedCommand::Loop => self.show_loop_status(),
             ParsedCommand::Status => self.show_status(),
@@ -1444,6 +1444,51 @@ impl TuiApp {
                 }
             }
         }
+    }
+    async fn handle_auth_command(&mut self) -> Result<(), TuiError> {
+        self.show_auth_status();
+        println!();
+        println!("[1] Add/update credentials");
+        println!("[2] Remove a provider");
+        println!("[3] Cancel");
+
+        let choice = prompt_choice(
+            "> ",
+            "Please choose 1, 2, or 3.",
+            "auth menu selection",
+            parse_auth_menu_selection,
+        )?;
+
+        match choice {
+            AuthMenuSelection::AddOrUpdate => self.auth_wizard().await,
+            AuthMenuSelection::RemoveProvider => self.remove_auth_provider().await,
+            AuthMenuSelection::Cancel => Ok(()),
+        }
+    }
+
+    async fn remove_auth_provider(&mut self) -> Result<(), TuiError> {
+        let providers = self.auth_manager.providers();
+        if providers.is_empty() {
+            println!("No providers to remove.");
+            return Ok(());
+        }
+
+        println!("Select a provider to remove:");
+        for (idx, provider) in providers.iter().enumerate() {
+            println!("  [{}] {}", idx + 1, provider);
+        }
+
+        let provider = prompt_provider_selection(&providers)?;
+        if !confirm_provider_removal(&provider)? {
+            println!("Removal cancelled.");
+            return Ok(());
+        }
+
+        self.auth_manager.remove(&provider);
+        persist_auth_manager(&self.auth_manager)?;
+        self.refresh_router_models().await?;
+        println!("Removed provider: {provider}");
+        Ok(())
     }
 
     fn show_budget_status(&self) {
@@ -2054,6 +2099,8 @@ pub enum TuiError {
     Io(io::Error),
     /// Authentication flow error.
     Auth(String),
+    /// User cancelled interactive input.
+    Cancelled,
     /// Conversation store/persistence error.
     Store(String),
     /// Model routing error.
@@ -2067,6 +2114,7 @@ impl fmt::Display for TuiError {
         match self {
             Self::Io(error) => write!(f, "io error: {error}"),
             Self::Auth(message) => write!(f, "auth error: {message}"),
+            Self::Cancelled => write!(f, "{CANCELLED_INPUT_MESSAGE}"),
             Self::Store(message) => write!(f, "store error: {message}"),
             Self::Router(message) => write!(f, "router error: {message}"),
             Self::Loop(message) => write!(f, "loop error: {message}"),
@@ -2675,6 +2723,8 @@ fn to_strings(values: &[&str]) -> Vec<String> {
 }
 
 fn prompt_line(prompt: &str) -> Result<String, TuiError> {
+    ensure_cooked_mode();
+
     print!("{prompt}");
     io::stdout().flush().map_err(TuiError::Io)?;
 
@@ -2685,6 +2735,39 @@ fn prompt_line(prompt: &str) -> Result<String, TuiError> {
     }
 
     Ok(input.trim().to_string())
+}
+
+fn ensure_cooked_mode() {
+    // Ensure cooked mode so stdin.read_line() handles Enter correctly even after raw-mode input paths.
+    terminal::disable_raw_mode().ok();
+}
+
+fn confirm_provider_removal(provider: &str) -> Result<bool, TuiError> {
+    let prompt = format!("Remove {provider}? [y/N]: ");
+    let response = prompt_line(&prompt)?;
+    Ok(removal_confirmation_accepted(&response))
+}
+
+fn removal_confirmation_accepted(response: &str) -> bool {
+    let normalized = response.trim();
+    normalized.eq_ignore_ascii_case("y") || normalized.eq_ignore_ascii_case("yes")
+}
+
+fn finalize_auth_wizard_result(result: Result<(), TuiError>) -> Result<(), TuiError> {
+    let mut stdout = io::stdout();
+    finalize_auth_wizard_result_with_writer(result, &mut stdout)
+}
+
+fn finalize_auth_wizard_result_with_writer(
+    result: Result<(), TuiError>,
+    writer: &mut impl Write,
+) -> Result<(), TuiError> {
+    if is_cancelled_error(&result) {
+        writeln!(writer, "Cancelled.").map_err(TuiError::Io)?;
+        return Ok(());
+    }
+
+    result
 }
 
 fn retry_limit_error(context: &str) -> TuiError {
@@ -2797,24 +2880,48 @@ fn read_secret_input(value: &mut String) -> Result<(), TuiError> {
     loop {
         let event = event::read().map_err(TuiError::Io)?;
         if let event::Event::Key(key_event) = event {
-            match key_event.code {
-                event::KeyCode::Enter => return Ok(()),
-                event::KeyCode::Char(ch) => {
+            match classify_secret_input_key(&key_event) {
+                SecretInputKeyAction::Submit => return Ok(()),
+                SecretInputKeyAction::Cancel => return Err(TuiError::Cancelled),
+                SecretInputKeyAction::Ignore => {}
+                SecretInputKeyAction::Type(ch) => {
                     value.push(ch);
                     display_len += 1;
                     print!("•");
                     io::stdout().flush().map_err(TuiError::Io)?;
                 }
-                event::KeyCode::Backspace => {
+                SecretInputKeyAction::Delete => {
                     if value.pop().is_some() && display_len > 0 {
                         display_len -= 1;
                         print!("\x08 \x08");
                         io::stdout().flush().map_err(TuiError::Io)?;
                     }
                 }
-                _ => {}
             }
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecretInputKeyAction {
+    Submit,
+    Cancel,
+    Type(char),
+    Delete,
+    Ignore,
+}
+
+fn classify_secret_input_key(key_event: &event::KeyEvent) -> SecretInputKeyAction {
+    if is_ctrl_c(key_event) {
+        return SecretInputKeyAction::Cancel;
+    }
+
+    match key_event.code {
+        event::KeyCode::Enter => SecretInputKeyAction::Submit,
+        event::KeyCode::Esc => SecretInputKeyAction::Cancel,
+        event::KeyCode::Char(ch) => SecretInputKeyAction::Type(ch),
+        event::KeyCode::Backspace => SecretInputKeyAction::Delete,
+        _ => SecretInputKeyAction::Ignore,
     }
 }
 
@@ -2854,8 +2961,13 @@ fn current_time_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn is_yes(value: &str) -> bool {
-    matches!(value.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+fn is_cancelled_error(result: &Result<(), TuiError>) -> bool {
+    matches!(result, Err(TuiError::Cancelled))
+}
+
+fn is_ctrl_c(key_event: &event::KeyEvent) -> bool {
+    key_event.code == event::KeyCode::Char('c')
+        && key_event.modifiers.contains(event::KeyModifiers::CONTROL)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2872,6 +2984,42 @@ fn parse_auth_selection(value: &str) -> Option<AuthSelection> {
         "3" => Some(AuthSelection::ApiKey),
         _ => None,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthMenuSelection {
+    AddOrUpdate,
+    RemoveProvider,
+    Cancel,
+}
+
+fn parse_auth_menu_selection(value: &str) -> Option<AuthMenuSelection> {
+    match value.trim() {
+        "1" => Some(AuthMenuSelection::AddOrUpdate),
+        "2" => Some(AuthMenuSelection::RemoveProvider),
+        "3" => Some(AuthMenuSelection::Cancel),
+        _ => None,
+    }
+}
+
+fn prompt_provider_selection(providers: &[String]) -> Result<String, TuiError> {
+    let selected = prompt_choice(
+        "> ",
+        "Please choose a listed provider number.",
+        "provider selection",
+        |value| parse_provider_selection(value, providers.len()),
+    )?;
+
+    Ok(providers[selected].clone())
+}
+
+fn parse_provider_selection(value: &str, provider_count: usize) -> Option<usize> {
+    value
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|selected| (1..=provider_count).contains(selected))
+        .map(|selected| selected - 1)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3663,6 +3811,141 @@ mod tests {
         );
         assert_eq!(parse_auth_selection("3"), Some(AuthSelection::ApiKey));
         assert_eq!(parse_auth_selection("9"), None);
+    }
+
+    #[test]
+    fn parse_auth_menu_selection() {
+        assert_eq!(
+            super::parse_auth_menu_selection("1"),
+            Some(super::AuthMenuSelection::AddOrUpdate)
+        );
+        assert_eq!(
+            super::parse_auth_menu_selection("2"),
+            Some(super::AuthMenuSelection::RemoveProvider)
+        );
+        assert_eq!(
+            super::parse_auth_menu_selection("3"),
+            Some(super::AuthMenuSelection::Cancel)
+        );
+        assert_eq!(super::parse_auth_menu_selection("0"), None);
+    }
+
+    #[test]
+    fn is_cancelled_error() {
+        let cancelled = Err(TuiError::Cancelled);
+        let other_auth = Err(TuiError::Auth("different".to_string()));
+        let ok_result = Ok(());
+
+        assert!(super::is_cancelled_error(&cancelled));
+        assert!(!super::is_cancelled_error(&other_auth));
+        assert!(!super::is_cancelled_error(&ok_result));
+    }
+
+    #[test]
+    fn cancelled_error_display_is_not_auth_specific() {
+        assert_eq!(TuiError::Cancelled.to_string(), "input cancelled");
+    }
+
+    #[test]
+    fn prompt_line_flow_recovers_raw_mode_before_reading_stdin() {
+        if terminal::enable_raw_mode().is_err() {
+            return;
+        }
+
+        super::ensure_cooked_mode();
+
+        assert!(!terminal::is_raw_mode_enabled().unwrap_or(false));
+    }
+
+    #[test]
+    fn removal_confirmation_accepts_only_yes_answers() {
+        assert!(super::removal_confirmation_accepted("y"));
+        assert!(super::removal_confirmation_accepted("Y"));
+        assert!(super::removal_confirmation_accepted("yes"));
+        assert!(super::removal_confirmation_accepted(" YeS "));
+        assert!(!super::removal_confirmation_accepted(""));
+        assert!(!super::removal_confirmation_accepted("n"));
+        assert!(!super::removal_confirmation_accepted("no"));
+    }
+
+    #[test]
+    fn finalize_auth_wizard_result_cancellation_returns_ok_and_prints_message() {
+        let mut output = Vec::new();
+
+        let result =
+            super::finalize_auth_wizard_result_with_writer(Err(TuiError::Cancelled), &mut output);
+
+        assert!(result.is_ok());
+        assert_eq!(
+            String::from_utf8(output).expect("utf8 output"),
+            "Cancelled.
+"
+        );
+    }
+
+    #[test]
+    fn classify_secret_input_key_cancels_on_escape_and_ctrl_c() {
+        let esc = event::KeyEvent::new(event::KeyCode::Esc, event::KeyModifiers::NONE);
+        let ctrl_c = event::KeyEvent::new(event::KeyCode::Char('c'), event::KeyModifiers::CONTROL);
+
+        assert_eq!(
+            super::classify_secret_input_key(&esc),
+            super::SecretInputKeyAction::Cancel
+        );
+        assert_eq!(
+            super::classify_secret_input_key(&ctrl_c),
+            super::SecretInputKeyAction::Cancel
+        );
+    }
+
+    #[test]
+    fn parse_provider_selection_rejects_out_of_range_and_invalid_values() {
+        assert_eq!(super::parse_provider_selection("0", 3), None);
+        assert_eq!(super::parse_provider_selection("4", 3), None);
+        assert_eq!(super::parse_provider_selection(" 2 ", 3), Some(1));
+        assert_eq!(super::parse_provider_selection("abc", 3), None);
+        assert_eq!(super::parse_provider_selection("", 3), None);
+    }
+
+    #[tokio::test]
+    async fn remove_provider_flow_updates_persisted_provider_list() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let temp_dir = TempDir::new().unwrap();
+        let _home = ScopedEnvVar::set("HOME", temp_dir.path().to_str().unwrap());
+
+        let mut auth_manager = AuthManager::new();
+        auth_manager.store(
+            "anthropic",
+            AuthMethod::SetupToken {
+                token: "setup-token-flow".to_string(),
+            },
+        );
+        auth_manager.store(
+            "openai",
+            AuthMethod::ApiKey {
+                provider: "openai".to_string(),
+                key: "openai-key-flow".to_string(),
+            },
+        );
+        auth_manager.store(
+            "openrouter",
+            AuthMethod::ApiKey {
+                provider: "openrouter".to_string(),
+                key: "openrouter-key-flow".to_string(),
+            },
+        );
+
+        let providers = auth_manager.providers();
+        let selected = super::parse_provider_selection("2", providers.len())
+            .expect("selection should map to provider index");
+        let removed_provider = providers[selected].clone();
+
+        auth_manager.remove(&removed_provider);
+        persist_auth_manager(&auth_manager).unwrap();
+        let loaded = load_auth_manager().unwrap();
+
+        assert!(loaded.get(&removed_provider).is_none());
+        assert_eq!(loaded.providers(), vec!["anthropic", "openrouter"]);
     }
 
     #[tokio::test]
