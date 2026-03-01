@@ -1663,9 +1663,14 @@ fn build_skill_registry(
             None
         }
     };
+    let self_modify_config = fx_core::self_modify::SelfModifyConfig::from(&config.self_modify);
+    let sm = self_modify_config.enabled.then_some(self_modify_config);
+    if let Some(ref smc) = sm {
+        executor = executor.with_self_modify(smc.clone());
+    }
     let mut registry = SkillRegistry::new();
     registry.register(Box::new(BuiltinToolsSkill::new(executor)));
-    let git_skill = GitSkill::new(working_dir.clone());
+    let git_skill = GitSkill::new(working_dir.clone(), sm);
     registry.register(Box::new(git_skill));
     (registry, snapshot_text)
 }

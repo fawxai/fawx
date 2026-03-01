@@ -26,6 +26,15 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Fawx Configuration
 # max_entries = 1000
 # max_value_size = 10240
 # max_snapshot_chars = 2000
+
+# [self_modify]
+# enabled = false
+# branch_prefix = "fawx/improve"
+# require_tests = true
+# [self_modify.paths]
+# allow = []
+# propose = []
+# deny = [".git/**", "*.key", "*.pem", "credentials.*"]
 "#;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -35,6 +44,7 @@ pub struct FawxConfig {
     pub model: ModelConfig,
     pub tools: ToolsConfig,
     pub memory: MemoryConfig,
+    pub self_modify: SelfModifyCliConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -98,6 +108,66 @@ impl Default for MemoryConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SelfModifyCliConfig {
+    pub enabled: bool,
+    pub branch_prefix: String,
+    pub require_tests: bool,
+    pub paths: SelfModifyPathsCliConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SelfModifyPathsCliConfig {
+    pub allow: Vec<String>,
+    pub propose: Vec<String>,
+    pub deny: Vec<String>,
+}
+
+impl Default for SelfModifyCliConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            branch_prefix: "fawx/improve".to_string(),
+            require_tests: true,
+            paths: SelfModifyPathsCliConfig::default(),
+        }
+    }
+}
+
+impl Default for SelfModifyPathsCliConfig {
+    fn default() -> Self {
+        Self {
+            allow: Vec::new(),
+            propose: Vec::new(),
+            deny: fx_core::self_modify::DEFAULT_DENY_PATHS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        }
+    }
+}
+
+impl From<&SelfModifyCliConfig> for fx_core::self_modify::SelfModifyConfig {
+    fn from(cli: &SelfModifyCliConfig) -> Self {
+        let SelfModifyCliConfig {
+            enabled,
+            branch_prefix,
+            require_tests,
+            paths,
+        } = cli;
+        Self {
+            enabled: *enabled,
+            branch_prefix: branch_prefix.clone(),
+            require_tests: *require_tests,
+            allow_paths: paths.allow.clone(),
+            propose_paths: paths.propose.clone(),
+            deny_paths: paths.deny.clone(),
+        }
+    }
+}
+
 impl FawxConfig {
     pub fn load(data_dir: &Path) -> Result<Self, String> {
         let config_path = data_dir.join("config.toml");
@@ -135,6 +205,8 @@ impl FawxConfig {
                 ));
             }
         }
+        let core_sm = fx_core::self_modify::SelfModifyConfig::from(&self.self_modify);
+        fx_core::self_modify::validate_glob_patterns(&core_sm)?;
         Ok(())
     }
 
@@ -239,6 +311,14 @@ max_snapshot_chars = 777
     }
 
     #[test]
+    fn default_template_uses_nested_self_modify_paths_section() {
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("[self_modify.paths]"));
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("allow = []"));
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("propose = []"));
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("deny = ["));
+    }
+
+    #[test]
     fn write_default_refuses_overwrite() {
         let temp = TempDir::new().expect("tempdir");
         fs::write(temp.path().join("config.toml"), "[general]\n").expect("write config");
@@ -278,6 +358,16 @@ max_snapshot_chars = 777
                 max_entries: 4,
                 max_value_size: 5,
                 max_snapshot_chars: 6,
+            },
+            self_modify: SelfModifyCliConfig {
+                enabled: true,
+                branch_prefix: "custom/prefix".to_string(),
+                require_tests: false,
+                paths: SelfModifyPathsCliConfig {
+                    allow: vec!["src/**".to_string()],
+                    propose: vec![],
+                    deny: vec!["*.key".to_string()],
+                },
             },
         };
 
@@ -355,5 +445,64 @@ max_snapshot_chars = 777
         fs::write(temp.path().join("config.toml"), content).expect("write config");
         let config = FawxConfig::load(temp.path()).expect("should accept 500 chars");
         assert_eq!(config.model.synthesis_instruction.unwrap().len(), 500);
+    }
+    #[test]
+    fn load_config_with_self_modify_section() {
+        let temp = TempDir::new().expect("tempdir");
+        let content = r#"
+[self_modify]
+enabled = true
+branch_prefix = "custom/prefix"
+require_tests = false
+
+[self_modify.paths]
+allow = ["src/**"]
+propose = ["kernel/**"]
+deny = [".git/**", "*.key"]
+"#;
+        fs::write(temp.path().join("config.toml"), content).expect("write config");
+        let loaded = FawxConfig::load(temp.path()).expect("load config");
+
+        assert!(loaded.self_modify.enabled);
+        assert_eq!(loaded.self_modify.branch_prefix, "custom/prefix");
+        assert!(!loaded.self_modify.require_tests);
+        assert_eq!(loaded.self_modify.paths.allow, vec!["src/**"]);
+        assert_eq!(loaded.self_modify.paths.propose, vec!["kernel/**"]);
+        assert_eq!(loaded.self_modify.paths.deny, vec![".git/**", "*.key"]);
+    }
+
+    #[test]
+    fn self_modify_cli_config_converts_to_core_config() {
+        let cli = SelfModifyCliConfig {
+            enabled: true,
+            branch_prefix: "test/prefix".to_string(),
+            require_tests: false,
+            paths: SelfModifyPathsCliConfig {
+                allow: vec!["src/**".to_string()],
+                propose: vec!["kernel/**".to_string()],
+                deny: vec!["*.key".to_string()],
+            },
+        };
+        let core = fx_core::self_modify::SelfModifyConfig::from(&cli);
+        assert!(core.enabled);
+        assert_eq!(core.branch_prefix, "test/prefix");
+        assert!(!core.require_tests);
+        assert_eq!(core.allow_paths, vec!["src/**"]);
+        assert_eq!(core.propose_paths, vec!["kernel/**"]);
+        assert_eq!(core.deny_paths, vec!["*.key"]);
+    }
+    #[test]
+    fn load_rejects_invalid_glob_pattern() {
+        let temp = TempDir::new().expect("tempdir");
+        let content = r#"
+[self_modify.paths]
+deny = ["[invalid"]
+"#;
+        fs::write(temp.path().join("config.toml"), content).expect("write config");
+        let error = FawxConfig::load(temp.path()).expect_err("should reject invalid glob");
+        assert!(
+            error.contains("invalid glob"),
+            "error should mention invalid glob, got: {error}"
+        );
     }
 }
