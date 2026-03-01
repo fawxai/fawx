@@ -200,7 +200,7 @@ Code that doesn't meet the standards above gets rewritten or removed.
 ## 7. Agent Execution Model
 
 ### Roles
-- **Clawdio main session** is the lead. Orchestrates, designs, reviews results, makes architectural calls. Does NOT write code unless absolutely necessary (e.g., a one-line config fix or emergency hotfix with no time to spawn).
+- **Clawdio main session** is the lead. Orchestrates, designs, reviews results, makes architectural calls. Does NOT write code, regardless of size. All code is delegated to subagents. Opus may be used as implementer only with explicit justification approved by Joe.
 - **Subagents** do all implementation, review, and fix work.
 
 ### Model allocation
@@ -211,15 +211,15 @@ Code that doesn't meet the standards above gets rewritten or removed.
 
 ### Concurrency model
 Work is classified by complexity tier:
-- **Simple** (< 50 lines): Direct N+1 worker. Still gets Opus review unless Joe explicitly waives it. CI + review as quality gate.
+- **Simple** (< 50 lines): N+1 Codex xhigh worker. Still gets Opus review unless Joe explicitly waives it. CI + review as quality gate.
 - **Standard** (single-PR features): N+1 orchestrator spawns N+2 workers (implementer, reviewer, fixer). Orchestrator manages the full PR lifecycle and only announces terminal status to main. Parallel orchestrators OK (max 2-3).
 - **Complex** (multi-crate, architectural): N+1 orchestrator (Opus high) with full context, delegates ALL implementation to N+2 Codex xhigh workers. **Sequential only — one PR at a time.**
 
 N+2 completions announce only to their parent N+1 (structural filtering). The main session stays free for conversation and high-level decisions.
 
 ### Rules
-1. Main session delegates code work to subagents. No inline code writing in the main chat except trivial edits.
-2. Quick fixes → direct N+1 worker (Codex xhigh).
+1. Main session NEVER writes code. All code work delegated to subagents, no exceptions.
+2. Quick fixes → N+1 Codex xhigh worker (never inline in main session).
 3. Standard features → N+1 orchestrator with N+2 workers.
 4. Complex/architectural → N+1 orchestrator (Opus high) delegates to N+2 Codex xhigh. Sequential pipeline.
 5. Code review → always Opus high.
