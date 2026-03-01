@@ -205,14 +205,15 @@ Code that doesn't meet the standards above gets rewritten or removed.
 
 ### Model allocation
 - **Reviews/re-reviews**: Opus high (always). Reviews catch real architectural bugs.
-- **Implementation/fixes**: Clawdio's judgment — Codex xhigh for straightforward work, Opus high when the problem demands deeper reasoning (complex architecture, subtle concurrency/ownership bugs, novel design). Justify Opus in the spawn prompt when chosen.
-- **Fixer**: Codex xhigh (default). Opus high if the review findings are architecturally complex.
+- **Implementation/fixes**: Codex xhigh (always). OpenAI has more usage runway — reserve Opus for reviews and orchestrators only.
+- **Fixer**: Codex xhigh (always).
+- **Orchestrators**: Opus high. Orchestrators make architectural decisions and scope work for implementers — they never write code directly.
 
 ### Concurrency model
 Work is classified by complexity tier:
 - **Simple** (< 50 lines): Direct N+1 worker. Still gets Opus review unless Joe explicitly waives it. CI + review as quality gate.
 - **Standard** (single-PR features): N+1 orchestrator spawns N+2 workers (implementer, reviewer, fixer). Orchestrator manages the full PR lifecycle and only announces terminal status to main. Parallel orchestrators OK (max 2-3).
-- **Complex** (multi-crate, architectural): Single N+1 agent with full context. **Sequential only — one PR at a time.** Review/fix cycles may use N+2 workers since they're more mechanical.
+- **Complex** (multi-crate, architectural): N+1 orchestrator (Opus high) with full context, delegates ALL implementation to N+2 Codex xhigh workers. **Sequential only — one PR at a time.**
 
 N+2 completions announce only to their parent N+1 (structural filtering). The main session stays free for conversation and high-level decisions.
 
@@ -220,7 +221,7 @@ N+2 completions announce only to their parent N+1 (structural filtering). The ma
 1. Main session delegates code work to subagents. No inline code writing in the main chat except trivial edits.
 2. Quick fixes → direct N+1 worker (Codex xhigh).
 3. Standard features → N+1 orchestrator with N+2 workers.
-4. Complex/architectural → single N+1 agent (Opus high), sequential pipeline.
+4. Complex/architectural → N+1 orchestrator (Opus high) delegates to N+2 Codex xhigh. Sequential pipeline.
 5. Code review → always Opus high.
 6. All review findings (blocking, non-blocking, nice-to-have) must be fixed. Fresh reviewer for R2.
 
