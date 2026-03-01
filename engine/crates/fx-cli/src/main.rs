@@ -52,6 +52,7 @@ enum Commands {
     },
 
     /// Run OAuth bridge server for Android Codex sign-in
+    #[cfg(feature = "oauth-bridge")]
     OauthBridge {
         /// Listen address for the bridge HTTP server
         #[arg(long, default_value = "127.0.0.1:4318")]
@@ -77,6 +78,10 @@ enum Commands {
         #[arg(long)]
         scope: Option<String>,
     },
+
+    /// Run OAuth bridge server (requires --features oauth-bridge)
+    #[cfg(not(feature = "oauth-bridge"))]
+    OauthBridge,
 
     /// Run deterministic agent-loop eval harness and emit machine-readable metrics.
     EvalDeterminism {
@@ -204,6 +209,13 @@ async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
         }
         Commands::Audit { command } => dispatch_audit(command).await,
         Commands::Skill { command } => dispatch_skill(command).await,
+        #[cfg(not(feature = "oauth-bridge"))]
+        Commands::OauthBridge => {
+            eprintln!("Error: the oauth-bridge feature is not enabled in this build.");
+            eprintln!("Rebuild with: cargo build -p fx-cli --features oauth-bridge");
+            Ok(1)
+        }
+        #[cfg(feature = "oauth-bridge")]
         Commands::OauthBridge {
             listen,
             auth_url,
@@ -225,6 +237,7 @@ async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
     }
 }
 
+#[cfg(feature = "oauth-bridge")]
 async fn dispatch_oauth_bridge(
     listen: String,
     auth_url: Option<String>,

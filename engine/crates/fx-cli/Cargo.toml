@@ -5,6 +5,11 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+# Enable the OAuth bridge HTTP server subcommand (`fawx oauth-bridge`).
+# Pulls in axum and crypto dependencies. Disabled by default to reduce build times.
+oauth-bridge = ["dep:axum", "dep:sha2", "dep:base64", "dep:rand", "dep:subtle"]
+
 [[bin]]
 name = "fawx"
 path = "src/main.rs"
@@ -34,18 +39,18 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 reqwest.workspace = true
-axum = "0.8"
+axum = { version = "0.8", optional = true }
 uuid = { version = "1.13", features = ["v4"] }
-rand = "0.8"
-sha2 = "0.10"
-base64 = "0.22"
+rand = { version = "0.8", optional = true }
+sha2 = { version = "0.10", optional = true }
+base64 = { version = "0.22", optional = true }
 dirs = "6.0"
 chrono = "0.4"
 # rustyline: readline with history, completion, and key bindings. Rolling our own
 # would be 1000+ lines for equivalent quality. Audited dependency: pure Rust,
 # no unsafe, actively maintained.
 rustyline = "15"
-subtle = "2.6"
+subtle = { version = "2.6", optional = true }
 urlencoding = "2.1"
 # termimad: markdown rendering for terminal output.
 # Forked to abbudjoe/termimad for supply-chain safety. MIT licensed.
