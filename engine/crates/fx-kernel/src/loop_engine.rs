@@ -213,6 +213,8 @@ Answer the user directly and concisely. \
 Never introduce yourself, greet the user, or add preamble — just answer. \
 Use tools when you need information not already in the conversation \
 (current time, file contents, directory listings, search results, memory, etc.). \
+When the user's request relates to an available tool's purpose, prefer calling the tool \
+over answering from general knowledge. \
 After using tools, respond with the answer — never narrate what tools you used, \
 describe the process, or comment on tool output metadata. \
 Never narrate your process, hedge with qualifiers, or reference tool mechanics. \
@@ -1354,7 +1356,7 @@ fn tool_synthesis_prompt(tool_results: &[ToolResult], instruction: &str) -> Stri
         .collect::<Vec<_>>()
         .join("\n");
 
-    format!("You are Fawx. Answer the user's question using these tool results. \
+    format!("You are Fawx. Never introduce yourself, greet the user, or add preamble. Answer the user's question using these tool results. \
 Do NOT describe what tools were called, narrate the process, or comment on how you got the information. \
 Just provide the answer directly. \
 If the user asked for a specific format or value type, preserve that exact format. \
@@ -1863,6 +1865,12 @@ mod tests {
         assert!(
             prompt.contains("Use tools when you need information not already in the conversation")
         );
+        assert!(
+            prompt.contains(
+                "When the user's request relates to an available tool's purpose, prefer calling the tool"
+            ),
+            "system prompt should encourage proactive tool usage for matching requests"
+        );
         assert!(prompt.contains("current time"));
     }
 
@@ -1956,6 +1964,15 @@ mod tests {
         assert!(
             prompt.contains("current_time: 2026-02-28T14:00:00Z"),
             "synthesis prompt must include tool results"
+        );
+    }
+
+    #[test]
+    fn tool_synthesis_prompt_explicitly_prohibits_intro_and_greeting() {
+        let prompt = tool_synthesis_prompt(&[], "Combine outputs");
+        assert!(
+            prompt.contains("Never introduce yourself, greet the user, or add preamble"),
+            "synthesis prompt should mirror no-intro guidance from reasoning prompt"
         );
     }
 

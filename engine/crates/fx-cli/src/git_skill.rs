@@ -4,9 +4,10 @@ use fx_llm::ToolDefinition;
 use fx_loadable::{Skill, SkillError};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Output, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::process::{Output, Stdio};
+use std::time::Duration;
+use tokio::process::{Child, Command};
+use tokio::time::timeout;
 
 const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const DIFF_TIMEOUT: Duration = Duration::from_secs(15);
@@ -36,43 +37,55 @@ impl GitSkill {
         Self { working_dir }
     }
 
-    fn run_git(&self, args: &[&str]) -> Result<String, String> {
-        self.run_git_with_timeout(args, STATUS_TIMEOUT)
+    async fn run_git(&self, args: &[&str]) -> Result<String, String> {
+        self.run_git_with_timeout(args, STATUS_TIMEOUT).await
     }
 
-    fn run_git_with_timeout(&self, args: &[&str], timeout: Duration) -> Result<String, String> {
-        let output = spawn_and_wait(
-            Command::new("git")
-                .arg("-C")
-                .arg(&self.working_dir)
-                .args(args)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped()),
-            timeout,
-        )?;
+    async fn run_git_with_timeout(
+        &self,
+        args: &[&str],
+        timeout_duration: Duration,
+    ) -> Result<String, String> {
+        let mut command = Command::new("git");
+        command
+            .arg("-C")
+            .arg(&self.working_dir)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let child = command
+            .spawn()
+            .map_err(|error| format!("failed to spawn git: {error}"))?;
+        let output = wait_for_git_output(child, timeout_duration).await?;
         parse_git_output(output, &self.working_dir, args)
     }
 
-    fn execute_status(&self) -> Result<String, String> {
+    async fn execute_status(&self) -> Result<String, String> {
         self.run_git(&["status", "--short", "--branch"])
+            .await
             .map_err(|error| friendly_status_error(&error))
     }
 
-    fn execute_diff(&self, arguments: &str) -> Result<String, String> {
+    async fn execute_diff(&self, arguments: &str) -> Result<String, String> {
         let parsed: GitDiffArgs = parse_args(arguments)?;
         validate_diff_ref(parsed.reference.as_deref())?;
         let args = build_diff_args(&parsed);
-        let output = self.run_git_with_timeout(&args, DIFF_TIMEOUT)?;
+        let output = self.run_git_with_timeout(&args, DIFF_TIMEOUT).await?;
         Ok(truncate_diff_output(output))
     }
 
-    fn execute_checkpoint(&self, arguments: &str) -> Result<String, String> {
+    async fn execute_checkpoint(&self, arguments: &str) -> Result<String, String> {
         let parsed: GitCheckpointArgs = parse_args(arguments)?;
         if parsed.message.trim().is_empty() {
             return Err("missing required field: message".to_string());
         }
-        self.run_git_with_timeout(&["add", "-A"], CHECKPOINT_TIMEOUT)?;
-        match self.run_git_with_timeout(&["commit", "-m", &parsed.message], CHECKPOINT_TIMEOUT) {
+        self.run_git_with_timeout(&["add", "-A"], CHECKPOINT_TIMEOUT)
+            .await?;
+        match self
+            .run_git_with_timeout(&["commit", "-m", &parsed.message], CHECKPOINT_TIMEOUT)
+            .await
+        {
             Ok(output) => Ok(output),
             Err(error) if error.contains("nothing to commit") => {
                 Ok("nothing to commit, working tree clean".to_string())
@@ -96,9 +109,6 @@ impl Skill for GitSkill {
         ]
     }
 
-    /// Uses `std::process::Command` via `spawn_and_wait`, which is acceptable for
-    /// these short-lived git operations. For longer-running commands we should migrate
-    /// to `tokio::process::Command` (tracked in #969).
     async fn execute(
         &self,
         tool_name: &str,
@@ -106,9 +116,9 @@ impl Skill for GitSkill {
         _cancel: Option<&CancellationToken>,
     ) -> Option<Result<String, SkillError>> {
         let result: Result<String, SkillError> = match tool_name {
-            "git_status" => self.execute_status(),
-            "git_diff" => self.execute_diff(arguments),
-            "git_checkpoint" => self.execute_checkpoint(arguments),
+            "git_status" => self.execute_status().await,
+            "git_diff" => self.execute_diff(arguments).await,
+            "git_checkpoint" => self.execute_checkpoint(arguments).await,
             _ => return None,
         };
         Some(result)
@@ -118,9 +128,8 @@ impl Skill for GitSkill {
 fn git_status_definition() -> ToolDefinition {
     ToolDefinition {
         name: "git_status".to_string(),
-        description:
-            "Show the current git repository status including branch, staged, and unstaged changes"
-                .to_string(),
+        description: "Show the current git repository status including branch, staged, and unstaged changes. Use this when the user asks about git status, the current branch, what files changed, or what is staged for commit."
+            .to_string(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {},
@@ -132,7 +141,8 @@ fn git_status_definition() -> ToolDefinition {
 fn git_diff_definition() -> ToolDefinition {
     ToolDefinition {
         name: "git_diff".to_string(),
-        description: "Show git diff of changes in the working directory".to_string(),
+        description: "Show git diff of changes in the working directory. Use this when the user asks to see what changed, review modifications, or compare file versions."
+            .to_string(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -153,7 +163,8 @@ fn git_diff_definition() -> ToolDefinition {
 fn git_checkpoint_definition() -> ToolDefinition {
     ToolDefinition {
         name: "git_checkpoint".to_string(),
-        description: "Create a local git checkpoint by staging all changes and committing with a message. Does NOT push.".to_string(),
+        description: "Create a local git checkpoint by staging all changes and committing with a message. Does NOT push. Use this when the user asks to save progress, create a commit, checkpoint work, or snapshot changes."
+            .to_string(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -232,96 +243,33 @@ fn truncate_diff_output(mut output: String) -> String {
     output
 }
 
-fn spawn_and_wait(command: &mut Command, timeout: Duration) -> Result<Output, String> {
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("failed to spawn git: {error}"))?;
-    let stdout_reader = spawn_pipe_reader(child.stdout.take());
-    let stderr_reader = spawn_pipe_reader(child.stderr.take());
-    wait_for_process(&mut child, timeout, stdout_reader, stderr_reader)
-}
-
-fn wait_for_process(
-    child: &mut Child,
-    timeout: Duration,
-    stdout_reader: thread::JoinHandle<Result<Vec<u8>, String>>,
-    stderr_reader: thread::JoinHandle<Result<Vec<u8>, String>>,
-) -> Result<Output, String> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return collect_output(status, stdout_reader, stderr_reader),
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = stdout_reader.join();
-                    let _ = stderr_reader.join();
-                    return Err("git command timed out".to_string());
-                }
-                thread::sleep(Duration::from_millis(20));
-            }
-            Err(error) => return Err(format!("failed while waiting for git: {error}")),
-        }
+async fn wait_for_git_output(child: Child, timeout_duration: Duration) -> Result<Output, String> {
+    match timeout(timeout_duration, child.wait_with_output()).await {
+        Ok(result) => result.map_err(|error| format!("failed while waiting for git: {error}")),
+        Err(_) => Err("git command timed out".to_string()),
     }
-}
-
-fn collect_output(
-    status: ExitStatus,
-    stdout_reader: thread::JoinHandle<Result<Vec<u8>, String>>,
-    stderr_reader: thread::JoinHandle<Result<Vec<u8>, String>>,
-) -> Result<Output, String> {
-    let stdout = join_pipe_reader(stdout_reader)?;
-    let stderr = join_pipe_reader(stderr_reader)?;
-    Ok(Output {
-        status,
-        stdout,
-        stderr,
-    })
-}
-
-fn spawn_pipe_reader(
-    pipe: Option<impl std::io::Read + Send + 'static>,
-) -> thread::JoinHandle<Result<Vec<u8>, String>> {
-    thread::spawn(move || drain_pipe(pipe))
-}
-
-fn join_pipe_reader(
-    reader: thread::JoinHandle<Result<Vec<u8>, String>>,
-) -> Result<Vec<u8>, String> {
-    reader
-        .join()
-        .map_err(|_| "git output reader thread panicked".to_string())?
-}
-
-fn drain_pipe(pipe: Option<impl std::io::Read>) -> Result<Vec<u8>, String> {
-    let mut bytes = Vec::new();
-    if let Some(mut reader) = pipe {
-        std::io::Read::read_to_end(&mut reader, &mut bytes)
-            .map_err(|error| format!("failed to read git output: {error}"))?;
-    }
-    Ok(bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    use std::process::Command as StdCommand;
     use tempfile::TempDir;
 
     fn init_test_repo() -> TempDir {
         let tmp = TempDir::new().expect("tempdir should be created");
-        Command::new("git")
+        StdCommand::new("git")
             .args(["init"])
             .current_dir(tmp.path())
             .output()
             .expect("git command should run in test setup");
-        Command::new("git")
+        StdCommand::new("git")
             .args(["config", "user.email", "test@test.com"])
             .current_dir(tmp.path())
             .output()
             .expect("git command should run in test setup");
-        Command::new("git")
+        StdCommand::new("git")
             .args(["config", "user.name", "Test"])
             .current_dir(tmp.path())
             .output()
@@ -342,12 +290,12 @@ mod tests {
 
     fn seed_initial_commit(repo: &TempDir, file: &str, content: &str) {
         fs::write(repo.path().join(file), content).expect("seed file should be written");
-        Command::new("git")
+        StdCommand::new("git")
             .args(["add", file])
             .current_dir(repo.path())
             .output()
             .expect("git command should run in test setup");
-        Command::new("git")
+        StdCommand::new("git")
             .args(["commit", "-m", "initial"])
             .current_dir(repo.path())
             .output()
@@ -366,6 +314,22 @@ mod tests {
         assert!(names.contains(&"git_status"));
         assert!(names.contains(&"git_diff"));
         assert!(names.contains(&"git_checkpoint"));
+    }
+
+    #[test]
+    fn git_tool_descriptions_include_when_to_use_guidance() {
+        let skill = GitSkill::new(PathBuf::from("."));
+        let definitions = skill.tool_definitions();
+        for tool_name in ["git_status", "git_diff", "git_checkpoint"] {
+            let definition = definitions
+                .iter()
+                .find(|definition| definition.name == tool_name)
+                .expect("tool definition should exist");
+            assert!(
+                definition.description.contains("Use this when"),
+                "{tool_name} description should include actionable usage guidance"
+            );
+        }
     }
 
     #[test]
@@ -423,7 +387,7 @@ mod tests {
         let repo = init_test_repo();
         seed_initial_commit(&repo, "file.txt", "one\n");
         fs::write(repo.path().join("file.txt"), "two\n").expect("file should be updated");
-        Command::new("git")
+        StdCommand::new("git")
             .args(["add", "file.txt"])
             .current_dir(repo.path())
             .output()
@@ -455,7 +419,7 @@ mod tests {
         .expect("checkpoint should succeed");
 
         assert!(output.contains("checkpoint commit"));
-        let log = Command::new("git")
+        let log = StdCommand::new("git")
             .args(["log", "--oneline", "-1"])
             .current_dir(repo.path())
             .output()
@@ -529,12 +493,12 @@ mod tests {
     async fn git_diff_with_valid_ref_compares_against_main() {
         let repo = init_test_repo();
         seed_initial_commit(&repo, "safe.txt", "one\n");
-        Command::new("git")
+        StdCommand::new("git")
             .args(["branch", "-M", "main"])
             .current_dir(repo.path())
             .output()
             .expect("git command should run in test setup");
-        Command::new("git")
+        StdCommand::new("git")
             .args(["checkout", "-b", "feature"])
             .current_dir(repo.path())
             .output()
