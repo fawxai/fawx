@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use fx_core::memory::MemoryProvider;
+use fx_core::memory::MemoryStore;
 use fx_core::self_modify::{classify_path, format_tier_violation, SelfModifyConfig};
 use fx_kernel::act::{ToolExecutor, ToolExecutorError, ToolResult};
 use fx_kernel::cancellation::CancellationToken;
@@ -23,7 +23,7 @@ const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 30;
 pub struct FawxToolExecutor {
     working_dir: PathBuf,
     config: ToolConfig,
-    memory: Option<Arc<Mutex<dyn MemoryProvider>>>,
+    memory: Option<Arc<Mutex<dyn MemoryStore>>>,
     self_modify: Option<SelfModifyConfig>,
 }
 
@@ -64,7 +64,7 @@ impl FawxToolExecutor {
     }
 
     /// Attach a persistent memory provider.
-    pub fn with_memory(mut self, memory: Arc<Mutex<dyn MemoryProvider>>) -> Self {
+    pub fn with_memory(mut self, memory: Arc<Mutex<dyn MemoryStore>>) -> Self {
         self.memory = Some(memory);
         self
     }
@@ -358,8 +358,12 @@ impl FawxToolExecutor {
     fn handle_memory_read(&self, args: &serde_json::Value) -> Result<String, String> {
         let parsed: MemoryReadArgs = parse_args(args)?;
         let memory = self.memory.as_ref().ok_or("memory not configured")?;
-        let guard = memory.lock().map_err(|e| format!("{e}"))?;
-        match guard.read(&parsed.key) {
+        let mut guard = memory.lock().map_err(|e| format!("{e}"))?;
+        let value = guard.read(&parsed.key);
+        if value.is_some() {
+            guard.touch(&parsed.key)?;
+        }
+        match value {
             Some(value) => Ok(value),
             None => Ok(format!("key '{}' not found", parsed.key)),
         }
@@ -838,6 +842,7 @@ struct MemoryDeleteArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fx_core::memory::MemoryProvider;
     use tempfile::TempDir;
 
     fn test_executor(root: &Path) -> FawxToolExecutor {

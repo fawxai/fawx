@@ -1664,8 +1664,7 @@ fn build_skill_registry(
         Ok(memory) => {
             let snapshot = memory.snapshot();
             let text = format_memory_for_prompt(&snapshot, config.memory.max_snapshot_chars);
-            let memory: Arc<Mutex<dyn fx_core::memory::MemoryProvider>> =
-                Arc::new(Mutex::new(memory));
+            let memory: Arc<Mutex<dyn fx_core::memory::MemoryStore>> = Arc::new(Mutex::new(memory));
             executor = executor.with_memory(memory);
             text
         }

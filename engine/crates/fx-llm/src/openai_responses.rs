@@ -779,7 +779,9 @@ fn pending_index_without_id(pending: &[PendingToolCall], delta: &ToolUseDelta) -
         .enumerate()
         .filter(|(_, call)| call.id.is_none() || call.name.is_none())
         .map(|(index, _)| index)
-        .last()
+        // Use next_back() instead of last() to avoid needless full iteration
+        // on this DoubleEndedIterator (clippy::double_ended_iterator_last).
+        .next_back()
 }
 
 fn same_or_unknown_name(left: Option<&str>, right: Option<&str>) -> bool {
