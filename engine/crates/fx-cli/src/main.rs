@@ -5,9 +5,6 @@ mod commands;
 mod config_bridge;
 mod confirmation;
 mod conversation_store;
-mod git_skill;
-mod skill_bridge;
-mod tools;
 mod tui;
 
 use clap::{Parser, Subcommand, ValueEnum};

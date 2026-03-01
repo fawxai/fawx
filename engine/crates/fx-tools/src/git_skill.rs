@@ -35,7 +35,7 @@ struct GitCheckpointArgs {
 }
 
 impl GitSkill {
-    pub(crate) fn new(working_dir: PathBuf, self_modify: Option<SelfModifyConfig>) -> Self {
+    pub fn new(working_dir: PathBuf, self_modify: Option<SelfModifyConfig>) -> Self {
         Self {
             working_dir,
             self_modify,

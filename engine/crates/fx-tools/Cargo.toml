@@ -1,0 +1,21 @@
+[package]
+name = "fx-tools"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+fx-core.workspace = true
+fx-kernel.workspace = true
+fx-llm = { path = "../fx-llm" }
+fx-loadable.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3.14"
+fx-memory.workspace = true

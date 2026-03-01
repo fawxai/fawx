@@ -2,9 +2,6 @@ use crate::auth_store::{migrate_if_needed, AuthStore};
 use crate::conversation_store::{
     ConversationMessage, ConversationStore, TokenUsage as ConversationTokenUsage,
 };
-use crate::git_skill::GitSkill;
-use crate::skill_bridge::BuiltinToolsSkill;
-use crate::tools::{FawxToolExecutor, ToolConfig};
 use async_trait::async_trait;
 use crossterm::style::Stylize;
 use crossterm::{cursor, event, style, terminal, ExecutableCommand};
@@ -29,6 +26,7 @@ use fx_llm::{
 };
 use fx_loadable::SkillRegistry;
 use fx_memory::{JsonFileMemory, JsonMemoryConfig, SignalStore};
+use fx_tools::{BuiltinToolsSkill, FawxToolExecutor, GitSkill, ToolConfig};
 use rustyline::completion::{Completer, Pair};
 use rustyline::config::CompletionType;
 use rustyline::error::ReadlineError;

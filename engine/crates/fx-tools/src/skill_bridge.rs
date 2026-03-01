@@ -16,7 +16,7 @@ pub struct BuiltinToolsSkill {
 }
 
 impl BuiltinToolsSkill {
-    pub(crate) fn new(executor: FawxToolExecutor) -> Self {
+    pub fn new(executor: FawxToolExecutor) -> Self {
         let tool_names = executor
             .tool_definitions()
             .into_iter()
