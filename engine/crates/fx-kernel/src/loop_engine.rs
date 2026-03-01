@@ -153,6 +153,7 @@ pub struct LoopEngine {
     signals: SignalCollector,
     cancel_token: Option<CancellationToken>,
     input_channel: Option<LoopInputChannel>,
+    user_stop_requested: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -173,6 +174,31 @@ struct IterationOutcome {
 enum IterationStep {
     Progress(IterationOutcome),
     Terminal(LoopResult),
+}
+
+#[derive(Debug, Clone)]
+struct ToolRoundState {
+    all_tool_results: Vec<ToolResult>,
+    current_calls: Vec<ToolCall>,
+    continuation_messages: Vec<Message>,
+    tokens_used: TokenUsage,
+}
+
+impl ToolRoundState {
+    fn new(calls: &[ToolCall], context_messages: &[Message]) -> Self {
+        Self {
+            all_tool_results: Vec::new(),
+            current_calls: calls.to_vec(),
+            continuation_messages: context_messages.to_vec(),
+            tokens_used: TokenUsage::default(),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ToolRoundOutcome {
+    Cancelled,
+    Response(CompletionResponse),
 }
 
 const REASONING_OUTPUT_TOKEN_HEURISTIC: u64 = 192;
@@ -224,6 +250,7 @@ impl LoopEngine {
             signals: SignalCollector::default(),
             cancel_token: None,
             input_channel: None,
+            user_stop_requested: false,
         }
     }
 
@@ -361,48 +388,53 @@ impl LoopEngine {
 
     /// Check both the cancellation token and input channel.
     fn check_cancellation(&mut self, partial: Option<String>) -> Option<IterationStep> {
-        // Check CancellationToken (Ctrl+C)
-        if let Some(token) = &self.cancel_token {
-            if token.is_cancelled() {
-                self.emit_signal(
-                    LoopStep::Act,
-                    SignalKind::Blocked,
-                    "user cancelled",
-                    serde_json::json!({"source": "cancellation_token"}),
-                );
-                return Some(IterationStep::Terminal(LoopResult::UserStopped {
-                    partial_response: partial,
-                    iterations: self.iteration_count,
-                    signals: Vec::new(),
-                }));
-            }
+        if self.user_stop_requested {
+            self.user_stop_requested = false;
+            return Some(self.user_stopped_step(partial, "user stopped", "input_channel"));
         }
 
-        // Check LoopInputChannel (bare-word commands)
-        match self.check_user_input() {
-            Some(LoopCommand::Stop | LoopCommand::Abort) => {
-                self.emit_signal(
-                    LoopStep::Act,
-                    SignalKind::Blocked,
-                    "user stopped",
-                    serde_json::json!({"source": "input_channel"}),
-                );
-                Some(IterationStep::Terminal(LoopResult::UserStopped {
-                    partial_response: partial,
-                    iterations: self.iteration_count,
-                    signals: Vec::new(),
-                }))
-            }
-            // Wait/Resume are noted but do not stop the loop
-            // (full pause logic can be added later).
-            _ => None,
+        if self.cancellation_token_triggered() {
+            return Some(self.user_stopped_step(partial, "user cancelled", "cancellation_token"));
         }
+
+        if self.consume_stop_or_abort_command() {
+            return Some(self.user_stopped_step(partial, "user stopped", "input_channel"));
+        }
+
+        None
+    }
+
+    fn user_stopped_step(
+        &mut self,
+        partial: Option<String>,
+        message: &str,
+        source: &str,
+    ) -> IterationStep {
+        self.emit_signal(
+            LoopStep::Act,
+            SignalKind::Blocked,
+            message,
+            serde_json::json!({ "source": source }),
+        );
+        IterationStep::Terminal(LoopResult::UserStopped {
+            partial_response: partial,
+            iterations: self.iteration_count,
+            signals: Vec::new(),
+        })
+    }
+
+    fn consume_stop_or_abort_command(&mut self) -> bool {
+        matches!(
+            self.check_user_input(),
+            Some(LoopCommand::Stop | LoopCommand::Abort)
+        )
     }
 
     fn prepare_cycle(&mut self) {
         self.iteration_count = 0;
         self.budget.reset(current_time_ms());
         self.signals.clear();
+        self.user_stop_requested = false;
         if let Some(token) = &self.cancel_token {
             token.reset();
         }
@@ -887,6 +919,48 @@ impl LoopEngine {
         }
     }
 
+    fn cancellation_token_triggered(&self) -> bool {
+        self.cancel_token
+            .as_ref()
+            .map(CancellationToken::is_cancelled)
+            .unwrap_or(false)
+    }
+
+    fn tool_round_interrupted(&mut self) -> bool {
+        if self.cancellation_token_triggered() {
+            return true;
+        }
+
+        if self.consume_stop_or_abort_command() {
+            self.user_stop_requested = true;
+            return true;
+        }
+
+        false
+    }
+
+    fn cancelled_tool_action(
+        &self,
+        decision: &Decision,
+        tool_results: Vec<ToolResult>,
+        tokens_used: TokenUsage,
+    ) -> ActionResult {
+        ActionResult {
+            decision: decision.clone(),
+            tool_results,
+            response_text: SAFE_FALLBACK_RESPONSE.to_string(),
+            tokens_used,
+        }
+    }
+
+    fn cancelled_tool_action_from_state(
+        &self,
+        decision: &Decision,
+        state: ToolRoundState,
+    ) -> ActionResult {
+        self.cancelled_tool_action(decision, state.all_tool_results, state.tokens_used)
+    }
+
     // Evaluated introducing a ToolActionContext wrapper here, but kept explicit
     // arguments because there are only four call-site inputs and bundling them
     // made the call site less readable.
@@ -897,43 +971,71 @@ impl LoopEngine {
         llm: &dyn LlmProvider,
         context_messages: &[Message],
     ) -> Result<ActionResult, LoopError> {
-        let mut all_tool_results = Vec::new();
-        let mut current_calls = calls.to_vec();
-        let mut continuation_messages = context_messages.to_vec();
-        let mut tokens_used = TokenUsage::default();
+        let mut state = ToolRoundState::new(calls, context_messages);
 
         for round in 0..self.max_iterations {
-            let round_started = current_time_ms();
-            let results = self.execute_tool_calls(&current_calls).await?;
-            append_tool_round_messages(&mut continuation_messages, &current_calls, &results)?;
-            all_tool_results.extend(results);
-
-            let response = self
-                .request_tool_continuation(llm, &continuation_messages, &mut tokens_used)
-                .await?;
-            let latency_ms = current_time_ms().saturating_sub(round_started);
-            self.emit_tool_round_trace_and_perf(
-                round + 1,
-                current_calls.len(),
-                &response,
-                latency_ms,
-            );
-
-            if !response.tool_calls.is_empty() {
-                current_calls = response.tool_calls;
-                continue;
+            if self.tool_round_interrupted() {
+                return Ok(self.cancelled_tool_action_from_state(decision, state));
             }
 
-            return Ok(self.finalize_tool_response(
-                decision,
-                all_tool_results,
-                &response,
-                tokens_used,
-            ));
+            match self.execute_tool_round(round + 1, llm, &mut state).await? {
+                ToolRoundOutcome::Cancelled => {
+                    return Ok(self.cancelled_tool_action_from_state(decision, state));
+                }
+                ToolRoundOutcome::Response(response) => {
+                    if !response.tool_calls.is_empty() {
+                        state.current_calls = response.tool_calls;
+                        continue;
+                    }
+
+                    return Ok(self.finalize_tool_response(
+                        decision,
+                        state.all_tool_results,
+                        &response,
+                        state.tokens_used,
+                    ));
+                }
+            }
         }
 
-        self.synthesize_tool_fallback(decision, all_tool_results, tokens_used, llm)
+        self.synthesize_tool_fallback(decision, state.all_tool_results, state.tokens_used, llm)
             .await
+    }
+
+    async fn execute_tool_round(
+        &mut self,
+        round: u32,
+        llm: &dyn LlmProvider,
+        state: &mut ToolRoundState,
+    ) -> Result<ToolRoundOutcome, LoopError> {
+        let round_started = current_time_ms();
+        let results = self.execute_tool_calls(&state.current_calls).await?;
+        append_tool_round_messages(
+            &mut state.continuation_messages,
+            &state.current_calls,
+            &results,
+        )?;
+        state.all_tool_results.extend(results);
+
+        if self.cancellation_token_triggered() {
+            return Ok(ToolRoundOutcome::Cancelled);
+        }
+
+        let response = self
+            .request_tool_continuation(llm, &state.continuation_messages, &mut state.tokens_used)
+            .await?;
+        self.emit_tool_round_trace_and_perf(
+            round,
+            state.current_calls.len(),
+            &response,
+            current_time_ms().saturating_sub(round_started),
+        );
+
+        if self.cancellation_token_triggered() {
+            return Ok(ToolRoundOutcome::Cancelled);
+        }
+
+        Ok(ToolRoundOutcome::Response(response))
     }
 
     async fn execute_tool_calls(&self, calls: &[ToolCall]) -> Result<Vec<ToolResult>, LoopError> {
@@ -1254,7 +1356,10 @@ fn tool_synthesis_prompt(tool_results: &[ToolResult], instruction: &str) -> Stri
 
     format!("You are Fawx. Answer the user's question using these tool results. \
 Do NOT describe what tools were called, narrate the process, or comment on how you got the information. \
-Just provide the answer directly.{error_relay_instruction}\n\n\
+Just provide the answer directly. \
+If the user asked for a specific format or value type, preserve that exact format. \
+Do not convert timestamps to human-readable, counts to lists, or raw values to prose \
+unless the user explicitly asked for that.{error_relay_instruction}\n\n\
 {instruction}\n\n\
 Tool results:\n{tool_summary}")
 }
@@ -1812,7 +1917,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_synthesis_prompt_includes_direct_answer_instruction_and_identity() {
+    fn tool_synthesis_prompt_content_is_complete() {
         let results = vec![ToolResult {
             tool_call_id: "call-1".to_string(),
             tool_name: "current_time".to_string(),
@@ -1831,6 +1936,18 @@ mod tests {
         assert!(
             prompt.contains("Do NOT describe what tools were called"),
             "synthesis prompt must block meta-narration"
+        );
+        assert!(
+            prompt.contains(
+                "If the user asked for a specific format or value type, preserve that exact format."
+            ),
+            "synthesis prompt must preserve requested output formats"
+        );
+        assert!(
+            prompt.contains(
+                "Do not convert timestamps to human-readable, counts to lists, or raw values to prose unless the user explicitly asked for that."
+            ),
+            "synthesis prompt must forbid format rewriting"
         );
         assert!(
             prompt.contains("Tell the user the time."),
@@ -3459,6 +3576,389 @@ mod phase4_tests {
         assert!(
             matches!(result2, LoopResult::Complete { .. }),
             "second cycle should Complete (token was reset), got: {result2:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use crate::cancellation::CancellationToken;
+    use crate::input::{loop_input_channel, LoopCommand};
+    use async_trait::async_trait;
+    use fx_core::error::LlmError as CoreLlmError;
+    use fx_core::types::{InputSource, ScreenState, UserInput};
+    use fx_llm::{
+        CompletionRequest, CompletionResponse, ContentBlock, Message, ProviderError, ToolCall,
+        ToolDefinition,
+    };
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::time::{Duration, Instant};
+
+    #[derive(Debug, Default)]
+    struct NoopToolExecutor;
+
+    #[async_trait]
+    impl ToolExecutor for NoopToolExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+            Ok(calls.iter().map(success_result).collect())
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![read_file_definition()]
+        }
+    }
+
+    #[derive(Debug)]
+    struct DelayedToolExecutor {
+        delay: Duration,
+    }
+
+    impl DelayedToolExecutor {
+        fn new(delay: Duration) -> Self {
+            Self { delay }
+        }
+    }
+
+    #[async_trait]
+    impl ToolExecutor for DelayedToolExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+            wait_for_delay_or_cancel(self.delay, cancel).await;
+            if cancel.is_some_and(CancellationToken::is_cancelled) {
+                return Ok(Vec::new());
+            }
+            Ok(calls.iter().map(success_result).collect())
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![read_file_definition()]
+        }
+    }
+
+    #[derive(Debug)]
+    struct RoundCancellingToolExecutor {
+        delay: Duration,
+        rounds: Arc<AtomicUsize>,
+        cancel_after_round: usize,
+    }
+
+    impl RoundCancellingToolExecutor {
+        fn new(delay: Duration, rounds: Arc<AtomicUsize>, cancel_after_round: usize) -> Self {
+            Self {
+                delay,
+                rounds,
+                cancel_after_round,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ToolExecutor for RoundCancellingToolExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+            tokio::time::sleep(self.delay).await;
+            let current_round = self.rounds.fetch_add(1, Ordering::SeqCst) + 1;
+            let results = calls.iter().map(success_result).collect();
+            if current_round >= self.cancel_after_round {
+                if let Some(token) = cancel {
+                    token.cancel();
+                }
+            }
+            Ok(results)
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![read_file_definition()]
+        }
+    }
+
+    #[derive(Debug)]
+    struct ScriptedLlm {
+        responses: Mutex<VecDeque<CompletionResponse>>,
+    }
+
+    impl ScriptedLlm {
+        fn new(responses: Vec<CompletionResponse>) -> Self {
+            Self {
+                responses: Mutex::new(VecDeque::from(responses)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for ScriptedLlm {
+        async fn generate(&self, _: &str, _: u32) -> Result<String, CoreLlmError> {
+            Ok("summary".to_string())
+        }
+
+        async fn generate_streaming(
+            &self,
+            _: &str,
+            _: u32,
+            callback: Box<dyn Fn(String) + Send + 'static>,
+        ) -> Result<String, CoreLlmError> {
+            callback("summary".to_string());
+            Ok("summary".to_string())
+        }
+
+        fn model_name(&self) -> &str {
+            "scripted"
+        }
+
+        async fn complete(
+            &self,
+            _: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            self.responses
+                .lock()
+                .expect("lock")
+                .pop_front()
+                .ok_or_else(|| ProviderError::Provider("no response".to_string()))
+        }
+    }
+
+    fn engine_with_executor(executor: Arc<dyn ToolExecutor>, max_iterations: u32) -> LoopEngine {
+        LoopEngine::new(
+            BudgetTracker::new(crate::budget::BudgetConfig::default(), 0, 0),
+            ContextCompactor::new(2048, 256),
+            max_iterations,
+            executor,
+            "Summarize tool output".to_string(),
+        )
+    }
+
+    fn test_snapshot(text: &str) -> PerceptionSnapshot {
+        PerceptionSnapshot {
+            timestamp_ms: 1,
+            screen: ScreenState {
+                current_app: "terminal".to_string(),
+                elements: Vec::new(),
+                text_content: text.to_string(),
+            },
+            notifications: Vec::new(),
+            active_app: "terminal".to_string(),
+            user_input: Some(UserInput {
+                text: text.to_string(),
+                source: InputSource::Text,
+                timestamp: 1,
+                context_id: None,
+            }),
+            sensor_data: None,
+            conversation_history: vec![Message::user(text)],
+        }
+    }
+
+    fn read_file_definition() -> ToolDefinition {
+        ToolDefinition {
+            name: "read_file".to_string(),
+            description: "Read a file".to_string(),
+            parameters: serde_json::json!({"type":"object"}),
+        }
+    }
+
+    fn read_file_call(id: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path":"README.md"}),
+        }
+    }
+
+    fn success_result(call: &ToolCall) -> ToolResult {
+        ToolResult {
+            tool_call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            success: true,
+            output: "ok".to_string(),
+        }
+    }
+
+    fn tool_use_response(call_id: &str) -> CompletionResponse {
+        CompletionResponse {
+            content: Vec::new(),
+            tool_calls: vec![read_file_call(call_id)],
+            usage: None,
+            stop_reason: Some("tool_use".to_string()),
+        }
+    }
+
+    fn text_response(text: &str) -> CompletionResponse {
+        CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        }
+    }
+
+    async fn wait_for_cancel(token: &CancellationToken) {
+        while !token.is_cancelled() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    async fn wait_for_delay_or_cancel(delay: Duration, cancel: Option<&CancellationToken>) {
+        if let Some(token) = cancel {
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = wait_for_cancel(token) => {}
+            }
+            return;
+        }
+        tokio::time::sleep(delay).await;
+    }
+
+    async fn run_cycle_with_inflight_command(command: LoopCommand) -> (LoopResult, usize) {
+        let rounds = Arc::new(AtomicUsize::new(0));
+        let executor = RoundCancellingToolExecutor::new(
+            Duration::from_millis(120),
+            Arc::clone(&rounds),
+            usize::MAX,
+        );
+        let mut engine = engine_with_executor(Arc::new(executor), 4);
+        let (sender, channel) = loop_input_channel();
+        engine.set_input_channel(channel);
+        let llm = ScriptedLlm::new(vec![
+            tool_use_response("call-1"),
+            tool_use_response("call-2"),
+            text_response("done"),
+        ]);
+
+        let send_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            sender.send(command).expect("send command");
+        });
+
+        let result = engine
+            .run_cycle(test_snapshot("read file"), &llm)
+            .await
+            .expect("run_cycle");
+        send_task.await.expect("send task");
+        (result, rounds.load(Ordering::SeqCst))
+    }
+
+    #[test]
+    fn check_user_input_prioritizes_abort_over_queued_commands() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let (sender, channel) = loop_input_channel();
+        engine.set_input_channel(channel);
+
+        sender.send(LoopCommand::Stop).expect("send Stop");
+        sender.send(LoopCommand::Abort).expect("send Abort");
+        sender.send(LoopCommand::Resume).expect("send Resume");
+
+        assert_eq!(engine.check_user_input(), Some(LoopCommand::Abort));
+    }
+
+    #[test]
+    fn check_cancellation_without_token_or_input_returns_none() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        assert!(engine.check_cancellation(None).is_none());
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_delayed_tool_execution_returns_user_stopped_quickly() {
+        let token = CancellationToken::new();
+        let mut engine = engine_with_executor(
+            Arc::new(DelayedToolExecutor::new(Duration::from_secs(5))),
+            4,
+        );
+        engine.set_cancel_token(token.clone());
+        let llm = ScriptedLlm::new(vec![tool_use_response("call-1")]);
+
+        let cancel_task = tokio::spawn({
+            let token = token.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                token.cancel();
+            }
+        });
+
+        let started = Instant::now();
+        let result = engine
+            .run_cycle(test_snapshot("read file"), &llm)
+            .await
+            .expect("run_cycle");
+        cancel_task.await.expect("cancel task");
+
+        assert!(
+            matches!(result, LoopResult::UserStopped { .. }),
+            "expected UserStopped, got: {result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "cancellation should return quickly"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_between_tool_continuation_rounds_returns_user_stopped() {
+        let token = CancellationToken::new();
+        let rounds = Arc::new(AtomicUsize::new(0));
+        let executor =
+            RoundCancellingToolExecutor::new(Duration::from_millis(20), Arc::clone(&rounds), 1);
+        let mut engine = engine_with_executor(Arc::new(executor), 4);
+        engine.set_cancel_token(token);
+
+        let llm = ScriptedLlm::new(vec![
+            tool_use_response("call-1"),
+            tool_use_response("call-2"),
+        ]);
+
+        let result = engine
+            .run_cycle(test_snapshot("read files"), &llm)
+            .await
+            .expect("run_cycle");
+
+        assert!(
+            matches!(result, LoopResult::UserStopped { .. }),
+            "expected UserStopped, got: {result:?}"
+        );
+        assert_eq!(
+            rounds.load(Ordering::SeqCst),
+            1,
+            "cancellation should stop before the second tool round executes"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_command_sent_during_tool_round_is_caught_at_iteration_boundary() {
+        let (result, rounds) = run_cycle_with_inflight_command(LoopCommand::Stop).await;
+        assert!(
+            matches!(result, LoopResult::UserStopped { .. }),
+            "expected UserStopped for Stop, got: {result:?}"
+        );
+        assert_eq!(
+            rounds, 1,
+            "Stop should be caught before the second tool round executes"
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_command_sent_during_tool_round_is_caught_at_iteration_boundary() {
+        let (result, rounds) = run_cycle_with_inflight_command(LoopCommand::Abort).await;
+        assert!(
+            matches!(result, LoopResult::UserStopped { .. }),
+            "expected UserStopped for Abort, got: {result:?}"
+        );
+        assert_eq!(
+            rounds, 1,
+            "Abort should be caught before the second tool round executes"
         );
     }
 }

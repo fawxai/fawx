@@ -75,7 +75,9 @@ const DEFAULT_CONTEXT_COMPACT_TARGET: usize = 6_000;
 const DEFAULT_SYNTHESIS_INSTRUCTION: &str =
     "Use the tool output to directly answer the user's question. Be natural and specific — \
 don't dump raw tool output, but don't hide data either. Match your response format to what \
-the user asked for. If they asked a simple question, give a simple answer. If they asked \
+the user asked for: if they asked for a specific format (e.g., a count, a timestamp, a \
+raw value), use exactly that format — do not reformat into a 'friendlier' version unless \
+explicitly asked. If they asked a simple question, give a simple answer. If they asked \
 for a listing or search results, present it cleanly formatted.";
 const MAX_SYNTHESIS_INSTRUCTION_LENGTH: usize = 500;
 const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
