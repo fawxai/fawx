@@ -1,7 +1,7 @@
 //! Persistent agent memory trait.
 //!
-//! The kernel defines this contract; implementations live in the loadable layer
-//! (e.g. `JsonFileMemory` in fx-cli).
+//! The kernel defines this contract; implementations live in dedicated
+//! implementation crates (e.g. `JsonFileMemory` in fx-memory).
 
 use serde::{Deserialize, Serialize};
 use std::fmt;

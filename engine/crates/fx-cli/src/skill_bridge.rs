@@ -80,8 +80,8 @@ impl Skill for BuiltinToolsSkill {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::json_memory::JsonFileMemory;
     use crate::tools::ToolConfig;
+    use fx_memory::JsonFileMemory;
     use tempfile::TempDir;
 
     fn build_memory_executor(temp: &TempDir) -> FawxToolExecutor {

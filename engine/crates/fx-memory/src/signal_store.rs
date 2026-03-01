@@ -3,7 +3,7 @@
 //! Writes signals from each loop cycle to a per-session JSONL file under
 //! `~/.fawx/signals/`. One JSON object per line, append-only.
 
-use fx_kernel::signals::Signal;
+use fx_core::signals::Signal;
 use std::fmt;
 use std::fs;
 use std::io::Write;
@@ -169,7 +169,7 @@ fn redacted_output_byte_count(output: &serde_json::Value) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fx_kernel::signals::{LoopStep, SignalKind};
+    use fx_core::signals::{LoopStep, SignalKind};
     use std::io::BufRead;
     use tempfile::TempDir;
 

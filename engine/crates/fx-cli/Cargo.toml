@@ -16,6 +16,7 @@ fx-kernel.workspace = true
 fx-auth.workspace = true
 fx-llm = { path = "../fx-llm" }
 fx-loadable = { path = "../fx-loadable" }
+fx-memory.workspace = true
 fx-security.workspace = true
 fx-skills = { path = "../fx-skills" }
 fx-storage.workspace = true
@@ -54,7 +55,6 @@ termimad = { git = "https://github.com/abbudjoe/termimad.git", rev = "f93824f301
 syntect = { git = "https://github.com/abbudjoe/syntect.git", rev = "6271d7dd8a63f13df08c151840f2358bf116cdcc", default-features = false, features = ["default-fancy"] }
 
 [dev-dependencies]
-filetime = "0.2"
 tempfile = "3.14"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

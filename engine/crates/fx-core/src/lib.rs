@@ -17,6 +17,7 @@ pub mod event;
 pub mod memory;
 pub mod message;
 pub mod self_modify;
+pub mod signals;
 pub mod types;
 
 pub use config::Config;

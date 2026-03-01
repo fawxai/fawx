@@ -54,7 +54,6 @@ pub struct JsonFileMemory {
 }
 
 impl JsonFileMemory {
-    #[cfg(test)]
     pub fn new(data_dir: &Path) -> Result<Self, String> {
         Self::new_with_config(data_dir, JsonMemoryConfig::default())
     }

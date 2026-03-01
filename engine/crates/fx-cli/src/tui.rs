@@ -3,8 +3,6 @@ use crate::conversation_store::{
     ConversationMessage, ConversationStore, TokenUsage as ConversationTokenUsage,
 };
 use crate::git_skill::GitSkill;
-use crate::json_memory::{JsonFileMemory, JsonMemoryConfig};
-use crate::signal_store::SignalStore;
 use crate::skill_bridge::BuiltinToolsSkill;
 use crate::tools::{FawxToolExecutor, ToolConfig};
 use async_trait::async_trait;
@@ -30,6 +28,7 @@ use fx_llm::{
     OpenAiProvider, OpenAiResponsesProvider, ProviderError, RouterError, StreamChunk,
 };
 use fx_loadable::SkillRegistry;
+use fx_memory::{JsonFileMemory, JsonMemoryConfig, SignalStore};
 use rustyline::completion::{Completer, Pair};
 use rustyline::config::CompletionType;
 use rustyline::error::ReadlineError;

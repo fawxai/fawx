@@ -1435,7 +1435,7 @@ mod tests {
     fn memory_tools_appear_in_definitions_when_memory_configured() {
         let temp = TempDir::new().expect("temp");
         let memory = Arc::new(Mutex::new(
-            crate::json_memory::JsonFileMemory::new(temp.path()).expect("memory"),
+            fx_memory::JsonFileMemory::new(temp.path()).expect("memory"),
         ));
         let executor = FawxToolExecutor::new(temp.path().to_path_buf(), ToolConfig::default())
             .with_memory(memory);
@@ -1460,7 +1460,7 @@ mod tests {
     fn memory_write_tool_stores_value() {
         let temp = TempDir::new().expect("temp");
         let memory = Arc::new(Mutex::new(
-            crate::json_memory::JsonFileMemory::new(temp.path()).expect("memory"),
+            fx_memory::JsonFileMemory::new(temp.path()).expect("memory"),
         ));
         let executor = FawxToolExecutor::new(temp.path().to_path_buf(), ToolConfig::default())
             .with_memory(memory.clone());
@@ -1476,7 +1476,7 @@ mod tests {
     fn memory_read_tool_retrieves_value() {
         let temp = TempDir::new().expect("temp");
         let memory = Arc::new(Mutex::new(
-            crate::json_memory::JsonFileMemory::new(temp.path()).expect("memory"),
+            fx_memory::JsonFileMemory::new(temp.path()).expect("memory"),
         ));
         {
             let mut guard = memory.lock().expect("lock");
@@ -1494,7 +1494,7 @@ mod tests {
     fn memory_list_tool_returns_entries() {
         let temp = TempDir::new().expect("temp");
         let memory = Arc::new(Mutex::new(
-            crate::json_memory::JsonFileMemory::new(temp.path()).expect("memory"),
+            fx_memory::JsonFileMemory::new(temp.path()).expect("memory"),
         ));
         {
             let mut guard = memory.lock().expect("lock");
@@ -1522,7 +1522,7 @@ mod tests {
     fn memory_delete_tool_removes_entry() {
         let temp = TempDir::new().expect("temp");
         let memory = Arc::new(Mutex::new(
-            crate::json_memory::JsonFileMemory::new(temp.path()).expect("memory"),
+            fx_memory::JsonFileMemory::new(temp.path()).expect("memory"),
         ));
         {
             let mut guard = memory.lock().expect("lock");
@@ -1550,7 +1550,7 @@ mod tests {
     fn memory_list_tool_returns_empty_message() {
         let temp = TempDir::new().expect("temp");
         let memory = Arc::new(Mutex::new(
-            crate::json_memory::JsonFileMemory::new(temp.path()).expect("memory"),
+            fx_memory::JsonFileMemory::new(temp.path()).expect("memory"),
         ));
         let executor = FawxToolExecutor::new(temp.path().to_path_buf(), ToolConfig::default())
             .with_memory(memory);
@@ -1562,7 +1562,7 @@ mod tests {
     fn memory_delete_tool_returns_not_found() {
         let temp = TempDir::new().expect("temp");
         let memory = Arc::new(Mutex::new(
-            crate::json_memory::JsonFileMemory::new(temp.path()).expect("memory"),
+            fx_memory::JsonFileMemory::new(temp.path()).expect("memory"),
         ));
         let executor = FawxToolExecutor::new(temp.path().to_path_buf(), ToolConfig::default())
             .with_memory(memory);

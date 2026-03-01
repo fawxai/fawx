@@ -11,6 +11,7 @@ members = [
     "engine/crates/fx-skills",
     "engine/crates/fx-storage",
     "engine/crates/fx-cli",
+    "engine/crates/fx-memory",
     "engine/crates/llama-cpp-sys",
 ]
 resolver = "2"
@@ -72,3 +73,4 @@ fx-agent = { path = "engine/crates/fx-agent" }
 fx-security = { path = "engine/crates/fx-security" }
 fx-skills = { path = "engine/crates/fx-skills" }
 fx-storage = { path = "engine/crates/fx-storage" }
+fx-memory = { path = "engine/crates/fx-memory" }
