@@ -685,6 +685,16 @@ impl LoopEngine {
             discrepancies.push("action produced an empty response".to_string());
         }
 
+        // Detect safe fallback responses — the model returned no tool calls
+        // and produced empty/unparseable text that was replaced by the fallback.
+        // This triggers a retry with a tool-directive continuation message.
+        if action.response_text == SAFE_FALLBACK_RESPONSE && action.tool_results.is_empty() {
+            discrepancies.push(
+                "model produced fallback instead of using tools or giving a substantive answer"
+                    .to_string(),
+            );
+        }
+
         let verification = build_verification(discrepancies);
         self.emit_verification_signals(&verification);
         Ok(verification)
@@ -754,10 +764,16 @@ impl LoopEngine {
             return Ok(continuation);
         }
 
-        let continuation = Continuation::Continue(
+        // When the model produced a safe fallback (no tools, no real response),
+        // retry with a tool-directive message to nudge toward tool use.
+        let is_fallback =
+            matches!(decision, Decision::Respond(text) if text == SAFE_FALLBACK_RESPONSE);
+        let message = if is_fallback {
+            "The previous attempt did not use tools. The user's question likely requires gathering information. Use the available tools (read_file, list_directory, search_text, etc.) to find the answer instead of responding with text alone."
+        } else {
             "The previous attempt produced no response. Try a different approach to answer the user's question."
-                .to_string(),
-        );
+        };
+        let continuation = Continuation::Continue(message.to_string());
         self.emit_continue_signal(&continuation);
         Ok(continuation)
     }
@@ -4011,6 +4027,335 @@ mod cancellation_tests {
         assert_eq!(
             rounds, 1,
             "Abort should be caught before the second tool round executes"
+        );
+    }
+}
+
+#[cfg(test)]
+mod fallback_retry_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use fx_core::error::LlmError as CoreLlmError;
+    use fx_core::types::{InputSource, ScreenState, UserInput};
+    use fx_llm::{
+        CompletionResponse, ContentBlock, Message, ProviderError, ToolCall, ToolDefinition,
+    };
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    #[derive(Debug, Default)]
+    struct StubToolExecutor;
+
+    #[async_trait]
+    impl ToolExecutor for StubToolExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+            Ok(calls
+                .iter()
+                .map(|call| ToolResult {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    success: true,
+                    output: "ok".to_string(),
+                })
+                .collect())
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition {
+                name: "read_file".to_string(),
+                description: "Read a file".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+            }]
+        }
+    }
+
+    #[derive(Debug)]
+    struct SequentialMockLlm {
+        responses: Mutex<VecDeque<CompletionResponse>>,
+    }
+
+    impl SequentialMockLlm {
+        fn new(responses: Vec<CompletionResponse>) -> Self {
+            Self {
+                responses: Mutex::new(VecDeque::from(responses)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for SequentialMockLlm {
+        async fn generate(&self, _: &str, _: u32) -> Result<String, CoreLlmError> {
+            Ok("summary".to_string())
+        }
+
+        async fn generate_streaming(
+            &self,
+            _: &str,
+            _: u32,
+            callback: Box<dyn Fn(String) + Send + 'static>,
+        ) -> Result<String, CoreLlmError> {
+            callback("summary".to_string());
+            Ok("summary".to_string())
+        }
+
+        fn model_name(&self) -> &str {
+            "mock"
+        }
+
+        async fn complete(
+            &self,
+            _: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            self.responses
+                .lock()
+                .expect("lock")
+                .pop_front()
+                .ok_or_else(|| ProviderError::Provider("no response".to_string()))
+        }
+    }
+
+    fn test_engine() -> LoopEngine {
+        LoopEngine::new(
+            BudgetTracker::new(crate::budget::BudgetConfig::default(), 0, 0),
+            ContextCompactor::new(2048, 256),
+            3,
+            Arc::new(StubToolExecutor),
+            "Summarize tool output".to_string(),
+        )
+    }
+
+    fn test_snapshot(text: &str) -> PerceptionSnapshot {
+        PerceptionSnapshot {
+            timestamp_ms: 1,
+            screen: ScreenState {
+                current_app: "terminal".to_string(),
+                elements: Vec::new(),
+                text_content: text.to_string(),
+            },
+            notifications: Vec::new(),
+            active_app: "terminal".to_string(),
+            user_input: Some(UserInput {
+                text: text.to_string(),
+                source: InputSource::Text,
+                timestamp: 1,
+                context_id: None,
+            }),
+            sensor_data: None,
+            conversation_history: vec![Message::user(text)],
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_detects_safe_fallback_as_discrepancy() {
+        let mut engine = test_engine();
+        let action = ActionResult {
+            decision: Decision::Respond(SAFE_FALLBACK_RESPONSE.to_string()),
+            tool_results: Vec::new(),
+            response_text: SAFE_FALLBACK_RESPONSE.to_string(),
+            tokens_used: TokenUsage::default(),
+        };
+
+        let verification = engine.verify(&action).await.expect("verify");
+        assert!(
+            !verification.outcome_satisfactory,
+            "safe fallback should not pass verification"
+        );
+        assert!(
+            verification
+                .discrepancies
+                .iter()
+                .any(|d| d.contains("fallback")),
+            "discrepancy should mention fallback: {:?}",
+            verification.discrepancies
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_does_not_flag_fallback_when_tools_were_used() {
+        let mut engine = test_engine();
+        let action = ActionResult {
+            decision: Decision::UseTools(vec![ToolCall {
+                id: "1".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "a.txt"}),
+            }]),
+            tool_results: vec![ToolResult {
+                tool_call_id: "1".to_string(),
+                tool_name: "read_file".to_string(),
+                success: true,
+                output: "ok".to_string(),
+            }],
+            response_text: SAFE_FALLBACK_RESPONSE.to_string(),
+            tokens_used: TokenUsage::default(),
+        };
+
+        let verification = engine.verify(&action).await.expect("verify");
+        assert!(
+            verification.outcome_satisfactory,
+            "fallback with tools used should still pass (tools produced results)"
+        );
+        assert!(
+            verification.discrepancies.is_empty(),
+            "fallback with tools used should not report discrepancies: {:?}",
+            verification.discrepancies
+        );
+    }
+
+    #[tokio::test]
+    async fn should_continue_returns_tool_directive_for_fallback() {
+        let mut engine = test_engine();
+        let decision = Decision::Respond(SAFE_FALLBACK_RESPONSE.to_string());
+        let verification = Verification {
+            outcome_satisfactory: false,
+            confidence: 0.45,
+            discrepancies: vec!["model produced fallback".to_string()],
+        };
+        let learning = Learning {
+            episode: "test".to_string(),
+            pattern: None,
+            adjustment: None,
+        };
+
+        let continuation = engine
+            .should_continue(&decision, &verification, &learning)
+            .await
+            .expect("should_continue");
+
+        match continuation {
+            Continuation::Continue(msg) => {
+                assert!(
+                    msg.contains("did not use tools"),
+                    "continuation for fallback should mention tools: {msg}"
+                );
+            }
+            other => panic!("expected Continue, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn should_continue_returns_generic_message_for_non_fallback_failure() {
+        let mut engine = test_engine();
+        let decision = Decision::Respond("some other response".to_string());
+        let verification = Verification {
+            outcome_satisfactory: false,
+            confidence: 0.45,
+            discrepancies: vec!["action produced an empty response".to_string()],
+        };
+        let learning = Learning {
+            episode: "test".to_string(),
+            pattern: None,
+            adjustment: None,
+        };
+
+        let continuation = engine
+            .should_continue(&decision, &verification, &learning)
+            .await
+            .expect("should_continue");
+
+        match continuation {
+            Continuation::Continue(msg) => {
+                assert!(
+                    msg.contains("produced no response"),
+                    "non-fallback continuation should use generic message: {msg}"
+                );
+            }
+            other => panic!("expected Continue, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_cycle_retries_on_fallback_then_succeeds_with_tools() {
+        let mut engine = test_engine();
+
+        // First response: model returns empty text (no tools) -> fallback
+        // Second response (retry): model uses tools
+        // Third response: tool continuation with final answer
+        let llm = SequentialMockLlm::new(vec![
+            // Iteration 1: empty response -> SAFE_FALLBACK
+            CompletionResponse {
+                content: Vec::new(),
+                tool_calls: Vec::new(),
+                usage: None,
+                stop_reason: None,
+            },
+            // Iteration 2 (retry): model uses tools
+            CompletionResponse {
+                content: Vec::new(),
+                tool_calls: vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": "README.md"}),
+                }],
+                usage: None,
+                stop_reason: Some("tool_use".to_string()),
+            },
+            // Tool continuation: final answer
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "Here are the file contents.".to_string(),
+                }],
+                tool_calls: Vec::new(),
+                usage: None,
+                stop_reason: None,
+            },
+        ]);
+
+        let result = engine
+            .run_cycle(test_snapshot("read the readme"), &llm)
+            .await
+            .expect("run_cycle");
+
+        match result {
+            LoopResult::Complete {
+                response,
+                iterations,
+                ..
+            } => {
+                assert_eq!(iterations, 2, "should take 2 iterations (fallback + retry)");
+                assert_eq!(response, "Here are the file contents.");
+            }
+            other => panic!("expected Complete, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_cycle_exhausts_iterations_on_repeated_fallback() {
+        let mut engine = LoopEngine::new(
+            BudgetTracker::new(crate::budget::BudgetConfig::default(), 0, 0),
+            ContextCompactor::new(2048, 256),
+            2,
+            Arc::new(StubToolExecutor),
+            "Summarize".to_string(),
+        );
+
+        // Both iterations return empty -> fallback each time
+        let llm = SequentialMockLlm::new(vec![
+            CompletionResponse {
+                content: Vec::new(),
+                tool_calls: Vec::new(),
+                usage: None,
+                stop_reason: None,
+            },
+            CompletionResponse {
+                content: Vec::new(),
+                tool_calls: Vec::new(),
+                usage: None,
+                stop_reason: None,
+            },
+        ]);
+
+        let result = engine
+            .run_cycle(test_snapshot("do something broad"), &llm)
+            .await
+            .expect("run_cycle");
+
+        assert!(
+            matches!(result, LoopResult::Error { .. }),
+            "repeated fallbacks should exhaust iterations: {result:?}"
         );
     }
 }
