@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 fx-core.workspace = true
 fx-kernel.workspace = true
+fx-auth.workspace = true
 fx-llm = { path = "../fx-llm" }
 fx-loadable = { path = "../fx-loadable" }
 fx-security.workspace = true

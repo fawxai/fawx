@@ -28,7 +28,6 @@
 //! - Three-gate decision: policy → budget → permission, no gate skippable
 
 pub mod act;
-pub mod auth;
 pub mod budget;
 pub mod cancellation;
 pub mod checkpoint;
@@ -38,7 +37,6 @@ pub mod decide;
 pub mod input;
 pub mod learn;
 pub mod loop_engine;
-pub mod oauth;
 pub mod perceive;
 pub mod permissions;
 pub mod policy;

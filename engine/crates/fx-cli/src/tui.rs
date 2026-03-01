@@ -12,17 +12,17 @@ use async_trait::async_trait;
 use crossterm::style::Stylize;
 use crossterm::{cursor, event, style, terminal, ExecutableCommand};
 use futures::StreamExt;
+use fx_auth::auth::{AuthManager, AuthMethod};
+use fx_auth::oauth::{PkceFlow, TokenExchangeRequest, TokenResponse};
 use fx_core::error::LlmError as CoreLlmError;
 use fx_core::memory::MemoryProvider;
 use fx_core::types::{InputSource, ScreenState, UserInput};
 use fx_kernel::act::TokenUsage;
-use fx_kernel::auth::{AuthManager, AuthMethod};
 use fx_kernel::budget::{BudgetConfig, BudgetTracker};
 use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::context_manager::ContextCompactor;
 use fx_kernel::input::LoopCommand;
 use fx_kernel::loop_engine::{LlmProvider as LoopLlmProvider, LoopEngine, LoopResult};
-use fx_kernel::oauth::{PkceFlow, TokenExchangeRequest, TokenResponse};
 use fx_kernel::signals::{LoopStep, Signal, SignalCollector};
 use fx_kernel::types::PerceptionSnapshot;
 use fx_llm::{
@@ -899,7 +899,7 @@ impl TuiApp {
     }
 
     fn store_openai_oauth_tokens(&mut self, token_response: TokenResponse) {
-        let account_id = fx_kernel::oauth::extract_openai_account_id(&token_response.access_token);
+        let account_id = fx_auth::oauth::extract_openai_account_id(&token_response.access_token);
         let expires_at =
             current_time_ms().saturating_add(token_response.expires_in.saturating_mul(1_000));
 
@@ -2284,7 +2284,7 @@ fn prompt_for_oauth_code(flow: &PkceFlow) -> Result<String, TuiError> {
     )?;
 
     flow.parse_callback(&input)
-        .or_else(|_| Ok::<String, fx_kernel::oauth::AuthError>(input.trim().to_string()))
+        .or_else(|_| Ok::<String, fx_auth::oauth::AuthError>(input.trim().to_string()))
         .map_err(|error| TuiError::Auth(format!("{error}")))
 }
 
@@ -2425,7 +2425,7 @@ fn openai_oauth_client_id() -> String {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| fx_kernel::oauth::OPENAI_CLIENT_ID.to_string())
+        .unwrap_or_else(|| fx_auth::oauth::OPENAI_CLIENT_ID.to_string())
 }
 
 fn openai_oauth_token_endpoint() -> String {
@@ -3981,7 +3981,7 @@ mod tests {
         let _env_lock = ENV_LOCK.lock().await;
         let _client_id = ScopedEnvVar::set("FAWX_OPENAI_CLIENT_ID", "   ");
 
-        assert_eq!(openai_oauth_client_id(), fx_kernel::oauth::OPENAI_CLIENT_ID);
+        assert_eq!(openai_oauth_client_id(), fx_auth::oauth::OPENAI_CLIENT_ID);
     }
 
     #[tokio::test]

@@ -2,6 +2,7 @@
 members = [
     "engine/crates/fx-core",
     "engine/crates/fx-kernel",
+    "engine/crates/fx-auth",
     "engine/crates/fx-loadable",
     "engine/crates/fx-agent",
     "engine/crates/fx-llm",
@@ -63,6 +64,7 @@ tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 # Shared crates
 fx-core = { path = "engine/crates/fx-core" }
 fx-kernel = { path = "engine/crates/fx-kernel" }
+fx-auth = { path = "engine/crates/fx-auth" }
 fx-loadable = { path = "engine/crates/fx-loadable" }
 fx-agent = { path = "engine/crates/fx-agent" }
 fx-security = { path = "engine/crates/fx-security" }
