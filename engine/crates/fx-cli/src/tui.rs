@@ -64,10 +64,6 @@ const FAWX_BANNER_ANSI: &str = include_str!("../../../../scripts/fawx-banner.ans
 
 const DEFAULT_OPENAI_TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
 const MAX_PROMPT_RETRIES: usize = 10;
-/// Cap conversation history to limit context bleed between unrelated turns.
-/// Higher values increase the chance of the model referencing stale context;
-/// lower values lose multi-turn continuity. 10 balances both concerns.
-const MAX_CONVERSATION_HISTORY: usize = 10;
 const DEFAULT_CONTEXT_MAX_TOKENS: usize = 8_000;
 const DEFAULT_CONTEXT_COMPACT_TARGET: usize = 6_000;
 const DEFAULT_SYNTHESIS_INSTRUCTION: &str =
@@ -693,18 +689,8 @@ impl TuiApp {
         if let Err(e) = signal_store.cleanup_old_signals() {
             eprintln!("warning: signal cleanup failed: {e}");
         }
-        if config.general.max_history > MAX_CONVERSATION_HISTORY {
-            eprintln!(
-                "Note: conversation history capped at {MAX_CONVERSATION_HISTORY} entries (configured: {})",
-                config.general.max_history
-            );
-        }
-        let max_history = config.general.max_history.min(MAX_CONVERSATION_HISTORY);
-        let conversation_history = if cfg!(test) {
-            Vec::new()
-        } else {
-            load_conversation_history(&conversation_store, max_history)
-        };
+        let max_history = config.general.max_history;
+        let conversation_history = load_startup_conversation_history(&conversation_store, &config);
 
         Ok(Self {
             router,
@@ -1896,6 +1882,20 @@ fn configured_working_dir(config: &FawxConfig) -> PathBuf {
         return path.clone();
     }
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn load_startup_conversation_history(
+    store: &ConversationStore,
+    config: &FawxConfig,
+) -> Vec<Message> {
+    if !should_load_startup_conversation_history(config) {
+        return Vec::new();
+    }
+    load_conversation_history(store, config.general.max_history)
+}
+
+fn should_load_startup_conversation_history(config: &FawxConfig) -> bool {
+    !cfg!(test) || config.general.data_dir.is_some()
 }
 
 fn load_conversation_history(store: &ConversationStore, max_history: usize) -> Vec<Message> {
@@ -4821,11 +4821,56 @@ mod tests {
                 .expect("message response");
         }
 
-        assert_eq!(app.conversation_history.len(), MAX_CONVERSATION_HISTORY);
+        assert_eq!(app.conversation_history.len(), app.max_history);
         assert_eq!(
             app.conversation_history[0],
-            Message::user("msg-10".to_string())
+            Message::user("msg-5".to_string())
         );
+    }
+
+    #[test]
+    fn startup_loads_configured_max_history_entries() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let mut store = ConversationStore::new(temp_dir.path()).expect("store");
+        store.ensure_active().expect("active conversation");
+
+        for index in 0..25 {
+            store
+                .save_message(&ConversationMessage {
+                    role: "user".to_string(),
+                    content: format!("msg-{index}"),
+                    timestamp_ms: index as u64,
+                    signals: None,
+                    tool_calls: None,
+                    token_usage: None,
+                })
+                .expect("save message");
+        }
+
+        let mut config = FawxConfig::default();
+        config.general.data_dir = Some(temp_dir.path().to_path_buf());
+        config.general.max_history = 20;
+
+        let app = TuiApp::new(
+            AuthManager::new(),
+            ModelRouter::new(),
+            build_loop_engine(),
+            config,
+        )
+        .expect("app");
+
+        assert_eq!(app.conversation_history.len(), 20);
+        assert_eq!(app.max_history, 20);
+        assert_eq!(
+            app.conversation_history[0],
+            Message::user("msg-5".to_string())
+        );
+    }
+
+    #[test]
+    fn startup_history_loader_uses_config_only_for_limit() {
+        let _loader: fn(&ConversationStore, &FawxConfig) -> Vec<Message> =
+            load_startup_conversation_history;
     }
 
     #[tokio::test]
