@@ -1,14 +1,19 @@
 [workspace]
 members = [
+    "engine/crates/fx-config",
     "engine/crates/fx-core",
     "engine/crates/fx-kernel",
+    "engine/crates/fx-auth",
     "engine/crates/fx-loadable",
     "engine/crates/fx-agent",
     "engine/crates/fx-llm",
     "engine/crates/fx-security",
     "engine/crates/fx-skills",
     "engine/crates/fx-storage",
+    "engine/crates/fx-tools",
     "engine/crates/fx-cli",
+    "engine/crates/fx-conversation",
+    "engine/crates/fx-memory",
     "engine/crates/llama-cpp-sys",
 ]
 resolver = "2"
@@ -61,10 +66,15 @@ http = "1"
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 
 # Shared crates
+fx-config = { path = "engine/crates/fx-config" }
 fx-core = { path = "engine/crates/fx-core" }
 fx-kernel = { path = "engine/crates/fx-kernel" }
+fx-auth = { path = "engine/crates/fx-auth" }
+fx-conversation = { path = "engine/crates/fx-conversation" }
 fx-loadable = { path = "engine/crates/fx-loadable" }
 fx-agent = { path = "engine/crates/fx-agent" }
 fx-security = { path = "engine/crates/fx-security" }
 fx-skills = { path = "engine/crates/fx-skills" }
 fx-storage = { path = "engine/crates/fx-storage" }
+fx-tools = { path = "engine/crates/fx-tools" }
+fx-memory = { path = "engine/crates/fx-memory" }

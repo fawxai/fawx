@@ -64,6 +64,9 @@ jobs:
       - name: Cargo check
         run: cargo check --workspace --all-targets
 
+      - name: Cargo check (oauth-bridge feature)
+        run: cargo check -p fx-cli --features oauth-bridge --all-targets
+
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -84,6 +87,9 @@ jobs:
       
       - name: Run tests
         run: cargo test --workspace
+
+      - name: Run tests (oauth-bridge feature)
+        run: cargo test -p fx-cli --features oauth-bridge
 
   clippy:
     name: Clippy
@@ -107,6 +113,9 @@ jobs:
       
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run clippy (oauth-bridge feature)
+        run: cargo clippy -p fx-cli --features oauth-bridge --all-targets -- -D warnings
 
   fmt:
     name: Format

@@ -4,7 +4,7 @@
 //! backed by SQLite via `fx-storage`. Uses machine-specific key derivation
 //! so credentials are unreadable if the database file is copied elsewhere.
 
-use fx_kernel::auth::AuthManager;
+use fx_auth::auth::AuthManager;
 use fx_storage::{derive_key, CredentialStore, EncryptedStore, Storage};
 use std::fs;
 use std::path::Path;
@@ -238,7 +238,7 @@ fn write_salt_file(path: &Path, salt: &[u8]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fx_kernel::auth::AuthMethod;
+    use fx_auth::auth::AuthMethod;
     use tempfile::TempDir;
 
     /// Helper: build a test `AuthManager` with one provider.

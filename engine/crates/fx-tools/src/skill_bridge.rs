@@ -16,7 +16,7 @@ pub struct BuiltinToolsSkill {
 }
 
 impl BuiltinToolsSkill {
-    pub(crate) fn new(executor: FawxToolExecutor) -> Self {
+    pub fn new(executor: FawxToolExecutor) -> Self {
         let tool_names = executor
             .tool_definitions()
             .into_iter()
@@ -80,8 +80,8 @@ impl Skill for BuiltinToolsSkill {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::json_memory::JsonFileMemory;
     use crate::tools::ToolConfig;
+    use fx_memory::JsonFileMemory;
     use tempfile::TempDir;
 
     fn build_memory_executor(temp: &TempDir) -> FawxToolExecutor {

@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 #[cfg(test)]
-pub(crate) const MAX_BUFFER_SIZE: usize = 20;
+const MAX_BUFFER_SIZE: usize = 20;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConversationMessage {
@@ -97,8 +97,6 @@ impl ConversationStore {
         };
         let path = self.conversations_dir.join(format!("{id}.jsonl"));
         if path.exists() {
-            // NOTE: current behavior is destructive truncation.
-            // Future improvement: archive the existing conversation file before clearing.
             fs::write(path, "").map_err(|error| error.to_string())?;
         }
         Ok(())

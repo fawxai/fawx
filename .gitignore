@@ -8,6 +8,7 @@ Thumbs.db
 *.swp
 *.swo
 *~
+*.bak
 
 # Environment & secrets
 .env

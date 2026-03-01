@@ -1,27 +1,23 @@
 use crate::auth_store::{migrate_if_needed, AuthStore};
-use crate::config::FawxConfig;
-use crate::conversation_store::{
-    ConversationMessage, ConversationStore, TokenUsage as ConversationTokenUsage,
-};
-use crate::git_skill::GitSkill;
-use crate::json_memory::{JsonFileMemory, JsonMemoryConfig};
-use crate::skill_bridge::BuiltinToolsSkill;
-use crate::tools::{FawxToolExecutor, ToolConfig};
 use async_trait::async_trait;
 use crossterm::style::Stylize;
 use crossterm::{cursor, event, style, terminal, ExecutableCommand};
 use futures::StreamExt;
+use fx_auth::auth::{AuthManager, AuthMethod};
+use fx_auth::oauth::{PkceFlow, TokenExchangeRequest, TokenResponse};
+use fx_config::FawxConfig;
+use fx_conversation::{
+    ConversationMessage, ConversationStore, TokenUsage as ConversationTokenUsage,
+};
 use fx_core::error::LlmError as CoreLlmError;
 use fx_core::memory::MemoryProvider;
 use fx_core::types::{InputSource, ScreenState, UserInput};
 use fx_kernel::act::TokenUsage;
-use fx_kernel::auth::{AuthManager, AuthMethod};
 use fx_kernel::budget::{BudgetConfig, BudgetTracker};
 use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::context_manager::ContextCompactor;
 use fx_kernel::input::LoopCommand;
 use fx_kernel::loop_engine::{LlmProvider as LoopLlmProvider, LoopEngine, LoopResult};
-use fx_kernel::oauth::{PkceFlow, TokenExchangeRequest, TokenResponse};
 use fx_kernel::signals::{LoopStep, Signal, SignalCollector};
 use fx_kernel::types::PerceptionSnapshot;
 use fx_llm::{
@@ -29,6 +25,8 @@ use fx_llm::{
     OpenAiProvider, OpenAiResponsesProvider, ProviderError, RouterError, StreamChunk,
 };
 use fx_loadable::SkillRegistry;
+use fx_memory::{JsonFileMemory, JsonMemoryConfig, SignalStore};
+use fx_tools::{BuiltinToolsSkill, FawxToolExecutor, GitSkill, ToolConfig};
 use rustyline::completion::{Completer, Pair};
 use rustyline::config::CompletionType;
 use rustyline::error::ReadlineError;
@@ -66,10 +64,6 @@ const FAWX_BANNER_ANSI: &str = include_str!("../../../../scripts/fawx-banner.ans
 
 const DEFAULT_OPENAI_TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
 const MAX_PROMPT_RETRIES: usize = 10;
-/// Cap conversation history to limit context bleed between unrelated turns.
-/// Higher values increase the chance of the model referencing stale context;
-/// lower values lose multi-turn continuity. 10 balances both concerns.
-const MAX_CONVERSATION_HISTORY: usize = 10;
 const DEFAULT_CONTEXT_MAX_TOKENS: usize = 8_000;
 const DEFAULT_CONTEXT_COMPACT_TARGET: usize = 6_000;
 const DEFAULT_SYNTHESIS_INSTRUCTION: &str =
@@ -414,6 +408,36 @@ fn version_parts(model_id: &str) -> Vec<u32> {
         .collect()
 }
 
+fn resolve_model_alias(selector: &str, model_ids: &[String]) -> Option<String> {
+    let family_prefix = claude_family_prefix(selector)?;
+    let matches = model_ids
+        .iter()
+        .filter(|model_id| model_id.starts_with(&family_prefix))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    highest_version_model(&matches).map(ToString::to_string)
+}
+
+fn claude_family_prefix(selector: &str) -> Option<String> {
+    let mut parts = selector.split('-');
+    let provider = parts.next()?;
+    let family = parts.next()?.to_ascii_lowercase();
+    let major = parts.next()?;
+
+    if !provider.eq_ignore_ascii_case("claude") {
+        return None;
+    }
+    if family.is_empty() || !family.chars().all(|ch| ch.is_ascii_alphabetic()) {
+        return None;
+    }
+    if major.parse::<u32>().is_err() {
+        return None;
+    }
+
+    Some(format!("claude-{family}-{major}-"))
+}
+
 const TUI_COMMANDS: &[&str] = &[
     "/help",
     "/quit",
@@ -667,6 +691,7 @@ pub struct TuiApp {
     conversation_history: Vec<Message>,
     conversation_store: ConversationStore,
     last_signals: Vec<Signal>,
+    signal_store: SignalStore,
     cancel_token: CancellationToken,
     config: FawxConfig,
     config_path: PathBuf,
@@ -686,23 +711,18 @@ impl TuiApp {
         let base_data_dir = fawx_data_dir();
         let data_dir = configured_data_dir(&base_data_dir, &config);
         let mut conversation_store = ConversationStore::new(&data_dir).map_err(TuiError::Store)?;
-        conversation_store
+        let session_id = conversation_store
             .ensure_active()
             .map_err(TuiError::Store)?;
-        if config.general.max_history > MAX_CONVERSATION_HISTORY {
-            eprintln!(
-                "Note: conversation history capped at {MAX_CONVERSATION_HISTORY} entries (configured: {})",
-                config.general.max_history
-            );
+        let signal_store =
+            SignalStore::new(&data_dir, &session_id).map_err(|e| TuiError::Store(e.to_string()))?;
+        if let Err(e) = signal_store.cleanup_old_signals() {
+            eprintln!("warning: signal cleanup failed: {e}");
         }
-        let max_history = config.general.max_history.min(MAX_CONVERSATION_HISTORY);
-        let conversation_history = if cfg!(test) {
-            Vec::new()
-        } else {
-            load_conversation_history(&conversation_store, max_history)
-        };
+        let max_history = config.general.max_history;
+        let conversation_history = load_startup_conversation_history(&conversation_store, &config);
 
-        Ok(Self {
+        let mut app = Self {
             router,
             auth_manager,
             catalog: ModelCatalog::new(),
@@ -711,12 +731,15 @@ impl TuiApp {
             conversation_history,
             conversation_store,
             last_signals: Vec::new(),
+            signal_store,
             cancel_token: CancellationToken::new(),
             config,
             config_path: base_data_dir.join("config.toml"),
             max_history,
             completer_model_ids: Arc::new(Mutex::new(Vec::new())),
-        })
+        };
+        app.select_first_available_model();
+        Ok(app)
     }
 
     /// Run the TUI main loop.
@@ -891,7 +914,7 @@ impl TuiApp {
     }
 
     fn store_openai_oauth_tokens(&mut self, token_response: TokenResponse) {
-        let account_id = fx_kernel::oauth::extract_openai_account_id(&token_response.access_token);
+        let account_id = fx_auth::oauth::extract_openai_account_id(&token_response.access_token);
         let expires_at =
             current_time_ms().saturating_add(token_response.expires_in.saturating_mul(1_000));
 
@@ -1047,6 +1070,9 @@ impl TuiApp {
         .await?;
 
         self.last_signals = loop_result_signals(&loop_result).to_vec();
+        if let Err(e) = self.signal_store.persist(&self.last_signals) {
+            eprintln!("warning: signal persist failed: {e}");
+        }
         let response_text = loop_result_response_text(&loop_result);
         let response = render_loop_result(loop_result.clone(), started.elapsed());
         self.record_conversation_turn(input, response_text.clone());
@@ -1069,8 +1095,27 @@ impl TuiApp {
     }
 
     fn set_active_model_from_selector(&mut self, selector: &str) -> Result<String, RouterError> {
-        self.router.set_active(selector)?;
-        Ok(self.router.active_model().unwrap_or(selector).to_string())
+        match self.router.set_active(selector) {
+            Ok(()) => {}
+            Err(error @ RouterError::ModelNotFound(_)) => {
+                let model_ids = self
+                    .router
+                    .available_models()
+                    .into_iter()
+                    .map(|model| model.model_id)
+                    .collect::<Vec<_>>();
+                let Some(alias_target) = resolve_model_alias(selector, &model_ids) else {
+                    return Err(error);
+                };
+                self.router.set_active(&alias_target)?;
+            }
+            Err(error) => return Err(error),
+        }
+
+        self.router
+            .active_model()
+            .map(ToString::to_string)
+            .ok_or(RouterError::NoActiveModel)
     }
 
     async fn set_active_model_with_refresh(
@@ -1312,15 +1357,15 @@ impl TuiApp {
     }
 
     fn select_first_available_model(&mut self) {
-        if self.router.active_model().is_some() {
-            return;
-        }
-
         if let Some(saved) = self.config.model.default_model.as_deref() {
             if self.router.set_active(saved).is_ok() {
                 return;
             }
             eprintln!("Saved model '{saved}' no longer available, selecting default");
+        }
+
+        if self.router.active_model().is_some() {
+            return;
         }
 
         let model_ids = self
@@ -1653,8 +1698,7 @@ fn build_skill_registry(
         Ok(memory) => {
             let snapshot = memory.snapshot();
             let text = format_memory_for_prompt(&snapshot, config.memory.max_snapshot_chars);
-            let memory: Arc<Mutex<dyn fx_core::memory::MemoryProvider>> =
-                Arc::new(Mutex::new(memory));
+            let memory: Arc<Mutex<dyn fx_core::memory::MemoryStore>> = Arc::new(Mutex::new(memory));
             executor = executor.with_memory(memory);
             text
         }
@@ -1663,9 +1707,14 @@ fn build_skill_registry(
             None
         }
     };
+    let self_modify_config = crate::config_bridge::to_core_self_modify(&config.self_modify);
+    let sm = self_modify_config.enabled.then_some(self_modify_config);
+    if let Some(ref smc) = sm {
+        executor = executor.with_self_modify(smc.clone());
+    }
     let mut registry = SkillRegistry::new();
     registry.register(Box::new(BuiltinToolsSkill::new(executor)));
-    let git_skill = GitSkill::new(working_dir.clone());
+    let git_skill = GitSkill::new(working_dir.clone(), sm);
     registry.register(Box::new(git_skill));
     (registry, snapshot_text)
 }
@@ -1884,6 +1933,20 @@ fn configured_working_dir(config: &FawxConfig) -> PathBuf {
         return path.clone();
     }
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn load_startup_conversation_history(
+    store: &ConversationStore,
+    config: &FawxConfig,
+) -> Vec<Message> {
+    if !should_load_startup_conversation_history(config) {
+        return Vec::new();
+    }
+    load_conversation_history(store, config.general.max_history)
+}
+
+fn should_load_startup_conversation_history(config: &FawxConfig) -> bool {
+    !cfg!(test) || config.general.data_dir.is_some()
 }
 
 fn load_conversation_history(store: &ConversationStore, max_history: usize) -> Vec<Message> {
@@ -2269,7 +2332,7 @@ fn prompt_for_oauth_code(flow: &PkceFlow) -> Result<String, TuiError> {
     )?;
 
     flow.parse_callback(&input)
-        .or_else(|_| Ok::<String, fx_kernel::oauth::AuthError>(input.trim().to_string()))
+        .or_else(|_| Ok::<String, fx_auth::oauth::AuthError>(input.trim().to_string()))
         .map_err(|error| TuiError::Auth(format!("{error}")))
 }
 
@@ -2410,7 +2473,7 @@ fn openai_oauth_client_id() -> String {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| fx_kernel::oauth::OPENAI_CLIENT_ID.to_string())
+        .unwrap_or_else(|| fx_auth::oauth::OPENAI_CLIENT_ID.to_string())
 }
 
 fn openai_oauth_token_endpoint() -> String {
@@ -3567,6 +3630,24 @@ mod tests {
         .expect("mock app")
     }
 
+    fn router_with_canonical_claude_models(initial_model: &str) -> ModelRouter {
+        let mut router = ModelRouter::new();
+        router.register_provider_with_auth(
+            Box::new(ModelEchoProvider {
+                provider_name: "echo-provider".to_string(),
+                models: vec![
+                    "claude-opus-4-20250514".to_string(),
+                    "claude-sonnet-4-20250514".to_string(),
+                ],
+            }),
+            "test",
+        );
+        router
+            .set_active(initial_model)
+            .expect("set initial canonical model");
+        router
+    }
+
     fn router_with_completion_response(
         model: &str,
         completion: fx_llm::CompletionResponse,
@@ -3966,7 +4047,7 @@ mod tests {
         let _env_lock = ENV_LOCK.lock().await;
         let _client_id = ScopedEnvVar::set("FAWX_OPENAI_CLIENT_ID", "   ");
 
-        assert_eq!(openai_oauth_client_id(), fx_kernel::oauth::OPENAI_CLIENT_ID);
+        assert_eq!(openai_oauth_client_id(), fx_auth::oauth::OPENAI_CLIENT_ID);
     }
 
     #[tokio::test]
@@ -4680,11 +4761,14 @@ mod tests {
             }),
             "test",
         );
+        router
+            .set_active("claude-opus-4-6-20250929")
+            .expect("set router default model");
 
         let mut config = FawxConfig::default();
         config.model.default_model = Some("claude-sonnet-4-6-20250929".to_string());
 
-        let mut app = TuiApp::new(
+        let app = TuiApp::new(
             test_provider_auth_manager(),
             router,
             build_loop_engine(),
@@ -4692,9 +4776,87 @@ mod tests {
         )
         .expect("mock app");
 
-        app.select_first_available_model();
-
         assert_eq!(app.current_model(), "claude-sonnet-4-6-20250929");
+    }
+
+    #[test]
+    fn resolve_model_alias_supports_new_claude_families() {
+        let models = vec![
+            "claude-haiku-4-20240101".to_string(),
+            "claude-haiku-4-20250514".to_string(),
+        ];
+
+        let resolved = resolve_model_alias("claude-haiku-4-6", &models);
+
+        assert_eq!(resolved.as_deref(), Some("claude-haiku-4-20250514"));
+    }
+
+    #[tokio::test]
+    async fn model_alias_persists_canonical_model_and_restores_on_restart() {
+        let _guard = ENV_LOCK.lock().await;
+        let temp_home = tempfile::tempdir().expect("temp HOME should be created");
+        let home = temp_home.path().to_string_lossy().to_string();
+        let _home_env = ScopedEnvVar::set("HOME", &home);
+
+        let mut app = TuiApp::new(
+            AuthManager::new(),
+            router_with_canonical_claude_models("claude-sonnet-4-20250514"),
+            build_loop_engine(),
+            FawxConfig::default(),
+        )
+        .expect("mock app");
+
+        app.handle_command("/model claude-opus-4-6")
+            .await
+            .expect("alias selector should resolve to canonical model");
+
+        let persisted = load_config().expect("persisted config should load");
+
+        assert_eq!(
+            persisted.model.default_model.as_deref(),
+            Some("claude-opus-4-20250514")
+        );
+
+        let restarted = TuiApp::new(
+            AuthManager::new(),
+            router_with_canonical_claude_models("claude-sonnet-4-20250514"),
+            build_loop_engine(),
+            persisted,
+        )
+        .expect("restarted app");
+
+        assert_eq!(restarted.current_model(), "claude-opus-4-20250514");
+    }
+
+    #[test]
+    fn stale_persisted_model_keeps_existing_router_active_model() {
+        let mut router = ModelRouter::new();
+        router.register_provider_with_auth(
+            Box::new(ModelEchoProvider {
+                provider_name: "echo-provider".to_string(),
+                models: vec![
+                    "claude-opus-4-6-20250929".to_string(),
+                    "claude-sonnet-4-6-20250929".to_string(),
+                ],
+            }),
+            "test",
+        );
+        router
+            .set_active("claude-opus-4-6-20250929")
+            .expect("set router default model");
+
+        let mut config = FawxConfig::default();
+        config.model.default_model = Some("claude-retired-0".to_string());
+
+        let app = TuiApp::new(
+            test_provider_auth_manager(),
+            router,
+            build_loop_engine(),
+            config,
+        )
+        .expect("mock app");
+
+        assert_eq!(app.current_model(), "claude-opus-4-6-20250929");
     }
 
     #[tokio::test]
@@ -4809,11 +4971,56 @@ mod tests {
                 .expect("message response");
         }
 
-        assert_eq!(app.conversation_history.len(), MAX_CONVERSATION_HISTORY);
+        assert_eq!(app.conversation_history.len(), app.max_history);
         assert_eq!(
             app.conversation_history[0],
-            Message::user("msg-10".to_string())
+            Message::user("msg-5".to_string())
         );
+    }
+
+    #[test]
+    fn startup_loads_configured_max_history_entries() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let mut store = ConversationStore::new(temp_dir.path()).expect("store");
+        store.ensure_active().expect("active conversation");
+
+        for index in 0..25 {
+            store
+                .save_message(&ConversationMessage {
+                    role: "user".to_string(),
+                    content: format!("msg-{index}"),
+                    timestamp_ms: index as u64,
+                    signals: None,
+                    tool_calls: None,
+                    token_usage: None,
+                })
+                .expect("save message");
+        }
+
+        let mut config = FawxConfig::default();
+        config.general.data_dir = Some(temp_dir.path().to_path_buf());
+        config.general.max_history = 20;
+
+        let app = TuiApp::new(
+            AuthManager::new(),
+            ModelRouter::new(),
+            build_loop_engine(),
+            config,
+        )
+        .expect("app");
+
+        assert_eq!(app.conversation_history.len(), 20);
+        assert_eq!(app.max_history, 20);
+        assert_eq!(
+            app.conversation_history[0],
+            Message::user("msg-5".to_string())
+        );
+    }
+
+    #[test]
+    fn startup_history_loader_uses_config_only_for_limit() {
+        let _loader: fn(&ConversationStore, &FawxConfig) -> Vec<Message> =
+            load_startup_conversation_history;
     }
 
     #[tokio::test]

@@ -1,5 +1,6 @@
 use async_trait::async_trait;
-use fx_core::memory::MemoryProvider;
+use fx_core::memory::MemoryStore;
+use fx_core::self_modify::{classify_path, format_tier_violation, SelfModifyConfig};
 use fx_kernel::act::{ToolExecutor, ToolExecutorError, ToolResult};
 use fx_kernel::cancellation::CancellationToken;
 use fx_llm::{ToolCall, ToolDefinition};
@@ -22,7 +23,8 @@ const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 30;
 pub struct FawxToolExecutor {
     working_dir: PathBuf,
     config: ToolConfig,
-    memory: Option<Arc<Mutex<dyn MemoryProvider>>>,
+    memory: Option<Arc<Mutex<dyn MemoryStore>>>,
+    self_modify: Option<SelfModifyConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -57,12 +59,19 @@ impl FawxToolExecutor {
             working_dir,
             config,
             memory: None,
+            self_modify: None,
         }
     }
 
     /// Attach a persistent memory provider.
-    pub fn with_memory(mut self, memory: Arc<Mutex<dyn MemoryProvider>>) -> Self {
+    pub fn with_memory(mut self, memory: Arc<Mutex<dyn MemoryStore>>) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    /// Attach a self-modification path enforcement config.
+    pub fn with_self_modify(mut self, config: SelfModifyConfig) -> Self {
+        self.self_modify = Some(config);
         self
     }
 
@@ -126,11 +135,23 @@ impl FawxToolExecutor {
             return Err("content exceeds maximum allowed size".to_string());
         }
         let path = self.jailed_path(&parsed.path)?;
+        self.check_self_modify_path(&path)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
         fs::write(&path, parsed.content.as_bytes()).map_err(|error| error.to_string())?;
         Ok(format!("wrote {} bytes to {}", len, path.display()))
+    }
+
+    fn check_self_modify_path(&self, path: &Path) -> Result<(), String> {
+        let Some(ref config) = self.self_modify else {
+            return Ok(());
+        };
+        let tier = classify_path(path, &self.working_dir, config);
+        match format_tier_violation(path, tier) {
+            Some(message) => Err(message),
+            None => Ok(()),
+        }
     }
 
     fn handle_list_directory(&self, args: &serde_json::Value) -> Result<String, String> {
@@ -337,8 +358,12 @@ impl FawxToolExecutor {
     fn handle_memory_read(&self, args: &serde_json::Value) -> Result<String, String> {
         let parsed: MemoryReadArgs = parse_args(args)?;
         let memory = self.memory.as_ref().ok_or("memory not configured")?;
-        let guard = memory.lock().map_err(|e| format!("{e}"))?;
-        match guard.read(&parsed.key) {
+        let mut guard = memory.lock().map_err(|e| format!("{e}"))?;
+        let value = guard.read(&parsed.key);
+        if value.is_some() {
+            guard.touch(&parsed.key)?;
+        }
+        match value {
             Some(value) => Ok(value),
             None => Ok(format!("key '{}' not found", parsed.key)),
         }
@@ -817,6 +842,7 @@ struct MemoryDeleteArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fx_core::memory::MemoryProvider;
     use tempfile::TempDir;
 
     fn test_executor(root: &Path) -> FawxToolExecutor {
@@ -1409,7 +1435,7 @@ mod tests {
     fn memory_tools_appear_in_definitions_when_memory_configured() {
         let temp = TempDir::new().expect("temp");
         let memory = Arc::new(Mutex::new(
-            crate::json_memory::JsonFileMemory::new(temp.path()).expect("memory"),
+            fx_memory::JsonFileMemory::new(temp.path()).expect("memory"),
         ));
         let executor = FawxToolExecutor::new(temp.path().to_path_buf(), ToolConfig::default())
             .with_memory(memory);
@@ -1434,7 +1460,7 @@ mod tests {
     fn memory_write_tool_stores_value() {
         let temp = TempDir::new().expect("temp");
         let memory = Arc::new(Mutex::new(
-            crate::json_memory::JsonFileMemory::new(temp.path()).expect("memory"),
+            fx_memory::JsonFileMemory::new(temp.path()).expect("memory"),
         ));
         let executor = FawxToolExecutor::new(temp.path().to_path_buf(), ToolConfig::default())
             .with_memory(memory.clone());
@@ -1450,7 +1476,7 @@ mod tests {
     fn memory_read_tool_retrieves_value() {
         let temp = TempDir::new().expect("temp");
         let memory = Arc::new(Mutex::new(
-            crate::json_memory::JsonFileMemory::new(temp.path()).expect("memory"),
+            fx_memory::JsonFileMemory::new(temp.path()).expect("memory"),
         ));
         {
             let mut guard = memory.lock().expect("lock");
@@ -1468,7 +1494,7 @@ mod tests {
     fn memory_list_tool_returns_entries() {
         let temp = TempDir::new().expect("temp");
         let memory = Arc::new(Mutex::new(
-            crate::json_memory::JsonFileMemory::new(temp.path()).expect("memory"),
+            fx_memory::JsonFileMemory::new(temp.path()).expect("memory"),
         ));
         {
             let mut guard = memory.lock().expect("lock");
@@ -1496,7 +1522,7 @@ mod tests {
     fn memory_delete_tool_removes_entry() {
         let temp = TempDir::new().expect("temp");
         let memory = Arc::new(Mutex::new(
-            crate::json_memory::JsonFileMemory::new(temp.path()).expect("memory"),
+            fx_memory::JsonFileMemory::new(temp.path()).expect("memory"),
         ));
         {
             let mut guard = memory.lock().expect("lock");
@@ -1524,7 +1550,7 @@ mod tests {
     fn memory_list_tool_returns_empty_message() {
         let temp = TempDir::new().expect("temp");
         let memory = Arc::new(Mutex::new(
-            crate::json_memory::JsonFileMemory::new(temp.path()).expect("memory"),
+            fx_memory::JsonFileMemory::new(temp.path()).expect("memory"),
         ));
         let executor = FawxToolExecutor::new(temp.path().to_path_buf(), ToolConfig::default())
             .with_memory(memory);
@@ -1536,7 +1562,7 @@ mod tests {
     fn memory_delete_tool_returns_not_found() {
         let temp = TempDir::new().expect("temp");
         let memory = Arc::new(Mutex::new(
-            crate::json_memory::JsonFileMemory::new(temp.path()).expect("memory"),
+            fx_memory::JsonFileMemory::new(temp.path()).expect("memory"),
         ));
         let executor = FawxToolExecutor::new(temp.path().to_path_buf(), ToolConfig::default())
             .with_memory(memory);
@@ -1577,5 +1603,65 @@ mod tests {
             !output.contains("vendor"),
             "vendor dir should be excluded, got: {output}"
         );
+    }
+
+    #[test]
+    fn write_file_denied_by_self_modify() {
+        let temp = TempDir::new().expect("temp");
+        let config = SelfModifyConfig {
+            enabled: true,
+            deny_paths: vec!["*.key".to_string()],
+            ..SelfModifyConfig::default()
+        };
+        let executor = FawxToolExecutor::new(temp.path().to_path_buf(), ToolConfig::default())
+            .with_self_modify(config);
+        let result = executor
+            .handle_write_file(&serde_json::json!({"path": "secret.key", "content": "data"}));
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("Self-modify policy violation [deny]"));
+    }
+
+    #[test]
+    fn write_file_propose_tier_requires_proposal_system() {
+        let temp = TempDir::new().expect("temp");
+        let config = SelfModifyConfig {
+            enabled: true,
+            propose_paths: vec!["kernel/**".to_string()],
+            ..SelfModifyConfig::default()
+        };
+        let executor = FawxToolExecutor::new(temp.path().to_path_buf(), ToolConfig::default())
+            .with_self_modify(config);
+        let result = executor
+            .handle_write_file(&serde_json::json!({"path": "kernel/loop.rs", "content": "data"}));
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.contains("Self-modify policy violation [propose]"));
+        assert!(error.contains("proposal system"));
+    }
+
+    #[test]
+    fn write_file_allowed_by_self_modify() {
+        let temp = TempDir::new().expect("temp");
+        let config = SelfModifyConfig {
+            enabled: true,
+            allow_paths: vec!["*.rs".to_string()],
+            ..SelfModifyConfig::default()
+        };
+        let executor = FawxToolExecutor::new(temp.path().to_path_buf(), ToolConfig::default())
+            .with_self_modify(config);
+        let result = executor
+            .handle_write_file(&serde_json::json!({"path": "main.rs", "content": "fn main() {}"}));
+        assert!(result.is_ok(), "expected Ok but got: {:?}", result);
+    }
+
+    #[test]
+    fn write_file_no_enforcement_when_disabled() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let result = executor
+            .handle_write_file(&serde_json::json!({"path": "secret.key", "content": "data"}));
+        assert!(result.is_ok());
     }
 }

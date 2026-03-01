@@ -12,8 +12,6 @@ fx-storage = { workspace = true }
 fx-llm = { path = "../fx-llm" }
 
 async-trait.workspace = true
-base64 = "0.22"
-ring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
