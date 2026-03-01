@@ -3,10 +3,10 @@
 //! Writes signals from each loop cycle to a per-session JSONL file under
 //! `~/.fawx/signals/`. One JSON object per line, append-only.
 
-use fx_core::signals::Signal;
+use fx_core::signals::{Signal, SignalKind};
 use std::fmt;
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
 /// Errors that can occur during signal store operations.
@@ -18,8 +18,12 @@ pub enum SignalStoreError {
     FileOpen(std::io::Error),
     /// Failed to write to a signal file.
     FileWrite(std::io::Error),
+    /// Failed to read a signal file.
+    FileRead(std::io::Error),
     /// Failed to serialize a signal to JSON.
     Serialize(serde_json::Error),
+    /// Failed to deserialize a signal from JSON.
+    Deserialize(serde_json::Error),
     /// Failed to read the signals directory for cleanup.
     DirectoryRead(std::io::Error),
 }
@@ -30,7 +34,9 @@ impl fmt::Display for SignalStoreError {
             Self::DirectoryAccess(e) => write!(f, "signal dir access: {e}"),
             Self::FileOpen(e) => write!(f, "signal persist open: {e}"),
             Self::FileWrite(e) => write!(f, "signal persist write: {e}"),
+            Self::FileRead(e) => write!(f, "signal read: {e}"),
             Self::Serialize(e) => write!(f, "signal serialize: {e}"),
+            Self::Deserialize(e) => write!(f, "signal deserialize: {e}"),
             Self::DirectoryRead(e) => write!(f, "read signals dir: {e}"),
         }
     }
@@ -42,8 +48,9 @@ impl std::error::Error for SignalStoreError {
             Self::DirectoryAccess(e)
             | Self::FileOpen(e)
             | Self::FileWrite(e)
+            | Self::FileRead(e)
             | Self::DirectoryRead(e) => Some(e),
-            Self::Serialize(e) => Some(e),
+            Self::Serialize(e) | Self::Deserialize(e) => Some(e),
         }
     }
 }
@@ -58,6 +65,22 @@ pub struct SignalStore {
 const RETENTION_DAYS: u64 = 30;
 const RETENTION_MS: u64 = RETENTION_DAYS * 24 * 60 * 60 * 1000;
 
+/// Filters used when reading signals from storage.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SignalQuery {
+    pub kind: Option<SignalKind>,
+}
+
+impl SignalQuery {
+    pub fn all() -> Self {
+        Self { kind: None }
+    }
+
+    pub fn by_kind(kind: SignalKind) -> Self {
+        Self { kind: Some(kind) }
+    }
+}
+
 impl SignalStore {
     /// Create a new signal store. Creates the signals directory if needed.
     pub fn new(data_dir: &Path, session_id: &str) -> Result<Self, SignalStoreError> {
@@ -69,12 +92,26 @@ impl SignalStore {
         })
     }
 
+    /// List all persisted signals for this session.
+    pub fn list(&self) -> Result<Vec<Signal>, SignalStoreError> {
+        self.query(SignalQuery::all())
+    }
+
+    /// Query persisted signals for this session.
+    pub fn query(&self, query: SignalQuery) -> Result<Vec<Signal>, SignalStoreError> {
+        read_signals_from_file(&self.session_path(), query.kind)
+    }
+
+    fn session_path(&self) -> PathBuf {
+        self.signals_dir.join(format!("{}.jsonl", self.session_id))
+    }
+
     /// Append signals from a loop cycle to the session's JSONL file.
     pub fn persist(&self, signals: &[Signal]) -> Result<(), SignalStoreError> {
         if signals.is_empty() {
             return Ok(());
         }
-        let path = self.signals_dir.join(format!("{}.jsonl", self.session_id));
+        let path = self.session_path();
         let mut file = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -119,6 +156,37 @@ impl SignalStore {
         }
         Ok(removed)
     }
+}
+
+fn read_signals_from_file(
+    path: &Path,
+    kind_filter: Option<SignalKind>,
+) -> Result<Vec<Signal>, SignalStoreError> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let file = fs::File::open(path).map_err(SignalStoreError::FileRead)?;
+    parse_signal_lines(std::io::BufReader::new(file).lines(), kind_filter)
+}
+
+fn parse_signal_lines(
+    lines: impl Iterator<Item = std::io::Result<String>>,
+    kind_filter: Option<SignalKind>,
+) -> Result<Vec<Signal>, SignalStoreError> {
+    let mut signals = Vec::new();
+    for line in lines {
+        let line = line.map_err(SignalStoreError::FileRead)?;
+        let signal =
+            serde_json::from_str::<Signal>(&line).map_err(SignalStoreError::Deserialize)?;
+        if matches_kind_filter(&signal, kind_filter) {
+            signals.push(signal);
+        }
+    }
+    Ok(signals)
+}
+
+fn matches_kind_filter(signal: &Signal, kind_filter: Option<SignalKind>) -> bool {
+    kind_filter.is_none_or(|kind| signal.kind == kind)
 }
 
 /// Redact signal messages that might contain sensitive user input.
@@ -236,6 +304,75 @@ mod tests {
             .collect::<Result<_, _>>()
             .expect("read lines");
         assert_eq!(lines.len(), 2);
+    }
+
+    fn persist_mixed_kind_signals(store: &SignalStore) {
+        let signals = vec![
+            mk_signal(LoopStep::Act, SignalKind::Friction, "slow response", 1),
+            mk_signal(LoopStep::Act, SignalKind::Success, "tool ran", 2),
+            mk_signal(LoopStep::Decide, SignalKind::Decision, "picked plan", 3),
+        ];
+        store.persist(&signals).expect("persist mixed kinds");
+    }
+
+    #[test]
+    fn query_without_kind_filter_returns_all_signals() {
+        let tmp = TempDir::new().expect("tempdir");
+        let store = SignalStore::new(tmp.path(), "sess-query-all").expect("new");
+        persist_mixed_kind_signals(&store);
+
+        let signals = store.list().expect("list");
+        assert_eq!(signals.len(), 3);
+    }
+
+    #[test]
+    fn list_and_query_return_empty_when_session_file_is_missing() {
+        let tmp = TempDir::new().expect("tempdir");
+        let store = SignalStore::new(tmp.path(), "sess-empty").expect("new");
+
+        let session_path = tmp.path().join("signals/sess-empty.jsonl");
+        assert!(
+            !session_path.exists(),
+            "test precondition: session file should not exist"
+        );
+
+        let listed = store.list().expect("list");
+        let queried = store
+            .query(SignalQuery::by_kind(SignalKind::Friction))
+            .expect("query");
+        assert!(listed.is_empty());
+        assert!(queried.is_empty());
+    }
+
+    #[test]
+    fn query_with_kind_filter_returns_only_matching_signals() {
+        let tmp = TempDir::new().expect("tempdir");
+        let store = SignalStore::new(tmp.path(), "sess-query-kind").expect("new");
+        persist_mixed_kind_signals(&store);
+
+        let filtered = store
+            .query(SignalQuery::by_kind(SignalKind::Friction))
+            .expect("query");
+        assert_eq!(filtered.len(), 1);
+        assert!(filtered
+            .iter()
+            .all(|signal| signal.kind == SignalKind::Friction));
+        assert_eq!(filtered[0].message, "slow response");
+    }
+
+    #[test]
+    fn persist_writes_snake_case_kind_labels() {
+        let tmp = TempDir::new().expect("tempdir");
+        let store = SignalStore::new(tmp.path(), "sess-kind-label").expect("new");
+        store
+            .persist(&[mk_signal(LoopStep::Act, SignalKind::Friction, "msg", 10)])
+            .expect("persist");
+
+        let content =
+            fs::read_to_string(tmp.path().join("signals/sess-kind-label.jsonl")).expect("read");
+        let parsed: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("line")).expect("parse value");
+        assert_eq!(parsed["kind"], serde_json::json!("friction"));
     }
 
     #[test]
