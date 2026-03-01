@@ -20,6 +20,7 @@ fx-tools.workspace = true
 fx-core.workspace = true
 fx-kernel.workspace = true
 fx-auth.workspace = true
+fx-conversation.workspace = true
 fx-llm = { path = "../fx-llm" }
 fx-loadable = { path = "../fx-loadable" }
 fx-memory.workspace = true

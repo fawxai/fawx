@@ -1,7 +1,4 @@
 use crate::auth_store::{migrate_if_needed, AuthStore};
-use crate::conversation_store::{
-    ConversationMessage, ConversationStore, TokenUsage as ConversationTokenUsage,
-};
 use async_trait::async_trait;
 use crossterm::style::Stylize;
 use crossterm::{cursor, event, style, terminal, ExecutableCommand};
@@ -9,6 +6,9 @@ use futures::StreamExt;
 use fx_auth::auth::{AuthManager, AuthMethod};
 use fx_auth::oauth::{PkceFlow, TokenExchangeRequest, TokenResponse};
 use fx_config::FawxConfig;
+use fx_conversation::{
+    ConversationMessage, ConversationStore, TokenUsage as ConversationTokenUsage,
+};
 use fx_core::error::LlmError as CoreLlmError;
 use fx_core::memory::MemoryProvider;
 use fx_core::types::{InputSource, ScreenState, UserInput};
