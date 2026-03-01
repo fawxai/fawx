@@ -5,6 +5,7 @@ use crate::conversation_store::{
 };
 use crate::git_skill::GitSkill;
 use crate::json_memory::{JsonFileMemory, JsonMemoryConfig};
+use crate::signal_store::SignalStore;
 use crate::skill_bridge::BuiltinToolsSkill;
 use crate::tools::{FawxToolExecutor, ToolConfig};
 use async_trait::async_trait;
@@ -667,6 +668,7 @@ pub struct TuiApp {
     conversation_history: Vec<Message>,
     conversation_store: ConversationStore,
     last_signals: Vec<Signal>,
+    signal_store: SignalStore,
     cancel_token: CancellationToken,
     config: FawxConfig,
     config_path: PathBuf,
@@ -686,9 +688,14 @@ impl TuiApp {
         let base_data_dir = fawx_data_dir();
         let data_dir = configured_data_dir(&base_data_dir, &config);
         let mut conversation_store = ConversationStore::new(&data_dir).map_err(TuiError::Store)?;
-        conversation_store
+        let session_id = conversation_store
             .ensure_active()
             .map_err(TuiError::Store)?;
+        let signal_store =
+            SignalStore::new(&data_dir, &session_id).map_err(|e| TuiError::Store(e.to_string()))?;
+        if let Err(e) = signal_store.cleanup_old_signals() {
+            eprintln!("warning: signal cleanup failed: {e}");
+        }
         if config.general.max_history > MAX_CONVERSATION_HISTORY {
             eprintln!(
                 "Note: conversation history capped at {MAX_CONVERSATION_HISTORY} entries (configured: {})",
@@ -711,6 +718,7 @@ impl TuiApp {
             conversation_history,
             conversation_store,
             last_signals: Vec::new(),
+            signal_store,
             cancel_token: CancellationToken::new(),
             config,
             config_path: base_data_dir.join("config.toml"),
@@ -1047,6 +1055,9 @@ impl TuiApp {
         .await?;
 
         self.last_signals = loop_result_signals(&loop_result).to_vec();
+        if let Err(e) = self.signal_store.persist(&self.last_signals) {
+            eprintln!("warning: signal persist failed: {e}");
+        }
         let response_text = loop_result_response_text(&loop_result);
         let response = render_loop_result(loop_result.clone(), started.elapsed());
         self.record_conversation_turn(input, response_text.clone());

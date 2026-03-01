@@ -7,6 +7,7 @@ mod confirmation;
 mod conversation_store;
 mod git_skill;
 mod json_memory;
+mod signal_store;
 mod skill_bridge;
 mod tools;
 mod tui;
