@@ -408,6 +408,36 @@ fn version_parts(model_id: &str) -> Vec<u32> {
         .collect()
 }
 
+fn resolve_model_alias(selector: &str, model_ids: &[String]) -> Option<String> {
+    let family_prefix = claude_family_prefix(selector)?;
+    let matches = model_ids
+        .iter()
+        .filter(|model_id| model_id.starts_with(&family_prefix))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    highest_version_model(&matches).map(ToString::to_string)
+}
+
+fn claude_family_prefix(selector: &str) -> Option<String> {
+    let mut parts = selector.split('-');
+    let provider = parts.next()?;
+    let family = parts.next()?.to_ascii_lowercase();
+    let major = parts.next()?;
+
+    if !provider.eq_ignore_ascii_case("claude") {
+        return None;
+    }
+    if family.is_empty() || !family.chars().all(|ch| ch.is_ascii_alphabetic()) {
+        return None;
+    }
+    if major.parse::<u32>().is_err() {
+        return None;
+    }
+
+    Some(format!("claude-{family}-{major}-"))
+}
+
 const TUI_COMMANDS: &[&str] = &[
     "/help",
     "/quit",
@@ -692,7 +722,7 @@ impl TuiApp {
         let max_history = config.general.max_history;
         let conversation_history = load_startup_conversation_history(&conversation_store, &config);
 
-        Ok(Self {
+        let mut app = Self {
             router,
             auth_manager,
             catalog: ModelCatalog::new(),
@@ -707,7 +737,9 @@ impl TuiApp {
             config_path: base_data_dir.join("config.toml"),
             max_history,
             completer_model_ids: Arc::new(Mutex::new(Vec::new())),
-        })
+        };
+        app.select_first_available_model();
+        Ok(app)
     }
 
     /// Run the TUI main loop.
@@ -1063,8 +1095,27 @@ impl TuiApp {
     }
 
     fn set_active_model_from_selector(&mut self, selector: &str) -> Result<String, RouterError> {
-        self.router.set_active(selector)?;
-        Ok(self.router.active_model().unwrap_or(selector).to_string())
+        match self.router.set_active(selector) {
+            Ok(()) => {}
+            Err(error @ RouterError::ModelNotFound(_)) => {
+                let model_ids = self
+                    .router
+                    .available_models()
+                    .into_iter()
+                    .map(|model| model.model_id)
+                    .collect::<Vec<_>>();
+                let Some(alias_target) = resolve_model_alias(selector, &model_ids) else {
+                    return Err(error);
+                };
+                self.router.set_active(&alias_target)?;
+            }
+            Err(error) => return Err(error),
+        }
+
+        self.router
+            .active_model()
+            .map(ToString::to_string)
+            .ok_or(RouterError::NoActiveModel)
     }
 
     async fn set_active_model_with_refresh(
@@ -1306,15 +1357,15 @@ impl TuiApp {
     }
 
     fn select_first_available_model(&mut self) {
-        if self.router.active_model().is_some() {
-            return;
-        }
-
         if let Some(saved) = self.config.model.default_model.as_deref() {
             if self.router.set_active(saved).is_ok() {
                 return;
             }
             eprintln!("Saved model '{saved}' no longer available, selecting default");
+        }
+
+        if self.router.active_model().is_some() {
+            return;
         }
 
         let model_ids = self
@@ -3579,6 +3630,24 @@ mod tests {
         .expect("mock app")
     }
 
+    fn router_with_canonical_claude_models(initial_model: &str) -> ModelRouter {
+        let mut router = ModelRouter::new();
+        router.register_provider_with_auth(
+            Box::new(ModelEchoProvider {
+                provider_name: "echo-provider".to_string(),
+                models: vec![
+                    "claude-opus-4-20250514".to_string(),
+                    "claude-sonnet-4-20250514".to_string(),
+                ],
+            }),
+            "test",
+        );
+        router
+            .set_active(initial_model)
+            .expect("set initial canonical model");
+        router
+    }
+
     fn router_with_completion_response(
         model: &str,
         completion: fx_llm::CompletionResponse,
@@ -4692,11 +4761,14 @@ mod tests {
             }),
             "test",
         );
+        router
+            .set_active("claude-opus-4-6-20250929")
+            .expect("set router default model");
 
         let mut config = FawxConfig::default();
         config.model.default_model = Some("claude-sonnet-4-6-20250929".to_string());
 
-        let mut app = TuiApp::new(
+        let app = TuiApp::new(
             test_provider_auth_manager(),
             router,
             build_loop_engine(),
@@ -4704,9 +4776,87 @@ mod tests {
         )
         .expect("mock app");
 
-        app.select_first_available_model();
-
         assert_eq!(app.current_model(), "claude-sonnet-4-6-20250929");
+    }
+
+    #[test]
+    fn resolve_model_alias_supports_new_claude_families() {
+        let models = vec![
+            "claude-haiku-4-20240101".to_string(),
+            "claude-haiku-4-20250514".to_string(),
+        ];
+
+        let resolved = resolve_model_alias("claude-haiku-4-6", &models);
+
+        assert_eq!(resolved.as_deref(), Some("claude-haiku-4-20250514"));
+    }
+
+    #[tokio::test]
+    async fn model_alias_persists_canonical_model_and_restores_on_restart() {
+        let _guard = ENV_LOCK.lock().await;
+        let temp_home = tempfile::tempdir().expect("temp HOME should be created");
+        let home = temp_home.path().to_string_lossy().to_string();
+        let _home_env = ScopedEnvVar::set("HOME", &home);
+
+        let mut app = TuiApp::new(
+            AuthManager::new(),
+            router_with_canonical_claude_models("claude-sonnet-4-20250514"),
+            build_loop_engine(),
+            FawxConfig::default(),
+        )
+        .expect("mock app");
+
+        app.handle_command("/model claude-opus-4-6")
+            .await
+            .expect("alias selector should resolve to canonical model");
+
+        let persisted = load_config().expect("persisted config should load");
+
+        assert_eq!(
+            persisted.model.default_model.as_deref(),
+            Some("claude-opus-4-20250514")
+        );
+
+        let restarted = TuiApp::new(
+            AuthManager::new(),
+            router_with_canonical_claude_models("claude-sonnet-4-20250514"),
+            build_loop_engine(),
+            persisted,
+        )
+        .expect("restarted app");
+
+        assert_eq!(restarted.current_model(), "claude-opus-4-20250514");
+    }
+
+    #[test]
+    fn stale_persisted_model_keeps_existing_router_active_model() {
+        let mut router = ModelRouter::new();
+        router.register_provider_with_auth(
+            Box::new(ModelEchoProvider {
+                provider_name: "echo-provider".to_string(),
+                models: vec![
+                    "claude-opus-4-6-20250929".to_string(),
+                    "claude-sonnet-4-6-20250929".to_string(),
+                ],
+            }),
+            "test",
+        );
+        router
+            .set_active("claude-opus-4-6-20250929")
+            .expect("set router default model");
+
+        let mut config = FawxConfig::default();
+        config.model.default_model = Some("claude-retired-0".to_string());
+
+        let app = TuiApp::new(
+            test_provider_auth_manager(),
+            router,
+            build_loop_engine(),
+            config,
+        )
+        .expect("mock app");
+
+        assert_eq!(app.current_model(), "claude-opus-4-6-20250929");
     }
 
     #[tokio::test]
