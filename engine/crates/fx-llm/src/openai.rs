@@ -526,8 +526,21 @@ fn parse_json_or_string(value: &str) -> Value {
 fn value_to_openai_content(value: Value) -> String {
     match value {
         Value::String(content) => content,
+        Value::Object(object) => {
+            legacy_tool_result_content(&object).unwrap_or_else(|| Value::Object(object).to_string())
+        }
         other => other.to_string(),
     }
+}
+
+fn legacy_tool_result_content(object: &serde_json::Map<String, Value>) -> Option<String> {
+    let output = object.get("output")?.as_str()?;
+    let success = object.get("success")?.as_bool()?;
+    Some(if success {
+        output.to_string()
+    } else {
+        format!("[ERROR] {output}")
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -814,12 +827,12 @@ mod tests {
     }
 
     #[test]
-    fn test_map_messages_to_openai_serializes_structured_tool_result_content() {
+    fn test_map_messages_to_openai_preserves_string_tool_result_content() {
         let messages = vec![Message {
             role: MessageRole::Tool,
             content: vec![ContentBlock::ToolResult {
                 tool_use_id: "call_1".to_string(),
-                content: json!({"ok": true, "items": [1, 2]}),
+                content: Value::String("tool output".to_string()),
             }],
         }];
 
@@ -827,12 +840,27 @@ mod tests {
         assert_eq!(mapped.len(), 1);
         assert_eq!(mapped[0].role, "tool");
         assert_eq!(mapped[0].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(mapped[0].content.as_deref(), Some("tool output"));
+    }
 
-        let expected: serde_json::Value =
-            serde_json::from_str(r#"{"ok": true, "items": [1,2]}"#).unwrap();
-        let actual_content = mapped[0].content.as_ref().unwrap();
-        let actual: serde_json::Value = serde_json::from_str(actual_content).unwrap();
-        assert_eq!(expected, actual);
+    #[test]
+    fn test_map_messages_to_openai_formats_legacy_structured_tool_result_content() {
+        let messages = vec![Message {
+            role: MessageRole::Tool,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "call_1".to_string(),
+                content: json!({"output": "permission denied", "success": false}),
+            }],
+        }];
+
+        let mapped = map_messages_to_openai(&messages).unwrap();
+        assert_eq!(mapped.len(), 1);
+        assert_eq!(mapped[0].role, "tool");
+        assert_eq!(mapped[0].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(
+            mapped[0].content.as_deref(),
+            Some("[ERROR] permission denied")
+        );
     }
 
     #[test]

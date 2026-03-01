@@ -72,7 +72,7 @@ impl FawxToolExecutor {
         cancel: Option<&CancellationToken>,
     ) -> ToolResult {
         if is_cancelled(cancel) {
-            return cancelled_result(&call.name);
+            return cancelled_result(&call.id, &call.name);
         }
         let output = match call.name.as_str() {
             "read_file" => self.handle_read_file(&call.arguments),
@@ -87,7 +87,7 @@ impl FawxToolExecutor {
             "memory_delete" => self.handle_memory_delete(&call.arguments),
             _ => Err(format!("unknown tool: {}", call.name)),
         };
-        to_tool_result(&call.name, output)
+        to_tool_result(&call.id, &call.name, output)
     }
 
     fn jailed_path(&self, requested: &str) -> Result<PathBuf, String> {
@@ -588,14 +588,20 @@ fn canonicalize_existing_or_parent(path: &Path) -> Result<PathBuf, String> {
     Ok(resolved)
 }
 
-fn to_tool_result(tool_name: &str, output: Result<String, String>) -> ToolResult {
+fn to_tool_result(
+    tool_call_id: &str,
+    tool_name: &str,
+    output: Result<String, String>,
+) -> ToolResult {
     match output {
         Ok(content) => ToolResult {
+            tool_call_id: tool_call_id.to_string(),
             tool_name: tool_name.to_string(),
             success: true,
             output: content,
         },
         Err(error) => ToolResult {
+            tool_call_id: tool_call_id.to_string(),
             tool_name: tool_name.to_string(),
             success: false,
             output: error,
@@ -607,8 +613,9 @@ fn is_cancelled(cancel: Option<&CancellationToken>) -> bool {
     cancel.is_some_and(CancellationToken::is_cancelled)
 }
 
-fn cancelled_result(tool_name: &str) -> ToolResult {
+fn cancelled_result(tool_call_id: &str, tool_name: &str) -> ToolResult {
     ToolResult {
+        tool_call_id: tool_call_id.to_string(),
         tool_name: tool_name.to_string(),
         success: false,
         output: "tool execution cancelled".to_string(),

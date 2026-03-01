@@ -64,6 +64,7 @@ impl SkillRegistry {
     /// Execute a single tool call by finding the first skill that handles it.
     async fn dispatch_call(
         &self,
+        tool_call_id: &str,
         tool_name: &str,
         arguments: &str,
         cancel: Option<&CancellationToken>,
@@ -72,11 +73,13 @@ impl SkillRegistry {
             if let Some(result) = skill.execute(tool_name, arguments, cancel).await {
                 return match result {
                     Ok(output) => ToolResult {
+                        tool_call_id: tool_call_id.to_string(),
                         tool_name: tool_name.to_string(),
                         success: true,
                         output,
                     },
                     Err(err) => ToolResult {
+                        tool_call_id: tool_call_id.to_string(),
                         tool_name: tool_name.to_string(),
                         success: false,
                         output: err,
@@ -85,6 +88,7 @@ impl SkillRegistry {
             }
         }
         ToolResult {
+            tool_call_id: tool_call_id.to_string(),
             tool_name: tool_name.to_string(),
             success: false,
             output: format!("no skill handles tool '{tool_name}'"),
@@ -113,7 +117,10 @@ impl ToolExecutor for SkillRegistry {
                 }
             }
             let args = call.arguments.to_string();
-            results.push(self.dispatch_call(&call.name, &args, cancel).await);
+            results.push(
+                self.dispatch_call(&call.id, &call.name, &args, cancel)
+                    .await,
+            );
         }
         Ok(results)
     }
@@ -312,7 +319,7 @@ mod tests {
         assert_eq!(reg.all_tool_definitions().len(), 2);
 
         // Dispatch goes to first-registered skill
-        let result = reg.dispatch_call("read_file", "{}", None).await;
+        let result = reg.dispatch_call("call_1", "read_file", "{}", None).await;
         assert!(result.success);
         assert_eq!(result.output, "fs:read_file");
     }

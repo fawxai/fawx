@@ -16,7 +16,10 @@ use crate::types::{
 use crate::verify::Verification;
 use async_trait::async_trait;
 use fx_core::types::{InputSource, UserInput};
-use fx_llm::{CompletionRequest, CompletionResponse, Message, ProviderError, ToolDefinition};
+use fx_llm::{
+    CompletionRequest, CompletionResponse, ContentBlock, Message, MessageRole, ProviderError,
+    ToolCall, ToolDefinition,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -175,6 +178,7 @@ enum IterationStep {
 const REASONING_OUTPUT_TOKEN_HEURISTIC: u64 = 192;
 const TOOL_SYNTHESIS_TOKEN_HEURISTIC: u64 = 320;
 const REASONING_MAX_OUTPUT_TOKENS: u32 = 768;
+const REASONING_TEMPERATURE: f32 = 0.2;
 const TOOL_SYNTHESIS_MAX_OUTPUT_TOKENS: u32 = 384;
 const DEFAULT_LLM_ACTION_COST_CENTS: u64 = 2;
 const SAFE_FALLBACK_RESPONSE: &str = "I wasn't able to process that. Could you try rephrasing?";
@@ -437,7 +441,7 @@ impl LoopEngine {
             return Ok(step);
         }
 
-        self.execute_action_and_finalize(&decision, llm, state)
+        self.execute_action_and_finalize(&decision, llm, state, &processed.context_window)
             .await
     }
 
@@ -446,8 +450,9 @@ impl LoopEngine {
         decision: &Decision,
         llm: &dyn LlmProvider,
         state: &mut CycleState,
+        context_messages: &[Message],
     ) -> Result<IterationStep, LoopError> {
-        let action = self.act(decision, llm).await?;
+        let action = self.act(decision, llm, context_messages).await?;
         let action_cost = self.action_cost_from_result(&action);
         if let Some(step) = self.budget_terminal(action_cost, Some(action.response_text.clone())) {
             return Ok(step);
@@ -610,6 +615,7 @@ impl LoopEngine {
         &mut self,
         decision: &Decision,
         llm: &dyn LlmProvider,
+        context_messages: &[Message],
     ) -> Result<ActionResult, LoopError> {
         match decision {
             // Note: Clarify and Defer are not produced by decide() in the current
@@ -618,7 +624,9 @@ impl LoopEngine {
                 Ok(self.text_action_result(decision, text))
             }
             Decision::UseTools(calls) => {
-                let action = self.act_with_tools(decision, calls, llm).await?;
+                let action = self
+                    .act_with_tools(decision, calls, llm, context_messages)
+                    .await?;
                 self.emit_action_signals(&action.tool_results);
                 Ok(action)
             }
@@ -743,6 +751,38 @@ impl LoopEngine {
         );
     }
 
+    fn emit_tool_round_trace_and_perf(
+        &mut self,
+        round: u32,
+        tool_calls: usize,
+        response: &CompletionResponse,
+        latency_ms: u64,
+    ) {
+        let mut metadata = serde_json::json!({
+            "round": round,
+            "tool_calls": tool_calls,
+            "follow_up_calls": response.tool_calls.len(),
+        });
+        if let Some(usage) = response.usage {
+            metadata["input_tokens"] = serde_json::json!(usage.input_tokens);
+            metadata["output_tokens"] = serde_json::json!(usage.output_tokens);
+        } else {
+            metadata["usage"] = serde_json::json!("unavailable");
+        }
+        self.emit_signal(
+            LoopStep::Act,
+            SignalKind::Trace,
+            "tool continuation round",
+            metadata,
+        );
+        self.emit_signal(
+            LoopStep::Act,
+            SignalKind::Performance,
+            "tool continuation latency",
+            serde_json::json!({"round": round, "latency_ms": latency_ms}),
+        );
+    }
+
     fn emit_decision_signals(&mut self, decision: &Decision) {
         let variant = decision_variant(decision);
         self.emit_signal(
@@ -847,14 +887,57 @@ impl LoopEngine {
         }
     }
 
+    // Evaluated introducing a ToolActionContext wrapper here, but kept explicit
+    // arguments because there are only four call-site inputs and bundling them
+    // made the call site less readable.
     async fn act_with_tools(
-        &self,
+        &mut self,
         decision: &Decision,
-        calls: &[fx_llm::ToolCall],
+        calls: &[ToolCall],
         llm: &dyn LlmProvider,
+        context_messages: &[Message],
     ) -> Result<ActionResult, LoopError> {
-        let tool_results = self
-            .tool_executor
+        let mut all_tool_results = Vec::new();
+        let mut current_calls = calls.to_vec();
+        let mut continuation_messages = context_messages.to_vec();
+        let mut tokens_used = TokenUsage::default();
+
+        for round in 0..self.max_iterations {
+            let round_started = current_time_ms();
+            let results = self.execute_tool_calls(&current_calls).await?;
+            append_tool_round_messages(&mut continuation_messages, &current_calls, &results)?;
+            all_tool_results.extend(results);
+
+            let response = self
+                .request_tool_continuation(llm, &continuation_messages, &mut tokens_used)
+                .await?;
+            let latency_ms = current_time_ms().saturating_sub(round_started);
+            self.emit_tool_round_trace_and_perf(
+                round + 1,
+                current_calls.len(),
+                &response,
+                latency_ms,
+            );
+
+            if !response.tool_calls.is_empty() {
+                current_calls = response.tool_calls;
+                continue;
+            }
+
+            return Ok(self.finalize_tool_response(
+                decision,
+                all_tool_results,
+                &response,
+                tokens_used,
+            ));
+        }
+
+        self.synthesize_tool_fallback(decision, all_tool_results, tokens_used, llm)
+            .await
+    }
+
+    async fn execute_tool_calls(&self, calls: &[ToolCall]) -> Result<Vec<ToolResult>, LoopError> {
+        self.tool_executor
             .execute_tools(calls, self.cancel_token.as_ref())
             .await
             .map_err(|error| {
@@ -863,16 +946,75 @@ impl LoopEngine {
                     &format!("tool execution failed: {}", error.message),
                     error.recoverable,
                 )
-            })?;
+            })
+    }
+
+    async fn request_tool_continuation(
+        &self,
+        llm: &dyn LlmProvider,
+        context_messages: &[Message],
+        tokens_used: &mut TokenUsage,
+    ) -> Result<CompletionResponse, LoopError> {
+        let request = build_continuation_request(
+            context_messages,
+            llm.model_name(),
+            self.tool_executor.tool_definitions(),
+            self.memory_context.as_deref(),
+        );
+        let response = llm.complete(request).await.map_err(|error| {
+            loop_error(
+                "act",
+                &format!("tool continuation completion failed: {error}"),
+                true,
+            )
+        })?;
+        tokens_used.accumulate(response_usage_or_estimate(&response, context_messages));
+        Ok(response)
+    }
+
+    fn finalize_tool_response(
+        &mut self,
+        decision: &Decision,
+        tool_results: Vec<ToolResult>,
+        response: &CompletionResponse,
+        tokens_used: TokenUsage,
+    ) -> ActionResult {
+        let text = extract_response_text(response);
+        let readable = extract_readable_text(&text);
+        let (response_text, used_fallback) = ensure_non_empty_response_with_flag(&readable);
+        if used_fallback {
+            self.emit_signal(
+                LoopStep::Act,
+                SignalKind::Trace,
+                "tool continuation returned empty text; using safe fallback",
+                serde_json::json!({
+                    "tool_count": tool_results.len(),
+                }),
+            );
+        }
+        ActionResult {
+            decision: decision.clone(),
+            tool_results,
+            response_text,
+            tokens_used,
+        }
+    }
+
+    async fn synthesize_tool_fallback(
+        &self,
+        decision: &Decision,
+        tool_results: Vec<ToolResult>,
+        mut tokens_used: TokenUsage,
+        llm: &dyn LlmProvider,
+    ) -> Result<ActionResult, LoopError> {
         let synthesis_prompt = tool_synthesis_prompt(&tool_results, &self.synthesis_instruction);
         let llm_text = self.generate_tool_summary(&synthesis_prompt, llm).await?;
-        let usage = synthesis_usage(&synthesis_prompt, &llm_text);
-
+        tokens_used.accumulate(synthesis_usage(&synthesis_prompt, &llm_text));
         Ok(ActionResult {
             decision: decision.clone(),
             tool_results,
             response_text: ensure_non_empty_response(&llm_text),
-            tokens_used: usage,
+            tokens_used,
         })
     }
 
@@ -1131,6 +1273,137 @@ fn synthesis_usage(prompt: &str, response: &str) -> TokenUsage {
     }
 }
 
+fn append_tool_round_messages(
+    context_messages: &mut Vec<Message>,
+    calls: &[ToolCall],
+    results: &[ToolResult],
+) -> Result<(), LoopError> {
+    let assistant_message = build_tool_use_assistant_message(calls);
+    let result_message = build_tool_result_message(calls, results)?;
+    context_messages.push(assistant_message);
+    context_messages.push(result_message);
+    Ok(())
+}
+
+/// Build an assistant message containing ToolUse content blocks.
+fn build_tool_use_assistant_message(calls: &[ToolCall]) -> Message {
+    let content = calls
+        .iter()
+        .map(|call| ContentBlock::ToolUse {
+            id: call.id.clone(),
+            name: call.name.clone(),
+            input: call.arguments.clone(),
+        })
+        .collect();
+    Message {
+        role: MessageRole::Assistant,
+        content,
+    }
+}
+
+/// Build a user message containing ToolResult content blocks.
+///
+/// Returns an error if any result has a `tool_call_id` not found in `calls`.
+fn build_tool_result_message(
+    calls: &[ToolCall],
+    results: &[ToolResult],
+) -> Result<Message, LoopError> {
+    let call_order = calls
+        .iter()
+        .enumerate()
+        .map(|(index, call)| (call.id.clone(), index))
+        .collect::<HashMap<_, _>>();
+    let mut ordered_results = indexed_tool_results(&call_order, results)?;
+    ordered_results.sort_by_key(|(index, _)| *index);
+    let content = ordered_results
+        .into_iter()
+        .map(|(_, result)| ContentBlock::ToolResult {
+            tool_use_id: result.tool_call_id.clone(),
+            content: if result.success {
+                serde_json::Value::String(result.output.clone())
+            } else {
+                serde_json::Value::String(format!("[ERROR] {}", result.output))
+            },
+        })
+        .collect();
+    Ok(Message {
+        role: MessageRole::User,
+        content,
+    })
+}
+
+fn indexed_tool_results<'a>(
+    call_order: &HashMap<String, usize>,
+    results: &'a [ToolResult],
+) -> Result<Vec<(usize, &'a ToolResult)>, LoopError> {
+    results
+        .iter()
+        .map(|result| {
+            call_order
+                .get(&result.tool_call_id)
+                .copied()
+                .map(|index| (index, result))
+                .ok_or_else(|| unmatched_tool_call_id_error(result))
+        })
+        .collect()
+}
+
+fn unmatched_tool_call_id_error(result: &ToolResult) -> LoopError {
+    loop_error(
+        "act",
+        &format!(
+            "tool result has unmatched tool_call_id '{}' for tool '{}'",
+            result.tool_call_id, result.tool_name
+        ),
+        false,
+    )
+}
+
+/// Build a CompletionRequest for tool result re-prompting.
+fn build_continuation_request(
+    context_messages: &[Message],
+    model: &str,
+    tool_definitions: Vec<ToolDefinition>,
+    memory_context: Option<&str>,
+) -> CompletionRequest {
+    let system_prompt = build_reasoning_system_prompt(&tool_definitions, memory_context);
+    CompletionRequest {
+        model: model.to_string(),
+        messages: context_messages.to_vec(),
+        tools: tool_definitions,
+        temperature: Some(REASONING_TEMPERATURE),
+        max_tokens: Some(REASONING_MAX_OUTPUT_TOKENS),
+        system_prompt: Some(system_prompt),
+    }
+}
+
+fn response_usage_or_estimate(
+    response: &CompletionResponse,
+    context_messages: &[Message],
+) -> TokenUsage {
+    if let Some(usage) = response.usage {
+        return TokenUsage {
+            input_tokens: u64::from(usage.input_tokens),
+            output_tokens: u64::from(usage.output_tokens),
+        };
+    }
+
+    let prompt_estimate: u64 = context_messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .map(|block| match block {
+            ContentBlock::Text { text } => estimate_tokens(text),
+            ContentBlock::ToolUse { input, .. } => estimate_tokens(&input.to_string()),
+            ContentBlock::ToolResult { content, .. } => estimate_tokens(&content.to_string()),
+        })
+        .sum();
+    let text = extract_response_text(response);
+    TokenUsage {
+        input_tokens: prompt_estimate,
+        output_tokens: estimate_tokens(&text),
+    }
+}
+
 fn build_verification(discrepancies: Vec<String>) -> Verification {
     let confidence = if discrepancies.is_empty() {
         VERIFICATION_CONFIDENCE_CLEAN
@@ -1239,7 +1512,7 @@ fn build_reasoning_request(
         model: model.to_string(),
         messages: [context, vec![Message::user(user_prompt)]].concat(),
         tools: tool_definitions,
-        temperature: Some(0.2),
+        temperature: Some(REASONING_TEMPERATURE),
         max_tokens: Some(REASONING_MAX_OUTPUT_TOKENS),
         system_prompt: Some(system_prompt),
     }
@@ -1330,11 +1603,15 @@ fn extract_response_text(response: &CompletionResponse) -> String {
 }
 
 fn ensure_non_empty_response(text: &str) -> String {
+    ensure_non_empty_response_with_flag(text).0
+}
+
+fn ensure_non_empty_response_with_flag(text: &str) -> (String, bool) {
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return SAFE_FALLBACK_RESPONSE.to_string();
+        return (SAFE_FALLBACK_RESPONSE.to_string(), true);
     }
-    trimmed.to_string()
+    (trimmed.to_string(), false)
 }
 
 fn loop_error(stage: &str, reason: &str, recoverable: bool) -> LoopError {
@@ -1377,6 +1654,7 @@ mod tests {
             Ok(calls
                 .iter()
                 .map(|call| ToolResult {
+                    tool_call_id: call.id.clone(),
                     tool_name: call.name.clone(),
                     success: true,
                     output: "ok".to_string(),
@@ -1536,6 +1814,7 @@ mod tests {
     #[test]
     fn tool_synthesis_prompt_includes_direct_answer_instruction_and_identity() {
         let results = vec![ToolResult {
+            tool_call_id: "call-1".to_string(),
             tool_name: "current_time".to_string(),
             output: "2026-02-28T14:00:00Z".to_string(),
             success: true,
@@ -1567,11 +1846,13 @@ mod tests {
     fn synthesis_includes_all_results() {
         let results = vec![
             ToolResult {
+                tool_call_id: "call-1".to_string(),
                 tool_name: "read_file".to_string(),
                 output: "alpha".to_string(),
                 success: true,
             },
             ToolResult {
+                tool_call_id: "call-2".to_string(),
                 tool_name: "search".to_string(),
                 output: "beta".to_string(),
                 success: true,
@@ -1602,11 +1883,13 @@ mod tests {
     fn synthesis_includes_failed_tool_results() {
         let results = vec![
             ToolResult {
+                tool_call_id: "call-1".to_string(),
                 tool_name: "read_file".to_string(),
                 output: "alpha".to_string(),
                 success: true,
             },
             ToolResult {
+                tool_call_id: "call-2".to_string(),
                 tool_name: "run_command".to_string(),
                 output: "permission denied".to_string(),
                 success: false,
@@ -1622,6 +1905,7 @@ mod tests {
     #[test]
     fn synthesis_prompt_includes_error_relay_instruction_when_tool_failed() {
         let results = vec![ToolResult {
+            tool_call_id: "call-1".to_string(),
             tool_name: "read_file".to_string(),
             output: "file not found: /foo/bar".to_string(),
             success: false,
@@ -1635,6 +1919,7 @@ mod tests {
     #[test]
     fn synthesis_prompt_omits_error_relay_when_all_tools_succeed() {
         let results = vec![ToolResult {
+            tool_call_id: "call-1".to_string(),
             tool_name: "read_file".to_string(),
             output: "alpha".to_string(),
             success: true,
@@ -1649,11 +1934,13 @@ mod tests {
     fn synthesis_prompt_error_relay_with_mixed_results() {
         let results = vec![
             ToolResult {
+                tool_call_id: "call-1".to_string(),
                 tool_name: "read_file".to_string(),
                 output: "alpha".to_string(),
                 success: true,
             },
             ToolResult {
+                tool_call_id: "call-2".to_string(),
                 tool_name: "run_command".to_string(),
                 output: "permission denied".to_string(),
                 success: false,
@@ -1752,6 +2039,7 @@ mod tests {
                 arguments: serde_json::json!({"path":"Cargo.toml"}),
             }]),
             tool_results: vec![ToolResult {
+                tool_call_id: "call-1".to_string(),
                 tool_name: "read_file".to_string(),
                 success: true,
                 output: "ok".to_string(),
@@ -1790,6 +2078,7 @@ mod phase2_tests {
             Ok(calls
                 .iter()
                 .map(|call| ToolResult {
+                    tool_call_id: call.id.clone(),
                     tool_name: call.name.clone(),
                     success: true,
                     output: "ok".to_string(),
@@ -1819,6 +2108,7 @@ mod phase2_tests {
             Ok(calls
                 .iter()
                 .map(|call| ToolResult {
+                    tool_call_id: call.id.clone(),
                     tool_name: call.name.clone(),
                     success: false,
                     output: "path escapes working directory".to_string(),
@@ -1927,6 +2217,7 @@ mod phase2_tests {
         let action = ActionResult {
             decision: Decision::UseTools(vec![]),
             tool_results: vec![ToolResult {
+                tool_call_id: "call-1".to_string(),
                 tool_name: "read_file".to_string(),
                 output: "path escapes working directory".to_string(),
                 success: false,
@@ -1953,6 +2244,7 @@ mod phase2_tests {
         let action = ActionResult {
             decision: Decision::UseTools(vec![]),
             tool_results: vec![ToolResult {
+                tool_call_id: "call-1".to_string(),
                 tool_name: "read_file".to_string(),
                 output: "path escapes working directory".to_string(),
                 success: false,
@@ -1982,6 +2274,7 @@ mod phase2_tests {
         let action = ActionResult {
             decision: Decision::UseTools(vec![]),
             tool_results: vec![ToolResult {
+                tool_call_id: "call-1".to_string(),
                 tool_name: "read_file".to_string(),
                 output: "file contents here".to_string(),
                 success: true,
@@ -2047,16 +2340,26 @@ mod phase2_tests {
 
         // First response: LLM returns a tool call
         // Second response: LLM synthesizes the tool results into a final answer
-        let llm = SequentialMockLlm::new(vec![CompletionResponse {
-            content: Vec::new(),
-            tool_calls: vec![ToolCall {
-                id: "call-1".to_string(),
-                name: "read_file".to_string(),
-                arguments: serde_json::json!({"path":"README.md"}),
-            }],
-            usage: None,
-            stop_reason: Some("tool_use".to_string()),
-        }]);
+        let llm = SequentialMockLlm::new(vec![
+            CompletionResponse {
+                content: Vec::new(),
+                tool_calls: vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path":"README.md"}),
+                }],
+                usage: None,
+                stop_reason: Some("tool_use".to_string()),
+            },
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "README loaded".to_string(),
+                }],
+                tool_calls: Vec::new(),
+                usage: None,
+                stop_reason: None,
+            },
+        ]);
 
         let result = engine
             .run_cycle(test_snapshot("read the readme"), &llm)
@@ -2073,16 +2376,26 @@ mod phase2_tests {
     async fn run_cycle_completes_in_one_iteration_when_tool_fails_but_synthesis_exists() {
         let mut engine = failing_tool_engine();
 
-        let llm = SequentialMockLlm::new(vec![CompletionResponse {
-            content: Vec::new(),
-            tool_calls: vec![ToolCall {
-                id: "call-1".to_string(),
-                name: "read_file".to_string(),
-                arguments: serde_json::json!({"path":"README.md"}),
-            }],
-            usage: None,
-            stop_reason: Some("tool_use".to_string()),
-        }]);
+        let llm = SequentialMockLlm::new(vec![
+            CompletionResponse {
+                content: Vec::new(),
+                tool_calls: vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path":"README.md"}),
+                }],
+                usage: None,
+                stop_reason: Some("tool_use".to_string()),
+            },
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "The file could not be read: path escapes working directory.".to_string(),
+                }],
+                tool_calls: Vec::new(),
+                usage: None,
+                stop_reason: None,
+            },
+        ]);
 
         let result = engine
             .run_cycle(test_snapshot("read the readme"), &llm)
@@ -2096,7 +2409,10 @@ mod phase2_tests {
                 ..
             } => {
                 assert_eq!(iterations, 1, "expected exactly one iteration");
-                assert_eq!(response, "summary");
+                assert_eq!(
+                    response,
+                    "The file could not be read: path escapes working directory."
+                );
             }
             other => panic!("expected LoopResult::Complete, got: {other:?}"),
         }
@@ -2238,19 +2554,29 @@ mod phase2_tests {
     #[tokio::test]
     async fn signals_include_decision_on_tool_call() {
         let mut engine = test_engine();
-        let llm = SequentialMockLlm::new(vec![CompletionResponse {
-            content: Vec::new(),
-            tool_calls: vec![ToolCall {
-                id: "call-1".to_string(),
-                name: "read_file".to_string(),
-                arguments: serde_json::json!({"path":"README.md"}),
-            }],
-            usage: Some(fx_llm::Usage {
-                input_tokens: 10,
-                output_tokens: 2,
-            }),
-            stop_reason: Some("tool_use".to_string()),
-        }]);
+        let llm = SequentialMockLlm::new(vec![
+            CompletionResponse {
+                content: Vec::new(),
+                tool_calls: vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path":"README.md"}),
+                }],
+                usage: Some(fx_llm::Usage {
+                    input_tokens: 10,
+                    output_tokens: 2,
+                }),
+                stop_reason: Some("tool_use".to_string()),
+            },
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "done".to_string(),
+                }],
+                tool_calls: Vec::new(),
+                usage: None,
+                stop_reason: None,
+            },
+        ]);
 
         let result = engine
             .run_cycle(test_snapshot("read the readme"), &llm)
@@ -2267,6 +2593,124 @@ mod phase2_tests {
 
         assert!(signals.iter().any(|signal| {
             signal.step == LoopStep::Decide && signal.kind == SignalKind::Decision
+        }));
+    }
+
+    #[tokio::test]
+    async fn tool_continuation_rounds_emit_trace_and_performance_signals() {
+        let mut engine = test_engine();
+        let llm = SequentialMockLlm::new(vec![
+            CompletionResponse {
+                content: Vec::new(),
+                tool_calls: vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path":"README.md"}),
+                }],
+                usage: Some(fx_llm::Usage {
+                    input_tokens: 10,
+                    output_tokens: 2,
+                }),
+                stop_reason: Some("tool_use".to_string()),
+            },
+            CompletionResponse {
+                content: Vec::new(),
+                tool_calls: vec![ToolCall {
+                    id: "call-2".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path":"Cargo.toml"}),
+                }],
+                usage: Some(fx_llm::Usage {
+                    input_tokens: 6,
+                    output_tokens: 3,
+                }),
+                stop_reason: Some("tool_use".to_string()),
+            },
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "done".to_string(),
+                }],
+                tool_calls: Vec::new(),
+                usage: Some(fx_llm::Usage {
+                    input_tokens: 5,
+                    output_tokens: 4,
+                }),
+                stop_reason: None,
+            },
+        ]);
+
+        let result = engine
+            .run_cycle(test_snapshot("read files"), &llm)
+            .await
+            .expect("run_cycle");
+
+        let signals = match result {
+            LoopResult::Complete { signals, .. }
+            | LoopResult::BudgetExhausted { signals, .. }
+            | LoopResult::NeedsInput { signals, .. }
+            | LoopResult::UserStopped { signals, .. }
+            | LoopResult::Error { signals, .. } => signals,
+        };
+
+        let round_trace_count = signals
+            .iter()
+            .filter(|signal| {
+                signal.step == LoopStep::Act
+                    && signal.kind == SignalKind::Trace
+                    && signal.message == "tool continuation round"
+            })
+            .count();
+        let round_perf_count = signals
+            .iter()
+            .filter(|signal| {
+                signal.step == LoopStep::Act
+                    && signal.kind == SignalKind::Performance
+                    && signal.message == "tool continuation latency"
+            })
+            .count();
+        assert_eq!(round_trace_count, 2, "expected 2 round trace signals");
+        assert_eq!(round_perf_count, 2, "expected 2 round performance signals");
+    }
+
+    #[tokio::test]
+    async fn empty_tool_continuation_emits_safe_fallback_trace() {
+        let mut engine = test_engine();
+        let llm = SequentialMockLlm::new(vec![
+            CompletionResponse {
+                content: Vec::new(),
+                tool_calls: vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path":"README.md"}),
+                }],
+                usage: None,
+                stop_reason: Some("tool_use".to_string()),
+            },
+            CompletionResponse {
+                content: Vec::new(),
+                tool_calls: Vec::new(),
+                usage: None,
+                stop_reason: None,
+            },
+        ]);
+
+        let result = engine
+            .run_cycle(test_snapshot("read the readme"), &llm)
+            .await
+            .expect("run_cycle");
+
+        let (response, signals) = match result {
+            LoopResult::Complete {
+                response, signals, ..
+            } => (response, signals),
+            other => panic!("expected LoopResult::Complete, got: {other:?}"),
+        };
+
+        assert_eq!(response, SAFE_FALLBACK_RESPONSE);
+        assert!(signals.iter().any(|signal| {
+            signal.step == LoopStep::Act
+                && signal.kind == SignalKind::Trace
+                && signal.message == "tool continuation returned empty text; using safe fallback"
         }));
     }
 
@@ -2339,6 +2783,7 @@ mod phase4_tests {
                 }
                 self.executed_count.fetch_add(1, Ordering::SeqCst);
                 results.push(ToolResult {
+                    tool_call_id: call.id.clone(),
                     tool_name: call.name.clone(),
                     success: true,
                     output: "ok".to_string(),
@@ -2377,6 +2822,7 @@ mod phase4_tests {
             Ok(calls
                 .iter()
                 .map(|call| ToolResult {
+                    tool_call_id: call.id.clone(),
                     tool_name: call.name.clone(),
                     success: true,
                     output: "ok".to_string(),
@@ -2521,45 +2967,279 @@ mod phase4_tests {
         }
     }
 
-    #[tokio::test]
-    async fn act_with_tools_executes_all_calls_and_synthesizes_response() {
-        let engine = p4_engine();
-        let decision = Decision::UseTools(vec![
-            ToolCall {
-                id: "1".to_string(),
-                name: "read_file".to_string(),
-                arguments: serde_json::json!({"path": "a.txt"}),
-            },
-            ToolCall {
-                id: "2".to_string(),
-                name: "read_file".to_string(),
-                arguments: serde_json::json!({"path": "b.txt"}),
-            },
-        ]);
+    fn read_file_call(id: &str, path: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path": path}),
+        }
+    }
 
-        let calls = match &decision {
+    fn calls_from_decision(decision: &Decision) -> &[ToolCall] {
+        match decision {
             Decision::UseTools(calls) => calls.as_slice(),
-            _ => unreachable!("decision should contain tool calls"),
-        };
+            _ => panic!("decision should contain tool calls"),
+        }
+    }
 
-        let llm = Phase4MockLlm::new(vec![CompletionResponse {
+    fn tool_use_response(calls: Vec<ToolCall>) -> CompletionResponse {
+        CompletionResponse {
+            content: Vec::new(),
+            tool_calls: calls,
+            usage: None,
+            stop_reason: Some("tool_use".to_string()),
+        }
+    }
+
+    fn text_response(text: &str) -> CompletionResponse {
+        CompletionResponse {
             content: vec![ContentBlock::Text {
-                text: "combined tool output".to_string(),
+                text: text.to_string(),
             }],
             tool_calls: Vec::new(),
             usage: None,
             stop_reason: None,
-        }]);
+        }
+    }
+
+    fn assert_tool_result_block(block: &ContentBlock, expected_id: &str, expected_content: &str) {
+        match block {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+            } => {
+                assert_eq!(tool_use_id, expected_id);
+                assert_eq!(content.as_str(), Some(expected_content));
+            }
+            other => panic!("expected ToolResult block, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn act_with_tools_executes_all_calls_and_returns_completion_text() {
+        let mut engine = p4_engine();
+        let decision = Decision::UseTools(vec![
+            read_file_call("1", "a.txt"),
+            read_file_call("2", "b.txt"),
+        ]);
+        let llm = Phase4MockLlm::new(vec![text_response("combined tool output")]);
+        let context_messages = vec![Message::user("read two files")];
 
         let action = engine
-            .act_with_tools(&decision, calls, &llm)
+            .act_with_tools(
+                &decision,
+                calls_from_decision(&decision),
+                &llm,
+                &context_messages,
+            )
             .await
             .expect("act_with_tools");
 
         assert_eq!(action.tool_results.len(), 2);
         assert_eq!(action.tool_results[0].tool_name, "read_file");
         assert_eq!(action.tool_results[1].tool_name, "read_file");
+        assert_eq!(action.response_text, "combined tool output");
+    }
+
+    #[tokio::test]
+    async fn act_with_tools_reprompts_on_follow_up_tool_calls() {
+        let mut engine = p4_engine();
+        let decision = Decision::UseTools(vec![read_file_call("call-1", "a.txt")]);
+        let llm = Phase4MockLlm::new(vec![
+            tool_use_response(vec![read_file_call("call-2", "b.txt")]),
+            text_response("done after two rounds"),
+        ]);
+        let context_messages = vec![Message::user("read files")];
+
+        let action = engine
+            .act_with_tools(
+                &decision,
+                calls_from_decision(&decision),
+                &llm,
+                &context_messages,
+            )
+            .await
+            .expect("act_with_tools");
+
+        assert_eq!(action.tool_results.len(), 2);
+        assert_eq!(action.tool_results[0].tool_call_id, "call-1");
+        assert_eq!(action.tool_results[1].tool_call_id, "call-2");
+        assert_eq!(action.response_text, "done after two rounds");
+    }
+
+    #[tokio::test]
+    async fn act_with_tools_chains_three_tool_rounds() {
+        let mut engine = p4_engine();
+        let decision = Decision::UseTools(vec![read_file_call("call-1", "a.txt")]);
+        let llm = Phase4MockLlm::new(vec![
+            tool_use_response(vec![read_file_call("call-2", "b.txt")]),
+            tool_use_response(vec![read_file_call("call-3", "c.txt")]),
+            text_response("done after three rounds"),
+        ]);
+        let context_messages = vec![Message::user("read files")];
+
+        let action = engine
+            .act_with_tools(
+                &decision,
+                calls_from_decision(&decision),
+                &llm,
+                &context_messages,
+            )
+            .await
+            .expect("act_with_tools");
+
+        assert_eq!(action.tool_results.len(), 3);
+        assert_eq!(action.tool_results[0].tool_call_id, "call-1");
+        assert_eq!(action.tool_results[1].tool_call_id, "call-2");
+        assert_eq!(action.tool_results[2].tool_call_id, "call-3");
+        assert_eq!(action.response_text, "done after three rounds");
+    }
+
+    #[tokio::test]
+    async fn act_with_tools_falls_back_to_synthesis_on_max_iterations() {
+        let mut engine = LoopEngine::new(
+            BudgetTracker::new(crate::budget::BudgetConfig::default(), 0, 0),
+            ContextCompactor::new(2048, 256),
+            1,
+            Arc::new(Phase4StubToolExecutor),
+            "Summarize tool output".to_string(),
+        );
+        let decision = Decision::UseTools(vec![read_file_call("call-1", "a.txt")]);
+        let llm = Phase4MockLlm::new(vec![tool_use_response(vec![read_file_call(
+            "call-2", "b.txt",
+        )])]);
+        let context_messages = vec![Message::user("read files")];
+
+        let action = engine
+            .act_with_tools(
+                &decision,
+                calls_from_decision(&decision),
+                &llm,
+                &context_messages,
+            )
+            .await
+            .expect("act_with_tools");
+
+        assert_eq!(action.tool_results.len(), 1);
         assert_eq!(action.response_text, "summary");
+    }
+
+    #[tokio::test]
+    async fn tool_result_has_tool_call_id() {
+        let executor = Phase4StubToolExecutor;
+        let calls = vec![ToolCall {
+            id: "call-42".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path": "README.md"}),
+        }];
+
+        let results = executor
+            .execute_tools(&calls, None)
+            .await
+            .expect("execute_tools");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].tool_call_id, "call-42");
+    }
+
+    #[test]
+    fn build_tool_use_assistant_message_creates_correct_blocks() {
+        let calls = vec![
+            ToolCall {
+                id: "call-1".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "a.txt"}),
+            },
+            ToolCall {
+                id: "call-2".to_string(),
+                name: "run_command".to_string(),
+                arguments: serde_json::json!({"command": "ls"}),
+            },
+        ];
+
+        let message = build_tool_use_assistant_message(&calls);
+
+        assert_eq!(message.role, fx_llm::MessageRole::Assistant);
+        assert_eq!(message.content.len(), 2);
+        match &message.content[0] {
+            ContentBlock::ToolUse { id, name, input } => {
+                assert_eq!(id, "call-1");
+                assert_eq!(name, "read_file");
+                assert_eq!(input["path"], "a.txt");
+            }
+            other => panic!("expected ToolUse block, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_tool_result_message_creates_correct_blocks() {
+        let calls = vec![
+            read_file_call("call-1", "a.txt"),
+            ToolCall {
+                id: "call-2".to_string(),
+                name: "run_command".to_string(),
+                arguments: serde_json::json!({"command": "ls"}),
+            },
+        ];
+        let results = vec![
+            ToolResult {
+                tool_call_id: "call-2".to_string(),
+                tool_name: "run_command".to_string(),
+                success: false,
+                output: "permission denied".to_string(),
+            },
+            ToolResult {
+                tool_call_id: "call-1".to_string(),
+                tool_name: "read_file".to_string(),
+                success: true,
+                output: "ok".to_string(),
+            },
+        ];
+
+        let message =
+            build_tool_result_message(&calls, &results).expect("build_tool_result_message");
+
+        assert_eq!(message.role, fx_llm::MessageRole::User);
+        assert_eq!(message.content.len(), 2);
+        assert_tool_result_block(&message.content[0], "call-1", "ok");
+        assert_tool_result_block(&message.content[1], "call-2", "[ERROR] permission denied");
+    }
+
+    #[test]
+    fn build_tool_result_message_formats_error_with_prefix() {
+        let calls = vec![read_file_call("call-1", "a.txt")];
+        let results = vec![ToolResult {
+            tool_call_id: "call-1".to_string(),
+            tool_name: "read_file".to_string(),
+            success: false,
+            output: "permission denied".to_string(),
+        }];
+
+        let message =
+            build_tool_result_message(&calls, &results).expect("build_tool_result_message");
+
+        assert_eq!(message.content.len(), 1);
+        assert_tool_result_block(&message.content[0], "call-1", "[ERROR] permission denied");
+    }
+
+    #[test]
+    fn build_tool_result_message_rejects_unmatched_tool_call_id() {
+        let calls = vec![read_file_call("call-1", "a.txt")];
+        let results = vec![ToolResult {
+            tool_call_id: "call-999".to_string(),
+            tool_name: "read_file".to_string(),
+            success: true,
+            output: "ok".to_string(),
+        }];
+
+        let error = build_tool_result_message(&calls, &results)
+            .expect_err("should reject unmatched tool_call_id");
+        assert_eq!(error.stage, "act");
+        assert!(
+            error.reason.contains("call-999"),
+            "error should mention the unmatched id: {}",
+            error.reason
+        );
     }
 
     // P4-1: execute_tools_cancellation_between_calls
