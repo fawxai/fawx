@@ -197,7 +197,7 @@ impl OpenAiResponsesProvider {
                 input_tokens: u.input_tokens.unwrap_or(0) as u32,
                 output_tokens: u.output_tokens.unwrap_or(0) as u32,
             }),
-            stop_reason: body.status,
+            stop_reason: normalize_responses_stop_reason(body.status),
             tool_calls,
         }
     }
@@ -556,12 +556,27 @@ fn tool_delta_from_output_item_event(data: &str) -> Option<ToolUseDelta> {
 fn usage_chunk_from_done_event(data: &str) -> Option<StreamChunk> {
     let parsed = serde_json::from_str::<SseResponseDone>(data).ok()?;
     let SseResponseDone { response, usage } = parsed;
-    let usage = response.and_then(|response| response.usage).or(usage)?;
+    let (response_usage, response_status) = response
+        .map(|response| (response.usage, response.status))
+        .unwrap_or((None, None));
+    let usage = response_usage.or(usage)?;
+    let stop_reason =
+        normalize_responses_stop_reason(response_status).unwrap_or_else(|| "stop".to_string());
 
     Some(StreamChunk {
         usage: Some(responses_usage_to_usage(usage)),
-        stop_reason: Some("stop".to_string()),
+        stop_reason: Some(stop_reason),
         ..Default::default()
+    })
+}
+
+fn normalize_responses_stop_reason(status: Option<String>) -> Option<String> {
+    status.map(|value| {
+        if value.eq_ignore_ascii_case("incomplete") {
+            "max_tokens".to_string()
+        } else {
+            value
+        }
     })
 }
 
@@ -875,6 +890,8 @@ struct SseResponseDone {
 struct SseResponseBody {
     #[serde(default)]
     usage: Option<ResponsesUsage>,
+    #[serde(default)]
+    status: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1429,6 +1446,30 @@ mod tests {
         assert_eq!(response.tool_calls[0].id, "call_123");
         assert_eq!(response.tool_calls[0].name, "emit_intent");
         assert_eq!(response.tool_calls[0].arguments["intent"], "open");
+    }
+
+    #[test]
+    fn openai_responses_incomplete_status_maps_to_max_tokens() {
+        let body = ResponsesResponseBody {
+            output: Vec::new(),
+            status: Some("incomplete".to_string()),
+            usage: None,
+        };
+
+        let response = OpenAiResponsesProvider::parse_response(body);
+        assert_eq!(response.stop_reason.as_deref(), Some("max_tokens"));
+    }
+
+    #[test]
+    fn openai_responses_done_event_incomplete_maps_to_max_tokens() {
+        let done_event = r#"{"type":"response.done","response":{"status":"incomplete","usage":{"input_tokens":5,"output_tokens":2}}}"#;
+        let chunk = OpenAiResponsesProvider::chunk_from_event("response.done", done_event)
+            .expect("done event should produce terminal chunk");
+
+        let usage = chunk.usage.expect("done event should include usage");
+        assert_eq!(usage.input_tokens, 5);
+        assert_eq!(usage.output_tokens, 2);
+        assert_eq!(chunk.stop_reason.as_deref(), Some("max_tokens"));
     }
 
     #[test]

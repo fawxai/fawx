@@ -757,6 +757,25 @@ mod tests {
     }
 
     #[test]
+    fn openai_chat_length_stop_reason_is_preserved() {
+        let body = OpenAiResponseBody {
+            choices: vec![OpenAiChoice {
+                message: OpenAiMessage {
+                    role: "assistant".to_string(),
+                    content: Some("Partial response".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                finish_reason: Some("length".to_string()),
+            }],
+            usage: None,
+        };
+
+        let mapped = OpenAiProvider::parse_completion_response(body).unwrap();
+        assert_eq!(mapped.stop_reason.as_deref(), Some("length"));
+    }
+
+    #[test]
     fn test_parse_sse_payload_maps_text_tool_and_stop_chunks() {
         let payload = r#"
             data: {"choices":[{"delta":{"content":"hel"},"finish_reason":null}]}

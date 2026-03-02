@@ -21,7 +21,7 @@ use fx_decompose::{
 };
 use fx_llm::{
     CompletionRequest, CompletionResponse, ContentBlock, Message, MessageRole, ProviderError,
-    ToolCall, ToolDefinition,
+    ToolCall, ToolDefinition, Usage,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -239,9 +239,10 @@ impl From<DecomposeSubGoalArguments> for SubGoal {
 
 const REASONING_OUTPUT_TOKEN_HEURISTIC: u64 = 192;
 const TOOL_SYNTHESIS_TOKEN_HEURISTIC: u64 = 320;
-const REASONING_MAX_OUTPUT_TOKENS: u32 = 768;
+const REASONING_MAX_OUTPUT_TOKENS: u32 = 4096;
 const REASONING_TEMPERATURE: f32 = 0.2;
-const TOOL_SYNTHESIS_MAX_OUTPUT_TOKENS: u32 = 384;
+const TOOL_SYNTHESIS_MAX_OUTPUT_TOKENS: u32 = 1024;
+const MAX_CONTINUATION_ATTEMPTS: u32 = 3;
 const DEFAULT_LLM_ACTION_COST_CENTS: u64 = 2;
 const SAFE_FALLBACK_RESPONSE: &str = "I wasn't able to process that. Could you try rephrasing?";
 const DECOMPOSE_TOOL_NAME: &str = "decompose";
@@ -666,15 +667,100 @@ impl LoopEngine {
             self.tool_executor.tool_definitions(),
             self.memory_context.as_deref(),
         );
+        let reasoning_messages = request.messages.clone();
         let started = current_time_ms();
         let response = llm
             .complete(request)
             .await
             .map_err(|error| loop_error("reason", &format!("completion failed: {error}"), true))?;
+        let response = self
+            .continue_truncated_response(response, &reasoning_messages, llm, LoopStep::Reason)
+            .await?;
         let latency_ms = current_time_ms().saturating_sub(started);
         let usage = response.usage;
         self.emit_reason_trace_and_perf(latency_ms, usage.as_ref());
         Ok(response)
+    }
+
+    fn emit_continuation_trace(&mut self, step: LoopStep, attempt: u32) {
+        self.emit_signal(
+            step,
+            SignalKind::Trace,
+            format!("response truncated, continuing ({attempt}/{MAX_CONTINUATION_ATTEMPTS})"),
+            serde_json::json!({"attempt": attempt}),
+        );
+    }
+
+    fn ensure_continuation_budget(
+        &self,
+        continuation_messages: &[Message],
+        step: LoopStep,
+    ) -> Result<(), LoopError> {
+        let cost = continuation_budget_cost_estimate(continuation_messages);
+        self.budget
+            .check_at(current_time_ms(), &cost)
+            .map_err(|_| loop_error(step_stage(step), "continuation budget exhausted", true))
+    }
+
+    fn record_continuation_budget(
+        &mut self,
+        response: &CompletionResponse,
+        continuation_messages: &[Message],
+    ) {
+        let cost = continuation_budget_cost(response, continuation_messages);
+        self.budget.record(&cost);
+    }
+
+    async fn request_truncated_continuation(
+        &mut self,
+        llm: &dyn LlmProvider,
+        continuation_messages: &[Message],
+        step: LoopStep,
+    ) -> Result<CompletionResponse, LoopError> {
+        self.ensure_continuation_budget(continuation_messages, step)?;
+        let request = build_truncation_continuation_request(
+            llm.model_name(),
+            continuation_messages,
+            self.tool_executor.tool_definitions(),
+            self.memory_context.as_deref(),
+            step,
+        );
+        let request_messages = request.messages.clone();
+        let stage = step_stage(step);
+        let response = llm.complete(request).await.map_err(|error| {
+            loop_error(
+                stage,
+                &format!("continuation completion failed: {error}"),
+                true,
+            )
+        })?;
+        self.record_continuation_budget(&response, &request_messages);
+        Ok(response)
+    }
+
+    async fn continue_truncated_response(
+        &mut self,
+        initial_response: CompletionResponse,
+        base_messages: &[Message],
+        llm: &dyn LlmProvider,
+        step: LoopStep,
+    ) -> Result<CompletionResponse, LoopError> {
+        let mut attempts = 0;
+        let mut full_text = extract_response_text(&initial_response);
+        let mut combined = initial_response;
+
+        while is_truncated(combined.stop_reason.as_deref()) && attempts < MAX_CONTINUATION_ATTEMPTS
+        {
+            attempts = attempts.saturating_add(1);
+            self.emit_continuation_trace(step, attempts);
+            let continuation_messages = build_continuation_messages(base_messages, &full_text);
+            let continued = self
+                .request_truncated_continuation(llm, &continuation_messages, step)
+                .await?;
+            combined = merge_continuation_response(combined, continued, &mut full_text);
+        }
+
+        Ok(combined)
     }
 
     /// Decide step.
@@ -1337,6 +1423,15 @@ impl LoopEngine {
                         state.current_calls = response.tool_calls;
                         continue;
                     }
+
+                    let response = self
+                        .continue_truncated_response(
+                            response,
+                            &state.continuation_messages,
+                            llm,
+                            LoopStep::Act,
+                        )
+                        .await?;
 
                     return Ok(self.finalize_tool_response(
                         decision,
@@ -2040,6 +2135,169 @@ fn build_continuation_request(
         max_tokens: Some(REASONING_MAX_OUTPUT_TOKENS),
         system_prompt: Some(system_prompt),
     }
+}
+
+fn build_truncation_continuation_request(
+    model: &str,
+    continuation_messages: &[Message],
+    tool_definitions: Vec<ToolDefinition>,
+    memory_context: Option<&str>,
+    step: LoopStep,
+) -> CompletionRequest {
+    let tools = tool_definitions_with_decompose(tool_definitions);
+    let system_prompt = build_reasoning_system_prompt(&tools, memory_context);
+    CompletionRequest {
+        model: model.to_string(),
+        messages: continuation_messages.to_vec(),
+        tools: continuation_tools_for_step(step, tools),
+        temperature: Some(REASONING_TEMPERATURE),
+        max_tokens: Some(REASONING_MAX_OUTPUT_TOKENS),
+        system_prompt: Some(system_prompt),
+    }
+}
+
+fn continuation_tools_for_step(step: LoopStep, tools: Vec<ToolDefinition>) -> Vec<ToolDefinition> {
+    match step {
+        LoopStep::Reason => tools,
+        _ => Vec::new(),
+    }
+}
+
+fn build_continuation_messages(base_messages: &[Message], full_text: &str) -> Vec<Message> {
+    let mut continuation_messages = base_messages.to_vec();
+    continuation_messages.push(Message::assistant(full_text.to_string()));
+    continuation_messages.push(Message::user(
+        "Continue from exactly where you left off. Do not repeat prior text.",
+    ));
+    continuation_messages
+}
+
+fn step_stage(step: LoopStep) -> &'static str {
+    match step {
+        LoopStep::Reason => "reason",
+        LoopStep::Act => "act",
+        _ => "act",
+    }
+}
+
+fn continuation_budget_cost_estimate(messages: &[Message]) -> ActionCost {
+    let input_tokens = messages
+        .iter()
+        .map(message_to_text)
+        .map(|text| estimate_tokens(&text))
+        .sum::<u64>();
+
+    ActionCost {
+        llm_calls: 1,
+        tool_invocations: 0,
+        tokens: input_tokens.saturating_add(REASONING_OUTPUT_TOKEN_HEURISTIC),
+        cost_cents: DEFAULT_LLM_ACTION_COST_CENTS,
+    }
+}
+
+fn continuation_budget_cost(
+    response: &CompletionResponse,
+    continuation_messages: &[Message],
+) -> ActionCost {
+    let usage = response_usage_or_estimate(response, continuation_messages);
+    ActionCost {
+        llm_calls: 1,
+        tool_invocations: 0,
+        tokens: usage.total_tokens(),
+        cost_cents: DEFAULT_LLM_ACTION_COST_CENTS,
+    }
+}
+
+fn merge_continuation_response(
+    previous: CompletionResponse,
+    continued: CompletionResponse,
+    full_text: &mut String,
+) -> CompletionResponse {
+    let new_text = extract_response_text(&continued);
+    let deduped = trim_duplicate_seam(full_text, &new_text, 120, 80);
+    full_text.push_str(&deduped);
+
+    CompletionResponse {
+        content: vec![ContentBlock::Text {
+            text: full_text.clone(),
+        }],
+        tool_calls: merge_tool_calls(previous.tool_calls, continued.tool_calls),
+        usage: merge_usage(previous.usage, continued.usage),
+        stop_reason: continued.stop_reason,
+    }
+}
+
+fn merge_tool_calls(previous: Vec<ToolCall>, continued: Vec<ToolCall>) -> Vec<ToolCall> {
+    let mut merged = previous;
+    for call in continued {
+        if !tool_call_exists(&merged, &call) {
+            merged.push(call);
+        }
+    }
+    merged
+}
+
+fn tool_call_exists(existing: &[ToolCall], candidate: &ToolCall) -> bool {
+    if !candidate.id.trim().is_empty() {
+        return existing.iter().any(|call| call.id == candidate.id);
+    }
+
+    existing.iter().any(|call| {
+        call.id.trim().is_empty()
+            && call.name == candidate.name
+            && call.arguments == candidate.arguments
+    })
+}
+
+fn is_truncated(stop_reason: Option<&str>) -> bool {
+    matches!(
+        stop_reason.map(|s| s.to_ascii_lowercase()).as_deref(),
+        Some("max_tokens" | "length" | "incomplete")
+    )
+}
+
+fn merge_usage(left: Option<Usage>, right: Option<Usage>) -> Option<Usage> {
+    if left.is_none() && right.is_none() {
+        return None;
+    }
+
+    let left_in = left.as_ref().map(|u| u.input_tokens).unwrap_or(0);
+    let left_out = left.as_ref().map(|u| u.output_tokens).unwrap_or(0);
+    let right_in = right.as_ref().map(|u| u.input_tokens).unwrap_or(0);
+    let right_out = right.as_ref().map(|u| u.output_tokens).unwrap_or(0);
+
+    Some(Usage {
+        input_tokens: left_in.saturating_add(right_in),
+        output_tokens: left_out.saturating_add(right_out),
+    })
+}
+
+fn trim_duplicate_seam(
+    full_text: &str,
+    new_text: &str,
+    overlap_window: usize,
+    min_overlap: usize,
+) -> String {
+    if full_text.is_empty() || new_text.is_empty() {
+        return new_text.to_string();
+    }
+
+    let full_chars = full_text.chars().collect::<Vec<_>>();
+    let new_chars = new_text.chars().collect::<Vec<_>>();
+    let max_overlap = overlap_window.min(full_chars.len()).min(new_chars.len());
+    if max_overlap < min_overlap {
+        return new_text.to_string();
+    }
+
+    for overlap in (min_overlap..=max_overlap).rev() {
+        let full_suffix = &full_chars[full_chars.len() - overlap..];
+        let new_prefix = &new_chars[..overlap];
+        if full_suffix == new_prefix {
+            return new_chars[overlap..].iter().collect();
+        }
+    }
+
+    new_text.to_string()
 }
 
 fn response_usage_or_estimate(
@@ -2865,7 +3123,7 @@ mod phase2_tests {
 
     fn test_engine() -> LoopEngine {
         LoopEngine::new(
-            BudgetTracker::new(crate::budget::BudgetConfig::default(), 0, 0),
+            BudgetTracker::new(crate::budget::BudgetConfig::default(), current_time_ms(), 0),
             ContextCompactor::new(2048, 256),
             3,
             Arc::new(StubToolExecutor),
@@ -2875,7 +3133,7 @@ mod phase2_tests {
 
     fn failing_tool_engine() -> LoopEngine {
         LoopEngine::new(
-            BudgetTracker::new(crate::budget::BudgetConfig::default(), 0, 0),
+            BudgetTracker::new(crate::budget::BudgetConfig::default(), current_time_ms(), 0),
             ContextCompactor::new(2048, 256),
             3,
             Arc::new(FailingToolExecutor),
@@ -2901,6 +3159,119 @@ mod phase2_tests {
             }),
             sensor_data: None,
             conversation_history: vec![Message::user(text)],
+        }
+    }
+
+    fn text_response(
+        text: &str,
+        stop_reason: Option<&str>,
+        usage: Option<fx_llm::Usage>,
+    ) -> CompletionResponse {
+        CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage,
+            stop_reason: stop_reason.map(|value| value.to_string()),
+        }
+    }
+
+    fn tool_call_response(
+        id: &str,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> CompletionResponse {
+        CompletionResponse {
+            content: Vec::new(),
+            tool_calls: vec![ToolCall {
+                id: id.to_string(),
+                name: name.to_string(),
+                arguments,
+            }],
+            usage: None,
+            stop_reason: Some("tool_use".to_string()),
+        }
+    }
+
+    fn expect_complete(result: LoopResult) -> (String, u32, Vec<Signal>) {
+        match result {
+            LoopResult::Complete {
+                response,
+                iterations,
+                signals,
+                ..
+            } => (response, iterations, signals),
+            other => panic!("expected LoopResult::Complete, got: {other:?}"),
+        }
+    }
+
+    fn has_truncation_trace(signals: &[Signal], step: LoopStep) -> bool {
+        signals.iter().any(|signal| {
+            signal.step == step
+                && signal.kind == SignalKind::Trace
+                && signal.message.starts_with("response truncated, continuing")
+        })
+    }
+
+    #[derive(Debug)]
+    struct StreamingCaptureLlm {
+        streamed_max_tokens: Mutex<Vec<u32>>,
+        complete_calls: Mutex<u32>,
+        output: String,
+    }
+
+    impl StreamingCaptureLlm {
+        fn new(output: &str) -> Self {
+            Self {
+                streamed_max_tokens: Mutex::new(Vec::new()),
+                complete_calls: Mutex::new(0),
+                output: output.to_string(),
+            }
+        }
+
+        fn streamed_max_tokens(&self) -> Vec<u32> {
+            self.streamed_max_tokens.lock().expect("lock").clone()
+        }
+
+        fn complete_calls(&self) -> u32 {
+            *self.complete_calls.lock().expect("lock")
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for StreamingCaptureLlm {
+        async fn generate(&self, _: &str, _: u32) -> Result<String, CoreLlmError> {
+            Ok(self.output.clone())
+        }
+
+        async fn generate_streaming(
+            &self,
+            _: &str,
+            max_tokens: u32,
+            callback: Box<dyn Fn(String) + Send + 'static>,
+        ) -> Result<String, CoreLlmError> {
+            self.streamed_max_tokens
+                .lock()
+                .expect("lock")
+                .push(max_tokens);
+            callback(self.output.clone());
+            Ok(self.output.clone())
+        }
+
+        fn model_name(&self) -> &str {
+            "stream-capture"
+        }
+
+        async fn complete(
+            &self,
+            _: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            let mut calls = self.complete_calls.lock().expect("lock");
+            *calls = calls.saturating_add(1);
+            Err(ProviderError::Provider(
+                "complete should not be called".to_string(),
+            ))
         }
     }
 
@@ -3405,6 +3776,392 @@ mod phase2_tests {
                 && signal.kind == SignalKind::Trace
                 && signal.message == "tool continuation returned empty text; using safe fallback"
         }));
+    }
+
+    #[test]
+    fn is_truncated_detects_anthropic_stop_reason() {
+        assert!(is_truncated(Some("max_tokens")));
+        assert!(is_truncated(Some("MAX_TOKENS")));
+    }
+
+    #[test]
+    fn is_truncated_detects_openai_finish_reason() {
+        assert!(is_truncated(Some("length")));
+        assert!(is_truncated(Some("LENGTH")));
+    }
+
+    #[test]
+    fn is_truncated_handles_none_and_unknown() {
+        assert!(!is_truncated(None));
+        assert!(!is_truncated(Some("stop")));
+        assert!(!is_truncated(Some("tool_use")));
+    }
+
+    #[test]
+    fn merge_usage_combines_token_counts() {
+        let merged = merge_usage(
+            Some(fx_llm::Usage {
+                input_tokens: 100,
+                output_tokens: 25,
+            }),
+            Some(fx_llm::Usage {
+                input_tokens: 30,
+                output_tokens: 10,
+            }),
+        )
+        .expect("usage should merge");
+        assert_eq!(merged.input_tokens, 130);
+        assert_eq!(merged.output_tokens, 35);
+
+        let right_only = merge_usage(
+            None,
+            Some(fx_llm::Usage {
+                input_tokens: 7,
+                output_tokens: 3,
+            }),
+        )
+        .expect("right usage should be preserved");
+        assert_eq!(right_only.input_tokens, 7);
+        assert_eq!(right_only.output_tokens, 3);
+
+        assert!(merge_usage(None, None).is_none());
+    }
+
+    #[test]
+    fn merge_continuation_response_preserves_tool_calls_when_continuation_has_none() {
+        let previous = CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "preface".to_string(),
+            }],
+            tool_calls: vec![ToolCall {
+                id: "call-1".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path":"README.md"}),
+            }],
+            usage: None,
+            stop_reason: Some("max_tokens".to_string()),
+        };
+        let continued = text_response(" continuation", Some("stop"), None);
+        let mut full_text = "preface".to_string();
+
+        let merged = merge_continuation_response(previous, continued, &mut full_text);
+
+        assert_eq!(merged.tool_calls.len(), 1);
+        assert_eq!(merged.tool_calls[0].id, "call-1");
+    }
+
+    #[test]
+    fn build_truncation_continuation_request_enables_tools_only_for_reason_step() {
+        let tool_definitions = vec![ToolDefinition {
+            name: "read_file".to_string(),
+            description: "Read a file".to_string(),
+            parameters: serde_json::json!({"type":"object"}),
+        }];
+        let messages = vec![Message::user("continue")];
+
+        let reason_request = build_truncation_continuation_request(
+            "mock",
+            &messages,
+            tool_definitions.clone(),
+            None,
+            LoopStep::Reason,
+        );
+        let act_request = build_truncation_continuation_request(
+            "mock",
+            &messages,
+            tool_definitions,
+            None,
+            LoopStep::Act,
+        );
+
+        assert!(reason_request
+            .tools
+            .iter()
+            .any(|tool| tool.name == "read_file"));
+        assert!(act_request.tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn continue_truncated_response_stitches_text() {
+        let mut engine = test_engine();
+        let initial = text_response(
+            "Hello",
+            Some("max_tokens"),
+            Some(fx_llm::Usage {
+                input_tokens: 10,
+                output_tokens: 4,
+            }),
+        );
+        let llm = SequentialMockLlm::new(vec![text_response(
+            " world",
+            Some("stop"),
+            Some(fx_llm::Usage {
+                input_tokens: 3,
+                output_tokens: 2,
+            }),
+        )]);
+
+        let stitched = engine
+            .continue_truncated_response(initial, &[Message::user("hello")], &llm, LoopStep::Reason)
+            .await
+            .expect("continuation should succeed");
+
+        assert_eq!(extract_response_text(&stitched), "Hello world");
+        assert_eq!(stitched.stop_reason.as_deref(), Some("stop"));
+        let usage = stitched.usage.expect("usage should be merged");
+        assert_eq!(usage.input_tokens, 13);
+        assert_eq!(usage.output_tokens, 6);
+    }
+
+    #[tokio::test]
+    async fn continue_truncated_response_respects_max_attempts() {
+        let mut engine = test_engine();
+        let initial = text_response("A", Some("max_tokens"), None);
+        let llm = SequentialMockLlm::new(vec![
+            text_response("B", Some("max_tokens"), None),
+            text_response("C", Some("max_tokens"), None),
+            text_response("D", Some("max_tokens"), None),
+        ]);
+
+        let stitched = engine
+            .continue_truncated_response(
+                initial,
+                &[Message::user("continue")],
+                &llm,
+                LoopStep::Reason,
+            )
+            .await
+            .expect("continuation should stop at max attempts");
+
+        assert_eq!(extract_response_text(&stitched), "ABCD");
+        assert_eq!(stitched.stop_reason.as_deref(), Some("max_tokens"));
+    }
+
+    #[tokio::test]
+    async fn continue_truncated_response_stops_on_natural_end() {
+        let mut engine = test_engine();
+        let initial = text_response("A", Some("max_tokens"), None);
+        let llm = SequentialMockLlm::new(vec![
+            text_response("B", Some("stop"), None),
+            text_response("C", Some("max_tokens"), None),
+        ]);
+
+        let stitched = engine
+            .continue_truncated_response(
+                initial,
+                &[Message::user("continue")],
+                &llm,
+                LoopStep::Reason,
+            )
+            .await
+            .expect("continuation should stop when natural stop reason arrives");
+
+        assert_eq!(extract_response_text(&stitched), "AB");
+        assert_eq!(stitched.stop_reason.as_deref(), Some("stop"));
+    }
+
+    #[tokio::test]
+    async fn run_cycle_auto_continues_truncated_response() {
+        let mut engine = test_engine();
+        let llm = SequentialMockLlm::new(vec![
+            text_response("First half", Some("max_tokens"), None),
+            text_response(" second half", Some("stop"), None),
+        ]);
+
+        let result = engine
+            .run_cycle(test_snapshot("finish your sentence"), &llm)
+            .await
+            .expect("run_cycle should succeed");
+        let (response, iterations, _) = expect_complete(result);
+
+        assert_eq!(iterations, 1);
+        assert_eq!(response, "First half second half");
+    }
+
+    #[tokio::test]
+    async fn tool_continuation_auto_continues_truncated_response() {
+        let mut engine = test_engine();
+        let llm = SequentialMockLlm::new(vec![
+            tool_call_response(
+                "call-1",
+                "read_file",
+                serde_json::json!({"path":"README.md"}),
+            ),
+            text_response("Tool answer part", Some("length"), None),
+            text_response(" two", Some("stop"), None),
+        ]);
+
+        let result = engine
+            .run_cycle(test_snapshot("read the file"), &llm)
+            .await
+            .expect("run_cycle should succeed");
+        let (response, iterations, _) = expect_complete(result);
+
+        assert_eq!(iterations, 1);
+        assert_eq!(response, "Tool answer part two");
+    }
+
+    #[tokio::test]
+    async fn reason_truncation_continuation_preserves_initial_tool_calls() {
+        let mut engine = test_engine();
+        let llm = SequentialMockLlm::new(vec![
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "I will read the file".to_string(),
+                }],
+                tool_calls: vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path":"README.md"}),
+                }],
+                usage: None,
+                stop_reason: Some("max_tokens".to_string()),
+            },
+            text_response(" and summarize it", Some("stop"), None),
+            text_response("tool executed", Some("stop"), None),
+        ]);
+
+        let result = engine
+            .run_cycle(test_snapshot("read the file"), &llm)
+            .await
+            .expect("run_cycle should succeed");
+        let (response, _, signals) = expect_complete(result);
+
+        assert_eq!(response, "tool executed");
+        assert!(has_truncation_trace(&signals, LoopStep::Reason));
+        assert!(signals.iter().any(|signal| {
+            signal.step == LoopStep::Act
+                && signal.kind == SignalKind::Success
+                && signal.message == "tool read_file"
+        }));
+    }
+
+    #[tokio::test]
+    async fn finalize_tool_response_receives_stitched_text_after_continuation() {
+        let mut engine = test_engine();
+        let overlap = "x".repeat(90);
+        let first = format!("Start {overlap}");
+        let second = format!("{overlap} End");
+        let expected = format!("Start {overlap} End");
+        let llm = SequentialMockLlm::new(vec![
+            tool_call_response(
+                "call-1",
+                "read_file",
+                serde_json::json!({"path":"README.md"}),
+            ),
+            text_response(&first, Some("max_tokens"), None),
+            text_response(&second, Some("stop"), None),
+        ]);
+
+        let result = engine
+            .run_cycle(test_snapshot("summarize tool output"), &llm)
+            .await
+            .expect("run_cycle should succeed");
+        let (response, _, _) = expect_complete(result);
+
+        assert_eq!(response, expected);
+    }
+
+    #[tokio::test]
+    async fn truncation_continuation_emits_reason_and_act_trace_signals() {
+        let mut reason_engine = test_engine();
+        let reason_llm = SequentialMockLlm::new(vec![
+            text_response("Reason part", Some("max_tokens"), None),
+            text_response(" complete", Some("stop"), None),
+        ]);
+
+        let reason_result = reason_engine
+            .run_cycle(test_snapshot("reason continuation"), &reason_llm)
+            .await
+            .expect("reason run should succeed");
+        let (_, _, reason_signals) = expect_complete(reason_result);
+        assert!(has_truncation_trace(&reason_signals, LoopStep::Reason));
+
+        let mut act_engine = test_engine();
+        let act_llm = SequentialMockLlm::new(vec![
+            tool_call_response(
+                "call-1",
+                "read_file",
+                serde_json::json!({"path":"README.md"}),
+            ),
+            text_response("Act part", Some("length"), None),
+            text_response(" complete", Some("stop"), None),
+        ]);
+
+        let act_result = act_engine
+            .run_cycle(test_snapshot("act continuation"), &act_llm)
+            .await
+            .expect("act run should succeed");
+        let (_, _, act_signals) = expect_complete(act_result);
+        assert!(has_truncation_trace(&act_signals, LoopStep::Act));
+    }
+
+    #[tokio::test]
+    async fn continuation_calls_record_budget() {
+        let mut baseline_engine = test_engine();
+        let baseline_llm = SequentialMockLlm::new(vec![text_response("done", Some("stop"), None)]);
+        baseline_engine
+            .run_cycle(test_snapshot("baseline"), &baseline_llm)
+            .await
+            .expect("baseline run should succeed");
+        let baseline_calls = baseline_engine.status(current_time_ms()).llm_calls_used;
+
+        let mut continuation_engine = test_engine();
+        let continuation_llm = SequentialMockLlm::new(vec![
+            text_response("first", Some("max_tokens"), None),
+            text_response(" second", Some("stop"), None),
+        ]);
+        continuation_engine
+            .run_cycle(test_snapshot("needs continuation"), &continuation_llm)
+            .await
+            .expect("continuation run should succeed");
+        let continuation_calls = continuation_engine.status(current_time_ms()).llm_calls_used;
+
+        assert_eq!(continuation_calls, baseline_calls.saturating_add(1));
+    }
+
+    #[test]
+    fn raised_max_tokens_constants_are_applied() {
+        assert_eq!(REASONING_MAX_OUTPUT_TOKENS, 4096);
+        assert_eq!(TOOL_SYNTHESIS_MAX_OUTPUT_TOKENS, 1024);
+
+        let perception = ProcessedPerception {
+            user_message: "hello".to_string(),
+            context_window: vec![Message::user("hello")],
+            active_goals: vec!["reply".to_string()],
+            budget_remaining: BudgetRemaining {
+                llm_calls: 8,
+                tool_invocations: 16,
+                tokens: 10_000,
+                cost_cents: 100,
+                wall_time_ms: 1_000,
+            },
+        };
+
+        let reasoning_request = build_reasoning_request(&perception, "mock", vec![], None);
+        let continuation_request =
+            build_continuation_request(&perception.context_window, "mock", vec![], None);
+
+        assert_eq!(reasoning_request.max_tokens, Some(4096));
+        assert_eq!(continuation_request.max_tokens, Some(4096));
+    }
+
+    #[tokio::test]
+    async fn tool_synthesis_uses_raised_token_cap_without_stop_reason_assumptions() {
+        let engine = test_engine();
+        let llm = StreamingCaptureLlm::new("summary from stream");
+
+        let summary = engine
+            .generate_tool_summary("summarize this", &llm)
+            .await
+            .expect("streaming synthesis should succeed");
+
+        assert_eq!(summary, "summary from stream");
+        assert_eq!(
+            llm.streamed_max_tokens(),
+            vec![TOOL_SYNTHESIS_MAX_OUTPUT_TOKENS]
+        );
+        assert_eq!(llm.complete_calls(), 0);
     }
 
     // B2: extract_readable_text unit tests
