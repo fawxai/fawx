@@ -904,10 +904,21 @@ impl LoopEngine {
             let execution = self
                 .run_sub_goal(sub_goal, per_goal_fraction, llm, context_messages)
                 .await;
+            let should_halt = should_halt_sub_goal_sequence(&execution.result);
             self.budget.absorb_child_usage(&execution.budget);
             self.roll_up_sub_goal_signals(&execution.result.signals);
             self.emit_sub_goal_completed(index, total, &execution.result);
             results.push(execution.result);
+
+            if should_halt {
+                self.emit_signal(
+                    LoopStep::Act,
+                    SignalKind::Trace,
+                    "stopping remaining sub-goals after budget exhaustion",
+                    serde_json::json!({"completed_sub_goals": index + 1, "total_sub_goals": total}),
+                );
+                break;
+            }
         }
         results
     }
@@ -1831,6 +1842,10 @@ fn format_sub_goal_outcome(outcome: &SubGoalOutcome) -> String {
         SubGoalOutcome::Failed(message) => format!("failed: {message}"),
         SubGoalOutcome::BudgetExhausted => "budget exhausted".to_string(),
     }
+}
+
+fn should_halt_sub_goal_sequence(result: &SubGoalResult) -> bool {
+    matches!(result.outcome, SubGoalOutcome::BudgetExhausted)
 }
 
 fn find_decompose_tool_call(tool_calls: &[ToolCall]) -> Option<&ToolCall> {
@@ -5987,6 +6002,71 @@ mod decomposition_tests {
         }
     }
 
+    fn decomposition_run_snapshot(text: &str) -> PerceptionSnapshot {
+        PerceptionSnapshot {
+            timestamp_ms: 1,
+            screen: ScreenState {
+                current_app: "terminal".to_string(),
+                elements: Vec::new(),
+                text_content: text.to_string(),
+            },
+            notifications: Vec::new(),
+            active_app: "terminal".to_string(),
+            user_input: Some(UserInput {
+                text: text.to_string(),
+                source: InputSource::Text,
+                timestamp: 1,
+                context_id: None,
+            }),
+            sensor_data: None,
+            conversation_history: vec![Message::user(text)],
+        }
+    }
+
+    fn decompose_plan_response(descriptions: &[&str]) -> CompletionResponse {
+        let sub_goals = descriptions
+            .iter()
+            .map(|description| serde_json::json!({"description": description}))
+            .collect::<Vec<_>>();
+        CompletionResponse {
+            content: Vec::new(),
+            tool_calls: vec![decompose_tool_call(serde_json::json!({
+                "sub_goals": sub_goals,
+                "strategy": "Sequential"
+            }))],
+            usage: None,
+            stop_reason: Some("tool_use".to_string()),
+        }
+    }
+
+    fn signals_from_result(result: &LoopResult) -> &[Signal] {
+        match result {
+            LoopResult::Complete { signals, .. }
+            | LoopResult::BudgetExhausted { signals, .. }
+            | LoopResult::NeedsInput { signals, .. }
+            | LoopResult::UserStopped { signals, .. }
+            | LoopResult::Error { signals, .. } => signals,
+        }
+    }
+
+    async fn run_budget_exhausted_decomposition_cycle() -> (LoopResult, usize) {
+        let mut engine = decomposition_engine(budget_config(4, 6), 0);
+        let llm = ScriptedLlm::new(vec![
+            Ok(decompose_plan_response(&["first", "second", "third"])),
+            Ok(text_response("   ")),
+            Ok(text_response("   ")),
+            Ok(text_response("   ")),
+        ]);
+        let result = engine
+            .run_cycle(
+                decomposition_run_snapshot("break this into sub-goals"),
+                &llm,
+            )
+            .await
+            .expect("run_cycle");
+        (result, llm.complete_calls())
+    }
+
     fn decompose_tool_call(arguments: serde_json::Value) -> ToolCall {
         ToolCall {
             id: "decompose-call".to_string(),
@@ -6124,6 +6204,44 @@ mod decomposition_tests {
         assert!(action
             .response_text
             .contains("budget-limited => budget exhausted"));
+    }
+
+    #[tokio::test]
+    async fn run_cycle_emits_single_budget_exhausted_signal_for_decomposition_path() {
+        let (result, llm_calls) = run_budget_exhausted_decomposition_cycle().await;
+
+        assert!(matches!(&result, LoopResult::Complete { .. }));
+        assert_eq!(llm_calls, 2);
+
+        let blocked_budget_signals = signals_from_result(&result)
+            .iter()
+            .filter(|signal| {
+                signal.kind == SignalKind::Blocked && signal.message == "budget exhausted"
+            })
+            .count();
+        assert_eq!(blocked_budget_signals, 1);
+    }
+
+    #[tokio::test]
+    async fn budget_exhaustion_halts_remaining_sub_goal_retries() {
+        let (result, _llm_calls) = run_budget_exhausted_decomposition_cycle().await;
+
+        let response = match &result {
+            LoopResult::Complete { response, .. } => response,
+            other => panic!("expected LoopResult::Complete, got: {other:?}"),
+        };
+        assert!(response.contains("first => budget exhausted"));
+        assert!(!response.contains("second =>"));
+
+        let progress_signals = signals_from_result(&result)
+            .iter()
+            .filter(|signal| {
+                signal.step == LoopStep::Act
+                    && signal.kind == SignalKind::Trace
+                    && signal.message.starts_with("Sub-goal ")
+            })
+            .count();
+        assert_eq!(progress_signals, 1);
     }
 
     #[tokio::test]
