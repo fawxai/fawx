@@ -63,6 +63,21 @@ impl SkillRegistry {
             .collect()
     }
 
+    /// Return a summary of each registered skill and its tool names.
+    pub fn skill_summaries(&self) -> Vec<(String, Vec<String>)> {
+        self.skills
+            .iter()
+            .map(|skill| {
+                let tools = skill
+                    .tool_definitions()
+                    .into_iter()
+                    .map(|definition| definition.name)
+                    .collect();
+                (skill.name().to_string(), tools)
+            })
+            .collect()
+    }
+
     /// Execute a single tool call by finding the first skill that handles it.
     async fn dispatch_call(
         &self,
@@ -359,6 +374,20 @@ mod tests {
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"http_get"));
         assert!(names.contains(&"http_post"));
+    }
+
+    #[test]
+    fn skill_summaries_returns_skill_names_and_tools() {
+        let mut reg = SkillRegistry::new();
+        reg.register(Box::new(MockSkill::new("fs", &["read_file", "write_file"])));
+        reg.register(Box::new(MockSkill::new("net", &["http_get"])));
+
+        let summaries = reg.skill_summaries();
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].0, "fs");
+        assert_eq!(summaries[0].1, vec!["read_file", "write_file"]);
+        assert_eq!(summaries[1].0, "net");
+        assert_eq!(summaries[1].1, vec!["http_get"]);
     }
 
     #[tokio::test]

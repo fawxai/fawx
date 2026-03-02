@@ -10,7 +10,8 @@ use fx_conversation::{
     ConversationMessage, ConversationStore, TokenUsage as ConversationTokenUsage,
 };
 use fx_core::error::LlmError as CoreLlmError;
-use fx_core::memory::MemoryStore;
+use fx_core::memory::{MemoryProvider, MemoryStore};
+use fx_core::runtime_info::{ConfigSummary, RuntimeInfo, SkillInfo};
 use fx_core::types::{InputSource, ScreenState, UserInput};
 use fx_kernel::act::TokenUsage;
 use fx_kernel::budget::{BudgetConfig, BudgetTracker};
@@ -43,7 +44,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::LazyLock;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Style as SyntectStyle, Theme, ThemeSet};
@@ -699,6 +700,7 @@ pub struct TuiApp {
     config_path: PathBuf,
     max_history: usize,
     memory: Option<SharedMemoryStore>,
+    runtime_info: Arc<RwLock<RuntimeInfo>>,
     /// Shared model ID list for readline tab-completion.
     completer_model_ids: Arc<Mutex<Vec<String>>>,
 }
@@ -710,9 +712,17 @@ impl TuiApp {
         auth_manager: AuthManager,
         router: ModelRouter,
         loop_engine: LoopEngine,
+        runtime_info: Arc<RwLock<RuntimeInfo>>,
         config: FawxConfig,
     ) -> Result<Self, TuiError> {
-        Self::new_with_memory(auth_manager, router, loop_engine, config, None)
+        Self::new_with_memory(
+            auth_manager,
+            router,
+            loop_engine,
+            runtime_info,
+            config,
+            None,
+        )
     }
 
     /// Create a new TUI application with shared memory context support.
@@ -720,6 +730,7 @@ impl TuiApp {
         auth_manager: AuthManager,
         router: ModelRouter,
         loop_engine: LoopEngine,
+        runtime_info: Arc<RwLock<RuntimeInfo>>,
         config: FawxConfig,
         memory: Option<SharedMemoryStore>,
     ) -> Result<Self, TuiError> {
@@ -752,6 +763,7 @@ impl TuiApp {
             config_path: base_data_dir.join("config.toml"),
             max_history,
             memory,
+            runtime_info,
             completer_model_ids: Arc::new(Mutex::new(Vec::new())),
         };
         app.select_first_available_model();
@@ -1152,10 +1164,13 @@ impl TuiApp {
             Err(error) => return Err(error),
         }
 
-        self.router
+        let resolved = self
+            .router
             .active_model()
             .map(ToString::to_string)
-            .ok_or(RouterError::NoActiveModel)
+            .ok_or(RouterError::NoActiveModel)?;
+        self.sync_runtime_info_model();
+        Ok(resolved)
     }
 
     async fn set_active_model_with_refresh(
@@ -1169,6 +1184,19 @@ impl TuiApp {
                     return Err(initial_error);
                 }
                 self.set_active_model_from_selector(selector)
+            }
+        }
+    }
+
+    fn sync_runtime_info_model(&self) {
+        let (active_model, provider) = runtime_model_state(&self.router);
+        match self.runtime_info.write() {
+            Ok(mut info) => {
+                info.active_model = active_model;
+                info.provider = provider;
+            }
+            Err(error) => {
+                eprintln!("warning: runtime info lock poisoned: {error}");
             }
         }
     }
@@ -1401,14 +1429,15 @@ impl TuiApp {
     }
 
     fn select_first_available_model(&mut self) {
-        if let Some(saved) = self.config.model.default_model.as_deref() {
-            if self.router.set_active(saved).is_ok() {
+        if let Some(saved) = self.config.model.default_model.clone() {
+            if self.set_active_model_from_selector(&saved).is_ok() {
                 return;
             }
             eprintln!("Saved model '{saved}' no longer available, selecting default");
         }
 
         if self.router.active_model().is_some() {
+            self.sync_runtime_info_model();
             return;
         }
 
@@ -1420,15 +1449,18 @@ impl TuiApp {
             .collect::<Vec<_>>();
 
         if let Some(model) = preferred_default_model(&model_ids) {
-            if let Err(error) = self.router.set_active(model) {
+            if let Err(error) = self.set_active_model_from_selector(model) {
                 eprintln!("failed to set initial model {model}: {error}");
             }
         }
+
+        // Sync even if no model matched — clear stale state
+        self.sync_runtime_info_model();
     }
 
     fn set_preferred_model(&mut self, candidates: &[String]) {
         for candidate in candidates {
-            if self.router.set_active(candidate).is_ok() {
+            if self.set_active_model_from_selector(candidate).is_ok() {
                 return;
             }
         }
@@ -1472,6 +1504,7 @@ impl TuiApp {
 
         self.router = refreshed;
         self.sync_completer_model_ids();
+        self.sync_runtime_info_model();
         Ok(())
     }
 
@@ -1673,6 +1706,26 @@ impl TuiApp {
     }
 }
 
+fn runtime_model_state(router: &ModelRouter) -> (String, String) {
+    let Some(active_model) = router.active_model().map(ToString::to_string) else {
+        return (String::new(), String::new());
+    };
+
+    let provider = router
+        .available_models()
+        .into_iter()
+        .find_map(|model| {
+            if model.model_id == active_model {
+                Some(model.provider_name)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
+
+    (active_model, provider)
+}
+
 /// Load the user config from ~/.fawx/config.toml (or return defaults).
 pub fn load_config() -> Result<FawxConfig, TuiError> {
     let base_data_dir = fawx_data_dir();
@@ -1683,17 +1736,27 @@ pub fn load_config() -> Result<FawxConfig, TuiError> {
 /// Convenience wrapper used by tests.
 #[cfg(test)]
 fn build_loop_engine() -> LoopEngine {
+    build_loop_engine_bundle().0
+}
+
+#[cfg(test)]
+fn build_loop_engine_bundle() -> (LoopEngine, Arc<RwLock<RuntimeInfo>>) {
     let config = load_config().unwrap_or_else(|error| {
         eprintln!("warning: failed to load config: {error}");
         FawxConfig::default()
     });
-    build_loop_engine_and_memory_from_config(&config).0
+    let (engine, _memory, runtime_info) = build_loop_engine_from_config(&config);
+    (engine, runtime_info)
 }
 
-/// Build a loop engine and optional shared memory store from config.
-pub fn build_loop_engine_and_memory_from_config(
+/// Build a loop engine from an already-loaded config.
+pub fn build_loop_engine_from_config(
     config: &FawxConfig,
-) -> (LoopEngine, Option<SharedMemoryStore>) {
+) -> (
+    LoopEngine,
+    Option<SharedMemoryStore>,
+    Arc<RwLock<RuntimeInfo>>,
+) {
     let base_data_dir = fawx_data_dir();
     let data_dir = configured_data_dir(&base_data_dir, config);
     build_loop_engine_with_config(data_dir, config.clone())
@@ -1702,69 +1765,125 @@ pub fn build_loop_engine_and_memory_from_config(
 fn build_loop_engine_with_config(
     data_dir: PathBuf,
     config: FawxConfig,
-) -> (LoopEngine, Option<SharedMemoryStore>) {
+) -> (
+    LoopEngine,
+    Option<SharedMemoryStore>,
+    Arc<RwLock<RuntimeInfo>>,
+) {
     let budget = BudgetTracker::new(BudgetConfig::default(), current_time_ms(), 0);
     let context = ContextCompactor::new(DEFAULT_CONTEXT_MAX_TOKENS, DEFAULT_CONTEXT_COMPACT_TARGET);
     let working_dir = configured_working_dir(&config);
-    let (registry, memory) = build_skill_registry(working_dir, &data_dir, &config);
+    let (registry, memory, memory_snapshot, runtime_info) =
+        build_skill_registry(working_dir, &data_dir, &config);
     let synthesis = config
         .model
         .synthesis_instruction
         .clone()
         .unwrap_or_else(|| DEFAULT_SYNTHESIS_INSTRUCTION.to_string());
 
-    let engine = LoopEngine::new(
+    let mut engine = LoopEngine::new(
         budget,
         context,
         config.general.max_iterations,
         std::sync::Arc::new(registry),
         synthesis,
     );
-    (engine, memory)
+    if let Some(snapshot_text) = memory_snapshot {
+        engine.set_memory_context(snapshot_text);
+    }
+    (engine, memory, runtime_info)
 }
 
 fn build_skill_registry(
     working_dir: PathBuf,
     data_dir: &Path,
     config: &FawxConfig,
-) -> (SkillRegistry, Option<SharedMemoryStore>) {
+) -> (
+    SkillRegistry,
+    Option<SharedMemoryStore>,
+    Option<String>,
+    Arc<RwLock<RuntimeInfo>>,
+) {
     let tool_config = ToolConfig {
         max_read_size: config.tools.max_read_size,
         search_exclude: config.tools.search_exclude.clone(),
         ..ToolConfig::default()
     };
-    let mut executor = FawxToolExecutor::new(working_dir.clone(), tool_config);
-    let memory = initialize_memory(data_dir, config);
-    if let Some(memory_store) = memory.as_ref() {
-        executor = executor.with_memory(Arc::clone(memory_store));
-    }
+    let executor = FawxToolExecutor::new(working_dir.clone(), tool_config);
+    let (mut executor, memory, snapshot_text, memory_enabled) =
+        attach_memory(executor, data_dir, config);
 
     let self_modify_config = crate::config_bridge::to_core_self_modify(&config.self_modify);
     let sm = self_modify_config.enabled.then_some(self_modify_config);
     if let Some(ref smc) = sm {
         executor = executor.with_self_modify(smc.clone());
     }
+
+    let runtime_info = new_runtime_info(config, memory_enabled);
+    executor = executor.with_runtime_info(Arc::clone(&runtime_info));
+
     let mut registry = SkillRegistry::new();
     registry.register(Box::new(BuiltinToolsSkill::new(executor)));
     let git_skill = GitSkill::new(working_dir.clone(), sm);
     registry.register(Box::new(git_skill));
-    (registry, memory)
+    apply_skill_summaries(&runtime_info, &registry);
+
+    (registry, memory, snapshot_text, runtime_info)
 }
 
-fn initialize_memory(data_dir: &Path, config: &FawxConfig) -> Option<SharedMemoryStore> {
+fn attach_memory(
+    mut executor: FawxToolExecutor,
+    data_dir: &Path,
+    config: &FawxConfig,
+) -> (
+    FawxToolExecutor,
+    Option<SharedMemoryStore>,
+    Option<String>,
+    bool,
+) {
     let memory_config = JsonMemoryConfig {
         max_entries: config.memory.max_entries,
         max_value_size: config.memory.max_value_size,
     };
     match JsonFileMemory::new_with_config(data_dir, memory_config) {
         Ok(memory_store) => {
+            let snapshot = memory_store.snapshot();
+            let text = format_memory_for_prompt(&snapshot, config.memory.max_snapshot_chars);
             let memory: SharedMemoryStore = Arc::new(Mutex::new(memory_store));
-            Some(memory)
+            executor = executor.with_memory(Arc::clone(&memory));
+            (executor, Some(memory), text, true)
         }
         Err(error) => {
             eprintln!("warning: failed to initialize memory: {error}");
-            None
+            (executor, None, None, false)
         }
+    }
+}
+
+fn new_runtime_info(config: &FawxConfig, memory_enabled: bool) -> Arc<RwLock<RuntimeInfo>> {
+    Arc::new(RwLock::new(RuntimeInfo {
+        active_model: String::new(),
+        provider: String::new(),
+        skills: Vec::new(),
+        config_summary: ConfigSummary {
+            max_iterations: config.general.max_iterations,
+            max_history: config.general.max_history,
+            memory_enabled,
+        },
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    }))
+}
+
+fn apply_skill_summaries(runtime_info: &Arc<RwLock<RuntimeInfo>>, registry: &SkillRegistry) {
+    let skills = registry
+        .skill_summaries()
+        .into_iter()
+        .map(|(name, tool_names)| SkillInfo { name, tool_names })
+        .collect::<Vec<_>>();
+
+    match runtime_info.write() {
+        Ok(mut info) => info.skills = skills,
+        Err(error) => eprintln!("warning: runtime info lock poisoned: {error}"),
     }
 }
 
@@ -3267,11 +3386,17 @@ mod tests {
         }
     }
 
+    fn test_engine_and_runtime_info() -> (LoopEngine, Arc<RwLock<RuntimeInfo>>) {
+        build_loop_engine_bundle()
+    }
+
     fn new_test_app() -> TuiApp {
+        let (loop_engine, runtime_info) = test_engine_and_runtime_info();
         TuiApp::new(
             AuthManager::new(),
             ModelRouter::new(),
-            build_loop_engine(),
+            loop_engine,
+            runtime_info,
             FawxConfig::default(),
         )
         .expect("new test app")
@@ -3659,10 +3784,12 @@ mod tests {
             .set_active("mock-loop-model")
             .expect("set active mock model");
 
+        let (loop_engine, runtime_info) = test_engine_and_runtime_info();
         TuiApp::new(
             test_provider_auth_manager(),
             router,
-            build_loop_engine(),
+            loop_engine,
+            runtime_info,
             FawxConfig::default(),
         )
         .expect("mock app")
@@ -3696,10 +3823,12 @@ mod tests {
             .set_active("gpt-5-mini")
             .expect("set initial active model");
 
+        let (loop_engine, runtime_info) = test_engine_and_runtime_info();
         TuiApp::new(
             test_provider_auth_manager(),
             router,
-            build_loop_engine(),
+            loop_engine,
+            runtime_info,
             FawxConfig::default(),
         )
         .expect("mock app")
@@ -4786,10 +4915,12 @@ mod tests {
 
     #[tokio::test]
     async fn run_exits_immediately_when_not_running() {
+        let (loop_engine, runtime_info) = test_engine_and_runtime_info();
         let mut app = TuiApp::new(
             test_auth_manager(),
             ModelRouter::new(),
-            build_loop_engine(),
+            loop_engine,
+            runtime_info,
             FawxConfig::default(),
         )
         .expect("app");
@@ -4843,10 +4974,12 @@ mod tests {
         let mut config = FawxConfig::default();
         config.model.default_model = Some("claude-sonnet-4-6-20250929".to_string());
 
+        let (loop_engine, runtime_info) = test_engine_and_runtime_info();
         let app = TuiApp::new(
             test_provider_auth_manager(),
             router,
-            build_loop_engine(),
+            loop_engine,
+            runtime_info,
             config,
         )
         .expect("mock app");
@@ -4873,10 +5006,12 @@ mod tests {
         let home = temp_home.path().to_string_lossy().to_string();
         let _home_env = ScopedEnvVar::set("HOME", &home);
 
+        let (loop_engine, runtime_info) = test_engine_and_runtime_info();
         let mut app = TuiApp::new(
             AuthManager::new(),
             router_with_canonical_claude_models("claude-sonnet-4-20250514"),
-            build_loop_engine(),
+            loop_engine,
+            runtime_info,
             FawxConfig::default(),
         )
         .expect("mock app");
@@ -4892,10 +5027,12 @@ mod tests {
             Some("claude-opus-4-20250514")
         );
 
+        let (loop_engine, runtime_info) = test_engine_and_runtime_info();
         let restarted = TuiApp::new(
             AuthManager::new(),
             router_with_canonical_claude_models("claude-sonnet-4-20250514"),
-            build_loop_engine(),
+            loop_engine,
+            runtime_info,
             persisted,
         )
         .expect("restarted app");
@@ -4923,10 +5060,12 @@ mod tests {
         let mut config = FawxConfig::default();
         config.model.default_model = Some("claude-retired-0".to_string());
 
+        let (loop_engine, runtime_info) = test_engine_and_runtime_info();
         let app = TuiApp::new(
             test_provider_auth_manager(),
             router,
-            build_loop_engine(),
+            loop_engine,
+            runtime_info,
             config,
         )
         .expect("mock app");
@@ -5076,10 +5215,12 @@ mod tests {
         config.general.data_dir = Some(temp_dir.path().to_path_buf());
         config.general.max_history = 20;
 
+        let (loop_engine, runtime_info) = test_engine_and_runtime_info();
         let app = TuiApp::new(
             AuthManager::new(),
             ModelRouter::new(),
-            build_loop_engine(),
+            loop_engine,
+            runtime_info,
             config,
         )
         .expect("app");

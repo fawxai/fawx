@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use fx_core::memory::MemoryStore;
+use fx_core::runtime_info::RuntimeInfo;
 use fx_core::self_modify::{classify_path, format_tier_violation, SelfModifyConfig};
 use fx_kernel::act::{
     cancelled_result, is_cancelled, timed_out_result, ConcurrencyPolicy, ToolExecutor,
@@ -13,7 +14,7 @@ use std::io::Read;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
 
@@ -28,6 +29,7 @@ pub struct FawxToolExecutor {
     working_dir: PathBuf,
     config: ToolConfig,
     memory: Option<Arc<Mutex<dyn MemoryStore>>>,
+    runtime_info: Option<Arc<RwLock<RuntimeInfo>>>,
     self_modify: Option<SelfModifyConfig>,
     concurrency_policy: ConcurrencyPolicy,
 }
@@ -64,6 +66,7 @@ impl FawxToolExecutor {
             working_dir,
             config,
             memory: None,
+            runtime_info: None,
             self_modify: None,
             concurrency_policy: ConcurrencyPolicy::default(),
         }
@@ -79,6 +82,12 @@ impl FawxToolExecutor {
     /// Attach a persistent memory provider.
     pub fn with_memory(mut self, memory: Arc<Mutex<dyn MemoryStore>>) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    /// Attach runtime self-introspection state.
+    pub fn with_runtime_info(mut self, info: Arc<RwLock<RuntimeInfo>>) -> Self {
+        self.runtime_info = Some(info);
         self
     }
 
@@ -103,6 +112,7 @@ impl FawxToolExecutor {
             "run_command" => self.handle_run_command(&call.arguments).await,
             "search_text" => self.handle_search_text(&call.arguments),
             "current_time" => self.handle_current_time(),
+            "self_info" => self.handle_self_info(&call.arguments),
             "memory_write" => self.handle_memory_write(&call.arguments),
             "memory_read" => self.handle_memory_read(&call.arguments),
             "memory_list" => self.handle_memory_list(),
@@ -262,6 +272,19 @@ impl FawxToolExecutor {
         Ok(format!(
             "iso8601_utc: {iso}\nepoch: {epoch}\nday_of_week: {day_of_week}"
         ))
+    }
+
+    fn handle_self_info(&self, args: &serde_json::Value) -> Result<String, String> {
+        let parsed: SelfInfoArgs = parse_args(args)?;
+        let info_lock = self
+            .runtime_info
+            .as_ref()
+            .ok_or_else(|| "runtime info not configured".to_string())?;
+        let info = info_lock
+            .read()
+            .map_err(|error| format!("failed to read runtime info: {error}"))?;
+        let section = parsed.section.as_deref().unwrap_or("all");
+        serialize_section(&info, section)
     }
 
     fn is_ignored_directory(&self, name: &str) -> bool {
@@ -453,6 +476,34 @@ impl FawxToolExecutor {
     }
 }
 
+fn serialize_section(info: &RuntimeInfo, section: &str) -> Result<String, String> {
+    let value = match section {
+        "model" => serde_json::json!({
+            "model": {
+                "active": &info.active_model,
+                "provider": &info.provider,
+            }
+        }),
+        "skills" => serde_json::json!({"skills": &info.skills}),
+        "config" => serde_json::json!({"config": &info.config_summary}),
+        "all" => serde_json::json!({
+            "model": {
+                "active": &info.active_model,
+                "provider": &info.provider,
+            },
+            "skills": &info.skills,
+            "config": &info.config_summary,
+            "version": &info.version,
+        }),
+        other => {
+            return Err(format!(
+                "unknown section '{other}', valid sections: model, skills, config, all"
+            ));
+        }
+    };
+    serde_json::to_string_pretty(&value).map_err(|error| error.to_string())
+}
+
 #[async_trait]
 impl ToolExecutor for FawxToolExecutor {
     async fn execute_tools(
@@ -623,6 +674,23 @@ pub fn fawx_tool_definitions() -> Vec<ToolDefinition> {
                     "file_glob": { "type": "string" }
                 },
                 "required": ["pattern"]
+            }),
+        },
+        ToolDefinition {
+            name: "self_info".to_string(),
+            description:
+                "Inspect runtime state: active model, loaded skills, configuration, and version"
+                    .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "section": {
+                        "type": "string",
+                        "enum": ["model", "skills", "config", "all"],
+                        "description": "Filter to a specific section. Defaults to 'all'."
+                    }
+                },
+                "required": []
             }),
         },
         ToolDefinition {
@@ -953,6 +1021,11 @@ struct SearchTextArgs {
 }
 
 #[derive(Deserialize)]
+struct SelfInfoArgs {
+    section: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct MemoryWriteArgs {
     key: String,
     value: String,
@@ -976,6 +1049,27 @@ mod tests {
 
     fn test_executor(root: &Path) -> FawxToolExecutor {
         FawxToolExecutor::new(root.to_path_buf(), ToolConfig::default())
+    }
+
+    fn sample_runtime_info(model: &str) -> Arc<RwLock<RuntimeInfo>> {
+        Arc::new(RwLock::new(RuntimeInfo {
+            active_model: model.to_string(),
+            provider: "openai".to_string(),
+            skills: vec![fx_core::runtime_info::SkillInfo {
+                name: "fawx-builtin".to_string(),
+                tool_names: vec!["read_file".to_string(), "self_info".to_string()],
+            }],
+            config_summary: fx_core::runtime_info::ConfigSummary {
+                max_iterations: 6,
+                max_history: 128,
+                memory_enabled: true,
+            },
+            version: "0.1.0".to_string(),
+        }))
+    }
+
+    fn parse_json_output(output: &str) -> serde_json::Value {
+        serde_json::from_str(output).expect("valid json output")
     }
 
     #[test]
@@ -1530,6 +1624,122 @@ mod tests {
     fn current_time_appears_in_definitions() {
         let definitions = fawx_tool_definitions();
         assert!(definitions.iter().any(|tool| tool.name == "current_time"));
+    }
+
+    #[test]
+    fn self_info_returns_all_sections() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path()).with_runtime_info(sample_runtime_info("model-a"));
+
+        let output = executor
+            .handle_self_info(&serde_json::json!({}))
+            .expect("self_info");
+        let parsed = parse_json_output(&output);
+        assert_eq!(parsed["model"]["active"], "model-a");
+        assert_eq!(parsed["model"]["provider"], "openai");
+        assert!(parsed.get("skills").is_some());
+        assert!(parsed.get("config").is_some());
+        assert!(parsed.get("version").is_some());
+    }
+
+    #[test]
+    fn self_info_filters_to_model_section() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path()).with_runtime_info(sample_runtime_info("model-a"));
+
+        let output = executor
+            .handle_self_info(&serde_json::json!({"section": "model"}))
+            .expect("self_info model");
+        let parsed = parse_json_output(&output);
+        let object = parsed.as_object().expect("model section object");
+
+        assert_eq!(object.len(), 1);
+        assert_eq!(parsed["model"]["active"], "model-a");
+        assert_eq!(parsed["model"]["provider"], "openai");
+    }
+
+    #[test]
+    fn self_info_filters_to_skills_section() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path()).with_runtime_info(sample_runtime_info("model-a"));
+
+        let output = executor
+            .handle_self_info(&serde_json::json!({"section": "skills"}))
+            .expect("self_info skills");
+        let parsed = parse_json_output(&output);
+        let object = parsed.as_object().expect("skills section object");
+
+        assert_eq!(object.len(), 1);
+        assert_eq!(parsed["skills"][0]["name"], "fawx-builtin");
+    }
+
+    #[test]
+    fn self_info_filters_to_config_section() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path()).with_runtime_info(sample_runtime_info("model-a"));
+
+        let output = executor
+            .handle_self_info(&serde_json::json!({"section": "config"}))
+            .expect("self_info config");
+        let parsed = parse_json_output(&output);
+        let object = parsed.as_object().expect("config section object");
+
+        assert_eq!(object.len(), 1);
+        assert_eq!(parsed["config"]["max_iterations"], 6);
+        assert!(parsed["config"]["memory_enabled"]
+            .as_bool()
+            .expect("memory_enabled bool"));
+    }
+
+    #[test]
+    fn self_info_reflects_runtime_state_changes() {
+        let temp = TempDir::new().expect("temp");
+        let runtime_info = sample_runtime_info("model-a");
+        let executor = test_executor(temp.path()).with_runtime_info(runtime_info.clone());
+
+        let first = executor
+            .handle_self_info(&serde_json::json!({"section": "model"}))
+            .expect("first self_info");
+        assert_eq!(parse_json_output(&first)["model"]["active"], "model-a");
+
+        {
+            let mut guard = runtime_info.write().expect("runtime info write lock");
+            guard.active_model = "model-b".to_string();
+        }
+
+        let second = executor
+            .handle_self_info(&serde_json::json!({"section": "model"}))
+            .expect("second self_info");
+        assert_eq!(parse_json_output(&second)["model"]["active"], "model-b");
+    }
+
+    #[test]
+    fn self_info_appears_in_tool_definitions() {
+        let definitions = fawx_tool_definitions();
+        assert!(definitions.iter().any(|tool| tool.name == "self_info"));
+    }
+
+    #[test]
+    fn self_info_unknown_section_returns_error() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path()).with_runtime_info(sample_runtime_info("model-a"));
+
+        let error = executor
+            .handle_self_info(&serde_json::json!({"section": "invalid"}))
+            .expect_err("invalid section should fail");
+        assert!(error.contains("unknown section 'invalid'"));
+        assert!(error.contains("valid sections: model, skills, config, all"));
+    }
+
+    #[test]
+    fn self_info_returns_error_when_not_configured() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+
+        let error = executor
+            .handle_self_info(&serde_json::json!({}))
+            .expect_err("missing runtime info should fail");
+        assert_eq!(error, "runtime info not configured");
     }
 
     #[tokio::test]
