@@ -44,4 +44,67 @@ pub enum InternalMessage {
         /// Status message
         message: String,
     },
+
+    /// A sub-goal has started execution within a decomposition plan.
+    SubGoalStarted {
+        /// Zero-based index within the plan.
+        index: usize,
+        /// Total sub-goals in the plan.
+        total: usize,
+        /// Sub-goal description.
+        description: String,
+    },
+
+    /// A sub-goal has finished execution.
+    SubGoalCompleted {
+        /// Zero-based index within the plan.
+        index: usize,
+        /// Total sub-goals in the plan.
+        total: usize,
+        /// Whether the sub-goal succeeded.
+        success: bool,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sub_goal_started_roundtrip_serde() {
+        let msg = InternalMessage::SubGoalStarted {
+            index: 0,
+            total: 3,
+            description: "Summarize findings".to_string(),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let decoded: InternalMessage = serde_json::from_str(&json).expect("deserialize");
+        assert!(matches!(
+            decoded,
+            InternalMessage::SubGoalStarted {
+                index: 0,
+                total: 3,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn sub_goal_completed_roundtrip_serde() {
+        let msg = InternalMessage::SubGoalCompleted {
+            index: 1,
+            total: 2,
+            success: true,
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let decoded: InternalMessage = serde_json::from_str(&json).expect("deserialize");
+        assert!(matches!(
+            decoded,
+            InternalMessage::SubGoalCompleted {
+                index: 1,
+                total: 2,
+                success: true
+            }
+        ));
+    }
 }

@@ -157,6 +157,7 @@ pub struct LoopEngine {
     cancel_token: Option<CancellationToken>,
     input_channel: Option<LoopInputChannel>,
     user_stop_requested: bool,
+    event_bus: Option<fx_core::EventBus>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -294,7 +295,13 @@ impl LoopEngine {
             cancel_token: None,
             input_channel: None,
             user_stop_requested: false,
+            event_bus: None,
         }
+    }
+
+    /// Attach an fx-core event bus for inter-component progress events.
+    pub fn set_event_bus(&mut self, bus: fx_core::EventBus) {
+        self.event_bus = Some(bus);
     }
 
     /// Attach a cancellation token for cooperative cancellation.
@@ -744,19 +751,19 @@ impl LoopEngine {
             self.emit_decomposition_truncation_signal(original_sub_goals, plan.sub_goals.len());
         }
 
-        // Each sub-goal gets up to 50% of the parent's remaining budget
-        // after previous sub-goals' consumption has been rolled up.
-        let per_goal_fraction = 0.5;
-        let mut results = Vec::with_capacity(plan.sub_goals.len());
-        for (index, sub_goal) in plan.sub_goals.iter().enumerate() {
-            self.emit_sub_goal_progress(index, plan.sub_goals.len(), &sub_goal.description);
-            let execution = self
-                .run_sub_goal(sub_goal, per_goal_fraction, llm, context_messages)
-                .await;
-            self.budget.absorb_child_usage(&execution.budget);
-            self.roll_up_sub_goal_signals(&execution.result.signals);
-            results.push(execution.result);
-        }
+        let results = match &plan.strategy {
+            AggregationStrategy::Parallel => {
+                self.execute_sub_goals_concurrent(plan, llm, context_messages)
+                    .await
+            }
+            AggregationStrategy::Sequential => {
+                self.execute_sub_goals_sequential(plan, llm, context_messages)
+                    .await
+            }
+            AggregationStrategy::Custom(s) => {
+                unreachable!("custom strategy '{s}' should be rejected during parsing")
+            }
+        };
 
         Ok(ActionResult {
             decision: decision.clone(),
@@ -764,6 +771,114 @@ impl LoopEngine {
             response_text: aggregate_sub_goal_results(&results),
             tokens_used: TokenUsage::default(),
         })
+    }
+
+    async fn execute_sub_goals_sequential(
+        &mut self,
+        plan: &DecompositionPlan,
+        llm: &dyn LlmProvider,
+        context_messages: &[Message],
+    ) -> Vec<SubGoalResult> {
+        // Each sequential sub-goal gets 50% of the parent's *remaining* budget
+        // after prior sub-goals' consumption. This creates a diminishing series
+        // (50%, 25%, 12.5%, ...) that naturally throttles later sub-goals.
+        let per_goal_fraction = 0.5;
+        let total = plan.sub_goals.len();
+        let mut results = Vec::with_capacity(total);
+        for (index, sub_goal) in plan.sub_goals.iter().enumerate() {
+            self.emit_sub_goal_progress(index, total, &sub_goal.description);
+            let execution = self
+                .run_sub_goal(sub_goal, per_goal_fraction, llm, context_messages)
+                .await;
+            self.budget.absorb_child_usage(&execution.budget);
+            self.roll_up_sub_goal_signals(&execution.result.signals);
+            self.emit_sub_goal_completed(index, total, &execution.result);
+            results.push(execution.result);
+        }
+        results
+    }
+
+    async fn execute_sub_goals_concurrent(
+        &mut self,
+        plan: &DecompositionPlan,
+        llm: &dyn LlmProvider,
+        context_messages: &[Message],
+    ) -> Vec<SubGoalResult> {
+        let count = plan.sub_goals.len().max(1);
+        // Concurrent sub-goals split the budget equally (1/N each) since all
+        // start from the same remaining budget snapshot and can't see each
+        // other's consumption until aggregation.
+        let per_goal_fraction = 1.0 / count as f32;
+        let total = plan.sub_goals.len();
+        for (index, sub_goal) in plan.sub_goals.iter().enumerate() {
+            self.emit_sub_goal_progress(index, total, &sub_goal.description);
+        }
+
+        let child_futures =
+            self.build_concurrent_futures(plan, per_goal_fraction, llm, context_messages);
+        let executions = futures_util::future::join_all(child_futures).await;
+        self.collect_concurrent_results(executions, total)
+    }
+
+    /// Build async futures for each sub-goal in the plan.
+    ///
+    /// Uses `futures_util::join_all` to multiplex all futures on the current
+    /// tokio task (cooperative concurrency). This is ideal for I/O-bound LLM
+    /// calls but does not achieve true thread-level parallelism. We cannot use
+    /// `tokio::JoinSet` because `llm: &dyn LlmProvider` is borrowed (not `'static`).
+    fn build_concurrent_futures<'a>(
+        &self,
+        plan: &'a DecompositionPlan,
+        fraction: f32,
+        llm: &'a dyn LlmProvider,
+        context_messages: &'a [Message],
+    ) -> Vec<impl std::future::Future<Output = SubGoalExecution> + 'a> {
+        plan.sub_goals
+            .iter()
+            .map(|sub_goal| {
+                let ts = current_time_ms();
+                let budget = self.budget.child_tracker(fraction, ts);
+                let mut child = self.build_child_engine(budget);
+                let snap = build_sub_goal_snapshot(sub_goal, context_messages, ts);
+                let goal = sub_goal.clone();
+                async move {
+                    let result = match Box::pin(child.run_cycle(snap, llm)).await {
+                        Ok(r) => sub_goal_result_from_loop(goal, r),
+                        Err(e) => failed_sub_goal_result(goal, e.reason),
+                    };
+                    SubGoalExecution {
+                        result,
+                        budget: child.budget,
+                    }
+                }
+            })
+            .collect()
+    }
+
+    fn collect_concurrent_results(
+        &mut self,
+        executions: Vec<SubGoalExecution>,
+        total: usize,
+    ) -> Vec<SubGoalResult> {
+        let mut results = Vec::with_capacity(total);
+        for (index, execution) in executions.into_iter().enumerate() {
+            self.budget.absorb_child_usage(&execution.budget);
+            self.roll_up_sub_goal_signals(&execution.result.signals);
+            self.emit_sub_goal_completed(index, total, &execution.result);
+            results.push(execution.result);
+        }
+        results
+    }
+
+    fn emit_sub_goal_completed(&self, index: usize, total: usize, result: &SubGoalResult) {
+        let success = matches!(result.outcome, SubGoalOutcome::Completed(_));
+        if let Some(bus) = &self.event_bus {
+            let _ = bus.publish(fx_core::message::InternalMessage::SubGoalCompleted {
+                index,
+                total,
+                success,
+            });
+        }
     }
 
     async fn run_sub_goal(
@@ -804,6 +919,9 @@ impl LoopEngine {
         if let Some(cancel_token) = &self.cancel_token {
             child.set_cancel_token(cancel_token.clone());
         }
+        if let Some(bus) = &self.event_bus {
+            child.set_event_bus(bus.clone());
+        }
 
         child
     }
@@ -838,6 +956,13 @@ impl LoopEngine {
                 "total": total,
             }),
         );
+        if let Some(bus) = &self.event_bus {
+            let _ = bus.publish(fx_core::message::InternalMessage::SubGoalStarted {
+                index,
+                total,
+                description: description.to_string(),
+            });
+        }
     }
 
     fn emit_decomposition_truncation_signal(
@@ -1594,7 +1719,7 @@ fn find_decompose_tool_call(tool_calls: &[ToolCall]) -> Option<&ToolCall> {
 fn parse_decomposition_plan(arguments: &serde_json::Value) -> Result<DecompositionPlan, LoopError> {
     let parsed = parse_decompose_arguments(arguments)?;
     if let Some(strategy) = &parsed.strategy {
-        if *strategy != AggregationStrategy::Sequential {
+        if matches!(strategy, AggregationStrategy::Custom(_)) {
             return Err(loop_error(
                 "decide",
                 &format!("unsupported decomposition strategy: {strategy:?}"),
@@ -4783,6 +4908,7 @@ mod decomposition_tests {
     use super::*;
     use crate::budget::BudgetConfig;
     use async_trait::async_trait;
+    use fx_core::message::InternalMessage;
     use fx_decompose::{AggregationStrategy, DecompositionPlan, SubGoal};
     use fx_llm::{
         CompletionRequest, CompletionResponse, ContentBlock, Message, ProviderError, ToolCall,
@@ -4901,6 +5027,17 @@ mod decomposition_tests {
             strategy: AggregationStrategy::Sequential,
             truncated_from: None,
         }
+    }
+
+    async fn collect_internal_events(
+        receiver: &mut tokio::sync::broadcast::Receiver<InternalMessage>,
+        count: usize,
+    ) -> Vec<InternalMessage> {
+        let mut events = Vec::with_capacity(count);
+        for _ in 0..count {
+            events.push(receiver.recv().await.expect("event"));
+        }
+        events
     }
 
     fn text_response(text: &str) -> CompletionResponse {
@@ -5108,6 +5245,109 @@ mod decomposition_tests {
             serde_json::json!(1)
         );
         assert_eq!(progress_traces[1].metadata["total"], serde_json::json!(2));
+    }
+
+    #[tokio::test]
+    async fn concurrent_execution_rolls_up_signals_from_all_children() {
+        let mut engine = decomposition_engine(budget_config(10, 6), 0);
+        let plan = concurrent_plan(&["signal-a", "signal-b"]);
+        let decision = Decision::Decompose(plan.clone());
+        let llm = ScriptedLlm::new(vec![Ok(text_response("one")), Ok(text_response("two"))]);
+
+        let _action = engine
+            .execute_decomposition(&decision, &plan, &llm, &[])
+            .await
+            .expect("decomposition");
+
+        let perceive_count = engine
+            .signals
+            .signals()
+            .iter()
+            .filter(|signal| signal.step == LoopStep::Perceive)
+            .count();
+        assert!(perceive_count >= 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_execution_emits_progress_events_via_event_bus() {
+        let mut engine = decomposition_engine(budget_config(10, 6), 0);
+        let bus = fx_core::EventBus::new(16);
+        let mut receiver = bus.subscribe();
+        engine.set_event_bus(bus);
+
+        let plan = concurrent_plan(&["first", "second"]);
+        let decision = Decision::Decompose(plan.clone());
+        let llm = ScriptedLlm::new(vec![Ok(text_response("one")), Ok(text_response("two"))]);
+
+        let _action = engine
+            .execute_decomposition(&decision, &plan, &llm, &[])
+            .await
+            .expect("decomposition");
+
+        let events = collect_internal_events(&mut receiver, 4).await;
+        assert!(
+            matches!(&events[0], InternalMessage::SubGoalStarted { index: 0, total: 2, description } if description == "first")
+        );
+        assert!(
+            matches!(&events[1], InternalMessage::SubGoalStarted { index: 1, total: 2, description } if description == "second")
+        );
+        assert!(matches!(
+            events[2],
+            InternalMessage::SubGoalCompleted {
+                index: 0,
+                total: 2,
+                success: true
+            }
+        ));
+        assert!(matches!(
+            events[3],
+            InternalMessage::SubGoalCompleted {
+                index: 1,
+                total: 2,
+                success: true
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn sequential_execution_emits_progress_events_via_event_bus() {
+        let mut engine = decomposition_engine(budget_config(10, 6), 0);
+        let bus = fx_core::EventBus::new(16);
+        let mut receiver = bus.subscribe();
+        engine.set_event_bus(bus);
+
+        let plan = decomposition_plan(&["first", "second"]);
+        let decision = Decision::Decompose(plan.clone());
+        let llm = ScriptedLlm::new(vec![Ok(text_response("one")), Ok(text_response("two"))]);
+
+        let _action = engine
+            .execute_decomposition(&decision, &plan, &llm, &[])
+            .await
+            .expect("decomposition");
+
+        let events = collect_internal_events(&mut receiver, 4).await;
+        assert!(
+            matches!(&events[0], InternalMessage::SubGoalStarted { index: 0, total: 2, description } if description == "first")
+        );
+        assert!(matches!(
+            events[1],
+            InternalMessage::SubGoalCompleted {
+                index: 0,
+                total: 2,
+                success: true
+            }
+        ));
+        assert!(
+            matches!(&events[2], InternalMessage::SubGoalStarted { index: 1, total: 2, description } if description == "second")
+        );
+        assert!(matches!(
+            events[3],
+            InternalMessage::SubGoalCompleted {
+                index: 1,
+                total: 2,
+                success: true
+            }
+        ));
     }
 
     #[tokio::test]
@@ -5354,7 +5594,7 @@ mod decomposition_tests {
             content: Vec::new(),
             tool_calls: vec![decompose_tool_call(serde_json::json!({
                 "sub_goals": [{"description": "Inspect crate configuration"}],
-                "strategy": "Parallel"
+                "strategy": {"Custom": "fan-out"}
             }))],
             usage: None,
             stop_reason: None,
@@ -5365,9 +5605,7 @@ mod decomposition_tests {
             .await
             .expect_err("unsupported strategy");
         assert_eq!(error.stage, "decide");
-        assert!(error
-            .reason
-            .contains("unsupported decomposition strategy: Parallel"));
+        assert!(error.reason.contains("unsupported decomposition strategy"));
     }
 
     #[tokio::test]
@@ -5453,5 +5691,190 @@ mod decomposition_tests {
             }
             other => panic!("expected decomposition decision, got: {other:?}"),
         }
+    }
+
+    fn concurrent_plan(descriptions: &[&str]) -> DecompositionPlan {
+        DecompositionPlan {
+            sub_goals: descriptions
+                .iter()
+                .map(|d| SubGoal {
+                    description: (*d).to_string(),
+                    required_tools: Vec::new(),
+                    expected_output: Some(format!("output for {d}")),
+                })
+                .collect(),
+            strategy: AggregationStrategy::Parallel,
+            truncated_from: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_strategy_accepted_by_decide() {
+        let mut engine = decomposition_engine(budget_config(10, 6), 0);
+        let response = CompletionResponse {
+            content: Vec::new(),
+            tool_calls: vec![decompose_tool_call(serde_json::json!({
+                "sub_goals": [{"description": "Check config"}],
+                "strategy": "Parallel"
+            }))],
+            usage: None,
+            stop_reason: None,
+        };
+        let decision = engine.decide(&response).await.expect("decision");
+        assert!(
+            matches!(decision, Decision::Decompose(p) if p.strategy == AggregationStrategy::Parallel)
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_execution_completes_all_sub_goals() {
+        let mut engine = decomposition_engine(budget_config(20, 6), 0);
+        let plan = concurrent_plan(&["first", "second", "third"]);
+        let decision = Decision::Decompose(plan.clone());
+        let llm = ScriptedLlm::new(vec![
+            Ok(text_response("first-ok")),
+            Ok(text_response("second-ok")),
+            Ok(text_response("third-ok")),
+        ]);
+        let action = engine
+            .execute_decomposition(&decision, &plan, &llm, &[])
+            .await
+            .expect("decomposition");
+        assert!(action
+            .response_text
+            .contains("first => completed: first-ok"));
+        assert!(action
+            .response_text
+            .contains("second => completed: second-ok"));
+        assert!(action
+            .response_text
+            .contains("third => completed: third-ok"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_execution_absorbs_budget_from_all_children() {
+        let mut engine = decomposition_engine(budget_config(20, 6), 0);
+        let plan = concurrent_plan(&["a", "b"]);
+        let decision = Decision::Decompose(plan.clone());
+        let llm = ScriptedLlm::new(vec![
+            Ok(text_response("a-done")),
+            Ok(text_response("b-done")),
+        ]);
+        engine
+            .execute_decomposition(&decision, &plan, &llm, &[])
+            .await
+            .expect("decomposition");
+        let status = engine.status(current_time_ms());
+        assert_eq!(status.llm_calls_used, 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_execution_rolls_up_signals() {
+        let mut engine = decomposition_engine(budget_config(20, 6), 0);
+        let plan = concurrent_plan(&["sig-a", "sig-b"]);
+        let decision = Decision::Decompose(plan.clone());
+        let llm = ScriptedLlm::new(vec![
+            Ok(text_response("a-done")),
+            Ok(text_response("b-done")),
+        ]);
+        engine
+            .execute_decomposition(&decision, &plan, &llm, &[])
+            .await
+            .expect("decomposition");
+        assert!(engine
+            .signals
+            .signals()
+            .iter()
+            .any(|s| s.step == LoopStep::Perceive));
+    }
+
+    #[tokio::test]
+    async fn concurrent_execution_handles_partial_failure() {
+        let mut engine = decomposition_engine(budget_config(20, 6), 0);
+        let plan = concurrent_plan(&["ok-1", "fail", "ok-2"]);
+        let decision = Decision::Decompose(plan.clone());
+        let llm = ScriptedLlm::new(vec![
+            Ok(text_response("ok-1-done")),
+            Err(ProviderError::Provider("boom".to_string())),
+            Ok(text_response("ok-2-done")),
+        ]);
+        let action = engine
+            .execute_decomposition(&decision, &plan, &llm, &[])
+            .await
+            .expect("decomposition");
+        assert!(action
+            .response_text
+            .contains("ok-1 => completed: ok-1-done"));
+        assert!(action.response_text.contains("fail => failed:"));
+        assert!(action
+            .response_text
+            .contains("ok-2 => completed: ok-2-done"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_execution_emits_event_bus_progress() {
+        let mut engine = decomposition_engine(budget_config(20, 6), 0);
+        let bus = fx_core::EventBus::new(32);
+        let mut rx = bus.subscribe();
+        engine.set_event_bus(bus);
+        let plan = concurrent_plan(&["ev-a", "ev-b"]);
+        let decision = Decision::Decompose(plan.clone());
+        let llm = ScriptedLlm::new(vec![Ok(text_response("a")), Ok(text_response("b"))]);
+        engine
+            .execute_decomposition(&decision, &plan, &llm, &[])
+            .await
+            .expect("decomposition");
+        let mut started = 0usize;
+        let mut completed = 0usize;
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                fx_core::message::InternalMessage::SubGoalStarted { .. } => started += 1,
+                fx_core::message::InternalMessage::SubGoalCompleted { .. } => completed += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(started, 2);
+        assert_eq!(completed, 2);
+    }
+
+    #[tokio::test]
+    async fn sequential_execution_emits_event_bus_progress() {
+        let mut engine = decomposition_engine(budget_config(20, 6), 0);
+        let bus = fx_core::EventBus::new(32);
+        let mut rx = bus.subscribe();
+        engine.set_event_bus(bus);
+        let plan = decomposition_plan(&["seq-a", "seq-b"]);
+        let decision = Decision::Decompose(plan.clone());
+        let llm = ScriptedLlm::new(vec![Ok(text_response("a")), Ok(text_response("b"))]);
+        engine
+            .execute_decomposition(&decision, &plan, &llm, &[])
+            .await
+            .expect("decomposition");
+        let mut started = 0usize;
+        let mut completed = 0usize;
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                fx_core::message::InternalMessage::SubGoalStarted { .. } => started += 1,
+                fx_core::message::InternalMessage::SubGoalCompleted { .. } => completed += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(started, 2);
+        assert_eq!(completed, 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_execution_with_empty_plan_returns_empty_results() {
+        let mut engine = decomposition_engine(budget_config(20, 6), 0);
+        let plan = DecompositionPlan {
+            sub_goals: Vec::new(),
+            strategy: AggregationStrategy::Parallel,
+            truncated_from: None,
+        };
+        let llm = ScriptedLlm::new(vec![]);
+
+        let results = engine.execute_sub_goals_concurrent(&plan, &llm, &[]).await;
+
+        assert!(results.is_empty());
     }
 }
