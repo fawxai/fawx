@@ -1,13 +1,14 @@
 use async_trait::async_trait;
 use fx_core::memory::MemoryStore;
 use fx_core::runtime_info::RuntimeInfo;
-use fx_core::self_modify::{classify_path, format_tier_violation, SelfModifyConfig};
+use fx_core::self_modify::{classify_path, format_tier_violation, PathTier, SelfModifyConfig};
 use fx_kernel::act::{
     cancelled_result, is_cancelled, timed_out_result, ConcurrencyPolicy, ToolExecutor,
     ToolExecutorError, ToolResult,
 };
 use fx_kernel::cancellation::CancellationToken;
 use fx_llm::{ToolCall, ToolDefinition};
+use fx_propose::{Proposal, ProposalWriter};
 use serde::Deserialize;
 use std::fs;
 use std::io::Read;
@@ -158,7 +159,26 @@ impl FawxToolExecutor {
             return Err("content exceeds maximum allowed size".to_string());
         }
         let path = self.jailed_path(&parsed.path)?;
-        self.check_self_modify_path(&path)?;
+
+        if let Some(ref sm_config) = self.self_modify {
+            let tier = classify_path(&path, &self.working_dir, sm_config);
+            match tier {
+                PathTier::Deny => {
+                    let message = format_tier_violation(&path, tier).unwrap_or_else(|| {
+                        format!(
+                            "Self-modify policy violation [deny]: {}. This path cannot be modified.",
+                            path.display()
+                        )
+                    });
+                    return Err(message);
+                }
+                PathTier::Propose => {
+                    return self.write_proposal(&path, &parsed.content, sm_config);
+                }
+                PathTier::Allow => {}
+            }
+        }
+
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
@@ -166,15 +186,44 @@ impl FawxToolExecutor {
         Ok(format!("wrote {} bytes to {}", len, path.display()))
     }
 
-    fn check_self_modify_path(&self, path: &Path) -> Result<(), String> {
-        let Some(ref config) = self.self_modify else {
-            return Ok(());
+    fn write_proposal(
+        &self,
+        path: &Path,
+        content: &str,
+        config: &SelfModifyConfig,
+    ) -> Result<String, String> {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| format!("system time error: {e}"))?
+            .as_secs();
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("unknown");
+        let path_exists = path.exists();
+        let action = if path_exists { "replace" } else { "create" };
+        let proposal = Proposal {
+            title: format!("Modify {filename}"),
+            description: format!(
+                "Agent attempted to {} propose-tier path: {} ({} bytes)",
+                action,
+                path.display(),
+                content.len()
+            ),
+            target_path: path.to_path_buf(),
+            proposed_content: build_proposed_content(path, content),
+            risk: "This path is classified as propose-tier under self-modification policy."
+                .to_string(),
+            timestamp,
         };
-        let tier = classify_path(path, &self.working_dir, config);
-        match format_tier_violation(path, tier) {
-            Some(message) => Err(message),
-            None => Ok(()),
-        }
+        let writer = ProposalWriter::new(config.proposals_dir.clone());
+        let proposal_path = writer.write(&proposal).map_err(|error| error.to_string())?;
+        Ok(format!(
+            "Proposal created at {}. The target file '{}' was NOT modified. \
+             A human must review and approve this proposal.",
+            proposal_path.display(),
+            path.display()
+        ))
     }
 
     fn handle_list_directory(&self, args: &serde_json::Value) -> Result<String, String> {
@@ -474,6 +523,22 @@ impl FawxToolExecutor {
 
         collect_ordered_results(&mut join_set, calls.len()).await
     }
+}
+
+fn build_proposed_content(path: &Path, content: &str) -> String {
+    if !path.exists() {
+        return content.to_string();
+    }
+
+    let original =
+        fs::read_to_string(path).unwrap_or_else(|_| "(binary or unreadable)".to_string());
+    format!(
+        "--- original ({} bytes) ---\n{}\n--- proposed ({} bytes) ---\n{}",
+        original.len(),
+        original,
+        content.len(),
+        content
+    )
 }
 
 fn serialize_section(info: &RuntimeInfo, section: &str) -> Result<String, String> {
@@ -1963,21 +2028,112 @@ mod tests {
     }
 
     #[test]
-    fn write_file_propose_tier_requires_proposal_system() {
+    fn write_file_propose_tier_creates_proposal() {
         let temp = TempDir::new().expect("temp");
+        let proposals_dir = temp.path().join("proposals");
         let config = SelfModifyConfig {
             enabled: true,
             propose_paths: vec!["kernel/**".to_string()],
+            proposals_dir: proposals_dir.clone(),
             ..SelfModifyConfig::default()
         };
         let executor = FawxToolExecutor::new(temp.path().to_path_buf(), ToolConfig::default())
             .with_self_modify(config);
-        let result = executor
-            .handle_write_file(&serde_json::json!({"path": "kernel/loop.rs", "content": "data"}));
-        assert!(result.is_err());
-        let error = result.unwrap_err();
-        assert!(error.contains("Self-modify policy violation [propose]"));
-        assert!(error.contains("proposal system"));
+
+        let message = executor
+            .handle_write_file(
+                &serde_json::json!({"path": "kernel/loop.rs", "content": "fn tick() {}"}),
+            )
+            .expect("propose tier should create proposal");
+        assert!(message.contains("Proposal created"));
+        assert!(message.contains("NOT modified"));
+        assert!(proposals_dir.exists());
+
+        let entries: Vec<_> = fs::read_dir(&proposals_dir)
+            .expect("read proposals")
+            .collect();
+        assert_eq!(entries.len(), 1);
+
+        let proposal_path = entries[0].as_ref().expect("entry").path();
+        let content = fs::read_to_string(&proposal_path).expect("read proposal");
+        assert!(content.contains("# Proposal:"));
+        assert!(content.contains("fn tick() {}"));
+        assert!(content.contains("kernel/loop.rs") || content.contains("loop.rs"));
+    }
+
+    #[test]
+    fn write_file_propose_tier_includes_original_in_proposal() {
+        let temp = TempDir::new().expect("temp");
+        let proposals_dir = temp.path().join("proposals");
+        let config = SelfModifyConfig {
+            enabled: true,
+            propose_paths: vec!["kernel/**".to_string()],
+            proposals_dir: proposals_dir.clone(),
+            ..SelfModifyConfig::default()
+        };
+        let kernel_dir = temp.path().join("kernel");
+        fs::create_dir_all(&kernel_dir).expect("create kernel dir");
+        fs::write(kernel_dir.join("loop.rs"), "fn old() {}").expect("write original");
+        let executor = FawxToolExecutor::new(temp.path().to_path_buf(), ToolConfig::default())
+            .with_self_modify(config);
+        executor
+            .handle_write_file(
+                &serde_json::json!({"path": "kernel/loop.rs", "content": "fn new() {}"}),
+            )
+            .expect("propose should succeed");
+        let proposal_path = fs::read_dir(&proposals_dir)
+            .expect("read proposals")
+            .next()
+            .expect("entry")
+            .expect("entry read")
+            .path();
+        let proposal = fs::read_to_string(proposal_path).expect("read proposal");
+        assert!(
+            proposal.contains("fn old() {}"),
+            "missing original: {proposal}"
+        );
+        assert!(
+            proposal.contains("fn new() {}"),
+            "missing proposed: {proposal}"
+        );
+        assert!(
+            proposal.contains("original"),
+            "missing original label: {proposal}"
+        );
+        assert!(
+            proposal.contains("proposed"),
+            "missing proposed label: {proposal}"
+        );
+    }
+
+    #[test]
+    fn write_file_propose_tier_does_not_modify_target() {
+        let temp = TempDir::new().expect("temp");
+        let proposals_dir = temp.path().join("proposals");
+        let config = SelfModifyConfig {
+            enabled: true,
+            propose_paths: vec!["kernel/**".to_string()],
+            proposals_dir,
+            ..SelfModifyConfig::default()
+        };
+
+        let kernel_dir = temp.path().join("kernel");
+        fs::create_dir_all(&kernel_dir).expect("create kernel dir");
+        fs::write(kernel_dir.join("loop.rs"), "original content").expect("write original");
+
+        let executor = FawxToolExecutor::new(temp.path().to_path_buf(), ToolConfig::default())
+            .with_self_modify(config);
+        let _result = executor
+            .handle_write_file(
+                &serde_json::json!({"path": "kernel/loop.rs", "content": "new content"}),
+            )
+            .expect("propose should succeed");
+
+        let actual = fs::read_to_string(kernel_dir.join("loop.rs")).expect("read target");
+        assert_eq!(
+            actual, "original content",
+            "target file should NOT be modified"
+        );
     }
 
     #[test]
