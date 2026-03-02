@@ -223,7 +223,7 @@ struct DecomposeSubGoalArguments {
     #[serde(default)]
     required_tools: Vec<String>,
     #[serde(default)]
-    expected_output: String,
+    expected_output: Option<String>,
 }
 
 impl From<DecomposeSubGoalArguments> for SubGoal {
@@ -4895,7 +4895,7 @@ mod decomposition_tests {
                 .map(|description| SubGoal {
                     description: (*description).to_string(),
                     required_tools: Vec::new(),
-                    expected_output: format!("output for {description}"),
+                    expected_output: Some(format!("output for {description}")),
                 })
                 .collect(),
             strategy: AggregationStrategy::Sequential,
@@ -5273,7 +5273,10 @@ mod decomposition_tests {
                 assert_eq!(plan.sub_goals.len(), 1);
                 assert_eq!(plan.sub_goals[0].description, "Inspect crate configuration");
                 assert_eq!(plan.sub_goals[0].required_tools, vec!["read_file"]);
-                assert_eq!(plan.sub_goals[0].expected_output, "Cargo metadata");
+                assert_eq!(
+                    plan.sub_goals[0].expected_output,
+                    Some("Cargo metadata".to_string())
+                );
                 assert_eq!(plan.strategy, AggregationStrategy::Sequential);
                 assert_eq!(plan.truncated_from, None);
             }
@@ -5445,7 +5448,7 @@ mod decomposition_tests {
                 assert_eq!(plan.sub_goals.len(), 1);
                 assert_eq!(plan.sub_goals[0].description, "Summarize findings");
                 assert!(plan.sub_goals[0].required_tools.is_empty());
-                assert_eq!(plan.sub_goals[0].expected_output, "");
+                assert_eq!(plan.sub_goals[0].expected_output, None);
                 assert_eq!(plan.strategy, AggregationStrategy::Sequential);
             }
             other => panic!("expected decomposition decision, got: {other:?}"),

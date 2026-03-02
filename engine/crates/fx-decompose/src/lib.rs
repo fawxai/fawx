@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 pub struct SubGoal {
     pub description: String,
     pub required_tools: Vec<String>,
-    pub expected_output: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_output: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -46,7 +47,7 @@ mod tests {
         SubGoal {
             description: "Summarize issue history".to_string(),
             required_tools: vec!["gh".to_string(), "read_file".to_string()],
-            expected_output: "Summary of issue events".to_string(),
+            expected_output: Some("Summary of issue events".to_string()),
         }
     }
 
@@ -137,11 +138,36 @@ mod tests {
         let goal = SubGoal {
             description: "No tool task".to_string(),
             required_tools: Vec::new(),
-            expected_output: "Plain text".to_string(),
+            expected_output: Some("Plain text".to_string()),
         };
 
         let encoded = serde_json::to_string(&goal).expect("serialize goal");
         let decoded: SubGoal = serde_json::from_str(&encoded).expect("deserialize goal");
         assert!(decoded.required_tools.is_empty());
+    }
+
+    #[test]
+    fn expected_output_missing_deserializes_to_none() {
+        let encoded = serde_json::json!({
+            "description": "Summarize findings",
+            "required_tools": ["read_file"]
+        });
+
+        let decoded: SubGoal = serde_json::from_value(encoded).expect("deserialize goal");
+
+        assert_eq!(decoded.expected_output, None);
+    }
+
+    #[test]
+    fn expected_output_none_is_omitted_from_serialization() {
+        let goal = SubGoal {
+            description: "Summarize findings".to_string(),
+            required_tools: Vec::new(),
+            expected_output: None,
+        };
+
+        let encoded = serde_json::to_value(&goal).expect("serialize goal");
+
+        assert!(encoded.get("expected_output").is_none());
     }
 }
