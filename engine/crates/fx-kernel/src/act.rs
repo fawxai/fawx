@@ -48,6 +48,26 @@ pub struct ConcurrencyPolicy {
     pub timeout_per_call: Option<std::time::Duration>,
 }
 
+/// Declares whether a tool's results may be cached for identical inputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCacheability {
+    /// Results are deterministic and safe to cache within a cycle.
+    Cacheable,
+    /// Results should never be cached unless explicitly opted in.
+    NeverCache,
+    /// Tool has side effects and may invalidate cache entries.
+    SideEffect,
+}
+
+/// Cache counters exposed by caching-capable executors.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ToolCacheStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub entries: u64,
+    pub evictions: u64,
+}
+
 /// Tool execution result.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolResult {
@@ -114,6 +134,20 @@ pub trait ToolExecutor: Send + Sync + std::fmt::Debug {
     /// Tool definitions exposed to the reasoning model.
     fn tool_definitions(&self) -> Vec<fx_llm::ToolDefinition> {
         Vec::new()
+    }
+
+    /// Classifies whether a tool may be cached for identical inputs.
+    fn cacheability(&self, tool_name: &str) -> ToolCacheability {
+        let _ = tool_name;
+        ToolCacheability::NeverCache
+    }
+
+    /// Clears any tool-result cache state for the current cycle.
+    fn clear_cache(&self) {}
+
+    /// Returns cache statistics when supported by the executor.
+    fn cache_stats(&self) -> Option<ToolCacheStats> {
+        None
     }
 }
 

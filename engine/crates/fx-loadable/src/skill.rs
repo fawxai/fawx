@@ -5,6 +5,7 @@
 //! which dispatches tool calls to the appropriate skill.
 
 use async_trait::async_trait;
+use fx_kernel::act::ToolCacheability;
 use fx_kernel::cancellation::CancellationToken;
 use fx_llm::ToolDefinition;
 
@@ -30,6 +31,12 @@ pub trait Skill: Send + Sync + std::fmt::Debug {
 
     /// Tool definitions this skill provides to the reasoning model.
     fn tool_definitions(&self) -> Vec<ToolDefinition>;
+
+    /// Cacheability classification for the given tool name.
+    fn cacheability(&self, tool_name: &str) -> ToolCacheability {
+        let _ = tool_name;
+        ToolCacheability::NeverCache
+    }
 
     /// Execute a tool call by name.
     ///
@@ -96,6 +103,12 @@ mod tests {
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].name, "greet");
         assert_eq!(skill.name(), "test_skill");
+    }
+
+    #[test]
+    fn skill_default_cacheability_is_never_cache() {
+        let skill = TestSkill;
+        assert_eq!(skill.cacheability("greet"), ToolCacheability::NeverCache);
     }
 
     #[tokio::test]

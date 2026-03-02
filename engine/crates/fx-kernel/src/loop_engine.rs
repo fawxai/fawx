@@ -372,8 +372,35 @@ impl LoopEngine {
     }
 
     fn finalize_result(&mut self, result: LoopResult) -> LoopResult {
+        self.emit_cache_stats_signal();
         let signals = self.signals.drain_all();
         attach_signals(result, signals)
+    }
+
+    fn emit_cache_stats_signal(&mut self) {
+        let Some(stats) = self.tool_executor.cache_stats() else {
+            return;
+        };
+
+        let total = stats.hits.saturating_add(stats.misses);
+        let hit_rate = if total == 0 {
+            0.0
+        } else {
+            stats.hits as f64 / total as f64
+        };
+
+        self.emit_signal(
+            LoopStep::Act,
+            SignalKind::Performance,
+            "tool cache stats",
+            serde_json::json!({
+                "hits": stats.hits,
+                "misses": stats.misses,
+                "entries": stats.entries,
+                "evictions": stats.evictions,
+                "hit_rate": hit_rate,
+            }),
+        );
     }
 
     /// Run one full loop cycle.
@@ -489,6 +516,7 @@ impl LoopEngine {
         if let Some(token) = &self.cancel_token {
             token.reset();
         }
+        self.tool_executor.clear_cache();
     }
 
     async fn execute_iteration(
@@ -3014,6 +3042,7 @@ mod phase2_tests {
         CompletionResponse, ContentBlock, Message, ProviderError, ToolCall, ToolDefinition,
     };
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     #[derive(Debug, Default)]
@@ -3073,6 +3102,53 @@ mod phase2_tests {
                 description: "Read a file".to_string(),
                 parameters: serde_json::json!({"type":"object"}),
             }]
+        }
+    }
+
+    #[derive(Debug)]
+    struct CacheAwareToolExecutor {
+        clear_calls: Arc<AtomicUsize>,
+        stats: crate::act::ToolCacheStats,
+    }
+
+    impl CacheAwareToolExecutor {
+        fn new(clear_calls: Arc<AtomicUsize>, stats: crate::act::ToolCacheStats) -> Self {
+            Self { clear_calls, stats }
+        }
+    }
+
+    #[async_trait]
+    impl ToolExecutor for CacheAwareToolExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+            Ok(calls
+                .iter()
+                .map(|call| ToolResult {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    success: true,
+                    output: "ok".to_string(),
+                })
+                .collect())
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition {
+                name: "read_file".to_string(),
+                description: "Read a file".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+            }]
+        }
+
+        fn clear_cache(&self) {
+            self.clear_calls.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn cache_stats(&self) -> Option<crate::act::ToolCacheStats> {
+            Some(self.stats)
         }
     }
 
@@ -3613,6 +3689,109 @@ mod phase2_tests {
         assert!(signals
             .iter()
             .any(|s| s.step == LoopStep::Continue && s.kind == SignalKind::Decision));
+    }
+
+    #[tokio::test]
+    async fn run_cycle_clears_tool_cache_at_cycle_boundary() {
+        let clear_calls = Arc::new(AtomicUsize::new(0));
+        let stats = crate::act::ToolCacheStats::default();
+        let executor = CacheAwareToolExecutor::new(Arc::clone(&clear_calls), stats);
+        let mut engine = LoopEngine::new(
+            BudgetTracker::new(crate::budget::BudgetConfig::default(), 0, 0),
+            ContextCompactor::new(2048, 256),
+            3,
+            Arc::new(executor),
+            "Summarize tool output".to_string(),
+        );
+
+        let llm = SequentialMockLlm::new(vec![
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "one".to_string(),
+                }],
+                tool_calls: Vec::new(),
+                usage: None,
+                stop_reason: None,
+            },
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "two".to_string(),
+                }],
+                tool_calls: Vec::new(),
+                usage: None,
+                stop_reason: None,
+            },
+        ]);
+
+        engine
+            .run_cycle(test_snapshot("hello"), &llm)
+            .await
+            .expect("first cycle");
+        engine
+            .run_cycle(test_snapshot("hello"), &llm)
+            .await
+            .expect("second cycle");
+
+        assert_eq!(clear_calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn run_cycle_emits_tool_cache_stats_signal() {
+        let clear_calls = Arc::new(AtomicUsize::new(0));
+        let stats = crate::act::ToolCacheStats {
+            hits: 2,
+            misses: 1,
+            entries: 4,
+            evictions: 1,
+        };
+        let executor = CacheAwareToolExecutor::new(Arc::clone(&clear_calls), stats);
+        let mut engine = LoopEngine::new(
+            BudgetTracker::new(crate::budget::BudgetConfig::default(), 0, 0),
+            ContextCompactor::new(2048, 256),
+            3,
+            Arc::new(executor),
+            "Summarize tool output".to_string(),
+        );
+
+        let llm = SequentialMockLlm::new(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "done".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let result = engine
+            .run_cycle(test_snapshot("hello"), &llm)
+            .await
+            .expect("run cycle");
+        let signals = match result {
+            LoopResult::Complete { signals, .. }
+            | LoopResult::BudgetExhausted { signals, .. }
+            | LoopResult::NeedsInput { signals, .. }
+            | LoopResult::UserStopped { signals, .. }
+            | LoopResult::Error { signals, .. } => signals,
+        };
+
+        let cache_signal = signals
+            .iter()
+            .find(|signal| {
+                signal.step == LoopStep::Act
+                    && signal.kind == SignalKind::Performance
+                    && signal.message == "tool cache stats"
+            })
+            .expect("cache stats signal");
+
+        assert_eq!(cache_signal.metadata["hits"], serde_json::json!(2));
+        assert_eq!(cache_signal.metadata["misses"], serde_json::json!(1));
+        assert_eq!(cache_signal.metadata["entries"], serde_json::json!(4));
+        assert_eq!(cache_signal.metadata["evictions"], serde_json::json!(1));
+        assert_eq!(
+            cache_signal.metadata["hit_rate"],
+            serde_json::json!(2.0 / 3.0)
+        );
+        assert_eq!(clear_calls.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

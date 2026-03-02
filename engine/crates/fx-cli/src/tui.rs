@@ -22,6 +22,7 @@ use fx_kernel::input::LoopCommand;
 use fx_kernel::loop_engine::{LlmProvider as LoopLlmProvider, LoopEngine, LoopResult};
 use fx_kernel::signals::{LoopStep, Signal, SignalCollector};
 use fx_kernel::types::PerceptionSnapshot;
+use fx_kernel::CachingExecutor;
 use fx_llm::{
     AnthropicProvider, CompletionRequest, Message, ModelCatalog, ModelInfo, ModelRouter,
     OpenAiProvider, OpenAiResponsesProvider, ProviderError, RouterError, StreamChunk,
@@ -1900,11 +1901,12 @@ fn build_loop_engine_with_config(
         .clone()
         .unwrap_or_else(|| DEFAULT_SYNTHESIS_INSTRUCTION.to_string());
 
+    let caching_registry = CachingExecutor::new(registry);
     let mut engine = LoopEngine::new(
         budget,
         context,
         config.general.max_iterations,
-        std::sync::Arc::new(registry),
+        std::sync::Arc::new(caching_registry),
         synthesis,
     );
     if let Some(snapshot_text) = memory_snapshot {

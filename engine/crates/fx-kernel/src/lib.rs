@@ -29,6 +29,7 @@
 
 pub mod act;
 pub mod budget;
+pub mod caching_executor;
 pub mod cancellation;
 pub mod checkpoint;
 pub mod context_manager;
@@ -50,8 +51,9 @@ pub mod watchdog;
 
 pub use act::{
     cancelled_result, is_cancelled, timed_out_result, ActionResult, ConcurrencyPolicy, TokenUsage,
-    ToolResult,
+    ToolCacheStats, ToolCacheability, ToolResult,
 };
+pub use caching_executor::CachingExecutor;
 pub use cancellation::CancellationToken;
 pub use continuation::Continuation;
 pub use decide::Decision;

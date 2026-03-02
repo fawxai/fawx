@@ -3,8 +3,8 @@ use fx_core::memory::MemoryStore;
 use fx_core::runtime_info::RuntimeInfo;
 use fx_core::self_modify::{classify_path, format_tier_violation, PathTier, SelfModifyConfig};
 use fx_kernel::act::{
-    cancelled_result, is_cancelled, timed_out_result, ConcurrencyPolicy, ToolExecutor,
-    ToolExecutorError, ToolResult,
+    cancelled_result, is_cancelled, timed_out_result, ConcurrencyPolicy, ToolCacheability,
+    ToolExecutor, ToolExecutorError, ToolResult,
 };
 use fx_kernel::cancellation::CancellationToken;
 use fx_llm::{ToolCall, ToolDefinition};
@@ -96,6 +96,19 @@ impl FawxToolExecutor {
     pub fn with_self_modify(mut self, config: SelfModifyConfig) -> Self {
         self.self_modify = Some(config);
         self
+    }
+
+    fn cacheability_for(tool_name: &str) -> ToolCacheability {
+        match tool_name {
+            "read_file" | "list_directory" | "search_text" | "memory_read" | "memory_list" => {
+                ToolCacheability::Cacheable
+            }
+            "write_file" | "memory_write" | "memory_delete" | "run_command" => {
+                ToolCacheability::SideEffect
+            }
+            "current_time" | "self_info" => ToolCacheability::NeverCache,
+            _ => ToolCacheability::NeverCache,
+        }
     }
 
     pub(crate) async fn execute_call(
@@ -597,6 +610,10 @@ impl ToolExecutor for FawxToolExecutor {
             defs.extend(memory_tool_definitions());
         }
         defs
+    }
+
+    fn cacheability(&self, tool_name: &str) -> ToolCacheability {
+        Self::cacheability_for(tool_name)
     }
 }
 
@@ -1689,6 +1706,41 @@ mod tests {
     fn current_time_appears_in_definitions() {
         let definitions = fawx_tool_definitions();
         assert!(definitions.iter().any(|tool| tool.name == "current_time"));
+    }
+
+    #[test]
+    fn cacheability_classifies_builtin_tools() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+
+        assert_eq!(
+            executor.cacheability("read_file"),
+            ToolCacheability::Cacheable
+        );
+        assert_eq!(
+            executor.cacheability("memory_list"),
+            ToolCacheability::Cacheable
+        );
+        assert_eq!(
+            executor.cacheability("write_file"),
+            ToolCacheability::SideEffect
+        );
+        assert_eq!(
+            executor.cacheability("run_command"),
+            ToolCacheability::SideEffect
+        );
+        assert_eq!(
+            executor.cacheability("current_time"),
+            ToolCacheability::NeverCache
+        );
+        assert_eq!(
+            executor.cacheability("self_info"),
+            ToolCacheability::NeverCache
+        );
+        assert_eq!(
+            executor.cacheability("unknown_tool"),
+            ToolCacheability::NeverCache
+        );
     }
 
     #[test]

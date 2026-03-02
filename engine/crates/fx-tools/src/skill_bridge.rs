@@ -1,6 +1,6 @@
 use crate::tools::FawxToolExecutor;
 use async_trait::async_trait;
-use fx_kernel::act::ToolExecutor;
+use fx_kernel::act::{ToolCacheability, ToolExecutor};
 use fx_kernel::cancellation::CancellationToken;
 use fx_llm::ToolCall;
 #[cfg(test)]
@@ -53,6 +53,10 @@ impl Skill for BuiltinToolsSkill {
 
     fn tool_definitions(&self) -> Vec<fx_llm::ToolDefinition> {
         self.executor.tool_definitions()
+    }
+
+    fn cacheability(&self, tool_name: &str) -> ToolCacheability {
+        self.executor.cacheability(tool_name)
     }
 
     async fn execute(
@@ -116,6 +120,22 @@ mod tests {
 
         let unique_count = names.iter().copied().collect::<HashSet<_>>().len();
         assert_eq!(unique_count, names.len());
+    }
+
+    #[test]
+    fn builtin_tools_skill_delegates_cacheability_classification() {
+        let temp = TempDir::new().expect("tempdir");
+        let skill = BuiltinToolsSkill::new(build_memory_executor(&temp));
+
+        assert_eq!(skill.cacheability("read_file"), ToolCacheability::Cacheable);
+        assert_eq!(
+            skill.cacheability("write_file"),
+            ToolCacheability::SideEffect
+        );
+        assert_eq!(
+            skill.cacheability("current_time"),
+            ToolCacheability::NeverCache
+        );
     }
 
     #[tokio::test]
