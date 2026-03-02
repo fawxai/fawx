@@ -1,6 +1,5 @@
 //! Fawx CLI - Management interface for the Fawx agent.
 
-mod analysis;
 mod auth_store;
 mod commands;
 mod config_bridge;

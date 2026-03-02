@@ -106,7 +106,7 @@ impl SignalStore {
 
     /// Query persisted signals for this session.
     pub fn query(&self, query: SignalQuery) -> Result<Vec<Signal>, SignalStoreError> {
-        let path = self.session_path()?;
+        let path = self.session_path();
         read_signals_from_file(&path, query.kind)
     }
 
@@ -149,8 +149,8 @@ impl SignalStore {
         Ok(all_signals)
     }
 
-    fn session_path(&self) -> Result<PathBuf, SignalStoreError> {
-        self.session_path_for(&self.session_id)
+    fn session_path(&self) -> PathBuf {
+        self.signals_dir.join(format!("{}.jsonl", self.session_id))
     }
 
     fn session_path_for(&self, session_id: &str) -> Result<PathBuf, SignalStoreError> {
@@ -163,7 +163,7 @@ impl SignalStore {
         if signals.is_empty() {
             return Ok(());
         }
-        let path = self.session_path()?;
+        let path = self.session_path();
         let mut file = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -211,6 +211,10 @@ impl SignalStore {
 }
 
 fn validate_session_id(session_id: &str) -> Result<(), SignalStoreError> {
+    if session_id.is_empty() {
+        return Err(SignalStoreError::InvalidSessionId(session_id.to_string()));
+    }
+
     let is_invalid =
         session_id.contains("/") || session_id.contains("\\") || session_id.contains("..");
 
@@ -470,6 +474,16 @@ mod tests {
         assert!(matches!(
             error,
             SignalStoreError::InvalidSessionId(ref id) if id == "../bad-session"
+        ));
+    }
+
+    #[test]
+    fn validate_session_id_rejects_empty_string() {
+        let error = validate_session_id("").expect_err("empty session id should fail");
+
+        assert!(matches!(
+            error,
+            SignalStoreError::InvalidSessionId(ref id) if id.is_empty()
         ));
     }
 

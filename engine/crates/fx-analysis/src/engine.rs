@@ -1,8 +1,9 @@
+use crate::AnalysisFinding;
 use fx_core::error::LlmError;
 use fx_core::signals::{Signal, SignalKind};
 use fx_kernel::loop_engine::LlmProvider;
 use fx_memory::signal_store::SignalStoreError;
-use fx_memory::{AnalysisFinding, SignalStore};
+use fx_memory::SignalStore;
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -284,9 +285,9 @@ fn extract_balanced_array(response: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Confidence;
     use async_trait::async_trait;
     use fx_core::signals::LoopStep;
-    use fx_memory::Confidence;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use tempfile::TempDir;
