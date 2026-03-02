@@ -7,17 +7,26 @@
 use async_trait::async_trait;
 use futures::{stream, SinkExt, StreamExt};
 use http::{header::HeaderValue, Request};
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest, Message as WsMessage};
+use tokio_tungstenite::tungstenite::{
+    self,
+    client::IntoClientRequest,
+    protocol::{frame::coding::CloseCode, CloseFrame},
+    Message as WsMessage,
+};
 
 use crate::provider::{CompletionStream, LlmProvider, ProviderCapabilities};
+use crate::sse::{SseFrame, SseFramer};
 use crate::types::{
     CompletionRequest, CompletionResponse, ContentBlock, LlmError, Message, MessageRole,
     StreamChunk, ToolCall, ToolUseDelta, Usage,
 };
 
 const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
+const WS_POLICY_CLOSE_PREFIX: &str = "websocket policy close (1008)";
+const STREAM_REQUIRED_DETAIL: &str = "Stream must be set to true";
 
 /// OpenAI Responses API provider for ChatGPT subscription auth.
 #[derive(Debug, Clone)]
@@ -27,6 +36,7 @@ pub struct OpenAiResponsesProvider {
     account_id: String,
     provider_name: String,
     supported_models: Vec<String>,
+    client: reqwest::Client,
 }
 
 impl OpenAiResponsesProvider {
@@ -49,12 +59,18 @@ impl OpenAiResponsesProvider {
             return Err(LlmError::Config("account_id cannot be empty".to_string()));
         }
 
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .map_err(|error| LlmError::Config(format!("failed to build HTTP client: {error}")))?;
+
         Ok(Self {
             base_url: DEFAULT_CODEX_BASE_URL.to_string(),
             access_token,
             account_id,
             provider_name: "openai".to_string(),
             supported_models: Vec::new(),
+            client,
         })
     }
 
@@ -169,7 +185,6 @@ impl OpenAiResponsesProvider {
         Ok(request)
     }
 
-    #[cfg(test)]
     fn parse_response(body: ResponsesResponseBody) -> CompletionResponse {
         let response_text = collect_output_text(&body.output);
         let tool_calls = collect_tool_calls(&body.output);
@@ -187,30 +202,146 @@ impl OpenAiResponsesProvider {
         }
     }
 
+    fn http_request_builder(&self, body: &ResponsesRequestBody) -> reqwest::RequestBuilder {
+        self.client
+            .post(self.endpoint())
+            .bearer_auth(&self.access_token)
+            .header("chatgpt-account-id", &self.account_id)
+            .header("openai-beta", "responses=experimental")
+            .json(body)
+    }
+
+    async fn complete_with_policy_fallback(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<CompletionResponse, LlmError> {
+        match self.complete_via_stream(request.clone()).await {
+            Ok(response) => Ok(response),
+            Err(error) if should_retry_http_after_ws_error(&error) => {
+                self.complete_via_http_fallback(request).await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn complete_via_http_fallback(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<CompletionResponse, LlmError> {
+        if self.capabilities().requires_streaming {
+            return self.complete_via_http_stream(request).await;
+        }
+
+        match self.complete_via_http(request.clone()).await {
+            Err(error) if should_retry_http_with_streaming(&error) => {
+                self.complete_via_http_stream(request).await
+            }
+            result => result,
+        }
+    }
+
+    async fn complete_via_http(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<CompletionResponse, LlmError> {
+        let body = self.build_request_body(&request, false)?;
+        let response = self.http_request_builder(&body).send().await?;
+        let status = response.status();
+
+        if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|error| format!("unable to read error body: {error}"));
+            return Err(Self::map_http_error(status, body));
+        }
+
+        let parsed = response
+            .json::<ResponsesResponseBody>()
+            .await
+            .map_err(|error| LlmError::InvalidResponse(error.to_string()))?;
+
+        Ok(Self::parse_response(parsed))
+    }
+
+    async fn complete_via_http_stream(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<CompletionResponse, LlmError> {
+        let body = self.build_request_body(&request, true)?;
+        let response = self.http_request_builder(&body).send().await?;
+        let status = response.status();
+
+        if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|error| format!("unable to read error body: {error}"));
+            return Err(Self::map_http_error(status, body));
+        }
+
+        Self::collect_http_stream_response(response).await
+    }
+
+    async fn collect_http_stream_response(
+        response: reqwest::Response,
+    ) -> Result<CompletionResponse, LlmError> {
+        let mut bytes_stream = response.bytes_stream();
+        let mut framer = SseFramer::default();
+        let mut accumulator = StreamAccumulator::default();
+
+        while let Some(bytes) = bytes_stream.next().await {
+            let bytes = bytes.map_err(|error| LlmError::Streaming(error.to_string()))?;
+            let mut frames = framer.push_bytes(&bytes)?;
+            apply_sse_frames(&mut accumulator, &mut frames)?;
+
+            if accumulator.terminal_seen {
+                break;
+            }
+        }
+
+        if !accumulator.terminal_seen {
+            let mut frames = framer.finish()?;
+            apply_sse_frames(&mut accumulator, &mut frames)?;
+        }
+
+        if !accumulator.terminal_seen {
+            return Err(LlmError::Provider(
+                "http stream ended before terminal response event".to_string(),
+            ));
+        }
+
+        Ok(completion_from_accumulator(accumulator))
+    }
+
+    fn map_http_error(status: StatusCode, body: String) -> LlmError {
+        match status.as_u16() {
+            401 | 403 => LlmError::Authentication(body),
+            429 => LlmError::RateLimited(body),
+            400..=499 => LlmError::Request(format!("client error {}: {body}", status.as_u16())),
+            500..=599 => LlmError::Provider(format!("server error {}: {body}", status.as_u16())),
+            _ => LlmError::Request(format!("http {}: {body}", status.as_u16())),
+        }
+    }
+
     async fn complete_via_stream(
         &self,
         request: CompletionRequest,
     ) -> Result<CompletionResponse, LlmError> {
         let mut stream = self.complete_stream(request).await?;
-        let mut text = String::new();
-        let mut usage = None;
-        let mut stop_reason = None;
-        let mut pending_tool_calls = Vec::new();
+        Self::aggregate_completion_stream(&mut stream).await
+    }
+
+    async fn aggregate_completion_stream(
+        stream: &mut CompletionStream,
+    ) -> Result<CompletionResponse, LlmError> {
+        let mut accumulator = StreamAccumulator::default();
 
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            text.push_str(chunk.delta_content.as_deref().unwrap_or_default());
-            usage = chunk.usage.or(usage);
-            stop_reason = chunk.stop_reason.or(stop_reason);
-            merge_tool_use_deltas(&mut pending_tool_calls, chunk.tool_use_deltas);
+            accumulate_stream_chunk(&mut accumulator, chunk?);
         }
 
-        Ok(CompletionResponse {
-            content: vec![ContentBlock::Text { text }],
-            tool_calls: finalize_tool_calls(pending_tool_calls),
-            usage,
-            stop_reason,
-        })
+        Ok(completion_from_accumulator(accumulator))
     }
 
     fn chunk_from_event(event_type: &str, data: &str) -> Option<StreamChunk> {
@@ -238,7 +369,7 @@ impl OpenAiResponsesProvider {
     }
 
     fn stream_from_ws<S>(
-        read: futures::stream::SplitStream<S>,
+        read: S,
     ) -> impl futures::Stream<Item = Result<StreamChunk, LlmError>> + Send
     where
         S: futures::Stream<Item = Result<WsMessage, tungstenite::Error>> + Unpin + Send + 'static,
@@ -275,16 +406,101 @@ impl OpenAiResponsesProvider {
                             return None;
                         }
                     }
-                    Some(Ok(WsMessage::Close(_))) | None => return None,
+                    Some(Ok(WsMessage::Close(frame))) => {
+                        return Some((Err(ws_close_error(frame)), (read, true)));
+                    }
                     Some(Ok(_)) => {}
                     Some(Err(error)) => {
                         let message = format!("websocket receive failed: {error}");
                         return Some((Err(LlmError::Provider(message)), (read, true)));
                     }
+                    None => {
+                        return Some((
+                            Err(LlmError::Provider(
+                                "websocket stream ended before terminal response event".to_string(),
+                            )),
+                            (read, true),
+                        ));
+                    }
                 }
             }
         })
     }
+}
+
+#[derive(Default)]
+struct StreamAccumulator {
+    text: String,
+    usage: Option<Usage>,
+    stop_reason: Option<String>,
+    pending_tool_calls: Vec<PendingToolCall>,
+    terminal_seen: bool,
+}
+
+fn should_retry_http_with_streaming(error: &LlmError) -> bool {
+    matches!(
+        error,
+        LlmError::Request(message)
+            if message.contains("client error 400")
+                && message.contains(STREAM_REQUIRED_DETAIL)
+    )
+}
+
+fn accumulate_stream_chunk(accumulator: &mut StreamAccumulator, chunk: StreamChunk) {
+    accumulator
+        .text
+        .push_str(chunk.delta_content.as_deref().unwrap_or_default());
+    accumulator.usage = chunk.usage.or(accumulator.usage);
+    accumulator.stop_reason = chunk.stop_reason.or(accumulator.stop_reason.take());
+    merge_tool_use_deltas(&mut accumulator.pending_tool_calls, chunk.tool_use_deltas);
+}
+
+fn completion_from_accumulator(accumulator: StreamAccumulator) -> CompletionResponse {
+    CompletionResponse {
+        content: vec![ContentBlock::Text {
+            text: accumulator.text,
+        }],
+        tool_calls: finalize_tool_calls(accumulator.pending_tool_calls),
+        usage: accumulator.usage,
+        stop_reason: accumulator.stop_reason,
+    }
+}
+
+fn apply_sse_frames(
+    accumulator: &mut StreamAccumulator,
+    frames: &mut Vec<SseFrame>,
+) -> Result<(), LlmError> {
+    for frame in frames.drain(..) {
+        if let SseFrame::Data(data) = frame {
+            apply_sse_data_frame(accumulator, &data)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn apply_sse_data_frame(accumulator: &mut StreamAccumulator, data: &str) -> Result<(), LlmError> {
+    let Some(parsed) = parse_ws_frame(data) else {
+        return Ok(());
+    };
+
+    let Some(event_type) = parsed.get("type").and_then(Value::as_str) else {
+        return Ok(());
+    };
+
+    if event_type == "error" || event_type == "response.failed" {
+        return Err(LlmError::Provider(ws_error_message(&parsed)));
+    }
+
+    if let Some(chunk) = OpenAiResponsesProvider::chunk_from_event(event_type, data) {
+        accumulate_stream_chunk(accumulator, chunk);
+    }
+
+    if is_terminal_ws_event(event_type) {
+        accumulator.terminal_seen = true;
+    }
+
+    Ok(())
 }
 
 fn chunk_from_tool_delta(delta: ToolUseDelta) -> StreamChunk {
@@ -388,6 +604,40 @@ fn ws_error_message(frame: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or("websocket error")
         .to_string()
+}
+
+fn should_retry_http_after_ws_error(error: &LlmError) -> bool {
+    matches!(error,
+        LlmError::Provider(message) if message.starts_with(WS_POLICY_CLOSE_PREFIX)
+    )
+}
+
+fn ws_close_error(frame: Option<CloseFrame>) -> LlmError {
+    let Some(frame) = frame else {
+        return LlmError::Provider("websocket closed before response completed".to_string());
+    };
+
+    if frame.code == CloseCode::Policy {
+        return LlmError::Provider(format!(
+            "{WS_POLICY_CLOSE_PREFIX}: {}",
+            close_reason_or_default(frame.reason.as_ref())
+        ));
+    }
+
+    LlmError::Provider(format!(
+        "websocket closed with code {}: {}",
+        u16::from(frame.code),
+        close_reason_or_default(frame.reason.as_ref())
+    ))
+}
+
+fn close_reason_or_default(reason: &str) -> &str {
+    let trimmed = reason.trim();
+    if trimmed.is_empty() {
+        "no reason provided"
+    } else {
+        trimmed
+    }
 }
 
 fn is_terminal_ws_event(event_type: &str) -> bool {
@@ -502,7 +752,7 @@ impl LlmProvider for OpenAiResponsesProvider {
     }
 
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
-        self.complete_via_stream(request).await
+        self.complete_with_policy_fallback(request).await
     }
 
     async fn complete_stream(
@@ -569,7 +819,6 @@ struct ResponsesTool {
 }
 
 #[derive(Deserialize)]
-#[cfg(test)]
 struct ResponsesResponseBody {
     #[serde(default)]
     output: Vec<ResponsesOutputItem>,
@@ -580,7 +829,6 @@ struct ResponsesResponseBody {
 }
 
 #[derive(Deserialize)]
-#[cfg(test)]
 struct ResponsesOutputItem {
     #[serde(default)]
     r#type: Option<String>,
@@ -597,7 +845,6 @@ struct ResponsesOutputItem {
 }
 
 #[derive(Deserialize)]
-#[cfg(test)]
 struct ResponsesContentPart {
     r#type: String,
     #[serde(default)]
@@ -681,7 +928,6 @@ fn extract_text(content: &[ContentBlock]) -> String {
         .join("")
 }
 
-#[cfg(test)]
 fn collect_output_text(output: &[ResponsesOutputItem]) -> String {
     let mut text_parts = Vec::new();
 
@@ -703,7 +949,6 @@ fn collect_output_text(output: &[ResponsesOutputItem]) -> String {
     text_parts.join("")
 }
 
-#[cfg(test)]
 fn collect_tool_calls(output: &[ResponsesOutputItem]) -> Vec<ToolCall> {
     let mut tool_calls = Vec::new();
 
@@ -843,6 +1088,7 @@ fn finalize_tool_calls(pending: Vec<PendingToolCall>) -> Vec<ToolCall> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::{pin_mut, stream, StreamExt};
 
     #[test]
     fn endpoint_resolves_correctly() {
@@ -1233,6 +1479,122 @@ mod tests {
 
         assert!(!capabilities.supports_temperature);
         assert!(capabilities.requires_streaming);
+    }
+
+    #[test]
+    fn policy_close_error_is_classified_for_http_retry() {
+        let error = ws_close_error(Some(CloseFrame {
+            code: CloseCode::Policy,
+            reason: "".into(),
+        }));
+
+        assert!(should_retry_http_after_ws_error(&error));
+        assert!(matches!(
+            error,
+            LlmError::Provider(message) if message.contains("1008")
+        ));
+    }
+
+    #[test]
+    fn non_policy_close_error_does_not_trigger_http_retry() {
+        let error = ws_close_error(Some(CloseFrame {
+            code: CloseCode::Away,
+            reason: "bye".into(),
+        }));
+
+        assert!(!should_retry_http_after_ws_error(&error));
+    }
+
+    #[test]
+    fn stream_required_http_error_triggers_streaming_retry() {
+        let error = OpenAiResponsesProvider::map_http_error(
+            StatusCode::BAD_REQUEST,
+            r#"{"detail":"Stream must be set to true"}"#.to_string(),
+        );
+
+        assert!(should_retry_http_with_streaming(&error));
+    }
+
+    #[test]
+    fn stream_required_http_retry_ignores_other_client_errors() {
+        let error = OpenAiResponsesProvider::map_http_error(
+            StatusCode::BAD_REQUEST,
+            r#"{"detail":"different error"}"#.to_string(),
+        );
+
+        assert!(!should_retry_http_with_streaming(&error));
+    }
+
+    #[test]
+    fn sse_frames_are_assembled_into_completion_response() {
+        let mut accumulator = StreamAccumulator::default();
+        let mut frames = vec![
+            SseFrame::Data(r#"{"type":"response.output_text.delta","delta":"Hey"}"#.to_string()),
+            SseFrame::Data(
+                r#"{"type":"response.done","response":{"usage":{"input_tokens":7,"output_tokens":3}}}"#
+                    .to_string(),
+            ),
+            SseFrame::Done,
+        ];
+
+        apply_sse_frames(&mut accumulator, &mut frames).expect("sse frames should parse");
+
+        let response = completion_from_accumulator(accumulator);
+        assert_eq!(
+            response.content,
+            vec![ContentBlock::Text {
+                text: "Hey".to_string()
+            }]
+        );
+        assert_eq!(response.stop_reason.as_deref(), Some("stop"));
+        assert_eq!(
+            response.usage,
+            Some(Usage {
+                input_tokens: 7,
+                output_tokens: 3,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_from_ws_policy_close_emits_error_instead_of_empty_stream() {
+        let frames = stream::iter(vec![Ok::<WsMessage, tungstenite::Error>(WsMessage::Close(
+            Some(CloseFrame {
+                code: CloseCode::Policy,
+                reason: "".into(),
+            }),
+        ))]);
+        let ws_stream = OpenAiResponsesProvider::stream_from_ws(frames);
+        pin_mut!(ws_stream);
+
+        let first = ws_stream
+            .next()
+            .await
+            .expect("policy close should emit an error item");
+
+        assert!(matches!(
+            first,
+            Err(LlmError::Provider(message)) if message.contains("1008")
+        ));
+        assert!(ws_stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_from_ws_end_before_terminal_emits_error() {
+        let frames = stream::empty::<Result<WsMessage, tungstenite::Error>>();
+        let ws_stream = OpenAiResponsesProvider::stream_from_ws(frames);
+        pin_mut!(ws_stream);
+
+        let first = ws_stream
+            .next()
+            .await
+            .expect("early socket end should emit an error item");
+
+        assert!(matches!(
+            first,
+            Err(LlmError::Provider(message)) if message.contains("terminal")
+        ));
+        assert!(ws_stream.next().await.is_none());
     }
 
     fn reconstructed_tool_calls(events: &[(&str, &str)]) -> Vec<ToolCall> {
