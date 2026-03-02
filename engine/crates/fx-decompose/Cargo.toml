@@ -1,0 +1,15 @@
+[package]
+name = "fx-decompose"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Task decomposition types and sub-goal execution for the Fawx engine."
+
+[dependencies]
+fx-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

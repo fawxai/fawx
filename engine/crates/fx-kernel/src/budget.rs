@@ -129,6 +129,16 @@ impl BudgetTracker {
         self.cost_cents = self.cost_cents.saturating_add(cost.cost_cents);
     }
 
+    /// Fold a child tracker's consumed resources into this tracker.
+    pub fn absorb_child_usage(&mut self, child: &BudgetTracker) {
+        self.record(&ActionCost {
+            llm_calls: child.llm_calls_used(),
+            tool_invocations: child.tool_invocations_used(),
+            tokens: child.tokens_used(),
+            cost_cents: child.cost_cents_used(),
+        });
+    }
+
     /// Snapshot remaining budget for each tracked resource at `current_time_ms`.
     pub fn remaining(&self, current_time_ms: u64) -> BudgetRemaining {
         BudgetRemaining {
@@ -601,6 +611,25 @@ mod tests {
         assert_eq!(tracker.tool_invocations, 3);
         assert_eq!(tracker.tokens_used, 500);
         assert_eq!(tracker.cost_cents, 5);
+    }
+
+    #[test]
+    fn absorb_child_usage_rolls_up_consumption() {
+        let mut parent = BudgetTracker::new(test_config(), 0, 0);
+        let mut child = BudgetTracker::new(test_config(), 0, 1);
+        child.record(&ActionCost {
+            llm_calls: 2,
+            tool_invocations: 3,
+            tokens: 450,
+            cost_cents: 8,
+        });
+
+        parent.absorb_child_usage(&child);
+
+        assert_eq!(parent.llm_calls_used(), 2);
+        assert_eq!(parent.tool_invocations_used(), 3);
+        assert_eq!(parent.tokens_used(), 450);
+        assert_eq!(parent.cost_cents_used(), 8);
     }
 
     #[test]

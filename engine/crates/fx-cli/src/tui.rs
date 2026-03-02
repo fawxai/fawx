@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use crossterm::style::Stylize;
 use crossterm::{cursor, event, style, terminal, ExecutableCommand};
 use futures::StreamExt;
+use fx_analysis::{AnalysisEngine, AnalysisError, AnalysisFinding, Confidence};
 use fx_auth::auth::{AuthManager, AuthMethod};
 use fx_auth::oauth::{PkceFlow, TokenExchangeRequest, TokenResponse};
 use fx_config::FawxConfig;
@@ -456,6 +457,7 @@ const TUI_COMMANDS: &[&str] = &[
     "/budget",
     "/signals",
     "/debug",
+    "/analyze",
     "/synthesis",
 ];
 
@@ -1040,6 +1042,7 @@ impl TuiApp {
             ParsedCommand::Status => self.show_status(),
             ParsedCommand::Signals => self.show_signals_summary(),
             ParsedCommand::Debug => self.show_signals_debug(),
+            ParsedCommand::Analyze => self.handle_analyze_command().await?,
             ParsedCommand::Synthesis(instruction) => {
                 self.update_synthesis_instruction(instruction);
             }
@@ -1219,6 +1222,121 @@ impl TuiApp {
 
         let collector = SignalCollector::from_signals(self.last_signals.clone());
         println!("{}", collector.debug_dump());
+    }
+
+    async fn handle_analyze_command(&mut self) -> Result<(), TuiError> {
+        let active_model = self
+            .router
+            .active_model()
+            .ok_or_else(|| TuiError::Router("no active model for analysis".to_string()))?
+            .to_string();
+        let llm = RouterLoopLlmProvider::new(&self.router, active_model);
+        let engine = AnalysisEngine::new(&self.signal_store);
+
+        println!("Analyzing signals across all sessions...");
+        match engine.analyze(&llm).await {
+            Ok(findings) if findings.is_empty() => {
+                println!("No patterns found. Collect more signals first.");
+            }
+            Ok(findings) => {
+                let (stored, surfaced, logged) =
+                    Self::route_findings_by_confidence(&findings, self.memory.as_ref());
+                Self::print_analysis_findings(&findings);
+                println!(
+                    "Wrote {} patterns to memory, surfaced {} for review, logged {}",
+                    stored, surfaced, logged
+                );
+            }
+            Err(AnalysisError::ParseError(error)) => {
+                eprintln!("Analysis model responded, but output was unparseable JSON: {error}");
+            }
+            Err(error) => return Err(error.into()),
+        }
+
+        Ok(())
+    }
+
+    fn print_analysis_findings(findings: &[AnalysisFinding]) {
+        for finding in findings {
+            let badge = Self::confidence_badge(finding.confidence);
+            println!("\n{badge} | {}", finding.pattern_name);
+            println!("  {}", finding.description);
+            println!("  Evidence: {} signals", finding.evidence.len());
+            if let Some(action) = &finding.suggested_action {
+                println!("  Suggested: {action}");
+            }
+        }
+
+        println!("\nFound {} patterns total.", findings.len());
+    }
+
+    fn route_findings_by_confidence(
+        findings: &[AnalysisFinding],
+        memory: Option<&SharedMemoryStore>,
+    ) -> (usize, usize, usize) {
+        let mut stored = 0;
+        let mut surfaced = 0;
+        let mut logged = 0;
+
+        for finding in findings {
+            match finding.confidence {
+                Confidence::High => {
+                    if Self::store_high_confidence_finding(memory, finding) {
+                        stored += 1;
+                    }
+                }
+                Confidence::Medium => {
+                    println!(
+                        "Consider: {} — {}",
+                        finding.pattern_name, finding.description
+                    );
+                    surfaced += 1;
+                }
+                Confidence::Low => {
+                    eprintln!("log: {} — {}", finding.pattern_name, finding.description);
+                    logged += 1;
+                }
+            }
+        }
+
+        (stored, surfaced, logged)
+    }
+
+    fn store_high_confidence_finding(
+        memory: Option<&SharedMemoryStore>,
+        finding: &AnalysisFinding,
+    ) -> bool {
+        let Some(memory_store) = memory else {
+            return false;
+        };
+
+        let mut store = match memory_store.lock() {
+            Ok(store) => store,
+            Err(error) => {
+                eprintln!("warning: failed to lock memory store: {error}");
+                return false;
+            }
+        };
+
+        let key = Self::pattern_memory_key(&finding.pattern_name);
+        if let Err(error) = store.write(&key, &finding.description) {
+            eprintln!("warning: failed to persist analysis finding: {error}");
+            return false;
+        }
+
+        true
+    }
+
+    fn pattern_memory_key(pattern_name: &str) -> String {
+        format!("pattern/{pattern_name}")
+    }
+
+    fn confidence_badge(confidence: Confidence) -> &'static str {
+        match confidence {
+            Confidence::High => "🔴 HIGH",
+            Confidence::Medium => "🟡 MEDIUM",
+            Confidence::Low => "🟢 LOW",
+        }
     }
 
     fn update_synthesis_instruction(&mut self, instruction: Option<String>) {
@@ -1531,6 +1649,7 @@ impl TuiApp {
         println!("  /loop          Show loop iteration details");
         println!("  /signals       Show condensed signal summary for last turn");
         println!("  /debug         Show full signal dump for last turn");
+        println!("  /analyze       Analyze persisted signals across sessions");
         println!("  /synthesis     Set or reset synthesis instruction");
         println!("  /clear         Clear the screen and active conversation");
         println!("  /new           Start a new conversation");
@@ -2360,6 +2479,12 @@ impl std::error::Error for TuiError {}
 impl From<io::Error> for TuiError {
     fn from(value: io::Error) -> Self {
         Self::Io(value)
+    }
+}
+
+impl From<AnalysisError> for TuiError {
+    fn from(value: AnalysisError) -> Self {
+        Self::Loop(format!("analysis failed: {value}"))
     }
 }
 
@@ -3282,6 +3407,7 @@ enum ParsedCommand {
     Status,
     Signals,
     Debug,
+    Analyze,
     Synthesis(Option<String>),
     Clear,
     New,
@@ -3311,6 +3437,7 @@ fn parse_command(value: &str) -> ParsedCommand {
         "status" => ParsedCommand::Status,
         "signals" => ParsedCommand::Signals,
         "debug" => ParsedCommand::Debug,
+        "analyze" => ParsedCommand::Analyze,
         "synthesis" => {
             let remainder = input[command.len()..].strip_prefix(' ');
             match remainder {
@@ -3350,8 +3477,9 @@ impl Drop for RawModeGuard {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use fx_core::memory::MemoryProvider;
+    use fx_core::memory::{MemoryProvider, MemoryTouchProvider};
     use fx_llm::ContentBlock;
+    use std::collections::BTreeMap;
     use std::ffi::OsString;
     use std::path::PathBuf;
     use std::pin::Pin;
@@ -3402,6 +3530,85 @@ mod tests {
         .expect("new test app")
     }
 
+    type RecordedWrites = Arc<Mutex<Vec<(String, String)>>>;
+
+    #[derive(Debug)]
+    struct MockMemoryStore {
+        entries: BTreeMap<String, String>,
+        writes: RecordedWrites,
+    }
+
+    impl MockMemoryStore {
+        fn new(writes: RecordedWrites) -> Self {
+            Self {
+                entries: BTreeMap::new(),
+                writes,
+            }
+        }
+    }
+
+    impl MemoryProvider for MockMemoryStore {
+        fn read(&self, key: &str) -> Option<String> {
+            self.entries.get(key).cloned()
+        }
+
+        fn write(&mut self, key: &str, value: &str) -> Result<(), String> {
+            self.entries.insert(key.to_string(), value.to_string());
+            match self.writes.lock() {
+                Ok(mut writes) => {
+                    writes.push((key.to_string(), value.to_string()));
+                    Ok(())
+                }
+                Err(error) => Err(format!("writes lock poisoned: {error}")),
+            }
+        }
+
+        fn list(&self) -> Vec<(String, String)> {
+            self.entries
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        }
+
+        fn delete(&mut self, key: &str) -> bool {
+            self.entries.remove(key).is_some()
+        }
+
+        fn search(&self, query: &str) -> Vec<(String, String)> {
+            self.entries
+                .iter()
+                .filter(|(key, value)| key.contains(query) || value.contains(query))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        }
+
+        fn snapshot(&self) -> Vec<(String, String)> {
+            self.list()
+        }
+    }
+
+    impl MemoryTouchProvider for MockMemoryStore {
+        fn touch(&mut self, _key: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn mock_memory_store() -> (SharedMemoryStore, RecordedWrites) {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let store = MockMemoryStore::new(Arc::clone(&writes));
+        (Arc::new(Mutex::new(store)), writes)
+    }
+
+    fn test_finding(pattern_name: &str, confidence: Confidence) -> AnalysisFinding {
+        AnalysisFinding {
+            pattern_name: pattern_name.to_string(),
+            description: format!("{pattern_name} description"),
+            confidence,
+            evidence: Vec::new(),
+            suggested_action: Some("apply corrective action".to_string()),
+        }
+    }
+
     fn test_auth_manager() -> AuthManager {
         let mut auth_manager = AuthManager::new();
         auth_manager.store(
@@ -3443,6 +3650,108 @@ mod tests {
         assert_ne!(project_prompt, food_prompt);
         assert!(project_prompt.contains("project_plan"));
         assert!(food_prompt.contains("favorite_food"));
+    }
+
+    #[test]
+    fn route_findings_writes_high_confidence_to_memory() {
+        let (memory, writes) = mock_memory_store();
+        let findings = vec![test_finding("Retry Storm", Confidence::High)];
+
+        let summary = TuiApp::route_findings_by_confidence(&findings, Some(&memory));
+
+        let writes = writes.lock().expect("lock writes");
+        assert_eq!(summary, (1, 0, 0));
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, "pattern/Retry Storm");
+        assert_eq!(writes[0].1, "Retry Storm description");
+    }
+
+    #[test]
+    fn route_findings_does_not_write_medium_confidence_to_memory() {
+        let (memory, writes) = mock_memory_store();
+        let findings = vec![test_finding("Needs Follow Up", Confidence::Medium)];
+
+        let summary = TuiApp::route_findings_by_confidence(&findings, Some(&memory));
+
+        assert_eq!(summary, (0, 1, 0));
+        assert!(writes.lock().expect("lock writes").is_empty());
+    }
+
+    #[test]
+    fn route_findings_does_not_write_low_confidence_to_memory() {
+        let (memory, writes) = mock_memory_store();
+        let findings = vec![test_finding("Loose Correlation", Confidence::Low)];
+
+        let summary = TuiApp::route_findings_by_confidence(&findings, Some(&memory));
+
+        assert_eq!(summary, (0, 0, 1));
+        assert!(writes.lock().expect("lock writes").is_empty());
+    }
+
+    #[test]
+    fn route_findings_uses_pattern_name_in_memory_key() {
+        let (memory, writes) = mock_memory_store();
+        let findings = vec![test_finding("Tool-Timeout Loop", Confidence::High)];
+
+        TuiApp::route_findings_by_confidence(&findings, Some(&memory));
+
+        let writes = writes.lock().expect("lock writes");
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, "pattern/Tool-Timeout Loop");
+    }
+
+    #[test]
+    fn route_findings_routes_mixed_confidence_bag() {
+        let (memory, writes) = mock_memory_store();
+        let findings = vec![
+            test_finding("Retry Storm", Confidence::High),
+            test_finding("Needs Follow Up", Confidence::Medium),
+            test_finding("Loose Correlation", Confidence::Low),
+            test_finding("Context Drift", Confidence::High),
+        ];
+
+        let summary = TuiApp::route_findings_by_confidence(&findings, Some(&memory));
+
+        let writes = writes.lock().expect("lock writes");
+        let keys: Vec<String> = writes.iter().map(|(key, _)| key.clone()).collect();
+        assert_eq!(summary, (2, 1, 1));
+        assert_eq!(keys, vec!["pattern/Retry Storm", "pattern/Context Drift"]);
+    }
+
+    #[test]
+    fn route_findings_without_memory_store_does_not_panic() {
+        let findings = vec![
+            test_finding("Retry Storm", Confidence::High),
+            test_finding("Needs Follow Up", Confidence::Medium),
+            test_finding("Loose Correlation", Confidence::Low),
+        ];
+
+        let summary = TuiApp::route_findings_by_confidence(&findings, None);
+
+        assert_eq!(summary, (0, 1, 1));
+    }
+
+    #[test]
+    fn route_findings_with_poisoned_memory_mutex_skips_high_confidence_writes() {
+        let (memory, writes) = mock_memory_store();
+        let poisoned_memory = Arc::clone(&memory);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = poisoned_memory
+                .lock()
+                .expect("lock memory before intentional panic");
+            panic!("intentional poison");
+        }));
+
+        let findings = vec![
+            test_finding("Retry Storm", Confidence::High),
+            test_finding("Needs Follow Up", Confidence::Medium),
+            test_finding("Loose Correlation", Confidence::Low),
+        ];
+
+        let summary = TuiApp::route_findings_by_confidence(&findings, Some(&memory));
+
+        assert_eq!(summary, (0, 1, 1));
+        assert!(writes.lock().expect("lock writes").is_empty());
     }
 
     fn mock_provider_capabilities() -> fx_llm::ProviderCapabilities {
@@ -4658,6 +4967,7 @@ mod tests {
         assert_eq!(parse_command("/help"), ParsedCommand::Help);
         assert_eq!(parse_command("/loop"), ParsedCommand::Loop);
         assert_eq!(parse_command("/status"), ParsedCommand::Status);
+        assert_eq!(parse_command("/analyze"), ParsedCommand::Analyze);
         assert_eq!(
             parse_command("/synthesis Show raw output"),
             ParsedCommand::Synthesis(Some("Show raw output".to_string()))
@@ -4783,6 +5093,7 @@ mod tests {
         assert!(should_add_to_history("/clear"));
         assert!(should_add_to_history("/new"));
         assert!(should_add_to_history("/history"));
+        assert!(should_add_to_history("/analyze"));
     }
 
     #[test]

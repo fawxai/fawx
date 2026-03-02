@@ -1,6 +1,7 @@
 //! Decide-step intent-to-decision translation.
 
 use crate::types::{IntendedAction, ReasonedIntent};
+use fx_decompose::DecompositionPlan;
 use fx_llm::ToolCall;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -16,6 +17,8 @@ pub enum Decision {
     Clarify(String),
     /// Decline/defer handling with an explanation.
     Defer(String),
+    /// Execute a decomposition plan with sub-goals.
+    Decompose(DecompositionPlan),
 }
 
 /// Error surfaced while translating an intent to executable decision(s).
@@ -239,6 +242,7 @@ fn serialize_params(
 mod tests {
     use super::*;
     use crate::types::Goal;
+    use fx_decompose::{AggregationStrategy, SubGoal};
     use std::collections::HashMap;
 
     fn intent(action: IntendedAction, confidence: f32) -> ReasonedIntent {
@@ -340,5 +344,24 @@ mod tests {
         );
 
         assert!(matches!(result, Err(error) if error.reason.contains("forced serializer failure")));
+    }
+
+    #[test]
+    fn decision_decompose_variant_constructs_with_plan() {
+        let plan = DecompositionPlan {
+            sub_goals: vec![SubGoal {
+                description: "inspect logs".to_string(),
+                required_tools: vec!["read_file".to_string()],
+                expected_output: "log summary".to_string(),
+            }],
+            strategy: AggregationStrategy::Sequential,
+            truncated_from: None,
+        };
+        let decision = Decision::Decompose(plan.clone());
+
+        assert!(matches!(
+            decision,
+            Decision::Decompose(ref captured) if captured == &plan
+        ));
     }
 }
