@@ -33,6 +33,7 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Fawx Configuration
 # max_entries = 1000
 # max_value_size = 10240
 # max_snapshot_chars = 2000
+# max_relevant_results = 5
 
 # [self_modify]
 # enabled = false
@@ -83,6 +84,7 @@ pub struct MemoryConfig {
     pub max_entries: usize,
     pub max_value_size: usize,
     pub max_snapshot_chars: usize,
+    pub max_relevant_results: usize,
 }
 
 impl Default for GeneralConfig {
@@ -111,6 +113,7 @@ impl Default for MemoryConfig {
             max_entries: 1000,
             max_value_size: 10240,
             max_snapshot_chars: 2000,
+            max_relevant_results: 5,
         }
     }
 }
@@ -264,6 +267,7 @@ max_read_size = 4096
 max_entries = 200
 max_value_size = 555
 max_snapshot_chars = 777
+max_relevant_results = 9
 "#;
         fs::write(temp.path().join("config.toml"), content).expect("write config");
         let loaded = FawxConfig::load(temp.path()).expect("load config");
@@ -273,6 +277,7 @@ max_snapshot_chars = 777
         assert_eq!(loaded.model.default_model.as_deref(), Some("gpt-4.1"));
         assert_eq!(loaded.tools.max_read_size, 4096);
         assert_eq!(loaded.memory.max_snapshot_chars, 777);
+        assert_eq!(loaded.memory.max_relevant_results, 9);
     }
 
     #[test]
@@ -286,6 +291,7 @@ max_snapshot_chars = 777
         assert_eq!(loaded.general.max_history, 20);
         assert_eq!(loaded.tools.max_read_size, 1024 * 1024);
         assert_eq!(loaded.memory.max_entries, 1000);
+        assert_eq!(loaded.memory.max_relevant_results, 5);
     }
 
     #[test]
@@ -334,6 +340,7 @@ max_snapshot_chars = 777
         assert_eq!(defaults.memory.max_entries, 1000);
         assert_eq!(defaults.memory.max_value_size, 10240);
         assert_eq!(defaults.memory.max_snapshot_chars, 2000);
+        assert_eq!(defaults.memory.max_relevant_results, 5);
     }
 
     #[test]
@@ -357,6 +364,7 @@ max_snapshot_chars = 777
                 max_entries: 4,
                 max_value_size: 5,
                 max_snapshot_chars: 6,
+                max_relevant_results: 7,
             },
             self_modify: SelfModifyCliConfig {
                 enabled: true,

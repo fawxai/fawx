@@ -103,6 +103,7 @@ mod tests {
             "list_directory",
             "run_command",
             "search_text",
+            "self_info",
             "current_time",
             "memory_write",
             "memory_read",

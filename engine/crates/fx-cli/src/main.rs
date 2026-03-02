@@ -156,8 +156,15 @@ async fn run_tui() -> anyhow::Result<i32> {
     let auth_manager = tui::load_auth_manager()?;
     let router = tui::build_router(&auth_manager)?;
     let config = tui::load_config()?;
-    let loop_engine = tui::build_loop_engine_from_config(&config);
-    let mut app = tui::TuiApp::new(auth_manager, router, loop_engine, config)?;
+    let (loop_engine, memory, runtime_info) = tui::build_loop_engine_from_config(&config);
+    let mut app = tui::TuiApp::new_with_memory(
+        auth_manager,
+        router,
+        loop_engine,
+        runtime_info,
+        config,
+        memory,
+    )?;
     app.run().await?;
     Ok(0)
 }

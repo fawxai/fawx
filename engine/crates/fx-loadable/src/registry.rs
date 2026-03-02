@@ -6,7 +6,9 @@
 //! loop engine.
 
 use async_trait::async_trait;
-use fx_kernel::act::{ToolExecutor, ToolExecutorError, ToolResult};
+use fx_kernel::act::{
+    cancelled_result, is_cancelled, timed_out_result, ToolExecutor, ToolExecutorError, ToolResult,
+};
 use fx_kernel::cancellation::CancellationToken;
 use fx_llm::{ToolCall, ToolDefinition};
 use tracing::warn;
@@ -57,7 +59,22 @@ impl SkillRegistry {
     pub fn all_tool_definitions(&self) -> Vec<ToolDefinition> {
         self.skills
             .iter()
-            .flat_map(|s| s.tool_definitions())
+            .flat_map(|skill| skill.tool_definitions())
+            .collect()
+    }
+
+    /// Return a summary of each registered skill and its tool names.
+    pub fn skill_summaries(&self) -> Vec<(String, Vec<String>)> {
+        self.skills
+            .iter()
+            .map(|skill| {
+                let tools = skill
+                    .tool_definitions()
+                    .into_iter()
+                    .map(|definition| definition.name)
+                    .collect();
+                (skill.name().to_string(), tools)
+            })
             .collect()
     }
 
@@ -87,6 +104,7 @@ impl SkillRegistry {
                 };
             }
         }
+
         ToolResult {
             tool_call_id: tool_call_id.to_string(),
             tool_name: tool_name.to_string(),
@@ -94,11 +112,123 @@ impl SkillRegistry {
             output: format!("no skill handles tool '{tool_name}'"),
         }
     }
+
+    async fn execute_single_call(
+        &self,
+        call: &ToolCall,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Vec<ToolResult>, ToolExecutorError> {
+        if is_cancelled(cancel) {
+            return Ok(vec![cancelled_result(&call.id, &call.name)]);
+        }
+        let args = call.arguments.to_string();
+        let request = DispatchRequest {
+            tool_call_id: &call.id,
+            tool_name: &call.name,
+            args: &args,
+            cancel,
+            timeout: self.concurrency_policy().timeout_per_call,
+        };
+        Ok(vec![dispatch_with_timeout(self, request).await])
+    }
+
+    async fn execute_calls_concurrent(
+        &self,
+        calls: &[ToolCall],
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Vec<ToolResult>, ToolExecutorError> {
+        // Registry skills are boxed trait objects and not Clone, so we run
+        // borrowed futures with join_all instead of spawning JoinSet tasks.
+        let policy = self.concurrency_policy();
+        let semaphore = create_registry_semaphore(policy.max_parallel);
+        let timeout = policy.timeout_per_call;
+        let futures = calls
+            .iter()
+            .map(|call| self.execute_call_with_policy(call, cancel, &semaphore, timeout));
+        Ok(futures::future::join_all(futures).await)
+    }
+
+    async fn execute_call_with_policy(
+        &self,
+        call: &ToolCall,
+        cancel: Option<&CancellationToken>,
+        semaphore: &Option<tokio::sync::Semaphore>,
+        timeout: Option<std::time::Duration>,
+    ) -> ToolResult {
+        if is_cancelled(cancel) {
+            return cancelled_result(&call.id, &call.name);
+        }
+        let _permit = if let Some(sem) = semaphore {
+            sem.acquire().await.ok()
+        } else {
+            None
+        };
+        if is_cancelled(cancel) {
+            return cancelled_result(&call.id, &call.name);
+        }
+        let args = call.arguments.to_string();
+        let request = DispatchRequest {
+            tool_call_id: &call.id,
+            tool_name: &call.name,
+            args: &args,
+            cancel,
+            timeout,
+        };
+        dispatch_with_timeout(self, request).await
+    }
 }
 
 impl Default for SkillRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+struct DispatchRequest<'a> {
+    tool_call_id: &'a str,
+    tool_name: &'a str,
+    args: &'a str,
+    cancel: Option<&'a CancellationToken>,
+    timeout: Option<std::time::Duration>,
+}
+
+fn create_registry_semaphore(
+    max_parallel: Option<std::num::NonZeroUsize>,
+) -> Option<tokio::sync::Semaphore> {
+    max_parallel.map(|limit| tokio::sync::Semaphore::new(limit.get()))
+}
+
+async fn dispatch_with_timeout(
+    registry: &SkillRegistry,
+    request: DispatchRequest<'_>,
+) -> ToolResult {
+    match request.timeout {
+        Some(duration) => {
+            match tokio::time::timeout(
+                duration,
+                registry.dispatch_call(
+                    request.tool_call_id,
+                    request.tool_name,
+                    request.args,
+                    request.cancel,
+                ),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => timed_out_result(request.tool_call_id, request.tool_name),
+            }
+        }
+        None => {
+            registry
+                .dispatch_call(
+                    request.tool_call_id,
+                    request.tool_name,
+                    request.args,
+                    request.cancel,
+                )
+                .await
+        }
     }
 }
 
@@ -109,20 +239,15 @@ impl ToolExecutor for SkillRegistry {
         calls: &[ToolCall],
         cancel: Option<&CancellationToken>,
     ) -> Result<Vec<ToolResult>, ToolExecutorError> {
-        let mut results = Vec::with_capacity(calls.len());
-        for call in calls {
-            if let Some(token) = cancel {
-                if token.is_cancelled() {
-                    break;
-                }
-            }
-            let args = call.arguments.to_string();
-            results.push(
-                self.dispatch_call(&call.id, &call.name, &args, cancel)
-                    .await,
-            );
+        if calls.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(results)
+        if calls.len() == 1 {
+            return self.execute_single_call(&calls[0], cancel).await;
+        }
+        // Cancellation returns a full-length result vector so callers retain
+        // call/result alignment instead of receiving partial results.
+        self.execute_calls_concurrent(calls, cancel).await
     }
 
     fn tool_definitions(&self) -> Vec<ToolDefinition> {
@@ -251,6 +376,20 @@ mod tests {
         assert!(names.contains(&"http_post"));
     }
 
+    #[test]
+    fn skill_summaries_returns_skill_names_and_tools() {
+        let mut reg = SkillRegistry::new();
+        reg.register(Box::new(MockSkill::new("fs", &["read_file", "write_file"])));
+        reg.register(Box::new(MockSkill::new("net", &["http_get"])));
+
+        let summaries = reg.skill_summaries();
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].0, "fs");
+        assert_eq!(summaries[0].1, vec!["read_file", "write_file"]);
+        assert_eq!(summaries[1].0, "net");
+        assert_eq!(summaries[1].1, vec!["http_get"]);
+    }
+
     #[tokio::test]
     async fn execute_dispatches_to_correct_skill() {
         let mut reg = SkillRegistry::new();
@@ -294,16 +433,103 @@ mod tests {
 
         let token = CancellationToken::new();
         let calls = vec![make_tool_call("read_file"), make_tool_call("read_file")];
-
-        // Cancel after setup — first call should still process
-        // (cancellation checked at top of loop iteration)
         let results = reg.execute_tools(&calls, Some(&token)).await.unwrap();
         assert_eq!(results.len(), 2);
 
-        // Now cancel before execution
         token.cancel();
         let results = reg.execute_tools(&calls, Some(&token)).await.unwrap();
+        for result in results {
+            assert!(!result.success);
+            assert!(result.output.contains("cancelled"));
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_multiple_tools_returns_in_order() {
+        let mut reg = SkillRegistry::new();
+        reg.register(Box::new(MockSkill::new("fs", &["read_file"])));
+        reg.register(Box::new(MockSkill::new("net", &["http_get"])));
+
+        let calls = vec![
+            ToolCall {
+                id: "1".to_string(),
+                name: "http_get".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "2".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "3".to_string(),
+                name: "http_get".to_string(),
+                arguments: serde_json::json!({}),
+            },
+        ];
+
+        let results = reg.execute_tools(&calls, None).await.unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].tool_call_id, "1");
+        assert_eq!(results[0].output, "net:http_get");
+        assert_eq!(results[1].tool_call_id, "2");
+        assert_eq!(results[1].output, "fs:read_file");
+        assert_eq!(results[2].tool_call_id, "3");
+        assert_eq!(results[2].output, "net:http_get");
+    }
+
+    #[tokio::test]
+    async fn execute_cancelled_returns_cancelled_results() {
+        let mut reg = SkillRegistry::new();
+        reg.register(Box::new(MockSkill::new("fs", &["read_file"])));
+        let token = CancellationToken::new();
+        token.cancel();
+        let calls = vec![
+            ToolCall {
+                id: "1".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "2".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "3".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({}),
+            },
+        ];
+
+        let results = reg.execute_tools(&calls, Some(&token)).await.unwrap();
+        assert_eq!(results.len(), calls.len());
+        for result in &results {
+            assert!(!result.success);
+            assert!(result.output.contains("cancelled"));
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_empty_calls_returns_empty() {
+        let reg = SkillRegistry::new();
+        let results = reg.execute_tools(&[], None).await.unwrap();
         assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn execute_single_call_fast_path() {
+        let mut reg = SkillRegistry::new();
+        reg.register(Box::new(MockSkill::new("fs", &["read_file"])));
+        let calls = vec![ToolCall {
+            id: "1".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({}),
+        }];
+
+        let results = reg.execute_tools(&calls, None).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].success);
     }
 
     #[tokio::test]

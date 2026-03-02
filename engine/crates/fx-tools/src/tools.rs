@@ -1,15 +1,20 @@
 use async_trait::async_trait;
 use fx_core::memory::MemoryStore;
+use fx_core::runtime_info::RuntimeInfo;
 use fx_core::self_modify::{classify_path, format_tier_violation, SelfModifyConfig};
-use fx_kernel::act::{ToolExecutor, ToolExecutorError, ToolResult};
+use fx_kernel::act::{
+    cancelled_result, is_cancelled, timed_out_result, ConcurrencyPolicy, ToolExecutor,
+    ToolExecutorError, ToolResult,
+};
 use fx_kernel::cancellation::CancellationToken;
 use fx_llm::{ToolCall, ToolDefinition};
 use serde::Deserialize;
 use std::fs;
 use std::io::Read;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
 
@@ -24,7 +29,9 @@ pub struct FawxToolExecutor {
     working_dir: PathBuf,
     config: ToolConfig,
     memory: Option<Arc<Mutex<dyn MemoryStore>>>,
+    runtime_info: Option<Arc<RwLock<RuntimeInfo>>>,
     self_modify: Option<SelfModifyConfig>,
+    concurrency_policy: ConcurrencyPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -59,13 +66,28 @@ impl FawxToolExecutor {
             working_dir,
             config,
             memory: None,
+            runtime_info: None,
             self_modify: None,
+            concurrency_policy: ConcurrencyPolicy::default(),
         }
+    }
+
+    /// Set the concurrency policy for parallel tool execution.
+    #[must_use]
+    pub fn with_concurrency_policy(mut self, policy: ConcurrencyPolicy) -> Self {
+        self.concurrency_policy = policy;
+        self
     }
 
     /// Attach a persistent memory provider.
     pub fn with_memory(mut self, memory: Arc<Mutex<dyn MemoryStore>>) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    /// Attach runtime self-introspection state.
+    pub fn with_runtime_info(mut self, info: Arc<RwLock<RuntimeInfo>>) -> Self {
+        self.runtime_info = Some(info);
         self
     }
 
@@ -90,6 +112,7 @@ impl FawxToolExecutor {
             "run_command" => self.handle_run_command(&call.arguments).await,
             "search_text" => self.handle_search_text(&call.arguments),
             "current_time" => self.handle_current_time(),
+            "self_info" => self.handle_self_info(&call.arguments),
             "memory_write" => self.handle_memory_write(&call.arguments),
             "memory_read" => self.handle_memory_read(&call.arguments),
             "memory_list" => self.handle_memory_list(),
@@ -251,6 +274,19 @@ impl FawxToolExecutor {
         ))
     }
 
+    fn handle_self_info(&self, args: &serde_json::Value) -> Result<String, String> {
+        let parsed: SelfInfoArgs = parse_args(args)?;
+        let info_lock = self
+            .runtime_info
+            .as_ref()
+            .ok_or_else(|| "runtime info not configured".to_string())?;
+        let info = info_lock
+            .read()
+            .map_err(|error| format!("failed to read runtime info: {error}"))?;
+        let section = parsed.section.as_deref().unwrap_or("all");
+        serialize_section(&info, section)
+    }
+
     fn is_ignored_directory(&self, name: &str) -> bool {
         if is_builtin_ignored_directory(name) {
             return true;
@@ -390,6 +426,82 @@ impl FawxToolExecutor {
             Ok(format!("key '{}' not found", parsed.key))
         }
     }
+
+    async fn execute_single_tool(
+        &self,
+        call: &ToolCall,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Vec<ToolResult>, ToolExecutorError> {
+        if is_cancelled(cancel) {
+            return Ok(vec![cancelled_result(&call.id, &call.name)]);
+        }
+        let timeout = self.concurrency_policy().timeout_per_call;
+        Ok(vec![
+            execute_with_timeout(self, call, cancel, timeout).await,
+        ])
+    }
+
+    async fn execute_tools_parallel(
+        &self,
+        calls: &[ToolCall],
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Vec<ToolResult>, ToolExecutorError> {
+        // This executor is Clone, so JoinSet lets each task own an executor
+        // instance while still enforcing max parallelism via a semaphore.
+        let policy = self.concurrency_policy();
+        let cancel_token = cancel.cloned();
+        let semaphore = create_semaphore(policy.max_parallel);
+        let mut join_set = tokio::task::JoinSet::new();
+
+        for (index, call) in calls.iter().enumerate() {
+            let executor = self.clone();
+            let call = call.clone();
+            let token = cancel_token.clone();
+            let sem = semaphore.clone();
+            let timeout = policy.timeout_per_call;
+            join_set.spawn(async move {
+                let task = ConcurrentToolTask {
+                    executor,
+                    index,
+                    call,
+                    cancel: token,
+                    semaphore: sem,
+                    timeout,
+                };
+                execute_one_tool(task).await
+            });
+        }
+
+        collect_ordered_results(&mut join_set, calls.len()).await
+    }
+}
+
+fn serialize_section(info: &RuntimeInfo, section: &str) -> Result<String, String> {
+    let value = match section {
+        "model" => serde_json::json!({
+            "model": {
+                "active": &info.active_model,
+                "provider": &info.provider,
+            }
+        }),
+        "skills" => serde_json::json!({"skills": &info.skills}),
+        "config" => serde_json::json!({"config": &info.config_summary}),
+        "all" => serde_json::json!({
+            "model": {
+                "active": &info.active_model,
+                "provider": &info.provider,
+            },
+            "skills": &info.skills,
+            "config": &info.config_summary,
+            "version": &info.version,
+        }),
+        other => {
+            return Err(format!(
+                "unknown section '{other}', valid sections: model, skills, config, all"
+            ));
+        }
+    };
+    serde_json::to_string_pretty(&value).map_err(|error| error.to_string())
 }
 
 #[async_trait]
@@ -399,16 +511,19 @@ impl ToolExecutor for FawxToolExecutor {
         calls: &[ToolCall],
         cancel: Option<&CancellationToken>,
     ) -> Result<Vec<ToolResult>, ToolExecutorError> {
-        let mut results = Vec::with_capacity(calls.len());
-        for call in calls {
-            if let Some(token) = cancel {
-                if token.is_cancelled() {
-                    break;
-                }
-            }
-            results.push(self.execute_call(call, cancel).await);
+        if calls.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(results)
+        if calls.len() == 1 {
+            return self.execute_single_tool(&calls[0], cancel).await;
+        }
+        // Cancellation returns a full-length result vector so callers can keep
+        // call/result alignment even when some calls never execute.
+        self.execute_tools_parallel(calls, cancel).await
+    }
+
+    fn concurrency_policy(&self) -> ConcurrencyPolicy {
+        self.concurrency_policy.clone()
     }
 
     fn tool_definitions(&self) -> Vec<ToolDefinition> {
@@ -418,6 +533,84 @@ impl ToolExecutor for FawxToolExecutor {
         }
         defs
     }
+}
+
+struct ConcurrentToolTask {
+    executor: FawxToolExecutor,
+    index: usize,
+    call: ToolCall,
+    cancel: Option<CancellationToken>,
+    semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    timeout: Option<Duration>,
+}
+
+fn create_semaphore(max_parallel: Option<NonZeroUsize>) -> Option<Arc<tokio::sync::Semaphore>> {
+    max_parallel.map(|limit| Arc::new(tokio::sync::Semaphore::new(limit.get())))
+}
+
+async fn execute_one_tool(task: ConcurrentToolTask) -> (usize, ToolResult) {
+    if is_cancelled(task.cancel.as_ref()) {
+        return (task.index, cancelled_result(&task.call.id, &task.call.name));
+    }
+    let _permit = acquire_permit(&task.semaphore).await;
+    if is_cancelled(task.cancel.as_ref()) {
+        return (task.index, cancelled_result(&task.call.id, &task.call.name));
+    }
+    let result = execute_with_timeout(
+        &task.executor,
+        &task.call,
+        task.cancel.as_ref(),
+        task.timeout,
+    )
+    .await;
+    (task.index, result)
+}
+
+async fn acquire_permit(
+    semaphore: &Option<Arc<tokio::sync::Semaphore>>,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    if let Some(sem) = semaphore {
+        sem.clone().acquire_owned().await.ok()
+    } else {
+        None
+    }
+}
+
+async fn execute_with_timeout(
+    executor: &FawxToolExecutor,
+    call: &ToolCall,
+    cancel: Option<&CancellationToken>,
+    timeout: Option<Duration>,
+) -> ToolResult {
+    match timeout {
+        Some(duration) => {
+            match tokio::time::timeout(duration, executor.execute_call(call, cancel)).await {
+                Ok(result) => result,
+                Err(_) => timed_out_result(&call.id, &call.name),
+            }
+        }
+        None => executor.execute_call(call, cancel).await,
+    }
+}
+
+async fn collect_ordered_results(
+    join_set: &mut tokio::task::JoinSet<(usize, ToolResult)>,
+    expected: usize,
+) -> Result<Vec<ToolResult>, ToolExecutorError> {
+    let mut indexed = Vec::with_capacity(expected);
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok(pair) => indexed.push(pair),
+            Err(err) => {
+                return Err(ToolExecutorError {
+                    message: format!("tool task panicked: {err}"),
+                    recoverable: false,
+                });
+            }
+        }
+    }
+    indexed.sort_by_key(|(index, _)| *index);
+    Ok(indexed.into_iter().map(|(_, result)| result).collect())
 }
 
 pub fn fawx_tool_definitions() -> Vec<ToolDefinition> {
@@ -481,6 +674,23 @@ pub fn fawx_tool_definitions() -> Vec<ToolDefinition> {
                     "file_glob": { "type": "string" }
                 },
                 "required": ["pattern"]
+            }),
+        },
+        ToolDefinition {
+            name: "self_info".to_string(),
+            description:
+                "Inspect runtime state: active model, loaded skills, configuration, and version"
+                    .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "section": {
+                        "type": "string",
+                        "enum": ["model", "skills", "config", "all"],
+                        "description": "Filter to a specific section. Defaults to 'all'."
+                    }
+                },
+                "required": []
             }),
         },
         ToolDefinition {
@@ -631,19 +841,6 @@ fn to_tool_result(
             success: false,
             output: error,
         },
-    }
-}
-
-fn is_cancelled(cancel: Option<&CancellationToken>) -> bool {
-    cancel.is_some_and(CancellationToken::is_cancelled)
-}
-
-fn cancelled_result(tool_call_id: &str, tool_name: &str) -> ToolResult {
-    ToolResult {
-        tool_call_id: tool_call_id.to_string(),
-        tool_name: tool_name.to_string(),
-        success: false,
-        output: "tool execution cancelled".to_string(),
     }
 }
 
@@ -824,6 +1021,11 @@ struct SearchTextArgs {
 }
 
 #[derive(Deserialize)]
+struct SelfInfoArgs {
+    section: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct MemoryWriteArgs {
     key: String,
     value: String,
@@ -847,6 +1049,27 @@ mod tests {
 
     fn test_executor(root: &Path) -> FawxToolExecutor {
         FawxToolExecutor::new(root.to_path_buf(), ToolConfig::default())
+    }
+
+    fn sample_runtime_info(model: &str) -> Arc<RwLock<RuntimeInfo>> {
+        Arc::new(RwLock::new(RuntimeInfo {
+            active_model: model.to_string(),
+            provider: "openai".to_string(),
+            skills: vec![fx_core::runtime_info::SkillInfo {
+                name: "fawx-builtin".to_string(),
+                tool_names: vec!["read_file".to_string(), "self_info".to_string()],
+            }],
+            config_summary: fx_core::runtime_info::ConfigSummary {
+                max_iterations: 6,
+                max_history: 128,
+                memory_enabled: true,
+            },
+            version: "0.1.0".to_string(),
+        }))
+    }
+
+    fn parse_json_output(output: &str) -> serde_json::Value {
+        serde_json::from_str(output).expect("valid json output")
     }
 
     #[test]
@@ -1403,6 +1626,122 @@ mod tests {
         assert!(definitions.iter().any(|tool| tool.name == "current_time"));
     }
 
+    #[test]
+    fn self_info_returns_all_sections() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path()).with_runtime_info(sample_runtime_info("model-a"));
+
+        let output = executor
+            .handle_self_info(&serde_json::json!({}))
+            .expect("self_info");
+        let parsed = parse_json_output(&output);
+        assert_eq!(parsed["model"]["active"], "model-a");
+        assert_eq!(parsed["model"]["provider"], "openai");
+        assert!(parsed.get("skills").is_some());
+        assert!(parsed.get("config").is_some());
+        assert!(parsed.get("version").is_some());
+    }
+
+    #[test]
+    fn self_info_filters_to_model_section() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path()).with_runtime_info(sample_runtime_info("model-a"));
+
+        let output = executor
+            .handle_self_info(&serde_json::json!({"section": "model"}))
+            .expect("self_info model");
+        let parsed = parse_json_output(&output);
+        let object = parsed.as_object().expect("model section object");
+
+        assert_eq!(object.len(), 1);
+        assert_eq!(parsed["model"]["active"], "model-a");
+        assert_eq!(parsed["model"]["provider"], "openai");
+    }
+
+    #[test]
+    fn self_info_filters_to_skills_section() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path()).with_runtime_info(sample_runtime_info("model-a"));
+
+        let output = executor
+            .handle_self_info(&serde_json::json!({"section": "skills"}))
+            .expect("self_info skills");
+        let parsed = parse_json_output(&output);
+        let object = parsed.as_object().expect("skills section object");
+
+        assert_eq!(object.len(), 1);
+        assert_eq!(parsed["skills"][0]["name"], "fawx-builtin");
+    }
+
+    #[test]
+    fn self_info_filters_to_config_section() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path()).with_runtime_info(sample_runtime_info("model-a"));
+
+        let output = executor
+            .handle_self_info(&serde_json::json!({"section": "config"}))
+            .expect("self_info config");
+        let parsed = parse_json_output(&output);
+        let object = parsed.as_object().expect("config section object");
+
+        assert_eq!(object.len(), 1);
+        assert_eq!(parsed["config"]["max_iterations"], 6);
+        assert!(parsed["config"]["memory_enabled"]
+            .as_bool()
+            .expect("memory_enabled bool"));
+    }
+
+    #[test]
+    fn self_info_reflects_runtime_state_changes() {
+        let temp = TempDir::new().expect("temp");
+        let runtime_info = sample_runtime_info("model-a");
+        let executor = test_executor(temp.path()).with_runtime_info(runtime_info.clone());
+
+        let first = executor
+            .handle_self_info(&serde_json::json!({"section": "model"}))
+            .expect("first self_info");
+        assert_eq!(parse_json_output(&first)["model"]["active"], "model-a");
+
+        {
+            let mut guard = runtime_info.write().expect("runtime info write lock");
+            guard.active_model = "model-b".to_string();
+        }
+
+        let second = executor
+            .handle_self_info(&serde_json::json!({"section": "model"}))
+            .expect("second self_info");
+        assert_eq!(parse_json_output(&second)["model"]["active"], "model-b");
+    }
+
+    #[test]
+    fn self_info_appears_in_tool_definitions() {
+        let definitions = fawx_tool_definitions();
+        assert!(definitions.iter().any(|tool| tool.name == "self_info"));
+    }
+
+    #[test]
+    fn self_info_unknown_section_returns_error() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path()).with_runtime_info(sample_runtime_info("model-a"));
+
+        let error = executor
+            .handle_self_info(&serde_json::json!({"section": "invalid"}))
+            .expect_err("invalid section should fail");
+        assert!(error.contains("unknown section 'invalid'"));
+        assert!(error.contains("valid sections: model, skills, config, all"));
+    }
+
+    #[test]
+    fn self_info_returns_error_when_not_configured() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+
+        let error = executor
+            .handle_self_info(&serde_json::json!({}))
+            .expect_err("missing runtime info should fail");
+        assert_eq!(error, "runtime info not configured");
+    }
+
     #[tokio::test]
     async fn tool_dispatch_handles_known_tool() {
         let temp = TempDir::new().expect("temp");
@@ -1663,5 +2002,188 @@ mod tests {
         let result = executor
             .handle_write_file(&serde_json::json!({"path": "secret.key", "content": "data"}));
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn concurrent_single_tool_call_works() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let calls = vec![ToolCall {
+            id: "1".to_string(),
+            name: "current_time".to_string(),
+            arguments: serde_json::json!({}),
+        }];
+        let results = executor.execute_tools(&calls, None).await.expect("results");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].success);
+    }
+
+    #[tokio::test]
+    async fn concurrent_multiple_tools_return_in_order() {
+        let temp = TempDir::new().expect("temp");
+        fs::write(temp.path().join("a.txt"), "aaa").expect("write");
+        fs::write(temp.path().join("b.txt"), "bbb").expect("write");
+        let executor = test_executor(temp.path());
+        let calls = vec![
+            ToolCall {
+                id: "1".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "a.txt"}),
+            },
+            ToolCall {
+                id: "2".to_string(),
+                name: "current_time".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "3".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "b.txt"}),
+            },
+        ];
+        let results = executor.execute_tools(&calls, None).await.expect("results");
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].tool_call_id, "1");
+        assert_eq!(results[0].output, "aaa");
+        assert_eq!(results[1].tool_call_id, "2");
+        assert!(results[1].output.contains("epoch:"));
+        assert_eq!(results[2].tool_call_id, "3");
+        assert_eq!(results[2].output, "bbb");
+    }
+
+    #[tokio::test]
+    async fn concurrent_cancellation_stops_pending() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let token = CancellationToken::new();
+        token.cancel();
+        let calls = vec![
+            ToolCall {
+                id: "1".to_string(),
+                name: "current_time".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "2".to_string(),
+                name: "current_time".to_string(),
+                arguments: serde_json::json!({}),
+            },
+        ];
+        let results = executor
+            .execute_tools(&calls, Some(&token))
+            .await
+            .expect("results");
+        assert_eq!(results.len(), calls.len());
+        for result in &results {
+            assert!(!result.success);
+            assert!(result.output.contains("cancelled"));
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_cancellation_after_wait_returns_cancelled_result() {
+        use fx_kernel::act::ConcurrencyPolicy;
+
+        let temp = TempDir::new().expect("temp");
+        let executor = FawxToolExecutor::new(
+            temp.path().to_path_buf(),
+            ToolConfig {
+                jail_to_working_dir: false,
+                ..ToolConfig::default()
+            },
+        )
+        .with_concurrency_policy(ConcurrencyPolicy {
+            max_parallel: Some(NonZeroUsize::new(1).expect("non-zero")),
+            timeout_per_call: None,
+        });
+
+        let token = CancellationToken::new();
+        let cancel_clone = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cancel_clone.cancel();
+        });
+
+        let calls = vec![
+            ToolCall {
+                id: "1".to_string(),
+                name: "run_command".to_string(),
+                arguments: serde_json::json!({"command": "sleep 1"}),
+            },
+            ToolCall {
+                id: "2".to_string(),
+                name: "current_time".to_string(),
+                arguments: serde_json::json!({}),
+            },
+        ];
+
+        let results = executor
+            .execute_tools(&calls, Some(&token))
+            .await
+            .expect("results");
+
+        assert_eq!(results.len(), calls.len());
+        assert_eq!(results[1].tool_call_id, "2");
+        assert!(!results[1].success);
+        assert!(results[1].output.contains("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_max_parallel_one_is_sequential() {
+        use fx_kernel::act::ConcurrencyPolicy;
+
+        let temp = TempDir::new().expect("temp");
+        fs::write(temp.path().join("a.txt"), "aaa").expect("write");
+        fs::write(temp.path().join("b.txt"), "bbb").expect("write");
+        let executor = FawxToolExecutor::new(temp.path().to_path_buf(), ToolConfig::default())
+            .with_concurrency_policy(ConcurrencyPolicy {
+                max_parallel: Some(NonZeroUsize::new(1).expect("non-zero")),
+                timeout_per_call: None,
+            });
+        let calls = vec![
+            ToolCall {
+                id: "1".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "a.txt"}),
+            },
+            ToolCall {
+                id: "2".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "b.txt"}),
+            },
+        ];
+        let results = executor.execute_tools(&calls, None).await.expect("results");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].tool_call_id, "1");
+        assert_eq!(results[0].output, "aaa");
+        assert_eq!(results[1].tool_call_id, "2");
+        assert_eq!(results[1].output, "bbb");
+    }
+
+    #[tokio::test]
+    async fn concurrent_timeout_returns_error() {
+        use fx_kernel::act::ConcurrencyPolicy;
+
+        let temp = TempDir::new().expect("temp");
+        let executor = FawxToolExecutor::new(
+            temp.path().to_path_buf(),
+            ToolConfig {
+                jail_to_working_dir: false,
+                ..ToolConfig::default()
+            },
+        )
+        .with_concurrency_policy(ConcurrencyPolicy {
+            max_parallel: None,
+            timeout_per_call: Some(Duration::from_millis(50)),
+        });
+        let calls = vec![ToolCall {
+            id: "1".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({"command": "sleep 5"}),
+        }];
+        let results = executor.execute_tools(&calls, None).await.expect("results");
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].success);
+        assert!(results[0].output.contains("timed out"));
     }
 }
