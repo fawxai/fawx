@@ -1,3 +1,4 @@
+use crate::analysis::{AnalysisEngine, AnalysisError};
 use crate::auth_store::{migrate_if_needed, AuthStore};
 use async_trait::async_trait;
 use crossterm::style::Stylize;
@@ -26,7 +27,7 @@ use fx_llm::{
     OpenAiProvider, OpenAiResponsesProvider, ProviderError, RouterError, StreamChunk,
 };
 use fx_loadable::SkillRegistry;
-use fx_memory::{JsonFileMemory, JsonMemoryConfig, SignalStore};
+use fx_memory::{AnalysisFinding, Confidence, JsonFileMemory, JsonMemoryConfig, SignalStore};
 use fx_tools::{BuiltinToolsSkill, FawxToolExecutor, GitSkill, ToolConfig};
 use rustyline::completion::{Completer, Pair};
 use rustyline::config::CompletionType;
@@ -456,6 +457,7 @@ const TUI_COMMANDS: &[&str] = &[
     "/budget",
     "/signals",
     "/debug",
+    "/analyze",
     "/synthesis",
 ];
 
@@ -1040,6 +1042,7 @@ impl TuiApp {
             ParsedCommand::Status => self.show_status(),
             ParsedCommand::Signals => self.show_signals_summary(),
             ParsedCommand::Debug => self.show_signals_debug(),
+            ParsedCommand::Analyze => self.handle_analyze_command().await?,
             ParsedCommand::Synthesis(instruction) => {
                 self.update_synthesis_instruction(instruction);
             }
@@ -1219,6 +1222,52 @@ impl TuiApp {
 
         let collector = SignalCollector::from_signals(self.last_signals.clone());
         println!("{}", collector.debug_dump());
+    }
+
+    async fn handle_analyze_command(&mut self) -> Result<(), TuiError> {
+        let active_model = self
+            .router
+            .active_model()
+            .ok_or_else(|| TuiError::Router("no active model for analysis".to_string()))?
+            .to_string();
+        let llm = RouterLoopLlmProvider::new(&self.router, active_model);
+        let engine = AnalysisEngine::new(&self.signal_store);
+
+        println!("Analyzing signals across all sessions...");
+        match engine.analyze(&llm).await {
+            Ok(findings) if findings.is_empty() => {
+                println!("No patterns found. Collect more signals first.");
+            }
+            Ok(findings) => Self::print_analysis_findings(&findings),
+            Err(AnalysisError::ParseError(error)) => {
+                eprintln!("Analysis model responded, but output was unparseable JSON: {error}");
+            }
+            Err(error) => return Err(error.into()),
+        }
+
+        Ok(())
+    }
+
+    fn print_analysis_findings(findings: &[AnalysisFinding]) {
+        for finding in findings {
+            let badge = Self::confidence_badge(finding.confidence);
+            println!("\n{badge} | {}", finding.pattern_name);
+            println!("  {}", finding.description);
+            println!("  Evidence: {} signals", finding.evidence.len());
+            if let Some(action) = &finding.suggested_action {
+                println!("  Suggested: {action}");
+            }
+        }
+
+        println!("\nFound {} patterns total.", findings.len());
+    }
+
+    fn confidence_badge(confidence: Confidence) -> &'static str {
+        match confidence {
+            Confidence::High => "🔴 HIGH",
+            Confidence::Medium => "🟡 MEDIUM",
+            Confidence::Low => "🟢 LOW",
+        }
     }
 
     fn update_synthesis_instruction(&mut self, instruction: Option<String>) {
@@ -1531,6 +1580,7 @@ impl TuiApp {
         println!("  /loop          Show loop iteration details");
         println!("  /signals       Show condensed signal summary for last turn");
         println!("  /debug         Show full signal dump for last turn");
+        println!("  /analyze       Analyze persisted signals across sessions");
         println!("  /synthesis     Set or reset synthesis instruction");
         println!("  /clear         Clear the screen and active conversation");
         println!("  /new           Start a new conversation");
@@ -2360,6 +2410,12 @@ impl std::error::Error for TuiError {}
 impl From<io::Error> for TuiError {
     fn from(value: io::Error) -> Self {
         Self::Io(value)
+    }
+}
+
+impl From<AnalysisError> for TuiError {
+    fn from(value: AnalysisError) -> Self {
+        Self::Loop(format!("analysis failed: {value}"))
     }
 }
 
@@ -3282,6 +3338,7 @@ enum ParsedCommand {
     Status,
     Signals,
     Debug,
+    Analyze,
     Synthesis(Option<String>),
     Clear,
     New,
@@ -3311,6 +3368,7 @@ fn parse_command(value: &str) -> ParsedCommand {
         "status" => ParsedCommand::Status,
         "signals" => ParsedCommand::Signals,
         "debug" => ParsedCommand::Debug,
+        "analyze" => ParsedCommand::Analyze,
         "synthesis" => {
             let remainder = input[command.len()..].strip_prefix(' ');
             match remainder {
@@ -4658,6 +4716,7 @@ mod tests {
         assert_eq!(parse_command("/help"), ParsedCommand::Help);
         assert_eq!(parse_command("/loop"), ParsedCommand::Loop);
         assert_eq!(parse_command("/status"), ParsedCommand::Status);
+        assert_eq!(parse_command("/analyze"), ParsedCommand::Analyze);
         assert_eq!(
             parse_command("/synthesis Show raw output"),
             ParsedCommand::Synthesis(Some("Show raw output".to_string()))
@@ -4783,6 +4842,7 @@ mod tests {
         assert!(should_add_to_history("/clear"));
         assert!(should_add_to_history("/new"));
         assert!(should_add_to_history("/history"));
+        assert!(should_add_to_history("/analyze"));
     }
 
     #[test]
