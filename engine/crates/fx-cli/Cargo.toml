@@ -36,6 +36,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
 crossterm.workspace = true
+libc = "0.2"
 futures.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
