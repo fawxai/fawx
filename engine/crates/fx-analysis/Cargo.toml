@@ -8,8 +8,8 @@ description = "Signal analysis engine and finding types for Fawx."
 
 [dependencies]
 fx-core.workspace = true
+fx-llm = { path = "../fx-llm" }
 fx-memory.workspace = true
-fx-kernel.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

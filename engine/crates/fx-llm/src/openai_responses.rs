@@ -311,6 +311,7 @@ fn tool_delta_from_arguments_event(data: &str, is_done_event: bool) -> Option<To
         id,
         name: parsed.name,
         arguments_delta,
+        arguments_done: is_done_event,
     })
 }
 
@@ -332,6 +333,7 @@ fn tool_delta_from_output_item_event(data: &str) -> Option<ToolUseDelta> {
         id,
         name,
         arguments_delta,
+        arguments_done: false,
     })
 }
 
@@ -801,26 +803,16 @@ fn apply_tool_use_delta(call: &mut PendingToolCall, delta: ToolUseDelta) {
     }
 
     if let Some(arguments_delta) = delta.arguments_delta {
-        merge_arguments(&mut call.arguments, &arguments_delta);
+        merge_arguments(&mut call.arguments, &arguments_delta, delta.arguments_done);
     }
 }
 
-fn merge_arguments(arguments: &mut String, incoming: &str) {
+fn merge_arguments(arguments: &mut String, incoming: &str, is_done_event: bool) {
     if incoming.is_empty() {
         return;
     }
 
-    if arguments.is_empty() {
-        arguments.push_str(incoming);
-        return;
-    }
-
-    if incoming.starts_with(arguments.as_str()) {
-        *arguments = incoming.to_string();
-        return;
-    }
-
-    if arguments.starts_with(incoming) {
+    if is_done_event && !arguments.is_empty() {
         return;
     }
 
@@ -1289,6 +1281,10 @@ mod tests {
                 r#"{"type":"response.function_call_arguments.delta","item_id":"call_1","delta":"{\"intent\":\"op"}"#,
             ),
             (
+                "response.function_call_arguments.delta",
+                r#"{"type":"response.function_call_arguments.delta","item_id":"call_1","delta":"en\"}"}"#,
+            ),
+            (
                 "response.function_call_arguments.done",
                 r#"{"type":"response.function_call_arguments.done","item_id":"call_1","arguments":"{\"intent\":\"open\"}"}"#,
             ),
@@ -1311,6 +1307,10 @@ mod tests {
             (
                 "response.output_item.added",
                 r#"{"type":"response.output_item.added","item":{"type":"function_call","id":"call_2","name":"emit_intent","arguments":""}}"#,
+            ),
+            (
+                "response.function_call_arguments.delta",
+                r#"{"type":"response.function_call_arguments.delta","item_id":"call_2","delta":"pen\"}"}"#,
             ),
             (
                 "response.function_call_arguments.done",
@@ -1346,6 +1346,36 @@ mod tests {
     }
 
     #[test]
+    fn merge_tool_use_deltas_done_event_with_full_arguments_does_not_double_append() {
+        let events = vec![
+            (
+                "response.output_item.added",
+                r#"{"type":"response.output_item.added","item":{"type":"function_call","id":"call_4","name":"emit_intent","arguments":""}}"#,
+            ),
+            (
+                "response.function_call_arguments.delta",
+                r#"{"type":"response.function_call_arguments.delta","item_id":"call_4","delta":"{\"intent\":\"op"}"#,
+            ),
+            (
+                "response.function_call_arguments.delta",
+                r#"{"type":"response.function_call_arguments.delta","item_id":"call_4","delta":"en\"}"}"#,
+            ),
+            (
+                "response.function_call_arguments.done",
+                r#"{"type":"response.function_call_arguments.done","item_id":"call_4","arguments":"{\"intent\":\"open\"}"}"#,
+            ),
+        ];
+
+        let tool_calls = reconstructed_tool_calls(&events);
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_4");
+        assert_eq!(tool_calls[0].name, "emit_intent");
+        assert_eq!(tool_calls[0].arguments["intent"], "open");
+        let expected = serde_json::from_str::<Value>(r#"{"intent":"open"}"#).unwrap();
+        assert_eq!(tool_calls[0].arguments, expected);
+    }
+
+    #[test]
     fn build_request_body_skips_empty_tool_result_call_id() {
         let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
         let request = CompletionRequest {
@@ -1378,6 +1408,7 @@ mod tests {
                 id: Some("call_1".to_string()),
                 name: Some("emit_intent".to_string()),
                 arguments_delta: Some("{\"intent\":\"op".to_string()),
+                arguments_done: false,
             }],
         );
         merge_tool_use_deltas(
@@ -1386,6 +1417,7 @@ mod tests {
                 id: Some("call_1".to_string()),
                 name: Some("emit_intent".to_string()),
                 arguments_delta: Some("en\"}".to_string()),
+                arguments_done: false,
             }],
         );
 
@@ -1405,6 +1437,7 @@ mod tests {
                 id: Some("call_1".to_string()),
                 name: None,
                 arguments_delta: Some("{\"intent\":\"op".to_string()),
+                arguments_done: false,
             }],
         );
         merge_tool_use_deltas(
@@ -1413,6 +1446,7 @@ mod tests {
                 id: Some("call_1".to_string()),
                 name: Some("emit_intent".to_string()),
                 arguments_delta: Some("en\"}".to_string()),
+                arguments_done: false,
             }],
         );
 
@@ -1421,5 +1455,26 @@ mod tests {
         assert_eq!(tool_calls[0].id, "call_1");
         assert_eq!(tool_calls[0].name, "emit_intent");
         assert_eq!(tool_calls[0].arguments["intent"], "open");
+    }
+
+    #[test]
+    fn merge_arguments_concatenates_without_dedup() {
+        let mut arguments = String::new();
+        merge_arguments(&mut arguments, "{\"findings\":[{", false);
+        merge_arguments(&mut arguments, "\"confidence\":\"high\"", false);
+        merge_arguments(&mut arguments, "}]}", false);
+
+        assert_eq!(arguments, "{\"findings\":[{\"confidence\":\"high\"}]}");
+        let parsed = serde_json::from_str::<Value>(&arguments).expect("valid json");
+        assert_eq!(parsed["findings"][0]["confidence"], "high");
+    }
+
+    #[test]
+    fn merge_arguments_handles_overlapping_like_chunks() {
+        let mut arguments = String::new();
+        merge_arguments(&mut arguments, "{\"a\":", false);
+        merge_arguments(&mut arguments, "{\"a\":\"b\"}", false);
+
+        assert_eq!(arguments, "{\"a\":{\"a\":\"b\"}");
     }
 }

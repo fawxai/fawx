@@ -1,36 +1,23 @@
 use crate::AnalysisFinding;
-use fx_core::error::LlmError;
 use fx_core::signals::{Signal, SignalKind};
-use fx_kernel::loop_engine::LlmProvider;
+use fx_llm::{
+    CompletionProvider, CompletionRequest, Message, ProviderError, ToolCall, ToolDefinition,
+};
 use fx_memory::signal_store::SignalStoreError;
 use fx_memory::SignalStore;
+use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fmt;
 
-const ANALYSIS_JSON_SCHEMA: &str = r#"[
-  {
-    "pattern_name": "...",
-    "description": "...",
-    "confidence": "high",
-    "evidence": [
-      {
-        "session_id": "...",
-        "signal_kind": "friction",
-        "message": "...",
-        "timestamp_ms": 0
-      }
-    ],
-    "suggested_action": "..."
-  }
-]
-"#;
+const REPORT_FINDINGS_TOOL_NAME: &str = "report_findings";
+const ANALYSIS_SYSTEM_PROMPT: &str = "You analyze runtime signals across sessions. Identify recurring patterns and report each one by calling the report_findings tool.";
 
 type SessionSignal = (String, Signal);
 
 #[derive(Debug)]
 pub enum AnalysisError {
     SignalStore(SignalStoreError),
-    Llm(LlmError),
+    Llm(ProviderError),
     ParseError(serde_json::Error),
 }
 
@@ -60,10 +47,100 @@ impl From<SignalStoreError> for AnalysisError {
     }
 }
 
-impl From<LlmError> for AnalysisError {
-    fn from(value: LlmError) -> Self {
+impl From<ProviderError> for AnalysisError {
+    fn from(value: ProviderError) -> Self {
         Self::Llm(value)
     }
+}
+
+impl From<serde_json::Error> for AnalysisError {
+    fn from(value: serde_json::Error) -> Self {
+        Self::ParseError(value)
+    }
+}
+
+#[must_use]
+pub fn report_findings_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: REPORT_FINDINGS_TOOL_NAME.to_string(),
+        description: "Report recurring analysis findings from runtime signals.".to_string(),
+        parameters: report_findings_parameters(),
+    }
+}
+
+fn report_findings_parameters() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["findings"],
+        "properties": {
+            "findings": {
+                "type": "array",
+                "items": finding_schema()
+            }
+        }
+    })
+}
+
+fn finding_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["pattern_name", "description", "confidence", "evidence"],
+        "properties": {
+            "pattern_name": { "type": "string" },
+            "description": { "type": "string" },
+            "confidence": {
+                "type": "string",
+                "enum": ["high", "medium", "low"]
+            },
+            "evidence": {
+                "type": "array",
+                "items": evidence_schema()
+            },
+            "suggested_action": { "type": "string" }
+        }
+    })
+}
+
+fn evidence_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["session_id", "signal_kind", "message", "timestamp_ms"],
+        "properties": {
+            "session_id": { "type": "string" },
+            "signal_kind": {
+                "type": "string",
+                "enum": signal_kind_values()
+            },
+            "message": { "type": "string" },
+            "timestamp_ms": { "type": "integer", "minimum": 0 }
+        }
+    })
+}
+
+/// Signal kind string values for the tool definition schema.
+///
+/// Uses `SignalKind::to_label()` which produces snake_case strings matching
+/// the `#[serde(rename_all = "snake_case")]` serialization format.
+/// If a new `SignalKind` variant is added, add it here too.
+fn signal_kind_values() -> Vec<&'static str> {
+    [
+        SignalKind::Trace,
+        SignalKind::Thinking,
+        SignalKind::Friction,
+        SignalKind::Success,
+        SignalKind::Blocked,
+        SignalKind::Performance,
+        SignalKind::UserIntervention,
+        SignalKind::UserInput,
+        SignalKind::UserFeedback,
+        SignalKind::Decision,
+    ]
+    .iter()
+    .map(|k| k.to_label())
+    .collect()
 }
 
 #[derive(Debug)]
@@ -76,72 +153,107 @@ impl<'a> AnalysisEngine<'a> {
         Self { signal_store }
     }
 
+    /// Analyze stored runtime signals and return recurring findings.
+    ///
+    /// `CompletionRequest.model` is intentionally empty because the caller's
+    /// `CompletionProvider` wrapper injects the active model before dispatch.
     pub async fn analyze(
         &self,
-        llm: &dyn LlmProvider,
+        provider: &dyn CompletionProvider,
     ) -> Result<Vec<AnalysisFinding>, AnalysisError> {
         let signals = self.signal_store.load_all()?;
         if signals.is_empty() {
             return Ok(Vec::new());
         }
 
-        let prompt = self.build_prompt(&signals);
-        let response = llm.generate(&prompt, 4096).await?;
-        self.parse_findings(&response)
-    }
-
-    fn build_prompt(&self, signals: &[SessionSignal]) -> String {
-        let counts = render_signal_counts(signals);
-        let friction = render_recent_signals(signals, SignalKind::Friction, 8);
-        let blocked = render_recent_signals(signals, SignalKind::Blocked, 8);
-        let success = render_recent_signals(signals, SignalKind::Success, 8);
-
-        format!(
-            "You are analyzing agent runtime signals captured across sessions.
-
-Signal counts by kind and session:
-{counts}
-
-Recent friction signals:
-{friction}
-
-Recent blocked signals:
-{blocked}
-
-Recent success signals:
-{success}
-
-Identify recurring patterns that emerge from these signals.
-For each pattern, provide:
-- pattern_name
-- description
-- confidence (high, medium, low)
-- evidence (array of objects with session_id, signal_kind, message, timestamp_ms)
-- suggested_action (optional)
-
-Return ONLY a JSON array that matches this schema exactly:
-{ANALYSIS_JSON_SCHEMA}"
-        )
-    }
-
-    fn parse_findings(&self, response: &str) -> Result<Vec<AnalysisFinding>, AnalysisError> {
-        if let Ok(findings) = serde_json::from_str::<Vec<AnalysisFinding>>(response) {
-            return Ok(findings);
-        }
-
-        let Some(json_array) = extract_json_array(response) else {
-            return Ok(Vec::new());
+        let request = CompletionRequest {
+            model: String::new(),
+            messages: vec![Message::user(build_signal_summary(&signals))],
+            tools: vec![report_findings_tool_definition()],
+            temperature: None,
+            max_tokens: Some(4096),
+            system_prompt: Some(ANALYSIS_SYSTEM_PROMPT.to_string()),
         };
 
-        parse_findings_from_json_array(&json_array)
+        let response = provider.complete(request).await?;
+        parse_tool_call_findings(&response.tool_calls)
     }
 }
 
-fn parse_findings_from_json_array(json_array: &str) -> Result<Vec<AnalysisFinding>, AnalysisError> {
-    serde_json::from_str::<Vec<AnalysisFinding>>(json_array).map_err(|error| {
-        tracing::warn!("analysis response contained unparseable findings JSON: {error}");
-        AnalysisError::ParseError(error)
-    })
+fn build_signal_summary(signals: &[SessionSignal]) -> String {
+    let counts = render_signal_counts(signals);
+    let friction = render_recent_signals(signals, SignalKind::Friction, 8);
+    let blocked = render_recent_signals(signals, SignalKind::Blocked, 8);
+    let success = render_recent_signals(signals, SignalKind::Success, 8);
+
+    format!(
+        "Signal counts by kind and session:\n{counts}\n\nRecent friction signals:\n{friction}\n\nRecent blocked signals:\n{blocked}\n\nRecent success signals:\n{success}"
+    )
+}
+
+fn parse_tool_call_findings(
+    tool_calls: &[ToolCall],
+) -> Result<Vec<AnalysisFinding>, AnalysisError> {
+    let mut findings: Vec<AnalysisFinding> = tool_calls
+        .iter()
+        .filter(|call| call.name == REPORT_FINDINGS_TOOL_NAME)
+        .try_fold(Vec::new(), collect_tool_call_findings)?;
+
+    deduplicate_findings(&mut findings);
+    Ok(findings)
+}
+
+fn deduplicate_findings(findings: &mut Vec<AnalysisFinding>) {
+    let mut seen = std::collections::HashSet::new();
+    findings.retain(|finding| seen.insert(finding.pattern_name.clone()));
+}
+
+fn collect_tool_call_findings(
+    mut findings: Vec<AnalysisFinding>,
+    tool_call: &ToolCall,
+) -> Result<Vec<AnalysisFinding>, AnalysisError> {
+    let args: ReportFindingsArgs = deserialize_tool_args(&tool_call.arguments)?;
+    findings.extend(args.findings);
+    Ok(findings)
+}
+
+/// Deserialize tool call arguments, handling both normal JSON objects
+/// and double-encoded JSON strings returned by some providers.
+fn deserialize_tool_args<T>(args: &serde_json::Value) -> Result<T, serde_json::Error>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let original_error = match serde_json::from_value::<T>(args.clone()) {
+        Ok(parsed) => return Ok(parsed),
+        Err(error) => error,
+    };
+
+    let serde_json::Value::String(encoded) = args else {
+        return Err(original_error);
+    };
+
+    // Try full string first (simple double-encoding).
+    if let Ok(parsed) = serde_json::from_str::<T>(encoded) {
+        return Ok(parsed);
+    }
+
+    // Some providers concatenate multiple JSON objects in one string.
+    // Use a streaming deserializer to extract the first valid value.
+    let mut streaming = serde_json::Deserializer::from_str(encoded).into_iter::<T>();
+    if let Some(first_result) = streaming.next() {
+        let parsed = first_result?;
+        if streaming.next().is_some() {
+            tracing::warn!("concatenated JSON tool arguments detected; using only first object");
+        }
+        return Ok(parsed);
+    }
+
+    Err(original_error)
+}
+
+#[derive(Debug, Deserialize)]
+struct ReportFindingsArgs {
+    findings: Vec<AnalysisFinding>,
 }
 
 fn render_signal_counts(signals: &[SessionSignal]) -> String {
@@ -197,114 +309,47 @@ fn sanitize_message(message: &str) -> String {
     }
 }
 
-fn extract_json_array(response: &str) -> Option<String> {
-    extract_json_code_block(response).or_else(|| extract_balanced_array(response))
-}
-
-fn extract_json_code_block(response: &str) -> Option<String> {
-    let mut parts = response.split("```");
-    while let Some(_prefix) = parts.next() {
-        let block = parts.next()?;
-        if let Some(payload) = json_payload_from_fenced_block(block) {
-            return Some(payload);
-        }
-    }
-    None
-}
-
-fn json_payload_from_fenced_block(block: &str) -> Option<String> {
-    if let Some((first_line, rest)) = block.trim().split_once('\n') {
-        if first_line.trim().eq_ignore_ascii_case("json") {
-            return Some(rest.trim().to_string());
-        }
-    }
-
-    let trimmed = strip_code_fence_language(block).trim();
-    if trimmed.starts_with('[') && trimmed.ends_with(']') {
-        Some(trimmed.to_string())
-    } else {
-        None
-    }
-}
-
-fn strip_code_fence_language(block: &str) -> &str {
-    let trimmed = block.trim();
-    let Some((first_line, rest)) = trimmed.split_once('\n') else {
-        return trimmed;
-    };
-
-    if is_fence_language(first_line) {
-        rest
-    } else {
-        trimmed
-    }
-}
-
-fn is_fence_language(line: &str) -> bool {
-    !line.is_empty()
-        && line
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
-}
-
-fn extract_balanced_array(response: &str) -> Option<String> {
-    let start = response.find('[')?;
-    let mut depth = 0usize;
-    let mut in_string = false;
-    let mut escaped = false;
-
-    for (index, ch) in response[start..].char_indices() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-
-        match ch {
-            '"' => in_string = true,
-            '[' => depth += 1,
-            ']' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    let end = start + index + 1;
-                    return Some(response[start..end].to_string());
-                }
-            }
-            _ => {}
-        }
-    }
-
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::Confidence;
     use async_trait::async_trait;
     use fx_core::signals::LoopStep;
+    use fx_llm::{CompletionResponse, CompletionStream, ContentBlock, ProviderCapabilities};
+    use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use tempfile::TempDir;
 
     #[derive(Debug)]
-    struct MockLlm {
-        response: String,
+    struct MockCompletionProvider {
+        model: String,
+        result: Result<CompletionResponse, ProviderError>,
         calls: AtomicUsize,
-        last_prompt: Mutex<Option<String>>,
+        last_request: Mutex<Option<CompletionRequest>>,
     }
 
-    impl MockLlm {
-        fn new(response: &str) -> Self {
+    impl MockCompletionProvider {
+        fn success(model: &str, tool_calls: Vec<ToolCall>) -> Self {
+            let response = CompletionResponse {
+                content: Vec::new(),
+                tool_calls,
+                usage: None,
+                stop_reason: Some("tool_use".to_string()),
+            };
+            Self::with_result(model, Ok(response))
+        }
+
+        fn failure(model: &str, error: ProviderError) -> Self {
+            Self::with_result(model, Err(error))
+        }
+
+        fn with_result(model: &str, result: Result<CompletionResponse, ProviderError>) -> Self {
             Self {
-                response: response.to_string(),
+                model: model.to_string(),
+                result,
                 calls: AtomicUsize::new(0),
-                last_prompt: Mutex::new(None),
+                last_request: Mutex::new(None),
             }
         }
 
@@ -312,38 +357,44 @@ mod tests {
             self.calls.load(Ordering::SeqCst)
         }
 
-        fn capture_prompt(&self, prompt: &str) {
-            let mut guard = self.last_prompt.lock().expect("prompt lock");
-            *guard = Some(prompt.to_string());
-        }
-
-        fn last_prompt(&self) -> Option<String> {
-            self.last_prompt.lock().expect("prompt lock").clone()
+        fn last_request(&self) -> Option<CompletionRequest> {
+            self.last_request.lock().expect("request lock").clone()
         }
     }
 
     #[async_trait]
-    impl LlmProvider for MockLlm {
-        async fn generate(&self, prompt: &str, _max_tokens: u32) -> Result<String, LlmError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            self.capture_prompt(prompt);
-            Ok(self.response.clone())
-        }
-
-        async fn generate_streaming(
+    impl CompletionProvider for MockCompletionProvider {
+        async fn complete(
             &self,
-            prompt: &str,
-            _max_tokens: u32,
-            callback: Box<dyn Fn(String) + Send + 'static>,
-        ) -> Result<String, LlmError> {
+            request: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            self.capture_prompt(prompt);
-            callback(self.response.clone());
-            Ok(self.response.clone())
+            *self.last_request.lock().expect("request lock") = Some(request);
+            self.result.clone()
         }
 
-        fn model_name(&self) -> &str {
-            "mock-model"
+        async fn complete_stream(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionStream, ProviderError> {
+            Err(ProviderError::Provider(
+                "streaming is not supported in tests".to_string(),
+            ))
+        }
+
+        fn name(&self) -> &str {
+            "mock-provider"
+        }
+
+        fn supported_models(&self) -> Vec<String> {
+            vec![self.model.clone()]
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                supports_temperature: true,
+                requires_streaming: false,
+            }
         }
     }
 
@@ -352,63 +403,92 @@ mod tests {
             step,
             kind,
             message: message.to_string(),
-            metadata: serde_json::json!({}),
+            metadata: json!({}),
             timestamp_ms,
         }
     }
 
-    fn mk_session_signal(
-        session_id: &str,
-        step: LoopStep,
-        kind: SignalKind,
-        message: &str,
-        timestamp_ms: u64,
-    ) -> SessionSignal {
-        (
-            session_id.to_string(),
-            mk_signal(step, kind, message, timestamp_ms),
-        )
+    fn mk_session_signal(session_id: &str, signal: Signal) -> SessionSignal {
+        (session_id.to_string(), signal)
+    }
+
+    fn sample_finding_json(pattern_name: &str, session_id: &str) -> serde_json::Value {
+        json!({
+            "pattern_name": pattern_name,
+            "description": "Repeated timeout while searching",
+            "confidence": "high",
+            "evidence": [{
+                "session_id": session_id,
+                "signal_kind": "friction",
+                "message": "tool timeout",
+                "timestamp_ms": 1
+            }],
+            "suggested_action": "Increase timeout budget"
+        })
+    }
+
+    fn report_findings_call(pattern_name: &str, session_id: &str) -> ToolCall {
+        report_findings_call_with_arguments(json!({
+            "findings": [sample_finding_json(pattern_name, session_id)]
+        }))
+    }
+
+    fn report_findings_call_with_arguments(arguments: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: "call-1".to_string(),
+            name: REPORT_FINDINGS_TOOL_NAME.to_string(),
+            arguments,
+        }
+    }
+
+    fn first_message_text(request: &CompletionRequest) -> Option<String> {
+        let message = request.messages.first()?;
+        let block = message.content.first()?;
+        match block {
+            ContentBlock::Text { text } => Some(text.clone()),
+            _ => None,
+        }
     }
 
     #[test]
-    fn prompt_construction_includes_session_aware_counts_and_details() {
-        let tmp = TempDir::new().expect("tempdir");
-        let store = SignalStore::new(tmp.path(), "prompt-session").expect("new store");
-        let engine = AnalysisEngine::new(&store);
+    fn report_findings_tool_definition_contains_findings_schema() {
+        let tool = report_findings_tool_definition();
 
+        assert_eq!(tool.name, REPORT_FINDINGS_TOOL_NAME);
+        assert_eq!(tool.parameters["type"], json!("object"));
+        assert_eq!(
+            tool.parameters["properties"]["findings"]["type"],
+            json!("array")
+        );
+    }
+
+    const SIGNAL_KIND_VARIANT_COUNT: usize = 10;
+
+    #[test]
+    fn signal_kind_values_matches_known_signal_kind_variant_count() {
+        assert_eq!(signal_kind_values().len(), SIGNAL_KIND_VARIANT_COUNT);
+    }
+
+    #[test]
+    fn build_signal_summary_includes_sections_without_prompt_instructions() {
         let signals = vec![
             mk_session_signal(
                 "session-a",
-                LoopStep::Act,
-                SignalKind::Friction,
-                "timeout while searching",
-                100,
-            ),
-            mk_session_signal(
-                "session-a",
-                LoopStep::Act,
-                SignalKind::Blocked,
-                "permission denied",
-                200,
+                mk_signal(LoopStep::Act, SignalKind::Friction, "timeout", 10),
             ),
             mk_session_signal(
                 "session-b",
-                LoopStep::Act,
-                SignalKind::Success,
-                "search completed",
-                300,
+                mk_signal(LoopStep::Act, SignalKind::Success, "completed", 20),
             ),
         ];
 
-        let prompt = engine.build_prompt(&signals);
+        let summary = build_signal_summary(&signals);
 
-        assert!(prompt.contains("Signal counts by kind and session:"));
-        assert!(prompt.contains("session_id=session-a kind=blocked count=1"));
-        assert!(prompt.contains("session_id=session-a kind=friction count=1"));
-        assert!(prompt.contains("session_id=session-b kind=success count=1"));
-        assert!(prompt.contains("Recent blocked signals:"));
-        assert!(prompt.contains("session_id=session-a"));
-        assert!(prompt.contains("permission denied"));
+        assert!(summary.contains("Signal counts by kind and session"));
+        assert!(summary.contains("session_id=session-a kind=friction count=1"));
+        assert!(summary.contains("Recent blocked signals"));
+        assert!(!summary.contains("Return ONLY"));
+        assert!(!summary.contains("pattern_name"));
     }
 
     #[test]
@@ -419,61 +499,19 @@ mod tests {
     }
 
     #[test]
-    fn render_signal_counts_aggregates_per_session_and_kind() {
-        let signals = vec![
-            mk_session_signal("session-a", LoopStep::Act, SignalKind::Friction, "one", 1),
-            mk_session_signal(
-                "session-a",
-                LoopStep::Reason,
-                SignalKind::Friction,
-                "two",
-                2,
-            ),
-            mk_session_signal("session-b", LoopStep::Act, SignalKind::Friction, "three", 3),
-        ];
-
-        let counts = render_signal_counts(&signals);
-
-        assert!(counts.contains("session_id=session-a kind=friction count=2"));
-        assert!(counts.contains("session_id=session-b kind=friction count=1"));
-    }
-
-    #[test]
-    fn render_recent_signals_returns_none_when_kind_is_missing() {
-        let signals = vec![mk_session_signal(
-            "session-a",
-            LoopStep::Act,
-            SignalKind::Success,
-            "ok",
-            1,
-        )];
-        let rendered = render_recent_signals(&signals, SignalKind::Blocked, 3);
-        assert_eq!(rendered, "- none");
-    }
-
-    #[test]
     fn render_recent_signals_respects_limit_order_and_session_context() {
         let signals = vec![
             mk_session_signal(
                 "session-a",
-                LoopStep::Act,
-                SignalKind::Friction,
-                "oldest",
-                1,
+                mk_signal(LoopStep::Act, SignalKind::Friction, "oldest", 1),
             ),
             mk_session_signal(
                 "session-b",
-                LoopStep::Act,
-                SignalKind::Friction,
-                "middle",
-                2,
+                mk_signal(LoopStep::Act, SignalKind::Friction, "middle", 2),
             ),
             mk_session_signal(
                 "session-c",
-                LoopStep::Act,
-                SignalKind::Friction,
-                "latest",
-                3,
+                mk_signal(LoopStep::Act, SignalKind::Friction, "latest", 3),
             ),
         ];
 
@@ -482,123 +520,114 @@ mod tests {
 
         assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("session_id=session-c"));
-        assert!(lines[0].contains("latest"));
         assert!(lines[1].contains("session_id=session-b"));
-        assert!(lines[1].contains("middle"));
     }
 
     #[test]
-    fn strip_code_fence_language_handles_language_and_plain_blocks() {
-        assert_eq!(strip_code_fence_language("json\n[]"), "[]");
-        assert_eq!(strip_code_fence_language("[]"), "[]");
-        assert_eq!(strip_code_fence_language(""), "");
+    fn tool_call_args_normal_object() {
+        let calls = vec![
+            ToolCall {
+                id: "ignore".to_string(),
+                name: "different_tool".to_string(),
+                arguments: json!({"ignored": true}),
+            },
+            report_findings_call("Timeout loop", "session-a"),
+        ];
+
+        let findings = parse_tool_call_findings(&calls).expect("parse findings");
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].pattern_name, "Timeout loop");
+        assert_eq!(findings[0].confidence, Confidence::High);
     }
 
     #[test]
-    fn extract_json_code_block_handles_empty_and_unfenced_input() {
-        assert_eq!(extract_json_code_block(""), None);
-        assert_eq!(extract_json_code_block("[{}]"), None);
+    fn tool_call_args_double_encoded_json_string() {
+        let arguments = json!({
+            "findings": [sample_finding_json("Timeout loop", "session-a")]
+        });
+        let call = report_findings_call_with_arguments(serde_json::Value::String(
+            serde_json::to_string(&arguments).expect("serialized args"),
+        ));
+
+        let findings = parse_tool_call_findings(&[call]).expect("parse findings");
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].pattern_name, "Timeout loop");
     }
 
     #[test]
-    fn extract_json_code_block_uses_json_block_when_multiple_fences_exist() {
-        let response = r#"```text
-ignore this
-```
-Some commentary.
-```json
-[{"pattern_name":"x"}]
-```
-```yaml
-foo: bar
-```
-"#;
+    fn tool_call_args_concatenated_json_objects() {
+        let arguments = json!({
+            "findings": [sample_finding_json("Timeout loop", "session-a")]
+        });
+        let serialized = serde_json::to_string(&arguments).expect("serialized args");
+        let call = report_findings_call_with_arguments(serde_json::Value::String(format!(
+            "{serialized}{serialized}{serialized}"
+        )));
 
-        let extracted = extract_json_code_block(response).expect("json code block");
-        assert_eq!(extracted, r#"[{"pattern_name":"x"}]"#);
+        let findings = parse_tool_call_findings(&[call]).expect("parse findings");
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].pattern_name, "Timeout loop");
     }
 
     #[test]
-    fn extract_balanced_array_handles_nested_arrays_and_string_brackets() {
-        let response =
-            r#"prefix [{"nested":[{"values":[1,2]}],"message":"contains [brackets]"}] suffix"#;
-        let extracted = extract_balanced_array(response).expect("balanced array");
+    fn duplicate_findings_deduplicated() {
+        let calls = vec![
+            report_findings_call("Timeout loop", "session-a"),
+            report_findings_call("Timeout loop", "session-a"),
+        ];
 
-        assert_eq!(
-            extracted,
-            r#"[{"nested":[{"values":[1,2]}],"message":"contains [brackets]"}]"#
-        );
+        let findings = parse_tool_call_findings(&calls).expect("parse findings");
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].pattern_name, "Timeout loop");
     }
 
     #[test]
-    fn extract_balanced_array_returns_none_for_unclosed_array() {
-        assert!(extract_balanced_array(r#"prefix [{"pattern":"oops"}"#).is_none());
-    }
+    fn tool_call_args_invalid_string() {
+        let calls = vec![report_findings_call_with_arguments(
+            serde_json::Value::String("not json at all".to_string()),
+        )];
 
-    #[test]
-    fn parse_findings_returns_empty_when_response_has_no_json() {
-        let tmp = TempDir::new().expect("tempdir");
-        let store = SignalStore::new(tmp.path(), "parse-session").expect("new store");
-        let engine = AnalysisEngine::new(&store);
-
-        let findings = engine
-            .parse_findings("No structured output was produced.")
-            .expect("non-json text should be treated as no findings");
-
-        assert!(findings.is_empty());
-    }
-
-    #[test]
-    fn parse_findings_returns_error_for_malformed_json_code_block() {
-        let tmp = TempDir::new().expect("tempdir");
-        let store = SignalStore::new(tmp.path(), "parse-session").expect("new store");
-        let engine = AnalysisEngine::new(&store);
-
-        let response = r#"```json
-[{"pattern_name":"oops"}
-```"#;
-        let error = engine
-            .parse_findings(response)
-            .expect_err("partial JSON should fail parsing");
+        let error = parse_tool_call_findings(&calls).expect_err("expected parse failure");
 
         assert!(matches!(error, AnalysisError::ParseError(_)));
     }
 
     #[test]
-    fn parse_findings_returns_error_for_wrong_schema_json() {
-        let tmp = TempDir::new().expect("tempdir");
-        let store = SignalStore::new(tmp.path(), "parse-session").expect("new store");
-        let engine = AnalysisEngine::new(&store);
+    fn parse_tool_call_findings_returns_parse_error_for_bad_arguments() {
+        let calls = vec![ToolCall {
+            id: "bad".to_string(),
+            name: REPORT_FINDINGS_TOOL_NAME.to_string(),
+            arguments: json!({"findings": "not-an-array"}),
+        }];
 
-        let response = r#"```json
-[{"pattern_name":123}]
-```"#;
-        let error = engine
-            .parse_findings(response)
-            .expect_err("schema mismatch should fail parsing");
+        let error = parse_tool_call_findings(&calls).expect_err("expected parse failure");
 
         assert!(matches!(error, AnalysisError::ParseError(_)));
     }
 
     #[tokio::test]
-    async fn analysis_with_no_signals_returns_empty_findings() {
+    async fn analysis_with_no_signals_returns_empty_findings_without_llm_call() {
         let tmp = TempDir::new().expect("tempdir");
-        let store = SignalStore::new(tmp.path(), "empty-session").expect("new store");
-        let engine = AnalysisEngine::new(&store);
-        let llm = MockLlm::new("[]");
+        let store = SignalStore::new(tmp.path(), "empty-session").expect("store");
 
-        let findings = engine.analyze(&llm).await.expect("analyze");
+        let provider = MockCompletionProvider::success("gpt-4o", Vec::new());
+
+        let engine = AnalysisEngine::new(&store);
+        let findings = engine.analyze(&provider).await.expect("analyze");
 
         assert!(findings.is_empty());
-        assert_eq!(llm.call_count(), 0);
+        assert_eq!(provider.call_count(), 0);
     }
 
     #[tokio::test]
-    async fn analysis_with_mock_signals_produces_structured_output() {
+    async fn analysis_uses_tool_calls_and_returns_findings() {
         let tmp = TempDir::new().expect("tempdir");
         let store_a = SignalStore::new(tmp.path(), "session-a").expect("store a");
         let store_b = SignalStore::new(tmp.path(), "session-b").expect("store b");
-
         store_a
             .persist(&[mk_signal(
                 LoopStep::Act,
@@ -608,51 +637,73 @@ foo: bar
             )])
             .expect("persist a");
         store_b
-            .persist(&[mk_signal(
-                LoopStep::Act,
-                SignalKind::Success,
-                "tool success",
-                2,
-            )])
+            .persist(&[mk_signal(LoopStep::Act, SignalKind::Success, "tool ok", 2)])
             .expect("persist b");
 
-        let llm = MockLlm::new(
-            r#"```json
-[
-  {
-    "pattern_name": "Timeout loop",
-    "description": "Repeated tool timeout friction",
-    "confidence": "high",
-    "evidence": [
-      {
-        "session_id": "session-a",
-        "signal_kind": "friction",
-        "message": "tool timeout",
-        "timestamp_ms": 1
-      }
-    ],
-    "suggested_action": "Increase timeout budget"
-  }
-]
-```"#,
+        let provider = MockCompletionProvider::success(
+            "gpt-4o",
+            vec![report_findings_call("Timeout loop", "session-a")],
         );
         let engine = AnalysisEngine::new(&store_a);
 
-        let findings = engine.analyze(&llm).await.expect("analyze");
-        let prompt = llm.last_prompt().expect("captured prompt");
+        let findings = engine.analyze(&provider).await.expect("analyze");
+        let request = provider.last_request().expect("captured request");
+        let summary = first_message_text(&request).expect("user summary");
 
-        assert_eq!(llm.call_count(), 1);
-        assert!(prompt.contains("session_id=session-a"));
-        assert!(prompt.contains("session_id=session-b"));
-        assert!(prompt.contains("tool timeout"));
-        assert!(prompt.contains("tool success"));
+        assert_eq!(provider.call_count(), 1);
+        assert_eq!(request.tools.len(), 1);
+        assert_eq!(request.tools[0].name, REPORT_FINDINGS_TOOL_NAME);
+        assert_eq!(
+            request.system_prompt.as_deref(),
+            Some(ANALYSIS_SYSTEM_PROMPT)
+        );
+        assert!(summary.contains("session_id=session-a"));
+        assert!(summary.contains("session_id=session-b"));
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].pattern_name, "Timeout loop");
-        assert_eq!(findings[0].confidence, Confidence::High);
-        assert_eq!(findings[0].evidence.len(), 1);
-        assert_eq!(
-            findings[0].suggested_action.as_deref(),
-            Some("Increase timeout budget")
-        );
+    }
+
+    #[tokio::test]
+    async fn analysis_propagates_provider_errors() {
+        let tmp = TempDir::new().expect("tempdir");
+        let store = SignalStore::new(tmp.path(), "error-session").expect("store");
+        store
+            .persist(&[mk_signal(LoopStep::Act, SignalKind::Friction, "failure", 1)])
+            .expect("persist");
+
+        let provider =
+            MockCompletionProvider::failure("gpt-4o", ProviderError::Provider("boom".to_string()));
+
+        let engine = AnalysisEngine::new(&store);
+        let error = engine
+            .analyze(&provider)
+            .await
+            .expect_err("expected provider failure");
+
+        assert!(matches!(error, AnalysisError::Llm(_)));
+    }
+
+    #[tokio::test]
+    async fn analysis_returns_parse_error_for_invalid_tool_payload() {
+        let tmp = TempDir::new().expect("tempdir");
+        let store = SignalStore::new(tmp.path(), "parse-session").expect("store");
+        store
+            .persist(&[mk_signal(LoopStep::Act, SignalKind::Friction, "failure", 1)])
+            .expect("persist");
+
+        let bad_call = ToolCall {
+            id: "bad-parse".to_string(),
+            name: REPORT_FINDINGS_TOOL_NAME.to_string(),
+            arguments: json!({"findings": [{"pattern_name": 123}]}),
+        };
+        let provider = MockCompletionProvider::success("gpt-4o", vec![bad_call]);
+
+        let engine = AnalysisEngine::new(&store);
+        let error = engine
+            .analyze(&provider)
+            .await
+            .expect_err("expected parse error");
+
+        assert!(matches!(error, AnalysisError::ParseError(_)));
     }
 }

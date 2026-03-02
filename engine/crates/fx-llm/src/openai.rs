@@ -235,6 +235,7 @@ impl OpenAiProvider {
                             id: tool_call.id,
                             name,
                             arguments_delta,
+                            arguments_done: false,
                         }
                     })
                     .collect::<Vec<_>>();
