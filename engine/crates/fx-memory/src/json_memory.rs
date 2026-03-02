@@ -211,6 +211,35 @@ impl MemoryProvider for JsonFileMemory {
         results
     }
 
+    fn search_relevant(&self, query: &str, max_results: usize) -> Vec<(String, String)> {
+        if max_results == 0 {
+            return Vec::new();
+        }
+
+        let query_terms = normalized_query_terms(query);
+        if query_terms.is_empty() {
+            return Vec::new();
+        }
+
+        let mut ranked: Vec<_> = self
+            .data
+            .iter()
+            .filter_map(|(key, entry)| {
+                let key_lower = key.to_lowercase();
+                let value_lower = entry.value.to_lowercase();
+                let match_count = relevance_match_count(&key_lower, &value_lower, &query_terms);
+                (match_count > 0).then(|| (key.clone(), entry.value.clone(), match_count))
+            })
+            .collect();
+
+        ranked.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+        ranked
+            .into_iter()
+            .take(max_results)
+            .map(|(key, value, _)| (key, value))
+            .collect()
+    }
+
     fn snapshot(&self) -> Vec<(String, String)> {
         let mut entries: Vec<_> = self
             .data
@@ -234,6 +263,23 @@ impl MemoryTouchProvider for JsonFileMemory {
         entry.access_count = entry.access_count.saturating_add(1);
         self.persist()
     }
+}
+
+fn normalized_query_terms(query: &str) -> Vec<String> {
+    let mut terms: Vec<_> = query
+        .split_whitespace()
+        .map(|term| term.to_lowercase())
+        .collect();
+    terms.sort();
+    terms.dedup();
+    terms
+}
+
+fn relevance_match_count(key_lower: &str, value_lower: &str, query_terms: &[String]) -> usize {
+    query_terms
+        .iter()
+        .filter(|term| key_lower.contains(term.as_str()) || value_lower.contains(term.as_str()))
+        .count()
 }
 
 fn now_ms() -> u64 {
@@ -348,6 +394,119 @@ mod tests {
 
         let results = memory.search("user");
         assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn search_relevant_returns_empty_for_no_matches() {
+        let temp = TempDir::new().expect("tempdir");
+        let mut memory = test_memory(temp.path());
+        memory.write("pet", "cat").expect("write");
+        memory.write("city", "denver").expect("write");
+
+        let results = memory.search_relevant("volcano glacier", 5);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_relevant_ranks_by_match_count() {
+        let temp = TempDir::new().expect("tempdir");
+        let mut memory = test_memory(temp.path());
+        memory
+            .write("project_launch", "shipping auth flow")
+            .expect("write");
+        memory
+            .write("project_notes", "shipping soon")
+            .expect("write");
+
+        let results = memory.search_relevant("project auth", 5);
+        let keys: Vec<_> = results.iter().map(|(key, _)| key.as_str()).collect();
+
+        assert_eq!(keys, vec!["project_launch", "project_notes"]);
+    }
+
+    #[test]
+    fn search_relevant_caps_at_max_results() {
+        let temp = TempDir::new().expect("tempdir");
+        let mut memory = test_memory(temp.path());
+
+        for i in 0..10 {
+            memory
+                .write(&format!("match-{i}"), "contains token")
+                .expect("write");
+        }
+
+        let results = memory.search_relevant("token", 3);
+        assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn search_relevant_zero_max_results_returns_empty() {
+        let temp = TempDir::new().expect("tempdir");
+        let mut memory = test_memory(temp.path());
+        memory.write("project", "auth rollout").expect("write");
+        memory.write("notes", "project status").expect("write");
+
+        let results = memory.search_relevant("project", 0);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_relevant_deduplicates_query_terms() {
+        let temp = TempDir::new().expect("tempdir");
+        let mut memory = test_memory(temp.path());
+        memory
+            .write("z_project_only", "project milestones")
+            .expect("write project");
+        memory
+            .write("a_auth_only", "auth milestones")
+            .expect("write auth");
+
+        let repeated_project = memory.search_relevant("project project project", 5);
+        let single_project = memory.search_relevant("project", 5);
+        assert_eq!(repeated_project, single_project);
+
+        let repeated_mixed = memory.search_relevant("project project auth", 5);
+        let unique_mixed = memory.search_relevant("project auth", 5);
+        assert_eq!(repeated_mixed, unique_mixed);
+    }
+
+    #[test]
+    fn search_relevant_handles_special_characters() {
+        let temp = TempDir::new().expect("tempdir");
+        let mut memory = test_memory(temp.path());
+        memory
+            .write("cpp_speed", "c++ (fast) iteration tricks")
+            .expect("write cpp speed");
+        memory
+            .write("cpp_basics", "c++ starter notes")
+            .expect("write cpp basics");
+
+        let results = memory.search_relevant("c++ (fast)", 5);
+        let keys: Vec<_> = results.iter().map(|(key, _)| key.as_str()).collect();
+
+        assert_eq!(keys.first().copied(), Some("cpp_speed"));
+        assert!(keys.contains(&"cpp_basics"));
+    }
+
+    #[test]
+    fn search_relevant_is_case_insensitive() {
+        let temp = TempDir::new().expect("tempdir");
+        let mut memory = test_memory(temp.path());
+        memory.write("greeting", "hello world").expect("write");
+
+        let results = memory.search_relevant("HELLO", 5);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "greeting");
+    }
+
+    #[test]
+    fn search_relevant_empty_query_returns_empty() {
+        let temp = TempDir::new().expect("tempdir");
+        let mut memory = test_memory(temp.path());
+        memory.write("anything", "value").expect("write");
+
+        assert!(memory.search_relevant("", 5).is_empty());
+        assert!(memory.search_relevant("   ", 5).is_empty());
     }
 
     #[test]

@@ -60,6 +60,15 @@ pub trait MemoryProvider: Send + Sync + std::fmt::Debug {
     /// Search keys and values by substring query.
     fn search(&self, query: &str) -> Vec<(String, String)>;
 
+    /// Search memories by relevance to a query string.
+    ///
+    /// Implementors can override this for custom relevance ranking. The default
+    /// behavior falls back to `search()` and truncates to `max_results`.
+    fn search_relevant(&self, query: &str, max_results: usize) -> Vec<(String, String)> {
+        let results = self.search(query);
+        results.into_iter().take(max_results).collect()
+    }
+
     /// Return all entries for system prompt injection.
     ///
     /// Sort contract: entries are ordered by descending `access_count`,
