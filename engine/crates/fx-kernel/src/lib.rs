@@ -56,6 +56,9 @@ pub use cancellation::CancellationToken;
 pub use continuation::Continuation;
 pub use decide::Decision;
 pub use event_bus::{CompletionEvent, EventBus, Observer, TaskResult};
+pub use fx_decompose::{
+    AggregationStrategy, DecompositionPlan, SubGoal, SubGoalOutcome, SubGoalResult,
+};
 pub use input::{loop_input_channel, LoopCommand, LoopInputChannel, LoopInputSender};
 pub use learn::Learning;
 pub use loop_engine::{LoopEngine, LoopResult, LoopStatus};

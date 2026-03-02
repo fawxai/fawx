@@ -1,7 +1,7 @@
 //! Agentic loop orchestrator.
 
 use crate::act::{ActionResult, TokenUsage, ToolExecutor, ToolResult};
-use crate::budget::{ActionCost, BudgetRemaining, BudgetTracker};
+use crate::budget::{ActionCost, BudgetRemaining, BudgetResource, BudgetTracker};
 use crate::cancellation::CancellationToken;
 use crate::context_manager::ContextCompactor;
 use crate::continuation::Continuation;
@@ -15,7 +15,10 @@ use crate::types::{
 };
 use crate::verify::Verification;
 use async_trait::async_trait;
-use fx_core::types::{InputSource, UserInput};
+use fx_core::types::{InputSource, ScreenState, UserInput};
+use fx_decompose::{
+    AggregationStrategy, DecompositionPlan, SubGoal, SubGoalOutcome, SubGoalResult,
+};
 use fx_llm::{
     CompletionRequest, CompletionResponse, ContentBlock, Message, MessageRole, ProviderError,
     ToolCall, ToolDefinition,
@@ -201,6 +204,38 @@ enum ToolRoundOutcome {
     Response(CompletionResponse),
 }
 
+#[derive(Debug)]
+struct SubGoalExecution {
+    result: SubGoalResult,
+    budget: BudgetTracker,
+}
+
+#[derive(Debug, Deserialize)]
+struct DecomposeToolArguments {
+    sub_goals: Vec<DecomposeSubGoalArguments>,
+    #[serde(default)]
+    strategy: Option<AggregationStrategy>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DecomposeSubGoalArguments {
+    description: String,
+    #[serde(default)]
+    required_tools: Vec<String>,
+    #[serde(default)]
+    expected_output: String,
+}
+
+impl From<DecomposeSubGoalArguments> for SubGoal {
+    fn from(value: DecomposeSubGoalArguments) -> Self {
+        Self {
+            description: value.description,
+            required_tools: value.required_tools,
+            expected_output: value.expected_output,
+        }
+    }
+}
+
 const REASONING_OUTPUT_TOKEN_HEURISTIC: u64 = 192;
 const TOOL_SYNTHESIS_TOKEN_HEURISTIC: u64 = 320;
 const REASONING_MAX_OUTPUT_TOKENS: u32 = 768;
@@ -208,6 +243,12 @@ const REASONING_TEMPERATURE: f32 = 0.2;
 const TOOL_SYNTHESIS_MAX_OUTPUT_TOKENS: u32 = 384;
 const DEFAULT_LLM_ACTION_COST_CENTS: u64 = 2;
 const SAFE_FALLBACK_RESPONSE: &str = "I wasn't able to process that. Could you try rephrasing?";
+const DECOMPOSE_TOOL_NAME: &str = "decompose";
+const DECOMPOSE_TOOL_DESCRIPTION: &str =
+    "Break a complex task into 2-4 high-level sub-goals. Each sub-goal should be substantial enough to justify its own execution context. Do NOT create more than 5 sub-goals. Prefer fewer, broader goals over many narrow ones. Only use this for tasks that genuinely cannot be handled with direct tool calls.";
+const MAX_SUB_GOALS: usize = 5;
+const DECOMPOSITION_DEPTH_LIMIT_RESPONSE: &str =
+    "I can't decompose this request further because the recursion depth limit was reached.";
 const REASONING_SYSTEM_PROMPT: &str = "You are Fawx, a capable personal assistant. \
 Answer the user directly and concisely. \
 Never introduce yourself, greet the user, or add preamble — just answer. \
@@ -631,6 +672,23 @@ impl LoopEngine {
 
     /// Decide step.
     async fn decide(&mut self, response: &CompletionResponse) -> Result<Decision, LoopError> {
+        // Decompose takes priority over all other tool calls in the same response.
+        // Other tool calls are intentionally discarded — the sub-goals will re-invoke tools as needed.
+        if let Some(decompose_call) = find_decompose_tool_call(&response.tool_calls) {
+            if response.tool_calls.len() > 1 {
+                self.emit_signal(
+                    LoopStep::Decide,
+                    SignalKind::Trace,
+                    "decompose takes precedence; dropping other tool calls",
+                    serde_json::json!({"dropped_count": response.tool_calls.len() - 1}),
+                );
+            }
+            let plan = parse_decomposition_plan(&decompose_call.arguments)?;
+            let decision = Decision::Decompose(plan);
+            self.emit_decision_signals(&decision);
+            return Ok(decision);
+        }
+
         if !response.tool_calls.is_empty() {
             let decision = Decision::UseTools(response.tool_calls.clone());
             self.emit_decision_signals(&decision);
@@ -664,6 +722,144 @@ impl LoopEngine {
                 self.emit_action_signals(&action.tool_results);
                 Ok(action)
             }
+            Decision::Decompose(plan) => {
+                self.execute_decomposition(decision, plan, llm, context_messages)
+                    .await
+            }
+        }
+    }
+
+    async fn execute_decomposition(
+        &mut self,
+        decision: &Decision,
+        plan: &DecompositionPlan,
+        llm: &dyn LlmProvider,
+        context_messages: &[Message],
+    ) -> Result<ActionResult, LoopError> {
+        if self.decomposition_depth_limited() {
+            return Ok(self.depth_limited_decomposition_result(decision));
+        }
+
+        if let Some(original_sub_goals) = plan.truncated_from {
+            self.emit_decomposition_truncation_signal(original_sub_goals, plan.sub_goals.len());
+        }
+
+        // Each sub-goal gets up to 50% of the parent's remaining budget
+        // after previous sub-goals' consumption has been rolled up.
+        let per_goal_fraction = 0.5;
+        let mut results = Vec::with_capacity(plan.sub_goals.len());
+        for (index, sub_goal) in plan.sub_goals.iter().enumerate() {
+            self.emit_sub_goal_progress(index, plan.sub_goals.len(), &sub_goal.description);
+            let execution = self
+                .run_sub_goal(sub_goal, per_goal_fraction, llm, context_messages)
+                .await;
+            self.budget.absorb_child_usage(&execution.budget);
+            self.roll_up_sub_goal_signals(&execution.result.signals);
+            results.push(execution.result);
+        }
+
+        Ok(ActionResult {
+            decision: decision.clone(),
+            tool_results: Vec::new(),
+            response_text: aggregate_sub_goal_results(&results),
+            tokens_used: TokenUsage::default(),
+        })
+    }
+
+    async fn run_sub_goal(
+        &self,
+        sub_goal: &SubGoal,
+        fraction: f32,
+        llm: &dyn LlmProvider,
+        context_messages: &[Message],
+    ) -> SubGoalExecution {
+        let timestamp_ms = current_time_ms();
+        let child_budget = self.budget.child_tracker(fraction, timestamp_ms);
+        let mut child = self.build_child_engine(child_budget);
+        let snapshot = build_sub_goal_snapshot(sub_goal, context_messages, timestamp_ms);
+
+        let result = match Box::pin(child.run_cycle(snapshot, llm)).await {
+            Ok(result) => sub_goal_result_from_loop(sub_goal.clone(), result),
+            Err(error) => failed_sub_goal_result(sub_goal.clone(), error.reason),
+        };
+
+        SubGoalExecution {
+            result,
+            budget: child.budget,
+        }
+    }
+
+    fn build_child_engine(&self, budget: BudgetTracker) -> LoopEngine {
+        let mut child = LoopEngine::new(
+            budget,
+            self.context.clone(),
+            child_max_iterations(self.max_iterations),
+            Arc::clone(&self.tool_executor),
+            self.synthesis_instruction.clone(),
+        );
+
+        if let Some(memory_context) = &self.memory_context {
+            child.set_memory_context(memory_context.clone());
+        }
+        if let Some(cancel_token) = &self.cancel_token {
+            child.set_cancel_token(cancel_token.clone());
+        }
+
+        child
+    }
+
+    fn decomposition_depth_limited(&self) -> bool {
+        matches!(
+            self.budget.check(&ActionCost::default()),
+            Err(crate::budget::BudgetExceeded {
+                resource: BudgetResource::RecursionDepth,
+                ..
+            })
+        )
+    }
+
+    fn depth_limited_decomposition_result(&mut self, decision: &Decision) -> ActionResult {
+        self.emit_signal(
+            LoopStep::Act,
+            SignalKind::Blocked,
+            "task decomposition blocked by recursion depth",
+            serde_json::json!({"reason": "max recursion depth reached"}),
+        );
+        self.text_action_result(decision, DECOMPOSITION_DEPTH_LIMIT_RESPONSE)
+    }
+
+    fn emit_sub_goal_progress(&mut self, index: usize, total: usize, description: &str) {
+        self.emit_signal(
+            LoopStep::Act,
+            SignalKind::Trace,
+            format!("Sub-goal {}/{}: {description}", index + 1, total),
+            serde_json::json!({
+                "sub_goal_index": index,
+                "total": total,
+            }),
+        );
+    }
+
+    fn emit_decomposition_truncation_signal(
+        &mut self,
+        original_sub_goals: usize,
+        retained_sub_goals: usize,
+    ) {
+        self.emit_signal(
+            LoopStep::Act,
+            SignalKind::Friction,
+            "decomposition plan truncated to max sub-goals",
+            serde_json::json!({
+                "original_sub_goals": original_sub_goals,
+                "retained_sub_goals": retained_sub_goals,
+                "max_sub_goals": MAX_SUB_GOALS,
+            }),
+        );
+    }
+
+    fn roll_up_sub_goal_signals(&mut self, signals: &[Signal]) {
+        for signal in signals {
+            self.signals.emit(signal.clone());
         }
     }
 
@@ -854,6 +1050,17 @@ impl LoopEngine {
                     serde_json::json!({"tools": tools}),
                 );
             }
+        }
+        if let Decision::Decompose(plan) = decision {
+            self.emit_signal(
+                LoopStep::Decide,
+                SignalKind::Trace,
+                "task decomposition initiated",
+                serde_json::json!({
+                    "sub_goals": plan.sub_goals.len(),
+                    "strategy": format!("{:?}", plan.strategy),
+                }),
+            );
         }
     }
 
@@ -1210,6 +1417,12 @@ impl LoopEngine {
             Decision::Respond(_) | Decision::Clarify(_) | Decision::Defer(_) => {
                 ActionCost::default()
             }
+            Decision::Decompose(plan) => ActionCost {
+                llm_calls: plan.sub_goals.len() as u32,
+                tool_invocations: 0,
+                tokens: TOOL_SYNTHESIS_TOKEN_HEURISTIC * plan.sub_goals.len() as u64,
+                cost_cents: DEFAULT_LLM_ACTION_COST_CENTS * plan.sub_goals.len() as u64,
+            },
         }
     }
 
@@ -1263,12 +1476,176 @@ impl LoopEngine {
     }
 }
 
+/// Cap child iterations at 3, with a floor of 1.
+/// Note: for parent max_iterations <= 3, children get the same count
+/// as the parent. This is intentional — sub-goals should be focused
+/// and complete within their allocation.
+fn child_max_iterations(max_iterations: u32) -> u32 {
+    max_iterations.clamp(1, 3)
+}
+
+fn build_sub_goal_snapshot(
+    sub_goal: &SubGoal,
+    context_messages: &[Message],
+    timestamp_ms: u64,
+) -> PerceptionSnapshot {
+    let description = sub_goal.description.clone();
+    PerceptionSnapshot {
+        timestamp_ms,
+        screen: ScreenState {
+            current_app: "decomposition".to_string(),
+            elements: Vec::new(),
+            text_content: description.clone(),
+        },
+        notifications: Vec::new(),
+        active_app: "decomposition".to_string(),
+        user_input: Some(UserInput {
+            text: description,
+            source: InputSource::Text,
+            timestamp: timestamp_ms,
+            context_id: None,
+        }),
+        sensor_data: None,
+        conversation_history: context_messages.to_vec(),
+    }
+}
+
+fn sub_goal_result_from_loop(goal: SubGoal, result: LoopResult) -> SubGoalResult {
+    match result {
+        LoopResult::Complete {
+            response, signals, ..
+        } => SubGoalResult {
+            goal,
+            outcome: SubGoalOutcome::Completed(response),
+            signals,
+        },
+        LoopResult::BudgetExhausted { signals, .. } => SubGoalResult {
+            goal,
+            outcome: SubGoalOutcome::BudgetExhausted,
+            signals,
+        },
+        LoopResult::Error {
+            message, signals, ..
+        } => failed_sub_goal_result_with_signals(goal, message, signals),
+        LoopResult::NeedsInput {
+            prompt, signals, ..
+        } => {
+            let message = format!("sub-goal needs user input: {prompt}");
+            failed_sub_goal_result_with_signals(goal, message, signals)
+        }
+        LoopResult::UserStopped { signals, .. } => {
+            let message = "sub-goal stopped before completion".to_string();
+            failed_sub_goal_result_with_signals(goal, message, signals)
+        }
+    }
+}
+
+fn failed_sub_goal_result(goal: SubGoal, message: String) -> SubGoalResult {
+    failed_sub_goal_result_with_signals(goal, message, Vec::new())
+}
+
+fn failed_sub_goal_result_with_signals(
+    goal: SubGoal,
+    message: String,
+    signals: Vec<Signal>,
+) -> SubGoalResult {
+    SubGoalResult {
+        goal,
+        outcome: SubGoalOutcome::Failed(message),
+        signals,
+    }
+}
+
+fn aggregate_sub_goal_results(results: &[SubGoalResult]) -> String {
+    if results.is_empty() {
+        return "Task decomposition contained no sub-goals.".to_string();
+    }
+
+    let mut lines = Vec::with_capacity(results.len() + 1);
+    lines.push("Task decomposition results:".to_string());
+    for (index, result) in results.iter().enumerate() {
+        lines.push(format_sub_goal_line(index + 1, result));
+    }
+    lines.join("\n")
+}
+
+fn format_sub_goal_line(index: usize, result: &SubGoalResult) -> String {
+    format!(
+        "{index}. {} => {}",
+        result.goal.description,
+        format_sub_goal_outcome(&result.outcome)
+    )
+}
+
+fn format_sub_goal_outcome(outcome: &SubGoalOutcome) -> String {
+    match outcome {
+        SubGoalOutcome::Completed(response) => format!("completed: {response}"),
+        SubGoalOutcome::Failed(message) => format!("failed: {message}"),
+        SubGoalOutcome::BudgetExhausted => "budget exhausted".to_string(),
+    }
+}
+
+fn find_decompose_tool_call(tool_calls: &[ToolCall]) -> Option<&ToolCall> {
+    tool_calls
+        .iter()
+        .find(|call| call.name == DECOMPOSE_TOOL_NAME)
+}
+
+fn parse_decomposition_plan(arguments: &serde_json::Value) -> Result<DecompositionPlan, LoopError> {
+    let parsed = parse_decompose_arguments(arguments)?;
+    if let Some(strategy) = &parsed.strategy {
+        if *strategy != AggregationStrategy::Sequential {
+            return Err(loop_error(
+                "decide",
+                &format!("unsupported decomposition strategy: {strategy:?}"),
+                false,
+            ));
+        }
+    }
+
+    if parsed.sub_goals.is_empty() {
+        return Err(loop_error(
+            "decide",
+            "decompose tool requires at least one sub_goal",
+            false,
+        ));
+    }
+
+    let mut sub_goals: Vec<SubGoal> = parsed.sub_goals.into_iter().map(SubGoal::from).collect();
+    let truncated_from = if sub_goals.len() > MAX_SUB_GOALS {
+        let original_sub_goals = sub_goals.len();
+        sub_goals.truncate(MAX_SUB_GOALS);
+        Some(original_sub_goals)
+    } else {
+        None
+    };
+
+    Ok(DecompositionPlan {
+        sub_goals,
+        strategy: parsed.strategy.unwrap_or(AggregationStrategy::Sequential),
+        truncated_from,
+    })
+}
+
+fn parse_decompose_arguments(
+    arguments: &serde_json::Value,
+) -> Result<DecomposeToolArguments, LoopError> {
+    serde_json::from_value(arguments.clone()).map_err(|error| {
+        loop_error(
+            "decide",
+            &format!("invalid decompose tool arguments: {error}"),
+            false,
+        )
+    })
+}
+
 fn decision_variant(decision: &Decision) -> &'static str {
     match decision {
         Decision::Respond(_) => "Respond",
         Decision::UseTools(_) => "UseTools",
         Decision::Clarify(_) => "Clarify",
         Decision::Defer(_) => "Defer",
+        Decision::Decompose(_) => "Decompose",
     }
 }
 
@@ -1482,6 +1859,45 @@ fn unmatched_tool_call_id_error(result: &ToolResult) -> LoopError {
     )
 }
 
+fn tool_definitions_with_decompose(
+    mut tool_definitions: Vec<ToolDefinition>,
+) -> Vec<ToolDefinition> {
+    let has_decompose = tool_definitions
+        .iter()
+        .any(|tool| tool.name == DECOMPOSE_TOOL_NAME);
+    if !has_decompose {
+        tool_definitions.push(decompose_tool_definition());
+    }
+    tool_definitions
+}
+
+fn decompose_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: DECOMPOSE_TOOL_NAME.to_string(),
+        description: DECOMPOSE_TOOL_DESCRIPTION.to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "sub_goals": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "description": {"type": "string", "description": "What this sub-goal should accomplish"},
+                            "required_tools": {"type": "array", "items": {"type": "string"}, "description": "Tools needed for this sub-goal"},
+                            "expected_output": {"type": "string", "description": "What the result should look like"}
+                        },
+                        "required": ["description"]
+                    },
+                    "description": "List of sub-goals to execute"
+                },
+                "strategy": {"type": "string", "enum": ["Sequential"], "description": "Execution strategy (only Sequential supported currently)"}
+            },
+            "required": ["sub_goals"]
+        }),
+    }
+}
+
 /// Build a CompletionRequest for tool result re-prompting.
 fn build_continuation_request(
     context_messages: &[Message],
@@ -1489,11 +1905,12 @@ fn build_continuation_request(
     tool_definitions: Vec<ToolDefinition>,
     memory_context: Option<&str>,
 ) -> CompletionRequest {
-    let system_prompt = build_reasoning_system_prompt(&tool_definitions, memory_context);
+    let tools = tool_definitions_with_decompose(tool_definitions);
+    let system_prompt = build_reasoning_system_prompt(&tools, memory_context);
     CompletionRequest {
         model: model.to_string(),
         messages: context_messages.to_vec(),
-        tools: tool_definitions,
+        tools,
         temperature: Some(REASONING_TEMPERATURE),
         max_tokens: Some(REASONING_MAX_OUTPUT_TOKENS),
         system_prompt: Some(system_prompt),
@@ -1629,12 +2046,13 @@ fn build_reasoning_request(
 ) -> CompletionRequest {
     let context = perception.context_window.clone();
     let user_prompt = reasoning_user_prompt(perception);
-    let system_prompt = build_reasoning_system_prompt(&tool_definitions, memory_context);
+    let tools = tool_definitions_with_decompose(tool_definitions);
+    let system_prompt = build_reasoning_system_prompt(&tools, memory_context);
 
     CompletionRequest {
         model: model.to_string(),
         messages: [context, vec![Message::user(user_prompt)]].concat(),
-        tools: tool_definitions,
+        tools,
         temperature: Some(REASONING_TEMPERATURE),
         max_tokens: Some(REASONING_MAX_OUTPUT_TOKENS),
         system_prompt: Some(system_prompt),
@@ -4357,5 +4775,680 @@ mod fallback_retry_tests {
             matches!(result, LoopResult::Error { .. }),
             "repeated fallbacks should exhaust iterations: {result:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod decomposition_tests {
+    use super::*;
+    use crate::budget::BudgetConfig;
+    use async_trait::async_trait;
+    use fx_decompose::{AggregationStrategy, DecompositionPlan, SubGoal};
+    use fx_llm::{
+        CompletionRequest, CompletionResponse, ContentBlock, Message, ProviderError, ToolCall,
+        ToolDefinition,
+    };
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    #[derive(Debug, Default)]
+    struct PassiveToolExecutor;
+
+    #[async_trait]
+    impl ToolExecutor for PassiveToolExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+            Ok(calls
+                .iter()
+                .map(|call| ToolResult {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    success: true,
+                    output: "ok".to_string(),
+                })
+                .collect())
+        }
+    }
+
+    #[derive(Debug)]
+    struct ScriptedLlm {
+        responses: Mutex<VecDeque<Result<CompletionResponse, ProviderError>>>,
+        complete_calls: AtomicUsize,
+    }
+
+    impl ScriptedLlm {
+        fn new(responses: Vec<Result<CompletionResponse, ProviderError>>) -> Self {
+            Self {
+                responses: Mutex::new(VecDeque::from(responses)),
+                complete_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn complete_calls(&self) -> usize {
+            self.complete_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for ScriptedLlm {
+        async fn generate(&self, _: &str, _: u32) -> Result<String, fx_core::error::LlmError> {
+            Ok("summary".to_string())
+        }
+
+        async fn generate_streaming(
+            &self,
+            _: &str,
+            _: u32,
+            callback: Box<dyn Fn(String) + Send + 'static>,
+        ) -> Result<String, fx_core::error::LlmError> {
+            callback("summary".to_string());
+            Ok("summary".to_string())
+        }
+
+        fn model_name(&self) -> &str {
+            "scripted-llm"
+        }
+
+        async fn complete(
+            &self,
+            _: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            self.complete_calls.fetch_add(1, Ordering::SeqCst);
+            self.responses
+                .lock()
+                .expect("lock")
+                .pop_front()
+                .unwrap_or_else(|| Err(ProviderError::Provider("no scripted response".to_string())))
+        }
+    }
+
+    fn budget_config(max_llm_calls: u32, max_recursion_depth: u32) -> BudgetConfig {
+        BudgetConfig {
+            max_llm_calls,
+            max_tool_invocations: 20,
+            max_tokens: 10_000,
+            max_cost_cents: 100,
+            max_wall_time_ms: 60_000,
+            max_recursion_depth,
+        }
+    }
+
+    fn decomposition_engine(config: BudgetConfig, depth: u32) -> LoopEngine {
+        let started_at_ms = current_time_ms();
+        LoopEngine::new(
+            BudgetTracker::new(config, started_at_ms, depth),
+            ContextCompactor::new(2048, 256),
+            4,
+            Arc::new(PassiveToolExecutor),
+            "Summarize tool output".to_string(),
+        )
+    }
+
+    fn decomposition_plan(descriptions: &[&str]) -> DecompositionPlan {
+        DecompositionPlan {
+            sub_goals: descriptions
+                .iter()
+                .map(|description| SubGoal {
+                    description: (*description).to_string(),
+                    required_tools: Vec::new(),
+                    expected_output: format!("output for {description}"),
+                })
+                .collect(),
+            strategy: AggregationStrategy::Sequential,
+            truncated_from: None,
+        }
+    }
+
+    fn text_response(text: &str) -> CompletionResponse {
+        CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        }
+    }
+
+    fn decompose_tool_call(arguments: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: "decompose-call".to_string(),
+            name: DECOMPOSE_TOOL_NAME.to_string(),
+            arguments,
+        }
+    }
+
+    fn sample_tool_definition() -> ToolDefinition {
+        ToolDefinition {
+            name: "read_file".to_string(),
+            description: "Read files".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    fn sample_budget_remaining() -> BudgetRemaining {
+        BudgetRemaining {
+            llm_calls: 8,
+            tool_invocations: 10,
+            tokens: 2_000,
+            cost_cents: 50,
+            wall_time_ms: 5_000,
+        }
+    }
+
+    fn sample_perception() -> ProcessedPerception {
+        ProcessedPerception {
+            user_message: "Break this task into phases".to_string(),
+            context_window: vec![Message::user("context")],
+            active_goals: vec!["Help the user".to_string()],
+            budget_remaining: sample_budget_remaining(),
+        }
+    }
+
+    fn assert_decompose_tool_present(tools: &[ToolDefinition]) {
+        let decompose_tools = tools
+            .iter()
+            .filter(|tool| tool.name == DECOMPOSE_TOOL_NAME)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            decompose_tools.len(),
+            1,
+            "decompose tool should be present once"
+        );
+        assert_eq!(decompose_tools[0].description, DECOMPOSE_TOOL_DESCRIPTION);
+        assert_eq!(
+            decompose_tools[0].parameters["required"],
+            serde_json::json!(["sub_goals"])
+        );
+    }
+
+    #[tokio::test]
+    async fn decomposition_uses_half_remaining_budget_for_each_sub_goal() {
+        let mut engine = decomposition_engine(budget_config(4, 6), 0);
+        let plan = decomposition_plan(&["first", "second", "third"]);
+        let decision = Decision::Decompose(plan.clone());
+        let llm = ScriptedLlm::new(vec![
+            Ok(text_response("first-ok")),
+            Ok(text_response("second-ok")),
+            Ok(text_response("third-ok")),
+        ]);
+
+        let action = engine
+            .execute_decomposition(&decision, &plan, &llm, &[])
+            .await
+            .expect("decomposition");
+
+        assert_eq!(llm.complete_calls(), 3);
+        assert!(action
+            .response_text
+            .contains("first => completed: first-ok"));
+        assert!(action
+            .response_text
+            .contains("second => completed: second-ok"));
+        assert!(action
+            .response_text
+            .contains("third => completed: third-ok"));
+
+        let status = engine.status(current_time_ms());
+        assert_eq!(status.llm_calls_used, 3);
+        assert_eq!(status.remaining.llm_calls, 1);
+        assert_eq!(status.tool_invocations_used, 0);
+        assert_eq!(status.cost_cents_used, 6);
+        assert!(status.tokens_used > 0);
+    }
+
+    #[test]
+    fn child_max_iterations_caps_at_three() {
+        assert_eq!(child_max_iterations(10), 3);
+        assert_eq!(child_max_iterations(3), 3);
+        assert_eq!(child_max_iterations(2), 2);
+        assert_eq!(child_max_iterations(1), 1);
+    }
+
+    #[tokio::test]
+    async fn sub_goal_failure_does_not_stop_remaining_sub_goals() {
+        let mut engine = decomposition_engine(budget_config(20, 6), 0);
+        let plan = decomposition_plan(&["first", "second", "third"]);
+        let decision = Decision::Decompose(plan.clone());
+        let llm = ScriptedLlm::new(vec![
+            Ok(text_response("first-ok")),
+            Err(ProviderError::Provider("boom".to_string())),
+            Ok(text_response("third-ok")),
+        ]);
+
+        let action = engine
+            .execute_decomposition(&decision, &plan, &llm, &[])
+            .await
+            .expect("decomposition");
+
+        assert_eq!(llm.complete_calls(), 3);
+        assert!(action
+            .response_text
+            .contains("first => completed: first-ok"));
+        assert!(action.response_text.contains("second => failed:"));
+        assert!(action
+            .response_text
+            .contains("third => completed: third-ok"));
+    }
+
+    #[tokio::test]
+    async fn budget_exhausted_sub_goal_maps_to_budget_exhausted_outcome() {
+        let mut engine = decomposition_engine(budget_config(0, 6), 0);
+        let plan = decomposition_plan(&["budget-limited"]);
+        let decision = Decision::Decompose(plan.clone());
+        let llm = ScriptedLlm::new(vec![Ok(text_response("unused"))]);
+
+        let action = engine
+            .execute_decomposition(&decision, &plan, &llm, &[])
+            .await
+            .expect("decomposition");
+
+        assert_eq!(llm.complete_calls(), 0);
+        assert!(action
+            .response_text
+            .contains("budget-limited => budget exhausted"));
+    }
+
+    #[tokio::test]
+    async fn decomposition_rolls_up_child_signals_into_parent_collector() {
+        let mut engine = decomposition_engine(budget_config(10, 6), 0);
+        let plan = decomposition_plan(&["collect-signals"]);
+        let decision = Decision::Decompose(plan.clone());
+        let llm = ScriptedLlm::new(vec![Ok(text_response("done"))]);
+
+        let _action = engine
+            .execute_decomposition(&decision, &plan, &llm, &[])
+            .await
+            .expect("decomposition");
+
+        assert!(engine
+            .signals
+            .signals()
+            .iter()
+            .any(|signal| signal.step == LoopStep::Perceive));
+    }
+
+    #[tokio::test]
+    async fn decomposition_emits_progress_trace_for_each_sub_goal() {
+        let mut engine = decomposition_engine(budget_config(10, 6), 0);
+        let plan = decomposition_plan(&["first", "second"]);
+        let decision = Decision::Decompose(plan.clone());
+        let llm = ScriptedLlm::new(vec![Ok(text_response("one")), Ok(text_response("two"))]);
+
+        let _action = engine
+            .execute_decomposition(&decision, &plan, &llm, &[])
+            .await
+            .expect("decomposition");
+
+        let progress_traces = engine
+            .signals
+            .signals()
+            .iter()
+            .filter(|signal| {
+                signal.step == LoopStep::Act
+                    && signal.kind == SignalKind::Trace
+                    && signal.message.starts_with("Sub-goal ")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(progress_traces.len(), 2);
+        assert_eq!(progress_traces[0].message, "Sub-goal 1/2: first");
+        assert_eq!(
+            progress_traces[0].metadata["sub_goal_index"],
+            serde_json::json!(0)
+        );
+        assert_eq!(progress_traces[0].metadata["total"], serde_json::json!(2));
+        assert_eq!(progress_traces[1].message, "Sub-goal 2/2: second");
+        assert_eq!(
+            progress_traces[1].metadata["sub_goal_index"],
+            serde_json::json!(1)
+        );
+        assert_eq!(progress_traces[1].metadata["total"], serde_json::json!(2));
+    }
+
+    #[tokio::test]
+    async fn decomposition_emits_truncation_signal_when_plan_is_truncated() {
+        let mut engine = decomposition_engine(budget_config(10, 6), 0);
+        let mut plan = decomposition_plan(&["first"]);
+        plan.truncated_from = Some(8);
+        let decision = Decision::Decompose(plan.clone());
+        let llm = ScriptedLlm::new(vec![Ok(text_response("done"))]);
+
+        let _action = engine
+            .execute_decomposition(&decision, &plan, &llm, &[])
+            .await
+            .expect("decomposition");
+
+        let truncation_signal = engine
+            .signals
+            .signals()
+            .iter()
+            .find(|signal| {
+                signal.step == LoopStep::Act
+                    && signal.kind == SignalKind::Friction
+                    && signal.message == "decomposition plan truncated to max sub-goals"
+            })
+            .expect("truncation signal");
+
+        assert_eq!(
+            truncation_signal.metadata["original_sub_goals"],
+            serde_json::json!(8)
+        );
+        assert_eq!(
+            truncation_signal.metadata["retained_sub_goals"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            truncation_signal.metadata["max_sub_goals"],
+            serde_json::json!(MAX_SUB_GOALS)
+        );
+    }
+
+    #[tokio::test]
+    async fn decomposition_at_depth_limit_returns_fallback_without_child_execution() {
+        let mut engine = decomposition_engine(budget_config(10, 1), 1);
+        let plan = decomposition_plan(&["depth-guarded"]);
+        let decision = Decision::Decompose(plan.clone());
+        let llm = ScriptedLlm::new(vec![Ok(text_response("unused"))]);
+
+        let action = engine
+            .execute_decomposition(&decision, &plan, &llm, &[])
+            .await
+            .expect("decomposition");
+
+        assert_eq!(llm.complete_calls(), 0);
+        assert!(action
+            .response_text
+            .contains("recursion depth limit was reached"));
+    }
+
+    #[tokio::test]
+    async fn aggregated_response_includes_results_from_all_sub_goals() {
+        let mut engine = decomposition_engine(budget_config(10, 6), 0);
+        let plan = decomposition_plan(&["analyze", "summarize"]);
+        let decision = Decision::Decompose(plan.clone());
+        let llm = ScriptedLlm::new(vec![
+            Ok(text_response("analysis")),
+            Ok(text_response("summary")),
+        ]);
+
+        let action = engine
+            .execute_decomposition(&decision, &plan, &llm, &[])
+            .await
+            .expect("decomposition");
+
+        assert!(
+            action
+                .response_text
+                .contains("analyze => completed: analysis"),
+            "unexpected aggregate response: {}",
+            action.response_text
+        );
+        assert!(
+            action
+                .response_text
+                .contains("summarize => completed: summary"),
+            "unexpected aggregate response: {}",
+            action.response_text
+        );
+    }
+
+    #[test]
+    fn estimate_action_cost_for_decompose_scales_with_sub_goal_count() {
+        let engine = decomposition_engine(budget_config(10, 6), 0);
+        let plan = decomposition_plan(&["a", "b", "c"]);
+        let cost = engine.estimate_action_cost(&Decision::Decompose(plan));
+
+        assert_eq!(cost.llm_calls, 3);
+        assert_eq!(cost.tool_invocations, 0);
+        assert_eq!(cost.tokens, TOOL_SYNTHESIS_TOKEN_HEURISTIC * 3);
+        assert_eq!(cost.cost_cents, DEFAULT_LLM_ACTION_COST_CENTS * 3);
+    }
+
+    #[test]
+    fn decision_variant_labels_decompose_decisions() {
+        let plan = decomposition_plan(&["single"]);
+        assert_eq!(decision_variant(&Decision::Decompose(plan)), "Decompose");
+    }
+
+    #[test]
+    fn emit_decision_signals_includes_decomposition_metadata() {
+        let mut engine = decomposition_engine(budget_config(10, 6), 0);
+        let decision = Decision::Decompose(DecompositionPlan {
+            sub_goals: decomposition_plan(&["one", "two"]).sub_goals,
+            strategy: AggregationStrategy::Parallel,
+            truncated_from: None,
+        });
+
+        engine.emit_decision_signals(&decision);
+
+        let decomposition_trace = engine
+            .signals
+            .signals()
+            .iter()
+            .find(|signal| signal.message == "task decomposition initiated")
+            .expect("trace signal");
+
+        assert_eq!(
+            decomposition_trace.metadata["sub_goals"],
+            serde_json::json!(2)
+        );
+        assert_eq!(
+            decomposition_trace.metadata["strategy"],
+            serde_json::json!("Parallel")
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_decompose_drops_other_tools_with_signal() {
+        let mut engine = decomposition_engine(budget_config(10, 6), 0);
+        let response = CompletionResponse {
+            content: Vec::new(),
+            tool_calls: vec![
+                ToolCall {
+                    id: "regular-tool".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": "Cargo.toml"}),
+                },
+                decompose_tool_call(serde_json::json!({
+                    "sub_goals": [{
+                        "description": "Inspect crate configuration",
+                        "required_tools": ["read_file"],
+                        "expected_output": "Cargo metadata"
+                    }],
+                    "strategy": "Sequential"
+                })),
+            ],
+            usage: None,
+            stop_reason: None,
+        };
+
+        let decision = engine.decide(&response).await.expect("decision");
+        match decision {
+            Decision::Decompose(plan) => {
+                assert_eq!(plan.sub_goals.len(), 1);
+                assert_eq!(plan.sub_goals[0].description, "Inspect crate configuration");
+                assert_eq!(plan.sub_goals[0].required_tools, vec!["read_file"]);
+                assert_eq!(plan.sub_goals[0].expected_output, "Cargo metadata");
+                assert_eq!(plan.strategy, AggregationStrategy::Sequential);
+                assert_eq!(plan.truncated_from, None);
+            }
+            other => panic!("expected decomposition decision, got: {other:?}"),
+        }
+
+        let drop_signal = engine
+            .signals
+            .signals()
+            .iter()
+            .find(|signal| {
+                signal.step == LoopStep::Decide
+                    && signal.kind == SignalKind::Trace
+                    && signal.message == "decompose takes precedence; dropping other tool calls"
+            })
+            .expect("drop trace signal");
+
+        assert_eq!(drop_signal.metadata["dropped_count"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn parse_decomposition_plan_truncates_sub_goals_to_maximum() {
+        let sub_goals = (0..8)
+            .map(|index| serde_json::json!({"description": format!("goal-{index}")}))
+            .collect::<Vec<_>>();
+        let arguments = serde_json::json!({"sub_goals": sub_goals});
+
+        let plan = parse_decomposition_plan(&arguments).expect("plan should parse");
+
+        assert_eq!(plan.sub_goals.len(), MAX_SUB_GOALS);
+        assert_eq!(plan.sub_goals[0].description, "goal-0");
+        assert_eq!(plan.sub_goals[MAX_SUB_GOALS - 1].description, "goal-4");
+        assert_eq!(plan.truncated_from, Some(8));
+    }
+
+    #[tokio::test]
+    async fn decide_rejects_empty_sub_goals() {
+        let mut engine = decomposition_engine(budget_config(10, 6), 0);
+        let response = CompletionResponse {
+            content: Vec::new(),
+            tool_calls: vec![decompose_tool_call(serde_json::json!({"sub_goals": []}))],
+            usage: None,
+            stop_reason: None,
+        };
+
+        let error = engine.decide(&response).await.expect_err("empty sub goals");
+        assert_eq!(error.stage, "decide");
+        assert!(error.reason.contains("at least one sub_goal"));
+    }
+
+    #[tokio::test]
+    async fn decide_rejects_malformed_decompose_arguments() {
+        let mut engine = decomposition_engine(budget_config(10, 6), 0);
+        let response = CompletionResponse {
+            content: Vec::new(),
+            tool_calls: vec![decompose_tool_call(serde_json::json!({
+                "sub_goals": "not-an-array"
+            }))],
+            usage: None,
+            stop_reason: None,
+        };
+
+        let error = engine
+            .decide(&response)
+            .await
+            .expect_err("malformed arguments");
+        assert_eq!(error.stage, "decide");
+        assert!(error.reason.contains("invalid decompose tool arguments"));
+    }
+
+    #[tokio::test]
+    async fn decide_rejects_unsupported_strategy() {
+        let mut engine = decomposition_engine(budget_config(10, 6), 0);
+        let response = CompletionResponse {
+            content: Vec::new(),
+            tool_calls: vec![decompose_tool_call(serde_json::json!({
+                "sub_goals": [{"description": "Inspect crate configuration"}],
+                "strategy": "Parallel"
+            }))],
+            usage: None,
+            stop_reason: None,
+        };
+
+        let error = engine
+            .decide(&response)
+            .await
+            .expect_err("unsupported strategy");
+        assert_eq!(error.stage, "decide");
+        assert!(error
+            .reason
+            .contains("unsupported decomposition strategy: Parallel"));
+    }
+
+    #[tokio::test]
+    async fn decide_normal_tools_still_work_with_decompose_registered() {
+        let mut engine = decomposition_engine(budget_config(10, 6), 0);
+        let response = CompletionResponse {
+            content: Vec::new(),
+            tool_calls: vec![ToolCall {
+                id: "regular-tool".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "Cargo.toml"}),
+            }],
+            usage: None,
+            stop_reason: None,
+        };
+
+        let decision = engine.decide(&response).await.expect("decision");
+        assert!(
+            matches!(decision, Decision::UseTools(calls) if calls.len() == 1 && calls[0].name == "read_file")
+        );
+    }
+
+    #[test]
+    fn decompose_tool_definition_included_in_reasoning_request() {
+        let request = build_reasoning_request(
+            &sample_perception(),
+            "mock-model",
+            vec![sample_tool_definition()],
+            None,
+        );
+
+        assert_decompose_tool_present(&request.tools);
+    }
+
+    #[test]
+    fn decompose_tool_definition_included_in_continuation_request() {
+        let request = build_continuation_request(
+            &[Message::assistant("intermediate")],
+            "mock-model",
+            vec![sample_tool_definition()],
+            None,
+        );
+
+        assert_decompose_tool_present(&request.tools);
+    }
+
+    #[test]
+    fn tool_definitions_with_decompose_does_not_duplicate() {
+        let tools = tool_definitions_with_decompose(vec![
+            sample_tool_definition(),
+            decompose_tool_definition(),
+        ]);
+        let decompose_tools = tools
+            .iter()
+            .filter(|tool| tool.name == DECOMPOSE_TOOL_NAME)
+            .collect::<Vec<_>>();
+
+        assert_eq!(tools.len(), 2);
+        assert_eq!(decompose_tools.len(), 1);
+        assert_eq!(decompose_tools[0].description, DECOMPOSE_TOOL_DESCRIPTION);
+    }
+
+    #[tokio::test]
+    async fn decide_decompose_with_optional_fields() {
+        let mut engine = decomposition_engine(budget_config(10, 6), 0);
+        let response = CompletionResponse {
+            content: Vec::new(),
+            tool_calls: vec![decompose_tool_call(serde_json::json!({
+                "sub_goals": [{"description": "Summarize findings"}]
+            }))],
+            usage: None,
+            stop_reason: None,
+        };
+
+        let decision = engine.decide(&response).await.expect("decision");
+        match decision {
+            Decision::Decompose(plan) => {
+                assert_eq!(plan.sub_goals.len(), 1);
+                assert_eq!(plan.sub_goals[0].description, "Summarize findings");
+                assert!(plan.sub_goals[0].required_tools.is_empty());
+                assert_eq!(plan.sub_goals[0].expected_output, "");
+                assert_eq!(plan.strategy, AggregationStrategy::Sequential);
+            }
+            other => panic!("expected decomposition decision, got: {other:?}"),
+        }
     }
 }
