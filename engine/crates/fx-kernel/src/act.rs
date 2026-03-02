@@ -4,6 +4,7 @@ use crate::cancellation::CancellationToken;
 use crate::decide::Decision;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::num::NonZeroUsize;
 
 /// Token accounting for loop steps that call an LLM.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -36,6 +37,17 @@ pub struct ToolExecutorError {
     pub recoverable: bool,
 }
 
+/// Controls parallel execution of tool calls.
+#[derive(Debug, Clone, Default)]
+pub struct ConcurrencyPolicy {
+    /// Maximum number of tool calls to execute in parallel.
+    /// `None` means unlimited (all calls run concurrently).
+    pub max_parallel: Option<NonZeroUsize>,
+    /// Per-tool-call timeout. If a call exceeds this, it returns
+    /// an error result (not a panic).
+    pub timeout_per_call: Option<std::time::Duration>,
+}
+
 /// Tool execution result.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolResult {
@@ -49,19 +61,55 @@ pub struct ToolResult {
     pub output: String,
 }
 
+/// Returns true when the optional cancellation token has been cancelled.
+#[must_use]
+pub fn is_cancelled(cancel: Option<&CancellationToken>) -> bool {
+    cancel.is_some_and(CancellationToken::is_cancelled)
+}
+
+/// Standardized tool result for cancellation.
+#[must_use]
+pub fn cancelled_result(tool_call_id: &str, tool_name: &str) -> ToolResult {
+    ToolResult {
+        tool_call_id: tool_call_id.to_string(),
+        tool_name: tool_name.to_string(),
+        success: false,
+        output: "tool execution cancelled".to_string(),
+    }
+}
+
+/// Standardized tool result for per-call timeout.
+#[must_use]
+pub fn timed_out_result(tool_call_id: &str, tool_name: &str) -> ToolResult {
+    ToolResult {
+        tool_call_id: tool_call_id.to_string(),
+        tool_name: tool_name.to_string(),
+        success: false,
+        output: "tool execution timed out".to_string(),
+    }
+}
+
 /// Tool execution abstraction for kernel act step.
 #[async_trait]
 pub trait ToolExecutor: Send + Sync + std::fmt::Debug {
     /// Execute requested tool calls and return tool results.
     ///
     /// When `cancel` is `Some`, implementations should check
-    /// [`CancellationToken::is_cancelled`] between individual tool calls
-    /// and return early (with partial results) if cancellation is observed.
+    /// [`CancellationToken::is_cancelled`] between individual tool calls.
+    /// The returned vector should preserve call-to-result alignment: each
+    /// requested call must produce one result, using a cancelled result if
+    /// cancellation is observed before execution begins.
     async fn execute_tools(
         &self,
         calls: &[fx_llm::ToolCall],
         cancel: Option<&CancellationToken>,
     ) -> Result<Vec<ToolResult>, ToolExecutorError>;
+
+    /// Returns the concurrency policy for parallel tool execution.
+    /// Default: unlimited parallelism, no per-call timeout.
+    fn concurrency_policy(&self) -> ConcurrencyPolicy {
+        ConcurrencyPolicy::default()
+    }
 
     /// Tool definitions exposed to the reasoning model.
     fn tool_definitions(&self) -> Vec<fx_llm::ToolDefinition> {
@@ -85,6 +133,23 @@ pub struct ActionResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrency_policy_default_is_unlimited() {
+        let policy = ConcurrencyPolicy::default();
+        assert_eq!(policy.max_parallel, None);
+        assert!(policy.timeout_per_call.is_none());
+    }
+
+    #[test]
+    fn concurrency_policy_custom_values() {
+        let policy = ConcurrencyPolicy {
+            max_parallel: Some(NonZeroUsize::new(4).expect("non-zero")),
+            timeout_per_call: Some(std::time::Duration::from_secs(30)),
+        };
+        assert_eq!(policy.max_parallel.map(NonZeroUsize::get), Some(4));
+        assert_eq!(policy.timeout_per_call.unwrap().as_secs(), 30);
+    }
 
     #[test]
     fn token_usage_accumulates_and_totals() {

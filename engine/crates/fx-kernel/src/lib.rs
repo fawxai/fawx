@@ -47,7 +47,10 @@ pub mod types;
 pub mod verify;
 pub mod watchdog;
 
-pub use act::{ActionResult, TokenUsage, ToolResult};
+pub use act::{
+    cancelled_result, is_cancelled, timed_out_result, ActionResult, ConcurrencyPolicy, TokenUsage,
+    ToolResult,
+};
 pub use cancellation::CancellationToken;
 pub use continuation::Continuation;
 pub use decide::Decision;
