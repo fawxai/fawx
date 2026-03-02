@@ -107,7 +107,11 @@ impl SignalStore {
     /// Query persisted signals for this session.
     pub fn query(&self, query: SignalQuery) -> Result<Vec<Signal>, SignalStoreError> {
         let path = self.session_path();
-        read_signals_from_file(&path, query.kind)
+        let (signals, skipped) = read_signals_from_file(&path, query.kind)?;
+        if skipped > 0 {
+            tracing::warn!("Skipped {skipped} malformed lines in {}", path.display());
+        }
+        Ok(signals)
     }
 
     /// List all session IDs that have persisted signal files.
@@ -129,22 +133,42 @@ impl SignalStore {
         Ok(sessions)
     }
 
+    /// Load signals for a session, returning signals, display path, and skip count.
+    fn load_session_with_skips(
+        &self,
+        session_id: &str,
+    ) -> Result<(Vec<Signal>, String, usize), SignalStoreError> {
+        let path = self.session_path_for(session_id)?;
+        let (signals, skipped) = read_signals_from_file(&path, None)?;
+        Ok((signals, path.display().to_string(), skipped))
+    }
+
     /// Read all persisted signals for a specific session ID.
     pub fn load_session(&self, session_id: &str) -> Result<Vec<Signal>, SignalStoreError> {
-        let path = self.session_path_for(session_id)?;
-        read_signals_from_file(&path, None)
+        let (signals, filename, skipped) = self.load_session_with_skips(session_id)?;
+        if skipped > 0 {
+            tracing::warn!("Skipped {skipped} malformed lines in {filename}");
+        }
+        Ok(signals)
     }
 
     /// Read all persisted signals across every known session.
     pub fn load_all(&self) -> Result<Vec<(String, Signal)>, SignalStoreError> {
         let mut all_signals = Vec::new();
+        let mut skip_counts: Vec<(String, usize)> = Vec::new();
         for session_id in self.list_all_sessions()? {
-            let signals = self.load_session(&session_id)?;
+            let (signals, filename, skipped) = self.load_session_with_skips(&session_id)?;
+            if skipped > 0 {
+                skip_counts.push((filename, skipped));
+            }
             all_signals.extend(
                 signals
                     .into_iter()
                     .map(|signal| (session_id.clone(), signal)),
             );
+        }
+        for (filename, count) in &skip_counts {
+            tracing::warn!("Skipped {count} malformed lines in {filename}");
         }
         Ok(all_signals)
     }
@@ -228,9 +252,9 @@ fn validate_session_id(session_id: &str) -> Result<(), SignalStoreError> {
 fn read_signals_from_file(
     path: &Path,
     kind_filter: Option<SignalKind>,
-) -> Result<Vec<Signal>, SignalStoreError> {
+) -> Result<(Vec<Signal>, usize), SignalStoreError> {
     if !path.exists() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
     let file = fs::File::open(path).map_err(SignalStoreError::FileRead)?;
     parse_signal_lines(std::io::BufReader::new(file).lines(), kind_filter, path)
@@ -240,8 +264,9 @@ fn parse_signal_lines(
     lines: impl Iterator<Item = std::io::Result<String>>,
     kind_filter: Option<SignalKind>,
     source_path: &Path,
-) -> Result<Vec<Signal>, SignalStoreError> {
+) -> Result<(Vec<Signal>, usize), SignalStoreError> {
     let mut signals = Vec::new();
+    let mut skipped = 0usize;
     for (line_number, line) in lines.enumerate() {
         let line = line.map_err(SignalStoreError::FileRead)?;
         let trimmed = line.trim();
@@ -256,15 +281,16 @@ fn parse_signal_lines(
                 }
             }
             Err(error) => {
-                eprintln!(
+                tracing::debug!(
                     "Skipping malformed signal line in {}:{}: {error}",
                     source_path.display(),
                     line_number + 1,
                 );
+                skipped += 1;
             }
         }
     }
-    Ok(signals)
+    Ok((signals, skipped))
 }
 
 fn matches_kind_filter(signal: &Signal, kind_filter: Option<SignalKind>) -> bool {
@@ -488,6 +514,51 @@ mod tests {
     }
 
     #[test]
+    fn load_all_aggregates_signals_with_malformed_lines_across_sessions() {
+        let tmp = TempDir::new().expect("tempdir");
+        let store = SignalStore::new(tmp.path(), "session-a").expect("new");
+
+        let valid_a =
+            serde_json::to_string(&mk_signal(LoopStep::Act, SignalKind::Success, "good-a", 1))
+                .expect("serialize signal");
+        let valid_b =
+            serde_json::to_string(&mk_signal(LoopStep::Act, SignalKind::Friction, "good-b", 2))
+                .expect("serialize signal");
+
+        // session-a: 1 good + 2 bad
+        fs::write(
+            tmp.path().join("signals/session-a.jsonl"),
+            format!(
+                "{valid_a}
+not-json
+{{
+"
+            ),
+        )
+        .expect("write a");
+
+        // session-b: 1 good + 1 bad
+        fs::write(
+            tmp.path().join("signals/session-b.jsonl"),
+            format!(
+                "{valid_b}
+broken
+"
+            ),
+        )
+        .expect("write b");
+
+        let signals = store.load_all().expect("load all");
+        assert_eq!(signals.len(), 2);
+        assert!(signals
+            .iter()
+            .any(|(sid, s)| sid == "session-a" && s.message == "good-a"));
+        assert!(signals
+            .iter()
+            .any(|(sid, s)| sid == "session-b" && s.message == "good-b"));
+    }
+
+    #[test]
     fn load_all_aggregates_signals_across_sessions_with_session_ids() {
         let tmp = TempDir::new().expect("tempdir");
         persist_single_signal(tmp.path(), "session-a", "first", 1);
@@ -566,8 +637,10 @@ mod tests {
             Ok("\t".to_string()),
         ];
 
-        let parsed = parse_signal_lines(lines.into_iter(), None, parse_test_path()).expect("parse");
+        let (parsed, skipped) =
+            parse_signal_lines(lines.into_iter(), None, parse_test_path()).expect("parse");
 
+        assert_eq!(skipped, 0);
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].message, "kept");
     }
@@ -583,8 +656,10 @@ mod tests {
             Ok(valid),
         ];
 
-        let parsed = parse_signal_lines(lines.into_iter(), None, parse_test_path()).expect("parse");
+        let (parsed, skipped) =
+            parse_signal_lines(lines.into_iter(), None, parse_test_path()).expect("parse");
 
+        assert_eq!(skipped, 0);
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].message, "kept");
     }
@@ -596,9 +671,10 @@ mod tests {
             Ok("{\"still\":\"not-a-signal\"}".to_string()),
         ];
 
-        let parsed = parse_signal_lines(lines.into_iter(), None, parse_test_path())
+        let (parsed, skipped) = parse_signal_lines(lines.into_iter(), None, parse_test_path())
             .expect("malformed lines should be skipped");
 
+        assert_eq!(skipped, 2);
         assert!(parsed.is_empty());
     }
 
@@ -622,11 +698,64 @@ mod tests {
             Ok(good_b),
         ];
 
-        let parsed = parse_signal_lines(lines.into_iter(), None, parse_test_path()).expect("parse");
+        let (parsed, skipped) =
+            parse_signal_lines(lines.into_iter(), None, parse_test_path()).expect("parse");
 
+        assert_eq!(skipped, 1);
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].message, "first");
         assert_eq!(parsed[1].message, "second");
+    }
+
+    #[test]
+    fn parse_signal_lines_returns_skip_count_for_malformed_lines() {
+        let good = serde_json::to_string(&mk_signal(LoopStep::Act, SignalKind::Success, "ok", 1))
+            .expect("serialize");
+        let lines = vec![
+            Ok(good),
+            Ok("{bad json 1}".to_string()),
+            Ok("{bad json 2}".to_string()),
+            Ok("{bad json 3}".to_string()),
+        ];
+
+        let (signals, skipped) =
+            parse_signal_lines(lines.into_iter(), None, parse_test_path()).expect("parse");
+
+        assert_eq!(signals.len(), 1);
+        assert_eq!(skipped, 3);
+    }
+
+    #[test]
+    fn read_signals_from_file_returns_skip_count_for_malformed_file() {
+        let tmp = TempDir::new().expect("tempdir");
+        fs::create_dir_all(tmp.path().join("signals")).expect("create signals dir");
+        let session_path = tmp.path().join("signals/session-a.jsonl");
+        let valid =
+            serde_json::to_string(&mk_signal(LoopStep::Act, SignalKind::Success, "kept", 1))
+                .expect("serialize signal");
+        fs::write(&session_path, format!("{valid}\nnot-json\n{{\n")).expect("write session file");
+
+        let (signals, skipped) = read_signals_from_file(&session_path, None).expect("read signals");
+
+        assert_eq!(skipped, 2);
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].message, "kept");
+    }
+
+    #[test]
+    fn load_session_keeps_valid_signals_when_file_has_malformed_lines() {
+        let tmp = TempDir::new().expect("tempdir");
+        let store = SignalStore::new(tmp.path(), "session-a").expect("new");
+        let session_path = tmp.path().join("signals/session-a.jsonl");
+        let valid =
+            serde_json::to_string(&mk_signal(LoopStep::Act, SignalKind::Success, "kept", 1))
+                .expect("serialize signal");
+        fs::write(&session_path, format!("{valid}\nnot-json\n{{\n")).expect("write session file");
+
+        let loaded = store.load_session("session-a").expect("load session");
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].message, "kept");
     }
 
     #[test]

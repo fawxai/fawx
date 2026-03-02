@@ -1230,11 +1230,11 @@ impl TuiApp {
             .active_model()
             .ok_or_else(|| TuiError::Router("no active model for analysis".to_string()))?
             .to_string();
-        let llm = RouterLoopLlmProvider::new(&self.router, active_model);
+        let provider = AnalysisCompletionProvider::new(&self.router, active_model);
         let engine = AnalysisEngine::new(&self.signal_store);
 
         println!("Analyzing signals across all sessions...");
-        match engine.analyze(&llm).await {
+        match engine.analyze(&provider).await {
             Ok(findings) if findings.is_empty() => {
                 println!("No patterns found. Collect more signals first.");
             }
@@ -2024,6 +2024,68 @@ fn format_memory_for_prompt(entries: &[(String, String)], max_chars: usize) -> O
         Use memory_write to update or add memories.)",
     );
     Some(text)
+}
+
+/// Thin wrapper to expose `ModelRouter` as a `CompletionProvider` for analysis.
+struct AnalysisCompletionProvider<'a> {
+    router: &'a ModelRouter,
+    active_model: String,
+}
+
+impl<'a> fmt::Debug for AnalysisCompletionProvider<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AnalysisCompletionProvider")
+            .field("active_model", &self.active_model)
+            .finish()
+    }
+}
+
+impl<'a> AnalysisCompletionProvider<'a> {
+    fn new(router: &'a ModelRouter, active_model: String) -> Self {
+        Self {
+            router,
+            active_model,
+        }
+    }
+
+    fn with_active_model(&self, mut request: CompletionRequest) -> CompletionRequest {
+        request.model = self.active_model.clone();
+        request
+    }
+}
+
+#[async_trait]
+impl fx_llm::CompletionProvider for AnalysisCompletionProvider<'_> {
+    async fn complete(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<fx_llm::CompletionResponse, fx_llm::ProviderError> {
+        self.router.complete(self.with_active_model(request)).await
+    }
+
+    async fn complete_stream(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<fx_llm::CompletionStream, fx_llm::ProviderError> {
+        self.router
+            .complete_stream(self.with_active_model(request))
+            .await
+    }
+
+    fn name(&self) -> &str {
+        "analysis"
+    }
+
+    fn supported_models(&self) -> Vec<String> {
+        vec![self.active_model.clone()]
+    }
+
+    fn capabilities(&self) -> fx_llm::ProviderCapabilities {
+        fx_llm::ProviderCapabilities {
+            supports_temperature: true,
+            requires_streaming: false,
+        }
+    }
 }
 
 impl<'a> fmt::Debug for RouterLoopLlmProvider<'a> {

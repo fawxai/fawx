@@ -174,6 +174,9 @@ pub struct ToolUseDelta {
     pub name: Option<String>,
     /// Incremental JSON argument text, when streamed as text deltas.
     pub arguments_delta: Option<String>,
+    /// Whether this delta came from a `*.function_call_arguments.done` event.
+    #[serde(default)]
+    pub arguments_done: bool,
 }
 
 /// Errors produced by provider adapters.
