@@ -13,6 +13,9 @@ use tokio::time::timeout;
 const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const DIFF_TIMEOUT: Duration = Duration::from_secs(15);
 const CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(10);
+const BRANCH_TIMEOUT: Duration = Duration::from_secs(5);
+const MERGE_TIMEOUT: Duration = Duration::from_secs(10);
+const REVERT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_DIFF_OUTPUT_CHARS: usize = 50_000;
 const TRUNCATED_SUFFIX: &str = "\n(truncated)";
 
@@ -32,6 +35,33 @@ struct GitDiffArgs {
 #[derive(Debug, Deserialize)]
 struct GitCheckpointArgs {
     message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitBranchCreateArgs {
+    name: String,
+    from: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitBranchSwitchArgs {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitBranchDeleteArgs {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitMergeArgs {
+    branch: String,
+    message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitRevertArgs {
+    commit_sha: String,
 }
 
 impl GitSkill {
@@ -134,6 +164,72 @@ impl GitSkill {
             ))
         }
     }
+
+    async fn execute_branch_create(&self, arguments: &str) -> Result<String, String> {
+        let parsed: GitBranchCreateArgs = parse_args(arguments)?;
+        validate_branch_name(&parsed.name)?;
+        if let Some(ref base) = parsed.from {
+            validate_branch_name(base)?;
+        }
+        let mut args = vec!["checkout", "-b", parsed.name.as_str()];
+        if let Some(base) = parsed.from.as_deref() {
+            args.push(base);
+        }
+        self.run_git_with_timeout(&args, BRANCH_TIMEOUT).await?;
+        Ok(format!("Created and switched to branch '{}'", parsed.name))
+    }
+
+    async fn execute_branch_switch(&self, arguments: &str) -> Result<String, String> {
+        let parsed: GitBranchSwitchArgs = parse_args(arguments)?;
+        validate_branch_name(&parsed.name)?;
+        self.run_git_with_timeout(&["rev-parse", "--verify", &parsed.name], BRANCH_TIMEOUT)
+            .await
+            .map_err(|_| format!("branch '{}' does not exist", parsed.name))?;
+        self.run_git_with_timeout(&["checkout", &parsed.name], BRANCH_TIMEOUT)
+            .await?;
+        Ok(format!("Switched to branch '{}'", parsed.name))
+    }
+
+    async fn execute_branch_delete(&self, arguments: &str) -> Result<String, String> {
+        let parsed: GitBranchDeleteArgs = parse_args(arguments)?;
+        validate_branch_name(&parsed.name)?;
+        let current = self
+            .run_git_with_timeout(&["branch", "--show-current"], BRANCH_TIMEOUT)
+            .await?;
+        if current.trim() == parsed.name {
+            return Err(format!(
+                "cannot delete the currently checked-out branch '{}'",
+                parsed.name
+            ));
+        }
+        self.run_git_with_timeout(&["branch", "-d", &parsed.name], BRANCH_TIMEOUT)
+            .await?;
+        Ok(format!("Deleted branch '{}'", parsed.name))
+    }
+
+    async fn execute_merge(&self, arguments: &str) -> Result<String, String> {
+        match &self.self_modify {
+            Some(config) if config.enabled => {}
+            _ => {
+                return Err("git_merge requires self-modification to be enabled".to_string());
+            }
+        }
+        let parsed: GitMergeArgs = parse_args(arguments)?;
+        validate_branch_name(&parsed.branch)?;
+        let mut args = vec!["merge", parsed.branch.as_str()];
+        if let Some(message) = parsed.message.as_deref() {
+            args.push("-m");
+            args.push(message);
+        }
+        self.run_git_with_timeout(&args, MERGE_TIMEOUT).await
+    }
+
+    async fn execute_revert(&self, arguments: &str) -> Result<String, String> {
+        let parsed: GitRevertArgs = parse_args(arguments)?;
+        validate_sha(&parsed.commit_sha)?;
+        self.run_git_with_timeout(&["revert", &parsed.commit_sha, "--no-edit"], REVERT_TIMEOUT)
+            .await
+    }
 }
 
 #[async_trait]
@@ -147,6 +243,11 @@ impl Skill for GitSkill {
             git_status_definition(),
             git_diff_definition(),
             git_checkpoint_definition(),
+            git_branch_create_definition(),
+            git_branch_switch_definition(),
+            git_branch_delete_definition(),
+            git_merge_definition(),
+            git_revert_definition(),
         ]
     }
 
@@ -160,6 +261,11 @@ impl Skill for GitSkill {
             "git_status" => self.execute_status().await,
             "git_diff" => self.execute_diff(arguments).await,
             "git_checkpoint" => self.execute_checkpoint(arguments).await,
+            "git_branch_create" => self.execute_branch_create(arguments).await,
+            "git_branch_switch" => self.execute_branch_switch(arguments).await,
+            "git_branch_delete" => self.execute_branch_delete(arguments).await,
+            "git_merge" => self.execute_merge(arguments).await,
+            "git_revert" => self.execute_revert(arguments).await,
             _ => return None,
         };
         Some(result)
@@ -215,6 +321,99 @@ fn git_checkpoint_definition() -> ToolDefinition {
                 }
             },
             "required": ["message"]
+        }),
+    }
+}
+
+fn git_branch_create_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "git_branch_create".to_string(),
+        description: "Create a new git branch and switch to it. Use this when the user wants to start a new feature branch, create a branch for changes, or branch from a specific ref.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Name for the new branch"
+                },
+                "from": {
+                    "type": "string",
+                    "description": "Base ref to branch from (branch, tag, or commit). Defaults to current HEAD."
+                }
+            },
+            "required": ["name"]
+        }),
+    }
+}
+
+fn git_branch_switch_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "git_branch_switch".to_string(),
+        description: "Switch to an existing git branch. Use this when the user wants to change branches, checkout a different branch, or move to another branch.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Name of the branch to switch to"
+                }
+            },
+            "required": ["name"]
+        }),
+    }
+}
+
+fn git_branch_delete_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "git_branch_delete".to_string(),
+        description: "Delete a git branch. Use this when the user wants to remove a branch that is no longer needed. Cannot delete the currently checked-out branch.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Name of the branch to delete"
+                }
+            },
+            "required": ["name"]
+        }),
+    }
+}
+
+fn git_merge_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "git_merge".to_string(),
+        description: "Merge a branch into the current branch. Use this when the user wants to merge changes from another branch. Requires self-modification to be enabled.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "branch": {
+                    "type": "string",
+                    "description": "Name of the branch to merge into the current branch"
+                },
+                "message": {
+                    "type": "string",
+                    "description": "Custom merge commit message"
+                }
+            },
+            "required": ["branch"]
+        }),
+    }
+}
+
+fn git_revert_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "git_revert".to_string(),
+        description: "Revert a specific commit by creating a new commit that undoes its changes. Use this when the user wants to undo a specific commit without rewriting history.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "commit_sha": {
+                    "type": "string",
+                    "description": "SHA of the commit to revert (7-40 hex characters)"
+                }
+            },
+            "required": ["commit_sha"]
         }),
     }
 }
@@ -291,6 +490,32 @@ async fn wait_for_git_output(child: Child, timeout_duration: Duration) -> Result
     }
 }
 
+fn validate_branch_name(name: &str) -> Result<(), String> {
+    if name.starts_with('-') {
+        return Err("invalid branch name: cannot start with '-'".to_string());
+    }
+    if name.contains(' ') {
+        return Err("invalid branch name: cannot contain spaces".to_string());
+    }
+    if name.contains("..") {
+        return Err("invalid branch name: cannot contain '..'".to_string());
+    }
+    Ok(())
+}
+
+fn validate_sha(sha: &str) -> Result<(), String> {
+    if sha.len() < 7 || sha.len() > 40 {
+        return Err(format!(
+            "invalid commit SHA: must be 7-40 characters, got {}",
+            sha.len()
+        ));
+    }
+    if !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("invalid commit SHA: must contain only hex characters".to_string());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,37 +556,57 @@ mod tests {
 
     fn seed_initial_commit(repo: &TempDir, file: &str, content: &str) {
         fs::write(repo.path().join(file), content).expect("seed file should be written");
-        StdCommand::new("git")
-            .args(["add", file])
+        run_git_ok(repo, &["add", file]);
+        run_git_ok(repo, &["commit", "-m", "initial"]);
+    }
+
+    fn run_git_ok(repo: &TempDir, args: &[&str]) {
+        let output = StdCommand::new("git")
+            .args(args)
             .current_dir(repo.path())
             .output()
-            .expect("git command should run in test setup");
-        StdCommand::new("git")
-            .args(["commit", "-m", "initial"])
-            .current_dir(repo.path())
-            .output()
-            .expect("git command should run in test setup");
+            .expect("git command should run in tests");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
-    fn git_skill_provides_three_tool_definitions() {
+    fn git_skill_provides_eight_tool_definitions() {
         let skill = GitSkill::new(PathBuf::from("."), None);
         let defs = skill.tool_definitions();
         let names: Vec<_> = defs
             .iter()
             .map(|definition| definition.name.as_str())
             .collect();
-        assert_eq!(defs.len(), 3);
+        assert_eq!(defs.len(), 8);
         assert!(names.contains(&"git_status"));
         assert!(names.contains(&"git_diff"));
         assert!(names.contains(&"git_checkpoint"));
+        assert!(names.contains(&"git_branch_create"));
+        assert!(names.contains(&"git_branch_switch"));
+        assert!(names.contains(&"git_branch_delete"));
+        assert!(names.contains(&"git_merge"));
+        assert!(names.contains(&"git_revert"));
     }
 
     #[test]
     fn git_tool_descriptions_include_when_to_use_guidance() {
         let skill = GitSkill::new(PathBuf::from("."), None);
         let definitions = skill.tool_definitions();
-        for tool_name in ["git_status", "git_diff", "git_checkpoint"] {
+        for tool_name in [
+            "git_status",
+            "git_diff",
+            "git_checkpoint",
+            "git_branch_create",
+            "git_branch_switch",
+            "git_branch_delete",
+            "git_merge",
+            "git_revert",
+        ] {
             let definition = definitions
                 .iter()
                 .find(|definition| definition.name == tool_name)
@@ -442,6 +687,316 @@ mod tests {
         assert!(output.contains("diff --git"));
         assert!(output.contains("-one"));
         assert!(output.contains("+two"));
+    }
+
+    #[tokio::test]
+    async fn git_branch_create_creates_branch() {
+        let repo = init_test_repo();
+        seed_initial_commit(&repo, "file.txt", "content\n");
+        let skill = GitSkill::new(repo.path().to_path_buf(), None);
+        let output = run_tool(
+            &skill,
+            "git_branch_create",
+            serde_json::json!({ "name": "feature-x" }),
+        )
+        .await
+        .expect("branch create should succeed");
+        assert!(output.contains("feature-x"));
+        let branch = StdCommand::new("git")
+            .args(["branch", "--show-current"])
+            .current_dir(repo.path())
+            .output()
+            .expect("git command should run");
+        let branch_name = String::from_utf8(branch.stdout).expect("valid utf8");
+        assert_eq!(branch_name.trim(), "feature-x");
+    }
+
+    #[tokio::test]
+    async fn git_branch_create_from_base_ref() {
+        let repo = init_test_repo();
+        seed_initial_commit(&repo, "file.txt", "content\n");
+        StdCommand::new("git")
+            .args(["branch", "-M", "main"])
+            .current_dir(repo.path())
+            .output()
+            .expect("git command should run");
+        let skill = GitSkill::new(repo.path().to_path_buf(), None);
+        let output = run_tool(
+            &skill,
+            "git_branch_create",
+            serde_json::json!({ "name": "from-main", "from": "main" }),
+        )
+        .await
+        .expect("branch create from base should succeed");
+        assert!(output.contains("from-main"));
+    }
+
+    #[tokio::test]
+    async fn git_branch_create_rejects_invalid_name() {
+        let repo = init_test_repo();
+        seed_initial_commit(&repo, "file.txt", "content\n");
+        let skill = GitSkill::new(repo.path().to_path_buf(), None);
+
+        let err1 = run_tool(
+            &skill,
+            "git_branch_create",
+            serde_json::json!({ "name": "has space" }),
+        )
+        .await
+        .expect_err("spaces should be rejected");
+        assert!(err1.contains("spaces"));
+
+        let err2 = run_tool(
+            &skill,
+            "git_branch_create",
+            serde_json::json!({ "name": "bad..name" }),
+        )
+        .await
+        .expect_err("double dots should be rejected");
+        assert!(err2.contains(".."));
+
+        let err3 = run_tool(
+            &skill,
+            "git_branch_create",
+            serde_json::json!({ "name": "-leading" }),
+        )
+        .await
+        .expect_err("leading dash should be rejected");
+        assert!(err3.contains("-"));
+    }
+
+    #[tokio::test]
+    async fn git_branch_create_rejects_invalid_from_ref() {
+        let repo = init_test_repo();
+        seed_initial_commit(&repo, "file.txt", "content\n");
+        let skill = GitSkill::new(repo.path().to_path_buf(), None);
+        let error = run_tool(
+            &skill,
+            "git_branch_create",
+            serde_json::json!({ "name": "valid-name", "from": "--exec=bad" }),
+        )
+        .await
+        .expect_err("dash-prefixed from ref should be rejected");
+        assert!(error.contains("invalid branch name"));
+    }
+
+    #[tokio::test]
+    async fn git_branch_switch_switches_to_existing_branch() {
+        let repo = init_test_repo();
+        seed_initial_commit(&repo, "file.txt", "content\n");
+        StdCommand::new("git")
+            .args(["branch", "-M", "main"])
+            .current_dir(repo.path())
+            .output()
+            .expect("git command should run");
+        StdCommand::new("git")
+            .args(["checkout", "-b", "other"])
+            .current_dir(repo.path())
+            .output()
+            .expect("git command should run");
+        StdCommand::new("git")
+            .args(["checkout", "main"])
+            .current_dir(repo.path())
+            .output()
+            .expect("git command should run");
+        let skill = GitSkill::new(repo.path().to_path_buf(), None);
+        let output = run_tool(
+            &skill,
+            "git_branch_switch",
+            serde_json::json!({ "name": "other" }),
+        )
+        .await
+        .expect("switch should succeed");
+        assert!(output.contains("other"));
+    }
+
+    #[tokio::test]
+    async fn git_branch_switch_errors_on_nonexistent() {
+        let repo = init_test_repo();
+        seed_initial_commit(&repo, "file.txt", "content\n");
+        let skill = GitSkill::new(repo.path().to_path_buf(), None);
+        let error = run_tool(
+            &skill,
+            "git_branch_switch",
+            serde_json::json!({ "name": "no-such-branch" }),
+        )
+        .await
+        .expect_err("switch to nonexistent should fail");
+        assert!(error.contains("does not exist"));
+    }
+
+    #[tokio::test]
+    async fn git_branch_delete_deletes_merged_branch() {
+        let repo = init_test_repo();
+        seed_initial_commit(&repo, "file.txt", "content\n");
+        StdCommand::new("git")
+            .args(["branch", "-M", "main"])
+            .current_dir(repo.path())
+            .output()
+            .expect("git command should run");
+        StdCommand::new("git")
+            .args(["checkout", "-b", "to-delete"])
+            .current_dir(repo.path())
+            .output()
+            .expect("git command should run");
+        StdCommand::new("git")
+            .args(["checkout", "main"])
+            .current_dir(repo.path())
+            .output()
+            .expect("git command should run");
+        let skill = GitSkill::new(repo.path().to_path_buf(), None);
+        let output = run_tool(
+            &skill,
+            "git_branch_delete",
+            serde_json::json!({ "name": "to-delete" }),
+        )
+        .await
+        .expect("delete should succeed");
+        assert!(output.contains("to-delete"));
+    }
+
+    #[tokio::test]
+    async fn git_branch_delete_refuses_current_branch() {
+        let repo = init_test_repo();
+        seed_initial_commit(&repo, "file.txt", "content\n");
+        StdCommand::new("git")
+            .args(["branch", "-M", "main"])
+            .current_dir(repo.path())
+            .output()
+            .expect("git command should run");
+        let skill = GitSkill::new(repo.path().to_path_buf(), None);
+        let error = run_tool(
+            &skill,
+            "git_branch_delete",
+            serde_json::json!({ "name": "main" }),
+        )
+        .await
+        .expect_err("deleting current branch should fail");
+        assert!(error.contains("currently checked-out"));
+    }
+
+    #[tokio::test]
+    async fn git_merge_succeeds_when_self_modify_enabled() {
+        let repo = init_test_repo();
+        seed_initial_commit(&repo, "file.txt", "content\n");
+        run_git_ok(&repo, &["branch", "-M", "main"]);
+        run_git_ok(&repo, &["checkout", "-b", "feature"]);
+        fs::write(repo.path().join("feature.txt"), "new\n").expect("write feature file");
+        run_git_ok(&repo, &["add", "-A"]);
+        run_git_ok(&repo, &["commit", "-m", "feature commit"]);
+        run_git_ok(&repo, &["checkout", "main"]);
+
+        let config = SelfModifyConfig {
+            enabled: true,
+            ..SelfModifyConfig::default()
+        };
+        let skill = GitSkill::new(repo.path().to_path_buf(), Some(config));
+        let output = run_tool(
+            &skill,
+            "git_merge",
+            serde_json::json!({ "branch": "feature" }),
+        )
+        .await
+        .expect("merge should succeed");
+
+        assert!(!output.is_empty());
+        let merged = fs::read_to_string(repo.path().join("feature.txt")).expect("read merged file");
+        assert_eq!(merged, "new\n");
+    }
+
+    #[tokio::test]
+    async fn git_merge_blocked_when_disabled() {
+        let repo = init_test_repo();
+        seed_initial_commit(&repo, "file.txt", "content\n");
+        let config = SelfModifyConfig {
+            enabled: false,
+            ..SelfModifyConfig::default()
+        };
+        let skill = GitSkill::new(repo.path().to_path_buf(), Some(config));
+        let error = run_tool(
+            &skill,
+            "git_merge",
+            serde_json::json!({ "branch": "feature" }),
+        )
+        .await
+        .expect_err("merge should be blocked");
+        assert!(error.contains("self-modification"));
+    }
+
+    #[tokio::test]
+    async fn git_merge_blocked_when_none() {
+        let repo = init_test_repo();
+        seed_initial_commit(&repo, "file.txt", "content\n");
+        let skill = GitSkill::new(repo.path().to_path_buf(), None);
+        let error = run_tool(
+            &skill,
+            "git_merge",
+            serde_json::json!({ "branch": "feature" }),
+        )
+        .await
+        .expect_err("merge with no config should be blocked");
+        assert!(error.contains("self-modification"));
+    }
+
+    #[tokio::test]
+    async fn git_revert_reverts_commit() {
+        let repo = init_test_repo();
+        seed_initial_commit(&repo, "file.txt", "original\n");
+        std::fs::write(repo.path().join("file.txt"), "changed\n").expect("write file");
+        StdCommand::new("git")
+            .args(["add", "-A"])
+            .current_dir(repo.path())
+            .output()
+            .expect("git command should run");
+        StdCommand::new("git")
+            .args(["commit", "-m", "change to revert"])
+            .current_dir(repo.path())
+            .output()
+            .expect("git command should run");
+        let log = StdCommand::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo.path())
+            .output()
+            .expect("git command should run");
+        let sha = String::from_utf8(log.stdout)
+            .expect("valid utf8")
+            .trim()
+            .to_string();
+        let skill = GitSkill::new(repo.path().to_path_buf(), None);
+        let output = run_tool(
+            &skill,
+            "git_revert",
+            serde_json::json!({ "commit_sha": sha }),
+        )
+        .await
+        .expect("revert should succeed");
+        assert!(!output.is_empty());
+        let reverted =
+            fs::read_to_string(repo.path().join("file.txt")).expect("read reverted file");
+        assert_eq!(reverted, "original\n");
+    }
+
+    #[tokio::test]
+    async fn git_revert_rejects_invalid_sha() {
+        let repo = init_test_repo();
+        seed_initial_commit(&repo, "file.txt", "content\n");
+        let skill = GitSkill::new(repo.path().to_path_buf(), None);
+
+        let invalid_values = [
+            "zzzzzzz",
+            "abc",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ];
+        for sha in invalid_values {
+            let error = run_tool(
+                &skill,
+                "git_revert",
+                serde_json::json!({ "commit_sha": sha }),
+            )
+            .await
+            .expect_err("invalid sha should fail");
+            assert!(error.contains("invalid commit SHA"));
+        }
     }
 
     #[tokio::test]
