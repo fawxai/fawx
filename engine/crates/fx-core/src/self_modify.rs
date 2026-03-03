@@ -21,6 +21,17 @@ pub enum PathTier {
 /// Default deny patterns shared between core and CLI configs.
 pub const DEFAULT_DENY_PATHS: &[&str] = &[".git/**", "*.key", "*.pem", "credentials.*"];
 
+/// Default proposals directory: `$HOME/.fawx/proposals`.
+///
+/// Falls back to `.fawx/proposals` (relative) when `HOME` is unset.
+#[must_use]
+pub fn default_proposals_dir() -> PathBuf {
+    match std::env::var("HOME") {
+        Ok(home) => PathBuf::from(home).join(".fawx").join("proposals"),
+        Err(_) => PathBuf::from(".fawx").join("proposals"),
+    }
+}
+
 /// Configuration for the self-modification path enforcement system.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelfModifyConfig {
@@ -30,6 +41,7 @@ pub struct SelfModifyConfig {
     pub allow_paths: Vec<String>,
     pub propose_paths: Vec<String>,
     pub deny_paths: Vec<String>,
+    pub proposals_dir: PathBuf,
 }
 
 impl Default for SelfModifyConfig {
@@ -41,6 +53,7 @@ impl Default for SelfModifyConfig {
             allow_paths: Vec::new(),
             propose_paths: Vec::new(),
             deny_paths: DEFAULT_DENY_PATHS.iter().map(|s| s.to_string()).collect(),
+            proposals_dir: default_proposals_dir(),
         }
     }
 }
@@ -443,5 +456,15 @@ mod tests {
         let a = SelfModifyConfig::default();
         let b = SelfModifyConfig::default();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn default_proposals_dir_ends_with_fawx_proposals() {
+        let dir = default_proposals_dir();
+        assert!(
+            dir.ends_with(".fawx/proposals"),
+            "expected path ending with .fawx/proposals, got: {}",
+            dir.display()
+        );
     }
 }

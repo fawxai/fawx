@@ -29,10 +29,12 @@
 
 pub mod act;
 pub mod budget;
+pub mod caching_executor;
 pub mod cancellation;
 pub mod checkpoint;
 pub mod context_manager;
 pub mod continuation;
+pub mod conversation_compactor;
 pub mod decide;
 pub mod event_bus;
 pub mod input;
@@ -50,8 +52,9 @@ pub mod watchdog;
 
 pub use act::{
     cancelled_result, is_cancelled, timed_out_result, ActionResult, ConcurrencyPolicy, TokenUsage,
-    ToolResult,
+    ToolCacheStats, ToolCacheability, ToolResult,
 };
+pub use caching_executor::CachingExecutor;
 pub use cancellation::CancellationToken;
 pub use continuation::Continuation;
 pub use decide::Decision;
@@ -61,7 +64,7 @@ pub use fx_decompose::{
 };
 pub use input::{loop_input_channel, LoopCommand, LoopInputChannel, LoopInputSender};
 pub use learn::Learning;
-pub use loop_engine::{LoopEngine, LoopResult, LoopStatus};
+pub use loop_engine::{LoopEngine, LoopEngineBuilder, LoopResult, LoopStatus};
 pub use perceive::ProcessedPerception;
 pub use signals::{LoopStep, Signal, SignalCollector, SignalKind};
 pub use types::{ContinuationDecision, EscalationContext, LoopError, LoopEvidence};

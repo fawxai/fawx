@@ -7,7 +7,8 @@
 
 use async_trait::async_trait;
 use fx_kernel::act::{
-    cancelled_result, is_cancelled, timed_out_result, ToolExecutor, ToolExecutorError, ToolResult,
+    cancelled_result, is_cancelled, timed_out_result, ToolCacheability, ToolExecutor,
+    ToolExecutorError, ToolResult,
 };
 use fx_kernel::cancellation::CancellationToken;
 use fx_llm::{ToolCall, ToolDefinition};
@@ -76,6 +77,18 @@ impl SkillRegistry {
                 (skill.name().to_string(), tools)
             })
             .collect()
+    }
+
+    fn owning_skill(&self, tool_name: &str) -> Option<&dyn Skill> {
+        self.skills
+            .iter()
+            .find(|skill| {
+                skill
+                    .tool_definitions()
+                    .iter()
+                    .any(|definition| definition.name == tool_name)
+            })
+            .map(|skill| skill.as_ref())
     }
 
     /// Execute a single tool call by finding the first skill that handles it.
@@ -253,6 +266,12 @@ impl ToolExecutor for SkillRegistry {
     fn tool_definitions(&self) -> Vec<ToolDefinition> {
         self.all_tool_definitions()
     }
+
+    fn cacheability(&self, tool_name: &str) -> ToolCacheability {
+        self.owning_skill(tool_name)
+            .map(|skill| skill.cacheability(tool_name))
+            .unwrap_or(ToolCacheability::NeverCache)
+    }
 }
 
 #[cfg(test)]
@@ -265,10 +284,19 @@ mod tests {
     struct MockSkill {
         skill_name: String,
         tools: Vec<ToolDefinition>,
+        cacheability: ToolCacheability,
     }
 
     impl MockSkill {
         fn new(name: &str, tool_names: &[&str]) -> Self {
+            Self::with_cacheability(name, tool_names, ToolCacheability::NeverCache)
+        }
+
+        fn with_cacheability(
+            name: &str,
+            tool_names: &[&str],
+            cacheability: ToolCacheability,
+        ) -> Self {
             let tools = tool_names
                 .iter()
                 .map(|t| ToolDefinition {
@@ -280,6 +308,7 @@ mod tests {
             Self {
                 skill_name: name.to_string(),
                 tools,
+                cacheability,
             }
         }
     }
@@ -292,6 +321,10 @@ mod tests {
 
         fn tool_definitions(&self) -> Vec<ToolDefinition> {
             self.tools.clone()
+        }
+
+        fn cacheability(&self, _tool_name: &str) -> ToolCacheability {
+            self.cacheability
         }
 
         async fn execute(
@@ -548,5 +581,32 @@ mod tests {
         let result = reg.dispatch_call("call_1", "read_file", "{}", None).await;
         assert!(result.success);
         assert_eq!(result.output, "fs:read_file");
+    }
+
+    #[test]
+    fn skill_registry_cacheability_delegates_to_owner() {
+        let mut reg = SkillRegistry::new();
+        reg.register(Box::new(MockSkill::with_cacheability(
+            "fs",
+            &["read_file"],
+            ToolCacheability::Cacheable,
+        )));
+
+        assert_eq!(reg.cacheability("read_file"), ToolCacheability::Cacheable);
+    }
+
+    #[test]
+    fn skill_registry_cacheability_defaults_to_never_cache_for_unknown_tool() {
+        let mut reg = SkillRegistry::new();
+        reg.register(Box::new(MockSkill::with_cacheability(
+            "fs",
+            &["read_file"],
+            ToolCacheability::Cacheable,
+        )));
+
+        assert_eq!(
+            reg.cacheability("unknown_tool"),
+            ToolCacheability::NeverCache
+        );
     }
 }

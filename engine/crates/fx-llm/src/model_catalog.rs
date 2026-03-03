@@ -297,8 +297,13 @@ impl ModelCatalog {
         let provider = normalize_provider(provider);
         let ids: Vec<&str> = match provider.as_str() {
             "anthropic" => vec![
-                "claude-sonnet-4-20250514",
+                "claude-opus-4-6",
+                "claude-sonnet-4-6",
+                "claude-opus-4-5-20251101",
+                "claude-sonnet-4-5-20250929",
+                "claude-haiku-4-5-20251001",
                 "claude-opus-4-20250514",
+                "claude-sonnet-4-20250514",
                 "claude-3-7-sonnet-latest",
             ],
             "openai" => vec!["gpt-4.1", "gpt-4o", "gpt-4o-mini"],
@@ -584,8 +589,13 @@ mod tests {
         assert_eq!(
             anthropic,
             vec![
-                "claude-sonnet-4-20250514".to_string(),
+                "claude-opus-4-6".to_string(),
+                "claude-sonnet-4-6".to_string(),
+                "claude-opus-4-5-20251101".to_string(),
+                "claude-sonnet-4-5-20250929".to_string(),
+                "claude-haiku-4-5-20251001".to_string(),
                 "claude-opus-4-20250514".to_string(),
+                "claude-sonnet-4-20250514".to_string(),
                 "claude-3-7-sonnet-latest".to_string(),
             ]
         );

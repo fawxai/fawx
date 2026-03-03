@@ -352,7 +352,8 @@ mod tests {
             sub_goals: vec![SubGoal {
                 description: "inspect logs".to_string(),
                 required_tools: vec!["read_file".to_string()],
-                expected_output: "log summary".to_string(),
+                expected_output: Some("log summary".to_string()),
+                complexity_hint: None,
             }],
             strategy: AggregationStrategy::Sequential,
             truncated_from: None,

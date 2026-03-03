@@ -155,7 +155,7 @@ impl AnthropicProvider {
             messages,
             tools,
             temperature: request.temperature,
-            max_tokens: request.max_tokens.unwrap_or(1024),
+            max_tokens: request.max_tokens.unwrap_or(4096),
             system: system_prompt,
             stream,
         })

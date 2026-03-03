@@ -11,6 +11,10 @@ pub fn to_core_self_modify(cli: &SelfModifyCliConfig) -> SelfModifyConfig {
         allow_paths: cli.paths.allow.clone(),
         propose_paths: cli.paths.propose.clone(),
         deny_paths: cli.paths.deny.clone(),
+        proposals_dir: cli
+            .proposals_dir
+            .clone()
+            .unwrap_or_else(fx_core::self_modify::default_proposals_dir),
     }
 }
 
@@ -18,6 +22,7 @@ pub fn to_core_self_modify(cli: &SelfModifyCliConfig) -> SelfModifyConfig {
 mod tests {
     use super::*;
     use fx_config::SelfModifyPathsCliConfig;
+    use std::path::PathBuf;
 
     #[test]
     fn self_modify_cli_config_converts_to_core_config() {
@@ -30,6 +35,7 @@ mod tests {
                 propose: vec!["kernel/**".to_string()],
                 deny: vec!["*.key".to_string()],
             },
+            proposals_dir: Some(PathBuf::from("/tmp/test-proposals")),
         };
         let core = to_core_self_modify(&cli);
         assert!(core.enabled);
@@ -38,5 +44,20 @@ mod tests {
         assert_eq!(core.allow_paths, vec!["src/**"]);
         assert_eq!(core.propose_paths, vec!["kernel/**"]);
         assert_eq!(core.deny_paths, vec!["*.key"]);
+        assert_eq!(core.proposals_dir, PathBuf::from("/tmp/test-proposals"));
+    }
+
+    #[test]
+    fn self_modify_proposals_dir_defaults_when_none() {
+        let cli = SelfModifyCliConfig {
+            proposals_dir: None,
+            ..SelfModifyCliConfig::default()
+        };
+        let core = to_core_self_modify(&cli);
+        assert!(
+            core.proposals_dir.ends_with(".fawx/proposals"),
+            "expected default proposals dir, got: {}",
+            core.proposals_dir.display()
+        );
     }
 }

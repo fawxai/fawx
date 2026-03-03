@@ -43,6 +43,7 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Fawx Configuration
 # allow = []
 # propose = []
 # deny = [".git/**", "*.key", "*.pem", "credentials.*"]
+# proposals_dir = "~/.fawx/proposals"
 "#;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -125,6 +126,7 @@ pub struct SelfModifyCliConfig {
     pub branch_prefix: String,
     pub require_tests: bool,
     pub paths: SelfModifyPathsCliConfig,
+    pub proposals_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -142,6 +144,7 @@ impl Default for SelfModifyCliConfig {
             branch_prefix: "fawx/improve".to_string(),
             require_tests: true,
             paths: SelfModifyPathsCliConfig::default(),
+            proposals_dir: None,
         }
     }
 }
@@ -375,6 +378,7 @@ max_relevant_results = 9
                     propose: vec![],
                     deny: vec!["*.key".to_string()],
                 },
+                proposals_dir: Some(PathBuf::from("/tmp/proposals")),
             },
         };
 

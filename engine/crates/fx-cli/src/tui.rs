@@ -14,19 +14,23 @@ use fx_core::error::LlmError as CoreLlmError;
 use fx_core::memory::{MemoryProvider, MemoryStore};
 use fx_core::runtime_info::{ConfigSummary, RuntimeInfo, SkillInfo};
 use fx_core::types::{InputSource, ScreenState, UserInput};
+use fx_improve::{CyclePaths, ImprovementConfig, OutputMode};
 use fx_kernel::act::TokenUsage;
 use fx_kernel::budget::{BudgetConfig, BudgetTracker};
 use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::context_manager::ContextCompactor;
 use fx_kernel::input::LoopCommand;
-use fx_kernel::loop_engine::{LlmProvider as LoopLlmProvider, LoopEngine, LoopResult};
+use fx_kernel::loop_engine::{
+    LlmProvider as LoopLlmProvider, LoopEngine, LoopEngineBuilder, LoopResult,
+};
 use fx_kernel::signals::{LoopStep, Signal, SignalCollector};
 use fx_kernel::types::PerceptionSnapshot;
+use fx_kernel::CachingExecutor;
 use fx_llm::{
     AnthropicProvider, CompletionRequest, Message, ModelCatalog, ModelInfo, ModelRouter,
     OpenAiProvider, OpenAiResponsesProvider, ProviderError, RouterError, StreamChunk,
 };
-use fx_loadable::SkillRegistry;
+use fx_loadable::{SkillRegistry, TransactionSkill};
 use fx_memory::{JsonFileMemory, JsonMemoryConfig, SignalStore};
 use fx_tools::{BuiltinToolsSkill, FawxToolExecutor, GitSkill, ToolConfig};
 use rustyline::completion::{Completer, Pair};
@@ -82,8 +86,13 @@ const CANCELLED_INPUT_MESSAGE: &str = "input cancelled";
 type SharedMemoryStore = Arc<Mutex<dyn MemoryStore>>;
 
 const DEFAULT_ANTHROPIC_MODELS: &[&str] = &[
-    "claude-sonnet-4-20250514",
+    "claude-opus-4-6",
+    "claude-sonnet-4-6",
+    "claude-opus-4-5-20251101",
+    "claude-sonnet-4-5-20250929",
+    "claude-haiku-4-5-20251001",
     "claude-opus-4-20250514",
+    "claude-sonnet-4-20250514",
     "claude-3-7-sonnet-latest",
 ];
 const DEFAULT_OPENAI_MODELS: &[&str] = &["gpt-4.1", "gpt-4o", "gpt-4o-mini"];
@@ -458,6 +467,7 @@ const TUI_COMMANDS: &[&str] = &[
     "/signals",
     "/debug",
     "/analyze",
+    "/improve",
     "/synthesis",
 ];
 
@@ -768,12 +778,13 @@ impl TuiApp {
             runtime_info,
             completer_model_ids: Arc::new(Mutex::new(Vec::new())),
         };
-        app.select_first_available_model();
+        app.select_first_available_model_without_refresh();
         Ok(app)
     }
 
     /// Run the TUI main loop.
     pub async fn run(&mut self) -> Result<(), TuiError> {
+        self.select_first_available_model().await;
         self.show_welcome();
 
         // Ctrl+C signals cancellation instead of killing the process.
@@ -989,7 +1000,7 @@ impl TuiApp {
 
         let preferred_models = self.get_models_for_provider(preferred_provider).await;
         self.refresh_router_models().await?;
-        self.set_preferred_model(&preferred_models);
+        self.set_preferred_model(&preferred_models).await;
         self.print_active_model();
 
         Ok(())
@@ -1043,6 +1054,7 @@ impl TuiApp {
             ParsedCommand::Signals => self.show_signals_summary(),
             ParsedCommand::Debug => self.show_signals_debug(),
             ParsedCommand::Analyze => self.handle_analyze_command().await?,
+            ParsedCommand::Improve(flags) => self.handle_improve_command(flags).await?,
             ParsedCommand::Synthesis(instruction) => {
                 self.update_synthesis_instruction(instruction);
             }
@@ -1142,30 +1154,19 @@ impl TuiApp {
         }
 
         if self.router.active_model().is_none() {
-            self.refresh_router_models().await?;
-            self.select_first_available_model();
+            self.select_first_available_model().await;
         }
 
         Ok(())
     }
 
-    fn set_active_model_from_selector(&mut self, selector: &str) -> Result<String, RouterError> {
-        match self.router.set_active(selector) {
-            Ok(()) => {}
-            Err(error @ RouterError::ModelNotFound(_)) => {
-                let model_ids = self
-                    .router
-                    .available_models()
-                    .into_iter()
-                    .map(|model| model.model_id)
-                    .collect::<Vec<_>>();
-                let Some(alias_target) = resolve_model_alias(selector, &model_ids) else {
-                    return Err(error);
-                };
-                self.router.set_active(&alias_target)?;
-            }
-            Err(error) => return Err(error),
-        }
+    // Sync counterpart of `set_active_model_with_refresh` for use in non-async contexts
+    // (constructor, tests). See async version for the authoritative startup path.
+    /// Set the active model by exact match only — no alias resolution, no API refresh.
+    /// Used as the first step in the layered matching strategy:
+    /// exact → from_selector (with alias) → with_refresh.
+    fn set_active_model_exact(&mut self, selector: &str) -> Result<String, RouterError> {
+        self.router.set_active(selector)?;
 
         let resolved = self
             .router
@@ -1176,18 +1177,53 @@ impl TuiApp {
         Ok(resolved)
     }
 
+    // Sync counterpart of `set_active_model_with_refresh` for use in non-async contexts
+    // (constructor, tests). See async version for the authoritative startup path.
+    fn set_active_model_from_selector(&mut self, selector: &str) -> Result<String, RouterError> {
+        match self.set_active_model_exact(selector) {
+            Ok(model) => Ok(model),
+            Err(error @ RouterError::ModelNotFound(_)) => {
+                let model_ids = self
+                    .router
+                    .available_models()
+                    .into_iter()
+                    .map(|model| model.model_id)
+                    .collect::<Vec<_>>();
+                let Some(alias_target) = resolve_model_alias(selector, &model_ids) else {
+                    return Err(error);
+                };
+                self.set_active_model_exact(&alias_target)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     async fn set_active_model_with_refresh(
         &mut self,
         selector: &str,
     ) -> Result<String, RouterError> {
-        match self.set_active_model_from_selector(selector) {
+        match self.set_active_model_exact(selector) {
             Ok(model) => Ok(model),
-            Err(initial_error) => {
-                if self.refresh_router_models().await.is_err() {
-                    return Err(initial_error);
+            Err(initial_error @ RouterError::ModelNotFound(_)) => {
+                if !self.auth_manager.has_any() {
+                    return self
+                        .set_active_model_from_selector(selector)
+                        .or(Err(initial_error));
                 }
-                self.set_active_model_from_selector(selector)
+
+                if self.refresh_router_models().await.is_err() {
+                    return self
+                        .set_active_model_from_selector(selector)
+                        .or(Err(initial_error));
+                }
+
+                // After a successful refresh, propagate the fresh error (more informative
+                // than the stale initial_error). When refresh fails or auth is missing,
+                // fall back to initial_error since no new information is available.
+                self.set_active_model_exact(selector)
+                    .or_else(|_| self.set_active_model_from_selector(selector))
             }
+            Err(error) => Err(error),
         }
     }
 
@@ -1254,6 +1290,81 @@ impl TuiApp {
         }
 
         Ok(())
+    }
+
+    async fn handle_improve_command(&mut self, flags: ImproveFlags) -> Result<(), TuiError> {
+        if let Some(unknown) = &flags.has_unknown_flag {
+            println!("Unknown flag: {unknown}");
+            println!("Usage: /improve [--dry-run]");
+            return Ok(());
+        }
+
+        let active_model = self
+            .router
+            .active_model()
+            .ok_or_else(|| TuiError::Router("no active model for improvement".to_string()))?
+            .to_string();
+
+        let (config, data_dir, repo_root) = Self::build_improve_config(&self.config, &flags);
+        let proposals_dir = data_dir.join("proposals");
+        let paths = CyclePaths {
+            data_dir: &data_dir,
+            repo_root: &repo_root,
+            proposals_dir: &proposals_dir,
+        };
+        let provider = AnalysisCompletionProvider::new(&self.router, active_model);
+
+        eprintln!("⚡ Analyzing signals...");
+        eprintln!("⚡ Planning improvements...");
+        let result =
+            fx_improve::run_improvement_cycle(&self.signal_store, &provider, &config, &paths)
+                .await?;
+        Self::print_improve_result(&result, flags.dry_run);
+
+        Ok(())
+    }
+
+    /// Build the [`ImprovementConfig`], data directory, and repo root for an
+    /// `/improve` invocation.
+    fn build_improve_config(
+        app_config: &FawxConfig,
+        flags: &ImproveFlags,
+    ) -> (ImprovementConfig, PathBuf, PathBuf) {
+        let base_data_dir = fawx_data_dir();
+        let data_dir = configured_data_dir(&base_data_dir, app_config);
+        let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+        let mut config = ImprovementConfig::default();
+        if flags.dry_run {
+            config.output_mode = OutputMode::DryRun;
+        }
+        (config, data_dir, repo_root)
+    }
+
+    fn print_improve_result(result: &fx_improve::ExecutionResult, dry_run: bool) {
+        if dry_run {
+            println!("⚡ Dry run complete.");
+        } else {
+            println!("⚡ Improvement cycle complete.");
+        }
+
+        if result.proposals_written.is_empty()
+            && result.branches_created.is_empty()
+            && result.skipped.is_empty()
+        {
+            println!("  No actionable improvements found.");
+            return;
+        }
+
+        for path in &result.proposals_written {
+            println!("  Proposal: {}", path.display());
+        }
+        for branch in &result.branches_created {
+            println!("  Branch: {branch}");
+        }
+        for (name, reason) in &result.skipped {
+            println!("  Skipped: {name} — {reason}");
+        }
     }
 
     fn print_analysis_findings(findings: &[AnalysisFinding]) {
@@ -1546,7 +1657,9 @@ impl TuiApp {
         }
     }
 
-    fn select_first_available_model(&mut self) {
+    // Sync counterpart of `select_first_available_model` for use in non-async contexts
+    // (constructor, tests). See async version for the authoritative startup path.
+    fn select_first_available_model_without_refresh(&mut self) {
         if let Some(saved) = self.config.model.default_model.clone() {
             if self.set_active_model_from_selector(&saved).is_ok() {
                 return;
@@ -1559,31 +1672,65 @@ impl TuiApp {
             return;
         }
 
-        let model_ids = self
-            .router
-            .available_models()
-            .into_iter()
-            .map(|model| model.model_id)
-            .collect::<Vec<_>>();
+        self.set_preferred_default_model_without_refresh();
+        self.sync_runtime_info_model();
+    }
+
+    async fn select_first_available_model(&mut self) {
+        if let Some(saved) = self.config.model.default_model.clone() {
+            if self.set_active_model_with_refresh(&saved).await.is_ok() {
+                return;
+            }
+            eprintln!("Saved model '{saved}' no longer available, selecting default");
+        }
+
+        if self.router.active_model().is_some() {
+            self.sync_runtime_info_model();
+            return;
+        }
+
+        self.set_preferred_default_model().await;
+        self.sync_runtime_info_model();
+    }
+
+    // Sync counterpart of `set_preferred_default_model` for use in non-async contexts
+    // (constructor, tests). See async version for the authoritative startup path.
+    fn set_preferred_default_model_without_refresh(&mut self) {
+        let model_ids = self.available_model_ids();
 
         if let Some(model) = preferred_default_model(&model_ids) {
             if let Err(error) = self.set_active_model_from_selector(model) {
                 eprintln!("failed to set initial model {model}: {error}");
             }
         }
-
-        // Sync even if no model matched — clear stale state
-        self.sync_runtime_info_model();
     }
 
-    fn set_preferred_model(&mut self, candidates: &[String]) {
+    async fn set_preferred_default_model(&mut self) {
+        let model_ids = self.available_model_ids();
+
+        if let Some(model) = preferred_default_model(&model_ids) {
+            if let Err(error) = self.set_active_model_with_refresh(model).await {
+                eprintln!("failed to set initial model {model}: {error}");
+            }
+        }
+    }
+
+    fn available_model_ids(&self) -> Vec<String> {
+        self.router
+            .available_models()
+            .into_iter()
+            .map(|model| model.model_id)
+            .collect()
+    }
+
+    async fn set_preferred_model(&mut self, candidates: &[String]) {
         for candidate in candidates {
-            if self.set_active_model_from_selector(candidate).is_ok() {
+            if self.set_active_model_with_refresh(candidate).await.is_ok() {
                 return;
             }
         }
 
-        self.select_first_available_model();
+        self.select_first_available_model().await;
     }
 
     async fn get_models_for_provider(&mut self, provider: &str) -> Vec<String> {
@@ -1650,6 +1797,7 @@ impl TuiApp {
         println!("  /signals       Show condensed signal summary for last turn");
         println!("  /debug         Show full signal dump for last turn");
         println!("  /analyze       Analyze persisted signals across sessions");
+        println!("  /improve       Run self-improvement cycle");
         println!("  /synthesis     Set or reset synthesis instruction");
         println!("  /clear         Clear the screen and active conversation");
         println!("  /new           Start a new conversation");
@@ -1812,6 +1960,7 @@ impl TuiApp {
                 context_id: None,
             }),
             conversation_history: self.conversation_history.clone(),
+            steer_context: None,
         }
     }
 
@@ -1864,18 +2013,22 @@ fn build_loop_engine_bundle() -> (LoopEngine, Arc<RwLock<RuntimeInfo>>) {
         eprintln!("warning: failed to load config: {error}");
         FawxConfig::default()
     });
-    let (engine, _memory, runtime_info) = build_loop_engine_from_config(&config);
+    let (engine, _memory, runtime_info) =
+        build_loop_engine_from_config(&config).expect("loop engine config should be valid");
     (engine, runtime_info)
 }
 
 /// Build a loop engine from an already-loaded config.
 pub fn build_loop_engine_from_config(
     config: &FawxConfig,
-) -> (
-    LoopEngine,
-    Option<SharedMemoryStore>,
-    Arc<RwLock<RuntimeInfo>>,
-) {
+) -> Result<
+    (
+        LoopEngine,
+        Option<SharedMemoryStore>,
+        Arc<RwLock<RuntimeInfo>>,
+    ),
+    TuiError,
+> {
     let base_data_dir = fawx_data_dir();
     let data_dir = configured_data_dir(&base_data_dir, config);
     build_loop_engine_with_config(data_dir, config.clone())
@@ -1884,11 +2037,14 @@ pub fn build_loop_engine_from_config(
 fn build_loop_engine_with_config(
     data_dir: PathBuf,
     config: FawxConfig,
-) -> (
-    LoopEngine,
-    Option<SharedMemoryStore>,
-    Arc<RwLock<RuntimeInfo>>,
-) {
+) -> Result<
+    (
+        LoopEngine,
+        Option<SharedMemoryStore>,
+        Arc<RwLock<RuntimeInfo>>,
+    ),
+    TuiError,
+> {
     let budget = BudgetTracker::new(BudgetConfig::default(), current_time_ms(), 0);
     let context = ContextCompactor::new(DEFAULT_CONTEXT_MAX_TOKENS, DEFAULT_CONTEXT_COMPACT_TARGET);
     let working_dir = configured_working_dir(&config);
@@ -1900,17 +2056,28 @@ fn build_loop_engine_with_config(
         .clone()
         .unwrap_or_else(|| DEFAULT_SYNTHESIS_INSTRUCTION.to_string());
 
-    let mut engine = LoopEngine::new(
-        budget,
-        context,
-        config.general.max_iterations,
-        std::sync::Arc::new(registry),
-        synthesis,
-    );
+    let caching_registry = CachingExecutor::new(registry);
+    let mut builder = LoopEngine::builder()
+        .budget(budget)
+        .context(context)
+        .max_iterations(config.general.max_iterations)
+        .tool_executor(std::sync::Arc::new(caching_registry))
+        .synthesis_instruction(synthesis);
     if let Some(snapshot_text) = memory_snapshot {
-        engine.set_memory_context(snapshot_text);
+        builder = builder.memory_context(snapshot_text);
     }
-    (engine, memory, runtime_info)
+
+    let engine = build_loop_engine_from_builder(builder)?;
+    Ok((engine, memory, runtime_info))
+}
+
+fn build_loop_engine_from_builder(builder: LoopEngineBuilder) -> Result<LoopEngine, TuiError> {
+    builder.build().map_err(|error| {
+        TuiError::Loop(format!(
+            "failed to build loop engine: stage={} reason={}",
+            error.stage, error.reason
+        ))
+    })
 }
 
 fn build_skill_registry(
@@ -1943,8 +2110,10 @@ fn build_skill_registry(
 
     let mut registry = SkillRegistry::new();
     registry.register(Box::new(BuiltinToolsSkill::new(executor)));
-    let git_skill = GitSkill::new(working_dir.clone(), sm);
+    let git_skill = GitSkill::new(working_dir.clone(), sm.clone());
     registry.register(Box::new(git_skill));
+    let tx_skill = TransactionSkill::new(working_dir.clone(), sm);
+    registry.register(Box::new(tx_skill));
     apply_skill_summaries(&runtime_info, &registry);
 
     (registry, memory, snapshot_text, runtime_info)
@@ -2118,7 +2287,7 @@ impl LoopLlmProvider for RouterLoopLlmProvider<'_> {
             tools: Vec::new(),
             temperature: None, // Codex Responses API does not support temperature
             max_tokens: Some(max_tokens),
-            system_prompt: None,
+            system_prompt: Some(prompt.to_string()),
         };
 
         let mut stream = self
@@ -2150,7 +2319,7 @@ impl LoopLlmProvider for RouterLoopLlmProvider<'_> {
             tools: Vec::new(),
             temperature: None,
             max_tokens: Some(max_tokens),
-            system_prompt: None,
+            system_prompt: Some(prompt.to_string()),
         };
 
         let mut stream = self
@@ -2547,6 +2716,12 @@ impl From<io::Error> for TuiError {
 impl From<AnalysisError> for TuiError {
     fn from(value: AnalysisError) -> Self {
         Self::Loop(format!("analysis failed: {value}"))
+    }
+}
+
+impl From<fx_improve::ImprovementError> for TuiError {
+    fn from(value: fx_improve::ImprovementError) -> Self {
+        Self::Loop(format!("improvement failed: {value}"))
     }
 }
 
@@ -3158,8 +3333,93 @@ fn prompt_line(prompt: &str) -> Result<String, TuiError> {
 }
 
 fn ensure_cooked_mode() {
+    ensure_cooked_mode_with(
+        || {
+            terminal::disable_raw_mode().ok();
+        },
+        drain_stdin,
+    );
+}
+
+fn ensure_cooked_mode_with<DisableRawMode, DrainStdin>(
+    mut disable_raw_mode: DisableRawMode,
+    mut drain_stdin: DrainStdin,
+) where
+    DisableRawMode: FnMut(),
+    DrainStdin: FnMut(),
+{
     // Ensure cooked mode so stdin.read_line() handles Enter correctly even after raw-mode input paths.
-    terminal::disable_raw_mode().ok();
+    disable_raw_mode();
+    drain_stdin();
+}
+
+/// Flush pending bytes from the terminal input queue.
+///
+/// After disabling raw mode the kernel tty buffer may still hold
+/// stale CR/LF bytes from the previous raw-mode session. Flushing
+/// prevents those bytes from being echoed as `^M` when cooked mode
+/// re-enables terminal echo.
+fn drain_stdin() {
+    #[cfg(unix)]
+    {
+        drain_stdin_with(drain_stdin_input_queue, log_drain_stdin_error);
+    }
+}
+
+#[cfg(unix)]
+fn drain_stdin_with<Drain, Log>(mut drain: Drain, mut log_error: Log)
+where
+    Drain: FnMut() -> io::Result<()>,
+    Log: FnMut(&io::Error),
+{
+    if let Err(error) = drain() {
+        log_error(&error);
+    }
+}
+
+#[cfg(unix)]
+fn drain_stdin_input_queue() -> io::Result<()> {
+    flush_stdin_input_queue_with(|fd, queue_selector| {
+        // SAFETY: tcflush is a standard POSIX call that discards
+        // data received but not yet read.
+        unsafe { libc::tcflush(fd, queue_selector) }
+    })
+}
+
+#[cfg(unix)]
+fn log_drain_stdin_error(error: &io::Error) {
+    if is_benign_stdin_flush_error(error) {
+        tracing::debug!(
+            errno = ?error.raw_os_error(),
+            error = %error,
+            "skipping stdin input queue flush because stdin is not a tty"
+        );
+        return;
+    }
+
+    tracing::warn!(
+        errno = ?error.raw_os_error(),
+        error = %error,
+        "failed to flush stdin input queue"
+    );
+}
+
+#[cfg(unix)]
+fn is_benign_stdin_flush_error(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ENOTTY)
+}
+
+#[cfg(unix)]
+fn flush_stdin_input_queue_with<F>(mut flush: F) -> io::Result<()>
+where
+    F: FnMut(i32, i32) -> i32,
+{
+    let status = flush(libc::STDIN_FILENO, libc::TCIFLUSH);
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 fn confirm_provider_removal(provider: &str) -> Result<bool, TuiError> {
@@ -3470,6 +3730,7 @@ enum ParsedCommand {
     Signals,
     Debug,
     Analyze,
+    Improve(ImproveFlags),
     Synthesis(Option<String>),
     Clear,
     New,
@@ -3478,6 +3739,13 @@ enum ParsedCommand {
     Help,
     Quit,
     Unknown(String),
+}
+
+/// Flags parsed from the `/improve` command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImproveFlags {
+    dry_run: bool,
+    has_unknown_flag: Option<String>,
 }
 
 fn parse_command(value: &str) -> ParsedCommand {
@@ -3500,6 +3768,7 @@ fn parse_command(value: &str) -> ParsedCommand {
         "signals" => ParsedCommand::Signals,
         "debug" => ParsedCommand::Debug,
         "analyze" => ParsedCommand::Analyze,
+        "improve" => ParsedCommand::Improve(parse_improve_flags(&mut parts)),
         "synthesis" => {
             let remainder = input[command.len()..].strip_prefix(' ');
             match remainder {
@@ -3516,6 +3785,23 @@ fn parse_command(value: &str) -> ParsedCommand {
         "quit" | "exit" => ParsedCommand::Quit,
         other => ParsedCommand::Unknown(other.to_string()),
     }
+}
+
+fn parse_improve_flags(parts: &mut std::str::SplitWhitespace<'_>) -> ImproveFlags {
+    let mut flags = ImproveFlags {
+        dry_run: false,
+        has_unknown_flag: None,
+    };
+    for arg in parts {
+        match arg {
+            "--dry-run" => flags.dry_run = true,
+            other => {
+                flags.has_unknown_flag = Some(other.to_string());
+                break;
+            }
+        }
+    }
+    flags
 }
 
 struct RawModeGuard;
@@ -3590,6 +3876,19 @@ mod tests {
             FawxConfig::default(),
         )
         .expect("new test app")
+    }
+
+    #[test]
+    fn build_loop_engine_from_builder_returns_tui_error_on_failure() {
+        let error = build_loop_engine_from_builder(LoopEngine::builder())
+            .expect_err("missing required fields should return an error");
+
+        match error {
+            TuiError::Loop(message) => {
+                assert!(message.contains("missing_required_field"));
+            }
+            other => panic!("expected TuiError::Loop, got {other:?}"),
+        }
     }
 
     type RecordedWrites = Arc<Mutex<Vec<(String, String)>>>;
@@ -4069,6 +4368,59 @@ mod tests {
         }
     }
 
+    /// A provider that captures the [`CompletionRequest`] for assertion and
+    /// returns a single successful stream chunk so the caller completes normally.
+    #[derive(Debug)]
+    struct RequestCapturingProvider {
+        provider_name: String,
+        model: String,
+        captured: Arc<Mutex<Vec<CompletionRequest>>>,
+    }
+
+    #[async_trait]
+    impl fx_llm::CompletionProvider for RequestCapturingProvider {
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> Result<fx_llm::CompletionResponse, fx_llm::ProviderError> {
+            self.captured.lock().unwrap().push(request);
+            Ok(fx_llm::CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "captured".to_string(),
+                }],
+                tool_calls: Vec::new(),
+                usage: None,
+                stop_reason: Some("end_turn".to_string()),
+            })
+        }
+
+        async fn complete_stream(
+            &self,
+            request: CompletionRequest,
+        ) -> Result<fx_llm::CompletionStream, fx_llm::ProviderError> {
+            self.captured.lock().unwrap().push(request);
+            let chunk = Ok(fx_llm::StreamChunk {
+                delta_content: Some("captured".to_string()),
+                tool_use_deltas: Vec::new(),
+                usage: None,
+                stop_reason: Some("end_turn".to_string()),
+            });
+            Ok(Box::pin(futures::stream::iter(vec![chunk])))
+        }
+
+        fn name(&self) -> &str {
+            &self.provider_name
+        }
+
+        fn supported_models(&self) -> Vec<String> {
+            vec![self.model.clone()]
+        }
+
+        fn capabilities(&self) -> fx_llm::ProviderCapabilities {
+            mock_provider_capabilities()
+        }
+    }
+
     #[test]
     fn test_completion_providers_expose_router_capabilities() {
         let static_provider = StaticCompletionProvider::new("mock-loop-model", "ok");
@@ -4178,6 +4530,21 @@ mod tests {
         auth_manager
     }
 
+    fn openai_oauth_auth_manager() -> AuthManager {
+        let mut auth_manager = AuthManager::new();
+        auth_manager.store(
+            "openai",
+            AuthMethod::OAuth {
+                provider: "openai".to_string(),
+                access_token: "oauth-access-token".to_string(),
+                refresh_token: "oauth-refresh-token".to_string(),
+                expires_at: 1_700_000_000_000,
+                account_id: Some("acct_model_refresh".to_string()),
+            },
+        );
+        auth_manager
+    }
+
     fn app_with_two_models() -> TuiApp {
         let mut router = ModelRouter::new();
         router.register_provider_with_auth(
@@ -4258,6 +4625,7 @@ mod tests {
                 context_id: None,
             }),
             conversation_history: Vec::new(),
+            steer_context: None,
         }
     }
 
@@ -4420,6 +4788,68 @@ mod tests {
         assert_eq!(
             error,
             fx_llm::ProviderError::Provider("test error".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_sets_system_prompt_for_openai_compatibility() {
+        let captured: Arc<Mutex<Vec<CompletionRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut router = ModelRouter::new();
+        router.register_provider_with_auth(
+            Box::new(RequestCapturingProvider {
+                provider_name: "capture-test".to_string(),
+                model: "capture-model".to_string(),
+                captured: Arc::clone(&captured),
+            }),
+            "test",
+        );
+        router.set_active("capture-model").expect("set active");
+
+        let provider = RouterLoopLlmProvider::new(&router, "capture-model".to_string());
+        let prompt = "Synthesize the tool results below.";
+        provider
+            .generate(prompt, 256)
+            .await
+            .expect("generate should succeed");
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].system_prompt,
+            Some(prompt.to_string()),
+            "generate() must set system_prompt so OpenAI Responses API gets an instructions field"
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_streaming_sets_system_prompt_for_openai_compatibility() {
+        let captured: Arc<Mutex<Vec<CompletionRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut router = ModelRouter::new();
+        router.register_provider_with_auth(
+            Box::new(RequestCapturingProvider {
+                provider_name: "capture-test".to_string(),
+                model: "capture-stream-model".to_string(),
+                captured: Arc::clone(&captured),
+            }),
+            "test",
+        );
+        router
+            .set_active("capture-stream-model")
+            .expect("set active");
+
+        let provider = RouterLoopLlmProvider::new(&router, "capture-stream-model".to_string());
+        let prompt = "Synthesize the tool results below.";
+        provider
+            .generate_streaming(prompt, 256, Box::new(|_| {}))
+            .await
+            .expect("generate_streaming should succeed");
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].system_prompt,
+            Some(prompt.to_string()),
+            "generate_streaming() must set system_prompt so OpenAI Responses API gets an instructions field"
         );
     }
 
@@ -5048,6 +5478,39 @@ mod tests {
     }
 
     #[test]
+    fn improve_command_parses_correctly() {
+        assert_eq!(
+            parse_command("/improve"),
+            ParsedCommand::Improve(ImproveFlags {
+                dry_run: false,
+                has_unknown_flag: None,
+            })
+        );
+    }
+
+    #[test]
+    fn improve_dry_run_flag_parsed() {
+        assert_eq!(
+            parse_command("/improve --dry-run"),
+            ParsedCommand::Improve(ImproveFlags {
+                dry_run: true,
+                has_unknown_flag: None,
+            })
+        );
+    }
+
+    #[test]
+    fn unknown_improve_subcommand_shows_help() {
+        assert_eq!(
+            parse_command("/improve --invalid"),
+            ParsedCommand::Improve(ImproveFlags {
+                dry_run: false,
+                has_unknown_flag: Some("--invalid".to_string()),
+            })
+        );
+    }
+
+    #[test]
     fn command_completer_matches_slash_commands() {
         let matches = command_completion_matches("/st");
 
@@ -5358,6 +5821,81 @@ mod tests {
         .expect("mock app");
 
         assert_eq!(app.current_model(), "claude-sonnet-4-6-20250929");
+    }
+
+    #[tokio::test]
+    async fn startup_refresh_restores_saved_model_missing_from_initial_router() {
+        let mut router = ModelRouter::new();
+        router.register_provider_with_auth(
+            Box::new(ModelEchoProvider {
+                provider_name: "openai".to_string(),
+                models: vec!["gpt-4o-mini".to_string()],
+            }),
+            "subscription",
+        );
+        router
+            .set_active("gpt-4o-mini")
+            .expect("set initial active model");
+
+        let mut config = FawxConfig::default();
+        config.model.default_model = Some("gpt-5.3-codex".to_string());
+
+        let (loop_engine, runtime_info) = test_engine_and_runtime_info();
+        let mut app = TuiApp::new(
+            openai_oauth_auth_manager(),
+            router,
+            loop_engine,
+            runtime_info,
+            config,
+        )
+        .expect("mock app");
+
+        assert_eq!(app.current_model(), "gpt-4o-mini");
+
+        app.select_first_available_model().await;
+
+        assert_eq!(app.current_model(), "gpt-5.3-codex");
+    }
+
+    #[test]
+    fn default_anthropic_models_include_claude_opus_4_6() {
+        assert!(DEFAULT_ANTHROPIC_MODELS.contains(&"claude-opus-4-6"));
+    }
+
+    #[tokio::test]
+    async fn model_selector_prefers_exact_match_over_family_alias() {
+        let mut router = ModelRouter::new();
+        router.register_provider_with_auth(
+            Box::new(ModelEchoProvider {
+                provider_name: "echo-provider".to_string(),
+                models: vec![
+                    "claude-opus-4-6".to_string(),
+                    "claude-opus-4-20250514".to_string(),
+                ],
+            }),
+            "test",
+        );
+        router
+            .set_active("claude-opus-4-20250514")
+            .expect("set initial active model");
+
+        let (loop_engine, runtime_info) = test_engine_and_runtime_info();
+        let mut app = TuiApp::new(
+            test_provider_auth_manager(),
+            router,
+            loop_engine,
+            runtime_info,
+            FawxConfig::default(),
+        )
+        .expect("mock app");
+
+        let resolved = app
+            .set_active_model_with_refresh("claude-opus-4-6")
+            .await
+            .expect("selector should resolve exact model");
+
+        assert_eq!(resolved, "claude-opus-4-6");
+        assert_eq!(app.current_model(), "claude-opus-4-6");
     }
 
     #[test]
@@ -6266,5 +6804,73 @@ mod tests {
         assert_eq!(grouped[0].1.len(), 2);
         assert_eq!(grouped[1].0, "OpenAI");
         assert_eq!(grouped[1].1.len(), 1);
+    }
+
+    #[test]
+    fn ensure_cooked_mode_disables_raw_mode_before_draining_stdin() {
+        let calls = std::cell::RefCell::new(Vec::new());
+
+        super::ensure_cooked_mode_with(
+            || calls.borrow_mut().push("disable_raw_mode"),
+            || calls.borrow_mut().push("drain_stdin"),
+        );
+
+        assert_eq!(calls.into_inner(), vec!["disable_raw_mode", "drain_stdin"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drain_stdin_flushes_stdin_input_queue() {
+        let captured_fd = std::cell::Cell::new(-1);
+        let captured_selector = std::cell::Cell::new(-1);
+
+        let result = super::flush_stdin_input_queue_with(|fd, queue_selector| {
+            captured_fd.set(fd);
+            captured_selector.set(queue_selector);
+            0
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(captured_fd.get(), libc::STDIN_FILENO);
+        assert_eq!(captured_selector.get(), libc::TCIFLUSH);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drain_stdin_reports_flush_errors() {
+        let captured_errno = std::cell::Cell::new(None);
+
+        super::drain_stdin_with(
+            || Err(io::Error::from_raw_os_error(libc::EIO)),
+            |error| captured_errno.set(error.raw_os_error()),
+        );
+
+        assert_eq!(captured_errno.get(), Some(libc::EIO));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drain_stdin_does_not_report_successful_flush() {
+        let report_count = std::cell::Cell::new(0);
+
+        super::drain_stdin_with(|| Ok(()), |_| report_count.set(report_count.get() + 1));
+
+        assert_eq!(report_count.get(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdin_flush_enotty_errors_are_benign() {
+        let error = io::Error::from_raw_os_error(libc::ENOTTY);
+
+        assert!(super::is_benign_stdin_flush_error(&error));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdin_flush_non_enotty_errors_are_not_benign() {
+        let error = io::Error::from_raw_os_error(libc::EIO);
+
+        assert!(!super::is_benign_stdin_flush_error(&error));
     }
 }

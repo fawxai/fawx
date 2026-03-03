@@ -126,6 +126,25 @@ fn evidence_schema() -> serde_json::Value {
 /// the `#[serde(rename_all = "snake_case")]` serialization format.
 /// If a new `SignalKind` variant is added, add it here too.
 fn signal_kind_values() -> Vec<&'static str> {
+    // Exhaustive match — compiler error if a SignalKind variant is added without updating.
+    fn _assert_exhaustive(k: SignalKind) {
+        match k {
+            SignalKind::Trace
+            | SignalKind::Thinking
+            | SignalKind::Friction
+            | SignalKind::Success
+            | SignalKind::Blocked
+            | SignalKind::Performance
+            | SignalKind::UserIntervention
+            | SignalKind::UserInput
+            | SignalKind::UserFeedback
+            | SignalKind::Decision => {}
+        }
+    }
+
+    // NOTE: variants intentionally listed in both the match guard above and the
+    // array below — the match catches new variants at compile time, the array
+    // defines the runtime list.
     [
         SignalKind::Trace,
         SignalKind::Thinking,
@@ -462,11 +481,18 @@ mod tests {
         );
     }
 
-    const SIGNAL_KIND_VARIANT_COUNT: usize = 10;
-
     #[test]
-    fn signal_kind_values_matches_known_signal_kind_variant_count() {
-        assert_eq!(signal_kind_values().len(), SIGNAL_KIND_VARIANT_COUNT);
+    fn signal_kind_values_are_non_empty_labels() {
+        let values = signal_kind_values();
+
+        assert!(!values.is_empty());
+        for label in values {
+            assert!(!label.is_empty(), "signal kind label must not be empty");
+            assert!(
+                label.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "signal kind label '{label}' must be snake_case"
+            );
+        }
     }
 
     #[test]

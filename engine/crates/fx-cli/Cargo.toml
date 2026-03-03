@@ -25,6 +25,7 @@ fx-llm = { path = "../fx-llm" }
 fx-loadable = { path = "../fx-loadable" }
 fx-memory.workspace = true
 fx-analysis.workspace = true
+fx-improve.workspace = true
 fx-security.workspace = true
 fx-skills = { path = "../fx-skills" }
 fx-storage.workspace = true
@@ -36,6 +37,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
 crossterm.workspace = true
+libc = "0.2"
 futures.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }

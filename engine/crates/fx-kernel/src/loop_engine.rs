@@ -1,10 +1,17 @@
 //! Agentic loop orchestrator.
 
 use crate::act::{ActionResult, TokenUsage, ToolExecutor, ToolResult};
-use crate::budget::{ActionCost, BudgetRemaining, BudgetResource, BudgetTracker};
+use crate::budget::{
+    build_skip_mask, effective_max_depth, ActionCost, AllocationMode, AllocationPlan,
+    BudgetAllocator, BudgetConfig, BudgetRemaining, BudgetTracker, DepthMode,
+};
 use crate::cancellation::CancellationToken;
 use crate::context_manager::ContextCompactor;
 use crate::continuation::Continuation;
+use crate::conversation_compactor::{
+    estimate_text_tokens, CompactionConfig, CompactionError, CompactionResult, CompactionStrategy,
+    ConversationBudget, SlidingWindowCompactor,
+};
 use crate::decide::{Decision, CONFIDENCE_CLARIFY_THRESHOLD};
 use crate::input::{LoopCommand, LoopInputChannel};
 use crate::learn::Learning;
@@ -15,15 +22,18 @@ use crate::types::{
 };
 use crate::verify::Verification;
 use async_trait::async_trait;
+use futures_util::StreamExt;
+use fx_core::message::{InternalMessage, StreamPhase};
 use fx_core::types::{InputSource, ScreenState, UserInput};
 use fx_decompose::{
-    AggregationStrategy, DecompositionPlan, SubGoal, SubGoalOutcome, SubGoalResult,
+    AggregationStrategy, ComplexityHint, DecompositionPlan, SubGoal, SubGoalOutcome, SubGoalResult,
 };
 use fx_llm::{
-    CompletionRequest, CompletionResponse, ContentBlock, Message, MessageRole, ProviderError,
-    ToolCall, ToolDefinition,
+    CompletionRequest, CompletionResponse, CompletionStream, ContentBlock, Message, MessageRole,
+    ProviderError, StreamChunk, ToolCall, ToolDefinition, ToolUseDelta, Usage,
 };
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -63,6 +73,47 @@ pub trait LlmProvider: Send + Sync + std::fmt::Debug {
             usage: None,
             stop_reason: None,
         })
+    }
+
+    async fn complete_stream(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<fx_llm::CompletionStream, ProviderError> {
+        let response = self.complete(request).await?;
+        let chunk = response_to_chunk(response);
+        let stream =
+            futures_util::stream::once(async move { Ok::<StreamChunk, ProviderError>(chunk) });
+        Ok(Box::pin(stream))
+    }
+}
+
+fn response_to_chunk(response: CompletionResponse) -> StreamChunk {
+    let delta_content = response
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let tool_use_deltas = response
+        .tool_calls
+        .into_iter()
+        .map(|call| ToolUseDelta {
+            id: Some(call.id),
+            name: Some(call.name),
+            arguments_delta: Some(call.arguments.to_string()),
+            arguments_done: true,
+        })
+        .collect();
+
+    StreamChunk {
+        delta_content: (!delta_content.is_empty()).then_some(delta_content),
+        tool_use_deltas,
+        usage: response.usage,
+        stop_reason: response.stop_reason,
     }
 }
 
@@ -139,11 +190,37 @@ pub enum LoopResult {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CompactionScope {
+    Perceive,
+    ToolContinuation,
+    DecomposeChild,
+}
+
+impl CompactionScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Perceive => "perceive",
+            Self::ToolContinuation => "tool_continuation",
+            Self::DecomposeChild => "decompose_child",
+        }
+    }
+}
+
+impl std::fmt::Display for CompactionScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Core orchestrator for the 7-step agentic loop.
 ///
-/// Note: `LoopEngine` previously derived `Clone`, but Phase 4 added
-/// `LoopInputChannel` which contains `mpsc::Receiver` (not `Clone`).
-/// No existing code clones `LoopEngine`, so this is a safe change.
+/// Note: `LoopEngine` previously derived `Clone`, but Phases 1-3
+/// (context window compaction) introduced two non-`Clone` fields:
+/// `conversation_compactor: Box<dyn CompactionStrategy>` and
+/// `compaction_last_iteration: Mutex<HashMap<CompactionScope, u32>>`.
+/// `LoopInputChannel` also contains an `mpsc::Receiver`, which remains
+/// non-`Clone`. No existing code clones `LoopEngine`, so this is a safe change.
 #[derive(Debug)]
 pub struct LoopEngine {
     budget: BudgetTracker,
@@ -157,6 +234,157 @@ pub struct LoopEngine {
     cancel_token: Option<CancellationToken>,
     input_channel: Option<LoopInputChannel>,
     user_stop_requested: bool,
+    pending_steer: Option<String>,
+    event_bus: Option<fx_core::EventBus>,
+    compaction_config: CompactionConfig,
+    conversation_budget: ConversationBudget,
+    conversation_compactor: Box<dyn CompactionStrategy>,
+    compaction_last_iteration: Mutex<HashMap<CompactionScope, u32>>,
+}
+
+#[derive(Debug, Default)]
+#[must_use = "builder does nothing unless .build() is called"]
+pub struct LoopEngineBuilder {
+    budget: Option<BudgetTracker>,
+    context: Option<ContextCompactor>,
+    tool_executor: Option<Arc<dyn ToolExecutor>>,
+    max_iterations: Option<u32>,
+    synthesis_instruction: Option<String>,
+    compaction_config: Option<CompactionConfig>,
+    compaction_llm: Option<Arc<dyn LlmProvider>>,
+    event_bus: Option<fx_core::EventBus>,
+    cancel_token: Option<CancellationToken>,
+    input_channel: Option<LoopInputChannel>,
+    memory_context: Option<String>,
+}
+
+impl LoopEngineBuilder {
+    pub fn budget(mut self, budget: BudgetTracker) -> Self {
+        self.budget = Some(budget);
+        self
+    }
+
+    pub fn context(mut self, context: ContextCompactor) -> Self {
+        self.context = Some(context);
+        self
+    }
+
+    pub fn max_iterations(mut self, max_iterations: u32) -> Self {
+        self.max_iterations = Some(max_iterations);
+        self
+    }
+
+    pub fn tool_executor(mut self, tool_executor: Arc<dyn ToolExecutor>) -> Self {
+        self.tool_executor = Some(tool_executor);
+        self
+    }
+
+    pub fn synthesis_instruction(mut self, synthesis_instruction: impl Into<String>) -> Self {
+        self.synthesis_instruction = Some(synthesis_instruction.into());
+        self
+    }
+
+    pub fn compaction_config(mut self, compaction_config: CompactionConfig) -> Self {
+        self.compaction_config = Some(compaction_config);
+        self
+    }
+
+    pub fn compaction_llm(mut self, llm: Arc<dyn LlmProvider>) -> Self {
+        self.compaction_llm = Some(llm);
+        self
+    }
+
+    pub fn event_bus(mut self, event_bus: fx_core::EventBus) -> Self {
+        self.event_bus = Some(event_bus);
+        self
+    }
+
+    pub fn cancel_token(mut self, cancel_token: CancellationToken) -> Self {
+        self.cancel_token = Some(cancel_token);
+        self
+    }
+
+    pub fn input_channel(mut self, input_channel: LoopInputChannel) -> Self {
+        self.input_channel = Some(input_channel);
+        self
+    }
+
+    pub fn memory_context(mut self, memory_context: impl Into<String>) -> Self {
+        self.memory_context = normalize_memory_context(memory_context.into());
+        self
+    }
+
+    pub fn build(self) -> Result<LoopEngine, LoopError> {
+        let budget = required_builder_field(self.budget, "budget")?;
+        let context = required_builder_field(self.context, "context")?;
+        let tool_executor = required_builder_field(self.tool_executor, "tool_executor")?;
+        let max_iterations = required_builder_field(self.max_iterations, "max_iterations")?.max(1);
+        let synthesis_instruction =
+            required_builder_field(self.synthesis_instruction, "synthesis_instruction")?;
+        let (compaction_config, conversation_budget, conversation_compactor) =
+            build_compaction_components(self.compaction_config, self.compaction_llm)?;
+
+        Ok(LoopEngine {
+            budget,
+            context,
+            tool_executor,
+            max_iterations,
+            iteration_count: 0,
+            synthesis_instruction,
+            memory_context: self.memory_context,
+            signals: SignalCollector::default(),
+            cancel_token: self.cancel_token,
+            input_channel: self.input_channel,
+            user_stop_requested: false,
+            pending_steer: None,
+            event_bus: self.event_bus,
+            compaction_config,
+            conversation_budget,
+            conversation_compactor,
+            compaction_last_iteration: Mutex::new(HashMap::new()),
+        })
+    }
+}
+
+fn build_compaction_components(
+    config: Option<CompactionConfig>,
+    llm: Option<Arc<dyn LlmProvider>>,
+) -> Result<
+    (
+        CompactionConfig,
+        ConversationBudget,
+        Box<dyn CompactionStrategy>,
+    ),
+    LoopError,
+> {
+    let compaction_config = config.unwrap_or_default();
+    compaction_config.validate().map_err(|error| {
+        loop_error(
+            "init",
+            &format!("invalid_compaction_config: {error}"),
+            false,
+        )
+    })?;
+
+    let conversation_budget = ConversationBudget::new(
+        compaction_config.model_context_limit,
+        compaction_config.compaction_threshold,
+        compaction_config.reserved_system_tokens,
+    );
+    let strategy = compaction_config.build_strategy(llm);
+    Ok((compaction_config, conversation_budget, strategy))
+}
+
+fn required_builder_field<T>(value: Option<T>, field: &str) -> Result<T, LoopError> {
+    value.ok_or_else(|| loop_error("init", &format!("missing_required_field: {field}"), false))
+}
+
+fn normalize_memory_context(memory_context: String) -> Option<String> {
+    if memory_context.trim().is_empty() {
+        None
+    } else {
+        Some(memory_context)
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -204,10 +432,83 @@ enum ToolRoundOutcome {
     Response(CompletionResponse),
 }
 
+#[derive(Debug, Default)]
+struct StreamToolCallState {
+    id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+    arguments_done: bool,
+}
+
+#[derive(Debug, Default)]
+struct StreamResponseState {
+    text: String,
+    usage: Option<Usage>,
+    stop_reason: Option<String>,
+    tool_calls_by_index: HashMap<usize, StreamToolCallState>,
+    id_to_index: HashMap<String, usize>,
+}
+
+impl StreamResponseState {
+    fn apply_chunk(&mut self, chunk: StreamChunk) {
+        if let Some(delta) = chunk.delta_content {
+            self.text.push_str(&delta);
+        }
+        self.usage = merge_usage(self.usage, chunk.usage);
+        self.stop_reason = chunk.stop_reason.or(self.stop_reason.take());
+        self.apply_tool_deltas(chunk.tool_use_deltas);
+    }
+
+    fn apply_tool_deltas(&mut self, deltas: Vec<ToolUseDelta>) {
+        for (chunk_index, delta) in deltas.into_iter().enumerate() {
+            let index = stream_tool_index(
+                chunk_index,
+                &delta,
+                &self.tool_calls_by_index,
+                &self.id_to_index,
+            );
+            let entry = self.tool_calls_by_index.entry(index).or_default();
+            merge_stream_tool_delta(entry, delta, &mut self.id_to_index, index);
+        }
+    }
+
+    fn into_response(self) -> CompletionResponse {
+        CompletionResponse {
+            content: vec![ContentBlock::Text { text: self.text }],
+            tool_calls: finalize_stream_tool_calls(self.tool_calls_by_index),
+            usage: self.usage,
+            stop_reason: self.stop_reason,
+        }
+    }
+
+    fn into_cancelled_response(self) -> CompletionResponse {
+        CompletionResponse {
+            content: vec![ContentBlock::Text { text: self.text }],
+            tool_calls: Vec::new(),
+            usage: self.usage,
+            stop_reason: Some("cancelled".to_string()),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct SubGoalExecution {
     result: SubGoalResult,
     budget: BudgetTracker,
+}
+
+struct CompactionContext<'a> {
+    scope: CompactionScope,
+    messages: &'a [Message],
+    target: usize,
+    hard_limit_exceeded: bool,
+    before_tokens: usize,
+}
+
+#[derive(Debug)]
+struct IndexedSubGoalExecution {
+    index: usize,
+    execution: SubGoalExecution,
 }
 
 #[derive(Debug, Deserialize)]
@@ -223,7 +524,9 @@ struct DecomposeSubGoalArguments {
     #[serde(default)]
     required_tools: Vec<String>,
     #[serde(default)]
-    expected_output: String,
+    expected_output: Option<String>,
+    #[serde(default)]
+    complexity_hint: Option<ComplexityHint>,
 }
 
 impl From<DecomposeSubGoalArguments> for SubGoal {
@@ -232,15 +535,17 @@ impl From<DecomposeSubGoalArguments> for SubGoal {
             description: value.description,
             required_tools: value.required_tools,
             expected_output: value.expected_output,
+            complexity_hint: value.complexity_hint,
         }
     }
 }
 
 const REASONING_OUTPUT_TOKEN_HEURISTIC: u64 = 192;
 const TOOL_SYNTHESIS_TOKEN_HEURISTIC: u64 = 320;
-const REASONING_MAX_OUTPUT_TOKENS: u32 = 768;
+const REASONING_MAX_OUTPUT_TOKENS: u32 = 4096;
 const REASONING_TEMPERATURE: f32 = 0.2;
-const TOOL_SYNTHESIS_MAX_OUTPUT_TOKENS: u32 = 384;
+const TOOL_SYNTHESIS_MAX_OUTPUT_TOKENS: u32 = 1024;
+const MAX_CONTINUATION_ATTEMPTS: u32 = 3;
 const DEFAULT_LLM_ACTION_COST_CENTS: u64 = 2;
 const SAFE_FALLBACK_RESPONSE: &str = "I wasn't able to process that. Could you try rephrasing?";
 const DECOMPOSE_TOOL_NAME: &str = "decompose";
@@ -274,27 +579,14 @@ const VERIFICATION_CONFIDENCE_SINGLE_DISCREPANCY: f64 = 0.45;
 const VERIFICATION_CONFIDENCE_MULTIPLE_DISCREPANCIES: f64 = 0.25;
 
 impl LoopEngine {
-    /// Create a loop engine with an injected tool executor.
-    pub fn new(
-        budget: BudgetTracker,
-        context: ContextCompactor,
-        max_iterations: u32,
-        tool_executor: Arc<dyn ToolExecutor>,
-        synthesis_instruction: String,
-    ) -> Self {
-        Self {
-            budget,
-            context,
-            tool_executor,
-            max_iterations: max_iterations.max(1),
-            iteration_count: 0,
-            synthesis_instruction,
-            memory_context: None,
-            signals: SignalCollector::default(),
-            cancel_token: None,
-            input_channel: None,
-            user_stop_requested: false,
-        }
+    /// Create a loop engine builder.
+    pub fn builder() -> LoopEngineBuilder {
+        LoopEngineBuilder::default()
+    }
+
+    /// Attach an fx-core event bus for inter-component progress events.
+    pub fn set_event_bus(&mut self, bus: fx_core::EventBus) {
+        self.event_bus = Some(bus);
     }
 
     /// Attach a cancellation token for cooperative cancellation.
@@ -323,11 +615,7 @@ impl LoopEngine {
 
     /// Set memory context for system prompt injection.
     pub fn set_memory_context(&mut self, context: String) {
-        if context.trim().is_empty() {
-            self.memory_context = None;
-        } else {
-            self.memory_context = Some(context);
-        }
+        self.memory_context = normalize_memory_context(context);
     }
 
     pub fn synthesis_instruction(&self) -> &str {
@@ -364,8 +652,35 @@ impl LoopEngine {
     }
 
     fn finalize_result(&mut self, result: LoopResult) -> LoopResult {
+        self.emit_cache_stats_signal();
         let signals = self.signals.drain_all();
         attach_signals(result, signals)
+    }
+
+    fn emit_cache_stats_signal(&mut self) {
+        let Some(stats) = self.tool_executor.cache_stats() else {
+            return;
+        };
+
+        let total = stats.hits.saturating_add(stats.misses);
+        let hit_rate = if total == 0 {
+            0.0
+        } else {
+            stats.hits as f64 / total as f64
+        };
+
+        self.emit_signal(
+            LoopStep::Act,
+            SignalKind::Performance,
+            "tool cache stats",
+            serde_json::json!({
+                "hits": stats.hits,
+                "misses": stats.misses,
+                "entries": stats.entries,
+                "evictions": stats.evictions,
+                "hit_rate": hit_rate,
+            }),
+        );
     }
 
     /// Run one full loop cycle.
@@ -410,23 +725,40 @@ impl LoopEngine {
         }))
     }
 
-    /// Drain the input channel and return the highest-priority command.
+    /// Drain the input channel and return the highest-priority flow command.
     ///
-    /// Priority ordering: `Abort` always wins. For other commands (`Stop`,
-    /// `Wait`, `Resume`), the last received command takes precedence.
-    /// In practice this is fine — users cannot queue multiple commands in
-    /// the microsecond window between drain calls.
+    /// Priority ordering: `Abort` > `Stop` > `Wait/Resume` > `StatusQuery` > `Steer`.
+    /// `StatusQuery` publishes an internal status message and does not alter loop flow.
+    /// `Steer` stores the latest steer text for the next perceive step.
     fn check_user_input(&mut self) -> Option<LoopCommand> {
         let channel = self.input_channel.as_mut()?;
         let mut highest: Option<LoopCommand> = None;
+        let mut status_requested = false;
+        let mut latest_steer: Option<String> = None;
+
         while let Some(cmd) = channel.try_recv() {
-            highest = Some(match (&highest, cmd) {
-                (Some(LoopCommand::Abort), _) => LoopCommand::Abort,
-                (_, LoopCommand::Abort) => LoopCommand::Abort,
-                _ => cmd,
-            });
+            match cmd {
+                LoopCommand::Steer(text) => latest_steer = Some(text),
+                LoopCommand::StatusQuery => status_requested = true,
+                flow_cmd => highest = Some(prioritize_flow_command(highest, flow_cmd)),
+            }
         }
+
+        if let Some(steer) = latest_steer {
+            self.pending_steer = Some(steer);
+        }
+        if status_requested {
+            self.publish_system_status();
+        }
+
         highest
+    }
+
+    fn publish_system_status(&self) {
+        let Some(bus) = &self.event_bus else { return };
+        let status = self.status(current_time_ms());
+        let message = format_system_status_message(&status);
+        let _ = bus.publish(InternalMessage::SystemStatus { message });
     }
 
     /// Check both the cancellation token and input channel.
@@ -478,9 +810,11 @@ impl LoopEngine {
         self.budget.reset(current_time_ms());
         self.signals.clear();
         self.user_stop_requested = false;
+        self.pending_steer = None;
         if let Some(token) = &self.cancel_token {
             token.reset();
         }
+        self.tool_executor.clear_cache();
     }
 
     async fn execute_iteration(
@@ -627,23 +961,40 @@ impl LoopEngine {
         &mut self,
         snapshot: &PerceptionSnapshot,
     ) -> Result<ProcessedPerception, LoopError> {
-        let user_message = extract_user_message(snapshot)?;
+        let mut snapshot_with_steer = snapshot.clone();
+        snapshot_with_steer.steer_context = self.pending_steer.take();
+
+        let user_message = extract_user_message(&snapshot_with_steer)?;
         self.emit_signal(
             LoopStep::Perceive,
             SignalKind::Trace,
             "processing user input",
             serde_json::json!({"input_length": user_message.len()}),
         );
-        let mut context_window = snapshot.conversation_history.clone();
+
+        let mut context_window = snapshot_with_steer.conversation_history.clone();
         context_window.push(Message::user(user_message.clone()));
 
-        self.append_compacted_summary(snapshot, &user_message, &mut context_window);
+        let compacted_context = self
+            .compact_if_needed(
+                &context_window,
+                CompactionScope::Perceive,
+                self.iteration_count,
+            )
+            .await?;
+        if let Cow::Owned(messages) = compacted_context {
+            context_window = messages;
+        }
+        self.ensure_within_hard_limit(CompactionScope::Perceive, &context_window)?;
+
+        self.append_compacted_summary(&snapshot_with_steer, &user_message, &mut context_window);
 
         Ok(ProcessedPerception {
             user_message: user_message.clone(),
             context_window,
             active_goals: vec![format!("Help the user with: {user_message}")],
-            budget_remaining: self.budget.remaining(snapshot.timestamp_ms),
+            budget_remaining: self.budget.remaining(snapshot_with_steer.timestamp_ms),
+            steer_context: snapshot_with_steer.steer_context,
         })
     }
 
@@ -659,15 +1010,181 @@ impl LoopEngine {
             self.tool_executor.tool_definitions(),
             self.memory_context.as_deref(),
         );
+        let reasoning_messages = request.messages.clone();
         let started = current_time_ms();
-        let response = llm
-            .complete(request)
+        let mut stream = llm
+            .complete_stream(request)
             .await
             .map_err(|error| loop_error("reason", &format!("completion failed: {error}"), true))?;
+
+        self.publish_stream_started(StreamPhase::Reason);
+        let response = self
+            .consume_stream_with_events(&mut stream, StreamPhase::Reason)
+            .await?;
+
+        let response = self
+            .continue_truncated_response(response, &reasoning_messages, llm, LoopStep::Reason)
+            .await?;
         let latency_ms = current_time_ms().saturating_sub(started);
         let usage = response.usage;
         self.emit_reason_trace_and_perf(latency_ms, usage.as_ref());
         Ok(response)
+    }
+
+    fn publish_stream_started(&self, phase: StreamPhase) {
+        if let Some(bus) = &self.event_bus {
+            let _ = bus.publish(InternalMessage::StreamingStarted { phase });
+        }
+    }
+
+    fn publish_stream_finished(&self, phase: StreamPhase) {
+        if let Some(bus) = &self.event_bus {
+            let _ = bus.publish(InternalMessage::StreamingFinished { phase });
+        }
+    }
+
+    fn publish_stream_delta(&self, delta: String, phase: StreamPhase) {
+        if let Some(bus) = &self.event_bus {
+            let _ = bus.publish(InternalMessage::StreamDelta { delta, phase });
+        }
+    }
+
+    fn stream_cancel_requested(&mut self) -> bool {
+        if self.user_stop_requested || self.cancellation_token_triggered() {
+            return true;
+        }
+
+        if self.consume_stop_or_abort_command() {
+            self.user_stop_requested = true;
+            return true;
+        }
+
+        false
+    }
+
+    /// Consume a completion stream, publishing delta/finished events.
+    ///
+    /// `StreamingFinished` is always published by this method on all exit
+    /// paths (success, cancellation, error). Callers must NOT publish
+    /// `StreamingFinished` themselves — doing so would produce duplicates.
+    async fn consume_stream_with_events(
+        &mut self,
+        stream: &mut CompletionStream,
+        phase: StreamPhase,
+    ) -> Result<CompletionResponse, LoopError> {
+        let mut state = StreamResponseState::default();
+        while let Some(chunk_result) = stream.next().await {
+            if self.stream_cancel_requested() {
+                self.publish_stream_finished(phase);
+                return Ok(state.into_cancelled_response());
+            }
+
+            let chunk = match chunk_result {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    self.publish_stream_finished(phase);
+                    return Err(loop_error(
+                        phase_stage(phase),
+                        &format!("stream consumption failed: {error}"),
+                        true,
+                    ));
+                }
+            };
+
+            if let Some(delta) = chunk.delta_content.clone() {
+                self.publish_stream_delta(delta, phase);
+            }
+            state.apply_chunk(chunk);
+
+            if self.stream_cancel_requested() {
+                self.publish_stream_finished(phase);
+                return Ok(state.into_cancelled_response());
+            }
+        }
+
+        self.publish_stream_finished(phase);
+        Ok(state.into_response())
+    }
+
+    fn emit_continuation_trace(&mut self, step: LoopStep, attempt: u32) {
+        self.emit_signal(
+            step,
+            SignalKind::Trace,
+            format!("response truncated, continuing ({attempt}/{MAX_CONTINUATION_ATTEMPTS})"),
+            serde_json::json!({"attempt": attempt}),
+        );
+    }
+
+    fn ensure_continuation_budget(
+        &self,
+        continuation_messages: &[Message],
+        step: LoopStep,
+    ) -> Result<(), LoopError> {
+        let cost = continuation_budget_cost_estimate(continuation_messages);
+        self.budget
+            .check_at(current_time_ms(), &cost)
+            .map_err(|_| loop_error(step_stage(step), "continuation budget exhausted", true))
+    }
+
+    fn record_continuation_budget(
+        &mut self,
+        response: &CompletionResponse,
+        continuation_messages: &[Message],
+    ) {
+        let cost = continuation_budget_cost(response, continuation_messages);
+        self.budget.record(&cost);
+    }
+
+    async fn request_truncated_continuation(
+        &mut self,
+        llm: &dyn LlmProvider,
+        continuation_messages: &[Message],
+        step: LoopStep,
+    ) -> Result<CompletionResponse, LoopError> {
+        self.ensure_continuation_budget(continuation_messages, step)?;
+        let request = build_truncation_continuation_request(
+            llm.model_name(),
+            continuation_messages,
+            self.tool_executor.tool_definitions(),
+            self.memory_context.as_deref(),
+            step,
+        );
+        let request_messages = request.messages.clone();
+        let stage = step_stage(step);
+        let response = llm.complete(request).await.map_err(|error| {
+            loop_error(
+                stage,
+                &format!("continuation completion failed: {error}"),
+                true,
+            )
+        })?;
+        self.record_continuation_budget(&response, &request_messages);
+        Ok(response)
+    }
+
+    async fn continue_truncated_response(
+        &mut self,
+        initial_response: CompletionResponse,
+        base_messages: &[Message],
+        llm: &dyn LlmProvider,
+        step: LoopStep,
+    ) -> Result<CompletionResponse, LoopError> {
+        let mut attempts = 0;
+        let mut full_text = extract_response_text(&initial_response);
+        let mut combined = initial_response;
+
+        while is_truncated(combined.stop_reason.as_deref()) && attempts < MAX_CONTINUATION_ATTEMPTS
+        {
+            attempts = attempts.saturating_add(1);
+            self.emit_continuation_trace(step, attempts);
+            let continuation_messages = build_continuation_messages(base_messages, &full_text);
+            let continued = self
+                .request_truncated_continuation(llm, &continuation_messages, step)
+                .await?;
+            combined = merge_continuation_response(combined, continued, &mut full_text);
+        }
+
+        Ok(combined)
     }
 
     /// Decide step.
@@ -736,7 +1253,10 @@ impl LoopEngine {
         llm: &dyn LlmProvider,
         context_messages: &[Message],
     ) -> Result<ActionResult, LoopError> {
-        if self.decomposition_depth_limited() {
+        let timestamp_ms = current_time_ms();
+        let remaining = self.budget.remaining(timestamp_ms);
+        let effective_cap = self.effective_decomposition_depth_cap(&remaining);
+        if self.decomposition_depth_limited(effective_cap) {
             return Ok(self.depth_limited_decomposition_result(decision));
         }
 
@@ -744,19 +1264,10 @@ impl LoopEngine {
             self.emit_decomposition_truncation_signal(original_sub_goals, plan.sub_goals.len());
         }
 
-        // Each sub-goal gets up to 50% of the parent's remaining budget
-        // after previous sub-goals' consumption has been rolled up.
-        let per_goal_fraction = 0.5;
-        let mut results = Vec::with_capacity(plan.sub_goals.len());
-        for (index, sub_goal) in plan.sub_goals.iter().enumerate() {
-            self.emit_sub_goal_progress(index, plan.sub_goals.len(), &sub_goal.description);
-            let execution = self
-                .run_sub_goal(sub_goal, per_goal_fraction, llm, context_messages)
-                .await;
-            self.budget.absorb_child_usage(&execution.budget);
-            self.roll_up_sub_goal_signals(&execution.result.signals);
-            results.push(execution.result);
-        }
+        let allocation = self.prepare_allocation_plan(plan, timestamp_ms, effective_cap);
+        let results = self
+            .execute_allocated_sub_goals(plan, &allocation, llm, context_messages)
+            .await;
 
         Ok(ActionResult {
             decision: decision.clone(),
@@ -766,56 +1277,322 @@ impl LoopEngine {
         })
     }
 
+    fn prepare_allocation_plan(
+        &self,
+        plan: &DecompositionPlan,
+        timestamp_ms: u64,
+        effective_cap: u32,
+    ) -> AllocationPlan {
+        let allocator = BudgetAllocator::new();
+        let mode = allocation_mode_for_strategy(&plan.strategy);
+        let mut allocation = allocator.allocate(&self.budget, &plan.sub_goals, mode, timestamp_ms);
+        self.apply_effective_depth_cap(&mut allocation.sub_goal_budgets, effective_cap);
+        allocation
+    }
+
+    async fn execute_allocated_sub_goals(
+        &mut self,
+        plan: &DecompositionPlan,
+        allocation: &AllocationPlan,
+        llm: &dyn LlmProvider,
+        context_messages: &[Message],
+    ) -> Vec<SubGoalResult> {
+        match &plan.strategy {
+            AggregationStrategy::Parallel => {
+                self.execute_sub_goals_concurrent(plan, allocation, llm, context_messages)
+                    .await
+            }
+            AggregationStrategy::Sequential => {
+                self.execute_sub_goals_sequential(plan, allocation, llm, context_messages)
+                    .await
+            }
+            AggregationStrategy::Custom(s) => {
+                unreachable!("custom strategy '{s}' should be rejected during parsing")
+            }
+        }
+    }
+
+    async fn execute_sub_goals_sequential(
+        &mut self,
+        plan: &DecompositionPlan,
+        allocation: &AllocationPlan,
+        llm: &dyn LlmProvider,
+        context_messages: &[Message],
+    ) -> Vec<SubGoalResult> {
+        let total = plan.sub_goals.len();
+        let skipped = build_skip_mask(total, &allocation.skipped_indices);
+        let mut results = Vec::with_capacity(total);
+
+        for (index, sub_goal) in plan.sub_goals.iter().enumerate() {
+            self.emit_sub_goal_progress(index, total, &sub_goal.description);
+            let result = if skipped.get(index).copied().unwrap_or(false) {
+                self.emit_sub_goal_skipped(index, total, &sub_goal.description);
+                skipped_sub_goal_result(sub_goal.clone())
+            } else {
+                let child_config = allocation
+                    .sub_goal_budgets
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_else(|| self.zero_sub_goal_budget());
+                let execution = self
+                    .run_sub_goal(sub_goal, child_config, llm, context_messages)
+                    .await;
+                self.budget.absorb_child_usage(&execution.budget);
+                self.roll_up_sub_goal_signals(&execution.result.signals);
+                execution.result
+            };
+
+            let should_halt = should_halt_sub_goal_sequence(&result);
+            self.emit_sub_goal_completed(index, total, &result);
+            results.push(result);
+
+            if should_halt {
+                self.emit_signal(
+                    LoopStep::Act,
+                    SignalKind::Trace,
+                    "stopping remaining sub-goals after budget exhaustion",
+                    serde_json::json!({"completed_sub_goals": index + 1, "total_sub_goals": total}),
+                );
+                break;
+            }
+        }
+
+        results
+    }
+
+    async fn execute_sub_goals_concurrent(
+        &mut self,
+        plan: &DecompositionPlan,
+        allocation: &AllocationPlan,
+        llm: &dyn LlmProvider,
+        context_messages: &[Message],
+    ) -> Vec<SubGoalResult> {
+        let total = plan.sub_goals.len();
+        let skipped = build_skip_mask(total, &allocation.skipped_indices);
+
+        for (index, sub_goal) in plan.sub_goals.iter().enumerate() {
+            self.emit_sub_goal_progress(index, total, &sub_goal.description);
+        }
+
+        let child_futures = self.build_concurrent_futures(
+            plan,
+            &allocation.sub_goal_budgets,
+            &skipped,
+            llm,
+            context_messages,
+        );
+        let executions = futures_util::future::join_all(child_futures).await;
+        self.collect_concurrent_results(plan, executions, &skipped)
+    }
+
+    /// Build async futures for each sub-goal in the plan.
+    ///
+    /// Uses `futures_util::join_all` to multiplex all futures on the current
+    /// tokio task (cooperative concurrency). This is ideal for I/O-bound LLM
+    /// calls but does not achieve true thread-level parallelism. We cannot use
+    /// `tokio::JoinSet` because `llm: &dyn LlmProvider` is borrowed (not `'static`).
+    fn build_concurrent_futures<'a>(
+        &'a self,
+        plan: &'a DecompositionPlan,
+        sub_goal_budgets: &'a [BudgetConfig],
+        skipped: &'a [bool],
+        llm: &'a dyn LlmProvider,
+        context_messages: &'a [Message],
+    ) -> Vec<impl std::future::Future<Output = IndexedSubGoalExecution> + 'a> {
+        plan.sub_goals
+            .iter()
+            .enumerate()
+            .filter_map(|(index, sub_goal)| {
+                if skipped.get(index).copied().unwrap_or(false) {
+                    return None;
+                }
+
+                let child_config = sub_goal_budgets
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_else(|| self.zero_sub_goal_budget());
+                let goal = sub_goal.clone();
+
+                Some(async move {
+                    let execution = self
+                        .run_sub_goal(&goal, child_config, llm, context_messages)
+                        .await;
+                    IndexedSubGoalExecution { index, execution }
+                })
+            })
+            .collect()
+    }
+
+    fn collect_concurrent_results(
+        &mut self,
+        plan: &DecompositionPlan,
+        executions: Vec<IndexedSubGoalExecution>,
+        skipped: &[bool],
+    ) -> Vec<SubGoalResult> {
+        let total = plan.sub_goals.len();
+        let mut ordered = vec![None; total];
+
+        for (index, slot) in ordered.iter_mut().enumerate().take(total) {
+            if !skipped.get(index).copied().unwrap_or(false) {
+                continue;
+            }
+            if let Some(goal) = plan.sub_goals.get(index) {
+                self.emit_sub_goal_skipped(index, total, &goal.description);
+                let result = skipped_sub_goal_result(goal.clone());
+                self.emit_sub_goal_completed(index, total, &result);
+                *slot = Some(result);
+            }
+        }
+
+        for indexed in executions {
+            let index = indexed.index;
+            self.budget.absorb_child_usage(&indexed.execution.budget);
+            self.roll_up_sub_goal_signals(&indexed.execution.result.signals);
+            self.emit_sub_goal_completed(index, total, &indexed.execution.result);
+            if let Some(slot) = ordered.get_mut(index) {
+                *slot = Some(indexed.execution.result);
+            }
+        }
+
+        ordered
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, maybe_result)| {
+                debug_assert!(
+                    maybe_result.is_some() || skipped.get(index).copied().unwrap_or(false),
+                    "unexpected missing result at index {index}"
+                );
+                maybe_result.or_else(|| {
+                    plan.sub_goals
+                        .get(index)
+                        .cloned()
+                        .map(skipped_sub_goal_result)
+                })
+            })
+            .collect()
+    }
+
+    fn emit_sub_goal_completed(&self, index: usize, total: usize, result: &SubGoalResult) {
+        let success = matches!(result.outcome, SubGoalOutcome::Completed(_));
+        if let Some(bus) = &self.event_bus {
+            let _ = bus.publish(fx_core::message::InternalMessage::SubGoalCompleted {
+                index,
+                total,
+                success,
+            });
+        }
+    }
+
     async fn run_sub_goal(
         &self,
         sub_goal: &SubGoal,
-        fraction: f32,
+        child_config: BudgetConfig,
         llm: &dyn LlmProvider,
         context_messages: &[Message],
     ) -> SubGoalExecution {
         let timestamp_ms = current_time_ms();
-        let child_budget = self.budget.child_tracker(fraction, timestamp_ms);
-        let mut child = self.build_child_engine(child_budget);
-        let snapshot = build_sub_goal_snapshot(sub_goal, context_messages, timestamp_ms);
+        let child_budget =
+            BudgetTracker::new(child_config, timestamp_ms, self.budget.child_depth());
+        let (mut child, compacted_context) = match self
+            .prepare_sub_goal_engine(sub_goal, child_budget, context_messages)
+            .await
+        {
+            Ok(values) => values,
+            Err(execution) => return execution,
+        };
+        let snapshot = build_sub_goal_snapshot(sub_goal, compacted_context.as_ref(), timestamp_ms);
 
         let result = match Box::pin(child.run_cycle(snapshot, llm)).await {
             Ok(result) => sub_goal_result_from_loop(sub_goal.clone(), result),
             Err(error) => failed_sub_goal_result(sub_goal.clone(), error.reason),
         };
-
         SubGoalExecution {
             result,
             budget: child.budget,
         }
     }
 
-    fn build_child_engine(&self, budget: BudgetTracker) -> LoopEngine {
-        let mut child = LoopEngine::new(
-            budget,
-            self.context.clone(),
-            child_max_iterations(self.max_iterations),
-            Arc::clone(&self.tool_executor),
-            self.synthesis_instruction.clone(),
-        );
+    async fn prepare_sub_goal_engine<'a>(
+        &self,
+        sub_goal: &SubGoal,
+        child_budget: BudgetTracker,
+        context_messages: &'a [Message],
+    ) -> Result<(LoopEngine, Cow<'a, [Message]>), SubGoalExecution> {
+        let compacted_context = self
+            .compact_if_needed(
+                context_messages,
+                CompactionScope::DecomposeChild,
+                self.iteration_count,
+            )
+            .await
+            .map_err(|error| {
+                failed_sub_goal_execution(sub_goal, error.reason, child_budget.clone())
+            })?;
 
-        if let Some(memory_context) = &self.memory_context {
-            child.set_memory_context(memory_context.clone());
-        }
-        if let Some(cancel_token) = &self.cancel_token {
-            child.set_cancel_token(cancel_token.clone());
-        }
+        self.ensure_within_hard_limit(CompactionScope::DecomposeChild, compacted_context.as_ref())
+            .map_err(|error| {
+                failed_sub_goal_execution(sub_goal, error.reason, child_budget.clone())
+            })?;
 
-        child
+        let child = self
+            .build_child_engine(child_budget.clone())
+            .map_err(|error| failed_sub_goal_execution(sub_goal, error.reason, child_budget))?;
+        Ok((child, compacted_context))
     }
 
-    fn decomposition_depth_limited(&self) -> bool {
-        matches!(
-            self.budget.check(&ActionCost::default()),
-            Err(crate::budget::BudgetExceeded {
-                resource: BudgetResource::RecursionDepth,
-                ..
-            })
-        )
+    fn build_child_engine(&self, budget: BudgetTracker) -> Result<LoopEngine, LoopError> {
+        let mut builder = LoopEngine::builder()
+            .budget(budget)
+            .context(self.context.clone())
+            .max_iterations(child_max_iterations(self.max_iterations))
+            .tool_executor(Arc::clone(&self.tool_executor))
+            .synthesis_instruction(self.synthesis_instruction.clone())
+            .compaction_config(self.compaction_config.clone());
+
+        if let Some(memory_context) = &self.memory_context {
+            builder = builder.memory_context(memory_context.clone());
+        }
+        if let Some(cancel_token) = &self.cancel_token {
+            builder = builder.cancel_token(cancel_token.clone());
+        }
+        if let Some(bus) = &self.event_bus {
+            builder = builder.event_bus(bus.clone());
+        }
+
+        builder.build()
+    }
+
+    fn decomposition_depth_limited(&self, effective_cap: u32) -> bool {
+        self.budget.depth() >= effective_cap
+    }
+
+    fn effective_decomposition_depth_cap(&self, remaining: &BudgetRemaining) -> u32 {
+        let config = self.budget.config();
+        match config.decompose_depth_mode {
+            DepthMode::Static => config.max_recursion_depth,
+            DepthMode::Adaptive => config
+                .max_recursion_depth
+                .min(effective_max_depth(remaining)),
+        }
+    }
+
+    fn apply_effective_depth_cap(&self, sub_goal_budgets: &mut [BudgetConfig], effective_cap: u32) {
+        for budget in sub_goal_budgets {
+            budget.max_recursion_depth = budget.max_recursion_depth.min(effective_cap);
+        }
+    }
+
+    fn zero_sub_goal_budget(&self) -> BudgetConfig {
+        let template = self.budget.config();
+        BudgetConfig {
+            max_llm_calls: 0,
+            max_tool_invocations: 0,
+            max_tokens: 0,
+            max_cost_cents: 0,
+            max_wall_time_ms: 0,
+            max_recursion_depth: template.max_recursion_depth,
+            decompose_depth_mode: template.decompose_depth_mode,
+        }
     }
 
     fn depth_limited_decomposition_result(&mut self, decision: &Decision) -> ActionResult {
@@ -836,6 +1613,26 @@ impl LoopEngine {
             serde_json::json!({
                 "sub_goal_index": index,
                 "total": total,
+            }),
+        );
+        if let Some(bus) = &self.event_bus {
+            let _ = bus.publish(fx_core::message::InternalMessage::SubGoalStarted {
+                index,
+                total,
+                description: description.to_string(),
+            });
+        }
+    }
+
+    fn emit_sub_goal_skipped(&mut self, index: usize, total: usize, description: &str) {
+        self.emit_signal(
+            LoopStep::Act,
+            SignalKind::Friction,
+            format!("Sub-goal {}/{} skipped: {description}", index + 1, total),
+            serde_json::json!({
+                "sub_goal_index": index,
+                "total": total,
+                "reason": "below_budget_floor",
             }),
         );
     }
@@ -1116,6 +1913,211 @@ impl LoopEngine {
         );
     }
 
+    fn compaction_cooldown_active(
+        &self,
+        scope: CompactionScope,
+        iteration: u32,
+        cooldown_turns: u32,
+    ) -> bool {
+        let map = self
+            .compaction_last_iteration
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        map.get(&scope)
+            .map(|last| iteration.saturating_sub(*last) < cooldown_turns)
+            .unwrap_or(false)
+    }
+
+    fn record_compaction_iteration(&self, scope: CompactionScope, iteration: u32) {
+        let mut map = self
+            .compaction_last_iteration
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        map.insert(scope, iteration);
+    }
+
+    fn should_skip_compaction(
+        &self,
+        scope: CompactionScope,
+        iteration: u32,
+        hard_limit_exceeded: bool,
+    ) -> bool {
+        let cooldown_active = self.compaction_cooldown_active(
+            scope,
+            iteration,
+            self.compaction_config.recompact_cooldown_turns,
+        );
+
+        if cooldown_active && !hard_limit_exceeded {
+            tracing::debug!(
+                scope = scope.as_str(),
+                iteration,
+                cooldown_turns = self.compaction_config.recompact_cooldown_turns,
+                "compaction skipped due to cooldown guard"
+            );
+            return true;
+        }
+
+        if cooldown_active && hard_limit_exceeded {
+            tracing::warn!(
+                scope = scope.as_str(),
+                iteration,
+                cooldown_turns = self.compaction_config.recompact_cooldown_turns,
+                "cooldown bypassed because conversation is above hard limit"
+            );
+        }
+
+        false
+    }
+
+    fn ensure_compacted_within_hard_limit(
+        &self,
+        scope: CompactionScope,
+        result: &CompactionResult,
+    ) -> Result<(), LoopError> {
+        if self
+            .conversation_budget
+            .exceeds_hard_limit(&result.messages)
+        {
+            return Err(context_exceeded_after_compaction_error(
+                scope,
+                result.estimated_tokens,
+                self.conversation_budget.conversation_budget(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn log_compaction_result(
+        &self,
+        scope: CompactionScope,
+        before_tokens: usize,
+        target_tokens: usize,
+        result: &CompactionResult,
+    ) {
+        tracing::info!(
+            scope = scope.as_str(),
+            strategy = if result.used_summarization {
+                "summarizing"
+            } else {
+                "sliding_window"
+            },
+            before_tokens,
+            after_tokens = result.estimated_tokens,
+            target_tokens,
+            messages_removed = result.compacted_count,
+            tokens_saved = before_tokens.saturating_sub(result.estimated_tokens),
+            "conversation compaction triggered"
+        );
+    }
+
+    async fn compact_if_needed<'a>(
+        &self,
+        messages: &'a [Message],
+        scope: CompactionScope,
+        iteration: u32,
+    ) -> Result<Cow<'a, [Message]>, LoopError> {
+        if !self.conversation_budget.needs_compaction(messages) {
+            return Ok(Cow::Borrowed(messages));
+        }
+
+        let before_tokens = ConversationBudget::estimate_tokens(messages);
+        let hard_limit_exceeded = self.conversation_budget.exceeds_hard_limit(messages);
+        if self.should_skip_compaction(scope, iteration, hard_limit_exceeded) {
+            return Ok(Cow::Borrowed(messages));
+        }
+
+        let target_tokens = self.conversation_budget.compaction_target();
+        let context = CompactionContext {
+            scope,
+            messages,
+            target: target_tokens,
+            hard_limit_exceeded,
+            before_tokens,
+        };
+        let result = self.run_compaction_strategy(context).await?;
+
+        self.ensure_compacted_within_hard_limit(scope, &result)?;
+        self.log_compaction_result(scope, before_tokens, target_tokens, &result);
+        self.record_compaction_iteration(scope, iteration);
+        Ok(Cow::Owned(result.messages))
+    }
+
+    async fn run_sliding_fallback(
+        &self,
+        scope: CompactionScope,
+        messages: &[Message],
+        target: usize,
+    ) -> Result<CompactionResult, LoopError> {
+        let fallback = SlidingWindowCompactor::new(self.compaction_config.preserve_recent_turns);
+        fallback
+            .compact(messages, target)
+            .await
+            .map_err(|error| compaction_failed_error(scope, error))
+    }
+
+    async fn run_compaction_strategy(
+        &self,
+        context: CompactionContext<'_>,
+    ) -> Result<CompactionResult, LoopError> {
+        match self
+            .conversation_compactor
+            .compact(context.messages, context.target)
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(CompactionError::SummarizationFailed { source }) => {
+                tracing::warn!(
+                    error = %source,
+                    scope = context.scope.as_str(),
+                    "summarization compaction failed; trying sliding fallback"
+                );
+                self.run_sliding_fallback(context.scope, context.messages, context.target)
+                    .await
+            }
+            Err(CompactionError::SummaryExceededTarget) => {
+                tracing::warn!(
+                    scope = context.scope.as_str(),
+                    "summary exceeded compaction target; trying sliding fallback"
+                );
+                self.run_sliding_fallback(context.scope, context.messages, context.target)
+                    .await
+            }
+            Err(CompactionError::AllMessagesProtected) => {
+                if context.hard_limit_exceeded {
+                    return Err(context_exceeded_after_compaction_error(
+                        context.scope,
+                        context.before_tokens,
+                        self.conversation_budget.conversation_budget(),
+                    ));
+                }
+                Ok(CompactionResult {
+                    messages: context.messages.to_vec(),
+                    compacted_count: 0,
+                    estimated_tokens: context.before_tokens,
+                    used_summarization: false,
+                })
+            }
+        }
+    }
+
+    fn ensure_within_hard_limit(
+        &self,
+        scope: CompactionScope,
+        messages: &[Message],
+    ) -> Result<(), LoopError> {
+        let estimated_tokens = ConversationBudget::estimate_tokens(messages);
+        let hard_limit_tokens = self.conversation_budget.conversation_budget();
+        if estimated_tokens > hard_limit_tokens {
+            return Err(context_exceeded_after_compaction_error(
+                scope,
+                estimated_tokens,
+                hard_limit_tokens,
+            ));
+        }
+        Ok(())
+    }
+
     fn append_compacted_summary(
         &self,
         snapshot: &PerceptionSnapshot,
@@ -1213,6 +2215,15 @@ impl LoopEngine {
                         continue;
                     }
 
+                    let response = self
+                        .continue_truncated_response(
+                            response,
+                            &state.continuation_messages,
+                            llm,
+                            LoopStep::Act,
+                        )
+                        .await?;
+
                     return Ok(self.finalize_tool_response(
                         decision,
                         state.all_tool_results,
@@ -1241,6 +2252,21 @@ impl LoopEngine {
             &results,
         )?;
         state.all_tool_results.extend(results);
+
+        let compacted = self
+            .compact_if_needed(
+                &state.continuation_messages,
+                CompactionScope::ToolContinuation,
+                round,
+            )
+            .await?;
+        if let Cow::Owned(messages) = compacted {
+            state.continuation_messages = messages;
+        }
+        self.ensure_within_hard_limit(
+            CompactionScope::ToolContinuation,
+            &state.continuation_messages,
+        )?;
 
         if self.cancellation_token_triggered() {
             return Ok(ToolRoundOutcome::Cancelled);
@@ -1277,7 +2303,7 @@ impl LoopEngine {
     }
 
     async fn request_tool_continuation(
-        &self,
+        &mut self,
         llm: &dyn LlmProvider,
         context_messages: &[Message],
         tokens_used: &mut TokenUsage,
@@ -1288,13 +2314,20 @@ impl LoopEngine {
             self.tool_executor.tool_definitions(),
             self.memory_context.as_deref(),
         );
-        let response = llm.complete(request).await.map_err(|error| {
+
+        let mut stream = llm.complete_stream(request).await.map_err(|error| {
             loop_error(
                 "act",
                 &format!("tool continuation completion failed: {error}"),
                 true,
             )
         })?;
+
+        self.publish_stream_started(StreamPhase::Synthesize);
+        let response = self
+            .consume_stream_with_events(&mut stream, StreamPhase::Synthesize)
+            .await?;
+
         tokens_used.accumulate(response_usage_or_estimate(&response, context_messages));
         Ok(response)
     }
@@ -1507,6 +2540,7 @@ fn build_sub_goal_snapshot(
         }),
         sensor_data: None,
         conversation_history: context_messages.to_vec(),
+        steer_context: None,
     }
 }
 
@@ -1540,6 +2574,17 @@ fn sub_goal_result_from_loop(goal: SubGoal, result: LoopResult) -> SubGoalResult
     }
 }
 
+fn failed_sub_goal_execution(
+    goal: &SubGoal,
+    message: String,
+    budget: BudgetTracker,
+) -> SubGoalExecution {
+    SubGoalExecution {
+        result: failed_sub_goal_result(goal.clone(), message),
+        budget,
+    }
+}
+
 fn failed_sub_goal_result(goal: SubGoal, message: String) -> SubGoalResult {
     failed_sub_goal_result_with_signals(goal, message, Vec::new())
 }
@@ -1553,6 +2598,14 @@ fn failed_sub_goal_result_with_signals(
         goal,
         outcome: SubGoalOutcome::Failed(message),
         signals,
+    }
+}
+
+fn skipped_sub_goal_result(goal: SubGoal) -> SubGoalResult {
+    SubGoalResult {
+        goal,
+        outcome: SubGoalOutcome::Skipped,
+        signals: Vec::new(),
     }
 }
 
@@ -1582,6 +2635,21 @@ fn format_sub_goal_outcome(outcome: &SubGoalOutcome) -> String {
         SubGoalOutcome::Completed(response) => format!("completed: {response}"),
         SubGoalOutcome::Failed(message) => format!("failed: {message}"),
         SubGoalOutcome::BudgetExhausted => "budget exhausted".to_string(),
+        SubGoalOutcome::Skipped => "skipped (below floor)".to_string(),
+    }
+}
+
+fn should_halt_sub_goal_sequence(result: &SubGoalResult) -> bool {
+    matches!(result.outcome, SubGoalOutcome::BudgetExhausted)
+}
+
+fn allocation_mode_for_strategy(strategy: &AggregationStrategy) -> AllocationMode {
+    match strategy {
+        AggregationStrategy::Sequential => AllocationMode::Sequential,
+        AggregationStrategy::Parallel => AllocationMode::Concurrent,
+        AggregationStrategy::Custom(s) => {
+            unreachable!("custom strategy '{s}' should be rejected during parsing")
+        }
     }
 }
 
@@ -1594,7 +2662,7 @@ fn find_decompose_tool_call(tool_calls: &[ToolCall]) -> Option<&ToolCall> {
 fn parse_decomposition_plan(arguments: &serde_json::Value) -> Result<DecompositionPlan, LoopError> {
     let parsed = parse_decompose_arguments(arguments)?;
     if let Some(strategy) = &parsed.strategy {
-        if *strategy != AggregationStrategy::Sequential {
+        if matches!(strategy, AggregationStrategy::Custom(_)) {
             return Err(loop_error(
                 "decide",
                 &format!("unsupported decomposition strategy: {strategy:?}"),
@@ -1885,13 +2953,18 @@ fn decompose_tool_definition() -> ToolDefinition {
                         "properties": {
                             "description": {"type": "string", "description": "What this sub-goal should accomplish"},
                             "required_tools": {"type": "array", "items": {"type": "string"}, "description": "Tools needed for this sub-goal"},
-                            "expected_output": {"type": "string", "description": "What the result should look like"}
+                            "expected_output": {"type": "string", "description": "What the result should look like"},
+                            "complexity_hint": {
+                                "type": "string",
+                                "enum": ["Trivial", "Moderate", "Complex"],
+                                "description": "Optional complexity hint to guide budget allocation"
+                            }
                         },
                         "required": ["description"]
                     },
                     "description": "List of sub-goals to execute"
                 },
-                "strategy": {"type": "string", "enum": ["Sequential"], "description": "Execution strategy (only Sequential supported currently)"}
+                "strategy": {"type": "string", "enum": ["Sequential", "Parallel"], "description": "Execution strategy"}
             },
             "required": ["sub_goals"]
         }),
@@ -1906,7 +2979,7 @@ fn build_continuation_request(
     memory_context: Option<&str>,
 ) -> CompletionRequest {
     let tools = tool_definitions_with_decompose(tool_definitions);
-    let system_prompt = build_reasoning_system_prompt(&tools, memory_context);
+    let system_prompt = build_reasoning_system_prompt(memory_context);
     CompletionRequest {
         model: model.to_string(),
         messages: context_messages.to_vec(),
@@ -1915,6 +2988,338 @@ fn build_continuation_request(
         max_tokens: Some(REASONING_MAX_OUTPUT_TOKENS),
         system_prompt: Some(system_prompt),
     }
+}
+
+fn build_truncation_continuation_request(
+    model: &str,
+    continuation_messages: &[Message],
+    tool_definitions: Vec<ToolDefinition>,
+    memory_context: Option<&str>,
+    step: LoopStep,
+) -> CompletionRequest {
+    let tools = tool_definitions_with_decompose(tool_definitions);
+    let system_prompt = build_reasoning_system_prompt(memory_context);
+    CompletionRequest {
+        model: model.to_string(),
+        messages: continuation_messages.to_vec(),
+        tools: continuation_tools_for_step(step, tools),
+        temperature: Some(REASONING_TEMPERATURE),
+        max_tokens: Some(REASONING_MAX_OUTPUT_TOKENS),
+        system_prompt: Some(system_prompt),
+    }
+}
+
+fn continuation_tools_for_step(step: LoopStep, tools: Vec<ToolDefinition>) -> Vec<ToolDefinition> {
+    match step {
+        LoopStep::Reason => tools,
+        _ => Vec::new(),
+    }
+}
+
+fn prioritize_flow_command(current: Option<LoopCommand>, incoming: LoopCommand) -> LoopCommand {
+    match current {
+        None => incoming,
+        Some(existing) if loop_command_priority(&existing) > loop_command_priority(&incoming) => {
+            existing
+        }
+        Some(existing)
+            if loop_command_priority(&existing) == loop_command_priority(&incoming)
+                && !matches!(incoming, LoopCommand::Wait | LoopCommand::Resume) =>
+        {
+            existing
+        }
+        _ => incoming,
+    }
+}
+
+fn loop_command_priority(command: &LoopCommand) -> u8 {
+    match command {
+        LoopCommand::Abort => 5,
+        LoopCommand::Stop => 4,
+        LoopCommand::Wait | LoopCommand::Resume => 3,
+        LoopCommand::StatusQuery => 2,
+        LoopCommand::Steer(_) => 1,
+    }
+}
+
+fn format_system_status_message(status: &LoopStatus) -> String {
+    format!(
+        "status: iter={}/{} llm={} tools={} tokens={} cost_cents={} remaining(llm={},tools={},tokens={},cost_cents={})",
+        status.iteration_count,
+        status.max_iterations,
+        status.llm_calls_used,
+        status.tool_invocations_used,
+        status.tokens_used,
+        status.cost_cents_used,
+        status.remaining.llm_calls,
+        status.remaining.tool_invocations,
+        status.remaining.tokens,
+        status.remaining.cost_cents,
+    )
+}
+
+fn build_continuation_messages(base_messages: &[Message], full_text: &str) -> Vec<Message> {
+    let mut continuation_messages = base_messages.to_vec();
+    continuation_messages.push(Message::assistant(full_text.to_string()));
+    continuation_messages.push(Message::user(
+        "Continue from exactly where you left off. Do not repeat prior text.",
+    ));
+    continuation_messages
+}
+
+fn step_stage(step: LoopStep) -> &'static str {
+    match step {
+        LoopStep::Reason => "reason",
+        LoopStep::Act => "act",
+        _ => "act",
+    }
+}
+
+fn phase_stage(phase: StreamPhase) -> &'static str {
+    match phase {
+        StreamPhase::Reason => "reason",
+        StreamPhase::Synthesize => "act",
+    }
+}
+
+fn continuation_budget_cost_estimate(messages: &[Message]) -> ActionCost {
+    let input_tokens = messages
+        .iter()
+        .map(message_to_text)
+        .map(|text| estimate_tokens(&text))
+        .sum::<u64>();
+
+    ActionCost {
+        llm_calls: 1,
+        tool_invocations: 0,
+        tokens: input_tokens.saturating_add(REASONING_OUTPUT_TOKEN_HEURISTIC),
+        cost_cents: DEFAULT_LLM_ACTION_COST_CENTS,
+    }
+}
+
+fn continuation_budget_cost(
+    response: &CompletionResponse,
+    continuation_messages: &[Message],
+) -> ActionCost {
+    let usage = response_usage_or_estimate(response, continuation_messages);
+    ActionCost {
+        llm_calls: 1,
+        tool_invocations: 0,
+        tokens: usage.total_tokens(),
+        cost_cents: DEFAULT_LLM_ACTION_COST_CENTS,
+    }
+}
+
+fn merge_continuation_response(
+    previous: CompletionResponse,
+    continued: CompletionResponse,
+    full_text: &mut String,
+) -> CompletionResponse {
+    let new_text = extract_response_text(&continued);
+    let deduped = trim_duplicate_seam(full_text, &new_text, 120, 80);
+    full_text.push_str(&deduped);
+
+    CompletionResponse {
+        content: vec![ContentBlock::Text {
+            text: full_text.clone(),
+        }],
+        tool_calls: merge_tool_calls(previous.tool_calls, continued.tool_calls),
+        usage: merge_usage(previous.usage, continued.usage),
+        stop_reason: continued.stop_reason,
+    }
+}
+
+fn merge_tool_calls(previous: Vec<ToolCall>, continued: Vec<ToolCall>) -> Vec<ToolCall> {
+    let mut merged = previous;
+    for call in continued {
+        if !tool_call_exists(&merged, &call) {
+            merged.push(call);
+        }
+    }
+    merged
+}
+
+fn tool_call_exists(existing: &[ToolCall], candidate: &ToolCall) -> bool {
+    if !candidate.id.trim().is_empty() {
+        return existing.iter().any(|call| call.id == candidate.id);
+    }
+
+    existing.iter().any(|call| {
+        call.id.trim().is_empty()
+            && call.name == candidate.name
+            && call.arguments == candidate.arguments
+    })
+}
+
+fn is_truncated(stop_reason: Option<&str>) -> bool {
+    matches!(
+        stop_reason.map(|s| s.to_ascii_lowercase()).as_deref(),
+        Some("max_tokens" | "length" | "incomplete")
+    )
+}
+
+fn merge_usage(left: Option<Usage>, right: Option<Usage>) -> Option<Usage> {
+    if left.is_none() && right.is_none() {
+        return None;
+    }
+
+    let left_in = left.as_ref().map(|u| u.input_tokens).unwrap_or(0);
+    let left_out = left.as_ref().map(|u| u.output_tokens).unwrap_or(0);
+    let right_in = right.as_ref().map(|u| u.input_tokens).unwrap_or(0);
+    let right_out = right.as_ref().map(|u| u.output_tokens).unwrap_or(0);
+
+    Some(Usage {
+        input_tokens: left_in.saturating_add(right_in),
+        output_tokens: left_out.saturating_add(right_out),
+    })
+}
+
+fn stream_tool_index(
+    chunk_index: usize,
+    delta: &ToolUseDelta,
+    tool_calls_by_index: &HashMap<usize, StreamToolCallState>,
+    id_to_index: &HashMap<String, usize>,
+) -> usize {
+    let Some(id) = delta.id.as_deref() else {
+        return chunk_index;
+    };
+
+    if let Some(index) = id_to_index.get(id).copied() {
+        return index;
+    }
+
+    if chunk_index_usable_for_id(chunk_index, id, tool_calls_by_index) {
+        return chunk_index;
+    }
+
+    next_stream_tool_index(tool_calls_by_index)
+}
+
+fn chunk_index_usable_for_id(
+    chunk_index: usize,
+    id: &str,
+    tool_calls_by_index: &HashMap<usize, StreamToolCallState>,
+) -> bool {
+    match tool_calls_by_index.get(&chunk_index) {
+        None => true,
+        Some(state) => match state.id.as_deref() {
+            None => true,
+            Some(existing_id) => existing_id == id,
+        },
+    }
+}
+
+fn next_stream_tool_index(tool_calls_by_index: &HashMap<usize, StreamToolCallState>) -> usize {
+    tool_calls_by_index
+        .keys()
+        .copied()
+        .max()
+        .map(|index| index.saturating_add(1))
+        .unwrap_or(0)
+}
+
+fn merge_stream_tool_delta(
+    entry: &mut StreamToolCallState,
+    delta: ToolUseDelta,
+    id_to_index: &mut HashMap<String, usize>,
+    index: usize,
+) {
+    if entry.id.is_none() {
+        entry.id = delta.id;
+    }
+    if entry.name.is_none() {
+        entry.name = delta.name;
+    }
+    if let Some(id) = entry.id.clone() {
+        id_to_index.insert(id, index);
+    }
+    if let Some(arguments_delta) = delta.arguments_delta {
+        merge_stream_arguments(&mut entry.arguments, &arguments_delta, delta.arguments_done);
+    }
+    entry.arguments_done |= delta.arguments_done;
+}
+
+fn merge_stream_arguments(arguments: &mut String, arguments_delta: &str, arguments_done: bool) {
+    if arguments_delta.is_empty() {
+        return;
+    }
+
+    let done_payload_is_complete = arguments_done
+        && !arguments.is_empty()
+        && serde_json::from_str::<serde_json::Value>(arguments_delta).is_ok();
+    if done_payload_is_complete {
+        arguments.clear();
+    }
+
+    arguments.push_str(arguments_delta);
+}
+
+fn finalize_stream_tool_calls(by_index: HashMap<usize, StreamToolCallState>) -> Vec<ToolCall> {
+    let mut indexed_calls = by_index.into_iter().collect::<Vec<_>>();
+    indexed_calls.sort_by_key(|(index, _)| *index);
+    indexed_calls
+        .into_iter()
+        .filter_map(|(_, state)| stream_tool_call_from_state(state))
+        .collect()
+}
+
+fn stream_tool_call_from_state(state: StreamToolCallState) -> Option<ToolCall> {
+    if !state.arguments_done {
+        return None;
+    }
+
+    let id = state.id?.trim().to_string();
+    let name = state.name?.trim().to_string();
+    if id.is_empty() || name.is_empty() {
+        return None;
+    }
+
+    let arguments = match serde_json::from_str::<serde_json::Value>(&state.arguments) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(
+                tool_id = %id,
+                tool_name = %name,
+                raw_arguments = %state.arguments,
+                error = %error,
+                "dropping tool call with malformed JSON arguments"
+            );
+            return None;
+        }
+    };
+    Some(ToolCall {
+        id,
+        name,
+        arguments,
+    })
+}
+
+fn trim_duplicate_seam(
+    full_text: &str,
+    new_text: &str,
+    overlap_window: usize,
+    min_overlap: usize,
+) -> String {
+    if full_text.is_empty() || new_text.is_empty() {
+        return new_text.to_string();
+    }
+
+    let full_chars = full_text.chars().collect::<Vec<_>>();
+    let new_chars = new_text.chars().collect::<Vec<_>>();
+    let max_overlap = overlap_window.min(full_chars.len()).min(new_chars.len());
+    if max_overlap < min_overlap {
+        return new_text.to_string();
+    }
+
+    for overlap in (min_overlap..=max_overlap).rev() {
+        let full_suffix = &full_chars[full_chars.len() - overlap..];
+        let new_prefix = &new_chars[..overlap];
+        if full_suffix == new_prefix {
+            return new_chars[overlap..].iter().collect();
+        }
+    }
+
+    new_text.to_string()
 }
 
 fn response_usage_or_estimate(
@@ -1984,14 +3389,7 @@ fn next_perception_from_sub_goal(
 }
 
 fn estimate_tokens(text: &str) -> u64 {
-    if text.trim().is_empty() {
-        return 0;
-    }
-
-    let char_count = text.chars().count();
-    let char_estimate = char_count.div_ceil(4) as u64;
-    let word_estimate = text.split_whitespace().count() as u64;
-    char_estimate.max(word_estimate).max(1)
+    estimate_text_tokens(text) as u64
 }
 
 fn message_to_text(message: &Message) -> String {
@@ -2047,7 +3445,7 @@ fn build_reasoning_request(
     let context = perception.context_window.clone();
     let user_prompt = reasoning_user_prompt(perception);
     let tools = tool_definitions_with_decompose(tool_definitions);
-    let system_prompt = build_reasoning_system_prompt(&tools, memory_context);
+    let system_prompt = build_reasoning_system_prompt(memory_context);
 
     CompletionRequest {
         model: model.to_string(),
@@ -2060,7 +3458,7 @@ fn build_reasoning_request(
 }
 
 fn reasoning_user_prompt(perception: &ProcessedPerception) -> String {
-    format!(
+    let mut prompt = format!(
         "Active goals:
 - {}
 
@@ -2075,19 +3473,17 @@ User message:
         perception.budget_remaining.tokens,
         perception.budget_remaining.llm_calls,
         perception.user_message,
-    )
+    );
+
+    if let Some(steer) = perception.steer_context.as_deref() {
+        prompt.push_str(&format!("\nUser steer (latest): {steer}"));
+    }
+
+    prompt
 }
 
-fn build_reasoning_system_prompt(
-    tool_definitions: &[ToolDefinition],
-    memory_context: Option<&str>,
-) -> String {
-    let mut prompt = format!(
-        "{REASONING_SYSTEM_PROMPT}
-
-{}",
-        available_tools_instructions(tool_definitions)
-    );
+fn build_reasoning_system_prompt(memory_context: Option<&str>) -> String {
+    let mut prompt = REASONING_SYSTEM_PROMPT.to_string();
     if let Some(mem) = memory_context {
         prompt.push_str("\n\n");
         prompt.push_str(mem);
@@ -2096,6 +3492,8 @@ fn build_reasoning_system_prompt(
     prompt
 }
 
+// Retained for potential use in non-structured-tool contexts (e.g. plain-text LLM fallback).
+#[allow(dead_code)]
 fn available_tools_instructions(tool_definitions: &[ToolDefinition]) -> String {
     let tools = tool_definitions
         .iter()
@@ -2153,6 +3551,28 @@ fn ensure_non_empty_response_with_flag(text: &str) -> (String, bool) {
         return (SAFE_FALLBACK_RESPONSE.to_string(), true);
     }
     (trimmed.to_string(), false)
+}
+
+fn compaction_failed_error(scope: CompactionScope, error: CompactionError) -> LoopError {
+    loop_error(
+        "compaction",
+        &format!("compaction_failed: scope={scope} error={error}"),
+        true,
+    )
+}
+
+fn context_exceeded_after_compaction_error(
+    scope: CompactionScope,
+    estimated_tokens: usize,
+    hard_limit_tokens: usize,
+) -> LoopError {
+    loop_error(
+        "compaction",
+        &format!(
+            "context_exceeded_after_compaction: scope={scope} estimated_tokens={estimated_tokens} hard_limit_tokens={hard_limit_tokens}",
+        ),
+        true,
+    )
 }
 
 fn loop_error(stage: &str, reason: &str, recoverable: bool) -> LoopError {
@@ -2258,13 +3678,18 @@ mod tests {
     }
 
     fn default_engine() -> LoopEngine {
-        LoopEngine::new(
-            BudgetTracker::new(crate::budget::BudgetConfig::default(), 0, 0),
-            ContextCompactor::new(2048, 256),
-            3,
-            Arc::new(TestStubToolExecutor),
-            "Summarize tool output".to_string(),
-        )
+        LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                0,
+                0,
+            ))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(TestStubToolExecutor))
+            .synthesis_instruction("Summarize tool output".to_string())
+            .build()
+            .expect("test engine build")
     }
 
     fn base_snapshot(text: &str) -> PerceptionSnapshot {
@@ -2285,17 +3710,13 @@ mod tests {
             }),
             sensor_data: None,
             conversation_history: vec![Message::user(text)],
+            steer_context: None,
         }
     }
 
     #[test]
     fn system_prompt_includes_tool_use_guidance() {
-        let defs = vec![ToolDefinition {
-            name: "current_time".to_string(),
-            description: "Get the current time".to_string(),
-            parameters: serde_json::json!({"type": "object", "properties": {}, "required": []}),
-        }];
-        let prompt = build_reasoning_system_prompt(&defs, None);
+        let prompt = build_reasoning_system_prompt(None);
         assert!(
             prompt.contains("Use tools when you need information not already in the conversation")
         );
@@ -2305,17 +3726,11 @@ mod tests {
             ),
             "system prompt should encourage proactive tool usage for matching requests"
         );
-        assert!(prompt.contains("current time"));
     }
 
     #[test]
     fn system_prompt_prohibits_greeting_and_preamble() {
-        let defs = vec![ToolDefinition {
-            name: "current_time".to_string(),
-            description: "Get the current time".to_string(),
-            parameters: serde_json::json!({"type": "object", "properties": {}, "required": []}),
-        }];
-        let prompt = build_reasoning_system_prompt(&defs, None);
+        let prompt = build_reasoning_system_prompt(None);
         assert!(
             prompt.contains("Never introduce yourself"),
             "system prompt must prohibit self-introduction (issue #959)"
@@ -2328,12 +3743,7 @@ mod tests {
 
     #[test]
     fn system_prompt_without_memory_omits_persistent_memory_block() {
-        let defs = vec![ToolDefinition {
-            name: "current_time".to_string(),
-            description: "Get the current time".to_string(),
-            parameters: serde_json::json!({"type": "object", "properties": {}, "required": []}),
-        }];
-        let prompt = build_reasoning_system_prompt(&defs, None);
+        let prompt = build_reasoning_system_prompt(None);
         assert!(
             !prompt.contains("You have persistent memory across sessions"),
             "system prompt without memory context should NOT include the persistent memory block"
@@ -2342,19 +3752,35 @@ mod tests {
 
     #[test]
     fn system_prompt_with_memory_includes_memory_instruction() {
-        let defs = vec![ToolDefinition {
-            name: "memory_write".to_string(),
-            description: "Store a fact".to_string(),
-            parameters: serde_json::json!({"type": "object"}),
-        }];
-        let prompt = build_reasoning_system_prompt(&defs, Some("user prefers dark mode"));
+        let prompt = build_reasoning_system_prompt(Some("user prefers dark mode"));
         assert!(
             prompt.contains("memory_write"),
-            "system prompt with memory context should mention memory_write"
+            "system prompt with memory context should mention memory_write via MEMORY_INSTRUCTION"
         );
         assert!(
             prompt.contains("user prefers dark mode"),
             "system prompt should include the memory context"
+        );
+    }
+
+    /// Regression test: tool definitions must NOT appear as text in the system
+    /// prompt. They are already provided via the structured `tools` field of
+    /// `CompletionRequest`. Duplicating them in the system prompt caused 9×
+    /// token bloat on OpenAI and broke multi-step instruction following.
+    #[test]
+    fn system_prompt_does_not_contain_tool_descriptions() {
+        let prompt = build_reasoning_system_prompt(None);
+        assert!(
+            !prompt.contains("Available tools:"),
+            "system prompt must not contain 'Available tools:' text — \
+             tool definitions belong in the structured tools field, not the prompt"
+        );
+
+        // Also verify with memory context (second code path).
+        let prompt_with_memory = build_reasoning_system_prompt(Some("user likes cats"));
+        assert!(
+            !prompt_with_memory.contains("Available tools:"),
+            "system prompt with memory must not contain 'Available tools:' text"
         );
     }
 
@@ -2631,6 +4057,7 @@ mod phase2_tests {
         CompletionResponse, ContentBlock, Message, ProviderError, ToolCall, ToolDefinition,
     };
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     #[derive(Debug, Default)]
@@ -2694,6 +4121,53 @@ mod phase2_tests {
     }
 
     #[derive(Debug)]
+    struct CacheAwareToolExecutor {
+        clear_calls: Arc<AtomicUsize>,
+        stats: crate::act::ToolCacheStats,
+    }
+
+    impl CacheAwareToolExecutor {
+        fn new(clear_calls: Arc<AtomicUsize>, stats: crate::act::ToolCacheStats) -> Self {
+            Self { clear_calls, stats }
+        }
+    }
+
+    #[async_trait]
+    impl ToolExecutor for CacheAwareToolExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+            Ok(calls
+                .iter()
+                .map(|call| ToolResult {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    success: true,
+                    output: "ok".to_string(),
+                })
+                .collect())
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition {
+                name: "read_file".to_string(),
+                description: "Read a file".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+            }]
+        }
+
+        fn clear_cache(&self) {
+            self.clear_calls.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn cache_stats(&self) -> Option<crate::act::ToolCacheStats> {
+            Some(self.stats)
+        }
+    }
+
+    #[derive(Debug)]
     struct SequentialMockLlm {
         responses: Mutex<VecDeque<CompletionResponse>>,
     }
@@ -2739,23 +4213,33 @@ mod phase2_tests {
     }
 
     fn test_engine() -> LoopEngine {
-        LoopEngine::new(
-            BudgetTracker::new(crate::budget::BudgetConfig::default(), 0, 0),
-            ContextCompactor::new(2048, 256),
-            3,
-            Arc::new(StubToolExecutor),
-            "Summarize tool output".to_string(),
-        )
+        LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                current_time_ms(),
+                0,
+            ))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(StubToolExecutor))
+            .synthesis_instruction("Summarize tool output".to_string())
+            .build()
+            .expect("test engine build")
     }
 
     fn failing_tool_engine() -> LoopEngine {
-        LoopEngine::new(
-            BudgetTracker::new(crate::budget::BudgetConfig::default(), 0, 0),
-            ContextCompactor::new(2048, 256),
-            3,
-            Arc::new(FailingToolExecutor),
-            "Summarize tool output".to_string(),
-        )
+        LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                current_time_ms(),
+                0,
+            ))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(FailingToolExecutor))
+            .synthesis_instruction("Summarize tool output".to_string())
+            .build()
+            .expect("test engine build")
     }
 
     fn test_snapshot(text: &str) -> PerceptionSnapshot {
@@ -2776,6 +4260,120 @@ mod phase2_tests {
             }),
             sensor_data: None,
             conversation_history: vec![Message::user(text)],
+            steer_context: None,
+        }
+    }
+
+    fn text_response(
+        text: &str,
+        stop_reason: Option<&str>,
+        usage: Option<fx_llm::Usage>,
+    ) -> CompletionResponse {
+        CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage,
+            stop_reason: stop_reason.map(|value| value.to_string()),
+        }
+    }
+
+    fn tool_call_response(
+        id: &str,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> CompletionResponse {
+        CompletionResponse {
+            content: Vec::new(),
+            tool_calls: vec![ToolCall {
+                id: id.to_string(),
+                name: name.to_string(),
+                arguments,
+            }],
+            usage: None,
+            stop_reason: Some("tool_use".to_string()),
+        }
+    }
+
+    fn expect_complete(result: LoopResult) -> (String, u32, Vec<Signal>) {
+        match result {
+            LoopResult::Complete {
+                response,
+                iterations,
+                signals,
+                ..
+            } => (response, iterations, signals),
+            other => panic!("expected LoopResult::Complete, got: {other:?}"),
+        }
+    }
+
+    fn has_truncation_trace(signals: &[Signal], step: LoopStep) -> bool {
+        signals.iter().any(|signal| {
+            signal.step == step
+                && signal.kind == SignalKind::Trace
+                && signal.message.starts_with("response truncated, continuing")
+        })
+    }
+
+    #[derive(Debug)]
+    struct StreamingCaptureLlm {
+        streamed_max_tokens: Mutex<Vec<u32>>,
+        complete_calls: Mutex<u32>,
+        output: String,
+    }
+
+    impl StreamingCaptureLlm {
+        fn new(output: &str) -> Self {
+            Self {
+                streamed_max_tokens: Mutex::new(Vec::new()),
+                complete_calls: Mutex::new(0),
+                output: output.to_string(),
+            }
+        }
+
+        fn streamed_max_tokens(&self) -> Vec<u32> {
+            self.streamed_max_tokens.lock().expect("lock").clone()
+        }
+
+        fn complete_calls(&self) -> u32 {
+            *self.complete_calls.lock().expect("lock")
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for StreamingCaptureLlm {
+        async fn generate(&self, _: &str, _: u32) -> Result<String, CoreLlmError> {
+            Ok(self.output.clone())
+        }
+
+        async fn generate_streaming(
+            &self,
+            _: &str,
+            max_tokens: u32,
+            callback: Box<dyn Fn(String) + Send + 'static>,
+        ) -> Result<String, CoreLlmError> {
+            self.streamed_max_tokens
+                .lock()
+                .expect("lock")
+                .push(max_tokens);
+            callback(self.output.clone());
+            Ok(self.output.clone())
+        }
+
+        fn model_name(&self) -> &str {
+            "stream-capture"
+        }
+
+        async fn complete(
+            &self,
+            _: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            let mut calls = self.complete_calls.lock().expect("lock");
+            *calls = calls.saturating_add(1);
+            Err(ProviderError::Provider(
+                "complete should not be called".to_string(),
+            ))
         }
     }
 
@@ -2996,14 +4594,16 @@ mod phase2_tests {
             max_cost_cents: 0,
             max_wall_time_ms: 0,
             max_recursion_depth: 0,
+            decompose_depth_mode: DepthMode::Adaptive,
         };
-        let mut engine = LoopEngine::new(
-            BudgetTracker::new(zero_budget, 0, 0),
-            ContextCompactor::new(2048, 256),
-            3,
-            Arc::new(StubToolExecutor),
-            "Summarize tool output".to_string(),
-        );
+        let mut engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(zero_budget, 0, 0))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(StubToolExecutor))
+            .synthesis_instruction("Summarize tool output".to_string())
+            .build()
+            .expect("test engine build");
 
         let llm = SequentialMockLlm::new(vec![CompletionResponse {
             content: vec![ContentBlock::Text {
@@ -3034,14 +4634,16 @@ mod phase2_tests {
             max_cost_cents: 0,
             max_wall_time_ms: 0,
             max_recursion_depth: 0,
+            decompose_depth_mode: DepthMode::Adaptive,
         };
-        let mut engine = LoopEngine::new(
-            BudgetTracker::new(zero_budget, 0, 0),
-            ContextCompactor::new(2048, 256),
-            3,
-            Arc::new(StubToolExecutor),
-            "Summarize tool output".to_string(),
-        );
+        let mut engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(zero_budget, 0, 0))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(StubToolExecutor))
+            .synthesis_instruction("Summarize tool output".to_string())
+            .build()
+            .expect("test engine build");
 
         let llm = SequentialMockLlm::new(vec![CompletionResponse {
             content: vec![ContentBlock::Text {
@@ -3117,6 +4719,119 @@ mod phase2_tests {
         assert!(signals
             .iter()
             .any(|s| s.step == LoopStep::Continue && s.kind == SignalKind::Decision));
+    }
+
+    #[tokio::test]
+    async fn run_cycle_clears_tool_cache_at_cycle_boundary() {
+        let clear_calls = Arc::new(AtomicUsize::new(0));
+        let stats = crate::act::ToolCacheStats::default();
+        let executor = CacheAwareToolExecutor::new(Arc::clone(&clear_calls), stats);
+        let mut engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                0,
+                0,
+            ))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(executor))
+            .synthesis_instruction("Summarize tool output".to_string())
+            .build()
+            .expect("test engine build");
+
+        let llm = SequentialMockLlm::new(vec![
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "one".to_string(),
+                }],
+                tool_calls: Vec::new(),
+                usage: None,
+                stop_reason: None,
+            },
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "two".to_string(),
+                }],
+                tool_calls: Vec::new(),
+                usage: None,
+                stop_reason: None,
+            },
+        ]);
+
+        engine
+            .run_cycle(test_snapshot("hello"), &llm)
+            .await
+            .expect("first cycle");
+        engine
+            .run_cycle(test_snapshot("hello"), &llm)
+            .await
+            .expect("second cycle");
+
+        assert_eq!(clear_calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn run_cycle_emits_tool_cache_stats_signal() {
+        let clear_calls = Arc::new(AtomicUsize::new(0));
+        let stats = crate::act::ToolCacheStats {
+            hits: 2,
+            misses: 1,
+            entries: 4,
+            evictions: 1,
+        };
+        let executor = CacheAwareToolExecutor::new(Arc::clone(&clear_calls), stats);
+        let mut engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                0,
+                0,
+            ))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(executor))
+            .synthesis_instruction("Summarize tool output".to_string())
+            .build()
+            .expect("test engine build");
+
+        let llm = SequentialMockLlm::new(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "done".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let result = engine
+            .run_cycle(test_snapshot("hello"), &llm)
+            .await
+            .expect("run cycle");
+        let signals = match result {
+            LoopResult::Complete { signals, .. }
+            | LoopResult::BudgetExhausted { signals, .. }
+            | LoopResult::NeedsInput { signals, .. }
+            | LoopResult::UserStopped { signals, .. }
+            | LoopResult::Error { signals, .. } => signals,
+        };
+
+        let cache_signal = signals
+            .iter()
+            .find(|signal| {
+                signal.step == LoopStep::Act
+                    && signal.kind == SignalKind::Performance
+                    && signal.message == "tool cache stats"
+            })
+            .expect("cache stats signal");
+
+        assert_eq!(cache_signal.metadata["hits"], serde_json::json!(2));
+        assert_eq!(cache_signal.metadata["misses"], serde_json::json!(1));
+        assert_eq!(cache_signal.metadata["entries"], serde_json::json!(4));
+        assert_eq!(cache_signal.metadata["evictions"], serde_json::json!(1));
+        assert_eq!(
+            cache_signal.metadata["hit_rate"],
+            serde_json::json!(2.0 / 3.0)
+        );
+        assert_eq!(clear_calls.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -3280,6 +4995,393 @@ mod phase2_tests {
                 && signal.kind == SignalKind::Trace
                 && signal.message == "tool continuation returned empty text; using safe fallback"
         }));
+    }
+
+    #[test]
+    fn is_truncated_detects_anthropic_stop_reason() {
+        assert!(is_truncated(Some("max_tokens")));
+        assert!(is_truncated(Some("MAX_TOKENS")));
+    }
+
+    #[test]
+    fn is_truncated_detects_openai_finish_reason() {
+        assert!(is_truncated(Some("length")));
+        assert!(is_truncated(Some("LENGTH")));
+    }
+
+    #[test]
+    fn is_truncated_handles_none_and_unknown() {
+        assert!(!is_truncated(None));
+        assert!(!is_truncated(Some("stop")));
+        assert!(!is_truncated(Some("tool_use")));
+    }
+
+    #[test]
+    fn merge_usage_combines_token_counts() {
+        let merged = merge_usage(
+            Some(fx_llm::Usage {
+                input_tokens: 100,
+                output_tokens: 25,
+            }),
+            Some(fx_llm::Usage {
+                input_tokens: 30,
+                output_tokens: 10,
+            }),
+        )
+        .expect("usage should merge");
+        assert_eq!(merged.input_tokens, 130);
+        assert_eq!(merged.output_tokens, 35);
+
+        let right_only = merge_usage(
+            None,
+            Some(fx_llm::Usage {
+                input_tokens: 7,
+                output_tokens: 3,
+            }),
+        )
+        .expect("right usage should be preserved");
+        assert_eq!(right_only.input_tokens, 7);
+        assert_eq!(right_only.output_tokens, 3);
+
+        assert!(merge_usage(None, None).is_none());
+    }
+
+    #[test]
+    fn merge_continuation_response_preserves_tool_calls_when_continuation_has_none() {
+        let previous = CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "preface".to_string(),
+            }],
+            tool_calls: vec![ToolCall {
+                id: "call-1".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path":"README.md"}),
+            }],
+            usage: None,
+            stop_reason: Some("max_tokens".to_string()),
+        };
+        let continued = text_response(" continuation", Some("stop"), None);
+        let mut full_text = "preface".to_string();
+
+        let merged = merge_continuation_response(previous, continued, &mut full_text);
+
+        assert_eq!(merged.tool_calls.len(), 1);
+        assert_eq!(merged.tool_calls[0].id, "call-1");
+    }
+
+    #[test]
+    fn build_truncation_continuation_request_enables_tools_only_for_reason_step() {
+        let tool_definitions = vec![ToolDefinition {
+            name: "read_file".to_string(),
+            description: "Read a file".to_string(),
+            parameters: serde_json::json!({"type":"object"}),
+        }];
+        let messages = vec![Message::user("continue")];
+
+        let reason_request = build_truncation_continuation_request(
+            "mock",
+            &messages,
+            tool_definitions.clone(),
+            None,
+            LoopStep::Reason,
+        );
+        let act_request = build_truncation_continuation_request(
+            "mock",
+            &messages,
+            tool_definitions,
+            None,
+            LoopStep::Act,
+        );
+
+        assert!(reason_request
+            .tools
+            .iter()
+            .any(|tool| tool.name == "read_file"));
+        assert!(act_request.tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn continue_truncated_response_stitches_text() {
+        let mut engine = test_engine();
+        let initial = text_response(
+            "Hello",
+            Some("max_tokens"),
+            Some(fx_llm::Usage {
+                input_tokens: 10,
+                output_tokens: 4,
+            }),
+        );
+        let llm = SequentialMockLlm::new(vec![text_response(
+            " world",
+            Some("stop"),
+            Some(fx_llm::Usage {
+                input_tokens: 3,
+                output_tokens: 2,
+            }),
+        )]);
+
+        let stitched = engine
+            .continue_truncated_response(initial, &[Message::user("hello")], &llm, LoopStep::Reason)
+            .await
+            .expect("continuation should succeed");
+
+        assert_eq!(extract_response_text(&stitched), "Hello world");
+        assert_eq!(stitched.stop_reason.as_deref(), Some("stop"));
+        let usage = stitched.usage.expect("usage should be merged");
+        assert_eq!(usage.input_tokens, 13);
+        assert_eq!(usage.output_tokens, 6);
+    }
+
+    #[tokio::test]
+    async fn continue_truncated_response_respects_max_attempts() {
+        let mut engine = test_engine();
+        let initial = text_response("A", Some("max_tokens"), None);
+        let llm = SequentialMockLlm::new(vec![
+            text_response("B", Some("max_tokens"), None),
+            text_response("C", Some("max_tokens"), None),
+            text_response("D", Some("max_tokens"), None),
+        ]);
+
+        let stitched = engine
+            .continue_truncated_response(
+                initial,
+                &[Message::user("continue")],
+                &llm,
+                LoopStep::Reason,
+            )
+            .await
+            .expect("continuation should stop at max attempts");
+
+        assert_eq!(extract_response_text(&stitched), "ABCD");
+        assert_eq!(stitched.stop_reason.as_deref(), Some("max_tokens"));
+    }
+
+    #[tokio::test]
+    async fn continue_truncated_response_stops_on_natural_end() {
+        let mut engine = test_engine();
+        let initial = text_response("A", Some("max_tokens"), None);
+        let llm = SequentialMockLlm::new(vec![
+            text_response("B", Some("stop"), None),
+            text_response("C", Some("max_tokens"), None),
+        ]);
+
+        let stitched = engine
+            .continue_truncated_response(
+                initial,
+                &[Message::user("continue")],
+                &llm,
+                LoopStep::Reason,
+            )
+            .await
+            .expect("continuation should stop when natural stop reason arrives");
+
+        assert_eq!(extract_response_text(&stitched), "AB");
+        assert_eq!(stitched.stop_reason.as_deref(), Some("stop"));
+    }
+
+    #[tokio::test]
+    async fn run_cycle_auto_continues_truncated_response() {
+        let mut engine = test_engine();
+        let llm = SequentialMockLlm::new(vec![
+            text_response("First half", Some("max_tokens"), None),
+            text_response(" second half", Some("stop"), None),
+        ]);
+
+        let result = engine
+            .run_cycle(test_snapshot("finish your sentence"), &llm)
+            .await
+            .expect("run_cycle should succeed");
+        let (response, iterations, _) = expect_complete(result);
+
+        assert_eq!(iterations, 1);
+        assert_eq!(response, "First half second half");
+    }
+
+    #[tokio::test]
+    async fn tool_continuation_auto_continues_truncated_response() {
+        let mut engine = test_engine();
+        let llm = SequentialMockLlm::new(vec![
+            tool_call_response(
+                "call-1",
+                "read_file",
+                serde_json::json!({"path":"README.md"}),
+            ),
+            text_response("Tool answer part", Some("length"), None),
+            text_response(" two", Some("stop"), None),
+        ]);
+
+        let result = engine
+            .run_cycle(test_snapshot("read the file"), &llm)
+            .await
+            .expect("run_cycle should succeed");
+        let (response, iterations, _) = expect_complete(result);
+
+        assert_eq!(iterations, 1);
+        assert_eq!(response, "Tool answer part two");
+    }
+
+    #[tokio::test]
+    async fn reason_truncation_continuation_preserves_initial_tool_calls() {
+        let mut engine = test_engine();
+        let llm = SequentialMockLlm::new(vec![
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "I will read the file".to_string(),
+                }],
+                tool_calls: vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path":"README.md"}),
+                }],
+                usage: None,
+                stop_reason: Some("max_tokens".to_string()),
+            },
+            text_response(" and summarize it", Some("stop"), None),
+            text_response("tool executed", Some("stop"), None),
+        ]);
+
+        let result = engine
+            .run_cycle(test_snapshot("read the file"), &llm)
+            .await
+            .expect("run_cycle should succeed");
+        let (response, _, signals) = expect_complete(result);
+
+        assert_eq!(response, "tool executed");
+        assert!(has_truncation_trace(&signals, LoopStep::Reason));
+        assert!(signals.iter().any(|signal| {
+            signal.step == LoopStep::Act
+                && signal.kind == SignalKind::Success
+                && signal.message == "tool read_file"
+        }));
+    }
+
+    #[tokio::test]
+    async fn finalize_tool_response_receives_stitched_text_after_continuation() {
+        let mut engine = test_engine();
+        let overlap = "x".repeat(90);
+        let first = format!("Start {overlap}");
+        let second = format!("{overlap} End");
+        let expected = format!("Start {overlap} End");
+        let llm = SequentialMockLlm::new(vec![
+            tool_call_response(
+                "call-1",
+                "read_file",
+                serde_json::json!({"path":"README.md"}),
+            ),
+            text_response(&first, Some("max_tokens"), None),
+            text_response(&second, Some("stop"), None),
+        ]);
+
+        let result = engine
+            .run_cycle(test_snapshot("summarize tool output"), &llm)
+            .await
+            .expect("run_cycle should succeed");
+        let (response, _, _) = expect_complete(result);
+
+        assert_eq!(response, expected);
+    }
+
+    #[tokio::test]
+    async fn truncation_continuation_emits_reason_and_act_trace_signals() {
+        let mut reason_engine = test_engine();
+        let reason_llm = SequentialMockLlm::new(vec![
+            text_response("Reason part", Some("max_tokens"), None),
+            text_response(" complete", Some("stop"), None),
+        ]);
+
+        let reason_result = reason_engine
+            .run_cycle(test_snapshot("reason continuation"), &reason_llm)
+            .await
+            .expect("reason run should succeed");
+        let (_, _, reason_signals) = expect_complete(reason_result);
+        assert!(has_truncation_trace(&reason_signals, LoopStep::Reason));
+
+        let mut act_engine = test_engine();
+        let act_llm = SequentialMockLlm::new(vec![
+            tool_call_response(
+                "call-1",
+                "read_file",
+                serde_json::json!({"path":"README.md"}),
+            ),
+            text_response("Act part", Some("length"), None),
+            text_response(" complete", Some("stop"), None),
+        ]);
+
+        let act_result = act_engine
+            .run_cycle(test_snapshot("act continuation"), &act_llm)
+            .await
+            .expect("act run should succeed");
+        let (_, _, act_signals) = expect_complete(act_result);
+        assert!(has_truncation_trace(&act_signals, LoopStep::Act));
+    }
+
+    #[tokio::test]
+    async fn continuation_calls_record_budget() {
+        let mut baseline_engine = test_engine();
+        let baseline_llm = SequentialMockLlm::new(vec![text_response("done", Some("stop"), None)]);
+        baseline_engine
+            .run_cycle(test_snapshot("baseline"), &baseline_llm)
+            .await
+            .expect("baseline run should succeed");
+        let baseline_calls = baseline_engine.status(current_time_ms()).llm_calls_used;
+
+        let mut continuation_engine = test_engine();
+        let continuation_llm = SequentialMockLlm::new(vec![
+            text_response("first", Some("max_tokens"), None),
+            text_response(" second", Some("stop"), None),
+        ]);
+        continuation_engine
+            .run_cycle(test_snapshot("needs continuation"), &continuation_llm)
+            .await
+            .expect("continuation run should succeed");
+        let continuation_calls = continuation_engine.status(current_time_ms()).llm_calls_used;
+
+        assert_eq!(continuation_calls, baseline_calls.saturating_add(1));
+    }
+
+    #[test]
+    fn raised_max_tokens_constants_are_applied() {
+        assert_eq!(REASONING_MAX_OUTPUT_TOKENS, 4096);
+        assert_eq!(TOOL_SYNTHESIS_MAX_OUTPUT_TOKENS, 1024);
+
+        let perception = ProcessedPerception {
+            user_message: "hello".to_string(),
+            context_window: vec![Message::user("hello")],
+            active_goals: vec!["reply".to_string()],
+            budget_remaining: BudgetRemaining {
+                llm_calls: 8,
+                tool_invocations: 16,
+                tokens: 10_000,
+                cost_cents: 100,
+                wall_time_ms: 1_000,
+            },
+            steer_context: None,
+        };
+
+        let reasoning_request = build_reasoning_request(&perception, "mock", vec![], None);
+        let continuation_request =
+            build_continuation_request(&perception.context_window, "mock", vec![], None);
+
+        assert_eq!(reasoning_request.max_tokens, Some(4096));
+        assert_eq!(continuation_request.max_tokens, Some(4096));
+    }
+
+    #[tokio::test]
+    async fn tool_synthesis_uses_raised_token_cap_without_stop_reason_assumptions() {
+        let engine = test_engine();
+        let llm = StreamingCaptureLlm::new("summary from stream");
+
+        let summary = engine
+            .generate_tool_summary("summarize this", &llm)
+            .await
+            .expect("streaming synthesis should succeed");
+
+        assert_eq!(summary, "summary from stream");
+        assert_eq!(
+            llm.streamed_max_tokens(),
+            vec![TOOL_SYNTHESIS_MAX_OUTPUT_TOKENS]
+        );
+        assert_eq!(llm.complete_calls(), 0);
     }
 
     // B2: extract_readable_text unit tests
@@ -3505,13 +5607,18 @@ mod phase4_tests {
     }
 
     fn p4_engine() -> LoopEngine {
-        LoopEngine::new(
-            BudgetTracker::new(crate::budget::BudgetConfig::default(), 0, 0),
-            ContextCompactor::new(2048, 256),
-            3,
-            Arc::new(Phase4StubToolExecutor),
-            "Summarize tool output".to_string(),
-        )
+        LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                0,
+                0,
+            ))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(Phase4StubToolExecutor))
+            .synthesis_instruction("Summarize tool output".to_string())
+            .build()
+            .expect("test engine build")
     }
 
     fn p4_snapshot(text: &str) -> PerceptionSnapshot {
@@ -3532,6 +5639,7 @@ mod phase4_tests {
             }),
             sensor_data: None,
             conversation_history: vec![Message::user(text)],
+            steer_context: None,
         }
     }
 
@@ -3665,13 +5773,18 @@ mod phase4_tests {
 
     #[tokio::test]
     async fn act_with_tools_falls_back_to_synthesis_on_max_iterations() {
-        let mut engine = LoopEngine::new(
-            BudgetTracker::new(crate::budget::BudgetConfig::default(), 0, 0),
-            ContextCompactor::new(2048, 256),
-            1,
-            Arc::new(Phase4StubToolExecutor),
-            "Summarize tool output".to_string(),
-        );
+        let mut engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                0,
+                0,
+            ))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(1)
+            .tool_executor(Arc::new(Phase4StubToolExecutor))
+            .synthesis_instruction("Summarize tool output".to_string())
+            .build()
+            .expect("test engine build");
         let decision = Decision::UseTools(vec![read_file_call("call-1", "a.txt")]);
         let llm = Phase4MockLlm::new(vec![tool_use_response(vec![read_file_call(
             "call-2", "b.txt",
@@ -4072,11 +6185,13 @@ mod cancellation_tests {
     use crate::cancellation::CancellationToken;
     use crate::input::{loop_input_channel, LoopCommand};
     use async_trait::async_trait;
+    use futures_util::StreamExt;
     use fx_core::error::LlmError as CoreLlmError;
+    use fx_core::message::{InternalMessage, StreamPhase};
     use fx_core::types::{InputSource, ScreenState, UserInput};
     use fx_llm::{
-        CompletionRequest, CompletionResponse, ContentBlock, Message, ProviderError, ToolCall,
-        ToolDefinition,
+        CompletionRequest, CompletionResponse, CompletionStream, ContentBlock, Message,
+        ProviderError, StreamChunk, ToolCall, ToolDefinition, ToolUseDelta, Usage,
     };
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4216,14 +6331,61 @@ mod cancellation_tests {
         }
     }
 
+    #[derive(Debug)]
+    struct PartialErrorStreamLlm;
+
+    #[async_trait]
+    impl LlmProvider for PartialErrorStreamLlm {
+        async fn generate(&self, _: &str, _: u32) -> Result<String, CoreLlmError> {
+            Ok("summary".to_string())
+        }
+
+        async fn generate_streaming(
+            &self,
+            _: &str,
+            _: u32,
+            callback: Box<dyn Fn(String) + Send + 'static>,
+        ) -> Result<String, CoreLlmError> {
+            callback("summary".to_string());
+            Ok("summary".to_string())
+        }
+
+        fn model_name(&self) -> &str {
+            "partial-error-stream"
+        }
+
+        async fn complete_stream(
+            &self,
+            _: CompletionRequest,
+        ) -> Result<CompletionStream, ProviderError> {
+            let chunks = vec![
+                Ok(StreamChunk {
+                    delta_content: Some("partial".to_string()),
+                    tool_use_deltas: Vec::new(),
+                    usage: None,
+                    stop_reason: None,
+                }),
+                Err(ProviderError::Streaming(
+                    "simulated stream failure".to_string(),
+                )),
+            ];
+            Ok(Box::pin(futures_util::stream::iter(chunks)))
+        }
+    }
+
     fn engine_with_executor(executor: Arc<dyn ToolExecutor>, max_iterations: u32) -> LoopEngine {
-        LoopEngine::new(
-            BudgetTracker::new(crate::budget::BudgetConfig::default(), 0, 0),
-            ContextCompactor::new(2048, 256),
-            max_iterations,
-            executor,
-            "Summarize tool output".to_string(),
-        )
+        LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                0,
+                0,
+            ))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(max_iterations)
+            .tool_executor(executor)
+            .synthesis_instruction("Summarize tool output".to_string())
+            .build()
+            .expect("test engine build")
     }
 
     fn test_snapshot(text: &str) -> PerceptionSnapshot {
@@ -4244,6 +6406,7 @@ mod cancellation_tests {
             }),
             sensor_data: None,
             conversation_history: vec![Message::user(text)],
+            steer_context: None,
         }
     }
 
@@ -4289,6 +6452,49 @@ mod cancellation_tests {
             tool_calls: Vec::new(),
             usage: None,
             stop_reason: None,
+        }
+    }
+
+    fn tool_delta(id: &str, name: Option<&str>, arguments_delta: &str, done: bool) -> ToolUseDelta {
+        ToolUseDelta {
+            id: Some(id.to_string()),
+            name: name.map(ToString::to_string),
+            arguments_delta: Some(arguments_delta.to_string()),
+            arguments_done: done,
+        }
+    }
+
+    fn single_tool_chunk(delta: ToolUseDelta, stop_reason: Option<&str>) -> StreamChunk {
+        StreamChunk {
+            delta_content: None,
+            tool_use_deltas: vec![delta],
+            usage: None,
+            stop_reason: stop_reason.map(ToString::to_string),
+        }
+    }
+
+    fn assert_tool_path(response: &CompletionResponse, id: &str, path: &str) {
+        let call = response
+            .tool_calls
+            .iter()
+            .find(|call| call.id == id)
+            .expect("tool call exists");
+        assert_eq!(call.arguments, serde_json::json!({"path": path}));
+    }
+
+    fn reason_perception(message: &str) -> ProcessedPerception {
+        ProcessedPerception {
+            user_message: message.to_string(),
+            context_window: vec![Message::user(message)],
+            active_goals: vec!["reply".to_string()],
+            budget_remaining: BudgetRemaining {
+                llm_calls: 3,
+                tool_invocations: 3,
+                tokens: 100,
+                cost_cents: 10,
+                wall_time_ms: 1_000,
+            },
+            steer_context: None,
         }
     }
 
@@ -4339,22 +6545,431 @@ mod cancellation_tests {
     }
 
     #[test]
-    fn check_user_input_prioritizes_abort_over_queued_commands() {
+    fn check_user_input_priority_order_is_abort_stop_wait_resume_status_steer() {
         let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
         let (sender, channel) = loop_input_channel();
         engine.set_input_channel(channel);
 
-        sender.send(LoopCommand::Stop).expect("send Stop");
-        sender.send(LoopCommand::Abort).expect("send Abort");
-        sender.send(LoopCommand::Resume).expect("send Resume");
+        sender
+            .send(LoopCommand::Steer("first".to_string()))
+            .expect("steer");
+        sender.send(LoopCommand::StatusQuery).expect("status");
+        sender.send(LoopCommand::Wait).expect("wait");
+        sender.send(LoopCommand::Resume).expect("resume");
+        sender.send(LoopCommand::Stop).expect("stop");
+        sender.send(LoopCommand::Abort).expect("abort");
 
         assert_eq!(engine.check_user_input(), Some(LoopCommand::Abort));
+    }
+
+    #[test]
+    fn check_user_input_prioritizes_stop_over_wait_resume() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let (sender, channel) = loop_input_channel();
+        engine.set_input_channel(channel);
+
+        sender.send(LoopCommand::Wait).expect("wait");
+        sender.send(LoopCommand::Resume).expect("resume");
+        sender.send(LoopCommand::Stop).expect("stop");
+
+        assert_eq!(engine.check_user_input(), Some(LoopCommand::Stop));
+    }
+
+    #[test]
+    fn check_user_input_keeps_latest_wait_resume_when_no_stop_or_abort() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let (sender, channel) = loop_input_channel();
+        engine.set_input_channel(channel);
+
+        sender.send(LoopCommand::Wait).expect("wait");
+        sender.send(LoopCommand::Resume).expect("resume");
+
+        assert_eq!(engine.check_user_input(), Some(LoopCommand::Resume));
+    }
+
+    #[test]
+    fn status_query_publishes_system_status_without_altering_flow() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let bus = fx_core::EventBus::new(4);
+        let mut receiver = bus.subscribe();
+        engine.set_event_bus(bus);
+
+        let (sender, channel) = loop_input_channel();
+        engine.set_input_channel(channel);
+        sender.send(LoopCommand::StatusQuery).expect("status");
+
+        assert_eq!(engine.check_user_input(), None);
+        let event = receiver.try_recv().expect("status event");
+        assert!(matches!(event, InternalMessage::SystemStatus { .. }));
+    }
+
+    #[test]
+    fn format_system_status_message_matches_spec_template() {
+        let status = LoopStatus {
+            iteration_count: 2,
+            max_iterations: 7,
+            llm_calls_used: 3,
+            tool_invocations_used: 5,
+            tokens_used: 144,
+            cost_cents_used: 11,
+            remaining: BudgetRemaining {
+                llm_calls: 4,
+                tool_invocations: 6,
+                tokens: 856,
+                cost_cents: 89,
+                wall_time_ms: 12_000,
+            },
+        };
+
+        assert_eq!(
+            format_system_status_message(&status),
+            "status: iter=2/7 llm=3 tools=5 tokens=144 cost_cents=11 remaining(llm=4,tools=6,tokens=856,cost_cents=89)"
+        );
+    }
+
+    #[tokio::test]
+    async fn steer_dedups_and_applies_latest_value_in_perceive_window() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let (sender, channel) = loop_input_channel();
+        engine.set_input_channel(channel);
+
+        sender
+            .send(LoopCommand::Steer("earlier".to_string()))
+            .expect("steer");
+        sender
+            .send(LoopCommand::Steer("latest".to_string()))
+            .expect("steer");
+
+        assert_eq!(engine.check_user_input(), None);
+
+        let processed = engine
+            .perceive(&test_snapshot("hello"))
+            .await
+            .expect("perceive");
+        assert_eq!(processed.steer_context.as_deref(), Some("latest"));
+
+        let next = engine
+            .perceive(&test_snapshot("hello again"))
+            .await
+            .expect("perceive");
+        assert_eq!(next.steer_context, None);
+    }
+
+    #[test]
+    fn reasoning_user_prompt_includes_steer_context() {
+        let perception = ProcessedPerception {
+            user_message: "hello".to_string(),
+            context_window: vec![Message::user("hello")],
+            active_goals: vec!["reply".to_string()],
+            budget_remaining: BudgetRemaining {
+                llm_calls: 3,
+                tool_invocations: 3,
+                tokens: 100,
+                cost_cents: 1,
+                wall_time_ms: 100,
+            },
+            steer_context: Some("be concise".to_string()),
+        };
+
+        let prompt = reasoning_user_prompt(&perception);
+        assert!(prompt.contains("User steer (latest): be concise"));
     }
 
     #[test]
     fn check_cancellation_without_token_or_input_returns_none() {
         let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
         assert!(engine.check_cancellation(None).is_none());
+    }
+
+    #[tokio::test]
+    async fn consume_stream_with_events_publishes_delta_events() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let bus = fx_core::EventBus::new(8);
+        let mut receiver = bus.subscribe();
+        engine.set_event_bus(bus);
+
+        let mut stream: CompletionStream = Box::pin(futures_util::stream::iter(vec![
+            Ok(StreamChunk {
+                delta_content: Some("Hel".to_string()),
+                tool_use_deltas: Vec::new(),
+                usage: None,
+                stop_reason: None,
+            }),
+            Ok(StreamChunk {
+                delta_content: Some("lo".to_string()),
+                tool_use_deltas: Vec::new(),
+                usage: None,
+                stop_reason: Some("stop".to_string()),
+            }),
+        ]));
+
+        let response = engine
+            .consume_stream_with_events(&mut stream, StreamPhase::Reason)
+            .await
+            .expect("stream consumed");
+
+        assert_eq!(extract_response_text(&response), "Hello");
+        assert_eq!(response.stop_reason.as_deref(), Some("stop"));
+
+        let first = receiver.try_recv().expect("first delta");
+        let second = receiver.try_recv().expect("second delta");
+        assert!(matches!(
+            first,
+            InternalMessage::StreamDelta { delta, phase }
+                if delta == "Hel" && phase == StreamPhase::Reason
+        ));
+        assert!(matches!(
+            second,
+            InternalMessage::StreamDelta { delta, phase }
+                if delta == "lo" && phase == StreamPhase::Reason
+        ));
+    }
+
+    #[tokio::test]
+    async fn consume_stream_with_events_assembles_tool_calls_from_deltas() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let mut stream: CompletionStream = Box::pin(futures_util::stream::iter(vec![
+            Ok(StreamChunk {
+                delta_content: None,
+                tool_use_deltas: vec![ToolUseDelta {
+                    id: Some("call-1".to_string()),
+                    name: Some("read_file".to_string()),
+                    arguments_delta: Some("{\"path\":\"READ".to_string()),
+                    arguments_done: false,
+                }],
+                usage: None,
+                stop_reason: None,
+            }),
+            Ok(StreamChunk {
+                delta_content: None,
+                tool_use_deltas: vec![ToolUseDelta {
+                    id: Some("call-1".to_string()),
+                    name: None,
+                    arguments_delta: Some("ME.md\"}".to_string()),
+                    arguments_done: true,
+                }],
+                usage: None,
+                stop_reason: Some("tool_use".to_string()),
+            }),
+        ]));
+
+        let response = engine
+            .consume_stream_with_events(&mut stream, StreamPhase::Synthesize)
+            .await
+            .expect("stream consumed");
+
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].id, "call-1");
+        assert_eq!(response.tool_calls[0].name, "read_file");
+        assert_eq!(
+            response.tool_calls[0].arguments,
+            serde_json::json!({"path":"README.md"})
+        );
+    }
+
+    #[tokio::test]
+    async fn consume_stream_with_events_keeps_distinct_calls_when_new_id_reuses_chunk_index_zero() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let chunks = vec![
+            Ok(single_tool_chunk(
+                tool_delta("call-1", Some("read_file"), "{\"path\":\"alpha.md\"}", true),
+                None,
+            )),
+            Ok(single_tool_chunk(
+                tool_delta("call-2", Some("read_file"), "{\"path\":\"beta.md\"}", true),
+                Some("tool_use"),
+            )),
+        ];
+        let mut stream: CompletionStream = Box::pin(futures_util::stream::iter(chunks));
+
+        let response = engine
+            .consume_stream_with_events(&mut stream, StreamPhase::Synthesize)
+            .await
+            .expect("stream consumed");
+
+        assert_eq!(response.tool_calls.len(), 2);
+        assert_tool_path(&response, "call-1", "alpha.md");
+        assert_tool_path(&response, "call-2", "beta.md");
+    }
+
+    #[tokio::test]
+    async fn consume_stream_with_events_supports_multi_tool_ids_across_chunks_same_local_index() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let chunks = vec![
+            Ok(single_tool_chunk(
+                tool_delta("call-1", Some("read_file"), "{\"path\":\"al", false),
+                None,
+            )),
+            Ok(single_tool_chunk(
+                tool_delta("call-2", Some("read_file"), "{\"path\":\"be", false),
+                None,
+            )),
+            Ok(single_tool_chunk(
+                tool_delta("call-1", None, "pha.md\"}", true),
+                None,
+            )),
+            Ok(single_tool_chunk(
+                tool_delta("call-2", None, "ta.md\"}", true),
+                Some("tool_use"),
+            )),
+        ];
+        let mut stream: CompletionStream = Box::pin(futures_util::stream::iter(chunks));
+
+        let response = engine
+            .consume_stream_with_events(&mut stream, StreamPhase::Synthesize)
+            .await
+            .expect("stream consumed");
+
+        assert_eq!(response.tool_calls.len(), 2);
+        assert_tool_path(&response, "call-1", "alpha.md");
+        assert_tool_path(&response, "call-2", "beta.md");
+    }
+
+    #[tokio::test]
+    async fn consume_stream_with_events_replaces_partial_args_with_done_payload() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let chunks = vec![
+            Ok(single_tool_chunk(
+                tool_delta("call-1", Some("read_file"), "{\"path\":\"READ", false),
+                None,
+            )),
+            Ok(single_tool_chunk(
+                tool_delta("call-1", None, "ME.md\"}", false),
+                None,
+            )),
+            Ok(single_tool_chunk(
+                tool_delta("call-1", None, "{\"path\":\"README.md\"}", true),
+                Some("tool_use"),
+            )),
+        ];
+        let mut stream: CompletionStream = Box::pin(futures_util::stream::iter(chunks));
+
+        let response = engine
+            .consume_stream_with_events(&mut stream, StreamPhase::Synthesize)
+            .await
+            .expect("stream consumed");
+
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_tool_path(&response, "call-1", "README.md");
+    }
+
+    #[tokio::test]
+    async fn reason_stream_error_after_partial_delta_emits_streaming_finished_once() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let bus = fx_core::EventBus::new(8);
+        let mut receiver = bus.subscribe();
+        engine.set_event_bus(bus);
+
+        let error = engine
+            .reason(&reason_perception("hello"), &PartialErrorStreamLlm)
+            .await
+            .expect_err("stream should fail");
+        assert!(error.reason.contains("stream consumption failed"));
+
+        let started = receiver.try_recv().expect("started event");
+        let delta = receiver.try_recv().expect("delta event");
+        let finished = receiver.try_recv().expect("finished event");
+        assert!(matches!(
+            started,
+            InternalMessage::StreamingStarted { phase } if phase == StreamPhase::Reason
+        ));
+        assert!(matches!(
+            delta,
+            InternalMessage::StreamDelta { delta, phase }
+                if delta == "partial" && phase == StreamPhase::Reason
+        ));
+        assert!(matches!(
+            finished,
+            InternalMessage::StreamingFinished { phase } if phase == StreamPhase::Reason
+        ));
+        assert!(
+            receiver.try_recv().is_err(),
+            "finished should be emitted once"
+        );
+    }
+
+    #[tokio::test]
+    async fn consume_stream_with_events_sets_cancelled_stop_reason_on_mid_stream_cancel() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let token = CancellationToken::new();
+        engine.set_cancel_token(token.clone());
+
+        let cancel_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            token.cancel();
+        });
+
+        let stream_values = vec![
+            StreamChunk {
+                delta_content: Some("first".to_string()),
+                tool_use_deltas: Vec::new(),
+                usage: None,
+                stop_reason: None,
+            },
+            StreamChunk {
+                delta_content: Some("second".to_string()),
+                tool_use_deltas: Vec::new(),
+                usage: None,
+                stop_reason: Some("stop".to_string()),
+            },
+        ];
+        let delayed = futures_util::stream::iter(stream_values).enumerate().then(
+            |(index, chunk)| async move {
+                if index == 1 {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Ok::<StreamChunk, ProviderError>(chunk)
+            },
+        );
+        let mut stream: CompletionStream = Box::pin(delayed);
+
+        let response = engine
+            .consume_stream_with_events(&mut stream, StreamPhase::Reason)
+            .await
+            .expect("stream consumed");
+        cancel_task.await.expect("cancel task");
+
+        assert_eq!(extract_response_text(&response), "first");
+        assert_eq!(response.stop_reason.as_deref(), Some("cancelled"));
+        assert!(response.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn response_to_chunk_converts_completion_response() {
+        let response = CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "hello".to_string(),
+            }],
+            tool_calls: vec![ToolCall {
+                id: "call-1".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path":"README.md"}),
+            }],
+            usage: Some(Usage {
+                input_tokens: 3,
+                output_tokens: 2,
+            }),
+            stop_reason: Some("stop".to_string()),
+        };
+
+        let chunk = response_to_chunk(response);
+        assert_eq!(chunk.delta_content.as_deref(), Some("hello"));
+        assert_eq!(chunk.stop_reason.as_deref(), Some("stop"));
+        assert_eq!(
+            chunk.usage,
+            Some(Usage {
+                input_tokens: 3,
+                output_tokens: 2,
+            })
+        );
+        assert_eq!(chunk.tool_use_deltas.len(), 1);
+        assert_eq!(chunk.tool_use_deltas[0].id.as_deref(), Some("call-1"));
+        assert_eq!(chunk.tool_use_deltas[0].name.as_deref(), Some("read_file"));
+        assert_eq!(
+            chunk.tool_use_deltas[0].arguments_delta.as_deref(),
+            Some("{\"path\":\"README.md\"}")
+        );
+        assert!(chunk.tool_use_deltas[0].arguments_done);
     }
 
     #[tokio::test]
@@ -4537,13 +7152,18 @@ mod fallback_retry_tests {
     }
 
     fn test_engine() -> LoopEngine {
-        LoopEngine::new(
-            BudgetTracker::new(crate::budget::BudgetConfig::default(), 0, 0),
-            ContextCompactor::new(2048, 256),
-            3,
-            Arc::new(StubToolExecutor),
-            "Summarize tool output".to_string(),
-        )
+        LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                0,
+                0,
+            ))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(StubToolExecutor))
+            .synthesis_instruction("Summarize tool output".to_string())
+            .build()
+            .expect("test engine build")
     }
 
     fn test_snapshot(text: &str) -> PerceptionSnapshot {
@@ -4564,6 +7184,7 @@ mod fallback_retry_tests {
             }),
             sensor_data: None,
             conversation_history: vec![Message::user(text)],
+            steer_context: None,
         }
     }
 
@@ -4742,13 +7363,18 @@ mod fallback_retry_tests {
 
     #[tokio::test]
     async fn run_cycle_exhausts_iterations_on_repeated_fallback() {
-        let mut engine = LoopEngine::new(
-            BudgetTracker::new(crate::budget::BudgetConfig::default(), 0, 0),
-            ContextCompactor::new(2048, 256),
-            2,
-            Arc::new(StubToolExecutor),
-            "Summarize".to_string(),
-        );
+        let mut engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                0,
+                0,
+            ))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(2)
+            .tool_executor(Arc::new(StubToolExecutor))
+            .synthesis_instruction("Summarize".to_string())
+            .build()
+            .expect("test engine build");
 
         // Both iterations return empty -> fallback each time
         let llm = SequentialMockLlm::new(vec![
@@ -4783,6 +7409,7 @@ mod decomposition_tests {
     use super::*;
     use crate::budget::BudgetConfig;
     use async_trait::async_trait;
+    use fx_core::message::InternalMessage;
     use fx_decompose::{AggregationStrategy, DecompositionPlan, SubGoal};
     use fx_llm::{
         CompletionRequest, CompletionResponse, ContentBlock, Message, ProviderError, ToolCall,
@@ -4866,7 +7493,11 @@ mod decomposition_tests {
         }
     }
 
-    fn budget_config(max_llm_calls: u32, max_recursion_depth: u32) -> BudgetConfig {
+    fn budget_config_with_mode(
+        max_llm_calls: u32,
+        max_recursion_depth: u32,
+        mode: DepthMode,
+    ) -> BudgetConfig {
         BudgetConfig {
             max_llm_calls,
             max_tool_invocations: 20,
@@ -4874,18 +7505,24 @@ mod decomposition_tests {
             max_cost_cents: 100,
             max_wall_time_ms: 60_000,
             max_recursion_depth,
+            decompose_depth_mode: mode,
         }
+    }
+
+    fn budget_config(max_llm_calls: u32, max_recursion_depth: u32) -> BudgetConfig {
+        budget_config_with_mode(max_llm_calls, max_recursion_depth, DepthMode::Static)
     }
 
     fn decomposition_engine(config: BudgetConfig, depth: u32) -> LoopEngine {
         let started_at_ms = current_time_ms();
-        LoopEngine::new(
-            BudgetTracker::new(config, started_at_ms, depth),
-            ContextCompactor::new(2048, 256),
-            4,
-            Arc::new(PassiveToolExecutor),
-            "Summarize tool output".to_string(),
-        )
+        LoopEngine::builder()
+            .budget(BudgetTracker::new(config, started_at_ms, depth))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(4)
+            .tool_executor(Arc::new(PassiveToolExecutor))
+            .synthesis_instruction("Summarize tool output".to_string())
+            .build()
+            .expect("test engine build")
     }
 
     fn decomposition_plan(descriptions: &[&str]) -> DecompositionPlan {
@@ -4895,12 +7532,30 @@ mod decomposition_tests {
                 .map(|description| SubGoal {
                     description: (*description).to_string(),
                     required_tools: Vec::new(),
-                    expected_output: format!("output for {description}"),
+                    expected_output: Some(format!("output for {description}")),
+                    complexity_hint: None,
                 })
                 .collect(),
             strategy: AggregationStrategy::Sequential,
             truncated_from: None,
         }
+    }
+
+    async fn collect_internal_events(
+        receiver: &mut tokio::sync::broadcast::Receiver<InternalMessage>,
+        count: usize,
+    ) -> Vec<InternalMessage> {
+        let mut events = Vec::with_capacity(count);
+        while events.len() < count {
+            let event = receiver.recv().await.expect("event");
+            if matches!(
+                event,
+                InternalMessage::SubGoalStarted { .. } | InternalMessage::SubGoalCompleted { .. }
+            ) {
+                events.push(event);
+            }
+        }
+        events
     }
 
     fn text_response(text: &str) -> CompletionResponse {
@@ -4912,6 +7567,72 @@ mod decomposition_tests {
             usage: None,
             stop_reason: None,
         }
+    }
+
+    fn decomposition_run_snapshot(text: &str) -> PerceptionSnapshot {
+        PerceptionSnapshot {
+            timestamp_ms: 1,
+            screen: ScreenState {
+                current_app: "terminal".to_string(),
+                elements: Vec::new(),
+                text_content: text.to_string(),
+            },
+            notifications: Vec::new(),
+            active_app: "terminal".to_string(),
+            user_input: Some(UserInput {
+                text: text.to_string(),
+                source: InputSource::Text,
+                timestamp: 1,
+                context_id: None,
+            }),
+            sensor_data: None,
+            conversation_history: vec![Message::user(text)],
+            steer_context: None,
+        }
+    }
+
+    fn decompose_plan_response(descriptions: &[&str]) -> CompletionResponse {
+        let sub_goals = descriptions
+            .iter()
+            .map(|description| serde_json::json!({"description": description}))
+            .collect::<Vec<_>>();
+        CompletionResponse {
+            content: Vec::new(),
+            tool_calls: vec![decompose_tool_call(serde_json::json!({
+                "sub_goals": sub_goals,
+                "strategy": "Sequential"
+            }))],
+            usage: None,
+            stop_reason: Some("tool_use".to_string()),
+        }
+    }
+
+    fn signals_from_result(result: &LoopResult) -> &[Signal] {
+        match result {
+            LoopResult::Complete { signals, .. }
+            | LoopResult::BudgetExhausted { signals, .. }
+            | LoopResult::NeedsInput { signals, .. }
+            | LoopResult::UserStopped { signals, .. }
+            | LoopResult::Error { signals, .. } => signals,
+        }
+    }
+
+    async fn run_budget_exhausted_decomposition_cycle() -> (LoopResult, usize) {
+        let mut engine = decomposition_engine(budget_config(4, 6), 0);
+        let llm = ScriptedLlm::new(vec![
+            Ok(decompose_plan_response(&["first", "second", "third"])),
+            Ok(text_response("   ")),
+            Ok(text_response("   ")),
+            Ok(text_response("   ")),
+        ]);
+        let result = engine
+            .run_cycle(
+                decomposition_run_snapshot("break this into sub-goals"),
+                &llm,
+            )
+            .await
+            .expect("run_cycle");
+        (result, llm.complete_calls())
     }
 
     fn decompose_tool_call(arguments: serde_json::Value) -> ToolCall {
@@ -4946,6 +7667,7 @@ mod decomposition_tests {
             context_window: vec![Message::user("context")],
             active_goals: vec!["Help the user".to_string()],
             budget_remaining: sample_budget_remaining(),
+            steer_context: None,
         }
     }
 
@@ -4967,8 +7689,8 @@ mod decomposition_tests {
     }
 
     #[tokio::test]
-    async fn decomposition_uses_half_remaining_budget_for_each_sub_goal() {
-        let mut engine = decomposition_engine(budget_config(4, 6), 0);
+    async fn decomposition_uses_allocator_plan_for_each_sub_goal() {
+        let mut engine = decomposition_engine(budget_config(20, 6), 0);
         let plan = decomposition_plan(&["first", "second", "third"]);
         let decision = Decision::Decompose(plan.clone());
         let llm = ScriptedLlm::new(vec![
@@ -4995,7 +7717,7 @@ mod decomposition_tests {
 
         let status = engine.status(current_time_ms());
         assert_eq!(status.llm_calls_used, 3);
-        assert_eq!(status.remaining.llm_calls, 1);
+        assert_eq!(status.remaining.llm_calls, 17);
         assert_eq!(status.tool_invocations_used, 0);
         assert_eq!(status.cost_cents_used, 6);
         assert!(status.tokens_used > 0);
@@ -5036,7 +7758,7 @@ mod decomposition_tests {
     }
 
     #[tokio::test]
-    async fn budget_exhausted_sub_goal_maps_to_budget_exhausted_outcome() {
+    async fn sub_goal_below_floor_maps_to_skipped_outcome() {
         let mut engine = decomposition_engine(budget_config(0, 6), 0);
         let plan = decomposition_plan(&["budget-limited"]);
         let decision = Decision::Decompose(plan.clone());
@@ -5050,7 +7772,46 @@ mod decomposition_tests {
         assert_eq!(llm.complete_calls(), 0);
         assert!(action
             .response_text
-            .contains("budget-limited => budget exhausted"));
+            .contains("budget-limited => skipped (below floor)"));
+    }
+
+    #[tokio::test]
+    async fn low_budget_decomposition_avoids_budget_exhaustion_signal() {
+        let (result, llm_calls) = run_budget_exhausted_decomposition_cycle().await;
+
+        assert!(matches!(&result, LoopResult::Complete { .. }));
+        assert_eq!(llm_calls, 1);
+
+        let blocked_budget_signals = signals_from_result(&result)
+            .iter()
+            .filter(|signal| {
+                signal.kind == SignalKind::Blocked && signal.message == "budget exhausted"
+            })
+            .count();
+        assert_eq!(blocked_budget_signals, 0);
+    }
+
+    #[tokio::test]
+    async fn low_budget_decomposition_skips_sub_goals_without_retry_storm() {
+        let (result, _llm_calls) = run_budget_exhausted_decomposition_cycle().await;
+
+        let response = match &result {
+            LoopResult::Complete { response, .. } => response,
+            other => panic!("expected LoopResult::Complete, got: {other:?}"),
+        };
+        assert!(response.contains("first => skipped (below floor)"));
+        assert!(response.contains("second => skipped (below floor)"));
+        assert!(response.contains("third => skipped (below floor)"));
+
+        let progress_signals = signals_from_result(&result)
+            .iter()
+            .filter(|signal| {
+                signal.step == LoopStep::Act
+                    && signal.kind == SignalKind::Trace
+                    && signal.message.starts_with("Sub-goal ")
+            })
+            .count();
+        assert_eq!(progress_signals, 3);
     }
 
     #[tokio::test]
@@ -5111,6 +7872,119 @@ mod decomposition_tests {
     }
 
     #[tokio::test]
+    async fn concurrent_execution_rolls_up_signals_from_all_children() {
+        let mut engine = decomposition_engine(budget_config(10, 6), 0);
+        let plan = concurrent_plan(&["signal-a", "signal-b"]);
+        let decision = Decision::Decompose(plan.clone());
+        let llm = ScriptedLlm::new(vec![Ok(text_response("one")), Ok(text_response("two"))]);
+
+        let _action = engine
+            .execute_decomposition(&decision, &plan, &llm, &[])
+            .await
+            .expect("decomposition");
+
+        let perceive_count = engine
+            .signals
+            .signals()
+            .iter()
+            .filter(|signal| signal.step == LoopStep::Perceive)
+            .count();
+        assert!(perceive_count >= 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_execution_emits_progress_events_via_event_bus() {
+        let mut engine = decomposition_engine(budget_config(10, 6), 0);
+        let bus = fx_core::EventBus::new(16);
+        let mut receiver = bus.subscribe();
+        engine.set_event_bus(bus);
+
+        let plan = concurrent_plan(&["first", "second"]);
+        let decision = Decision::Decompose(plan.clone());
+        let llm = ScriptedLlm::new(vec![Ok(text_response("one")), Ok(text_response("two"))]);
+
+        let _action = engine
+            .execute_decomposition(&decision, &plan, &llm, &[])
+            .await
+            .expect("decomposition");
+
+        let events = collect_internal_events(&mut receiver, 4).await;
+        assert_eq!(events.len(), 4);
+        assert!(events.iter().any(|event| {
+            matches!(event, InternalMessage::SubGoalStarted { index: 0, total: 2, description } if description == "first")
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(event, InternalMessage::SubGoalStarted { index: 1, total: 2, description } if description == "second")
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                InternalMessage::SubGoalCompleted {
+                    index: 0,
+                    total: 2,
+                    success: true
+                }
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                InternalMessage::SubGoalCompleted {
+                    index: 1,
+                    total: 2,
+                    success: true
+                }
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn sequential_execution_emits_progress_events_via_event_bus() {
+        let mut engine = decomposition_engine(budget_config(10, 6), 0);
+        let bus = fx_core::EventBus::new(16);
+        let mut receiver = bus.subscribe();
+        engine.set_event_bus(bus);
+
+        let plan = decomposition_plan(&["first", "second"]);
+        let decision = Decision::Decompose(plan.clone());
+        let llm = ScriptedLlm::new(vec![Ok(text_response("one")), Ok(text_response("two"))]);
+
+        let _action = engine
+            .execute_decomposition(&decision, &plan, &llm, &[])
+            .await
+            .expect("decomposition");
+
+        let events = collect_internal_events(&mut receiver, 4).await;
+        assert_eq!(events.len(), 4);
+        assert!(events.iter().any(|event| {
+            matches!(event, InternalMessage::SubGoalStarted { index: 0, total: 2, description } if description == "first")
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                InternalMessage::SubGoalCompleted {
+                    index: 0,
+                    total: 2,
+                    success: true
+                }
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(event, InternalMessage::SubGoalStarted { index: 1, total: 2, description } if description == "second")
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                InternalMessage::SubGoalCompleted {
+                    index: 1,
+                    total: 2,
+                    success: true
+                }
+            )
+        }));
+    }
+
+    #[tokio::test]
     async fn decomposition_emits_truncation_signal_when_plan_is_truncated() {
         let mut engine = decomposition_engine(budget_config(10, 6), 0);
         let mut plan = decomposition_plan(&["first"]);
@@ -5168,7 +8042,7 @@ mod decomposition_tests {
 
     #[tokio::test]
     async fn aggregated_response_includes_results_from_all_sub_goals() {
-        let mut engine = decomposition_engine(budget_config(10, 6), 0);
+        let mut engine = decomposition_engine(budget_config(20, 6), 0);
         let plan = decomposition_plan(&["analyze", "summarize"]);
         let decision = Decision::Decompose(plan.clone());
         let llm = ScriptedLlm::new(vec![
@@ -5273,7 +8147,10 @@ mod decomposition_tests {
                 assert_eq!(plan.sub_goals.len(), 1);
                 assert_eq!(plan.sub_goals[0].description, "Inspect crate configuration");
                 assert_eq!(plan.sub_goals[0].required_tools, vec!["read_file"]);
-                assert_eq!(plan.sub_goals[0].expected_output, "Cargo metadata");
+                assert_eq!(
+                    plan.sub_goals[0].expected_output,
+                    Some("Cargo metadata".to_string())
+                );
                 assert_eq!(plan.strategy, AggregationStrategy::Sequential);
                 assert_eq!(plan.truncated_from, None);
             }
@@ -5351,7 +8228,7 @@ mod decomposition_tests {
             content: Vec::new(),
             tool_calls: vec![decompose_tool_call(serde_json::json!({
                 "sub_goals": [{"description": "Inspect crate configuration"}],
-                "strategy": "Parallel"
+                "strategy": {"Custom": "fan-out"}
             }))],
             usage: None,
             stop_reason: None,
@@ -5362,9 +8239,7 @@ mod decomposition_tests {
             .await
             .expect_err("unsupported strategy");
         assert_eq!(error.stage, "decide");
-        assert!(error
-            .reason
-            .contains("unsupported decomposition strategy: Parallel"));
+        assert!(error.reason.contains("unsupported decomposition strategy"));
     }
 
     #[tokio::test]
@@ -5445,10 +8320,1812 @@ mod decomposition_tests {
                 assert_eq!(plan.sub_goals.len(), 1);
                 assert_eq!(plan.sub_goals[0].description, "Summarize findings");
                 assert!(plan.sub_goals[0].required_tools.is_empty());
-                assert_eq!(plan.sub_goals[0].expected_output, "");
+                assert_eq!(plan.sub_goals[0].expected_output, None);
+                assert_eq!(plan.sub_goals[0].complexity_hint, None);
                 assert_eq!(plan.strategy, AggregationStrategy::Sequential);
             }
             other => panic!("expected decomposition decision, got: {other:?}"),
         }
+    }
+
+    fn concurrent_plan(descriptions: &[&str]) -> DecompositionPlan {
+        DecompositionPlan {
+            sub_goals: descriptions
+                .iter()
+                .map(|d| SubGoal {
+                    description: (*d).to_string(),
+                    required_tools: Vec::new(),
+                    expected_output: Some(format!("output for {d}")),
+                    complexity_hint: None,
+                })
+                .collect(),
+            strategy: AggregationStrategy::Parallel,
+            truncated_from: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_strategy_accepted_by_decide() {
+        let mut engine = decomposition_engine(budget_config(10, 6), 0);
+        let response = CompletionResponse {
+            content: Vec::new(),
+            tool_calls: vec![decompose_tool_call(serde_json::json!({
+                "sub_goals": [{"description": "Check config"}],
+                "strategy": "Parallel"
+            }))],
+            usage: None,
+            stop_reason: None,
+        };
+        let decision = engine.decide(&response).await.expect("decision");
+        assert!(
+            matches!(decision, Decision::Decompose(p) if p.strategy == AggregationStrategy::Parallel)
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_execution_completes_all_sub_goals() {
+        let mut engine = decomposition_engine(budget_config(20, 6), 0);
+        let plan = concurrent_plan(&["first", "second", "third"]);
+        let decision = Decision::Decompose(plan.clone());
+        let llm = ScriptedLlm::new(vec![
+            Ok(text_response("first-ok")),
+            Ok(text_response("second-ok")),
+            Ok(text_response("third-ok")),
+        ]);
+        let action = engine
+            .execute_decomposition(&decision, &plan, &llm, &[])
+            .await
+            .expect("decomposition");
+        assert!(action
+            .response_text
+            .contains("first => completed: first-ok"));
+        assert!(action
+            .response_text
+            .contains("second => completed: second-ok"));
+        assert!(action
+            .response_text
+            .contains("third => completed: third-ok"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_execution_absorbs_budget_from_all_children() {
+        let mut engine = decomposition_engine(budget_config(20, 6), 0);
+        let plan = concurrent_plan(&["a", "b"]);
+        let decision = Decision::Decompose(plan.clone());
+        let llm = ScriptedLlm::new(vec![
+            Ok(text_response("a-done")),
+            Ok(text_response("b-done")),
+        ]);
+        engine
+            .execute_decomposition(&decision, &plan, &llm, &[])
+            .await
+            .expect("decomposition");
+        let status = engine.status(current_time_ms());
+        assert_eq!(status.llm_calls_used, 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_execution_rolls_up_signals() {
+        let mut engine = decomposition_engine(budget_config(20, 6), 0);
+        let plan = concurrent_plan(&["sig-a", "sig-b"]);
+        let decision = Decision::Decompose(plan.clone());
+        let llm = ScriptedLlm::new(vec![
+            Ok(text_response("a-done")),
+            Ok(text_response("b-done")),
+        ]);
+        engine
+            .execute_decomposition(&decision, &plan, &llm, &[])
+            .await
+            .expect("decomposition");
+        assert!(engine
+            .signals
+            .signals()
+            .iter()
+            .any(|s| s.step == LoopStep::Perceive));
+    }
+
+    #[tokio::test]
+    async fn concurrent_execution_handles_partial_failure() {
+        let mut engine = decomposition_engine(budget_config(20, 6), 0);
+        let plan = concurrent_plan(&["ok-1", "fail", "ok-2"]);
+        let decision = Decision::Decompose(plan.clone());
+        let llm = ScriptedLlm::new(vec![
+            Ok(text_response("ok-1-done")),
+            Err(ProviderError::Provider("boom".to_string())),
+            Ok(text_response("ok-2-done")),
+        ]);
+        let action = engine
+            .execute_decomposition(&decision, &plan, &llm, &[])
+            .await
+            .expect("decomposition");
+        assert!(action
+            .response_text
+            .contains("ok-1 => completed: ok-1-done"));
+        assert!(action.response_text.contains("fail => failed:"));
+        assert!(action
+            .response_text
+            .contains("ok-2 => completed: ok-2-done"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_execution_emits_event_bus_progress() {
+        let mut engine = decomposition_engine(budget_config(20, 6), 0);
+        let bus = fx_core::EventBus::new(32);
+        let mut rx = bus.subscribe();
+        engine.set_event_bus(bus);
+        let plan = concurrent_plan(&["ev-a", "ev-b"]);
+        let decision = Decision::Decompose(plan.clone());
+        let llm = ScriptedLlm::new(vec![Ok(text_response("a")), Ok(text_response("b"))]);
+        engine
+            .execute_decomposition(&decision, &plan, &llm, &[])
+            .await
+            .expect("decomposition");
+        let mut started = 0usize;
+        let mut completed = 0usize;
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                fx_core::message::InternalMessage::SubGoalStarted { .. } => started += 1,
+                fx_core::message::InternalMessage::SubGoalCompleted { .. } => completed += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(started, 2);
+        assert_eq!(completed, 2);
+    }
+
+    #[tokio::test]
+    async fn sequential_execution_emits_event_bus_progress() {
+        let mut engine = decomposition_engine(budget_config(20, 6), 0);
+        let bus = fx_core::EventBus::new(32);
+        let mut rx = bus.subscribe();
+        engine.set_event_bus(bus);
+        let plan = decomposition_plan(&["seq-a", "seq-b"]);
+        let decision = Decision::Decompose(plan.clone());
+        let llm = ScriptedLlm::new(vec![Ok(text_response("a")), Ok(text_response("b"))]);
+        engine
+            .execute_decomposition(&decision, &plan, &llm, &[])
+            .await
+            .expect("decomposition");
+        let mut started = 0usize;
+        let mut completed = 0usize;
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                fx_core::message::InternalMessage::SubGoalStarted { .. } => started += 1,
+                fx_core::message::InternalMessage::SubGoalCompleted { .. } => completed += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(started, 2);
+        assert_eq!(completed, 2);
+    }
+
+    #[test]
+    fn sequential_adaptive_allocation_gives_more_to_complex_sub_goals() {
+        let engine = decomposition_engine(budget_config_with_mode(40, 8, DepthMode::Adaptive), 0);
+        let plan = DecompositionPlan {
+            sub_goals: vec![
+                SubGoal {
+                    description: "quick note".to_string(),
+                    required_tools: Vec::new(),
+                    expected_output: None,
+                    complexity_hint: Some(ComplexityHint::Trivial),
+                },
+                SubGoal {
+                    description: "implement migration plan".to_string(),
+                    required_tools: vec!["read_file".to_string(), "edit".to_string()],
+                    expected_output: None,
+                    complexity_hint: Some(ComplexityHint::Complex),
+                },
+            ],
+            strategy: AggregationStrategy::Sequential,
+            truncated_from: None,
+        };
+        let allocator = BudgetAllocator::new();
+
+        let allocation = allocator.allocate(
+            &engine.budget,
+            &plan.sub_goals,
+            AllocationMode::Sequential,
+            current_time_ms(),
+        );
+
+        assert!(
+            allocation.sub_goal_budgets[1].max_llm_calls
+                > allocation.sub_goal_budgets[0].max_llm_calls
+        );
+    }
+
+    #[test]
+    fn concurrent_adaptive_allocation_distributes_proportionally() {
+        let engine = decomposition_engine(budget_config_with_mode(50, 8, DepthMode::Adaptive), 0);
+        let plan = DecompositionPlan {
+            sub_goals: vec![
+                SubGoal {
+                    description: "quick note".to_string(),
+                    required_tools: Vec::new(),
+                    expected_output: None,
+                    complexity_hint: Some(ComplexityHint::Trivial),
+                },
+                SubGoal {
+                    description: "complex migration".to_string(),
+                    required_tools: vec![
+                        "read".to_string(),
+                        "edit".to_string(),
+                        "test".to_string(),
+                    ],
+                    expected_output: None,
+                    complexity_hint: Some(ComplexityHint::Complex),
+                },
+            ],
+            strategy: AggregationStrategy::Parallel,
+            truncated_from: None,
+        };
+        let allocator = BudgetAllocator::new();
+
+        let allocation = allocator.allocate(
+            &engine.budget,
+            &plan.sub_goals,
+            AllocationMode::Concurrent,
+            current_time_ms(),
+        );
+
+        assert_eq!(allocation.sub_goal_budgets[0].max_llm_calls, 9);
+        assert_eq!(allocation.sub_goal_budgets[1].max_llm_calls, 36);
+    }
+
+    #[tokio::test]
+    async fn budget_floor_skips_non_viable_sub_goals_with_signal() {
+        let mut engine = decomposition_engine(budget_config(4, 6), 0);
+        let plan = decomposition_plan(&["first", "second", "third"]);
+        let decision = Decision::Decompose(plan.clone());
+        let llm = ScriptedLlm::new(vec![Ok(text_response("unused"))]);
+
+        let action = engine
+            .execute_decomposition(&decision, &plan, &llm, &[])
+            .await
+            .expect("decomposition");
+
+        assert!(action.response_text.contains("skipped (below floor)"));
+        let skipped_signal = engine
+            .signals
+            .signals()
+            .iter()
+            .find(|signal| {
+                signal.step == LoopStep::Act
+                    && signal.kind == SignalKind::Friction
+                    && signal.message.contains("skipped:")
+            })
+            .expect("skipped signal");
+        assert_eq!(
+            skipped_signal.metadata["reason"],
+            serde_json::json!("below_budget_floor")
+        );
+    }
+
+    #[test]
+    fn parent_continuation_budget_prevents_parent_starvation() {
+        let engine = decomposition_engine(budget_config(40, 8), 0);
+        let plan = decomposition_plan(&["one", "two"]);
+        let allocator = BudgetAllocator::new();
+        let remaining = engine.budget.remaining(current_time_ms());
+
+        let allocation = allocator.allocate(
+            &engine.budget,
+            &plan.sub_goals,
+            AllocationMode::Sequential,
+            current_time_ms(),
+        );
+
+        assert!(allocation.parent_continuation_budget.max_llm_calls >= 4);
+        let child_sum = allocation
+            .sub_goal_budgets
+            .iter()
+            .fold(0_u32, |acc, budget| {
+                acc.saturating_add(budget.max_llm_calls)
+            });
+        assert!(
+            child_sum
+                <= remaining
+                    .llm_calls
+                    .saturating_sub(allocation.parent_continuation_budget.max_llm_calls)
+        );
+    }
+
+    #[tokio::test]
+    async fn child_budget_increments_depth_and_inherits_effective_max_depth() {
+        let config = budget_config_with_mode(8, 3, DepthMode::Adaptive);
+        let engine = decomposition_engine(config, 0);
+        let remaining = engine.budget.remaining(current_time_ms());
+        let effective_cap = engine.effective_decomposition_depth_cap(&remaining);
+        let mut child_budget = budget_config_with_mode(8, 3, DepthMode::Adaptive);
+        engine.apply_effective_depth_cap(std::slice::from_mut(&mut child_budget), effective_cap);
+
+        let goal = SubGoal {
+            description: "child".to_string(),
+            required_tools: Vec::new(),
+            expected_output: None,
+            complexity_hint: None,
+        };
+        let llm = ScriptedLlm::new(vec![Ok(text_response("done"))]);
+        let execution = engine.run_sub_goal(&goal, child_budget, &llm, &[]).await;
+
+        assert_eq!(execution.budget.depth(), 1);
+        assert_eq!(execution.budget.config().max_recursion_depth, effective_cap);
+    }
+
+    #[test]
+    fn format_sub_goal_outcome_includes_skipped_variant() {
+        assert_eq!(
+            format_sub_goal_outcome(&SubGoalOutcome::Skipped),
+            "skipped (below floor)"
+        );
+    }
+
+    #[tokio::test]
+    async fn backward_compat_no_complexity_hint() {
+        let mut engine = decomposition_engine(budget_config(20, 6), 0);
+        let response = CompletionResponse {
+            content: Vec::new(),
+            tool_calls: vec![decompose_tool_call(serde_json::json!({
+                "sub_goals": [{"description": "Summarize findings"}],
+                "strategy": "Sequential"
+            }))],
+            usage: None,
+            stop_reason: None,
+        };
+        let decision = engine.decide(&response).await.expect("decision");
+        let plan = match decision {
+            Decision::Decompose(plan) => plan,
+            other => panic!("expected decomposition, got: {other:?}"),
+        };
+        assert_eq!(plan.sub_goals[0].complexity_hint, None);
+
+        let action = engine
+            .execute_decomposition(
+                &Decision::Decompose(plan.clone()),
+                &plan,
+                &ScriptedLlm::new(vec![Ok(text_response("ok"))]),
+                &[],
+            )
+            .await
+            .expect("decomposition");
+        assert!(action.response_text.contains("completed: ok"));
+    }
+
+    #[test]
+    fn third_sequential_sub_goal_gets_viable_budget() {
+        let engine = decomposition_engine(budget_config(20, 6), 0);
+        let plan = decomposition_plan(&["first", "second", "third"]);
+        let allocation = BudgetAllocator::new().allocate(
+            &engine.budget,
+            &plan.sub_goals,
+            AllocationMode::Sequential,
+            current_time_ms(),
+        );
+        let floor = crate::budget::BudgetFloor::default();
+        let third = &allocation.sub_goal_budgets[2];
+
+        assert!(!allocation.skipped_indices.contains(&2));
+        assert!(third.max_llm_calls >= floor.min_llm_calls);
+        assert!(third.max_tool_invocations >= floor.min_tool_invocations);
+        assert!(third.max_tokens >= floor.min_tokens);
+    }
+
+    #[test]
+    fn nested_decomposition_all_leaves_get_floor_budget_or_skipped() {
+        let root_engine = decomposition_engine(budget_config(20, 6), 0);
+        let root_plan = decomposition_plan(&["branch-a", "branch-b"]);
+        let allocator = BudgetAllocator::new();
+        let root_allocation = allocator.allocate(
+            &root_engine.budget,
+            &root_plan.sub_goals,
+            AllocationMode::Sequential,
+            current_time_ms(),
+        );
+        let floor = crate::budget::BudgetFloor::default();
+
+        for root_budget in root_allocation.sub_goal_budgets {
+            let child_tracker = BudgetTracker::new(
+                root_budget,
+                current_time_ms(),
+                root_engine.budget.child_depth(),
+            );
+            let leaf_goals = decomposition_plan(&["leaf-1", "leaf-2", "leaf-3"]).sub_goals;
+            let leaf_allocation = allocator.allocate(
+                &child_tracker,
+                &leaf_goals,
+                AllocationMode::Sequential,
+                current_time_ms(),
+            );
+
+            for (index, budget) in leaf_allocation.sub_goal_budgets.iter().enumerate() {
+                let skipped = leaf_allocation.skipped_indices.contains(&index);
+                let viable = budget.max_llm_calls >= floor.min_llm_calls
+                    && budget.max_tool_invocations >= floor.min_tool_invocations
+                    && budget.max_tokens >= floor.min_tokens
+                    && budget.max_cost_cents >= floor.min_cost_cents
+                    && budget.max_wall_time_ms >= floor.min_wall_time_ms;
+                assert!(skipped || viable, "leaf {index} must be viable or skipped");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_decomposition_blocks_when_effective_cap_zero() {
+        let mut engine =
+            decomposition_engine(budget_config_with_mode(6, 8, DepthMode::Adaptive), 0);
+        let plan = decomposition_plan(&["depth-capped"]);
+        let decision = Decision::Decompose(plan.clone());
+        let llm = ScriptedLlm::new(vec![Ok(text_response("unused"))]);
+
+        let action = engine
+            .execute_decomposition(&decision, &plan, &llm, &[])
+            .await
+            .expect("decomposition");
+
+        assert_eq!(llm.complete_calls(), 0);
+        assert!(action
+            .response_text
+            .contains("recursion depth limit was reached"));
+    }
+
+    #[tokio::test]
+    async fn execute_decomposition_blocks_when_current_depth_meets_effective_cap() {
+        let mut engine =
+            decomposition_engine(budget_config_with_mode(20, 8, DepthMode::Adaptive), 2);
+        let plan = decomposition_plan(&["depth-capped"]);
+        let decision = Decision::Decompose(plan.clone());
+        let llm = ScriptedLlm::new(vec![Ok(text_response("unused"))]);
+
+        let action = engine
+            .execute_decomposition(&decision, &plan, &llm, &[])
+            .await
+            .expect("decomposition");
+
+        assert_eq!(llm.complete_calls(), 0);
+        assert!(action
+            .response_text
+            .contains("recursion depth limit was reached"));
+    }
+
+    #[test]
+    fn child_budget_inherits_effective_cap_in_adaptive_mode() {
+        let engine = decomposition_engine(budget_config_with_mode(8, 8, DepthMode::Adaptive), 0);
+        let remaining = engine.budget.remaining(current_time_ms());
+        let effective_cap = engine.effective_decomposition_depth_cap(&remaining);
+        let plan = decomposition_plan(&["single-child"]);
+        let allocator = BudgetAllocator::new();
+        let mut allocation = allocator.allocate(
+            &engine.budget,
+            &plan.sub_goals,
+            AllocationMode::Sequential,
+            current_time_ms(),
+        );
+
+        engine.apply_effective_depth_cap(&mut allocation.sub_goal_budgets, effective_cap);
+
+        assert_eq!(effective_cap, 1);
+        assert_eq!(allocation.sub_goal_budgets[0].max_recursion_depth, 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_execution_with_empty_plan_returns_empty_results() {
+        let mut engine = decomposition_engine(budget_config(20, 6), 0);
+        let plan = DecompositionPlan {
+            sub_goals: Vec::new(),
+            strategy: AggregationStrategy::Parallel,
+            truncated_from: None,
+        };
+        let llm = ScriptedLlm::new(vec![]);
+
+        let allocation = AllocationPlan {
+            sub_goal_budgets: Vec::new(),
+            parent_continuation_budget: budget_config(20, 6),
+            skipped_indices: Vec::new(),
+        };
+        let results = engine
+            .execute_sub_goals_concurrent(&plan, &allocation, &llm, &[])
+            .await;
+
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "unexpected missing result at index 0")]
+    fn collect_concurrent_results_panics_for_unexpected_missing_slot() {
+        let mut engine = decomposition_engine(budget_config(20, 6), 0);
+        let plan = decomposition_plan(&["missing"]);
+
+        let _ = engine.collect_concurrent_results(&plan, Vec::new(), &[false]);
+    }
+}
+
+#[cfg(test)]
+mod context_compaction_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use fx_core::error::LlmError as CoreLlmError;
+    use fx_core::types::{InputSource, ScreenState, UserInput};
+    use fx_llm::{
+        CompletionRequest, CompletionResponse, ContentBlock, Message, ProviderError, ToolCall,
+        ToolDefinition,
+    };
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::Subscriber;
+    use tracing_subscriber::filter::LevelFilter;
+    use tracing_subscriber::layer::{Context, Layer};
+    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::Registry;
+
+    fn words(count: usize) -> String {
+        std::iter::repeat_n("a", count)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn text_response(text: &str) -> CompletionResponse {
+        CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        }
+    }
+
+    fn read_call(id: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path":"/tmp/demo"}),
+        }
+    }
+
+    const COMPACTED_CONTEXT_SUMMARY_PREFIX: &str = "Compacted context summary:";
+
+    fn has_compaction_marker(messages: &[Message]) -> bool {
+        messages.iter().any(|message| {
+            message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::Text { text } if text.starts_with("[context compacted:")
+                )
+            })
+        })
+    }
+
+    fn has_conversation_summary_marker(messages: &[Message]) -> bool {
+        messages.iter().any(|message| {
+            message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::Text { text } if text.starts_with("[context summary]")
+                )
+            })
+        })
+    }
+
+    fn summary_message_index(messages: &[Message]) -> Option<usize> {
+        messages.iter().position(|message| {
+            message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::Text { text }
+                        if text.starts_with(COMPACTED_CONTEXT_SUMMARY_PREFIX)
+                )
+            })
+        })
+    }
+
+    fn marker_message_index(messages: &[Message]) -> Option<usize> {
+        messages.iter().position(|message| {
+            message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::Text { text } if text.starts_with("[context compacted:")
+                )
+            })
+        })
+    }
+
+    fn large_history(count: usize, words_per_message: usize) -> Vec<Message> {
+        (0..count)
+            .map(|index| {
+                if index % 2 == 0 {
+                    Message::user(format!(
+                        "u{index} {}",
+                        words(words_per_message.saturating_sub(1))
+                    ))
+                } else {
+                    Message::assistant(format!(
+                        "a{index} {}",
+                        words(words_per_message.saturating_sub(1))
+                    ))
+                }
+            })
+            .collect()
+    }
+
+    fn snapshot_with_history(history: Vec<Message>, user_text: &str) -> PerceptionSnapshot {
+        PerceptionSnapshot {
+            timestamp_ms: 10,
+            screen: ScreenState {
+                current_app: "terminal".to_string(),
+                elements: Vec::new(),
+                text_content: user_text.to_string(),
+            },
+            notifications: Vec::new(),
+            active_app: "terminal".to_string(),
+            user_input: Some(UserInput {
+                text: user_text.to_string(),
+                source: InputSource::Text,
+                timestamp: 10,
+                context_id: None,
+            }),
+            sensor_data: None,
+            conversation_history: history,
+            steer_context: None,
+        }
+    }
+
+    fn compaction_config() -> CompactionConfig {
+        CompactionConfig {
+            compaction_threshold: 0.2,
+            preserve_recent_turns: 2,
+            model_context_limit: 5_000,
+            reserved_system_tokens: 0,
+            recompact_cooldown_turns: 3,
+            use_summarization: false,
+            max_summary_tokens: 512,
+        }
+    }
+
+    fn engine_with(
+        context: ContextCompactor,
+        tool_executor: Arc<dyn ToolExecutor>,
+        config: CompactionConfig,
+    ) -> LoopEngine {
+        LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                current_time_ms(),
+                0,
+            ))
+            .context(context)
+            .max_iterations(4)
+            .tool_executor(tool_executor)
+            .synthesis_instruction("synthesize".to_string())
+            .compaction_config(config)
+            .build()
+            .expect("test engine build")
+    }
+
+    #[test]
+    fn compaction_scope_display_uses_scope_label() {
+        assert_eq!(CompactionScope::Perceive.to_string(), "perceive");
+        assert_eq!(
+            CompactionScope::ToolContinuation.to_string(),
+            "tool_continuation"
+        );
+        assert_eq!(
+            CompactionScope::DecomposeChild.to_string(),
+            "decompose_child"
+        );
+    }
+
+    #[test]
+    fn builder_missing_required_field_returns_error() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let error = LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                current_time_ms(),
+                0,
+            ))
+            .context(ContextCompactor::new(2_048, 256))
+            .max_iterations(4)
+            .tool_executor(executor)
+            .build()
+            .expect_err("missing synthesis instruction should fail");
+
+        assert_eq!(error.stage, "init");
+        assert_eq!(
+            error.reason,
+            "missing_required_field: synthesis_instruction"
+        );
+    }
+
+    #[test]
+    fn builder_with_no_fields_returns_error() {
+        let error = LoopEngine::builder().build().expect_err("should fail");
+        assert_eq!(error.stage, "init");
+    }
+
+    #[test]
+    fn builder_memory_context_whitespace_normalizes_to_none() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                current_time_ms(),
+                0,
+            ))
+            .context(ContextCompactor::new(2_048, 256))
+            .max_iterations(4)
+            .tool_executor(executor)
+            .synthesis_instruction("synthesize".to_string())
+            .memory_context("   ".to_string())
+            .build()
+            .expect("test engine build");
+
+        assert!(engine.memory_context.is_none());
+    }
+
+    #[test]
+    fn builder_default_optionals() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                current_time_ms(),
+                0,
+            ))
+            .context(ContextCompactor::new(2_048, 256))
+            .max_iterations(4)
+            .tool_executor(executor)
+            .synthesis_instruction("synthesize".to_string())
+            .build()
+            .expect("test engine build");
+
+        let defaults = CompactionConfig::default();
+        assert!(engine.memory_context.is_none());
+        assert!(engine.cancel_token.is_none());
+        assert!(engine.input_channel.is_none());
+        assert!(engine.event_bus.is_none());
+        assert_eq!(
+            engine.compaction_config.compaction_threshold,
+            defaults.compaction_threshold
+        );
+        assert_eq!(
+            engine.compaction_config.preserve_recent_turns,
+            defaults.preserve_recent_turns
+        );
+        assert_eq!(
+            engine.conversation_budget.conversation_budget(),
+            defaults.model_context_limit
+                - defaults.reserved_system_tokens
+                - ConversationBudget::DEFAULT_OUTPUT_RESERVE_TOKENS
+        );
+    }
+
+    #[test]
+    fn builder_full_config() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let config = CompactionConfig {
+            compaction_threshold: 0.3,
+            preserve_recent_turns: 3,
+            model_context_limit: 5_200,
+            reserved_system_tokens: 100,
+            recompact_cooldown_turns: 4,
+            use_summarization: true,
+            max_summary_tokens: 256,
+        };
+        let llm: Arc<dyn LlmProvider> = Arc::new(RecordingLlm::new(Vec::new()));
+        let cancel_token = CancellationToken::new();
+        let event_bus = fx_core::EventBus::new(16);
+        let (_, input_channel) = crate::input::loop_input_channel();
+
+        let engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                current_time_ms(),
+                0,
+            ))
+            .context(ContextCompactor::new(2_048, 256))
+            .max_iterations(4)
+            .tool_executor(executor)
+            .synthesis_instruction("synthesize".to_string())
+            .compaction_config(config.clone())
+            .compaction_llm(llm)
+            .event_bus(event_bus)
+            .cancel_token(cancel_token)
+            .input_channel(input_channel)
+            .memory_context("remember this".to_string())
+            .build()
+            .expect("test engine build");
+
+        assert_eq!(engine.compaction_config.preserve_recent_turns, 3);
+        assert_eq!(engine.memory_context.as_deref(), Some("remember this"));
+        assert!(engine.cancel_token.is_some());
+        assert!(engine.input_channel.is_some());
+        assert!(engine.event_bus.is_some());
+        assert_eq!(
+            engine.conversation_budget.conversation_budget(),
+            config.model_context_limit
+                - config.reserved_system_tokens
+                - ConversationBudget::DEFAULT_OUTPUT_RESERVE_TOKENS
+        );
+    }
+
+    #[test]
+    fn builder_validates_compaction_config() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let mut config = CompactionConfig::default();
+        config.recompact_cooldown_turns = 0;
+
+        let error = LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                current_time_ms(),
+                0,
+            ))
+            .context(ContextCompactor::new(2_048, 256))
+            .max_iterations(4)
+            .tool_executor(executor)
+            .synthesis_instruction("synthesize".to_string())
+            .compaction_config(config)
+            .build()
+            .expect_err("invalid config should fail");
+
+        assert_eq!(error.stage, "init");
+        assert!(error.reason.contains("invalid_compaction_config"));
+    }
+
+    #[test]
+    fn build_compaction_components_default_to_valid_budget_and_strategy() {
+        let (config, budget, _strategy) =
+            build_compaction_components(None, None).expect("components should build");
+        let defaults = CompactionConfig::default();
+
+        assert_eq!(config.compaction_threshold, defaults.compaction_threshold);
+        assert_eq!(config.preserve_recent_turns, defaults.preserve_recent_turns);
+        assert_eq!(
+            budget.conversation_budget(),
+            defaults.model_context_limit
+                - defaults.reserved_system_tokens
+                - ConversationBudget::DEFAULT_OUTPUT_RESERVE_TOKENS
+        );
+    }
+
+    #[test]
+    fn build_compaction_components_reject_invalid_config() {
+        let mut config = CompactionConfig::default();
+        config.recompact_cooldown_turns = 0;
+
+        let error =
+            build_compaction_components(Some(config), None).expect_err("invalid config rejected");
+        assert_eq!(error.stage, "init");
+        assert!(error.reason.contains("invalid_compaction_config"));
+    }
+
+    #[derive(Debug)]
+    struct RecordingLlm {
+        responses: Mutex<VecDeque<Result<CompletionResponse, ProviderError>>>,
+        requests: Mutex<Vec<CompletionRequest>>,
+        generated_summary: String,
+    }
+
+    impl RecordingLlm {
+        fn new(responses: Vec<Result<CompletionResponse, ProviderError>>) -> Self {
+            Self::with_generated_summary(responses, "summary".to_string())
+        }
+
+        fn with_generated_summary(
+            responses: Vec<Result<CompletionResponse, ProviderError>>,
+            generated_summary: String,
+        ) -> Self {
+            Self {
+                responses: Mutex::new(VecDeque::from(responses)),
+                requests: Mutex::new(Vec::new()),
+                generated_summary,
+            }
+        }
+
+        fn requests(&self) -> Vec<CompletionRequest> {
+            self.requests.lock().expect("requests lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for RecordingLlm {
+        async fn generate(&self, _: &str, _: u32) -> Result<String, CoreLlmError> {
+            Ok(self.generated_summary.clone())
+        }
+
+        async fn generate_streaming(
+            &self,
+            _: &str,
+            _: u32,
+            callback: Box<dyn Fn(String) + Send + 'static>,
+        ) -> Result<String, CoreLlmError> {
+            callback(self.generated_summary.clone());
+            Ok(self.generated_summary.clone())
+        }
+
+        fn model_name(&self) -> &str {
+            "mock"
+        }
+
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            self.requests.lock().expect("requests lock").push(request);
+            self.responses
+                .lock()
+                .expect("response lock")
+                .pop_front()
+                .unwrap_or_else(|| Ok(text_response("ok")))
+        }
+    }
+
+    #[derive(Debug)]
+    struct SizedToolExecutor {
+        output_words: usize,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for SizedToolExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+            Ok(calls
+                .iter()
+                .map(|call| ToolResult {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    success: true,
+                    output: words(self.output_words),
+                })
+                .collect())
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition {
+                name: "read_file".to_string(),
+                description: "read file".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+            }]
+        }
+    }
+
+    #[tokio::test]
+    async fn long_conversation_triggers_compaction_in_perceive() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let mut engine = engine_with(
+            ContextCompactor::new(2_048, 256),
+            executor,
+            compaction_config(),
+        );
+        let snapshot = snapshot_with_history(large_history(14, 70), "latest user request");
+
+        let processed = engine.perceive(&snapshot).await.expect("perceive");
+
+        assert!(has_compaction_marker(&processed.context_window));
+        assert!(processed.context_window.len() < snapshot.conversation_history.len() + 1);
+    }
+
+    #[tokio::test]
+    async fn tool_rounds_compact_continuation_messages() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 120 });
+        let mut engine = engine_with(
+            ContextCompactor::new(2_048, 256),
+            executor,
+            compaction_config(),
+        );
+        let llm = RecordingLlm::new(vec![Ok(text_response("done"))]);
+        let calls = vec![read_call("call-1")];
+        let mut state = ToolRoundState::new(&calls, &large_history(12, 70));
+
+        let _ = engine
+            .execute_tool_round(1, &llm, &mut state)
+            .await
+            .expect("tool round");
+
+        assert!(has_compaction_marker(&state.continuation_messages));
+    }
+
+    #[tokio::test]
+    async fn decompose_child_receives_compacted_context() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let engine = engine_with(
+            ContextCompactor::new(2_048, 256),
+            executor,
+            compaction_config(),
+        );
+        let llm = RecordingLlm::new(vec![Ok(text_response("child done"))]);
+        let goal = SubGoal {
+            description: "child task".to_string(),
+            required_tools: Vec::new(),
+            expected_output: None,
+            complexity_hint: None,
+        };
+        let child_budget = BudgetConfig::default();
+
+        let _execution = engine
+            .run_sub_goal(&goal, child_budget, &llm, &large_history(10, 60))
+            .await;
+
+        let requests = llm.requests();
+        assert!(!requests.is_empty());
+        assert!(has_compaction_marker(&requests[0].messages));
+    }
+
+    #[tokio::test]
+    async fn run_sub_goal_fails_when_compacted_context_stays_over_hard_limit() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let mut config = compaction_config();
+        config.preserve_recent_turns = 4;
+        let engine = engine_with(ContextCompactor::new(2_048, 256), executor, config);
+        let llm = RecordingLlm::new(Vec::new());
+        let goal = SubGoal {
+            description: "child task".to_string(),
+            required_tools: Vec::new(),
+            expected_output: None,
+            complexity_hint: None,
+        };
+        let protected = vec![
+            Message::user(words(260)),
+            Message::assistant(words(260)),
+            Message::user(words(260)),
+            Message::assistant(words(260)),
+        ];
+        let child_budget = BudgetConfig::default();
+
+        let execution = engine
+            .run_sub_goal(&goal, child_budget, &llm, &protected)
+            .await;
+        let SubGoalOutcome::Failed(message) = &execution.result.outcome else {
+            panic!("expected failed sub-goal outcome")
+        };
+
+        assert!(message.starts_with("context_exceeded_after_compaction:"));
+        assert!(llm.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn perceive_orders_compaction_before_reasoning_summary() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let mut config = compaction_config();
+        config.model_context_limit = 5_600;
+        let mut engine = engine_with(ContextCompactor::new(1, 2_500), executor, config);
+        let user_text = format!("need order check {}", words(500));
+        let snapshot = snapshot_with_history(large_history(12, 70), &user_text);
+
+        let synthetic = engine.synthetic_context(&snapshot, &user_text);
+        assert!(engine.context.needs_compaction(&synthetic));
+
+        let processed = engine.perceive(&snapshot).await.expect("perceive");
+
+        let marker = marker_message_index(&processed.context_window).expect("marker index");
+        let summary = summary_message_index(&processed.context_window)
+            .expect("expected compacted context summary in context window");
+        assert!(marker < summary);
+    }
+
+    #[tokio::test]
+    async fn cooldown_skips_compaction_when_within_window() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let engine = engine_with(
+            ContextCompactor::new(2_048, 256),
+            executor,
+            compaction_config(),
+        );
+        let messages = large_history(12, 60);
+
+        let first = engine
+            .compact_if_needed(&messages, CompactionScope::Perceive, 10)
+            .await
+            .expect("first compaction");
+        assert!(has_compaction_marker(first.as_ref()));
+
+        let second_input = large_history(12, 60);
+        let second = engine
+            .compact_if_needed(&second_input, CompactionScope::Perceive, 11)
+            .await
+            .expect("second compaction");
+
+        assert_eq!(second.as_ref(), second_input.as_slice());
+    }
+
+    #[tokio::test]
+    async fn cooldown_allows_compaction_after_window_elapsed() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let engine = engine_with(
+            ContextCompactor::new(2_048, 256),
+            executor,
+            compaction_config(),
+        );
+        let messages = large_history(12, 60);
+
+        let _ = engine
+            .compact_if_needed(&messages, CompactionScope::Perceive, 10)
+            .await
+            .expect("first compaction");
+
+        let second = engine
+            .compact_if_needed(&messages, CompactionScope::Perceive, 13)
+            .await
+            .expect("second compaction");
+
+        assert!(has_compaction_marker(second.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn cooldown_bypasses_when_hard_limit_exceeded() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let engine = engine_with(
+            ContextCompactor::new(2_048, 256),
+            executor,
+            compaction_config(),
+        );
+
+        let _ = engine
+            .compact_if_needed(&large_history(10, 60), CompactionScope::Perceive, 10)
+            .await
+            .expect("first compaction");
+
+        let oversized = large_history(16, 80);
+        let second = engine
+            .compact_if_needed(&oversized, CompactionScope::Perceive, 11)
+            .await
+            .expect("bypass compaction");
+
+        assert_ne!(second.as_ref(), oversized.as_slice());
+    }
+
+    #[tokio::test]
+    async fn summary_exceeded_target_falls_back_to_sliding_compactor() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let mut config = compaction_config();
+        config.use_summarization = true;
+        let llm: Arc<dyn LlmProvider> = Arc::new(RecordingLlm::with_generated_summary(
+            Vec::new(),
+            words(2_000),
+        ));
+
+        let engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                current_time_ms(),
+                0,
+            ))
+            .context(ContextCompactor::new(2_048, 256))
+            .max_iterations(4)
+            .tool_executor(executor)
+            .synthesis_instruction("synthesize".to_string())
+            .compaction_config(config)
+            .compaction_llm(llm)
+            .build()
+            .expect("test engine build");
+
+        let history = large_history(12, 70);
+        let compacted = engine
+            .compact_if_needed(&history, CompactionScope::Perceive, 1)
+            .await
+            .expect("compaction should fall back to sliding window");
+
+        assert!(has_compaction_marker(compacted.as_ref()));
+        assert!(!has_conversation_summary_marker(compacted.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn all_messages_protected_over_hard_limit_returns_context_exceeded() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let mut config = compaction_config();
+        config.preserve_recent_turns = 4;
+        let engine = engine_with(ContextCompactor::new(2_048, 256), executor, config);
+        let protected = vec![
+            Message::user(words(260)),
+            Message::assistant(words(260)),
+            Message::user(words(260)),
+            Message::assistant(words(260)),
+        ];
+
+        let error = engine
+            .compact_if_needed(&protected, CompactionScope::Perceive, 2)
+            .await
+            .expect_err("context exceeded error");
+
+        assert_eq!(error.stage, "compaction");
+        assert!(error
+            .reason
+            .starts_with("context_exceeded_after_compaction:"));
+    }
+
+    #[tokio::test]
+    async fn compaction_preserves_session_coherence() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let mut config = compaction_config();
+        config.preserve_recent_turns = 4;
+        let engine = engine_with(ContextCompactor::new(2_048, 256), executor, config);
+
+        let mut messages = vec![Message::system("system policy")];
+        messages.extend(large_history(12, 60));
+        let compacted = engine
+            .compact_if_needed(&messages, CompactionScope::Perceive, 3)
+            .await
+            .expect("compact");
+
+        assert_eq!(compacted[0].role, MessageRole::System);
+        assert!(has_compaction_marker(compacted.as_ref()));
+        assert_eq!(
+            &compacted[compacted.len() - 4..],
+            &messages[messages.len() - 4..]
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_coexists_with_existing_context_compactor() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let mut config = compaction_config();
+        config.model_context_limit = 5_600;
+        let mut engine = engine_with(ContextCompactor::new(1, 2_500), executor, config);
+        let user_text = format!("coexistence check {}", words(500));
+        let snapshot = snapshot_with_history(large_history(12, 70), &user_text);
+
+        let synthetic = engine.synthetic_context(&snapshot, &user_text);
+        assert!(engine.context.needs_compaction(&synthetic));
+
+        let processed = engine.perceive(&snapshot).await.expect("perceive");
+
+        assert!(has_compaction_marker(&processed.context_window));
+        let marker =
+            marker_message_index(&processed.context_window).expect("expected compaction marker");
+        let summary = summary_message_index(&processed.context_window)
+            .expect("expected compacted context summary in context window");
+        assert!(marker < summary);
+    }
+
+    #[tokio::test]
+    async fn compaction_with_all_protected_messages() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let mut config = compaction_config();
+        config.preserve_recent_turns = 4;
+        let engine = engine_with(ContextCompactor::new(2_048, 256), executor, config);
+
+        let protected_under_limit = vec![
+            Message::user(words(60)),
+            Message::assistant(words(60)),
+            Message::user(words(60)),
+            Message::assistant(words(60)),
+        ];
+
+        let result = engine
+            .compact_if_needed(&protected_under_limit, CompactionScope::Perceive, 1)
+            .await
+            .expect("under hard limit keeps original");
+        assert_eq!(result.as_ref(), protected_under_limit.as_slice());
+
+        let protected_over_limit = vec![
+            Message::user(words(260)),
+            Message::assistant(words(260)),
+            Message::user(words(260)),
+            Message::assistant(words(260)),
+        ];
+        let error = engine
+            .compact_if_needed(&protected_over_limit, CompactionScope::Perceive, 2)
+            .await
+            .expect_err("over hard limit errors");
+        assert!(error
+            .reason
+            .starts_with("context_exceeded_after_compaction:"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_decompose_children_each_compact_independently() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let mut config = compaction_config();
+        config.recompact_cooldown_turns = 1;
+        let mut engine = engine_with(ContextCompactor::new(2_048, 256), executor, config);
+        let plan = DecompositionPlan {
+            sub_goals: vec![
+                SubGoal {
+                    description: "child-a".to_string(),
+                    required_tools: Vec::new(),
+                    expected_output: None,
+                    complexity_hint: None,
+                },
+                SubGoal {
+                    description: "child-b".to_string(),
+                    required_tools: Vec::new(),
+                    expected_output: None,
+                    complexity_hint: None,
+                },
+            ],
+            strategy: AggregationStrategy::Parallel,
+            truncated_from: None,
+        };
+        let llm = RecordingLlm::new(vec![Ok(text_response("a")), Ok(text_response("b"))]);
+        let allocation = AllocationPlan {
+            sub_goal_budgets: vec![BudgetConfig::default(); plan.sub_goals.len()],
+            parent_continuation_budget: BudgetConfig::default(),
+            skipped_indices: Vec::new(),
+        };
+
+        let results = engine
+            .execute_sub_goals_concurrent(&plan, &allocation, &llm, &large_history(12, 60))
+            .await;
+
+        assert_eq!(results.len(), 2);
+
+        let requests = llm.requests();
+        let compacted_requests = requests
+            .iter()
+            .filter(|request| has_compaction_marker(&request.messages))
+            .count();
+        assert!(compacted_requests >= 2);
+    }
+
+    #[derive(Default)]
+    struct EventFields {
+        values: HashMap<String, String>,
+    }
+
+    impl Visit for EventFields {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.values
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.values
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.values
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_i64(&mut self, field: &Field, value: i64) {
+            self.values
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_bool(&mut self, field: &Field, value: bool) {
+            self.values
+                .insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    #[derive(Default)]
+    struct CaptureLayer {
+        events: Arc<Mutex<Vec<HashMap<String, String>>>>,
+    }
+
+    impl<S> Layer<S> for CaptureLayer
+    where
+        S: Subscriber,
+    {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            let mut fields = EventFields::default();
+            event.record(&mut fields);
+            self.events.lock().expect("events lock").push(fields.values);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn compaction_emits_observability_fields() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let engine = engine_with(
+            ContextCompactor::new(2_048, 256),
+            executor,
+            compaction_config(),
+        );
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = Registry::default()
+            .with(LevelFilter::TRACE)
+            .with(CaptureLayer {
+                events: Arc::clone(&events),
+            });
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let history = large_history(12, 70);
+        let compacted = engine
+            .compact_if_needed(&history, CompactionScope::Perceive, 1)
+            .await
+            .expect("compaction should succeed");
+        assert!(has_compaction_marker(compacted.as_ref()));
+
+        let captured = events.lock().expect("events lock").clone();
+        assert!(
+            !captured.is_empty(),
+            "expected tracing events to be captured"
+        );
+
+        let info_event = captured.iter().find(|event| {
+            event.contains_key("before_tokens")
+                && event.contains_key("after_tokens")
+                && event.contains_key("messages_removed")
+        });
+
+        let info_event = info_event
+            .unwrap_or_else(|| panic!("compaction info event missing; captured={captured:?}"));
+        for key in [
+            "scope",
+            "strategy",
+            "before_tokens",
+            "after_tokens",
+            "target_tokens",
+            "tokens_saved",
+            "messages_removed",
+        ] {
+            assert!(
+                info_event.contains_key(key),
+                "missing observability field: {key}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod r2_streaming_review_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use fx_llm::{CompletionResponse, CompletionStream, ContentBlock, ProviderError, StreamChunk};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[derive(Debug)]
+    struct NoopToolExecutor;
+
+    #[async_trait]
+    impl ToolExecutor for NoopToolExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+            Ok(calls
+                .iter()
+                .map(|call| ToolResult {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    success: true,
+                    output: "ok".to_string(),
+                })
+                .collect())
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition {
+                name: "read_file".to_string(),
+                description: "Read a file".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+            }]
+        }
+    }
+
+    fn engine_with_bus(bus: &fx_core::EventBus) -> LoopEngine {
+        let mut engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                0,
+                0,
+            ))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(NoopToolExecutor))
+            .synthesis_instruction("Summarize tool output".to_string())
+            .build()
+            .expect("test engine build");
+        engine.set_event_bus(bus.clone());
+        engine
+    }
+
+    fn base_engine() -> LoopEngine {
+        LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                0,
+                0,
+            ))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(NoopToolExecutor))
+            .synthesis_instruction("Summarize tool output".to_string())
+            .build()
+            .expect("test engine build")
+    }
+
+    // -- Finding NB1: stream_tool_call_from_state drops malformed JSON --
+
+    #[test]
+    fn stream_tool_call_from_state_drops_malformed_json_arguments() {
+        let state = StreamToolCallState {
+            id: Some("call-1".to_string()),
+            name: Some("read_file".to_string()),
+            arguments: "not valid json {{{".to_string(),
+            arguments_done: true,
+        };
+        let result = stream_tool_call_from_state(state);
+        assert!(
+            result.is_none(),
+            "malformed JSON arguments should cause the tool call to be dropped"
+        );
+    }
+
+    #[test]
+    fn stream_tool_call_from_state_accepts_valid_json_arguments() {
+        let state = StreamToolCallState {
+            id: Some("call-1".to_string()),
+            name: Some("read_file".to_string()),
+            arguments: r#"{"path":"README.md"}"#.to_string(),
+            arguments_done: true,
+        };
+        let result = stream_tool_call_from_state(state);
+        assert!(result.is_some(), "valid JSON arguments should be accepted");
+        let call = result.expect("tool call");
+        assert_eq!(call.id, "call-1");
+        assert_eq!(call.name, "read_file");
+        assert_eq!(call.arguments, serde_json::json!({"path": "README.md"}));
+    }
+
+    #[test]
+    fn finalize_stream_tool_calls_filters_out_malformed_arguments() {
+        let mut by_index = HashMap::new();
+        by_index.insert(
+            0,
+            StreamToolCallState {
+                id: Some("call-good".to_string()),
+                name: Some("read_file".to_string()),
+                arguments: r#"{"path":"a.txt"}"#.to_string(),
+                arguments_done: true,
+            },
+        );
+        by_index.insert(
+            1,
+            StreamToolCallState {
+                id: Some("call-bad".to_string()),
+                name: Some("write_file".to_string()),
+                arguments: "truncated json {".to_string(),
+                arguments_done: true,
+            },
+        );
+        let calls = finalize_stream_tool_calls(by_index);
+        assert_eq!(calls.len(), 1, "only the valid tool call should survive");
+        assert_eq!(calls[0].id, "call-good");
+    }
+
+    // -- Finding NB2: StreamingFinished exactly once for all paths --
+
+    fn count_streaming_finished(
+        receiver: &mut tokio::sync::broadcast::Receiver<fx_core::message::InternalMessage>,
+    ) -> usize {
+        let mut count = 0;
+        while let Ok(msg) = receiver.try_recv() {
+            if matches!(msg, InternalMessage::StreamingFinished { .. }) {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    #[tokio::test]
+    async fn consume_stream_publishes_exactly_one_finished_on_success() {
+        let bus = fx_core::EventBus::new(16);
+        let mut receiver = bus.subscribe();
+        let mut engine = engine_with_bus(&bus);
+
+        let mut stream: CompletionStream =
+            Box::pin(futures_util::stream::iter(vec![Ok(StreamChunk {
+                delta_content: Some("hello".to_string()),
+                tool_use_deltas: Vec::new(),
+                usage: None,
+                stop_reason: Some("stop".to_string()),
+            })]));
+
+        let response = engine
+            .consume_stream_with_events(&mut stream, StreamPhase::Reason)
+            .await
+            .expect("stream consumed");
+
+        assert_eq!(extract_response_text(&response), "hello");
+        assert_eq!(
+            count_streaming_finished(&mut receiver),
+            1,
+            "exactly one StreamingFinished on success path"
+        );
+    }
+
+    #[tokio::test]
+    async fn consume_stream_publishes_exactly_one_finished_on_cancel() {
+        let bus = fx_core::EventBus::new(16);
+        let mut receiver = bus.subscribe();
+        let mut engine = engine_with_bus(&bus);
+        let token = CancellationToken::new();
+        engine.set_cancel_token(token.clone());
+
+        let cancel_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            token.cancel();
+        });
+
+        let delayed = futures_util::stream::iter(vec![
+            StreamChunk {
+                delta_content: Some("first".to_string()),
+                tool_use_deltas: Vec::new(),
+                usage: None,
+                stop_reason: None,
+            },
+            StreamChunk {
+                delta_content: Some("second".to_string()),
+                tool_use_deltas: Vec::new(),
+                usage: None,
+                stop_reason: Some("stop".to_string()),
+            },
+        ])
+        .enumerate()
+        .then(|(index, chunk)| async move {
+            if index == 1 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Ok::<StreamChunk, ProviderError>(chunk)
+        });
+        let mut stream: CompletionStream = Box::pin(delayed);
+
+        let response = engine
+            .consume_stream_with_events(&mut stream, StreamPhase::Reason)
+            .await
+            .expect("stream consumed");
+        cancel_task.await.expect("cancel task");
+
+        assert_eq!(response.stop_reason.as_deref(), Some("cancelled"));
+        assert_eq!(
+            count_streaming_finished(&mut receiver),
+            1,
+            "exactly one StreamingFinished on cancel path"
+        );
+    }
+
+    #[tokio::test]
+    async fn consume_stream_publishes_exactly_one_finished_on_error() {
+        let bus = fx_core::EventBus::new(16);
+        let mut receiver = bus.subscribe();
+        let mut engine = engine_with_bus(&bus);
+
+        let chunks = vec![
+            Ok(StreamChunk {
+                delta_content: Some("partial".to_string()),
+                tool_use_deltas: Vec::new(),
+                usage: None,
+                stop_reason: None,
+            }),
+            Err(ProviderError::Streaming(
+                "simulated stream failure".to_string(),
+            )),
+        ];
+        let mut stream: CompletionStream = Box::pin(futures_util::stream::iter(chunks));
+
+        let error = engine
+            .consume_stream_with_events(&mut stream, StreamPhase::Reason)
+            .await
+            .expect_err("stream should fail");
+        assert!(error.reason.contains("stream consumption failed"));
+
+        assert_eq!(
+            count_streaming_finished(&mut receiver),
+            1,
+            "exactly one StreamingFinished on error path"
+        );
+    }
+
+    // -- Nice-to-have 1: response_to_chunk multi-text-block test --
+
+    #[test]
+    fn response_to_chunk_joins_multiple_text_blocks_with_newline() {
+        let response = CompletionResponse {
+            content: vec![
+                ContentBlock::Text {
+                    text: "first paragraph".to_string(),
+                },
+                ContentBlock::Text {
+                    text: "second paragraph".to_string(),
+                },
+                ContentBlock::Text {
+                    text: "third paragraph".to_string(),
+                },
+            ],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        };
+
+        let chunk = response_to_chunk(response);
+        assert_eq!(
+            chunk.delta_content.as_deref(),
+            Some("first paragraph\nsecond paragraph\nthird paragraph"),
+            "multiple text blocks should be joined with newlines"
+        );
+    }
+
+    #[test]
+    fn response_to_chunk_skips_non_text_blocks_in_join() {
+        let response = CompletionResponse {
+            content: vec![
+                ContentBlock::Text {
+                    text: "before".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "t1".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({}),
+                },
+                ContentBlock::Text {
+                    text: "after".to_string(),
+                },
+            ],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        };
+
+        let chunk = response_to_chunk(response);
+        assert_eq!(
+            chunk.delta_content.as_deref(),
+            Some("before\nafter"),
+            "non-text blocks should be skipped in the join"
+        );
+    }
+
+    // -- Nice-to-have 2: empty stream edge case test --
+
+    #[tokio::test]
+    async fn consume_stream_with_zero_chunks_produces_empty_response() {
+        let mut engine = base_engine();
+
+        let mut stream: CompletionStream = Box::pin(futures_util::stream::iter(Vec::<
+            Result<StreamChunk, ProviderError>,
+        >::new()));
+
+        let response = engine
+            .consume_stream_with_events(&mut stream, StreamPhase::Reason)
+            .await
+            .expect("empty stream consumed");
+
+        assert_eq!(
+            extract_response_text(&response),
+            "",
+            "zero chunks should produce empty text"
+        );
+        assert!(
+            response.tool_calls.is_empty(),
+            "zero chunks should produce no tool calls"
+        );
+        assert!(
+            response.usage.is_none(),
+            "zero chunks should produce no usage"
+        );
+        assert!(
+            response.stop_reason.is_none(),
+            "zero chunks should produce no stop reason"
+        );
+    }
+
+    #[test]
+    fn default_stream_response_state_produces_empty_response() {
+        let state = StreamResponseState::default();
+        let response = state.into_response();
+
+        assert_eq!(
+            extract_response_text(&response),
+            "",
+            "default state should produce empty text"
+        );
+        assert!(
+            response.tool_calls.is_empty(),
+            "default state should produce no tool calls"
+        );
+        assert!(
+            response.usage.is_none(),
+            "default state should produce no usage"
+        );
     }
 }

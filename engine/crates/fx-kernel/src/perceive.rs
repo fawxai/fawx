@@ -1,6 +1,7 @@
 //! Perceive-step context assembly utilities.
 
 use crate::budget::BudgetSnapshot;
+use crate::conversation_compactor::estimate_text_tokens;
 use crate::types::*;
 use fx_core::types::{Notification, UiElement, UserInput};
 use fx_llm::Message;
@@ -17,6 +18,8 @@ pub struct ProcessedPerception {
     pub active_goals: Vec<String>,
     /// Remaining budget snapshot captured at perception time.
     pub budget_remaining: BudgetSnapshot,
+    /// Latest steer text provided by the user, if any.
+    pub steer_context: Option<String>,
 }
 
 /// Assembles a [`ReasoningContext`] from perception and memory retrieval outputs.
@@ -55,6 +58,7 @@ const SENSOR_BASE_OVERHEAD_TOKENS: usize = 6;
 const SENSOR_LOCATION_TOKENS: usize = 8;
 const SENSOR_BATTERY_TOKENS: usize = 2;
 const USER_INPUT_OVERHEAD_TOKENS: usize = 4;
+const STEER_CONTEXT_OVERHEAD_TOKENS: usize = 3;
 const CONVERSATION_MESSAGE_OVERHEAD_TOKENS: usize = 4;
 const MEMORY_ENTRY_OVERHEAD_TOKENS: usize = 3;
 const GOAL_OVERHEAD_TOKENS: usize = 4;
@@ -186,6 +190,7 @@ fn estimate_perception_tokens(perception: &PerceptionSnapshot) -> usize {
     total += estimate_notification_tokens(&perception.notifications);
     total += estimate_sensor_tokens(&perception.sensor_data);
     total += estimate_user_input_tokens(&perception.user_input);
+    total += estimate_steer_context_tokens(&perception.steer_context);
     total += estimate_conversation_history_tokens(&perception.conversation_history);
     total
 }
@@ -234,6 +239,13 @@ fn estimate_user_input_tokens(user_input: &Option<UserInput>) -> usize {
         total += estimate_text_tokens(ctx_id);
     }
     total
+}
+
+fn estimate_steer_context_tokens(steer_context: &Option<String>) -> usize {
+    steer_context
+        .as_ref()
+        .map(|text| STEER_CONTEXT_OVERHEAD_TOKENS + estimate_text_tokens(text))
+        .unwrap_or(0)
 }
 
 fn estimate_conversation_history_tokens(history: &[Message]) -> usize {
@@ -335,16 +347,6 @@ pub enum TrimmingPolicy {
     ByRecency,
     /// Remove entries furthest from current goal.
     ByGoalDistance,
-}
-
-fn estimate_text_tokens(text: &str) -> usize {
-    if text.trim().is_empty() {
-        return 0;
-    }
-
-    let char_estimate = text.chars().count().div_ceil(4);
-    let word_estimate = text.split_whitespace().count();
-    char_estimate.max(word_estimate).max(1)
 }
 
 fn retain_top_by_score_preserving_order<T, F>(entries: Vec<T>, limit: usize, score: F) -> Vec<T>
@@ -576,6 +578,7 @@ mod tests {
             sensor_data: None,
             user_input: None,
             conversation_history: Vec::new(),
+            steer_context: None,
         }
     }
 
