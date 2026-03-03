@@ -1,11 +1,27 @@
 //! Budget accounting and guardrails for the Decide step budget gate.
 
 use crate::types::*;
+use fx_decompose::{ComplexityHint, SubGoal};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_LLM_CALL_TOKENS: u64 = 1_000;
 const DEFAULT_LLM_CALL_COST_CENTS: u64 = 2;
 const DEFAULT_TOOL_INVOCATION_COST_CENTS: u64 = 1;
+const COMPLEXITY_KEYWORDS: [&str; 6] = [
+    "analyze",
+    "refactor",
+    "implement",
+    "redesign",
+    "migrate",
+    "rewrite",
+];
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum DepthMode {
+    Static,
+    #[default]
+    Adaptive,
+}
 
 /// Budget configuration for a single loop invocation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -22,6 +38,9 @@ pub struct BudgetConfig {
     pub max_wall_time_ms: u64,
     /// Kernel-enforced maximum recursion depth.
     pub max_recursion_depth: u32,
+    /// Runtime mode for decomposition depth limiting.
+    #[serde(default)]
+    pub decompose_depth_mode: DepthMode,
 }
 
 impl BudgetConfig {
@@ -34,6 +53,7 @@ impl BudgetConfig {
             max_cost_cents: 100,
             max_wall_time_ms: 2 * 60 * 1000,
             max_recursion_depth: 3,
+            decompose_depth_mode: DepthMode::Adaptive,
         }
     }
 
@@ -48,6 +68,7 @@ impl BudgetConfig {
             max_cost_cents: u64::MAX,
             max_wall_time_ms: u64::MAX,
             max_recursion_depth: u32::MAX,
+            decompose_depth_mode: DepthMode::Adaptive,
         }
     }
 }
@@ -62,6 +83,260 @@ impl Default for BudgetConfig {
             max_cost_cents: 500,
             max_wall_time_ms: 15 * 60 * 1000,
             max_recursion_depth: 8,
+            decompose_depth_mode: DepthMode::Adaptive,
+        }
+    }
+}
+
+/// Allocation policy selector.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AllocationMode {
+    Sequential,
+    Concurrent,
+}
+
+/// Minimum viable budget for executing a sub-goal.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BudgetFloor {
+    pub min_llm_calls: u32,
+    pub min_tool_invocations: u32,
+    pub min_tokens: u64,
+    pub min_cost_cents: u64,
+    pub min_wall_time_ms: u64,
+}
+
+impl Default for BudgetFloor {
+    fn default() -> Self {
+        Self {
+            min_llm_calls: 2,
+            min_tool_invocations: 2,
+            min_tokens: 1_000,
+            min_cost_cents: 4,
+            min_wall_time_ms: 5_000,
+        }
+    }
+}
+
+/// Result of decomposition budget planning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllocationPlan {
+    /// Budget config for each sub-goal, in original order.
+    pub sub_goal_budgets: Vec<BudgetConfig>,
+    /// Budget intentionally reserved for parent continuation.
+    pub parent_continuation_budget: BudgetConfig,
+    /// Indices that should not execute because they are below floor.
+    pub skipped_indices: Vec<usize>,
+}
+
+/// Infallible allocator for decomposition budgets.
+#[derive(Debug, Clone)]
+pub struct BudgetAllocator {
+    /// Fraction of remaining resources reserved for parent continuation.
+    pub parent_continuation_fraction: f32,
+    /// Minimum viable budget floor.
+    pub floor: BudgetFloor,
+}
+
+impl Default for BudgetAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BudgetAllocator {
+    pub fn new() -> Self {
+        Self {
+            parent_continuation_fraction: 0.10,
+            floor: BudgetFloor::default(),
+        }
+    }
+
+    pub fn allocate(
+        &self,
+        parent: &BudgetTracker,
+        sub_goals: &[SubGoal],
+        mode: AllocationMode,
+        current_time_ms: u64,
+    ) -> AllocationPlan {
+        // V1: both modes use snapshot-based allocation; match kept for exhaustiveness.
+        match mode {
+            AllocationMode::Sequential | AllocationMode::Concurrent => {}
+        }
+
+        let remaining = parent.remaining(current_time_ms);
+        let reserved = self.reserve_parent_continuation(&remaining);
+        let parent_budget = budget_from_remaining(parent.config(), &reserved);
+        if sub_goals.is_empty() {
+            return AllocationPlan {
+                sub_goal_budgets: Vec::new(),
+                parent_continuation_budget: parent_budget,
+                skipped_indices: Vec::new(),
+            };
+        }
+
+        let weights = self.compute_weights(sub_goals);
+        let distributable = subtract_remaining(&remaining, &reserved);
+        let mut sub_goal_budgets =
+            self.distribute_by_weight(parent.config(), &distributable, &weights);
+        let (skipped_indices, reclaimed) = self.enforce_floor(&mut sub_goal_budgets);
+        self.redistribute_skipped(
+            &mut sub_goal_budgets,
+            &weights,
+            &skipped_indices,
+            &reclaimed,
+        );
+
+        AllocationPlan {
+            sub_goal_budgets,
+            parent_continuation_budget: parent_budget,
+            skipped_indices,
+        }
+    }
+
+    fn compute_weights(&self, sub_goals: &[SubGoal]) -> Vec<u32> {
+        sub_goals
+            .iter()
+            .map(|sub_goal| {
+                sub_goal
+                    .complexity_hint
+                    .unwrap_or_else(|| estimate_complexity(sub_goal))
+                    .weight()
+            })
+            .collect()
+    }
+
+    fn distribute_by_weight(
+        &self,
+        template: &BudgetConfig,
+        distributable: &BudgetRemaining,
+        weights: &[u32],
+    ) -> Vec<BudgetConfig> {
+        let llm_calls = distribute_u32(distributable.llm_calls, weights);
+        let tool_invocations = distribute_u32(distributable.tool_invocations, weights);
+        let tokens = distribute_u64(distributable.tokens, weights);
+        let cost_cents = distribute_u64(distributable.cost_cents, weights);
+        let wall_time_ms = distribute_u64(distributable.wall_time_ms, weights);
+
+        let mut budgets = Vec::with_capacity(weights.len());
+        for index in 0..weights.len() {
+            budgets.push(BudgetConfig {
+                max_llm_calls: llm_calls.get(index).copied().unwrap_or_default(),
+                max_tool_invocations: tool_invocations.get(index).copied().unwrap_or_default(),
+                max_tokens: tokens.get(index).copied().unwrap_or_default(),
+                max_cost_cents: cost_cents.get(index).copied().unwrap_or_default(),
+                max_wall_time_ms: wall_time_ms.get(index).copied().unwrap_or_default(),
+                max_recursion_depth: template.max_recursion_depth,
+                decompose_depth_mode: template.decompose_depth_mode,
+            });
+        }
+
+        budgets
+    }
+
+    fn enforce_floor(&self, budgets: &mut [BudgetConfig]) -> (Vec<usize>, BudgetRemaining) {
+        let mut skipped_indices = Vec::new();
+        let mut reclaimed = BudgetRemaining::default();
+
+        for (index, budget) in budgets.iter_mut().enumerate() {
+            if !self.below_floor(budget) {
+                continue;
+            }
+
+            skipped_indices.push(index);
+            reclaimed.llm_calls = reclaimed.llm_calls.saturating_add(budget.max_llm_calls);
+            reclaimed.tool_invocations = reclaimed
+                .tool_invocations
+                .saturating_add(budget.max_tool_invocations);
+            reclaimed.tokens = reclaimed.tokens.saturating_add(budget.max_tokens);
+            reclaimed.cost_cents = reclaimed.cost_cents.saturating_add(budget.max_cost_cents);
+            reclaimed.wall_time_ms = reclaimed
+                .wall_time_ms
+                .saturating_add(budget.max_wall_time_ms);
+
+            *budget = zeroed_config_like(budget);
+        }
+
+        (skipped_indices, reclaimed)
+    }
+
+    fn redistribute_skipped(
+        &self,
+        budgets: &mut [BudgetConfig],
+        weights: &[u32],
+        skipped_indices: &[usize],
+        reclaimed: &BudgetRemaining,
+    ) {
+        if skipped_indices.is_empty() {
+            return;
+        }
+
+        let skip_mask = build_skip_mask(budgets.len(), skipped_indices);
+        let recipients = recipient_indices(&skip_mask);
+        if recipients.is_empty() {
+            return;
+        }
+
+        let recipient_weights = recipients
+            .iter()
+            .map(|&index| weights.get(index).copied().unwrap_or(1))
+            .collect::<Vec<_>>();
+
+        let llm_calls = distribute_u32(reclaimed.llm_calls, &recipient_weights);
+        let tool_invocations = distribute_u32(reclaimed.tool_invocations, &recipient_weights);
+        let tokens = distribute_u64(reclaimed.tokens, &recipient_weights);
+        let cost_cents = distribute_u64(reclaimed.cost_cents, &recipient_weights);
+        let wall_time_ms = distribute_u64(reclaimed.wall_time_ms, &recipient_weights);
+
+        for (recipient_position, &goal_index) in recipients.iter().enumerate() {
+            if let Some(goal_budget) = budgets.get_mut(goal_index) {
+                goal_budget.max_llm_calls = goal_budget.max_llm_calls.saturating_add(
+                    llm_calls
+                        .get(recipient_position)
+                        .copied()
+                        .unwrap_or_default(),
+                );
+                goal_budget.max_tool_invocations = goal_budget.max_tool_invocations.saturating_add(
+                    tool_invocations
+                        .get(recipient_position)
+                        .copied()
+                        .unwrap_or_default(),
+                );
+                goal_budget.max_tokens = goal_budget
+                    .max_tokens
+                    .saturating_add(tokens.get(recipient_position).copied().unwrap_or_default());
+                goal_budget.max_cost_cents = goal_budget.max_cost_cents.saturating_add(
+                    cost_cents
+                        .get(recipient_position)
+                        .copied()
+                        .unwrap_or_default(),
+                );
+                goal_budget.max_wall_time_ms = goal_budget.max_wall_time_ms.saturating_add(
+                    wall_time_ms
+                        .get(recipient_position)
+                        .copied()
+                        .unwrap_or_default(),
+                );
+            }
+        }
+    }
+
+    fn below_floor(&self, budget: &BudgetConfig) -> bool {
+        budget.max_llm_calls < self.floor.min_llm_calls
+            || budget.max_tool_invocations < self.floor.min_tool_invocations
+            || budget.max_tokens < self.floor.min_tokens
+            || budget.max_cost_cents < self.floor.min_cost_cents
+            || budget.max_wall_time_ms < self.floor.min_wall_time_ms
+    }
+
+    fn reserve_parent_continuation(&self, remaining: &BudgetRemaining) -> BudgetRemaining {
+        let fraction = bounded_fraction(self.parent_continuation_fraction);
+
+        BudgetRemaining {
+            llm_calls: to_u32(share_u64(u64::from(remaining.llm_calls), fraction)),
+            tool_invocations: to_u32(share_u64(u64::from(remaining.tool_invocations), fraction)),
+            tokens: share_u64(remaining.tokens, fraction),
+            cost_cents: share_u64(remaining.cost_cents, fraction),
+            wall_time_ms: share_u64(remaining.wall_time_ms, fraction),
         }
     }
 }
@@ -190,41 +465,17 @@ impl BudgetTracker {
         self.cost_cents
     }
 
-    /// Create a child budget config by partitioning remaining resources.
-    ///
-    /// `fraction` is clamped into `[0.0, 1.0]` and partitioning uses *remaining*
-    /// wall-time at `current_time_ms`, not the original configured wall-time.
-    pub fn partition_child(&self, fraction: f32, current_time_ms: u64) -> BudgetConfig {
-        let bounded_fraction = if fraction.is_finite() {
-            fraction.clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-
-        let remaining = self.remaining(current_time_ms);
-
-        BudgetConfig {
-            max_llm_calls: partition_u32(remaining.llm_calls, bounded_fraction),
-            max_tool_invocations: partition_u32(remaining.tool_invocations, bounded_fraction),
-            max_tokens: partition_u64(remaining.tokens, bounded_fraction),
-            max_cost_cents: partition_u64(remaining.cost_cents, bounded_fraction),
-            max_wall_time_ms: partition_u64(remaining.wall_time_ms, bounded_fraction),
-            max_recursion_depth: self.config.max_recursion_depth,
-        }
-    }
-
     /// Depth to assign to a child tracker spawned from this tracker.
     pub fn child_depth(&self) -> u32 {
         self.depth.saturating_add(1)
     }
 
-    /// Create a child tracker with partitioned config and incremented depth.
-    pub fn child_tracker(&self, fraction: f32, current_time_ms: u64) -> Self {
-        Self::new(
-            self.partition_child(fraction, current_time_ms),
-            current_time_ms,
-            self.child_depth(),
-        )
+    pub(crate) fn config(&self) -> &BudgetConfig {
+        &self.config
+    }
+
+    pub(crate) fn depth(&self) -> u32 {
+        self.depth
     }
 
     fn check_resources(&self, cost: &ActionCost) -> Result<(), BudgetExceeded> {
@@ -301,7 +552,7 @@ pub struct ActionCost {
 }
 
 /// Remaining budget snapshot.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct BudgetRemaining {
     /// Remaining LLM calls.
     pub llm_calls: u32,
@@ -317,6 +568,35 @@ pub struct BudgetRemaining {
 
 /// Alias used by the loop engine perception pipeline.
 pub type BudgetSnapshot = BudgetRemaining;
+
+/// Adaptive decomposition depth cap based on remaining LLM calls.
+pub fn effective_max_depth(remaining: &BudgetRemaining) -> u32 {
+    match remaining.llm_calls {
+        calls if calls > 32 => 3,
+        calls if calls > 16 => 2,
+        calls if calls > 6 => 1,
+        _ => 0,
+    }
+}
+
+/// Estimate complexity from description and required tools.
+pub(crate) fn estimate_complexity(sub_goal: &SubGoal) -> ComplexityHint {
+    let description_len = sub_goal.description.chars().count();
+    let tools_count = sub_goal.required_tools.len();
+
+    if description_len > 200
+        || tools_count >= 3
+        || contains_complexity_keyword(&sub_goal.description)
+    {
+        return ComplexityHint::Complex;
+    }
+
+    if description_len < 50 && tools_count == 0 {
+        return ComplexityHint::Trivial;
+    }
+
+    ComplexityHint::Moderate
+}
 
 /// Error returned when a requested action would exceed a budget limit.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -389,22 +669,175 @@ pub fn estimate_cost(action: &IntendedAction) -> ActionCost {
     }
 }
 
-fn partition_u64(value: u64, fraction: f32) -> u64 {
-    if value == 0 {
-        return 0;
+fn bounded_fraction(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
     }
-
-    let scaled = (value as f64 * f64::from(fraction)).floor() as u64;
-    scaled.max(1)
 }
 
-fn partition_u32(value: u32, fraction: f32) -> u32 {
-    if value == 0 {
-        return 0;
+fn share_u64(value: u64, fraction: f32) -> u64 {
+    ((value as f64) * f64::from(fraction)).floor() as u64
+}
+
+fn distribute_u32(total: u32, weights: &[u32]) -> Vec<u32> {
+    distribute_u64(u64::from(total), weights)
+        .into_iter()
+        .map(to_u32)
+        .collect()
+}
+
+fn distribute_u64(total: u64, weights: &[u32]) -> Vec<u64> {
+    if weights.is_empty() || total == 0 {
+        return vec![0; weights.len()];
     }
 
-    let scaled = (f64::from(value) * f64::from(fraction)).floor() as u32;
-    scaled.max(1)
+    let total_weight = weights
+        .iter()
+        .fold(0_u64, |acc, weight| acc.saturating_add(u64::from(*weight)));
+    if total_weight == 0 {
+        return vec![0; weights.len()];
+    }
+
+    let (allocations, mut ranking, allocated) =
+        base_weighted_allocations(total, weights, total_weight);
+    let leftover = total.saturating_sub(allocated);
+    distribute_remainders(allocations, &mut ranking, leftover)
+}
+
+fn base_weighted_allocations(
+    total: u64,
+    weights: &[u32],
+    total_weight: u64,
+) -> (Vec<u64>, Vec<(usize, u32, u64)>, u64) {
+    let mut allocations = vec![0_u64; weights.len()];
+    let mut ranking = Vec::with_capacity(weights.len());
+    let mut allocated = 0_u64;
+
+    for (index, weight) in weights.iter().enumerate() {
+        let numerator = total.saturating_mul(u64::from(*weight));
+        let base = numerator / total_weight;
+        let remainder = numerator % total_weight;
+        allocations[index] = base;
+        allocated = allocated.saturating_add(base);
+        ranking.push((index, *weight, remainder));
+    }
+
+    (allocations, ranking, allocated)
+}
+
+fn distribute_remainders(
+    mut allocations: Vec<u64>,
+    ranking: &mut [(usize, u32, u64)],
+    mut leftover: u64,
+) -> Vec<u64> {
+    ranking.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    if ranking.is_empty() {
+        return allocations;
+    }
+
+    let recipient_count = ranking.len() as u64;
+    if leftover > recipient_count {
+        let even_share = leftover / recipient_count;
+        for (index, _, _) in ranking.iter() {
+            if let Some(value) = allocations.get_mut(*index) {
+                *value = value.saturating_add(even_share);
+            }
+        }
+        leftover %= recipient_count;
+    }
+
+    let mut cursor = 0_usize;
+    while leftover > 0 {
+        let index = ranking[cursor].0;
+        if let Some(value) = allocations.get_mut(index) {
+            *value = value.saturating_add(1);
+        }
+        leftover = leftover.saturating_sub(1);
+        cursor = (cursor + 1) % ranking.len();
+    }
+
+    allocations
+}
+
+fn to_u32(value: u64) -> u32 {
+    if value > u64::from(u32::MAX) {
+        u32::MAX
+    } else {
+        value as u32
+    }
+}
+
+fn contains_complexity_keyword(description: &str) -> bool {
+    let normalized = description.to_ascii_lowercase();
+    normalized
+        .split(|ch: char| !ch.is_ascii_lowercase() && !ch.is_ascii_digit())
+        .filter(|token| !token.is_empty())
+        .any(is_complexity_keyword)
+}
+
+fn is_complexity_keyword(token: &str) -> bool {
+    COMPLEXITY_KEYWORDS.contains(&token)
+}
+
+fn subtract_remaining(total: &BudgetRemaining, reserved: &BudgetRemaining) -> BudgetRemaining {
+    BudgetRemaining {
+        llm_calls: total.llm_calls.saturating_sub(reserved.llm_calls),
+        tool_invocations: total
+            .tool_invocations
+            .saturating_sub(reserved.tool_invocations),
+        tokens: total.tokens.saturating_sub(reserved.tokens),
+        cost_cents: total.cost_cents.saturating_sub(reserved.cost_cents),
+        wall_time_ms: total.wall_time_ms.saturating_sub(reserved.wall_time_ms),
+    }
+}
+
+fn budget_from_remaining(template: &BudgetConfig, remaining: &BudgetRemaining) -> BudgetConfig {
+    BudgetConfig {
+        max_llm_calls: remaining.llm_calls,
+        max_tool_invocations: remaining.tool_invocations,
+        max_tokens: remaining.tokens,
+        max_cost_cents: remaining.cost_cents,
+        max_wall_time_ms: remaining.wall_time_ms,
+        max_recursion_depth: template.max_recursion_depth,
+        decompose_depth_mode: template.decompose_depth_mode,
+    }
+}
+
+fn zeroed_config_like(template: &BudgetConfig) -> BudgetConfig {
+    BudgetConfig {
+        max_llm_calls: 0,
+        max_tool_invocations: 0,
+        max_tokens: 0,
+        max_cost_cents: 0,
+        max_wall_time_ms: 0,
+        max_recursion_depth: template.max_recursion_depth,
+        decompose_depth_mode: template.decompose_depth_mode,
+    }
+}
+
+pub(crate) fn build_skip_mask(total: usize, skipped_indices: &[usize]) -> Vec<bool> {
+    let mut mask = vec![false; total];
+    for &index in skipped_indices {
+        if let Some(entry) = mask.get_mut(index) {
+            *entry = true;
+        }
+    }
+    mask
+}
+
+fn recipient_indices(skip_mask: &[bool]) -> Vec<usize> {
+    skip_mask
+        .iter()
+        .enumerate()
+        .filter_map(|(index, is_skipped)| if *is_skipped { None } else { Some(index) })
+        .collect()
 }
 
 #[cfg(test)]
@@ -420,6 +853,84 @@ mod tests {
             max_cost_cents: 100,
             max_wall_time_ms: 10_000,
             max_recursion_depth: 4,
+            decompose_depth_mode: DepthMode::Adaptive,
+        }
+    }
+
+    fn zero_floor() -> BudgetFloor {
+        BudgetFloor {
+            min_llm_calls: 0,
+            min_tool_invocations: 0,
+            min_tokens: 0,
+            min_cost_cents: 0,
+            min_wall_time_ms: 0,
+        }
+    }
+
+    fn allocation_config() -> BudgetConfig {
+        BudgetConfig {
+            max_llm_calls: 100,
+            max_tool_invocations: 100,
+            max_tokens: 20_000,
+            max_cost_cents: 200,
+            max_wall_time_ms: 100_000,
+            max_recursion_depth: 6,
+            decompose_depth_mode: DepthMode::Adaptive,
+        }
+    }
+
+    fn sub_goal(
+        description: &str,
+        required_tools: &[&str],
+        hint: Option<ComplexityHint>,
+    ) -> SubGoal {
+        SubGoal {
+            description: description.to_string(),
+            required_tools: required_tools
+                .iter()
+                .map(|tool| (*tool).to_string())
+                .collect(),
+            expected_output: None,
+            complexity_hint: hint,
+        }
+    }
+
+    fn sum_llm_calls(budgets: &[BudgetConfig]) -> u32 {
+        budgets.iter().fold(0_u32, |acc, budget| {
+            acc.saturating_add(budget.max_llm_calls)
+        })
+    }
+
+    fn sum_tool_calls(budgets: &[BudgetConfig]) -> u32 {
+        budgets.iter().fold(0_u32, |acc, budget| {
+            acc.saturating_add(budget.max_tool_invocations)
+        })
+    }
+
+    fn sum_tokens(budgets: &[BudgetConfig]) -> u64 {
+        budgets
+            .iter()
+            .fold(0_u64, |acc, budget| acc.saturating_add(budget.max_tokens))
+    }
+
+    fn sum_cost_cents(budgets: &[BudgetConfig]) -> u64 {
+        budgets.iter().fold(0_u64, |acc, budget| {
+            acc.saturating_add(budget.max_cost_cents)
+        })
+    }
+
+    fn sum_wall_time_ms(budgets: &[BudgetConfig]) -> u64 {
+        budgets.iter().fold(0_u64, |acc, budget| {
+            acc.saturating_add(budget.max_wall_time_ms)
+        })
+    }
+
+    fn resolved_depth_cap(config: &BudgetConfig, remaining: &BudgetRemaining) -> u32 {
+        match config.decompose_depth_mode {
+            DepthMode::Static => config.max_recursion_depth,
+            DepthMode::Adaptive => config
+                .max_recursion_depth
+                .min(effective_max_depth(remaining)),
         }
     }
 
@@ -747,93 +1258,9 @@ mod tests {
     }
 
     #[test]
-    fn partition_child_apportions_remaining_budget() {
-        let mut tracker = BudgetTracker::new(test_config(), 1_000, 0);
-        tracker.record(&ActionCost {
-            llm_calls: 2,
-            tool_invocations: 4,
-            tokens: 2_000,
-            cost_cents: 20,
-        });
-
-        let child = tracker.partition_child(0.5, 6_000);
-
-        assert_eq!(
-            child,
-            BudgetConfig {
-                max_llm_calls: 4,
-                max_tool_invocations: 8,
-                max_tokens: 4_000,
-                max_cost_cents: 40,
-                max_wall_time_ms: 2_500,
-                max_recursion_depth: 4,
-            }
-        );
-    }
-
-    #[test]
-    fn partition_child_with_zero_fraction_produces_minimum_viable_config() {
-        let tracker = BudgetTracker::new(test_config(), 0, 0);
-
-        let child = tracker.partition_child(0.0, 0);
-
-        assert_eq!(child.max_llm_calls, 1);
-        assert_eq!(child.max_tool_invocations, 1);
-        assert_eq!(child.max_tokens, 1);
-        assert_eq!(child.max_cost_cents, 1);
-        assert_eq!(child.max_wall_time_ms, 1);
-        assert_eq!(child.max_recursion_depth, 4);
-    }
-
-    #[test]
-    fn partition_child_with_one_fraction_uses_full_parent_remaining() {
-        let mut tracker = BudgetTracker::new(test_config(), 1_000, 1);
-        tracker.record(&ActionCost {
-            llm_calls: 3,
-            tool_invocations: 5,
-            tokens: 2_500,
-            cost_cents: 25,
-        });
-
-        let child = tracker.partition_child(1.0, 6_000);
-
-        assert_eq!(child.max_llm_calls, 7);
-        assert_eq!(child.max_tool_invocations, 15);
-        assert_eq!(child.max_tokens, 7_500);
-        assert_eq!(child.max_cost_cents, 75);
-        assert_eq!(child.max_wall_time_ms, 5_000);
-        assert_eq!(child.max_recursion_depth, 4);
-    }
-
-    #[test]
-    fn partition_child_clamps_fraction_greater_than_one() {
-        let mut tracker = BudgetTracker::new(test_config(), 1_000, 1);
-        tracker.record(&ActionCost {
-            llm_calls: 3,
-            tool_invocations: 5,
-            tokens: 2_500,
-            cost_cents: 25,
-        });
-
-        let child = tracker.partition_child(1.5, 6_000);
-
-        assert_eq!(child.max_llm_calls, 7);
-        assert_eq!(child.max_tool_invocations, 15);
-        assert_eq!(child.max_tokens, 7_500);
-        assert_eq!(child.max_cost_cents, 75);
-        assert_eq!(child.max_wall_time_ms, 5_000);
-    }
-
-    #[test]
-    fn child_tracker_increments_depth() {
+    fn child_depth_increments() {
         let tracker = BudgetTracker::new(test_config(), 1_000, 2);
-
         assert_eq!(tracker.child_depth(), 3);
-
-        let child = tracker.child_tracker(0.5, 6_000);
-        assert_eq!(child.depth, 3);
-        assert_eq!(child.start_time_ms, 6_000);
-        assert_eq!(child.config.max_recursion_depth, 4);
     }
 
     #[test]
@@ -869,6 +1296,10 @@ mod tests {
         assert!(default.max_cost_cents > conservative.max_cost_cents);
         assert!(default.max_wall_time_ms > conservative.max_wall_time_ms);
         assert!(default.max_recursion_depth > conservative.max_recursion_depth);
+
+        assert_eq!(default.decompose_depth_mode, DepthMode::Adaptive);
+        assert_eq!(conservative.decompose_depth_mode, DepthMode::Adaptive);
+        assert_eq!(unlimited.decompose_depth_mode, DepthMode::Adaptive);
 
         assert_eq!(unlimited.max_llm_calls, u32::MAX);
         assert_eq!(unlimited.max_tool_invocations, u32::MAX);
@@ -933,5 +1364,480 @@ mod tests {
                 cost_cents: 6,
             }
         );
+    }
+
+    // ----- BudgetAllocator unit tests (13) -----
+
+    #[test]
+    fn allocate_reserves_parent_continuation_budget() {
+        let tracker = BudgetTracker::new(allocation_config(), 0, 0);
+        let allocator = BudgetAllocator::new();
+        let sub_goals = vec![sub_goal("one", &[], Some(ComplexityHint::Moderate))];
+
+        let plan = allocator.allocate(&tracker, &sub_goals, AllocationMode::Sequential, 0);
+
+        assert_eq!(plan.parent_continuation_budget.max_llm_calls, 10);
+        assert_eq!(plan.parent_continuation_budget.max_tool_invocations, 10);
+        assert_eq!(plan.parent_continuation_budget.max_tokens, 2_000);
+        assert_eq!(plan.parent_continuation_budget.max_cost_cents, 20);
+        assert_eq!(plan.parent_continuation_budget.max_wall_time_ms, 10_000);
+        assert_eq!(plan.sub_goal_budgets[0].max_llm_calls, 90);
+    }
+
+    #[test]
+    fn allocate_distributes_by_complexity_weight() {
+        let mut config = allocation_config();
+        config.max_llm_calls = 50;
+        config.max_tool_invocations = 50;
+        let tracker = BudgetTracker::new(config, 0, 0);
+        let allocator = BudgetAllocator {
+            parent_continuation_fraction: 0.0,
+            floor: zero_floor(),
+        };
+        let sub_goals = vec![
+            sub_goal("tiny", &[], Some(ComplexityHint::Trivial)),
+            sub_goal("big", &[], Some(ComplexityHint::Complex)),
+        ];
+
+        let plan = allocator.allocate(&tracker, &sub_goals, AllocationMode::Concurrent, 0);
+
+        assert_eq!(plan.sub_goal_budgets[0].max_llm_calls, 10);
+        assert_eq!(plan.sub_goal_budgets[1].max_llm_calls, 40);
+        assert_eq!(plan.sub_goal_budgets[0].max_tool_invocations, 10);
+        assert_eq!(plan.sub_goal_budgets[1].max_tool_invocations, 40);
+    }
+
+    #[test]
+    fn allocate_integer_rounding_conserves_resource_totals() {
+        let config = BudgetConfig {
+            max_llm_calls: 11,
+            max_tool_invocations: 13,
+            max_tokens: 10_003,
+            max_cost_cents: 17,
+            max_wall_time_ms: 9_999,
+            max_recursion_depth: 5,
+            decompose_depth_mode: DepthMode::Adaptive,
+        };
+        let tracker = BudgetTracker::new(config.clone(), 0, 0);
+        let allocator = BudgetAllocator {
+            parent_continuation_fraction: 0.0,
+            floor: zero_floor(),
+        };
+        let sub_goals = vec![
+            sub_goal("a", &[], Some(ComplexityHint::Trivial)),
+            sub_goal("b", &[], Some(ComplexityHint::Moderate)),
+            sub_goal("c", &[], Some(ComplexityHint::Complex)),
+        ];
+
+        let plan = allocator.allocate(&tracker, &sub_goals, AllocationMode::Sequential, 0);
+        let remaining = tracker.remaining(0);
+
+        assert_eq!(sum_llm_calls(&plan.sub_goal_budgets), remaining.llm_calls);
+        assert_eq!(
+            sum_tool_calls(&plan.sub_goal_budgets),
+            remaining.tool_invocations
+        );
+        assert_eq!(sum_tokens(&plan.sub_goal_budgets), remaining.tokens);
+        assert_eq!(sum_cost_cents(&plan.sub_goal_budgets), remaining.cost_cents);
+        assert_eq!(
+            sum_wall_time_ms(&plan.sub_goal_budgets),
+            remaining.wall_time_ms
+        );
+    }
+
+    #[test]
+    fn allocate_integer_rounding_is_deterministic_for_ties() {
+        let config = BudgetConfig {
+            max_llm_calls: 5,
+            max_tool_invocations: 5,
+            max_tokens: 5_000,
+            max_cost_cents: 5,
+            max_wall_time_ms: 5_000,
+            max_recursion_depth: 5,
+            decompose_depth_mode: DepthMode::Adaptive,
+        };
+        let tracker = BudgetTracker::new(config, 0, 0);
+        let allocator = BudgetAllocator {
+            parent_continuation_fraction: 0.0,
+            floor: zero_floor(),
+        };
+        let sub_goals = vec![
+            sub_goal("one", &[], Some(ComplexityHint::Moderate)),
+            sub_goal("two", &[], Some(ComplexityHint::Moderate)),
+            sub_goal("three", &[], Some(ComplexityHint::Moderate)),
+        ];
+
+        let first = allocator.allocate(&tracker, &sub_goals, AllocationMode::Concurrent, 0);
+        let second = allocator.allocate(&tracker, &sub_goals, AllocationMode::Concurrent, 0);
+
+        assert_eq!(first.sub_goal_budgets[0].max_llm_calls, 2);
+        assert_eq!(first.sub_goal_budgets[1].max_llm_calls, 2);
+        assert_eq!(first.sub_goal_budgets[2].max_llm_calls, 1);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn distribute_remainders_handles_large_leftover_without_linear_work() {
+        let mut ranking = vec![(0, 1, 0), (1, 1, 0), (2, 1, 0)];
+
+        let allocations = distribute_remainders(vec![0, 0, 0], &mut ranking, 1_000_000_001);
+
+        assert_eq!(allocations, vec![333_333_334, 333_333_334, 333_333_333]);
+        assert_eq!(allocations.iter().sum::<u64>(), 1_000_000_001);
+    }
+
+    #[test]
+    fn build_skip_mask_marks_only_in_range_indices() {
+        let mask = build_skip_mask(3, &[0, 2, 99]);
+
+        assert_eq!(mask, vec![true, false, true]);
+    }
+
+    #[test]
+    fn allocate_skips_sub_goals_below_floor() {
+        let config = BudgetConfig {
+            max_llm_calls: 8,
+            max_tool_invocations: 8,
+            max_tokens: 3_000,
+            max_cost_cents: 12,
+            max_wall_time_ms: 12_000,
+            max_recursion_depth: 5,
+            decompose_depth_mode: DepthMode::Adaptive,
+        };
+        let tracker = BudgetTracker::new(config, 0, 0);
+        let allocator = BudgetAllocator::new();
+        let sub_goals = vec![
+            sub_goal("short", &[], Some(ComplexityHint::Trivial)),
+            sub_goal("also short", &[], Some(ComplexityHint::Trivial)),
+            sub_goal("heavy", &[], Some(ComplexityHint::Complex)),
+        ];
+
+        let plan = allocator.allocate(&tracker, &sub_goals, AllocationMode::Sequential, 0);
+
+        assert!(plan.skipped_indices.contains(&0));
+        assert!(plan.skipped_indices.contains(&1));
+        assert!(!plan.skipped_indices.contains(&2));
+    }
+
+    #[test]
+    fn allocate_redistributes_skipped_budget() {
+        let config = BudgetConfig {
+            max_llm_calls: 8,
+            max_tool_invocations: 8,
+            max_tokens: 3_000,
+            max_cost_cents: 12,
+            max_wall_time_ms: 12_000,
+            max_recursion_depth: 5,
+            decompose_depth_mode: DepthMode::Adaptive,
+        };
+        let tracker = BudgetTracker::new(config, 0, 0);
+        let allocator = BudgetAllocator {
+            parent_continuation_fraction: 0.0,
+            floor: BudgetFloor::default(),
+        };
+        let sub_goals = vec![
+            sub_goal("short", &[], Some(ComplexityHint::Trivial)),
+            sub_goal("also short", &[], Some(ComplexityHint::Trivial)),
+            sub_goal("heavy", &[], Some(ComplexityHint::Complex)),
+        ];
+
+        let plan = allocator.allocate(&tracker, &sub_goals, AllocationMode::Concurrent, 0);
+
+        assert_eq!(plan.sub_goal_budgets[0].max_llm_calls, 0);
+        assert_eq!(plan.sub_goal_budgets[1].max_llm_calls, 0);
+        assert_eq!(plan.sub_goal_budgets[2].max_llm_calls, 8);
+        assert_eq!(plan.sub_goal_budgets[2].max_tokens, 3_000);
+        assert_eq!(plan.sub_goal_budgets[2].max_cost_cents, 12);
+    }
+
+    #[test]
+    fn allocate_single_sub_goal_gets_full_distributable() {
+        let tracker = BudgetTracker::new(allocation_config(), 0, 0);
+        let allocator = BudgetAllocator::new();
+        let sub_goals = vec![sub_goal("only", &[], None)];
+
+        let plan = allocator.allocate(&tracker, &sub_goals, AllocationMode::Sequential, 0);
+
+        assert_eq!(plan.sub_goal_budgets.len(), 1);
+        assert_eq!(plan.sub_goal_budgets[0].max_llm_calls, 90);
+        assert_eq!(plan.sub_goal_budgets[0].max_tool_invocations, 90);
+        assert_eq!(plan.sub_goal_budgets[0].max_tokens, 18_000);
+    }
+
+    #[test]
+    fn allocate_all_sub_goals_below_floor_returns_all_skipped() {
+        let config = BudgetConfig {
+            max_llm_calls: 2,
+            max_tool_invocations: 2,
+            max_tokens: 500,
+            max_cost_cents: 2,
+            max_wall_time_ms: 1_000,
+            max_recursion_depth: 5,
+            decompose_depth_mode: DepthMode::Adaptive,
+        };
+        let tracker = BudgetTracker::new(config, 0, 0);
+        let allocator = BudgetAllocator::new();
+        let sub_goals = vec![sub_goal("a", &[], None), sub_goal("b", &[], None)];
+
+        let plan = allocator.allocate(&tracker, &sub_goals, AllocationMode::Sequential, 0);
+
+        assert_eq!(plan.skipped_indices, vec![0, 1]);
+        assert!(plan
+            .sub_goal_budgets
+            .iter()
+            .all(|budget| budget.max_llm_calls == 0));
+    }
+
+    #[test]
+    fn allocate_mode_sequential_and_concurrent_match_in_v1() {
+        let tracker = BudgetTracker::new(allocation_config(), 0, 0);
+        let allocator = BudgetAllocator {
+            parent_continuation_fraction: 0.0,
+            floor: zero_floor(),
+        };
+        let sub_goals = vec![
+            sub_goal("a", &[], Some(ComplexityHint::Trivial)),
+            sub_goal("b", &[], Some(ComplexityHint::Moderate)),
+            sub_goal("c", &[], Some(ComplexityHint::Complex)),
+        ];
+
+        let sequential = allocator.allocate(&tracker, &sub_goals, AllocationMode::Sequential, 0);
+        let concurrent = allocator.allocate(&tracker, &sub_goals, AllocationMode::Concurrent, 0);
+
+        assert_eq!(sequential, concurrent);
+    }
+
+    #[test]
+    fn allocate_zero_sub_goals_returns_empty_plan() {
+        let tracker = BudgetTracker::new(allocation_config(), 0, 0);
+        let allocator = BudgetAllocator::new();
+
+        let plan = allocator.allocate(&tracker, &[], AllocationMode::Sequential, 0);
+
+        assert!(plan.sub_goal_budgets.is_empty());
+        assert!(plan.skipped_indices.is_empty());
+    }
+
+    #[test]
+    fn allocate_zero_remaining_is_infallible() {
+        let config = BudgetConfig {
+            max_llm_calls: 0,
+            max_tool_invocations: 0,
+            max_tokens: 0,
+            max_cost_cents: 0,
+            max_wall_time_ms: 0,
+            max_recursion_depth: 5,
+            decompose_depth_mode: DepthMode::Adaptive,
+        };
+        let tracker = BudgetTracker::new(config, 0, 0);
+        let allocator = BudgetAllocator::new();
+        let goals = vec![sub_goal("a", &[], None), sub_goal("b", &[], None)];
+
+        let plan = allocator.allocate(&tracker, &goals, AllocationMode::Concurrent, 0);
+
+        assert_eq!(plan.sub_goal_budgets.len(), 2);
+        assert_eq!(plan.skipped_indices, vec![0, 1]);
+        assert_eq!(sum_llm_calls(&plan.sub_goal_budgets), 0);
+    }
+
+    #[test]
+    fn parent_continuation_budget_clamps_to_remaining() {
+        let config = BudgetConfig {
+            max_llm_calls: 3,
+            max_tool_invocations: 3,
+            max_tokens: 30,
+            max_cost_cents: 3,
+            max_wall_time_ms: 30,
+            max_recursion_depth: 5,
+            decompose_depth_mode: DepthMode::Adaptive,
+        };
+        let tracker = BudgetTracker::new(config, 0, 0);
+        let allocator = BudgetAllocator {
+            parent_continuation_fraction: 5.0,
+            floor: zero_floor(),
+        };
+        let goals = vec![sub_goal("a", &[], None)];
+
+        let plan = allocator.allocate(&tracker, &goals, AllocationMode::Sequential, 0);
+
+        assert_eq!(plan.parent_continuation_budget.max_llm_calls, 3);
+        assert_eq!(plan.parent_continuation_budget.max_tool_invocations, 3);
+        assert_eq!(plan.parent_continuation_budget.max_tokens, 30);
+        assert_eq!(plan.sub_goal_budgets[0].max_llm_calls, 0);
+    }
+
+    #[test]
+    fn complexity_hint_overrides_heuristic() {
+        let config = BudgetConfig {
+            max_llm_calls: 10,
+            max_tool_invocations: 10,
+            max_tokens: 10_000,
+            max_cost_cents: 20,
+            max_wall_time_ms: 10_000,
+            max_recursion_depth: 5,
+            decompose_depth_mode: DepthMode::Adaptive,
+        };
+        let tracker = BudgetTracker::new(config, 0, 0);
+        let allocator = BudgetAllocator {
+            parent_continuation_fraction: 0.0,
+            floor: zero_floor(),
+        };
+        let goals = vec![
+            sub_goal("tiny task", &[], Some(ComplexityHint::Complex)),
+            sub_goal("tiny task", &[], None),
+        ];
+
+        let plan = allocator.allocate(&tracker, &goals, AllocationMode::Sequential, 0);
+
+        assert!(plan.sub_goal_budgets[0].max_llm_calls > plan.sub_goal_budgets[1].max_llm_calls);
+    }
+
+    // ----- estimate_complexity unit tests (10) -----
+
+    #[test]
+    fn trivial_for_short_description_no_tools() {
+        let goal = sub_goal("quick status check", &[], None);
+        assert_eq!(estimate_complexity(&goal), ComplexityHint::Trivial);
+    }
+
+    #[test]
+    fn complex_keyword_preempts_trivial_when_conditions_overlap() {
+        let goal = sub_goal("refactor", &[], None);
+        assert_eq!(estimate_complexity(&goal), ComplexityHint::Complex);
+    }
+
+    #[test]
+    fn boundary_50_chars_is_moderate_not_trivial() {
+        let goal = sub_goal(&"a".repeat(50), &[], None);
+        assert_eq!(estimate_complexity(&goal), ComplexityHint::Moderate);
+    }
+
+    #[test]
+    fn exactly_2_tools_is_moderate() {
+        let goal = sub_goal("inspect", &["one", "two"], None);
+        assert_eq!(estimate_complexity(&goal), ComplexityHint::Moderate);
+    }
+
+    #[test]
+    fn exactly_3_tools_is_complex() {
+        let goal = sub_goal("inspect", &["one", "two", "three"], None);
+        assert_eq!(estimate_complexity(&goal), ComplexityHint::Complex);
+    }
+
+    #[test]
+    fn moderate_for_medium_description_few_tools() {
+        let goal = sub_goal(&"m".repeat(120), &["tool-a"], None);
+        assert_eq!(estimate_complexity(&goal), ComplexityHint::Moderate);
+    }
+
+    #[test]
+    fn complex_for_long_description() {
+        let goal = sub_goal(&"c".repeat(201), &[], None);
+        assert_eq!(estimate_complexity(&goal), ComplexityHint::Complex);
+    }
+
+    #[test]
+    fn keyword_matching_is_case_insensitive() {
+        let goal = sub_goal("Please ReFaCtOr this module", &[], None);
+        assert_eq!(estimate_complexity(&goal), ComplexityHint::Complex);
+    }
+
+    #[test]
+    fn keyword_matching_uses_word_boundaries() {
+        let no_match = sub_goal("implementation details", &["tool"], None);
+        let match_word = sub_goal("implement api", &[], None);
+
+        assert_eq!(estimate_complexity(&no_match), ComplexityHint::Moderate);
+        assert_eq!(estimate_complexity(&match_word), ComplexityHint::Complex);
+    }
+
+    #[test]
+    fn complex_for_exhaustive_keyword_list() {
+        for keyword in COMPLEXITY_KEYWORDS {
+            let goal = sub_goal(keyword, &[], None);
+            assert_eq!(estimate_complexity(&goal), ComplexityHint::Complex);
+        }
+    }
+
+    // ----- Dynamic depth cap tests (budget-side) -----
+
+    #[test]
+    fn effective_max_depth_threshold_mapping_is_stable() {
+        assert_eq!(
+            effective_max_depth(&BudgetRemaining {
+                llm_calls: 33,
+                ..BudgetRemaining::default()
+            }),
+            3
+        );
+        assert_eq!(
+            effective_max_depth(&BudgetRemaining {
+                llm_calls: 17,
+                ..BudgetRemaining::default()
+            }),
+            2
+        );
+        assert_eq!(
+            effective_max_depth(&BudgetRemaining {
+                llm_calls: 7,
+                ..BudgetRemaining::default()
+            }),
+            1
+        );
+        assert_eq!(
+            effective_max_depth(&BudgetRemaining {
+                llm_calls: 6,
+                ..BudgetRemaining::default()
+            }),
+            0
+        );
+    }
+
+    #[test]
+    fn depth_mode_default_is_adaptive() {
+        assert_eq!(DepthMode::default(), DepthMode::Adaptive);
+        assert_eq!(
+            BudgetConfig::default().decompose_depth_mode,
+            DepthMode::Adaptive
+        );
+    }
+
+    #[test]
+    fn depth_mode_static_ignores_budget_derived_depth() {
+        let config = BudgetConfig {
+            max_recursion_depth: 8,
+            decompose_depth_mode: DepthMode::Static,
+            ..test_config()
+        };
+        let remaining = BudgetRemaining {
+            llm_calls: 1,
+            ..BudgetRemaining::default()
+        };
+
+        assert_eq!(effective_max_depth(&remaining), 0);
+        assert_eq!(resolved_depth_cap(&config, &remaining), 8);
+    }
+
+    #[test]
+    fn depth_mode_adaptive_uses_min_of_static_and_effective_cap() {
+        let config = BudgetConfig {
+            max_recursion_depth: 2,
+            decompose_depth_mode: DepthMode::Adaptive,
+            ..test_config()
+        };
+
+        let high_budget = BudgetRemaining {
+            llm_calls: 40,
+            ..BudgetRemaining::default()
+        };
+        let low_budget = BudgetRemaining {
+            llm_calls: 8,
+            ..BudgetRemaining::default()
+        };
+
+        assert_eq!(effective_max_depth(&high_budget), 3);
+        assert_eq!(resolved_depth_cap(&config, &high_budget), 2);
+        assert_eq!(effective_max_depth(&low_budget), 1);
+        assert_eq!(resolved_depth_cap(&config, &low_budget), 1);
     }
 }

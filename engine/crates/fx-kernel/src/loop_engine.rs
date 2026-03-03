@@ -1,7 +1,10 @@
 //! Agentic loop orchestrator.
 
 use crate::act::{ActionResult, TokenUsage, ToolExecutor, ToolResult};
-use crate::budget::{ActionCost, BudgetRemaining, BudgetResource, BudgetTracker};
+use crate::budget::{
+    build_skip_mask, effective_max_depth, ActionCost, AllocationMode, AllocationPlan,
+    BudgetAllocator, BudgetConfig, BudgetRemaining, BudgetTracker, DepthMode,
+};
 use crate::cancellation::CancellationToken;
 use crate::context_manager::ContextCompactor;
 use crate::continuation::Continuation;
@@ -21,7 +24,7 @@ use crate::verify::Verification;
 use async_trait::async_trait;
 use fx_core::types::{InputSource, ScreenState, UserInput};
 use fx_decompose::{
-    AggregationStrategy, DecompositionPlan, SubGoal, SubGoalOutcome, SubGoalResult,
+    AggregationStrategy, ComplexityHint, DecompositionPlan, SubGoal, SubGoalOutcome, SubGoalResult,
 };
 use fx_llm::{
     CompletionRequest, CompletionResponse, ContentBlock, Message, MessageRole, ProviderError,
@@ -398,6 +401,12 @@ struct CompactionContext<'a> {
     before_tokens: usize,
 }
 
+#[derive(Debug)]
+struct IndexedSubGoalExecution {
+    index: usize,
+    execution: SubGoalExecution,
+}
+
 #[derive(Debug, Deserialize)]
 struct DecomposeToolArguments {
     sub_goals: Vec<DecomposeSubGoalArguments>,
@@ -412,6 +421,8 @@ struct DecomposeSubGoalArguments {
     required_tools: Vec<String>,
     #[serde(default)]
     expected_output: Option<String>,
+    #[serde(default)]
+    complexity_hint: Option<ComplexityHint>,
 }
 
 impl From<DecomposeSubGoalArguments> for SubGoal {
@@ -420,6 +431,7 @@ impl From<DecomposeSubGoalArguments> for SubGoal {
             description: value.description,
             required_tools: value.required_tools,
             expected_output: value.expected_output,
+            complexity_hint: value.complexity_hint,
         }
     }
 }
@@ -1034,7 +1046,10 @@ impl LoopEngine {
         llm: &dyn LlmProvider,
         context_messages: &[Message],
     ) -> Result<ActionResult, LoopError> {
-        if self.decomposition_depth_limited() {
+        let timestamp_ms = current_time_ms();
+        let remaining = self.budget.remaining(timestamp_ms);
+        let effective_cap = self.effective_decomposition_depth_cap(&remaining);
+        if self.decomposition_depth_limited(effective_cap) {
             return Ok(self.depth_limited_decomposition_result(decision));
         }
 
@@ -1042,19 +1057,10 @@ impl LoopEngine {
             self.emit_decomposition_truncation_signal(original_sub_goals, plan.sub_goals.len());
         }
 
-        let results = match &plan.strategy {
-            AggregationStrategy::Parallel => {
-                self.execute_sub_goals_concurrent(plan, llm, context_messages)
-                    .await
-            }
-            AggregationStrategy::Sequential => {
-                self.execute_sub_goals_sequential(plan, llm, context_messages)
-                    .await
-            }
-            AggregationStrategy::Custom(s) => {
-                unreachable!("custom strategy '{s}' should be rejected during parsing")
-            }
-        };
+        let allocation = self.prepare_allocation_plan(plan, timestamp_ms, effective_cap);
+        let results = self
+            .execute_allocated_sub_goals(plan, &allocation, llm, context_messages)
+            .await;
 
         Ok(ActionResult {
             decision: decision.clone(),
@@ -1064,28 +1070,74 @@ impl LoopEngine {
         })
     }
 
-    async fn execute_sub_goals_sequential(
+    fn prepare_allocation_plan(
+        &self,
+        plan: &DecompositionPlan,
+        timestamp_ms: u64,
+        effective_cap: u32,
+    ) -> AllocationPlan {
+        let allocator = BudgetAllocator::new();
+        let mode = allocation_mode_for_strategy(&plan.strategy);
+        let mut allocation = allocator.allocate(&self.budget, &plan.sub_goals, mode, timestamp_ms);
+        self.apply_effective_depth_cap(&mut allocation.sub_goal_budgets, effective_cap);
+        allocation
+    }
+
+    async fn execute_allocated_sub_goals(
         &mut self,
         plan: &DecompositionPlan,
+        allocation: &AllocationPlan,
         llm: &dyn LlmProvider,
         context_messages: &[Message],
     ) -> Vec<SubGoalResult> {
-        // Each sequential sub-goal gets 50% of the parent's *remaining* budget
-        // after prior sub-goals' consumption. This creates a diminishing series
-        // (50%, 25%, 12.5%, ...) that naturally throttles later sub-goals.
-        let per_goal_fraction = 0.5;
+        match &plan.strategy {
+            AggregationStrategy::Parallel => {
+                self.execute_sub_goals_concurrent(plan, allocation, llm, context_messages)
+                    .await
+            }
+            AggregationStrategy::Sequential => {
+                self.execute_sub_goals_sequential(plan, allocation, llm, context_messages)
+                    .await
+            }
+            AggregationStrategy::Custom(s) => {
+                unreachable!("custom strategy '{s}' should be rejected during parsing")
+            }
+        }
+    }
+
+    async fn execute_sub_goals_sequential(
+        &mut self,
+        plan: &DecompositionPlan,
+        allocation: &AllocationPlan,
+        llm: &dyn LlmProvider,
+        context_messages: &[Message],
+    ) -> Vec<SubGoalResult> {
         let total = plan.sub_goals.len();
+        let skipped = build_skip_mask(total, &allocation.skipped_indices);
         let mut results = Vec::with_capacity(total);
+
         for (index, sub_goal) in plan.sub_goals.iter().enumerate() {
             self.emit_sub_goal_progress(index, total, &sub_goal.description);
-            let execution = self
-                .run_sub_goal(sub_goal, per_goal_fraction, llm, context_messages)
-                .await;
-            let should_halt = should_halt_sub_goal_sequence(&execution.result);
-            self.budget.absorb_child_usage(&execution.budget);
-            self.roll_up_sub_goal_signals(&execution.result.signals);
-            self.emit_sub_goal_completed(index, total, &execution.result);
-            results.push(execution.result);
+            let result = if skipped.get(index).copied().unwrap_or(false) {
+                self.emit_sub_goal_skipped(index, total, &sub_goal.description);
+                skipped_sub_goal_result(sub_goal.clone())
+            } else {
+                let child_config = allocation
+                    .sub_goal_budgets
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_else(|| self.zero_sub_goal_budget());
+                let execution = self
+                    .run_sub_goal(sub_goal, child_config, llm, context_messages)
+                    .await;
+                self.budget.absorb_child_usage(&execution.budget);
+                self.roll_up_sub_goal_signals(&execution.result.signals);
+                execution.result
+            };
+
+            let should_halt = should_halt_sub_goal_sequence(&result);
+            self.emit_sub_goal_completed(index, total, &result);
+            results.push(result);
 
             if should_halt {
                 self.emit_signal(
@@ -1097,29 +1149,33 @@ impl LoopEngine {
                 break;
             }
         }
+
         results
     }
 
     async fn execute_sub_goals_concurrent(
         &mut self,
         plan: &DecompositionPlan,
+        allocation: &AllocationPlan,
         llm: &dyn LlmProvider,
         context_messages: &[Message],
     ) -> Vec<SubGoalResult> {
-        let count = plan.sub_goals.len().max(1);
-        // Concurrent sub-goals split the budget equally (1/N each) since all
-        // start from the same remaining budget snapshot and can't see each
-        // other's consumption until aggregation.
-        let per_goal_fraction = 1.0 / count as f32;
         let total = plan.sub_goals.len();
+        let skipped = build_skip_mask(total, &allocation.skipped_indices);
+
         for (index, sub_goal) in plan.sub_goals.iter().enumerate() {
             self.emit_sub_goal_progress(index, total, &sub_goal.description);
         }
 
-        let child_futures =
-            self.build_concurrent_futures(plan, per_goal_fraction, llm, context_messages);
+        let child_futures = self.build_concurrent_futures(
+            plan,
+            &allocation.sub_goal_budgets,
+            &skipped,
+            llm,
+            context_messages,
+        );
         let executions = futures_util::future::join_all(child_futures).await;
-        self.collect_concurrent_results(executions, total)
+        self.collect_concurrent_results(plan, executions, &skipped)
     }
 
     /// Build async futures for each sub-goal in the plan.
@@ -1131,29 +1187,82 @@ impl LoopEngine {
     fn build_concurrent_futures<'a>(
         &'a self,
         plan: &'a DecompositionPlan,
-        fraction: f32,
+        sub_goal_budgets: &'a [BudgetConfig],
+        skipped: &'a [bool],
         llm: &'a dyn LlmProvider,
         context_messages: &'a [Message],
-    ) -> Vec<impl std::future::Future<Output = SubGoalExecution> + 'a> {
+    ) -> Vec<impl std::future::Future<Output = IndexedSubGoalExecution> + 'a> {
         plan.sub_goals
             .iter()
-            .map(|sub_goal| self.run_sub_goal(sub_goal, fraction, llm, context_messages))
+            .enumerate()
+            .filter_map(|(index, sub_goal)| {
+                if skipped.get(index).copied().unwrap_or(false) {
+                    return None;
+                }
+
+                let child_config = sub_goal_budgets
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_else(|| self.zero_sub_goal_budget());
+                let goal = sub_goal.clone();
+
+                Some(async move {
+                    let execution = self
+                        .run_sub_goal(&goal, child_config, llm, context_messages)
+                        .await;
+                    IndexedSubGoalExecution { index, execution }
+                })
+            })
             .collect()
     }
 
     fn collect_concurrent_results(
         &mut self,
-        executions: Vec<SubGoalExecution>,
-        total: usize,
+        plan: &DecompositionPlan,
+        executions: Vec<IndexedSubGoalExecution>,
+        skipped: &[bool],
     ) -> Vec<SubGoalResult> {
-        let mut results = Vec::with_capacity(total);
-        for (index, execution) in executions.into_iter().enumerate() {
-            self.budget.absorb_child_usage(&execution.budget);
-            self.roll_up_sub_goal_signals(&execution.result.signals);
-            self.emit_sub_goal_completed(index, total, &execution.result);
-            results.push(execution.result);
+        let total = plan.sub_goals.len();
+        let mut ordered = vec![None; total];
+
+        for (index, slot) in ordered.iter_mut().enumerate().take(total) {
+            if !skipped.get(index).copied().unwrap_or(false) {
+                continue;
+            }
+            if let Some(goal) = plan.sub_goals.get(index) {
+                self.emit_sub_goal_skipped(index, total, &goal.description);
+                let result = skipped_sub_goal_result(goal.clone());
+                self.emit_sub_goal_completed(index, total, &result);
+                *slot = Some(result);
+            }
         }
-        results
+
+        for indexed in executions {
+            let index = indexed.index;
+            self.budget.absorb_child_usage(&indexed.execution.budget);
+            self.roll_up_sub_goal_signals(&indexed.execution.result.signals);
+            self.emit_sub_goal_completed(index, total, &indexed.execution.result);
+            if let Some(slot) = ordered.get_mut(index) {
+                *slot = Some(indexed.execution.result);
+            }
+        }
+
+        ordered
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, maybe_result)| {
+                debug_assert!(
+                    maybe_result.is_some() || skipped.get(index).copied().unwrap_or(false),
+                    "unexpected missing result at index {index}"
+                );
+                maybe_result.or_else(|| {
+                    plan.sub_goals
+                        .get(index)
+                        .cloned()
+                        .map(skipped_sub_goal_result)
+                })
+            })
+            .collect()
     }
 
     fn emit_sub_goal_completed(&self, index: usize, total: usize, result: &SubGoalResult) {
@@ -1170,12 +1279,13 @@ impl LoopEngine {
     async fn run_sub_goal(
         &self,
         sub_goal: &SubGoal,
-        fraction: f32,
+        child_config: BudgetConfig,
         llm: &dyn LlmProvider,
         context_messages: &[Message],
     ) -> SubGoalExecution {
         let timestamp_ms = current_time_ms();
-        let child_budget = self.budget.child_tracker(fraction, timestamp_ms);
+        let child_budget =
+            BudgetTracker::new(child_config, timestamp_ms, self.budget.child_depth());
         let (mut child, compacted_context) = match self
             .prepare_sub_goal_engine(sub_goal, child_budget, context_messages)
             .await
@@ -1245,14 +1355,37 @@ impl LoopEngine {
         builder.build()
     }
 
-    fn decomposition_depth_limited(&self) -> bool {
-        matches!(
-            self.budget.check(&ActionCost::default()),
-            Err(crate::budget::BudgetExceeded {
-                resource: BudgetResource::RecursionDepth,
-                ..
-            })
-        )
+    fn decomposition_depth_limited(&self, effective_cap: u32) -> bool {
+        self.budget.depth() >= effective_cap
+    }
+
+    fn effective_decomposition_depth_cap(&self, remaining: &BudgetRemaining) -> u32 {
+        let config = self.budget.config();
+        match config.decompose_depth_mode {
+            DepthMode::Static => config.max_recursion_depth,
+            DepthMode::Adaptive => config
+                .max_recursion_depth
+                .min(effective_max_depth(remaining)),
+        }
+    }
+
+    fn apply_effective_depth_cap(&self, sub_goal_budgets: &mut [BudgetConfig], effective_cap: u32) {
+        for budget in sub_goal_budgets {
+            budget.max_recursion_depth = budget.max_recursion_depth.min(effective_cap);
+        }
+    }
+
+    fn zero_sub_goal_budget(&self) -> BudgetConfig {
+        let template = self.budget.config();
+        BudgetConfig {
+            max_llm_calls: 0,
+            max_tool_invocations: 0,
+            max_tokens: 0,
+            max_cost_cents: 0,
+            max_wall_time_ms: 0,
+            max_recursion_depth: template.max_recursion_depth,
+            decompose_depth_mode: template.decompose_depth_mode,
+        }
     }
 
     fn depth_limited_decomposition_result(&mut self, decision: &Decision) -> ActionResult {
@@ -1282,6 +1415,19 @@ impl LoopEngine {
                 description: description.to_string(),
             });
         }
+    }
+
+    fn emit_sub_goal_skipped(&mut self, index: usize, total: usize, description: &str) {
+        self.emit_signal(
+            LoopStep::Act,
+            SignalKind::Friction,
+            format!("Sub-goal {}/{} skipped: {description}", index + 1, total),
+            serde_json::json!({
+                "sub_goal_index": index,
+                "total": total,
+                "reason": "below_budget_floor",
+            }),
+        );
     }
 
     fn emit_decomposition_truncation_signal(
@@ -2240,6 +2386,14 @@ fn failed_sub_goal_result_with_signals(
     }
 }
 
+fn skipped_sub_goal_result(goal: SubGoal) -> SubGoalResult {
+    SubGoalResult {
+        goal,
+        outcome: SubGoalOutcome::Skipped,
+        signals: Vec::new(),
+    }
+}
+
 fn aggregate_sub_goal_results(results: &[SubGoalResult]) -> String {
     if results.is_empty() {
         return "Task decomposition contained no sub-goals.".to_string();
@@ -2266,11 +2420,22 @@ fn format_sub_goal_outcome(outcome: &SubGoalOutcome) -> String {
         SubGoalOutcome::Completed(response) => format!("completed: {response}"),
         SubGoalOutcome::Failed(message) => format!("failed: {message}"),
         SubGoalOutcome::BudgetExhausted => "budget exhausted".to_string(),
+        SubGoalOutcome::Skipped => "skipped (below floor)".to_string(),
     }
 }
 
 fn should_halt_sub_goal_sequence(result: &SubGoalResult) -> bool {
     matches!(result.outcome, SubGoalOutcome::BudgetExhausted)
+}
+
+fn allocation_mode_for_strategy(strategy: &AggregationStrategy) -> AllocationMode {
+    match strategy {
+        AggregationStrategy::Sequential => AllocationMode::Sequential,
+        AggregationStrategy::Parallel => AllocationMode::Concurrent,
+        AggregationStrategy::Custom(s) => {
+            unreachable!("custom strategy '{s}' should be rejected during parsing")
+        }
+    }
 }
 
 fn find_decompose_tool_call(tool_calls: &[ToolCall]) -> Option<&ToolCall> {
@@ -2573,13 +2738,18 @@ fn decompose_tool_definition() -> ToolDefinition {
                         "properties": {
                             "description": {"type": "string", "description": "What this sub-goal should accomplish"},
                             "required_tools": {"type": "array", "items": {"type": "string"}, "description": "Tools needed for this sub-goal"},
-                            "expected_output": {"type": "string", "description": "What the result should look like"}
+                            "expected_output": {"type": "string", "description": "What the result should look like"},
+                            "complexity_hint": {
+                                "type": "string",
+                                "enum": ["Trivial", "Moderate", "Complex"],
+                                "description": "Optional complexity hint to guide budget allocation"
+                            }
                         },
                         "required": ["description"]
                     },
                     "description": "List of sub-goals to execute"
                 },
-                "strategy": {"type": "string", "enum": ["Sequential"], "description": "Execution strategy (only Sequential supported currently)"}
+                "strategy": {"type": "string", "enum": ["Sequential", "Parallel"], "description": "Execution strategy"}
             },
             "required": ["sub_goals"]
         }),
@@ -4038,6 +4208,7 @@ mod phase2_tests {
             max_cost_cents: 0,
             max_wall_time_ms: 0,
             max_recursion_depth: 0,
+            decompose_depth_mode: DepthMode::Adaptive,
         };
         let mut engine = LoopEngine::builder()
             .budget(BudgetTracker::new(zero_budget, 0, 0))
@@ -4077,6 +4248,7 @@ mod phase2_tests {
             max_cost_cents: 0,
             max_wall_time_ms: 0,
             max_recursion_depth: 0,
+            decompose_depth_mode: DepthMode::Adaptive,
         };
         let mut engine = LoopEngine::builder()
             .budget(BudgetTracker::new(zero_budget, 0, 0))
@@ -6435,7 +6607,11 @@ mod decomposition_tests {
         }
     }
 
-    fn budget_config(max_llm_calls: u32, max_recursion_depth: u32) -> BudgetConfig {
+    fn budget_config_with_mode(
+        max_llm_calls: u32,
+        max_recursion_depth: u32,
+        mode: DepthMode,
+    ) -> BudgetConfig {
         BudgetConfig {
             max_llm_calls,
             max_tool_invocations: 20,
@@ -6443,7 +6619,12 @@ mod decomposition_tests {
             max_cost_cents: 100,
             max_wall_time_ms: 60_000,
             max_recursion_depth,
+            decompose_depth_mode: mode,
         }
+    }
+
+    fn budget_config(max_llm_calls: u32, max_recursion_depth: u32) -> BudgetConfig {
+        budget_config_with_mode(max_llm_calls, max_recursion_depth, DepthMode::Static)
     }
 
     fn decomposition_engine(config: BudgetConfig, depth: u32) -> LoopEngine {
@@ -6466,6 +6647,7 @@ mod decomposition_tests {
                     description: (*description).to_string(),
                     required_tools: Vec::new(),
                     expected_output: Some(format!("output for {description}")),
+                    complexity_hint: None,
                 })
                 .collect(),
             strategy: AggregationStrategy::Sequential,
@@ -6613,8 +6795,8 @@ mod decomposition_tests {
     }
 
     #[tokio::test]
-    async fn decomposition_uses_half_remaining_budget_for_each_sub_goal() {
-        let mut engine = decomposition_engine(budget_config(4, 6), 0);
+    async fn decomposition_uses_allocator_plan_for_each_sub_goal() {
+        let mut engine = decomposition_engine(budget_config(20, 6), 0);
         let plan = decomposition_plan(&["first", "second", "third"]);
         let decision = Decision::Decompose(plan.clone());
         let llm = ScriptedLlm::new(vec![
@@ -6641,7 +6823,7 @@ mod decomposition_tests {
 
         let status = engine.status(current_time_ms());
         assert_eq!(status.llm_calls_used, 3);
-        assert_eq!(status.remaining.llm_calls, 1);
+        assert_eq!(status.remaining.llm_calls, 17);
         assert_eq!(status.tool_invocations_used, 0);
         assert_eq!(status.cost_cents_used, 6);
         assert!(status.tokens_used > 0);
@@ -6682,7 +6864,7 @@ mod decomposition_tests {
     }
 
     #[tokio::test]
-    async fn budget_exhausted_sub_goal_maps_to_budget_exhausted_outcome() {
+    async fn sub_goal_below_floor_maps_to_skipped_outcome() {
         let mut engine = decomposition_engine(budget_config(0, 6), 0);
         let plan = decomposition_plan(&["budget-limited"]);
         let decision = Decision::Decompose(plan.clone());
@@ -6696,15 +6878,15 @@ mod decomposition_tests {
         assert_eq!(llm.complete_calls(), 0);
         assert!(action
             .response_text
-            .contains("budget-limited => budget exhausted"));
+            .contains("budget-limited => skipped (below floor)"));
     }
 
     #[tokio::test]
-    async fn run_cycle_emits_single_budget_exhausted_signal_for_decomposition_path() {
+    async fn low_budget_decomposition_avoids_budget_exhaustion_signal() {
         let (result, llm_calls) = run_budget_exhausted_decomposition_cycle().await;
 
         assert!(matches!(&result, LoopResult::Complete { .. }));
-        assert_eq!(llm_calls, 2);
+        assert_eq!(llm_calls, 1);
 
         let blocked_budget_signals = signals_from_result(&result)
             .iter()
@@ -6712,19 +6894,20 @@ mod decomposition_tests {
                 signal.kind == SignalKind::Blocked && signal.message == "budget exhausted"
             })
             .count();
-        assert_eq!(blocked_budget_signals, 1);
+        assert_eq!(blocked_budget_signals, 0);
     }
 
     #[tokio::test]
-    async fn budget_exhaustion_halts_remaining_sub_goal_retries() {
+    async fn low_budget_decomposition_skips_sub_goals_without_retry_storm() {
         let (result, _llm_calls) = run_budget_exhausted_decomposition_cycle().await;
 
         let response = match &result {
             LoopResult::Complete { response, .. } => response,
             other => panic!("expected LoopResult::Complete, got: {other:?}"),
         };
-        assert!(response.contains("first => budget exhausted"));
-        assert!(!response.contains("second =>"));
+        assert!(response.contains("first => skipped (below floor)"));
+        assert!(response.contains("second => skipped (below floor)"));
+        assert!(response.contains("third => skipped (below floor)"));
 
         let progress_signals = signals_from_result(&result)
             .iter()
@@ -6734,7 +6917,7 @@ mod decomposition_tests {
                     && signal.message.starts_with("Sub-goal ")
             })
             .count();
-        assert_eq!(progress_signals, 1);
+        assert_eq!(progress_signals, 3);
     }
 
     #[tokio::test]
@@ -6955,7 +7138,7 @@ mod decomposition_tests {
 
     #[tokio::test]
     async fn aggregated_response_includes_results_from_all_sub_goals() {
-        let mut engine = decomposition_engine(budget_config(10, 6), 0);
+        let mut engine = decomposition_engine(budget_config(20, 6), 0);
         let plan = decomposition_plan(&["analyze", "summarize"]);
         let decision = Decision::Decompose(plan.clone());
         let llm = ScriptedLlm::new(vec![
@@ -7234,6 +7417,7 @@ mod decomposition_tests {
                 assert_eq!(plan.sub_goals[0].description, "Summarize findings");
                 assert!(plan.sub_goals[0].required_tools.is_empty());
                 assert_eq!(plan.sub_goals[0].expected_output, None);
+                assert_eq!(plan.sub_goals[0].complexity_hint, None);
                 assert_eq!(plan.strategy, AggregationStrategy::Sequential);
             }
             other => panic!("expected decomposition decision, got: {other:?}"),
@@ -7248,6 +7432,7 @@ mod decomposition_tests {
                     description: (*d).to_string(),
                     required_tools: Vec::new(),
                     expected_output: Some(format!("output for {d}")),
+                    complexity_hint: None,
                 })
                 .collect(),
             strategy: AggregationStrategy::Parallel,
@@ -7410,6 +7595,315 @@ mod decomposition_tests {
         assert_eq!(completed, 2);
     }
 
+    #[test]
+    fn sequential_adaptive_allocation_gives_more_to_complex_sub_goals() {
+        let engine = decomposition_engine(budget_config_with_mode(40, 8, DepthMode::Adaptive), 0);
+        let plan = DecompositionPlan {
+            sub_goals: vec![
+                SubGoal {
+                    description: "quick note".to_string(),
+                    required_tools: Vec::new(),
+                    expected_output: None,
+                    complexity_hint: Some(ComplexityHint::Trivial),
+                },
+                SubGoal {
+                    description: "implement migration plan".to_string(),
+                    required_tools: vec!["read_file".to_string(), "edit".to_string()],
+                    expected_output: None,
+                    complexity_hint: Some(ComplexityHint::Complex),
+                },
+            ],
+            strategy: AggregationStrategy::Sequential,
+            truncated_from: None,
+        };
+        let allocator = BudgetAllocator::new();
+
+        let allocation = allocator.allocate(
+            &engine.budget,
+            &plan.sub_goals,
+            AllocationMode::Sequential,
+            current_time_ms(),
+        );
+
+        assert!(
+            allocation.sub_goal_budgets[1].max_llm_calls
+                > allocation.sub_goal_budgets[0].max_llm_calls
+        );
+    }
+
+    #[test]
+    fn concurrent_adaptive_allocation_distributes_proportionally() {
+        let engine = decomposition_engine(budget_config_with_mode(50, 8, DepthMode::Adaptive), 0);
+        let plan = DecompositionPlan {
+            sub_goals: vec![
+                SubGoal {
+                    description: "quick note".to_string(),
+                    required_tools: Vec::new(),
+                    expected_output: None,
+                    complexity_hint: Some(ComplexityHint::Trivial),
+                },
+                SubGoal {
+                    description: "complex migration".to_string(),
+                    required_tools: vec![
+                        "read".to_string(),
+                        "edit".to_string(),
+                        "test".to_string(),
+                    ],
+                    expected_output: None,
+                    complexity_hint: Some(ComplexityHint::Complex),
+                },
+            ],
+            strategy: AggregationStrategy::Parallel,
+            truncated_from: None,
+        };
+        let allocator = BudgetAllocator::new();
+
+        let allocation = allocator.allocate(
+            &engine.budget,
+            &plan.sub_goals,
+            AllocationMode::Concurrent,
+            current_time_ms(),
+        );
+
+        assert_eq!(allocation.sub_goal_budgets[0].max_llm_calls, 9);
+        assert_eq!(allocation.sub_goal_budgets[1].max_llm_calls, 36);
+    }
+
+    #[tokio::test]
+    async fn budget_floor_skips_non_viable_sub_goals_with_signal() {
+        let mut engine = decomposition_engine(budget_config(4, 6), 0);
+        let plan = decomposition_plan(&["first", "second", "third"]);
+        let decision = Decision::Decompose(plan.clone());
+        let llm = ScriptedLlm::new(vec![Ok(text_response("unused"))]);
+
+        let action = engine
+            .execute_decomposition(&decision, &plan, &llm, &[])
+            .await
+            .expect("decomposition");
+
+        assert!(action.response_text.contains("skipped (below floor)"));
+        let skipped_signal = engine
+            .signals
+            .signals()
+            .iter()
+            .find(|signal| {
+                signal.step == LoopStep::Act
+                    && signal.kind == SignalKind::Friction
+                    && signal.message.contains("skipped:")
+            })
+            .expect("skipped signal");
+        assert_eq!(
+            skipped_signal.metadata["reason"],
+            serde_json::json!("below_budget_floor")
+        );
+    }
+
+    #[test]
+    fn parent_continuation_budget_prevents_parent_starvation() {
+        let engine = decomposition_engine(budget_config(40, 8), 0);
+        let plan = decomposition_plan(&["one", "two"]);
+        let allocator = BudgetAllocator::new();
+        let remaining = engine.budget.remaining(current_time_ms());
+
+        let allocation = allocator.allocate(
+            &engine.budget,
+            &plan.sub_goals,
+            AllocationMode::Sequential,
+            current_time_ms(),
+        );
+
+        assert!(allocation.parent_continuation_budget.max_llm_calls >= 4);
+        let child_sum = allocation
+            .sub_goal_budgets
+            .iter()
+            .fold(0_u32, |acc, budget| {
+                acc.saturating_add(budget.max_llm_calls)
+            });
+        assert!(
+            child_sum
+                <= remaining
+                    .llm_calls
+                    .saturating_sub(allocation.parent_continuation_budget.max_llm_calls)
+        );
+    }
+
+    #[tokio::test]
+    async fn child_budget_increments_depth_and_inherits_effective_max_depth() {
+        let config = budget_config_with_mode(8, 3, DepthMode::Adaptive);
+        let engine = decomposition_engine(config, 0);
+        let remaining = engine.budget.remaining(current_time_ms());
+        let effective_cap = engine.effective_decomposition_depth_cap(&remaining);
+        let mut child_budget = budget_config_with_mode(8, 3, DepthMode::Adaptive);
+        engine.apply_effective_depth_cap(std::slice::from_mut(&mut child_budget), effective_cap);
+
+        let goal = SubGoal {
+            description: "child".to_string(),
+            required_tools: Vec::new(),
+            expected_output: None,
+            complexity_hint: None,
+        };
+        let llm = ScriptedLlm::new(vec![Ok(text_response("done"))]);
+        let execution = engine.run_sub_goal(&goal, child_budget, &llm, &[]).await;
+
+        assert_eq!(execution.budget.depth(), 1);
+        assert_eq!(execution.budget.config().max_recursion_depth, effective_cap);
+    }
+
+    #[test]
+    fn format_sub_goal_outcome_includes_skipped_variant() {
+        assert_eq!(
+            format_sub_goal_outcome(&SubGoalOutcome::Skipped),
+            "skipped (below floor)"
+        );
+    }
+
+    #[tokio::test]
+    async fn backward_compat_no_complexity_hint() {
+        let mut engine = decomposition_engine(budget_config(20, 6), 0);
+        let response = CompletionResponse {
+            content: Vec::new(),
+            tool_calls: vec![decompose_tool_call(serde_json::json!({
+                "sub_goals": [{"description": "Summarize findings"}],
+                "strategy": "Sequential"
+            }))],
+            usage: None,
+            stop_reason: None,
+        };
+        let decision = engine.decide(&response).await.expect("decision");
+        let plan = match decision {
+            Decision::Decompose(plan) => plan,
+            other => panic!("expected decomposition, got: {other:?}"),
+        };
+        assert_eq!(plan.sub_goals[0].complexity_hint, None);
+
+        let action = engine
+            .execute_decomposition(
+                &Decision::Decompose(plan.clone()),
+                &plan,
+                &ScriptedLlm::new(vec![Ok(text_response("ok"))]),
+                &[],
+            )
+            .await
+            .expect("decomposition");
+        assert!(action.response_text.contains("completed: ok"));
+    }
+
+    #[test]
+    fn third_sequential_sub_goal_gets_viable_budget() {
+        let engine = decomposition_engine(budget_config(20, 6), 0);
+        let plan = decomposition_plan(&["first", "second", "third"]);
+        let allocation = BudgetAllocator::new().allocate(
+            &engine.budget,
+            &plan.sub_goals,
+            AllocationMode::Sequential,
+            current_time_ms(),
+        );
+        let floor = crate::budget::BudgetFloor::default();
+        let third = &allocation.sub_goal_budgets[2];
+
+        assert!(!allocation.skipped_indices.contains(&2));
+        assert!(third.max_llm_calls >= floor.min_llm_calls);
+        assert!(third.max_tool_invocations >= floor.min_tool_invocations);
+        assert!(third.max_tokens >= floor.min_tokens);
+    }
+
+    #[test]
+    fn nested_decomposition_all_leaves_get_floor_budget_or_skipped() {
+        let root_engine = decomposition_engine(budget_config(20, 6), 0);
+        let root_plan = decomposition_plan(&["branch-a", "branch-b"]);
+        let allocator = BudgetAllocator::new();
+        let root_allocation = allocator.allocate(
+            &root_engine.budget,
+            &root_plan.sub_goals,
+            AllocationMode::Sequential,
+            current_time_ms(),
+        );
+        let floor = crate::budget::BudgetFloor::default();
+
+        for root_budget in root_allocation.sub_goal_budgets {
+            let child_tracker = BudgetTracker::new(
+                root_budget,
+                current_time_ms(),
+                root_engine.budget.child_depth(),
+            );
+            let leaf_goals = decomposition_plan(&["leaf-1", "leaf-2", "leaf-3"]).sub_goals;
+            let leaf_allocation = allocator.allocate(
+                &child_tracker,
+                &leaf_goals,
+                AllocationMode::Sequential,
+                current_time_ms(),
+            );
+
+            for (index, budget) in leaf_allocation.sub_goal_budgets.iter().enumerate() {
+                let skipped = leaf_allocation.skipped_indices.contains(&index);
+                let viable = budget.max_llm_calls >= floor.min_llm_calls
+                    && budget.max_tool_invocations >= floor.min_tool_invocations
+                    && budget.max_tokens >= floor.min_tokens
+                    && budget.max_cost_cents >= floor.min_cost_cents
+                    && budget.max_wall_time_ms >= floor.min_wall_time_ms;
+                assert!(skipped || viable, "leaf {index} must be viable or skipped");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_decomposition_blocks_when_effective_cap_zero() {
+        let mut engine =
+            decomposition_engine(budget_config_with_mode(6, 8, DepthMode::Adaptive), 0);
+        let plan = decomposition_plan(&["depth-capped"]);
+        let decision = Decision::Decompose(plan.clone());
+        let llm = ScriptedLlm::new(vec![Ok(text_response("unused"))]);
+
+        let action = engine
+            .execute_decomposition(&decision, &plan, &llm, &[])
+            .await
+            .expect("decomposition");
+
+        assert_eq!(llm.complete_calls(), 0);
+        assert!(action
+            .response_text
+            .contains("recursion depth limit was reached"));
+    }
+
+    #[tokio::test]
+    async fn execute_decomposition_blocks_when_current_depth_meets_effective_cap() {
+        let mut engine =
+            decomposition_engine(budget_config_with_mode(20, 8, DepthMode::Adaptive), 2);
+        let plan = decomposition_plan(&["depth-capped"]);
+        let decision = Decision::Decompose(plan.clone());
+        let llm = ScriptedLlm::new(vec![Ok(text_response("unused"))]);
+
+        let action = engine
+            .execute_decomposition(&decision, &plan, &llm, &[])
+            .await
+            .expect("decomposition");
+
+        assert_eq!(llm.complete_calls(), 0);
+        assert!(action
+            .response_text
+            .contains("recursion depth limit was reached"));
+    }
+
+    #[test]
+    fn child_budget_inherits_effective_cap_in_adaptive_mode() {
+        let engine = decomposition_engine(budget_config_with_mode(8, 8, DepthMode::Adaptive), 0);
+        let remaining = engine.budget.remaining(current_time_ms());
+        let effective_cap = engine.effective_decomposition_depth_cap(&remaining);
+        let plan = decomposition_plan(&["single-child"]);
+        let allocator = BudgetAllocator::new();
+        let mut allocation = allocator.allocate(
+            &engine.budget,
+            &plan.sub_goals,
+            AllocationMode::Sequential,
+            current_time_ms(),
+        );
+
+        engine.apply_effective_depth_cap(&mut allocation.sub_goal_budgets, effective_cap);
+
+        assert_eq!(effective_cap, 1);
+        assert_eq!(allocation.sub_goal_budgets[0].max_recursion_depth, 1);
+    }
+
     #[tokio::test]
     async fn concurrent_execution_with_empty_plan_returns_empty_results() {
         let mut engine = decomposition_engine(budget_config(20, 6), 0);
@@ -7420,9 +7914,26 @@ mod decomposition_tests {
         };
         let llm = ScriptedLlm::new(vec![]);
 
-        let results = engine.execute_sub_goals_concurrent(&plan, &llm, &[]).await;
+        let allocation = AllocationPlan {
+            sub_goal_budgets: Vec::new(),
+            parent_continuation_budget: budget_config(20, 6),
+            skipped_indices: Vec::new(),
+        };
+        let results = engine
+            .execute_sub_goals_concurrent(&plan, &allocation, &llm, &[])
+            .await;
 
         assert!(results.is_empty());
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "unexpected missing result at index 0")]
+    fn collect_concurrent_results_panics_for_unexpected_missing_slot() {
+        let mut engine = decomposition_engine(budget_config(20, 6), 0);
+        let plan = decomposition_plan(&["missing"]);
+
+        let _ = engine.collect_concurrent_results(&plan, Vec::new(), &[false]);
     }
 }
 
@@ -7928,10 +8439,12 @@ mod context_compaction_tests {
             description: "child task".to_string(),
             required_tools: Vec::new(),
             expected_output: None,
+            complexity_hint: None,
         };
+        let child_budget = BudgetConfig::default();
 
         let _execution = engine
-            .run_sub_goal(&goal, 0.5, &llm, &large_history(10, 60))
+            .run_sub_goal(&goal, child_budget, &llm, &large_history(10, 60))
             .await;
 
         let requests = llm.requests();
@@ -7950,6 +8463,7 @@ mod context_compaction_tests {
             description: "child task".to_string(),
             required_tools: Vec::new(),
             expected_output: None,
+            complexity_hint: None,
         };
         let protected = vec![
             Message::user(words(260)),
@@ -7957,8 +8471,11 @@ mod context_compaction_tests {
             Message::user(words(260)),
             Message::assistant(words(260)),
         ];
+        let child_budget = BudgetConfig::default();
 
-        let execution = engine.run_sub_goal(&goal, 0.5, &llm, &protected).await;
+        let execution = engine
+            .run_sub_goal(&goal, child_budget, &llm, &protected)
+            .await;
         let SubGoalOutcome::Failed(message) = &execution.result.outcome else {
             panic!("expected failed sub-goal outcome")
         };
@@ -8208,20 +8725,27 @@ mod context_compaction_tests {
                     description: "child-a".to_string(),
                     required_tools: Vec::new(),
                     expected_output: None,
+                    complexity_hint: None,
                 },
                 SubGoal {
                     description: "child-b".to_string(),
                     required_tools: Vec::new(),
                     expected_output: None,
+                    complexity_hint: None,
                 },
             ],
             strategy: AggregationStrategy::Parallel,
             truncated_from: None,
         };
         let llm = RecordingLlm::new(vec![Ok(text_response("a")), Ok(text_response("b"))]);
+        let allocation = AllocationPlan {
+            sub_goal_budgets: vec![BudgetConfig::default(); plan.sub_goals.len()],
+            parent_continuation_budget: BudgetConfig::default(),
+            skipped_indices: Vec::new(),
+        };
 
         let results = engine
-            .execute_sub_goals_concurrent(&plan, &llm, &large_history(12, 60))
+            .execute_sub_goals_concurrent(&plan, &allocation, &llm, &large_history(12, 60))
             .await;
 
         assert_eq!(results.len(), 2);

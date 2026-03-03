@@ -1,12 +1,31 @@
 use fx_core::signals::Signal;
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ComplexityHint {
+    Trivial,
+    Moderate,
+    Complex,
+}
+
+impl ComplexityHint {
+    pub const fn weight(self) -> u32 {
+        match self {
+            Self::Trivial => 1,
+            Self::Moderate => 2,
+            Self::Complex => 4,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SubGoal {
     pub description: String,
     pub required_tools: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_output: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub complexity_hint: Option<ComplexityHint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -36,6 +55,7 @@ pub enum SubGoalOutcome {
     Completed(String),
     Failed(String),
     BudgetExhausted,
+    Skipped,
 }
 
 #[cfg(test)]
@@ -48,6 +68,7 @@ mod tests {
             description: "Summarize issue history".to_string(),
             required_tools: vec!["gh".to_string(), "read_file".to_string()],
             expected_output: Some("Summary of issue events".to_string()),
+            complexity_hint: Some(ComplexityHint::Moderate),
         }
     }
 
@@ -113,10 +134,12 @@ mod tests {
         let completed = SubGoalOutcome::Completed("ok".to_string());
         let failed = SubGoalOutcome::Failed("boom".to_string());
         let exhausted = SubGoalOutcome::BudgetExhausted;
+        let skipped = SubGoalOutcome::Skipped;
 
         assert!(matches!(completed, SubGoalOutcome::Completed(text) if text == "ok"));
         assert!(matches!(failed, SubGoalOutcome::Failed(text) if text == "boom"));
         assert!(matches!(exhausted, SubGoalOutcome::BudgetExhausted));
+        assert!(matches!(skipped, SubGoalOutcome::Skipped));
     }
 
     #[test]
@@ -139,6 +162,7 @@ mod tests {
             description: "No tool task".to_string(),
             required_tools: Vec::new(),
             expected_output: Some("Plain text".to_string()),
+            complexity_hint: None,
         };
 
         let encoded = serde_json::to_string(&goal).expect("serialize goal");
@@ -164,10 +188,41 @@ mod tests {
             description: "Summarize findings".to_string(),
             required_tools: Vec::new(),
             expected_output: None,
+            complexity_hint: None,
         };
 
         let encoded = serde_json::to_value(&goal).expect("serialize goal");
 
         assert!(encoded.get("expected_output").is_none());
+    }
+
+    #[test]
+    fn sub_goal_with_complexity_hint_roundtrip_serde() {
+        let goal = SubGoal {
+            description: "Implement adaptive budget allocator".to_string(),
+            required_tools: vec!["read_file".to_string()],
+            expected_output: Some("patch".to_string()),
+            complexity_hint: Some(ComplexityHint::Complex),
+        };
+
+        let encoded = serde_json::to_string(&goal).expect("serialize sub-goal");
+        let decoded: SubGoal = serde_json::from_str(&encoded).expect("deserialize sub-goal");
+
+        assert_eq!(decoded.complexity_hint, Some(ComplexityHint::Complex));
+        assert_eq!(decoded, goal);
+    }
+
+    #[test]
+    fn complexity_hint_weight_values_are_stable() {
+        assert_eq!(ComplexityHint::Trivial.weight(), 1);
+        assert_eq!(ComplexityHint::Moderate.weight(), 2);
+        assert_eq!(ComplexityHint::Complex.weight(), 4);
+    }
+
+    #[test]
+    fn sub_goal_outcome_skipped_roundtrip_serde() {
+        let encoded = serde_json::to_string(&SubGoalOutcome::Skipped).expect("serialize skipped");
+        let decoded: SubGoalOutcome = serde_json::from_str(&encoded).expect("deserialize skipped");
+        assert_eq!(decoded, SubGoalOutcome::Skipped);
     }
 }
