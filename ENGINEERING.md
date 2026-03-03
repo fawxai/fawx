@@ -200,30 +200,30 @@ Code that doesn't meet the standards above gets rewritten or removed.
 ## 7. Agent Execution Model
 
 ### Roles
-- **Clawdio main session** is the lead. Orchestrates, designs, reviews results, makes architectural calls. Does NOT write code, regardless of size. All code is delegated to subagents. Opus may be used as implementer only with explicit justification approved by Joe.
-- **Subagents** do all implementation, review, and fix work.
+- **Clawdio main session** is the lead. Orchestrates, designs, reviews results, makes architectural calls. Does NOT write code, regardless of size. All code is delegated to subagents.
+- **Subagents** do all implementation, review, and fix work. Every subagent is Opus.
 
-### Model allocation
-- **Reviews/re-reviews**: Opus high (always). Reviews catch real architectural bugs.
-- **Implementation/fixes**: Codex xhigh (always). OpenAI has more usage runway — reserve Opus for reviews and orchestrators only.
-- **Fixer**: Codex xhigh (always).
-- **Orchestrators**: Opus high. Orchestrators make architectural decisions and scope work for implementers — they never write code directly.
+### Model policy
+- **ALL subagents: Opus adaptive** (`model: "anthropic/claude-opus-4-6"`, `thinking: "adaptive"`). No Codex, no Sonnet.
+- Adaptive thinking lets Claude decide when and how much to reason per request.
+- Always use full model path `anthropic/claude-opus-4-6` — never the `opus` alias (can silently fall back to wrong provider).
 
-### Concurrency model
-Work is classified by complexity tier:
-- **Simple** (< 50 lines): N+1 Codex xhigh worker. Still gets Opus review unless Joe explicitly waives it. CI + review as quality gate.
-- **Standard** (single-PR features): N+1 orchestrator spawns N+2 workers (implementer, reviewer, fixer). Orchestrator manages the full PR lifecycle and only announces terminal status to main. Parallel orchestrators OK (max 2-3).
-- **Complex** (multi-crate, architectural): N+1 orchestrator (Opus high) with full context, delegates ALL implementation to N+2 Codex xhigh workers. **Sequential only — one PR at a time.**
+### Orchestration model
+- **Main session owns the state machine.** Clawdio directly manages implement → review → fix → re-review loops. Do not delegate lifecycle management to N+1 orchestrator subagents.
+- **Subagents get single-responsibility prompts.** One job each: "implement this spec," "review this diff," "fix these findings."
+- **Spec-driven implementation.** Implementers receive a written spec file, not prose descriptions.
 
-N+2 completions announce only to their parent N+1 (structural filtering). The main session stays free for conversation and high-level decisions.
+### Concurrency
+- **Simple** (< 50 lines): Direct Opus worker + Opus review. Parallel OK.
+- **Standard** (single-PR features): Main session spawns workers directly. Parallel PRs OK (max 2-3) if no file overlap.
+- **Complex** (multi-crate, architectural): **Sequential only — one PR at a time.** Main session manages full context.
 
 ### Rules
-1. Main session NEVER writes code. All code work delegated to subagents, no exceptions.
-2. Quick fixes → N+1 Codex xhigh worker (never inline in main session).
-3. Standard features → N+1 orchestrator with N+2 workers.
-4. Complex/architectural → N+1 orchestrator (Opus high) delegates to N+2 Codex xhigh. Sequential pipeline.
-5. Code review → always Opus high.
-6. All review findings (blocking, non-blocking, nice-to-have) must be fixed. Fresh reviewer for R2.
+1. Main session NEVER writes code. All code work delegated to Opus subagents, no exceptions.
+2. All subagents use `anthropic/claude-opus-4-6` with `thinking: "adaptive"`.
+3. Main session chains stages (implement → review → fix → re-review) directly — no N+1 orchestrator layer.
+4. All review findings (blocking, non-blocking, nice-to-have) must be fixed. Fresh reviewer for R2.
+5. Every subagent prompt includes ENGINEERING.md rules and the spec file path.
 
 ---
 
