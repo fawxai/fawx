@@ -23,6 +23,7 @@ pub mod builtin;
 pub mod loader;
 pub mod registry;
 pub mod skill;
+pub mod transaction_skill;
 
 pub(crate) mod ab_slots;
 pub(crate) mod config;
@@ -34,6 +35,7 @@ pub use builtin::BuiltinSkill;
 pub use loader::{SkillLoader, SkillManifest};
 pub use registry::SkillRegistry;
 pub use skill::{Skill, SkillError};
+pub use transaction_skill::TransactionSkill;
 
 /// A strategy identifier for A/B slot management.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

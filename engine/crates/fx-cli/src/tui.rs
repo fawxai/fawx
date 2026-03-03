@@ -29,7 +29,7 @@ use fx_llm::{
     AnthropicProvider, CompletionRequest, Message, ModelCatalog, ModelInfo, ModelRouter,
     OpenAiProvider, OpenAiResponsesProvider, ProviderError, RouterError, StreamChunk,
 };
-use fx_loadable::SkillRegistry;
+use fx_loadable::{SkillRegistry, TransactionSkill};
 use fx_memory::{JsonFileMemory, JsonMemoryConfig, SignalStore};
 use fx_tools::{BuiltinToolsSkill, FawxToolExecutor, GitSkill, ToolConfig};
 use rustyline::completion::{Completer, Pair};
@@ -2031,8 +2031,10 @@ fn build_skill_registry(
 
     let mut registry = SkillRegistry::new();
     registry.register(Box::new(BuiltinToolsSkill::new(executor)));
-    let git_skill = GitSkill::new(working_dir.clone(), sm);
+    let git_skill = GitSkill::new(working_dir.clone(), sm.clone());
     registry.register(Box::new(git_skill));
+    let tx_skill = TransactionSkill::new(working_dir.clone(), sm);
+    registry.register(Box::new(tx_skill));
     apply_skill_summaries(&runtime_info, &registry);
 
     (registry, memory, snapshot_text, runtime_info)
