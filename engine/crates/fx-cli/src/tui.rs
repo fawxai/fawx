@@ -12,8 +12,10 @@ use fx_conversation::{
 };
 use fx_core::error::LlmError as CoreLlmError;
 use fx_core::memory::{MemoryProvider, MemoryStore};
+use fx_core::message::{InternalMessage, StreamPhase};
 use fx_core::runtime_info::{ConfigSummary, RuntimeInfo, SkillInfo};
 use fx_core::types::{InputSource, ScreenState, UserInput};
+use fx_core::EventBus;
 use fx_improve::{CyclePaths, ImprovementConfig, OutputMode};
 use fx_kernel::act::TokenUsage;
 use fx_kernel::budget::{BudgetConfig, BudgetTracker};
@@ -48,6 +50,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -57,6 +60,7 @@ use syntect::parsing::SyntaxSet;
 use syntect::util::as_24_bit_terminal_escaped;
 use termimad::crossterm::style::{Attribute as MadAttribute, Color as MadColor};
 use termimad::{MadSkin, StyledChar};
+use tokio::sync::broadcast;
 use tokio::sync::oneshot;
 use tokio::time::{sleep, Duration};
 
@@ -316,9 +320,235 @@ fn spinner_frame(index: usize) -> char {
 
 fn clear_spinner_line() {
     eprint!("\r\x1b[2K");
-    let _ = io::stderr().flush();
 }
 
+// ---------------------------------------------------------------------------
+// Streaming renderer
+// ---------------------------------------------------------------------------
+
+/// Renders streaming LLM output token-by-token to stdout.
+///
+/// Tracks phase transitions (Reason → Synthesize) and prints the
+/// `assistant ›` prefix exactly once per user cycle.
+struct StreamRenderer {
+    /// Whether the assistant prefix has been printed for this cycle.
+    prefix_printed: bool,
+    /// Current streaming phase.
+    current_phase: Option<StreamPhase>,
+    /// Token count accumulated so far.
+    token_count: usize,
+    /// Accumulated raw text for markdown reprint on finalize.
+    buffer: String,
+}
+
+impl StreamRenderer {
+    fn new() -> Self {
+        Self {
+            prefix_printed: false,
+            current_phase: None,
+            token_count: 0,
+            buffer: String::new(),
+        }
+    }
+
+    /// Handle a `StreamingStarted` event.
+    fn handle_started(&mut self, phase: StreamPhase) {
+        self.current_phase = Some(phase);
+    }
+
+    /// Handle a `StreamDelta` event — print the token immediately.
+    fn handle_delta(&mut self, delta: &str) {
+        if !self.prefix_printed {
+            self.print_prefix();
+        }
+        self.token_count += 1;
+        self.buffer.push_str(delta);
+        self.write_delta(delta);
+    }
+
+    /// Handle a `StreamingFinished` event.
+    fn handle_finished(&mut self, _phase: StreamPhase) {
+        self.current_phase = None;
+    }
+
+    /// Print a trailing newline if any tokens were rendered.
+    ///
+    /// The raw streamed text is kept as-is. Full markdown formatting is
+    /// deferred to incremental rendering (#1097) — cursor-based reprint
+    /// is unreliable across terminal scrollback and varying widths.
+    ///
+    /// Future enhancement: if incremental markdown rendering is added,
+    /// consider a threshold-based skip (e.g. >50 lines) to avoid a
+    /// visible flash from clearing and reprinting long responses.
+    fn finalize(&self) {
+        if self.prefix_printed {
+            println!();
+        }
+    }
+
+    fn print_prefix(&mut self) {
+        print!(
+            "\n{} ",
+            "assistant \u{203a}"
+                .bold()
+                .with(theme_color(255, 165, 0, 214))
+        );
+        let _ = io::stdout().flush();
+        self.prefix_printed = true;
+    }
+
+    fn write_delta(&self, delta: &str) {
+        print!("{delta}");
+        let _ = io::stdout().flush();
+    }
+
+    /// Print the `[interrupted]` marker when a stream is cancelled.
+    ///
+    /// Associated function (no `&self`) because the renderer may already
+    /// be dropped by the time the caller decides to print the marker.
+    fn print_interrupted_marker() {
+        eprint!(" \x1b[33m[interrupted]\x1b[0m");
+        let _ = io::stderr().flush();
+    }
+}
+
+/// Run a future with a combined thinking spinner + streaming display.
+///
+/// Shows a spinner until `StreamingStarted` arrives, then switches to
+/// token-by-token rendering. Returns `(result, streamed)` where `streamed`
+/// indicates whether streaming output was rendered.
+async fn run_with_streaming_display<F, T>(event_bus: &EventBus, future: F) -> (T, bool)
+where
+    F: Future<Output = T>,
+{
+    let receiver = event_bus.subscribe();
+    let streamed = Arc::new(AtomicBool::new(false));
+    let streamed_inner = Arc::clone(&streamed);
+    let (stop_tx, stop_rx) = oneshot::channel::<()>();
+
+    let display_handle = tokio::spawn(async move {
+        streaming_display_loop(receiver, stop_rx, streamed_inner).await;
+    });
+
+    let result = future.await;
+    let _ = stop_tx.send(());
+    let _ = display_handle.await;
+    (result, streamed.load(Ordering::Relaxed))
+}
+
+/// Mutable state carried through each tick of the display loop.
+struct DisplayLoopState {
+    renderer: StreamRenderer,
+    spinner_active: bool,
+    frame_index: usize,
+    streamed: Arc<AtomicBool>,
+}
+
+impl DisplayLoopState {
+    fn new(streamed: Arc<AtomicBool>) -> Self {
+        Self {
+            renderer: StreamRenderer::new(),
+            spinner_active: true,
+            frame_index: 0,
+            streamed,
+        }
+    }
+}
+
+/// Event loop that drives the spinner → streaming transition.
+async fn streaming_display_loop(
+    mut receiver: broadcast::Receiver<InternalMessage>,
+    mut stop: oneshot::Receiver<()>,
+    streamed: Arc<AtomicBool>,
+) {
+    let mut state = DisplayLoopState::new(streamed);
+
+    loop {
+        if !dispatch_streaming_event(&mut receiver, &mut stop, &mut state).await {
+            break;
+        }
+    }
+
+    if state.spinner_active {
+        clear_spinner_line();
+    }
+    state.renderer.finalize();
+}
+
+/// Process one tick of the streaming display loop.
+///
+/// Returns `false` when the loop should exit.
+async fn dispatch_streaming_event(
+    receiver: &mut broadcast::Receiver<InternalMessage>,
+    stop: &mut oneshot::Receiver<()>,
+    state: &mut DisplayLoopState,
+) -> bool {
+    tokio::select! {
+        biased;
+        _ = &mut *stop => false,
+        msg = receiver.recv() => {
+            handle_bus_message(
+                msg,
+                &mut state.renderer,
+                &mut state.spinner_active,
+                &state.streamed,
+            );
+            true
+        }
+        _ = sleep(Duration::from_millis(80)), if state.spinner_active => {
+            eprint!("\r\x1b[2K{} thinking...", spinner_frame(state.frame_index));
+            let _ = io::stderr().flush();
+            state.frame_index += 1;
+            true
+        }
+    }
+}
+
+/// Route a single bus message to the renderer.
+fn handle_bus_message(
+    msg: Result<InternalMessage, broadcast::error::RecvError>,
+    renderer: &mut StreamRenderer,
+    spinner_active: &mut bool,
+    streamed: &Arc<AtomicBool>,
+) {
+    let message = match msg {
+        Ok(m) => m,
+        Err(broadcast::error::RecvError::Lagged(n)) => {
+            tracing::warn!(skipped = n, "stream display lagged, events skipped");
+            // Future enhancement: print an inline `[...{n} events skipped...]`
+            // marker so the user knows displayed text may be incomplete.
+            return;
+        }
+        Err(broadcast::error::RecvError::Closed) => return,
+    };
+    match message {
+        InternalMessage::StreamingStarted { phase } => {
+            stop_spinner_if_active(spinner_active);
+            renderer.handle_started(phase);
+            streamed.store(true, Ordering::Relaxed);
+        }
+        InternalMessage::StreamDelta { delta, .. } => {
+            stop_spinner_if_active(spinner_active);
+            renderer.handle_delta(&delta);
+            streamed.store(true, Ordering::Relaxed);
+        }
+        InternalMessage::StreamingFinished { phase } => {
+            renderer.handle_finished(phase);
+        }
+        _ => {}
+    }
+}
+
+fn stop_spinner_if_active(spinner_active: &mut bool) {
+    if *spinner_active {
+        clear_spinner_line();
+        *spinner_active = false;
+        let _ = io::stderr().flush();
+    }
+}
+
+/// Legacy thinking spinner — retained for existing tests.
+#[cfg(test)]
 async fn run_thinking_spinner(mut stop_signal: oneshot::Receiver<()>) {
     let mut frame_index = 0;
     loop {
@@ -334,18 +564,6 @@ async fn run_thinking_spinner(mut stop_signal: oneshot::Receiver<()>) {
             }
         }
     }
-}
-
-async fn run_with_thinking_spinner<F, T>(future: F) -> T
-where
-    F: Future<Output = T>,
-{
-    let (stop_tx, stop_rx) = oneshot::channel();
-    let spinner_task = tokio::spawn(run_thinking_spinner(stop_rx));
-    let result = future.await;
-    let _ = stop_tx.send(());
-    let _ = spinner_task.await;
-    result
 }
 
 /// Curated preference order — newest capable model first.
@@ -715,6 +933,8 @@ pub struct TuiApp {
     runtime_info: Arc<RwLock<RuntimeInfo>>,
     /// Shared model ID list for readline tab-completion.
     completer_model_ids: Arc<Mutex<Vec<String>>>,
+    /// Event bus for streaming events from the kernel.
+    event_bus: EventBus,
 }
 
 impl TuiApp {
@@ -727,6 +947,7 @@ impl TuiApp {
         runtime_info: Arc<RwLock<RuntimeInfo>>,
         config: FawxConfig,
     ) -> Result<Self, TuiError> {
+        let event_bus = EventBus::new(EVENT_BUS_CAPACITY);
         Self::new_with_memory(
             auth_manager,
             router,
@@ -734,6 +955,7 @@ impl TuiApp {
             runtime_info,
             config,
             None,
+            event_bus,
         )
     }
 
@@ -745,6 +967,7 @@ impl TuiApp {
         runtime_info: Arc<RwLock<RuntimeInfo>>,
         config: FawxConfig,
         memory: Option<SharedMemoryStore>,
+        event_bus: EventBus,
     ) -> Result<Self, TuiError> {
         let base_data_dir = fawx_data_dir();
         let data_dir = configured_data_dir(&base_data_dir, &config);
@@ -777,6 +1000,7 @@ impl TuiApp {
             memory,
             runtime_info,
             completer_model_ids: Arc::new(Mutex::new(Vec::new())),
+            event_bus,
         };
         app.select_first_available_model_without_refresh();
         Ok(app)
@@ -848,7 +1072,8 @@ impl TuiApp {
         }
 
         match self.handle_message(input).await {
-            Ok(response) => self.display_response(&response)?,
+            Ok(Some(response)) => self.display_response(&response)?,
+            Ok(None) => {} // streaming already rendered inline
             Err(error) => println!("{}\n", format_error_message(&error.to_string())),
         }
 
@@ -1090,39 +1315,88 @@ impl TuiApp {
     }
 
     /// Process a user message by running the full loop engine.
-    async fn handle_message(&mut self, input: &str) -> Result<String, TuiError> {
+    ///
+    /// Returns `Ok(None)` when streaming rendered the response inline,
+    /// or `Ok(Some(rendered))` for batch display.
+    async fn handle_message(&mut self, input: &str) -> Result<Option<String>, TuiError> {
         self.ensure_message_auth().await?;
-
-        let active_model = self
-            .router
-            .active_model()
-            .ok_or_else(|| TuiError::Router("no active model selected".to_string()))?
-            .to_string();
-
+        let active_model = self.resolve_active_model()?;
         self.update_memory_context_for_input(input);
         let snapshot = self.build_perception_snapshot(input);
         let started = Instant::now();
-        let loop_result = run_with_thinking_spinner(async {
+
+        let (loop_result, streamed) = self.run_cycle_with_display(snapshot, active_model).await?;
+
+        self.post_cycle_bookkeeping(input, &loop_result)?;
+        self.finalize_streaming_display(&loop_result, streamed, started.elapsed())
+    }
+
+    /// Resolve the currently active model ID.
+    fn resolve_active_model(&self) -> Result<String, TuiError> {
+        self.router
+            .active_model()
+            .map(|m| m.to_string())
+            .ok_or_else(|| TuiError::Router("no active model selected".to_string()))
+    }
+
+    /// Run the loop engine cycle with streaming display or a fallback
+    /// thinking spinner.
+    async fn run_cycle_with_display(
+        &mut self,
+        snapshot: PerceptionSnapshot,
+        active_model: String,
+    ) -> Result<(LoopResult, bool), TuiError> {
+        let event_bus = &self.event_bus;
+        let (result, streamed) = run_with_streaming_display(event_bus, async {
             let router = &self.router;
             let llm = RouterLoopLlmProvider::new(router, active_model);
-            let loop_engine = &mut self.loop_engine;
-            loop_engine
+            self.loop_engine
                 .run_cycle(snapshot, &llm)
                 .await
                 .map_err(|error| TuiError::Loop(error.reason))
         })
-        .await?;
+        .await;
+        Ok((result?, streamed))
+    }
 
-        self.last_signals = loop_result_signals(&loop_result).to_vec();
+    /// Persist signals, conversation turn, and signal store after a cycle.
+    fn post_cycle_bookkeeping(
+        &mut self,
+        input: &str,
+        loop_result: &LoopResult,
+    ) -> Result<(), TuiError> {
+        self.last_signals = loop_result_signals(loop_result).to_vec();
         if let Err(e) = self.signal_store.persist(&self.last_signals) {
             eprintln!("warning: signal persist failed: {e}");
         }
-        let response_text = loop_result_response_text(&loop_result);
-        let response = render_loop_result(loop_result.clone(), started.elapsed());
+        let response_text = loop_result_response_text(loop_result);
         self.record_conversation_turn(input, response_text.clone());
-        self.persist_turn(input, &response_text, &loop_result)
+        self.persist_turn(input, &response_text, loop_result)
             .map_err(TuiError::Store)?;
-        Ok(response)
+        Ok(())
+    }
+
+    /// Decide whether to return a batch-rendered response or `None`
+    /// (streaming already displayed the text).
+    fn finalize_streaming_display(
+        &self,
+        loop_result: &LoopResult,
+        streamed: bool,
+        wall_time: std::time::Duration,
+    ) -> Result<Option<String>, TuiError> {
+        if streamed {
+            if matches!(loop_result, LoopResult::UserStopped { .. }) {
+                StreamRenderer::print_interrupted_marker();
+            }
+            let metadata = format_loop_metadata_for_result(loop_result, wall_time);
+            if let Some(meta) = metadata {
+                println!("{meta}");
+            }
+            println!();
+            Ok(None)
+        } else {
+            Ok(Some(render_loop_result(loop_result.clone(), wall_time)))
+        }
     }
 
     fn update_memory_context_for_input(&mut self, input: &str) {
@@ -2004,47 +2278,41 @@ pub fn load_config() -> Result<FawxConfig, TuiError> {
 /// Convenience wrapper used by tests.
 #[cfg(test)]
 fn build_loop_engine() -> LoopEngine {
-    build_loop_engine_bundle().0
+    build_loop_engine_bundle().engine
 }
 
 #[cfg(test)]
-fn build_loop_engine_bundle() -> (LoopEngine, Arc<RwLock<RuntimeInfo>>) {
+fn build_loop_engine_bundle() -> LoopEngineBundle {
     let config = load_config().unwrap_or_else(|error| {
         eprintln!("warning: failed to load config: {error}");
         FawxConfig::default()
     });
-    let (engine, _memory, runtime_info) =
-        build_loop_engine_from_config(&config).expect("loop engine config should be valid");
-    (engine, runtime_info)
+    build_loop_engine_from_config(&config).expect("loop engine config should be valid")
+}
+
+/// Bundle returned by the loop engine builder functions.
+pub struct LoopEngineBundle {
+    pub engine: LoopEngine,
+    pub memory: Option<SharedMemoryStore>,
+    pub runtime_info: Arc<RwLock<RuntimeInfo>>,
+    pub event_bus: EventBus,
 }
 
 /// Build a loop engine from an already-loaded config.
-pub fn build_loop_engine_from_config(
-    config: &FawxConfig,
-) -> Result<
-    (
-        LoopEngine,
-        Option<SharedMemoryStore>,
-        Arc<RwLock<RuntimeInfo>>,
-    ),
-    TuiError,
-> {
+pub fn build_loop_engine_from_config(config: &FawxConfig) -> Result<LoopEngineBundle, TuiError> {
     let base_data_dir = fawx_data_dir();
     let data_dir = configured_data_dir(&base_data_dir, config);
     build_loop_engine_with_config(data_dir, config.clone())
 }
 
+/// Capacity of the streaming event bus broadcast channel.
+const EVENT_BUS_CAPACITY: usize = 256;
+
 fn build_loop_engine_with_config(
     data_dir: PathBuf,
     config: FawxConfig,
-) -> Result<
-    (
-        LoopEngine,
-        Option<SharedMemoryStore>,
-        Arc<RwLock<RuntimeInfo>>,
-    ),
-    TuiError,
-> {
+) -> Result<LoopEngineBundle, TuiError> {
+    let event_bus = EventBus::new(EVENT_BUS_CAPACITY);
     let budget = BudgetTracker::new(BudgetConfig::default(), current_time_ms(), 0);
     let context = ContextCompactor::new(DEFAULT_CONTEXT_MAX_TOKENS, DEFAULT_CONTEXT_COMPACT_TARGET);
     let working_dir = configured_working_dir(&config);
@@ -2062,13 +2330,19 @@ fn build_loop_engine_with_config(
         .context(context)
         .max_iterations(config.general.max_iterations)
         .tool_executor(std::sync::Arc::new(caching_registry))
-        .synthesis_instruction(synthesis);
+        .synthesis_instruction(synthesis)
+        .event_bus(event_bus.clone());
     if let Some(snapshot_text) = memory_snapshot {
         builder = builder.memory_context(snapshot_text);
     }
 
     let engine = build_loop_engine_from_builder(builder)?;
-    Ok((engine, memory, runtime_info))
+    Ok(LoopEngineBundle {
+        engine,
+        memory,
+        runtime_info,
+        event_bus,
+    })
 }
 
 fn build_loop_engine_from_builder(builder: LoopEngineBuilder) -> Result<LoopEngine, TuiError> {
@@ -2347,6 +2621,13 @@ impl LoopLlmProvider for RouterLoopLlmProvider<'_> {
         self.router.complete(request).await
     }
 
+    async fn complete_stream(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<fx_llm::CompletionStream, ProviderError> {
+        self.router.complete_stream(request).await
+    }
+
     fn model_name(&self) -> &str {
         &self.active_model
     }
@@ -2592,6 +2873,36 @@ fn format_loop_metadata(
         tokens.output_tokens,
         format_wall_time(wall_time),
     )
+}
+
+/// Extract metadata line from a [`LoopResult`] for streaming display.
+///
+/// When the response text was already streamed to stdout, we only need
+/// the trailing metadata line (iterations, tokens, wall time).
+fn format_loop_metadata_for_result(
+    result: &LoopResult,
+    wall_time: std::time::Duration,
+) -> Option<String> {
+    match result {
+        LoopResult::Complete {
+            iterations,
+            tokens_used,
+            ..
+        } => Some(format_loop_metadata(*iterations, tokens_used, wall_time)),
+        LoopResult::UserStopped { iterations, .. } => {
+            let wall = format_wall_time(wall_time);
+            Some(format!(
+                "\x1b[33m  \u{23f9} Stopped by user after {iterations} iteration(s) \u{00b7} {wall}\x1b[0m"
+            ))
+        }
+        LoopResult::BudgetExhausted { iterations, .. } => {
+            let wall = format_wall_time(wall_time);
+            Some(format!(
+                "\x1b[33m  \u{2717} budget exhausted after {iterations} iteration(s) \u{00b7} {wall}\x1b[0m"
+            ))
+        }
+        _ => None,
+    }
 }
 
 fn render_user_stopped(partial: Option<String>, iterations: u32) -> String {
@@ -3863,7 +4174,8 @@ mod tests {
     }
 
     fn test_engine_and_runtime_info() -> (LoopEngine, Arc<RwLock<RuntimeInfo>>) {
-        build_loop_engine_bundle()
+        let bundle = build_loop_engine_bundle();
+        (bundle.engine, bundle.runtime_info)
     }
 
     fn new_test_app() -> TuiApp {
@@ -4323,7 +4635,17 @@ mod tests {
             &self,
             _request: CompletionRequest,
         ) -> Result<fx_llm::CompletionStream, fx_llm::ProviderError> {
-            Ok(Box::pin(futures::stream::iter(vec![])))
+            let response = self.completion.clone();
+            let chunk = fx_llm::StreamChunk {
+                delta_content: response.content.first().and_then(|b| match b {
+                    fx_llm::ContentBlock::Text { text } => Some(text.clone()),
+                    _ => None,
+                }),
+                tool_use_deltas: Vec::new(),
+                usage: response.usage,
+                stop_reason: response.stop_reason.clone(),
+            };
+            Ok(Box::pin(futures::stream::iter(vec![Ok(chunk)])))
         }
 
         fn name(&self) -> &str {
@@ -5192,6 +5514,18 @@ mod tests {
     }
 
     #[test]
+    fn stream_renderer_buffers_deltas() {
+        let mut renderer = StreamRenderer::new();
+        renderer.handle_delta("Hello ");
+        renderer.handle_delta("**world**\n");
+        renderer.handle_delta("Second line");
+
+        assert!(renderer.prefix_printed);
+        assert_eq!(renderer.token_count, 3);
+        assert_eq!(renderer.buffer, "Hello **world**\nSecond line");
+    }
+
+    #[test]
     fn build_markdown_skin_returns_valid_skin() {
         let skin = build_markdown_skin();
         let text = skin.term_text("**test**");
@@ -6013,7 +6347,11 @@ mod tests {
         app.handle_command("/model claude-sonnet-4-6")
             .await
             .unwrap();
-        let rendered = app.handle_message("hello").await.expect("loop response");
+        let rendered = app
+            .handle_message("hello")
+            .await
+            .expect("loop response")
+            .expect("batch response");
 
         assert!(rendered.contains("claude-sonnet-4-6-20250929"));
     }
@@ -6027,7 +6365,8 @@ mod tests {
         let rendered = app
             .handle_message("hello")
             .await
-            .expect("loop-generated message");
+            .expect("loop-generated message")
+            .expect("batch response");
 
         assert!(rendered.contains("Loop-integrated reply"));
         assert!(rendered.contains("1 iteration"));
@@ -6549,7 +6888,11 @@ mod tests {
         let plain_text = "Hello! How can I help you today?";
         let mut app = app_with_mock_model(plain_text);
 
-        let rendered = app.handle_message("Hey!").await.expect("loop result");
+        let rendered = app
+            .handle_message("Hey!")
+            .await
+            .expect("loop result")
+            .expect("batch response");
 
         assert!(
             rendered.contains("Hello! How can I help you today?"),
@@ -6564,7 +6907,11 @@ mod tests {
         let valid_json = r#"{"action":{"Respond":{"text":"Hey there! How can I help?"}},"rationale":"greeting","confidence":0.95,"expected_outcome":null,"sub_goals":[]}"#;
         let mut app = app_with_mock_model(valid_json);
 
-        let rendered = app.handle_message("Hey!").await.expect("loop result");
+        let rendered = app
+            .handle_message("Hey!")
+            .await
+            .expect("loop result")
+            .expect("batch response");
 
         assert!(
             rendered.contains("Hey there! How can I help?"),
@@ -6872,5 +7219,135 @@ mod tests {
         let error = io::Error::from_raw_os_error(libc::EIO);
 
         assert!(!super::is_benign_stdin_flush_error(&error));
+    }
+
+    // ---------------------------------------------------------------
+    // Streaming renderer tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn stream_renderer_prints_prefix_once_per_cycle() {
+        let mut renderer = StreamRenderer::new();
+
+        // First delta prints the prefix.
+        renderer.handle_delta("Hello");
+        assert!(renderer.prefix_printed);
+
+        // Second delta does NOT re-print the prefix (flag stays true).
+        let before = renderer.prefix_printed;
+        renderer.handle_delta(" world");
+        assert_eq!(renderer.prefix_printed, before);
+        assert_eq!(renderer.token_count, 2);
+    }
+
+    #[test]
+    fn stream_renderer_handles_multi_phase() {
+        let mut renderer = StreamRenderer::new();
+
+        // Reason phase
+        renderer.handle_started(StreamPhase::Reason);
+        assert_eq!(renderer.current_phase, Some(StreamPhase::Reason));
+        renderer.handle_delta("reasoning");
+        renderer.handle_finished(StreamPhase::Reason);
+        assert_eq!(renderer.current_phase, None);
+
+        // Synthesize phase
+        renderer.handle_started(StreamPhase::Synthesize);
+        assert_eq!(renderer.current_phase, Some(StreamPhase::Synthesize));
+        renderer.handle_delta(" final");
+        renderer.handle_finished(StreamPhase::Synthesize);
+        assert_eq!(renderer.current_phase, None);
+
+        // Prefix was printed exactly once.
+        assert!(renderer.prefix_printed);
+        assert_eq!(renderer.token_count, 2);
+    }
+
+    #[test]
+    fn stream_renderer_increments_token_count_per_delta() {
+        // Verify that each `handle_delta` call increments `token_count`.
+        let mut renderer = StreamRenderer::new();
+        renderer.handle_delta("a");
+        assert_eq!(renderer.token_count, 1);
+        renderer.handle_delta("b");
+        assert_eq!(renderer.token_count, 2);
+        renderer.handle_delta("c");
+        assert_eq!(renderer.token_count, 3);
+    }
+
+    #[test]
+    fn stream_interrupted_marker_does_not_panic() {
+        // Verify the associated function doesn't panic.
+        // Actual stderr content is verified via integration tests.
+        StreamRenderer::print_interrupted_marker();
+    }
+
+    #[test]
+    fn stream_renderer_resets_between_turns() {
+        // Turn 1
+        let mut r1 = StreamRenderer::new();
+        r1.handle_started(StreamPhase::Reason);
+        r1.handle_delta("first turn");
+        r1.handle_finished(StreamPhase::Reason);
+        r1.finalize();
+        assert!(r1.prefix_printed);
+        assert_eq!(r1.token_count, 1);
+
+        // Turn 2 — fresh renderer, all state reset
+        let r2 = StreamRenderer::new();
+        assert!(!r2.prefix_printed);
+        assert_eq!(r2.token_count, 0);
+        assert_eq!(r2.current_phase, None);
+    }
+
+    #[tokio::test]
+    async fn display_loop_processes_streaming_events_end_to_end() {
+        use std::sync::atomic::Ordering;
+
+        let bus = EventBus::new(16);
+        let mut receiver = bus.subscribe();
+        let streamed = Arc::new(AtomicBool::new(false));
+        let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
+        let mut state = DisplayLoopState::new(Arc::clone(&streamed));
+
+        // Before any events: spinner is active, nothing streamed.
+        assert!(state.spinner_active);
+        assert!(!streamed.load(Ordering::Relaxed));
+
+        // Publish StreamingStarted → deactivates spinner.
+        bus.publish(InternalMessage::StreamingStarted {
+            phase: StreamPhase::Synthesize,
+        })
+        .unwrap();
+        let cont = dispatch_streaming_event(&mut receiver, &mut stop_rx, &mut state).await;
+        assert!(cont);
+        assert!(!state.spinner_active);
+        assert!(streamed.load(Ordering::Relaxed));
+        assert_eq!(state.renderer.current_phase, Some(StreamPhase::Synthesize),);
+
+        // Publish StreamDelta → renderer accumulates token.
+        bus.publish(InternalMessage::StreamDelta {
+            delta: "hello".into(),
+            phase: StreamPhase::Synthesize,
+        })
+        .unwrap();
+        let cont = dispatch_streaming_event(&mut receiver, &mut stop_rx, &mut state).await;
+        assert!(cont);
+        assert_eq!(state.renderer.token_count, 1);
+        assert!(state.renderer.prefix_printed);
+
+        // Publish StreamingFinished → phase cleared.
+        bus.publish(InternalMessage::StreamingFinished {
+            phase: StreamPhase::Synthesize,
+        })
+        .unwrap();
+        let cont = dispatch_streaming_event(&mut receiver, &mut stop_rx, &mut state).await;
+        assert!(cont);
+        assert_eq!(state.renderer.current_phase, None);
+
+        // Stop signal → loop exits.
+        let _ = stop_tx.send(());
+        let cont = dispatch_streaming_event(&mut receiver, &mut stop_rx, &mut state).await;
+        assert!(!cont);
     }
 }

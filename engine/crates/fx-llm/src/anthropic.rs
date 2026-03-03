@@ -230,15 +230,71 @@ impl AnthropicProvider {
     fn parse_sse_payload(payload: &str) -> Result<Vec<StreamChunk>, LlmError> {
         let mut framer = SseFramer::default();
         let mut chunks = Vec::new();
+        let mut tool_use_active = false;
+        let mut current_tool_use_id: Option<String> = None;
 
         for line in payload.lines() {
             let mut framed = framer.push_bytes(format!("{line}\n").as_bytes())?;
-            chunks.append(&mut Self::map_sse_frames(&mut framed)?);
+            let mut frame_chunks = Self::map_sse_frames(&mut framed)?;
+            Self::track_tool_use_state(
+                &mut frame_chunks,
+                &mut tool_use_active,
+                &mut current_tool_use_id,
+            );
+            chunks.append(&mut frame_chunks);
         }
 
         let mut final_frames = framer.finish()?;
-        chunks.append(&mut Self::map_sse_frames(&mut final_frames)?);
+        let mut final_chunks = Self::map_sse_frames(&mut final_frames)?;
+        Self::track_tool_use_state(
+            &mut final_chunks,
+            &mut tool_use_active,
+            &mut current_tool_use_id,
+        );
+        chunks.append(&mut final_chunks);
         Ok(chunks)
+    }
+
+    /// Filter `content_block_stop` done-marker chunks unless a tool_use
+    /// block is active. Updates `tool_use_active` based on block
+    /// start/stop transitions.
+    fn track_tool_use_state(
+        chunks: &mut Vec<StreamChunk>,
+        tool_use_active: &mut bool,
+        current_tool_use_id: &mut Option<String>,
+    ) {
+        for chunk in chunks.iter_mut() {
+            for delta in &mut chunk.tool_use_deltas {
+                if let Some(id) = &delta.id {
+                    *tool_use_active = true;
+                    *current_tool_use_id = Some(id.clone());
+                } else if delta.arguments_delta.is_some() {
+                    delta.id.clone_from(current_tool_use_id);
+                }
+            }
+        }
+
+        chunks.retain(|chunk| {
+            let is_done_marker = chunk.delta_content.is_none()
+                && chunk.tool_use_deltas.len() == 1
+                && chunk.tool_use_deltas[0].arguments_done
+                && chunk.tool_use_deltas[0].arguments_delta.is_none()
+                && chunk.tool_use_deltas[0].name.is_none();
+
+            if is_done_marker && !*tool_use_active {
+                return false;
+            }
+            true
+        });
+
+        // Reset after a done marker is emitted
+        if chunks
+            .iter()
+            .any(|c| c.tool_use_deltas.first().is_some_and(|d| d.arguments_done))
+        {
+            *tool_use_active = false;
+            *current_tool_use_id = None;
+        }
     }
 
     fn parse_sse_data(data: &str) -> Result<Vec<StreamChunk>, LlmError> {
@@ -302,6 +358,23 @@ impl AnthropicProvider {
                     });
                 }
             }
+            "content_block_stop" => {
+                // Mark the most recent tool-use delta as done so that
+                // downstream consumers (e.g. `finalize_stream_tool_calls`)
+                // know the arguments are complete. `arguments_delta` is
+                // `None` because this is purely a done signal with no data.
+                chunks.push(StreamChunk {
+                    delta_content: None,
+                    tool_use_deltas: vec![ToolUseDelta {
+                        id: None,
+                        name: None,
+                        arguments_delta: None,
+                        arguments_done: true,
+                    }],
+                    usage: None,
+                    stop_reason: None,
+                });
+            }
             "message_delta" => {
                 let usage = event.usage.map(|usage| Usage {
                     input_tokens: usage.input_tokens,
@@ -349,7 +422,12 @@ impl AnthropicProvider {
                             };
 
                             match Self::map_sse_frames(&mut frames) {
-                                Ok(chunks) => {
+                                Ok(mut chunks) => {
+                                    Self::track_tool_use_state(
+                                        &mut chunks,
+                                        &mut state.tool_use_active,
+                                        &mut state.current_tool_use_id,
+                                    );
                                     state.pending_chunks.extend(chunks.into_iter().map(Ok))
                                 }
                                 Err(error) => {
@@ -372,7 +450,12 @@ impl AnthropicProvider {
                             };
 
                             match Self::map_sse_frames(&mut frames) {
-                                Ok(chunks) => {
+                                Ok(mut chunks) => {
+                                    Self::track_tool_use_state(
+                                        &mut chunks,
+                                        &mut state.tool_use_active,
+                                        &mut state.current_tool_use_id,
+                                    );
                                     state.pending_chunks.extend(chunks.into_iter().map(Ok))
                                 }
                                 Err(error) => {
@@ -605,6 +688,8 @@ struct AnthropicSseState {
     framer: SseFramer,
     pending_chunks: std::collections::VecDeque<Result<StreamChunk, LlmError>>,
     finished: bool,
+    tool_use_active: bool,
+    current_tool_use_id: Option<String>,
 }
 
 impl AnthropicSseState {
@@ -617,6 +702,8 @@ impl AnthropicSseState {
             framer: SseFramer::default(),
             pending_chunks: std::collections::VecDeque::new(),
             finished: false,
+            tool_use_active: false,
+            current_tool_use_id: None,
         }
     }
 }
@@ -827,5 +914,82 @@ mod tests {
 
         let result = provider.build_request_body(&request, false);
         assert!(matches!(result, Err(LlmError::UnsupportedModel(_))));
+    }
+
+    #[test]
+    fn content_block_stop_marks_tool_arguments_done() {
+        let payload = r#"
+            data: {"type":"content_block_start","content_block":{"type":"tool_use","id":"toolu_abc","name":"list_directory","input":{}}}
+
+            data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"/tmp\"}"}}
+
+            data: {"type":"content_block_stop","index":1}
+
+            data: [DONE]
+        "#;
+
+        let chunks = AnthropicProvider::parse_sse_payload(payload).unwrap();
+
+        // content_block_start (tool id+name), delta (args), stop (done marker)
+        assert!(
+            chunks.len() >= 3,
+            "expected at least 3 chunks, got {}",
+            chunks.len()
+        );
+
+        let done_chunk = chunks
+            .iter()
+            .find(|c| c.tool_use_deltas.first().is_some_and(|d| d.arguments_done));
+        assert!(
+            done_chunk.is_some(),
+            "content_block_stop must emit a ToolUseDelta with arguments_done=true"
+        );
+
+        // The done marker should carry no argument data — it's purely a
+        // completion signal, not a delta with an empty string.
+        let done_delta = &done_chunk.unwrap().tool_use_deltas[0];
+        assert!(
+            done_delta.arguments_delta.is_none(),
+            "content_block_stop done marker must have arguments_delta=None, not Some(\"\")"
+        );
+    }
+
+    #[test]
+    fn multi_tool_streaming_preserves_separate_arguments() {
+        let payload = r#"
+            data: {"type":"content_block_start","content_block":{"type":"tool_use","id":"toolu_01","name":"read_file","input":{}}}
+
+            data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"/tmp/a.txt\"}"}}
+
+            data: {"type":"content_block_stop","index":0}
+
+            data: {"type":"content_block_start","content_block":{"type":"tool_use","id":"toolu_02","name":"read_file","input":{}}}
+
+            data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"/tmp/b.txt\"}"}}
+
+            data: {"type":"content_block_stop","index":1}
+
+            data: [DONE]
+        "#;
+
+        let chunks = AnthropicProvider::parse_sse_payload(payload).unwrap();
+
+        let tool_deltas: Vec<_> = chunks
+            .iter()
+            .flat_map(|c| &c.tool_use_deltas)
+            .filter(|d| d.arguments_delta.as_ref().is_some_and(|s| !s.is_empty()))
+            .collect();
+
+        assert_eq!(tool_deltas.len(), 2, "expected 2 argument deltas");
+        assert_eq!(
+            tool_deltas[0].id.as_deref(),
+            Some("toolu_01"),
+            "first argument delta must carry toolu_01 id"
+        );
+        assert_eq!(
+            tool_deltas[1].id.as_deref(),
+            Some("toolu_02"),
+            "second argument delta must carry toolu_02 id"
+        );
     }
 }

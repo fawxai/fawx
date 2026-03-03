@@ -2,8 +2,9 @@
 
 use crate::act::{ActionResult, TokenUsage, ToolExecutor, ToolResult};
 use crate::budget::{
-    build_skip_mask, effective_max_depth, ActionCost, AllocationMode, AllocationPlan,
-    BudgetAllocator, BudgetConfig, BudgetRemaining, BudgetTracker, DepthMode,
+    build_skip_mask, effective_max_depth, truncate_tool_result, ActionCost, AllocationMode,
+    AllocationPlan, BudgetAllocator, BudgetConfig, BudgetRemaining, BudgetState, BudgetTracker,
+    DepthMode,
 };
 use crate::cancellation::CancellationToken;
 use crate::context_manager::ContextCompactor;
@@ -240,6 +241,9 @@ pub struct LoopEngine {
     conversation_budget: ConversationBudget,
     conversation_compactor: Box<dyn CompactionStrategy>,
     compaction_last_iteration: Mutex<HashMap<CompactionScope, u32>>,
+    /// Guards performance signal to fire only on the Normal→Low transition,
+    /// not on every `perceive()` call while the budget stays Low.
+    budget_low_signaled: bool,
 }
 
 #[derive(Debug, Default)]
@@ -342,6 +346,7 @@ impl LoopEngineBuilder {
             conversation_budget,
             conversation_compactor,
             compaction_last_iteration: Mutex::new(HashMap::new()),
+            budget_low_signaled: false,
         })
     }
 }
@@ -573,6 +578,10 @@ const MEMORY_INSTRUCTION: &str = "\n\nYou have persistent memory across sessions
 Use memory_write to save important facts about the user, their preferences, \
 and project context. Use memory_read to recall specific details. \
 Memories survive restart \u{2014} write anything worth remembering.";
+
+const BUDGET_LOW_WRAP_UP_DIRECTIVE: &str = "You are running low on budget. \
+Do not call any tools. Do not decompose. \
+Summarize what you have accomplished and what remains undone. Be concise.";
 
 const VERIFICATION_CONFIDENCE_CLEAN: f64 = 0.9;
 const VERIFICATION_CONFIDENCE_SINGLE_DISCREPANCY: f64 = 0.45;
@@ -811,6 +820,7 @@ impl LoopEngine {
         self.signals.clear();
         self.user_stop_requested = false;
         self.pending_steer = None;
+        self.budget_low_signaled = false;
         if let Some(token) = &self.cancel_token {
             token.reset();
         }
@@ -988,6 +998,19 @@ impl LoopEngine {
         self.ensure_within_hard_limit(CompactionScope::Perceive, &context_window)?;
 
         self.append_compacted_summary(&snapshot_with_steer, &user_message, &mut context_window);
+
+        if self.budget.state() == BudgetState::Low {
+            if !self.budget_low_signaled {
+                self.emit_signal(
+                    LoopStep::Perceive,
+                    SignalKind::Performance,
+                    "budget soft-ceiling reached, entering wrap-up mode",
+                    serde_json::json!({"budget_state": "low"}),
+                );
+                self.budget_low_signaled = true;
+            }
+            context_window.push(Message::system(BUDGET_LOW_WRAP_UP_DIRECTIVE.to_string()));
+        }
 
         Ok(ProcessedPerception {
             user_message: user_message.clone(),
@@ -1253,6 +1276,10 @@ impl LoopEngine {
         llm: &dyn LlmProvider,
         context_messages: &[Message],
     ) -> Result<ActionResult, LoopError> {
+        if self.budget.state() == BudgetState::Low {
+            return Ok(self.budget_low_blocked_result(decision, "decomposition"));
+        }
+
         let timestamp_ms = current_time_ms();
         let remaining = self.budget.remaining(timestamp_ms);
         let effective_cap = self.effective_decomposition_depth_cap(&remaining);
@@ -1592,6 +1619,9 @@ impl LoopEngine {
             max_wall_time_ms: 0,
             max_recursion_depth: template.max_recursion_depth,
             decompose_depth_mode: template.decompose_depth_mode,
+            soft_ceiling_percent: template.soft_ceiling_percent,
+            max_fan_out: template.max_fan_out,
+            max_tool_result_bytes: template.max_tool_result_bytes,
         }
     }
 
@@ -2198,7 +2228,18 @@ impl LoopEngine {
         llm: &dyn LlmProvider,
         context_messages: &[Message],
     ) -> Result<ActionResult, LoopError> {
-        let mut state = ToolRoundState::new(calls, context_messages);
+        if self.budget.state() == BudgetState::Low {
+            return Ok(self.budget_low_blocked_result(decision, "tool dispatch"));
+        }
+
+        let (execute_calls, deferred) = self.apply_fan_out_cap(calls);
+        let mut state = ToolRoundState::new(&execute_calls, context_messages);
+
+        // Inject deferred tool results immediately so they're present in
+        // all_tool_results regardless of which return path the loop takes.
+        if !deferred.is_empty() {
+            self.append_deferred_tool_results(&mut state, &deferred, calls.len());
+        }
 
         for round in 0..self.max_iterations {
             if self.tool_round_interrupted() {
@@ -2211,7 +2252,13 @@ impl LoopEngine {
                 }
                 ToolRoundOutcome::Response(response) => {
                     if !response.tool_calls.is_empty() {
-                        state.current_calls = response.tool_calls;
+                        let (capped, round_deferred) = self.apply_fan_out_cap(&response.tool_calls);
+                        self.append_deferred_tool_results(
+                            &mut state,
+                            &round_deferred,
+                            response.tool_calls.len(),
+                        );
+                        state.current_calls = capped;
                         continue;
                     }
 
@@ -2236,6 +2283,74 @@ impl LoopEngine {
 
         self.synthesize_tool_fallback(decision, state.all_tool_results, state.tokens_used, llm)
             .await
+    }
+
+    fn apply_fan_out_cap(&mut self, calls: &[ToolCall]) -> (Vec<ToolCall>, Vec<ToolCall>) {
+        let max_fan_out = self.budget.config().max_fan_out;
+        if calls.len() <= max_fan_out {
+            return (calls.to_vec(), Vec::new());
+        }
+        let execute = calls[..max_fan_out].to_vec();
+        let deferred = calls[max_fan_out..].to_vec();
+        let deferred_names: Vec<&str> = deferred.iter().map(|c| c.name.as_str()).collect();
+        self.emit_signal(
+            LoopStep::Act,
+            SignalKind::Friction,
+            format!(
+                "fan-out cap: executing {}/{}, deferring: {}",
+                max_fan_out,
+                calls.len(),
+                deferred_names.join(", ")
+            ),
+            serde_json::json!({
+                "executed": max_fan_out,
+                "total": calls.len(),
+                "deferred_tools": deferred_names,
+            }),
+        );
+        (execute, deferred)
+    }
+
+    fn append_deferred_tool_results(
+        &self,
+        state: &mut ToolRoundState,
+        deferred: &[ToolCall],
+        total: usize,
+    ) {
+        let executed = total.saturating_sub(deferred.len());
+        let names: Vec<&str> = deferred.iter().map(|c| c.name.as_str()).collect();
+        let msg = format!(
+            "Tool calls deferred (budget: {executed}/{total}): {}. \
+             Re-request in your next turn if still needed.",
+            names.join(", ")
+        );
+        // Inject as synthetic tool results so synthesize_tool_fallback
+        // (which builds its prompt from all_tool_results) includes them.
+        for call in deferred {
+            state.all_tool_results.push(ToolResult {
+                tool_call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                success: false,
+                output: msg.clone(),
+            });
+        }
+    }
+
+    fn budget_low_blocked_result(
+        &mut self,
+        decision: &Decision,
+        action_name: &str,
+    ) -> ActionResult {
+        self.emit_signal(
+            LoopStep::Act,
+            SignalKind::Blocked,
+            format!("{action_name} blocked: budget is low, wrapping up"),
+            serde_json::json!({"reason": "budget_soft_ceiling"}),
+        );
+        self.text_action_result(
+            decision,
+            &format!("{action_name} was not executed because the budget soft-ceiling was reached. Summarizing what has been accomplished so far."),
+        )
     }
 
     async fn execute_tool_round(
@@ -2290,7 +2405,9 @@ impl LoopEngine {
     }
 
     async fn execute_tool_calls(&self, calls: &[ToolCall]) -> Result<Vec<ToolResult>, LoopError> {
-        self.tool_executor
+        let max_bytes = self.budget.config().max_tool_result_bytes;
+        let results = self
+            .tool_executor
             .execute_tools(calls, self.cancel_token.as_ref())
             .await
             .map_err(|error| {
@@ -2299,7 +2416,8 @@ impl LoopEngine {
                     &format!("tool execution failed: {}", error.message),
                     error.recoverable,
                 )
-            })
+            })?;
+        Ok(truncate_tool_results(results, max_bytes))
     }
 
     async fn request_tool_continuation(
@@ -2775,6 +2893,18 @@ fn attach_signals(result: LoopResult, signals: Vec<Signal>) -> LoopResult {
             signals,
         },
     }
+}
+
+fn truncate_tool_results(results: Vec<ToolResult>, max_bytes: usize) -> Vec<ToolResult> {
+    results
+        .into_iter()
+        .map(|mut result| {
+            if result.output.len() > max_bytes {
+                result.output = truncate_tool_result(&result.output, max_bytes).into_owned();
+            }
+            result
+        })
+        .collect()
 }
 
 fn extract_user_message(snapshot: &PerceptionSnapshot) -> Result<String, LoopError> {
@@ -4595,6 +4725,7 @@ mod phase2_tests {
             max_wall_time_ms: 0,
             max_recursion_depth: 0,
             decompose_depth_mode: DepthMode::Adaptive,
+            ..BudgetConfig::default()
         };
         let mut engine = LoopEngine::builder()
             .budget(BudgetTracker::new(zero_budget, 0, 0))
@@ -4635,6 +4766,7 @@ mod phase2_tests {
             max_wall_time_ms: 0,
             max_recursion_depth: 0,
             decompose_depth_mode: DepthMode::Adaptive,
+            ..BudgetConfig::default()
         };
         let mut engine = LoopEngine::builder()
             .budget(BudgetTracker::new(zero_budget, 0, 0))
@@ -7506,6 +7638,7 @@ mod decomposition_tests {
             max_wall_time_ms: 60_000,
             max_recursion_depth,
             decompose_depth_mode: mode,
+            ..BudgetConfig::default()
         }
     }
 
@@ -10127,5 +10260,822 @@ mod r2_streaming_review_tests {
             response.usage.is_none(),
             "default state should produce no usage"
         );
+    }
+
+    #[test]
+    fn finalize_stream_tool_calls_separates_multi_tool_arguments() {
+        let mut state = StreamResponseState::default();
+
+        // Tool 1: content_block_start with id
+        state.apply_chunk(StreamChunk {
+            tool_use_deltas: vec![ToolUseDelta {
+                id: Some("toolu_01".to_string()),
+                name: Some("read_file".to_string()),
+                arguments_delta: None,
+                arguments_done: false,
+            }],
+            ..Default::default()
+        });
+
+        // Tool 1: argument delta (id present from provider fix)
+        state.apply_chunk(StreamChunk {
+            tool_use_deltas: vec![ToolUseDelta {
+                id: Some("toolu_01".to_string()),
+                name: None,
+                arguments_delta: Some(r#"{"path":"/tmp/a.txt"}"#.to_string()),
+                arguments_done: false,
+            }],
+            ..Default::default()
+        });
+
+        // Tool 1: done
+        state.apply_chunk(StreamChunk {
+            tool_use_deltas: vec![ToolUseDelta {
+                id: Some("toolu_01".to_string()),
+                name: None,
+                arguments_delta: None,
+                arguments_done: true,
+            }],
+            ..Default::default()
+        });
+
+        // Tool 2: content_block_start with id
+        state.apply_chunk(StreamChunk {
+            tool_use_deltas: vec![ToolUseDelta {
+                id: Some("toolu_02".to_string()),
+                name: Some("read_file".to_string()),
+                arguments_delta: None,
+                arguments_done: false,
+            }],
+            ..Default::default()
+        });
+
+        // Tool 2: argument delta with id (injected by provider)
+        state.apply_chunk(StreamChunk {
+            tool_use_deltas: vec![ToolUseDelta {
+                id: Some("toolu_02".to_string()),
+                name: None,
+                arguments_delta: Some(r#"{"path":"/tmp/b.txt"}"#.to_string()),
+                arguments_done: false,
+            }],
+            ..Default::default()
+        });
+
+        // Tool 2: done
+        state.apply_chunk(StreamChunk {
+            tool_use_deltas: vec![ToolUseDelta {
+                id: Some("toolu_02".to_string()),
+                name: None,
+                arguments_delta: None,
+                arguments_done: true,
+            }],
+            ..Default::default()
+        });
+
+        let response = state.into_response();
+        assert_eq!(
+            response.tool_calls.len(),
+            2,
+            "expected 2 separate tool calls, got {}",
+            response.tool_calls.len()
+        );
+        assert_eq!(response.tool_calls[0].id, "toolu_01");
+        assert_eq!(
+            response.tool_calls[0].arguments,
+            serde_json::json!({"path": "/tmp/a.txt"})
+        );
+        assert_eq!(response.tool_calls[1].id, "toolu_02");
+        assert_eq!(
+            response.tool_calls[1].arguments,
+            serde_json::json!({"path": "/tmp/b.txt"})
+        );
+    }
+}
+
+#[cfg(test)]
+mod loop_resilience_tests {
+    use super::*;
+    use crate::act::{ToolExecutor, ToolResult};
+    use crate::budget::{ActionCost, BudgetConfig, BudgetTracker};
+    use crate::cancellation::CancellationToken;
+    use crate::context_manager::ContextCompactor;
+    use async_trait::async_trait;
+    use fx_core::error::LlmError as CoreLlmError;
+    use fx_core::types::{InputSource, ScreenState, UserInput};
+    use fx_llm::{
+        CompletionResponse, ContentBlock, Message, ProviderError, ToolCall, ToolDefinition,
+    };
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    #[derive(Debug, Default)]
+    struct StubToolExecutor;
+
+    #[async_trait]
+    impl ToolExecutor for StubToolExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+            Ok(calls
+                .iter()
+                .map(|call| ToolResult {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    success: true,
+                    output: "ok".to_string(),
+                })
+                .collect())
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition {
+                name: "read_file".to_string(),
+                description: "Read a file".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+            }]
+        }
+    }
+
+    /// Tool executor that returns large outputs for truncation testing.
+    #[derive(Debug)]
+    struct LargeOutputToolExecutor {
+        output_size: usize,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for LargeOutputToolExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+            Ok(calls
+                .iter()
+                .map(|call| ToolResult {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    success: true,
+                    output: "x".repeat(self.output_size),
+                })
+                .collect())
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition {
+                name: "read_file".to_string(),
+                description: "Read a file".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+            }]
+        }
+    }
+
+    #[derive(Debug)]
+    struct SequentialMockLlm {
+        responses: Mutex<VecDeque<CompletionResponse>>,
+    }
+
+    impl SequentialMockLlm {
+        fn new(responses: Vec<CompletionResponse>) -> Self {
+            Self {
+                responses: Mutex::new(VecDeque::from(responses)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for SequentialMockLlm {
+        async fn generate(&self, _: &str, _: u32) -> Result<String, CoreLlmError> {
+            Ok("summary".to_string())
+        }
+
+        async fn generate_streaming(
+            &self,
+            _: &str,
+            _: u32,
+            callback: Box<dyn Fn(String) + Send + 'static>,
+        ) -> Result<String, CoreLlmError> {
+            callback("summary".to_string());
+            Ok("summary".to_string())
+        }
+
+        fn model_name(&self) -> &str {
+            "mock"
+        }
+
+        async fn complete(
+            &self,
+            _: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            self.responses
+                .lock()
+                .expect("lock")
+                .pop_front()
+                .ok_or_else(|| ProviderError::Provider("no response".to_string()))
+        }
+    }
+
+    fn high_budget_engine() -> LoopEngine {
+        LoopEngine::builder()
+            .budget(BudgetTracker::new(BudgetConfig::default(), 0, 0))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(StubToolExecutor))
+            .synthesis_instruction("Summarize".to_string())
+            .build()
+            .expect("build")
+    }
+
+    fn low_budget_engine() -> LoopEngine {
+        let config = BudgetConfig {
+            max_cost_cents: 100,
+            soft_ceiling_percent: 80,
+            ..BudgetConfig::default()
+        };
+        let mut tracker = BudgetTracker::new(config, 0, 0);
+        // Push past the soft ceiling (81%)
+        tracker.record(&ActionCost {
+            cost_cents: 81,
+            ..ActionCost::default()
+        });
+        LoopEngine::builder()
+            .budget(tracker)
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(StubToolExecutor))
+            .synthesis_instruction("Summarize".to_string())
+            .build()
+            .expect("build")
+    }
+
+    fn fan_out_engine(max_fan_out: usize) -> LoopEngine {
+        let config = BudgetConfig {
+            max_fan_out,
+            ..BudgetConfig::default()
+        };
+        LoopEngine::builder()
+            .budget(BudgetTracker::new(config, 0, 0))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(5)
+            .tool_executor(Arc::new(StubToolExecutor))
+            .synthesis_instruction("Summarize".to_string())
+            .build()
+            .expect("build")
+    }
+
+    fn test_snapshot(text: &str) -> PerceptionSnapshot {
+        PerceptionSnapshot {
+            timestamp_ms: 1,
+            screen: ScreenState {
+                current_app: "terminal".to_string(),
+                elements: Vec::new(),
+                text_content: text.to_string(),
+            },
+            notifications: Vec::new(),
+            active_app: "terminal".to_string(),
+            user_input: Some(UserInput {
+                text: text.to_string(),
+                source: InputSource::Text,
+                timestamp: 1,
+                context_id: None,
+            }),
+            sensor_data: None,
+            conversation_history: vec![Message::user(text)],
+            steer_context: None,
+        }
+    }
+
+    // --- Test 4: Tool dispatch blocked when state() == Low ---
+    #[tokio::test]
+    async fn tool_dispatch_blocked_when_budget_low() {
+        let mut engine = low_budget_engine();
+        let decision = Decision::UseTools(vec![ToolCall {
+            id: "1".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path": "test.rs"}),
+        }]);
+        let context = vec![Message::user("read file")];
+        let llm = SequentialMockLlm::new(vec![]);
+
+        let result = engine
+            .act(&decision, &llm, &context)
+            .await
+            .expect("act should succeed");
+
+        assert!(
+            result.response_text.contains("soft-ceiling"),
+            "response should mention soft-ceiling: {}",
+            result.response_text,
+        );
+        assert!(result.tool_results.is_empty(), "no tools should execute");
+    }
+
+    // --- Test 5: Decompose blocked at 85% cost ---
+    #[tokio::test]
+    async fn decompose_blocked_when_budget_low() {
+        let config = BudgetConfig {
+            max_cost_cents: 100,
+            soft_ceiling_percent: 80,
+            ..BudgetConfig::default()
+        };
+        let mut tracker = BudgetTracker::new(config, 0, 0);
+        tracker.record(&ActionCost {
+            cost_cents: 85,
+            ..ActionCost::default()
+        });
+        let mut engine = LoopEngine::builder()
+            .budget(tracker)
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(StubToolExecutor))
+            .synthesis_instruction("Summarize".to_string())
+            .build()
+            .expect("build");
+
+        let plan = fx_decompose::DecompositionPlan {
+            sub_goals: vec![fx_decompose::SubGoal {
+                description: "sub-goal".to_string(),
+                required_tools: vec![],
+                expected_output: None,
+                complexity_hint: None,
+            }],
+            strategy: fx_decompose::AggregationStrategy::Sequential,
+            truncated_from: None,
+        };
+        let decision = Decision::Decompose(plan.clone());
+        let context = vec![Message::user("do stuff")];
+        let llm = SequentialMockLlm::new(vec![]);
+
+        let result = engine
+            .act(&decision, &llm, &context)
+            .await
+            .expect("act should succeed");
+
+        assert!(
+            result.response_text.contains("soft-ceiling"),
+            "decompose should be blocked by soft-ceiling: {}",
+            result.response_text,
+        );
+    }
+
+    // --- Test 7: Performance signal emitted on Normal→Low transition ---
+    #[tokio::test]
+    async fn performance_signal_emitted_on_budget_low_transition() {
+        let config = BudgetConfig {
+            max_cost_cents: 100,
+            soft_ceiling_percent: 80,
+            ..BudgetConfig::default()
+        };
+        let mut tracker = BudgetTracker::new(config, 0, 0);
+        // Push past soft ceiling
+        tracker.record(&ActionCost {
+            cost_cents: 81,
+            ..ActionCost::default()
+        });
+        let mut engine = LoopEngine::builder()
+            .budget(tracker)
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(StubToolExecutor))
+            .synthesis_instruction("Summarize".to_string())
+            .build()
+            .expect("build");
+
+        let snapshot = test_snapshot("hello");
+        let _processed = engine.perceive(&snapshot).await.expect("perceive");
+
+        let signals = engine.signals.drain_all();
+        let perf_signals: Vec<_> = signals
+            .iter()
+            .filter(|s| {
+                s.kind == SignalKind::Performance && s.message.contains("budget soft-ceiling")
+            })
+            .collect();
+        assert_eq!(
+            perf_signals.len(),
+            1,
+            "exactly one performance signal on Normal→Low transition"
+        );
+    }
+
+    // --- Test 7b: Performance signal fires only once across multiple perceive calls ---
+    #[tokio::test]
+    async fn performance_signal_emitted_only_once_across_perceive_calls() {
+        let mut engine = low_budget_engine();
+        let snapshot = test_snapshot("hello");
+
+        // First perceive — should emit the signal
+        let _first = engine.perceive(&snapshot).await.expect("perceive 1");
+        // Second perceive — should NOT emit again
+        let _second = engine.perceive(&snapshot).await.expect("perceive 2");
+
+        let signals = engine.signals.drain_all();
+        let perf_signals: Vec<_> = signals
+            .iter()
+            .filter(|s| {
+                s.kind == SignalKind::Performance && s.message.contains("budget soft-ceiling")
+            })
+            .collect();
+        assert_eq!(
+            perf_signals.len(),
+            1,
+            "performance signal should fire exactly once, not on every perceive()"
+        );
+    }
+
+    // --- Test 7c: Wrap-up directive is system message, not user ---
+    #[tokio::test]
+    async fn wrap_up_directive_is_system_message() {
+        let mut engine = low_budget_engine();
+        let snapshot = test_snapshot("hello");
+        let processed = engine.perceive(&snapshot).await.expect("perceive");
+
+        let wrap_up_msg = processed
+            .context_window
+            .iter()
+            .find(|msg| {
+                msg.content.iter().any(|block| match block {
+                    ContentBlock::Text { text } => text.contains("running low on budget"),
+                    _ => false,
+                })
+            })
+            .expect("wrap-up directive should exist");
+        assert_eq!(
+            wrap_up_msg.role,
+            MessageRole::System,
+            "wrap-up directive should be a system message, not user"
+        );
+    }
+
+    // --- Test 8: Wrap-up directive present in perceive() when state() == Low ---
+    #[tokio::test]
+    async fn wrap_up_directive_injected_when_budget_low() {
+        let mut engine = low_budget_engine();
+        let snapshot = test_snapshot("hello");
+        let processed = engine.perceive(&snapshot).await.expect("perceive");
+
+        let has_wrap_up = processed.context_window.iter().any(|msg| {
+            msg.content.iter().any(|block| match block {
+                ContentBlock::Text { text } => text.contains("running low on budget"),
+                _ => false,
+            })
+        });
+        assert!(has_wrap_up, "wrap-up directive should be in context window");
+    }
+
+    // --- Test 8b: Wrap-up directive NOT present when budget Normal ---
+    #[tokio::test]
+    async fn no_wrap_up_directive_when_budget_normal() {
+        let mut engine = high_budget_engine();
+        let snapshot = test_snapshot("hello");
+        let processed = engine.perceive(&snapshot).await.expect("perceive");
+
+        let has_wrap_up = processed.context_window.iter().any(|msg| {
+            msg.content.iter().any(|block| match block {
+                ContentBlock::Text { text } => text.contains("running low on budget"),
+                _ => false,
+            })
+        });
+        assert!(!has_wrap_up, "no wrap-up directive when budget normal");
+    }
+
+    // --- Test 9: 3 tool calls with cap=4 → all 3 execute ---
+    #[tokio::test]
+    async fn fan_out_3_calls_within_cap_all_execute() {
+        let mut engine = fan_out_engine(4);
+        let calls: Vec<ToolCall> = (0..3)
+            .map(|i| ToolCall {
+                id: format!("call-{i}"),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": format!("file{i}.txt")}),
+            })
+            .collect();
+        let decision = Decision::UseTools(calls.clone());
+        let context = vec![Message::user("read files")];
+        let llm = SequentialMockLlm::new(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "done reading".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let result = engine.act(&decision, &llm, &context).await.expect("act");
+
+        assert_eq!(result.tool_results.len(), 3, "all 3 should execute");
+    }
+
+    // --- Test 10: 6 tool calls with cap=4 → first 4 execute, last 2 deferred ---
+    #[tokio::test]
+    async fn fan_out_6_calls_cap_4_defers_2() {
+        let mut engine = fan_out_engine(4);
+        let calls: Vec<ToolCall> = (0..6)
+            .map(|i| ToolCall {
+                id: format!("call-{i}"),
+                name: format!("tool_{i}"),
+                arguments: serde_json::json!({}),
+            })
+            .collect();
+        let decision = Decision::UseTools(calls.clone());
+        let context = vec![Message::user("do stuff")];
+        let llm = SequentialMockLlm::new(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "completed".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let result = engine.act(&decision, &llm, &context).await.expect("act");
+
+        let executed: Vec<_> = result.tool_results.iter().filter(|r| r.success).collect();
+        assert_eq!(executed.len(), 4, "only first 4 should execute");
+        let deferred_results: Vec<_> = result
+            .tool_results
+            .iter()
+            .filter(|r| !r.success && r.output.contains("deferred"))
+            .collect();
+        assert_eq!(deferred_results.len(), 2, "2 deferred as synthetic results");
+        // Check that deferred signal was emitted
+        let signals = engine.signals.drain_all();
+        let friction: Vec<_> = signals
+            .iter()
+            .filter(|s| s.kind == SignalKind::Friction && s.message.contains("fan-out cap"))
+            .collect();
+        assert_eq!(friction.len(), 1, "fan-out friction signal emitted");
+    }
+
+    // --- Test 11: Deferred message lists correct tool names ---
+    #[tokio::test]
+    async fn fan_out_deferred_message_lists_tool_names() {
+        let mut engine = fan_out_engine(2);
+        let calls = vec![
+            ToolCall {
+                id: "a".to_string(),
+                name: "alpha".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "b".to_string(),
+                name: "beta".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "c".to_string(),
+                name: "gamma".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "d".to_string(),
+                name: "delta".to_string(),
+                arguments: serde_json::json!({}),
+            },
+        ];
+
+        let (execute, deferred) = engine.apply_fan_out_cap(&calls);
+        assert_eq!(execute.len(), 2);
+        assert_eq!(deferred.len(), 2);
+        assert_eq!(deferred[0].name, "gamma");
+        assert_eq!(deferred[1].name, "delta");
+
+        let signals = engine.signals.drain_all();
+        let friction = signals
+            .iter()
+            .find(|s| s.kind == SignalKind::Friction)
+            .expect("friction signal");
+        assert!(
+            friction.message.contains("gamma"),
+            "deferred message should list gamma: {}",
+            friction.message
+        );
+        assert!(
+            friction.message.contains("delta"),
+            "deferred message should list delta: {}",
+            friction.message
+        );
+    }
+
+    // --- Test 12: Cap=1 forces strictly sequential tool execution ---
+    #[tokio::test]
+    async fn fan_out_cap_1_forces_sequential() {
+        let mut engine = fan_out_engine(1);
+        let calls: Vec<ToolCall> = (0..3)
+            .map(|i| ToolCall {
+                id: format!("call-{i}"),
+                name: format!("tool_{i}"),
+                arguments: serde_json::json!({}),
+            })
+            .collect();
+        let decision = Decision::UseTools(calls.clone());
+        let context = vec![Message::user("do stuff")];
+        let llm = SequentialMockLlm::new(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "done".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let result = engine.act(&decision, &llm, &context).await.expect("act");
+
+        let executed: Vec<_> = result.tool_results.iter().filter(|r| r.success).collect();
+        assert_eq!(executed.len(), 1, "cap=1 should execute exactly 1 tool");
+        let deferred_results: Vec<_> = result
+            .tool_results
+            .iter()
+            .filter(|r| !r.success && r.output.contains("deferred"))
+            .collect();
+        assert_eq!(
+            deferred_results.len(),
+            2,
+            "cap=1 with 3 calls should defer 2"
+        );
+    }
+
+    // --- Test 11b: Deferred tools injected as synthetic tool results ---
+    #[tokio::test]
+    async fn deferred_tools_appear_in_synthesis_results() {
+        let mut engine = fan_out_engine(1);
+        let calls = vec![
+            ToolCall {
+                id: "a".to_string(),
+                name: "alpha".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "b".to_string(),
+                name: "beta".to_string(),
+                arguments: serde_json::json!({}),
+            },
+        ];
+
+        // LLM returns empty so we fall through to synthesize_tool_fallback
+        let llm = SequentialMockLlm::new(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "summary".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let decision = Decision::UseTools(calls);
+        let context = vec![Message::user("do things")];
+        let result = engine.act(&decision, &llm, &context).await.expect("act");
+
+        // Should have 1 executed + 1 deferred-as-synthetic = 2 tool results
+        assert_eq!(
+            result.tool_results.len(),
+            2,
+            "deferred tool should appear as synthetic tool result"
+        );
+        let deferred_result = result
+            .tool_results
+            .iter()
+            .find(|r| r.tool_name == "beta")
+            .expect("beta should be in results");
+        assert!(
+            !deferred_result.success,
+            "deferred result should be marked as not successful"
+        );
+        assert!(
+            deferred_result.output.contains("deferred"),
+            "deferred result should mention deferral: {}",
+            deferred_result.output
+        );
+    }
+
+    // --- Test 12b: Continuation tool calls also capped by fan-out ---
+    #[tokio::test]
+    async fn continuation_tool_calls_capped_by_fan_out() {
+        let mut engine = fan_out_engine(2);
+
+        // Initial: 2 calls (within cap). Continuation response has 4 more calls.
+        let initial_calls: Vec<ToolCall> = (0..2)
+            .map(|i| ToolCall {
+                id: format!("init-{i}"),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": format!("f{i}.txt")}),
+            })
+            .collect();
+
+        // Mock LLM: first call returns 4 tool calls (should be capped to 2),
+        // second call returns 2 more (capped to 2), third returns final text.
+        let continuation_calls: Vec<ToolCall> = (0..4)
+            .map(|i| ToolCall {
+                id: format!("cont-{i}"),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": format!("c{i}.txt")}),
+            })
+            .collect();
+        let llm = SequentialMockLlm::new(vec![
+            // First continuation: returns 4 tool calls
+            CompletionResponse {
+                content: Vec::new(),
+                tool_calls: continuation_calls,
+                usage: None,
+                stop_reason: Some("tool_use".to_string()),
+            },
+            // Second continuation: returns text (done)
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "all done".to_string(),
+                }],
+                tool_calls: Vec::new(),
+                usage: None,
+                stop_reason: None,
+            },
+        ]);
+
+        let decision = Decision::UseTools(initial_calls);
+        let context = vec![Message::user("read files")];
+        let result = engine.act(&decision, &llm, &context).await.expect("act");
+
+        // Initial 2 + capped 2 executed + 2 deferred (synthetic) = 6 total
+        assert_eq!(
+            result.tool_results.len(),
+            6,
+            "continuation tool calls should include capped + deferred: got {}",
+            result.tool_results.len()
+        );
+
+        // The last 2 entries are synthetic deferred results (not successfully executed)
+        let deferred_results: Vec<_> = result.tool_results.iter().filter(|r| !r.success).collect();
+        assert_eq!(
+            deferred_results.len(),
+            2,
+            "expected 2 deferred tool results, got {}",
+            deferred_results.len()
+        );
+        for r in &deferred_results {
+            assert!(
+                r.output.contains("deferred"),
+                "deferred result should mention deferral: {}",
+                r.output
+            );
+        }
+    }
+
+    // --- Tool result truncation via execute_tool_calls ---
+    #[tokio::test]
+    async fn tool_results_truncated_by_execute_tool_calls() {
+        let config = BudgetConfig {
+            max_tool_result_bytes: 100,
+            ..BudgetConfig::default()
+        };
+        let engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(config, 0, 0))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(LargeOutputToolExecutor { output_size: 500 }))
+            .synthesis_instruction("Summarize".to_string())
+            .build()
+            .expect("build");
+
+        let calls = vec![ToolCall {
+            id: "1".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path": "big.txt"}),
+        }];
+        let results = engine.execute_tool_calls(&calls).await.expect("execute");
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].output.contains("[truncated"),
+            "output should be truncated: {}",
+            &results[0].output[..100.min(results[0].output.len())]
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_results_not_truncated_within_limit() {
+        let config = BudgetConfig {
+            max_tool_result_bytes: 1000,
+            ..BudgetConfig::default()
+        };
+        let engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(config, 0, 0))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(LargeOutputToolExecutor { output_size: 500 }))
+            .synthesis_instruction("Summarize".to_string())
+            .build()
+            .expect("build");
+
+        let calls = vec![ToolCall {
+            id: "1".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path": "small.txt"}),
+        }];
+        let results = engine.execute_tool_calls(&calls).await.expect("execute");
+        assert_eq!(results.len(), 1);
+        assert!(
+            !results[0].output.contains("[truncated"),
+            "output within limit should NOT be truncated"
+        );
+        assert_eq!(results[0].output.len(), 500);
     }
 }
