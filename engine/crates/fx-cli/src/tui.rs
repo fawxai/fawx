@@ -14,6 +14,7 @@ use fx_core::error::LlmError as CoreLlmError;
 use fx_core::memory::{MemoryProvider, MemoryStore};
 use fx_core::runtime_info::{ConfigSummary, RuntimeInfo, SkillInfo};
 use fx_core::types::{InputSource, ScreenState, UserInput};
+use fx_improve::{CyclePaths, ImprovementConfig, OutputMode};
 use fx_kernel::act::TokenUsage;
 use fx_kernel::budget::{BudgetConfig, BudgetTracker};
 use fx_kernel::cancellation::CancellationToken;
@@ -466,6 +467,7 @@ const TUI_COMMANDS: &[&str] = &[
     "/signals",
     "/debug",
     "/analyze",
+    "/improve",
     "/synthesis",
 ];
 
@@ -1052,6 +1054,7 @@ impl TuiApp {
             ParsedCommand::Signals => self.show_signals_summary(),
             ParsedCommand::Debug => self.show_signals_debug(),
             ParsedCommand::Analyze => self.handle_analyze_command().await?,
+            ParsedCommand::Improve(flags) => self.handle_improve_command(flags).await?,
             ParsedCommand::Synthesis(instruction) => {
                 self.update_synthesis_instruction(instruction);
             }
@@ -1287,6 +1290,81 @@ impl TuiApp {
         }
 
         Ok(())
+    }
+
+    async fn handle_improve_command(&mut self, flags: ImproveFlags) -> Result<(), TuiError> {
+        if let Some(unknown) = &flags.has_unknown_flag {
+            println!("Unknown flag: {unknown}");
+            println!("Usage: /improve [--dry-run]");
+            return Ok(());
+        }
+
+        let active_model = self
+            .router
+            .active_model()
+            .ok_or_else(|| TuiError::Router("no active model for improvement".to_string()))?
+            .to_string();
+
+        let (config, data_dir, repo_root) = Self::build_improve_config(&self.config, &flags);
+        let proposals_dir = data_dir.join("proposals");
+        let paths = CyclePaths {
+            data_dir: &data_dir,
+            repo_root: &repo_root,
+            proposals_dir: &proposals_dir,
+        };
+        let provider = AnalysisCompletionProvider::new(&self.router, active_model);
+
+        eprintln!("⚡ Analyzing signals...");
+        eprintln!("⚡ Planning improvements...");
+        let result =
+            fx_improve::run_improvement_cycle(&self.signal_store, &provider, &config, &paths)
+                .await?;
+        Self::print_improve_result(&result, flags.dry_run);
+
+        Ok(())
+    }
+
+    /// Build the [`ImprovementConfig`], data directory, and repo root for an
+    /// `/improve` invocation.
+    fn build_improve_config(
+        app_config: &FawxConfig,
+        flags: &ImproveFlags,
+    ) -> (ImprovementConfig, PathBuf, PathBuf) {
+        let base_data_dir = fawx_data_dir();
+        let data_dir = configured_data_dir(&base_data_dir, app_config);
+        let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+        let mut config = ImprovementConfig::default();
+        if flags.dry_run {
+            config.output_mode = OutputMode::DryRun;
+        }
+        (config, data_dir, repo_root)
+    }
+
+    fn print_improve_result(result: &fx_improve::ExecutionResult, dry_run: bool) {
+        if dry_run {
+            println!("⚡ Dry run complete.");
+        } else {
+            println!("⚡ Improvement cycle complete.");
+        }
+
+        if result.proposals_written.is_empty()
+            && result.branches_created.is_empty()
+            && result.skipped.is_empty()
+        {
+            println!("  No actionable improvements found.");
+            return;
+        }
+
+        for path in &result.proposals_written {
+            println!("  Proposal: {}", path.display());
+        }
+        for branch in &result.branches_created {
+            println!("  Branch: {branch}");
+        }
+        for (name, reason) in &result.skipped {
+            println!("  Skipped: {name} — {reason}");
+        }
     }
 
     fn print_analysis_findings(findings: &[AnalysisFinding]) {
@@ -1719,6 +1797,7 @@ impl TuiApp {
         println!("  /signals       Show condensed signal summary for last turn");
         println!("  /debug         Show full signal dump for last turn");
         println!("  /analyze       Analyze persisted signals across sessions");
+        println!("  /improve       Run self-improvement cycle");
         println!("  /synthesis     Set or reset synthesis instruction");
         println!("  /clear         Clear the screen and active conversation");
         println!("  /new           Start a new conversation");
@@ -2637,6 +2716,12 @@ impl From<io::Error> for TuiError {
 impl From<AnalysisError> for TuiError {
     fn from(value: AnalysisError) -> Self {
         Self::Loop(format!("analysis failed: {value}"))
+    }
+}
+
+impl From<fx_improve::ImprovementError> for TuiError {
+    fn from(value: fx_improve::ImprovementError) -> Self {
+        Self::Loop(format!("improvement failed: {value}"))
     }
 }
 
@@ -3645,6 +3730,7 @@ enum ParsedCommand {
     Signals,
     Debug,
     Analyze,
+    Improve(ImproveFlags),
     Synthesis(Option<String>),
     Clear,
     New,
@@ -3653,6 +3739,13 @@ enum ParsedCommand {
     Help,
     Quit,
     Unknown(String),
+}
+
+/// Flags parsed from the `/improve` command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImproveFlags {
+    dry_run: bool,
+    has_unknown_flag: Option<String>,
 }
 
 fn parse_command(value: &str) -> ParsedCommand {
@@ -3675,6 +3768,7 @@ fn parse_command(value: &str) -> ParsedCommand {
         "signals" => ParsedCommand::Signals,
         "debug" => ParsedCommand::Debug,
         "analyze" => ParsedCommand::Analyze,
+        "improve" => ParsedCommand::Improve(parse_improve_flags(&mut parts)),
         "synthesis" => {
             let remainder = input[command.len()..].strip_prefix(' ');
             match remainder {
@@ -3691,6 +3785,23 @@ fn parse_command(value: &str) -> ParsedCommand {
         "quit" | "exit" => ParsedCommand::Quit,
         other => ParsedCommand::Unknown(other.to_string()),
     }
+}
+
+fn parse_improve_flags(parts: &mut std::str::SplitWhitespace<'_>) -> ImproveFlags {
+    let mut flags = ImproveFlags {
+        dry_run: false,
+        has_unknown_flag: None,
+    };
+    for arg in parts {
+        match arg {
+            "--dry-run" => flags.dry_run = true,
+            other => {
+                flags.has_unknown_flag = Some(other.to_string());
+                break;
+            }
+        }
+    }
+    flags
 }
 
 struct RawModeGuard;
@@ -5364,6 +5475,39 @@ mod tests {
         assert_eq!(parse_command("/cls"), ParsedCommand::Clear);
         assert_eq!(parse_command("/quit"), ParsedCommand::Quit);
         assert_eq!(parse_command("/exit"), ParsedCommand::Quit);
+    }
+
+    #[test]
+    fn improve_command_parses_correctly() {
+        assert_eq!(
+            parse_command("/improve"),
+            ParsedCommand::Improve(ImproveFlags {
+                dry_run: false,
+                has_unknown_flag: None,
+            })
+        );
+    }
+
+    #[test]
+    fn improve_dry_run_flag_parsed() {
+        assert_eq!(
+            parse_command("/improve --dry-run"),
+            ParsedCommand::Improve(ImproveFlags {
+                dry_run: true,
+                has_unknown_flag: None,
+            })
+        );
+    }
+
+    #[test]
+    fn unknown_improve_subcommand_shows_help() {
+        assert_eq!(
+            parse_command("/improve --invalid"),
+            ParsedCommand::Improve(ImproveFlags {
+                dry_run: false,
+                has_unknown_flag: Some("--invalid".to_string()),
+            })
+        );
     }
 
     #[test]

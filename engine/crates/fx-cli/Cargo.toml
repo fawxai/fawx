@@ -25,6 +25,7 @@ fx-llm = { path = "../fx-llm" }
 fx-loadable = { path = "../fx-loadable" }
 fx-memory.workspace = true
 fx-analysis.workspace = true
+fx-improve.workspace = true
 fx-security.workspace = true
 fx-skills = { path = "../fx-skills" }
 fx-storage.workspace = true
