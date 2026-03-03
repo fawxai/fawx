@@ -30,7 +30,7 @@ Atomic multi-file writes: batch all changes, validate together, commit all or ro
 |-----------|-----------|
 | `BuiltinToolsSkill.write_file` | Current single-file write. Transactions complement, don't replace. |
 | `BuiltinToolsSkill.run_command` | Validation step runs configurable check commands via this. |
-| `SelfModifyConfig` in `GitSkill` | `allow`/`propose`/`deny` tiers. Transactions respect these — `deny` paths rejected at stage time, `propose` paths require approval. |
+| `SelfModifyConfig` in `fx-core/src/self_modify.rs` | `allow`/`propose`/`deny` tiers via `classify_path()` + `PathTier`. Transactions respect these — `deny` paths rejected at commit time, `propose` paths require approval. Also: `format_tier_violation()`, `validate_glob_patterns()`, `DEFAULT_DENY_PATHS`. |
 | `Skill` trait | Transactions implement this. Standard pattern. |
 | `SkillRegistry` | Registration point. |
 
@@ -314,3 +314,13 @@ impl Skill for TransactionSkill {
 | Large file staging OOMs | Cap staged content at 1MB per file, 10MB per transaction. Return error on exceed. |
 | Race condition: external process modifies file between snapshot and rollback | Accept as known limitation in V1. Snapshot is best-effort. |
 | Model forgets to commit | Transaction auto-expires after 10 iterations with warning in tool output. |
+
+---
+
+## 10. Dependency Notes
+
+### CancellationToken (fx-kernel)
+The `Skill` trait's `execute()` takes `Option<&CancellationToken>` where `CancellationToken` lives in `fx-kernel/src/cancellation.rs`. This means fx-transactions depends on fx-kernel — wrong direction architecturally (fx-kernel is the engine, fx-transactions is a loadable skill). However, this matches the existing pattern: `GitSkill` in fx-tools already depends on fx-kernel for the same reason. Accepted for now. Future cleanup: move `CancellationToken` to fx-core.
+
+### self_modify.rs extraction (future, opt-in)
+`SelfModifyConfig`, `classify_path()`, `PathTier`, etc. currently live in `fx-core/src/self_modify.rs` (470 lines, 7 public items, 32% of fx-core). This is a future extraction candidate into an `fx-policy` crate if transaction-specific policy logic is added (e.g., transaction-scoped path overrides, per-transaction tier escalation). For V1, use `fx-core::self_modify` directly — all consumers already depend on fx-core.
