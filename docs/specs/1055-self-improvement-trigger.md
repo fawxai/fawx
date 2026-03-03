@@ -455,3 +455,16 @@ async fn handle_improve_command(&mut self, args: &str) -> Result<(), Box<dyn Err
 | Phase 3: Post-session auto | ~80 lines code, ~40 lines tests | 0.5 day | Low — config flag + trigger point |
 
 **Total:** ~580 lines code + ~390 lines tests. 2-3 focused implementation days.
+
+---
+
+## 10. Future Extension: Skill Doc Output (deferred — YAGNI)
+
+Hermes Agent (Nous Research) auto-creates skill documents when it solves hard problems — lightweight procedural memory. We considered adding a `SkillDoc` output mode alongside `ProposalOnly` and `ProposalWithBranch`.
+
+**Decision (2026-03-03): Deferred.** Reasons:
+1. **YAGNI.** We don't have data showing findings that aren't code fixes. Build the core pipeline first; if we see non-code findings in practice, add the skill doc path then.
+2. **Avoid premature classification.** An earlier design proposed heuristic routing (CodeFix vs SkillDoc based on evidence keywords). This repeats the `emit_intent` mistake — forcing structure where the model should choose naturally. If we add skill docs later, give the model both tools (`propose_code_change` + `write_skill_doc`) and let it choose. Enforce constraints on outputs, not classification on inputs.
+3. **Layering principle.** Start simple, add complexity only when needed. The core pipeline (signals → analysis → code proposals → human gate) is already high-value.
+
+**When to revisit:** After #1055 ships and we've run ≥10 improvement cycles, review the findings. If >30% of findings are task-approach patterns rather than code bugs, add the skill doc path.
