@@ -116,7 +116,7 @@ impl OpenAiResponsesProvider {
             map_message_to_responses_input(&mut input, message)?;
         }
 
-        let tools = request
+        let tools: Vec<ResponsesTool> = request
             .tools
             .iter()
             .map(|tool| ResponsesTool {
@@ -127,6 +127,12 @@ impl OpenAiResponsesProvider {
             })
             .collect();
 
+        let tool_choice = if tools.is_empty() {
+            None
+        } else {
+            Some(json!("required"))
+        };
+
         Ok(ResponsesRequestBody {
             model: request.model.clone(),
             instructions: request.system_prompt.clone(),
@@ -135,6 +141,7 @@ impl OpenAiResponsesProvider {
             stream,
             store: false,
             temperature: request.temperature,
+            tool_choice,
         })
     }
 
@@ -360,8 +367,11 @@ impl OpenAiResponsesProvider {
             "response.function_call_arguments.done" => {
                 tool_delta_from_arguments_event(data, true).map(chunk_from_tool_delta)
             }
-            "response.output_item.added" | "response.output_item.done" => {
-                tool_delta_from_output_item_event(data).map(chunk_from_tool_delta)
+            "response.output_item.added" => {
+                tool_delta_from_output_item_event(data, false).map(chunk_from_tool_delta)
+            }
+            "response.output_item.done" => {
+                tool_delta_from_output_item_event(data, true).map(chunk_from_tool_delta)
             }
             "response.completed" | "response.done" => usage_chunk_from_done_event(data),
             _ => None,
@@ -531,7 +541,7 @@ fn tool_delta_from_arguments_event(data: &str, is_done_event: bool) -> Option<To
     })
 }
 
-fn tool_delta_from_output_item_event(data: &str) -> Option<ToolUseDelta> {
+fn tool_delta_from_output_item_event(data: &str, is_done_event: bool) -> Option<ToolUseDelta> {
     let parsed = serde_json::from_str::<SseOutputItemEvent>(data).ok()?;
     let item = parsed.item?;
     if item.r#type.as_deref() != Some("function_call") {
@@ -549,7 +559,7 @@ fn tool_delta_from_output_item_event(data: &str) -> Option<ToolUseDelta> {
         id,
         name,
         arguments_delta,
-        arguments_done: false,
+        arguments_done: is_done_event,
     })
 }
 
@@ -819,6 +829,8 @@ struct ResponsesRequestBody {
     store: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<Value>,
 }
 
 /// Maps a Fawx ToolDefinition to the OpenAI Responses API function tool format.
@@ -1379,6 +1391,44 @@ mod tests {
     }
 
     #[test]
+    fn build_request_body_sets_tool_choice_when_tools_present() {
+        let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
+        let request = CompletionRequest {
+            model: "gpt-4.1".to_string(),
+            messages: vec![],
+            system_prompt: None,
+            tools: vec![crate::types::ToolDefinition {
+                name: "test_tool".to_string(),
+                description: "a test tool".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            }],
+            temperature: None,
+            max_tokens: None,
+        };
+
+        let body = provider.build_request_body(&request, false).unwrap();
+        let serialized = serde_json::to_value(&body).unwrap();
+        assert_eq!(serialized["tool_choice"], "required");
+    }
+
+    #[test]
+    fn build_request_body_omits_tool_choice_when_no_tools() {
+        let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
+        let request = CompletionRequest {
+            model: "gpt-4.1".to_string(),
+            messages: vec![],
+            system_prompt: None,
+            tools: vec![],
+            temperature: None,
+            max_tokens: None,
+        };
+
+        let body = provider.build_request_body(&request, false).unwrap();
+        let serialized = serde_json::to_value(&body).unwrap();
+        assert!(serialized.get("tool_choice").is_none());
+    }
+
+    #[test]
     fn test_ws_endpoint_converts_https_to_wss() {
         let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
         assert_eq!(
@@ -1775,6 +1825,40 @@ mod tests {
         assert_eq!(tool_calls[0].name, "emit_intent");
         assert_eq!(tool_calls[0].arguments["intent"], "open");
         let expected = serde_json::from_str::<Value>(r#"{"intent":"open"}"#).unwrap();
+        assert_eq!(tool_calls[0].arguments, expected);
+    }
+
+    #[test]
+    fn output_item_done_does_not_double_append_arguments() {
+        let full_args = r#"{"intent":"open"}"#;
+        let events = vec![
+            (
+                "response.output_item.added",
+                r#"{"type":"response.output_item.added","item":{"type":"function_call","id":"call_5","name":"emit_intent","arguments":""}}"#,
+            ),
+            (
+                "response.function_call_arguments.delta",
+                r#"{"type":"response.function_call_arguments.delta","item_id":"call_5","delta":"{\"intent\":\"op"}"#,
+            ),
+            (
+                "response.function_call_arguments.delta",
+                r#"{"type":"response.function_call_arguments.delta","item_id":"call_5","delta":"en\"}"}"#,
+            ),
+            (
+                "response.function_call_arguments.done",
+                r#"{"type":"response.function_call_arguments.done","item_id":"call_5","arguments":"{\"intent\":\"open\"}"}"#,
+            ),
+            (
+                "response.output_item.done",
+                r#"{"type":"response.output_item.done","item":{"type":"function_call","id":"call_5","name":"emit_intent","arguments":"{\"intent\":\"open\"}"}}"#,
+            ),
+        ];
+
+        let tool_calls = reconstructed_tool_calls(&events);
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_5");
+        assert_eq!(tool_calls[0].name, "emit_intent");
+        let expected = serde_json::from_str::<Value>(full_args).unwrap();
         assert_eq!(tool_calls[0].arguments, expected);
     }
 
