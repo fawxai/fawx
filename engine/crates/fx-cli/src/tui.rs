@@ -2205,7 +2205,7 @@ impl LoopLlmProvider for RouterLoopLlmProvider<'_> {
             tools: Vec::new(),
             temperature: None, // Codex Responses API does not support temperature
             max_tokens: Some(max_tokens),
-            system_prompt: None,
+            system_prompt: Some(prompt.to_string()),
         };
 
         let mut stream = self
@@ -2237,7 +2237,7 @@ impl LoopLlmProvider for RouterLoopLlmProvider<'_> {
             tools: Vec::new(),
             temperature: None,
             max_tokens: Some(max_tokens),
-            system_prompt: None,
+            system_prompt: Some(prompt.to_string()),
         };
 
         let mut stream = self
@@ -4254,6 +4254,59 @@ mod tests {
         }
     }
 
+    /// A provider that captures the [`CompletionRequest`] for assertion and
+    /// returns a single successful stream chunk so the caller completes normally.
+    #[derive(Debug)]
+    struct RequestCapturingProvider {
+        provider_name: String,
+        model: String,
+        captured: Arc<Mutex<Vec<CompletionRequest>>>,
+    }
+
+    #[async_trait]
+    impl fx_llm::CompletionProvider for RequestCapturingProvider {
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> Result<fx_llm::CompletionResponse, fx_llm::ProviderError> {
+            self.captured.lock().unwrap().push(request);
+            Ok(fx_llm::CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "captured".to_string(),
+                }],
+                tool_calls: Vec::new(),
+                usage: None,
+                stop_reason: Some("end_turn".to_string()),
+            })
+        }
+
+        async fn complete_stream(
+            &self,
+            request: CompletionRequest,
+        ) -> Result<fx_llm::CompletionStream, fx_llm::ProviderError> {
+            self.captured.lock().unwrap().push(request);
+            let chunk = Ok(fx_llm::StreamChunk {
+                delta_content: Some("captured".to_string()),
+                tool_use_deltas: Vec::new(),
+                usage: None,
+                stop_reason: Some("end_turn".to_string()),
+            });
+            Ok(Box::pin(futures::stream::iter(vec![chunk])))
+        }
+
+        fn name(&self) -> &str {
+            &self.provider_name
+        }
+
+        fn supported_models(&self) -> Vec<String> {
+            vec![self.model.clone()]
+        }
+
+        fn capabilities(&self) -> fx_llm::ProviderCapabilities {
+            mock_provider_capabilities()
+        }
+    }
+
     #[test]
     fn test_completion_providers_expose_router_capabilities() {
         let static_provider = StaticCompletionProvider::new("mock-loop-model", "ok");
@@ -4620,6 +4673,68 @@ mod tests {
         assert_eq!(
             error,
             fx_llm::ProviderError::Provider("test error".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_sets_system_prompt_for_openai_compatibility() {
+        let captured: Arc<Mutex<Vec<CompletionRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut router = ModelRouter::new();
+        router.register_provider_with_auth(
+            Box::new(RequestCapturingProvider {
+                provider_name: "capture-test".to_string(),
+                model: "capture-model".to_string(),
+                captured: Arc::clone(&captured),
+            }),
+            "test",
+        );
+        router.set_active("capture-model").expect("set active");
+
+        let provider = RouterLoopLlmProvider::new(&router, "capture-model".to_string());
+        let prompt = "Synthesize the tool results below.";
+        provider
+            .generate(prompt, 256)
+            .await
+            .expect("generate should succeed");
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].system_prompt,
+            Some(prompt.to_string()),
+            "generate() must set system_prompt so OpenAI Responses API gets an instructions field"
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_streaming_sets_system_prompt_for_openai_compatibility() {
+        let captured: Arc<Mutex<Vec<CompletionRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut router = ModelRouter::new();
+        router.register_provider_with_auth(
+            Box::new(RequestCapturingProvider {
+                provider_name: "capture-test".to_string(),
+                model: "capture-stream-model".to_string(),
+                captured: Arc::clone(&captured),
+            }),
+            "test",
+        );
+        router
+            .set_active("capture-stream-model")
+            .expect("set active");
+
+        let provider = RouterLoopLlmProvider::new(&router, "capture-stream-model".to_string());
+        let prompt = "Synthesize the tool results below.";
+        provider
+            .generate_streaming(prompt, 256, Box::new(|_| {}))
+            .await
+            .expect("generate_streaming should succeed");
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].system_prompt,
+            Some(prompt.to_string()),
+            "generate_streaming() must set system_prompt so OpenAI Responses API gets an instructions field"
         );
     }
 
