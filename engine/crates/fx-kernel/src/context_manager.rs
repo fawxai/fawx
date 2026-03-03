@@ -375,6 +375,7 @@ mod tests {
                 sensor_data: None,
                 user_input: None,
                 conversation_history: Vec::new(),
+                steer_context: None,
             },
             working_memory: (0..8)
                 .map(|index| WorkingMemoryEntry {

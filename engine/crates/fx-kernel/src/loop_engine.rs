@@ -22,13 +22,15 @@ use crate::types::{
 };
 use crate::verify::Verification;
 use async_trait::async_trait;
+use futures_util::StreamExt;
+use fx_core::message::{InternalMessage, StreamPhase};
 use fx_core::types::{InputSource, ScreenState, UserInput};
 use fx_decompose::{
     AggregationStrategy, ComplexityHint, DecompositionPlan, SubGoal, SubGoalOutcome, SubGoalResult,
 };
 use fx_llm::{
-    CompletionRequest, CompletionResponse, ContentBlock, Message, MessageRole, ProviderError,
-    ToolCall, ToolDefinition, Usage,
+    CompletionRequest, CompletionResponse, CompletionStream, ContentBlock, Message, MessageRole,
+    ProviderError, StreamChunk, ToolCall, ToolDefinition, ToolUseDelta, Usage,
 };
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -71,6 +73,47 @@ pub trait LlmProvider: Send + Sync + std::fmt::Debug {
             usage: None,
             stop_reason: None,
         })
+    }
+
+    async fn complete_stream(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<fx_llm::CompletionStream, ProviderError> {
+        let response = self.complete(request).await?;
+        let chunk = response_to_chunk(response);
+        let stream =
+            futures_util::stream::once(async move { Ok::<StreamChunk, ProviderError>(chunk) });
+        Ok(Box::pin(stream))
+    }
+}
+
+fn response_to_chunk(response: CompletionResponse) -> StreamChunk {
+    let delta_content = response
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let tool_use_deltas = response
+        .tool_calls
+        .into_iter()
+        .map(|call| ToolUseDelta {
+            id: Some(call.id),
+            name: Some(call.name),
+            arguments_delta: Some(call.arguments.to_string()),
+            arguments_done: true,
+        })
+        .collect();
+
+    StreamChunk {
+        delta_content: (!delta_content.is_empty()).then_some(delta_content),
+        tool_use_deltas,
+        usage: response.usage,
+        stop_reason: response.stop_reason,
     }
 }
 
@@ -191,6 +234,7 @@ pub struct LoopEngine {
     cancel_token: Option<CancellationToken>,
     input_channel: Option<LoopInputChannel>,
     user_stop_requested: bool,
+    pending_steer: Option<String>,
     event_bus: Option<fx_core::EventBus>,
     compaction_config: CompactionConfig,
     conversation_budget: ConversationBudget,
@@ -292,6 +336,7 @@ impl LoopEngineBuilder {
             cancel_token: self.cancel_token,
             input_channel: self.input_channel,
             user_stop_requested: false,
+            pending_steer: None,
             event_bus: self.event_bus,
             compaction_config,
             conversation_budget,
@@ -385,6 +430,65 @@ impl ToolRoundState {
 enum ToolRoundOutcome {
     Cancelled,
     Response(CompletionResponse),
+}
+
+#[derive(Debug, Default)]
+struct StreamToolCallState {
+    id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+    arguments_done: bool,
+}
+
+#[derive(Debug, Default)]
+struct StreamResponseState {
+    text: String,
+    usage: Option<Usage>,
+    stop_reason: Option<String>,
+    tool_calls_by_index: HashMap<usize, StreamToolCallState>,
+    id_to_index: HashMap<String, usize>,
+}
+
+impl StreamResponseState {
+    fn apply_chunk(&mut self, chunk: StreamChunk) {
+        if let Some(delta) = chunk.delta_content {
+            self.text.push_str(&delta);
+        }
+        self.usage = merge_usage(self.usage, chunk.usage);
+        self.stop_reason = chunk.stop_reason.or(self.stop_reason.take());
+        self.apply_tool_deltas(chunk.tool_use_deltas);
+    }
+
+    fn apply_tool_deltas(&mut self, deltas: Vec<ToolUseDelta>) {
+        for (chunk_index, delta) in deltas.into_iter().enumerate() {
+            let index = stream_tool_index(
+                chunk_index,
+                &delta,
+                &self.tool_calls_by_index,
+                &self.id_to_index,
+            );
+            let entry = self.tool_calls_by_index.entry(index).or_default();
+            merge_stream_tool_delta(entry, delta, &mut self.id_to_index, index);
+        }
+    }
+
+    fn into_response(self) -> CompletionResponse {
+        CompletionResponse {
+            content: vec![ContentBlock::Text { text: self.text }],
+            tool_calls: finalize_stream_tool_calls(self.tool_calls_by_index),
+            usage: self.usage,
+            stop_reason: self.stop_reason,
+        }
+    }
+
+    fn into_cancelled_response(self) -> CompletionResponse {
+        CompletionResponse {
+            content: vec![ContentBlock::Text { text: self.text }],
+            tool_calls: Vec::new(),
+            usage: self.usage,
+            stop_reason: Some("cancelled".to_string()),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -621,23 +725,40 @@ impl LoopEngine {
         }))
     }
 
-    /// Drain the input channel and return the highest-priority command.
+    /// Drain the input channel and return the highest-priority flow command.
     ///
-    /// Priority ordering: `Abort` always wins. For other commands (`Stop`,
-    /// `Wait`, `Resume`), the last received command takes precedence.
-    /// In practice this is fine — users cannot queue multiple commands in
-    /// the microsecond window between drain calls.
+    /// Priority ordering: `Abort` > `Stop` > `Wait/Resume` > `StatusQuery` > `Steer`.
+    /// `StatusQuery` publishes an internal status message and does not alter loop flow.
+    /// `Steer` stores the latest steer text for the next perceive step.
     fn check_user_input(&mut self) -> Option<LoopCommand> {
         let channel = self.input_channel.as_mut()?;
         let mut highest: Option<LoopCommand> = None;
+        let mut status_requested = false;
+        let mut latest_steer: Option<String> = None;
+
         while let Some(cmd) = channel.try_recv() {
-            highest = Some(match (&highest, cmd) {
-                (Some(LoopCommand::Abort), _) => LoopCommand::Abort,
-                (_, LoopCommand::Abort) => LoopCommand::Abort,
-                _ => cmd,
-            });
+            match cmd {
+                LoopCommand::Steer(text) => latest_steer = Some(text),
+                LoopCommand::StatusQuery => status_requested = true,
+                flow_cmd => highest = Some(prioritize_flow_command(highest, flow_cmd)),
+            }
         }
+
+        if let Some(steer) = latest_steer {
+            self.pending_steer = Some(steer);
+        }
+        if status_requested {
+            self.publish_system_status();
+        }
+
         highest
+    }
+
+    fn publish_system_status(&self) {
+        let Some(bus) = &self.event_bus else { return };
+        let status = self.status(current_time_ms());
+        let message = format_system_status_message(&status);
+        let _ = bus.publish(InternalMessage::SystemStatus { message });
     }
 
     /// Check both the cancellation token and input channel.
@@ -689,6 +810,7 @@ impl LoopEngine {
         self.budget.reset(current_time_ms());
         self.signals.clear();
         self.user_stop_requested = false;
+        self.pending_steer = None;
         if let Some(token) = &self.cancel_token {
             token.reset();
         }
@@ -839,7 +961,10 @@ impl LoopEngine {
         &mut self,
         snapshot: &PerceptionSnapshot,
     ) -> Result<ProcessedPerception, LoopError> {
-        let user_message = extract_user_message(snapshot)?;
+        let mut snapshot_with_steer = snapshot.clone();
+        snapshot_with_steer.steer_context = self.pending_steer.take();
+
+        let user_message = extract_user_message(&snapshot_with_steer)?;
         self.emit_signal(
             LoopStep::Perceive,
             SignalKind::Trace,
@@ -847,7 +972,7 @@ impl LoopEngine {
             serde_json::json!({"input_length": user_message.len()}),
         );
 
-        let mut context_window = snapshot.conversation_history.clone();
+        let mut context_window = snapshot_with_steer.conversation_history.clone();
         context_window.push(Message::user(user_message.clone()));
 
         let compacted_context = self
@@ -862,13 +987,14 @@ impl LoopEngine {
         }
         self.ensure_within_hard_limit(CompactionScope::Perceive, &context_window)?;
 
-        self.append_compacted_summary(snapshot, &user_message, &mut context_window);
+        self.append_compacted_summary(&snapshot_with_steer, &user_message, &mut context_window);
 
         Ok(ProcessedPerception {
             user_message: user_message.clone(),
             context_window,
             active_goals: vec![format!("Help the user with: {user_message}")],
-            budget_remaining: self.budget.remaining(snapshot.timestamp_ms),
+            budget_remaining: self.budget.remaining(snapshot_with_steer.timestamp_ms),
+            steer_context: snapshot_with_steer.steer_context,
         })
     }
 
@@ -886,10 +1012,16 @@ impl LoopEngine {
         );
         let reasoning_messages = request.messages.clone();
         let started = current_time_ms();
-        let response = llm
-            .complete(request)
+        let mut stream = llm
+            .complete_stream(request)
             .await
             .map_err(|error| loop_error("reason", &format!("completion failed: {error}"), true))?;
+
+        self.publish_stream_started(StreamPhase::Reason);
+        let response = self
+            .consume_stream_with_events(&mut stream, StreamPhase::Reason)
+            .await?;
+
         let response = self
             .continue_truncated_response(response, &reasoning_messages, llm, LoopStep::Reason)
             .await?;
@@ -897,6 +1029,81 @@ impl LoopEngine {
         let usage = response.usage;
         self.emit_reason_trace_and_perf(latency_ms, usage.as_ref());
         Ok(response)
+    }
+
+    fn publish_stream_started(&self, phase: StreamPhase) {
+        if let Some(bus) = &self.event_bus {
+            let _ = bus.publish(InternalMessage::StreamingStarted { phase });
+        }
+    }
+
+    fn publish_stream_finished(&self, phase: StreamPhase) {
+        if let Some(bus) = &self.event_bus {
+            let _ = bus.publish(InternalMessage::StreamingFinished { phase });
+        }
+    }
+
+    fn publish_stream_delta(&self, delta: String, phase: StreamPhase) {
+        if let Some(bus) = &self.event_bus {
+            let _ = bus.publish(InternalMessage::StreamDelta { delta, phase });
+        }
+    }
+
+    fn stream_cancel_requested(&mut self) -> bool {
+        if self.user_stop_requested || self.cancellation_token_triggered() {
+            return true;
+        }
+
+        if self.consume_stop_or_abort_command() {
+            self.user_stop_requested = true;
+            return true;
+        }
+
+        false
+    }
+
+    /// Consume a completion stream, publishing delta/finished events.
+    ///
+    /// `StreamingFinished` is always published by this method on all exit
+    /// paths (success, cancellation, error). Callers must NOT publish
+    /// `StreamingFinished` themselves — doing so would produce duplicates.
+    async fn consume_stream_with_events(
+        &mut self,
+        stream: &mut CompletionStream,
+        phase: StreamPhase,
+    ) -> Result<CompletionResponse, LoopError> {
+        let mut state = StreamResponseState::default();
+        while let Some(chunk_result) = stream.next().await {
+            if self.stream_cancel_requested() {
+                self.publish_stream_finished(phase);
+                return Ok(state.into_cancelled_response());
+            }
+
+            let chunk = match chunk_result {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    self.publish_stream_finished(phase);
+                    return Err(loop_error(
+                        phase_stage(phase),
+                        &format!("stream consumption failed: {error}"),
+                        true,
+                    ));
+                }
+            };
+
+            if let Some(delta) = chunk.delta_content.clone() {
+                self.publish_stream_delta(delta, phase);
+            }
+            state.apply_chunk(chunk);
+
+            if self.stream_cancel_requested() {
+                self.publish_stream_finished(phase);
+                return Ok(state.into_cancelled_response());
+            }
+        }
+
+        self.publish_stream_finished(phase);
+        Ok(state.into_response())
     }
 
     fn emit_continuation_trace(&mut self, step: LoopStep, attempt: u32) {
@@ -2096,7 +2303,7 @@ impl LoopEngine {
     }
 
     async fn request_tool_continuation(
-        &self,
+        &mut self,
         llm: &dyn LlmProvider,
         context_messages: &[Message],
         tokens_used: &mut TokenUsage,
@@ -2107,13 +2314,20 @@ impl LoopEngine {
             self.tool_executor.tool_definitions(),
             self.memory_context.as_deref(),
         );
-        let response = llm.complete(request).await.map_err(|error| {
+
+        let mut stream = llm.complete_stream(request).await.map_err(|error| {
             loop_error(
                 "act",
                 &format!("tool continuation completion failed: {error}"),
                 true,
             )
         })?;
+
+        self.publish_stream_started(StreamPhase::Synthesize);
+        let response = self
+            .consume_stream_with_events(&mut stream, StreamPhase::Synthesize)
+            .await?;
+
         tokens_used.accumulate(response_usage_or_estimate(&response, context_messages));
         Ok(response)
     }
@@ -2326,6 +2540,7 @@ fn build_sub_goal_snapshot(
         }),
         sensor_data: None,
         conversation_history: context_messages.to_vec(),
+        steer_context: None,
     }
 }
 
@@ -2801,6 +3016,48 @@ fn continuation_tools_for_step(step: LoopStep, tools: Vec<ToolDefinition>) -> Ve
     }
 }
 
+fn prioritize_flow_command(current: Option<LoopCommand>, incoming: LoopCommand) -> LoopCommand {
+    match current {
+        None => incoming,
+        Some(existing) if loop_command_priority(&existing) > loop_command_priority(&incoming) => {
+            existing
+        }
+        Some(existing)
+            if loop_command_priority(&existing) == loop_command_priority(&incoming)
+                && !matches!(incoming, LoopCommand::Wait | LoopCommand::Resume) =>
+        {
+            existing
+        }
+        _ => incoming,
+    }
+}
+
+fn loop_command_priority(command: &LoopCommand) -> u8 {
+    match command {
+        LoopCommand::Abort => 5,
+        LoopCommand::Stop => 4,
+        LoopCommand::Wait | LoopCommand::Resume => 3,
+        LoopCommand::StatusQuery => 2,
+        LoopCommand::Steer(_) => 1,
+    }
+}
+
+fn format_system_status_message(status: &LoopStatus) -> String {
+    format!(
+        "status: iter={}/{} llm={} tools={} tokens={} cost_cents={} remaining(llm={},tools={},tokens={},cost_cents={})",
+        status.iteration_count,
+        status.max_iterations,
+        status.llm_calls_used,
+        status.tool_invocations_used,
+        status.tokens_used,
+        status.cost_cents_used,
+        status.remaining.llm_calls,
+        status.remaining.tool_invocations,
+        status.remaining.tokens,
+        status.remaining.cost_cents,
+    )
+}
+
 fn build_continuation_messages(base_messages: &[Message], full_text: &str) -> Vec<Message> {
     let mut continuation_messages = base_messages.to_vec();
     continuation_messages.push(Message::assistant(full_text.to_string()));
@@ -2815,6 +3072,13 @@ fn step_stage(step: LoopStep) -> &'static str {
         LoopStep::Reason => "reason",
         LoopStep::Act => "act",
         _ => "act",
+    }
+}
+
+fn phase_stage(phase: StreamPhase) -> &'static str {
+    match phase {
+        StreamPhase::Reason => "reason",
+        StreamPhase::Synthesize => "act",
     }
 }
 
@@ -2907,6 +3171,126 @@ fn merge_usage(left: Option<Usage>, right: Option<Usage>) -> Option<Usage> {
     Some(Usage {
         input_tokens: left_in.saturating_add(right_in),
         output_tokens: left_out.saturating_add(right_out),
+    })
+}
+
+fn stream_tool_index(
+    chunk_index: usize,
+    delta: &ToolUseDelta,
+    tool_calls_by_index: &HashMap<usize, StreamToolCallState>,
+    id_to_index: &HashMap<String, usize>,
+) -> usize {
+    let Some(id) = delta.id.as_deref() else {
+        return chunk_index;
+    };
+
+    if let Some(index) = id_to_index.get(id).copied() {
+        return index;
+    }
+
+    if chunk_index_usable_for_id(chunk_index, id, tool_calls_by_index) {
+        return chunk_index;
+    }
+
+    next_stream_tool_index(tool_calls_by_index)
+}
+
+fn chunk_index_usable_for_id(
+    chunk_index: usize,
+    id: &str,
+    tool_calls_by_index: &HashMap<usize, StreamToolCallState>,
+) -> bool {
+    match tool_calls_by_index.get(&chunk_index) {
+        None => true,
+        Some(state) => match state.id.as_deref() {
+            None => true,
+            Some(existing_id) => existing_id == id,
+        },
+    }
+}
+
+fn next_stream_tool_index(tool_calls_by_index: &HashMap<usize, StreamToolCallState>) -> usize {
+    tool_calls_by_index
+        .keys()
+        .copied()
+        .max()
+        .map(|index| index.saturating_add(1))
+        .unwrap_or(0)
+}
+
+fn merge_stream_tool_delta(
+    entry: &mut StreamToolCallState,
+    delta: ToolUseDelta,
+    id_to_index: &mut HashMap<String, usize>,
+    index: usize,
+) {
+    if entry.id.is_none() {
+        entry.id = delta.id;
+    }
+    if entry.name.is_none() {
+        entry.name = delta.name;
+    }
+    if let Some(id) = entry.id.clone() {
+        id_to_index.insert(id, index);
+    }
+    if let Some(arguments_delta) = delta.arguments_delta {
+        merge_stream_arguments(&mut entry.arguments, &arguments_delta, delta.arguments_done);
+    }
+    entry.arguments_done |= delta.arguments_done;
+}
+
+fn merge_stream_arguments(arguments: &mut String, arguments_delta: &str, arguments_done: bool) {
+    if arguments_delta.is_empty() {
+        return;
+    }
+
+    let done_payload_is_complete = arguments_done
+        && !arguments.is_empty()
+        && serde_json::from_str::<serde_json::Value>(arguments_delta).is_ok();
+    if done_payload_is_complete {
+        arguments.clear();
+    }
+
+    arguments.push_str(arguments_delta);
+}
+
+fn finalize_stream_tool_calls(by_index: HashMap<usize, StreamToolCallState>) -> Vec<ToolCall> {
+    let mut indexed_calls = by_index.into_iter().collect::<Vec<_>>();
+    indexed_calls.sort_by_key(|(index, _)| *index);
+    indexed_calls
+        .into_iter()
+        .filter_map(|(_, state)| stream_tool_call_from_state(state))
+        .collect()
+}
+
+fn stream_tool_call_from_state(state: StreamToolCallState) -> Option<ToolCall> {
+    if !state.arguments_done {
+        return None;
+    }
+
+    let id = state.id?.trim().to_string();
+    let name = state.name?.trim().to_string();
+    if id.is_empty() || name.is_empty() {
+        return None;
+    }
+
+    let arguments = match serde_json::from_str::<serde_json::Value>(&state.arguments) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(
+                tool_id = %id,
+                tool_name = %name,
+                raw_arguments = %state.arguments,
+                error = %error,
+                "dropping tool call with malformed JSON arguments"
+            );
+            return None;
+        }
+    };
+    Some(ToolCall {
+        id,
+        name,
+        arguments,
     })
 }
 
@@ -3074,7 +3458,7 @@ fn build_reasoning_request(
 }
 
 fn reasoning_user_prompt(perception: &ProcessedPerception) -> String {
-    format!(
+    let mut prompt = format!(
         "Active goals:
 - {}
 
@@ -3089,7 +3473,13 @@ User message:
         perception.budget_remaining.tokens,
         perception.budget_remaining.llm_calls,
         perception.user_message,
-    )
+    );
+
+    if let Some(steer) = perception.steer_context.as_deref() {
+        prompt.push_str(&format!("\nUser steer (latest): {steer}"));
+    }
+
+    prompt
 }
 
 fn build_reasoning_system_prompt(memory_context: Option<&str>) -> String {
@@ -3320,6 +3710,7 @@ mod tests {
             }),
             sensor_data: None,
             conversation_history: vec![Message::user(text)],
+            steer_context: None,
         }
     }
 
@@ -3869,6 +4260,7 @@ mod phase2_tests {
             }),
             sensor_data: None,
             conversation_history: vec![Message::user(text)],
+            steer_context: None,
         }
     }
 
@@ -4963,6 +5355,7 @@ mod phase2_tests {
                 cost_cents: 100,
                 wall_time_ms: 1_000,
             },
+            steer_context: None,
         };
 
         let reasoning_request = build_reasoning_request(&perception, "mock", vec![], None);
@@ -5246,6 +5639,7 @@ mod phase4_tests {
             }),
             sensor_data: None,
             conversation_history: vec![Message::user(text)],
+            steer_context: None,
         }
     }
 
@@ -5791,11 +6185,13 @@ mod cancellation_tests {
     use crate::cancellation::CancellationToken;
     use crate::input::{loop_input_channel, LoopCommand};
     use async_trait::async_trait;
+    use futures_util::StreamExt;
     use fx_core::error::LlmError as CoreLlmError;
+    use fx_core::message::{InternalMessage, StreamPhase};
     use fx_core::types::{InputSource, ScreenState, UserInput};
     use fx_llm::{
-        CompletionRequest, CompletionResponse, ContentBlock, Message, ProviderError, ToolCall,
-        ToolDefinition,
+        CompletionRequest, CompletionResponse, CompletionStream, ContentBlock, Message,
+        ProviderError, StreamChunk, ToolCall, ToolDefinition, ToolUseDelta, Usage,
     };
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -5935,6 +6331,48 @@ mod cancellation_tests {
         }
     }
 
+    #[derive(Debug)]
+    struct PartialErrorStreamLlm;
+
+    #[async_trait]
+    impl LlmProvider for PartialErrorStreamLlm {
+        async fn generate(&self, _: &str, _: u32) -> Result<String, CoreLlmError> {
+            Ok("summary".to_string())
+        }
+
+        async fn generate_streaming(
+            &self,
+            _: &str,
+            _: u32,
+            callback: Box<dyn Fn(String) + Send + 'static>,
+        ) -> Result<String, CoreLlmError> {
+            callback("summary".to_string());
+            Ok("summary".to_string())
+        }
+
+        fn model_name(&self) -> &str {
+            "partial-error-stream"
+        }
+
+        async fn complete_stream(
+            &self,
+            _: CompletionRequest,
+        ) -> Result<CompletionStream, ProviderError> {
+            let chunks = vec![
+                Ok(StreamChunk {
+                    delta_content: Some("partial".to_string()),
+                    tool_use_deltas: Vec::new(),
+                    usage: None,
+                    stop_reason: None,
+                }),
+                Err(ProviderError::Streaming(
+                    "simulated stream failure".to_string(),
+                )),
+            ];
+            Ok(Box::pin(futures_util::stream::iter(chunks)))
+        }
+    }
+
     fn engine_with_executor(executor: Arc<dyn ToolExecutor>, max_iterations: u32) -> LoopEngine {
         LoopEngine::builder()
             .budget(BudgetTracker::new(
@@ -5968,6 +6406,7 @@ mod cancellation_tests {
             }),
             sensor_data: None,
             conversation_history: vec![Message::user(text)],
+            steer_context: None,
         }
     }
 
@@ -6013,6 +6452,49 @@ mod cancellation_tests {
             tool_calls: Vec::new(),
             usage: None,
             stop_reason: None,
+        }
+    }
+
+    fn tool_delta(id: &str, name: Option<&str>, arguments_delta: &str, done: bool) -> ToolUseDelta {
+        ToolUseDelta {
+            id: Some(id.to_string()),
+            name: name.map(ToString::to_string),
+            arguments_delta: Some(arguments_delta.to_string()),
+            arguments_done: done,
+        }
+    }
+
+    fn single_tool_chunk(delta: ToolUseDelta, stop_reason: Option<&str>) -> StreamChunk {
+        StreamChunk {
+            delta_content: None,
+            tool_use_deltas: vec![delta],
+            usage: None,
+            stop_reason: stop_reason.map(ToString::to_string),
+        }
+    }
+
+    fn assert_tool_path(response: &CompletionResponse, id: &str, path: &str) {
+        let call = response
+            .tool_calls
+            .iter()
+            .find(|call| call.id == id)
+            .expect("tool call exists");
+        assert_eq!(call.arguments, serde_json::json!({"path": path}));
+    }
+
+    fn reason_perception(message: &str) -> ProcessedPerception {
+        ProcessedPerception {
+            user_message: message.to_string(),
+            context_window: vec![Message::user(message)],
+            active_goals: vec!["reply".to_string()],
+            budget_remaining: BudgetRemaining {
+                llm_calls: 3,
+                tool_invocations: 3,
+                tokens: 100,
+                cost_cents: 10,
+                wall_time_ms: 1_000,
+            },
+            steer_context: None,
         }
     }
 
@@ -6063,22 +6545,431 @@ mod cancellation_tests {
     }
 
     #[test]
-    fn check_user_input_prioritizes_abort_over_queued_commands() {
+    fn check_user_input_priority_order_is_abort_stop_wait_resume_status_steer() {
         let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
         let (sender, channel) = loop_input_channel();
         engine.set_input_channel(channel);
 
-        sender.send(LoopCommand::Stop).expect("send Stop");
-        sender.send(LoopCommand::Abort).expect("send Abort");
-        sender.send(LoopCommand::Resume).expect("send Resume");
+        sender
+            .send(LoopCommand::Steer("first".to_string()))
+            .expect("steer");
+        sender.send(LoopCommand::StatusQuery).expect("status");
+        sender.send(LoopCommand::Wait).expect("wait");
+        sender.send(LoopCommand::Resume).expect("resume");
+        sender.send(LoopCommand::Stop).expect("stop");
+        sender.send(LoopCommand::Abort).expect("abort");
 
         assert_eq!(engine.check_user_input(), Some(LoopCommand::Abort));
+    }
+
+    #[test]
+    fn check_user_input_prioritizes_stop_over_wait_resume() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let (sender, channel) = loop_input_channel();
+        engine.set_input_channel(channel);
+
+        sender.send(LoopCommand::Wait).expect("wait");
+        sender.send(LoopCommand::Resume).expect("resume");
+        sender.send(LoopCommand::Stop).expect("stop");
+
+        assert_eq!(engine.check_user_input(), Some(LoopCommand::Stop));
+    }
+
+    #[test]
+    fn check_user_input_keeps_latest_wait_resume_when_no_stop_or_abort() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let (sender, channel) = loop_input_channel();
+        engine.set_input_channel(channel);
+
+        sender.send(LoopCommand::Wait).expect("wait");
+        sender.send(LoopCommand::Resume).expect("resume");
+
+        assert_eq!(engine.check_user_input(), Some(LoopCommand::Resume));
+    }
+
+    #[test]
+    fn status_query_publishes_system_status_without_altering_flow() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let bus = fx_core::EventBus::new(4);
+        let mut receiver = bus.subscribe();
+        engine.set_event_bus(bus);
+
+        let (sender, channel) = loop_input_channel();
+        engine.set_input_channel(channel);
+        sender.send(LoopCommand::StatusQuery).expect("status");
+
+        assert_eq!(engine.check_user_input(), None);
+        let event = receiver.try_recv().expect("status event");
+        assert!(matches!(event, InternalMessage::SystemStatus { .. }));
+    }
+
+    #[test]
+    fn format_system_status_message_matches_spec_template() {
+        let status = LoopStatus {
+            iteration_count: 2,
+            max_iterations: 7,
+            llm_calls_used: 3,
+            tool_invocations_used: 5,
+            tokens_used: 144,
+            cost_cents_used: 11,
+            remaining: BudgetRemaining {
+                llm_calls: 4,
+                tool_invocations: 6,
+                tokens: 856,
+                cost_cents: 89,
+                wall_time_ms: 12_000,
+            },
+        };
+
+        assert_eq!(
+            format_system_status_message(&status),
+            "status: iter=2/7 llm=3 tools=5 tokens=144 cost_cents=11 remaining(llm=4,tools=6,tokens=856,cost_cents=89)"
+        );
+    }
+
+    #[tokio::test]
+    async fn steer_dedups_and_applies_latest_value_in_perceive_window() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let (sender, channel) = loop_input_channel();
+        engine.set_input_channel(channel);
+
+        sender
+            .send(LoopCommand::Steer("earlier".to_string()))
+            .expect("steer");
+        sender
+            .send(LoopCommand::Steer("latest".to_string()))
+            .expect("steer");
+
+        assert_eq!(engine.check_user_input(), None);
+
+        let processed = engine
+            .perceive(&test_snapshot("hello"))
+            .await
+            .expect("perceive");
+        assert_eq!(processed.steer_context.as_deref(), Some("latest"));
+
+        let next = engine
+            .perceive(&test_snapshot("hello again"))
+            .await
+            .expect("perceive");
+        assert_eq!(next.steer_context, None);
+    }
+
+    #[test]
+    fn reasoning_user_prompt_includes_steer_context() {
+        let perception = ProcessedPerception {
+            user_message: "hello".to_string(),
+            context_window: vec![Message::user("hello")],
+            active_goals: vec!["reply".to_string()],
+            budget_remaining: BudgetRemaining {
+                llm_calls: 3,
+                tool_invocations: 3,
+                tokens: 100,
+                cost_cents: 1,
+                wall_time_ms: 100,
+            },
+            steer_context: Some("be concise".to_string()),
+        };
+
+        let prompt = reasoning_user_prompt(&perception);
+        assert!(prompt.contains("User steer (latest): be concise"));
     }
 
     #[test]
     fn check_cancellation_without_token_or_input_returns_none() {
         let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
         assert!(engine.check_cancellation(None).is_none());
+    }
+
+    #[tokio::test]
+    async fn consume_stream_with_events_publishes_delta_events() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let bus = fx_core::EventBus::new(8);
+        let mut receiver = bus.subscribe();
+        engine.set_event_bus(bus);
+
+        let mut stream: CompletionStream = Box::pin(futures_util::stream::iter(vec![
+            Ok(StreamChunk {
+                delta_content: Some("Hel".to_string()),
+                tool_use_deltas: Vec::new(),
+                usage: None,
+                stop_reason: None,
+            }),
+            Ok(StreamChunk {
+                delta_content: Some("lo".to_string()),
+                tool_use_deltas: Vec::new(),
+                usage: None,
+                stop_reason: Some("stop".to_string()),
+            }),
+        ]));
+
+        let response = engine
+            .consume_stream_with_events(&mut stream, StreamPhase::Reason)
+            .await
+            .expect("stream consumed");
+
+        assert_eq!(extract_response_text(&response), "Hello");
+        assert_eq!(response.stop_reason.as_deref(), Some("stop"));
+
+        let first = receiver.try_recv().expect("first delta");
+        let second = receiver.try_recv().expect("second delta");
+        assert!(matches!(
+            first,
+            InternalMessage::StreamDelta { delta, phase }
+                if delta == "Hel" && phase == StreamPhase::Reason
+        ));
+        assert!(matches!(
+            second,
+            InternalMessage::StreamDelta { delta, phase }
+                if delta == "lo" && phase == StreamPhase::Reason
+        ));
+    }
+
+    #[tokio::test]
+    async fn consume_stream_with_events_assembles_tool_calls_from_deltas() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let mut stream: CompletionStream = Box::pin(futures_util::stream::iter(vec![
+            Ok(StreamChunk {
+                delta_content: None,
+                tool_use_deltas: vec![ToolUseDelta {
+                    id: Some("call-1".to_string()),
+                    name: Some("read_file".to_string()),
+                    arguments_delta: Some("{\"path\":\"READ".to_string()),
+                    arguments_done: false,
+                }],
+                usage: None,
+                stop_reason: None,
+            }),
+            Ok(StreamChunk {
+                delta_content: None,
+                tool_use_deltas: vec![ToolUseDelta {
+                    id: Some("call-1".to_string()),
+                    name: None,
+                    arguments_delta: Some("ME.md\"}".to_string()),
+                    arguments_done: true,
+                }],
+                usage: None,
+                stop_reason: Some("tool_use".to_string()),
+            }),
+        ]));
+
+        let response = engine
+            .consume_stream_with_events(&mut stream, StreamPhase::Synthesize)
+            .await
+            .expect("stream consumed");
+
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].id, "call-1");
+        assert_eq!(response.tool_calls[0].name, "read_file");
+        assert_eq!(
+            response.tool_calls[0].arguments,
+            serde_json::json!({"path":"README.md"})
+        );
+    }
+
+    #[tokio::test]
+    async fn consume_stream_with_events_keeps_distinct_calls_when_new_id_reuses_chunk_index_zero() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let chunks = vec![
+            Ok(single_tool_chunk(
+                tool_delta("call-1", Some("read_file"), "{\"path\":\"alpha.md\"}", true),
+                None,
+            )),
+            Ok(single_tool_chunk(
+                tool_delta("call-2", Some("read_file"), "{\"path\":\"beta.md\"}", true),
+                Some("tool_use"),
+            )),
+        ];
+        let mut stream: CompletionStream = Box::pin(futures_util::stream::iter(chunks));
+
+        let response = engine
+            .consume_stream_with_events(&mut stream, StreamPhase::Synthesize)
+            .await
+            .expect("stream consumed");
+
+        assert_eq!(response.tool_calls.len(), 2);
+        assert_tool_path(&response, "call-1", "alpha.md");
+        assert_tool_path(&response, "call-2", "beta.md");
+    }
+
+    #[tokio::test]
+    async fn consume_stream_with_events_supports_multi_tool_ids_across_chunks_same_local_index() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let chunks = vec![
+            Ok(single_tool_chunk(
+                tool_delta("call-1", Some("read_file"), "{\"path\":\"al", false),
+                None,
+            )),
+            Ok(single_tool_chunk(
+                tool_delta("call-2", Some("read_file"), "{\"path\":\"be", false),
+                None,
+            )),
+            Ok(single_tool_chunk(
+                tool_delta("call-1", None, "pha.md\"}", true),
+                None,
+            )),
+            Ok(single_tool_chunk(
+                tool_delta("call-2", None, "ta.md\"}", true),
+                Some("tool_use"),
+            )),
+        ];
+        let mut stream: CompletionStream = Box::pin(futures_util::stream::iter(chunks));
+
+        let response = engine
+            .consume_stream_with_events(&mut stream, StreamPhase::Synthesize)
+            .await
+            .expect("stream consumed");
+
+        assert_eq!(response.tool_calls.len(), 2);
+        assert_tool_path(&response, "call-1", "alpha.md");
+        assert_tool_path(&response, "call-2", "beta.md");
+    }
+
+    #[tokio::test]
+    async fn consume_stream_with_events_replaces_partial_args_with_done_payload() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let chunks = vec![
+            Ok(single_tool_chunk(
+                tool_delta("call-1", Some("read_file"), "{\"path\":\"READ", false),
+                None,
+            )),
+            Ok(single_tool_chunk(
+                tool_delta("call-1", None, "ME.md\"}", false),
+                None,
+            )),
+            Ok(single_tool_chunk(
+                tool_delta("call-1", None, "{\"path\":\"README.md\"}", true),
+                Some("tool_use"),
+            )),
+        ];
+        let mut stream: CompletionStream = Box::pin(futures_util::stream::iter(chunks));
+
+        let response = engine
+            .consume_stream_with_events(&mut stream, StreamPhase::Synthesize)
+            .await
+            .expect("stream consumed");
+
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_tool_path(&response, "call-1", "README.md");
+    }
+
+    #[tokio::test]
+    async fn reason_stream_error_after_partial_delta_emits_streaming_finished_once() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let bus = fx_core::EventBus::new(8);
+        let mut receiver = bus.subscribe();
+        engine.set_event_bus(bus);
+
+        let error = engine
+            .reason(&reason_perception("hello"), &PartialErrorStreamLlm)
+            .await
+            .expect_err("stream should fail");
+        assert!(error.reason.contains("stream consumption failed"));
+
+        let started = receiver.try_recv().expect("started event");
+        let delta = receiver.try_recv().expect("delta event");
+        let finished = receiver.try_recv().expect("finished event");
+        assert!(matches!(
+            started,
+            InternalMessage::StreamingStarted { phase } if phase == StreamPhase::Reason
+        ));
+        assert!(matches!(
+            delta,
+            InternalMessage::StreamDelta { delta, phase }
+                if delta == "partial" && phase == StreamPhase::Reason
+        ));
+        assert!(matches!(
+            finished,
+            InternalMessage::StreamingFinished { phase } if phase == StreamPhase::Reason
+        ));
+        assert!(
+            receiver.try_recv().is_err(),
+            "finished should be emitted once"
+        );
+    }
+
+    #[tokio::test]
+    async fn consume_stream_with_events_sets_cancelled_stop_reason_on_mid_stream_cancel() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let token = CancellationToken::new();
+        engine.set_cancel_token(token.clone());
+
+        let cancel_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            token.cancel();
+        });
+
+        let stream_values = vec![
+            StreamChunk {
+                delta_content: Some("first".to_string()),
+                tool_use_deltas: Vec::new(),
+                usage: None,
+                stop_reason: None,
+            },
+            StreamChunk {
+                delta_content: Some("second".to_string()),
+                tool_use_deltas: Vec::new(),
+                usage: None,
+                stop_reason: Some("stop".to_string()),
+            },
+        ];
+        let delayed = futures_util::stream::iter(stream_values).enumerate().then(
+            |(index, chunk)| async move {
+                if index == 1 {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Ok::<StreamChunk, ProviderError>(chunk)
+            },
+        );
+        let mut stream: CompletionStream = Box::pin(delayed);
+
+        let response = engine
+            .consume_stream_with_events(&mut stream, StreamPhase::Reason)
+            .await
+            .expect("stream consumed");
+        cancel_task.await.expect("cancel task");
+
+        assert_eq!(extract_response_text(&response), "first");
+        assert_eq!(response.stop_reason.as_deref(), Some("cancelled"));
+        assert!(response.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn response_to_chunk_converts_completion_response() {
+        let response = CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "hello".to_string(),
+            }],
+            tool_calls: vec![ToolCall {
+                id: "call-1".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path":"README.md"}),
+            }],
+            usage: Some(Usage {
+                input_tokens: 3,
+                output_tokens: 2,
+            }),
+            stop_reason: Some("stop".to_string()),
+        };
+
+        let chunk = response_to_chunk(response);
+        assert_eq!(chunk.delta_content.as_deref(), Some("hello"));
+        assert_eq!(chunk.stop_reason.as_deref(), Some("stop"));
+        assert_eq!(
+            chunk.usage,
+            Some(Usage {
+                input_tokens: 3,
+                output_tokens: 2,
+            })
+        );
+        assert_eq!(chunk.tool_use_deltas.len(), 1);
+        assert_eq!(chunk.tool_use_deltas[0].id.as_deref(), Some("call-1"));
+        assert_eq!(chunk.tool_use_deltas[0].name.as_deref(), Some("read_file"));
+        assert_eq!(
+            chunk.tool_use_deltas[0].arguments_delta.as_deref(),
+            Some("{\"path\":\"README.md\"}")
+        );
+        assert!(chunk.tool_use_deltas[0].arguments_done);
     }
 
     #[tokio::test]
@@ -6293,6 +7184,7 @@ mod fallback_retry_tests {
             }),
             sensor_data: None,
             conversation_history: vec![Message::user(text)],
+            steer_context: None,
         }
     }
 
@@ -6654,8 +7546,14 @@ mod decomposition_tests {
         count: usize,
     ) -> Vec<InternalMessage> {
         let mut events = Vec::with_capacity(count);
-        for _ in 0..count {
-            events.push(receiver.recv().await.expect("event"));
+        while events.len() < count {
+            let event = receiver.recv().await.expect("event");
+            if matches!(
+                event,
+                InternalMessage::SubGoalStarted { .. } | InternalMessage::SubGoalCompleted { .. }
+            ) {
+                events.push(event);
+            }
         }
         events
     }
@@ -6689,6 +7587,7 @@ mod decomposition_tests {
             }),
             sensor_data: None,
             conversation_history: vec![Message::user(text)],
+            steer_context: None,
         }
     }
 
@@ -6768,6 +7667,7 @@ mod decomposition_tests {
             context_window: vec![Message::user("context")],
             active_goals: vec!["Help the user".to_string()],
             budget_remaining: sample_budget_remaining(),
+            steer_context: None,
         }
     }
 
@@ -7009,28 +7909,33 @@ mod decomposition_tests {
             .expect("decomposition");
 
         let events = collect_internal_events(&mut receiver, 4).await;
-        assert!(
-            matches!(&events[0], InternalMessage::SubGoalStarted { index: 0, total: 2, description } if description == "first")
-        );
-        assert!(
-            matches!(&events[1], InternalMessage::SubGoalStarted { index: 1, total: 2, description } if description == "second")
-        );
-        assert!(matches!(
-            events[2],
-            InternalMessage::SubGoalCompleted {
-                index: 0,
-                total: 2,
-                success: true
-            }
-        ));
-        assert!(matches!(
-            events[3],
-            InternalMessage::SubGoalCompleted {
-                index: 1,
-                total: 2,
-                success: true
-            }
-        ));
+        assert_eq!(events.len(), 4);
+        assert!(events.iter().any(|event| {
+            matches!(event, InternalMessage::SubGoalStarted { index: 0, total: 2, description } if description == "first")
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(event, InternalMessage::SubGoalStarted { index: 1, total: 2, description } if description == "second")
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                InternalMessage::SubGoalCompleted {
+                    index: 0,
+                    total: 2,
+                    success: true
+                }
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                InternalMessage::SubGoalCompleted {
+                    index: 1,
+                    total: 2,
+                    success: true
+                }
+            )
+        }));
     }
 
     #[tokio::test]
@@ -7050,28 +7955,33 @@ mod decomposition_tests {
             .expect("decomposition");
 
         let events = collect_internal_events(&mut receiver, 4).await;
-        assert!(
-            matches!(&events[0], InternalMessage::SubGoalStarted { index: 0, total: 2, description } if description == "first")
-        );
-        assert!(matches!(
-            events[1],
-            InternalMessage::SubGoalCompleted {
-                index: 0,
-                total: 2,
-                success: true
-            }
-        ));
-        assert!(
-            matches!(&events[2], InternalMessage::SubGoalStarted { index: 1, total: 2, description } if description == "second")
-        );
-        assert!(matches!(
-            events[3],
-            InternalMessage::SubGoalCompleted {
-                index: 1,
-                total: 2,
-                success: true
-            }
-        ));
+        assert_eq!(events.len(), 4);
+        assert!(events.iter().any(|event| {
+            matches!(event, InternalMessage::SubGoalStarted { index: 0, total: 2, description } if description == "first")
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                InternalMessage::SubGoalCompleted {
+                    index: 0,
+                    total: 2,
+                    success: true
+                }
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(event, InternalMessage::SubGoalStarted { index: 1, total: 2, description } if description == "second")
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                InternalMessage::SubGoalCompleted {
+                    index: 1,
+                    total: 2,
+                    success: true
+                }
+            )
+        }));
     }
 
     #[tokio::test]
@@ -8058,6 +8968,7 @@ mod context_compaction_tests {
             }),
             sensor_data: None,
             conversation_history: history,
+            steer_context: None,
         }
     }
 
@@ -8851,5 +9762,370 @@ mod context_compaction_tests {
                 "missing observability field: {key}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod r2_streaming_review_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use fx_llm::{CompletionResponse, CompletionStream, ContentBlock, ProviderError, StreamChunk};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[derive(Debug)]
+    struct NoopToolExecutor;
+
+    #[async_trait]
+    impl ToolExecutor for NoopToolExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+            Ok(calls
+                .iter()
+                .map(|call| ToolResult {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    success: true,
+                    output: "ok".to_string(),
+                })
+                .collect())
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition {
+                name: "read_file".to_string(),
+                description: "Read a file".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+            }]
+        }
+    }
+
+    fn engine_with_bus(bus: &fx_core::EventBus) -> LoopEngine {
+        let mut engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                0,
+                0,
+            ))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(NoopToolExecutor))
+            .synthesis_instruction("Summarize tool output".to_string())
+            .build()
+            .expect("test engine build");
+        engine.set_event_bus(bus.clone());
+        engine
+    }
+
+    fn base_engine() -> LoopEngine {
+        LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                0,
+                0,
+            ))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(NoopToolExecutor))
+            .synthesis_instruction("Summarize tool output".to_string())
+            .build()
+            .expect("test engine build")
+    }
+
+    // -- Finding NB1: stream_tool_call_from_state drops malformed JSON --
+
+    #[test]
+    fn stream_tool_call_from_state_drops_malformed_json_arguments() {
+        let state = StreamToolCallState {
+            id: Some("call-1".to_string()),
+            name: Some("read_file".to_string()),
+            arguments: "not valid json {{{".to_string(),
+            arguments_done: true,
+        };
+        let result = stream_tool_call_from_state(state);
+        assert!(
+            result.is_none(),
+            "malformed JSON arguments should cause the tool call to be dropped"
+        );
+    }
+
+    #[test]
+    fn stream_tool_call_from_state_accepts_valid_json_arguments() {
+        let state = StreamToolCallState {
+            id: Some("call-1".to_string()),
+            name: Some("read_file".to_string()),
+            arguments: r#"{"path":"README.md"}"#.to_string(),
+            arguments_done: true,
+        };
+        let result = stream_tool_call_from_state(state);
+        assert!(result.is_some(), "valid JSON arguments should be accepted");
+        let call = result.expect("tool call");
+        assert_eq!(call.id, "call-1");
+        assert_eq!(call.name, "read_file");
+        assert_eq!(call.arguments, serde_json::json!({"path": "README.md"}));
+    }
+
+    #[test]
+    fn finalize_stream_tool_calls_filters_out_malformed_arguments() {
+        let mut by_index = HashMap::new();
+        by_index.insert(
+            0,
+            StreamToolCallState {
+                id: Some("call-good".to_string()),
+                name: Some("read_file".to_string()),
+                arguments: r#"{"path":"a.txt"}"#.to_string(),
+                arguments_done: true,
+            },
+        );
+        by_index.insert(
+            1,
+            StreamToolCallState {
+                id: Some("call-bad".to_string()),
+                name: Some("write_file".to_string()),
+                arguments: "truncated json {".to_string(),
+                arguments_done: true,
+            },
+        );
+        let calls = finalize_stream_tool_calls(by_index);
+        assert_eq!(calls.len(), 1, "only the valid tool call should survive");
+        assert_eq!(calls[0].id, "call-good");
+    }
+
+    // -- Finding NB2: StreamingFinished exactly once for all paths --
+
+    fn count_streaming_finished(
+        receiver: &mut tokio::sync::broadcast::Receiver<fx_core::message::InternalMessage>,
+    ) -> usize {
+        let mut count = 0;
+        while let Ok(msg) = receiver.try_recv() {
+            if matches!(msg, InternalMessage::StreamingFinished { .. }) {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    #[tokio::test]
+    async fn consume_stream_publishes_exactly_one_finished_on_success() {
+        let bus = fx_core::EventBus::new(16);
+        let mut receiver = bus.subscribe();
+        let mut engine = engine_with_bus(&bus);
+
+        let mut stream: CompletionStream =
+            Box::pin(futures_util::stream::iter(vec![Ok(StreamChunk {
+                delta_content: Some("hello".to_string()),
+                tool_use_deltas: Vec::new(),
+                usage: None,
+                stop_reason: Some("stop".to_string()),
+            })]));
+
+        let response = engine
+            .consume_stream_with_events(&mut stream, StreamPhase::Reason)
+            .await
+            .expect("stream consumed");
+
+        assert_eq!(extract_response_text(&response), "hello");
+        assert_eq!(
+            count_streaming_finished(&mut receiver),
+            1,
+            "exactly one StreamingFinished on success path"
+        );
+    }
+
+    #[tokio::test]
+    async fn consume_stream_publishes_exactly_one_finished_on_cancel() {
+        let bus = fx_core::EventBus::new(16);
+        let mut receiver = bus.subscribe();
+        let mut engine = engine_with_bus(&bus);
+        let token = CancellationToken::new();
+        engine.set_cancel_token(token.clone());
+
+        let cancel_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            token.cancel();
+        });
+
+        let delayed = futures_util::stream::iter(vec![
+            StreamChunk {
+                delta_content: Some("first".to_string()),
+                tool_use_deltas: Vec::new(),
+                usage: None,
+                stop_reason: None,
+            },
+            StreamChunk {
+                delta_content: Some("second".to_string()),
+                tool_use_deltas: Vec::new(),
+                usage: None,
+                stop_reason: Some("stop".to_string()),
+            },
+        ])
+        .enumerate()
+        .then(|(index, chunk)| async move {
+            if index == 1 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Ok::<StreamChunk, ProviderError>(chunk)
+        });
+        let mut stream: CompletionStream = Box::pin(delayed);
+
+        let response = engine
+            .consume_stream_with_events(&mut stream, StreamPhase::Reason)
+            .await
+            .expect("stream consumed");
+        cancel_task.await.expect("cancel task");
+
+        assert_eq!(response.stop_reason.as_deref(), Some("cancelled"));
+        assert_eq!(
+            count_streaming_finished(&mut receiver),
+            1,
+            "exactly one StreamingFinished on cancel path"
+        );
+    }
+
+    #[tokio::test]
+    async fn consume_stream_publishes_exactly_one_finished_on_error() {
+        let bus = fx_core::EventBus::new(16);
+        let mut receiver = bus.subscribe();
+        let mut engine = engine_with_bus(&bus);
+
+        let chunks = vec![
+            Ok(StreamChunk {
+                delta_content: Some("partial".to_string()),
+                tool_use_deltas: Vec::new(),
+                usage: None,
+                stop_reason: None,
+            }),
+            Err(ProviderError::Streaming(
+                "simulated stream failure".to_string(),
+            )),
+        ];
+        let mut stream: CompletionStream = Box::pin(futures_util::stream::iter(chunks));
+
+        let error = engine
+            .consume_stream_with_events(&mut stream, StreamPhase::Reason)
+            .await
+            .expect_err("stream should fail");
+        assert!(error.reason.contains("stream consumption failed"));
+
+        assert_eq!(
+            count_streaming_finished(&mut receiver),
+            1,
+            "exactly one StreamingFinished on error path"
+        );
+    }
+
+    // -- Nice-to-have 1: response_to_chunk multi-text-block test --
+
+    #[test]
+    fn response_to_chunk_joins_multiple_text_blocks_with_newline() {
+        let response = CompletionResponse {
+            content: vec![
+                ContentBlock::Text {
+                    text: "first paragraph".to_string(),
+                },
+                ContentBlock::Text {
+                    text: "second paragraph".to_string(),
+                },
+                ContentBlock::Text {
+                    text: "third paragraph".to_string(),
+                },
+            ],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        };
+
+        let chunk = response_to_chunk(response);
+        assert_eq!(
+            chunk.delta_content.as_deref(),
+            Some("first paragraph\nsecond paragraph\nthird paragraph"),
+            "multiple text blocks should be joined with newlines"
+        );
+    }
+
+    #[test]
+    fn response_to_chunk_skips_non_text_blocks_in_join() {
+        let response = CompletionResponse {
+            content: vec![
+                ContentBlock::Text {
+                    text: "before".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "t1".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({}),
+                },
+                ContentBlock::Text {
+                    text: "after".to_string(),
+                },
+            ],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        };
+
+        let chunk = response_to_chunk(response);
+        assert_eq!(
+            chunk.delta_content.as_deref(),
+            Some("before\nafter"),
+            "non-text blocks should be skipped in the join"
+        );
+    }
+
+    // -- Nice-to-have 2: empty stream edge case test --
+
+    #[tokio::test]
+    async fn consume_stream_with_zero_chunks_produces_empty_response() {
+        let mut engine = base_engine();
+
+        let mut stream: CompletionStream = Box::pin(futures_util::stream::iter(Vec::<
+            Result<StreamChunk, ProviderError>,
+        >::new()));
+
+        let response = engine
+            .consume_stream_with_events(&mut stream, StreamPhase::Reason)
+            .await
+            .expect("empty stream consumed");
+
+        assert_eq!(
+            extract_response_text(&response),
+            "",
+            "zero chunks should produce empty text"
+        );
+        assert!(
+            response.tool_calls.is_empty(),
+            "zero chunks should produce no tool calls"
+        );
+        assert!(
+            response.usage.is_none(),
+            "zero chunks should produce no usage"
+        );
+        assert!(
+            response.stop_reason.is_none(),
+            "zero chunks should produce no stop reason"
+        );
+    }
+
+    #[test]
+    fn default_stream_response_state_produces_empty_response() {
+        let state = StreamResponseState::default();
+        let response = state.into_response();
+
+        assert_eq!(
+            extract_response_text(&response),
+            "",
+            "default state should produce empty text"
+        );
+        assert!(
+            response.tool_calls.is_empty(),
+            "default state should produce no tool calls"
+        );
+        assert!(
+            response.usage.is_none(),
+            "default state should produce no usage"
+        );
     }
 }

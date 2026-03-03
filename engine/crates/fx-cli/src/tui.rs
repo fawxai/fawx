@@ -1881,6 +1881,7 @@ impl TuiApp {
                 context_id: None,
             }),
             conversation_history: self.conversation_history.clone(),
+            steer_context: None,
         }
     }
 
@@ -4511,6 +4512,7 @@ mod tests {
                 context_id: None,
             }),
             conversation_history: Vec::new(),
+            steer_context: None,
         }
     }
 

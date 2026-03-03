@@ -26,6 +26,9 @@ pub struct PerceptionSnapshot {
     /// Prior conversation turns retained for context-window construction.
     #[serde(default)]
     pub conversation_history: Vec<Message>,
+    /// Latest user steering guidance queued for this turn.
+    #[serde(default)]
+    pub steer_context: Option<String>,
 }
 
 /// Sensor data captured alongside perception.
@@ -463,6 +466,7 @@ mod tests {
                 context_id: Some("ctx-123".to_owned()),
             }),
             conversation_history: Vec::new(),
+            steer_context: None,
         };
 
         let encoded = serde_json::to_string(&snapshot).expect("serialize snapshot");
@@ -621,6 +625,7 @@ mod tests {
                 sensor_data: None,
                 user_input: None,
                 conversation_history: Vec::new(),
+                steer_context: None,
             },
             working_memory: vec![WorkingMemoryEntry {
                 key: "thread_id".to_owned(),
@@ -660,6 +665,7 @@ mod tests {
                 sensor_data: None,
                 user_input: None,
                 conversation_history: Vec::new(),
+                steer_context: None,
             },
             working_memory: vec![],
             relevant_episodic: vec![],

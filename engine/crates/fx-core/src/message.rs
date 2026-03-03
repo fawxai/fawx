@@ -4,6 +4,13 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Which LLM phase is streaming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StreamPhase {
+    Reason,
+    Synthesize,
+}
+
 /// Internal message sent between crates via the event bus.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum InternalMessage {
@@ -43,6 +50,26 @@ pub enum InternalMessage {
     SystemStatus {
         /// Status message
         message: String,
+    },
+
+    /// Streaming started for an LLM phase.
+    StreamingStarted {
+        /// Which phase is currently streaming.
+        phase: StreamPhase,
+    },
+
+    /// Streaming text delta for an LLM phase.
+    StreamDelta {
+        /// Incremental text emitted by the model.
+        delta: String,
+        /// Which phase emitted the delta.
+        phase: StreamPhase,
+    },
+
+    /// Streaming finished for an LLM phase.
+    StreamingFinished {
+        /// Which phase finished streaming.
+        phase: StreamPhase,
     },
 
     /// A sub-goal has started execution within a decomposition plan.
@@ -104,6 +131,53 @@ mod tests {
                 index: 1,
                 total: 2,
                 success: true
+            }
+        ));
+    }
+
+    #[test]
+    fn streaming_started_roundtrip_serde() {
+        let msg = InternalMessage::StreamingStarted {
+            phase: StreamPhase::Reason,
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let decoded: InternalMessage = serde_json::from_str(&json).expect("deserialize");
+        assert!(matches!(
+            decoded,
+            InternalMessage::StreamingStarted {
+                phase: StreamPhase::Reason
+            }
+        ));
+    }
+
+    #[test]
+    fn stream_delta_roundtrip_serde() {
+        let msg = InternalMessage::StreamDelta {
+            delta: "delta".to_string(),
+            phase: StreamPhase::Synthesize,
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let decoded: InternalMessage = serde_json::from_str(&json).expect("deserialize");
+        assert!(matches!(
+            decoded,
+            InternalMessage::StreamDelta {
+                delta,
+                phase: StreamPhase::Synthesize
+            } if delta == "delta"
+        ));
+    }
+
+    #[test]
+    fn streaming_finished_roundtrip_serde() {
+        let msg = InternalMessage::StreamingFinished {
+            phase: StreamPhase::Reason,
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let decoded: InternalMessage = serde_json::from_str(&json).expect("deserialize");
+        assert!(matches!(
+            decoded,
+            InternalMessage::StreamingFinished {
+                phase: StreamPhase::Reason
             }
         ));
     }

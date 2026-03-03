@@ -6,13 +6,7 @@
 use tokio::sync::mpsc;
 
 /// Commands the user can issue during loop execution.
-///
-/// NOTE: Loop V2 spec §4 also defines `Steer(String)` and `AbortNegative`
-/// commands, and per-step cancellation semantics (REASON/DECIDE/ACT/SYNTHESIZE).
-/// These are deferred to a follow-up PR as the current Stop/Abort/Wait/Resume
-/// set covers the primary use cases.
-/// See: docs/architecture/loop-v2-spec.md Phase 4
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoopCommand {
     /// Graceful stop after the current step completes.
     Stop,
@@ -22,6 +16,10 @@ pub enum LoopCommand {
     Wait,
     /// Resume after a Wait.
     Resume,
+    /// Ask for the current loop/budget status without changing flow.
+    StatusQuery,
+    /// Steer the model with additional user guidance.
+    Steer(String),
 }
 
 /// Receiving end of the user-input channel (held by the loop engine).

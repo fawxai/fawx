@@ -444,6 +444,7 @@ mod tests {
                 sensor_data: None,
                 user_input: None,
                 conversation_history: Vec::new(),
+                steer_context: None,
             },
             working_memory: vec![WorkingMemoryEntry {
                 key: "last_contact".to_owned(),
