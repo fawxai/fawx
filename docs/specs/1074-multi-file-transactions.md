@@ -2,7 +2,7 @@
 
 **Status:** Implementation Spec  
 **Date:** 2026-03-03  
-**Crate scope:** New `TransactionSkill` in `fx-tools` (implements `Skill` trait)  
+**Crate scope:** New `fx-transactions` crate (implements `Skill` trait from `fx-loadable`)  
 **Prerequisites:** None (standalone loadable skill)
 
 ---
@@ -176,7 +176,7 @@ impl TransactionStore {
 ## 5. Skill Implementation
 
 ```rust
-// fx-tools/src/transaction_skill.rs
+// fx-transactions/src/skill.rs
 
 #[derive(Debug)]
 pub struct TransactionSkill {
@@ -223,7 +223,7 @@ impl Skill for TransactionSkill {
 
 ### Phase 1: Transaction Store
 
-1. Add `transaction_skill.rs` to `fx-tools/src/`
+1. Create `fx-transactions` crate (`engine/crates/fx-transactions/`). Deps: `fx-loadable` (Skill trait), `fx-core`, `fx-kernel` (CancellationToken), `serde`, `thiserror`, `async-trait`, `tokio` (fs).
 2. Implement `StagedWrite`, `Transaction`, `TransactionStatus`, `TransactionStore`
 3. All pure in-memory operations, no I/O
 4. Unit tests for begin/stage/cancel/list
