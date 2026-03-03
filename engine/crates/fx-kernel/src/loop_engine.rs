@@ -2764,7 +2764,7 @@ fn build_continuation_request(
     memory_context: Option<&str>,
 ) -> CompletionRequest {
     let tools = tool_definitions_with_decompose(tool_definitions);
-    let system_prompt = build_reasoning_system_prompt(&tools, memory_context);
+    let system_prompt = build_reasoning_system_prompt(memory_context);
     CompletionRequest {
         model: model.to_string(),
         messages: context_messages.to_vec(),
@@ -2783,7 +2783,7 @@ fn build_truncation_continuation_request(
     step: LoopStep,
 ) -> CompletionRequest {
     let tools = tool_definitions_with_decompose(tool_definitions);
-    let system_prompt = build_reasoning_system_prompt(&tools, memory_context);
+    let system_prompt = build_reasoning_system_prompt(memory_context);
     CompletionRequest {
         model: model.to_string(),
         messages: continuation_messages.to_vec(),
@@ -3061,7 +3061,7 @@ fn build_reasoning_request(
     let context = perception.context_window.clone();
     let user_prompt = reasoning_user_prompt(perception);
     let tools = tool_definitions_with_decompose(tool_definitions);
-    let system_prompt = build_reasoning_system_prompt(&tools, memory_context);
+    let system_prompt = build_reasoning_system_prompt(memory_context);
 
     CompletionRequest {
         model: model.to_string(),
@@ -3092,16 +3092,8 @@ User message:
     )
 }
 
-fn build_reasoning_system_prompt(
-    tool_definitions: &[ToolDefinition],
-    memory_context: Option<&str>,
-) -> String {
-    let mut prompt = format!(
-        "{REASONING_SYSTEM_PROMPT}
-
-{}",
-        available_tools_instructions(tool_definitions)
-    );
+fn build_reasoning_system_prompt(memory_context: Option<&str>) -> String {
+    let mut prompt = REASONING_SYSTEM_PROMPT.to_string();
     if let Some(mem) = memory_context {
         prompt.push_str("\n\n");
         prompt.push_str(mem);
@@ -3110,6 +3102,8 @@ fn build_reasoning_system_prompt(
     prompt
 }
 
+// Retained for potential use in non-structured-tool contexts (e.g. plain-text LLM fallback).
+#[allow(dead_code)]
 fn available_tools_instructions(tool_definitions: &[ToolDefinition]) -> String {
     let tools = tool_definitions
         .iter()
@@ -3331,12 +3325,7 @@ mod tests {
 
     #[test]
     fn system_prompt_includes_tool_use_guidance() {
-        let defs = vec![ToolDefinition {
-            name: "current_time".to_string(),
-            description: "Get the current time".to_string(),
-            parameters: serde_json::json!({"type": "object", "properties": {}, "required": []}),
-        }];
-        let prompt = build_reasoning_system_prompt(&defs, None);
+        let prompt = build_reasoning_system_prompt(None);
         assert!(
             prompt.contains("Use tools when you need information not already in the conversation")
         );
@@ -3346,17 +3335,11 @@ mod tests {
             ),
             "system prompt should encourage proactive tool usage for matching requests"
         );
-        assert!(prompt.contains("current time"));
     }
 
     #[test]
     fn system_prompt_prohibits_greeting_and_preamble() {
-        let defs = vec![ToolDefinition {
-            name: "current_time".to_string(),
-            description: "Get the current time".to_string(),
-            parameters: serde_json::json!({"type": "object", "properties": {}, "required": []}),
-        }];
-        let prompt = build_reasoning_system_prompt(&defs, None);
+        let prompt = build_reasoning_system_prompt(None);
         assert!(
             prompt.contains("Never introduce yourself"),
             "system prompt must prohibit self-introduction (issue #959)"
@@ -3369,12 +3352,7 @@ mod tests {
 
     #[test]
     fn system_prompt_without_memory_omits_persistent_memory_block() {
-        let defs = vec![ToolDefinition {
-            name: "current_time".to_string(),
-            description: "Get the current time".to_string(),
-            parameters: serde_json::json!({"type": "object", "properties": {}, "required": []}),
-        }];
-        let prompt = build_reasoning_system_prompt(&defs, None);
+        let prompt = build_reasoning_system_prompt(None);
         assert!(
             !prompt.contains("You have persistent memory across sessions"),
             "system prompt without memory context should NOT include the persistent memory block"
@@ -3383,19 +3361,35 @@ mod tests {
 
     #[test]
     fn system_prompt_with_memory_includes_memory_instruction() {
-        let defs = vec![ToolDefinition {
-            name: "memory_write".to_string(),
-            description: "Store a fact".to_string(),
-            parameters: serde_json::json!({"type": "object"}),
-        }];
-        let prompt = build_reasoning_system_prompt(&defs, Some("user prefers dark mode"));
+        let prompt = build_reasoning_system_prompt(Some("user prefers dark mode"));
         assert!(
             prompt.contains("memory_write"),
-            "system prompt with memory context should mention memory_write"
+            "system prompt with memory context should mention memory_write via MEMORY_INSTRUCTION"
         );
         assert!(
             prompt.contains("user prefers dark mode"),
             "system prompt should include the memory context"
+        );
+    }
+
+    /// Regression test: tool definitions must NOT appear as text in the system
+    /// prompt. They are already provided via the structured `tools` field of
+    /// `CompletionRequest`. Duplicating them in the system prompt caused 9×
+    /// token bloat on OpenAI and broke multi-step instruction following.
+    #[test]
+    fn system_prompt_does_not_contain_tool_descriptions() {
+        let prompt = build_reasoning_system_prompt(None);
+        assert!(
+            !prompt.contains("Available tools:"),
+            "system prompt must not contain 'Available tools:' text — \
+             tool definitions belong in the structured tools field, not the prompt"
+        );
+
+        // Also verify with memory context (second code path).
+        let prompt_with_memory = build_reasoning_system_prompt(Some("user likes cats"));
+        assert!(
+            !prompt_with_memory.contains("Available tools:"),
+            "system prompt with memory must not contain 'Available tools:' text"
         );
     }
 
