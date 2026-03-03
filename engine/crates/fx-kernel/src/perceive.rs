@@ -1,6 +1,7 @@
 //! Perceive-step context assembly utilities.
 
 use crate::budget::BudgetSnapshot;
+use crate::conversation_compactor::estimate_text_tokens;
 use crate::types::*;
 use fx_core::types::{Notification, UiElement, UserInput};
 use fx_llm::Message;
@@ -335,16 +336,6 @@ pub enum TrimmingPolicy {
     ByRecency,
     /// Remove entries furthest from current goal.
     ByGoalDistance,
-}
-
-fn estimate_text_tokens(text: &str) -> usize {
-    if text.trim().is_empty() {
-        return 0;
-    }
-
-    let char_estimate = text.chars().count().div_ceil(4);
-    let word_estimate = text.split_whitespace().count();
-    char_estimate.max(word_estimate).max(1)
 }
 
 fn retain_top_by_score_preserving_order<T, F>(entries: Vec<T>, limit: usize, score: F) -> Vec<T>

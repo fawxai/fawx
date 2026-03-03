@@ -19,7 +19,9 @@ use fx_kernel::budget::{BudgetConfig, BudgetTracker};
 use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::context_manager::ContextCompactor;
 use fx_kernel::input::LoopCommand;
-use fx_kernel::loop_engine::{LlmProvider as LoopLlmProvider, LoopEngine, LoopResult};
+use fx_kernel::loop_engine::{
+    LlmProvider as LoopLlmProvider, LoopEngine, LoopEngineBuilder, LoopResult,
+};
 use fx_kernel::signals::{LoopStep, Signal, SignalCollector};
 use fx_kernel::types::PerceptionSnapshot;
 use fx_kernel::CachingExecutor;
@@ -1865,18 +1867,22 @@ fn build_loop_engine_bundle() -> (LoopEngine, Arc<RwLock<RuntimeInfo>>) {
         eprintln!("warning: failed to load config: {error}");
         FawxConfig::default()
     });
-    let (engine, _memory, runtime_info) = build_loop_engine_from_config(&config);
+    let (engine, _memory, runtime_info) =
+        build_loop_engine_from_config(&config).expect("loop engine config should be valid");
     (engine, runtime_info)
 }
 
 /// Build a loop engine from an already-loaded config.
 pub fn build_loop_engine_from_config(
     config: &FawxConfig,
-) -> (
-    LoopEngine,
-    Option<SharedMemoryStore>,
-    Arc<RwLock<RuntimeInfo>>,
-) {
+) -> Result<
+    (
+        LoopEngine,
+        Option<SharedMemoryStore>,
+        Arc<RwLock<RuntimeInfo>>,
+    ),
+    TuiError,
+> {
     let base_data_dir = fawx_data_dir();
     let data_dir = configured_data_dir(&base_data_dir, config);
     build_loop_engine_with_config(data_dir, config.clone())
@@ -1885,11 +1891,14 @@ pub fn build_loop_engine_from_config(
 fn build_loop_engine_with_config(
     data_dir: PathBuf,
     config: FawxConfig,
-) -> (
-    LoopEngine,
-    Option<SharedMemoryStore>,
-    Arc<RwLock<RuntimeInfo>>,
-) {
+) -> Result<
+    (
+        LoopEngine,
+        Option<SharedMemoryStore>,
+        Arc<RwLock<RuntimeInfo>>,
+    ),
+    TuiError,
+> {
     let budget = BudgetTracker::new(BudgetConfig::default(), current_time_ms(), 0);
     let context = ContextCompactor::new(DEFAULT_CONTEXT_MAX_TOKENS, DEFAULT_CONTEXT_COMPACT_TARGET);
     let working_dir = configured_working_dir(&config);
@@ -1902,17 +1911,27 @@ fn build_loop_engine_with_config(
         .unwrap_or_else(|| DEFAULT_SYNTHESIS_INSTRUCTION.to_string());
 
     let caching_registry = CachingExecutor::new(registry);
-    let mut engine = LoopEngine::new(
-        budget,
-        context,
-        config.general.max_iterations,
-        std::sync::Arc::new(caching_registry),
-        synthesis,
-    );
+    let mut builder = LoopEngine::builder()
+        .budget(budget)
+        .context(context)
+        .max_iterations(config.general.max_iterations)
+        .tool_executor(std::sync::Arc::new(caching_registry))
+        .synthesis_instruction(synthesis);
     if let Some(snapshot_text) = memory_snapshot {
-        engine.set_memory_context(snapshot_text);
+        builder = builder.memory_context(snapshot_text);
     }
-    (engine, memory, runtime_info)
+
+    let engine = build_loop_engine_from_builder(builder)?;
+    Ok((engine, memory, runtime_info))
+}
+
+fn build_loop_engine_from_builder(builder: LoopEngineBuilder) -> Result<LoopEngine, TuiError> {
+    builder.build().map_err(|error| {
+        TuiError::Loop(format!(
+            "failed to build loop engine: stage={} reason={}",
+            error.stage, error.reason
+        ))
+    })
 }
 
 fn build_skill_registry(
@@ -3677,6 +3696,19 @@ mod tests {
             FawxConfig::default(),
         )
         .expect("new test app")
+    }
+
+    #[test]
+    fn build_loop_engine_from_builder_returns_tui_error_on_failure() {
+        let error = build_loop_engine_from_builder(LoopEngine::builder())
+            .expect_err("missing required fields should return an error");
+
+        match error {
+            TuiError::Loop(message) => {
+                assert!(message.contains("missing_required_field"));
+            }
+            other => panic!("expected TuiError::Loop, got {other:?}"),
+        }
     }
 
     type RecordedWrites = Arc<Mutex<Vec<(String, String)>>>;

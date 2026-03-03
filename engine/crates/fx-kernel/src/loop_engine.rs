@@ -5,6 +5,10 @@ use crate::budget::{ActionCost, BudgetRemaining, BudgetResource, BudgetTracker};
 use crate::cancellation::CancellationToken;
 use crate::context_manager::ContextCompactor;
 use crate::continuation::Continuation;
+use crate::conversation_compactor::{
+    estimate_text_tokens, CompactionConfig, CompactionError, CompactionResult, CompactionStrategy,
+    ConversationBudget, SlidingWindowCompactor,
+};
 use crate::decide::{Decision, CONFIDENCE_CLARIFY_THRESHOLD};
 use crate::input::{LoopCommand, LoopInputChannel};
 use crate::learn::Learning;
@@ -24,6 +28,7 @@ use fx_llm::{
     ToolCall, ToolDefinition, Usage,
 };
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -139,11 +144,37 @@ pub enum LoopResult {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CompactionScope {
+    Perceive,
+    ToolContinuation,
+    DecomposeChild,
+}
+
+impl CompactionScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Perceive => "perceive",
+            Self::ToolContinuation => "tool_continuation",
+            Self::DecomposeChild => "decompose_child",
+        }
+    }
+}
+
+impl std::fmt::Display for CompactionScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Core orchestrator for the 7-step agentic loop.
 ///
-/// Note: `LoopEngine` previously derived `Clone`, but Phase 4 added
-/// `LoopInputChannel` which contains `mpsc::Receiver` (not `Clone`).
-/// No existing code clones `LoopEngine`, so this is a safe change.
+/// Note: `LoopEngine` previously derived `Clone`, but Phases 1-3
+/// (context window compaction) introduced two non-`Clone` fields:
+/// `conversation_compactor: Box<dyn CompactionStrategy>` and
+/// `compaction_last_iteration: Mutex<HashMap<CompactionScope, u32>>`.
+/// `LoopInputChannel` also contains an `mpsc::Receiver`, which remains
+/// non-`Clone`. No existing code clones `LoopEngine`, so this is a safe change.
 #[derive(Debug)]
 pub struct LoopEngine {
     budget: BudgetTracker,
@@ -158,6 +189,154 @@ pub struct LoopEngine {
     input_channel: Option<LoopInputChannel>,
     user_stop_requested: bool,
     event_bus: Option<fx_core::EventBus>,
+    compaction_config: CompactionConfig,
+    conversation_budget: ConversationBudget,
+    conversation_compactor: Box<dyn CompactionStrategy>,
+    compaction_last_iteration: Mutex<HashMap<CompactionScope, u32>>,
+}
+
+#[derive(Debug, Default)]
+#[must_use = "builder does nothing unless .build() is called"]
+pub struct LoopEngineBuilder {
+    budget: Option<BudgetTracker>,
+    context: Option<ContextCompactor>,
+    tool_executor: Option<Arc<dyn ToolExecutor>>,
+    max_iterations: Option<u32>,
+    synthesis_instruction: Option<String>,
+    compaction_config: Option<CompactionConfig>,
+    compaction_llm: Option<Arc<dyn LlmProvider>>,
+    event_bus: Option<fx_core::EventBus>,
+    cancel_token: Option<CancellationToken>,
+    input_channel: Option<LoopInputChannel>,
+    memory_context: Option<String>,
+}
+
+impl LoopEngineBuilder {
+    pub fn budget(mut self, budget: BudgetTracker) -> Self {
+        self.budget = Some(budget);
+        self
+    }
+
+    pub fn context(mut self, context: ContextCompactor) -> Self {
+        self.context = Some(context);
+        self
+    }
+
+    pub fn max_iterations(mut self, max_iterations: u32) -> Self {
+        self.max_iterations = Some(max_iterations);
+        self
+    }
+
+    pub fn tool_executor(mut self, tool_executor: Arc<dyn ToolExecutor>) -> Self {
+        self.tool_executor = Some(tool_executor);
+        self
+    }
+
+    pub fn synthesis_instruction(mut self, synthesis_instruction: impl Into<String>) -> Self {
+        self.synthesis_instruction = Some(synthesis_instruction.into());
+        self
+    }
+
+    pub fn compaction_config(mut self, compaction_config: CompactionConfig) -> Self {
+        self.compaction_config = Some(compaction_config);
+        self
+    }
+
+    pub fn compaction_llm(mut self, llm: Arc<dyn LlmProvider>) -> Self {
+        self.compaction_llm = Some(llm);
+        self
+    }
+
+    pub fn event_bus(mut self, event_bus: fx_core::EventBus) -> Self {
+        self.event_bus = Some(event_bus);
+        self
+    }
+
+    pub fn cancel_token(mut self, cancel_token: CancellationToken) -> Self {
+        self.cancel_token = Some(cancel_token);
+        self
+    }
+
+    pub fn input_channel(mut self, input_channel: LoopInputChannel) -> Self {
+        self.input_channel = Some(input_channel);
+        self
+    }
+
+    pub fn memory_context(mut self, memory_context: impl Into<String>) -> Self {
+        self.memory_context = normalize_memory_context(memory_context.into());
+        self
+    }
+
+    pub fn build(self) -> Result<LoopEngine, LoopError> {
+        let budget = required_builder_field(self.budget, "budget")?;
+        let context = required_builder_field(self.context, "context")?;
+        let tool_executor = required_builder_field(self.tool_executor, "tool_executor")?;
+        let max_iterations = required_builder_field(self.max_iterations, "max_iterations")?.max(1);
+        let synthesis_instruction =
+            required_builder_field(self.synthesis_instruction, "synthesis_instruction")?;
+        let (compaction_config, conversation_budget, conversation_compactor) =
+            build_compaction_components(self.compaction_config, self.compaction_llm)?;
+
+        Ok(LoopEngine {
+            budget,
+            context,
+            tool_executor,
+            max_iterations,
+            iteration_count: 0,
+            synthesis_instruction,
+            memory_context: self.memory_context,
+            signals: SignalCollector::default(),
+            cancel_token: self.cancel_token,
+            input_channel: self.input_channel,
+            user_stop_requested: false,
+            event_bus: self.event_bus,
+            compaction_config,
+            conversation_budget,
+            conversation_compactor,
+            compaction_last_iteration: Mutex::new(HashMap::new()),
+        })
+    }
+}
+
+fn build_compaction_components(
+    config: Option<CompactionConfig>,
+    llm: Option<Arc<dyn LlmProvider>>,
+) -> Result<
+    (
+        CompactionConfig,
+        ConversationBudget,
+        Box<dyn CompactionStrategy>,
+    ),
+    LoopError,
+> {
+    let compaction_config = config.unwrap_or_default();
+    compaction_config.validate().map_err(|error| {
+        loop_error(
+            "init",
+            &format!("invalid_compaction_config: {error}"),
+            false,
+        )
+    })?;
+
+    let conversation_budget = ConversationBudget::new(
+        compaction_config.model_context_limit,
+        compaction_config.compaction_threshold,
+        compaction_config.reserved_system_tokens,
+    );
+    let strategy = compaction_config.build_strategy(llm);
+    Ok((compaction_config, conversation_budget, strategy))
+}
+
+fn required_builder_field<T>(value: Option<T>, field: &str) -> Result<T, LoopError> {
+    value.ok_or_else(|| loop_error("init", &format!("missing_required_field: {field}"), false))
+}
+
+fn normalize_memory_context(memory_context: String) -> Option<String> {
+    if memory_context.trim().is_empty() {
+        None
+    } else {
+        Some(memory_context)
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -209,6 +388,14 @@ enum ToolRoundOutcome {
 struct SubGoalExecution {
     result: SubGoalResult,
     budget: BudgetTracker,
+}
+
+struct CompactionContext<'a> {
+    scope: CompactionScope,
+    messages: &'a [Message],
+    target: usize,
+    hard_limit_exceeded: bool,
+    before_tokens: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -276,28 +463,9 @@ const VERIFICATION_CONFIDENCE_SINGLE_DISCREPANCY: f64 = 0.45;
 const VERIFICATION_CONFIDENCE_MULTIPLE_DISCREPANCIES: f64 = 0.25;
 
 impl LoopEngine {
-    /// Create a loop engine with an injected tool executor.
-    pub fn new(
-        budget: BudgetTracker,
-        context: ContextCompactor,
-        max_iterations: u32,
-        tool_executor: Arc<dyn ToolExecutor>,
-        synthesis_instruction: String,
-    ) -> Self {
-        Self {
-            budget,
-            context,
-            tool_executor,
-            max_iterations: max_iterations.max(1),
-            iteration_count: 0,
-            synthesis_instruction,
-            memory_context: None,
-            signals: SignalCollector::default(),
-            cancel_token: None,
-            input_channel: None,
-            user_stop_requested: false,
-            event_bus: None,
-        }
+    /// Create a loop engine builder.
+    pub fn builder() -> LoopEngineBuilder {
+        LoopEngineBuilder::default()
     }
 
     /// Attach an fx-core event bus for inter-component progress events.
@@ -331,11 +499,7 @@ impl LoopEngine {
 
     /// Set memory context for system prompt injection.
     pub fn set_memory_context(&mut self, context: String) {
-        if context.trim().is_empty() {
-            self.memory_context = None;
-        } else {
-            self.memory_context = Some(context);
-        }
+        self.memory_context = normalize_memory_context(context);
     }
 
     pub fn synthesis_instruction(&self) -> &str {
@@ -670,8 +834,21 @@ impl LoopEngine {
             "processing user input",
             serde_json::json!({"input_length": user_message.len()}),
         );
+
         let mut context_window = snapshot.conversation_history.clone();
         context_window.push(Message::user(user_message.clone()));
+
+        let compacted_context = self
+            .compact_if_needed(
+                &context_window,
+                CompactionScope::Perceive,
+                self.iteration_count,
+            )
+            .await?;
+        if let Cow::Owned(messages) = compacted_context {
+            context_window = messages;
+        }
+        self.ensure_within_hard_limit(CompactionScope::Perceive, &context_window)?;
 
         self.append_compacted_summary(snapshot, &user_message, &mut context_window);
 
@@ -952,7 +1129,7 @@ impl LoopEngine {
     /// calls but does not achieve true thread-level parallelism. We cannot use
     /// `tokio::JoinSet` because `llm: &dyn LlmProvider` is borrowed (not `'static`).
     fn build_concurrent_futures<'a>(
-        &self,
+        &'a self,
         plan: &'a DecompositionPlan,
         fraction: f32,
         llm: &'a dyn LlmProvider,
@@ -960,23 +1137,7 @@ impl LoopEngine {
     ) -> Vec<impl std::future::Future<Output = SubGoalExecution> + 'a> {
         plan.sub_goals
             .iter()
-            .map(|sub_goal| {
-                let ts = current_time_ms();
-                let budget = self.budget.child_tracker(fraction, ts);
-                let mut child = self.build_child_engine(budget);
-                let snap = build_sub_goal_snapshot(sub_goal, context_messages, ts);
-                let goal = sub_goal.clone();
-                async move {
-                    let result = match Box::pin(child.run_cycle(snap, llm)).await {
-                        Ok(r) => sub_goal_result_from_loop(goal, r),
-                        Err(e) => failed_sub_goal_result(goal, e.reason),
-                    };
-                    SubGoalExecution {
-                        result,
-                        budget: child.budget,
-                    }
-                }
-            })
+            .map(|sub_goal| self.run_sub_goal(sub_goal, fraction, llm, context_messages))
             .collect()
     }
 
@@ -1015,40 +1176,73 @@ impl LoopEngine {
     ) -> SubGoalExecution {
         let timestamp_ms = current_time_ms();
         let child_budget = self.budget.child_tracker(fraction, timestamp_ms);
-        let mut child = self.build_child_engine(child_budget);
-        let snapshot = build_sub_goal_snapshot(sub_goal, context_messages, timestamp_ms);
+        let (mut child, compacted_context) = match self
+            .prepare_sub_goal_engine(sub_goal, child_budget, context_messages)
+            .await
+        {
+            Ok(values) => values,
+            Err(execution) => return execution,
+        };
+        let snapshot = build_sub_goal_snapshot(sub_goal, compacted_context.as_ref(), timestamp_ms);
 
         let result = match Box::pin(child.run_cycle(snapshot, llm)).await {
             Ok(result) => sub_goal_result_from_loop(sub_goal.clone(), result),
             Err(error) => failed_sub_goal_result(sub_goal.clone(), error.reason),
         };
-
         SubGoalExecution {
             result,
             budget: child.budget,
         }
     }
 
-    fn build_child_engine(&self, budget: BudgetTracker) -> LoopEngine {
-        let mut child = LoopEngine::new(
-            budget,
-            self.context.clone(),
-            child_max_iterations(self.max_iterations),
-            Arc::clone(&self.tool_executor),
-            self.synthesis_instruction.clone(),
-        );
+    async fn prepare_sub_goal_engine<'a>(
+        &self,
+        sub_goal: &SubGoal,
+        child_budget: BudgetTracker,
+        context_messages: &'a [Message],
+    ) -> Result<(LoopEngine, Cow<'a, [Message]>), SubGoalExecution> {
+        let compacted_context = self
+            .compact_if_needed(
+                context_messages,
+                CompactionScope::DecomposeChild,
+                self.iteration_count,
+            )
+            .await
+            .map_err(|error| {
+                failed_sub_goal_execution(sub_goal, error.reason, child_budget.clone())
+            })?;
+
+        self.ensure_within_hard_limit(CompactionScope::DecomposeChild, compacted_context.as_ref())
+            .map_err(|error| {
+                failed_sub_goal_execution(sub_goal, error.reason, child_budget.clone())
+            })?;
+
+        let child = self
+            .build_child_engine(child_budget.clone())
+            .map_err(|error| failed_sub_goal_execution(sub_goal, error.reason, child_budget))?;
+        Ok((child, compacted_context))
+    }
+
+    fn build_child_engine(&self, budget: BudgetTracker) -> Result<LoopEngine, LoopError> {
+        let mut builder = LoopEngine::builder()
+            .budget(budget)
+            .context(self.context.clone())
+            .max_iterations(child_max_iterations(self.max_iterations))
+            .tool_executor(Arc::clone(&self.tool_executor))
+            .synthesis_instruction(self.synthesis_instruction.clone())
+            .compaction_config(self.compaction_config.clone());
 
         if let Some(memory_context) = &self.memory_context {
-            child.set_memory_context(memory_context.clone());
+            builder = builder.memory_context(memory_context.clone());
         }
         if let Some(cancel_token) = &self.cancel_token {
-            child.set_cancel_token(cancel_token.clone());
+            builder = builder.cancel_token(cancel_token.clone());
         }
         if let Some(bus) = &self.event_bus {
-            child.set_event_bus(bus.clone());
+            builder = builder.event_bus(bus.clone());
         }
 
-        child
+        builder.build()
     }
 
     fn decomposition_depth_limited(&self) -> bool {
@@ -1366,6 +1560,211 @@ impl LoopEngine {
         );
     }
 
+    fn compaction_cooldown_active(
+        &self,
+        scope: CompactionScope,
+        iteration: u32,
+        cooldown_turns: u32,
+    ) -> bool {
+        let map = self
+            .compaction_last_iteration
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        map.get(&scope)
+            .map(|last| iteration.saturating_sub(*last) < cooldown_turns)
+            .unwrap_or(false)
+    }
+
+    fn record_compaction_iteration(&self, scope: CompactionScope, iteration: u32) {
+        let mut map = self
+            .compaction_last_iteration
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        map.insert(scope, iteration);
+    }
+
+    fn should_skip_compaction(
+        &self,
+        scope: CompactionScope,
+        iteration: u32,
+        hard_limit_exceeded: bool,
+    ) -> bool {
+        let cooldown_active = self.compaction_cooldown_active(
+            scope,
+            iteration,
+            self.compaction_config.recompact_cooldown_turns,
+        );
+
+        if cooldown_active && !hard_limit_exceeded {
+            tracing::debug!(
+                scope = scope.as_str(),
+                iteration,
+                cooldown_turns = self.compaction_config.recompact_cooldown_turns,
+                "compaction skipped due to cooldown guard"
+            );
+            return true;
+        }
+
+        if cooldown_active && hard_limit_exceeded {
+            tracing::warn!(
+                scope = scope.as_str(),
+                iteration,
+                cooldown_turns = self.compaction_config.recompact_cooldown_turns,
+                "cooldown bypassed because conversation is above hard limit"
+            );
+        }
+
+        false
+    }
+
+    fn ensure_compacted_within_hard_limit(
+        &self,
+        scope: CompactionScope,
+        result: &CompactionResult,
+    ) -> Result<(), LoopError> {
+        if self
+            .conversation_budget
+            .exceeds_hard_limit(&result.messages)
+        {
+            return Err(context_exceeded_after_compaction_error(
+                scope,
+                result.estimated_tokens,
+                self.conversation_budget.conversation_budget(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn log_compaction_result(
+        &self,
+        scope: CompactionScope,
+        before_tokens: usize,
+        target_tokens: usize,
+        result: &CompactionResult,
+    ) {
+        tracing::info!(
+            scope = scope.as_str(),
+            strategy = if result.used_summarization {
+                "summarizing"
+            } else {
+                "sliding_window"
+            },
+            before_tokens,
+            after_tokens = result.estimated_tokens,
+            target_tokens,
+            messages_removed = result.compacted_count,
+            tokens_saved = before_tokens.saturating_sub(result.estimated_tokens),
+            "conversation compaction triggered"
+        );
+    }
+
+    async fn compact_if_needed<'a>(
+        &self,
+        messages: &'a [Message],
+        scope: CompactionScope,
+        iteration: u32,
+    ) -> Result<Cow<'a, [Message]>, LoopError> {
+        if !self.conversation_budget.needs_compaction(messages) {
+            return Ok(Cow::Borrowed(messages));
+        }
+
+        let before_tokens = ConversationBudget::estimate_tokens(messages);
+        let hard_limit_exceeded = self.conversation_budget.exceeds_hard_limit(messages);
+        if self.should_skip_compaction(scope, iteration, hard_limit_exceeded) {
+            return Ok(Cow::Borrowed(messages));
+        }
+
+        let target_tokens = self.conversation_budget.compaction_target();
+        let context = CompactionContext {
+            scope,
+            messages,
+            target: target_tokens,
+            hard_limit_exceeded,
+            before_tokens,
+        };
+        let result = self.run_compaction_strategy(context).await?;
+
+        self.ensure_compacted_within_hard_limit(scope, &result)?;
+        self.log_compaction_result(scope, before_tokens, target_tokens, &result);
+        self.record_compaction_iteration(scope, iteration);
+        Ok(Cow::Owned(result.messages))
+    }
+
+    async fn run_sliding_fallback(
+        &self,
+        scope: CompactionScope,
+        messages: &[Message],
+        target: usize,
+    ) -> Result<CompactionResult, LoopError> {
+        let fallback = SlidingWindowCompactor::new(self.compaction_config.preserve_recent_turns);
+        fallback
+            .compact(messages, target)
+            .await
+            .map_err(|error| compaction_failed_error(scope, error))
+    }
+
+    async fn run_compaction_strategy(
+        &self,
+        context: CompactionContext<'_>,
+    ) -> Result<CompactionResult, LoopError> {
+        match self
+            .conversation_compactor
+            .compact(context.messages, context.target)
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(CompactionError::SummarizationFailed { source }) => {
+                tracing::warn!(
+                    error = %source,
+                    scope = context.scope.as_str(),
+                    "summarization compaction failed; trying sliding fallback"
+                );
+                self.run_sliding_fallback(context.scope, context.messages, context.target)
+                    .await
+            }
+            Err(CompactionError::SummaryExceededTarget) => {
+                tracing::warn!(
+                    scope = context.scope.as_str(),
+                    "summary exceeded compaction target; trying sliding fallback"
+                );
+                self.run_sliding_fallback(context.scope, context.messages, context.target)
+                    .await
+            }
+            Err(CompactionError::AllMessagesProtected) => {
+                if context.hard_limit_exceeded {
+                    return Err(context_exceeded_after_compaction_error(
+                        context.scope,
+                        context.before_tokens,
+                        self.conversation_budget.conversation_budget(),
+                    ));
+                }
+                Ok(CompactionResult {
+                    messages: context.messages.to_vec(),
+                    compacted_count: 0,
+                    estimated_tokens: context.before_tokens,
+                    used_summarization: false,
+                })
+            }
+        }
+    }
+
+    fn ensure_within_hard_limit(
+        &self,
+        scope: CompactionScope,
+        messages: &[Message],
+    ) -> Result<(), LoopError> {
+        let estimated_tokens = ConversationBudget::estimate_tokens(messages);
+        let hard_limit_tokens = self.conversation_budget.conversation_budget();
+        if estimated_tokens > hard_limit_tokens {
+            return Err(context_exceeded_after_compaction_error(
+                scope,
+                estimated_tokens,
+                hard_limit_tokens,
+            ));
+        }
+        Ok(())
+    }
+
     fn append_compacted_summary(
         &self,
         snapshot: &PerceptionSnapshot,
@@ -1500,6 +1899,21 @@ impl LoopEngine {
             &results,
         )?;
         state.all_tool_results.extend(results);
+
+        let compacted = self
+            .compact_if_needed(
+                &state.continuation_messages,
+                CompactionScope::ToolContinuation,
+                round,
+            )
+            .await?;
+        if let Cow::Owned(messages) = compacted {
+            state.continuation_messages = messages;
+        }
+        self.ensure_within_hard_limit(
+            CompactionScope::ToolContinuation,
+            &state.continuation_messages,
+        )?;
 
         if self.cancellation_token_triggered() {
             return Ok(ToolRoundOutcome::Cancelled);
@@ -1796,6 +2210,17 @@ fn sub_goal_result_from_loop(goal: SubGoal, result: LoopResult) -> SubGoalResult
             let message = "sub-goal stopped before completion".to_string();
             failed_sub_goal_result_with_signals(goal, message, signals)
         }
+    }
+}
+
+fn failed_sub_goal_execution(
+    goal: &SubGoal,
+    message: String,
+    budget: BudgetTracker,
+) -> SubGoalExecution {
+    SubGoalExecution {
+        result: failed_sub_goal_result(goal.clone(), message),
+        budget,
     }
 }
 
@@ -2410,14 +2835,7 @@ fn next_perception_from_sub_goal(
 }
 
 fn estimate_tokens(text: &str) -> u64 {
-    if text.trim().is_empty() {
-        return 0;
-    }
-
-    let char_count = text.chars().count();
-    let char_estimate = char_count.div_ceil(4) as u64;
-    let word_estimate = text.split_whitespace().count() as u64;
-    char_estimate.max(word_estimate).max(1)
+    estimate_text_tokens(text) as u64
 }
 
 fn message_to_text(message: &Message) -> String {
@@ -2581,6 +2999,28 @@ fn ensure_non_empty_response_with_flag(text: &str) -> (String, bool) {
     (trimmed.to_string(), false)
 }
 
+fn compaction_failed_error(scope: CompactionScope, error: CompactionError) -> LoopError {
+    loop_error(
+        "compaction",
+        &format!("compaction_failed: scope={scope} error={error}"),
+        true,
+    )
+}
+
+fn context_exceeded_after_compaction_error(
+    scope: CompactionScope,
+    estimated_tokens: usize,
+    hard_limit_tokens: usize,
+) -> LoopError {
+    loop_error(
+        "compaction",
+        &format!(
+            "context_exceeded_after_compaction: scope={scope} estimated_tokens={estimated_tokens} hard_limit_tokens={hard_limit_tokens}",
+        ),
+        true,
+    )
+}
+
 fn loop_error(stage: &str, reason: &str, recoverable: bool) -> LoopError {
     LoopError {
         stage: stage.to_string(),
@@ -2684,13 +3124,18 @@ mod tests {
     }
 
     fn default_engine() -> LoopEngine {
-        LoopEngine::new(
-            BudgetTracker::new(crate::budget::BudgetConfig::default(), 0, 0),
-            ContextCompactor::new(2048, 256),
-            3,
-            Arc::new(TestStubToolExecutor),
-            "Summarize tool output".to_string(),
-        )
+        LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                0,
+                0,
+            ))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(TestStubToolExecutor))
+            .synthesis_instruction("Summarize tool output".to_string())
+            .build()
+            .expect("test engine build")
     }
 
     fn base_snapshot(text: &str) -> PerceptionSnapshot {
@@ -3213,23 +3658,33 @@ mod phase2_tests {
     }
 
     fn test_engine() -> LoopEngine {
-        LoopEngine::new(
-            BudgetTracker::new(crate::budget::BudgetConfig::default(), current_time_ms(), 0),
-            ContextCompactor::new(2048, 256),
-            3,
-            Arc::new(StubToolExecutor),
-            "Summarize tool output".to_string(),
-        )
+        LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                current_time_ms(),
+                0,
+            ))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(StubToolExecutor))
+            .synthesis_instruction("Summarize tool output".to_string())
+            .build()
+            .expect("test engine build")
     }
 
     fn failing_tool_engine() -> LoopEngine {
-        LoopEngine::new(
-            BudgetTracker::new(crate::budget::BudgetConfig::default(), current_time_ms(), 0),
-            ContextCompactor::new(2048, 256),
-            3,
-            Arc::new(FailingToolExecutor),
-            "Summarize tool output".to_string(),
-        )
+        LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                current_time_ms(),
+                0,
+            ))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(FailingToolExecutor))
+            .synthesis_instruction("Summarize tool output".to_string())
+            .build()
+            .expect("test engine build")
     }
 
     fn test_snapshot(text: &str) -> PerceptionSnapshot {
@@ -3584,13 +4039,14 @@ mod phase2_tests {
             max_wall_time_ms: 0,
             max_recursion_depth: 0,
         };
-        let mut engine = LoopEngine::new(
-            BudgetTracker::new(zero_budget, 0, 0),
-            ContextCompactor::new(2048, 256),
-            3,
-            Arc::new(StubToolExecutor),
-            "Summarize tool output".to_string(),
-        );
+        let mut engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(zero_budget, 0, 0))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(StubToolExecutor))
+            .synthesis_instruction("Summarize tool output".to_string())
+            .build()
+            .expect("test engine build");
 
         let llm = SequentialMockLlm::new(vec![CompletionResponse {
             content: vec![ContentBlock::Text {
@@ -3622,13 +4078,14 @@ mod phase2_tests {
             max_wall_time_ms: 0,
             max_recursion_depth: 0,
         };
-        let mut engine = LoopEngine::new(
-            BudgetTracker::new(zero_budget, 0, 0),
-            ContextCompactor::new(2048, 256),
-            3,
-            Arc::new(StubToolExecutor),
-            "Summarize tool output".to_string(),
-        );
+        let mut engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(zero_budget, 0, 0))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(StubToolExecutor))
+            .synthesis_instruction("Summarize tool output".to_string())
+            .build()
+            .expect("test engine build");
 
         let llm = SequentialMockLlm::new(vec![CompletionResponse {
             content: vec![ContentBlock::Text {
@@ -3711,13 +4168,18 @@ mod phase2_tests {
         let clear_calls = Arc::new(AtomicUsize::new(0));
         let stats = crate::act::ToolCacheStats::default();
         let executor = CacheAwareToolExecutor::new(Arc::clone(&clear_calls), stats);
-        let mut engine = LoopEngine::new(
-            BudgetTracker::new(crate::budget::BudgetConfig::default(), 0, 0),
-            ContextCompactor::new(2048, 256),
-            3,
-            Arc::new(executor),
-            "Summarize tool output".to_string(),
-        );
+        let mut engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                0,
+                0,
+            ))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(executor))
+            .synthesis_instruction("Summarize tool output".to_string())
+            .build()
+            .expect("test engine build");
 
         let llm = SequentialMockLlm::new(vec![
             CompletionResponse {
@@ -3760,13 +4222,18 @@ mod phase2_tests {
             evictions: 1,
         };
         let executor = CacheAwareToolExecutor::new(Arc::clone(&clear_calls), stats);
-        let mut engine = LoopEngine::new(
-            BudgetTracker::new(crate::budget::BudgetConfig::default(), 0, 0),
-            ContextCompactor::new(2048, 256),
-            3,
-            Arc::new(executor),
-            "Summarize tool output".to_string(),
-        );
+        let mut engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                0,
+                0,
+            ))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(executor))
+            .synthesis_instruction("Summarize tool output".to_string())
+            .build()
+            .expect("test engine build");
 
         let llm = SequentialMockLlm::new(vec![CompletionResponse {
             content: vec![ContentBlock::Text {
@@ -4581,13 +5048,18 @@ mod phase4_tests {
     }
 
     fn p4_engine() -> LoopEngine {
-        LoopEngine::new(
-            BudgetTracker::new(crate::budget::BudgetConfig::default(), 0, 0),
-            ContextCompactor::new(2048, 256),
-            3,
-            Arc::new(Phase4StubToolExecutor),
-            "Summarize tool output".to_string(),
-        )
+        LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                0,
+                0,
+            ))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(Phase4StubToolExecutor))
+            .synthesis_instruction("Summarize tool output".to_string())
+            .build()
+            .expect("test engine build")
     }
 
     fn p4_snapshot(text: &str) -> PerceptionSnapshot {
@@ -4741,13 +5213,18 @@ mod phase4_tests {
 
     #[tokio::test]
     async fn act_with_tools_falls_back_to_synthesis_on_max_iterations() {
-        let mut engine = LoopEngine::new(
-            BudgetTracker::new(crate::budget::BudgetConfig::default(), 0, 0),
-            ContextCompactor::new(2048, 256),
-            1,
-            Arc::new(Phase4StubToolExecutor),
-            "Summarize tool output".to_string(),
-        );
+        let mut engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                0,
+                0,
+            ))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(1)
+            .tool_executor(Arc::new(Phase4StubToolExecutor))
+            .synthesis_instruction("Summarize tool output".to_string())
+            .build()
+            .expect("test engine build");
         let decision = Decision::UseTools(vec![read_file_call("call-1", "a.txt")]);
         let llm = Phase4MockLlm::new(vec![tool_use_response(vec![read_file_call(
             "call-2", "b.txt",
@@ -5293,13 +5770,18 @@ mod cancellation_tests {
     }
 
     fn engine_with_executor(executor: Arc<dyn ToolExecutor>, max_iterations: u32) -> LoopEngine {
-        LoopEngine::new(
-            BudgetTracker::new(crate::budget::BudgetConfig::default(), 0, 0),
-            ContextCompactor::new(2048, 256),
-            max_iterations,
-            executor,
-            "Summarize tool output".to_string(),
-        )
+        LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                0,
+                0,
+            ))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(max_iterations)
+            .tool_executor(executor)
+            .synthesis_instruction("Summarize tool output".to_string())
+            .build()
+            .expect("test engine build")
     }
 
     fn test_snapshot(text: &str) -> PerceptionSnapshot {
@@ -5613,13 +6095,18 @@ mod fallback_retry_tests {
     }
 
     fn test_engine() -> LoopEngine {
-        LoopEngine::new(
-            BudgetTracker::new(crate::budget::BudgetConfig::default(), 0, 0),
-            ContextCompactor::new(2048, 256),
-            3,
-            Arc::new(StubToolExecutor),
-            "Summarize tool output".to_string(),
-        )
+        LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                0,
+                0,
+            ))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(StubToolExecutor))
+            .synthesis_instruction("Summarize tool output".to_string())
+            .build()
+            .expect("test engine build")
     }
 
     fn test_snapshot(text: &str) -> PerceptionSnapshot {
@@ -5818,13 +6305,18 @@ mod fallback_retry_tests {
 
     #[tokio::test]
     async fn run_cycle_exhausts_iterations_on_repeated_fallback() {
-        let mut engine = LoopEngine::new(
-            BudgetTracker::new(crate::budget::BudgetConfig::default(), 0, 0),
-            ContextCompactor::new(2048, 256),
-            2,
-            Arc::new(StubToolExecutor),
-            "Summarize".to_string(),
-        );
+        let mut engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                0,
+                0,
+            ))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(2)
+            .tool_executor(Arc::new(StubToolExecutor))
+            .synthesis_instruction("Summarize".to_string())
+            .build()
+            .expect("test engine build");
 
         // Both iterations return empty -> fallback each time
         let llm = SequentialMockLlm::new(vec![
@@ -5956,13 +6448,14 @@ mod decomposition_tests {
 
     fn decomposition_engine(config: BudgetConfig, depth: u32) -> LoopEngine {
         let started_at_ms = current_time_ms();
-        LoopEngine::new(
-            BudgetTracker::new(config, started_at_ms, depth),
-            ContextCompactor::new(2048, 256),
-            4,
-            Arc::new(PassiveToolExecutor),
-            "Summarize tool output".to_string(),
-        )
+        LoopEngine::builder()
+            .budget(BudgetTracker::new(config, started_at_ms, depth))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(4)
+            .tool_executor(Arc::new(PassiveToolExecutor))
+            .synthesis_instruction("Summarize tool output".to_string())
+            .build()
+            .expect("test engine build")
     }
 
     fn decomposition_plan(descriptions: &[&str]) -> DecompositionPlan {
@@ -6930,5 +7423,915 @@ mod decomposition_tests {
         let results = engine.execute_sub_goals_concurrent(&plan, &llm, &[]).await;
 
         assert!(results.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod context_compaction_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use fx_core::error::LlmError as CoreLlmError;
+    use fx_core::types::{InputSource, ScreenState, UserInput};
+    use fx_llm::{
+        CompletionRequest, CompletionResponse, ContentBlock, Message, ProviderError, ToolCall,
+        ToolDefinition,
+    };
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::Subscriber;
+    use tracing_subscriber::filter::LevelFilter;
+    use tracing_subscriber::layer::{Context, Layer};
+    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::Registry;
+
+    fn words(count: usize) -> String {
+        std::iter::repeat_n("a", count)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn text_response(text: &str) -> CompletionResponse {
+        CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        }
+    }
+
+    fn read_call(id: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path":"/tmp/demo"}),
+        }
+    }
+
+    const COMPACTED_CONTEXT_SUMMARY_PREFIX: &str = "Compacted context summary:";
+
+    fn has_compaction_marker(messages: &[Message]) -> bool {
+        messages.iter().any(|message| {
+            message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::Text { text } if text.starts_with("[context compacted:")
+                )
+            })
+        })
+    }
+
+    fn has_conversation_summary_marker(messages: &[Message]) -> bool {
+        messages.iter().any(|message| {
+            message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::Text { text } if text.starts_with("[context summary]")
+                )
+            })
+        })
+    }
+
+    fn summary_message_index(messages: &[Message]) -> Option<usize> {
+        messages.iter().position(|message| {
+            message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::Text { text }
+                        if text.starts_with(COMPACTED_CONTEXT_SUMMARY_PREFIX)
+                )
+            })
+        })
+    }
+
+    fn marker_message_index(messages: &[Message]) -> Option<usize> {
+        messages.iter().position(|message| {
+            message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::Text { text } if text.starts_with("[context compacted:")
+                )
+            })
+        })
+    }
+
+    fn large_history(count: usize, words_per_message: usize) -> Vec<Message> {
+        (0..count)
+            .map(|index| {
+                if index % 2 == 0 {
+                    Message::user(format!(
+                        "u{index} {}",
+                        words(words_per_message.saturating_sub(1))
+                    ))
+                } else {
+                    Message::assistant(format!(
+                        "a{index} {}",
+                        words(words_per_message.saturating_sub(1))
+                    ))
+                }
+            })
+            .collect()
+    }
+
+    fn snapshot_with_history(history: Vec<Message>, user_text: &str) -> PerceptionSnapshot {
+        PerceptionSnapshot {
+            timestamp_ms: 10,
+            screen: ScreenState {
+                current_app: "terminal".to_string(),
+                elements: Vec::new(),
+                text_content: user_text.to_string(),
+            },
+            notifications: Vec::new(),
+            active_app: "terminal".to_string(),
+            user_input: Some(UserInput {
+                text: user_text.to_string(),
+                source: InputSource::Text,
+                timestamp: 10,
+                context_id: None,
+            }),
+            sensor_data: None,
+            conversation_history: history,
+        }
+    }
+
+    fn compaction_config() -> CompactionConfig {
+        CompactionConfig {
+            compaction_threshold: 0.2,
+            preserve_recent_turns: 2,
+            model_context_limit: 5_000,
+            reserved_system_tokens: 0,
+            recompact_cooldown_turns: 3,
+            use_summarization: false,
+            max_summary_tokens: 512,
+        }
+    }
+
+    fn engine_with(
+        context: ContextCompactor,
+        tool_executor: Arc<dyn ToolExecutor>,
+        config: CompactionConfig,
+    ) -> LoopEngine {
+        LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                current_time_ms(),
+                0,
+            ))
+            .context(context)
+            .max_iterations(4)
+            .tool_executor(tool_executor)
+            .synthesis_instruction("synthesize".to_string())
+            .compaction_config(config)
+            .build()
+            .expect("test engine build")
+    }
+
+    #[test]
+    fn compaction_scope_display_uses_scope_label() {
+        assert_eq!(CompactionScope::Perceive.to_string(), "perceive");
+        assert_eq!(
+            CompactionScope::ToolContinuation.to_string(),
+            "tool_continuation"
+        );
+        assert_eq!(
+            CompactionScope::DecomposeChild.to_string(),
+            "decompose_child"
+        );
+    }
+
+    #[test]
+    fn builder_missing_required_field_returns_error() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let error = LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                current_time_ms(),
+                0,
+            ))
+            .context(ContextCompactor::new(2_048, 256))
+            .max_iterations(4)
+            .tool_executor(executor)
+            .build()
+            .expect_err("missing synthesis instruction should fail");
+
+        assert_eq!(error.stage, "init");
+        assert_eq!(
+            error.reason,
+            "missing_required_field: synthesis_instruction"
+        );
+    }
+
+    #[test]
+    fn builder_with_no_fields_returns_error() {
+        let error = LoopEngine::builder().build().expect_err("should fail");
+        assert_eq!(error.stage, "init");
+    }
+
+    #[test]
+    fn builder_memory_context_whitespace_normalizes_to_none() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                current_time_ms(),
+                0,
+            ))
+            .context(ContextCompactor::new(2_048, 256))
+            .max_iterations(4)
+            .tool_executor(executor)
+            .synthesis_instruction("synthesize".to_string())
+            .memory_context("   ".to_string())
+            .build()
+            .expect("test engine build");
+
+        assert!(engine.memory_context.is_none());
+    }
+
+    #[test]
+    fn builder_default_optionals() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                current_time_ms(),
+                0,
+            ))
+            .context(ContextCompactor::new(2_048, 256))
+            .max_iterations(4)
+            .tool_executor(executor)
+            .synthesis_instruction("synthesize".to_string())
+            .build()
+            .expect("test engine build");
+
+        let defaults = CompactionConfig::default();
+        assert!(engine.memory_context.is_none());
+        assert!(engine.cancel_token.is_none());
+        assert!(engine.input_channel.is_none());
+        assert!(engine.event_bus.is_none());
+        assert_eq!(
+            engine.compaction_config.compaction_threshold,
+            defaults.compaction_threshold
+        );
+        assert_eq!(
+            engine.compaction_config.preserve_recent_turns,
+            defaults.preserve_recent_turns
+        );
+        assert_eq!(
+            engine.conversation_budget.conversation_budget(),
+            defaults.model_context_limit
+                - defaults.reserved_system_tokens
+                - ConversationBudget::DEFAULT_OUTPUT_RESERVE_TOKENS
+        );
+    }
+
+    #[test]
+    fn builder_full_config() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let config = CompactionConfig {
+            compaction_threshold: 0.3,
+            preserve_recent_turns: 3,
+            model_context_limit: 5_200,
+            reserved_system_tokens: 100,
+            recompact_cooldown_turns: 4,
+            use_summarization: true,
+            max_summary_tokens: 256,
+        };
+        let llm: Arc<dyn LlmProvider> = Arc::new(RecordingLlm::new(Vec::new()));
+        let cancel_token = CancellationToken::new();
+        let event_bus = fx_core::EventBus::new(16);
+        let (_, input_channel) = crate::input::loop_input_channel();
+
+        let engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                current_time_ms(),
+                0,
+            ))
+            .context(ContextCompactor::new(2_048, 256))
+            .max_iterations(4)
+            .tool_executor(executor)
+            .synthesis_instruction("synthesize".to_string())
+            .compaction_config(config.clone())
+            .compaction_llm(llm)
+            .event_bus(event_bus)
+            .cancel_token(cancel_token)
+            .input_channel(input_channel)
+            .memory_context("remember this".to_string())
+            .build()
+            .expect("test engine build");
+
+        assert_eq!(engine.compaction_config.preserve_recent_turns, 3);
+        assert_eq!(engine.memory_context.as_deref(), Some("remember this"));
+        assert!(engine.cancel_token.is_some());
+        assert!(engine.input_channel.is_some());
+        assert!(engine.event_bus.is_some());
+        assert_eq!(
+            engine.conversation_budget.conversation_budget(),
+            config.model_context_limit
+                - config.reserved_system_tokens
+                - ConversationBudget::DEFAULT_OUTPUT_RESERVE_TOKENS
+        );
+    }
+
+    #[test]
+    fn builder_validates_compaction_config() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let mut config = CompactionConfig::default();
+        config.recompact_cooldown_turns = 0;
+
+        let error = LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                current_time_ms(),
+                0,
+            ))
+            .context(ContextCompactor::new(2_048, 256))
+            .max_iterations(4)
+            .tool_executor(executor)
+            .synthesis_instruction("synthesize".to_string())
+            .compaction_config(config)
+            .build()
+            .expect_err("invalid config should fail");
+
+        assert_eq!(error.stage, "init");
+        assert!(error.reason.contains("invalid_compaction_config"));
+    }
+
+    #[test]
+    fn build_compaction_components_default_to_valid_budget_and_strategy() {
+        let (config, budget, _strategy) =
+            build_compaction_components(None, None).expect("components should build");
+        let defaults = CompactionConfig::default();
+
+        assert_eq!(config.compaction_threshold, defaults.compaction_threshold);
+        assert_eq!(config.preserve_recent_turns, defaults.preserve_recent_turns);
+        assert_eq!(
+            budget.conversation_budget(),
+            defaults.model_context_limit
+                - defaults.reserved_system_tokens
+                - ConversationBudget::DEFAULT_OUTPUT_RESERVE_TOKENS
+        );
+    }
+
+    #[test]
+    fn build_compaction_components_reject_invalid_config() {
+        let mut config = CompactionConfig::default();
+        config.recompact_cooldown_turns = 0;
+
+        let error =
+            build_compaction_components(Some(config), None).expect_err("invalid config rejected");
+        assert_eq!(error.stage, "init");
+        assert!(error.reason.contains("invalid_compaction_config"));
+    }
+
+    #[derive(Debug)]
+    struct RecordingLlm {
+        responses: Mutex<VecDeque<Result<CompletionResponse, ProviderError>>>,
+        requests: Mutex<Vec<CompletionRequest>>,
+        generated_summary: String,
+    }
+
+    impl RecordingLlm {
+        fn new(responses: Vec<Result<CompletionResponse, ProviderError>>) -> Self {
+            Self::with_generated_summary(responses, "summary".to_string())
+        }
+
+        fn with_generated_summary(
+            responses: Vec<Result<CompletionResponse, ProviderError>>,
+            generated_summary: String,
+        ) -> Self {
+            Self {
+                responses: Mutex::new(VecDeque::from(responses)),
+                requests: Mutex::new(Vec::new()),
+                generated_summary,
+            }
+        }
+
+        fn requests(&self) -> Vec<CompletionRequest> {
+            self.requests.lock().expect("requests lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for RecordingLlm {
+        async fn generate(&self, _: &str, _: u32) -> Result<String, CoreLlmError> {
+            Ok(self.generated_summary.clone())
+        }
+
+        async fn generate_streaming(
+            &self,
+            _: &str,
+            _: u32,
+            callback: Box<dyn Fn(String) + Send + 'static>,
+        ) -> Result<String, CoreLlmError> {
+            callback(self.generated_summary.clone());
+            Ok(self.generated_summary.clone())
+        }
+
+        fn model_name(&self) -> &str {
+            "mock"
+        }
+
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            self.requests.lock().expect("requests lock").push(request);
+            self.responses
+                .lock()
+                .expect("response lock")
+                .pop_front()
+                .unwrap_or_else(|| Ok(text_response("ok")))
+        }
+    }
+
+    #[derive(Debug)]
+    struct SizedToolExecutor {
+        output_words: usize,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for SizedToolExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+            Ok(calls
+                .iter()
+                .map(|call| ToolResult {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    success: true,
+                    output: words(self.output_words),
+                })
+                .collect())
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition {
+                name: "read_file".to_string(),
+                description: "read file".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+            }]
+        }
+    }
+
+    #[tokio::test]
+    async fn long_conversation_triggers_compaction_in_perceive() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let mut engine = engine_with(
+            ContextCompactor::new(2_048, 256),
+            executor,
+            compaction_config(),
+        );
+        let snapshot = snapshot_with_history(large_history(14, 70), "latest user request");
+
+        let processed = engine.perceive(&snapshot).await.expect("perceive");
+
+        assert!(has_compaction_marker(&processed.context_window));
+        assert!(processed.context_window.len() < snapshot.conversation_history.len() + 1);
+    }
+
+    #[tokio::test]
+    async fn tool_rounds_compact_continuation_messages() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 120 });
+        let mut engine = engine_with(
+            ContextCompactor::new(2_048, 256),
+            executor,
+            compaction_config(),
+        );
+        let llm = RecordingLlm::new(vec![Ok(text_response("done"))]);
+        let calls = vec![read_call("call-1")];
+        let mut state = ToolRoundState::new(&calls, &large_history(12, 70));
+
+        let _ = engine
+            .execute_tool_round(1, &llm, &mut state)
+            .await
+            .expect("tool round");
+
+        assert!(has_compaction_marker(&state.continuation_messages));
+    }
+
+    #[tokio::test]
+    async fn decompose_child_receives_compacted_context() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let engine = engine_with(
+            ContextCompactor::new(2_048, 256),
+            executor,
+            compaction_config(),
+        );
+        let llm = RecordingLlm::new(vec![Ok(text_response("child done"))]);
+        let goal = SubGoal {
+            description: "child task".to_string(),
+            required_tools: Vec::new(),
+            expected_output: None,
+        };
+
+        let _execution = engine
+            .run_sub_goal(&goal, 0.5, &llm, &large_history(10, 60))
+            .await;
+
+        let requests = llm.requests();
+        assert!(!requests.is_empty());
+        assert!(has_compaction_marker(&requests[0].messages));
+    }
+
+    #[tokio::test]
+    async fn run_sub_goal_fails_when_compacted_context_stays_over_hard_limit() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let mut config = compaction_config();
+        config.preserve_recent_turns = 4;
+        let engine = engine_with(ContextCompactor::new(2_048, 256), executor, config);
+        let llm = RecordingLlm::new(Vec::new());
+        let goal = SubGoal {
+            description: "child task".to_string(),
+            required_tools: Vec::new(),
+            expected_output: None,
+        };
+        let protected = vec![
+            Message::user(words(260)),
+            Message::assistant(words(260)),
+            Message::user(words(260)),
+            Message::assistant(words(260)),
+        ];
+
+        let execution = engine.run_sub_goal(&goal, 0.5, &llm, &protected).await;
+        let SubGoalOutcome::Failed(message) = &execution.result.outcome else {
+            panic!("expected failed sub-goal outcome")
+        };
+
+        assert!(message.starts_with("context_exceeded_after_compaction:"));
+        assert!(llm.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn perceive_orders_compaction_before_reasoning_summary() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let mut config = compaction_config();
+        config.model_context_limit = 5_600;
+        let mut engine = engine_with(ContextCompactor::new(1, 2_500), executor, config);
+        let user_text = format!("need order check {}", words(500));
+        let snapshot = snapshot_with_history(large_history(12, 70), &user_text);
+
+        let synthetic = engine.synthetic_context(&snapshot, &user_text);
+        assert!(engine.context.needs_compaction(&synthetic));
+
+        let processed = engine.perceive(&snapshot).await.expect("perceive");
+
+        let marker = marker_message_index(&processed.context_window).expect("marker index");
+        let summary = summary_message_index(&processed.context_window)
+            .expect("expected compacted context summary in context window");
+        assert!(marker < summary);
+    }
+
+    #[tokio::test]
+    async fn cooldown_skips_compaction_when_within_window() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let engine = engine_with(
+            ContextCompactor::new(2_048, 256),
+            executor,
+            compaction_config(),
+        );
+        let messages = large_history(12, 60);
+
+        let first = engine
+            .compact_if_needed(&messages, CompactionScope::Perceive, 10)
+            .await
+            .expect("first compaction");
+        assert!(has_compaction_marker(first.as_ref()));
+
+        let second_input = large_history(12, 60);
+        let second = engine
+            .compact_if_needed(&second_input, CompactionScope::Perceive, 11)
+            .await
+            .expect("second compaction");
+
+        assert_eq!(second.as_ref(), second_input.as_slice());
+    }
+
+    #[tokio::test]
+    async fn cooldown_allows_compaction_after_window_elapsed() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let engine = engine_with(
+            ContextCompactor::new(2_048, 256),
+            executor,
+            compaction_config(),
+        );
+        let messages = large_history(12, 60);
+
+        let _ = engine
+            .compact_if_needed(&messages, CompactionScope::Perceive, 10)
+            .await
+            .expect("first compaction");
+
+        let second = engine
+            .compact_if_needed(&messages, CompactionScope::Perceive, 13)
+            .await
+            .expect("second compaction");
+
+        assert!(has_compaction_marker(second.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn cooldown_bypasses_when_hard_limit_exceeded() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let engine = engine_with(
+            ContextCompactor::new(2_048, 256),
+            executor,
+            compaction_config(),
+        );
+
+        let _ = engine
+            .compact_if_needed(&large_history(10, 60), CompactionScope::Perceive, 10)
+            .await
+            .expect("first compaction");
+
+        let oversized = large_history(16, 80);
+        let second = engine
+            .compact_if_needed(&oversized, CompactionScope::Perceive, 11)
+            .await
+            .expect("bypass compaction");
+
+        assert_ne!(second.as_ref(), oversized.as_slice());
+    }
+
+    #[tokio::test]
+    async fn summary_exceeded_target_falls_back_to_sliding_compactor() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let mut config = compaction_config();
+        config.use_summarization = true;
+        let llm: Arc<dyn LlmProvider> = Arc::new(RecordingLlm::with_generated_summary(
+            Vec::new(),
+            words(2_000),
+        ));
+
+        let engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                current_time_ms(),
+                0,
+            ))
+            .context(ContextCompactor::new(2_048, 256))
+            .max_iterations(4)
+            .tool_executor(executor)
+            .synthesis_instruction("synthesize".to_string())
+            .compaction_config(config)
+            .compaction_llm(llm)
+            .build()
+            .expect("test engine build");
+
+        let history = large_history(12, 70);
+        let compacted = engine
+            .compact_if_needed(&history, CompactionScope::Perceive, 1)
+            .await
+            .expect("compaction should fall back to sliding window");
+
+        assert!(has_compaction_marker(compacted.as_ref()));
+        assert!(!has_conversation_summary_marker(compacted.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn all_messages_protected_over_hard_limit_returns_context_exceeded() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let mut config = compaction_config();
+        config.preserve_recent_turns = 4;
+        let engine = engine_with(ContextCompactor::new(2_048, 256), executor, config);
+        let protected = vec![
+            Message::user(words(260)),
+            Message::assistant(words(260)),
+            Message::user(words(260)),
+            Message::assistant(words(260)),
+        ];
+
+        let error = engine
+            .compact_if_needed(&protected, CompactionScope::Perceive, 2)
+            .await
+            .expect_err("context exceeded error");
+
+        assert_eq!(error.stage, "compaction");
+        assert!(error
+            .reason
+            .starts_with("context_exceeded_after_compaction:"));
+    }
+
+    #[tokio::test]
+    async fn compaction_preserves_session_coherence() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let mut config = compaction_config();
+        config.preserve_recent_turns = 4;
+        let engine = engine_with(ContextCompactor::new(2_048, 256), executor, config);
+
+        let mut messages = vec![Message::system("system policy")];
+        messages.extend(large_history(12, 60));
+        let compacted = engine
+            .compact_if_needed(&messages, CompactionScope::Perceive, 3)
+            .await
+            .expect("compact");
+
+        assert_eq!(compacted[0].role, MessageRole::System);
+        assert!(has_compaction_marker(compacted.as_ref()));
+        assert_eq!(
+            &compacted[compacted.len() - 4..],
+            &messages[messages.len() - 4..]
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_coexists_with_existing_context_compactor() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let mut config = compaction_config();
+        config.model_context_limit = 5_600;
+        let mut engine = engine_with(ContextCompactor::new(1, 2_500), executor, config);
+        let user_text = format!("coexistence check {}", words(500));
+        let snapshot = snapshot_with_history(large_history(12, 70), &user_text);
+
+        let synthetic = engine.synthetic_context(&snapshot, &user_text);
+        assert!(engine.context.needs_compaction(&synthetic));
+
+        let processed = engine.perceive(&snapshot).await.expect("perceive");
+
+        assert!(has_compaction_marker(&processed.context_window));
+        let marker =
+            marker_message_index(&processed.context_window).expect("expected compaction marker");
+        let summary = summary_message_index(&processed.context_window)
+            .expect("expected compacted context summary in context window");
+        assert!(marker < summary);
+    }
+
+    #[tokio::test]
+    async fn compaction_with_all_protected_messages() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let mut config = compaction_config();
+        config.preserve_recent_turns = 4;
+        let engine = engine_with(ContextCompactor::new(2_048, 256), executor, config);
+
+        let protected_under_limit = vec![
+            Message::user(words(60)),
+            Message::assistant(words(60)),
+            Message::user(words(60)),
+            Message::assistant(words(60)),
+        ];
+
+        let result = engine
+            .compact_if_needed(&protected_under_limit, CompactionScope::Perceive, 1)
+            .await
+            .expect("under hard limit keeps original");
+        assert_eq!(result.as_ref(), protected_under_limit.as_slice());
+
+        let protected_over_limit = vec![
+            Message::user(words(260)),
+            Message::assistant(words(260)),
+            Message::user(words(260)),
+            Message::assistant(words(260)),
+        ];
+        let error = engine
+            .compact_if_needed(&protected_over_limit, CompactionScope::Perceive, 2)
+            .await
+            .expect_err("over hard limit errors");
+        assert!(error
+            .reason
+            .starts_with("context_exceeded_after_compaction:"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_decompose_children_each_compact_independently() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let mut config = compaction_config();
+        config.recompact_cooldown_turns = 1;
+        let mut engine = engine_with(ContextCompactor::new(2_048, 256), executor, config);
+        let plan = DecompositionPlan {
+            sub_goals: vec![
+                SubGoal {
+                    description: "child-a".to_string(),
+                    required_tools: Vec::new(),
+                    expected_output: None,
+                },
+                SubGoal {
+                    description: "child-b".to_string(),
+                    required_tools: Vec::new(),
+                    expected_output: None,
+                },
+            ],
+            strategy: AggregationStrategy::Parallel,
+            truncated_from: None,
+        };
+        let llm = RecordingLlm::new(vec![Ok(text_response("a")), Ok(text_response("b"))]);
+
+        let results = engine
+            .execute_sub_goals_concurrent(&plan, &llm, &large_history(12, 60))
+            .await;
+
+        assert_eq!(results.len(), 2);
+
+        let requests = llm.requests();
+        let compacted_requests = requests
+            .iter()
+            .filter(|request| has_compaction_marker(&request.messages))
+            .count();
+        assert!(compacted_requests >= 2);
+    }
+
+    #[derive(Default)]
+    struct EventFields {
+        values: HashMap<String, String>,
+    }
+
+    impl Visit for EventFields {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.values
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.values
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.values
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_i64(&mut self, field: &Field, value: i64) {
+            self.values
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_bool(&mut self, field: &Field, value: bool) {
+            self.values
+                .insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    #[derive(Default)]
+    struct CaptureLayer {
+        events: Arc<Mutex<Vec<HashMap<String, String>>>>,
+    }
+
+    impl<S> Layer<S> for CaptureLayer
+    where
+        S: Subscriber,
+    {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            let mut fields = EventFields::default();
+            event.record(&mut fields);
+            self.events.lock().expect("events lock").push(fields.values);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn compaction_emits_observability_fields() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let engine = engine_with(
+            ContextCompactor::new(2_048, 256),
+            executor,
+            compaction_config(),
+        );
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = Registry::default()
+            .with(LevelFilter::TRACE)
+            .with(CaptureLayer {
+                events: Arc::clone(&events),
+            });
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let history = large_history(12, 70);
+        let compacted = engine
+            .compact_if_needed(&history, CompactionScope::Perceive, 1)
+            .await
+            .expect("compaction should succeed");
+        assert!(has_compaction_marker(compacted.as_ref()));
+
+        let captured = events.lock().expect("events lock").clone();
+        assert!(
+            !captured.is_empty(),
+            "expected tracing events to be captured"
+        );
+
+        let info_event = captured.iter().find(|event| {
+            event.contains_key("before_tokens")
+                && event.contains_key("after_tokens")
+                && event.contains_key("messages_removed")
+        });
+
+        let info_event = info_event
+            .unwrap_or_else(|| panic!("compaction info event missing; captured={captured:?}"));
+        for key in [
+            "scope",
+            "strategy",
+            "before_tokens",
+            "after_tokens",
+            "target_tokens",
+            "tokens_saved",
+            "messages_removed",
+        ] {
+            assert!(
+                info_event.contains_key(key),
+                "missing observability field: {key}"
+            );
+        }
     }
 }
