@@ -17,6 +17,7 @@ members = [
     "engine/crates/fx-cli",
     "engine/crates/fx-conversation",
     "engine/crates/fx-memory",
+    "engine/crates/fx-improve",
     "engine/crates/fx-transactions",
     "engine/crates/llama-cpp-sys",
 ]
@@ -86,3 +87,4 @@ fx-tools = { path = "engine/crates/fx-tools" }
 fx-transactions = { path = "engine/crates/fx-transactions" }
 fx-analysis = { path = "engine/crates/fx-analysis" }
 fx-memory = { path = "engine/crates/fx-memory" }
+fx-improve = { path = "engine/crates/fx-improve" }

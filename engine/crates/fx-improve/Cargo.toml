@@ -1,0 +1,24 @@
+[package]
+name = "fx-improve"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Self-improvement pipeline: signals → analysis → plans → proposals."
+
+[dependencies]
+fx-analysis.workspace = true
+fx-core.workspace = true
+fx-llm = { path = "../fx-llm" }
+fx-memory.workspace = true
+fx-propose.workspace = true
+ring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+tempfile = "3.14"
+tokio.workspace = true
