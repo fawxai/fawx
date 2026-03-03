@@ -85,8 +85,13 @@ const CANCELLED_INPUT_MESSAGE: &str = "input cancelled";
 type SharedMemoryStore = Arc<Mutex<dyn MemoryStore>>;
 
 const DEFAULT_ANTHROPIC_MODELS: &[&str] = &[
-    "claude-sonnet-4-20250514",
+    "claude-opus-4-6",
+    "claude-sonnet-4-6",
+    "claude-opus-4-5-20251101",
+    "claude-sonnet-4-5-20250929",
+    "claude-haiku-4-5-20251001",
     "claude-opus-4-20250514",
+    "claude-sonnet-4-20250514",
     "claude-3-7-sonnet-latest",
 ];
 const DEFAULT_OPENAI_MODELS: &[&str] = &["gpt-4.1", "gpt-4o", "gpt-4o-mini"];
@@ -771,12 +776,13 @@ impl TuiApp {
             runtime_info,
             completer_model_ids: Arc::new(Mutex::new(Vec::new())),
         };
-        app.select_first_available_model();
+        app.select_first_available_model_without_refresh();
         Ok(app)
     }
 
     /// Run the TUI main loop.
     pub async fn run(&mut self) -> Result<(), TuiError> {
+        self.select_first_available_model().await;
         self.show_welcome();
 
         // Ctrl+C signals cancellation instead of killing the process.
@@ -992,7 +998,7 @@ impl TuiApp {
 
         let preferred_models = self.get_models_for_provider(preferred_provider).await;
         self.refresh_router_models().await?;
-        self.set_preferred_model(&preferred_models);
+        self.set_preferred_model(&preferred_models).await;
         self.print_active_model();
 
         Ok(())
@@ -1145,30 +1151,19 @@ impl TuiApp {
         }
 
         if self.router.active_model().is_none() {
-            self.refresh_router_models().await?;
-            self.select_first_available_model();
+            self.select_first_available_model().await;
         }
 
         Ok(())
     }
 
-    fn set_active_model_from_selector(&mut self, selector: &str) -> Result<String, RouterError> {
-        match self.router.set_active(selector) {
-            Ok(()) => {}
-            Err(error @ RouterError::ModelNotFound(_)) => {
-                let model_ids = self
-                    .router
-                    .available_models()
-                    .into_iter()
-                    .map(|model| model.model_id)
-                    .collect::<Vec<_>>();
-                let Some(alias_target) = resolve_model_alias(selector, &model_ids) else {
-                    return Err(error);
-                };
-                self.router.set_active(&alias_target)?;
-            }
-            Err(error) => return Err(error),
-        }
+    // Sync counterpart of `set_active_model_with_refresh` for use in non-async contexts
+    // (constructor, tests). See async version for the authoritative startup path.
+    /// Set the active model by exact match only — no alias resolution, no API refresh.
+    /// Used as the first step in the layered matching strategy:
+    /// exact → from_selector (with alias) → with_refresh.
+    fn set_active_model_exact(&mut self, selector: &str) -> Result<String, RouterError> {
+        self.router.set_active(selector)?;
 
         let resolved = self
             .router
@@ -1179,18 +1174,53 @@ impl TuiApp {
         Ok(resolved)
     }
 
+    // Sync counterpart of `set_active_model_with_refresh` for use in non-async contexts
+    // (constructor, tests). See async version for the authoritative startup path.
+    fn set_active_model_from_selector(&mut self, selector: &str) -> Result<String, RouterError> {
+        match self.set_active_model_exact(selector) {
+            Ok(model) => Ok(model),
+            Err(error @ RouterError::ModelNotFound(_)) => {
+                let model_ids = self
+                    .router
+                    .available_models()
+                    .into_iter()
+                    .map(|model| model.model_id)
+                    .collect::<Vec<_>>();
+                let Some(alias_target) = resolve_model_alias(selector, &model_ids) else {
+                    return Err(error);
+                };
+                self.set_active_model_exact(&alias_target)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     async fn set_active_model_with_refresh(
         &mut self,
         selector: &str,
     ) -> Result<String, RouterError> {
-        match self.set_active_model_from_selector(selector) {
+        match self.set_active_model_exact(selector) {
             Ok(model) => Ok(model),
-            Err(initial_error) => {
-                if self.refresh_router_models().await.is_err() {
-                    return Err(initial_error);
+            Err(initial_error @ RouterError::ModelNotFound(_)) => {
+                if !self.auth_manager.has_any() {
+                    return self
+                        .set_active_model_from_selector(selector)
+                        .or(Err(initial_error));
                 }
-                self.set_active_model_from_selector(selector)
+
+                if self.refresh_router_models().await.is_err() {
+                    return self
+                        .set_active_model_from_selector(selector)
+                        .or(Err(initial_error));
+                }
+
+                // After a successful refresh, propagate the fresh error (more informative
+                // than the stale initial_error). When refresh fails or auth is missing,
+                // fall back to initial_error since no new information is available.
+                self.set_active_model_exact(selector)
+                    .or_else(|_| self.set_active_model_from_selector(selector))
             }
+            Err(error) => Err(error),
         }
     }
 
@@ -1549,7 +1579,9 @@ impl TuiApp {
         }
     }
 
-    fn select_first_available_model(&mut self) {
+    // Sync counterpart of `select_first_available_model` for use in non-async contexts
+    // (constructor, tests). See async version for the authoritative startup path.
+    fn select_first_available_model_without_refresh(&mut self) {
         if let Some(saved) = self.config.model.default_model.clone() {
             if self.set_active_model_from_selector(&saved).is_ok() {
                 return;
@@ -1562,31 +1594,65 @@ impl TuiApp {
             return;
         }
 
-        let model_ids = self
-            .router
-            .available_models()
-            .into_iter()
-            .map(|model| model.model_id)
-            .collect::<Vec<_>>();
+        self.set_preferred_default_model_without_refresh();
+        self.sync_runtime_info_model();
+    }
+
+    async fn select_first_available_model(&mut self) {
+        if let Some(saved) = self.config.model.default_model.clone() {
+            if self.set_active_model_with_refresh(&saved).await.is_ok() {
+                return;
+            }
+            eprintln!("Saved model '{saved}' no longer available, selecting default");
+        }
+
+        if self.router.active_model().is_some() {
+            self.sync_runtime_info_model();
+            return;
+        }
+
+        self.set_preferred_default_model().await;
+        self.sync_runtime_info_model();
+    }
+
+    // Sync counterpart of `set_preferred_default_model` for use in non-async contexts
+    // (constructor, tests). See async version for the authoritative startup path.
+    fn set_preferred_default_model_without_refresh(&mut self) {
+        let model_ids = self.available_model_ids();
 
         if let Some(model) = preferred_default_model(&model_ids) {
             if let Err(error) = self.set_active_model_from_selector(model) {
                 eprintln!("failed to set initial model {model}: {error}");
             }
         }
-
-        // Sync even if no model matched — clear stale state
-        self.sync_runtime_info_model();
     }
 
-    fn set_preferred_model(&mut self, candidates: &[String]) {
+    async fn set_preferred_default_model(&mut self) {
+        let model_ids = self.available_model_ids();
+
+        if let Some(model) = preferred_default_model(&model_ids) {
+            if let Err(error) = self.set_active_model_with_refresh(model).await {
+                eprintln!("failed to set initial model {model}: {error}");
+            }
+        }
+    }
+
+    fn available_model_ids(&self) -> Vec<String> {
+        self.router
+            .available_models()
+            .into_iter()
+            .map(|model| model.model_id)
+            .collect()
+    }
+
+    async fn set_preferred_model(&mut self, candidates: &[String]) {
         for candidate in candidates {
-            if self.set_active_model_from_selector(candidate).is_ok() {
+            if self.set_active_model_with_refresh(candidate).await.is_ok() {
                 return;
             }
         }
 
-        self.select_first_available_model();
+        self.select_first_available_model().await;
     }
 
     async fn get_models_for_provider(&mut self, provider: &str) -> Vec<String> {
@@ -4297,6 +4363,21 @@ mod tests {
         auth_manager
     }
 
+    fn openai_oauth_auth_manager() -> AuthManager {
+        let mut auth_manager = AuthManager::new();
+        auth_manager.store(
+            "openai",
+            AuthMethod::OAuth {
+                provider: "openai".to_string(),
+                access_token: "oauth-access-token".to_string(),
+                refresh_token: "oauth-refresh-token".to_string(),
+                expires_at: 1_700_000_000_000,
+                account_id: Some("acct_model_refresh".to_string()),
+            },
+        );
+        auth_manager
+    }
+
     fn app_with_two_models() -> TuiApp {
         let mut router = ModelRouter::new();
         router.register_provider_with_auth(
@@ -5477,6 +5558,81 @@ mod tests {
         .expect("mock app");
 
         assert_eq!(app.current_model(), "claude-sonnet-4-6-20250929");
+    }
+
+    #[tokio::test]
+    async fn startup_refresh_restores_saved_model_missing_from_initial_router() {
+        let mut router = ModelRouter::new();
+        router.register_provider_with_auth(
+            Box::new(ModelEchoProvider {
+                provider_name: "openai".to_string(),
+                models: vec!["gpt-4o-mini".to_string()],
+            }),
+            "subscription",
+        );
+        router
+            .set_active("gpt-4o-mini")
+            .expect("set initial active model");
+
+        let mut config = FawxConfig::default();
+        config.model.default_model = Some("gpt-5.3-codex".to_string());
+
+        let (loop_engine, runtime_info) = test_engine_and_runtime_info();
+        let mut app = TuiApp::new(
+            openai_oauth_auth_manager(),
+            router,
+            loop_engine,
+            runtime_info,
+            config,
+        )
+        .expect("mock app");
+
+        assert_eq!(app.current_model(), "gpt-4o-mini");
+
+        app.select_first_available_model().await;
+
+        assert_eq!(app.current_model(), "gpt-5.3-codex");
+    }
+
+    #[test]
+    fn default_anthropic_models_include_claude_opus_4_6() {
+        assert!(DEFAULT_ANTHROPIC_MODELS.contains(&"claude-opus-4-6"));
+    }
+
+    #[tokio::test]
+    async fn model_selector_prefers_exact_match_over_family_alias() {
+        let mut router = ModelRouter::new();
+        router.register_provider_with_auth(
+            Box::new(ModelEchoProvider {
+                provider_name: "echo-provider".to_string(),
+                models: vec![
+                    "claude-opus-4-6".to_string(),
+                    "claude-opus-4-20250514".to_string(),
+                ],
+            }),
+            "test",
+        );
+        router
+            .set_active("claude-opus-4-20250514")
+            .expect("set initial active model");
+
+        let (loop_engine, runtime_info) = test_engine_and_runtime_info();
+        let mut app = TuiApp::new(
+            test_provider_auth_manager(),
+            router,
+            loop_engine,
+            runtime_info,
+            FawxConfig::default(),
+        )
+        .expect("mock app");
+
+        let resolved = app
+            .set_active_model_with_refresh("claude-opus-4-6")
+            .await
+            .expect("selector should resolve exact model");
+
+        assert_eq!(resolved, "claude-opus-4-6");
+        assert_eq!(app.current_model(), "claude-opus-4-6");
     }
 
     #[test]
