@@ -318,8 +318,46 @@ fn spinner_frame(index: usize) -> char {
     SPINNER_FRAMES[index % SPINNER_FRAMES.len()]
 }
 
+/// Escape sequence that clears both the spinner line and the dimmed prompt
+/// line below it:
+/// - `\r`       — move to start of current line (spinner)
+/// - `\x1b[2K`  — erase spinner line
+/// - `\x1b[1B`  — move down to the dimmed prompt line
+/// - `\x1b[2K`  — erase dimmed prompt line
+/// - `\x1b[1A`  — move back up to the spinner line position
+const CLEAR_SPINNER_ESCAPE: &str = "\r\x1b[2K\x1b[1B\x1b[2K\x1b[1A";
+
 fn clear_spinner_line() {
-    eprint!("\r\x1b[2K");
+    eprint!("{CLEAR_SPINNER_ESCAPE}");
+}
+
+/// Build a dimmed (gray) version of the `you ›` prompt for display during
+/// the spinner/thinking phase. Uses ANSI dim attribute (\x1b[2m) to visually
+/// distinguish the inactive prompt from the normal interactive one.
+fn build_dimmed_prompt() -> String {
+    format!("\x1b[2m{PROMPT_COLOR_START}you › {PROMPT_COLOR_END}")
+}
+
+/// Render the spinner line with a dimmed prompt on the line below.
+///
+/// Layout:
+/// ```text
+/// ⠸ thinking...
+/// you ›            (dimmed)
+/// ```
+///
+/// After writing both lines the cursor is moved back up to the spinner line
+/// so subsequent spinner ticks overwrite the correct line.
+fn render_spinner_with_prompt(frame_index: usize) {
+    let frame = spinner_frame(frame_index);
+    let dimmed = build_dimmed_prompt();
+    // \r\x1b[2K  — clear spinner line and move to column 0
+    // {frame} thinking...  — spinner content
+    // \n\x1b[2K  — move down and clear the prompt line
+    // {dimmed}  — dimmed prompt
+    // \x1b[1A   — move cursor back up to the spinner line
+    eprint!("\r\x1b[2K{frame} thinking...\n\x1b[2K{dimmed}\x1b[1A");
+    let _ = io::stderr().flush();
 }
 
 // ---------------------------------------------------------------------------
@@ -499,8 +537,7 @@ async fn dispatch_streaming_event(
             true
         }
         _ = sleep(Duration::from_millis(80)), if state.spinner_active => {
-            eprint!("\r\x1b[2K{} thinking...", spinner_frame(state.frame_index));
-            let _ = io::stderr().flush();
+            render_spinner_with_prompt(state.frame_index);
             state.frame_index += 1;
             true
         }
@@ -551,6 +588,12 @@ fn stop_spinner_if_active(spinner_active: &mut bool) {
 }
 
 /// Legacy thinking spinner — retained for existing tests.
+///
+/// NOTE: This renders a single-line spinner but calls `clear_spinner_line()`
+/// (which clears two lines) on stop. The mismatch is intentional: this
+/// function only exists under `#[cfg(test)]` for backward-compatible test
+/// coverage. Production code uses `render_spinner_with_prompt()` which
+/// renders two lines and pairs correctly with `clear_spinner_line()`.
 #[cfg(test)]
 async fn run_thinking_spinner(mut stop_signal: oneshot::Receiver<()>) {
     let mut frame_index = 0;
@@ -6049,6 +6092,116 @@ mod tests {
         );
         assert!(prompt.contains(PROMPT_COLOR_START));
         assert!(prompt.contains(PROMPT_COLOR_END));
+    }
+
+    #[test]
+    fn dimmed_prompt_contains_dim_attribute_and_color_codes() {
+        let dimmed = build_dimmed_prompt();
+
+        assert!(
+            dimmed.contains("\x1b[2m"),
+            "dimmed prompt should contain ANSI dim attribute"
+        );
+        assert!(
+            dimmed.contains(PROMPT_COLOR_START),
+            "dimmed prompt should contain prompt color"
+        );
+        assert!(
+            dimmed.contains(PROMPT_COLOR_END),
+            "dimmed prompt should contain color reset"
+        );
+        assert!(
+            dimmed.contains("you ›"),
+            "dimmed prompt should contain the prompt text"
+        );
+        assert!(
+            dimmed.ends_with("\x1b[0m"),
+            "dimmed prompt should end with full ANSI reset"
+        );
+    }
+
+    #[test]
+    fn clear_spinner_line_output_clears_two_lines() {
+        // Validate that CLEAR_SPINNER_ESCAPE (the constant used by
+        // clear_spinner_line()) has the correct two-line clear structure.
+
+        // Starts with carriage return to reach column 0
+        assert!(
+            CLEAR_SPINNER_ESCAPE.starts_with('\r'),
+            "clear pattern must start with carriage return"
+        );
+        // Moves cursor down to the dimmed prompt line
+        assert!(
+            CLEAR_SPINNER_ESCAPE.contains("\x1b[1B"),
+            "clear pattern must move cursor down"
+        );
+        // Erases exactly two lines (spinner + dimmed prompt)
+        assert_eq!(
+            CLEAR_SPINNER_ESCAPE.matches("\x1b[2K").count(),
+            2,
+            "clear pattern must erase exactly two lines"
+        );
+        // Moves cursor back up so subsequent output starts at the right row
+        assert!(
+            CLEAR_SPINNER_ESCAPE.contains("\x1b[1A"),
+            "clear pattern must move cursor back up"
+        );
+
+        // Also call the function to ensure it doesn't panic and uses
+        // the constant (the function is thin — it just eprints the
+        // constant, but calling it exercises the code path).
+        clear_spinner_line();
+    }
+
+    #[test]
+    fn dimmed_prompt_differs_from_interactive_prompt() {
+        let interactive = build_tui_prompt();
+        let dimmed = build_dimmed_prompt();
+
+        assert_ne!(
+            interactive, dimmed,
+            "dimmed prompt must be visually distinct from interactive prompt"
+        );
+        // Both contain the core prompt text
+        assert!(interactive.contains("you ›"));
+        assert!(dimmed.contains("you ›"));
+        // Only dimmed has the dim attribute
+        assert!(!interactive.contains("\x1b[2m"));
+        assert!(dimmed.contains("\x1b[2m"));
+    }
+
+    #[tokio::test]
+    async fn spinner_stops_on_streaming_started() {
+        let bus = EventBus::new(16);
+        let receiver = bus.subscribe();
+        let streamed = Arc::new(AtomicBool::new(false));
+        let mut state = DisplayLoopState::new(Arc::clone(&streamed));
+
+        // Verify spinner starts active
+        assert!(state.spinner_active);
+
+        // Simulate StreamingStarted
+        bus.publish(InternalMessage::StreamingStarted {
+            phase: StreamPhase::Synthesize,
+        })
+        .expect("publish should succeed");
+
+        let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
+        let mut rx = receiver;
+
+        // Process one event — should deactivate spinner
+        dispatch_streaming_event(&mut rx, &mut stop_rx, &mut state).await;
+
+        assert!(
+            !state.spinner_active,
+            "spinner should be deactivated after StreamingStarted"
+        );
+        assert!(
+            streamed.load(Ordering::Relaxed),
+            "streamed flag should be set after StreamingStarted"
+        );
+
+        drop(stop_tx);
     }
 
     #[tokio::test]
