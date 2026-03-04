@@ -132,9 +132,9 @@
   <div class="text">DNS poisoning redirects api.anthropic.com to attacker endpoint. The agent's brain is now controlled by the attacker. Especially dangerous on mobile/public networks where DNS cannot be trusted.</div>
 </div>
 
-<h2>Threat Model — Twelve Attack Surfaces</h2>
+<h2>Threat Model — Fourteen Attack Surfaces</h2>
 
-<p>Traditional security models focus on network perimeter, user authentication, and data access control. AI-native systems have <em>fundamentally different</em> attack surfaces. Six of these twelve surfaces are unique to systems where the "user" is an autonomous agent that processes external content and modifies itself.</p>
+<p>Traditional security models focus on network perimeter, user authentication, and data access control. AI-native systems have <em>fundamentally different</em> attack surfaces. Eight of these fourteen surfaces are unique to systems where the "user" is an autonomous agent that processes external content and modifies itself.</p>
 
 <table>
   <thead>
@@ -218,11 +218,23 @@
       <td>Network</td>
       <td>DNS poisoning redirects api.anthropic.com to attacker endpoint. Agent's brain now controlled. Especially dangerous on mobile/public networks. DNS-over-HTTPS or pinned resolvers required.</td>
     </tr>
+    <tr>
+      <td>13</td>
+      <td class="surface-unique">Loadable layer → kernel inputs ✦</td>
+      <td>Internal</td>
+      <td>Tools/skills inject crafted content into model context (prompt injection via tool result), write false memory signals, trigger budget-exhausting decomposition spirals. Self-improvement (#1055) amplifies: poisoned signals → poisoned proposals. <em>Reserved for #1102.</em></td>
+    </tr>
+    <tr>
+      <td>14</td>
+      <td class="surface-unique">Budget manipulation / resource exhaustion ✦</td>
+      <td>Internal</td>
+      <td>Crafted prompts or poisoned state drain the agent’s budget through decompose spirals, retry amplification, fan-out explosion, or doomed iterations from false memories. Budget exhaustion = agent disabled.</td>
+    </tr>
   </tbody>
 </table>
 
 <div class="note">
-  <strong>✦ Unique to AI-native systems:</strong> Surfaces 6, 7, 8, 9, 10, 11 do not exist in traditional security models. They emerge from having an autonomous agent that processes external content, modifies itself, and operates through recursive sub-processes.
+  <strong>✦ Unique to AI-native systems:</strong> Surfaces 6, 7, 8, 9, 10, 11, 13, and 14 do not exist in traditional security models. They emerge from having an autonomous agent that processes external content, modifies itself, operates through recursive sub-processes, and manages finite computational budgets.
 </div>
 
 <h3>Surface Breakdown</h3>
@@ -251,6 +263,22 @@
 <p>Fawx uses recursive subagent spawning for complex tasks. If a subagent is compromised (through any of the above attack surfaces), it can inject malicious instructions in its output that gets processed by the orchestrating agent. The compromised subagent might claim elevated permissions it doesn't have, or provide false information that causes the orchestrator to take harmful actions.</p>
 
 <p>This is why subagent roles have <strong>typed, locked permissions</strong> — implementers cannot post reviews, reviewers cannot push code, and no subagent can escalate its own permissions or modify the permission system.</p>
+
+<h4>14. Budget Manipulation / Resource Exhaustion (AI-Native)</h4>
+<p>The agent operates under a computational budget — LLM calls, tool invocations, tokens, cost in cents, and wall-clock time. When any resource is exhausted, the loop terminates. An attacker who can manipulate the agent’s budget consumption can effectively disable it — a denial-of-service attack that doesn’t require network access, authentication bypass, or code execution.</p>
+
+<p>Budget manipulation attacks work through the agent’s own decision-making:</p>
+
+<ul>
+  <li><strong>Decompose spirals:</strong> Craft prompts that trigger recursive decomposition, burning budget on planning overhead. Adaptive depth cap (<code>effective_max_depth()</code>) scales with remaining LLM calls, preventing deep trees. Cost gate rejects plans exceeding 150% of remaining budget. Batch detection and complexity floor prevent trivial decomposition overhead.</li>
+  <li><strong>Retry amplification:</strong> Cause persistent tool failures that the model retries, draining invocation and LLM call budgets. Per-tool retry cap (default 2 retries = 3 total attempts per tool name per cycle) escalates to <code>SignalKind::Blocked</code>.</li>
+  <li><strong>Fan-out explosion:</strong> Request operations that generate many parallel tool calls, inflating context and consuming invocation budget. Fan-out cap (default 4 per LLM response) defers excess calls. Tool result truncation (16KB) and aggregate result bytes tracking (400KB) cap context consumption.</li>
+  <li><strong>Poisoned state:</strong> False information in persistent memory causes the model to attempt impossible tasks, wasting budget on doomed iterations. Primary defense is upstream (memory system hardening, surface #7); budget guardrails are defense-in-depth.</li>
+</ul>
+
+<p>Defense is multi-layered and kernel-enforced: budget soft-ceiling forces graceful wrap-up at 80% cost consumption, fan-out caps limit parallel tool calls per turn, per-tool retry caps prevent retry loops, decompose cost gates reject expensive plans, and adaptive depth caps scale decomposition depth with remaining budget. The agent cannot disable or circumvent these mechanisms. <code>BudgetConfig::conservative()</code> provides a significantly tighter profile (8 LLM calls, 16 tool invocations, 100 cents, 2-minute wall time) for autonomous/background actions, drastically reducing the attack surface for non-user-initiated loops.</p>
+
+<p><strong>Residual risk:</strong> Low for most vectors after Wave 4 (#1098, #1100, #1101). Medium for memory poisoning → budget waste (primary fix is in memory system, surface #7) and cross-tool cycling (model rotates tool names to bypass per-tool retry cap, but soft-ceiling at 80% is the backstop regardless of cycling pattern). No budget attack vector has severity above Medium. See <a href="../specs/1104-budget-attack-surface.md">budget attack surface spec</a> for full threat analysis.</p>
 
 <h2>Tool Execution Security</h2>
 
@@ -415,6 +443,20 @@
       <td class="priority-immediate">Immediate</td>
       <td>Network stack</td>
     </tr>
+    <tr>
+      <td>13</td>
+      <td>Loadable layer → kernel inputs</td>
+      <td>Input validation, context isolation, memory provenance tracking</td>
+      <td class="priority-nearterm">Near-term</td>
+      <td>Kernel boundary hardening (#1102)</td>
+    </tr>
+    <tr>
+      <td>14</td>
+      <td>Budget manipulation</td>
+      <td>Soft-ceiling wrap-up, fan-out cap, per-tool retry limit, decompose cost gate, adaptive depth cap</td>
+      <td class="priority-immediate">Immediate</td>
+      <td>Budget system (#1098, #1100, #1101)</td>
+    </tr>
   </tbody>
 </table>
 
@@ -457,6 +499,7 @@
     <li><strong>DNS resolution hardened against poisoning</strong> — DNS-over-HTTPS or pinned resolvers required</li>
     <li><strong>Kernel is immutable at runtime</strong> — Cannot be modified by the agent, loadable modules, or any external input</li>
     <li><strong>Scheduled tasks from externally-triggered sessions require user confirmation</strong> — Cron jobs and delayed tasks created during external input processing are quarantined until approved</li>
+    <li><strong>Budget guardrails are kernel-enforced and cannot be bypassed by the agent</strong> — Soft-ceiling, fan-out cap, per-tool retry limit, decompose cost gate, and depth cap are compiled into the kernel. The agent cannot modify budget limits, disable enforcement, or reset consumed budget counters. Budget soft-ceiling at 80% forces graceful wrap-up regardless of consumption pattern.</li>
   </ol>
 </div>
 

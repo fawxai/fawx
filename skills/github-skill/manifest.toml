@@ -1,0 +1,7 @@
+name = "github"
+version = "1.0.0"
+description = "GitHub integration: create and comment on pull requests"
+author = "Fawx Team"
+api_version = "host_api_v1"
+capabilities = ["network", "storage"]
+entry_point = "run"

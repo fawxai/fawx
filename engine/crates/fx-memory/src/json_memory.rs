@@ -206,6 +206,9 @@ impl MemoryProvider for JsonFileMemory {
     }
 
     fn write(&mut self, key: &str, value: &str) -> Result<(), String> {
+        if key.is_empty() {
+            return Err("memory key must not be empty".to_string());
+        }
         if value.len() > self.config.max_value_size {
             return Err(format!(
                 "value exceeds max size ({} bytes)",
@@ -1192,5 +1195,74 @@ mod tests {
             (weight - 5.0).abs() < 0.001,
             "weight={weight}, expected 5.0 when now=0"
         );
+    }
+
+    // ── Security boundary tests: memory write validation (spec #1102, T-12) ──
+
+    #[test]
+    fn t12_write_rejects_empty_key() {
+        let temp = TempDir::new().expect("tempdir");
+        let mut memory = test_memory(temp.path());
+        let result = memory.write("", "some value");
+        assert!(result.is_err(), "writing with empty key should be rejected");
+    }
+
+    #[test]
+    fn t12_write_rejects_value_exceeding_max_size() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = JsonMemoryConfig {
+            max_value_size: 100,
+            ..JsonMemoryConfig::default()
+        };
+        let mut memory =
+            JsonFileMemory::new_with_config(temp.path(), config).expect("create memory");
+        let big = "x".repeat(101);
+        let result = memory.write("key", &big);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn t12_write_succeeds_with_valid_key_value() {
+        let temp = TempDir::new().expect("tempdir");
+        let mut memory = test_memory(temp.path());
+        memory
+            .write("valid_key", "valid_value")
+            .expect("write should succeed");
+        let entry = memory.data.get("valid_key").expect("entry should exist");
+        assert_eq!(entry.value, "valid_value");
+        assert_eq!(entry.source, MemorySource::User);
+    }
+
+    #[test]
+    fn t12_write_handles_null_bytes_without_panic() {
+        let temp = TempDir::new().expect("tempdir");
+        let mut memory = test_memory(temp.path());
+        // Must not panic regardless of outcome.
+        let _ = memory.write("null_test", "value\0with\0nulls");
+    }
+
+    #[test]
+    fn t12_write_handles_extremely_long_key_without_panic() {
+        let temp = TempDir::new().expect("tempdir");
+        let mut memory = test_memory(temp.path());
+        let long_key = "k".repeat(10_000);
+        // Must not panic regardless of outcome.
+        let _ = memory.write(&long_key, "value");
+    }
+
+    #[test]
+    fn t12_write_at_exact_max_value_size_succeeds() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = JsonMemoryConfig {
+            max_value_size: 100,
+            ..JsonMemoryConfig::default()
+        };
+        let mut memory =
+            JsonFileMemory::new_with_config(temp.path(), config).expect("create memory");
+        let exact = "x".repeat(100);
+        memory
+            .write("key", &exact)
+            .expect("exact-size write should succeed");
+        assert_eq!(memory.read("key"), Some(exact));
     }
 }

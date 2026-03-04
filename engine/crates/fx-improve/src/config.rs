@@ -60,8 +60,10 @@ mod tests {
 
     #[test]
     fn validate_rejects_zero_min_evidence_count() {
-        let mut config = ImprovementConfig::default();
-        config.min_evidence_count = 0;
+        let config = ImprovementConfig {
+            min_evidence_count: 0,
+            ..ImprovementConfig::default()
+        };
 
         let error = config.validate().unwrap_err();
         assert!(
@@ -71,8 +73,10 @@ mod tests {
 
     #[test]
     fn validate_rejects_zero_max_improvements_per_run() {
-        let mut config = ImprovementConfig::default();
-        config.max_improvements_per_run = 0;
+        let config = ImprovementConfig {
+            max_improvements_per_run: 0,
+            ..ImprovementConfig::default()
+        };
 
         let error = config.validate().unwrap_err();
         assert!(
@@ -82,8 +86,10 @@ mod tests {
 
     #[test]
     fn validate_rejects_zero_cooldown_hours() {
-        let mut config = ImprovementConfig::default();
-        config.cooldown_hours = 0;
+        let config = ImprovementConfig {
+            cooldown_hours: 0,
+            ..ImprovementConfig::default()
+        };
 
         let error = config.validate().unwrap_err();
         assert!(

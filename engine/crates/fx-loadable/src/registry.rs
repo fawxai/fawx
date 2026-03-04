@@ -610,3 +610,148 @@ mod tests {
         );
     }
 }
+
+/// Security boundary tests: registry immutability (spec #1102, T-4 and T-5).
+#[cfg(test)]
+mod security_boundary_tests {
+    use super::*;
+    use crate::skill::Skill;
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct ProbeSkillA;
+
+    #[async_trait]
+    impl Skill for ProbeSkillA {
+        fn name(&self) -> &str {
+            "probe_a"
+        }
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition {
+                name: "tool_a".to_string(),
+                description: "Probe A tool".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            }]
+        }
+        async fn execute(
+            &self,
+            tool_name: &str,
+            _arguments: &str,
+            _cancel: Option<&CancellationToken>,
+        ) -> Option<Result<String, String>> {
+            if tool_name == "tool_a" {
+                Some(Ok("probe_a executed".to_string()))
+            } else {
+                None
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct ProbeSkillB;
+
+    #[async_trait]
+    impl Skill for ProbeSkillB {
+        fn name(&self) -> &str {
+            "probe_b"
+        }
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition {
+                name: "tool_b".to_string(),
+                description: "Probe B tool".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            }]
+        }
+        async fn execute(
+            &self,
+            tool_name: &str,
+            _arguments: &str,
+            _cancel: Option<&CancellationToken>,
+        ) -> Option<Result<String, String>> {
+            if tool_name == "tool_b" {
+                Some(Ok("probe_b executed".to_string()))
+            } else {
+                None
+            }
+        }
+    }
+
+    // ── T-4: SkillRegistry is immutable through ToolExecutor trait ──
+
+    #[test]
+    fn t4_tool_executor_trait_exposes_only_immutable_methods() {
+        // ToolExecutor methods are all &self — no &mut self.
+        // This test proves we can call every method through Arc.
+        let mut reg = SkillRegistry::new();
+        reg.register(Box::new(ProbeSkillA));
+
+        let executor: Arc<dyn ToolExecutor> = Arc::new(reg);
+
+        let defs = executor.tool_definitions();
+        assert_eq!(defs.len(), 1);
+
+        let cache = executor.cacheability("tool_a");
+        assert_eq!(cache, ToolCacheability::NeverCache);
+
+        let stats = executor.cache_stats();
+        assert!(stats.is_none());
+
+        executor.clear_cache();
+
+        let policy = executor.concurrency_policy();
+        assert!(policy.max_parallel.is_none());
+    }
+
+    #[test]
+    fn t4_arc_dyn_tool_executor_cannot_call_register() {
+        // register() takes &mut self — inaccessible through Arc<dyn ToolExecutor>.
+        // If someone adds register() to ToolExecutor, this comment is the checkpoint.
+        let mut reg = SkillRegistry::new();
+        reg.register(Box::new(ProbeSkillA));
+        let executor: Arc<dyn ToolExecutor> = Arc::new(reg);
+
+        // The following would NOT compile:
+        // executor.register(Box::new(ProbeSkillB));
+
+        let defs = executor.tool_definitions();
+        assert_eq!(defs.len(), 1, "only ProbeSkillA should be registered");
+        assert_eq!(defs[0].name, "tool_a");
+    }
+
+    // ── T-5: Skill cannot access other skills or the registry ──
+
+    #[tokio::test]
+    async fn t5_skill_execute_receives_no_registry_reference() {
+        let mut reg = SkillRegistry::new();
+        reg.register(Box::new(ProbeSkillA));
+        reg.register(Box::new(ProbeSkillB));
+
+        let call = ToolCall {
+            id: "call-1".to_string(),
+            name: "tool_a".to_string(),
+            arguments: serde_json::json!({}),
+        };
+        let results = reg.execute_tools(&[call], None).await.unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].success);
+        assert_eq!(results[0].output, "probe_a executed");
+    }
+
+    #[tokio::test]
+    async fn t5_skill_registry_immutable_after_arc_wrapping() {
+        let mut reg = SkillRegistry::new();
+        reg.register(Box::new(ProbeSkillA));
+
+        let executor: Arc<dyn ToolExecutor> = Arc::new(reg);
+
+        let call = ToolCall {
+            id: "call-1".to_string(),
+            name: "tool_a".to_string(),
+            arguments: serde_json::json!({}),
+        };
+        let results: Vec<ToolResult> = executor.execute_tools(&[call], None).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].success);
+    }
+}
