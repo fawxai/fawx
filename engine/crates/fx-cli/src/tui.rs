@@ -2434,6 +2434,19 @@ fn build_skill_registry(
     registry.register(Box::new(git_skill));
     let tx_skill = TransactionSkill::new(working_dir.clone(), sm);
     registry.register(Box::new(tx_skill));
+
+    // Load WASM skills from ~/.fawx/skills/
+    match fx_loadable::wasm_skill::load_wasm_skills() {
+        Ok(wasm_skills) => {
+            for skill in wasm_skills {
+                registry.register(skill);
+            }
+        }
+        Err(e) => {
+            eprintln!("warning: failed to load WASM skills: {e}");
+        }
+    }
+
     apply_skill_summaries(&runtime_info, &registry);
 
     (registry, memory, snapshot_text, runtime_info)

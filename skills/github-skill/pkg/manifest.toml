@@ -1,0 +1,7 @@
+name = "github-skill"
+version = "1.0.0"
+description = "Create and comment on pull requests via the GitHub API"
+author = "fawx"
+api_version = "host_api_v1"
+capabilities = ["network", "storage"]
+entry_point = "run"

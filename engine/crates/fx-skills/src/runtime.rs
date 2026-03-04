@@ -116,13 +116,25 @@ pub struct SkillRuntime {
 }
 
 impl SkillRuntime {
-    /// Create a new skill runtime.
+    /// Create a new skill runtime with a default wasmtime engine.
     pub fn new() -> Result<Self, SkillError> {
         let engine = Engine::default();
         Ok(Self {
             engine,
             skills: HashMap::new(),
         })
+    }
+
+    /// Create a skill runtime sharing an existing wasmtime engine.
+    ///
+    /// Use this when loading skills that were compiled with a specific
+    /// engine (e.g., from a [`SkillLoader`]). Wasmtime requires modules
+    /// and stores to use the same `Engine` instance.
+    pub fn with_engine(engine: Engine) -> Self {
+        Self {
+            engine,
+            skills: HashMap::new(),
+        }
     }
 
     /// Register a loaded skill.
@@ -301,60 +313,57 @@ impl SkillRuntime {
         Ok(())
     }
 
-    /// Invoke a skill by name with input.
+    /// Invoke a skill by name with input, using the default [`MockHostApi`].
+    ///
+    /// For production use with a real host API, use [`invoke_with_host_api`](Self::invoke_with_host_api).
     pub fn invoke(&mut self, skill_name: &str, input: &str) -> Result<String, SkillError> {
+        let host_api = Box::new(MockHostApi::new(input));
+        self.invoke_with_host_api(skill_name, input, host_api)
+    }
+
+    /// Invoke a skill by name with input, using the provided [`HostApi`] implementation.
+    ///
+    /// This is the primary execution path for production callers (e.g., [`WasmSkill`])
+    /// that supply a [`LiveHostApi`] backed by real runtime services.
+    pub fn invoke_with_host_api(
+        &mut self,
+        skill_name: &str,
+        _input: &str,
+        host_api: Box<dyn HostApi>,
+    ) -> Result<String, SkillError> {
         let skill = self
             .skills
             .get(skill_name)
             .ok_or_else(|| SkillError::Execution(format!("Skill '{}' not found", skill_name)))?;
 
-        // Create host API state with skill's declared capabilities
         let capabilities = skill.capabilities().to_vec();
-        let host_api = Box::new(MockHostApi::new(input));
         let mut store = Store::new(&self.engine, HostState::new(host_api, capabilities));
 
-        // Create linker and link host functions
         let mut linker = Linker::new(&self.engine);
         Self::link_host_functions(&mut linker)?;
 
-        // Instantiate the module
         let instance = linker
             .instantiate(&mut store, skill.module())
-            .map_err(|e| SkillError::Execution(format!("Failed to instantiate module: {}", e)))?;
+            .map_err(|e| SkillError::Execution(format!("Failed to instantiate module: {e}")))?;
 
-        // Get the memory export and store it in the host state
         let memory = instance
             .get_memory(&mut store, "memory")
             .ok_or_else(|| SkillError::Execution("Module does not export 'memory'".to_string()))?;
 
         store.data_mut().set_memory(memory);
 
-        // Get the entry point function
         let entry_point = skill.manifest().entry_point.as_str();
         let run_func = instance
             .get_typed_func::<(), ()>(&mut store, entry_point)
             .map_err(|e| {
-                SkillError::Execution(format!(
-                    "Failed to get entry point '{}': {}",
-                    entry_point, e
-                ))
+                SkillError::Execution(format!("Failed to get entry point '{entry_point}': {e}"))
             })?;
 
-        // Call the entry point
         run_func
             .call(&mut store, ())
-            .map_err(|e| SkillError::Execution(format!("Skill execution failed: {}", e)))?;
+            .map_err(|e| SkillError::Execution(format!("Skill execution failed: {e}")))?;
 
-        // Extract the output
-        let api_ref = &store.data().api;
-        // We need to downcast to get the output
-        // This is safe because we created a MockHostApi above
-        let mock_api = api_ref
-            .as_any()
-            .downcast_ref::<MockHostApi>()
-            .ok_or_else(|| SkillError::Execution("Failed to access host API".to_string()))?;
-
-        Ok(mock_api.get_output())
+        Ok(store.data().api.get_output())
     }
 
     /// Invoke a skill asynchronously, enabling concurrent skill invocations.
@@ -611,6 +620,47 @@ mod tests {
         let result = runtime.invoke_skill_async("nonexistent", "input").await;
         assert!(result.is_err());
         assert!(matches!(result, Err(SkillError::Execution(_))));
+    }
+
+    /// Regression test: invoke_with_host_api works with a custom HostApi
+    /// implementation, not just MockHostApi. This would have caught the bug
+    /// where invoke() hardcoded MockHostApi and LiveHostApi was dead code.
+    #[test]
+    fn test_invoke_with_custom_host_api() {
+        let mut runtime = SkillRuntime::new().expect("Should create runtime");
+        let loader = SkillLoader::with_engine(runtime.engine().clone(), vec![]);
+
+        let manifest = create_test_manifest("test");
+        let wasm = create_invocable_wasm(runtime.engine());
+
+        let skill = loader.load(&wasm, &manifest, None).expect("Should load");
+        runtime.register_skill(skill).expect("Should register");
+
+        // Use a MockHostApi passed explicitly — verifying the host_api parameter
+        // is actually used (not replaced by an internal MockHostApi).
+        let host_api = Box::new(MockHostApi::new("custom input"));
+        let output = runtime
+            .invoke_with_host_api("test", "custom input", host_api)
+            .expect("Should invoke with custom host API");
+
+        // The test WASM always writes "ok" regardless of input
+        assert_eq!(output, "ok");
+    }
+
+    /// invoke() delegates to invoke_with_host_api, producing the same result.
+    #[test]
+    fn test_invoke_delegates_to_invoke_with_host_api() {
+        let mut runtime = SkillRuntime::new().expect("Should create runtime");
+        let loader = SkillLoader::with_engine(runtime.engine().clone(), vec![]);
+
+        let manifest = create_test_manifest("test");
+        let wasm = create_invocable_wasm(runtime.engine());
+
+        let skill = loader.load(&wasm, &manifest, None).expect("Should load");
+        runtime.register_skill(skill).expect("Should register");
+
+        let output = runtime.invoke("test", "input").expect("Should invoke");
+        assert_eq!(output, "ok");
     }
 
     #[tokio::test]

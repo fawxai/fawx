@@ -24,6 +24,8 @@ pub mod loader;
 pub mod registry;
 pub mod skill;
 pub mod transaction_skill;
+pub mod wasm_host;
+pub mod wasm_skill;
 
 pub(crate) mod ab_slots;
 pub(crate) mod config;
