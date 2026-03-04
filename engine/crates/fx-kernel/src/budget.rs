@@ -21,6 +21,8 @@ pub enum BudgetState {
 const DEFAULT_SOFT_CEILING_PERCENT: u8 = 80;
 const DEFAULT_MAX_FAN_OUT: usize = 4;
 const DEFAULT_MAX_TOOL_RESULT_BYTES: usize = 16_384;
+const DEFAULT_MAX_AGGREGATE_RESULT_BYTES: usize = 400_000;
+const DEFAULT_MAX_SYNTHESIS_TOKENS: usize = 50_000;
 const DEFAULT_LLM_CALL_TOKENS: u64 = 1_000;
 const DEFAULT_LLM_CALL_COST_CENTS: u64 = 2;
 const DEFAULT_TOOL_INVOCATION_COST_CENTS: u64 = 1;
@@ -69,6 +71,17 @@ pub struct BudgetConfig {
     /// Maximum bytes per individual tool result before truncation.
     #[serde(default = "default_max_tool_result_bytes")]
     pub max_tool_result_bytes: usize,
+    /// Maximum aggregate tool result bytes before triggering `BudgetState::Low`.
+    ///
+    /// NTH2: Currently a static default. When per-provider model context window
+    /// detection is added, this should be derived as a fraction of the model's
+    /// reported context limit (e.g., 50–75%) to automatically scale with the
+    /// available context budget.
+    #[serde(default = "default_max_aggregate_result_bytes")]
+    pub max_aggregate_result_bytes: usize,
+    /// Maximum tokens to include in the synthesis prompt (Layer 2 eviction limit).
+    #[serde(default = "default_max_synthesis_tokens")]
+    pub max_synthesis_tokens: usize,
 }
 
 fn default_soft_ceiling_percent() -> u8 {
@@ -81,6 +94,14 @@ fn default_max_fan_out() -> usize {
 
 fn default_max_tool_result_bytes() -> usize {
     DEFAULT_MAX_TOOL_RESULT_BYTES
+}
+
+fn default_max_aggregate_result_bytes() -> usize {
+    DEFAULT_MAX_AGGREGATE_RESULT_BYTES
+}
+
+fn default_max_synthesis_tokens() -> usize {
+    DEFAULT_MAX_SYNTHESIS_TOKENS
 }
 
 impl BudgetConfig {
@@ -97,6 +118,8 @@ impl BudgetConfig {
             soft_ceiling_percent: DEFAULT_SOFT_CEILING_PERCENT,
             max_fan_out: DEFAULT_MAX_FAN_OUT,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
+            max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
         }
     }
 
@@ -115,6 +138,8 @@ impl BudgetConfig {
             soft_ceiling_percent: 100,
             max_fan_out: usize::MAX,
             max_tool_result_bytes: usize::MAX,
+            max_aggregate_result_bytes: usize::MAX,
+            max_synthesis_tokens: usize::MAX,
         }
     }
 }
@@ -133,6 +158,8 @@ impl Default for BudgetConfig {
             soft_ceiling_percent: DEFAULT_SOFT_CEILING_PERCENT,
             max_fan_out: DEFAULT_MAX_FAN_OUT,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
+            max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
         }
     }
 }
@@ -279,6 +306,8 @@ impl BudgetAllocator {
                 soft_ceiling_percent: template.soft_ceiling_percent,
                 max_fan_out: template.max_fan_out,
                 max_tool_result_bytes: template.max_tool_result_bytes,
+                max_aggregate_result_bytes: template.max_aggregate_result_bytes,
+                max_synthesis_tokens: template.max_synthesis_tokens,
             });
         }
 
@@ -403,6 +432,10 @@ pub struct BudgetTracker {
     cost_cents: u64,
     start_time_ms: u64,
     depth: u32,
+    /// Accumulated tool result bytes across all rounds in this cycle.
+    /// Triggers `BudgetState::Low` when exceeding `config.max_aggregate_result_bytes`.
+    #[serde(default)]
+    accumulated_result_bytes: usize,
 }
 
 impl BudgetTracker {
@@ -418,6 +451,7 @@ impl BudgetTracker {
             cost_cents: 0,
             start_time_ms,
             depth,
+            accumulated_result_bytes: 0,
         }
     }
 
@@ -437,6 +471,9 @@ impl BudgetTracker {
             return BudgetState::Low;
         }
         if self.exceeds_fraction(self.cost_cents, self.config.max_cost_cents, fraction) {
+            return BudgetState::Low;
+        }
+        if self.accumulated_result_bytes > self.config.max_aggregate_result_bytes {
             return BudgetState::Low;
         }
         BudgetState::Normal
@@ -517,12 +554,23 @@ impl BudgetTracker {
         current_time_ms.saturating_sub(self.start_time_ms) > self.config.max_wall_time_ms
     }
 
+    /// Record tool result bytes for aggregate tracking (Layer 3).
+    pub fn record_result_bytes(&mut self, bytes: usize) {
+        self.accumulated_result_bytes = self.accumulated_result_bytes.saturating_add(bytes);
+    }
+
+    /// Accumulated tool result bytes tracked this cycle.
+    pub fn accumulated_result_bytes(&self) -> usize {
+        self.accumulated_result_bytes
+    }
+
     /// Reset consumed budget counters for a fresh cycle starting at `start_time_ms`.
     pub fn reset(&mut self, start_time_ms: u64) {
         self.llm_calls = 0;
         self.tool_invocations = 0;
         self.tokens_used = 0;
         self.cost_cents = 0;
+        self.accumulated_result_bytes = 0;
         self.start_time_ms = start_time_ms;
     }
 
@@ -891,6 +939,8 @@ fn budget_from_remaining(template: &BudgetConfig, remaining: &BudgetRemaining) -
         soft_ceiling_percent: template.soft_ceiling_percent,
         max_fan_out: template.max_fan_out,
         max_tool_result_bytes: template.max_tool_result_bytes,
+        max_aggregate_result_bytes: template.max_aggregate_result_bytes,
+        max_synthesis_tokens: template.max_synthesis_tokens,
     }
 }
 
@@ -906,6 +956,8 @@ fn zeroed_config_like(template: &BudgetConfig) -> BudgetConfig {
         soft_ceiling_percent: template.soft_ceiling_percent,
         max_fan_out: template.max_fan_out,
         max_tool_result_bytes: template.max_tool_result_bytes,
+        max_aggregate_result_bytes: template.max_aggregate_result_bytes,
+        max_synthesis_tokens: template.max_synthesis_tokens,
     }
 }
 
@@ -972,6 +1024,8 @@ mod tests {
             soft_ceiling_percent: DEFAULT_SOFT_CEILING_PERCENT,
             max_fan_out: DEFAULT_MAX_FAN_OUT,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
+            max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
         }
     }
 
@@ -997,6 +1051,8 @@ mod tests {
             soft_ceiling_percent: DEFAULT_SOFT_CEILING_PERCENT,
             max_fan_out: DEFAULT_MAX_FAN_OUT,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
+            max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
         }
     }
 
@@ -1541,6 +1597,8 @@ mod tests {
             soft_ceiling_percent: DEFAULT_SOFT_CEILING_PERCENT,
             max_fan_out: DEFAULT_MAX_FAN_OUT,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
+            max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
         };
         let tracker = BudgetTracker::new(config.clone(), 0, 0);
         let allocator = BudgetAllocator {
@@ -1582,6 +1640,8 @@ mod tests {
             soft_ceiling_percent: DEFAULT_SOFT_CEILING_PERCENT,
             max_fan_out: DEFAULT_MAX_FAN_OUT,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
+            max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
         };
         let tracker = BudgetTracker::new(config, 0, 0);
         let allocator = BudgetAllocator {
@@ -1633,6 +1693,8 @@ mod tests {
             soft_ceiling_percent: DEFAULT_SOFT_CEILING_PERCENT,
             max_fan_out: DEFAULT_MAX_FAN_OUT,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
+            max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
         };
         let tracker = BudgetTracker::new(config, 0, 0);
         let allocator = BudgetAllocator::new();
@@ -1662,6 +1724,8 @@ mod tests {
             soft_ceiling_percent: DEFAULT_SOFT_CEILING_PERCENT,
             max_fan_out: DEFAULT_MAX_FAN_OUT,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
+            max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
         };
         let tracker = BudgetTracker::new(config, 0, 0);
         let allocator = BudgetAllocator {
@@ -1710,6 +1774,8 @@ mod tests {
             soft_ceiling_percent: DEFAULT_SOFT_CEILING_PERCENT,
             max_fan_out: DEFAULT_MAX_FAN_OUT,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
+            max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
         };
         let tracker = BudgetTracker::new(config, 0, 0);
         let allocator = BudgetAllocator::new();
@@ -1767,6 +1833,8 @@ mod tests {
             soft_ceiling_percent: DEFAULT_SOFT_CEILING_PERCENT,
             max_fan_out: DEFAULT_MAX_FAN_OUT,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
+            max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
         };
         let tracker = BudgetTracker::new(config, 0, 0);
         let allocator = BudgetAllocator::new();
@@ -1792,6 +1860,8 @@ mod tests {
             soft_ceiling_percent: DEFAULT_SOFT_CEILING_PERCENT,
             max_fan_out: DEFAULT_MAX_FAN_OUT,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
+            max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
         };
         let tracker = BudgetTracker::new(config, 0, 0);
         let allocator = BudgetAllocator {
@@ -1821,6 +1891,8 @@ mod tests {
             soft_ceiling_percent: DEFAULT_SOFT_CEILING_PERCENT,
             max_fan_out: DEFAULT_MAX_FAN_OUT,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
+            max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
         };
         let tracker = BudgetTracker::new(config, 0, 0);
         let allocator = BudgetAllocator {
@@ -1955,6 +2027,8 @@ mod tests {
             soft_ceiling_percent: DEFAULT_SOFT_CEILING_PERCENT,
             max_fan_out: DEFAULT_MAX_FAN_OUT,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
+            max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
             ..test_config()
         };
         let remaining = BudgetRemaining {
@@ -1974,6 +2048,8 @@ mod tests {
             soft_ceiling_percent: DEFAULT_SOFT_CEILING_PERCENT,
             max_fan_out: DEFAULT_MAX_FAN_OUT,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
+            max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
             ..test_config()
         };
 
@@ -2242,5 +2318,68 @@ mod tests {
         // Must not panic and must be valid UTF-8
         assert!(result.len() > 0);
         assert!(result.contains("[truncated"));
+    }
+}
+
+#[cfg(test)]
+mod synthesis_context_guard_budget_tests {
+    use super::*;
+
+    #[test]
+    fn accumulated_result_bytes_triggers_low_state() {
+        let config = BudgetConfig {
+            max_aggregate_result_bytes: 1_000,
+            ..BudgetConfig::default()
+        };
+        let mut tracker = BudgetTracker::new(config, 0, 0);
+
+        assert_eq!(tracker.state(), BudgetState::Normal);
+
+        tracker.record_result_bytes(500);
+        assert_eq!(tracker.state(), BudgetState::Normal);
+
+        tracker.record_result_bytes(501);
+        assert_eq!(
+            tracker.state(),
+            BudgetState::Low,
+            "exceeding max_aggregate_result_bytes should trigger Low"
+        );
+    }
+
+    #[test]
+    fn accumulated_result_bytes_reset_on_cycle_reset() {
+        let config = BudgetConfig {
+            max_aggregate_result_bytes: 1_000,
+            ..BudgetConfig::default()
+        };
+        let mut tracker = BudgetTracker::new(config, 0, 0);
+
+        tracker.record_result_bytes(2_000);
+        assert_eq!(tracker.state(), BudgetState::Low);
+
+        tracker.reset(100);
+        assert_eq!(tracker.accumulated_result_bytes(), 0);
+        assert_eq!(tracker.state(), BudgetState::Normal);
+    }
+
+    #[test]
+    fn accumulated_result_bytes_uses_saturating_add() {
+        let config = BudgetConfig::default();
+        let mut tracker = BudgetTracker::new(config, 0, 0);
+
+        tracker.record_result_bytes(usize::MAX);
+        tracker.record_result_bytes(1);
+        assert_eq!(tracker.accumulated_result_bytes(), usize::MAX);
+    }
+
+    #[test]
+    fn normal_state_when_under_aggregate_limit() {
+        let config = BudgetConfig {
+            max_aggregate_result_bytes: 100_000,
+            ..BudgetConfig::default()
+        };
+        let mut tracker = BudgetTracker::new(config, 0, 0);
+        tracker.record_result_bytes(50_000);
+        assert_eq!(tracker.state(), BudgetState::Normal);
     }
 }

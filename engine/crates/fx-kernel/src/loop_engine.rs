@@ -1635,6 +1635,8 @@ impl LoopEngine {
             soft_ceiling_percent: template.soft_ceiling_percent,
             max_fan_out: template.max_fan_out,
             max_tool_result_bytes: template.max_tool_result_bytes,
+            max_aggregate_result_bytes: template.max_aggregate_result_bytes,
+            max_synthesis_tokens: template.max_synthesis_tokens,
         }
     }
 
@@ -2422,6 +2424,10 @@ impl LoopEngine {
         let round_started = current_time_ms();
         let results = self.execute_tool_calls(&state.current_calls).await?;
         self.record_tool_execution_cost(results.len());
+
+        let round_result_bytes: usize = results.iter().map(|r| r.output.len()).sum();
+        self.budget.record_result_bytes(round_result_bytes);
+
         append_tool_round_messages(
             &mut state.continuation_messages,
             &state.current_calls,
@@ -2540,12 +2546,19 @@ impl LoopEngine {
         mut tokens_used: TokenUsage,
         llm: &dyn LlmProvider,
     ) -> Result<ActionResult, LoopError> {
-        let synthesis_prompt = tool_synthesis_prompt(&tool_results, &self.synthesis_instruction);
+        let max_tokens = self.budget.config().max_synthesis_tokens;
+        let evicted = evict_oldest_results(tool_results, max_tokens);
+        let synthesis_prompt = tool_synthesis_prompt(&evicted, &self.synthesis_instruction);
         let llm_text = self.generate_tool_summary(&synthesis_prompt, llm).await?;
         tokens_used.accumulate(synthesis_usage(&synthesis_prompt, &llm_text));
         Ok(ActionResult {
             decision: decision.clone(),
-            tool_results,
+            // NB3: Evicted stubs intentionally replace original data here. This is the
+            // synthesis fallback path — tool results are consumed only by the synthesis
+            // prompt above, not by any downstream consumer. The `ActionResult` returned
+            // from this path carries the LLM-generated summary as `response_text`, so
+            // the stub-containing `tool_results` serve only as an audit/debug trace.
+            tool_results: evicted,
             response_text: ensure_non_empty_response(&llm_text),
             tokens_used,
         })
@@ -2947,6 +2960,110 @@ fn attach_signals(result: LoopResult, signals: Vec<Signal>) -> LoopResult {
             recoverable,
             signals,
         },
+    }
+}
+
+/// Evict oldest tool results until aggregate token count fits within `max_tokens`.
+///
+/// Evicted results are replaced with stubs preserving `tool_call_id` and `tool_name`.
+/// If a single remaining result still exceeds the limit, it is truncated in-place.
+fn evict_oldest_results(mut results: Vec<ToolResult>, max_tokens: usize) -> Vec<ToolResult> {
+    if results.is_empty() {
+        return results;
+    }
+
+    // NB1: Clamp max_tokens to a floor of 1000 tokens so that a misconfigured
+    // `max_synthesis_tokens: 0` doesn't evict everything including the last result,
+    // leaving nothing for synthesis.
+    const MIN_SYNTHESIS_TOKENS: usize = 1_000;
+    let max_tokens = max_tokens.max(MIN_SYNTHESIS_TOKENS);
+
+    let total_tokens = estimate_results_tokens(&results);
+    if total_tokens <= max_tokens {
+        // NTH1: Log accumulated bytes when eviction is NOT triggered to aid
+        // debugging "why didn't it evict?" scenarios.
+        let total_bytes: usize = results.iter().map(|r| r.output.len()).sum();
+        tracing::debug!(
+            total_bytes,
+            total_tokens,
+            max_tokens,
+            result_count = results.len(),
+            "synthesis context guard: under token limit, no eviction needed"
+        );
+        return results;
+    }
+
+    let (evicted_count, bytes_saved) = evict_results_until_under_limit(&mut results, max_tokens);
+
+    if evicted_count > 0 {
+        tracing::info!(
+            evicted_count,
+            bytes_saved,
+            remaining = results.len() - evicted_count.min(results.len()),
+            "synthesis context guard: evicted oldest tool results"
+        );
+    }
+
+    truncate_single_oversized_result(&mut results, max_tokens);
+    results
+}
+
+fn estimate_results_tokens(results: &[ToolResult]) -> usize {
+    results
+        .iter()
+        .map(|r| estimate_text_tokens(&r.output))
+        .sum()
+}
+
+/// Walk results front-to-back (oldest first), replacing with stubs.
+/// Returns `(evicted_count, bytes_saved)`.
+fn evict_results_until_under_limit(
+    results: &mut [ToolResult],
+    max_tokens: usize,
+) -> (usize, usize) {
+    let mut current_tokens = estimate_results_tokens(results);
+    let mut evicted_count = 0usize;
+    let mut bytes_saved = 0usize;
+
+    for result in results.iter_mut() {
+        if current_tokens <= max_tokens {
+            break;
+        }
+        let old_tokens = estimate_text_tokens(&result.output);
+        let stub = format!(
+            "[evicted: {} result too large for synthesis]",
+            result.tool_name
+        );
+        let stub_tokens = estimate_text_tokens(&stub);
+        bytes_saved = bytes_saved.saturating_add(result.output.len());
+        result.output = stub;
+        current_tokens = current_tokens
+            .saturating_sub(old_tokens)
+            .saturating_add(stub_tokens);
+        evicted_count = evicted_count.saturating_add(1);
+    }
+
+    (evicted_count, bytes_saved)
+}
+
+/// If a single result still exceeds `max_tokens`, truncate it.
+fn truncate_single_oversized_result(results: &mut [ToolResult], max_tokens: usize) {
+    let current_tokens = estimate_results_tokens(results);
+    if current_tokens <= max_tokens {
+        return;
+    }
+
+    // Find the largest result and truncate it
+    if let Some(largest) = results.iter_mut().max_by_key(|r| r.output.len()) {
+        let excess_tokens = current_tokens.saturating_sub(max_tokens);
+        // NB2: This uses the char-based inverse (4 bytes/token) of `estimate_text_tokens`.
+        // When the word-count path dominates (many short words), this undershoots — the
+        // result may remain slightly over limit. This is intentional: conservative eviction
+        // (removing less than optimal) is safer than over-eviction which could discard
+        // useful context needed for synthesis.
+        let excess_bytes = excess_tokens.saturating_mul(4);
+        let target_bytes = largest.output.len().saturating_sub(excess_bytes);
+        largest.output = truncate_tool_result(&largest.output, target_bytes).into_owned();
     }
 }
 
@@ -11193,6 +11310,139 @@ mod loop_resilience_tests {
             "output within limit should NOT be truncated"
         );
         assert_eq!(results[0].output.len(), 500);
+    }
+}
+
+#[cfg(test)]
+mod synthesis_context_guard_tests {
+    use super::*;
+
+    fn make_tool_result(index: usize, output_size: usize) -> ToolResult {
+        ToolResult {
+            tool_call_id: format!("call-{index}"),
+            tool_name: format!("tool_{index}"),
+            success: true,
+            output: "x".repeat(output_size),
+        }
+    }
+
+    #[test]
+    fn eviction_reduces_total_tokens_and_replaces_oldest_with_stubs() {
+        // 10 results, each ~5000 tokens (20_000 chars / 4 = 5000 tokens)
+        // Total: ~50_000 tokens. Limit: 10_000 tokens.
+        let results: Vec<ToolResult> = (0..10).map(|i| make_tool_result(i, 20_000)).collect();
+
+        let evicted = evict_oldest_results(results, 10_000);
+
+        assert_eq!(evicted.len(), 10);
+
+        let stubs: Vec<_> = evicted
+            .iter()
+            .filter(|r| r.output.starts_with("[evicted:"))
+            .collect();
+        assert!(!stubs.is_empty(), "at least some results should be evicted");
+
+        // Stubs should preserve tool_name
+        for stub in &stubs {
+            assert!(
+                stub.output.contains(&stub.tool_name),
+                "eviction stub must include tool_name"
+            );
+        }
+
+        // Total tokens should be under limit
+        let total_tokens = estimate_results_tokens(&evicted);
+        assert!(
+            total_tokens <= 10_000,
+            "total tokens {total_tokens} should be <= 10_000"
+        );
+    }
+
+    #[test]
+    fn no_eviction_when_under_limit() {
+        let results: Vec<ToolResult> = (0..3).map(|i| make_tool_result(i, 100)).collect();
+
+        let evicted = evict_oldest_results(results.clone(), 100_000);
+
+        assert_eq!(evicted.len(), 3);
+        for (orig, ev) in results.iter().zip(evicted.iter()) {
+            assert_eq!(orig.output, ev.output);
+        }
+    }
+
+    #[test]
+    fn single_oversized_result_is_truncated() {
+        // One result with 400K chars (~100K tokens), limit = 1_000 tokens
+        let results = vec![make_tool_result(0, 400_000)];
+        let evicted = evict_oldest_results(results, 1_000);
+
+        assert_eq!(evicted.len(), 1);
+        assert!(
+            evicted[0].output.len() < 400_000,
+            "oversized result should be truncated"
+        );
+    }
+
+    #[test]
+    fn eviction_order_is_oldest_first() {
+        // 5 results, each ~2500 tokens (10_000 chars). Total ~12_500. Limit: 5_000
+        let results: Vec<ToolResult> = (0..5).map(|i| make_tool_result(i, 10_000)).collect();
+
+        let evicted = evict_oldest_results(results, 5_000);
+
+        // Oldest (index 0, 1, ...) should be evicted first
+        let first_non_stub = evicted
+            .iter()
+            .position(|r| !r.output.starts_with("[evicted:"));
+
+        if let Some(pos) = first_non_stub {
+            // All items before pos should be stubs
+            for item in &evicted[..pos] {
+                assert!(
+                    item.output.starts_with("[evicted:"),
+                    "earlier results should be evicted first"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn empty_results_returns_empty() {
+        let results = evict_oldest_results(Vec::new(), 1_000);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn zero_max_tokens_clamps_to_floor_preserving_results() {
+        // NB1: max_synthesis_tokens == 0 should not evict everything.
+        // The floor clamp (1000 tokens) ensures at least some results survive.
+        let results: Vec<ToolResult> = (0..3).map(|i| make_tool_result(i, 100)).collect();
+
+        let evicted = evict_oldest_results(results, 0);
+
+        assert_eq!(evicted.len(), 3);
+        // Small results (~25 tokens each) fit under the 1000-token floor,
+        // so none should be evicted.
+        let stubs: Vec<_> = evicted
+            .iter()
+            .filter(|r| r.output.starts_with("[evicted:"))
+            .collect();
+        assert!(
+            stubs.is_empty(),
+            "small results should survive under the floor clamp"
+        );
+    }
+
+    #[test]
+    fn synthesis_prompt_after_eviction_is_valid() {
+        let results: Vec<ToolResult> = (0..10).map(|i| make_tool_result(i, 20_000)).collect();
+
+        let evicted = evict_oldest_results(results, 10_000);
+        let prompt = tool_synthesis_prompt(&evicted, "Summarize results");
+
+        // Prompt should be constructable and contain tool result sections
+        assert!(prompt.contains("Tool results:"));
+        assert!(prompt.contains("Summarize results"));
     }
 }
 
