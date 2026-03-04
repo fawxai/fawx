@@ -70,9 +70,9 @@ const BANNER_ART: &str = r#"   ___
   / _/__ __    ____  __
  / _/ _ `/ |/|/ /\ \/ /
 /_/ \_,_/|__,__/ /_/\_\"#;
-#[allow(dead_code)]
 /// Pre-rendered braille+truecolor ANSI banner (via ascii-image-converter).
-const FAWX_BANNER_ANSI: &str = include_str!("../../../../scripts/fawx-banner.ans");
+/// Plain-text source art lives in `docs/fawx-hero.txt` (no ANSI escapes).
+const FAWX_BANNER_ANSI: &str = include_str!("../../../../docs/fawx-hero-ansi.txt");
 
 const DEFAULT_OPENAI_TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
 const MAX_PROMPT_RETRIES: usize = 10;
@@ -330,7 +330,15 @@ fn spinner_frame(index: usize) -> char {
 const CLEAR_SPINNER_ESCAPE: &str = "\r\x1b[2K\x1b[1B\x1b[2K\x1b[1A";
 
 fn clear_spinner_line() {
-    eprint!("{CLEAR_SPINNER_ESCAPE}");
+    if crate::scroll_region::is_active() {
+        // Scroll region mode: clear spinner at its absolute position
+        let row = crate::scroll_region::scroll_region_end();
+        eprint!("\x1b[{row};1H\x1b[2K");
+        let _ = io::stderr().flush();
+    } else {
+        // Legacy mode: clear spinner + dimmed prompt (two lines)
+        eprint!("{CLEAR_SPINNER_ESCAPE}");
+    }
 }
 
 /// Build a dimmed (gray) version of the `you ›` prompt for display during
@@ -342,24 +350,26 @@ fn build_dimmed_prompt() -> String {
 
 /// Render the spinner line with a dimmed prompt on the line below.
 ///
-/// Layout:
-/// ```text
-/// ⠸ thinking...
-/// you ›            (dimmed)
-/// ```
-///
-/// After writing both lines the cursor is moved back up to the spinner line
-/// so subsequent spinner ticks overwrite the correct line.
+/// When the scroll region is active, the spinner renders at the bottom
+/// of the scroll region using absolute positioning, then the cursor is
+/// pinned to the input bar so it never appears in the output area.
+/// When inactive, falls back to the legacy two-line inline layout.
 fn render_spinner_with_prompt(frame_index: usize) {
     let frame = spinner_frame(frame_index);
-    let dimmed = build_dimmed_prompt();
-    // \r\x1b[2K  — clear spinner line and move to column 0
-    // {frame} thinking...  — spinner content
-    // \n\x1b[2K  — move down and clear the prompt line
-    // {dimmed}  — dimmed prompt
-    // \x1b[1A   — move cursor back up to the spinner line
-    eprint!("\r\x1b[2K{frame} thinking...\n\x1b[2K{dimmed}\x1b[1A");
-    let _ = io::stderr().flush();
+    if crate::scroll_region::is_active() {
+        // Absolute-position the spinner at the scroll region bottom so
+        // the cursor can be pinned to the input bar between frames.
+        let row = crate::scroll_region::scroll_region_end();
+        eprint!("\x1b[{row};1H\x1b[2K{frame} thinking...");
+        let _ = io::stderr().flush();
+        crate::scroll_region::refresh_input_bar();
+        crate::scroll_region::pin_cursor_to_input_bar();
+    } else {
+        // Legacy mode: spinner + dimmed prompt inline
+        let dimmed = build_dimmed_prompt();
+        eprint!("\r\x1b[2K{frame} thinking...\n\x1b[2K{dimmed}\x1b[1A");
+        let _ = io::stderr().flush();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -369,9 +379,9 @@ fn render_spinner_with_prompt(frame_index: usize) {
 /// Renders streaming LLM output token-by-token to stdout.
 ///
 /// Tracks phase transitions (Reason → Synthesize) and prints the
-/// `assistant ›` prefix exactly once per user cycle.
+/// `fawx ›` prefix exactly once per user cycle.
 struct StreamRenderer {
-    /// Whether the assistant prefix has been printed for this cycle.
+    /// Whether the fawx prefix has been printed for this cycle.
     prefix_printed: bool,
     /// Current streaming phase.
     current_phase: Option<StreamPhase>,
@@ -430,11 +440,11 @@ impl StreamRenderer {
     }
 
     fn print_prefix(&mut self) {
+        // Ensure output goes to the scroll region
+        crate::scroll_region::position_for_output();
         print!(
             "\n{} ",
-            "assistant \u{203a}"
-                .bold()
-                .with(theme_color(255, 165, 0, 214))
+            "fawx \u{203a}".bold().with(theme_color(255, 165, 0, 214))
         );
         let _ = io::stdout().flush();
         self.prefix_printed = true;
@@ -516,6 +526,11 @@ async fn streaming_display_loop(
         clear_spinner_line();
     }
     state.renderer.finalize();
+
+    // Refresh the input bar after streaming completes and pin cursor
+    // there so it doesn't linger in the scroll region.
+    crate::scroll_region::refresh_input_bar();
+    crate::scroll_region::pin_cursor_to_input_bar();
 }
 
 /// Process one tick of the streaming display loop.
@@ -896,7 +911,12 @@ fn history_namespace_for_cwd(home: &Path, cwd: &Path) -> Option<String> {
 }
 
 fn build_tui_prompt() -> String {
-    format!("{PROMPT_COLOR_START}you › {PROMPT_COLOR_END}")
+    if crate::scroll_region::supports_256_color() {
+        // Subtle dark gray background on the prompt; resets after so typed text is normal
+        format!("\x1b[48;5;236m{PROMPT_COLOR_START}you \u{203a} {PROMPT_COLOR_END}")
+    } else {
+        format!("{PROMPT_COLOR_START}you \u{203a} {PROMPT_COLOR_END}")
+    }
 }
 
 fn load_history_with_warning(
@@ -1077,6 +1097,17 @@ impl TuiApp {
         self.select_first_available_model().await;
         self.show_welcome();
 
+        // Install panic hook to reset scroll region on unexpected exit.
+        crate::scroll_region::install_panic_hook();
+
+        // Set up persistent input bar via ANSI scroll region.
+        // Degrades gracefully if the terminal doesn't support it.
+        crate::scroll_region::setup_scroll_region();
+
+        // Spawn a resize handler that re-applies the scroll region
+        // when the terminal dimensions change (SIGWINCH on Unix).
+        spawn_resize_handler();
+
         // Ctrl+C signals cancellation instead of killing the process.
         // First press: graceful cancel. Second press: force exit (NB1).
         let cancel_for_signal = self.cancel_token.clone();
@@ -1086,6 +1117,7 @@ impl TuiApp {
             cancel_for_signal.cancel();
             // Second Ctrl+C: force exit
             tokio::signal::ctrl_c().await.ok();
+            crate::scroll_region::reset_scroll_region();
             eprintln!("\n⏹ Force quit.");
             std::process::exit(130);
         });
@@ -1097,8 +1129,14 @@ impl TuiApp {
         let mut editor = configure_line_editor(Arc::clone(&self.completer_model_ids))?;
         let prompt = build_tui_prompt();
         while self.running {
+            // Prepare input bar for readline
+            crate::scroll_region::prepare_for_input();
+
             match editor.readline(&prompt) {
                 Ok(line) => {
+                    // Restore dimmed bar while processing
+                    crate::scroll_region::restore_dimmed_bar();
+
                     let trimmed = line.trim();
                     if trimmed.is_empty() {
                         continue;
@@ -1114,14 +1152,22 @@ impl TuiApp {
                     self.process_input_line(trimmed).await?;
                 }
                 Err(ReadlineError::Interrupted) => {
+                    crate::scroll_region::restore_dimmed_bar();
                     println!("^C");
                 }
-                Err(ReadlineError::Eof) => break,
-                Err(error) => return Err(TuiError::Auth(error.to_string())),
+                Err(ReadlineError::Eof) => {
+                    crate::scroll_region::restore_dimmed_bar();
+                    break;
+                }
+                Err(error) => {
+                    crate::scroll_region::reset_scroll_region();
+                    return Err(TuiError::Auth(error.to_string()));
+                }
             }
         }
 
         save_line_editor_history(&mut editor);
+        crate::scroll_region::reset_scroll_region();
         Ok(())
     }
 
@@ -1136,6 +1182,9 @@ impl TuiApp {
             }
             return Ok(());
         }
+
+        // Echo user message with shaded background into the scroll region
+        echo_user_message(input);
 
         match self.handle_message(input).await {
             Ok(Some(response)) => self.display_response(&response)?,
@@ -1968,16 +2017,20 @@ impl TuiApp {
         let mut stdout = io::stdout();
         move_cursor_to_start(&mut stdout)?;
 
+        // Ensure output goes to the scroll region
+        crate::scroll_region::position_for_output();
+
         println!();
         print!(
             "{} ",
-            "assistant \u{203a}"
-                .bold()
-                .with(theme_color(255, 165, 0, 214))
+            "fawx \u{203a}".bold().with(theme_color(255, 165, 0, 214))
         );
         let rendered = render_markdown(response);
         println!("{rendered}");
         println!();
+
+        // Refresh the input bar after output
+        crate::scroll_region::refresh_input_bar();
 
         Ok(())
     }
@@ -3123,6 +3176,56 @@ fn format_wall_time(wall_time: std::time::Duration) -> String {
     } else {
         format!("{}ms", wall_time.as_millis())
     }
+}
+
+/// Spawn a background task that listens for terminal resize signals
+/// (SIGWINCH on Unix) and re-applies the scroll region.
+fn spawn_resize_handler() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        tokio::spawn(async {
+            let mut sigwinch = match signal(SignalKind::window_change()) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            loop {
+                sigwinch.recv().await;
+                crate::scroll_region::handle_resize();
+            }
+        });
+    }
+    // On non-Unix platforms, resize handling is not supported.
+    // The scroll region will be set once at startup and not updated.
+}
+
+/// Echo the user's message into the scroll region with a shaded background.
+///
+/// Makes user messages visually distinct from assistant responses in the
+/// conversation thread. Degrades gracefully without 256-color support.
+/// Calculate the display width (column count) of a string.
+///
+/// Uses `chars().count()` which is correct for text containing only
+/// single-width characters (ASCII, basic Latin, common symbols).
+fn display_width(text: &str) -> usize {
+    text.chars().count()
+}
+
+fn echo_user_message(input: &str) {
+    crate::scroll_region::position_for_output();
+    let width = crate::scroll_region::current_width() as usize;
+    let prefix = "you \u{203a} ";
+    let visible_len = display_width(prefix) + display_width(input);
+    let padding = " ".repeat(width.saturating_sub(visible_len));
+
+    if crate::scroll_region::supports_256_color() {
+        // Dark gray background (237 = slightly lighter than input bar's 236)
+        println!("\x1b[48;5;237m{PROMPT_COLOR_START}{prefix}\x1b[39m{input}{padding}\x1b[0m");
+    } else {
+        println!("{PROMPT_COLOR_START}{prefix}{PROMPT_COLOR_END}{input}");
+    }
+
+    crate::scroll_region::refresh_input_bar();
 }
 
 fn format_error_message(error: &str) -> String {
@@ -7075,6 +7178,24 @@ mod tests {
         assert_eq!(sanitized, "Answer\nwarning");
     }
 
+    #[test]
+    fn display_width_counts_chars_not_bytes() {
+        // "you › " contains U+203A (›) which is 3 bytes in UTF-8 but 1 column
+        let prefix = "you \u{203a} ";
+        assert_eq!(
+            display_width(prefix),
+            6,
+            "display width should be 6 columns"
+        );
+        assert_eq!(prefix.len(), 8, "byte length should be 8 (3-byte ›)");
+    }
+
+    #[test]
+    fn display_width_ascii_matches_len() {
+        let ascii = "hello world";
+        assert_eq!(display_width(ascii), ascii.len());
+    }
+
     #[tokio::test]
     async fn generate_streaming_prints_tokens_incrementally() {
         let chunks = vec![
@@ -7609,5 +7730,56 @@ mod tests {
         let _ = stop_tx.send(());
         let cont = dispatch_streaming_event(&mut receiver, &mut stop_rx, &mut state).await;
         assert!(!cont);
+    }
+
+    #[test]
+    fn fawx_prefix_in_stream_renderer() {
+        let mut renderer = StreamRenderer::new();
+        assert!(!renderer.prefix_printed);
+        // After calling print_prefix, the flag should be set
+        renderer.print_prefix();
+        assert!(renderer.prefix_printed);
+    }
+
+    #[test]
+    fn build_dimmed_prompt_still_works_after_refactor() {
+        let dimmed = build_dimmed_prompt();
+        assert!(
+            dimmed.contains("you \u{203a}"),
+            "dimmed prompt must contain prompt text"
+        );
+        assert!(
+            dimmed.contains("\x1b[2m"),
+            "dimmed prompt must contain dim attribute"
+        );
+        assert!(
+            dimmed.contains(PROMPT_COLOR_START),
+            "dimmed prompt must contain color start"
+        );
+    }
+
+    #[test]
+    fn scroll_region_escape_sequences_are_correct() {
+        // Verify the DECSTBM format for various terminal heights
+        // INPUT_BAR_ROWS=2 (separator + prompt)
+        let esc_24 = crate::scroll_region::scroll_region_escape(24);
+        assert_eq!(
+            esc_24, "\x1b[1;22r",
+            "24-row terminal should have scroll region 1-22"
+        );
+
+        let esc_50 = crate::scroll_region::scroll_region_escape(50);
+        assert_eq!(
+            esc_50, "\x1b[1;48r",
+            "50-row terminal should have scroll region 1-48"
+        );
+    }
+
+    #[test]
+    fn clear_spinner_escape_constant_unchanged() {
+        // The legacy CLEAR_SPINNER_ESCAPE constant must remain valid
+        // for non-scroll-region mode
+        assert!(CLEAR_SPINNER_ESCAPE.starts_with('\r'));
+        assert_eq!(CLEAR_SPINNER_ESCAPE.matches("\x1b[2K").count(), 2);
     }
 }

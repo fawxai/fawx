@@ -5,6 +5,7 @@ mod commands;
 mod config_bridge;
 mod confirmation;
 mod markdown;
+mod scroll_region;
 mod tui;
 
 use clap::{Parser, Subcommand, ValueEnum};
