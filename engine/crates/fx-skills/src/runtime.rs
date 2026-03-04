@@ -6,6 +6,7 @@ use crate::manifest::{Capability, SkillManifest};
 use fx_core::error::SkillError;
 use std::collections::HashMap;
 use wasmtime::{Caller, Engine, Linker, Memory, Store};
+use wasmtime_wasi::p1::WasiP1Ctx;
 
 /// Starting offset for string allocations in WASM linear memory.
 const WASM_STRING_BUFFER_START: u32 = 1024;
@@ -18,6 +19,9 @@ struct HostState {
     capabilities: Vec<Capability>,
     /// Next free offset for string allocation in WASM memory.
     alloc_offset: u32,
+    /// WASI preview1 context, lazily initialized only for modules that import
+    /// from `wasi_snapshot_preview1`.
+    wasi_context: Option<WasiP1Ctx>,
 }
 
 impl HostState {
@@ -28,7 +32,18 @@ impl HostState {
             memory: None,
             capabilities,
             alloc_offset: WASM_STRING_BUFFER_START,
+            wasi_context: None,
         }
+    }
+
+    /// Initialize the WASI preview1 context.
+    /// Called only when the module imports from `wasi_snapshot_preview1`.
+    fn init_wasi_context(&mut self) {
+        let wasi_context = wasmtime_wasi::WasiCtxBuilder::new()
+            .inherit_stdout()
+            .inherit_stderr()
+            .build_p1();
+        self.wasi_context = Some(wasi_context);
     }
 
     /// Set the linear memory reference.
@@ -455,9 +470,30 @@ impl SkillRuntime {
             .ok_or_else(|| SkillError::Execution(format!("Skill '{}' not found", skill_name)))?;
 
         let capabilities = skill.capabilities().to_vec();
-        let mut store = Store::new(&self.engine, HostState::new(host_api, capabilities));
+        let mut host_state = HostState::new(host_api, capabilities);
+
+        // Only initialize WASI context and link WASI imports when the module
+        // actually imports from `wasi_snapshot_preview1`.
+        let needs_wasi = skill
+            .module()
+            .imports()
+            .any(|imp| imp.module() == "wasi_snapshot_preview1");
 
         let mut linker = Linker::new(&self.engine);
+
+        if needs_wasi {
+            host_state.init_wasi_context();
+            wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |state: &mut HostState| {
+                state
+                    .wasi_context
+                    .as_mut()
+                    .expect("WASI context must be initialized when WASI imports are present")
+            })
+            .map_err(|e| SkillError::Execution(format!("Failed to link WASI: {e}")))?;
+        }
+
+        let mut store = Store::new(&self.engine, host_state);
+
         Self::link_host_functions(&mut linker)?;
 
         let instance = linker
@@ -806,6 +842,63 @@ mod tests {
 
         assert!(output1.contains("skill1"));
         assert!(output2.contains("skill2"));
+    }
+
+    #[test]
+    fn test_wasi_module_instantiation_succeeds() {
+        // A WASM module that imports WASI fd_write (like wasm32-wasip1 targets produce)
+        let wat = r#"
+            (module
+                (import "wasi_snapshot_preview1" "fd_write"
+                    (func $fd_write (param i32 i32 i32 i32) (result i32)))
+                (import "host_api_v1" "log" (func $log (param i32 i32 i32)))
+                (import "host_api_v1" "kv_get" (func $kv_get (param i32 i32) (result i32)))
+                (import "host_api_v1" "kv_set" (func $kv_set (param i32 i32 i32 i32)))
+                (import "host_api_v1" "get_input" (func $get_input (result i32)))
+                (import "host_api_v1" "set_output" (func $set_output (param i32 i32)))
+                (memory (export "memory") 1)
+                (func (export "run")
+                    (i32.store8 (i32.const 0) (i32.const 111))
+                    (i32.store8 (i32.const 1) (i32.const 107))
+                    (call $set_output (i32.const 0) (i32.const 2))
+                )
+            )
+        "#;
+
+        let mut runtime = SkillRuntime::new().expect("Should create runtime");
+        let loader = SkillLoader::with_engine(runtime.engine().clone(), vec![]);
+        let manifest = create_test_manifest("wasi-skill");
+
+        let skill = loader
+            .load(wat.as_bytes(), &manifest, None)
+            .expect("Should load WASI module");
+        runtime.register_skill(skill).expect("Should register");
+
+        let result = runtime.invoke("wasi-skill", "test");
+        assert!(
+            result.is_ok(),
+            "WASI module should invoke successfully: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_non_wasi_module_still_works_with_wasi_linked() {
+        // Verify that modules WITHOUT WASI imports still work when WASI is linked
+        let mut runtime = SkillRuntime::new().expect("Should create runtime");
+        let loader = SkillLoader::with_engine(runtime.engine().clone(), vec![]);
+        let manifest = create_test_manifest("non-wasi-skill");
+
+        let wasm = create_invocable_wasm(runtime.engine());
+        let skill = loader
+            .load(&wasm, &manifest, None)
+            .expect("Should load non-WASI module");
+        runtime.register_skill(skill).expect("Should register");
+
+        let result = runtime.invoke("non-wasi-skill", "test");
+        assert!(
+            result.is_ok(),
+            "Non-WASI module should still work: {result:?}"
+        );
     }
 
     /// Create a WAT module that imports and calls http_request.
