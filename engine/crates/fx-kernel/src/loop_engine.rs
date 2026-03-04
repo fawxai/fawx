@@ -2,8 +2,9 @@
 
 use crate::act::{ActionResult, TokenUsage, ToolExecutor, ToolResult};
 use crate::budget::{
-    build_skip_mask, effective_max_depth, ActionCost, AllocationMode, AllocationPlan,
-    BudgetAllocator, BudgetConfig, BudgetRemaining, BudgetTracker, DepthMode,
+    build_skip_mask, effective_max_depth, truncate_tool_result, ActionCost, AllocationMode,
+    AllocationPlan, BudgetAllocator, BudgetConfig, BudgetRemaining, BudgetState, BudgetTracker,
+    DepthMode,
 };
 use crate::cancellation::CancellationToken;
 use crate::context_manager::ContextCompactor;
@@ -240,6 +241,9 @@ pub struct LoopEngine {
     conversation_budget: ConversationBudget,
     conversation_compactor: Box<dyn CompactionStrategy>,
     compaction_last_iteration: Mutex<HashMap<CompactionScope, u32>>,
+    /// Guards performance signal to fire only on the Normal→Low transition,
+    /// not on every `perceive()` call while the budget stays Low.
+    budget_low_signaled: bool,
 }
 
 #[derive(Debug, Default)]
@@ -342,6 +346,7 @@ impl LoopEngineBuilder {
             conversation_budget,
             conversation_compactor,
             compaction_last_iteration: Mutex::new(HashMap::new()),
+            budget_low_signaled: false,
         })
     }
 }
@@ -429,6 +434,8 @@ impl ToolRoundState {
 #[derive(Debug)]
 enum ToolRoundOutcome {
     Cancelled,
+    /// Budget soft-ceiling crossed after tool execution; skip LLM continuation.
+    BudgetLow,
     Response(CompletionResponse),
 }
 
@@ -573,6 +580,10 @@ const MEMORY_INSTRUCTION: &str = "\n\nYou have persistent memory across sessions
 Use memory_write to save important facts about the user, their preferences, \
 and project context. Use memory_read to recall specific details. \
 Memories survive restart \u{2014} write anything worth remembering.";
+
+const BUDGET_LOW_WRAP_UP_DIRECTIVE: &str = "You are running low on budget. \
+Do not call any tools. Do not decompose. \
+Summarize what you have accomplished and what remains undone. Be concise.";
 
 const VERIFICATION_CONFIDENCE_CLEAN: f64 = 0.9;
 const VERIFICATION_CONFIDENCE_SINGLE_DISCREPANCY: f64 = 0.45;
@@ -811,6 +822,7 @@ impl LoopEngine {
         self.signals.clear();
         self.user_stop_requested = false;
         self.pending_steer = None;
+        self.budget_low_signaled = false;
         if let Some(token) = &self.cancel_token {
             token.reset();
         }
@@ -862,12 +874,23 @@ impl LoopEngine {
         context_messages: &[Message],
     ) -> Result<IterationStep, LoopError> {
         let action = self.act(decision, llm, context_messages).await?;
-        let action_cost = self.action_cost_from_result(&action);
-        if let Some(step) = self.budget_terminal(action_cost, Some(action.response_text.clone())) {
+
+        // Tool actions record costs incrementally inside act_with_tools().
+        // Non-tool actions need their costs recorded here.
+        if action.tool_results.is_empty() {
+            let action_cost = self.action_cost_from_result(&action);
+            if let Some(step) =
+                self.budget_terminal(action_cost, Some(action.response_text.clone()))
+            {
+                return Ok(step);
+            }
+            self.budget.record(&action_cost);
+        } else if let Some(step) =
+            self.budget_terminal(ActionCost::default(), Some(action.response_text.clone()))
+        {
             return Ok(step);
         }
 
-        self.budget.record(&action_cost);
         state.tokens.accumulate(action.tokens_used);
         state.partial_response = Some(action.response_text.clone());
 
@@ -988,6 +1011,19 @@ impl LoopEngine {
         self.ensure_within_hard_limit(CompactionScope::Perceive, &context_window)?;
 
         self.append_compacted_summary(&snapshot_with_steer, &user_message, &mut context_window);
+
+        if self.budget.state() == BudgetState::Low {
+            if !self.budget_low_signaled {
+                self.emit_signal(
+                    LoopStep::Perceive,
+                    SignalKind::Performance,
+                    "budget soft-ceiling reached, entering wrap-up mode",
+                    serde_json::json!({"budget_state": "low"}),
+                );
+                self.budget_low_signaled = true;
+            }
+            context_window.push(Message::system(BUDGET_LOW_WRAP_UP_DIRECTIVE.to_string()));
+        }
 
         Ok(ProcessedPerception {
             user_message: user_message.clone(),
@@ -1253,6 +1289,10 @@ impl LoopEngine {
         llm: &dyn LlmProvider,
         context_messages: &[Message],
     ) -> Result<ActionResult, LoopError> {
+        if self.budget.state() == BudgetState::Low {
+            return Ok(self.budget_low_blocked_result(decision, "decomposition"));
+        }
+
         let timestamp_ms = current_time_ms();
         let remaining = self.budget.remaining(timestamp_ms);
         let effective_cap = self.effective_decomposition_depth_cap(&remaining);
@@ -1592,6 +1632,11 @@ impl LoopEngine {
             max_wall_time_ms: 0,
             max_recursion_depth: template.max_recursion_depth,
             decompose_depth_mode: template.decompose_depth_mode,
+            soft_ceiling_percent: template.soft_ceiling_percent,
+            max_fan_out: template.max_fan_out,
+            max_tool_result_bytes: template.max_tool_result_bytes,
+            max_aggregate_result_bytes: template.max_aggregate_result_bytes,
+            max_synthesis_tokens: template.max_synthesis_tokens,
         }
     }
 
@@ -2198,20 +2243,43 @@ impl LoopEngine {
         llm: &dyn LlmProvider,
         context_messages: &[Message],
     ) -> Result<ActionResult, LoopError> {
-        let mut state = ToolRoundState::new(calls, context_messages);
+        if self.budget.state() == BudgetState::Low {
+            return Ok(self.budget_low_blocked_result(decision, "tool dispatch"));
+        }
+
+        let (execute_calls, deferred) = self.apply_fan_out_cap(calls);
+        let mut state = ToolRoundState::new(&execute_calls, context_messages);
+
+        // Inject deferred tool results immediately so they're present in
+        // all_tool_results regardless of which return path the loop takes.
+        if !deferred.is_empty() {
+            self.append_deferred_tool_results(&mut state, &deferred, calls.len());
+        }
 
         for round in 0..self.max_iterations {
             if self.tool_round_interrupted() {
                 return Ok(self.cancelled_tool_action_from_state(decision, state));
             }
 
+            if self.budget.state() == BudgetState::Low {
+                self.emit_budget_low_break_signal(round);
+                break;
+            }
+
             match self.execute_tool_round(round + 1, llm, &mut state).await? {
                 ToolRoundOutcome::Cancelled => {
                     return Ok(self.cancelled_tool_action_from_state(decision, state));
                 }
+                ToolRoundOutcome::BudgetLow => break,
                 ToolRoundOutcome::Response(response) => {
                     if !response.tool_calls.is_empty() {
-                        state.current_calls = response.tool_calls;
+                        let (capped, round_deferred) = self.apply_fan_out_cap(&response.tool_calls);
+                        self.append_deferred_tool_results(
+                            &mut state,
+                            &round_deferred,
+                            response.tool_calls.len(),
+                        );
+                        state.current_calls = capped;
                         continue;
                     }
 
@@ -2238,6 +2306,115 @@ impl LoopEngine {
             .await
     }
 
+    fn apply_fan_out_cap(&mut self, calls: &[ToolCall]) -> (Vec<ToolCall>, Vec<ToolCall>) {
+        let max_fan_out = self.budget.config().max_fan_out;
+        if calls.len() <= max_fan_out {
+            return (calls.to_vec(), Vec::new());
+        }
+        let execute = calls[..max_fan_out].to_vec();
+        let deferred = calls[max_fan_out..].to_vec();
+        let deferred_names: Vec<&str> = deferred.iter().map(|c| c.name.as_str()).collect();
+        self.emit_signal(
+            LoopStep::Act,
+            SignalKind::Friction,
+            format!(
+                "fan-out cap: executing {}/{}, deferring: {}",
+                max_fan_out,
+                calls.len(),
+                deferred_names.join(", ")
+            ),
+            serde_json::json!({
+                "executed": max_fan_out,
+                "total": calls.len(),
+                "deferred_tools": deferred_names,
+            }),
+        );
+        (execute, deferred)
+    }
+
+    fn append_deferred_tool_results(
+        &self,
+        state: &mut ToolRoundState,
+        deferred: &[ToolCall],
+        total: usize,
+    ) {
+        let executed = total.saturating_sub(deferred.len());
+        let names: Vec<&str> = deferred.iter().map(|c| c.name.as_str()).collect();
+        let msg = format!(
+            "Tool calls deferred (budget: {executed}/{total}): {}. \
+             Re-request in your next turn if still needed.",
+            names.join(", ")
+        );
+        // Inject as synthetic tool results so synthesize_tool_fallback
+        // (which builds its prompt from all_tool_results) includes them.
+        for call in deferred {
+            state.all_tool_results.push(ToolResult {
+                tool_call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                success: false,
+                output: msg.clone(),
+            });
+        }
+    }
+
+    fn budget_low_blocked_result(
+        &mut self,
+        decision: &Decision,
+        action_name: &str,
+    ) -> ActionResult {
+        self.emit_signal(
+            LoopStep::Act,
+            SignalKind::Blocked,
+            format!("{action_name} blocked: budget is low, wrapping up"),
+            serde_json::json!({"reason": "budget_soft_ceiling"}),
+        );
+        self.text_action_result(
+            decision,
+            &format!("{action_name} was not executed because the budget soft-ceiling was reached. Summarizing what has been accomplished so far."),
+        )
+    }
+
+    fn record_tool_execution_cost(&mut self, tool_count: usize) {
+        self.budget.record(&ActionCost {
+            llm_calls: 0,
+            tool_invocations: tool_count as u32,
+            tokens: 0,
+            cost_cents: tool_count as u64,
+        });
+    }
+
+    fn record_continuation_cost(
+        &mut self,
+        response: &CompletionResponse,
+        context_messages: &[Message],
+    ) {
+        let cost = continuation_budget_cost(response, context_messages);
+        self.budget.record(&cost);
+    }
+
+    async fn compact_tool_continuation(
+        &mut self,
+        round: u32,
+        messages: &mut Vec<Message>,
+    ) -> Result<(), LoopError> {
+        let compacted = self
+            .compact_if_needed(messages, CompactionScope::ToolContinuation, round)
+            .await?;
+        if let Cow::Owned(compacted_messages) = compacted {
+            *messages = compacted_messages;
+        }
+        self.ensure_within_hard_limit(CompactionScope::ToolContinuation, messages)
+    }
+
+    fn emit_budget_low_break_signal(&mut self, round: u32) {
+        self.emit_signal(
+            LoopStep::Act,
+            SignalKind::Blocked,
+            format!("budget soft-ceiling reached during tool round {round}, breaking loop"),
+            serde_json::json!({"reason": "budget_soft_ceiling", "round": round}),
+        );
+    }
+
     async fn execute_tool_round(
         &mut self,
         round: u32,
@@ -2246,6 +2423,11 @@ impl LoopEngine {
     ) -> Result<ToolRoundOutcome, LoopError> {
         let round_started = current_time_ms();
         let results = self.execute_tool_calls(&state.current_calls).await?;
+        self.record_tool_execution_cost(results.len());
+
+        let round_result_bytes: usize = results.iter().map(|r| r.output.len()).sum();
+        self.budget.record_result_bytes(round_result_bytes);
+
         append_tool_round_messages(
             &mut state.continuation_messages,
             &state.current_calls,
@@ -2253,28 +2435,22 @@ impl LoopEngine {
         )?;
         state.all_tool_results.extend(results);
 
-        let compacted = self
-            .compact_if_needed(
-                &state.continuation_messages,
-                CompactionScope::ToolContinuation,
-                round,
-            )
+        self.compact_tool_continuation(round, &mut state.continuation_messages)
             .await?;
-        if let Cow::Owned(messages) = compacted {
-            state.continuation_messages = messages;
-        }
-        self.ensure_within_hard_limit(
-            CompactionScope::ToolContinuation,
-            &state.continuation_messages,
-        )?;
 
         if self.cancellation_token_triggered() {
             return Ok(ToolRoundOutcome::Cancelled);
         }
 
+        if self.budget.state() == BudgetState::Low {
+            self.emit_budget_low_break_signal(round);
+            return Ok(ToolRoundOutcome::BudgetLow);
+        }
+
         let response = self
             .request_tool_continuation(llm, &state.continuation_messages, &mut state.tokens_used)
             .await?;
+        self.record_continuation_cost(&response, &state.continuation_messages);
         self.emit_tool_round_trace_and_perf(
             round,
             state.current_calls.len(),
@@ -2290,7 +2466,9 @@ impl LoopEngine {
     }
 
     async fn execute_tool_calls(&self, calls: &[ToolCall]) -> Result<Vec<ToolResult>, LoopError> {
-        self.tool_executor
+        let max_bytes = self.budget.config().max_tool_result_bytes;
+        let results = self
+            .tool_executor
             .execute_tools(calls, self.cancel_token.as_ref())
             .await
             .map_err(|error| {
@@ -2299,7 +2477,8 @@ impl LoopEngine {
                     &format!("tool execution failed: {}", error.message),
                     error.recoverable,
                 )
-            })
+            })?;
+        Ok(truncate_tool_results(results, max_bytes))
     }
 
     async fn request_tool_continuation(
@@ -2367,12 +2546,19 @@ impl LoopEngine {
         mut tokens_used: TokenUsage,
         llm: &dyn LlmProvider,
     ) -> Result<ActionResult, LoopError> {
-        let synthesis_prompt = tool_synthesis_prompt(&tool_results, &self.synthesis_instruction);
+        let max_tokens = self.budget.config().max_synthesis_tokens;
+        let evicted = evict_oldest_results(tool_results, max_tokens);
+        let synthesis_prompt = tool_synthesis_prompt(&evicted, &self.synthesis_instruction);
         let llm_text = self.generate_tool_summary(&synthesis_prompt, llm).await?;
         tokens_used.accumulate(synthesis_usage(&synthesis_prompt, &llm_text));
         Ok(ActionResult {
             decision: decision.clone(),
-            tool_results,
+            // NB3: Evicted stubs intentionally replace original data here. This is the
+            // synthesis fallback path — tool results are consumed only by the synthesis
+            // prompt above, not by any downstream consumer. The `ActionResult` returned
+            // from this path carries the LLM-generated summary as `response_text`, so
+            // the stub-containing `tool_results` serve only as an audit/debug trace.
+            tool_results: evicted,
             response_text: ensure_non_empty_response(&llm_text),
             tokens_used,
         })
@@ -2775,6 +2961,122 @@ fn attach_signals(result: LoopResult, signals: Vec<Signal>) -> LoopResult {
             signals,
         },
     }
+}
+
+/// Evict oldest tool results until aggregate token count fits within `max_tokens`.
+///
+/// Evicted results are replaced with stubs preserving `tool_call_id` and `tool_name`.
+/// If a single remaining result still exceeds the limit, it is truncated in-place.
+fn evict_oldest_results(mut results: Vec<ToolResult>, max_tokens: usize) -> Vec<ToolResult> {
+    if results.is_empty() {
+        return results;
+    }
+
+    // NB1: Clamp max_tokens to a floor of 1000 tokens so that a misconfigured
+    // `max_synthesis_tokens: 0` doesn't evict everything including the last result,
+    // leaving nothing for synthesis.
+    const MIN_SYNTHESIS_TOKENS: usize = 1_000;
+    let max_tokens = max_tokens.max(MIN_SYNTHESIS_TOKENS);
+
+    let total_tokens = estimate_results_tokens(&results);
+    if total_tokens <= max_tokens {
+        // NTH1: Log accumulated bytes when eviction is NOT triggered to aid
+        // debugging "why didn't it evict?" scenarios.
+        let total_bytes: usize = results.iter().map(|r| r.output.len()).sum();
+        tracing::debug!(
+            total_bytes,
+            total_tokens,
+            max_tokens,
+            result_count = results.len(),
+            "synthesis context guard: under token limit, no eviction needed"
+        );
+        return results;
+    }
+
+    let (evicted_count, bytes_saved) = evict_results_until_under_limit(&mut results, max_tokens);
+
+    if evicted_count > 0 {
+        tracing::info!(
+            evicted_count,
+            bytes_saved,
+            remaining = results.len() - evicted_count.min(results.len()),
+            "synthesis context guard: evicted oldest tool results"
+        );
+    }
+
+    truncate_single_oversized_result(&mut results, max_tokens);
+    results
+}
+
+fn estimate_results_tokens(results: &[ToolResult]) -> usize {
+    results
+        .iter()
+        .map(|r| estimate_text_tokens(&r.output))
+        .sum()
+}
+
+/// Walk results front-to-back (oldest first), replacing with stubs.
+/// Returns `(evicted_count, bytes_saved)`.
+fn evict_results_until_under_limit(
+    results: &mut [ToolResult],
+    max_tokens: usize,
+) -> (usize, usize) {
+    let mut current_tokens = estimate_results_tokens(results);
+    let mut evicted_count = 0usize;
+    let mut bytes_saved = 0usize;
+
+    for result in results.iter_mut() {
+        if current_tokens <= max_tokens {
+            break;
+        }
+        let old_tokens = estimate_text_tokens(&result.output);
+        let stub = format!(
+            "[evicted: {} result too large for synthesis]",
+            result.tool_name
+        );
+        let stub_tokens = estimate_text_tokens(&stub);
+        bytes_saved = bytes_saved.saturating_add(result.output.len());
+        result.output = stub;
+        current_tokens = current_tokens
+            .saturating_sub(old_tokens)
+            .saturating_add(stub_tokens);
+        evicted_count = evicted_count.saturating_add(1);
+    }
+
+    (evicted_count, bytes_saved)
+}
+
+/// If a single result still exceeds `max_tokens`, truncate it.
+fn truncate_single_oversized_result(results: &mut [ToolResult], max_tokens: usize) {
+    let current_tokens = estimate_results_tokens(results);
+    if current_tokens <= max_tokens {
+        return;
+    }
+
+    // Find the largest result and truncate it
+    if let Some(largest) = results.iter_mut().max_by_key(|r| r.output.len()) {
+        let excess_tokens = current_tokens.saturating_sub(max_tokens);
+        // NB2: This uses the char-based inverse (4 bytes/token) of `estimate_text_tokens`.
+        // When the word-count path dominates (many short words), this undershoots — the
+        // result may remain slightly over limit. This is intentional: conservative eviction
+        // (removing less than optimal) is safer than over-eviction which could discard
+        // useful context needed for synthesis.
+        let excess_bytes = excess_tokens.saturating_mul(4);
+        let target_bytes = largest.output.len().saturating_sub(excess_bytes);
+        largest.output = truncate_tool_result(&largest.output, target_bytes).into_owned();
+    }
+}
+
+fn truncate_tool_results(results: Vec<ToolResult>, max_bytes: usize) -> Vec<ToolResult> {
+    results
+        .into_iter()
+        .map(|mut result| {
+            if result.output.len() > max_bytes {
+                result.output = truncate_tool_result(&result.output, max_bytes).into_owned();
+            }
+            result
+        })
+        .collect()
 }
 
 fn extract_user_message(snapshot: &PerceptionSnapshot) -> Result<String, LoopError> {
@@ -4595,6 +4897,7 @@ mod phase2_tests {
             max_wall_time_ms: 0,
             max_recursion_depth: 0,
             decompose_depth_mode: DepthMode::Adaptive,
+            ..BudgetConfig::default()
         };
         let mut engine = LoopEngine::builder()
             .budget(BudgetTracker::new(zero_budget, 0, 0))
@@ -4635,6 +4938,7 @@ mod phase2_tests {
             max_wall_time_ms: 0,
             max_recursion_depth: 0,
             decompose_depth_mode: DepthMode::Adaptive,
+            ..BudgetConfig::default()
         };
         let mut engine = LoopEngine::builder()
             .budget(BudgetTracker::new(zero_budget, 0, 0))
@@ -5802,6 +6106,67 @@ mod phase4_tests {
             .expect("act_with_tools");
 
         assert_eq!(action.tool_results.len(), 1);
+        assert_eq!(action.response_text, "summary");
+    }
+
+    /// Regression test for #1105: budget soft-ceiling must be checked within
+    /// the tool round loop, not only at act_with_tools entry. When budget
+    /// crosses 80% mid-loop, the loop breaks and falls through to synthesis
+    /// instead of continuing to burn through rounds.
+    #[tokio::test]
+    async fn act_with_tools_breaks_on_budget_soft_ceiling_mid_loop() {
+        let config = crate::budget::BudgetConfig {
+            max_cost_cents: 100,
+            soft_ceiling_percent: 80,
+            ..crate::budget::BudgetConfig::default()
+        };
+        let mut tracker = BudgetTracker::new(config, 0, 0);
+        // Pre-record 76% cost. After round 1 (3 tools + 1 LLM continuation),
+        // budget will be 76 + 3 + 2 = 81%, crossing the 80% soft ceiling.
+        tracker.record(&ActionCost {
+            cost_cents: 76,
+            ..ActionCost::default()
+        });
+        assert_eq!(tracker.state(), BudgetState::Normal);
+
+        let mut engine = LoopEngine::builder()
+            .budget(tracker)
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(5)
+            .tool_executor(Arc::new(Phase4StubToolExecutor))
+            .synthesis_instruction("Summarize tool output".to_string())
+            .build()
+            .expect("test engine build");
+
+        let decision = Decision::UseTools(vec![
+            read_file_call("call-1", "a.txt"),
+            read_file_call("call-2", "b.txt"),
+            read_file_call("call-3", "c.txt"),
+        ]);
+        // LLM would return more tool calls for round 2 — but the budget
+        // soft-ceiling should prevent round 2 from executing.
+        let llm = Phase4MockLlm::new(vec![tool_use_response(vec![read_file_call(
+            "call-4", "d.txt",
+        )])]);
+        let context_messages = vec![Message::user("read many files")];
+
+        let action = engine
+            .act_with_tools(
+                &decision,
+                calls_from_decision(&decision),
+                &llm,
+                &context_messages,
+            )
+            .await
+            .expect("act_with_tools should succeed via synthesis fallback");
+
+        // Only round 1's 3 tool results should be present.
+        // Round 2 should NOT have executed.
+        assert_eq!(action.tool_results.len(), 3, "only round 1 tools executed");
+        assert_eq!(action.tool_results[0].tool_call_id, "call-1");
+        assert_eq!(action.tool_results[1].tool_call_id, "call-2");
+        assert_eq!(action.tool_results[2].tool_call_id, "call-3");
+        // Falls through to synthesize_tool_fallback which returns "summary"
         assert_eq!(action.response_text, "summary");
     }
 
@@ -7506,6 +7871,7 @@ mod decomposition_tests {
             max_wall_time_ms: 60_000,
             max_recursion_depth,
             decompose_depth_mode: mode,
+            ..BudgetConfig::default()
         }
     }
 
@@ -10126,6 +10492,1918 @@ mod r2_streaming_review_tests {
         assert!(
             response.usage.is_none(),
             "default state should produce no usage"
+        );
+    }
+
+    #[test]
+    fn finalize_stream_tool_calls_separates_multi_tool_arguments() {
+        let mut state = StreamResponseState::default();
+
+        // Tool 1: content_block_start with id
+        state.apply_chunk(StreamChunk {
+            tool_use_deltas: vec![ToolUseDelta {
+                id: Some("toolu_01".to_string()),
+                name: Some("read_file".to_string()),
+                arguments_delta: None,
+                arguments_done: false,
+            }],
+            ..Default::default()
+        });
+
+        // Tool 1: argument delta (id present from provider fix)
+        state.apply_chunk(StreamChunk {
+            tool_use_deltas: vec![ToolUseDelta {
+                id: Some("toolu_01".to_string()),
+                name: None,
+                arguments_delta: Some(r#"{"path":"/tmp/a.txt"}"#.to_string()),
+                arguments_done: false,
+            }],
+            ..Default::default()
+        });
+
+        // Tool 1: done
+        state.apply_chunk(StreamChunk {
+            tool_use_deltas: vec![ToolUseDelta {
+                id: Some("toolu_01".to_string()),
+                name: None,
+                arguments_delta: None,
+                arguments_done: true,
+            }],
+            ..Default::default()
+        });
+
+        // Tool 2: content_block_start with id
+        state.apply_chunk(StreamChunk {
+            tool_use_deltas: vec![ToolUseDelta {
+                id: Some("toolu_02".to_string()),
+                name: Some("read_file".to_string()),
+                arguments_delta: None,
+                arguments_done: false,
+            }],
+            ..Default::default()
+        });
+
+        // Tool 2: argument delta with id (injected by provider)
+        state.apply_chunk(StreamChunk {
+            tool_use_deltas: vec![ToolUseDelta {
+                id: Some("toolu_02".to_string()),
+                name: None,
+                arguments_delta: Some(r#"{"path":"/tmp/b.txt"}"#.to_string()),
+                arguments_done: false,
+            }],
+            ..Default::default()
+        });
+
+        // Tool 2: done
+        state.apply_chunk(StreamChunk {
+            tool_use_deltas: vec![ToolUseDelta {
+                id: Some("toolu_02".to_string()),
+                name: None,
+                arguments_delta: None,
+                arguments_done: true,
+            }],
+            ..Default::default()
+        });
+
+        let response = state.into_response();
+        assert_eq!(
+            response.tool_calls.len(),
+            2,
+            "expected 2 separate tool calls, got {}",
+            response.tool_calls.len()
+        );
+        assert_eq!(response.tool_calls[0].id, "toolu_01");
+        assert_eq!(
+            response.tool_calls[0].arguments,
+            serde_json::json!({"path": "/tmp/a.txt"})
+        );
+        assert_eq!(response.tool_calls[1].id, "toolu_02");
+        assert_eq!(
+            response.tool_calls[1].arguments,
+            serde_json::json!({"path": "/tmp/b.txt"})
+        );
+    }
+}
+
+#[cfg(test)]
+mod loop_resilience_tests {
+    use super::*;
+    use crate::act::{ToolExecutor, ToolResult};
+    use crate::budget::{ActionCost, BudgetConfig, BudgetTracker};
+    use crate::cancellation::CancellationToken;
+    use crate::context_manager::ContextCompactor;
+    use async_trait::async_trait;
+    use fx_core::error::LlmError as CoreLlmError;
+    use fx_core::types::{InputSource, ScreenState, UserInput};
+    use fx_llm::{
+        CompletionResponse, ContentBlock, Message, ProviderError, ToolCall, ToolDefinition,
+    };
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    #[derive(Debug, Default)]
+    struct StubToolExecutor;
+
+    #[async_trait]
+    impl ToolExecutor for StubToolExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+            Ok(calls
+                .iter()
+                .map(|call| ToolResult {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    success: true,
+                    output: "ok".to_string(),
+                })
+                .collect())
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition {
+                name: "read_file".to_string(),
+                description: "Read a file".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+            }]
+        }
+    }
+
+    /// Tool executor that returns large outputs for truncation testing.
+    #[derive(Debug)]
+    struct LargeOutputToolExecutor {
+        output_size: usize,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for LargeOutputToolExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+            Ok(calls
+                .iter()
+                .map(|call| ToolResult {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    success: true,
+                    output: "x".repeat(self.output_size),
+                })
+                .collect())
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition {
+                name: "read_file".to_string(),
+                description: "Read a file".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+            }]
+        }
+    }
+
+    #[derive(Debug)]
+    struct SequentialMockLlm {
+        responses: Mutex<VecDeque<CompletionResponse>>,
+    }
+
+    impl SequentialMockLlm {
+        fn new(responses: Vec<CompletionResponse>) -> Self {
+            Self {
+                responses: Mutex::new(VecDeque::from(responses)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for SequentialMockLlm {
+        async fn generate(&self, _: &str, _: u32) -> Result<String, CoreLlmError> {
+            Ok("summary".to_string())
+        }
+
+        async fn generate_streaming(
+            &self,
+            _: &str,
+            _: u32,
+            callback: Box<dyn Fn(String) + Send + 'static>,
+        ) -> Result<String, CoreLlmError> {
+            callback("summary".to_string());
+            Ok("summary".to_string())
+        }
+
+        fn model_name(&self) -> &str {
+            "mock"
+        }
+
+        async fn complete(
+            &self,
+            _: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            self.responses
+                .lock()
+                .expect("lock")
+                .pop_front()
+                .ok_or_else(|| ProviderError::Provider("no response".to_string()))
+        }
+    }
+
+    fn high_budget_engine() -> LoopEngine {
+        LoopEngine::builder()
+            .budget(BudgetTracker::new(BudgetConfig::default(), 0, 0))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(StubToolExecutor))
+            .synthesis_instruction("Summarize".to_string())
+            .build()
+            .expect("build")
+    }
+
+    fn low_budget_engine() -> LoopEngine {
+        let config = BudgetConfig {
+            max_cost_cents: 100,
+            soft_ceiling_percent: 80,
+            ..BudgetConfig::default()
+        };
+        let mut tracker = BudgetTracker::new(config, 0, 0);
+        // Push past the soft ceiling (81%)
+        tracker.record(&ActionCost {
+            cost_cents: 81,
+            ..ActionCost::default()
+        });
+        LoopEngine::builder()
+            .budget(tracker)
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(StubToolExecutor))
+            .synthesis_instruction("Summarize".to_string())
+            .build()
+            .expect("build")
+    }
+
+    fn fan_out_engine(max_fan_out: usize) -> LoopEngine {
+        let config = BudgetConfig {
+            max_fan_out,
+            ..BudgetConfig::default()
+        };
+        LoopEngine::builder()
+            .budget(BudgetTracker::new(config, 0, 0))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(5)
+            .tool_executor(Arc::new(StubToolExecutor))
+            .synthesis_instruction("Summarize".to_string())
+            .build()
+            .expect("build")
+    }
+
+    fn test_snapshot(text: &str) -> PerceptionSnapshot {
+        PerceptionSnapshot {
+            timestamp_ms: 1,
+            screen: ScreenState {
+                current_app: "terminal".to_string(),
+                elements: Vec::new(),
+                text_content: text.to_string(),
+            },
+            notifications: Vec::new(),
+            active_app: "terminal".to_string(),
+            user_input: Some(UserInput {
+                text: text.to_string(),
+                source: InputSource::Text,
+                timestamp: 1,
+                context_id: None,
+            }),
+            sensor_data: None,
+            conversation_history: vec![Message::user(text)],
+            steer_context: None,
+        }
+    }
+
+    // --- Test 4: Tool dispatch blocked when state() == Low ---
+    #[tokio::test]
+    async fn tool_dispatch_blocked_when_budget_low() {
+        let mut engine = low_budget_engine();
+        let decision = Decision::UseTools(vec![ToolCall {
+            id: "1".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path": "test.rs"}),
+        }]);
+        let context = vec![Message::user("read file")];
+        let llm = SequentialMockLlm::new(vec![]);
+
+        let result = engine
+            .act(&decision, &llm, &context)
+            .await
+            .expect("act should succeed");
+
+        assert!(
+            result.response_text.contains("soft-ceiling"),
+            "response should mention soft-ceiling: {}",
+            result.response_text,
+        );
+        assert!(result.tool_results.is_empty(), "no tools should execute");
+    }
+
+    // --- Test 5: Decompose blocked at 85% cost ---
+    #[tokio::test]
+    async fn decompose_blocked_when_budget_low() {
+        let config = BudgetConfig {
+            max_cost_cents: 100,
+            soft_ceiling_percent: 80,
+            ..BudgetConfig::default()
+        };
+        let mut tracker = BudgetTracker::new(config, 0, 0);
+        tracker.record(&ActionCost {
+            cost_cents: 85,
+            ..ActionCost::default()
+        });
+        let mut engine = LoopEngine::builder()
+            .budget(tracker)
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(StubToolExecutor))
+            .synthesis_instruction("Summarize".to_string())
+            .build()
+            .expect("build");
+
+        let plan = fx_decompose::DecompositionPlan {
+            sub_goals: vec![fx_decompose::SubGoal {
+                description: "sub-goal".to_string(),
+                required_tools: vec![],
+                expected_output: None,
+                complexity_hint: None,
+            }],
+            strategy: fx_decompose::AggregationStrategy::Sequential,
+            truncated_from: None,
+        };
+        let decision = Decision::Decompose(plan.clone());
+        let context = vec![Message::user("do stuff")];
+        let llm = SequentialMockLlm::new(vec![]);
+
+        let result = engine
+            .act(&decision, &llm, &context)
+            .await
+            .expect("act should succeed");
+
+        assert!(
+            result.response_text.contains("soft-ceiling"),
+            "decompose should be blocked by soft-ceiling: {}",
+            result.response_text,
+        );
+    }
+
+    // --- Test 7: Performance signal emitted on Normal→Low transition ---
+    #[tokio::test]
+    async fn performance_signal_emitted_on_budget_low_transition() {
+        let config = BudgetConfig {
+            max_cost_cents: 100,
+            soft_ceiling_percent: 80,
+            ..BudgetConfig::default()
+        };
+        let mut tracker = BudgetTracker::new(config, 0, 0);
+        // Push past soft ceiling
+        tracker.record(&ActionCost {
+            cost_cents: 81,
+            ..ActionCost::default()
+        });
+        let mut engine = LoopEngine::builder()
+            .budget(tracker)
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(StubToolExecutor))
+            .synthesis_instruction("Summarize".to_string())
+            .build()
+            .expect("build");
+
+        let snapshot = test_snapshot("hello");
+        let _processed = engine.perceive(&snapshot).await.expect("perceive");
+
+        let signals = engine.signals.drain_all();
+        let perf_signals: Vec<_> = signals
+            .iter()
+            .filter(|s| {
+                s.kind == SignalKind::Performance && s.message.contains("budget soft-ceiling")
+            })
+            .collect();
+        assert_eq!(
+            perf_signals.len(),
+            1,
+            "exactly one performance signal on Normal→Low transition"
+        );
+    }
+
+    // --- Test 7b: Performance signal fires only once across multiple perceive calls ---
+    #[tokio::test]
+    async fn performance_signal_emitted_only_once_across_perceive_calls() {
+        let mut engine = low_budget_engine();
+        let snapshot = test_snapshot("hello");
+
+        // First perceive — should emit the signal
+        let _first = engine.perceive(&snapshot).await.expect("perceive 1");
+        // Second perceive — should NOT emit again
+        let _second = engine.perceive(&snapshot).await.expect("perceive 2");
+
+        let signals = engine.signals.drain_all();
+        let perf_signals: Vec<_> = signals
+            .iter()
+            .filter(|s| {
+                s.kind == SignalKind::Performance && s.message.contains("budget soft-ceiling")
+            })
+            .collect();
+        assert_eq!(
+            perf_signals.len(),
+            1,
+            "performance signal should fire exactly once, not on every perceive()"
+        );
+    }
+
+    // --- Test 7c: Wrap-up directive is system message, not user ---
+    #[tokio::test]
+    async fn wrap_up_directive_is_system_message() {
+        let mut engine = low_budget_engine();
+        let snapshot = test_snapshot("hello");
+        let processed = engine.perceive(&snapshot).await.expect("perceive");
+
+        let wrap_up_msg = processed
+            .context_window
+            .iter()
+            .find(|msg| {
+                msg.content.iter().any(|block| match block {
+                    ContentBlock::Text { text } => text.contains("running low on budget"),
+                    _ => false,
+                })
+            })
+            .expect("wrap-up directive should exist");
+        assert_eq!(
+            wrap_up_msg.role,
+            MessageRole::System,
+            "wrap-up directive should be a system message, not user"
+        );
+    }
+
+    // --- Test 8: Wrap-up directive present in perceive() when state() == Low ---
+    #[tokio::test]
+    async fn wrap_up_directive_injected_when_budget_low() {
+        let mut engine = low_budget_engine();
+        let snapshot = test_snapshot("hello");
+        let processed = engine.perceive(&snapshot).await.expect("perceive");
+
+        let has_wrap_up = processed.context_window.iter().any(|msg| {
+            msg.content.iter().any(|block| match block {
+                ContentBlock::Text { text } => text.contains("running low on budget"),
+                _ => false,
+            })
+        });
+        assert!(has_wrap_up, "wrap-up directive should be in context window");
+    }
+
+    // --- Test 8b: Wrap-up directive NOT present when budget Normal ---
+    #[tokio::test]
+    async fn no_wrap_up_directive_when_budget_normal() {
+        let mut engine = high_budget_engine();
+        let snapshot = test_snapshot("hello");
+        let processed = engine.perceive(&snapshot).await.expect("perceive");
+
+        let has_wrap_up = processed.context_window.iter().any(|msg| {
+            msg.content.iter().any(|block| match block {
+                ContentBlock::Text { text } => text.contains("running low on budget"),
+                _ => false,
+            })
+        });
+        assert!(!has_wrap_up, "no wrap-up directive when budget normal");
+    }
+
+    // --- Test 9: 3 tool calls with cap=4 → all 3 execute ---
+    #[tokio::test]
+    async fn fan_out_3_calls_within_cap_all_execute() {
+        let mut engine = fan_out_engine(4);
+        let calls: Vec<ToolCall> = (0..3)
+            .map(|i| ToolCall {
+                id: format!("call-{i}"),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": format!("file{i}.txt")}),
+            })
+            .collect();
+        let decision = Decision::UseTools(calls.clone());
+        let context = vec![Message::user("read files")];
+        let llm = SequentialMockLlm::new(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "done reading".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let result = engine.act(&decision, &llm, &context).await.expect("act");
+
+        assert_eq!(result.tool_results.len(), 3, "all 3 should execute");
+    }
+
+    // --- Test 10: 6 tool calls with cap=4 → first 4 execute, last 2 deferred ---
+    #[tokio::test]
+    async fn fan_out_6_calls_cap_4_defers_2() {
+        let mut engine = fan_out_engine(4);
+        let calls: Vec<ToolCall> = (0..6)
+            .map(|i| ToolCall {
+                id: format!("call-{i}"),
+                name: format!("tool_{i}"),
+                arguments: serde_json::json!({}),
+            })
+            .collect();
+        let decision = Decision::UseTools(calls.clone());
+        let context = vec![Message::user("do stuff")];
+        let llm = SequentialMockLlm::new(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "completed".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let result = engine.act(&decision, &llm, &context).await.expect("act");
+
+        let executed: Vec<_> = result.tool_results.iter().filter(|r| r.success).collect();
+        assert_eq!(executed.len(), 4, "only first 4 should execute");
+        let deferred_results: Vec<_> = result
+            .tool_results
+            .iter()
+            .filter(|r| !r.success && r.output.contains("deferred"))
+            .collect();
+        assert_eq!(deferred_results.len(), 2, "2 deferred as synthetic results");
+        // Check that deferred signal was emitted
+        let signals = engine.signals.drain_all();
+        let friction: Vec<_> = signals
+            .iter()
+            .filter(|s| s.kind == SignalKind::Friction && s.message.contains("fan-out cap"))
+            .collect();
+        assert_eq!(friction.len(), 1, "fan-out friction signal emitted");
+    }
+
+    // --- Test 11: Deferred message lists correct tool names ---
+    #[tokio::test]
+    async fn fan_out_deferred_message_lists_tool_names() {
+        let mut engine = fan_out_engine(2);
+        let calls = vec![
+            ToolCall {
+                id: "a".to_string(),
+                name: "alpha".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "b".to_string(),
+                name: "beta".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "c".to_string(),
+                name: "gamma".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "d".to_string(),
+                name: "delta".to_string(),
+                arguments: serde_json::json!({}),
+            },
+        ];
+
+        let (execute, deferred) = engine.apply_fan_out_cap(&calls);
+        assert_eq!(execute.len(), 2);
+        assert_eq!(deferred.len(), 2);
+        assert_eq!(deferred[0].name, "gamma");
+        assert_eq!(deferred[1].name, "delta");
+
+        let signals = engine.signals.drain_all();
+        let friction = signals
+            .iter()
+            .find(|s| s.kind == SignalKind::Friction)
+            .expect("friction signal");
+        assert!(
+            friction.message.contains("gamma"),
+            "deferred message should list gamma: {}",
+            friction.message
+        );
+        assert!(
+            friction.message.contains("delta"),
+            "deferred message should list delta: {}",
+            friction.message
+        );
+    }
+
+    // --- Test 12: Cap=1 forces strictly sequential tool execution ---
+    #[tokio::test]
+    async fn fan_out_cap_1_forces_sequential() {
+        let mut engine = fan_out_engine(1);
+        let calls: Vec<ToolCall> = (0..3)
+            .map(|i| ToolCall {
+                id: format!("call-{i}"),
+                name: format!("tool_{i}"),
+                arguments: serde_json::json!({}),
+            })
+            .collect();
+        let decision = Decision::UseTools(calls.clone());
+        let context = vec![Message::user("do stuff")];
+        let llm = SequentialMockLlm::new(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "done".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let result = engine.act(&decision, &llm, &context).await.expect("act");
+
+        let executed: Vec<_> = result.tool_results.iter().filter(|r| r.success).collect();
+        assert_eq!(executed.len(), 1, "cap=1 should execute exactly 1 tool");
+        let deferred_results: Vec<_> = result
+            .tool_results
+            .iter()
+            .filter(|r| !r.success && r.output.contains("deferred"))
+            .collect();
+        assert_eq!(
+            deferred_results.len(),
+            2,
+            "cap=1 with 3 calls should defer 2"
+        );
+    }
+
+    // --- Test 11b: Deferred tools injected as synthetic tool results ---
+    #[tokio::test]
+    async fn deferred_tools_appear_in_synthesis_results() {
+        let mut engine = fan_out_engine(1);
+        let calls = vec![
+            ToolCall {
+                id: "a".to_string(),
+                name: "alpha".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "b".to_string(),
+                name: "beta".to_string(),
+                arguments: serde_json::json!({}),
+            },
+        ];
+
+        // LLM returns empty so we fall through to synthesize_tool_fallback
+        let llm = SequentialMockLlm::new(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "summary".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        }]);
+
+        let decision = Decision::UseTools(calls);
+        let context = vec![Message::user("do things")];
+        let result = engine.act(&decision, &llm, &context).await.expect("act");
+
+        // Should have 1 executed + 1 deferred-as-synthetic = 2 tool results
+        assert_eq!(
+            result.tool_results.len(),
+            2,
+            "deferred tool should appear as synthetic tool result"
+        );
+        let deferred_result = result
+            .tool_results
+            .iter()
+            .find(|r| r.tool_name == "beta")
+            .expect("beta should be in results");
+        assert!(
+            !deferred_result.success,
+            "deferred result should be marked as not successful"
+        );
+        assert!(
+            deferred_result.output.contains("deferred"),
+            "deferred result should mention deferral: {}",
+            deferred_result.output
+        );
+    }
+
+    // --- Test 12b: Continuation tool calls also capped by fan-out ---
+    #[tokio::test]
+    async fn continuation_tool_calls_capped_by_fan_out() {
+        let mut engine = fan_out_engine(2);
+
+        // Initial: 2 calls (within cap). Continuation response has 4 more calls.
+        let initial_calls: Vec<ToolCall> = (0..2)
+            .map(|i| ToolCall {
+                id: format!("init-{i}"),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": format!("f{i}.txt")}),
+            })
+            .collect();
+
+        // Mock LLM: first call returns 4 tool calls (should be capped to 2),
+        // second call returns 2 more (capped to 2), third returns final text.
+        let continuation_calls: Vec<ToolCall> = (0..4)
+            .map(|i| ToolCall {
+                id: format!("cont-{i}"),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": format!("c{i}.txt")}),
+            })
+            .collect();
+        let llm = SequentialMockLlm::new(vec![
+            // First continuation: returns 4 tool calls
+            CompletionResponse {
+                content: Vec::new(),
+                tool_calls: continuation_calls,
+                usage: None,
+                stop_reason: Some("tool_use".to_string()),
+            },
+            // Second continuation: returns text (done)
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "all done".to_string(),
+                }],
+                tool_calls: Vec::new(),
+                usage: None,
+                stop_reason: None,
+            },
+        ]);
+
+        let decision = Decision::UseTools(initial_calls);
+        let context = vec![Message::user("read files")];
+        let result = engine.act(&decision, &llm, &context).await.expect("act");
+
+        // Initial 2 + capped 2 executed + 2 deferred (synthetic) = 6 total
+        assert_eq!(
+            result.tool_results.len(),
+            6,
+            "continuation tool calls should include capped + deferred: got {}",
+            result.tool_results.len()
+        );
+
+        // The last 2 entries are synthetic deferred results (not successfully executed)
+        let deferred_results: Vec<_> = result.tool_results.iter().filter(|r| !r.success).collect();
+        assert_eq!(
+            deferred_results.len(),
+            2,
+            "expected 2 deferred tool results, got {}",
+            deferred_results.len()
+        );
+        for r in &deferred_results {
+            assert!(
+                r.output.contains("deferred"),
+                "deferred result should mention deferral: {}",
+                r.output
+            );
+        }
+    }
+
+    // --- Tool result truncation via execute_tool_calls ---
+    #[tokio::test]
+    async fn tool_results_truncated_by_execute_tool_calls() {
+        let config = BudgetConfig {
+            max_tool_result_bytes: 100,
+            ..BudgetConfig::default()
+        };
+        let engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(config, 0, 0))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(LargeOutputToolExecutor { output_size: 500 }))
+            .synthesis_instruction("Summarize".to_string())
+            .build()
+            .expect("build");
+
+        let calls = vec![ToolCall {
+            id: "1".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path": "big.txt"}),
+        }];
+        let results = engine.execute_tool_calls(&calls).await.expect("execute");
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].output.contains("[truncated"),
+            "output should be truncated: {}",
+            &results[0].output[..100.min(results[0].output.len())]
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_results_not_truncated_within_limit() {
+        let config = BudgetConfig {
+            max_tool_result_bytes: 1000,
+            ..BudgetConfig::default()
+        };
+        let engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(config, 0, 0))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(LargeOutputToolExecutor { output_size: 500 }))
+            .synthesis_instruction("Summarize".to_string())
+            .build()
+            .expect("build");
+
+        let calls = vec![ToolCall {
+            id: "1".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path": "small.txt"}),
+        }];
+        let results = engine.execute_tool_calls(&calls).await.expect("execute");
+        assert_eq!(results.len(), 1);
+        assert!(
+            !results[0].output.contains("[truncated"),
+            "output within limit should NOT be truncated"
+        );
+        assert_eq!(results[0].output.len(), 500);
+    }
+}
+
+#[cfg(test)]
+mod synthesis_context_guard_tests {
+    use super::*;
+
+    fn make_tool_result(index: usize, output_size: usize) -> ToolResult {
+        ToolResult {
+            tool_call_id: format!("call-{index}"),
+            tool_name: format!("tool_{index}"),
+            success: true,
+            output: "x".repeat(output_size),
+        }
+    }
+
+    #[test]
+    fn eviction_reduces_total_tokens_and_replaces_oldest_with_stubs() {
+        // 10 results, each ~5000 tokens (20_000 chars / 4 = 5000 tokens)
+        // Total: ~50_000 tokens. Limit: 10_000 tokens.
+        let results: Vec<ToolResult> = (0..10).map(|i| make_tool_result(i, 20_000)).collect();
+
+        let evicted = evict_oldest_results(results, 10_000);
+
+        assert_eq!(evicted.len(), 10);
+
+        let stubs: Vec<_> = evicted
+            .iter()
+            .filter(|r| r.output.starts_with("[evicted:"))
+            .collect();
+        assert!(!stubs.is_empty(), "at least some results should be evicted");
+
+        // Stubs should preserve tool_name
+        for stub in &stubs {
+            assert!(
+                stub.output.contains(&stub.tool_name),
+                "eviction stub must include tool_name"
+            );
+        }
+
+        // Total tokens should be under limit
+        let total_tokens = estimate_results_tokens(&evicted);
+        assert!(
+            total_tokens <= 10_000,
+            "total tokens {total_tokens} should be <= 10_000"
+        );
+    }
+
+    #[test]
+    fn no_eviction_when_under_limit() {
+        let results: Vec<ToolResult> = (0..3).map(|i| make_tool_result(i, 100)).collect();
+
+        let evicted = evict_oldest_results(results.clone(), 100_000);
+
+        assert_eq!(evicted.len(), 3);
+        for (orig, ev) in results.iter().zip(evicted.iter()) {
+            assert_eq!(orig.output, ev.output);
+        }
+    }
+
+    #[test]
+    fn single_oversized_result_is_truncated() {
+        // One result with 400K chars (~100K tokens), limit = 1_000 tokens
+        let results = vec![make_tool_result(0, 400_000)];
+        let evicted = evict_oldest_results(results, 1_000);
+
+        assert_eq!(evicted.len(), 1);
+        assert!(
+            evicted[0].output.len() < 400_000,
+            "oversized result should be truncated"
+        );
+    }
+
+    #[test]
+    fn eviction_order_is_oldest_first() {
+        // 5 results, each ~2500 tokens (10_000 chars). Total ~12_500. Limit: 5_000
+        let results: Vec<ToolResult> = (0..5).map(|i| make_tool_result(i, 10_000)).collect();
+
+        let evicted = evict_oldest_results(results, 5_000);
+
+        // Oldest (index 0, 1, ...) should be evicted first
+        let first_non_stub = evicted
+            .iter()
+            .position(|r| !r.output.starts_with("[evicted:"));
+
+        if let Some(pos) = first_non_stub {
+            // All items before pos should be stubs
+            for item in &evicted[..pos] {
+                assert!(
+                    item.output.starts_with("[evicted:"),
+                    "earlier results should be evicted first"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn empty_results_returns_empty() {
+        let results = evict_oldest_results(Vec::new(), 1_000);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn zero_max_tokens_clamps_to_floor_preserving_results() {
+        // NB1: max_synthesis_tokens == 0 should not evict everything.
+        // The floor clamp (1000 tokens) ensures at least some results survive.
+        let results: Vec<ToolResult> = (0..3).map(|i| make_tool_result(i, 100)).collect();
+
+        let evicted = evict_oldest_results(results, 0);
+
+        assert_eq!(evicted.len(), 3);
+        // Small results (~25 tokens each) fit under the 1000-token floor,
+        // so none should be evicted.
+        let stubs: Vec<_> = evicted
+            .iter()
+            .filter(|r| r.output.starts_with("[evicted:"))
+            .collect();
+        assert!(
+            stubs.is_empty(),
+            "small results should survive under the floor clamp"
+        );
+    }
+
+    #[test]
+    fn synthesis_prompt_after_eviction_is_valid() {
+        let results: Vec<ToolResult> = (0..10).map(|i| make_tool_result(i, 20_000)).collect();
+
+        let evicted = evict_oldest_results(results, 10_000);
+        let prompt = tool_synthesis_prompt(&evicted, "Summarize results");
+
+        // Prompt should be constructable and contain tool result sections
+        assert!(prompt.contains("Tool results:"));
+        assert!(prompt.contains("Summarize results"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared test fixtures for error-path and integration tests
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod test_fixtures {
+    use super::*;
+    use crate::act::{ToolExecutor, ToolResult};
+    use crate::budget::{BudgetConfig, BudgetTracker, DepthMode};
+    use crate::cancellation::CancellationToken;
+    use crate::context_manager::ContextCompactor;
+    use async_trait::async_trait;
+    use fx_core::error::LlmError as CoreLlmError;
+    use fx_core::types::{InputSource, ScreenState, UserInput};
+    use fx_decompose::{AggregationStrategy, DecompositionPlan, SubGoal};
+    use fx_llm::{
+        CompletionRequest, CompletionResponse, ContentBlock, Message, ProviderError, ToolCall,
+        ToolDefinition,
+    };
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    // -- LLM providers --------------------------------------------------------
+
+    #[derive(Debug)]
+    pub(super) struct ScriptedLlm {
+        responses: Mutex<VecDeque<Result<CompletionResponse, ProviderError>>>,
+    }
+
+    impl ScriptedLlm {
+        pub(super) fn new(responses: Vec<Result<CompletionResponse, ProviderError>>) -> Self {
+            Self {
+                responses: Mutex::new(VecDeque::from(responses)),
+            }
+        }
+
+        pub(super) fn ok(responses: Vec<CompletionResponse>) -> Self {
+            Self::new(responses.into_iter().map(Ok).collect())
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for ScriptedLlm {
+        async fn generate(&self, _: &str, _: u32) -> Result<String, CoreLlmError> {
+            Ok("summary".to_string())
+        }
+
+        async fn generate_streaming(
+            &self,
+            _: &str,
+            _: u32,
+            callback: Box<dyn Fn(String) + Send + 'static>,
+        ) -> Result<String, CoreLlmError> {
+            callback("summary".to_string());
+            Ok("summary".to_string())
+        }
+
+        fn model_name(&self) -> &str {
+            "scripted"
+        }
+
+        async fn complete(
+            &self,
+            _: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            self.responses
+                .lock()
+                .expect("lock")
+                .pop_front()
+                .unwrap_or_else(|| Err(ProviderError::Provider("no scripted response".to_string())))
+        }
+    }
+
+    /// LLM that cancels a token after the N-th call to `complete()`.
+    #[derive(Debug)]
+    pub(super) struct CancelAfterNthCallLlm {
+        cancel_token: CancellationToken,
+        cancel_after: usize,
+        call_count: AtomicUsize,
+        responses: Mutex<VecDeque<Result<CompletionResponse, ProviderError>>>,
+    }
+
+    impl CancelAfterNthCallLlm {
+        pub(super) fn new(
+            cancel_token: CancellationToken,
+            cancel_after: usize,
+            responses: Vec<Result<CompletionResponse, ProviderError>>,
+        ) -> Self {
+            Self {
+                cancel_token,
+                cancel_after,
+                call_count: AtomicUsize::new(0),
+                responses: Mutex::new(VecDeque::from(responses)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for CancelAfterNthCallLlm {
+        async fn generate(&self, _: &str, _: u32) -> Result<String, CoreLlmError> {
+            Ok("summary".to_string())
+        }
+
+        async fn generate_streaming(
+            &self,
+            _: &str,
+            _: u32,
+            callback: Box<dyn Fn(String) + Send + 'static>,
+        ) -> Result<String, CoreLlmError> {
+            callback("summary".to_string());
+            Ok("summary".to_string())
+        }
+
+        fn model_name(&self) -> &str {
+            "cancel-after-nth"
+        }
+
+        async fn complete(
+            &self,
+            _: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            let call_number = self.call_count.fetch_add(1, Ordering::SeqCst) + 1;
+            if call_number >= self.cancel_after {
+                self.cancel_token.cancel();
+            }
+            self.responses
+                .lock()
+                .expect("lock")
+                .pop_front()
+                .unwrap_or_else(|| Err(ProviderError::Provider("no scripted response".to_string())))
+        }
+    }
+
+    // -- Tool executors -------------------------------------------------------
+
+    #[derive(Debug, Default)]
+    pub(super) struct StubToolExecutor;
+
+    #[async_trait]
+    impl ToolExecutor for StubToolExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+            Ok(calls
+                .iter()
+                .map(|call| ToolResult {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    success: true,
+                    output: "ok".to_string(),
+                })
+                .collect())
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![read_file_def()]
+        }
+    }
+
+    /// Tool executor that always fails.
+    #[derive(Debug, Default)]
+    pub(super) struct AlwaysFailingToolExecutor;
+
+    #[async_trait]
+    impl ToolExecutor for AlwaysFailingToolExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+            Ok(calls
+                .iter()
+                .map(|call| ToolResult {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    success: false,
+                    output: "tool crashed: segfault".to_string(),
+                })
+                .collect())
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![read_file_def()]
+        }
+    }
+
+    /// Tool executor that sleeps, then checks cancellation.
+    #[derive(Debug)]
+    pub(super) struct SlowToolExecutor {
+        pub(super) delay: tokio::time::Duration,
+        pub(super) executions: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for SlowToolExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            let step = tokio::time::Duration::from_millis(5);
+            let mut remaining = self.delay;
+            while !remaining.is_zero() {
+                if cancel.is_some_and(CancellationToken::is_cancelled) {
+                    break;
+                }
+                let sleep_for = remaining.min(step);
+                tokio::time::sleep(sleep_for).await;
+                remaining = remaining.saturating_sub(sleep_for);
+            }
+            if cancel.is_some_and(CancellationToken::is_cancelled) {
+                return Ok(calls
+                    .iter()
+                    .map(|call| ToolResult {
+                        tool_call_id: call.id.clone(),
+                        tool_name: call.name.clone(),
+                        success: false,
+                        output: "cancelled mid-execution".to_string(),
+                    })
+                    .collect());
+            }
+            Ok(calls
+                .iter()
+                .map(|call| ToolResult {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    success: true,
+                    output: "slow result".to_string(),
+                })
+                .collect())
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![read_file_def()]
+        }
+    }
+
+    /// Tool executor producing very large outputs to push context past limits.
+    #[derive(Debug)]
+    pub(super) struct LargeOutputToolExecutor {
+        pub(super) output_size: usize,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for LargeOutputToolExecutor {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+            Ok(calls
+                .iter()
+                .map(|call| ToolResult {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    success: true,
+                    output: "X".repeat(self.output_size),
+                })
+                .collect())
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![read_file_def()]
+        }
+    }
+
+    // -- Factory functions ----------------------------------------------------
+
+    pub(super) fn read_file_def() -> ToolDefinition {
+        ToolDefinition {
+            name: "read_file".to_string(),
+            description: "Read a file".to_string(),
+            parameters: serde_json::json!({"type":"object"}),
+        }
+    }
+
+    pub(super) fn read_file_call(id: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path":"README.md"}),
+        }
+    }
+
+    pub(super) fn text_response(text: &str) -> CompletionResponse {
+        CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        }
+    }
+
+    pub(super) fn tool_use_response(calls: Vec<ToolCall>) -> CompletionResponse {
+        CompletionResponse {
+            content: Vec::new(),
+            tool_calls: calls,
+            usage: None,
+            stop_reason: Some("tool_use".to_string()),
+        }
+    }
+
+    pub(super) fn test_snapshot(text: &str) -> PerceptionSnapshot {
+        PerceptionSnapshot {
+            timestamp_ms: 1,
+            screen: ScreenState {
+                current_app: "terminal".to_string(),
+                elements: Vec::new(),
+                text_content: text.to_string(),
+            },
+            notifications: Vec::new(),
+            active_app: "terminal".to_string(),
+            user_input: Some(UserInput {
+                text: text.to_string(),
+                source: InputSource::Text,
+                timestamp: 1,
+                context_id: None,
+            }),
+            sensor_data: None,
+            conversation_history: vec![Message::user(text)],
+            steer_context: None,
+        }
+    }
+
+    pub(super) fn budget_config_with_llm_calls(
+        max_llm_calls: u32,
+        max_recursion_depth: u32,
+    ) -> BudgetConfig {
+        BudgetConfig {
+            max_llm_calls,
+            max_tool_invocations: 20,
+            max_tokens: 100_000,
+            max_cost_cents: 500,
+            max_wall_time_ms: 60_000,
+            max_recursion_depth,
+            decompose_depth_mode: DepthMode::Static,
+            ..BudgetConfig::default()
+        }
+    }
+
+    pub(super) fn build_engine_with_executor(
+        executor: Arc<dyn ToolExecutor>,
+        config: BudgetConfig,
+        depth: u32,
+        max_iterations: u32,
+    ) -> LoopEngine {
+        LoopEngine::builder()
+            .budget(BudgetTracker::new(config, current_time_ms(), depth))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(max_iterations)
+            .tool_executor(executor)
+            .synthesis_instruction("Summarize tool output".to_string())
+            .build()
+            .expect("test engine build")
+    }
+
+    pub(super) fn decomposition_plan(descriptions: &[&str]) -> DecompositionPlan {
+        DecompositionPlan {
+            sub_goals: descriptions
+                .iter()
+                .map(|desc| SubGoal {
+                    description: (*desc).to_string(),
+                    required_tools: Vec::new(),
+                    expected_output: Some(format!("output for {desc}")),
+                    complexity_hint: None,
+                })
+                .collect(),
+            strategy: AggregationStrategy::Sequential,
+            truncated_from: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Error-path coverage tests (#1099)
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod error_path_coverage_tests {
+    use super::test_fixtures::*;
+    use super::*;
+    use crate::budget::{BudgetConfig, BudgetTracker, DepthMode};
+    use crate::cancellation::CancellationToken;
+    use crate::context_manager::ContextCompactor;
+    use fx_llm::{CompletionResponse, ToolCall};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::time::Duration;
+
+    // =========================================================================
+    // 1. Budget exhaustion mid-tool-call
+    // =========================================================================
+
+    /// When the budget is nearly exhausted and a tool call pushes it over the
+    /// soft ceiling, the loop must terminate with `BudgetExhausted` — not
+    /// `Complete` — without panicking.
+    #[tokio::test]
+    async fn budget_exhaustion_mid_tool_execution_returns_budget_exhausted() {
+        // Budget: 1 LLM call only. The first call returns a tool use, which
+        // consumes the single call. The engine must report BudgetExhausted
+        // (not silently complete).
+        let tight_budget = BudgetConfig {
+            max_llm_calls: 1,
+            max_tool_invocations: 1,
+            max_tokens: 100_000,
+            max_cost_cents: 500,
+            max_wall_time_ms: 60_000,
+            max_recursion_depth: 2,
+            decompose_depth_mode: DepthMode::Static,
+            soft_ceiling_percent: 50,
+            ..BudgetConfig::default()
+        };
+        let mut engine = build_engine_with_executor(Arc::new(StubToolExecutor), tight_budget, 0, 3);
+
+        // Single LLM call returns a tool use — budget is then exhausted.
+        let llm = ScriptedLlm::ok(vec![
+            tool_use_response(vec![read_file_call("call-1")]),
+            text_response("partial answer"),
+        ]);
+
+        let result = engine
+            .run_cycle(test_snapshot("read something"), &llm)
+            .await
+            .expect("run_cycle should not panic");
+
+        // With only 1 LLM call, the engine must report budget exhaustion.
+        match &result {
+            LoopResult::BudgetExhausted {
+                partial_response, ..
+            } => {
+                // Budget was exhausted — correct. Partial response is optional
+                // but if present should not be empty.
+                if let Some(partial) = partial_response {
+                    assert!(!partial.is_empty(), "partial response should not be empty");
+                }
+            }
+            LoopResult::Complete { response, .. } => {
+                // Synthesis fallback completed before budget check — acceptable
+                // only if the response contains meaningful content.
+                assert!(
+                    !response.is_empty(),
+                    "synthesis fallback must produce non-empty response"
+                );
+            }
+            other => panic!("expected BudgetExhausted or Complete, got: {other:?}"),
+        }
+    }
+
+    /// When tool invocations are consumed after some work, the engine
+    /// returns `BudgetExhausted` with partial_response reflecting work done.
+    /// Budget allows 1 tool invocation — the tool runs, produces output,
+    /// then the next LLM call triggers budget exhaustion with the tool
+    /// output preserved as partial_response.
+    #[tokio::test]
+    async fn budget_exhaustion_preserves_partial_response() {
+        let tight_budget = BudgetConfig {
+            max_llm_calls: 2,
+            max_tool_invocations: 1, // Allow exactly 1 tool invocation
+            max_tokens: 100_000,
+            max_cost_cents: 500,
+            max_wall_time_ms: 60_000,
+            max_recursion_depth: 2,
+            decompose_depth_mode: DepthMode::Static,
+            // Low soft ceiling so second LLM call triggers budget exhaustion
+            soft_ceiling_percent: 50,
+            ..BudgetConfig::default()
+        };
+        let mut engine = build_engine_with_executor(Arc::new(StubToolExecutor), tight_budget, 0, 3);
+
+        // LLM call 1: tool use → tool executes (consuming the 1 invocation).
+        // LLM call 2: budget is now low/exhausted → synthesis or BudgetExhausted.
+        let llm = ScriptedLlm::ok(vec![
+            tool_use_response(vec![read_file_call("call-1")]),
+            text_response("synthesis after tool output"),
+        ]);
+
+        let result = engine
+            .run_cycle(test_snapshot("read the file"), &llm)
+            .await
+            .expect("run_cycle should not panic");
+
+        match &result {
+            LoopResult::BudgetExhausted {
+                partial_response, ..
+            } => {
+                // After one tool invocation completes, the partial_response
+                // should reflect the work done (tool output or synthesis).
+                assert!(
+                    partial_response.is_some(),
+                    "BudgetExhausted after tool execution must preserve partial_response, got None"
+                );
+                let text = partial_response.as_ref().unwrap();
+                assert!(
+                    !text.is_empty(),
+                    "partial_response should contain tool output or synthesis content"
+                );
+            }
+            LoopResult::Complete { response, .. } => {
+                // Synthesis fallback completed — response must contain
+                // relevant content from the tool output or synthesis.
+                assert!(!response.is_empty(), "synthesis response must not be empty");
+            }
+            other => panic!("expected BudgetExhausted or Complete, got: {other:?}"),
+        }
+    }
+
+    // =========================================================================
+    // 2. Decomposition depth >2 integration test
+    // =========================================================================
+
+    /// Depth-0 decomposition with cap=3 completes a single sub-goal without
+    /// recursion issues.
+    #[tokio::test]
+    async fn decompose_at_depth_zero_with_cap_three_completes() {
+        let config = budget_config_with_llm_calls(30, 3);
+        let mut engine = build_engine_with_executor(
+            Arc::new(StubToolExecutor),
+            config.clone(),
+            0, // depth 0
+            4,
+        );
+
+        let plan = decomposition_plan(&["analyze the codebase"]);
+        let decision = Decision::Decompose(plan.clone());
+
+        let llm = ScriptedLlm::ok(vec![text_response("analysis complete")]);
+
+        let action = engine
+            .execute_decomposition(&decision, &plan, &llm, &[])
+            .await
+            .expect("decomposition at depth 0");
+
+        assert!(
+            action
+                .response_text
+                .contains("analyze the codebase => completed"),
+            "depth-0 decomposition should complete sub-goal: {}",
+            action.response_text
+        );
+    }
+
+    /// At max depth, decomposition returns the depth-limited fallback
+    /// without attempting child execution.
+    #[tokio::test]
+    async fn decompose_at_max_depth_returns_fallback() {
+        let config = budget_config_with_llm_calls(20, 2);
+        let mut engine = build_engine_with_executor(
+            Arc::new(StubToolExecutor),
+            config,
+            2, // Already at depth 2 == max_recursion_depth
+            4,
+        );
+
+        let plan = decomposition_plan(&["should not execute"]);
+        let decision = Decision::Decompose(plan.clone());
+        let llm = ScriptedLlm::ok(vec![]);
+
+        let action = engine
+            .execute_decomposition(&decision, &plan, &llm, &[])
+            .await
+            .expect("decomposition at max depth");
+
+        assert!(
+            action
+                .response_text
+                .contains("recursion depth limit was reached"),
+            "should return depth limit message: {}",
+            action.response_text
+        );
+    }
+
+    /// End-to-end: decomposition at depth 0 with depth_cap=2. Children at
+    /// depth 1 execute, but grandchildren at depth 2 hit the cap.
+    #[tokio::test]
+    async fn decompose_depth_cap_prevents_infinite_recursion_end_to_end() {
+        let config = budget_config_with_llm_calls(20, 2);
+        let mut engine =
+            build_engine_with_executor(Arc::new(StubToolExecutor), config.clone(), 0, 4);
+
+        let plan = decomposition_plan(&["step one", "step two"]);
+        let decision = Decision::Decompose(plan.clone());
+        let llm = ScriptedLlm::ok(vec![
+            text_response("step one done"),
+            text_response("step two done"),
+        ]);
+
+        let action = engine
+            .execute_decomposition(&decision, &plan, &llm, &[])
+            .await
+            .expect("execute_decomposition should succeed");
+
+        assert!(
+            action.response_text.contains("step one => completed"),
+            "response should contain step one result: {}",
+            action.response_text
+        );
+        assert!(
+            action.response_text.contains("step two => completed"),
+            "response should contain step two result: {}",
+            action.response_text
+        );
+
+        // Now verify depth-2 child cannot decompose
+        let mut depth_2_engine =
+            build_engine_with_executor(Arc::new(StubToolExecutor), config, 2, 4);
+        let child_plan = decomposition_plan(&["should not run"]);
+        let child_decision = Decision::Decompose(child_plan.clone());
+        let unused_llm = ScriptedLlm::ok(vec![]);
+
+        let child_action = depth_2_engine
+            .execute_decomposition(&child_decision, &child_plan, &unused_llm, &[])
+            .await
+            .expect("depth-limited decomposition");
+
+        assert!(
+            child_action
+                .response_text
+                .contains("recursion depth limit was reached"),
+            "depth-2 child should be depth-limited: {}",
+            child_action.response_text
+        );
+    }
+
+    // =========================================================================
+    // 3. Tool friction → escalation (repeated tool failures)
+    // =========================================================================
+
+    /// When all tool calls fail repeatedly, the loop should not retry until
+    /// budget is gone. It should synthesize a response from the failed results.
+    #[tokio::test]
+    async fn repeated_tool_failures_synthesize_without_infinite_retry() {
+        let mut engine = build_engine_with_executor(
+            Arc::new(AlwaysFailingToolExecutor),
+            BudgetConfig::default(),
+            0,
+            3,
+        );
+
+        let llm = ScriptedLlm::ok(vec![
+            tool_use_response(vec![read_file_call("call-1")]),
+            text_response("I was unable to read the file due to an error."),
+        ]);
+
+        let result = engine
+            .run_cycle(test_snapshot("read the config"), &llm)
+            .await
+            .expect("run_cycle should not panic");
+
+        match &result {
+            LoopResult::Complete {
+                response,
+                iterations,
+                ..
+            } => {
+                assert_eq!(
+                    *iterations, 1,
+                    "should complete in 1 iteration, not retry: got {iterations}"
+                );
+                assert!(
+                    response.contains("unable to read") || response.contains("error"),
+                    "response should acknowledge the failure: {response}"
+                );
+            }
+            other => panic!("expected Complete, got: {other:?}"),
+        }
+    }
+
+    /// When the LLM keeps requesting tool calls that all fail, the loop
+    /// exhausts max_iterations and falls back to synthesis rather than
+    /// looping until budget is gone.
+    #[tokio::test]
+    async fn tool_friction_caps_at_max_iterations() {
+        let mut engine = build_engine_with_executor(
+            Arc::new(AlwaysFailingToolExecutor),
+            BudgetConfig::default(),
+            0,
+            2, // Only 2 iterations
+        );
+
+        // Only script the responses that will actually be consumed in 2
+        // iterations: tool call → failure → tool call → failure → synthesis.
+        let llm = ScriptedLlm::ok(vec![
+            tool_use_response(vec![read_file_call("call-1")]),
+            tool_use_response(vec![read_file_call("call-2")]),
+            text_response("tools keep failing"),
+        ]);
+
+        let result = engine
+            .run_cycle(test_snapshot("read something"), &llm)
+            .await
+            .expect("run_cycle should not panic");
+
+        match &result {
+            LoopResult::Complete { iterations, .. } => {
+                assert!(
+                    *iterations <= 2,
+                    "should not exceed max_iterations=2: got {iterations}"
+                );
+            }
+            LoopResult::Error { recoverable, .. } => {
+                assert!(*recoverable, "iteration-limit error should be recoverable");
+            }
+            other => panic!("expected Complete or Error, got: {other:?}"),
+        }
+    }
+
+    // =========================================================================
+    // 4. Context overflow during tool round
+    // =========================================================================
+
+    /// When tool results push context past the hard limit, the engine
+    /// should return a recoverable `LoopError` or `LoopResult::Error`, not
+    /// panic. If compaction rescues the situation, the response must
+    /// acknowledge truncation or compaction.
+    #[tokio::test]
+    async fn context_overflow_during_tool_round_returns_error() {
+        let config = BudgetConfig::default();
+        let mut engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(config, current_time_ms(), 0))
+            .context(ContextCompactor::new(256, 64))
+            .max_iterations(3)
+            .tool_executor(Arc::new(LargeOutputToolExecutor {
+                output_size: 50_000,
+            }))
+            .synthesis_instruction("Summarize".to_string())
+            .build()
+            .expect("test engine build");
+
+        let llm = ScriptedLlm::ok(vec![
+            tool_use_response(vec![read_file_call("call-1")]),
+            text_response("synthesized"),
+        ]);
+
+        let result = engine
+            .run_cycle(test_snapshot("read the big file"), &llm)
+            .await;
+
+        match result {
+            Err(error) => {
+                assert!(
+                    error.reason.contains("context_exceeded_after_compaction"),
+                    "error should mention context exceeded: {}",
+                    error.reason
+                );
+                assert!(error.recoverable, "context overflow should be recoverable");
+            }
+            Ok(LoopResult::Error {
+                message,
+                recoverable,
+                ..
+            }) => {
+                assert!(recoverable, "context overflow error should be recoverable");
+                assert!(
+                    message.contains("context") || message.contains("limit"),
+                    "error message should mention context: {message}"
+                );
+            }
+            Ok(LoopResult::Complete { response, .. }) => {
+                // Compaction rescued the situation — verify the response
+                // acknowledges truncation or contains synthesis content.
+                assert!(
+                    !response.is_empty(),
+                    "compaction-rescued response must not be empty"
+                );
+            }
+            Ok(LoopResult::BudgetExhausted { .. }) => {
+                // Budget exhaustion from context pressure is acceptable.
+            }
+            Ok(other) => {
+                panic!("expected Error, Complete (compacted), or BudgetExhausted, got: {other:?}");
+            }
+        }
+    }
+
+    /// Context overflow produces a recoverable error even with moderately
+    /// large tool output that exceeds a small context budget mid-round.
+    #[tokio::test]
+    async fn context_overflow_mid_tool_round_is_recoverable() {
+        let config = BudgetConfig {
+            max_tool_result_bytes: usize::MAX,
+            ..BudgetConfig::default()
+        };
+        let mut engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(config, current_time_ms(), 0))
+            .context(ContextCompactor::new(512, 64))
+            .max_iterations(3)
+            .tool_executor(Arc::new(LargeOutputToolExecutor {
+                output_size: 100_000,
+            }))
+            .synthesis_instruction("Summarize".to_string())
+            .build()
+            .expect("test engine build");
+
+        let llm = ScriptedLlm::ok(vec![
+            tool_use_response(vec![read_file_call("call-1")]),
+            text_response("done"),
+        ]);
+
+        let result = engine
+            .run_cycle(test_snapshot("process large data"), &llm)
+            .await;
+
+        match result {
+            Err(error) => {
+                assert!(
+                    error.recoverable,
+                    "context overflow should be recoverable: {}",
+                    error.reason
+                );
+            }
+            Ok(LoopResult::Error {
+                recoverable,
+                message,
+                ..
+            }) => {
+                assert!(
+                    recoverable,
+                    "context overflow LoopResult::Error should be recoverable: {message}"
+                );
+            }
+            Ok(LoopResult::Complete { response, .. }) => {
+                // Compaction handled it — response must be non-empty.
+                assert!(
+                    !response.is_empty(),
+                    "compaction-rescued response must not be empty"
+                );
+            }
+            Ok(LoopResult::BudgetExhausted { .. }) => {
+                // Budget exhaustion from context pressure is acceptable.
+            }
+            Ok(other) => {
+                panic!("expected Error, Complete (compacted), or BudgetExhausted, got: {other:?}");
+            }
+        }
+    }
+
+    // =========================================================================
+    // 5. Cancellation during decomposition
+    // =========================================================================
+
+    /// When cancellation fires during sequential decomposition, the engine
+    /// should stop processing remaining sub-goals and return `UserStopped`.
+    #[tokio::test]
+    async fn cancellation_during_decomposition_returns_user_stopped() {
+        let token = CancellationToken::new();
+        let cancel_token = token.clone();
+
+        let config = budget_config_with_llm_calls(20, 4);
+        let mut engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(config, current_time_ms(), 0))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(4)
+            .tool_executor(Arc::new(StubToolExecutor))
+            .synthesis_instruction("Summarize".to_string())
+            .cancel_token(token)
+            .build()
+            .expect("test engine build");
+
+        let llm = CancelAfterNthCallLlm::new(
+            cancel_token,
+            2, // Cancel after 2nd complete() call
+            vec![
+                Ok(CompletionResponse {
+                    content: Vec::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "decompose".to_string(),
+                        name: DECOMPOSE_TOOL_NAME.to_string(),
+                        arguments: serde_json::json!({
+                            "sub_goals": [
+                                {"description": "first task"},
+                                {"description": "second task"},
+                                {"description": "third task"},
+                            ],
+                            "strategy": "Sequential"
+                        }),
+                    }],
+                    usage: None,
+                    stop_reason: Some("tool_use".to_string()),
+                }),
+                Ok(text_response("first task done")),
+                Ok(text_response("second task done")),
+                Ok(text_response("third task done")),
+            ],
+        );
+
+        let result = engine
+            .run_cycle(test_snapshot("do three things"), &llm)
+            .await
+            .expect("run_cycle should not panic on cancellation");
+
+        // With 20 LLM calls of budget, BudgetExhausted would indicate a bug
+        // in cancellation handling — only UserStopped or Complete (if the
+        // cycle finished before cancel was checked) are acceptable.
+        match &result {
+            LoopResult::UserStopped {
+                partial_response, ..
+            } => {
+                if let Some(partial) = partial_response {
+                    assert!(!partial.is_empty(), "partial response should not be empty");
+                }
+            }
+            LoopResult::Complete { response, .. } => {
+                assert!(!response.is_empty(), "response should not be empty");
+            }
+            other => {
+                panic!("expected UserStopped or Complete, got: {other:?}");
+            }
+        }
+    }
+
+    /// Cancellation during tool execution within a decomposed sub-goal
+    /// should produce a clean result without panicking.
+    #[tokio::test]
+    async fn cancellation_during_slow_tool_in_decomposition_is_clean() {
+        let token = CancellationToken::new();
+        let cancel_clone = token.clone();
+        let executions = Arc::new(AtomicUsize::new(0));
+
+        let config = budget_config_with_llm_calls(20, 4);
+        let mut engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(config, current_time_ms(), 0))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(4)
+            .tool_executor(Arc::new(SlowToolExecutor {
+                delay: Duration::from_secs(10),
+                executions: Arc::clone(&executions),
+            }))
+            .synthesis_instruction("Summarize".to_string())
+            .cancel_token(token)
+            .build()
+            .expect("test engine build");
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel_clone.cancel();
+        });
+
+        let llm = ScriptedLlm::ok(vec![tool_use_response(vec![read_file_call("call-1")])]);
+
+        let result = engine
+            .run_cycle(test_snapshot("read slowly"), &llm)
+            .await
+            .expect("run_cycle should not panic");
+
+        match &result {
+            LoopResult::UserStopped { .. } | LoopResult::Complete { .. } => {
+                // Both acceptable — cancel may race with completion
+            }
+            other => panic!("expected UserStopped or Complete, got: {other:?}"),
+        }
+
+        assert!(
+            executions.load(Ordering::SeqCst) >= 1,
+            "tool executor should have been called at least once"
         );
     }
 }

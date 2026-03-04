@@ -3,7 +3,26 @@
 use crate::types::*;
 use fx_decompose::{ComplexityHint, SubGoal};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
+/// Budget state for soft-ceiling awareness.
+///
+/// Only two states. `Exhausted` is already handled by the existing
+/// `BudgetExceeded` / `LoopResult::BudgetExhausted` path — no need
+/// to duplicate that in the enum (YAGNI).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BudgetState {
+    /// Below soft-ceiling. Full capabilities.
+    Normal,
+    /// Soft-ceiling crossed. Wrap-up mode: no tools, no decompose, synthesize only.
+    Low,
+}
+
+const DEFAULT_SOFT_CEILING_PERCENT: u8 = 80;
+const DEFAULT_MAX_FAN_OUT: usize = 4;
+const DEFAULT_MAX_TOOL_RESULT_BYTES: usize = 16_384;
+const DEFAULT_MAX_AGGREGATE_RESULT_BYTES: usize = 400_000;
+const DEFAULT_MAX_SYNTHESIS_TOKENS: usize = 50_000;
 const DEFAULT_LLM_CALL_TOKENS: u64 = 1_000;
 const DEFAULT_LLM_CALL_COST_CENTS: u64 = 2;
 const DEFAULT_TOOL_INVOCATION_COST_CENTS: u64 = 1;
@@ -41,6 +60,48 @@ pub struct BudgetConfig {
     /// Runtime mode for decomposition depth limiting.
     #[serde(default)]
     pub decompose_depth_mode: DepthMode,
+    /// Percentage of cost/LLM-call budget at which soft-ceiling triggers (0–100).
+    /// Stored as integer to preserve `Eq` derivation; converted to f64 only in
+    /// [`BudgetTracker::state()`] computation.
+    #[serde(default = "default_soft_ceiling_percent")]
+    pub soft_ceiling_percent: u8,
+    /// Maximum tool calls executed per LLM response (fan-out cap).
+    #[serde(default = "default_max_fan_out")]
+    pub max_fan_out: usize,
+    /// Maximum bytes per individual tool result before truncation.
+    #[serde(default = "default_max_tool_result_bytes")]
+    pub max_tool_result_bytes: usize,
+    /// Maximum aggregate tool result bytes before triggering `BudgetState::Low`.
+    ///
+    /// NTH2: Currently a static default. When per-provider model context window
+    /// detection is added, this should be derived as a fraction of the model's
+    /// reported context limit (e.g., 50–75%) to automatically scale with the
+    /// available context budget.
+    #[serde(default = "default_max_aggregate_result_bytes")]
+    pub max_aggregate_result_bytes: usize,
+    /// Maximum tokens to include in the synthesis prompt (Layer 2 eviction limit).
+    #[serde(default = "default_max_synthesis_tokens")]
+    pub max_synthesis_tokens: usize,
+}
+
+fn default_soft_ceiling_percent() -> u8 {
+    DEFAULT_SOFT_CEILING_PERCENT
+}
+
+fn default_max_fan_out() -> usize {
+    DEFAULT_MAX_FAN_OUT
+}
+
+fn default_max_tool_result_bytes() -> usize {
+    DEFAULT_MAX_TOOL_RESULT_BYTES
+}
+
+fn default_max_aggregate_result_bytes() -> usize {
+    DEFAULT_MAX_AGGREGATE_RESULT_BYTES
+}
+
+fn default_max_synthesis_tokens() -> usize {
+    DEFAULT_MAX_SYNTHESIS_TOKENS
 }
 
 impl BudgetConfig {
@@ -54,6 +115,11 @@ impl BudgetConfig {
             max_wall_time_ms: 2 * 60 * 1000,
             max_recursion_depth: 3,
             decompose_depth_mode: DepthMode::Adaptive,
+            soft_ceiling_percent: DEFAULT_SOFT_CEILING_PERCENT,
+            max_fan_out: DEFAULT_MAX_FAN_OUT,
+            max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
+            max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
         }
     }
 
@@ -69,6 +135,11 @@ impl BudgetConfig {
             max_wall_time_ms: u64::MAX,
             max_recursion_depth: u32::MAX,
             decompose_depth_mode: DepthMode::Adaptive,
+            soft_ceiling_percent: 100,
+            max_fan_out: usize::MAX,
+            max_tool_result_bytes: usize::MAX,
+            max_aggregate_result_bytes: usize::MAX,
+            max_synthesis_tokens: usize::MAX,
         }
     }
 }
@@ -84,6 +155,11 @@ impl Default for BudgetConfig {
             max_wall_time_ms: 15 * 60 * 1000,
             max_recursion_depth: 8,
             decompose_depth_mode: DepthMode::Adaptive,
+            soft_ceiling_percent: DEFAULT_SOFT_CEILING_PERCENT,
+            max_fan_out: DEFAULT_MAX_FAN_OUT,
+            max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
+            max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
         }
     }
 }
@@ -227,6 +303,11 @@ impl BudgetAllocator {
                 max_wall_time_ms: wall_time_ms.get(index).copied().unwrap_or_default(),
                 max_recursion_depth: template.max_recursion_depth,
                 decompose_depth_mode: template.decompose_depth_mode,
+                soft_ceiling_percent: template.soft_ceiling_percent,
+                max_fan_out: template.max_fan_out,
+                max_tool_result_bytes: template.max_tool_result_bytes,
+                max_aggregate_result_bytes: template.max_aggregate_result_bytes,
+                max_synthesis_tokens: template.max_synthesis_tokens,
             });
         }
 
@@ -351,6 +432,10 @@ pub struct BudgetTracker {
     cost_cents: u64,
     start_time_ms: u64,
     depth: u32,
+    /// Accumulated tool result bytes across all rounds in this cycle.
+    /// Triggers `BudgetState::Low` when exceeding `config.max_aggregate_result_bytes`.
+    #[serde(default)]
+    accumulated_result_bytes: usize,
 }
 
 impl BudgetTracker {
@@ -366,7 +451,40 @@ impl BudgetTracker {
             cost_cents: 0,
             start_time_ms,
             depth,
+            accumulated_result_bytes: 0,
         }
+    }
+
+    /// Compute the current budget state based on cost and LLM call consumption.
+    ///
+    /// Returns `BudgetState::Low` when either `cost_cents` or `llm_calls`
+    /// exceeds the soft-ceiling fraction of their respective maximum.
+    /// Wall time is intentionally excluded — hitting 80% wall time while
+    /// at 10% cost shouldn't force wrap-up.
+    pub fn state(&self) -> BudgetState {
+        let fraction = f64::from(self.config.soft_ceiling_percent) / 100.0;
+        if self.exceeds_fraction(
+            u64::from(self.llm_calls),
+            u64::from(self.config.max_llm_calls),
+            fraction,
+        ) {
+            return BudgetState::Low;
+        }
+        if self.exceeds_fraction(self.cost_cents, self.config.max_cost_cents, fraction) {
+            return BudgetState::Low;
+        }
+        if self.accumulated_result_bytes > self.config.max_aggregate_result_bytes {
+            return BudgetState::Low;
+        }
+        BudgetState::Normal
+    }
+
+    fn exceeds_fraction(&self, current: u64, max: u64, fraction: f64) -> bool {
+        if max == 0 {
+            return false;
+        }
+        let threshold = (max as f64 * fraction) as u64;
+        current > threshold
     }
 
     /// Check whether the proposed action cost can be admitted under current limits.
@@ -436,12 +554,23 @@ impl BudgetTracker {
         current_time_ms.saturating_sub(self.start_time_ms) > self.config.max_wall_time_ms
     }
 
+    /// Record tool result bytes for aggregate tracking (Layer 3).
+    pub fn record_result_bytes(&mut self, bytes: usize) {
+        self.accumulated_result_bytes = self.accumulated_result_bytes.saturating_add(bytes);
+    }
+
+    /// Accumulated tool result bytes tracked this cycle.
+    pub fn accumulated_result_bytes(&self) -> usize {
+        self.accumulated_result_bytes
+    }
+
     /// Reset consumed budget counters for a fresh cycle starting at `start_time_ms`.
     pub fn reset(&mut self, start_time_ms: u64) {
         self.llm_calls = 0;
         self.tool_invocations = 0;
         self.tokens_used = 0;
         self.cost_cents = 0;
+        self.accumulated_result_bytes = 0;
         self.start_time_ms = start_time_ms;
     }
 
@@ -807,6 +936,11 @@ fn budget_from_remaining(template: &BudgetConfig, remaining: &BudgetRemaining) -
         max_wall_time_ms: remaining.wall_time_ms,
         max_recursion_depth: template.max_recursion_depth,
         decompose_depth_mode: template.decompose_depth_mode,
+        soft_ceiling_percent: template.soft_ceiling_percent,
+        max_fan_out: template.max_fan_out,
+        max_tool_result_bytes: template.max_tool_result_bytes,
+        max_aggregate_result_bytes: template.max_aggregate_result_bytes,
+        max_synthesis_tokens: template.max_synthesis_tokens,
     }
 }
 
@@ -819,7 +953,40 @@ fn zeroed_config_like(template: &BudgetConfig) -> BudgetConfig {
         max_wall_time_ms: 0,
         max_recursion_depth: template.max_recursion_depth,
         decompose_depth_mode: template.decompose_depth_mode,
+        soft_ceiling_percent: template.soft_ceiling_percent,
+        max_fan_out: template.max_fan_out,
+        max_tool_result_bytes: template.max_tool_result_bytes,
+        max_aggregate_result_bytes: template.max_aggregate_result_bytes,
+        max_synthesis_tokens: template.max_synthesis_tokens,
     }
+}
+
+/// Truncate a tool result string to `max_bytes`, appending a marker.
+///
+/// If the result is within the limit, returns it unchanged.
+/// If empty, returns it unchanged.
+pub fn truncate_tool_result<'a>(output: &'a str, max_bytes: usize) -> Cow<'a, str> {
+    if output.is_empty() || output.len() <= max_bytes {
+        return Cow::Borrowed(output);
+    }
+    let total_bytes = output.len();
+    let remaining_bytes = total_bytes.saturating_sub(max_bytes);
+    // Truncate at a char boundary at or before max_bytes.
+    let truncated = truncate_at_char_boundary(output, max_bytes);
+    Cow::Owned(format!(
+        "{truncated}\n[truncated — {remaining_bytes} bytes omitted, {total_bytes} total]"
+    ))
+}
+
+fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if max_bytes >= s.len() {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 pub(crate) fn build_skip_mask(total: usize, skipped_indices: &[usize]) -> Vec<bool> {
@@ -854,6 +1021,11 @@ mod tests {
             max_wall_time_ms: 10_000,
             max_recursion_depth: 4,
             decompose_depth_mode: DepthMode::Adaptive,
+            soft_ceiling_percent: DEFAULT_SOFT_CEILING_PERCENT,
+            max_fan_out: DEFAULT_MAX_FAN_OUT,
+            max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
+            max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
         }
     }
 
@@ -876,6 +1048,11 @@ mod tests {
             max_wall_time_ms: 100_000,
             max_recursion_depth: 6,
             decompose_depth_mode: DepthMode::Adaptive,
+            soft_ceiling_percent: DEFAULT_SOFT_CEILING_PERCENT,
+            max_fan_out: DEFAULT_MAX_FAN_OUT,
+            max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
+            max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
         }
     }
 
@@ -1417,6 +1594,11 @@ mod tests {
             max_wall_time_ms: 9_999,
             max_recursion_depth: 5,
             decompose_depth_mode: DepthMode::Adaptive,
+            soft_ceiling_percent: DEFAULT_SOFT_CEILING_PERCENT,
+            max_fan_out: DEFAULT_MAX_FAN_OUT,
+            max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
+            max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
         };
         let tracker = BudgetTracker::new(config.clone(), 0, 0);
         let allocator = BudgetAllocator {
@@ -1455,6 +1637,11 @@ mod tests {
             max_wall_time_ms: 5_000,
             max_recursion_depth: 5,
             decompose_depth_mode: DepthMode::Adaptive,
+            soft_ceiling_percent: DEFAULT_SOFT_CEILING_PERCENT,
+            max_fan_out: DEFAULT_MAX_FAN_OUT,
+            max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
+            max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
         };
         let tracker = BudgetTracker::new(config, 0, 0);
         let allocator = BudgetAllocator {
@@ -1503,6 +1690,11 @@ mod tests {
             max_wall_time_ms: 12_000,
             max_recursion_depth: 5,
             decompose_depth_mode: DepthMode::Adaptive,
+            soft_ceiling_percent: DEFAULT_SOFT_CEILING_PERCENT,
+            max_fan_out: DEFAULT_MAX_FAN_OUT,
+            max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
+            max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
         };
         let tracker = BudgetTracker::new(config, 0, 0);
         let allocator = BudgetAllocator::new();
@@ -1529,6 +1721,11 @@ mod tests {
             max_wall_time_ms: 12_000,
             max_recursion_depth: 5,
             decompose_depth_mode: DepthMode::Adaptive,
+            soft_ceiling_percent: DEFAULT_SOFT_CEILING_PERCENT,
+            max_fan_out: DEFAULT_MAX_FAN_OUT,
+            max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
+            max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
         };
         let tracker = BudgetTracker::new(config, 0, 0);
         let allocator = BudgetAllocator {
@@ -1574,6 +1771,11 @@ mod tests {
             max_wall_time_ms: 1_000,
             max_recursion_depth: 5,
             decompose_depth_mode: DepthMode::Adaptive,
+            soft_ceiling_percent: DEFAULT_SOFT_CEILING_PERCENT,
+            max_fan_out: DEFAULT_MAX_FAN_OUT,
+            max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
+            max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
         };
         let tracker = BudgetTracker::new(config, 0, 0);
         let allocator = BudgetAllocator::new();
@@ -1628,6 +1830,11 @@ mod tests {
             max_wall_time_ms: 0,
             max_recursion_depth: 5,
             decompose_depth_mode: DepthMode::Adaptive,
+            soft_ceiling_percent: DEFAULT_SOFT_CEILING_PERCENT,
+            max_fan_out: DEFAULT_MAX_FAN_OUT,
+            max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
+            max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
         };
         let tracker = BudgetTracker::new(config, 0, 0);
         let allocator = BudgetAllocator::new();
@@ -1650,6 +1857,11 @@ mod tests {
             max_wall_time_ms: 30,
             max_recursion_depth: 5,
             decompose_depth_mode: DepthMode::Adaptive,
+            soft_ceiling_percent: DEFAULT_SOFT_CEILING_PERCENT,
+            max_fan_out: DEFAULT_MAX_FAN_OUT,
+            max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
+            max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
         };
         let tracker = BudgetTracker::new(config, 0, 0);
         let allocator = BudgetAllocator {
@@ -1676,6 +1888,11 @@ mod tests {
             max_wall_time_ms: 10_000,
             max_recursion_depth: 5,
             decompose_depth_mode: DepthMode::Adaptive,
+            soft_ceiling_percent: DEFAULT_SOFT_CEILING_PERCENT,
+            max_fan_out: DEFAULT_MAX_FAN_OUT,
+            max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
+            max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
         };
         let tracker = BudgetTracker::new(config, 0, 0);
         let allocator = BudgetAllocator {
@@ -1807,6 +2024,11 @@ mod tests {
         let config = BudgetConfig {
             max_recursion_depth: 8,
             decompose_depth_mode: DepthMode::Static,
+            soft_ceiling_percent: DEFAULT_SOFT_CEILING_PERCENT,
+            max_fan_out: DEFAULT_MAX_FAN_OUT,
+            max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
+            max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
             ..test_config()
         };
         let remaining = BudgetRemaining {
@@ -1823,6 +2045,11 @@ mod tests {
         let config = BudgetConfig {
             max_recursion_depth: 2,
             decompose_depth_mode: DepthMode::Adaptive,
+            soft_ceiling_percent: DEFAULT_SOFT_CEILING_PERCENT,
+            max_fan_out: DEFAULT_MAX_FAN_OUT,
+            max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+            max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
+            max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
             ..test_config()
         };
 
@@ -1839,5 +2066,320 @@ mod tests {
         assert_eq!(resolved_depth_cap(&config, &high_budget), 2);
         assert_eq!(effective_max_depth(&low_budget), 1);
         assert_eq!(resolved_depth_cap(&config, &low_budget), 1);
+    }
+
+    // --- Loop resilience: budget soft-ceiling tests ---
+
+    /// Test 1: Agent at 79% cost budget → `state()` returns `Normal`.
+    #[test]
+    fn budget_state_normal_at_79_percent_cost() {
+        let config = BudgetConfig {
+            max_cost_cents: 100,
+            ..BudgetConfig::default()
+        };
+        let mut tracker = BudgetTracker::new(config, 0, 0);
+        // Record 79 cents out of 100
+        tracker.record(&ActionCost {
+            cost_cents: 79,
+            ..ActionCost::default()
+        });
+        assert_eq!(tracker.state(), BudgetState::Normal);
+    }
+
+    /// Test 2: Agent at 81% cost budget → `state()` returns `Low`.
+    #[test]
+    fn budget_state_low_at_81_percent_cost() {
+        let config = BudgetConfig {
+            max_cost_cents: 100,
+            ..BudgetConfig::default()
+        };
+        let mut tracker = BudgetTracker::new(config, 0, 0);
+        tracker.record(&ActionCost {
+            cost_cents: 81,
+            ..ActionCost::default()
+        });
+        assert_eq!(tracker.state(), BudgetState::Low);
+    }
+
+    /// Test 3: Agent at 81% LLM calls (cost still Normal) → `state()` returns `Low`.
+    #[test]
+    fn budget_state_low_at_81_percent_llm_calls() {
+        let config = BudgetConfig {
+            max_llm_calls: 100,
+            max_cost_cents: 10_000, // Cost well below ceiling
+            ..BudgetConfig::default()
+        };
+        let mut tracker = BudgetTracker::new(config, 0, 0);
+        // Record 81 LLM calls out of 100
+        for _ in 0..81 {
+            tracker.record(&ActionCost {
+                llm_calls: 1,
+                cost_cents: 1,
+                ..ActionCost::default()
+            });
+        }
+        assert_eq!(tracker.state(), BudgetState::Low);
+    }
+
+    /// Test 6 (partial — state monotonicity check): Low stays Low even if we
+    /// don't record more cost. (Monotonicity within run_cycle is enforced by
+    /// the fact that record() only adds and reset() is only called in
+    /// prepare_cycle().)
+    #[test]
+    fn budget_state_stays_low_once_crossed() {
+        let config = BudgetConfig {
+            max_cost_cents: 100,
+            ..BudgetConfig::default()
+        };
+        let mut tracker = BudgetTracker::new(config, 0, 0);
+        tracker.record(&ActionCost {
+            cost_cents: 81,
+            ..ActionCost::default()
+        });
+        assert_eq!(tracker.state(), BudgetState::Low);
+        // No additional recording — still Low
+        assert_eq!(tracker.state(), BudgetState::Low);
+    }
+
+    /// `state()` returns Normal after reset().
+    #[test]
+    fn budget_state_normal_after_reset() {
+        let config = BudgetConfig {
+            max_cost_cents: 100,
+            ..BudgetConfig::default()
+        };
+        let mut tracker = BudgetTracker::new(config, 0, 0);
+        tracker.record(&ActionCost {
+            cost_cents: 81,
+            ..ActionCost::default()
+        });
+        assert_eq!(tracker.state(), BudgetState::Low);
+        tracker.reset(1);
+        assert_eq!(tracker.state(), BudgetState::Normal);
+    }
+
+    /// Stronger monotonicity test: records cost through multiple thresholds.
+    /// 50% → Normal, 81% → Low, stays Low without additional recording.
+    #[test]
+    fn budget_state_monotonicity_through_thresholds() {
+        let config = BudgetConfig {
+            max_cost_cents: 100,
+            ..BudgetConfig::default()
+        };
+        let mut tracker = BudgetTracker::new(config, 0, 0);
+
+        // At 50% → Normal
+        tracker.record(&ActionCost {
+            cost_cents: 50,
+            ..ActionCost::default()
+        });
+        assert_eq!(
+            tracker.state(),
+            BudgetState::Normal,
+            "50% cost should be Normal"
+        );
+
+        // Push to 81% → Low
+        tracker.record(&ActionCost {
+            cost_cents: 31,
+            ..ActionCost::default()
+        });
+        assert_eq!(tracker.state(), BudgetState::Low, "81% cost should be Low");
+
+        // No more recording → still Low
+        assert_eq!(
+            tracker.state(),
+            BudgetState::Low,
+            "should stay Low without additional recording"
+        );
+    }
+
+    /// Boundary test: exactly 80/100 = Normal (threshold uses `>` not `>=`),
+    /// and 81/100 = Low (just over).
+    #[test]
+    fn budget_state_boundary_at_exactly_80_percent() {
+        let config = BudgetConfig {
+            max_cost_cents: 100,
+            ..BudgetConfig::default()
+        };
+
+        // Exactly at threshold → Normal (exceeds_fraction uses `>`)
+        let mut tracker = BudgetTracker::new(config.clone(), 0, 0);
+        tracker.record(&ActionCost {
+            cost_cents: 80,
+            ..ActionCost::default()
+        });
+        assert_eq!(
+            tracker.state(),
+            BudgetState::Normal,
+            "exactly 80% (at threshold, not over) should be Normal"
+        );
+
+        // One cent over → Low
+        let mut tracker = BudgetTracker::new(config, 0, 0);
+        tracker.record(&ActionCost {
+            cost_cents: 81,
+            ..ActionCost::default()
+        });
+        assert_eq!(
+            tracker.state(),
+            BudgetState::Low,
+            "81% (just over threshold) should be Low"
+        );
+    }
+
+    /// Custom soft_ceiling_percent works.
+    #[test]
+    fn budget_state_custom_fraction() {
+        let config = BudgetConfig {
+            max_cost_cents: 100,
+            soft_ceiling_percent: 50,
+            ..BudgetConfig::default()
+        };
+        let mut tracker = BudgetTracker::new(config, 0, 0);
+        tracker.record(&ActionCost {
+            cost_cents: 51,
+            ..ActionCost::default()
+        });
+        assert_eq!(tracker.state(), BudgetState::Low);
+    }
+
+    // --- Loop resilience: tool result truncation tests ---
+
+    /// Test 13: 8KB result with 16KB limit → no truncation.
+    #[test]
+    fn truncate_tool_result_no_op_within_limit() {
+        let input = "x".repeat(8_000);
+        let result = truncate_tool_result(&input, 16_384);
+        assert_eq!(result, input);
+    }
+
+    /// Test 14: 32KB result with 16KB limit → truncated to 16KB + marker.
+    #[test]
+    fn truncate_tool_result_truncates_over_limit() {
+        let input = "x".repeat(32_000);
+        let result = truncate_tool_result(&input, 16_384);
+        assert!(result.len() < input.len());
+        assert!(result.starts_with(&"x".repeat(16_384)));
+        assert!(result.contains("[truncated"));
+    }
+
+    /// Test 15: Marker includes correct byte counts.
+    #[test]
+    fn truncate_tool_result_marker_has_correct_counts() {
+        let input = "a".repeat(20_000);
+        let result = truncate_tool_result(&input, 10_000);
+        // Remaining = 20000 - 10000 = 10000
+        assert!(
+            result.contains("10000 bytes omitted"),
+            "marker should list remaining bytes: {result}"
+        );
+        assert!(
+            result.contains("20000 total"),
+            "marker should list total bytes: {result}"
+        );
+    }
+
+    /// Test 16: Empty result → no truncation, no marker.
+    #[test]
+    fn truncate_tool_result_empty_is_noop() {
+        let result = truncate_tool_result("", 16_384);
+        assert_eq!(result, "");
+    }
+
+    /// Cow::Borrowed returned when no truncation needed (avoids allocation).
+    #[test]
+    fn truncate_tool_result_returns_borrowed_within_limit() {
+        let input = "short output";
+        let result = truncate_tool_result(input, 16_384);
+        assert!(
+            matches!(result, Cow::Borrowed(_)),
+            "should return Cow::Borrowed when within limit"
+        );
+    }
+
+    /// Cow::Owned returned when truncation occurs.
+    #[test]
+    fn truncate_tool_result_returns_owned_when_truncated() {
+        let input = "x".repeat(32_000);
+        let result = truncate_tool_result(&input, 16_384);
+        assert!(
+            matches!(result, Cow::Owned(_)),
+            "should return Cow::Owned when truncated"
+        );
+    }
+
+    /// Multi-byte char boundary safety.
+    #[test]
+    fn truncate_tool_result_respects_char_boundaries() {
+        // '€' is 3 bytes in UTF-8
+        let input = "€".repeat(10_000);
+        let result = truncate_tool_result(&input, 100);
+        // Must not panic and must be valid UTF-8
+        assert!(result.len() > 0);
+        assert!(result.contains("[truncated"));
+    }
+}
+
+#[cfg(test)]
+mod synthesis_context_guard_budget_tests {
+    use super::*;
+
+    #[test]
+    fn accumulated_result_bytes_triggers_low_state() {
+        let config = BudgetConfig {
+            max_aggregate_result_bytes: 1_000,
+            ..BudgetConfig::default()
+        };
+        let mut tracker = BudgetTracker::new(config, 0, 0);
+
+        assert_eq!(tracker.state(), BudgetState::Normal);
+
+        tracker.record_result_bytes(500);
+        assert_eq!(tracker.state(), BudgetState::Normal);
+
+        tracker.record_result_bytes(501);
+        assert_eq!(
+            tracker.state(),
+            BudgetState::Low,
+            "exceeding max_aggregate_result_bytes should trigger Low"
+        );
+    }
+
+    #[test]
+    fn accumulated_result_bytes_reset_on_cycle_reset() {
+        let config = BudgetConfig {
+            max_aggregate_result_bytes: 1_000,
+            ..BudgetConfig::default()
+        };
+        let mut tracker = BudgetTracker::new(config, 0, 0);
+
+        tracker.record_result_bytes(2_000);
+        assert_eq!(tracker.state(), BudgetState::Low);
+
+        tracker.reset(100);
+        assert_eq!(tracker.accumulated_result_bytes(), 0);
+        assert_eq!(tracker.state(), BudgetState::Normal);
+    }
+
+    #[test]
+    fn accumulated_result_bytes_uses_saturating_add() {
+        let config = BudgetConfig::default();
+        let mut tracker = BudgetTracker::new(config, 0, 0);
+
+        tracker.record_result_bytes(usize::MAX);
+        tracker.record_result_bytes(1);
+        assert_eq!(tracker.accumulated_result_bytes(), usize::MAX);
+    }
+
+    #[test]
+    fn normal_state_when_under_aggregate_limit() {
+        let config = BudgetConfig {
+            max_aggregate_result_bytes: 100_000,
+            ..BudgetConfig::default()
+        };
+        let mut tracker = BudgetTracker::new(config, 0, 0);
+        tracker.record_result_bytes(50_000);
+        assert_eq!(tracker.state(), BudgetState::Normal);
     }
 }
