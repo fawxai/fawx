@@ -434,6 +434,8 @@ impl ToolRoundState {
 #[derive(Debug)]
 enum ToolRoundOutcome {
     Cancelled,
+    /// Budget soft-ceiling crossed after tool execution; skip LLM continuation.
+    BudgetLow,
     Response(CompletionResponse),
 }
 
@@ -872,12 +874,23 @@ impl LoopEngine {
         context_messages: &[Message],
     ) -> Result<IterationStep, LoopError> {
         let action = self.act(decision, llm, context_messages).await?;
-        let action_cost = self.action_cost_from_result(&action);
-        if let Some(step) = self.budget_terminal(action_cost, Some(action.response_text.clone())) {
+
+        // Tool actions record costs incrementally inside act_with_tools().
+        // Non-tool actions need their costs recorded here.
+        if action.tool_results.is_empty() {
+            let action_cost = self.action_cost_from_result(&action);
+            if let Some(step) =
+                self.budget_terminal(action_cost, Some(action.response_text.clone()))
+            {
+                return Ok(step);
+            }
+            self.budget.record(&action_cost);
+        } else if let Some(step) =
+            self.budget_terminal(ActionCost::default(), Some(action.response_text.clone()))
+        {
             return Ok(step);
         }
 
-        self.budget.record(&action_cost);
         state.tokens.accumulate(action.tokens_used);
         state.partial_response = Some(action.response_text.clone());
 
@@ -2246,10 +2259,16 @@ impl LoopEngine {
                 return Ok(self.cancelled_tool_action_from_state(decision, state));
             }
 
+            if self.budget.state() == BudgetState::Low {
+                self.emit_budget_low_break_signal(round);
+                break;
+            }
+
             match self.execute_tool_round(round + 1, llm, &mut state).await? {
                 ToolRoundOutcome::Cancelled => {
                     return Ok(self.cancelled_tool_action_from_state(decision, state));
                 }
+                ToolRoundOutcome::BudgetLow => break,
                 ToolRoundOutcome::Response(response) => {
                     if !response.tool_calls.is_empty() {
                         let (capped, round_deferred) = self.apply_fan_out_cap(&response.tool_calls);
@@ -2353,6 +2372,47 @@ impl LoopEngine {
         )
     }
 
+    fn record_tool_execution_cost(&mut self, tool_count: usize) {
+        self.budget.record(&ActionCost {
+            llm_calls: 0,
+            tool_invocations: tool_count as u32,
+            tokens: 0,
+            cost_cents: tool_count as u64,
+        });
+    }
+
+    fn record_continuation_cost(
+        &mut self,
+        response: &CompletionResponse,
+        context_messages: &[Message],
+    ) {
+        let cost = continuation_budget_cost(response, context_messages);
+        self.budget.record(&cost);
+    }
+
+    async fn compact_tool_continuation(
+        &mut self,
+        round: u32,
+        messages: &mut Vec<Message>,
+    ) -> Result<(), LoopError> {
+        let compacted = self
+            .compact_if_needed(messages, CompactionScope::ToolContinuation, round)
+            .await?;
+        if let Cow::Owned(compacted_messages) = compacted {
+            *messages = compacted_messages;
+        }
+        self.ensure_within_hard_limit(CompactionScope::ToolContinuation, messages)
+    }
+
+    fn emit_budget_low_break_signal(&mut self, round: u32) {
+        self.emit_signal(
+            LoopStep::Act,
+            SignalKind::Blocked,
+            format!("budget soft-ceiling reached during tool round {round}, breaking loop"),
+            serde_json::json!({"reason": "budget_soft_ceiling", "round": round}),
+        );
+    }
+
     async fn execute_tool_round(
         &mut self,
         round: u32,
@@ -2361,6 +2421,7 @@ impl LoopEngine {
     ) -> Result<ToolRoundOutcome, LoopError> {
         let round_started = current_time_ms();
         let results = self.execute_tool_calls(&state.current_calls).await?;
+        self.record_tool_execution_cost(results.len());
         append_tool_round_messages(
             &mut state.continuation_messages,
             &state.current_calls,
@@ -2368,28 +2429,22 @@ impl LoopEngine {
         )?;
         state.all_tool_results.extend(results);
 
-        let compacted = self
-            .compact_if_needed(
-                &state.continuation_messages,
-                CompactionScope::ToolContinuation,
-                round,
-            )
+        self.compact_tool_continuation(round, &mut state.continuation_messages)
             .await?;
-        if let Cow::Owned(messages) = compacted {
-            state.continuation_messages = messages;
-        }
-        self.ensure_within_hard_limit(
-            CompactionScope::ToolContinuation,
-            &state.continuation_messages,
-        )?;
 
         if self.cancellation_token_triggered() {
             return Ok(ToolRoundOutcome::Cancelled);
         }
 
+        if self.budget.state() == BudgetState::Low {
+            self.emit_budget_low_break_signal(round);
+            return Ok(ToolRoundOutcome::BudgetLow);
+        }
+
         let response = self
             .request_tool_continuation(llm, &state.continuation_messages, &mut state.tokens_used)
             .await?;
+        self.record_continuation_cost(&response, &state.continuation_messages);
         self.emit_tool_round_trace_and_perf(
             round,
             state.current_calls.len(),
@@ -5934,6 +5989,67 @@ mod phase4_tests {
             .expect("act_with_tools");
 
         assert_eq!(action.tool_results.len(), 1);
+        assert_eq!(action.response_text, "summary");
+    }
+
+    /// Regression test for #1105: budget soft-ceiling must be checked within
+    /// the tool round loop, not only at act_with_tools entry. When budget
+    /// crosses 80% mid-loop, the loop breaks and falls through to synthesis
+    /// instead of continuing to burn through rounds.
+    #[tokio::test]
+    async fn act_with_tools_breaks_on_budget_soft_ceiling_mid_loop() {
+        let config = crate::budget::BudgetConfig {
+            max_cost_cents: 100,
+            soft_ceiling_percent: 80,
+            ..crate::budget::BudgetConfig::default()
+        };
+        let mut tracker = BudgetTracker::new(config, 0, 0);
+        // Pre-record 76% cost. After round 1 (3 tools + 1 LLM continuation),
+        // budget will be 76 + 3 + 2 = 81%, crossing the 80% soft ceiling.
+        tracker.record(&ActionCost {
+            cost_cents: 76,
+            ..ActionCost::default()
+        });
+        assert_eq!(tracker.state(), BudgetState::Normal);
+
+        let mut engine = LoopEngine::builder()
+            .budget(tracker)
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(5)
+            .tool_executor(Arc::new(Phase4StubToolExecutor))
+            .synthesis_instruction("Summarize tool output".to_string())
+            .build()
+            .expect("test engine build");
+
+        let decision = Decision::UseTools(vec![
+            read_file_call("call-1", "a.txt"),
+            read_file_call("call-2", "b.txt"),
+            read_file_call("call-3", "c.txt"),
+        ]);
+        // LLM would return more tool calls for round 2 — but the budget
+        // soft-ceiling should prevent round 2 from executing.
+        let llm = Phase4MockLlm::new(vec![tool_use_response(vec![read_file_call(
+            "call-4", "d.txt",
+        )])]);
+        let context_messages = vec![Message::user("read many files")];
+
+        let action = engine
+            .act_with_tools(
+                &decision,
+                calls_from_decision(&decision),
+                &llm,
+                &context_messages,
+            )
+            .await
+            .expect("act_with_tools should succeed via synthesis fallback");
+
+        // Only round 1's 3 tool results should be present.
+        // Round 2 should NOT have executed.
+        assert_eq!(action.tool_results.len(), 3, "only round 1 tools executed");
+        assert_eq!(action.tool_results[0].tool_call_id, "call-1");
+        assert_eq!(action.tool_results[1].tool_call_id, "call-2");
+        assert_eq!(action.tool_results[2].tool_call_id, "call-3");
+        // Falls through to synthesize_tool_fallback which returns "summary"
         assert_eq!(action.response_text, "summary");
     }
 
