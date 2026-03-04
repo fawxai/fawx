@@ -199,8 +199,10 @@ mod tests {
     #[test]
     fn respects_max_improvements_per_run() {
         let tmp = TempDir::new().unwrap();
-        let mut config = ImprovementConfig::default();
-        config.max_improvements_per_run = 1;
+        let config = ImprovementConfig {
+            max_improvements_per_run: 1,
+            ..ImprovementConfig::default()
+        };
         let detector = ImprovementDetector::new(config, tmp.path()).unwrap();
         let findings = vec![
             mk_finding("a", Confidence::High, 5, true),
