@@ -38,6 +38,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
 crossterm.workspace = true
+ratatui.workspace = true
+tui-textarea.workspace = true
 libc = "0.2"
 futures.workspace = true
 serde = { workspace = true }
@@ -51,10 +53,7 @@ sha2 = { version = "0.10", optional = true }
 base64 = { version = "0.22", optional = true }
 dirs = "6.0"
 chrono = "0.4"
-# rustyline: readline with history, completion, and key bindings. Rolling our own
-# would be 1000+ lines for equivalent quality. Audited dependency: pure Rust,
-# no unsafe, actively maintained.
-rustyline = "15"
+
 subtle = { version = "2.6", optional = true }
 urlencoding = "2.1"
 # termimad: markdown rendering for terminal output.

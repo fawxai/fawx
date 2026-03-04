@@ -1,5 +1,7 @@
 use crate::auth_store::{migrate_if_needed, AuthStore};
+use crate::ui;
 use async_trait::async_trait;
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::style::Stylize;
 use crossterm::{cursor, event, style, terminal, ExecutableCommand};
 use futures::StreamExt;
@@ -12,7 +14,7 @@ use fx_conversation::{
 };
 use fx_core::error::LlmError as CoreLlmError;
 use fx_core::memory::{MemoryProvider, MemoryStore};
-use fx_core::message::{InternalMessage, StreamPhase};
+use fx_core::message::InternalMessage;
 use fx_core::runtime_info::{ConfigSummary, RuntimeInfo, SkillInfo};
 use fx_core::types::{InputSource, ScreenState, UserInput};
 use fx_core::EventBus;
@@ -37,22 +39,14 @@ use fx_memory::{JsonFileMemory, JsonMemoryConfig, SignalStore};
 use fx_scratchpad::skill::ScratchpadSkill;
 use fx_scratchpad::Scratchpad;
 use fx_tools::{BuiltinToolsSkill, FawxToolExecutor, GitSkill, ToolConfig};
-use rustyline::completion::{Completer, Pair};
-use rustyline::config::CompletionType;
-use rustyline::error::ReadlineError;
-use rustyline::highlight::Highlighter;
-use rustyline::hint::{Hinter, HistoryHinter};
-use rustyline::history::DefaultHistory;
-use rustyline::validate::Validator;
-use rustyline::{Context, Editor, Helper};
+use ratatui::DefaultTerminal;
 use std::collections::hash_map::DefaultHasher;
 use std::fmt;
-use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+
 use std::sync::LazyLock;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -63,7 +57,6 @@ use syntect::util::as_24_bit_terminal_escaped;
 use termimad::crossterm::style::{Attribute as MadAttribute, Color as MadColor};
 use termimad::{MadSkin, StyledChar};
 use tokio::sync::broadcast;
-use tokio::sync::oneshot;
 use tokio::time::{sleep, Duration};
 
 const BANNER_ART: &str = r#"   ___
@@ -320,310 +313,104 @@ fn spinner_frame(index: usize) -> char {
     SPINNER_FRAMES[index % SPINNER_FRAMES.len()]
 }
 
-/// Escape sequence that clears both the spinner line and the dimmed prompt
-/// line below it:
-/// - `\r`       — move to start of current line (spinner)
-/// - `\x1b[2K`  — erase spinner line
-/// - `\x1b[1B`  — move down to the dimmed prompt line
-/// - `\x1b[2K`  — erase dimmed prompt line
-/// - `\x1b[1A`  — move back up to the spinner line position
-const CLEAR_SPINNER_ESCAPE: &str = "\r\x1b[2K\x1b[1B\x1b[2K\x1b[1A";
-
-fn clear_spinner_line() {
-    if crate::scroll_region::is_active() {
-        // Scroll region mode: clear spinner at its absolute position
-        let row = crate::scroll_region::scroll_region_end();
-        eprint!("\x1b[{row};1H\x1b[2K");
-        let _ = io::stderr().flush();
-    } else {
-        // Legacy mode: clear spinner + dimmed prompt (two lines)
-        eprint!("{CLEAR_SPINNER_ESCAPE}");
-    }
-}
-
-/// Build a dimmed (gray) version of the `you ›` prompt for display during
-/// the spinner/thinking phase. Uses ANSI dim attribute (\x1b[2m) to visually
-/// distinguish the inactive prompt from the normal interactive one.
-fn build_dimmed_prompt() -> String {
-    format!("\x1b[2m{PROMPT_COLOR_START}you › {PROMPT_COLOR_END}")
-}
-
-/// Render the spinner line with a dimmed prompt on the line below.
-///
-/// When the scroll region is active, the spinner renders at the bottom
-/// of the scroll region using absolute positioning, then the cursor is
-/// pinned to the input bar so it never appears in the output area.
-/// When inactive, falls back to the legacy two-line inline layout.
-fn render_spinner_with_prompt(frame_index: usize) {
-    let frame = spinner_frame(frame_index);
-    if crate::scroll_region::is_active() {
-        // Absolute-position the spinner at the scroll region bottom so
-        // the cursor can be pinned to the input bar between frames.
-        let row = crate::scroll_region::scroll_region_end();
-        eprint!("\x1b[{row};1H\x1b[2K{frame} thinking...");
-        let _ = io::stderr().flush();
-        crate::scroll_region::refresh_input_bar();
-        crate::scroll_region::pin_cursor_to_input_bar();
-    } else {
-        // Legacy mode: spinner + dimmed prompt inline
-        let dimmed = build_dimmed_prompt();
-        eprint!("\r\x1b[2K{frame} thinking...\n\x1b[2K{dimmed}\x1b[1A");
-        let _ = io::stderr().flush();
-    }
-}
-
 // ---------------------------------------------------------------------------
-// Streaming renderer
+// Ratatui event loop helpers
 // ---------------------------------------------------------------------------
 
-/// Renders streaming LLM output token-by-token to stdout.
-///
-/// Tracks phase transitions (Reason → Synthesize) and prints the
-/// `fawx ›` prefix exactly once per user cycle.
-struct StreamRenderer {
-    /// Whether the fawx prefix has been printed for this cycle.
-    prefix_printed: bool,
-    /// Current streaming phase.
-    current_phase: Option<StreamPhase>,
-    /// Token count accumulated so far.
-    token_count: usize,
-    /// Accumulated raw text for markdown reprint on finalize.
-    buffer: String,
-    /// Incremental markdown renderer for ANSI-formatted streaming output.
-    md: crate::markdown::MarkdownRenderer,
+/// Install a panic hook that restores the terminal on panic.
+fn install_ratatui_panic_hook() {
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
+        original_hook(info);
+    }));
 }
 
-impl StreamRenderer {
-    fn new() -> Self {
-        Self {
-            prefix_printed: false,
-            current_phase: None,
-            token_count: 0,
-            buffer: String::new(),
-            md: crate::markdown::MarkdownRenderer::new(),
-        }
-    }
-
-    /// Handle a `StreamingStarted` event.
-    fn handle_started(&mut self, phase: StreamPhase) {
-        self.current_phase = Some(phase);
-    }
-
-    /// Handle a `StreamDelta` event — render markdown incrementally.
-    fn handle_delta(&mut self, delta: &str) {
-        if !self.prefix_printed {
-            self.print_prefix();
-        }
-        self.token_count += 1;
-        self.buffer.push_str(delta);
-        let formatted = self.md.push(delta);
-        if !formatted.is_empty() {
-            self.write_delta(&formatted);
-        }
-    }
-
-    /// Handle a `StreamingFinished` event.
-    fn handle_finished(&mut self, _phase: StreamPhase) {
-        self.current_phase = None;
-    }
-
-    /// Print any trailing markdown content and a final newline.
-    fn finalize(&mut self) {
-        if self.prefix_printed {
-            let tail = self.md.flush();
-            if !tail.is_empty() {
-                print!("{tail}");
-                let _ = io::stdout().flush();
-            }
-            println!();
-        }
-    }
-
-    fn print_prefix(&mut self) {
-        // Ensure output goes to the scroll region
-        crate::scroll_region::position_for_output();
-        print!(
-            "\n{} ",
-            "fawx \u{203a}".bold().with(theme_color(255, 165, 0, 214))
-        );
-        let _ = io::stdout().flush();
-        self.prefix_printed = true;
-    }
-
-    fn write_delta(&self, delta: &str) {
-        print!("{delta}");
-        let _ = io::stdout().flush();
-    }
-
-    /// Print the `[interrupted]` marker when a stream is cancelled.
-    ///
-    /// Associated function (no `&self`) because the renderer may already
-    /// be dropped by the time the caller decides to print the marker.
-    fn print_interrupted_marker() {
-        eprint!(" \x1b[33m[interrupted]\x1b[0m");
-        let _ = io::stderr().flush();
-    }
-}
-
-/// Run a future with a combined thinking spinner + streaming display.
-///
-/// Shows a spinner until `StreamingStarted` arrives, then switches to
-/// token-by-token rendering. Returns `(result, streamed)` where `streamed`
-/// indicates whether streaming output was rendered.
-async fn run_with_streaming_display<F, T>(event_bus: &EventBus, future: F) -> (T, bool)
-where
-    F: Future<Output = T>,
-{
-    let receiver = event_bus.subscribe();
-    let streamed = Arc::new(AtomicBool::new(false));
-    let streamed_inner = Arc::clone(&streamed);
-    let (stop_tx, stop_rx) = oneshot::channel::<()>();
-
-    let display_handle = tokio::spawn(async move {
-        streaming_display_loop(receiver, stop_rx, streamed_inner).await;
-    });
-
-    let result = future.await;
-    let _ = stop_tx.send(());
-    let _ = display_handle.await;
-    (result, streamed.load(Ordering::Relaxed))
-}
-
-/// Mutable state carried through each tick of the display loop.
-struct DisplayLoopState {
-    renderer: StreamRenderer,
-    spinner_active: bool,
-    frame_index: usize,
-    streamed: Arc<AtomicBool>,
-}
-
-impl DisplayLoopState {
-    fn new(streamed: Arc<AtomicBool>) -> Self {
-        Self {
-            renderer: StreamRenderer::new(),
-            spinner_active: true,
-            frame_index: 0,
-            streamed,
-        }
-    }
-}
-
-/// Event loop that drives the spinner → streaming transition.
-async fn streaming_display_loop(
-    mut receiver: broadcast::Receiver<InternalMessage>,
-    mut stop: oneshot::Receiver<()>,
-    streamed: Arc<AtomicBool>,
+/// Drain streaming events from the event bus into the FawxApp.
+fn drain_bus_events(
+    bus_rx: &mut broadcast::Receiver<InternalMessage>,
+    app: &mut ui::FawxApp,
+    streamed: &mut bool,
 ) {
-    let mut state = DisplayLoopState::new(streamed);
-
     loop {
-        if !dispatch_streaming_event(&mut receiver, &mut stop, &mut state).await {
-            break;
-        }
-    }
-
-    if state.spinner_active {
-        clear_spinner_line();
-    }
-    state.renderer.finalize();
-
-    // Refresh the input bar after streaming completes and pin cursor
-    // there so it doesn't linger in the scroll region.
-    crate::scroll_region::refresh_input_bar();
-    crate::scroll_region::pin_cursor_to_input_bar();
-}
-
-/// Process one tick of the streaming display loop.
-///
-/// Returns `false` when the loop should exit.
-async fn dispatch_streaming_event(
-    receiver: &mut broadcast::Receiver<InternalMessage>,
-    stop: &mut oneshot::Receiver<()>,
-    state: &mut DisplayLoopState,
-) -> bool {
-    tokio::select! {
-        biased;
-        _ = &mut *stop => false,
-        msg = receiver.recv() => {
-            handle_bus_message(
-                msg,
-                &mut state.renderer,
-                &mut state.spinner_active,
-                &state.streamed,
-            );
-            true
-        }
-        _ = sleep(Duration::from_millis(80)), if state.spinner_active => {
-            render_spinner_with_prompt(state.frame_index);
-            state.frame_index += 1;
-            true
+        match bus_rx.try_recv() {
+            Ok(msg) => route_bus_message_to_app(msg, app, streamed),
+            Err(broadcast::error::TryRecvError::Empty) => break,
+            Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                tracing::warn!(skipped = n, "stream display lagged");
+            }
+            Err(broadcast::error::TryRecvError::Closed) => break,
         }
     }
 }
 
-/// Route a single bus message to the renderer.
-fn handle_bus_message(
-    msg: Result<InternalMessage, broadcast::error::RecvError>,
-    renderer: &mut StreamRenderer,
-    spinner_active: &mut bool,
-    streamed: &Arc<AtomicBool>,
-) {
-    let message = match msg {
-        Ok(m) => m,
-        Err(broadcast::error::RecvError::Lagged(n)) => {
-            tracing::warn!(skipped = n, "stream display lagged, events skipped");
-            // Future enhancement: print an inline `[...{n} events skipped...]`
-            // marker so the user knows displayed text may be incomplete.
-            return;
-        }
-        Err(broadcast::error::RecvError::Closed) => return,
-    };
-    match message {
-        InternalMessage::StreamingStarted { phase } => {
-            stop_spinner_if_active(spinner_active);
-            renderer.handle_started(phase);
-            streamed.store(true, Ordering::Relaxed);
+/// Route a single bus message to the FawxApp output.
+fn route_bus_message_to_app(msg: InternalMessage, app: &mut ui::FawxApp, streamed: &mut bool) {
+    match msg {
+        InternalMessage::StreamingStarted { .. } => {
+            app.set_state(ui::AppState::Streaming);
+            *streamed = true;
         }
         InternalMessage::StreamDelta { delta, .. } => {
-            stop_spinner_if_active(spinner_active);
-            renderer.handle_delta(&delta);
-            streamed.store(true, Ordering::Relaxed);
+            app.append_streaming_delta(&delta);
+            *streamed = true;
         }
-        InternalMessage::StreamingFinished { phase } => {
-            renderer.handle_finished(phase);
-        }
+        InternalMessage::StreamingFinished { .. } => {}
         _ => {}
     }
 }
 
-fn stop_spinner_if_active(spinner_active: &mut bool) {
-    if *spinner_active {
-        clear_spinner_line();
-        *spinner_active = false;
-        let _ = io::stderr().flush();
+/// Handle a key event during the idle (input) state.
+///
+/// Returns `Some(text)` if the user submitted input, `None` otherwise.
+fn handle_idle_key(key: KeyEvent, app: &mut ui::FawxApp) -> Option<String> {
+    match key.code {
+        KeyCode::Enter => {
+            let text = app.submit_input();
+            if text.is_empty() {
+                None
+            } else {
+                Some(text)
+            }
+        }
+        KeyCode::Up => {
+            app.history_up();
+            None
+        }
+        KeyCode::Down => {
+            app.history_down();
+            None
+        }
+        KeyCode::Char(c) => {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'c' {
+                return None; // handled by signal handler
+            }
+            app.input_text.push(c);
+            None
+        }
+        KeyCode::Backspace => {
+            app.input_text.pop();
+            None
+        }
+        KeyCode::PageUp => {
+            app.scroll_up();
+            None
+        }
+        KeyCode::PageDown => {
+            app.scroll_down();
+            None
+        }
+        _ => None,
     }
 }
 
-/// Legacy thinking spinner — retained for existing tests.
-///
-/// NOTE: This renders a single-line spinner but calls `clear_spinner_line()`
-/// (which clears two lines) on stop. The mismatch is intentional: this
-/// function only exists under `#[cfg(test)]` for backward-compatible test
-/// coverage. Production code uses `render_spinner_with_prompt()` which
-/// renders two lines and pairs correctly with `clear_spinner_line()`.
-#[cfg(test)]
-async fn run_thinking_spinner(mut stop_signal: oneshot::Receiver<()>) {
-    let mut frame_index = 0;
-    loop {
-        tokio::select! {
-            _ = &mut stop_signal => {
-                clear_spinner_line();
-                break;
-            }
-            _ = sleep(Duration::from_millis(80)) => {
-                eprint!("\r\x1b[2K{} thinking...", spinner_frame(frame_index));
-                let _ = io::stderr().flush();
-                frame_index += 1;
+/// Non-blocking check for Ctrl+C during execution.
+fn check_ctrl_c_nonblocking(cancel_token: &CancellationToken) {
+    if crossterm::event::poll(Duration::ZERO).unwrap_or(false) {
+        if let Ok(Event::Key(key)) = crossterm::event::read() {
+            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                cancel_token.cancel();
             }
         }
     }
@@ -755,109 +542,6 @@ const TUI_COMMANDS: &[&str] = &[
 const PROMPT_COLOR_START: &str = "\x1b[38;2;255;204;0m";
 const PROMPT_COLOR_END: &str = "\x1b[0m";
 
-struct FawxReadlineHelper {
-    hinter: HistoryHinter,
-    model_ids: Arc<Mutex<Vec<String>>>,
-}
-
-impl Default for FawxReadlineHelper {
-    fn default() -> Self {
-        Self {
-            hinter: HistoryHinter {},
-            model_ids: Arc::new(Mutex::new(Vec::new())),
-        }
-    }
-}
-
-impl Helper for FawxReadlineHelper {}
-impl Highlighter for FawxReadlineHelper {}
-impl Validator for FawxReadlineHelper {}
-
-impl Hinter for FawxReadlineHelper {
-    type Hint = String;
-
-    fn hint(&self, line: &str, pos: usize, context: &Context<'_>) -> Option<String> {
-        if line.len() < 2 {
-            return None;
-        }
-        self.hinter.hint(line, pos, context)
-    }
-}
-
-impl Completer for FawxReadlineHelper {
-    type Candidate = Pair;
-
-    fn complete(
-        &self,
-        line: &str,
-        pos: usize,
-        _context: &Context<'_>,
-    ) -> rustyline::Result<(usize, Vec<Pair>)> {
-        let line_end = pos.min(line.len());
-
-        // Complete model IDs after "/model "
-        if let Some(model_prefix) = line[..line_end].strip_prefix("/model ") {
-            return Ok((
-                "/model ".len(),
-                model_completion_matches(model_prefix, &self.model_ids),
-            ));
-        }
-
-        let start = token_start(line, line_end);
-        if start != 0 {
-            return Ok((start, Vec::new()));
-        }
-
-        let prefix = &line[start..line_end];
-        if !prefix.starts_with('/') {
-            return Ok((start, Vec::new()));
-        }
-
-        Ok((start, command_completion_matches(prefix)))
-    }
-}
-
-fn token_start(line: &str, cursor: usize) -> usize {
-    line[..cursor]
-        .char_indices()
-        .rev()
-        .find_map(|(idx, ch)| ch.is_whitespace().then_some(idx + ch.len_utf8()))
-        .unwrap_or(0)
-}
-
-fn command_completion_matches(prefix: &str) -> Vec<Pair> {
-    if !prefix.starts_with('/') {
-        return Vec::new();
-    }
-
-    TUI_COMMANDS
-        .iter()
-        .filter(|command| command.starts_with(prefix))
-        .map(|command| Pair {
-            display: (*command).to_string(),
-            replacement: (*command).to_string(),
-        })
-        .collect()
-}
-
-fn model_completion_matches(prefix: &str, model_ids: &Arc<Mutex<Vec<String>>>) -> Vec<Pair> {
-    let ids = match model_ids.lock() {
-        Ok(guard) => guard.clone(),
-        Err(_) => {
-            eprintln!("warning: model completion list mutex poisoned; returning no suggestions");
-            return Vec::new();
-        }
-    };
-    let normalized_prefix = prefix.to_lowercase();
-    ids.iter()
-        .filter(|id| id.to_lowercase().starts_with(&normalized_prefix))
-        .map(|id| Pair {
-            display: id.clone(),
-            replacement: id.clone(),
-        })
-        .collect()
-}
-
 /// Group models by provider name, preserving insertion order.
 fn group_models_by_provider(models: &[ModelInfo]) -> Vec<(String, Vec<&ModelInfo>)> {
     let mut groups: Vec<(String, Vec<&ModelInfo>)> = Vec::new();
@@ -910,67 +594,8 @@ fn history_namespace_for_cwd(home: &Path, cwd: &Path) -> Option<String> {
     Some(format!("{:016x}", hasher.finish()))
 }
 
-fn build_tui_prompt() -> String {
-    if crate::scroll_region::supports_256_color() {
-        // Subtle dark gray background on the prompt; resets after so typed text is normal
-        format!("\x1b[48;5;236m{PROMPT_COLOR_START}you \u{203a} {PROMPT_COLOR_END}")
-    } else {
-        format!("{PROMPT_COLOR_START}you \u{203a} {PROMPT_COLOR_END}")
-    }
-}
-
-fn load_history_with_warning(
-    editor: &mut Editor<FawxReadlineHelper, DefaultHistory>,
-    path: &Path,
-) -> bool {
-    match editor.load_history(path) {
-        Ok(()) => true,
-        Err(error) => {
-            eprintln!(
-                "warning: failed to load command history from {}: {}",
-                path.display(),
-                error
-            );
-            false
-        }
-    }
-}
-
-fn configure_line_editor(
-    model_ids: Arc<Mutex<Vec<String>>>,
-) -> Result<Editor<FawxReadlineHelper, DefaultHistory>, TuiError> {
-    let config = rustyline::Config::builder()
-        .completion_type(CompletionType::List)
-        .build();
-    let mut editor =
-        Editor::with_config(config).map_err(|error| TuiError::Auth(error.to_string()))?;
-    editor.set_helper(Some(FawxReadlineHelper {
-        hinter: HistoryHinter {},
-        model_ids,
-    }));
-
-    if let Some(path) = history_path() {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(TuiError::Io)?;
-        }
-        if path.exists() {
-            load_history_with_warning(&mut editor, &path);
-        }
-    }
-
-    Ok(editor)
-}
-
-fn save_line_editor_history(editor: &mut Editor<FawxReadlineHelper, DefaultHistory>) {
-    if let Some(path) = history_path() {
-        if let Err(error) = editor.save_history(&path) {
-            eprintln!("failed to save command history: {error}");
-        }
-    }
-}
-
 /// Parse a bare-word command typed during spinner/thinking phase.
-#[allow(dead_code)] // Wired into readline handoff in a follow-up.
+#[allow(dead_code)] // TODO(#1148): Phase 3 readline handoff will wire this in
 pub(crate) fn parse_bare_command(input: &str) -> Option<LoopCommand> {
     match input.trim().to_lowercase().as_str() {
         "stop" | "s" => Some(LoopCommand::Stop),
@@ -999,11 +624,13 @@ pub struct TuiApp {
     max_history: usize,
     memory: Option<SharedMemoryStore>,
     runtime_info: Arc<RwLock<RuntimeInfo>>,
-    /// Shared model ID list for readline tab-completion.
+    /// Shared model ID list for tab-completion.
     completer_model_ids: Arc<Mutex<Vec<String>>>,
     /// Event bus for streaming events from the kernel.
     event_bus: EventBus,
     scratchpad: Arc<Mutex<Scratchpad>>,
+    /// Buffer for command output that will be flushed to FawxApp.
+    output_buffer: Vec<String>,
 }
 
 /// Dependencies for constructing a [`TuiApp`]. Avoids > 5 bare parameters.
@@ -1016,6 +643,18 @@ pub struct TuiAppDeps {
     pub memory: Option<SharedMemoryStore>,
     pub event_bus: EventBus,
     pub scratchpad: Arc<Mutex<Scratchpad>>,
+}
+
+/// Bundles mutable references needed by [`TuiApp::run_cycle_rendering`],
+/// keeping the parameter count within the 4-5 limit.
+struct CycleRenderingContext<'a> {
+    snapshot: Option<PerceptionSnapshot>,
+    active_model: String,
+    terminal: &'a mut DefaultTerminal,
+    app: &'a mut ui::FawxApp,
+    bus_rx: &'a mut broadcast::Receiver<InternalMessage>,
+    cancel_token: &'a CancellationToken,
+    streamed: &'a mut bool,
 }
 
 impl TuiApp {
@@ -1087,88 +726,228 @@ impl TuiApp {
             completer_model_ids: Arc::new(Mutex::new(Vec::new())),
             event_bus,
             scratchpad,
+            output_buffer: Vec::new(),
         };
         app.select_first_available_model_without_refresh();
         Ok(app)
     }
 
-    /// Run the TUI main loop.
+    /// Write a line to the output buffer (collected and flushed to UI later).
+    fn tui_println(&mut self, line: impl Into<String>) {
+        self.output_buffer.push(line.into());
+    }
+
+    /// Drain the output buffer into the FawxApp.
+    fn flush_output_to(&mut self, app: &mut ui::FawxApp) {
+        for line in self.output_buffer.drain(..) {
+            app.add_output(line);
+        }
+    }
+
+    /// Run the TUI main loop using ratatui rendering.
     pub async fn run(&mut self) -> Result<(), TuiError> {
         self.select_first_available_model().await;
+
+        install_ratatui_panic_hook();
+
+        crossterm::terminal::enable_raw_mode().map_err(TuiError::Io)?;
+        let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
+        let mut terminal = ratatui::Terminal::new(backend).map_err(TuiError::Io)?;
+        let mut app = ui::FawxApp::new();
+
+        // Show welcome banner
         self.show_welcome();
+        self.flush_output_to(&mut app);
 
-        // Install panic hook to reset scroll region on unexpected exit.
-        crate::scroll_region::install_panic_hook();
-
-        // Set up persistent input bar via ANSI scroll region.
-        // Degrades gracefully if the terminal doesn't support it.
-        crate::scroll_region::setup_scroll_region();
-
-        // Spawn a resize handler that re-applies the scroll region
-        // when the terminal dimensions change (SIGWINCH on Unix).
-        spawn_resize_handler();
-
-        // Ctrl+C signals cancellation instead of killing the process.
-        // First press: graceful cancel. Second press: force exit (NB1).
+        // Ctrl+C: first press = cancel, second = force exit.
         let cancel_for_signal = self.cancel_token.clone();
         tokio::spawn(async move {
-            // First Ctrl+C: graceful cancel
             tokio::signal::ctrl_c().await.ok();
             cancel_for_signal.cancel();
-            // Second Ctrl+C: force exit
             tokio::signal::ctrl_c().await.ok();
-            crate::scroll_region::reset_scroll_region();
-            eprintln!("\n⏹ Force quit.");
+            let _ = crossterm::terminal::disable_raw_mode();
+            let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
+            eprintln!("\n\u{23f9} Force quit.");
             std::process::exit(130);
         });
 
-        // Wire the cancellation token into the loop engine.
         self.loop_engine.set_cancel_token(self.cancel_token.clone());
-
         self.sync_completer_model_ids();
-        let mut editor = configure_line_editor(Arc::clone(&self.completer_model_ids))?;
-        let prompt = build_tui_prompt();
+
         while self.running {
-            // Prepare input bar for readline
-            crate::scroll_region::prepare_for_input();
+            terminal
+                .draw(|frame| ui::draw(frame, &app))
+                .map_err(TuiError::Io)?;
 
-            match editor.readline(&prompt) {
-                Ok(line) => {
-                    // Restore dimmed bar while processing
-                    crate::scroll_region::restore_dimmed_bar();
+            let poll_duration = match app.state {
+                ui::AppState::Idle => Duration::from_secs(3600),
+                _ => Duration::from_millis(50),
+            };
 
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    // Only persist recognized slash commands and chat messages in history.
-                    // Mistyped commands (e.g. /ex, /halp) are excluded to keep the
-                    // HistoryHinter from suggesting invalid completions.
-                    if should_add_to_history(trimmed) {
-                        if let Err(error) = editor.add_history_entry(trimmed) {
-                            eprintln!("failed to add command history entry: {error}");
+            if crossterm::event::poll(poll_duration).map_err(TuiError::Io)? {
+                match crossterm::event::read().map_err(TuiError::Io)? {
+                    Event::Key(key) => {
+                        if let Some(input) = handle_idle_key(key, &mut app) {
+                            self.process_input_line_tui(&input, &mut terminal, &mut app)
+                                .await?;
+                        }
+                        // Handle Ctrl+C during idle as quit
+                        if key.code == KeyCode::Char('c')
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            break;
                         }
                     }
-                    self.process_input_line(trimmed).await?;
-                }
-                Err(ReadlineError::Interrupted) => {
-                    crate::scroll_region::restore_dimmed_bar();
-                    println!("^C");
-                }
-                Err(ReadlineError::Eof) => {
-                    crate::scroll_region::restore_dimmed_bar();
-                    break;
-                }
-                Err(error) => {
-                    crate::scroll_region::reset_scroll_region();
-                    return Err(TuiError::Auth(error.to_string()));
+                    Event::Resize(_w, _h) => {
+                        // Terminal size changed — the next draw() call
+                        // queries the new dimensions automatically.
+                    }
+                    _ => {}
                 }
             }
         }
 
-        save_line_editor_history(&mut editor);
-        crate::scroll_region::reset_scroll_region();
+        crossterm::terminal::disable_raw_mode().map_err(TuiError::Io)?;
+        crossterm::execute!(std::io::stdout(), crossterm::cursor::Show).map_err(TuiError::Io)?;
         Ok(())
+    }
+
+    /// Process user input and run the agent cycle with ratatui rendering.
+    async fn process_input_line_tui(
+        &mut self,
+        input: &str,
+        terminal: &mut DefaultTerminal,
+        app: &mut ui::FawxApp,
+    ) -> Result<(), TuiError> {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+
+        // Add to history
+        if should_add_to_history(trimmed) {
+            app.push_history(trimmed.to_string());
+        }
+
+        if trimmed.starts_with('/') {
+            if let Err(error) = self.handle_command(trimmed).await {
+                self.tui_println(format_error_message(&error.to_string()));
+            }
+            self.flush_output_to(app);
+            return Ok(());
+        }
+
+        // Echo user message
+        app.add_output(String::new());
+        app.add_output(format!("you \u{203a} {}", trimmed));
+
+        // Run agent cycle with rendering
+        self.run_agent_cycle_tui(trimmed, terminal, app).await
+    }
+
+    /// Run a single agent cycle with ratatui rendering for the spinner
+    /// and streaming output.
+    async fn run_agent_cycle_tui(
+        &mut self,
+        input: &str,
+        terminal: &mut DefaultTerminal,
+        app: &mut ui::FawxApp,
+    ) -> Result<(), TuiError> {
+        app.set_state(ui::AppState::Executing { spinner_frame: 0 });
+
+        let mut bus_rx = self.event_bus.subscribe();
+        let cancel_token = self.cancel_token.clone();
+        let mut streamed = false;
+        let started = Instant::now();
+
+        self.ensure_message_auth().await?;
+        let active_model = self.resolve_active_model()?;
+        self.update_memory_context_for_input(input);
+        let snapshot = self.build_perception_snapshot(input);
+
+        // Run cycle — blocks on the engine but tokio::select! lets us
+        // interleave rendering ticks and keyboard checks.
+        let mut ctx = CycleRenderingContext {
+            snapshot: Some(snapshot),
+            active_model,
+            terminal,
+            app,
+            bus_rx: &mut bus_rx,
+            cancel_token: &cancel_token,
+            streamed: &mut streamed,
+        };
+        let result = self.run_cycle_rendering(&mut ctx).await;
+
+        // Drain any remaining bus events
+        drain_bus_events(&mut bus_rx, app, &mut streamed);
+        app.finish_streaming();
+        app.set_state(ui::AppState::Idle);
+
+        self.handle_cycle_result(input, result, streamed, started, app);
+        Ok(())
+    }
+
+    /// Rendering + cycle select loop. Isolated to satisfy the borrow checker:
+    /// borrows of `self.loop_engine` and `self.router` end at the loop exit.
+    async fn run_cycle_rendering(
+        &mut self,
+        ctx: &mut CycleRenderingContext<'_>,
+    ) -> Result<LoopResult, TuiError> {
+        let snapshot = ctx.snapshot.take().expect("snapshot must be provided");
+        let active_model = std::mem::take(&mut ctx.active_model);
+        let llm = RouterLoopLlmProvider::new(&self.router, active_model);
+        let cycle_future = self.loop_engine.run_cycle(snapshot, &llm);
+        tokio::pin!(cycle_future);
+
+        loop {
+            ctx.terminal
+                .draw(|frame| ui::draw(frame, ctx.app))
+                .map_err(TuiError::Io)?;
+
+            tokio::select! {
+                biased;
+                result = &mut cycle_future => {
+                    return result.map_err(|e| TuiError::Loop(e.reason));
+                }
+                _ = sleep(Duration::from_millis(50)) => {
+                    drain_bus_events(ctx.bus_rx, ctx.app, ctx.streamed);
+                    if let ui::AppState::Executing { ref mut spinner_frame } = ctx.app.state {
+                        *spinner_frame += 1;
+                    }
+                    check_ctrl_c_nonblocking(ctx.cancel_token);
+                }
+            }
+        }
+    }
+
+    /// Post-cycle: bookkeeping + output.
+    fn handle_cycle_result(
+        &mut self,
+        input: &str,
+        result: Result<LoopResult, TuiError>,
+        streamed: bool,
+        started: Instant,
+        app: &mut ui::FawxApp,
+    ) {
+        match result {
+            Ok(ref loop_result) => {
+                if let Err(e) = self.post_cycle_bookkeeping(input, loop_result) {
+                    self.tui_println(format_error_message(&e.to_string()));
+                }
+                if !streamed {
+                    let rendered = render_loop_result(loop_result.clone(), started.elapsed());
+                    self.tui_println(rendered);
+                } else if let Some(m) =
+                    format_loop_metadata_for_result(loop_result, started.elapsed())
+                {
+                    self.tui_println(m);
+                }
+            }
+            Err(ref error) => {
+                self.tui_println(format_error_message(&error.to_string()));
+            }
+        }
+        self.flush_output_to(app);
     }
 
     async fn process_input_line(&mut self, input: &str) -> Result<(), TuiError> {
@@ -1178,60 +957,52 @@ impl TuiApp {
 
         if input.starts_with('/') {
             if let Err(error) = self.handle_command(input).await {
-                println!("{}\n", format_error_message(&error.to_string()));
+                self.tui_println(format_error_message(&error.to_string()));
             }
             return Ok(());
         }
 
-        // Echo user message with shaded background into the scroll region
-        echo_user_message(input);
+        self.tui_println(format!("you \u{203a} {input}"));
 
         match self.handle_message(input).await {
             Ok(Some(response)) => self.display_response(&response)?,
             Ok(None) => {} // streaming already rendered inline
-            Err(error) => println!("{}\n", format_error_message(&error.to_string())),
+            Err(error) => self.tui_println(format_error_message(&error.to_string())),
         }
 
         Ok(())
     }
 
     /// Display the welcome banner.
-    fn show_welcome(&self) {
-        let mut stdout = io::stdout();
-        if let Err(error) = stdout.execute(terminal::Clear(terminal::ClearType::CurrentLine)) {
-            eprintln!("failed to clear terminal line: {error}");
+    fn show_welcome(&mut self) {
+        // Show ANSI hero art on truecolor terminals, plain ASCII fallback otherwise.
+        let banner = if supports_truecolor() {
+            FAWX_BANNER_ANSI
+        } else {
+            BANNER_ART
+        };
+        for line in banner.lines() {
+            self.tui_println(line.to_string());
         }
-
-        let amber = theme_color(255, 165, 0, 214);
-        let burnt = theme_color(210, 112, 10, 166);
-
-        println!();
-        print!("{}", render_banner(supports_truecolor(), amber));
-        println!();
-        println!(
-            "  {}",
-            "fawx \u{00b7} agentic engine \u{00b7} type /help for commands"
-                .with(burnt)
-                .attribute(style::Attribute::Dim)
+        self.tui_println(String::new());
+        self.tui_println(
+            "  fawx \u{00b7} agentic engine \u{00b7} type /help for commands".to_string(),
         );
         if !self.auth_manager.has_any() {
-            println!(
-                "  {}",
-                "Not authenticated · /auth to set up or just send a message"
-                    .with(burnt)
-                    .attribute(style::Attribute::Dim)
+            self.tui_println(
+                "  Not authenticated \u{00b7} /auth to set up or just send a message".to_string(),
             );
         }
-        println!();
+        self.tui_println(String::new());
     }
 
     /// Run the first-time auth wizard if no credentials exist.
     async fn auth_wizard(&mut self) -> Result<(), TuiError> {
-        println!("Welcome to Fawx.\n");
+        self.tui_println("Welcome to Fawx.\n");
         if self.auth_manager.providers().is_empty() {
-            println!("No credentials found. Let's set up authentication.\n");
+            self.tui_println("No credentials found. Let's set up authentication.\n");
         } else {
-            println!("Add another provider.\n");
+            self.tui_println("Add another provider.\n");
         }
 
         let result = self.run_auth_wizard_flow().await;
@@ -1249,12 +1020,12 @@ impl TuiApp {
         self.persist_and_activate_model(&preferred_provider).await
     }
 
-    fn run_auth_selection(&self) -> Result<AuthSelection, TuiError> {
-        println!("How would you like to authenticate?");
-        println!("  [1] Claude subscription (paste setup-token)");
-        println!("  [2] ChatGPT subscription (browser sign-in)");
-        println!("  [3] API key (any provider)");
-        println!();
+    fn run_auth_selection(&mut self) -> Result<AuthSelection, TuiError> {
+        self.tui_println("How would you like to authenticate?");
+        self.tui_println("  [1] Claude subscription (paste setup-token)");
+        self.tui_println("  [2] ChatGPT subscription (browser sign-in)");
+        self.tui_println("  [3] API key (any provider)");
+        self.tui_println(String::new());
 
         prompt_choice(
             "> ",
@@ -1274,7 +1045,7 @@ impl TuiApp {
         self.auth_manager
             .store("anthropic", AuthMethod::SetupToken { token });
 
-        println!("✓ Authenticated. Token stored.\n");
+        self.tui_println("✓ Authenticated. Token stored.\n");
         Ok("anthropic".to_string())
     }
 
@@ -1286,11 +1057,11 @@ impl TuiApp {
         let auth_url = flow.authorization_url(&client_id);
         let auth_code = obtain_oauth_authorization_code(&flow, &auth_url).await?;
 
-        println!("Exchanging authorization code for tokens...");
+        self.tui_println("Exchanging authorization code for tokens...");
         let token_response = exchange_oauth_code_for_tokens(&flow, &client_id, &auth_code).await?;
         self.store_openai_oauth_tokens(token_response);
 
-        println!("✓ Authenticated. Tokens stored.\n");
+        self.tui_println("✓ Authenticated. Tokens stored.\n");
         Ok("openai".to_string())
     }
 
@@ -1328,7 +1099,7 @@ impl TuiApp {
             },
         );
 
-        println!("✓ API key stored.\n");
+        self.tui_println("✓ API key stored.\n");
         Ok(provider)
     }
 
@@ -1346,7 +1117,7 @@ impl TuiApp {
         Ok(())
     }
 
-    fn print_active_model(&self) {
+    fn print_active_model(&mut self) {
         if let Some(active_model) = self.router.active_model() {
             let model_info = self
                 .router
@@ -1355,12 +1126,12 @@ impl TuiApp {
                 .find(|model| model.model_id == active_model);
 
             if let Some(model_info) = model_info {
-                println!(
-                    "Active model: {} ({} {})\n",
+                self.tui_println(format!(
+                    "Active model: {} ({} {})",
                     active_model, model_info.provider_name, model_info.auth_method
-                );
+                ));
             } else {
-                println!("Active model: {active_model}\n");
+                self.tui_println(format!("Active model: {active_model}\n"));
             }
         }
     }
@@ -1379,10 +1150,10 @@ impl TuiApp {
                         if let Err(error) = self.config.save(&fawx_data_dir()) {
                             eprintln!("Warning: couldn't save model preference: {error}");
                         }
-                        println!("Active model set to: {resolved_model}");
+                        self.tui_println(format!("Active model set to: {resolved_model}"));
                     }
                     Err(error) => {
-                        println!("Couldn't select model: {error}");
+                        self.tui_println(format!("Couldn't select model: {error}"));
                         self.show_model_menu();
                     }
                 }
@@ -1411,18 +1182,18 @@ impl TuiApp {
                     .create_new()
                     .map_err(TuiError::Store)?;
                 self.conversation_history.clear();
-                println!("Started new conversation: {id}");
+                self.tui_println(format!("Started new conversation: {id}"));
             }
             ParsedCommand::History => self.show_conversation_history(),
             ParsedCommand::Config(action) => self.handle_config_command(action)?,
             ParsedCommand::Help => self.show_help(),
             ParsedCommand::Quit => {
                 self.running = false;
-                println!("Goodbye!");
+                self.tui_println("Goodbye!");
             }
             ParsedCommand::Unknown(command) => {
-                println!("Unknown command: /{command}");
-                println!("Type /help for available commands.");
+                self.tui_println(format!("Unknown command: /{command}"));
+                self.tui_println("Type /help for available commands.");
             }
         }
 
@@ -1440,10 +1211,13 @@ impl TuiApp {
         let snapshot = self.build_perception_snapshot(input);
         let started = Instant::now();
 
-        let (loop_result, streamed) = self.run_cycle_with_display(snapshot, active_model).await?;
+        let loop_result = self.run_cycle(snapshot, active_model).await?;
 
         self.post_cycle_bookkeeping(input, &loop_result)?;
-        self.finalize_streaming_display(&loop_result, streamed, started.elapsed())
+        // In the ratatui path, streaming is handled by run_agent_cycle_tui.
+        // For the legacy path (tests), we pass streamed=false so the
+        // response is returned as a batch string.
+        self.finalize_streaming_display(&loop_result, false, started.elapsed())
     }
 
     /// Resolve the currently active model ID.
@@ -1454,24 +1228,17 @@ impl TuiApp {
             .ok_or_else(|| TuiError::Router("no active model selected".to_string()))
     }
 
-    /// Run the loop engine cycle with streaming display or a fallback
-    /// thinking spinner.
-    async fn run_cycle_with_display(
+    /// Run the loop engine cycle (no display — callers handle rendering).
+    async fn run_cycle(
         &mut self,
         snapshot: PerceptionSnapshot,
         active_model: String,
-    ) -> Result<(LoopResult, bool), TuiError> {
-        let event_bus = &self.event_bus;
-        let (result, streamed) = run_with_streaming_display(event_bus, async {
-            let router = &self.router;
-            let llm = RouterLoopLlmProvider::new(router, active_model);
-            self.loop_engine
-                .run_cycle(snapshot, &llm)
-                .await
-                .map_err(|error| TuiError::Loop(error.reason))
-        })
-        .await;
-        Ok((result?, streamed))
+    ) -> Result<LoopResult, TuiError> {
+        let llm = RouterLoopLlmProvider::new(&self.router, active_model);
+        self.loop_engine
+            .run_cycle(snapshot, &llm)
+            .await
+            .map_err(|error| TuiError::Loop(error.reason))
     }
 
     /// Persist signals, conversation turn, and signal store after a cycle.
@@ -1494,20 +1261,20 @@ impl TuiApp {
     /// Decide whether to return a batch-rendered response or `None`
     /// (streaming already displayed the text).
     fn finalize_streaming_display(
-        &self,
+        &mut self,
         loop_result: &LoopResult,
         streamed: bool,
         wall_time: std::time::Duration,
     ) -> Result<Option<String>, TuiError> {
         if streamed {
             if matches!(loop_result, LoopResult::UserStopped { .. }) {
-                StreamRenderer::print_interrupted_marker();
+                self.tui_println(" [interrupted]".to_string());
             }
             let metadata = format_loop_metadata_for_result(loop_result, wall_time);
             if let Some(meta) = metadata {
-                println!("{meta}");
+                self.tui_println(meta);
             }
-            println!();
+            self.tui_println(String::new());
             Ok(None)
         } else {
             Ok(Some(render_loop_result(loop_result.clone(), wall_time)))
@@ -1641,24 +1408,24 @@ impl TuiApp {
         }
     }
 
-    fn show_signals_summary(&self) {
+    fn show_signals_summary(&mut self) {
         if self.last_signals.is_empty() {
-            println!("No signals from last turn.");
+            self.tui_println("No signals from last turn.");
             return;
         }
 
         let collector = SignalCollector::from_signals(self.last_signals.clone());
-        println!("{}", collector.summary());
+        self.tui_println(collector.summary().to_string());
     }
 
-    fn show_signals_debug(&self) {
+    fn show_signals_debug(&mut self) {
         if self.last_signals.is_empty() {
-            println!("No signals from last turn.");
+            self.tui_println("No signals from last turn.");
             return;
         }
 
         let collector = SignalCollector::from_signals(self.last_signals.clone());
-        println!("{}", collector.debug_dump());
+        self.tui_println(collector.debug_dump().to_string());
     }
 
     async fn handle_analyze_command(&mut self) -> Result<(), TuiError> {
@@ -1667,25 +1434,34 @@ impl TuiApp {
             .active_model()
             .ok_or_else(|| TuiError::Router("no active model for analysis".to_string()))?
             .to_string();
-        let provider = AnalysisCompletionProvider::new(&self.router, active_model);
-        let engine = AnalysisEngine::new(&self.signal_store);
+        self.tui_println("Analyzing signals across all sessions...");
 
-        println!("Analyzing signals across all sessions...");
-        match engine.analyze(&provider).await {
+        // Create provider and engine in a block so the borrow of self.router
+        // and self.signal_store ends before we call self.tui_println.
+        let analysis_result = {
+            let provider = AnalysisCompletionProvider::new(&self.router, active_model);
+            let engine = AnalysisEngine::new(&self.signal_store);
+            engine.analyze(&provider).await
+        };
+
+        match analysis_result {
             Ok(findings) if findings.is_empty() => {
-                println!("No patterns found. Collect more signals first.");
+                self.tui_println("No patterns found. Collect more signals first.");
             }
             Ok(findings) => {
+                let memory_ref = self.memory.as_ref().cloned();
                 let (stored, surfaced, logged) =
-                    Self::route_findings_by_confidence(&findings, self.memory.as_ref());
-                Self::print_analysis_findings(&findings);
-                println!(
+                    self.route_findings_by_confidence(&findings, memory_ref.as_ref());
+                self.print_analysis_findings(&findings);
+                self.tui_println(format!(
                     "Wrote {} patterns to memory, surfaced {} for review, logged {}",
                     stored, surfaced, logged
-                );
+                ));
             }
             Err(AnalysisError::ParseError(error)) => {
-                eprintln!("Analysis model responded, but output was unparseable JSON: {error}");
+                self.tui_println(format!(
+                    "Analysis model responded, but output was unparseable JSON: {error}"
+                ));
             }
             Err(error) => return Err(error.into()),
         }
@@ -1695,8 +1471,8 @@ impl TuiApp {
 
     async fn handle_improve_command(&mut self, flags: ImproveFlags) -> Result<(), TuiError> {
         if let Some(unknown) = &flags.has_unknown_flag {
-            println!("Unknown flag: {unknown}");
-            println!("Usage: /improve [--dry-run]");
+            self.tui_println(format!("Unknown flag: {unknown}"));
+            self.tui_println("Usage: /improve [--dry-run]");
             return Ok(());
         }
 
@@ -1713,14 +1489,14 @@ impl TuiApp {
             repo_root: &repo_root,
             proposals_dir: &proposals_dir,
         };
-        let provider = AnalysisCompletionProvider::new(&self.router, active_model);
+        self.tui_println("⚡ Analyzing signals...");
+        self.tui_println("⚡ Planning improvements...");
 
-        eprintln!("⚡ Analyzing signals...");
-        eprintln!("⚡ Planning improvements...");
+        let provider = AnalysisCompletionProvider::new(&self.router, active_model);
         let result =
             fx_improve::run_improvement_cycle(&self.signal_store, &provider, &config, &paths)
                 .await?;
-        Self::print_improve_result(&result, flags.dry_run);
+        self.print_improve_result(&result, flags.dry_run);
 
         Ok(())
     }
@@ -1742,47 +1518,48 @@ impl TuiApp {
         (config, data_dir, repo_root)
     }
 
-    fn print_improve_result(result: &fx_improve::ExecutionResult, dry_run: bool) {
+    fn print_improve_result(&mut self, result: &fx_improve::ExecutionResult, dry_run: bool) {
         if dry_run {
-            println!("⚡ Dry run complete.");
+            self.tui_println("⚡ Dry run complete.");
         } else {
-            println!("⚡ Improvement cycle complete.");
+            self.tui_println("⚡ Improvement cycle complete.");
         }
 
         if result.proposals_written.is_empty()
             && result.branches_created.is_empty()
             && result.skipped.is_empty()
         {
-            println!("  No actionable improvements found.");
+            self.tui_println("  No actionable improvements found.");
             return;
         }
 
         for path in &result.proposals_written {
-            println!("  Proposal: {}", path.display());
+            self.tui_println(format!("  Proposal: {}", path.display()));
         }
         for branch in &result.branches_created {
-            println!("  Branch: {branch}");
+            self.tui_println(format!("  Branch: {branch}"));
         }
         for (name, reason) in &result.skipped {
-            println!("  Skipped: {name} — {reason}");
+            self.tui_println(format!("  Skipped: {name} — {reason}"));
         }
     }
 
-    fn print_analysis_findings(findings: &[AnalysisFinding]) {
+    fn print_analysis_findings(&mut self, findings: &[AnalysisFinding]) {
         for finding in findings {
             let badge = Self::confidence_badge(finding.confidence);
-            println!("\n{badge} | {}", finding.pattern_name);
-            println!("  {}", finding.description);
-            println!("  Evidence: {} signals", finding.evidence.len());
+            self.tui_println(format!("\n{badge} | {}", finding.pattern_name));
+            self.tui_println(format!("  {}", finding.description));
+            self.tui_println(format!("  Evidence: {} signals", finding.evidence.len()));
             if let Some(action) = &finding.suggested_action {
-                println!("  Suggested: {action}");
+                self.tui_println(format!("  Suggested: {action}"));
             }
         }
 
-        println!("\nFound {} patterns total.", findings.len());
+        self.tui_println(format!("\nFound {} patterns total.", findings.len()));
     }
 
     fn route_findings_by_confidence(
+        &mut self,
         findings: &[AnalysisFinding],
         memory: Option<&SharedMemoryStore>,
     ) -> (usize, usize, usize) {
@@ -1798,14 +1575,14 @@ impl TuiApp {
                     }
                 }
                 Confidence::Medium => {
-                    println!(
+                    self.tui_println(format!(
                         "Consider: {} — {}",
                         finding.pattern_name, finding.description
-                    );
+                    ));
                     surfaced += 1;
                 }
                 Confidence::Low => {
-                    eprintln!("log: {} — {}", finding.pattern_name, finding.description);
+                    tracing::debug!("log: {} — {}", finding.pattern_name, finding.description);
                     logged += 1;
                 }
             }
@@ -1853,34 +1630,40 @@ impl TuiApp {
 
     fn update_synthesis_instruction(&mut self, instruction: Option<String>) {
         match instruction {
-            None => println!("Usage: /synthesis <instruction> or /synthesis reset"),
+            None => self.tui_println("Usage: /synthesis <instruction> or /synthesis reset"),
             Some(value) if value.trim().is_empty() => {
-                println!("Synthesis instruction cannot be empty.");
+                self.tui_println("Synthesis instruction cannot be empty.");
             }
             Some(value) if value.eq_ignore_ascii_case("reset") => {
                 if let Err(error) = self
                     .loop_engine
                     .set_synthesis_instruction(DEFAULT_SYNTHESIS_INSTRUCTION.to_string())
                 {
-                    println!("Failed to reset synthesis instruction: {}", error.reason);
+                    self.tui_println(format!(
+                        "Failed to reset synthesis instruction: {}",
+                        error.reason
+                    ));
                     return;
                 }
-                println!("Synthesis instruction reset to default.");
+                self.tui_println("Synthesis instruction reset to default.");
             }
             Some(value) => {
                 if value.len() > MAX_SYNTHESIS_INSTRUCTION_LENGTH {
-                    println!(
+                    self.tui_println(format!(
                         "Synthesis instruction exceeds {} characters.",
                         MAX_SYNTHESIS_INSTRUCTION_LENGTH
-                    );
+                    ));
                     return;
                 }
 
                 match self.loop_engine.set_synthesis_instruction(value.clone()) {
-                    Ok(()) => println!("Synthesis instruction updated: {}", value.trim()),
-                    Err(error) => {
-                        println!("Failed to update synthesis instruction: {}", error.reason)
+                    Ok(()) => {
+                        self.tui_println(format!("Synthesis instruction updated: {}", value.trim()))
                     }
+                    Err(error) => self.tui_println(format!(
+                        "Failed to update synthesis instruction: {}",
+                        error.reason
+                    )),
                 }
             }
         }
@@ -1917,14 +1700,14 @@ impl TuiApp {
         match action.as_deref() {
             None => self.show_config(),
             Some("init") => self.init_config_file()?,
-            Some(other) => {
-                println!("Unknown /config action: {other}. Use /config or /config init.")
-            }
+            Some(other) => self.tui_println(format!(
+                "Unknown /config action: {other}. Use /config or /config init."
+            )),
         }
         Ok(())
     }
 
-    fn show_config(&self) {
+    fn show_config(&mut self) {
         let fields: &[(&str, String)] = &[
             (
                 "general.max_iterations",
@@ -1979,13 +1762,13 @@ impl TuiApp {
         for (key, value) in fields {
             output.push_str(&format!("  {key} = {value}\n"));
         }
-        print!("{output}");
+        self.tui_println(output);
     }
 
     fn init_config_file(&mut self) -> Result<(), TuiError> {
         let base_data_dir = fawx_data_dir();
         let created = FawxConfig::write_default(&base_data_dir).map_err(TuiError::Store)?;
-        println!("Created default config at {}", created.display());
+        self.tui_println(format!("Created default config at {}", created.display()));
         Ok(())
     }
 
@@ -1999,65 +1782,53 @@ impl TuiApp {
             .to_string()
     }
 
-    fn show_conversation_history(&self) {
+    fn show_conversation_history(&mut self) {
         let conversations = self.conversation_store.list_conversations();
         if conversations.is_empty() {
-            println!("No saved conversations yet.");
+            self.tui_println("No saved conversations yet.");
             return;
         }
 
-        println!("Saved conversations:");
+        self.tui_println("Saved conversations:");
         for (id, count) in conversations {
-            println!("  - {id}: {count} messages");
+            self.tui_println(format!("  - {id}: {count} messages"));
         }
     }
 
-    /// Display formatted output to the terminal.
-    fn display_response(&self, response: &str) -> Result<(), TuiError> {
-        let mut stdout = io::stdout();
-        move_cursor_to_start(&mut stdout)?;
-
-        // Ensure output goes to the scroll region
-        crate::scroll_region::position_for_output();
-
-        println!();
-        print!(
-            "{} ",
-            "fawx \u{203a}".bold().with(theme_color(255, 165, 0, 214))
-        );
-        let rendered = render_markdown(response);
-        println!("{rendered}");
-        println!();
-
-        // Refresh the input bar after output
-        crate::scroll_region::refresh_input_bar();
-
+    /// Display formatted output to the output buffer.
+    fn display_response(&mut self, response: &str) -> Result<(), TuiError> {
+        self.tui_println(String::new());
+        self.tui_println(format!("fawx \u{203a} {response}"));
+        self.tui_println(String::new());
         Ok(())
     }
 
     /// Display the model selection menu grouped by provider.
-    fn show_model_menu(&self) {
-        let active = self.router.active_model();
+    fn show_model_menu(&mut self) {
+        let active = self.router.active_model().map(|s| s.to_string());
         let models = self.router.available_models();
 
         if models.is_empty() {
-            println!("No models available. Use /auth to configure credentials.");
+            self.tui_println("No models available. Use /auth to configure credentials.");
             return;
         }
 
         let grouped = group_models_by_provider(&models);
 
-        println!("Available models:");
+        self.tui_println("Available models:");
         for (provider, group) in &grouped {
-            println!();
-            println!("{provider}:");
+            self.tui_println(String::new());
+            self.tui_println(format!("{provider}:"));
             for model in group {
-                let marker = if Some(model.model_id.as_str()) == active {
+                let marker = if active.as_deref() == Some(model.model_id.as_str()) {
                     "*"
                 } else {
                     " "
                 };
-                println!("  {marker} {} ({})", model.model_id, model.auth_method);
+                self.tui_println(format!(
+                    "  {marker} {} ({})",
+                    model.model_id, model.auth_method
+                ));
             }
         }
     }
@@ -2191,51 +1962,58 @@ impl TuiApp {
         }
     }
 
-    fn show_help(&self) {
-        println!("{}", "Commands".bold().with(theme_color(255, 165, 0, 214)));
-        println!("  /model         List models and switch active model");
-        println!("  /model <name>  Switch to a specific model");
-        println!("  /auth          Show credentials / run auth wizard");
-        println!("  /status        Show model, tokens, budget summary");
-        println!("  /budget        Show detailed budget usage");
-        println!("  /loop          Show loop iteration details");
-        println!("  /signals       Show condensed signal summary for last turn");
-        println!("  /debug         Show full signal dump for last turn");
-        println!("  /analyze       Analyze persisted signals across sessions");
-        println!("  /improve       Run self-improvement cycle");
-        println!("  /synthesis     Set or reset synthesis instruction");
-        println!("  /clear         Clear the screen and active conversation");
-        println!("  /new           Start a new conversation");
-        println!("  /history       List saved conversations");
-        println!("  /config        Show loaded config values");
-        println!("  /config init   Create ~/.fawx/config.toml template");
-        println!("  /help          Show this help");
-        println!("  /quit          Exit");
+    fn show_help(&mut self) {
+        self.tui_println(format!(
+            "{}",
+            "Commands".bold().with(theme_color(255, 165, 0, 214))
+        ));
+        self.tui_println("  /model         List models and switch active model");
+        self.tui_println("  /model <name>  Switch to a specific model");
+        self.tui_println("  /auth          Show credentials / run auth wizard");
+        self.tui_println("  /status        Show model, tokens, budget summary");
+        self.tui_println("  /budget        Show detailed budget usage");
+        self.tui_println("  /loop          Show loop iteration details");
+        self.tui_println("  /signals       Show condensed signal summary for last turn");
+        self.tui_println("  /debug         Show full signal dump for last turn");
+        self.tui_println("  /analyze       Analyze persisted signals across sessions");
+        self.tui_println("  /improve       Run self-improvement cycle");
+        self.tui_println("  /synthesis     Set or reset synthesis instruction");
+        self.tui_println("  /clear         Clear the screen and active conversation");
+        self.tui_println("  /new           Start a new conversation");
+        self.tui_println("  /history       List saved conversations");
+        self.tui_println("  /config        Show loaded config values");
+        self.tui_println("  /config init   Create ~/.fawx/config.toml template");
+        self.tui_println("  /help          Show this help");
+        self.tui_println("  /quit          Exit");
     }
 
-    fn show_auth_status(&self) {
+    fn show_auth_status(&mut self) {
         let providers = self.auth_manager.providers();
         if providers.is_empty() {
-            println!("No credentials configured.");
+            self.tui_println("No credentials configured.");
             return;
         }
 
-        println!("Configured credentials:");
+        self.tui_println("Configured credentials:");
         for provider in providers {
             if let Some(method) = self.auth_manager.get(&provider) {
                 match method {
                     AuthMethod::SetupToken { .. } => {
-                        println!("  - {provider}: Claude setup-token (subscription)");
+                        self.tui_println(format!(
+                            "  - {provider}: Claude setup-token (subscription)"
+                        ));
                     }
                     AuthMethod::OAuth { account_id, .. } => {
                         if let Some(account_id) = account_id {
-                            println!("  - {provider}: OAuth subscription ({account_id})");
+                            self.tui_println(format!(
+                                "  - {provider}: OAuth subscription ({account_id})"
+                            ));
                         } else {
-                            println!("  - {provider}: OAuth subscription");
+                            self.tui_println(format!("  - {provider}: OAuth subscription"));
                         }
                     }
                     AuthMethod::ApiKey { .. } => {
-                        println!("  - {provider}: API key");
+                        self.tui_println(format!("  - {provider}: API key"));
                     }
                 }
             }
@@ -2243,10 +2021,10 @@ impl TuiApp {
     }
     async fn handle_auth_command(&mut self) -> Result<(), TuiError> {
         self.show_auth_status();
-        println!();
-        println!("[1] Add/update credentials");
-        println!("[2] Remove a provider");
-        println!("[3] Cancel");
+        self.tui_println(String::new());
+        self.tui_println("[1] Add/update credentials");
+        self.tui_println("[2] Remove a provider");
+        self.tui_println("[3] Cancel");
 
         let choice = prompt_choice(
             "> ",
@@ -2265,71 +2043,80 @@ impl TuiApp {
     async fn remove_auth_provider(&mut self) -> Result<(), TuiError> {
         let providers = self.auth_manager.providers();
         if providers.is_empty() {
-            println!("No providers to remove.");
+            self.tui_println("No providers to remove.");
             return Ok(());
         }
 
-        println!("Select a provider to remove:");
+        self.tui_println("Select a provider to remove:");
         for (idx, provider) in providers.iter().enumerate() {
-            println!("  [{}] {}", idx + 1, provider);
+            self.tui_println(format!("  [{}] {}", idx + 1, provider));
         }
 
         let provider = prompt_provider_selection(&providers)?;
         if !confirm_provider_removal(&provider)? {
-            println!("Removal cancelled.");
+            self.tui_println("Removal cancelled.");
             return Ok(());
         }
 
         self.auth_manager.remove(&provider);
         persist_auth_manager(&self.auth_manager)?;
         self.refresh_router_models().await?;
-        println!("Removed provider: {provider}");
+        self.tui_println(format!("Removed provider: {provider}"));
         Ok(())
     }
 
-    fn show_budget_status(&self) {
+    fn show_budget_status(&mut self) {
         let status = self.loop_engine.status(current_time_ms());
-        println!("Budget usage:");
-        println!("  - LLM calls used: {}", status.llm_calls_used);
-        println!("  - Tool calls used: {}", status.tool_invocations_used);
-        println!("  - Tokens used: {}", status.tokens_used);
-        println!("  - Cost used (cents): {}", status.cost_cents_used);
-        println!("  - Tokens remaining: {}", status.remaining.tokens);
-        println!("  - LLM calls remaining: {}", status.remaining.llm_calls);
+        self.tui_println("Budget usage:");
+        self.tui_println(format!("  - LLM calls used: {}", status.llm_calls_used));
+        self.tui_println(format!(
+            "  - Tool calls used: {}",
+            status.tool_invocations_used
+        ));
+        self.tui_println(format!("  - Tokens used: {}", status.tokens_used));
+        self.tui_println(format!("  - Cost used (cents): {}", status.cost_cents_used));
+        self.tui_println(format!("  - Tokens remaining: {}", status.remaining.tokens));
+        self.tui_println(format!(
+            "  - LLM calls remaining: {}",
+            status.remaining.llm_calls
+        ));
     }
 
-    fn show_loop_status(&self) {
+    fn show_loop_status(&mut self) {
         let status = self.loop_engine.status(current_time_ms());
-        println!("Loop status:");
-        println!(
+        self.tui_println("Loop status:");
+        self.tui_println(format!(
             "  - Iterations (last cycle): {}/{}",
             status.iteration_count, status.max_iterations
-        );
-        println!("  - Tokens used (tracker): {}", status.tokens_used);
-        println!("  - Tokens remaining: {}", status.remaining.tokens);
-        println!("  - LLM calls remaining: {}", status.remaining.llm_calls);
-        println!(
+        ));
+        self.tui_println(format!("  - Tokens used (tracker): {}", status.tokens_used));
+        self.tui_println(format!("  - Tokens remaining: {}", status.remaining.tokens));
+        self.tui_println(format!(
+            "  - LLM calls remaining: {}",
+            status.remaining.llm_calls
+        ));
+        self.tui_println(format!(
             "  - Tool calls remaining: {}",
             status.remaining.tool_invocations
-        );
-        println!(
+        ));
+        self.tui_println(format!(
             "  - Wall time remaining (ms): {}",
             status.remaining.wall_time_ms
-        );
+        ));
     }
 
-    fn show_status(&self) {
-        let model = self.current_model();
+    fn show_status(&mut self) {
+        let model = self.current_model().to_string();
         let status = self.loop_engine.status(current_time_ms());
         let providers = self.auth_manager.providers();
-        println!(
-            "{}",
-            "Fawx Status".bold().with(theme_color(255, 165, 0, 214))
-        );
-        println!("  model:     {model}");
-        println!("  providers: {}", providers.join(", "));
-        println!("  tokens:    {} used", status.tokens_used);
-        println!("  budget:    {} tokens remaining", status.remaining.tokens);
+        self.tui_println("Fawx Status");
+        self.tui_println(format!("  model:     {model}"));
+        self.tui_println(format!("  providers: {}", providers.join(", ")));
+        self.tui_println(format!("  tokens:    {} used", status.tokens_used));
+        self.tui_println(format!(
+            "  budget:    {} tokens remaining",
+            status.remaining.tokens
+        ));
     }
 
     fn current_model(&self) -> &str {
@@ -3180,63 +2967,8 @@ fn format_wall_time(wall_time: std::time::Duration) -> String {
 
 /// Spawn a background task that listens for terminal resize signals
 /// (SIGWINCH on Unix) and re-applies the scroll region.
-fn spawn_resize_handler() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        tokio::spawn(async {
-            let mut sigwinch = match signal(SignalKind::window_change()) {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            loop {
-                sigwinch.recv().await;
-                crate::scroll_region::handle_resize();
-            }
-        });
-    }
-    // On non-Unix platforms, resize handling is not supported.
-    // The scroll region will be set once at startup and not updated.
-}
-
-/// Echo the user's message into the scroll region with a shaded background.
-///
-/// Makes user messages visually distinct from assistant responses in the
-/// conversation thread. Degrades gracefully without 256-color support.
-/// Calculate the display width (column count) of a string.
-///
-/// Uses `chars().count()` which is correct for text containing only
-/// single-width characters (ASCII, basic Latin, common symbols).
-fn display_width(text: &str) -> usize {
-    text.chars().count()
-}
-
-fn echo_user_message(input: &str) {
-    crate::scroll_region::position_for_output();
-    let width = crate::scroll_region::current_width() as usize;
-    let prefix = "you \u{203a} ";
-    let visible_len = display_width(prefix) + display_width(input);
-    let padding = " ".repeat(width.saturating_sub(visible_len));
-
-    if crate::scroll_region::supports_256_color() {
-        // Dark gray background (237 = slightly lighter than input bar's 236)
-        println!("\x1b[48;5;237m{PROMPT_COLOR_START}{prefix}\x1b[39m{input}{padding}\x1b[0m");
-    } else {
-        println!("{PROMPT_COLOR_START}{prefix}{PROMPT_COLOR_END}{input}");
-    }
-
-    crate::scroll_region::refresh_input_bar();
-}
-
 fn format_error_message(error: &str) -> String {
-    format!("\x1b[31m  \u{2717} {error}\x1b[0m")
-}
-
-fn move_cursor_to_start(stdout: &mut impl Write) -> Result<(), TuiError> {
-    stdout
-        .execute(cursor::MoveToColumn(0))
-        .map(|_| ())
-        .map_err(TuiError::Io)
+    format!("  \u{2717} {error}")
 }
 
 /// User-facing TUI errors.
@@ -3398,14 +3130,14 @@ async fn oauth_code_with_callback_server<F>(
 where
     F: std::future::Future<Output = Result<String, TuiError>>,
 {
-    println!("Opening browser for ChatGPT sign-in...");
+    eprintln!("Opening browser for ChatGPT sign-in...");
     if let Err(error) = open_browser(auth_url) {
-        println!(
+        eprintln!(
             "Couldn't open browser automatically ({error}). Open this URL manually:\n{auth_url}"
         );
     }
-    println!("Waiting for callback on http://localhost:1455/auth/callback...");
-    println!("(Or paste the redirect URL/code below if browser didn't work)\n");
+    eprintln!("Waiting for callback on http://localhost:1455/auth/callback...");
+    eprintln!("(Or paste the redirect URL/code below if browser didn't work)\n");
 
     tokio::select! {
         result = server => result.or_else(|_| prompt_for_oauth_code(flow)),
@@ -3413,8 +3145,8 @@ where
 }
 
 fn oauth_code_manual_fallback(flow: &PkceFlow, auth_url: &str) -> Result<String, TuiError> {
-    println!("Couldn't start local server. Open this URL in your browser:\n");
-    println!("  {auth_url}\n");
+    eprintln!("Couldn't start local server. Open this URL in your browser:\n");
+    eprintln!("  {auth_url}\n");
     prompt_for_oauth_code(flow)
 }
 
@@ -3884,7 +3616,7 @@ fn to_strings(values: &[&str]) -> Vec<String> {
 fn prompt_line(prompt: &str) -> Result<String, TuiError> {
     ensure_cooked_mode();
 
-    print!("{prompt}");
+    eprint!("{prompt}");
     io::stdout().flush().map_err(TuiError::Io)?;
 
     let mut input = String::new();
@@ -4033,7 +3765,7 @@ where
             return Ok(parsed);
         }
 
-        println!("{invalid_message}");
+        eprint!("{invalid_message}");
     }
 
     Err(retry_limit_error(context))
@@ -4050,19 +3782,19 @@ fn prompt_non_empty_line(
             return Ok(value);
         }
 
-        println!("{empty_message}");
+        eprint!("{empty_message}");
     }
 
     Err(retry_limit_error(context))
 }
 
 fn prompt_api_key_provider() -> Result<String, TuiError> {
-    println!("Which provider?");
-    println!("  [1] Anthropic");
-    println!("  [2] OpenAI");
-    println!("  [3] OpenRouter");
-    println!("  [4] Other (OpenAI-compatible)");
-    println!();
+    eprintln!("Which provider?");
+    eprintln!("  [1] Anthropic");
+    eprintln!("  [2] OpenAI");
+    eprintln!("  [3] OpenRouter");
+    eprintln!("  [4] Other (OpenAI-compatible)");
+    eprintln!();
 
     let choice = prompt_choice(
         "> ",
@@ -4094,14 +3826,14 @@ fn prompt_non_empty_secret(
             return Ok(value);
         }
 
-        println!("{empty_message}");
+        eprint!("{empty_message}");
     }
 
     Err(retry_limit_error(context))
 }
 
 fn prompt_secret(prompt: &str) -> Result<String, TuiError> {
-    print!("{prompt}");
+    eprint!("{prompt}");
     io::stdout().flush().map_err(TuiError::Io)?;
 
     let _guard = RawModeGuard::new()?;
@@ -4110,9 +3842,9 @@ fn prompt_secret(prompt: &str) -> Result<String, TuiError> {
 
     let trimmed = value.trim().to_string();
     if trimmed.is_empty() {
-        println!();
+        eprintln!();
     } else {
-        println!(" ({} chars)", trimmed.len());
+        eprint!(" ({} chars)", trimmed.len());
     }
 
     Ok(trimmed)
@@ -4131,13 +3863,13 @@ fn read_secret_input(value: &mut String) -> Result<(), TuiError> {
                 SecretInputKeyAction::Type(ch) => {
                     value.push(ch);
                     display_len += 1;
-                    print!("•");
+                    eprint!("•");
                     io::stdout().flush().map_err(TuiError::Io)?;
                 }
                 SecretInputKeyAction::Delete => {
                     if value.pop().is_some() && display_len > 0 {
                         display_len -= 1;
-                        print!("\x08 \x08");
+                        eprint!("\x08 \x08");
                         io::stdout().flush().map_err(TuiError::Io)?;
                     }
                 }
@@ -4583,7 +4315,8 @@ mod tests {
         let (memory, writes) = mock_memory_store();
         let findings = vec![test_finding("Retry Storm", Confidence::High)];
 
-        let summary = TuiApp::route_findings_by_confidence(&findings, Some(&memory));
+        let mut app = new_test_app();
+        let summary = app.route_findings_by_confidence(&findings, Some(&memory));
 
         let writes = writes.lock().expect("lock writes");
         assert_eq!(summary, (1, 0, 0));
@@ -4597,7 +4330,8 @@ mod tests {
         let (memory, writes) = mock_memory_store();
         let findings = vec![test_finding("Needs Follow Up", Confidence::Medium)];
 
-        let summary = TuiApp::route_findings_by_confidence(&findings, Some(&memory));
+        let mut app = new_test_app();
+        let summary = app.route_findings_by_confidence(&findings, Some(&memory));
 
         assert_eq!(summary, (0, 1, 0));
         assert!(writes.lock().expect("lock writes").is_empty());
@@ -4608,7 +4342,8 @@ mod tests {
         let (memory, writes) = mock_memory_store();
         let findings = vec![test_finding("Loose Correlation", Confidence::Low)];
 
-        let summary = TuiApp::route_findings_by_confidence(&findings, Some(&memory));
+        let mut app = new_test_app();
+        let summary = app.route_findings_by_confidence(&findings, Some(&memory));
 
         assert_eq!(summary, (0, 0, 1));
         assert!(writes.lock().expect("lock writes").is_empty());
@@ -4619,7 +4354,8 @@ mod tests {
         let (memory, writes) = mock_memory_store();
         let findings = vec![test_finding("Tool-Timeout Loop", Confidence::High)];
 
-        TuiApp::route_findings_by_confidence(&findings, Some(&memory));
+        let mut app = new_test_app();
+        app.route_findings_by_confidence(&findings, Some(&memory));
 
         let writes = writes.lock().expect("lock writes");
         assert_eq!(writes.len(), 1);
@@ -4636,7 +4372,8 @@ mod tests {
             test_finding("Context Drift", Confidence::High),
         ];
 
-        let summary = TuiApp::route_findings_by_confidence(&findings, Some(&memory));
+        let mut app = new_test_app();
+        let summary = app.route_findings_by_confidence(&findings, Some(&memory));
 
         let writes = writes.lock().expect("lock writes");
         let keys: Vec<String> = writes.iter().map(|(key, _)| key.clone()).collect();
@@ -4652,7 +4389,8 @@ mod tests {
             test_finding("Loose Correlation", Confidence::Low),
         ];
 
-        let summary = TuiApp::route_findings_by_confidence(&findings, None);
+        let mut app = new_test_app();
+        let summary = app.route_findings_by_confidence(&findings, None);
 
         assert_eq!(summary, (0, 1, 1));
     }
@@ -4674,7 +4412,8 @@ mod tests {
             test_finding("Loose Correlation", Confidence::Low),
         ];
 
-        let summary = TuiApp::route_findings_by_confidence(&findings, Some(&memory));
+        let mut app = new_test_app();
+        let summary = app.route_findings_by_confidence(&findings, Some(&memory));
 
         assert_eq!(summary, (0, 1, 1));
         assert!(writes.lock().expect("lock writes").is_empty());
@@ -5767,18 +5506,6 @@ mod tests {
     }
 
     #[test]
-    fn stream_renderer_buffers_deltas() {
-        let mut renderer = StreamRenderer::new();
-        renderer.handle_delta("Hello ");
-        renderer.handle_delta("**world**\n");
-        renderer.handle_delta("Second line");
-
-        assert!(renderer.prefix_printed);
-        assert_eq!(renderer.token_count, 3);
-        assert_eq!(renderer.buffer, "Hello **world**\nSecond line");
-    }
-
-    #[test]
     fn build_markdown_skin_returns_valid_skin() {
         let skin = build_markdown_skin();
         let text = skin.term_text("**test**");
@@ -5946,38 +5673,6 @@ mod tests {
         assert_eq!(preferred_default_model(&model_ids), None);
     }
 
-    #[tokio::test]
-    async fn spinner_stops_when_signaled() {
-        let (stop_tx, stop_rx) = oneshot::channel();
-        let spinner = tokio::spawn(run_thinking_spinner(stop_rx));
-
-        let _ = stop_tx.send(());
-
-        tokio::time::timeout(Duration::from_millis(200), spinner)
-            .await
-            .expect("spinner should stop quickly")
-            .expect("spinner task should join");
-    }
-
-    #[test]
-    fn format_error_message_uses_ansi_escape_sequences() {
-        let message = format_error_message("boom");
-
-        assert!(message.contains("\x1b[31m"));
-        assert!(message.contains("\u{2717} boom"));
-        assert!(message.contains("\x1b[0m"));
-    }
-
-    #[test]
-    fn move_cursor_to_start_returns_error_when_terminal_write_fails() {
-        let mut writer = FailingWriter;
-
-        let error = move_cursor_to_start(&mut writer).expect_err("terminal error expected");
-        assert!(
-            matches!(error, TuiError::Io(io_error) if io_error.to_string().contains("write failed"))
-        );
-    }
-
     #[test]
     fn parse_oauth_callback_request_extracts_path_and_query() {
         let request =
@@ -6098,106 +5793,6 @@ mod tests {
     }
 
     #[test]
-    fn command_completer_matches_slash_commands() {
-        let matches = command_completion_matches("/st");
-
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].replacement, "/status");
-    }
-
-    #[test]
-    fn command_completer_empty_for_non_slash() {
-        let matches = command_completion_matches("hello");
-
-        assert!(matches.is_empty());
-    }
-
-    #[test]
-    fn readline_completer_matches_first_token_prefix() {
-        let helper = FawxReadlineHelper::default();
-        let history = DefaultHistory::new();
-        let context = rustyline::Context::new(&history);
-
-        let (start, matches) = helper
-            .complete("/h", 2, &context)
-            .expect("completion should succeed");
-
-        assert_eq!(start, 0);
-        assert!(matches.iter().any(|pair| pair.replacement == "/help"));
-    }
-
-    #[test]
-    fn readline_completer_returns_no_matches_after_first_token() {
-        let helper = FawxReadlineHelper::default();
-        let history = DefaultHistory::new();
-        let context = rustyline::Context::new(&history);
-        let line = "/help arg";
-
-        let (start, matches) = helper
-            .complete(line, line.len(), &context)
-            .expect("completion should succeed");
-
-        assert_eq!(start, 6);
-        assert!(matches.is_empty());
-    }
-
-    #[test]
-    fn readline_completer_keeps_start_at_zero_inside_first_token() {
-        let helper = FawxReadlineHelper::default();
-        let history = DefaultHistory::new();
-        let context = rustyline::Context::new(&history);
-
-        let (start, matches) = helper
-            .complete("/help", 2, &context)
-            .expect("completion should succeed");
-
-        assert_eq!(start, 0);
-        assert!(matches.iter().any(|pair| pair.replacement == "/help"));
-    }
-
-    #[test]
-    fn hinter_suppresses_hints_for_single_char_input() {
-        let helper = FawxReadlineHelper::default();
-        let history = DefaultHistory::new();
-        let context = rustyline::Context::new(&history);
-
-        assert!(
-            helper.hint("/", 1, &context).is_none(),
-            "single char should not trigger hint"
-        );
-        assert!(
-            helper.hint("", 0, &context).is_none(),
-            "empty input should not trigger hint"
-        );
-    }
-
-    #[test]
-    fn hinter_allows_hints_for_two_or_more_chars() {
-        let helper = FawxReadlineHelper::default();
-        let history = DefaultHistory::new();
-        let context = rustyline::Context::new(&history);
-
-        // With no history loaded, hint returns None regardless,
-        // but the gate should not block the call.
-        let _ = helper.hint("/h", 2, &context);
-        let _ = helper.hint("/he", 3, &context);
-        // No panic = gate allows through.
-    }
-
-    #[test]
-    fn token_start_returns_zero_for_first_token() {
-        assert_eq!(token_start("/help", 5), 0);
-        assert_eq!(token_start("/h", 2), 0);
-        assert_eq!(token_start("", 0), 0);
-    }
-
-    #[test]
-    fn token_start_returns_position_after_whitespace() {
-        assert_eq!(token_start("/help arg", 9), 6);
-        assert_eq!(token_start("a b c", 5), 4);
-        assert_eq!(token_start("hello  world", 12), 7);
-    }
-    #[test]
     fn should_add_to_history_accepts_valid_commands() {
         assert!(should_add_to_history("/help"));
         assert!(should_add_to_history("/quit"));
@@ -6265,259 +5860,6 @@ mod tests {
                 .join(".fawx")
         ));
         assert!(file_name == "history.txt" || file_name.starts_with("history-"));
-    }
-
-    #[test]
-    fn load_history_with_warning_returns_false_for_unreadable_history_path() {
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
-        let history_path = tempdir.path().join("history-as-directory");
-        std::fs::create_dir(&history_path).expect("history path directory should be created");
-
-        let mut editor = Editor::new().expect("editor should be created");
-        editor.set_helper(Some(FawxReadlineHelper::default()));
-
-        let loaded = load_history_with_warning(&mut editor, &history_path);
-
-        assert!(!loaded);
-    }
-
-    #[test]
-    fn tui_prompt_contains_ansi_color_codes() {
-        let prompt = build_tui_prompt();
-        assert!(
-            !prompt.contains("\x01"),
-            "prompt should not contain readline markers"
-        );
-        assert!(
-            !prompt.contains("\x02"),
-            "prompt should not contain readline markers"
-        );
-        assert!(prompt.contains(PROMPT_COLOR_START));
-        assert!(prompt.contains(PROMPT_COLOR_END));
-    }
-
-    #[test]
-    fn dimmed_prompt_contains_dim_attribute_and_color_codes() {
-        let dimmed = build_dimmed_prompt();
-
-        assert!(
-            dimmed.contains("\x1b[2m"),
-            "dimmed prompt should contain ANSI dim attribute"
-        );
-        assert!(
-            dimmed.contains(PROMPT_COLOR_START),
-            "dimmed prompt should contain prompt color"
-        );
-        assert!(
-            dimmed.contains(PROMPT_COLOR_END),
-            "dimmed prompt should contain color reset"
-        );
-        assert!(
-            dimmed.contains("you ›"),
-            "dimmed prompt should contain the prompt text"
-        );
-        assert!(
-            dimmed.ends_with("\x1b[0m"),
-            "dimmed prompt should end with full ANSI reset"
-        );
-    }
-
-    #[test]
-    fn clear_spinner_line_output_clears_two_lines() {
-        // Validate that CLEAR_SPINNER_ESCAPE (the constant used by
-        // clear_spinner_line()) has the correct two-line clear structure.
-
-        // Starts with carriage return to reach column 0
-        assert!(
-            CLEAR_SPINNER_ESCAPE.starts_with('\r'),
-            "clear pattern must start with carriage return"
-        );
-        // Moves cursor down to the dimmed prompt line
-        assert!(
-            CLEAR_SPINNER_ESCAPE.contains("\x1b[1B"),
-            "clear pattern must move cursor down"
-        );
-        // Erases exactly two lines (spinner + dimmed prompt)
-        assert_eq!(
-            CLEAR_SPINNER_ESCAPE.matches("\x1b[2K").count(),
-            2,
-            "clear pattern must erase exactly two lines"
-        );
-        // Moves cursor back up so subsequent output starts at the right row
-        assert!(
-            CLEAR_SPINNER_ESCAPE.contains("\x1b[1A"),
-            "clear pattern must move cursor back up"
-        );
-
-        // Also call the function to ensure it doesn't panic and uses
-        // the constant (the function is thin — it just eprints the
-        // constant, but calling it exercises the code path).
-        clear_spinner_line();
-    }
-
-    #[test]
-    fn dimmed_prompt_differs_from_interactive_prompt() {
-        let interactive = build_tui_prompt();
-        let dimmed = build_dimmed_prompt();
-
-        assert_ne!(
-            interactive, dimmed,
-            "dimmed prompt must be visually distinct from interactive prompt"
-        );
-        // Both contain the core prompt text
-        assert!(interactive.contains("you ›"));
-        assert!(dimmed.contains("you ›"));
-        // Only dimmed has the dim attribute
-        assert!(!interactive.contains("\x1b[2m"));
-        assert!(dimmed.contains("\x1b[2m"));
-    }
-
-    #[tokio::test]
-    async fn spinner_stops_on_streaming_started() {
-        let bus = EventBus::new(16);
-        let receiver = bus.subscribe();
-        let streamed = Arc::new(AtomicBool::new(false));
-        let mut state = DisplayLoopState::new(Arc::clone(&streamed));
-
-        // Verify spinner starts active
-        assert!(state.spinner_active);
-
-        // Simulate StreamingStarted
-        bus.publish(InternalMessage::StreamingStarted {
-            phase: StreamPhase::Synthesize,
-        })
-        .expect("publish should succeed");
-
-        let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
-        let mut rx = receiver;
-
-        // Process one event — should deactivate spinner
-        dispatch_streaming_event(&mut rx, &mut stop_rx, &mut state).await;
-
-        assert!(
-            !state.spinner_active,
-            "spinner should be deactivated after StreamingStarted"
-        );
-        assert!(
-            streamed.load(Ordering::Relaxed),
-            "streamed flag should be set after StreamingStarted"
-        );
-
-        drop(stop_tx);
-    }
-
-    #[tokio::test]
-    async fn handle_command_dispatches_help_without_stopping() {
-        let mut app = new_test_app();
-
-        app.handle_command("/help").await.unwrap();
-
-        assert!(app.running);
-    }
-
-    #[tokio::test]
-    async fn tui_runs_without_auth_configured() {
-        let mut app = new_test_app();
-
-        app.process_input_line("/help").await.unwrap();
-        app.process_input_line("/status").await.unwrap();
-
-        assert!(app.running);
-        assert!(!app.auth_manager.has_any());
-    }
-
-    #[tokio::test]
-    async fn help_command_works_without_auth() {
-        let mut app = new_test_app();
-
-        app.process_input_line("/help").await.unwrap();
-
-        assert!(app.running);
-        assert!(!app.auth_manager.has_any());
-    }
-
-    #[tokio::test]
-    async fn quit_command_works_without_auth() {
-        let mut app = new_test_app();
-
-        app.process_input_line("/quit").await.unwrap();
-
-        assert!(!app.running);
-        assert!(!app.auth_manager.has_any());
-    }
-
-    #[tokio::test]
-    async fn run_exits_immediately_when_not_running() {
-        let (loop_engine, runtime_info) = test_engine_and_runtime_info();
-        let mut app = TuiApp::new(
-            test_auth_manager(),
-            ModelRouter::new(),
-            loop_engine,
-            runtime_info,
-            FawxConfig::default(),
-        )
-        .expect("app");
-        app.running = false;
-
-        let result = app.run().await;
-
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn handle_command_dispatches_quit_and_stops() {
-        let mut app = new_test_app();
-
-        app.handle_command("/quit").await.unwrap();
-
-        assert!(!app.running);
-    }
-
-    #[tokio::test]
-    async fn message_triggers_auth_when_not_configured() {
-        let mut app = new_test_app();
-
-        let error = app
-            .handle_message("hello")
-            .await
-            .expect_err("message should trigger auth wizard without configured credentials");
-
-        assert!(
-            matches!(error, TuiError::Auth(message) if message.contains("stdin closed unexpectedly"))
-        );
-    }
-
-    #[test]
-    fn persisted_model_used_on_startup() {
-        let mut router = ModelRouter::new();
-        router.register_provider_with_auth(
-            Box::new(ModelEchoProvider {
-                provider_name: "echo-provider".to_string(),
-                models: vec![
-                    "claude-opus-4-6-20250929".to_string(),
-                    "claude-sonnet-4-6-20250929".to_string(),
-                ],
-            }),
-            "test",
-        );
-        router
-            .set_active("claude-opus-4-6-20250929")
-            .expect("set router default model");
-
-        let mut config = FawxConfig::default();
-        config.model.default_model = Some("claude-sonnet-4-6-20250929".to_string());
-
-        let (loop_engine, runtime_info) = test_engine_and_runtime_info();
-        let app = TuiApp::new(
-            test_provider_auth_manager(),
-            router,
-            loop_engine,
-            runtime_info,
-            config,
-        )
-        .expect("mock app");
-
-        assert_eq!(app.current_model(), "claude-sonnet-4-6-20250929");
     }
 
     #[tokio::test]
@@ -7178,24 +6520,6 @@ mod tests {
         assert_eq!(sanitized, "Answer\nwarning");
     }
 
-    #[test]
-    fn display_width_counts_chars_not_bytes() {
-        // "you › " contains U+203A (›) which is 3 bytes in UTF-8 but 1 column
-        let prefix = "you \u{203a} ";
-        assert_eq!(
-            display_width(prefix),
-            6,
-            "display width should be 6 columns"
-        );
-        assert_eq!(prefix.len(), 8, "byte length should be 8 (3-byte ›)");
-    }
-
-    #[test]
-    fn display_width_ascii_matches_len() {
-        let ascii = "hello world";
-        assert_eq!(display_width(ascii), ascii.len());
-    }
-
     #[tokio::test]
     async fn generate_streaming_prints_tokens_incrementally() {
         let chunks = vec![
@@ -7428,86 +6752,6 @@ mod tests {
     }
 
     #[test]
-    fn completer_returns_model_matches() {
-        let ids = Arc::new(Mutex::new(vec![
-            "Claude-sonnet-4-20260514".to_string(),
-            "Claude-opus-4-20260514".to_string(),
-            "gpt-4o".to_string(),
-        ]));
-        let helper = FawxReadlineHelper {
-            hinter: HistoryHinter {},
-            model_ids: Arc::clone(&ids),
-        };
-        let history = DefaultHistory::new();
-        let ctx = rustyline::Context::new(&history);
-        let (pos, matches) = helper.complete("/model clau", 11, &ctx).unwrap();
-        assert_eq!(pos, "/model ".len());
-        assert_eq!(matches.len(), 2);
-        assert_eq!(matches[0].replacement, "Claude-sonnet-4-20260514");
-        assert_eq!(matches[1].replacement, "Claude-opus-4-20260514");
-    }
-
-    #[test]
-    fn completer_returns_empty_for_no_model_match() {
-        let ids = Arc::new(Mutex::new(vec![
-            "claude-sonnet-4-20260514".to_string(),
-            "gpt-4o".to_string(),
-        ]));
-        let helper = FawxReadlineHelper {
-            hinter: HistoryHinter {},
-            model_ids: Arc::clone(&ids),
-        };
-        let history = DefaultHistory::new();
-        let ctx = rustyline::Context::new(&history);
-        let (pos, matches) = helper.complete("/model xyz", 10, &ctx).unwrap();
-        assert_eq!(pos, "/model ".len());
-        assert!(matches.is_empty());
-    }
-
-    #[test]
-    fn completer_returns_all_models_for_empty_model_prefix() {
-        let ids = Arc::new(Mutex::new(vec![
-            "claude-sonnet-4-20260514".to_string(),
-            "gpt-4o".to_string(),
-        ]));
-        let helper = FawxReadlineHelper {
-            hinter: HistoryHinter {},
-            model_ids: Arc::clone(&ids),
-        };
-        let history = DefaultHistory::new();
-        let ctx = rustyline::Context::new(&history);
-        let (pos, matches) = helper.complete("/model ", 7, &ctx).unwrap();
-        assert_eq!(pos, "/model ".len());
-        assert_eq!(matches.len(), 2);
-        assert_eq!(matches[0].replacement, "claude-sonnet-4-20260514");
-        assert_eq!(matches[1].replacement, "gpt-4o");
-    }
-
-    #[test]
-    fn completer_returns_empty_when_no_models_registered() {
-        let ids = Arc::new(Mutex::new(Vec::new()));
-        let helper = FawxReadlineHelper {
-            hinter: HistoryHinter {},
-            model_ids: Arc::clone(&ids),
-        };
-        let history = DefaultHistory::new();
-        let ctx = rustyline::Context::new(&history);
-        let (pos, matches) = helper.complete("/model ", 7, &ctx).unwrap();
-        assert_eq!(pos, "/model ".len());
-        assert!(matches.is_empty());
-    }
-
-    #[test]
-    fn completer_still_completes_slash_commands() {
-        let helper = FawxReadlineHelper::default();
-        let history = DefaultHistory::new();
-        let ctx = rustyline::Context::new(&history);
-        let (pos, matches) = helper.complete("/mo", 3, &ctx).unwrap();
-        assert_eq!(pos, 0);
-        assert!(matches.iter().any(|m| m.replacement == "/model"));
-    }
-
-    #[test]
     fn group_models_by_provider_groups_correctly() {
         let models = vec![
             ModelInfo {
@@ -7602,184 +6846,101 @@ mod tests {
         assert!(!super::is_benign_stdin_flush_error(&error));
     }
 
-    // ---------------------------------------------------------------
-    // Streaming renderer tests
-    // ---------------------------------------------------------------
+    // ── Restored functional tests (review #1147) ────────────────
 
-    #[test]
-    fn stream_renderer_prints_prefix_once_per_cycle() {
-        let mut renderer = StreamRenderer::new();
+    #[tokio::test]
+    async fn handle_command_dispatches_help_without_stopping() {
+        let mut app = new_test_app();
 
-        // First delta prints the prefix.
-        renderer.handle_delta("Hello");
-        assert!(renderer.prefix_printed);
+        app.handle_command("/help").await.unwrap();
 
-        // Second delta does NOT re-print the prefix (flag stays true).
-        let before = renderer.prefix_printed;
-        renderer.handle_delta(" world");
-        assert_eq!(renderer.prefix_printed, before);
-        assert_eq!(renderer.token_count, 2);
-    }
-
-    #[test]
-    fn stream_renderer_handles_multi_phase() {
-        let mut renderer = StreamRenderer::new();
-
-        // Reason phase
-        renderer.handle_started(StreamPhase::Reason);
-        assert_eq!(renderer.current_phase, Some(StreamPhase::Reason));
-        renderer.handle_delta("reasoning");
-        renderer.handle_finished(StreamPhase::Reason);
-        assert_eq!(renderer.current_phase, None);
-
-        // Synthesize phase
-        renderer.handle_started(StreamPhase::Synthesize);
-        assert_eq!(renderer.current_phase, Some(StreamPhase::Synthesize));
-        renderer.handle_delta(" final");
-        renderer.handle_finished(StreamPhase::Synthesize);
-        assert_eq!(renderer.current_phase, None);
-
-        // Prefix was printed exactly once.
-        assert!(renderer.prefix_printed);
-        assert_eq!(renderer.token_count, 2);
-    }
-
-    #[test]
-    fn stream_renderer_increments_token_count_per_delta() {
-        // Verify that each `handle_delta` call increments `token_count`.
-        let mut renderer = StreamRenderer::new();
-        renderer.handle_delta("a");
-        assert_eq!(renderer.token_count, 1);
-        renderer.handle_delta("b");
-        assert_eq!(renderer.token_count, 2);
-        renderer.handle_delta("c");
-        assert_eq!(renderer.token_count, 3);
-    }
-
-    #[test]
-    fn stream_interrupted_marker_does_not_panic() {
-        // Verify the associated function doesn't panic.
-        // Actual stderr content is verified via integration tests.
-        StreamRenderer::print_interrupted_marker();
-    }
-
-    #[test]
-    fn stream_renderer_resets_between_turns() {
-        // Turn 1
-        let mut r1 = StreamRenderer::new();
-        r1.handle_started(StreamPhase::Reason);
-        r1.handle_delta("first turn");
-        r1.handle_finished(StreamPhase::Reason);
-        r1.finalize();
-        assert!(r1.prefix_printed);
-        assert_eq!(r1.token_count, 1);
-
-        // Turn 2 — fresh renderer, all state reset
-        let r2 = StreamRenderer::new();
-        assert!(!r2.prefix_printed);
-        assert_eq!(r2.token_count, 0);
-        assert_eq!(r2.current_phase, None);
+        assert!(app.running);
     }
 
     #[tokio::test]
-    async fn display_loop_processes_streaming_events_end_to_end() {
-        use std::sync::atomic::Ordering;
+    async fn tui_runs_without_auth_configured() {
+        let mut app = new_test_app();
 
-        let bus = EventBus::new(16);
-        let mut receiver = bus.subscribe();
-        let streamed = Arc::new(AtomicBool::new(false));
-        let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
-        let mut state = DisplayLoopState::new(Arc::clone(&streamed));
+        app.process_input_line("/help").await.unwrap();
+        app.process_input_line("/status").await.unwrap();
 
-        // Before any events: spinner is active, nothing streamed.
-        assert!(state.spinner_active);
-        assert!(!streamed.load(Ordering::Relaxed));
-
-        // Publish StreamingStarted → deactivates spinner.
-        bus.publish(InternalMessage::StreamingStarted {
-            phase: StreamPhase::Synthesize,
-        })
-        .unwrap();
-        let cont = dispatch_streaming_event(&mut receiver, &mut stop_rx, &mut state).await;
-        assert!(cont);
-        assert!(!state.spinner_active);
-        assert!(streamed.load(Ordering::Relaxed));
-        assert_eq!(state.renderer.current_phase, Some(StreamPhase::Synthesize),);
-
-        // Publish StreamDelta → renderer accumulates token.
-        bus.publish(InternalMessage::StreamDelta {
-            delta: "hello".into(),
-            phase: StreamPhase::Synthesize,
-        })
-        .unwrap();
-        let cont = dispatch_streaming_event(&mut receiver, &mut stop_rx, &mut state).await;
-        assert!(cont);
-        assert_eq!(state.renderer.token_count, 1);
-        assert!(state.renderer.prefix_printed);
-
-        // Publish StreamingFinished → phase cleared.
-        bus.publish(InternalMessage::StreamingFinished {
-            phase: StreamPhase::Synthesize,
-        })
-        .unwrap();
-        let cont = dispatch_streaming_event(&mut receiver, &mut stop_rx, &mut state).await;
-        assert!(cont);
-        assert_eq!(state.renderer.current_phase, None);
-
-        // Stop signal → loop exits.
-        let _ = stop_tx.send(());
-        let cont = dispatch_streaming_event(&mut receiver, &mut stop_rx, &mut state).await;
-        assert!(!cont);
+        assert!(app.running);
+        assert!(!app.auth_manager.has_any());
     }
 
-    #[test]
-    fn fawx_prefix_in_stream_renderer() {
-        let mut renderer = StreamRenderer::new();
-        assert!(!renderer.prefix_printed);
-        // After calling print_prefix, the flag should be set
-        renderer.print_prefix();
-        assert!(renderer.prefix_printed);
+    #[tokio::test]
+    async fn help_command_works_without_auth() {
+        let mut app = new_test_app();
+
+        app.process_input_line("/help").await.unwrap();
+
+        assert!(app.running);
+        assert!(!app.auth_manager.has_any());
     }
 
-    #[test]
-    fn build_dimmed_prompt_still_works_after_refactor() {
-        let dimmed = build_dimmed_prompt();
+    #[tokio::test]
+    async fn quit_command_works_without_auth() {
+        let mut app = new_test_app();
+
+        app.process_input_line("/quit").await.unwrap();
+
+        assert!(!app.running);
+        assert!(!app.auth_manager.has_any());
+    }
+
+    #[tokio::test]
+    async fn handle_command_dispatches_quit_and_stops() {
+        let mut app = new_test_app();
+
+        app.handle_command("/quit").await.unwrap();
+
+        assert!(!app.running);
+    }
+
+    #[tokio::test]
+    async fn message_triggers_auth_when_not_configured() {
+        let mut app = new_test_app();
+
+        let error = app
+            .handle_message("hello")
+            .await
+            .expect_err("should trigger auth without credentials");
+
         assert!(
-            dimmed.contains("you \u{203a}"),
-            "dimmed prompt must contain prompt text"
-        );
-        assert!(
-            dimmed.contains("\x1b[2m"),
-            "dimmed prompt must contain dim attribute"
-        );
-        assert!(
-            dimmed.contains(PROMPT_COLOR_START),
-            "dimmed prompt must contain color start"
+            matches!(error, TuiError::Auth(message) if message.contains("stdin closed unexpectedly"))
         );
     }
 
     #[test]
-    fn scroll_region_escape_sequences_are_correct() {
-        // Verify the DECSTBM format for various terminal heights
-        // INPUT_BAR_ROWS=2 (separator + prompt)
-        let esc_24 = crate::scroll_region::scroll_region_escape(24);
-        assert_eq!(
-            esc_24, "\x1b[1;22r",
-            "24-row terminal should have scroll region 1-22"
+    fn persisted_model_used_on_startup() {
+        let mut router = ModelRouter::new();
+        router.register_provider_with_auth(
+            Box::new(ModelEchoProvider {
+                provider_name: "echo-provider".to_string(),
+                models: vec![
+                    "claude-opus-4-6-20250929".to_string(),
+                    "claude-sonnet-4-6-20250929".to_string(),
+                ],
+            }),
+            "test",
         );
+        router
+            .set_active("claude-opus-4-6-20250929")
+            .expect("set router default model");
 
-        let esc_50 = crate::scroll_region::scroll_region_escape(50);
-        assert_eq!(
-            esc_50, "\x1b[1;48r",
-            "50-row terminal should have scroll region 1-48"
-        );
-    }
+        let mut config = FawxConfig::default();
+        config.model.default_model = Some("claude-sonnet-4-6-20250929".to_string());
 
-    #[test]
-    fn clear_spinner_escape_constant_unchanged() {
-        // The legacy CLEAR_SPINNER_ESCAPE constant must remain valid
-        // for non-scroll-region mode
-        assert!(CLEAR_SPINNER_ESCAPE.starts_with('\r'));
-        assert_eq!(CLEAR_SPINNER_ESCAPE.matches("\x1b[2K").count(), 2);
+        let (loop_engine, runtime_info) = test_engine_and_runtime_info();
+        let app = TuiApp::new(
+            test_provider_auth_manager(),
+            router,
+            loop_engine,
+            runtime_info,
+            config,
+        )
+        .expect("mock app");
+
+        assert_eq!(app.current_model(), "claude-sonnet-4-6-20250929");
     }
 }

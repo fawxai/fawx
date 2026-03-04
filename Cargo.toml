@@ -45,7 +45,9 @@ async-trait = "0.1"
 
 # CLI
 clap = { version = "4.5", features = ["derive"] }
-crossterm = "0.27"
+crossterm = "0.28"
+ratatui = "0.29"
+tui-textarea = "0.7"
 
 # Logging
 tracing = "0.1"
