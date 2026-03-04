@@ -5,6 +5,7 @@ use futures::{stream, Stream, StreamExt};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::provider::{CompletionStream, LlmProvider, ProviderCapabilities};
@@ -230,171 +231,159 @@ impl AnthropicProvider {
     fn parse_sse_payload(payload: &str) -> Result<Vec<StreamChunk>, LlmError> {
         let mut framer = SseFramer::default();
         let mut chunks = Vec::new();
-        let mut tool_use_active = false;
-        let mut current_tool_use_id: Option<String> = None;
+        let mut tool_ids_by_index: HashMap<usize, String> = HashMap::new();
 
         for line in payload.lines() {
             let mut framed = framer.push_bytes(format!("{line}\n").as_bytes())?;
-            let mut frame_chunks = Self::map_sse_frames(&mut framed)?;
-            Self::track_tool_use_state(
-                &mut frame_chunks,
-                &mut tool_use_active,
-                &mut current_tool_use_id,
-            );
+            let mut frame_chunks = Self::map_sse_frames(&mut framed, &mut tool_ids_by_index)?;
             chunks.append(&mut frame_chunks);
         }
 
         let mut final_frames = framer.finish()?;
-        let mut final_chunks = Self::map_sse_frames(&mut final_frames)?;
-        Self::track_tool_use_state(
-            &mut final_chunks,
-            &mut tool_use_active,
-            &mut current_tool_use_id,
-        );
+        let mut final_chunks = Self::map_sse_frames(&mut final_frames, &mut tool_ids_by_index)?;
         chunks.append(&mut final_chunks);
         Ok(chunks)
     }
 
-    /// Filter `content_block_stop` done-marker chunks unless a tool_use
-    /// block is active. Updates `tool_use_active` based on block
-    /// start/stop transitions.
-    fn track_tool_use_state(
-        chunks: &mut Vec<StreamChunk>,
-        tool_use_active: &mut bool,
-        current_tool_use_id: &mut Option<String>,
-    ) {
-        for chunk in chunks.iter_mut() {
-            for delta in &mut chunk.tool_use_deltas {
-                if let Some(id) = &delta.id {
-                    *tool_use_active = true;
-                    *current_tool_use_id = Some(id.clone());
-                } else if delta.arguments_delta.is_some() {
-                    delta.id.clone_from(current_tool_use_id);
-                }
-            }
+    /// Handle a `content_block_start` SSE event. If the block is a
+    /// `tool_use`, record the `index → id` mapping and emit the
+    /// start-of-tool-call chunk.
+    fn handle_block_start(
+        event: AnthropicStreamEvent,
+        tool_ids_by_index: &mut HashMap<usize, String>,
+    ) -> Vec<StreamChunk> {
+        let Some(AnthropicContentBlock::ToolUse { id, name, .. }) = event.content_block else {
+            return Vec::new();
+        };
+        if let Some(index) = event.index {
+            tool_ids_by_index.insert(index, id.clone());
         }
-
-        chunks.retain(|chunk| {
-            let is_done_marker = chunk.delta_content.is_none()
-                && chunk.tool_use_deltas.len() == 1
-                && chunk.tool_use_deltas[0].arguments_done
-                && chunk.tool_use_deltas[0].arguments_delta.is_none()
-                && chunk.tool_use_deltas[0].name.is_none();
-
-            if is_done_marker && !*tool_use_active {
-                return false;
-            }
-            true
-        });
-
-        // Reset after a done marker is emitted
-        if chunks
-            .iter()
-            .any(|c| c.tool_use_deltas.first().is_some_and(|d| d.arguments_done))
-        {
-            *tool_use_active = false;
-            *current_tool_use_id = None;
-        }
+        vec![StreamChunk {
+            delta_content: None,
+            tool_use_deltas: vec![ToolUseDelta {
+                id: Some(id),
+                name: Some(name),
+                arguments_delta: None,
+                arguments_done: false,
+            }],
+            usage: None,
+            stop_reason: None,
+        }]
     }
 
-    fn parse_sse_data(data: &str) -> Result<Vec<StreamChunk>, LlmError> {
+    /// Handle a `content_block_delta` SSE event. For `input_json_delta`
+    /// payloads, resolve the tool-call ID from the event's `index` field
+    /// using the `tool_ids_by_index` map.
+    fn handle_block_delta(
+        event: AnthropicStreamEvent,
+        tool_ids_by_index: &HashMap<usize, String>,
+    ) -> Vec<StreamChunk> {
+        let Some(delta) = event.delta else {
+            return Vec::new();
+        };
+        let mut chunks = Vec::new();
+        if let Some(text) = delta.text {
+            chunks.push(StreamChunk {
+                delta_content: Some(text),
+                tool_use_deltas: Vec::new(),
+                usage: None,
+                stop_reason: None,
+            });
+        }
+        if let Some(partial_json) = delta.partial_json {
+            let tool_id = event
+                .index
+                .and_then(|idx| tool_ids_by_index.get(&idx).cloned());
+            chunks.push(StreamChunk {
+                delta_content: None,
+                tool_use_deltas: vec![ToolUseDelta {
+                    id: tool_id,
+                    name: None,
+                    arguments_delta: Some(partial_json),
+                    arguments_done: false,
+                }],
+                usage: None,
+                stop_reason: None,
+            });
+        }
+        chunks
+    }
+
+    /// Handle a `content_block_stop` SSE event. Only emits a done-marker
+    /// chunk when the stopped block was a tool-use block (tracked in
+    /// `tool_ids_by_index`). Text-block stops produce no output.
+    fn handle_block_stop(
+        event: AnthropicStreamEvent,
+        tool_ids_by_index: &mut HashMap<usize, String>,
+    ) -> Vec<StreamChunk> {
+        let Some(tool_id) = event.index.and_then(|idx| tool_ids_by_index.remove(&idx)) else {
+            return Vec::new();
+        };
+        vec![StreamChunk {
+            delta_content: None,
+            tool_use_deltas: vec![ToolUseDelta {
+                id: Some(tool_id),
+                name: None,
+                arguments_delta: None,
+                arguments_done: true,
+            }],
+            usage: None,
+            stop_reason: None,
+        }]
+    }
+
+    /// Parse a single SSE `data:` payload into zero or more stream chunks.
+    ///
+    /// `tool_ids_by_index` maps Anthropic content-block indices to
+    /// tool-use IDs, enabling correct routing of interleaved deltas
+    /// across concurrent tool-call blocks.
+    fn parse_sse_data(
+        data: &str,
+        tool_ids_by_index: &mut HashMap<usize, String>,
+    ) -> Result<Vec<StreamChunk>, LlmError> {
         let event: AnthropicStreamEvent = serde_json::from_str(data)
             .map_err(|error| LlmError::Streaming(format!("invalid SSE JSON: {error}")))?;
 
-        let mut chunks = Vec::new();
-
         match event.event_type.as_str() {
-            "content_block_start" => {
-                if let Some(AnthropicContentBlock::ToolUse { id, name, .. }) = event.content_block {
-                    chunks.push(StreamChunk {
-                        delta_content: None,
-                        tool_use_deltas: vec![ToolUseDelta {
-                            id: Some(id),
-                            name: Some(name),
-                            arguments_delta: None,
-                            arguments_done: false,
-                        }],
-                        usage: None,
-                        stop_reason: None,
-                    });
-                }
-            }
-            "content_block_delta" => {
-                if let Some(delta) = event.delta {
-                    if let Some(text) = delta.text {
-                        chunks.push(StreamChunk {
-                            delta_content: Some(text),
-                            tool_use_deltas: Vec::new(),
-                            usage: None,
-                            stop_reason: None,
-                        });
-                    }
-
-                    if let Some(partial_json) = delta.partial_json {
-                        chunks.push(StreamChunk {
-                            delta_content: None,
-                            tool_use_deltas: vec![ToolUseDelta {
-                                id: None,
-                                name: None,
-                                arguments_delta: Some(partial_json),
-                                arguments_done: false,
-                            }],
-                            usage: None,
-                            stop_reason: None,
-                        });
-                    }
-                }
-            }
-            "message_start" => {
-                if let Some(usage) = event.message.and_then(|message| message.usage) {
-                    chunks.push(StreamChunk {
-                        delta_content: None,
-                        tool_use_deltas: Vec::new(),
-                        usage: Some(Usage {
-                            input_tokens: usage.input_tokens,
-                            output_tokens: usage.output_tokens,
-                        }),
-                        stop_reason: None,
-                    });
-                }
-            }
-            "content_block_stop" => {
-                // Mark the most recent tool-use delta as done so that
-                // downstream consumers (e.g. `finalize_stream_tool_calls`)
-                // know the arguments are complete. `arguments_delta` is
-                // `None` because this is purely a done signal with no data.
-                chunks.push(StreamChunk {
-                    delta_content: None,
-                    tool_use_deltas: vec![ToolUseDelta {
-                        id: None,
-                        name: None,
-                        arguments_delta: None,
-                        arguments_done: true,
-                    }],
-                    usage: None,
-                    stop_reason: None,
-                });
-            }
-            "message_delta" => {
-                let usage = event.usage.map(|usage| Usage {
-                    input_tokens: usage.input_tokens,
-                    output_tokens: usage.output_tokens,
-                });
-                let stop_reason = event.delta.and_then(|delta| delta.stop_reason);
-
-                if usage.is_some() || stop_reason.is_some() {
-                    chunks.push(StreamChunk {
-                        delta_content: None,
-                        tool_use_deltas: Vec::new(),
-                        usage,
-                        stop_reason,
-                    });
-                }
-            }
-            _ => {}
+            "content_block_start" => Ok(Self::handle_block_start(event, tool_ids_by_index)),
+            "content_block_delta" => Ok(Self::handle_block_delta(event, tool_ids_by_index)),
+            "content_block_stop" => Ok(Self::handle_block_stop(event, tool_ids_by_index)),
+            "message_start" => Ok(Self::handle_message_start(event)),
+            "message_delta" => Ok(Self::handle_message_delta(event)),
+            _ => Ok(Vec::new()),
         }
+    }
 
-        Ok(chunks)
+    fn handle_message_start(event: AnthropicStreamEvent) -> Vec<StreamChunk> {
+        let Some(usage) = event.message.and_then(|m| m.usage) else {
+            return Vec::new();
+        };
+        vec![StreamChunk {
+            delta_content: None,
+            tool_use_deltas: Vec::new(),
+            usage: Some(Usage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+            }),
+            stop_reason: None,
+        }]
+    }
+
+    fn handle_message_delta(event: AnthropicStreamEvent) -> Vec<StreamChunk> {
+        let usage = event.usage.map(|u| Usage {
+            input_tokens: u.input_tokens,
+            output_tokens: u.output_tokens,
+        });
+        let stop_reason = event.delta.and_then(|d| d.stop_reason);
+        if usage.is_none() && stop_reason.is_none() {
+            return Vec::new();
+        }
+        vec![StreamChunk {
+            delta_content: None,
+            tool_use_deltas: Vec::new(),
+            usage,
+            stop_reason,
+        }]
     }
 
     fn stream_from_sse(
@@ -421,14 +410,9 @@ impl AnthropicProvider {
                                 }
                             };
 
-                            match Self::map_sse_frames(&mut frames) {
-                                Ok(mut chunks) => {
-                                    Self::track_tool_use_state(
-                                        &mut chunks,
-                                        &mut state.tool_use_active,
-                                        &mut state.current_tool_use_id,
-                                    );
-                                    state.pending_chunks.extend(chunks.into_iter().map(Ok))
+                            match Self::map_sse_frames(&mut frames, &mut state.tool_ids_by_index) {
+                                Ok(chunks) => {
+                                    state.pending_chunks.extend(chunks.into_iter().map(Ok));
                                 }
                                 Err(error) => {
                                     state.finished = true;
@@ -449,14 +433,9 @@ impl AnthropicProvider {
                                 }
                             };
 
-                            match Self::map_sse_frames(&mut frames) {
-                                Ok(mut chunks) => {
-                                    Self::track_tool_use_state(
-                                        &mut chunks,
-                                        &mut state.tool_use_active,
-                                        &mut state.current_tool_use_id,
-                                    );
-                                    state.pending_chunks.extend(chunks.into_iter().map(Ok))
+                            match Self::map_sse_frames(&mut frames, &mut state.tool_ids_by_index) {
+                                Ok(chunks) => {
+                                    state.pending_chunks.extend(chunks.into_iter().map(Ok));
                                 }
                                 Err(error) => {
                                     state.finished = true;
@@ -472,11 +451,16 @@ impl AnthropicProvider {
         )
     }
 
-    fn map_sse_frames(frames: &mut Vec<SseFrame>) -> Result<Vec<StreamChunk>, LlmError> {
+    fn map_sse_frames(
+        frames: &mut Vec<SseFrame>,
+        tool_ids_by_index: &mut HashMap<usize, String>,
+    ) -> Result<Vec<StreamChunk>, LlmError> {
         let mut chunks = Vec::new();
         for frame in frames.drain(..) {
             match frame {
-                SseFrame::Data(data) => chunks.append(&mut Self::parse_sse_data(&data)?),
+                SseFrame::Data(data) => {
+                    chunks.append(&mut Self::parse_sse_data(&data, tool_ids_by_index)?);
+                }
                 SseFrame::Done => break,
             }
         }
@@ -656,6 +640,11 @@ struct AnthropicUsage {
 struct AnthropicStreamEvent {
     #[serde(rename = "type")]
     event_type: String,
+    /// Content block index — present on all `content_block_*` events.
+    /// Used to route deltas to the correct tool-use block when multiple
+    /// tool calls are streamed concurrently.
+    #[serde(default)]
+    index: Option<usize>,
     #[serde(default)]
     delta: Option<AnthropicStreamDelta>,
     #[serde(default)]
@@ -688,8 +677,9 @@ struct AnthropicSseState {
     framer: SseFramer,
     pending_chunks: std::collections::VecDeque<Result<StreamChunk, LlmError>>,
     finished: bool,
-    tool_use_active: bool,
-    current_tool_use_id: Option<String>,
+    /// Maps Anthropic content-block index → tool-use ID for correct
+    /// routing of interleaved streaming deltas.
+    tool_ids_by_index: HashMap<usize, String>,
 }
 
 impl AnthropicSseState {
@@ -702,8 +692,7 @@ impl AnthropicSseState {
             framer: SseFramer::default(),
             pending_chunks: std::collections::VecDeque::new(),
             finished: false,
-            tool_use_active: false,
-            current_tool_use_id: None,
+            tool_ids_by_index: HashMap::new(),
         }
     }
 }
@@ -789,11 +778,11 @@ mod tests {
     #[test]
     fn test_parse_sse_payload_maps_text_tool_and_usage_chunks() {
         let payload = r#"
-            data: {"type":"content_block_delta","delta":{"text":"hel"}}
+            data: {"type":"content_block_delta","index":0,"delta":{"text":"hel"}}
 
-            data: {"type":"content_block_start","content_block":{"type":"tool_use","id":"toolu_01","name":"search","input":{}}}
+            data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01","name":"search","input":{}}}
 
-            data: {"type":"content_block_delta","delta":{"partial_json":"{\"query\":\"cit"}}
+            data: {"type":"content_block_delta","index":1,"delta":{"partial_json":"{\"query\":\"cit"}}
 
             data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9}}
 
@@ -814,6 +803,11 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("query"));
+        assert_eq!(
+            chunks[2].tool_use_deltas[0].id.as_deref(),
+            Some("toolu_01"),
+            "delta must carry the tool ID resolved from index"
+        );
 
         assert_eq!(chunks[3].usage.unwrap().output_tokens, 9);
         assert_eq!(chunks[3].stop_reason.as_deref(), Some("end_turn"));
@@ -919,7 +913,7 @@ mod tests {
     #[test]
     fn content_block_stop_marks_tool_arguments_done() {
         let payload = r#"
-            data: {"type":"content_block_start","content_block":{"type":"tool_use","id":"toolu_abc","name":"list_directory","input":{}}}
+            data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_abc","name":"list_directory","input":{}}}
 
             data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"/tmp\"}"}}
 
@@ -954,16 +948,147 @@ mod tests {
         );
     }
 
+    /// Regression test for #1106: interleaved deltas across concurrent
+    /// tool-use blocks must route to the correct tool ID via the `index`
+    /// field, not a single `current_tool_use_id`.
+    #[test]
+    fn interleaved_tool_deltas_route_to_correct_tool_id() {
+        // Simulates: tool A starts, tool A delta, tool B starts (would
+        // overwrite single ID), tool A delta again → must still carry
+        // tool A's ID, not tool B's.
+        let payload = r#"
+            data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_A","name":"search","input":{}}}
+
+            data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"q\":"}}
+
+            data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_B","name":"write","input":{}}}
+
+            data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"hello\"}"}}
+
+            data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"data\":\"world\"}"}}
+
+            data: {"type":"content_block_stop","index":0}
+
+            data: {"type":"content_block_stop","index":1}
+
+            data: [DONE]
+        "#;
+
+        let chunks = AnthropicProvider::parse_sse_payload(payload).unwrap();
+
+        let arg_deltas: Vec<_> = chunks
+            .iter()
+            .flat_map(|c| &c.tool_use_deltas)
+            .filter(|d| d.arguments_delta.is_some())
+            .collect();
+
+        assert_eq!(arg_deltas.len(), 3, "expected 3 argument deltas");
+
+        // First two deltas belong to tool A (index 0)
+        assert_eq!(arg_deltas[0].id.as_deref(), Some("toolu_A"));
+        assert_eq!(arg_deltas[1].id.as_deref(), Some("toolu_A"));
+        // Third delta belongs to tool B (index 1)
+        assert_eq!(arg_deltas[2].id.as_deref(), Some("toolu_B"));
+
+        // Concatenated args for tool A must form valid JSON (no `}{`)
+        let tool_a_args: String = arg_deltas
+            .iter()
+            .filter(|d| d.id.as_deref() == Some("toolu_A"))
+            .filter_map(|d| d.arguments_delta.as_deref())
+            .collect();
+        assert!(
+            !tool_a_args.contains("}{"),
+            "tool A arguments must not contain '}}{{': {tool_a_args}"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&tool_a_args)
+            .expect("tool A concatenated arguments must be valid JSON");
+        assert_eq!(parsed["q"], "hello");
+    }
+
+    /// Regression test for #1106: 4+ concurrent tool blocks must all
+    /// have their arguments correctly routed via per-index tracking.
+    #[test]
+    fn four_concurrent_tool_blocks_all_arguments_clean() {
+        let payload = r#"
+            data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t0","name":"a","input":{}}}
+
+            data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t1","name":"b","input":{}}}
+
+            data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"t2","name":"c","input":{}}}
+
+            data: {"type":"content_block_start","index":3,"content_block":{"type":"tool_use","id":"t3","name":"d","input":{}}}
+
+            data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"x\":2}"}}
+
+            data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"x\":0}"}}
+
+            data: {"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"{\"x\":3}"}}
+
+            data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"x\":1}"}}
+
+            data: {"type":"content_block_stop","index":0}
+
+            data: {"type":"content_block_stop","index":1}
+
+            data: {"type":"content_block_stop","index":2}
+
+            data: {"type":"content_block_stop","index":3}
+
+            data: [DONE]
+        "#;
+
+        let chunks = AnthropicProvider::parse_sse_payload(payload).unwrap();
+
+        // Verify each tool delta carries the correct ID
+        let arg_deltas: Vec<_> = chunks
+            .iter()
+            .flat_map(|c| &c.tool_use_deltas)
+            .filter(|d| d.arguments_delta.is_some())
+            .collect();
+
+        assert_eq!(arg_deltas.len(), 4, "expected 4 argument deltas");
+
+        // Deltas arrive in order: index 2, 0, 3, 1
+        assert_eq!(arg_deltas[0].id.as_deref(), Some("t2"));
+        assert_eq!(arg_deltas[1].id.as_deref(), Some("t0"));
+        assert_eq!(arg_deltas[2].id.as_deref(), Some("t3"));
+        assert_eq!(arg_deltas[3].id.as_deref(), Some("t1"));
+
+        // Each argument parses as valid JSON
+        for delta in &arg_deltas {
+            let json_str = delta.arguments_delta.as_deref().unwrap();
+            assert!(
+                !json_str.contains("}{"),
+                "arguments must not contain '}}{{': {json_str}"
+            );
+            serde_json::from_str::<serde_json::Value>(json_str)
+                .expect("each tool's arguments must be valid JSON");
+        }
+
+        // Verify done markers carry correct tool IDs
+        let done_deltas: Vec<_> = chunks
+            .iter()
+            .flat_map(|c| &c.tool_use_deltas)
+            .filter(|d| d.arguments_done)
+            .collect();
+        assert_eq!(done_deltas.len(), 4, "expected 4 done markers");
+        let done_ids: Vec<_> = done_deltas.iter().filter_map(|d| d.id.as_deref()).collect();
+        assert!(done_ids.contains(&"t0"));
+        assert!(done_ids.contains(&"t1"));
+        assert!(done_ids.contains(&"t2"));
+        assert!(done_ids.contains(&"t3"));
+    }
+
     #[test]
     fn multi_tool_streaming_preserves_separate_arguments() {
         let payload = r#"
-            data: {"type":"content_block_start","content_block":{"type":"tool_use","id":"toolu_01","name":"read_file","input":{}}}
+            data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_01","name":"read_file","input":{}}}
 
             data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"/tmp/a.txt\"}"}}
 
             data: {"type":"content_block_stop","index":0}
 
-            data: {"type":"content_block_start","content_block":{"type":"tool_use","id":"toolu_02","name":"read_file","input":{}}}
+            data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_02","name":"read_file","input":{}}}
 
             data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"/tmp/b.txt\"}"}}
 
