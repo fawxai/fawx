@@ -13344,7 +13344,7 @@ mod decompose_gate_tests {
         ]);
         let decision = Decision::Decompose(p.clone());
 
-        let result = engine
+        let _result = engine
             .evaluate_decompose_gates(&p, &decision, &llm, &[])
             .await;
 
@@ -13367,7 +13367,7 @@ mod decompose_gate_tests {
         let p = plan(vec![sub_goal("read a", &["read_file"], None)]);
         let decision = Decision::Decompose(p.clone());
 
-        let result = engine
+        let _result = engine
             .evaluate_decompose_gates(&p, &decision, &llm, &[])
             .await;
 
@@ -13394,7 +13394,7 @@ mod decompose_gate_tests {
         ]);
         let decision = Decision::Decompose(p.clone());
 
-        let result = engine
+        let _result = engine
             .evaluate_decompose_gates(&p, &decision, &llm, &[])
             .await;
 
@@ -13433,7 +13433,7 @@ mod decompose_gate_tests {
             .await;
 
         assert!(result.is_some(), "batch gate should fire");
-        let action = result.unwrap().expect("should succeed");
+        let _action = result.unwrap().expect("should succeed");
         // act_with_tools applies fan-out cap — should have deferred some
         let signals = engine.signals.drain_all();
         assert!(
@@ -13494,7 +13494,7 @@ mod decompose_gate_tests {
         ]);
         let decision = Decision::Decompose(p.clone());
 
-        let result = engine
+        let _result = engine
             .evaluate_decompose_gates(&p, &decision, &llm, &[])
             .await;
 
@@ -13520,7 +13520,7 @@ mod decompose_gate_tests {
         ]);
         let decision = Decision::Decompose(p.clone());
 
-        let result = engine
+        let _result = engine
             .evaluate_decompose_gates(&p, &decision, &llm, &[])
             .await;
 
@@ -13597,7 +13597,7 @@ mod decompose_gate_tests {
         let p = plan(sub_goals);
         let decision = Decision::Decompose(p.clone());
 
-        let result = engine
+        let _result = engine
             .evaluate_decompose_gates(&p, &decision, &llm, &[])
             .await;
 
@@ -13658,7 +13658,7 @@ mod decompose_gate_tests {
         )]);
         let decision = Decision::Decompose(p.clone());
 
-        let result = engine
+        let _result = engine
             .evaluate_decompose_gates(&p, &decision, &llm, &[])
             .await;
 
@@ -13859,7 +13859,7 @@ mod decompose_gate_tests {
         };
         let decision = Decision::Decompose(p.clone());
 
-        let result = engine
+        let _result = engine
             .evaluate_decompose_gates(&p, &decision, &llm, &[])
             .await;
 

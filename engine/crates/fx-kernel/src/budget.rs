@@ -2344,7 +2344,7 @@ mod tests {
         let input = "€".repeat(10_000);
         let result = truncate_tool_result(&input, 100);
         // Must not panic and must be valid UTF-8
-        assert!(result.len() > 0);
+        assert!(!result.is_empty());
         assert!(result.contains("[truncated"));
     }
 }

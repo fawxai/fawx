@@ -1,3 +1,4 @@
+#![allow(clippy::field_reassign_with_default)]
 //! Self-improvement pipeline: signals → analysis → plans → proposals.
 //!
 //! Connects the analysis engine (which detects recurring patterns from
