@@ -310,6 +310,110 @@ impl SkillRuntime {
             )
             .map_err(|e| SkillError::Execution(format!("Failed to link set_output: {}", e)))?;
 
+        Self::link_http_request(linker)?;
+
+        Ok(())
+    }
+
+    /// Link the http_request host function to the WASM linker.
+    ///
+    /// Signature: `(method_ptr, method_len, url_ptr, url_len,
+    ///              headers_ptr, headers_len, body_ptr, body_len) -> u32`
+    /// Returns a pointer to a NUL-terminated response string in WASM memory,
+    /// or 0 on failure.
+    fn link_http_request(linker: &mut Linker<HostState>) -> Result<(), SkillError> {
+        linker
+            .func_wrap(
+                "host_api_v1",
+                "http_request",
+                |mut caller: Caller<'_, HostState>,
+                 method_ptr: u32,
+                 method_len: u32,
+                 url_ptr: u32,
+                 url_len: u32,
+                 headers_ptr: u32,
+                 headers_len: u32,
+                 body_ptr: u32,
+                 body_len: u32|
+                 -> u32 {
+                    // Check Network capability
+                    if !caller.data().has_capability(&Capability::Network) {
+                        tracing::warn!("http_request denied: skill lacks Network capability");
+                        return 0;
+                    }
+
+                    // Read all string parameters from WASM memory
+                    let method = match caller.data().read_string(&caller, method_ptr, method_len) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::error!("http_request: failed to read method: {}", e);
+                            return 0;
+                        }
+                    };
+
+                    let url = match caller.data().read_string(&caller, url_ptr, url_len) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::error!("http_request: failed to read url: {}", e);
+                            return 0;
+                        }
+                    };
+
+                    let headers = match caller.data().read_string(&caller, headers_ptr, headers_len)
+                    {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::error!("http_request: failed to read headers: {}", e);
+                            return 0;
+                        }
+                    };
+
+                    let body = match caller.data().read_string(&caller, body_ptr, body_len) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::error!("http_request: failed to read body: {}", e);
+                            return 0;
+                        }
+                    };
+
+                    // Call the host API
+                    let response = match caller
+                        .data()
+                        .api
+                        .http_request(&method, &url, &headers, &body)
+                    {
+                        Some(r) => r,
+                        None => return 0,
+                    };
+
+                    // Write response to WASM memory
+                    let memory = match caller.data().memory {
+                        Some(m) => m,
+                        None => {
+                            tracing::error!("Memory not initialized for http_request");
+                            return 0;
+                        }
+                    };
+                    let mut alloc_offset = caller.data().alloc_offset;
+                    match HostState::write_to_memory(
+                        memory,
+                        &mut caller,
+                        &response,
+                        &mut alloc_offset,
+                    ) {
+                        Ok(ptr) => {
+                            caller.data_mut().alloc_offset = alloc_offset;
+                            ptr
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to write http_request response: {}", e);
+                            0
+                        }
+                    }
+                },
+            )
+            .map_err(|e| SkillError::Execution(format!("Failed to link http_request: {}", e)))?;
+
         Ok(())
     }
 
@@ -321,6 +425,19 @@ impl SkillRuntime {
         self.invoke_with_host_api(skill_name, input, host_api)
     }
 
+    /// Invoke a skill by name with a caller-supplied `HostApi` implementation.
+    ///
+    /// This is the primary invocation path. It accepts any `HostApi` (e.g.,
+    /// `LiveHostApi` for production HTTP, `MockHostApi` for tests) and runs
+    /// the WASM module with it.
+    pub fn invoke_with_api(
+        &mut self,
+        skill_name: &str,
+        host_api: Box<dyn HostApi>,
+    ) -> Result<String, SkillError> {
+        self.invoke_with_host_api(skill_name, "", host_api)
+    }
+
     /// Invoke a skill by name with input, using the provided [`HostApi`] implementation.
     ///
     /// This is the primary execution path for production callers (e.g., [`WasmSkill`])
@@ -329,6 +446,7 @@ impl SkillRuntime {
         &mut self,
         skill_name: &str,
         _input: &str,
+
         host_api: Box<dyn HostApi>,
     ) -> Result<String, SkillError> {
         let skill = self
@@ -688,5 +806,135 @@ mod tests {
 
         assert!(output1.contains("skill1"));
         assert!(output2.contains("skill2"));
+    }
+
+    /// Create a WAT module that imports and calls http_request.
+    ///
+    /// The module writes a URL string to memory, calls http_request,
+    /// and forwards the response (or "no_response") to set_output.
+    fn create_http_request_wasm() -> Vec<u8> {
+        let wat = r#"
+            (module
+                (import "host_api_v1" "log" (func $log (param i32 i32 i32)))
+                (import "host_api_v1" "kv_get" (func $kv_get (param i32 i32) (result i32)))
+                (import "host_api_v1" "kv_set" (func $kv_set (param i32 i32 i32 i32)))
+                (import "host_api_v1" "get_input" (func $get_input (result i32)))
+                (import "host_api_v1" "set_output" (func $set_output (param i32 i32)))
+                (import "host_api_v1" "http_request"
+                    (func $http_request
+                        (param i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+
+                ;; Data section: method="GET" at 0, url at 3, headers="{}" at 100, body="" at 102
+                (data (i32.const 0) "GET")
+                (data (i32.const 3) "https://mock.test/api")
+                (data (i32.const 100) "{}")
+                ;; "no_response" fallback at offset 200
+                (data (i32.const 200) "no_response")
+
+                (func (export "run")
+                    (local $resp_ptr i32)
+                    ;; Call http_request(method_ptr=0, method_len=3,
+                    ;;                   url_ptr=3, url_len=20,
+                    ;;                   headers_ptr=100, headers_len=2,
+                    ;;                   body_ptr=102, body_len=0)
+                    (local.set $resp_ptr
+                        (call $http_request
+                            (i32.const 0)   (i32.const 3)   ;; "GET"
+                            (i32.const 3)   (i32.const 21)  ;; "https://mock.test/api"
+                            (i32.const 100) (i32.const 2)   ;; "{}"
+                            (i32.const 102) (i32.const 0))) ;; ""
+
+                    ;; If resp_ptr == 0, output "no_response"
+                    (if (i32.eqz (local.get $resp_ptr))
+                        (then
+                            (call $set_output (i32.const 200) (i32.const 11)))
+                        (else
+                            ;; Response is NUL-terminated at resp_ptr.
+                            ;; We know our mock response is 13 bytes: '{"status":"ok"}'
+                            ;; but we need to measure. For test simplicity, use
+                            ;; a known length. The mock returns exactly "mock_response"
+                            ;; which is 13 bytes.
+                            (call $set_output (local.get $resp_ptr) (i32.const 13))))
+                )
+            )
+        "#;
+        wat.as_bytes().to_vec()
+    }
+
+    fn create_http_manifest(name: &str, with_network: bool) -> SkillManifest {
+        SkillManifest {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            description: "HTTP test skill".to_string(),
+            author: "Fawx".to_string(),
+            api_version: "host_api_v1".to_string(),
+            capabilities: if with_network {
+                vec![Capability::Network]
+            } else {
+                vec![]
+            },
+            entry_point: "run".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_wasm_http_request_no_canned_response() {
+        let mut runtime = SkillRuntime::new().expect("Should create runtime");
+        let loader = SkillLoader::with_engine(runtime.engine().clone(), vec![]);
+
+        let manifest = create_http_manifest("http_test", true);
+        let wasm = create_http_request_wasm();
+
+        let skill = loader.load(&wasm, &manifest, None).expect("Should load");
+        runtime.register_skill(skill).expect("Should register");
+
+        // invoke() uses MockHostApi with no canned responses.
+        // The WASM module gets None from http_request -> outputs "no_response".
+        let output = runtime.invoke("http_test", "input").expect("Should invoke");
+        assert_eq!(output, "no_response");
+    }
+
+    #[test]
+    fn test_wasm_http_request_success_with_canned_response() {
+        let mut runtime = SkillRuntime::new().expect("Should create runtime");
+        let loader = SkillLoader::with_engine(runtime.engine().clone(), vec![]);
+
+        let manifest = create_http_manifest("http_success", true);
+        let wasm = create_http_request_wasm();
+
+        let skill = loader.load(&wasm, &manifest, None).expect("Should load");
+        runtime.register_skill(skill).expect("Should register");
+
+        // Create a MockHostApi with a canned response for the URL the WASM sends.
+        // The WAT uses url_ptr=3, url_len=21 -> "https://mock.test/api"
+        let mock_api = MockHostApi::new("input");
+        mock_api.add_http_response("https://mock.test/api", "mock_response!");
+
+        // invoke_with_api lets us inject the prepared MockHostApi
+        let output = runtime
+            .invoke_with_api("http_success", Box::new(mock_api))
+            .expect("Should invoke");
+
+        // The WAT reads 13 bytes from the response pointer for set_output.
+        // "mock_response!" is 14 bytes, but the WAT only reads 13 -> "mock_response"
+        assert_eq!(output, "mock_response");
+    }
+
+    #[test]
+    fn test_wasm_http_request_without_network_capability() {
+        let mut runtime = SkillRuntime::new().expect("Should create runtime");
+        let loader = SkillLoader::with_engine(runtime.engine().clone(), vec![]);
+
+        // Skill without Network capability
+        let manifest = create_http_manifest("no_net", false);
+        let wasm = create_http_request_wasm();
+
+        let skill = loader.load(&wasm, &manifest, None).expect("Should load");
+        runtime.register_skill(skill).expect("Should register");
+
+        // Without Network capability, http_request returns 0 → "no_response"
+        let output = runtime.invoke("no_net", "input").expect("Should invoke");
+        assert_eq!(output, "no_response");
     }
 }

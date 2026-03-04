@@ -96,6 +96,20 @@ impl HostApi for LiveHostApi {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = text.to_string();
     }
 
+    fn http_request(
+        &self,
+        _method: &str,
+        _url: &str,
+        _headers: &str,
+        _body: &str,
+    ) -> Option<String> {
+        // HTTP requests are not yet supported in the loadable LiveHostApi.
+        // The WASM linker layer gates on Network capability and this will
+        // be wired to a real HTTP client when needed.
+        tracing::warn!("http_request called on loadable LiveHostApi (not yet implemented)");
+        None
+    }
+
     fn get_output(&self) -> String {
         self.output
             .lock()
