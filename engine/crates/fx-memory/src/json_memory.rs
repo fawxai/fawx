@@ -1,6 +1,7 @@
 //! JSON file-backed persistent memory.
 
 use fx_core::memory::{MemoryEntry, MemoryProvider, MemorySource, MemoryTouchProvider};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -8,11 +9,46 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_MAX_ENTRIES: usize = 1000;
 const DEFAULT_MAX_VALUE_SIZE: usize = 10240; // 10 KB
+const MS_PER_DAY: f64 = 86_400_000.0;
+
+/// Configuration for time-based memory decay and pruning.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecayConfig {
+    /// Decay factor per day of non-access. Range: (0.0, 1.0]. Default: 0.95.
+    pub decay_factor: f64,
+    /// Entries with decayed weight below this are pruned. Default: 0.1.
+    pub prune_threshold: f64,
+}
+
+impl Default for DecayConfig {
+    fn default() -> Self {
+        Self {
+            decay_factor: 0.95,
+            prune_threshold: 0.1,
+        }
+    }
+}
+
+/// Compute the time-decayed weight of a memory entry.
+///
+/// Weight = `base_weight * decay_factor^days_since_access`, where
+/// `base_weight = access_count.max(1)` so new entries start at 1.0.
+pub(crate) fn decayed_weight(entry: &MemoryEntry, now_ms: u64, config: &DecayConfig) -> f64 {
+    let last_active_ms = if entry.last_accessed_at_ms == 0 {
+        entry.created_at_ms
+    } else {
+        entry.last_accessed_at_ms
+    };
+    let days_since_access = now_ms.saturating_sub(last_active_ms) as f64 / MS_PER_DAY;
+    let base_weight = entry.access_count.max(1) as f64;
+    base_weight * config.decay_factor.powf(days_since_access)
+}
 
 #[derive(Debug, Clone)]
 pub struct JsonMemoryConfig {
     pub max_entries: usize,
     pub max_value_size: usize,
+    pub decay_config: DecayConfig,
 }
 
 impl Default for JsonMemoryConfig {
@@ -20,6 +56,7 @@ impl Default for JsonMemoryConfig {
         Self {
             max_entries: DEFAULT_MAX_ENTRIES,
             max_value_size: DEFAULT_MAX_VALUE_SIZE,
+            decay_config: DecayConfig::default(),
         }
     }
 }
@@ -142,6 +179,25 @@ impl JsonFileMemory {
         let json = serde_json::to_string_pretty(&self.data).map_err(|e| e.to_string())?;
         fs::write(&self.path, json).map_err(|e| e.to_string())
     }
+
+    /// Remove entries with decayed weight below the prune threshold.
+    ///
+    /// Persists changes if any entries were pruned. Returns the number
+    /// of entries removed.
+    pub fn prune(&mut self) -> usize {
+        let now = now_ms();
+        let before = self.data.len();
+        let decay = &self.config.decay_config;
+        self.data
+            .retain(|_key, entry| decayed_weight(entry, now, decay) >= decay.prune_threshold);
+        let pruned = before - self.data.len();
+        if pruned > 0 {
+            if let Err(e) = self.persist() {
+                eprintln!("warning: memory persist after prune failed: {e}");
+            }
+        }
+        pruned
+    }
 }
 
 impl MemoryProvider for JsonFileMemory {
@@ -157,10 +213,13 @@ impl MemoryProvider for JsonFileMemory {
             ));
         }
         if self.data.len() >= self.config.max_entries && !self.data.contains_key(key) {
-            return Err(format!(
-                "memory full ({} entries max)",
-                self.config.max_entries
-            ));
+            self.prune();
+            if self.data.len() >= self.config.max_entries {
+                return Err(format!(
+                    "memory full ({} entries max)",
+                    self.config.max_entries
+                ));
+            }
         }
         self.data.insert(
             key.to_string(),
@@ -241,12 +300,21 @@ impl MemoryProvider for JsonFileMemory {
     }
 
     fn snapshot(&self) -> Vec<(String, String)> {
+        let now = now_ms();
+        let decay = &self.config.decay_config;
         let mut entries: Vec<_> = self
             .data
             .iter()
-            .map(|(key, entry)| (key.clone(), entry.value.clone(), entry.access_count))
+            .map(|(key, entry)| {
+                let weight = decayed_weight(entry, now, decay);
+                (key.clone(), entry.value.clone(), weight)
+            })
             .collect();
-        entries.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+        entries.sort_by(|a, b| {
+            b.2.partial_cmp(&a.2)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
         entries
             .into_iter()
             .map(|(key, value, _)| (key, value))
@@ -630,11 +698,13 @@ mod tests {
         let mut memory = test_memory(temp.path());
         memory.write("a", "1").expect("write");
         memory.write("b", "2").expect("write");
-        assert_eq!(memory.snapshot(), memory.list());
+        let mut snapshot = memory.snapshot();
+        snapshot.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(snapshot, memory.list());
     }
 
     #[test]
-    fn snapshot_sorted_by_access_count() {
+    fn snapshot_sorted_by_decayed_weight() {
         let temp = TempDir::new().expect("tempdir");
         let mut memory = test_memory(temp.path());
         memory.write("a", "1").expect("write");
@@ -647,6 +717,10 @@ mod tests {
 
         let snapshot = memory.snapshot();
         let keys: Vec<_> = snapshot.iter().map(|(key, _)| key.as_str()).collect();
+        // b: access_count=2, weight≈2.0 (highest)
+        // c: access_count=1, last_accessed=now, weight≈1.0
+        // a: access_count=0, base_weight=max(1)=1, created slightly before c,
+        //    so marginally more elapsed time → marginally lower weight
         assert_eq!(keys, vec!["b", "c", "a"]);
     }
 
@@ -699,7 +773,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_documents_sort_by_access_count_then_key() {
+    fn snapshot_documents_sort_by_decayed_weight_then_key() {
         let temp = TempDir::new().expect("tempdir");
         let mut memory = test_memory(temp.path());
         memory.write("z", "last-alpha").expect("write");
@@ -713,7 +787,410 @@ mod tests {
 
         let snapshot = memory.snapshot();
         let keys: Vec<_> = snapshot.iter().map(|(k, _)| k.as_str()).collect();
-        // m(2) > a(1) > z(0)
+        // m: access_count=2, weight≈2.0
+        // a: access_count=1, weight≈1.0
+        // z: access_count=0, base_weight=max(1)=1, weight≈1.0
+        // a and z tie on weight, sorted by key ascending
         assert_eq!(keys, vec!["m", "a", "z"]);
+    }
+
+    // ===== Memory Decay and Pruning Tests (spec #1103) =====
+
+    fn make_entry(access_count: u32, last_accessed_at_ms: u64, created_at_ms: u64) -> MemoryEntry {
+        MemoryEntry {
+            value: "test".to_string(),
+            created_at_ms,
+            last_accessed_at_ms,
+            access_count,
+            source: MemorySource::User,
+            tags: Vec::new(),
+        }
+    }
+
+    fn config_with_decay(factor: f64, threshold: f64, max: usize) -> JsonMemoryConfig {
+        JsonMemoryConfig {
+            max_entries: max,
+            max_value_size: DEFAULT_MAX_VALUE_SIZE,
+            decay_config: DecayConfig {
+                decay_factor: factor,
+                prune_threshold: threshold,
+            },
+        }
+    }
+
+    // --- Decay function tests (1-6) ---
+
+    #[test]
+    fn decay_entry_accessed_today_weight_approx_one() {
+        let now = 1_700_000_000_000u64;
+        let entry = make_entry(1, now, now - 86_400_000);
+        let config = DecayConfig::default();
+        let weight = decayed_weight(&entry, now, &config);
+        assert!(
+            (weight - 1.0).abs() < 0.01,
+            "weight={weight}, expected ≈1.0"
+        );
+    }
+
+    #[test]
+    fn decay_entry_accessed_14_days_ago() {
+        let now = 1_700_000_000_000u64;
+        let fourteen_days_ms = 14 * 86_400_000u64;
+        let entry = make_entry(1, now - fourteen_days_ms, now - 30 * 86_400_000);
+        let config = DecayConfig::default(); // factor=0.95
+        let weight = decayed_weight(&entry, now, &config);
+        // 1.0 * 0.95^14 ≈ 0.488
+        assert!(
+            (weight - 0.488).abs() < 0.01,
+            "weight={weight}, expected ≈0.488"
+        );
+        assert!(weight > 0.1, "should be above default prune threshold");
+    }
+
+    #[test]
+    fn decay_entry_accessed_45_days_ago_below_threshold() {
+        let now = 1_700_000_000_000u64;
+        let forty_five_days_ms = 45 * 86_400_000u64;
+        let entry = make_entry(1, now - forty_five_days_ms, now - 60 * 86_400_000);
+        let config = DecayConfig::default();
+        let weight = decayed_weight(&entry, now, &config);
+        // 1.0 * 0.95^45 ≈ 0.099
+        assert!(weight < 0.1, "weight={weight}, expected < 0.1 (threshold)");
+    }
+
+    #[test]
+    fn decay_high_access_count_survives_45_days() {
+        let now = 1_700_000_000_000u64;
+        let forty_five_days_ms = 45 * 86_400_000u64;
+        let entry = make_entry(10, now - forty_five_days_ms, now - 60 * 86_400_000);
+        let config = DecayConfig::default();
+        let weight = decayed_weight(&entry, now, &config);
+        // 10.0 * 0.95^45 ≈ 0.99
+        assert!(
+            (weight - 0.99).abs() < 0.05,
+            "weight={weight}, expected ≈0.99"
+        );
+    }
+
+    #[test]
+    fn decay_never_accessed_uses_created_at() {
+        let now = 1_700_000_000_000u64;
+        let seven_days_ms = 7 * 86_400_000u64;
+        let entry = make_entry(1, 0, now - seven_days_ms);
+        let config = DecayConfig::default();
+        let weight = decayed_weight(&entry, now, &config);
+        // 1.0 * 0.95^7 ≈ 0.698
+        assert!(
+            (weight - 0.698).abs() < 0.01,
+            "weight={weight}, expected ≈0.698"
+        );
+    }
+
+    #[test]
+    fn decay_brand_new_entry_weight_approx_one() {
+        let now = 1_700_000_000_000u64;
+        // access_count=0 → base_weight = max(1) = 1
+        let entry = make_entry(0, 0, now);
+        let config = DecayConfig::default();
+        let weight = decayed_weight(&entry, now, &config);
+        assert!(
+            (weight - 1.0).abs() < 0.001,
+            "weight={weight}, expected ≈1.0"
+        );
+    }
+
+    // --- Pruning tests (7-11) ---
+
+    #[test]
+    fn prune_removes_entries_below_threshold() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = config_with_decay(0.95, 0.1, 1000);
+        let mut memory =
+            JsonFileMemory::new_with_config(temp.path(), config).expect("create memory");
+
+        let now = now_ms();
+        let old_ms = now.saturating_sub(50 * 86_400_000); // 50 days ago
+                                                          // Insert 5 entries: 3 fresh, 2 stale
+        for i in 0..3 {
+            memory
+                .data
+                .insert(format!("fresh-{i}"), make_entry(1, now, now - 86_400_000));
+        }
+        for i in 0..2 {
+            memory.data.insert(
+                format!("stale-{i}"),
+                make_entry(1, old_ms, old_ms - 86_400_000),
+            );
+        }
+
+        let pruned = memory.prune();
+        assert_eq!(pruned, 2);
+        assert_eq!(memory.data.len(), 3);
+        assert!(memory.data.contains_key("fresh-0"));
+        assert!(!memory.data.contains_key("stale-0"));
+    }
+
+    #[test]
+    fn prune_no_entries_below_threshold() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = config_with_decay(0.95, 0.1, 1000);
+        let mut memory =
+            JsonFileMemory::new_with_config(temp.path(), config).expect("create memory");
+
+        let now = now_ms();
+        for i in 0..5 {
+            memory
+                .data
+                .insert(format!("fresh-{i}"), make_entry(1, now, now - 86_400_000));
+        }
+
+        let pruned = memory.prune();
+        assert_eq!(pruned, 0);
+        assert_eq!(memory.data.len(), 5);
+    }
+
+    #[test]
+    fn write_prunes_before_rejecting_when_full() {
+        let temp = TempDir::new().expect("tempdir");
+        let max = 5;
+        let config = config_with_decay(0.95, 0.1, max);
+        let mut memory =
+            JsonFileMemory::new_with_config(temp.path(), config).expect("create memory");
+
+        let now = now_ms();
+        let old_ms = now.saturating_sub(50 * 86_400_000);
+        // Fill with 2 fresh + 3 stale
+        for i in 0..2 {
+            memory
+                .data
+                .insert(format!("fresh-{i}"), make_entry(1, now, now - 86_400_000));
+        }
+        for i in 0..3 {
+            memory.data.insert(
+                format!("stale-{i}"),
+                make_entry(1, old_ms, old_ms - 86_400_000),
+            );
+        }
+        memory.persist().expect("persist");
+
+        // Should succeed: prune removes 3 stale entries first
+        memory
+            .write("new-entry", "hello")
+            .expect("write after prune");
+        assert_eq!(memory.data.len(), 3); // 2 fresh + 1 new
+    }
+
+    #[test]
+    fn write_rejects_when_prune_frees_nothing() {
+        let temp = TempDir::new().expect("tempdir");
+        let max = 5;
+        let config = config_with_decay(0.95, 0.1, max);
+        let mut memory =
+            JsonFileMemory::new_with_config(temp.path(), config).expect("create memory");
+
+        let now = now_ms();
+        for i in 0..5 {
+            memory
+                .data
+                .insert(format!("fresh-{i}"), make_entry(1, now, now - 86_400_000));
+        }
+        memory.persist().expect("persist");
+
+        let result = memory.write("overflow", "value");
+        assert!(result.is_err());
+        assert!(result.expect_err("full").contains("full"));
+    }
+
+    #[test]
+    fn prune_persists_to_disk() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = config_with_decay(0.95, 0.1, 1000);
+        let mut memory =
+            JsonFileMemory::new_with_config(temp.path(), config.clone()).expect("create memory");
+
+        let now = now_ms();
+        let old_ms = now.saturating_sub(50 * 86_400_000);
+        memory
+            .data
+            .insert("fresh".to_string(), make_entry(1, now, now - 86_400_000));
+        memory.data.insert(
+            "stale".to_string(),
+            make_entry(1, old_ms, old_ms - 86_400_000),
+        );
+        memory.persist().expect("persist");
+
+        let pruned = memory.prune();
+        assert_eq!(pruned, 1);
+
+        // Reload from disk
+        let reloaded = JsonFileMemory::new_with_config(temp.path(), config).expect("reload memory");
+        assert_eq!(reloaded.data.len(), 1);
+        assert!(reloaded.data.contains_key("fresh"));
+        assert!(!reloaded.data.contains_key("stale"));
+    }
+
+    // --- Snapshot ordering tests (12-13) ---
+
+    #[test]
+    fn snapshot_prefers_recent_over_historically_popular() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = config_with_decay(0.95, 0.1, 1000);
+        let mut memory =
+            JsonFileMemory::new_with_config(temp.path(), config).expect("create memory");
+
+        let now = now_ms();
+        let sixty_days_ms = 60 * 86_400_000u64;
+        // A: access_count=10, last accessed 60 days ago
+        // weight: 10 * 0.95^60 ≈ 0.461
+        memory.data.insert(
+            "popular_old".to_string(),
+            make_entry(10, now - sixty_days_ms, now - 90 * 86_400_000),
+        );
+        // B: access_count=2, last accessed today
+        // weight: 2 * 0.95^0 ≈ 2.0
+        memory
+            .data
+            .insert("recent".to_string(), make_entry(2, now, now - 86_400_000));
+
+        let snapshot = memory.snapshot();
+        let keys: Vec<_> = snapshot.iter().map(|(k, _)| k.as_str()).collect();
+        // B (2.0) > A (0.461) → recent first
+        assert_eq!(keys[0], "recent");
+        assert_eq!(keys[1], "popular_old");
+    }
+
+    #[test]
+    fn snapshot_order_matches_decayed_weight_with_tiebreaker() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = config_with_decay(0.95, 0.1, 1000);
+        let mut memory =
+            JsonFileMemory::new_with_config(temp.path(), config).expect("create memory");
+
+        let now = now_ms();
+        // Three entries with same access_count=1, same last_accessed=now
+        // → same decayed_weight, should sort by key name ascending
+        memory
+            .data
+            .insert("charlie".to_string(), make_entry(1, now, now));
+        memory
+            .data
+            .insert("alpha".to_string(), make_entry(1, now, now));
+        memory
+            .data
+            .insert("bravo".to_string(), make_entry(1, now, now));
+
+        let snapshot = memory.snapshot();
+        let keys: Vec<_> = snapshot.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["alpha", "bravo", "charlie"]);
+    }
+
+    // --- Configuration tests (14-17) ---
+
+    #[test]
+    fn decay_factor_one_means_no_decay() {
+        let now = 1_700_000_000_000u64;
+        let hundred_days_ms = 100 * 86_400_000u64;
+        let entry = make_entry(1, now - hundred_days_ms, now - 200 * 86_400_000);
+        let config = DecayConfig {
+            decay_factor: 1.0,
+            prune_threshold: 0.1,
+        };
+        let weight = decayed_weight(&entry, now, &config);
+        // 1.0 * 1.0^100 = 1.0 — no decay
+        assert!(
+            (weight - 1.0).abs() < 0.001,
+            "weight={weight}, expected 1.0 with decay_factor=1.0"
+        );
+    }
+
+    #[test]
+    fn aggressive_decay_factor_half() {
+        let now = 1_700_000_000_000u64;
+        let one_day_ms = 86_400_000u64;
+        let entry = make_entry(1, now - one_day_ms, now - 2 * one_day_ms);
+        let config = DecayConfig {
+            decay_factor: 0.5,
+            prune_threshold: 0.1,
+        };
+        let weight = decayed_weight(&entry, now, &config);
+        // 1.0 * 0.5^1 = 0.5
+        assert!(
+            (weight - 0.5).abs() < 0.001,
+            "weight={weight}, expected 0.5"
+        );
+    }
+
+    #[test]
+    fn prune_threshold_zero_never_prunes() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = config_with_decay(0.95, 0.0, 1000);
+        let mut memory =
+            JsonFileMemory::new_with_config(temp.path(), config).expect("create memory");
+
+        let now = now_ms();
+        let old_ms = now.saturating_sub(365 * 86_400_000);
+        // Very old entry — would be pruned with default threshold
+        memory
+            .data
+            .insert("ancient".to_string(), make_entry(1, old_ms, old_ms));
+
+        let pruned = memory.prune();
+        assert_eq!(pruned, 0, "threshold=0.0 should never prune");
+        assert_eq!(memory.data.len(), 1);
+    }
+
+    #[test]
+    fn default_decay_config_values() {
+        let config = DecayConfig::default();
+        assert!((config.decay_factor - 0.95).abs() < f64::EPSILON);
+        assert!((config.prune_threshold - 0.1).abs() < f64::EPSILON);
+    }
+
+    // --- Edge case tests (18-20) ---
+
+    #[test]
+    fn prune_empty_memory_returns_zero() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = config_with_decay(0.95, 0.1, 1000);
+        let mut memory =
+            JsonFileMemory::new_with_config(temp.path(), config).expect("create memory");
+        assert!(memory.data.is_empty());
+        let pruned = memory.prune();
+        assert_eq!(pruned, 0);
+    }
+
+    #[test]
+    fn prune_removes_all_entries_when_all_below_threshold() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = config_with_decay(0.95, 0.1, 1000);
+        let mut memory =
+            JsonFileMemory::new_with_config(temp.path(), config).expect("create memory");
+
+        let now = now_ms();
+        let old_ms = now.saturating_sub(50 * 86_400_000);
+        for i in 0..5 {
+            memory.data.insert(
+                format!("stale-{i}"),
+                make_entry(1, old_ms, old_ms - 86_400_000),
+            );
+        }
+        memory.persist().expect("persist");
+
+        let pruned = memory.prune();
+        assert_eq!(pruned, 5);
+        assert!(memory.data.is_empty());
+    }
+
+    #[test]
+    fn decay_clock_at_zero_means_no_decay() {
+        // If system clock returns 0 (before epoch), days_since_access = 0
+        let entry = make_entry(5, 0, 0);
+        let config = DecayConfig::default();
+        let weight = decayed_weight(&entry, 0, &config);
+        // 5.0 * 0.95^0 = 5.0
+        assert!(
+            (weight - 5.0).abs() < 0.001,
+            "weight={weight}, expected 5.0 when now=0"
+        );
     }
 }
