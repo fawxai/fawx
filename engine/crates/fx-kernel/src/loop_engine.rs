@@ -3847,7 +3847,12 @@ fn stream_tool_call_from_state(state: StreamToolCallState) -> Option<ToolCall> {
         return None;
     }
 
-    let arguments = match serde_json::from_str::<serde_json::Value>(&state.arguments) {
+    let raw_args = if state.arguments.trim().is_empty() {
+        "{}".to_string()
+    } else {
+        state.arguments.clone()
+    };
+    let arguments = match serde_json::from_str::<serde_json::Value>(&raw_args) {
         Ok(value) => value,
         Err(error) => {
             tracing::warn!(
@@ -10503,6 +10508,77 @@ mod r2_streaming_review_tests {
         assert_eq!(call.id, "call-1");
         assert_eq!(call.name, "read_file");
         assert_eq!(call.arguments, serde_json::json!({"path": "README.md"}));
+    }
+
+    // -- Regression tests for #1118: empty args for zero-param tools --
+
+    #[test]
+    fn stream_tool_call_from_state_normalizes_empty_arguments_to_empty_object() {
+        let state = StreamToolCallState {
+            id: Some("call-1".to_string()),
+            name: Some("git_status".to_string()),
+            arguments: String::new(),
+            arguments_done: true,
+        };
+        let result = stream_tool_call_from_state(state);
+        assert!(
+            result.is_some(),
+            "empty arguments should be normalized to {{}}, not dropped"
+        );
+        let call = result.expect("tool call");
+        assert_eq!(call.id, "call-1");
+        assert_eq!(call.name, "git_status");
+        assert_eq!(call.arguments, serde_json::json!({}));
+    }
+
+    #[test]
+    fn stream_tool_call_from_state_normalizes_whitespace_arguments_to_empty_object() {
+        let state = StreamToolCallState {
+            id: Some("call-1".to_string()),
+            name: Some("current_time".to_string()),
+            arguments: "   \n\t  ".to_string(),
+            arguments_done: true,
+        };
+        let result = stream_tool_call_from_state(state);
+        assert!(
+            result.is_some(),
+            "whitespace-only arguments should be normalized to {{}}, not dropped"
+        );
+        let call = result.expect("tool call");
+        assert_eq!(call.arguments, serde_json::json!({}));
+    }
+
+    #[test]
+    fn finalize_stream_tool_calls_preserves_zero_param_tool_calls() {
+        let mut by_index = HashMap::new();
+        by_index.insert(
+            0,
+            StreamToolCallState {
+                id: Some("call-zero".to_string()),
+                name: Some("memory_list".to_string()),
+                arguments: String::new(),
+                arguments_done: true,
+            },
+        );
+        by_index.insert(
+            1,
+            StreamToolCallState {
+                id: Some("call-with-args".to_string()),
+                name: Some("read_file".to_string()),
+                arguments: r#"{"path":"test.rs"}"#.to_string(),
+                arguments_done: true,
+            },
+        );
+        let calls = finalize_stream_tool_calls(by_index);
+        assert_eq!(
+            calls.len(),
+            2,
+            "both zero-param and parameterized tool calls should be preserved"
+        );
+        assert_eq!(calls[0].name, "memory_list");
+        assert_eq!(calls[0].arguments, serde_json::json!({}));
+        assert_eq!(calls[1].name, "read_file");
+        assert_eq!(calls[1].arguments, serde_json::json!({"path": "test.rs"}));
     }
 
     #[test]

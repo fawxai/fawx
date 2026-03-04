@@ -987,7 +987,8 @@ fn collect_tool_calls(output: &[ResponsesOutputItem]) -> Vec<ToolCall> {
         }
 
         if let (Some(id), Some(name), Some(arguments)) = (&item.id, &item.name, &item.arguments) {
-            let arguments_value = match serde_json::from_str::<Value>(arguments) {
+            let raw_args = crate::normalize_tool_arguments(arguments);
+            let arguments_value = match serde_json::from_str::<Value>(raw_args) {
                 Ok(value) => value,
                 Err(_) => Value::String(arguments.clone()),
             };
@@ -1102,8 +1103,9 @@ fn finalize_tool_calls(pending: Vec<PendingToolCall>) -> Vec<ToolCall> {
             if id.is_empty() || name.is_empty() {
                 return None;
             }
-            let arguments = serde_json::from_str::<Value>(&call.arguments)
-                .unwrap_or(Value::String(call.arguments));
+            let raw_args = crate::normalize_tool_arguments(&call.arguments).to_string();
+            let arguments =
+                serde_json::from_str::<Value>(&raw_args).unwrap_or(Value::String(raw_args));
 
             Some(ToolCall {
                 id,
@@ -1963,5 +1965,79 @@ mod tests {
         merge_arguments(&mut arguments, "{\"a\":\"b\"}", false);
 
         assert_eq!(arguments, "{\"a\":{\"a\":\"b\"}");
+    }
+
+    // -- Regression tests for #1118: empty args for zero-param tools --
+
+    #[test]
+    fn finalize_tool_calls_normalizes_empty_arguments_to_empty_object() {
+        let pending = vec![PendingToolCall {
+            id: Some("call_1".to_string()),
+            name: Some("git_status".to_string()),
+            arguments: String::new(),
+        }];
+        let tool_calls = finalize_tool_calls(pending);
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].name, "git_status");
+        assert_eq!(
+            tool_calls[0].arguments,
+            Value::Object(serde_json::Map::new()),
+            "empty arguments should be normalized to {{}}"
+        );
+    }
+
+    #[test]
+    fn finalize_tool_calls_normalizes_whitespace_arguments_to_empty_object() {
+        let pending = vec![PendingToolCall {
+            id: Some("call_1".to_string()),
+            name: Some("current_time".to_string()),
+            arguments: "  \t\n  ".to_string(),
+        }];
+        let tool_calls = finalize_tool_calls(pending);
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(
+            tool_calls[0].arguments,
+            Value::Object(serde_json::Map::new()),
+            "whitespace-only arguments should be normalized to {{}}"
+        );
+    }
+
+    #[test]
+    fn collect_tool_calls_normalizes_empty_arguments_to_empty_object() {
+        let output = vec![ResponsesOutputItem {
+            r#type: Some("function_call".to_string()),
+            id: Some("call_abc".to_string()),
+            name: Some("get_weather".to_string()),
+            arguments: Some("".to_string()),
+            content: None,
+            text: None,
+        }];
+        let tool_calls = collect_tool_calls(&output);
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].name, "get_weather");
+        assert_eq!(
+            tool_calls[0].arguments,
+            Value::Object(serde_json::Map::new()),
+            "empty arguments in collect_tool_calls should be normalized to {{}}"
+        );
+    }
+
+    #[test]
+    fn collect_tool_calls_preserves_valid_json_arguments() {
+        let output = vec![ResponsesOutputItem {
+            r#type: Some("function_call".to_string()),
+            id: Some("call_def".to_string()),
+            name: Some("search".to_string()),
+            arguments: Some(r#"{"query":"rust"}"#.to_string()),
+            content: None,
+            text: None,
+        }];
+        let tool_calls = collect_tool_calls(&output);
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(
+            tool_calls[0].arguments,
+            serde_json::json!({"query": "rust"}),
+            "valid JSON arguments should be parsed as-is"
+        );
     }
 }

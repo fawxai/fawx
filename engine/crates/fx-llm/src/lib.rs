@@ -65,6 +65,18 @@ pub type BoxedProvider = Box<dyn LlmProvider>;
 /// Type alias for shared legacy prompt providers.
 pub type SharedProvider = Arc<dyn LlmProvider>;
 
+/// Normalize raw tool-call arguments: empty/whitespace-only strings become `"{}"`.
+///
+/// LLM providers sometimes return empty strings for zero-parameter tool calls.
+/// All consumers expect valid JSON (`Value::Object({})`), so we normalize here.
+pub(crate) fn normalize_tool_arguments(raw: &str) -> &str {
+    if raw.trim().is_empty() {
+        "{}"
+    } else {
+        raw
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

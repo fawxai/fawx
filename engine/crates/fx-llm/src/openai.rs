@@ -521,7 +521,8 @@ fn extract_text(blocks: &[ContentBlock]) -> String {
 }
 
 fn parse_json_or_string(value: &str) -> Value {
-    serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_string()))
+    let normalized = crate::normalize_tool_arguments(value);
+    serde_json::from_str(normalized).unwrap_or_else(|_| Value::String(value.to_string()))
 }
 
 fn value_to_openai_content(value: Value) -> String {
@@ -972,5 +973,35 @@ mod tests {
 
         let result = provider.build_request_body(&request, false);
         assert!(matches!(result, Err(LlmError::UnsupportedModel(_))));
+    }
+
+    #[test]
+    fn test_parse_json_or_string_normalizes_empty_to_object() {
+        let result = parse_json_or_string("");
+        assert_eq!(
+            result,
+            Value::Object(serde_json::Map::new()),
+            "empty string should be normalized to {{}}"
+        );
+    }
+
+    #[test]
+    fn test_parse_json_or_string_normalizes_whitespace_to_object() {
+        let result = parse_json_or_string("  \t\n  ");
+        assert_eq!(
+            result,
+            Value::Object(serde_json::Map::new()),
+            "whitespace-only string should be normalized to {{}}"
+        );
+    }
+
+    #[test]
+    fn test_parse_json_or_string_preserves_valid_json() {
+        let result = parse_json_or_string(r#"{"key": "value"}"#);
+        assert_eq!(
+            result,
+            serde_json::json!({"key": "value"}),
+            "valid JSON should be parsed as-is"
+        );
     }
 }
