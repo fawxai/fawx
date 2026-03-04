@@ -125,4 +125,51 @@ mod tests {
         let result = skill.execute("unknown", "{}", None).await;
         assert!(result.is_none());
     }
+
+    // ── T-6: Skill execute signature provides minimal surface ──
+
+    #[test]
+    fn t6_skill_execute_takes_minimal_parameters() {
+        // Compile-time assertion. If Skill::execute() signature changes to
+        // include additional parameters (registry, executor, signal collector),
+        // the TestSkill implementation above fails to compile.
+        //
+        // Trait signature:
+        //   async fn execute(&self, &str, &str, Option<&CancellationToken>)
+        //       -> Option<Result<String, SkillError>>
+        //
+        // No kernel types appear in the signature.
+
+        let skill = TestSkill;
+        let tool_name: &str = "greet";
+        let arguments: &str = "{}";
+        let cancel: Option<&CancellationToken> = None;
+
+        let _future = skill.execute(tool_name, arguments, cancel);
+    }
+
+    // ── T-10: Skill has no signal access ──
+
+    #[test]
+    fn t10_skill_has_no_signal_access() {
+        // Skill::execute() returns Option<Result<String, SkillError>>.
+        // No method on the Skill trait accepts or returns SignalCollector,
+        // Signal, or any signal-related type. The complete trait surface is:
+        //   - name(&self) -> &str
+        //   - tool_definitions(&self) -> Vec<ToolDefinition>
+        //   - cacheability(&self, &str) -> ToolCacheability
+        //   - execute(&self, &str, &str, Option<&CancellationToken>)
+        //       -> Option<Result<String, SkillError>>
+        //
+        // If any of these gains a SignalCollector parameter, this test file
+        // will fail to compile because the TestSkill mock implements the
+        // current signatures exactly.
+        //
+        // Runtime verification: a skill returns String output, not signals.
+        let skill = TestSkill;
+        let defs = skill.tool_definitions();
+        assert_eq!(defs.len(), 1, "skill exposes only tool definitions");
+        assert_eq!(skill.cacheability("greet"), ToolCacheability::NeverCache);
+        assert_eq!(skill.name(), "test_skill");
+    }
 }
