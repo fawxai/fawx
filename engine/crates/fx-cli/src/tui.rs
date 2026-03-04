@@ -23,7 +23,7 @@ use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::context_manager::ContextCompactor;
 use fx_kernel::input::LoopCommand;
 use fx_kernel::loop_engine::{
-    LlmProvider as LoopLlmProvider, LoopEngine, LoopEngineBuilder, LoopResult,
+    LlmProvider as LoopLlmProvider, LoopEngine, LoopEngineBuilder, LoopResult, ScratchpadProvider,
 };
 use fx_kernel::signals::{LoopStep, Signal, SignalCollector};
 use fx_kernel::types::PerceptionSnapshot;
@@ -34,6 +34,8 @@ use fx_llm::{
 };
 use fx_loadable::{SkillRegistry, TransactionSkill};
 use fx_memory::{JsonFileMemory, JsonMemoryConfig, SignalStore};
+use fx_scratchpad::skill::ScratchpadSkill;
+use fx_scratchpad::Scratchpad;
 use fx_tools::{BuiltinToolsSkill, FawxToolExecutor, GitSkill, ToolConfig};
 use rustyline::completion::{Completer, Pair};
 use rustyline::config::CompletionType;
@@ -981,6 +983,19 @@ pub struct TuiApp {
     completer_model_ids: Arc<Mutex<Vec<String>>>,
     /// Event bus for streaming events from the kernel.
     event_bus: EventBus,
+    scratchpad: Arc<Mutex<Scratchpad>>,
+}
+
+/// Dependencies for constructing a [`TuiApp`]. Avoids > 5 bare parameters.
+pub struct TuiAppDeps {
+    pub auth_manager: AuthManager,
+    pub router: ModelRouter,
+    pub loop_engine: LoopEngine,
+    pub runtime_info: Arc<RwLock<RuntimeInfo>>,
+    pub config: FawxConfig,
+    pub memory: Option<SharedMemoryStore>,
+    pub event_bus: EventBus,
+    pub scratchpad: Arc<Mutex<Scratchpad>>,
 }
 
 impl TuiApp {
@@ -994,27 +1009,31 @@ impl TuiApp {
         config: FawxConfig,
     ) -> Result<Self, TuiError> {
         let event_bus = EventBus::new(EVENT_BUS_CAPACITY);
-        Self::new_with_memory(
+        let scratchpad = Arc::new(Mutex::new(Scratchpad::new()));
+        Self::new_with_deps(TuiAppDeps {
             auth_manager,
             router,
             loop_engine,
             runtime_info,
             config,
-            None,
+            memory: None,
             event_bus,
-        )
+            scratchpad,
+        })
     }
 
-    /// Create a new TUI application with shared memory context support.
-    pub fn new_with_memory(
-        auth_manager: AuthManager,
-        router: ModelRouter,
-        loop_engine: LoopEngine,
-        runtime_info: Arc<RwLock<RuntimeInfo>>,
-        config: FawxConfig,
-        memory: Option<SharedMemoryStore>,
-        event_bus: EventBus,
-    ) -> Result<Self, TuiError> {
+    /// Create a new TUI application with full dependency injection.
+    pub fn new_with_deps(deps: TuiAppDeps) -> Result<Self, TuiError> {
+        let TuiAppDeps {
+            auth_manager,
+            router,
+            loop_engine,
+            runtime_info,
+            config,
+            memory,
+            event_bus,
+            scratchpad,
+        } = deps;
         let base_data_dir = fawx_data_dir();
         let data_dir = configured_data_dir(&base_data_dir, &config);
         let mut conversation_store = ConversationStore::new(&data_dir).map_err(TuiError::Store)?;
@@ -1047,6 +1066,7 @@ impl TuiApp {
             runtime_info,
             completer_model_ids: Arc::new(Mutex::new(Vec::new())),
             event_bus,
+            scratchpad,
         };
         app.select_first_available_model_without_refresh();
         Ok(app)
@@ -1448,6 +1468,18 @@ impl TuiApp {
     fn update_memory_context_for_input(&mut self, input: &str) {
         let memory_context = self.relevant_memory_context(input).unwrap_or_default();
         self.loop_engine.set_memory_context(memory_context);
+        self.update_scratchpad_context();
+    }
+
+    fn update_scratchpad_context(&mut self) {
+        let context = match self.scratchpad.lock() {
+            Ok(sp) => sp.render_for_context(),
+            Err(e) => {
+                eprintln!("warning: failed to lock scratchpad: {e}");
+                return;
+            }
+        };
+        self.loop_engine.set_scratchpad_context(context);
     }
 
     fn relevant_memory_context(&self, input: &str) -> Option<String> {
@@ -2342,6 +2374,7 @@ pub struct LoopEngineBundle {
     pub memory: Option<SharedMemoryStore>,
     pub runtime_info: Arc<RwLock<RuntimeInfo>>,
     pub event_bus: EventBus,
+    pub scratchpad: Arc<Mutex<Scratchpad>>,
 }
 
 /// Build a loop engine from an already-loaded config.
@@ -2362,32 +2395,38 @@ fn build_loop_engine_with_config(
     let budget = BudgetTracker::new(BudgetConfig::default(), current_time_ms(), 0);
     let context = ContextCompactor::new(DEFAULT_CONTEXT_MAX_TOKENS, DEFAULT_CONTEXT_COMPACT_TARGET);
     let working_dir = configured_working_dir(&config);
-    let (registry, memory, memory_snapshot, runtime_info) =
-        build_skill_registry(working_dir, &data_dir, &config);
+    let skills = build_skill_registry(working_dir, &data_dir, &config);
     let synthesis = config
         .model
         .synthesis_instruction
         .clone()
         .unwrap_or_else(|| DEFAULT_SYNTHESIS_INSTRUCTION.to_string());
 
-    let caching_registry = CachingExecutor::new(registry);
+    let bridge: Arc<dyn ScratchpadProvider> = Arc::new(ScratchpadBridge {
+        scratchpad: Arc::clone(&skills.scratchpad),
+    });
+
+    let caching_registry = CachingExecutor::new(skills.registry);
     let mut builder = LoopEngine::builder()
         .budget(budget)
         .context(context)
         .max_iterations(config.general.max_iterations)
         .tool_executor(std::sync::Arc::new(caching_registry))
         .synthesis_instruction(synthesis)
-        .event_bus(event_bus.clone());
-    if let Some(snapshot_text) = memory_snapshot {
+        .event_bus(event_bus.clone())
+        .iteration_counter(Arc::clone(&skills.iteration_counter))
+        .scratchpad_provider(bridge);
+    if let Some(snapshot_text) = skills.memory_snapshot {
         builder = builder.memory_context(snapshot_text);
     }
 
     let engine = build_loop_engine_from_builder(builder)?;
     Ok(LoopEngineBundle {
         engine,
-        memory,
-        runtime_info,
+        memory: skills.memory,
+        runtime_info: skills.runtime_info,
         event_bus,
+        scratchpad: skills.scratchpad,
     })
 }
 
@@ -2400,16 +2439,51 @@ fn build_loop_engine_from_builder(builder: LoopEngineBuilder) -> Result<LoopEngi
     })
 }
 
+/// Bridges `fx_scratchpad::Scratchpad` into the kernel's [`ScratchpadProvider`]
+/// trait without introducing a circular crate dependency.
+struct ScratchpadBridge {
+    scratchpad: Arc<Mutex<Scratchpad>>,
+}
+
+impl ScratchpadProvider for ScratchpadBridge {
+    fn render_for_context(&self) -> String {
+        match self.scratchpad.lock() {
+            Ok(sp) => sp.render_for_context(),
+            Err(_) => String::new(),
+        }
+    }
+
+    fn compact_if_needed(&self, current_iteration: u32) {
+        let Ok(mut sp) = self.scratchpad.lock() else {
+            return;
+        };
+        let rendered_len = sp.render_for_context().len();
+        if rendered_len > fx_scratchpad::SCRATCHPAD_COMPACT_THRESHOLD_CHARS {
+            sp.compact(
+                fx_scratchpad::SCRATCHPAD_COMPACT_TARGET_TOKENS,
+                current_iteration,
+                fx_scratchpad::SCRATCHPAD_AGE_THRESHOLD,
+            );
+        }
+    }
+}
+
+/// Result of [`build_skill_registry`]: groups related outputs to avoid a
+/// large tuple return type.
+struct SkillRegistryBundle {
+    registry: SkillRegistry,
+    memory: Option<SharedMemoryStore>,
+    memory_snapshot: Option<String>,
+    runtime_info: Arc<RwLock<RuntimeInfo>>,
+    scratchpad: Arc<Mutex<Scratchpad>>,
+    iteration_counter: Arc<std::sync::atomic::AtomicU32>,
+}
+
 fn build_skill_registry(
     working_dir: PathBuf,
     data_dir: &Path,
     config: &FawxConfig,
-) -> (
-    SkillRegistry,
-    Option<SharedMemoryStore>,
-    Option<String>,
-    Arc<RwLock<RuntimeInfo>>,
-) {
+) -> SkillRegistryBundle {
     let tool_config = ToolConfig {
         max_read_size: config.tools.max_read_size,
         search_exclude: config.tools.search_exclude.clone(),
@@ -2434,6 +2508,11 @@ fn build_skill_registry(
     registry.register(Box::new(git_skill));
     let tx_skill = TransactionSkill::new(working_dir.clone(), sm);
     registry.register(Box::new(tx_skill));
+    let scratchpad = Arc::new(Mutex::new(Scratchpad::new()));
+    let iteration_counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let scratchpad_skill =
+        ScratchpadSkill::new(Arc::clone(&scratchpad), Arc::clone(&iteration_counter));
+    registry.register(Box::new(scratchpad_skill));
 
     // Load WASM skills from ~/.fawx/skills/
     match fx_loadable::wasm_skill::load_wasm_skills() {
@@ -2449,7 +2528,14 @@ fn build_skill_registry(
 
     apply_skill_summaries(&runtime_info, &registry);
 
-    (registry, memory, snapshot_text, runtime_info)
+    SkillRegistryBundle {
+        registry,
+        memory,
+        memory_snapshot: snapshot_text,
+        runtime_info,
+        scratchpad,
+        iteration_counter,
+    }
 }
 
 fn attach_memory(

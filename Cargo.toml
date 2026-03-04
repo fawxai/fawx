@@ -19,6 +19,7 @@ members = [
     "engine/crates/fx-memory",
     "engine/crates/fx-improve",
     "engine/crates/fx-transactions",
+    "engine/crates/fx-scratchpad",
     "engine/crates/llama-cpp-sys",
 ]
 resolver = "2"
@@ -88,3 +89,4 @@ fx-transactions = { path = "engine/crates/fx-transactions" }
 fx-analysis = { path = "engine/crates/fx-analysis" }
 fx-memory = { path = "engine/crates/fx-memory" }
 fx-improve = { path = "engine/crates/fx-improve" }
+fx-scratchpad = { path = "engine/crates/fx-scratchpad" }
