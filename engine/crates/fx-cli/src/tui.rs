@@ -2409,9 +2409,14 @@ fn attach_memory(
     let memory_config = JsonMemoryConfig {
         max_entries: config.memory.max_entries,
         max_value_size: config.memory.max_value_size,
+        decay_config: fx_memory::DecayConfig::default(),
     };
     match JsonFileMemory::new_with_config(data_dir, memory_config) {
-        Ok(memory_store) => {
+        Ok(mut memory_store) => {
+            let pruned = memory_store.prune();
+            if pruned > 0 {
+                eprintln!("memory: pruned {pruned} stale entries at session start");
+            }
             let snapshot = memory_store.snapshot();
             let text = format_memory_for_prompt(&snapshot, config.memory.max_snapshot_chars);
             let memory: SharedMemoryStore = Arc::new(Mutex::new(memory_store));

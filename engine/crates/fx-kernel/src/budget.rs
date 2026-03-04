@@ -82,6 +82,10 @@ pub struct BudgetConfig {
     /// Maximum tokens to include in the synthesis prompt (Layer 2 eviction limit).
     #[serde(default = "default_max_synthesis_tokens")]
     pub max_synthesis_tokens: usize,
+    /// Maximum retries per tool name per cycle (0 = no retries, only initial attempt).
+    /// Total attempts = max_tool_retries + 1.
+    #[serde(default = "default_max_tool_retries")]
+    pub max_tool_retries: u8,
 }
 
 fn default_soft_ceiling_percent() -> u8 {
@@ -104,6 +108,12 @@ fn default_max_synthesis_tokens() -> usize {
     DEFAULT_MAX_SYNTHESIS_TOKENS
 }
 
+const DEFAULT_MAX_TOOL_RETRIES: u8 = 2;
+
+fn default_max_tool_retries() -> u8 {
+    DEFAULT_MAX_TOOL_RETRIES
+}
+
 impl BudgetConfig {
     /// Return a conservative configuration for background/proactive actions.
     pub fn conservative() -> Self {
@@ -120,6 +130,7 @@ impl BudgetConfig {
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
+            max_tool_retries: 1,
         }
     }
 
@@ -140,6 +151,7 @@ impl BudgetConfig {
             max_tool_result_bytes: usize::MAX,
             max_aggregate_result_bytes: usize::MAX,
             max_synthesis_tokens: usize::MAX,
+            max_tool_retries: u8::MAX,
         }
     }
 }
@@ -160,6 +172,7 @@ impl Default for BudgetConfig {
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
+            max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
         }
     }
 }
@@ -308,6 +321,7 @@ impl BudgetAllocator {
                 max_tool_result_bytes: template.max_tool_result_bytes,
                 max_aggregate_result_bytes: template.max_aggregate_result_bytes,
                 max_synthesis_tokens: template.max_synthesis_tokens,
+                max_tool_retries: template.max_tool_retries,
             });
         }
 
@@ -941,6 +955,7 @@ fn budget_from_remaining(template: &BudgetConfig, remaining: &BudgetRemaining) -
         max_tool_result_bytes: template.max_tool_result_bytes,
         max_aggregate_result_bytes: template.max_aggregate_result_bytes,
         max_synthesis_tokens: template.max_synthesis_tokens,
+        max_tool_retries: template.max_tool_retries,
     }
 }
 
@@ -958,6 +973,7 @@ fn zeroed_config_like(template: &BudgetConfig) -> BudgetConfig {
         max_tool_result_bytes: template.max_tool_result_bytes,
         max_aggregate_result_bytes: template.max_aggregate_result_bytes,
         max_synthesis_tokens: template.max_synthesis_tokens,
+        max_tool_retries: template.max_tool_retries,
     }
 }
 
@@ -1026,6 +1042,7 @@ mod tests {
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
+            max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
         }
     }
 
@@ -1053,6 +1070,7 @@ mod tests {
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
+            max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
         }
     }
 
@@ -1599,6 +1617,7 @@ mod tests {
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
+            max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
         };
         let tracker = BudgetTracker::new(config.clone(), 0, 0);
         let allocator = BudgetAllocator {
@@ -1642,6 +1661,7 @@ mod tests {
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
+            max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
         };
         let tracker = BudgetTracker::new(config, 0, 0);
         let allocator = BudgetAllocator {
@@ -1695,6 +1715,7 @@ mod tests {
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
+            max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
         };
         let tracker = BudgetTracker::new(config, 0, 0);
         let allocator = BudgetAllocator::new();
@@ -1726,6 +1747,7 @@ mod tests {
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
+            max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
         };
         let tracker = BudgetTracker::new(config, 0, 0);
         let allocator = BudgetAllocator {
@@ -1776,6 +1798,7 @@ mod tests {
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
+            max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
         };
         let tracker = BudgetTracker::new(config, 0, 0);
         let allocator = BudgetAllocator::new();
@@ -1835,6 +1858,7 @@ mod tests {
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
+            max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
         };
         let tracker = BudgetTracker::new(config, 0, 0);
         let allocator = BudgetAllocator::new();
@@ -1862,6 +1886,7 @@ mod tests {
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
+            max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
         };
         let tracker = BudgetTracker::new(config, 0, 0);
         let allocator = BudgetAllocator {
@@ -1893,6 +1918,7 @@ mod tests {
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
+            max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
         };
         let tracker = BudgetTracker::new(config, 0, 0);
         let allocator = BudgetAllocator {
@@ -2029,6 +2055,7 @@ mod tests {
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
+            max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
             ..test_config()
         };
         let remaining = BudgetRemaining {
@@ -2050,6 +2077,7 @@ mod tests {
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             max_aggregate_result_bytes: DEFAULT_MAX_AGGREGATE_RESULT_BYTES,
             max_synthesis_tokens: DEFAULT_MAX_SYNTHESIS_TOKENS,
+            max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
             ..test_config()
         };
 
