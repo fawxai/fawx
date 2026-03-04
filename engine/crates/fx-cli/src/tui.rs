@@ -126,7 +126,7 @@ fn supports_truecolor() -> bool {
     false
 }
 
-fn theme_color(r: u8, g: u8, b: u8, fallback_256: u8) -> style::Color {
+pub(crate) fn theme_color(r: u8, g: u8, b: u8, fallback_256: u8) -> style::Color {
     if supports_truecolor() {
         style::Color::Rgb { r, g, b }
     } else {
@@ -339,6 +339,8 @@ struct StreamRenderer {
     token_count: usize,
     /// Accumulated raw text for markdown reprint on finalize.
     buffer: String,
+    /// Incremental markdown renderer for ANSI-formatted streaming output.
+    md: crate::markdown::MarkdownRenderer,
 }
 
 impl StreamRenderer {
@@ -348,6 +350,7 @@ impl StreamRenderer {
             current_phase: None,
             token_count: 0,
             buffer: String::new(),
+            md: crate::markdown::MarkdownRenderer::new(),
         }
     }
 
@@ -356,14 +359,17 @@ impl StreamRenderer {
         self.current_phase = Some(phase);
     }
 
-    /// Handle a `StreamDelta` event — print the token immediately.
+    /// Handle a `StreamDelta` event — render markdown incrementally.
     fn handle_delta(&mut self, delta: &str) {
         if !self.prefix_printed {
             self.print_prefix();
         }
         self.token_count += 1;
         self.buffer.push_str(delta);
-        self.write_delta(delta);
+        let formatted = self.md.push(delta);
+        if !formatted.is_empty() {
+            self.write_delta(&formatted);
+        }
     }
 
     /// Handle a `StreamingFinished` event.
@@ -371,17 +377,14 @@ impl StreamRenderer {
         self.current_phase = None;
     }
 
-    /// Print a trailing newline if any tokens were rendered.
-    ///
-    /// The raw streamed text is kept as-is. Full markdown formatting is
-    /// deferred to incremental rendering (#1097) — cursor-based reprint
-    /// is unreliable across terminal scrollback and varying widths.
-    ///
-    /// Future enhancement: if incremental markdown rendering is added,
-    /// consider a threshold-based skip (e.g. >50 lines) to avoid a
-    /// visible flash from clearing and reprinting long responses.
-    fn finalize(&self) {
+    /// Print any trailing markdown content and a final newline.
+    fn finalize(&mut self) {
         if self.prefix_printed {
+            let tail = self.md.flush();
+            if !tail.is_empty() {
+                print!("{tail}");
+                let _ = io::stdout().flush();
+            }
             println!();
         }
     }
