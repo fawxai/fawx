@@ -48,6 +48,12 @@ pub struct FawxApp {
     pub history_index: Option<usize>,
     /// Whether the "fawx ›" prefix has been printed for the current stream.
     pub streaming_prefix_printed: bool,
+    /// Inputs queued while the agent is executing (one per future turn).
+    pub pending_inputs: Vec<String>,
+    /// Steer message for the running agent (last one wins).
+    pub steer_message: Option<String>,
+    /// Whether an abort has been requested for the current cycle.
+    pub abort_requested: bool,
 }
 
 impl FawxApp {
@@ -61,6 +67,9 @@ impl FawxApp {
             command_history: Vec::new(),
             history_index: None,
             streaming_prefix_printed: false,
+            pending_inputs: Vec::new(),
+            steer_message: None,
+            abort_requested: false,
         }
     }
 
@@ -173,6 +182,42 @@ impl FawxApp {
         self.streaming_prefix_printed = false;
     }
 
+    /// Queue a user input to be executed after the current turn completes.
+    pub fn queue_input(&mut self, text: String) {
+        self.pending_inputs.push(text);
+    }
+
+    /// Set (or replace) the steer message. Last one wins.
+    pub fn set_steer(&mut self, text: String) {
+        self.steer_message = Some(text);
+    }
+
+    /// Request an abort of the running agent cycle.
+    pub fn request_abort(&mut self) {
+        self.abort_requested = true;
+    }
+
+    /// Drain and return the next queued input, if any.
+    pub fn drain_next_input(&mut self) -> Option<String> {
+        if self.pending_inputs.is_empty() {
+            None
+        } else {
+            Some(self.pending_inputs.remove(0))
+        }
+    }
+
+    /// Take the steer message, leaving `None` behind.
+    pub fn take_steer(&mut self) -> Option<String> {
+        self.steer_message.take()
+    }
+
+    /// Reset abort/steer/queue state for a new cycle.
+    pub fn reset_cycle_state(&mut self) {
+        self.abort_requested = false;
+        self.steer_message = None;
+        // pending_inputs are intentionally preserved across cycles
+    }
+
     /// Calculate how many terminal rows the input bar needs given
     /// the current input text and available `width`.
     pub fn calculate_input_height(&self, width: u16) -> u16 {
@@ -206,7 +251,7 @@ pub fn draw(frame: &mut Frame, app: &FawxApp) {
     .split(frame.area());
 
     render_output(frame, layout[0], app);
-    render_separator(frame, layout[1]);
+    render_separator(frame, layout[1], app);
     render_input(frame, layout[2], app);
 }
 
@@ -241,11 +286,71 @@ fn render_output(frame: &mut Frame, area: ratatui::layout::Rect, app: &FawxApp) 
     frame.render_widget(paragraph, area);
 }
 
-/// Render the amber separator line.
-fn render_separator(frame: &mut Frame, area: ratatui::layout::Rect) {
-    let sep = "─".repeat(area.width as usize);
-    let line = Paragraph::new(Line::from(Span::styled(sep, Style::default().fg(AMBER))));
-    frame.render_widget(line, area);
+/// Build status indicator spans for the separator line.
+fn build_status_indicators(app: &FawxApp) -> Vec<Span<'_>> {
+    let mut indicators: Vec<Span<'_>> = Vec::new();
+
+    match &app.state {
+        AppState::Executing { .. } => {
+            if app.abort_requested {
+                indicators.push(Span::styled(
+                    " ⛔ Aborting... ",
+                    Style::default().fg(Color::Red),
+                ));
+            } else {
+                indicators.push(Span::styled(
+                    " ⏳ Thinking... ",
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+        }
+        AppState::Streaming => {
+            indicators.push(Span::styled(
+                " 📡 Streaming... ",
+                Style::default().fg(Color::Cyan),
+            ));
+        }
+        AppState::Idle => {}
+    }
+
+    if app.steer_message.is_some() {
+        indicators.push(Span::styled(
+            "↪ Steer queued ",
+            Style::default().fg(Color::Magenta),
+        ));
+    }
+
+    let queued = app.pending_inputs.len();
+    if queued > 0 {
+        indicators.push(Span::styled(
+            format!("📋 {queued} queued "),
+            Style::default().fg(Color::Blue),
+        ));
+    }
+
+    indicators
+}
+
+/// Render the amber separator line with optional status indicators.
+fn render_separator(frame: &mut Frame, area: ratatui::layout::Rect, app: &FawxApp) {
+    let indicators = build_status_indicators(app);
+
+    if indicators.is_empty() {
+        let sep = "─".repeat(area.width as usize);
+        let line = Paragraph::new(Line::from(Span::styled(sep, Style::default().fg(AMBER))));
+        frame.render_widget(line, area);
+    } else {
+        let indicator_text: String = indicators.iter().map(|s| s.content.as_ref()).collect();
+        let indicator_char_len = indicator_text.chars().count();
+        let fill_len = (area.width as usize).saturating_sub(indicator_char_len);
+        let mut spans = vec![Span::styled(
+            "─".repeat(fill_len),
+            Style::default().fg(AMBER),
+        )];
+        spans.extend(indicators);
+        let line = Paragraph::new(Line::from(spans));
+        frame.render_widget(line, area);
+    }
 }
 
 /// Render the input bar with prompt and current text.
@@ -455,5 +560,66 @@ mod tests {
 
         app.set_state(AppState::Idle);
         assert_eq!(app.state, AppState::Idle);
+    }
+
+    #[test]
+    fn test_queue_input_and_drain() {
+        let mut app = FawxApp::new();
+        app.queue_input("first".into());
+        app.queue_input("second".into());
+        app.queue_input("third".into());
+        assert_eq!(app.pending_inputs.len(), 3);
+
+        assert_eq!(app.drain_next_input(), Some("first".into()));
+        assert_eq!(app.drain_next_input(), Some("second".into()));
+        assert_eq!(app.drain_next_input(), Some("third".into()));
+        assert_eq!(app.drain_next_input(), None);
+    }
+
+    #[test]
+    fn test_set_steer_last_wins() {
+        let mut app = FawxApp::new();
+        app.set_steer("first steer".into());
+        app.set_steer("second steer".into());
+        assert_eq!(app.steer_message.as_deref(), Some("second steer"));
+    }
+
+    #[test]
+    fn test_take_steer_clears() {
+        let mut app = FawxApp::new();
+        app.set_steer("my steer".into());
+        let taken = app.take_steer();
+        assert_eq!(taken.as_deref(), Some("my steer"));
+        assert!(app.steer_message.is_none());
+    }
+
+    #[test]
+    fn test_request_abort() {
+        let mut app = FawxApp::new();
+        assert!(!app.abort_requested);
+        app.request_abort();
+        assert!(app.abort_requested);
+    }
+
+    #[test]
+    fn test_reset_cycle_state() {
+        let mut app = FawxApp::new();
+        app.request_abort();
+        app.set_steer("steer".into());
+        app.queue_input("queued".into());
+        app.reset_cycle_state();
+        // abort and steer are cleared
+        assert!(!app.abort_requested);
+        assert!(app.steer_message.is_none());
+        // pending inputs are preserved across cycles
+        assert_eq!(app.pending_inputs.len(), 1);
+    }
+
+    #[test]
+    fn test_new_has_empty_steer_queue_state() {
+        let app = FawxApp::new();
+        assert!(app.pending_inputs.is_empty());
+        assert!(app.steer_message.is_none());
+        assert!(!app.abort_requested);
     }
 }

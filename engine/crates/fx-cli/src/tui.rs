@@ -23,7 +23,7 @@ use fx_kernel::act::TokenUsage;
 use fx_kernel::budget::{BudgetConfig, BudgetTracker};
 use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::context_manager::ContextCompactor;
-use fx_kernel::input::LoopCommand;
+use fx_kernel::input::{loop_input_channel, LoopCommand, LoopInputSender};
 use fx_kernel::loop_engine::{
     LlmProvider as LoopLlmProvider, LoopEngine, LoopEngineBuilder, LoopResult, ScratchpadProvider,
 };
@@ -405,14 +405,107 @@ fn handle_idle_key(key: KeyEvent, app: &mut ui::FawxApp) -> Option<String> {
     }
 }
 
-/// Non-blocking check for Ctrl+C during execution.
-fn check_ctrl_c_nonblocking(cancel_token: &CancellationToken) {
-    if crossterm::event::poll(Duration::ZERO).unwrap_or(false) {
+/// Check if input is a control command that only makes sense during execution.
+///
+/// During idle, only `/stop` (with slash) is recognized so that bare words
+/// like "a", "s", "no" are not intercepted as control commands.
+fn is_idle_control_command(input: &str) -> bool {
+    let trimmed = input.trim();
+    trimmed.eq_ignore_ascii_case("/stop") || trimmed.eq_ignore_ascii_case("/abort")
+}
+
+/// Poll for key events during execution and route them.
+fn poll_execution_keys(
+    app: &mut ui::FawxApp,
+    cancel_token: &CancellationToken,
+    input_sender: &Option<LoopInputSender>,
+) {
+    while crossterm::event::poll(Duration::ZERO).unwrap_or(false) {
         if let Ok(Event::Key(key)) = crossterm::event::read() {
-            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                cancel_token.cancel();
+            handle_execution_key(key, app, cancel_token, input_sender);
+        } else {
+            break;
+        }
+    }
+}
+
+/// Handle key events during execution, routing input to steer/abort/queue.
+///
+/// Returns `true` if an abort was requested (Ctrl+C or `/stop`).
+fn handle_execution_key(
+    key: KeyEvent,
+    app: &mut ui::FawxApp,
+    cancel_token: &CancellationToken,
+    input_sender: &Option<LoopInputSender>,
+) {
+    match key.code {
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.request_abort();
+            cancel_token.cancel();
+            if let Some(sender) = input_sender {
+                let _ = sender.send(LoopCommand::Abort);
             }
         }
+        KeyCode::Enter => {
+            let text = app.submit_input();
+            if text.is_empty() {
+                return;
+            }
+            route_execution_input(&text, app, cancel_token, input_sender);
+        }
+        KeyCode::Char(c) => {
+            if !key.modifiers.contains(KeyModifiers::CONTROL) {
+                app.input_text.push(c);
+            }
+        }
+        KeyCode::Backspace => {
+            app.input_text.pop();
+        }
+        KeyCode::PageUp => app.scroll_up(),
+        KeyCode::PageDown => app.scroll_down(),
+        _ => {}
+    }
+}
+
+/// Route submitted text during execution to the appropriate handler.
+fn route_execution_input(
+    text: &str,
+    app: &mut ui::FawxApp,
+    cancel_token: &CancellationToken,
+    input_sender: &Option<LoopInputSender>,
+) {
+    if let Some(cmd) = parse_bare_command(text) {
+        match cmd {
+            LoopCommand::Stop | LoopCommand::Abort => {
+                app.request_abort();
+                cancel_token.cancel();
+                if let Some(sender) = input_sender {
+                    let _ = sender.send(LoopCommand::Abort);
+                }
+                app.add_output(format!("⛔ {text}"));
+            }
+            LoopCommand::Steer(ref steer_text) => {
+                app.set_steer(steer_text.clone());
+                if let Some(sender) = input_sender {
+                    let _ = sender.send(LoopCommand::Steer(steer_text.clone()));
+                }
+                app.add_output(format!("↪ Steer: {steer_text}"));
+            }
+            LoopCommand::StatusQuery => {
+                if let Some(sender) = input_sender {
+                    let _ = sender.send(LoopCommand::StatusQuery);
+                }
+            }
+            other => {
+                if let Some(sender) = input_sender {
+                    let _ = sender.send(other);
+                }
+            }
+        }
+    } else {
+        // Not a command — queue for the next turn
+        app.queue_input(text.to_string());
+        app.add_output(format!("📋 Queued: {text}"));
     }
 }
 
@@ -594,15 +687,43 @@ fn history_namespace_for_cwd(home: &Path, cwd: &Path) -> Option<String> {
     Some(format!("{:016x}", hasher.finish()))
 }
 
-/// Parse a bare-word command typed during spinner/thinking phase.
-#[allow(dead_code)] // TODO(#1148): Phase 3 readline handoff will wire this in
+/// Parse a bare-word command typed during execution.
+///
+/// Returns `Some(LoopCommand)` for recognized commands, `None` for
+/// unrecognized text (callers decide whether to steer or queue).
 pub(crate) fn parse_bare_command(input: &str) -> Option<LoopCommand> {
-    match input.trim().to_lowercase().as_str() {
-        "stop" | "s" => Some(LoopCommand::Stop),
-        "abort" | "a" | "cancel" => Some(LoopCommand::Abort),
+    let trimmed = input.trim();
+    let lower = trimmed.to_lowercase();
+
+    // Handle "/steer <text>" and "steer <text>" with a single strip_prefix chain
+    let steer_text = lower
+        .strip_prefix("/steer ")
+        .or_else(|| lower.strip_prefix("steer "))
+        .and_then(|_| {
+            // Use the original (non-lowercased) text for the steer payload
+            let prefix_len = if trimmed.starts_with('/') {
+                "/steer ".len()
+            } else {
+                "steer ".len()
+            };
+            let text = trimmed[prefix_len..].trim();
+            if text.is_empty() {
+                None
+            } else {
+                Some(text)
+            }
+        });
+    if let Some(text) = steer_text {
+        return Some(LoopCommand::Steer(text.to_string()));
+    }
+
+    match lower.as_str() {
+        "stop" | "s" | "/stop" => Some(LoopCommand::Stop),
+        "abort" | "a" | "cancel" | "/abort" => Some(LoopCommand::Abort),
         "no" => Some(LoopCommand::Stop),
-        "wait" | "pause" | "w" => Some(LoopCommand::Wait),
-        "go" | "resume" | "continue" => Some(LoopCommand::Resume),
+        "wait" | "pause" | "w" | "/wait" => Some(LoopCommand::Wait),
+        "go" | "resume" | "continue" | "/resume" => Some(LoopCommand::Resume),
+        "status" | "st" | "/status" => Some(LoopCommand::StatusQuery),
         _ => None,
     }
 }
@@ -655,6 +776,7 @@ struct CycleRenderingContext<'a> {
     bus_rx: &'a mut broadcast::Receiver<InternalMessage>,
     cancel_token: &'a CancellationToken,
     streamed: &'a mut bool,
+    input_sender: Option<LoopInputSender>,
 }
 
 impl TuiApp {
@@ -829,6 +951,12 @@ impl TuiApp {
             app.push_history(trimmed.to_string());
         }
 
+        // Handle control commands when idle (e.g. /stop shows "nothing running")
+        if is_idle_control_command(trimmed) {
+            app.add_output("ℹ Nothing is running.".to_string());
+            return Ok(());
+        }
+
         if trimmed.starts_with('/') {
             if let Err(error) = self.handle_command(trimmed).await {
                 self.tui_println(format_error_message(&error.to_string()));
@@ -842,7 +970,16 @@ impl TuiApp {
         app.add_output(format!("you \u{203a} {}", trimmed));
 
         // Run agent cycle with rendering
-        self.run_agent_cycle_tui(trimmed, terminal, app).await
+        self.run_agent_cycle_tui(trimmed, terminal, app).await?;
+
+        // After cycle completes, drain queued inputs (one per cycle)
+        while let Some(queued) = app.drain_next_input() {
+            app.add_output(String::new());
+            app.add_output(format!("you \u{203a} {}", queued));
+            self.run_agent_cycle_tui(&queued, terminal, app).await?;
+        }
+
+        Ok(())
     }
 
     /// Run a single agent cycle with ratatui rendering for the spinner
@@ -854,11 +991,21 @@ impl TuiApp {
         app: &mut ui::FawxApp,
     ) -> Result<(), TuiError> {
         app.set_state(ui::AppState::Executing { spinner_frame: 0 });
+        app.reset_cycle_state();
 
         let mut bus_rx = self.event_bus.subscribe();
         let cancel_token = self.cancel_token.clone();
         let mut streamed = false;
         let started = Instant::now();
+
+        // Wire up the input channel so the engine can receive commands
+        let (sender, channel) = loop_input_channel();
+        self.loop_engine.set_input_channel(channel);
+
+        // Forward any leftover steer from a previous cycle
+        if let Some(steer) = app.take_steer() {
+            let _ = sender.send(LoopCommand::Steer(steer));
+        }
 
         self.ensure_message_auth().await?;
         let active_model = self.resolve_active_model()?;
@@ -875,6 +1022,7 @@ impl TuiApp {
             bus_rx: &mut bus_rx,
             cancel_token: &cancel_token,
             streamed: &mut streamed,
+            input_sender: Some(sender),
         };
         let result = self.run_cycle_rendering(&mut ctx).await;
 
@@ -914,7 +1062,12 @@ impl TuiApp {
                     if let ui::AppState::Executing { ref mut spinner_frame } = ctx.app.state {
                         *spinner_frame += 1;
                     }
-                    check_ctrl_c_nonblocking(ctx.cancel_token);
+                    // Handle key events during execution (steer/abort/queue)
+                    poll_execution_keys(
+                        ctx.app,
+                        ctx.cancel_token,
+                        &ctx.input_sender,
+                    );
                 }
             }
         }
@@ -6942,5 +7095,148 @@ mod tests {
         .expect("mock app");
 
         assert_eq!(app.current_model(), "claude-sonnet-4-6-20250929");
+    }
+
+    // ── Steer / Abort / Queue tests ────────────────────────────
+
+    #[test]
+    fn parse_bare_command_recognizes_status_aliases() {
+        use fx_kernel::input::LoopCommand;
+        assert_eq!(parse_bare_command("status"), Some(LoopCommand::StatusQuery));
+        assert_eq!(parse_bare_command("st"), Some(LoopCommand::StatusQuery));
+        assert_eq!(
+            parse_bare_command("/status"),
+            Some(LoopCommand::StatusQuery)
+        );
+    }
+
+    #[test]
+    fn parse_bare_command_recognizes_slash_stop() {
+        use fx_kernel::input::LoopCommand;
+        assert_eq!(parse_bare_command("/stop"), Some(LoopCommand::Stop));
+        assert_eq!(parse_bare_command("/abort"), Some(LoopCommand::Abort));
+    }
+
+    #[test]
+    fn parse_bare_command_steer_with_text() {
+        use fx_kernel::input::LoopCommand;
+        assert_eq!(
+            parse_bare_command("/steer try harder"),
+            Some(LoopCommand::Steer("try harder".to_string()))
+        );
+        assert_eq!(
+            parse_bare_command("steer use a different approach"),
+            Some(LoopCommand::Steer("use a different approach".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_bare_command_steer_empty_returns_none() {
+        // "/steer " with no message text should return None
+        assert_eq!(parse_bare_command("/steer "), None);
+        assert_eq!(parse_bare_command("steer "), None);
+    }
+
+    #[test]
+    fn route_execution_input_stop_sets_abort() {
+        let mut app = ui::FawxApp::new();
+        let cancel = CancellationToken::new();
+        route_execution_input("/stop", &mut app, &cancel, &None);
+        assert!(app.abort_requested);
+        assert!(cancel.is_cancelled());
+    }
+
+    #[test]
+    fn route_execution_input_steer_sets_message() {
+        let mut app = ui::FawxApp::new();
+        let cancel = CancellationToken::new();
+        route_execution_input("/steer foo bar", &mut app, &cancel, &None);
+        assert_eq!(app.steer_message.as_deref(), Some("foo bar"));
+        assert!(!app.abort_requested);
+    }
+
+    #[test]
+    fn route_execution_input_plain_text_queues() {
+        let mut app = ui::FawxApp::new();
+        let cancel = CancellationToken::new();
+        route_execution_input("hello world", &mut app, &cancel, &None);
+        assert_eq!(app.pending_inputs, vec!["hello world".to_string()]);
+        assert!(!app.abort_requested);
+    }
+
+    #[test]
+    fn queued_inputs_drain_in_order() {
+        let mut app = ui::FawxApp::new();
+        app.queue_input("first".into());
+        app.queue_input("second".into());
+        app.queue_input("third".into());
+        assert_eq!(app.drain_next_input(), Some("first".into()));
+        assert_eq!(app.drain_next_input(), Some("second".into()));
+        assert_eq!(app.drain_next_input(), Some("third".into()));
+        assert_eq!(app.drain_next_input(), None);
+    }
+
+    #[test]
+    fn steer_clears_after_take() {
+        let mut app = ui::FawxApp::new();
+        app.set_steer("redirect".into());
+        assert_eq!(app.take_steer(), Some("redirect".into()));
+        assert!(app.take_steer().is_none());
+    }
+
+    #[test]
+    fn multiple_steers_last_wins() {
+        let mut app = ui::FawxApp::new();
+        app.set_steer("first".into());
+        app.set_steer("second".into());
+        app.set_steer("third".into());
+        assert_eq!(app.steer_message.as_deref(), Some("third"));
+    }
+
+    #[test]
+    fn abort_plus_steer_abort_takes_priority() {
+        let mut app = ui::FawxApp::new();
+        let cancel = CancellationToken::new();
+        // Steer first, then stop
+        route_execution_input("/steer try again", &mut app, &cancel, &None);
+        route_execution_input("/stop", &mut app, &cancel, &None);
+        // Abort should be set even though steer was set first
+        assert!(app.abort_requested);
+        assert!(cancel.is_cancelled());
+    }
+
+    #[test]
+    fn idle_stop_detected_as_control_command() {
+        // Only slash-prefixed commands are recognized during idle
+        assert!(is_idle_control_command("/stop"));
+        assert!(is_idle_control_command("/abort"));
+        assert!(is_idle_control_command("/STOP"));
+        assert!(is_idle_control_command(" /stop "));
+        // Bare aliases must NOT be intercepted during idle — they are
+        // valid user messages (e.g. "a", "s", "no").
+        assert!(!is_idle_control_command("stop"));
+        assert!(!is_idle_control_command("abort"));
+        assert!(!is_idle_control_command("a"));
+        assert!(!is_idle_control_command("s"));
+        assert!(!is_idle_control_command("no"));
+        assert!(!is_idle_control_command("hello"));
+        assert!(!is_idle_control_command("/steer something"));
+        assert!(!is_idle_control_command("status"));
+    }
+
+    #[test]
+    fn route_execution_input_sends_to_channel() {
+        let (sender, mut receiver) = fx_kernel::input::loop_input_channel();
+        let mut app = ui::FawxApp::new();
+        let cancel = CancellationToken::new();
+        let sender_opt = Some(sender);
+
+        route_execution_input("/steer try plan B", &mut app, &cancel, &sender_opt);
+        let cmd = receiver.try_recv();
+        assert_eq!(cmd, Some(LoopCommand::Steer("try plan B".to_string())));
+
+        route_execution_input("/stop", &mut app, &cancel, &sender_opt);
+        let cmd = receiver.try_recv();
+        assert_eq!(cmd, Some(LoopCommand::Abort));
     }
 }
