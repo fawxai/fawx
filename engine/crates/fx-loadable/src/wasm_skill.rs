@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use fx_kernel::act::ToolCacheability;
 use fx_kernel::cancellation::CancellationToken;
 use fx_llm::ToolDefinition;
+use fx_skills::live_host_api::CredentialProvider;
 use fx_skills::loader::LoadedSkill;
 use fx_skills::manifest::SkillManifest;
 use fx_skills::runtime::SkillRuntime;
@@ -30,6 +31,7 @@ use std::sync::{Arc, Mutex};
 pub struct WasmSkill {
     manifest: SkillManifest,
     runtime: Arc<Mutex<SkillRuntime>>,
+    credential_provider: Option<Arc<dyn CredentialProvider>>,
 }
 
 impl std::fmt::Debug for WasmSkill {
@@ -47,7 +49,10 @@ impl WasmSkill {
     /// Extracts the wasmtime `Engine` from the compiled module so the
     /// runtime uses the same engine (wasmtime requires engine parity
     /// between `Module` and `Store`).
-    pub fn new(loaded: LoadedSkill) -> Result<Self, SkillError> {
+    pub fn new(
+        loaded: LoadedSkill,
+        credential_provider: Option<Arc<dyn CredentialProvider>>,
+    ) -> Result<Self, SkillError> {
         let manifest = loaded.manifest().clone();
         let engine = loaded.module().engine().clone();
         let mut runtime = SkillRuntime::with_engine(engine);
@@ -57,6 +62,7 @@ impl WasmSkill {
         Ok(Self {
             manifest,
             runtime: Arc::new(Mutex::new(runtime)),
+            credential_provider,
         })
     }
 
@@ -128,6 +134,8 @@ impl Skill for WasmSkill {
 
         let skill_name = self.manifest.name.clone();
         let runtime = Arc::clone(&self.runtime);
+        let capabilities = self.manifest.capabilities.clone();
+        let credential_provider = self.credential_provider.clone();
 
         // Run WASM execution on a blocking thread to keep the async
         // executor free for other tasks.
@@ -136,6 +144,8 @@ impl Skill for WasmSkill {
                 skill_name: &skill_name,
                 input: input.clone(),
                 storage_quota: None,
+                capabilities,
+                credential_provider,
             }));
             let mut rt = runtime.lock().unwrap_or_else(|p| p.into_inner());
             rt.invoke_with_host_api(&skill_name, &input, host_api)
@@ -156,9 +166,14 @@ impl Skill for WasmSkill {
 /// Load all installed WASM skills from `~/.fawx/skills/` and return
 /// them as boxed [`Skill`] trait objects ready for registry insertion.
 ///
+/// The optional `credential_provider` bridges the encrypted credential
+/// store so skills can retrieve secrets (e.g., GitHub PAT) via `kv_get`.
+///
 /// Errors from individual skills are logged and skipped; only a
 /// directory-level failure propagates as an error.
-pub fn load_wasm_skills() -> Result<Vec<Box<dyn Skill>>, SkillError> {
+pub fn load_wasm_skills(
+    credential_provider: Option<Arc<dyn CredentialProvider>>,
+) -> Result<Vec<Box<dyn Skill>>, SkillError> {
     let wasm_registry = fx_skills::registry::SkillRegistry::new()
         .map_err(|e| format!("failed to create WASM skill registry: {e}"))?;
 
@@ -169,7 +184,7 @@ pub fn load_wasm_skills() -> Result<Vec<Box<dyn Skill>>, SkillError> {
     let mut skills: Vec<Box<dyn Skill>> = Vec::new();
 
     for (name, loaded_skill) in loaded {
-        match WasmSkill::new(loaded_skill) {
+        match WasmSkill::new(loaded_skill, credential_provider.clone()) {
             Ok(wasm_skill) => {
                 tracing::info!(skill = %name, "loaded WASM skill");
                 skills.push(Box::new(wasm_skill));
@@ -231,13 +246,13 @@ mod tests {
 
     #[test]
     fn wasm_skill_name_matches_manifest() {
-        let skill = WasmSkill::new(load_test_skill("echo")).expect("create");
+        let skill = WasmSkill::new(load_test_skill("echo"), None).expect("create");
         assert_eq!(skill.name(), "echo");
     }
 
     #[test]
     fn wasm_skill_exposes_one_tool() {
-        let skill = WasmSkill::new(load_test_skill("echo")).expect("create");
+        let skill = WasmSkill::new(load_test_skill("echo"), None).expect("create");
         let defs = skill.tool_definitions();
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].name, "echo");
@@ -246,20 +261,20 @@ mod tests {
 
     #[test]
     fn wasm_skill_cacheability_is_never() {
-        let skill = WasmSkill::new(load_test_skill("echo")).expect("create");
+        let skill = WasmSkill::new(load_test_skill("echo"), None).expect("create");
         assert_eq!(skill.cacheability("echo"), ToolCacheability::NeverCache);
     }
 
     #[tokio::test]
     async fn wasm_skill_returns_none_for_unknown_tool() {
-        let skill = WasmSkill::new(load_test_skill("echo")).expect("create");
+        let skill = WasmSkill::new(load_test_skill("echo"), None).expect("create");
         let result = skill.execute("other_tool", "{}", None).await;
         assert!(result.is_none());
     }
 
     #[tokio::test]
     async fn wasm_skill_executes_known_tool() {
-        let skill = WasmSkill::new(load_test_skill("echo")).expect("create");
+        let skill = WasmSkill::new(load_test_skill("echo"), None).expect("create");
         let result = skill.execute("echo", r#"{"input": "hello"}"#, None).await;
         assert!(result.is_some());
         let output = result.unwrap();
@@ -270,7 +285,7 @@ mod tests {
 
     #[tokio::test]
     async fn wasm_skill_handles_missing_input_field() {
-        let skill = WasmSkill::new(load_test_skill("echo")).expect("create");
+        let skill = WasmSkill::new(load_test_skill("echo"), None).expect("create");
         // No "input" key — falls back to empty string
         let result = skill.execute("echo", "{}", None).await;
         assert!(result.is_some());
@@ -280,7 +295,7 @@ mod tests {
 
     #[tokio::test]
     async fn wasm_skill_handles_invalid_json() {
-        let skill = WasmSkill::new(load_test_skill("echo")).expect("create");
+        let skill = WasmSkill::new(load_test_skill("echo"), None).expect("create");
         let result = skill.execute("echo", "not json", None).await;
         assert!(result.is_some());
         let err = result.unwrap();
@@ -290,7 +305,7 @@ mod tests {
 
     #[test]
     fn wasm_skill_debug_format() {
-        let skill = WasmSkill::new(load_test_skill("echo")).expect("create");
+        let skill = WasmSkill::new(load_test_skill("echo"), None).expect("create");
         let debug = format!("{skill:?}");
         assert!(debug.contains("echo"));
         assert!(debug.contains("1.0.0"));
@@ -299,7 +314,7 @@ mod tests {
     #[test]
     fn load_wasm_skills_empty_dir() {
         // Default ~/.fawx/skills/ may be empty or have skills — just verify no panic
-        let result = load_wasm_skills();
+        let result = load_wasm_skills(None);
         assert!(result.is_ok());
     }
 }

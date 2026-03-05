@@ -39,6 +39,7 @@ use fx_loadable::{SkillRegistry, TransactionSkill};
 use fx_memory::{JsonFileMemory, JsonMemoryConfig, SignalStore};
 use fx_scratchpad::skill::ScratchpadSkill;
 use fx_scratchpad::Scratchpad;
+use fx_skills::live_host_api::CredentialProvider;
 use fx_tools::{BuiltinToolsSkill, FawxToolExecutor, GitSkill, ToolConfig};
 use ratatui::DefaultTerminal;
 use std::collections::hash_map::DefaultHasher;
@@ -2762,6 +2763,29 @@ impl ScratchpadProvider for ScratchpadBridge {
     }
 }
 
+/// Bridges the encrypted credential store to the [`CredentialProvider`]
+/// trait so WASM skills can retrieve secrets via `kv_get`.
+///
+/// Maps well-known key names to credential store lookups:
+/// - `"github_token"` → GitHub PAT from the encrypted store
+struct CredentialStoreBridge {
+    store: fx_auth::credential_store::EncryptedFileCredentialStore,
+}
+
+impl CredentialProvider for CredentialStoreBridge {
+    fn get_credential(&self, key: &str) -> Option<zeroize::Zeroizing<String>> {
+        use fx_auth::credential_store::{AuthProvider, CredentialMethod};
+        match key {
+            "github_token" => self
+                .store
+                .get(AuthProvider::GitHub, CredentialMethod::Pat)
+                .ok()
+                .flatten(),
+            _ => None,
+        }
+    }
+}
+
 /// Result of [`build_skill_registry`]: groups related outputs to avoid a
 /// large tuple return type.
 struct SkillRegistryBundle {
@@ -2808,8 +2832,18 @@ fn build_skill_registry(
         ScratchpadSkill::new(Arc::clone(&scratchpad), Arc::clone(&iteration_counter));
     registry.register(Box::new(scratchpad_skill));
 
+    // Build credential provider bridge for WASM skills
+    let credential_provider: Option<Arc<dyn CredentialProvider>> =
+        match fx_auth::credential_store::EncryptedFileCredentialStore::open(data_dir) {
+            Ok(store) => Some(Arc::new(CredentialStoreBridge { store })),
+            Err(e) => {
+                tracing::warn!("credential store unavailable for WASM skills: {e}");
+                None
+            }
+        };
+
     // Load WASM skills from ~/.fawx/skills/
-    match fx_loadable::wasm_skill::load_wasm_skills() {
+    match fx_loadable::wasm_skill::load_wasm_skills(credential_provider) {
         Ok(wasm_skills) => {
             for skill in wasm_skills {
                 registry.register(skill);

@@ -5,6 +5,8 @@
 
 use fx_core::error::SkillError;
 use fx_skills::host_api::HostApi;
+use fx_skills::live_host_api::{execute_http_request, CredentialProvider};
+use fx_skills::manifest::Capability;
 use fx_skills::storage::SkillStorage;
 use std::sync::{Arc, Mutex};
 
@@ -16,12 +18,25 @@ const DEFAULT_STORAGE_QUOTA: usize = 64 * 1024;
 /// Routes WASM host function calls to:
 /// - `tracing` for logging
 /// - [`SkillStorage`] for key-value persistence
+/// - [`CredentialProvider`] for secret retrieval (e.g., GitHub PAT)
+/// - `execute_http_request` for outbound HTTP (capability-gated)
 /// - Input/output buffers for skill invocation I/O
-#[derive(Debug)]
 pub struct LiveHostApi {
     storage: Arc<Mutex<SkillStorage>>,
     input: String,
     output: Arc<Mutex<String>>,
+    capabilities: Vec<Capability>,
+    credential_provider: Option<Arc<dyn CredentialProvider>>,
+}
+
+impl std::fmt::Debug for LiveHostApi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveHostApi")
+            .field("input", &self.input)
+            .field("capabilities", &self.capabilities)
+            .field("credential_provider", &self.credential_provider.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Configuration for creating a [`LiveHostApi`].
@@ -32,6 +47,10 @@ pub struct LiveHostApiConfig<'a> {
     pub input: String,
     /// Storage quota in bytes (defaults to [`DEFAULT_STORAGE_QUOTA`]).
     pub storage_quota: Option<usize>,
+    /// Capabilities the skill has declared in its manifest.
+    pub capabilities: Vec<Capability>,
+    /// Optional credential provider for bridging secrets to skills.
+    pub credential_provider: Option<Arc<dyn CredentialProvider>>,
 }
 
 impl LiveHostApi {
@@ -42,6 +61,8 @@ impl LiveHostApi {
             storage: Arc::new(Mutex::new(SkillStorage::new(config.skill_name, quota))),
             input: config.input,
             output: Arc::new(Mutex::new(String::new())),
+            capabilities: config.capabilities,
+            credential_provider: config.credential_provider,
         }
     }
 
@@ -72,6 +93,13 @@ impl HostApi for LiveHostApi {
     }
 
     fn kv_get(&self, key: &str) -> Option<String> {
+        // Credential provider takes priority (bridges secrets to skills)
+        if let Some(provider) = &self.credential_provider {
+            if let Some(value) = provider.get_credential(key) {
+                return Some((*value).clone());
+            }
+        }
+        // Fall back to skill-local storage
         self.storage
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -96,18 +124,12 @@ impl HostApi for LiveHostApi {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = text.to_string();
     }
 
-    fn http_request(
-        &self,
-        _method: &str,
-        _url: &str,
-        _headers: &str,
-        _body: &str,
-    ) -> Option<String> {
-        // HTTP requests are not yet supported in the loadable LiveHostApi.
-        // The WASM linker layer gates on Network capability and this will
-        // be wired to a real HTTP client when needed.
-        tracing::warn!("http_request called on loadable LiveHostApi (not yet implemented)");
-        None
+    fn http_request(&self, method: &str, url: &str, headers: &str, body: &str) -> Option<String> {
+        if !self.capabilities.contains(&Capability::Network) {
+            tracing::error!("http_request denied: skill lacks Network capability");
+            return None;
+        }
+        execute_http_request(method, url, headers, body)
     }
 
     fn get_output(&self) -> String {
@@ -125,13 +147,45 @@ impl HostApi for LiveHostApi {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use zeroize::Zeroizing;
 
-    fn make_api(input: &str) -> LiveHostApi {
-        LiveHostApi::new(LiveHostApiConfig {
+    fn make_config(input: &str) -> LiveHostApiConfig<'_> {
+        LiveHostApiConfig {
             skill_name: "test_skill",
             input: input.to_string(),
             storage_quota: None,
-        })
+            capabilities: vec![],
+            credential_provider: None,
+        }
+    }
+
+    fn make_api(input: &str) -> LiveHostApi {
+        LiveHostApi::new(make_config(input))
+    }
+
+    /// Mock credential provider for testing.
+    struct MockCredentialProvider {
+        credentials: HashMap<String, String>,
+    }
+
+    impl MockCredentialProvider {
+        fn new() -> Self {
+            Self {
+                credentials: HashMap::new(),
+            }
+        }
+
+        fn with_credential(mut self, key: &str, value: &str) -> Self {
+            self.credentials.insert(key.to_string(), value.to_string());
+            self
+        }
+    }
+
+    impl CredentialProvider for MockCredentialProvider {
+        fn get_credential(&self, key: &str) -> Option<Zeroizing<String>> {
+            self.credentials.get(key).map(|v| Zeroizing::new(v.clone()))
+        }
     }
 
     #[test]
@@ -158,6 +212,8 @@ mod tests {
             skill_name: "test",
             input: String::new(),
             storage_quota: Some(10),
+            capabilities: vec![],
+            credential_provider: None,
         });
 
         // 3 + 3 = 6 bytes, within quota
@@ -202,5 +258,69 @@ mod tests {
         // After taking, the output should be empty
         let second = api.take_output();
         assert_eq!(second, "");
+    }
+
+    #[test]
+    fn kv_get_bridges_credential_provider() {
+        let provider =
+            MockCredentialProvider::new().with_credential("github_token", "ghp_test_token_12345");
+        let api = LiveHostApi::new(LiveHostApiConfig {
+            skill_name: "test",
+            input: String::new(),
+            storage_quota: None,
+            capabilities: vec![],
+            credential_provider: Some(Arc::new(provider)),
+        });
+        assert_eq!(
+            api.kv_get("github_token"),
+            Some("ghp_test_token_12345".to_string())
+        );
+    }
+
+    #[test]
+    fn kv_get_credential_provider_priority_over_storage() {
+        let provider =
+            MockCredentialProvider::new().with_credential("github_token", "from_provider");
+        let mut api = LiveHostApi::new(LiveHostApiConfig {
+            skill_name: "test",
+            input: String::new(),
+            storage_quota: None,
+            capabilities: vec![],
+            credential_provider: Some(Arc::new(provider)),
+        });
+        // Store a value in skill-local storage under the same key
+        api.kv_set("github_token", "from_storage")
+            .expect("should set");
+        // Provider wins
+        assert_eq!(
+            api.kv_get("github_token"),
+            Some("from_provider".to_string())
+        );
+    }
+
+    #[test]
+    fn http_request_denied_without_network_capability() {
+        let api = make_api("");
+        // No capabilities → denied
+        let result = api.http_request("GET", "https://example.com", "", "");
+        assert!(result.is_none());
+    }
+
+    /// Verifies that with Network capability, the request passes capability
+    /// gating and reaches HTTPS enforcement. Using `http://` (not `https://`)
+    /// triggers the HTTPS-only rejection in `execute_http_request`, proving
+    /// the request was NOT short-circuited by capability denial.
+    #[test]
+    fn http_request_requires_https_when_capable() {
+        let api = LiveHostApi::new(LiveHostApiConfig {
+            skill_name: "test",
+            input: String::new(),
+            storage_quota: None,
+            capabilities: vec![Capability::Network],
+            credential_provider: None,
+        });
+        // Capability check passes, but HTTPS enforcement rejects http://
+        let result = api.http_request("GET", "http://example.com", "{}", "");
+        assert_eq!(result, None);
     }
 }

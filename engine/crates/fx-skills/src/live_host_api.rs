@@ -84,7 +84,7 @@ fn parse_headers(headers_json: &str) -> Option<Vec<(String, String)>> {
 /// Execute an HTTP request via ureq.
 ///
 /// Enforces HTTPS-only, 30s timeout, and 1MB response limit.
-fn execute_http_request(method: &str, url: &str, headers: &str, body: &str) -> Option<String> {
+pub fn execute_http_request(method: &str, url: &str, headers: &str, body: &str) -> Option<String> {
     // HTTPS only
     if !url.starts_with("https://") {
         tracing::error!("http_request denied: URL must use HTTPS, got: {}", url);
