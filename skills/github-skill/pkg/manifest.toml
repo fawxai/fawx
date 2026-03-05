@@ -1,6 +1,6 @@
 name = "github-skill"
 version = "1.0.0"
-description = "Create and comment on pull requests via the GitHub API"
+description = "Manage pull requests and issues via the GitHub API (create_pr, comment_pr, list_prs, view_pr, list_issues)"
 author = "fawx"
 api_version = "host_api_v1"
 capabilities = ["network", "storage"]

@@ -880,11 +880,8 @@ impl TuiApp {
         install_ratatui_panic_hook();
 
         crossterm::terminal::enable_raw_mode().map_err(TuiError::Io)?;
-        crossterm::execute!(
-            std::io::stdout(),
-            crossterm::terminal::EnterAlternateScreen
-        )
-        .map_err(TuiError::Io)?;
+        crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)
+            .map_err(TuiError::Io)?;
         let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
         let mut terminal = ratatui::Terminal::new(backend).map_err(TuiError::Io)?;
         let mut app = ui::FawxApp::new();

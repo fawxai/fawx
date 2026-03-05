@@ -4,6 +4,8 @@ use crate::host_api::{HostApi, HostApiBase};
 use crate::manifest::Capability;
 use fx_core::error::SkillError;
 use std::io::Read;
+use std::sync::Arc;
+use zeroize::Zeroizing;
 
 /// Maximum response body size: 1 MB.
 const MAX_RESPONSE_BYTES: u64 = 1_048_576;
@@ -11,18 +13,33 @@ const MAX_RESPONSE_BYTES: u64 = 1_048_576;
 /// HTTP request timeout in seconds.
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 
+/// Trait for providing credentials to WASM skills via `kv_get`.
+///
+/// This is a bridge trait so `fx-skills` doesn't depend on `fx-auth` directly.
+/// The TUI initialization implements this trait using the real credential store.
+pub trait CredentialProvider: Send + Sync {
+    /// Get a credential by key name (e.g., "github_token").
+    ///
+    /// Returns the credential wrapped in [`Zeroizing`] so the secret
+    /// is automatically zeroed on drop, preventing leaks to the allocator.
+    fn get_credential(&self, key: &str) -> Option<Zeroizing<String>>;
+}
+
 /// Configuration for creating a LiveHostApi instance.
 pub struct LiveHostApiConfig {
     /// Input text for the skill.
     pub input: String,
     /// Capabilities granted to the skill.
     pub capabilities: Vec<Capability>,
+    /// Optional credential provider for bridging secrets to skills.
+    pub credential_provider: Option<Arc<dyn CredentialProvider>>,
 }
 
 /// Live implementation of HostApi that makes real HTTP requests.
 pub struct LiveHostApi {
     base: HostApiBase,
     capabilities: Vec<Capability>,
+    credential_provider: Option<Arc<dyn CredentialProvider>>,
 }
 
 impl LiveHostApi {
@@ -31,6 +48,7 @@ impl LiveHostApi {
         Self {
             base: HostApiBase::new(config.input),
             capabilities: config.capabilities,
+            credential_provider: config.credential_provider,
         }
     }
 
@@ -167,6 +185,15 @@ impl HostApi for LiveHostApi {
     }
 
     fn kv_get(&self, key: &str) -> Option<String> {
+        // Bridge: credential provider keys take priority.
+        // Note: the Zeroizing wrapper is consumed here because kv_get
+        // returns a plain String for the WASM ABI boundary. The secret
+        // is only exposed for the duration of the skill invocation.
+        if let Some(provider) = &self.credential_provider {
+            if let Some(value) = provider.get_credential(key) {
+                return Some((*value).clone());
+            }
+        }
         self.base.kv_get(key)
     }
 
@@ -212,6 +239,7 @@ mod tests {
         LiveHostApiConfig {
             input: "test".to_string(),
             capabilities,
+            credential_provider: None,
         }
     }
 
@@ -333,5 +361,91 @@ mod tests {
         let reader = std::io::Cursor::new(data);
         let result = read_limited_body(reader);
         assert_eq!(result, None, "Invalid UTF-8 should return None");
+    }
+
+    /// Mock credential provider for testing the KV bridge.
+    struct MockCredentialProvider {
+        credentials: std::collections::HashMap<String, String>,
+    }
+
+    impl MockCredentialProvider {
+        fn new() -> Self {
+            Self {
+                credentials: std::collections::HashMap::new(),
+            }
+        }
+
+        fn with_credential(mut self, key: &str, value: &str) -> Self {
+            self.credentials.insert(key.to_string(), value.to_string());
+            self
+        }
+    }
+
+    impl CredentialProvider for MockCredentialProvider {
+        fn get_credential(&self, key: &str) -> Option<Zeroizing<String>> {
+            self.credentials.get(key).map(|v| Zeroizing::new(v.clone()))
+        }
+    }
+
+    #[test]
+    fn kv_get_bridges_github_token_from_credential_provider() {
+        let provider =
+            MockCredentialProvider::new().with_credential("github_token", "ghp_test_token_12345");
+
+        let config = LiveHostApiConfig {
+            input: "test".to_string(),
+            capabilities: vec![],
+            credential_provider: Some(Arc::new(provider)),
+        };
+        let api = LiveHostApi::new(config);
+
+        assert_eq!(
+            api.kv_get("github_token"),
+            Some("ghp_test_token_12345".to_string())
+        );
+    }
+
+    #[test]
+    fn kv_get_returns_none_for_unknown_credential_key() {
+        let provider = MockCredentialProvider::new().with_credential("github_token", "ghp_test");
+
+        let config = LiveHostApiConfig {
+            input: "test".to_string(),
+            capabilities: vec![],
+            credential_provider: Some(Arc::new(provider)),
+        };
+        let api = LiveHostApi::new(config);
+
+        assert_eq!(api.kv_get("other_key"), None);
+    }
+
+    #[test]
+    fn kv_get_falls_through_without_credential_provider() {
+        let mut api = LiveHostApi::new(make_config(vec![]));
+        api.kv_set("regular_key", "regular_value").expect("set");
+        assert_eq!(api.kv_get("regular_key"), Some("regular_value".to_string()));
+        assert_eq!(api.kv_get("github_token"), None);
+    }
+
+    #[test]
+    fn credential_provider_takes_priority_over_base_kv() {
+        let provider =
+            MockCredentialProvider::new().with_credential("github_token", "from_credential_store");
+
+        let config = LiveHostApiConfig {
+            input: "test".to_string(),
+            capabilities: vec![],
+            credential_provider: Some(Arc::new(provider)),
+        };
+        let mut api = LiveHostApi::new(config);
+
+        // Set a different value in the base KV
+        api.kv_set("github_token", "from_base_kv").expect("set");
+
+        // Credential provider should take priority
+        assert_eq!(
+            api.kv_get("github_token"),
+            Some("from_credential_store".to_string())
+        );
     }
 }

@@ -21,6 +21,7 @@ semver.workspace = true
 ureq.workspace = true
 dirs = "6.0"
 hex = "0.4"
+zeroize.workspace = true
 
 [features]
 default = []
