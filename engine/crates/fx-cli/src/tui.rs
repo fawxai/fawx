@@ -7,6 +7,7 @@ use crossterm::{cursor, event, style, terminal, ExecutableCommand};
 use futures::StreamExt;
 use fx_analysis::{AnalysisEngine, AnalysisError, AnalysisFinding, Confidence};
 use fx_auth::auth::{AuthManager, AuthMethod};
+use fx_auth::credential_store::CredentialStore as CredentialStoreTrait;
 use fx_auth::oauth::{PkceFlow, TokenExchangeRequest, TokenResponse};
 use fx_config::FawxConfig;
 use fx_conversation::{
@@ -739,6 +740,7 @@ pub(crate) fn parse_bare_command(input: &str) -> Option<LoopCommand> {
 pub struct TuiApp {
     router: ModelRouter,
     auth_manager: AuthManager,
+    auth_store: AuthStore,
     catalog: ModelCatalog,
     loop_engine: LoopEngine,
     running: bool,
@@ -757,6 +759,8 @@ pub struct TuiApp {
     /// Event bus for streaming events from the kernel.
     event_bus: EventBus,
     scratchpad: Arc<Mutex<Scratchpad>>,
+    /// Single encrypted credential store instance (opened once at startup).
+    credential_store: Option<fx_auth::credential_store::EncryptedFileCredentialStore>,
     /// Buffer for command output that will be flushed to FawxApp.
     output_buffer: Vec<String>,
 }
@@ -824,6 +828,8 @@ impl TuiApp {
         } = deps;
         let base_data_dir = fawx_data_dir();
         let data_dir = configured_data_dir(&base_data_dir, &config);
+        let auth_store = AuthStore::open(&data_dir)
+            .map_err(|e| TuiError::Auth(format!("failed to open auth store: {e}")))?;
         let mut conversation_store = ConversationStore::new(&data_dir).map_err(TuiError::Store)?;
         let session_id = conversation_store
             .ensure_active()
@@ -835,10 +841,19 @@ impl TuiApp {
         }
         let max_history = config.general.max_history;
         let conversation_history = load_startup_conversation_history(&conversation_store, &config);
+        let credential_store =
+            match fx_auth::credential_store::EncryptedFileCredentialStore::open(&data_dir) {
+                Ok(store) => Some(store),
+                Err(e) => {
+                    tracing::warn!("credential store unavailable: {e}");
+                    None
+                }
+            };
 
         let mut app = Self {
             router,
             auth_manager,
+            auth_store,
             catalog: ModelCatalog::new(),
             loop_engine,
             running: true,
@@ -855,6 +870,7 @@ impl TuiApp {
             completer_model_ids: Arc::new(Mutex::new(Vec::new())),
             event_bus,
             scratchpad,
+            credential_store,
             output_buffer: Vec::new(),
         };
         app.select_first_available_model_without_refresh();
@@ -864,6 +880,22 @@ impl TuiApp {
     /// Write a line to the output buffer (collected and flushed to UI later).
     fn tui_println(&mut self, line: impl Into<String>) {
         self.output_buffer.push(line.into());
+    }
+
+    /// Return a reference to the credential store, or an error if unavailable.
+    fn get_credential_store(
+        &self,
+    ) -> Result<&fx_auth::credential_store::EncryptedFileCredentialStore, TuiError> {
+        self.credential_store
+            .as_ref()
+            .ok_or_else(|| TuiError::Auth("credential store not available".into()))
+    }
+
+    /// Persist the current auth manager to the encrypted store.
+    fn persist_auth_manager(&self) -> Result<(), TuiError> {
+        self.auth_store
+            .save_auth_manager(&self.auth_manager)
+            .map_err(TuiError::Auth)
     }
 
     /// Drain the output buffer into the FawxApp.
@@ -1278,7 +1310,7 @@ impl TuiApp {
         &mut self,
         preferred_provider: &str,
     ) -> Result<(), TuiError> {
-        persist_auth_manager(&self.auth_manager)?;
+        self.persist_auth_manager()?;
 
         let preferred_models = self.get_models_for_provider(preferred_provider).await;
         self.refresh_router_models().await?;
@@ -1329,7 +1361,17 @@ impl TuiApp {
                     }
                 }
             }
-            ParsedCommand::Auth => self.handle_auth_command().await?,
+            ParsedCommand::Auth {
+                subcommand,
+                action,
+                value,
+                has_extra_args,
+            } => {
+                if has_extra_args {
+                    self.tui_println("Note: extra arguments ignored.");
+                }
+                self.handle_auth_command(subcommand, action, value).await?;
+            }
             ParsedCommand::Budget => self.show_budget_status(),
             ParsedCommand::Loop => self.show_loop_status(),
             ParsedCommand::Status => self.show_status(),
@@ -2140,7 +2182,9 @@ impl TuiApp {
         ));
         self.tui_println("  /model         List models and switch active model");
         self.tui_println("  /model <name>  Switch to a specific model");
-        self.tui_println("  /auth          Show credentials / run auth wizard");
+        self.tui_println("  /auth          Show credential status + auth help");
+        self.tui_println("  /auth <provider> set-token <TOKEN>");
+        self.tui_println("                 Save API key or PAT for a provider");
         self.tui_println("  /status        Show model, tokens, budget summary");
         self.tui_println("  /budget        Show detailed budget usage");
         self.tui_println("  /loop          Show loop iteration details");
@@ -2158,81 +2202,320 @@ impl TuiApp {
         self.tui_println("  /quit          Exit");
     }
 
+    /// Display status for all known providers.
     fn show_auth_status(&mut self) {
-        let providers = self.auth_manager.providers();
-        if providers.is_empty() {
-            self.tui_println("No credentials configured.");
-            return;
-        }
-
-        self.tui_println("Configured credentials:");
-        for provider in providers {
-            if let Some(method) = self.auth_manager.get(&provider) {
-                match method {
-                    AuthMethod::SetupToken { .. } => {
-                        self.tui_println(format!(
-                            "  - {provider}: Claude setup-token (subscription)"
-                        ));
-                    }
-                    AuthMethod::OAuth { account_id, .. } => {
-                        if let Some(account_id) = account_id {
-                            self.tui_println(format!(
-                                "  - {provider}: OAuth subscription ({account_id})"
-                            ));
-                        } else {
-                            self.tui_println(format!("  - {provider}: OAuth subscription"));
-                        }
-                    }
-                    AuthMethod::ApiKey { .. } => {
-                        self.tui_println(format!("  - {provider}: API key"));
-                    }
+        match self.provider_status_rows() {
+            Ok(rows) if rows.is_empty() => {
+                self.tui_println("No credentials configured.");
+            }
+            Ok(rows) => {
+                self.tui_println("Configured credentials:");
+                for (provider, status, configured) in rows {
+                    let marker = if configured { "✓" } else { "✗" };
+                    self.tui_println(format!("  {marker} {provider}: {status}"));
                 }
+            }
+            Err(error) => {
+                self.tui_println(format!("Error loading credential status: {error}"));
             }
         }
     }
-    async fn handle_auth_command(&mut self) -> Result<(), TuiError> {
-        self.show_auth_status();
+
+    /// Gather status rows for all known providers.
+    fn provider_status_rows(&self) -> Result<Vec<(String, String, bool)>, TuiError> {
+        let providers = self.collect_provider_names();
+        Ok(providers
+            .into_iter()
+            .map(|p| self.single_provider_status(&p))
+            .collect())
+    }
+
+    /// Gather de-duplicated, sorted provider names from all sources.
+    fn collect_provider_names(&self) -> Vec<String> {
+        let mut providers = vec![
+            "anthropic".to_string(),
+            "openai".to_string(),
+            "github".to_string(),
+        ];
+        providers.extend(
+            self.auth_manager
+                .providers()
+                .into_iter()
+                .map(|p| normalize_provider_name(&p)),
+        );
+        if let Ok(tokens) = self.auth_store.list_provider_tokens() {
+            providers.extend(tokens);
+        }
+        providers.sort();
+        providers.dedup();
+        providers
+    }
+
+    /// Determine the status string for a single provider.
+    fn single_provider_status(&self, provider: &str) -> (String, String, bool) {
+        let github_pat = self.github_pat_configured();
+        let status = self.provider_status_label(provider, github_pat);
+        let configured = status != "not configured";
+        (provider.to_string(), status.to_string(), configured)
+    }
+
+    /// Check whether a GitHub PAT exists in the credential store.
+    fn github_pat_configured(&self) -> bool {
+        let Some(store) = self.credential_store.as_ref() else {
+            return false;
+        };
+        CredentialStoreTrait::status(store, fx_auth::credential_store::AuthProvider::GitHub)
+            .map(|s| s.configured)
+            .unwrap_or(false)
+    }
+
+    /// Return a human label for a provider's auth status.
+    fn provider_status_label(&self, provider: &str, github_pat: bool) -> &str {
+        if provider == "github" && github_pat {
+            return "configured";
+        }
+        if let Some(method) = self.auth_manager.get(provider) {
+            return match method {
+                AuthMethod::OAuth { .. } => "configured (OAuth)",
+                AuthMethod::SetupToken { .. } | AuthMethod::ApiKey { .. } => "configured",
+            };
+        }
+        if self
+            .auth_store
+            .get_provider_token(provider)
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return "configured";
+        }
+        "not configured"
+    }
+
+    /// Dispatch `/auth` subcommands.
+    async fn handle_auth_command(
+        &mut self,
+        subcommand: Option<String>,
+        action: Option<String>,
+        value: Option<String>,
+    ) -> Result<(), TuiError> {
+        let norm_sub = subcommand.as_deref().map(normalize_provider_name);
+        let norm_act = action.as_deref().map(|a| a.to_ascii_lowercase());
+
+        match (norm_sub.as_deref(), norm_act.as_deref(), value.as_deref()) {
+            (None, _, _) => {
+                self.show_auth_status();
+                self.show_auth_help();
+            }
+            (Some("list-providers"), _, _) => self.show_auth_status(),
+            (Some("github"), Some("set-token"), t) => {
+                self.handle_github_set_token(t).await?;
+            }
+            (Some(p), Some("set-token"), Some(t)) => {
+                self.handle_provider_set_token(p, t).await?;
+            }
+            (Some(_), Some("set-token"), None) => {
+                self.tui_println("Usage: /auth <provider> set-token <TOKEN>");
+            }
+            (Some("github"), Some("show-status"), _) => {
+                self.handle_github_show_status();
+            }
+            (Some(p), Some("show-status"), _) => {
+                self.handle_provider_show_status(p);
+            }
+            (Some("github"), Some("clear-token"), _) => {
+                self.handle_github_clear_token().await?;
+            }
+            (Some(p), Some("clear-token"), _) => {
+                self.handle_provider_clear_token(p).await?;
+            }
+            (Some(p), _, _) => {
+                self.tui_println(format!("Unknown auth action for provider: {p}"));
+                self.show_provider_auth_help(p);
+            }
+        }
+        Ok(())
+    }
+
+    /// Print auth help text.
+    fn show_auth_help(&mut self) {
         self.tui_println(String::new());
-        self.tui_println("[1] Add/update credentials");
-        self.tui_println("[2] Remove a provider");
-        self.tui_println("[3] Cancel");
+        self.tui_println("Auth commands:");
+        self.tui_println("  /auth list-providers                  Show all providers");
+        self.tui_println("  /auth <provider> set-token <TOKEN>    Save API key or token");
+        self.tui_println("  /auth <provider> show-status          Check provider auth status");
+        self.tui_println("  /auth <provider> clear-token          Remove stored credentials");
+        self.tui_println(String::new());
+        self.tui_println("Examples:");
+        self.tui_println("  /auth anthropic set-token sk-ant-xxxxx");
+        self.tui_println("  /auth openai set-token sk-xxxxx");
+        self.tui_println("  /auth github set-token ghp_xxxxx");
+    }
 
-        let choice = prompt_choice(
-            "> ",
-            "Please choose 1, 2, or 3.",
-            "auth menu selection",
-            parse_auth_menu_selection,
-        )?;
+    /// Print per-provider usage hint.
+    fn show_provider_auth_help(&mut self, provider: &str) {
+        self.tui_println(format!(
+            "Usage: /auth {provider} <set-token|show-status|clear-token> [TOKEN]"
+        ));
+    }
 
-        match choice {
-            AuthMenuSelection::AddOrUpdate => self.auth_wizard().await,
-            AuthMenuSelection::RemoveProvider => self.remove_auth_provider().await,
-            AuthMenuSelection::Cancel => Ok(()),
+    /// `/auth github set-token <TOKEN>` — validate and store a GitHub PAT.
+    async fn handle_github_set_token(&mut self, token: Option<&str>) -> Result<(), TuiError> {
+        let Some(token) = token else {
+            self.tui_println("Usage: /auth github set-token <TOKEN>");
+            return Ok(());
+        };
+        let token = token.trim();
+        if token.is_empty() {
+            self.tui_println("Usage: /auth github set-token <TOKEN>");
+            return Ok(());
+        }
+        let token = zeroize::Zeroizing::new(token.to_string());
+        self.tui_println("Validating token...");
+        match fx_auth::github::validate_github_pat(&token).await {
+            Ok(info) => {
+                self.store_github_pat(&token, &info)?;
+                self.tui_println("✓ github: token saved.");
+                self.tui_println(format!("  Login: {}", info.login));
+                for line in format_github_token_result(&token, &info) {
+                    self.tui_println(line);
+                }
+            }
+            Err(error) => {
+                self.tui_println(format!("✗ Token validation failed: {error}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Store a validated GitHub PAT in the credential store.
+    fn store_github_pat(
+        &self,
+        token: &zeroize::Zeroizing<String>,
+        info: &fx_auth::github::GitHubTokenInfo,
+    ) -> Result<(), TuiError> {
+        let store = self.get_credential_store()?;
+        store_github_pat_in(store, token, info)
+    }
+
+    /// `/auth <provider> set-token <TOKEN>` — generic key storage.
+    async fn handle_provider_set_token(
+        &mut self,
+        provider: &str,
+        token: &str,
+    ) -> Result<(), TuiError> {
+        // Provider name is already normalized by the dispatcher.
+        let token = token.trim();
+        if token.is_empty() {
+            self.tui_println("Usage: /auth <provider> set-token <TOKEN>");
+            return Ok(());
+        }
+        let token = zeroize::Zeroizing::new(token.to_string());
+        self.auth_store
+            .store_provider_token(provider, &token)
+            .map_err(TuiError::Auth)?;
+        if provider != "github" {
+            self.auth_manager.store(
+                provider,
+                AuthMethod::ApiKey {
+                    provider: provider.to_string(),
+                    key: (*token).clone(),
+                },
+            );
+            self.persist_auth_manager()?;
+            self.refresh_router_models().await?;
+        }
+        self.tui_println(format!("✓ {provider}: token saved."));
+        Ok(())
+    }
+
+    /// `/auth github show-status` — display GitHub credential status.
+    fn handle_github_show_status(&mut self) {
+        let lines = match self.credential_store.as_ref() {
+            Some(store) => format_github_status_lines(store),
+            None => vec!["Error: credential store not available".to_string()],
+        };
+        for line in lines {
+            self.tui_println(line);
         }
     }
 
-    async fn remove_auth_provider(&mut self) -> Result<(), TuiError> {
-        let providers = self.auth_manager.providers();
-        if providers.is_empty() {
-            self.tui_println("No providers to remove.");
-            return Ok(());
+    /// `/auth <provider> show-status` — generic status check.
+    fn handle_provider_show_status(&mut self, provider: &str) {
+        let provider = normalize_provider_name(provider);
+        let configured = self
+            .auth_store
+            .get_provider_token(&provider)
+            .ok()
+            .flatten()
+            .is_some();
+        self.tui_println(format!("{provider} auth status:"));
+        if let Some(method) = self.auth_manager.get(&provider) {
+            match method {
+                AuthMethod::OAuth { .. } => {
+                    self.tui_println("  Status: configured (OAuth)");
+                }
+                AuthMethod::SetupToken { .. } | AuthMethod::ApiKey { .. } => {
+                    self.tui_println("  Status: configured");
+                }
+            }
+        } else if configured {
+            self.tui_println("  Status: configured");
+        } else {
+            self.tui_println("  Status: not configured");
         }
+    }
 
-        self.tui_println("Select a provider to remove:");
-        for (idx, provider) in providers.iter().enumerate() {
-            self.tui_println(format!("  [{}] {}", idx + 1, provider));
+    /// `/auth github clear-token` — remove GitHub credentials.
+    async fn handle_github_clear_token(&mut self) -> Result<(), TuiError> {
+        let removed_pat = self.clear_github_credential()?;
+        let removed_token = self
+            .auth_store
+            .clear_provider_token("github")
+            .map_err(TuiError::Auth)?;
+        let removed_auth = self.auth_manager.get("github").is_some();
+        if removed_auth {
+            self.auth_manager.remove("github");
+            self.persist_auth_manager()?;
+            self.refresh_router_models().await?;
         }
-
-        let provider = prompt_provider_selection(&providers)?;
-        if !confirm_provider_removal(&provider)? {
-            self.tui_println("Removal cancelled.");
-            return Ok(());
+        if removed_pat || removed_token || removed_auth {
+            self.tui_println("✓ github: credentials removed.");
+        } else {
+            self.tui_println("github: not configured");
         }
+        Ok(())
+    }
 
-        self.auth_manager.remove(&provider);
-        persist_auth_manager(&self.auth_manager)?;
-        self.refresh_router_models().await?;
-        self.tui_println(format!("Removed provider: {provider}"));
+    /// Clear the GitHub PAT from the encrypted credential store.
+    fn clear_github_credential(&self) -> Result<bool, TuiError> {
+        let store = self.get_credential_store()?;
+        store
+            .clear(
+                fx_auth::credential_store::AuthProvider::GitHub,
+                fx_auth::credential_store::CredentialMethod::Pat,
+            )
+            .map_err(|e| TuiError::Auth(format!("failed to clear credential: {e}")))
+    }
+
+    /// `/auth <provider> clear-token` — generic credential removal.
+    async fn handle_provider_clear_token(&mut self, provider: &str) -> Result<(), TuiError> {
+        let provider = normalize_provider_name(provider);
+        let removed_token = self
+            .auth_store
+            .clear_provider_token(&provider)
+            .map_err(TuiError::Auth)?;
+        let removed_auth = self.auth_manager.get(&provider).is_some();
+        if removed_auth {
+            self.auth_manager.remove(&provider);
+            self.persist_auth_manager()?;
+            self.refresh_router_models().await?;
+        }
+        if removed_token || removed_auth {
+            self.tui_println(format!("✓ {provider}: credentials removed."));
+        } else {
+            self.tui_println(format!("{provider}: not configured."));
+        }
         Ok(())
     }
 
@@ -4190,7 +4473,12 @@ fn parse_api_key_provider_selection(value: &str) -> Option<ApiKeyProvider> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ParsedCommand {
     Model(Option<String>),
-    Auth,
+    Auth {
+        subcommand: Option<String>,
+        action: Option<String>,
+        value: Option<String>,
+        has_extra_args: bool,
+    },
     Budget,
     Loop,
     Status,
@@ -4228,7 +4516,18 @@ fn parse_command(value: &str) -> ParsedCommand {
 
     match command {
         "model" => ParsedCommand::Model(parts.next().map(ToString::to_string)),
-        "auth" => ParsedCommand::Auth,
+        "auth" => {
+            let subcommand = parts.next().map(ToString::to_string);
+            let action = parts.next().map(ToString::to_string);
+            let value = parts.next().map(ToString::to_string);
+            let has_extra_args = parts.next().is_some();
+            ParsedCommand::Auth {
+                subcommand,
+                action,
+                value,
+                has_extra_args,
+            }
+        }
         "budget" => ParsedCommand::Budget,
         "loop" => ParsedCommand::Loop,
         "status" => ParsedCommand::Status,
@@ -4288,6 +4587,227 @@ impl Drop for RawModeGuard {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Auth helper free functions
+// ---------------------------------------------------------------------------
+
+/// Normalize a provider name to lowercase for consistent lookups.
+fn normalize_provider_name(value: &str) -> String {
+    let lower = value.trim().to_ascii_lowercase();
+    match lower.as_str() {
+        "gh" => "github".to_string(),
+        other => other.to_string(),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitHubPatKind {
+    Classic,
+    FineGrained,
+    Unknown,
+}
+
+/// Classify a GitHub PAT by its prefix.
+fn classify_github_pat(token: &str) -> GitHubPatKind {
+    if token.starts_with("github_pat_") {
+        GitHubPatKind::FineGrained
+    } else if token.starts_with("ghp_") {
+        GitHubPatKind::Classic
+    } else {
+        GitHubPatKind::Unknown
+    }
+}
+
+/// Serialize a [`GitHubPatKind`] to a metadata label string.
+fn pat_kind_label(kind: GitHubPatKind) -> &'static str {
+    match kind {
+        GitHubPatKind::Classic => "classic",
+        GitHubPatKind::FineGrained => "fine_grained",
+        GitHubPatKind::Unknown => "unknown",
+    }
+}
+
+/// Deserialize a metadata label string back to [`GitHubPatKind`].
+fn pat_kind_from_label(label: &str) -> GitHubPatKind {
+    match label {
+        "classic" => GitHubPatKind::Classic,
+        "fine_grained" => GitHubPatKind::FineGrained,
+        _ => GitHubPatKind::Unknown,
+    }
+}
+
+/// Infer the PAT kind from prefix and scope heuristics.
+fn infer_github_pat_kind(token: &str, scopes: &[String]) -> GitHubPatKind {
+    let prefix_kind = classify_github_pat(token);
+    if prefix_kind != GitHubPatKind::Unknown {
+        return prefix_kind;
+    }
+    // Fine-grained PATs report empty scopes via the API.
+    if scopes.is_empty() {
+        GitHubPatKind::FineGrained
+    } else {
+        GitHubPatKind::Classic
+    }
+}
+
+/// Build scope display string.
+fn github_scope_display(scopes: &[String], kind: GitHubPatKind) -> String {
+    if kind == GitHubPatKind::FineGrained {
+        return "(fine-grained — scopes N/A)".to_string();
+    }
+    if scopes.is_empty() {
+        "(none)".to_string()
+    } else {
+        scopes.join(", ")
+    }
+}
+
+/// Format token info lines after successful validation.
+fn format_github_token_result(
+    token: &zeroize::Zeroizing<String>,
+    info: &fx_auth::github::GitHubTokenInfo,
+) -> Vec<String> {
+    let token_kind = infer_github_pat_kind(token.as_str(), &info.scopes);
+    let mut lines = Vec::new();
+    if token_kind == GitHubPatKind::FineGrained {
+        lines.push("  Type: fine-grained PAT".to_string());
+    } else {
+        lines.push(format!(
+            "  Scopes: {}",
+            github_scope_display(&info.scopes, token_kind)
+        ));
+    }
+    if token_kind == GitHubPatKind::Classic && !info.missing_scopes.is_empty() {
+        lines.push(format!(
+            "  ⚠ Missing recommended scopes: {}",
+            info.missing_scopes.join(", ")
+        ));
+    }
+    lines
+}
+
+/// Build display lines for GitHub credential status.
+fn format_github_status_lines(
+    store: &fx_auth::credential_store::EncryptedFileCredentialStore,
+) -> Vec<String> {
+    match store.status(fx_auth::credential_store::AuthProvider::GitHub) {
+        Ok(status) if status.configured => format_github_configured_status(store, status.metadata),
+        Ok(_) => vec![
+            "GitHub: not configured".to_string(),
+            "  Use /auth github set-token <TOKEN> to configure.".to_string(),
+        ],
+        Err(e) => vec![format!("Error reading status: {e}")],
+    }
+}
+
+/// Format lines for a configured GitHub credential.
+fn format_github_configured_status(
+    store: &fx_auth::credential_store::EncryptedFileCredentialStore,
+    metadata: Option<fx_auth::credential_store::CredentialMetadata>,
+) -> Vec<String> {
+    let Some(meta) = metadata else {
+        return vec!["GitHub: configured".to_string()];
+    };
+    let token_kind = github_pat_kind_from_store(store);
+    let mut lines = vec![
+        "GitHub credential status:".to_string(),
+        format!("  Login: {}", meta.login.as_deref().unwrap_or("(unknown)")),
+        format!("  Method: {}", meta.method),
+        format!(
+            "  Scopes: {}",
+            github_scope_display(&meta.scopes, token_kind)
+        ),
+    ];
+    if meta.last_validated_ms > 0 {
+        let age_ms = fx_auth::credential_store::current_timestamp_ms()
+            .saturating_sub(meta.last_validated_ms);
+        lines.push(format!("  Last validated: {}", humanize_elapsed_ms(age_ms)));
+    }
+    lines
+}
+
+/// Determine the PAT kind from stored metadata (avoids decrypting the secret).
+fn github_pat_kind_from_store(
+    store: &fx_auth::credential_store::EncryptedFileCredentialStore,
+) -> GitHubPatKind {
+    use fx_auth::credential_store::{AuthProvider, CredentialStore};
+    store
+        .status(AuthProvider::GitHub)
+        .ok()
+        .and_then(|s| s.metadata)
+        .and_then(|m| m.token_kind)
+        .map(|kind| pat_kind_from_label(&kind))
+        .unwrap_or(GitHubPatKind::Unknown)
+}
+
+/// Persist a GitHub PAT and verify the round-trip.
+fn store_github_pat_in(
+    store: &fx_auth::credential_store::EncryptedFileCredentialStore,
+    token: &zeroize::Zeroizing<String>,
+    info: &fx_auth::github::GitHubTokenInfo,
+) -> Result<(), TuiError> {
+    use fx_auth::credential_store::{
+        AuthProvider, CredentialMetadata, CredentialMethod, CredentialStore,
+    };
+    let pat_kind = infer_github_pat_kind(token.as_str(), &info.scopes);
+    let metadata = CredentialMetadata {
+        provider: AuthProvider::GitHub,
+        method: CredentialMethod::Pat,
+        last_validated_ms: fx_auth::credential_store::current_timestamp_ms(),
+        login: Some(info.login.clone()),
+        scopes: info.scopes.clone(),
+        token_kind: Some(pat_kind_label(pat_kind).to_string()),
+    };
+    store
+        .set(
+            AuthProvider::GitHub,
+            CredentialMethod::Pat,
+            token,
+            &metadata,
+        )
+        .map_err(|e| TuiError::Auth(format!("failed to store credential: {e}")))?;
+    // Always verify: encrypted storage round-trip catches silent corruption
+    verify_github_pat_stored(store, token)
+}
+
+/// Verify a stored GitHub PAT matches the expected value.
+fn verify_github_pat_stored(
+    store: &fx_auth::credential_store::EncryptedFileCredentialStore,
+    token: &zeroize::Zeroizing<String>,
+) -> Result<(), TuiError> {
+    use fx_auth::credential_store::{AuthProvider, CredentialMethod, CredentialStore};
+    let persisted = store
+        .get(AuthProvider::GitHub, CredentialMethod::Pat)
+        .map_err(|e| TuiError::Auth(format!("failed to verify stored credential: {e}")))?;
+    match persisted {
+        Some(saved) if saved.as_str() == token.as_str() => Ok(()),
+        Some(_) => Err(TuiError::Auth(
+            "credential verification failed (token mismatch)".to_string(),
+        )),
+        None => Err(TuiError::Auth(
+            "credential verification failed (token missing)".to_string(),
+        )),
+    }
+}
+
+/// Human-friendly elapsed time label.
+fn humanize_elapsed_ms(ms: u64) -> String {
+    let secs = ms / 1000;
+    if secs < 60 {
+        return "just now".to_string();
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{mins}m ago");
+    }
+    let hours = mins / 60;
+    if hours < 24 {
+        return format!("{hours}h ago");
+    }
+    let days = hours / 24;
+    format!("{days}d ago")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4334,16 +4854,29 @@ mod tests {
         (bundle.engine, bundle.runtime_info)
     }
 
-    fn new_test_app() -> TuiApp {
+    /// Returns a `FawxConfig` whose `data_dir` points at a fresh temporary
+    /// directory.  The caller **must** keep the returned `TempDir` alive for
+    /// as long as the `TuiApp` (or anything else using the directory) is in
+    /// scope – dropping it deletes the directory and the SQLite files inside.
+    fn test_config_with_temp_dir() -> (FawxConfig, tempfile::TempDir) {
+        let temp_dir = tempfile::tempdir().expect("create temp data dir for test");
+        let mut config = FawxConfig::default();
+        config.general.data_dir = Some(temp_dir.path().to_path_buf());
+        (config, temp_dir)
+    }
+
+    fn new_test_app() -> (TuiApp, tempfile::TempDir) {
+        let (config, temp_dir) = test_config_with_temp_dir();
         let (loop_engine, runtime_info) = test_engine_and_runtime_info();
-        TuiApp::new(
+        let app = TuiApp::new(
             AuthManager::new(),
             ModelRouter::new(),
             loop_engine,
             runtime_info,
-            FawxConfig::default(),
+            config,
         )
-        .expect("new test app")
+        .expect("new test app");
+        (app, temp_dir)
     }
 
     #[test]
@@ -4486,7 +5019,7 @@ mod tests {
         let (memory, writes) = mock_memory_store();
         let findings = vec![test_finding("Retry Storm", Confidence::High)];
 
-        let mut app = new_test_app();
+        let (mut app, _temp_dir) = new_test_app();
         let summary = app.route_findings_by_confidence(&findings, Some(&memory));
 
         let writes = writes.lock().expect("lock writes");
@@ -4501,7 +5034,7 @@ mod tests {
         let (memory, writes) = mock_memory_store();
         let findings = vec![test_finding("Needs Follow Up", Confidence::Medium)];
 
-        let mut app = new_test_app();
+        let (mut app, _temp_dir) = new_test_app();
         let summary = app.route_findings_by_confidence(&findings, Some(&memory));
 
         assert_eq!(summary, (0, 1, 0));
@@ -4513,7 +5046,7 @@ mod tests {
         let (memory, writes) = mock_memory_store();
         let findings = vec![test_finding("Loose Correlation", Confidence::Low)];
 
-        let mut app = new_test_app();
+        let (mut app, _temp_dir) = new_test_app();
         let summary = app.route_findings_by_confidence(&findings, Some(&memory));
 
         assert_eq!(summary, (0, 0, 1));
@@ -4525,7 +5058,7 @@ mod tests {
         let (memory, writes) = mock_memory_store();
         let findings = vec![test_finding("Tool-Timeout Loop", Confidence::High)];
 
-        let mut app = new_test_app();
+        let (mut app, _temp_dir) = new_test_app();
         app.route_findings_by_confidence(&findings, Some(&memory));
 
         let writes = writes.lock().expect("lock writes");
@@ -4543,7 +5076,7 @@ mod tests {
             test_finding("Context Drift", Confidence::High),
         ];
 
-        let mut app = new_test_app();
+        let (mut app, _temp_dir) = new_test_app();
         let summary = app.route_findings_by_confidence(&findings, Some(&memory));
 
         let writes = writes.lock().expect("lock writes");
@@ -4560,7 +5093,7 @@ mod tests {
             test_finding("Loose Correlation", Confidence::Low),
         ];
 
-        let mut app = new_test_app();
+        let (mut app, _temp_dir) = new_test_app();
         let summary = app.route_findings_by_confidence(&findings, None);
 
         assert_eq!(summary, (0, 1, 1));
@@ -4583,7 +5116,7 @@ mod tests {
             test_finding("Loose Correlation", Confidence::Low),
         ];
 
-        let mut app = new_test_app();
+        let (mut app, _temp_dir) = new_test_app();
         let summary = app.route_findings_by_confidence(&findings, Some(&memory));
 
         assert_eq!(summary, (0, 1, 1));
@@ -4982,7 +5515,8 @@ mod tests {
         );
     }
 
-    fn app_with_mock_model(response: &str) -> TuiApp {
+    fn app_with_mock_model(response: &str) -> (TuiApp, tempfile::TempDir) {
+        let (config, temp_dir) = test_config_with_temp_dir();
         let mut router = ModelRouter::new();
         router.register_provider_with_auth(
             Box::new(StaticCompletionProvider::new("mock-loop-model", response)),
@@ -4993,14 +5527,15 @@ mod tests {
             .expect("set active mock model");
 
         let (loop_engine, runtime_info) = test_engine_and_runtime_info();
-        TuiApp::new(
+        let app = TuiApp::new(
             test_provider_auth_manager(),
             router,
             loop_engine,
             runtime_info,
-            FawxConfig::default(),
+            config,
         )
-        .expect("mock app")
+        .expect("mock app");
+        (app, temp_dir)
     }
 
     fn test_provider_auth_manager() -> AuthManager {
@@ -5030,7 +5565,8 @@ mod tests {
         auth_manager
     }
 
-    fn app_with_two_models() -> TuiApp {
+    fn app_with_two_models() -> (TuiApp, tempfile::TempDir) {
+        let (config, temp_dir) = test_config_with_temp_dir();
         let mut router = ModelRouter::new();
         router.register_provider_with_auth(
             Box::new(ModelEchoProvider {
@@ -5047,14 +5583,15 @@ mod tests {
             .expect("set initial active model");
 
         let (loop_engine, runtime_info) = test_engine_and_runtime_info();
-        TuiApp::new(
+        let app = TuiApp::new(
             test_provider_auth_manager(),
             router,
             loop_engine,
             runtime_info,
-            FawxConfig::default(),
+            config,
         )
-        .expect("mock app")
+        .expect("mock app");
+        (app, temp_dir)
     }
 
     fn router_with_canonical_claude_models(initial_model: &str) -> ModelRouter {
@@ -6047,7 +6584,7 @@ mod tests {
             .set_active("gpt-4o-mini")
             .expect("set initial active model");
 
-        let mut config = FawxConfig::default();
+        let (mut config, _temp_dir) = test_config_with_temp_dir();
         config.model.default_model = Some("gpt-5.3-codex".to_string());
 
         let (loop_engine, runtime_info) = test_engine_and_runtime_info();
@@ -6089,13 +6626,14 @@ mod tests {
             .set_active("claude-opus-4-20250514")
             .expect("set initial active model");
 
+        let (config, _temp_dir) = test_config_with_temp_dir();
         let (loop_engine, runtime_info) = test_engine_and_runtime_info();
         let mut app = TuiApp::new(
             test_provider_auth_manager(),
             router,
             loop_engine,
             runtime_info,
-            FawxConfig::default(),
+            config,
         )
         .expect("mock app");
 
@@ -6148,6 +6686,10 @@ mod tests {
             Some("claude-opus-4-20250514")
         );
 
+        // Drop the first app to release the auth store SQLite lock before
+        // creating the second instance pointing at the same data directory.
+        drop(app);
+
         let (loop_engine, runtime_info) = test_engine_and_runtime_info();
         let restarted = TuiApp::new(
             AuthManager::new(),
@@ -6178,7 +6720,7 @@ mod tests {
             .set_active("claude-opus-4-6-20250929")
             .expect("set router default model");
 
-        let mut config = FawxConfig::default();
+        let (mut config, _temp_dir) = test_config_with_temp_dir();
         config.model.default_model = Some("claude-retired-0".to_string());
 
         let (loop_engine, runtime_info) = test_engine_and_runtime_info();
@@ -6196,7 +6738,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_reflects_switched_model() {
-        let mut app = app_with_two_models();
+        let (mut app, _temp_dir) = app_with_two_models();
 
         app.handle_command("/model claude-sonnet-4-6")
             .await
@@ -6207,7 +6749,7 @@ mod tests {
 
     #[tokio::test]
     async fn model_command_resolves_prefix_to_full_model_id() {
-        let mut app = app_with_two_models();
+        let (mut app, _temp_dir) = app_with_two_models();
 
         let resolved = app
             .set_active_model_from_selector("claude-sonnet-4-6")
@@ -6218,7 +6760,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_message_uses_current_active_model() {
-        let mut app = app_with_two_models();
+        let (mut app, _temp_dir) = app_with_two_models();
 
         app.handle_command("/model claude-sonnet-4-6")
             .await
@@ -6234,7 +6776,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_message_returns_loop_result_not_raw_completion_payload() {
-        let mut app = app_with_mock_model(
+        let (mut app, _temp_dir) = app_with_mock_model(
             r#"{"action":{"Respond":{"text":"Loop-integrated reply"}},"rationale":"direct","confidence":0.91,"expected_outcome":null,"sub_goals":[]}"#,
         );
 
@@ -6250,7 +6792,7 @@ mod tests {
 
     #[tokio::test]
     async fn conversation_history_accumulates_across_messages() {
-        let mut app = app_with_mock_model(
+        let (mut app, _temp_dir) = app_with_mock_model(
             r#"{"action":{"Respond":{"text":"hello"}},"rationale":"r","confidence":0.9,"expected_outcome":null,"sub_goals":[]}"#,
         );
 
@@ -6273,7 +6815,7 @@ mod tests {
 
     #[tokio::test]
     async fn model_switch_preserves_conversation_history() {
-        let mut app = app_with_two_models();
+        let (mut app, _temp_dir) = app_with_two_models();
 
         app.handle_message("remember the launch code")
             .await
@@ -6299,7 +6841,7 @@ mod tests {
 
     #[tokio::test]
     async fn conversation_history_respects_max_limit() {
-        let mut app = app_with_mock_model(
+        let (mut app, _temp_dir) = app_with_mock_model(
             r#"{"action":{"Respond":{"text":"ok"}},"rationale":"r","confidence":0.9,"expected_outcome":null,"sub_goals":[]}"#,
         );
 
@@ -6367,7 +6909,7 @@ mod tests {
 
     #[tokio::test]
     async fn synthesis_command_updates_instruction() {
-        let mut app = new_test_app();
+        let (mut app, _temp_dir) = new_test_app();
 
         app.handle_command("/synthesis Show raw output verbatim")
             .await
@@ -6388,7 +6930,7 @@ mod tests {
 
     #[tokio::test]
     async fn synthesis_command_rejects_whitespace_only_instruction() {
-        let mut app = new_test_app();
+        let (mut app, _temp_dir) = new_test_app();
 
         app.handle_command("/synthesis    ")
             .await
@@ -6402,7 +6944,7 @@ mod tests {
 
     #[tokio::test]
     async fn synthesis_command_rejects_instruction_over_max_length() {
-        let mut app = new_test_app();
+        let (mut app, _temp_dir) = new_test_app();
         let long_value = "x".repeat(MAX_SYNTHESIS_INSTRUCTION_LENGTH + 1);
 
         app.handle_command(&format!("/synthesis {long_value}"))
@@ -6417,7 +6959,7 @@ mod tests {
 
     #[tokio::test]
     async fn clear_command_resets_conversation_history() {
-        let mut app = app_with_mock_model(
+        let (mut app, _temp_dir) = app_with_mock_model(
             r#"{"action":{"Respond":{"text":"ok"}},"rationale":"r","confidence":0.9,"expected_outcome":null,"sub_goals":[]}"#,
         );
 
@@ -6762,7 +7304,7 @@ mod tests {
     async fn handle_message_passes_plain_text_response_through() {
         // Verify that a normal plain-text LLM response renders correctly.
         let plain_text = "Hello! How can I help you today?";
-        let mut app = app_with_mock_model(plain_text);
+        let (mut app, _temp_dir) = app_with_mock_model(plain_text);
 
         let rendered = app
             .handle_message("Hey!")
@@ -6781,7 +7323,7 @@ mod tests {
         // When the LLM follows the schema correctly, the Respond text
         // should appear in the rendered output.
         let valid_json = r#"{"action":{"Respond":{"text":"Hey there! How can I help?"}},"rationale":"greeting","confidence":0.95,"expected_outcome":null,"sub_goals":[]}"#;
-        let mut app = app_with_mock_model(valid_json);
+        let (mut app, _temp_dir) = app_with_mock_model(valid_json);
 
         let rendered = app
             .handle_message("Hey!")
@@ -7021,7 +7563,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_command_dispatches_help_without_stopping() {
-        let mut app = new_test_app();
+        let (mut app, _temp_dir) = new_test_app();
 
         app.handle_command("/help").await.unwrap();
 
@@ -7030,7 +7572,7 @@ mod tests {
 
     #[tokio::test]
     async fn tui_runs_without_auth_configured() {
-        let mut app = new_test_app();
+        let (mut app, _temp_dir) = new_test_app();
 
         app.process_input_line("/help").await.unwrap();
         app.process_input_line("/status").await.unwrap();
@@ -7041,7 +7583,7 @@ mod tests {
 
     #[tokio::test]
     async fn help_command_works_without_auth() {
-        let mut app = new_test_app();
+        let (mut app, _temp_dir) = new_test_app();
 
         app.process_input_line("/help").await.unwrap();
 
@@ -7051,7 +7593,7 @@ mod tests {
 
     #[tokio::test]
     async fn quit_command_works_without_auth() {
-        let mut app = new_test_app();
+        let (mut app, _temp_dir) = new_test_app();
 
         app.process_input_line("/quit").await.unwrap();
 
@@ -7061,7 +7603,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_command_dispatches_quit_and_stops() {
-        let mut app = new_test_app();
+        let (mut app, _temp_dir) = new_test_app();
 
         app.handle_command("/quit").await.unwrap();
 
@@ -7070,7 +7612,7 @@ mod tests {
 
     #[tokio::test]
     async fn message_triggers_auth_when_not_configured() {
-        let mut app = new_test_app();
+        let (mut app, _temp_dir) = new_test_app();
 
         let error = app
             .handle_message("hello")
@@ -7099,7 +7641,7 @@ mod tests {
             .set_active("claude-opus-4-6-20250929")
             .expect("set router default model");
 
-        let mut config = FawxConfig::default();
+        let (mut config, _temp_dir) = test_config_with_temp_dir();
         config.model.default_model = Some("claude-sonnet-4-6-20250929".to_string());
 
         let (loop_engine, runtime_info) = test_engine_and_runtime_info();
@@ -7283,5 +7825,212 @@ mod tests {
 
         // No channel — stored in app for forwarding at next cycle start
         assert_eq!(app.steer_message.as_deref(), Some("fallback msg"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Auth command tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn normalize_provider_name_lowercase() {
+        assert_eq!(normalize_provider_name("GitHub"), "github");
+    }
+
+    #[test]
+    fn normalize_provider_name_trims() {
+        assert_eq!(normalize_provider_name("  openai  "), "openai");
+    }
+
+    #[test]
+    fn normalize_provider_name_gh_alias() {
+        assert_eq!(normalize_provider_name("gh"), "github");
+        assert_eq!(normalize_provider_name("GH"), "github");
+    }
+
+    #[test]
+    fn normalize_provider_name_passthrough() {
+        assert_eq!(normalize_provider_name("anthropic"), "anthropic");
+        assert_eq!(normalize_provider_name("openai"), "openai");
+    }
+
+    #[test]
+    fn parse_auth_bare() {
+        let cmd = parse_command("/auth");
+        assert!(matches!(
+            cmd,
+            ParsedCommand::Auth {
+                subcommand: None,
+                action: None,
+                value: None,
+                has_extra_args: false,
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_auth_github_set_token() {
+        let cmd = parse_command("/auth github set-token ghp_xxxxx");
+        assert!(matches!(
+            cmd,
+            ParsedCommand::Auth {
+                subcommand: Some(ref s),
+                action: Some(ref a),
+                value: Some(ref v),
+                has_extra_args: false,
+            } if s == "github" && a == "set-token" && v == "ghp_xxxxx"
+        ));
+    }
+
+    #[test]
+    fn parse_auth_github_show_status() {
+        let cmd = parse_command("/auth github show-status");
+        assert!(matches!(
+            cmd,
+            ParsedCommand::Auth {
+                subcommand: Some(ref s),
+                action: Some(ref a),
+                value: None,
+                has_extra_args: false,
+            } if s == "github" && a == "show-status"
+        ));
+    }
+
+    #[test]
+    fn parse_auth_github_clear_token() {
+        let cmd = parse_command("/auth github clear-token");
+        assert!(matches!(
+            cmd,
+            ParsedCommand::Auth {
+                subcommand: Some(ref s),
+                action: Some(ref a),
+                value: None,
+                has_extra_args: false,
+            } if s == "github" && a == "clear-token"
+        ));
+    }
+
+    #[test]
+    fn parse_auth_list_providers() {
+        let cmd = parse_command("/auth list-providers");
+        assert!(matches!(
+            cmd,
+            ParsedCommand::Auth {
+                subcommand: Some(ref s),
+                action: None,
+                value: None,
+                has_extra_args: false,
+            } if s == "list-providers"
+        ));
+    }
+
+    #[test]
+    fn parse_auth_unknown_provider() {
+        let cmd = parse_command("/auth foobar");
+        assert!(matches!(
+            cmd,
+            ParsedCommand::Auth {
+                subcommand: Some(ref s),
+                action: None,
+                value: None,
+                has_extra_args: false,
+            } if s == "foobar"
+        ));
+    }
+
+    #[test]
+    fn parse_auth_extra_args_detected() {
+        let cmd = parse_command("/auth github set-token ghp_xxx extra stuff");
+        assert!(matches!(
+            cmd,
+            ParsedCommand::Auth {
+                has_extra_args: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn show_auth_status_no_credentials_no_panic() {
+        let (mut app, _temp_dir) = new_test_app();
+        app.show_auth_status();
+        // Should produce output without panicking.
+        assert!(!app.output_buffer.is_empty());
+    }
+
+    #[test]
+    fn classify_github_pat_classic() {
+        assert_eq!(classify_github_pat("ghp_abc123"), GitHubPatKind::Classic);
+    }
+
+    #[test]
+    fn classify_github_pat_fine_grained() {
+        assert_eq!(
+            classify_github_pat("github_pat_abc123"),
+            GitHubPatKind::FineGrained
+        );
+    }
+
+    #[test]
+    fn classify_github_pat_unknown() {
+        assert_eq!(classify_github_pat("other_token"), GitHubPatKind::Unknown);
+    }
+
+    #[test]
+    fn humanize_elapsed_ms_just_now() {
+        assert_eq!(humanize_elapsed_ms(5000), "just now");
+    }
+
+    #[test]
+    fn humanize_elapsed_ms_minutes() {
+        assert_eq!(humanize_elapsed_ms(300_000), "5m ago");
+    }
+
+    #[test]
+    fn humanize_elapsed_ms_hours() {
+        assert_eq!(humanize_elapsed_ms(7_200_000), "2h ago");
+    }
+
+    #[test]
+    fn humanize_elapsed_ms_days() {
+        assert_eq!(humanize_elapsed_ms(172_800_000), "2d ago");
+    }
+
+    #[test]
+    fn format_github_token_result_classic_with_scopes() {
+        let token = zeroize::Zeroizing::new("ghp_abc123".to_string());
+        let info = fx_auth::github::GitHubTokenInfo {
+            login: "testuser".to_string(),
+            scopes: vec!["repo".to_string(), "workflow".to_string()],
+            missing_scopes: vec![],
+        };
+        let lines = format_github_token_result(&token, &info);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("repo, workflow"));
+    }
+
+    #[test]
+    fn format_github_token_result_fine_grained() {
+        let token = zeroize::Zeroizing::new("github_pat_abc123".to_string());
+        let info = fx_auth::github::GitHubTokenInfo {
+            login: "testuser".to_string(),
+            scopes: vec![],
+            missing_scopes: vec![],
+        };
+        let lines = format_github_token_result(&token, &info);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("fine-grained"));
+    }
+
+    #[test]
+    fn format_github_token_result_missing_scopes() {
+        let token = zeroize::Zeroizing::new("ghp_abc123".to_string());
+        let info = fx_auth::github::GitHubTokenInfo {
+            login: "testuser".to_string(),
+            scopes: vec!["repo".to_string()],
+            missing_scopes: vec!["workflow".to_string()],
+        };
+        let lines = format_github_token_result(&token, &info);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].contains("Missing recommended scopes"));
     }
 }

@@ -110,6 +110,10 @@ pub struct CredentialMetadata {
     pub login: Option<String>,
     /// Scopes/permissions the credential grants (if known).
     pub scopes: Vec<String>,
+    /// Token kind hint (e.g. "classic", "fine_grained", "unknown") stored at
+    /// set-token time so status display can avoid decrypting the secret.
+    #[serde(default)]
+    pub token_kind: Option<String>,
 }
 
 /// Status of a credential provider.
@@ -383,6 +387,7 @@ mod tests {
             last_validated_ms: 1_000_000,
             login: Some("testuser".to_string()),
             scopes: vec!["repo".to_string(), "workflow".to_string()],
+            token_kind: None,
         }
     }
 
