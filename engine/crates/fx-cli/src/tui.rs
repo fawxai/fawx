@@ -322,7 +322,11 @@ fn install_ratatui_panic_hook() {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = crossterm::terminal::disable_raw_mode();
-        let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::terminal::LeaveAlternateScreen,
+            crossterm::cursor::Show
+        );
         original_hook(info);
     }));
 }
@@ -873,6 +877,11 @@ impl TuiApp {
         install_ratatui_panic_hook();
 
         crossterm::terminal::enable_raw_mode().map_err(TuiError::Io)?;
+        crossterm::execute!(
+            std::io::stdout(),
+            crossterm::terminal::EnterAlternateScreen
+        )
+        .map_err(TuiError::Io)?;
         let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
         let mut terminal = ratatui::Terminal::new(backend).map_err(TuiError::Io)?;
         let mut app = ui::FawxApp::new();
@@ -888,7 +897,11 @@ impl TuiApp {
             cancel_for_signal.cancel();
             tokio::signal::ctrl_c().await.ok();
             let _ = crossterm::terminal::disable_raw_mode();
-            let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
+            let _ = crossterm::execute!(
+                std::io::stdout(),
+                crossterm::terminal::LeaveAlternateScreen,
+                crossterm::cursor::Show
+            );
             eprintln!("\n\u{23f9} Force quit.");
             std::process::exit(130);
         });
@@ -930,7 +943,12 @@ impl TuiApp {
         }
 
         crossterm::terminal::disable_raw_mode().map_err(TuiError::Io)?;
-        crossterm::execute!(std::io::stdout(), crossterm::cursor::Show).map_err(TuiError::Io)?;
+        crossterm::execute!(
+            std::io::stdout(),
+            crossterm::terminal::LeaveAlternateScreen,
+            crossterm::cursor::Show
+        )
+        .map_err(TuiError::Io)?;
         Ok(())
     }
 

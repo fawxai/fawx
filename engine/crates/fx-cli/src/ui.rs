@@ -11,6 +11,7 @@ use ratatui::{
     widgets::{Block, Paragraph, Wrap},
     Frame,
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 // ── Styling constants ──────────────────────────────────────────
 
@@ -41,6 +42,12 @@ pub enum AppState {
 /// Core application state for the ratatui TUI.
 pub struct FawxApp {
     pub output_lines: Vec<String>,
+    /// Scroll offset in visual rows from the bottom of the output.
+    ///
+    /// This value is unbounded — it may exceed the actual number of visual
+    /// rows. [`render_output`] clamps it to `max_scroll` at render time so
+    /// that out-of-range offsets are harmless. The final value is also
+    /// clamped to [`u16::MAX`] before being passed to [`Paragraph::scroll`].
     pub scroll_offset: usize,
     pub input_text: String,
     pub state: AppState,
@@ -54,6 +61,8 @@ pub struct FawxApp {
     pub steer_message: Option<String>,
     /// Whether an abort has been requested for the current cycle.
     pub abort_requested: bool,
+    /// Whether the user has manually scrolled up (disables auto-scroll to bottom).
+    pub user_scrolled: bool,
 }
 
 impl FawxApp {
@@ -70,6 +79,7 @@ impl FawxApp {
             pending_inputs: Vec::new(),
             steer_message: None,
             abort_requested: false,
+            user_scrolled: false,
         }
     }
 
@@ -91,20 +101,20 @@ impl FawxApp {
 
     /// Scroll the output region up (toward older content) by one line.
     pub fn scroll_up(&mut self) {
-        let max = self.output_lines.len();
-        if self.scroll_offset < max {
-            self.scroll_offset += 1;
-        }
+        self.scroll_offset = self.scroll_offset.saturating_add(1);
+        self.user_scrolled = true;
     }
 
     /// Scroll the output region down (toward newer content) by one line.
     pub fn scroll_down(&mut self) {
         self.scroll_offset = self.scroll_offset.saturating_sub(1);
+        self.user_scrolled = self.scroll_offset > 0;
     }
 
     /// Jump to the bottom of output (follow latest content).
     pub fn scroll_to_bottom(&mut self) {
         self.scroll_offset = 0;
+        self.user_scrolled = false;
     }
 
     /// Take the current input text, push it to history, clear the
@@ -157,7 +167,9 @@ impl FawxApp {
         self.add_output(String::new());
         self.add_output("fawx › ".to_string());
         self.streaming_prefix_printed = true;
-        self.scroll_to_bottom();
+        if !self.user_scrolled {
+            self.scroll_to_bottom();
+        }
     }
 
     /// Append a streaming delta to the output buffer.
@@ -174,7 +186,9 @@ impl FawxApp {
                 last.push(ch);
             }
         }
-        self.scroll_to_bottom();
+        if !self.user_scrolled {
+            self.scroll_to_bottom();
+        }
     }
 
     /// Finish streaming: reset the streaming flag.
@@ -255,33 +269,129 @@ pub fn draw(frame: &mut Frame, app: &FawxApp) {
     render_input(frame, layout[2], app);
 }
 
+/// Split lines that exceed `width` display columns into multiple lines,
+/// preserving styles. Uses [`unicode_width`] so that wide characters
+/// (CJK, braille, wide emoji) are measured by display columns, not char
+/// count. Each output line fits within the terminal width, giving an
+/// exact row count.
+fn wrap_lines_to_width(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
+    if width == 0 {
+        return lines;
+    }
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        let display_width: usize = line.spans.iter().map(|s| s.content.width()).sum();
+        if display_width <= width {
+            out.push(line);
+        } else if line.spans.len() == 1 {
+            wrap_single_span(&line.spans[0], width, &mut out);
+        } else {
+            wrap_multi_span(&line.spans, width, &mut out);
+        }
+    }
+    out
+}
+
+/// Width-aware wrapping for a single-span line.
+fn wrap_single_span(span: &Span<'_>, width: usize, out: &mut Vec<Line<'static>>) {
+    let style = span.style;
+    let chars: Vec<char> = span.content.chars().collect();
+    let mut current_width = 0;
+    let mut chunk_start = 0;
+    for (i, &ch) in chars.iter().enumerate() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if current_width + w > width && chunk_start < i {
+            let s: String = chars[chunk_start..i].iter().collect();
+            out.push(Line::from(Span::styled(s, style)));
+            current_width = w;
+            chunk_start = i;
+        } else {
+            current_width += w;
+        }
+    }
+    if chunk_start < chars.len() {
+        let s: String = chars[chunk_start..].iter().collect();
+        out.push(Line::from(Span::styled(s, style)));
+    }
+}
+
+/// Width-aware wrapping for a multi-span line.
+fn wrap_multi_span(spans: &[Span<'_>], width: usize, out: &mut Vec<Line<'static>>) {
+    let styled_chars: Vec<(char, Style)> = spans
+        .iter()
+        .flat_map(|s| s.content.chars().map(move |c| (c, s.style)))
+        .collect();
+    let mut current_width = 0;
+    let mut chunk_start = 0;
+    for (i, &(ch, _)) in styled_chars.iter().enumerate() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if current_width + w > width && chunk_start < i {
+            let row_spans = chunk_to_spans(&styled_chars[chunk_start..i]);
+            out.push(Line::from(row_spans));
+            current_width = w;
+            chunk_start = i;
+        } else {
+            current_width += w;
+        }
+    }
+    if chunk_start < styled_chars.len() {
+        let row_spans = chunk_to_spans(&styled_chars[chunk_start..]);
+        out.push(Line::from(row_spans));
+    }
+}
+
+/// Group consecutive chars with the same style into Spans.
+fn chunk_to_spans(chars: &[(char, ratatui::style::Style)]) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    if chars.is_empty() {
+        return spans;
+    }
+    let mut buf = String::new();
+    let mut cur_style = chars[0].1;
+    for &(c, style) in chars {
+        if style == cur_style {
+            buf.push(c);
+        } else {
+            spans.push(Span::styled(std::mem::take(&mut buf), cur_style));
+            cur_style = style;
+            buf.push(c);
+        }
+    }
+    if !buf.is_empty() {
+        spans.push(Span::styled(buf, cur_style));
+    }
+    spans
+}
+
 /// Render the scrollable output region.
 fn render_output(frame: &mut Frame, area: ratatui::layout::Rect, app: &FawxApp) {
-    let lines: Vec<Line<'_>> = app
+    let width = area.width as usize;
+
+    let lines: Vec<Line<'static>> = app
         .output_lines
         .iter()
         .map(|s| {
             if crate::ansi::contains_ansi(s) {
                 crate::ansi::ansi_to_line(s)
             } else {
-                Line::from(s.as_str())
+                Line::from(s.to_string())
             }
         })
         .collect();
 
-    let total = lines.len() as u16;
-    let visible = area.height;
-    let scroll = if app.scroll_offset == 0 {
-        total.saturating_sub(visible)
-    } else {
-        total
-            .saturating_sub(visible)
-            .saturating_sub(app.scroll_offset as u16)
-    };
+    // Pre-wrap lines so visual row count is exact.
+    let lines = wrap_lines_to_width(lines, width);
+    let total_visual_rows = lines.len();
+    let visible_height = area.height as usize;
 
-    let paragraph = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
+    // Scroll: show bottom unless user scrolled up.
+    let max_scroll = total_visual_rows.saturating_sub(visible_height);
+    let clamped_offset = app.scroll_offset.min(max_scroll);
+    let scroll = max_scroll.saturating_sub(clamped_offset);
+
+    let scroll_u16 = u16::try_from(scroll).unwrap_or(u16::MAX);
+    let paragraph = Paragraph::new(lines).scroll((scroll_u16, 0));
+    // NOTE: No .wrap() — lines are already pre-wrapped.
 
     frame.render_widget(paragraph, area);
 }
@@ -396,6 +506,7 @@ mod tests {
         assert_eq!(app.state, AppState::Idle);
         assert!(app.command_history.is_empty());
         assert_eq!(app.history_index, None);
+        assert!(!app.user_scrolled);
     }
 
     #[test]
@@ -497,8 +608,12 @@ mod tests {
     #[test]
     fn test_scroll_bounds() {
         let mut app = FawxApp::new();
-        // No output — scroll_up shouldn't go negative
+        // No output — scroll_up still increments (render clamps)
         app.scroll_up();
+        assert_eq!(app.scroll_offset, 1);
+
+        // scroll_to_bottom resets
+        app.scroll_to_bottom();
         assert_eq!(app.scroll_offset, 0);
 
         // scroll_down at 0 stays at 0
@@ -516,10 +631,10 @@ mod tests {
         app.scroll_up();
         assert_eq!(app.scroll_offset, 2);
 
-        // Can't exceed total lines
+        // No artificial cap — render_output clamps at render time
         app.scroll_offset = 100;
         app.scroll_up();
-        assert_eq!(app.scroll_offset, 100);
+        assert_eq!(app.scroll_offset, 101);
 
         // scroll_to_bottom resets
         app.scroll_to_bottom();
@@ -621,5 +736,192 @@ mod tests {
         assert!(app.pending_inputs.is_empty());
         assert!(app.steer_message.is_none());
         assert!(!app.abort_requested);
+    }
+
+    // ── wrap_lines_to_width tests ──────────────────────────────
+
+    #[test]
+    fn test_wrap_short_lines_noop() {
+        let lines = vec![Line::from("hello"), Line::from("world")];
+        let result = wrap_lines_to_width(lines, 10);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].spans[0].content.as_ref(), "hello");
+        assert_eq!(result[1].spans[0].content.as_ref(), "world");
+    }
+
+    #[test]
+    fn test_wrap_single_span_exceeding_width() {
+        let lines = vec![Line::from("abcdefghij")]; // 10 chars
+        let result = wrap_lines_to_width(lines, 4);
+        assert_eq!(result.len(), 3); // "abcd", "efgh", "ij"
+        assert_eq!(result[0].spans[0].content.as_ref(), "abcd");
+        assert_eq!(result[1].spans[0].content.as_ref(), "efgh");
+        assert_eq!(result[2].spans[0].content.as_ref(), "ij");
+    }
+
+    #[test]
+    fn test_wrap_multi_span_exceeding_width() {
+        let red = Style::default().fg(Color::Red);
+        let blue = Style::default().fg(Color::Blue);
+        // "aaa" (red) + "bbb" (blue) = 6 chars, width 4
+        let lines = vec![Line::from(vec![
+            Span::styled("aaa", red),
+            Span::styled("bbb", blue),
+        ])];
+        let result = wrap_lines_to_width(lines, 4);
+        // First line: "aaa" red + "b" blue = 4 chars
+        // Second line: "bb" blue = 2 chars
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].spans.len(), 2);
+        assert_eq!(result[0].spans[0].content.as_ref(), "aaa");
+        assert_eq!(result[0].spans[0].style, red);
+        assert_eq!(result[0].spans[1].content.as_ref(), "b");
+        assert_eq!(result[0].spans[1].style, blue);
+        assert_eq!(result[1].spans[0].content.as_ref(), "bb");
+        assert_eq!(result[1].spans[0].style, blue);
+    }
+
+    #[test]
+    fn test_wrap_width_zero_noop() {
+        let lines = vec![Line::from("anything")];
+        let result = wrap_lines_to_width(lines, 0);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].spans[0].content.as_ref(), "anything");
+    }
+
+    #[test]
+    fn test_wrap_exact_width_no_wrap() {
+        // A line with exactly `width` display columns should NOT be wrapped.
+        let lines = vec![Line::from("abcd")]; // 4 chars, 4 display columns
+        let result = wrap_lines_to_width(lines, 4);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].spans[0].content.as_ref(), "abcd");
+    }
+
+    #[test]
+    fn test_wrap_empty_line_passthrough() {
+        let lines = vec![Line::from(""), Line::from("hello")];
+        let result = wrap_lines_to_width(lines, 10);
+        assert_eq!(result.len(), 2);
+        // Empty Line::from("") has zero spans — verify it passes through intact.
+        assert!(result[0].spans.is_empty());
+        assert_eq!(result[1].spans[0].content.as_ref(), "hello");
+    }
+
+    #[test]
+    fn test_wrap_wide_chars_cjk() {
+        // Each CJK char takes 2 display columns. "你好世界" = 4 chars, 8 columns.
+        // Width 5 → first line "你好" (4 cols), second line "世界" (4 cols).
+        // "你" (2) + "好" (2) = 4 ≤ 5; adding "世" (2) = 6 > 5 → break.
+        let lines = vec![Line::from("你好世界")];
+        let result = wrap_lines_to_width(lines, 5);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].spans[0].content.as_ref(), "你好");
+        assert_eq!(result[1].spans[0].content.as_ref(), "世界");
+    }
+
+    #[test]
+    fn test_wrap_wide_chars_multi_span() {
+        let red = Style::default().fg(Color::Red);
+        let blue = Style::default().fg(Color::Blue);
+        // "你好" (red, 4 cols) + "世界" (blue, 4 cols) = 8 cols, width 5
+        let lines = vec![Line::from(vec![
+            Span::styled("你好", red),
+            Span::styled("世界", blue),
+        ])];
+        let result = wrap_lines_to_width(lines, 5);
+        assert_eq!(result.len(), 2);
+        // First line: "你好" (red) fits in 4 cols; "世" (blue, 2 cols)
+        // would exceed 6 > 5, so break after "你好".
+        assert_eq!(result[0].spans[0].content.as_ref(), "你好");
+        assert_eq!(result[0].spans[0].style, red);
+        assert_eq!(result[1].spans[0].content.as_ref(), "世界");
+        assert_eq!(result[1].spans[0].style, blue);
+    }
+
+    #[test]
+    fn test_wrap_preserves_styles_across_boundary() {
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        // 8 bold chars, width 3 → "abc", "def", "gh"
+        let lines = vec![Line::from(Span::styled("abcdefgh", bold))];
+        let result = wrap_lines_to_width(lines, 3);
+        assert_eq!(result.len(), 3);
+        for row in &result {
+            assert_eq!(row.spans[0].style, bold);
+        }
+        assert_eq!(result[0].spans[0].content.as_ref(), "abc");
+        assert_eq!(result[1].spans[0].content.as_ref(), "def");
+        assert_eq!(result[2].spans[0].content.as_ref(), "gh");
+    }
+
+    // ── user_scrolled tests ────────────────────────────────────
+
+    #[test]
+    fn test_user_scrolled_set_on_scroll_up_cleared_on_bottom() {
+        let mut app = FawxApp::new();
+        assert!(!app.user_scrolled);
+        app.scroll_up();
+        assert!(app.user_scrolled);
+        app.scroll_to_bottom();
+        assert!(!app.user_scrolled);
+    }
+
+    #[test]
+    fn test_user_scrolled_cleared_when_scroll_down_reaches_zero() {
+        let mut app = FawxApp::new();
+        app.scroll_offset = 2;
+        app.user_scrolled = true;
+        app.scroll_down(); // offset → 1
+        assert!(app.user_scrolled);
+        app.scroll_down(); // offset → 0
+        assert!(!app.user_scrolled);
+    }
+
+    #[test]
+    fn test_scroll_up_no_artificial_cap() {
+        let mut app = FawxApp::new();
+        // With zero output lines, scroll_up should still increment
+        // (render_output clamps at render time).
+        app.scroll_up();
+        assert_eq!(app.scroll_offset, 1);
+        app.scroll_up();
+        assert_eq!(app.scroll_offset, 2);
+        // Even with 5 output lines, can scroll past logical count
+        for i in 0..5 {
+            app.add_output(format!("line {i}"));
+        }
+        app.scroll_offset = 10;
+        app.scroll_up();
+        assert_eq!(app.scroll_offset, 11);
+    }
+
+    #[test]
+    fn test_start_streaming_no_scroll_when_user_scrolled() {
+        let mut app = FawxApp::new();
+        for i in 0..50 {
+            app.add_output(format!("line {i}"));
+        }
+        app.scroll_offset = 10;
+        app.user_scrolled = true;
+        app.start_streaming();
+        // scroll_offset should remain unchanged
+        assert_eq!(app.scroll_offset, 10);
+        assert!(app.user_scrolled);
+    }
+
+    #[test]
+    fn test_append_streaming_delta_no_scroll_when_user_scrolled() {
+        let mut app = FawxApp::new();
+        for i in 0..50 {
+            app.add_output(format!("line {i}"));
+        }
+        app.scroll_offset = 5;
+        app.user_scrolled = true;
+        app.streaming_prefix_printed = true;
+        app.output_lines.push(String::new()); // current streaming line
+        app.append_streaming_delta("hello");
+        // scroll_offset should remain unchanged
+        assert_eq!(app.scroll_offset, 5);
+        assert!(app.user_scrolled);
     }
 }
