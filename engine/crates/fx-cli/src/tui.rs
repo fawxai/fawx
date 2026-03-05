@@ -489,11 +489,14 @@ fn route_execution_input(
                 app.add_output(format!("⛔ {text}"));
             }
             LoopCommand::Steer(ref steer_text) => {
-                app.set_steer(steer_text.clone());
                 if let Some(sender) = input_sender {
                     let _ = sender.send(LoopCommand::Steer(steer_text.clone()));
+                    app.add_output(format!("↪ Steer sent: {steer_text}"));
+                } else {
+                    // No channel available — store for forwarding at next cycle start
+                    app.set_steer(steer_text.clone());
+                    app.add_output(format!("↪ Steer queued: {steer_text}"));
                 }
-                app.add_output(format!("↪ Steer: {steer_text}"));
             }
             LoopCommand::StatusQuery => {
                 if let Some(sender) = input_sender {
@@ -7256,5 +7259,32 @@ mod tests {
         route_execution_input("/stop", &mut app, &cancel, &sender_opt);
         let cmd = receiver.try_recv();
         assert_eq!(cmd, Some(LoopCommand::Abort));
+    }
+
+    #[test]
+    fn steer_with_channel_does_not_store_in_app() {
+        let (sender, mut receiver) = fx_kernel::input::loop_input_channel();
+        let mut app = ui::FawxApp::new();
+        let cancel = CancellationToken::new();
+        let sender_opt = Some(sender);
+
+        route_execution_input("/steer try harder", &mut app, &cancel, &sender_opt);
+
+        // Message sent via channel
+        let cmd = receiver.try_recv();
+        assert_eq!(cmd, Some(LoopCommand::Steer("try harder".to_string())));
+        // Must NOT be stored in app (prevents duplicate injection via take_steer)
+        assert!(app.steer_message.is_none());
+    }
+
+    #[test]
+    fn steer_without_channel_falls_back_to_app_storage() {
+        let mut app = ui::FawxApp::new();
+        let cancel = CancellationToken::new();
+
+        route_execution_input("/steer fallback msg", &mut app, &cancel, &None);
+
+        // No channel — stored in app for forwarding at next cycle start
+        assert_eq!(app.steer_message.as_deref(), Some("fallback msg"));
     }
 }
