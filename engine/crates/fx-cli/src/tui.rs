@@ -760,8 +760,8 @@ pub struct TuiApp {
     /// Event bus for streaming events from the kernel.
     event_bus: EventBus,
     scratchpad: Arc<Mutex<Scratchpad>>,
-    /// Single encrypted credential store instance (opened once at startup).
-    credential_store: Option<fx_auth::credential_store::EncryptedFileCredentialStore>,
+    /// Single encrypted credential store instance (opened once at startup, shared via Arc).
+    credential_store: Option<Arc<fx_auth::credential_store::EncryptedFileCredentialStore>>,
     /// Buffer for command output that will be flushed to FawxApp.
     output_buffer: Vec<String>,
 }
@@ -776,6 +776,7 @@ pub struct TuiAppDeps {
     pub memory: Option<SharedMemoryStore>,
     pub event_bus: EventBus,
     pub scratchpad: Arc<Mutex<Scratchpad>>,
+    pub credential_store: Option<Arc<fx_auth::credential_store::EncryptedFileCredentialStore>>,
 }
 
 /// Bundles mutable references needed by [`TuiApp::run_cycle_rendering`],
@@ -812,6 +813,7 @@ impl TuiApp {
             memory: None,
             event_bus,
             scratchpad,
+            credential_store: None,
         })
     }
 
@@ -826,6 +828,7 @@ impl TuiApp {
             memory,
             event_bus,
             scratchpad,
+            credential_store,
         } = deps;
         let base_data_dir = fawx_data_dir();
         let data_dir = configured_data_dir(&base_data_dir, &config);
@@ -842,15 +845,6 @@ impl TuiApp {
         }
         let max_history = config.general.max_history;
         let conversation_history = load_startup_conversation_history(&conversation_store, &config);
-        let credential_store =
-            match fx_auth::credential_store::EncryptedFileCredentialStore::open(&data_dir) {
-                Ok(store) => Some(store),
-                Err(e) => {
-                    tracing::warn!("credential store unavailable: {e}");
-                    None
-                }
-            };
-
         let mut app = Self {
             router,
             auth_manager,
@@ -886,7 +880,7 @@ impl TuiApp {
     /// Return a reference to the credential store, or an error if unavailable.
     fn get_credential_store(
         &self,
-    ) -> Result<&fx_auth::credential_store::EncryptedFileCredentialStore, TuiError> {
+    ) -> Result<&Arc<fx_auth::credential_store::EncryptedFileCredentialStore>, TuiError> {
         self.credential_store
             .as_ref()
             .ok_or_else(|| TuiError::Auth("credential store not available".into()))
@@ -2265,9 +2259,12 @@ impl TuiApp {
         let Some(store) = self.credential_store.as_ref() else {
             return false;
         };
-        CredentialStoreTrait::status(store, fx_auth::credential_store::AuthProvider::GitHub)
-            .map(|s| s.configured)
-            .unwrap_or(false)
+        CredentialStoreTrait::status(
+            store.as_ref(),
+            fx_auth::credential_store::AuthProvider::GitHub,
+        )
+        .map(|s| s.configured)
+        .unwrap_or(false)
     }
 
     /// Return a human label for a provider's auth status.
@@ -2670,6 +2667,7 @@ pub struct LoopEngineBundle {
     pub runtime_info: Arc<RwLock<RuntimeInfo>>,
     pub event_bus: EventBus,
     pub scratchpad: Arc<Mutex<Scratchpad>>,
+    pub credential_store: Option<Arc<fx_auth::credential_store::EncryptedFileCredentialStore>>,
 }
 
 /// Build a loop engine from an already-loaded config.
@@ -2722,6 +2720,7 @@ fn build_loop_engine_with_config(
         runtime_info: skills.runtime_info,
         event_bus,
         scratchpad: skills.scratchpad,
+        credential_store: skills.credential_store,
     })
 }
 
@@ -2769,7 +2768,7 @@ impl ScratchpadProvider for ScratchpadBridge {
 /// Maps well-known key names to credential store lookups:
 /// - `"github_token"` → GitHub PAT from the encrypted store
 struct CredentialStoreBridge {
-    store: fx_auth::credential_store::EncryptedFileCredentialStore,
+    store: Arc<fx_auth::credential_store::EncryptedFileCredentialStore>,
 }
 
 impl CredentialProvider for CredentialStoreBridge {
@@ -2795,6 +2794,7 @@ struct SkillRegistryBundle {
     runtime_info: Arc<RwLock<RuntimeInfo>>,
     scratchpad: Arc<Mutex<Scratchpad>>,
     iteration_counter: Arc<std::sync::atomic::AtomicU32>,
+    credential_store: Option<Arc<fx_auth::credential_store::EncryptedFileCredentialStore>>,
 }
 
 fn build_skill_registry(
@@ -2832,15 +2832,22 @@ fn build_skill_registry(
         ScratchpadSkill::new(Arc::clone(&scratchpad), Arc::clone(&iteration_counter));
     registry.register(Box::new(scratchpad_skill));
 
-    // Build credential provider bridge for WASM skills
-    let credential_provider: Option<Arc<dyn CredentialProvider>> =
+    // Open the credential store once and share via Arc between TuiApp and WASM bridge.
+    let credential_store: Option<Arc<fx_auth::credential_store::EncryptedFileCredentialStore>> =
         match fx_auth::credential_store::EncryptedFileCredentialStore::open(data_dir) {
-            Ok(store) => Some(Arc::new(CredentialStoreBridge { store })),
+            Ok(store) => Some(Arc::new(store)),
             Err(e) => {
-                tracing::warn!("credential store unavailable for WASM skills: {e}");
+                tracing::warn!("credential store unavailable: {e}");
                 None
             }
         };
+
+    let credential_provider: Option<Arc<dyn CredentialProvider>> =
+        credential_store.as_ref().map(|store| {
+            Arc::new(CredentialStoreBridge {
+                store: Arc::clone(store),
+            }) as Arc<dyn CredentialProvider>
+        });
 
     // Load WASM skills from ~/.fawx/skills/
     match fx_loadable::wasm_skill::load_wasm_skills(credential_provider) {
@@ -2863,6 +2870,7 @@ fn build_skill_registry(
         runtime_info,
         scratchpad,
         iteration_counter,
+        credential_store,
     }
 }
 

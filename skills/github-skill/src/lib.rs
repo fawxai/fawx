@@ -104,15 +104,15 @@ struct HttpReq<'a> {
 #[derive(Deserialize)]
 #[serde(tag = "action")]
 enum Input {
-    #[serde(rename = "create_pr")]
+    #[serde(rename = "create_pr", alias = "create_pull_request")]
     CreatePr(CreatePrInput),
-    #[serde(rename = "comment_pr")]
+    #[serde(rename = "comment_pr", alias = "comment_pull_request")]
     CommentPr(CommentPrInput),
-    #[serde(rename = "list_prs")]
+    #[serde(rename = "list_prs", alias = "list_pull_requests", alias = "list_pr")]
     ListPrs(ListPrsInput),
-    #[serde(rename = "view_pr")]
+    #[serde(rename = "view_pr", alias = "view_pull_request", alias = "get_pr")]
     ViewPr(ViewPrInput),
-    #[serde(rename = "list_issues")]
+    #[serde(rename = "list_issues", alias = "list_issue")]
     ListIssues(ListIssuesInput),
 }
 

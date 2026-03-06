@@ -174,6 +174,7 @@ async fn run_tui() -> anyhow::Result<i32> {
         memory: bundle.memory,
         event_bus: bundle.event_bus,
         scratchpad: bundle.scratchpad,
+        credential_store: bundle.credential_store,
     })?;
     app.run().await?;
     Ok(0)
