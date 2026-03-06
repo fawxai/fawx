@@ -39,6 +39,7 @@ pub use loader::{SkillLoader, SkillManifest};
 pub use registry::SkillRegistry;
 pub use skill::{Skill, SkillError};
 pub use transaction_skill::TransactionSkill;
+pub use wasm_skill::SignaturePolicy;
 pub use watcher::{ReloadEvent, SkillWatcher};
 
 /// A strategy identifier for A/B slot management.

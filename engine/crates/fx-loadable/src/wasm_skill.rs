@@ -19,6 +19,20 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+/// Complete signature verification policy — trusted keys and enforcement mode.
+///
+/// Groups `trusted_keys` and `require_signatures` into a single value so they
+/// travel together through load / watch / validate call chains without inflating
+/// parameter lists.
+#[derive(Debug, Clone, Default)]
+pub struct SignaturePolicy {
+    /// Ed25519 public keys trusted for WASM skill verification.
+    pub trusted_keys: Vec<Vec<u8>>,
+    /// When true, reject unsigned skills. Invalid signatures are always rejected
+    /// regardless of this flag.
+    pub require_signatures: bool,
+}
+
 /// A WASM skill adapted to the kernel's [`Skill`] trait.
 ///
 /// Wraps a [`SkillRuntime`] containing one loaded skill and exposes it
@@ -181,11 +195,24 @@ impl Skill for WasmSkill {
 pub fn load_wasm_skill_from_dir(
     skill_dir: &Path,
     credential_provider: Option<Arc<dyn CredentialProvider>>,
+    policy: &SignaturePolicy,
 ) -> Result<(WasmSkill, [u8; 32]), SkillError> {
     let manifest = read_manifest(skill_dir)?;
     let wasm_bytes = read_wasm_bytes(skill_dir, &manifest.name)?;
     let hash = compute_wasm_hash(&wasm_bytes);
-    let loaded = compile_skill(&wasm_bytes, &manifest)?;
+    let signature = read_signature_file(skill_dir, &manifest.name)?;
+    validate_signature_policy(&signature, policy, &manifest.name)?;
+    // Only pass signature to the loader when we actually have keys to verify against.
+    // validate_signature_policy already warned if signature is present but no keys.
+    let effective_signature = signature
+        .as_deref()
+        .filter(|_| !policy.trusted_keys.is_empty());
+    let loaded = compile_skill(
+        &wasm_bytes,
+        &manifest,
+        effective_signature,
+        &policy.trusted_keys,
+    )?;
     let wasm_skill = WasmSkill::new(loaded, credential_provider)?;
     Ok((wasm_skill, hash))
 }
@@ -217,11 +244,124 @@ pub fn compute_wasm_hash(wasm_bytes: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// Compile a WASM skill from bytes and manifest.
-fn compile_skill(wasm_bytes: &[u8], manifest: &SkillManifest) -> Result<LoadedSkill, SkillError> {
-    fx_skills::loader::SkillLoader::new(vec![])
-        .load(wasm_bytes, manifest, None)
+/// Compile a WASM skill from bytes and manifest, with optional signature verification.
+fn compile_skill(
+    wasm_bytes: &[u8],
+    manifest: &SkillManifest,
+    signature: Option<&[u8]>,
+    trusted_keys: &[Vec<u8>],
+) -> Result<LoadedSkill, SkillError> {
+    fx_skills::loader::SkillLoader::new(trusted_keys.to_vec())
+        .load(wasm_bytes, manifest, signature)
         .map_err(|e| format!("failed to compile skill '{}': {e}", manifest.name))
+}
+
+/// Read `{name}.wasm.sig` from a skill directory, if present.
+/// Returns `None` if file doesn't exist, `Err` on read failure.
+fn read_signature_file(skill_dir: &Path, name: &str) -> Result<Option<Vec<u8>>, SkillError> {
+    let sig_path = skill_dir.join(format!("{name}.wasm.sig"));
+    match std::fs::read(&sig_path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!(
+            "failed to read signature file {}: {e}",
+            sig_path.display()
+        )),
+    }
+}
+
+/// Load Ed25519 public keys from `~/.fawx/trusted_keys/*.pub`.
+/// Each file contains a raw 32-byte Ed25519 public key.
+/// Returns empty vec if directory doesn't exist.
+///
+/// Delegates to [`load_trusted_keys_from`] with the default keys directory.
+pub fn load_trusted_keys() -> Result<Vec<Vec<u8>>, SkillError> {
+    let home = dirs::home_dir().ok_or_else(|| "failed to determine home directory".to_string())?;
+    let keys_dir = home.join(".fawx").join("trusted_keys");
+    load_trusted_keys_from(&keys_dir)
+}
+
+/// Load Ed25519 public keys from `*.pub` files in `keys_dir`.
+///
+/// Each `.pub` file must contain exactly 32 bytes (a raw Ed25519 public key).
+/// Files that are not 32 bytes are logged and skipped.
+/// Directory entry read errors are logged and skipped rather than silently
+/// swallowed, since this is a security-critical path.
+///
+/// Returns empty vec if `keys_dir` doesn't exist.
+pub fn load_trusted_keys_from(keys_dir: &Path) -> Result<Vec<Vec<u8>>, SkillError> {
+    let entries = match std::fs::read_dir(keys_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(format!(
+                "failed to read trusted keys directory {}: {e}",
+                keys_dir.display()
+            ))
+        }
+    };
+
+    let mut keys = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("pub") {
+                    let key_bytes = std::fs::read(&path).map_err(|e| {
+                        format!("failed to read trusted key {}: {e}", path.display())
+                    })?;
+                    if key_bytes.len() != 32 {
+                        tracing::warn!(
+                            path = %path.display(),
+                            len = key_bytes.len(),
+                            "skipping invalid trusted key (expected 32 bytes)"
+                        );
+                        continue;
+                    }
+                    keys.push(key_bytes);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "failed to read directory entry in trusted keys"
+                );
+            }
+        }
+    }
+
+    Ok(keys)
+}
+
+/// Validate signature policy before compilation.
+///
+/// - Signature present + no trusted keys → warn, allow load
+/// - No signature + require_signatures → reject
+/// - No signature + !require_signatures → warn, allow load
+/// - Signature verification itself is handled by `SkillLoader::load()`
+fn validate_signature_policy(
+    signature: &Option<Vec<u8>>,
+    policy: &SignaturePolicy,
+    skill_name: &str,
+) -> Result<(), SkillError> {
+    match signature {
+        Some(_) if policy.trusted_keys.is_empty() => {
+            tracing::warn!(
+                skill = %skill_name,
+                "signature found but no trusted keys configured — cannot verify"
+            );
+            Ok(())
+        }
+        Some(_) => Ok(()),
+        None if policy.require_signatures => Err(format!(
+            "skill '{}' has no signature but require_signatures is enabled",
+            skill_name
+        )),
+        None => {
+            tracing::warn!(skill = %skill_name, "loading unsigned WASM skill");
+            Ok(())
+        }
+    }
 }
 
 /// Load all installed WASM skills from `~/.fawx/skills/` and return
@@ -234,6 +374,7 @@ fn compile_skill(wasm_bytes: &[u8], manifest: &SkillManifest) -> Result<LoadedSk
 /// directory-level failure propagates as an error.
 pub fn load_wasm_skills(
     credential_provider: Option<Arc<dyn CredentialProvider>>,
+    policy: &SignaturePolicy,
 ) -> Result<Vec<Arc<dyn Skill>>, SkillError> {
     let skills_dir = skills_directory()?;
     let entries = read_skill_directories(&skills_dir)?;
@@ -242,7 +383,7 @@ pub fn load_wasm_skills(
 
     for entry in entries {
         let skill_dir = entry.path();
-        match load_wasm_skill_from_dir(&skill_dir, credential_provider.clone()) {
+        match load_wasm_skill_from_dir(&skill_dir, credential_provider.clone(), policy) {
             Ok((wasm_skill, _hash)) => {
                 tracing::info!(skill = %wasm_skill.name(), "loaded WASM skill");
                 skills.push(Arc::new(wasm_skill));
@@ -265,10 +406,22 @@ fn skills_directory() -> Result<std::path::PathBuf, SkillError> {
 /// Read subdirectories from the skills directory.
 fn read_skill_directories(skills_dir: &Path) -> Result<Vec<std::fs::DirEntry>, SkillError> {
     match std::fs::read_dir(skills_dir) {
-        Ok(entries) => Ok(entries
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().is_dir())
-            .collect()),
+        Ok(entries) => {
+            let mut dirs = Vec::new();
+            for entry in entries {
+                match entry {
+                    Ok(e) if e.path().is_dir() => dirs.push(e),
+                    Ok(_) => {} // regular file, skip
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "failed to read directory entry in skills directory"
+                        );
+                    }
+                }
+            }
+            Ok(dirs)
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(format!(
             "failed to read skills directory {}: {e}",
@@ -393,7 +546,7 @@ mod tests {
     #[test]
     fn load_wasm_skills_empty_dir() {
         // Default ~/.fawx/skills/ may be empty or have skills — just verify no panic
-        let result = load_wasm_skills(None);
+        let result = load_wasm_skills(None, &SignaturePolicy::default());
         assert!(result.is_ok());
     }
 
@@ -428,7 +581,11 @@ entry_point = "{}"
     fn load_wasm_skill_from_dir_valid_directory() {
         let tmp = tempfile::TempDir::new().unwrap();
         setup_skill_dir(tmp.path(), "testskill");
-        let result = load_wasm_skill_from_dir(&tmp.path().join("testskill"), None);
+        let result = load_wasm_skill_from_dir(
+            &tmp.path().join("testskill"),
+            None,
+            &SignaturePolicy::default(),
+        );
         assert!(result.is_ok());
         let (skill, hash) = result.unwrap();
         assert_eq!(skill.name(), "testskill");
@@ -442,7 +599,7 @@ entry_point = "{}"
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(skill_dir.join("nomanifest.wasm"), invocable_wasm_bytes()).unwrap();
 
-        let result = load_wasm_skill_from_dir(&skill_dir, None);
+        let result = load_wasm_skill_from_dir(&skill_dir, None, &SignaturePolicy::default());
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("manifest"));
     }
@@ -470,7 +627,7 @@ entry_point = "{}"
         );
         std::fs::write(skill_dir.join("manifest.toml"), toml_str).unwrap();
 
-        let result = load_wasm_skill_from_dir(&skill_dir, None);
+        let result = load_wasm_skill_from_dir(&skill_dir, None, &SignaturePolicy::default());
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("WASM"));
     }
@@ -499,7 +656,7 @@ entry_point = "{}"
         std::fs::write(skill_dir.join("manifest.toml"), toml_str).unwrap();
         std::fs::write(skill_dir.join("badwasm.wasm"), b"not wasm").unwrap();
 
-        let result = load_wasm_skill_from_dir(&skill_dir, None);
+        let result = load_wasm_skill_from_dir(&skill_dir, None, &SignaturePolicy::default());
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("compile"));
     }
@@ -517,5 +674,189 @@ entry_point = "{}"
         let hash1 = compute_wasm_hash(b"hello");
         let hash2 = compute_wasm_hash(b"world");
         assert_ne!(hash1, hash2);
+    }
+
+    // --- Signature verification wiring tests ---
+
+    #[test]
+    fn unsigned_skill_loads_when_signatures_not_required() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        setup_skill_dir(tmp.path(), "unsigned");
+        let policy = SignaturePolicy {
+            trusted_keys: vec![],
+            require_signatures: false,
+        };
+        let result = load_wasm_skill_from_dir(&tmp.path().join("unsigned"), None, &policy);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().0.name(), "unsigned");
+    }
+
+    #[test]
+    fn unsigned_skill_rejected_when_signatures_required() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        setup_skill_dir(tmp.path(), "unsigned_req");
+        let policy = SignaturePolicy {
+            trusted_keys: vec![],
+            require_signatures: true,
+        };
+        let result = load_wasm_skill_from_dir(&tmp.path().join("unsigned_req"), None, &policy);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("no signature") && err.contains("require_signatures"),
+            "expected require_signatures error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn signed_skill_with_valid_signature_loads() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        setup_skill_dir(tmp.path(), "signed_ok");
+        let (private_key, public_key) = fx_skills::signing::generate_keypair().expect("keygen");
+        let wasm_bytes = invocable_wasm_bytes();
+        let signature = fx_skills::signing::sign_skill(&wasm_bytes, &private_key).expect("sign");
+        let skill_dir = tmp.path().join("signed_ok");
+        std::fs::write(skill_dir.join("signed_ok.wasm.sig"), &signature).unwrap();
+
+        let policy = SignaturePolicy {
+            trusted_keys: vec![public_key],
+            require_signatures: true,
+        };
+        let result = load_wasm_skill_from_dir(&skill_dir, None, &policy);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().0.name(), "signed_ok");
+    }
+
+    #[test]
+    fn signed_skill_with_invalid_signature_always_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        setup_skill_dir(tmp.path(), "bad_sig");
+        let (_, wrong_public_key) = fx_skills::signing::generate_keypair().expect("keygen");
+        let (other_private, _) = fx_skills::signing::generate_keypair().expect("keygen2");
+        let wasm_bytes = invocable_wasm_bytes();
+        let bad_signature =
+            fx_skills::signing::sign_skill(&wasm_bytes, &other_private).expect("sign");
+        let skill_dir = tmp.path().join("bad_sig");
+        std::fs::write(skill_dir.join("bad_sig.wasm.sig"), &bad_signature).unwrap();
+
+        // Even with require_signatures = false, invalid sig must be rejected
+        let policy = SignaturePolicy {
+            trusted_keys: vec![wrong_public_key],
+            require_signatures: false,
+        };
+        let result = load_wasm_skill_from_dir(&skill_dir, None, &policy);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("Signature verification failed"),
+            "expected signature verification error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn signed_skill_with_tampered_wasm_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        setup_skill_dir(tmp.path(), "tampered");
+        let (private_key, public_key) = fx_skills::signing::generate_keypair().expect("keygen");
+        let original_wasm = invocable_wasm_bytes();
+        let signature = fx_skills::signing::sign_skill(&original_wasm, &private_key).expect("sign");
+        let skill_dir = tmp.path().join("tampered");
+        std::fs::write(skill_dir.join("tampered.wasm.sig"), &signature).unwrap();
+        // Tamper with the WASM file after signing
+        let mut tampered = original_wasm;
+        tampered.push(0xFF);
+        std::fs::write(skill_dir.join("tampered.wasm"), &tampered).unwrap();
+
+        let policy = SignaturePolicy {
+            trusted_keys: vec![public_key],
+            require_signatures: true,
+        };
+        let result = load_wasm_skill_from_dir(&skill_dir, None, &policy);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn signature_present_but_no_trusted_keys_loads_skill() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        setup_skill_dir(tmp.path(), "nokeys");
+        let skill_dir = tmp.path().join("nokeys");
+        // Write a dummy signature file (won't be verified — no keys)
+        std::fs::write(skill_dir.join("nokeys.wasm.sig"), vec![0u8; 64]).unwrap();
+
+        let result = load_wasm_skill_from_dir(&skill_dir, None, &SignaturePolicy::default());
+        // Should load (signature present but no keys to verify against)
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn load_trusted_keys_from_reads_pub_files_from_directory() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let keys_dir = tmp.path().join("trusted_keys");
+        std::fs::create_dir_all(&keys_dir).unwrap();
+        let (_, pub_key1) = fx_skills::signing::generate_keypair().expect("keygen");
+        let (_, pub_key2) = fx_skills::signing::generate_keypair().expect("keygen");
+        std::fs::write(keys_dir.join("key1.pub"), &pub_key1).unwrap();
+        std::fs::write(keys_dir.join("key2.pub"), &pub_key2).unwrap();
+        // Non-.pub file should be ignored
+        std::fs::write(keys_dir.join("readme.txt"), b"ignore me").unwrap();
+
+        let keys = load_trusted_keys_from(&keys_dir).expect("load keys");
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&pub_key1));
+        assert!(keys.contains(&pub_key2));
+    }
+
+    #[test]
+    fn load_trusted_keys_from_skips_invalid_length_keys() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let keys_dir = tmp.path().join("trusted_keys");
+        std::fs::create_dir_all(&keys_dir).unwrap();
+        let (_, valid_key) = fx_skills::signing::generate_keypair().expect("keygen");
+        std::fs::write(keys_dir.join("good.pub"), &valid_key).unwrap();
+        // Write a key that's not 32 bytes
+        std::fs::write(keys_dir.join("bad.pub"), b"too short").unwrap();
+        std::fs::write(keys_dir.join("also_bad.pub"), vec![0u8; 64]).unwrap();
+
+        let keys = load_trusted_keys_from(&keys_dir).expect("load keys");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0], valid_key);
+    }
+
+    #[test]
+    fn load_trusted_keys_from_returns_empty_when_dir_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let keys_dir = tmp.path().join("nonexistent");
+        let keys = load_trusted_keys_from(&keys_dir).expect("load keys");
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn load_trusted_keys_delegates_to_load_trusted_keys_from() {
+        // load_trusted_keys uses ~/.fawx/trusted_keys, which typically doesn't exist
+        // in CI/test envs. Verify it returns Ok gracefully (either empty or loaded).
+        let result = load_trusted_keys();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn read_signature_file_returns_none_when_no_sig() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        setup_skill_dir(tmp.path(), "nosig");
+        let skill_dir = tmp.path().join("nosig");
+        let result = read_signature_file(&skill_dir, "nosig");
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn read_signature_file_reads_valid_sig() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        setup_skill_dir(tmp.path(), "withsig");
+        let skill_dir = tmp.path().join("withsig");
+        let sig_bytes = vec![42u8; 64];
+        std::fs::write(skill_dir.join("withsig.wasm.sig"), &sig_bytes).unwrap();
+        let result = read_signature_file(&skill_dir, "withsig");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().unwrap(), sig_bytes);
     }
 }

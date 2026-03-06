@@ -38,7 +38,7 @@ use fx_llm::{
     AnthropicProvider, CompletionRequest, Message, ModelCatalog, ModelInfo, ModelRouter,
     OpenAiProvider, OpenAiResponsesProvider, ProviderError, RouterError, StreamChunk,
 };
-use fx_loadable::{ReloadEvent, SkillRegistry, SkillWatcher, TransactionSkill};
+use fx_loadable::{ReloadEvent, SignaturePolicy, SkillRegistry, SkillWatcher, TransactionSkill};
 use fx_memory::{JsonFileMemory, JsonMemoryConfig, SignalStore};
 use fx_scratchpad::skill::ScratchpadSkill;
 use fx_scratchpad::Scratchpad;
@@ -1021,6 +1021,9 @@ pub struct TuiApp {
     credential_store: Option<Arc<fx_auth::credential_store::EncryptedFileCredentialStore>>,
     /// Buffer for command output that will be flushed to FawxApp.
     output_buffer: Vec<String>,
+    /// Signature verification policy, loaded once at startup and shared with the
+    /// hot-reload watcher to avoid redundant `load_trusted_keys()` calls.
+    signature_policy: SignaturePolicy,
 }
 
 /// Dependencies for constructing a [`TuiApp`]. Avoids > 5 bare parameters.
@@ -1037,6 +1040,7 @@ pub struct TuiAppDeps {
     pub credential_provider: Option<Arc<dyn CredentialProvider>>,
     pub tool_executor: Arc<dyn ToolExecutor>,
     pub credential_store: Option<Arc<fx_auth::credential_store::EncryptedFileCredentialStore>>,
+    pub signature_policy: SignaturePolicy,
 }
 
 /// Bundles mutable references needed by [`TuiApp::run_cycle_rendering`],
@@ -1082,6 +1086,7 @@ impl TuiApp {
             credential_provider: None,
             tool_executor,
             credential_store: None,
+            signature_policy: SignaturePolicy::default(),
         })
     }
 
@@ -1100,6 +1105,7 @@ impl TuiApp {
             credential_provider,
             tool_executor,
             credential_store,
+            signature_policy,
         } = deps;
         let base_data_dir = fawx_data_dir();
         let data_dir = configured_data_dir(&base_data_dir, &config);
@@ -1142,6 +1148,7 @@ impl TuiApp {
             tool_executor,
             credential_store,
             output_buffer: Vec::new(),
+            signature_policy,
         };
         app.select_first_available_model_without_refresh();
         Ok(app)
@@ -1191,6 +1198,7 @@ impl TuiApp {
             Arc::clone(&self.skill_registry),
             reload_tx,
             self.credential_provider.clone(),
+            self.signature_policy.clone(),
         );
         watcher.initialize_hashes();
         tokio::spawn(async move {
@@ -3009,6 +3017,8 @@ pub struct LoopEngineBundle {
     pub credential_provider: Option<Arc<dyn CredentialProvider>>,
     pub tool_executor: Arc<dyn ToolExecutor>,
     pub credential_store: Option<Arc<fx_auth::credential_store::EncryptedFileCredentialStore>>,
+    /// Signature policy loaded once at startup, shared with skill watcher.
+    pub signature_policy: SignaturePolicy,
 }
 
 impl LoopEngineBundle {
@@ -3031,6 +3041,7 @@ impl LoopEngineBundle {
             credential_provider: self.credential_provider,
             tool_executor: self.tool_executor,
             credential_store: self.credential_store,
+            signature_policy: self.signature_policy,
         }
     }
 }
@@ -3099,6 +3110,7 @@ fn build_loop_engine_with_config(
         credential_provider: skills.credential_provider,
         tool_executor,
         credential_store: skills.credential_store,
+        signature_policy: skills.signature_policy,
     })
 }
 
@@ -3212,6 +3224,9 @@ struct SkillRegistryBundle {
     iteration_counter: Arc<std::sync::atomic::AtomicU32>,
     credential_provider: Option<Arc<dyn CredentialProvider>>,
     credential_store: Option<Arc<fx_auth::credential_store::EncryptedFileCredentialStore>>,
+    /// Signature policy loaded once at startup, shared with the skill watcher
+    /// to avoid redundant filesystem reads.
+    signature_policy: SignaturePolicy,
 }
 
 fn build_skill_registry(
@@ -3267,7 +3282,16 @@ fn build_skill_registry(
         });
 
     // Load WASM skills from ~/.fawx/skills/
-    match fx_loadable::wasm_skill::load_wasm_skills(credential_provider.clone()) {
+    let trusted_keys = fx_loadable::wasm_skill::load_trusted_keys().unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "failed to load trusted keys");
+        vec![]
+    });
+    let signature_policy = SignaturePolicy {
+        trusted_keys,
+        require_signatures: config.security.require_signatures,
+    };
+    match fx_loadable::wasm_skill::load_wasm_skills(credential_provider.clone(), &signature_policy)
+    {
         Ok(wasm_skills) => {
             for skill in wasm_skills {
                 registry.register(skill);
@@ -3289,6 +3313,7 @@ fn build_skill_registry(
         iteration_counter,
         credential_provider,
         credential_store,
+        signature_policy,
     }
 }
 

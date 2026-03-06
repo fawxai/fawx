@@ -7,7 +7,9 @@
 
 use crate::registry::SkillRegistry;
 use crate::skill::SkillError;
-use crate::wasm_skill::{compute_wasm_hash, load_wasm_skill_from_dir, read_manifest};
+use crate::wasm_skill::{
+    compute_wasm_hash, load_wasm_skill_from_dir, read_manifest, SignaturePolicy,
+};
 use fx_skills::live_host_api::CredentialProvider;
 use notify::{EventKind, RecursiveMode, Watcher};
 use std::collections::{HashMap, HashSet};
@@ -50,6 +52,7 @@ pub struct SkillWatcher {
     event_tx: mpsc::Sender<ReloadEvent>,
     hashes: HashMap<String, SkillState>,
     credential_provider: Option<Arc<dyn CredentialProvider>>,
+    signature_policy: SignaturePolicy,
 }
 
 /// Debounce window for filesystem events (per skill directory).
@@ -65,6 +68,7 @@ impl SkillWatcher {
         registry: Arc<SkillRegistry>,
         event_tx: mpsc::Sender<ReloadEvent>,
         credential_provider: Option<Arc<dyn CredentialProvider>>,
+        signature_policy: SignaturePolicy,
     ) -> Self {
         Self {
             skills_dir,
@@ -72,6 +76,7 @@ impl SkillWatcher {
             event_tx,
             hashes: HashMap::new(),
             credential_provider,
+            signature_policy,
         }
     }
 
@@ -207,7 +212,11 @@ impl SkillWatcher {
 
     /// Attempt to load or update a skill from its directory.
     fn handle_load_or_update(&mut self, skill_name: &str, skill_dir: &Path) {
-        match load_wasm_skill_from_dir(skill_dir, self.credential_provider.clone()) {
+        match load_wasm_skill_from_dir(
+            skill_dir,
+            self.credential_provider.clone(),
+            &self.signature_policy,
+        ) {
             Ok((wasm_skill, new_hash)) => {
                 self.apply_loaded_skill(skill_name, wasm_skill, new_hash);
             }
@@ -544,7 +553,13 @@ entry_point = "run"
 
         let registry = Arc::new(SkillRegistry::new());
         let (tx, _rx) = mpsc::channel(16);
-        let mut watcher = SkillWatcher::new(tmp.path().to_path_buf(), registry, tx, None);
+        let mut watcher = SkillWatcher::new(
+            tmp.path().to_path_buf(),
+            registry,
+            tx,
+            None,
+            SignaturePolicy::default(),
+        );
 
         watcher.initialize_hashes();
         assert_eq!(watcher.hashes.len(), 2);
@@ -559,7 +574,13 @@ entry_point = "run"
 
         let registry = Arc::new(SkillRegistry::new());
         let (tx, _rx) = mpsc::channel(16);
-        let mut watcher = SkillWatcher::new(tmp.path().to_path_buf(), registry, tx, None);
+        let mut watcher = SkillWatcher::new(
+            tmp.path().to_path_buf(),
+            registry,
+            tx,
+            None,
+            SignaturePolicy::default(),
+        );
 
         watcher.initialize_hashes();
 
@@ -574,7 +595,13 @@ entry_point = "run"
 
         let registry = Arc::new(SkillRegistry::new());
         let (tx, _rx) = mpsc::channel(16);
-        let mut watcher = SkillWatcher::new(tmp.path().to_path_buf(), registry, tx, None);
+        let mut watcher = SkillWatcher::new(
+            tmp.path().to_path_buf(),
+            registry,
+            tx,
+            None,
+            SignaturePolicy::default(),
+        );
 
         watcher.initialize_hashes();
         assert_eq!(watcher.hashes["versioned"].version, "2.5.0");
@@ -622,7 +649,13 @@ entry_point = "run"
 
         let registry = Arc::new(SkillRegistry::new());
         let (tx, mut rx) = mpsc::channel(16);
-        let mut watcher = SkillWatcher::new(tmp.path().to_path_buf(), registry.clone(), tx, None);
+        let mut watcher = SkillWatcher::new(
+            tmp.path().to_path_buf(),
+            registry.clone(),
+            tx,
+            None,
+            SignaturePolicy::default(),
+        );
 
         watcher.process_skill_change("newskill").await;
 
@@ -646,7 +679,13 @@ entry_point = "run"
 
         let registry = Arc::new(SkillRegistry::new());
         let (tx, mut rx) = mpsc::channel(16);
-        let mut watcher = SkillWatcher::new(tmp.path().to_path_buf(), registry, tx, None);
+        let mut watcher = SkillWatcher::new(
+            tmp.path().to_path_buf(),
+            registry,
+            tx,
+            None,
+            SignaturePolicy::default(),
+        );
 
         watcher.process_skill_change("verskill").await;
 
@@ -685,7 +724,13 @@ entry_point = "run"
 
         let registry = Arc::new(SkillRegistry::new());
         let (tx, mut rx) = mpsc::channel(16);
-        let mut watcher = SkillWatcher::new(tmp.path().to_path_buf(), registry.clone(), tx, None);
+        let mut watcher = SkillWatcher::new(
+            tmp.path().to_path_buf(),
+            registry.clone(),
+            tx,
+            None,
+            SignaturePolicy::default(),
+        );
 
         // First load
         watcher.process_skill_change("updskill").await;
@@ -709,7 +754,13 @@ entry_point = "run"
 
         let registry = Arc::new(SkillRegistry::new());
         let (tx, mut rx) = mpsc::channel(16);
-        let mut watcher = SkillWatcher::new(tmp.path().to_path_buf(), registry, tx, None);
+        let mut watcher = SkillWatcher::new(
+            tmp.path().to_path_buf(),
+            registry,
+            tx,
+            None,
+            SignaturePolicy::default(),
+        );
 
         // First load
         watcher.process_skill_change("upver").await;
@@ -747,7 +798,13 @@ entry_point = "run"
 
         let registry = Arc::new(SkillRegistry::new());
         let (tx, mut rx) = mpsc::channel(16);
-        let mut watcher = SkillWatcher::new(tmp.path().to_path_buf(), registry, tx, None);
+        let mut watcher = SkillWatcher::new(
+            tmp.path().to_path_buf(),
+            registry,
+            tx,
+            None,
+            SignaturePolicy::default(),
+        );
 
         // First load
         watcher.process_skill_change("sameskill").await;
@@ -767,7 +824,13 @@ entry_point = "run"
 
         let registry = Arc::new(SkillRegistry::new());
         let (tx, mut rx) = mpsc::channel(16);
-        let mut watcher = SkillWatcher::new(tmp.path().to_path_buf(), registry.clone(), tx, None);
+        let mut watcher = SkillWatcher::new(
+            tmp.path().to_path_buf(),
+            registry.clone(),
+            tx,
+            None,
+            SignaturePolicy::default(),
+        );
 
         // Load first
         watcher.process_skill_change("rmskill").await;
@@ -792,7 +855,13 @@ entry_point = "run"
 
         let registry = Arc::new(SkillRegistry::new());
         let (tx, mut rx) = mpsc::channel(16);
-        let mut watcher = SkillWatcher::new(tmp.path().to_path_buf(), registry.clone(), tx, None);
+        let mut watcher = SkillWatcher::new(
+            tmp.path().to_path_buf(),
+            registry.clone(),
+            tx,
+            None,
+            SignaturePolicy::default(),
+        );
 
         // Load successfully first
         watcher.process_skill_change("errskill").await;
@@ -831,7 +900,13 @@ entry_point = "run"
 
         let registry = Arc::new(SkillRegistry::new());
         let (tx, mut rx) = mpsc::channel(16);
-        let mut watcher = SkillWatcher::new(tmp.path().to_path_buf(), registry, tx, None);
+        let mut watcher = SkillWatcher::new(
+            tmp.path().to_path_buf(),
+            registry,
+            tx,
+            None,
+            SignaturePolicy::default(),
+        );
 
         watcher.process_skill_change(name).await;
 
@@ -846,7 +921,13 @@ entry_point = "run"
 
         let registry = Arc::new(SkillRegistry::new());
         let (tx, mut rx) = mpsc::channel(16);
-        let mut watcher = SkillWatcher::new(tmp.path().to_path_buf(), registry.clone(), tx, None);
+        let mut watcher = SkillWatcher::new(
+            tmp.path().to_path_buf(),
+            registry.clone(),
+            tx,
+            None,
+            SignaturePolicy::default(),
+        );
 
         watcher.process_skill_change("debounce").await;
         let _ = rx.try_recv(); // Loaded
@@ -905,7 +986,13 @@ entry_point = "run"
         let registry = Arc::new(SkillRegistry::new());
         // Channel with capacity 1 — fill it to verify try_send doesn't block
         let (tx, _rx) = mpsc::channel(1);
-        let mut watcher = SkillWatcher::new(tmp.path().to_path_buf(), registry, tx, None);
+        let mut watcher = SkillWatcher::new(
+            tmp.path().to_path_buf(),
+            registry,
+            tx,
+            None,
+            SignaturePolicy::default(),
+        );
 
         // Load the skill first
         watcher.process_skill_change("trysend").await;

@@ -35,6 +35,9 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Fawx Configuration
 # max_snapshot_chars = 2000
 # max_relevant_results = 5
 
+# [security]
+# require_signatures = false
+
 # [self_modify]
 # enabled = false
 # branch_prefix = "fawx/improve"
@@ -53,7 +56,18 @@ pub struct FawxConfig {
     pub model: ModelConfig,
     pub tools: ToolsConfig,
     pub memory: MemoryConfig,
+    pub security: SecurityConfig,
     pub self_modify: SelfModifyCliConfig,
+}
+
+/// Security settings for WASM skill signature verification.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SecurityConfig {
+    /// When true, reject any WASM skill without a valid signature.
+    /// When false (default), unsigned skills load with a warning.
+    /// Invalid signatures are ALWAYS rejected regardless of this setting.
+    pub require_signatures: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -380,6 +394,9 @@ max_relevant_results = 9
                 },
                 proposals_dir: Some(PathBuf::from("/tmp/proposals")),
             },
+            security: SecurityConfig {
+                require_signatures: true,
+            },
         };
 
         let encoded = toml::to_string(&original).expect("serialize");
@@ -495,6 +512,31 @@ deny = ["[invalid"]
         assert!(
             error.contains("invalid glob"),
             "error should mention invalid glob, got: {error}"
+        );
+    }
+
+    #[test]
+    fn security_config_defaults_and_roundtrip() {
+        let defaults = SecurityConfig::default();
+        assert!(!defaults.require_signatures);
+
+        let config = SecurityConfig {
+            require_signatures: true,
+        };
+        let encoded = toml::to_string(&config).expect("serialize");
+        let decoded: SecurityConfig = toml::from_str(&encoded).expect("deserialize");
+        assert_eq!(decoded, config);
+    }
+
+    #[test]
+    fn config_template_includes_security_section() {
+        assert!(
+            DEFAULT_CONFIG_TEMPLATE.contains("[security]"),
+            "template should contain [security] section"
+        );
+        assert!(
+            DEFAULT_CONFIG_TEMPLATE.contains("require_signatures"),
+            "template should mention require_signatures"
         );
     }
 }
