@@ -11,7 +11,9 @@ use ratatui::{
     widgets::{Block, Paragraph, Wrap},
     Frame,
 };
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use std::borrow::Cow;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 // ── Styling constants ──────────────────────────────────────────
 
@@ -50,11 +52,18 @@ pub struct FawxApp {
     /// clamped to [`u16::MAX`] before being passed to [`Paragraph::scroll`].
     pub scroll_offset: usize,
     pub input_text: String,
+    pasted_line_count: Option<usize>,
     pub state: AppState,
     pub command_history: Vec<String>,
     pub history_index: Option<usize>,
     /// Whether the "fawx ›" prefix has been printed for the current stream.
     pub streaming_prefix_printed: bool,
+    /// Index of the first output line that belongs to the active stream, if any.
+    pub streaming_start_index: Option<usize>,
+    /// Index of the current logical line receiving streamed tokens.
+    pub streaming_line_index: Option<usize>,
+    /// Whether streamed deltas should be ignored until the next explicit start event.
+    pub suppress_stream_until_next_start: bool,
     /// Inputs queued while the agent is executing (one per future turn).
     pub pending_inputs: Vec<String>,
     /// Steer message for the running agent (last one wins).
@@ -72,10 +81,14 @@ impl FawxApp {
             output_lines: Vec::new(),
             scroll_offset: 0,
             input_text: String::new(),
+            pasted_line_count: None,
             state: AppState::Idle,
             command_history: Vec::new(),
             history_index: None,
             streaming_prefix_printed: false,
+            streaming_start_index: None,
+            streaming_line_index: None,
+            suppress_stream_until_next_start: false,
             pending_inputs: Vec::new(),
             steer_message: None,
             abort_requested: false,
@@ -121,6 +134,7 @@ impl FawxApp {
     /// input field, and return the submitted text.
     pub fn submit_input(&mut self) -> String {
         let text = std::mem::take(&mut self.input_text);
+        self.pasted_line_count = None;
         if !text.is_empty() {
             self.command_history.push(text.clone());
         }
@@ -138,6 +152,7 @@ impl FawxApp {
             None => self.command_history.len() - 1,
         };
         self.history_index = Some(idx);
+        self.pasted_line_count = None;
         self.input_text = self.command_history[idx].clone();
     }
 
@@ -146,6 +161,7 @@ impl FawxApp {
         let Some(idx) = self.history_index else {
             return;
         };
+        self.pasted_line_count = None;
         if idx + 1 >= self.command_history.len() {
             self.history_index = None;
             self.input_text.clear();
@@ -162,9 +178,47 @@ impl FawxApp {
         self.history_index = None;
     }
 
+    /// Store pasted input, showing a compact preview if it spans multiple lines.
+    pub fn set_pasted_input(&mut self, pasted: String) {
+        self.input_text = pasted;
+        self.pasted_line_count = pasted_line_count(&self.input_text);
+        self.history_index = None;
+    }
+
+    /// Append a typed character, clearing any pending multiline paste preview first.
+    pub fn append_input_char(&mut self, ch: char) {
+        if self.pasted_line_count.is_some() {
+            self.input_text.clear();
+            self.pasted_line_count = None;
+        }
+        self.input_text.push(ch);
+    }
+
+    /// Remove one character, or clear the entire pending multiline paste preview.
+    pub fn backspace_input(&mut self) {
+        if self.pasted_line_count.is_some() {
+            self.input_text.clear();
+            self.pasted_line_count = None;
+        } else {
+            self.input_text.pop();
+        }
+    }
+
+    fn input_display_text(&self) -> Cow<'_, str> {
+        match self.pasted_line_count {
+            Some(1) => Cow::Borrowed("[pasted 1 line]"),
+            Some(lines) => Cow::Owned(format!("[pasted {lines} lines]")),
+            None => Cow::Borrowed(self.input_text.as_str()),
+        }
+    }
+
     /// Begin streaming output: add the "fawx ›" prefix line.
     pub fn start_streaming(&mut self) {
         self.add_output(String::new());
+        let prefix_index = self.output_lines.len();
+        self.streaming_start_index = Some(prefix_index);
+        self.streaming_line_index = Some(prefix_index);
+        self.suppress_stream_until_next_start = false;
         self.add_output("fawx › ".to_string());
         self.streaming_prefix_printed = true;
         if !self.user_scrolled {
@@ -176,14 +230,40 @@ impl FawxApp {
     ///
     /// Handles newlines by splitting into separate output lines.
     pub fn append_streaming_delta(&mut self, delta: &str) {
+        if self.suppress_stream_until_next_start {
+            return;
+        }
         if !self.streaming_prefix_printed {
             self.start_streaming();
         }
         for ch in delta.chars() {
-            if ch == '\n' {
-                self.output_lines.push(String::new());
-            } else if let Some(last) = self.output_lines.last_mut() {
-                last.push(ch);
+            let Some(line_index) = self.streaming_line_index else {
+                break;
+            };
+            match ch {
+                '\n' => {
+                    // insert() is O(n) for Vec, but streaming lines are always
+                    // appended near the end of output_lines (the stream cursor
+                    // tracks the last line), so the shift is bounded by the
+                    // number of lines *after* the cursor — typically zero or a
+                    // small constant. A VecDeque would penalise the far more
+                    // frequent index-based access in rendering.
+                    let next_index = line_index + 1;
+                    self.output_lines.insert(next_index, String::new());
+                    self.streaming_line_index = Some(next_index);
+                }
+                '\r' => {}
+                '\t' => {
+                    if let Some(line) = self.output_lines.get_mut(line_index) {
+                        line.push_str("    ");
+                    }
+                }
+                ch if ch.is_control() && ch != '\x1b' => {}
+                _ => {
+                    if let Some(line) = self.output_lines.get_mut(line_index) {
+                        line.push(ch);
+                    }
+                }
             }
         }
         if !self.user_scrolled {
@@ -194,6 +274,20 @@ impl FawxApp {
     /// Finish streaming: reset the streaming flag.
     pub fn finish_streaming(&mut self) {
         self.streaming_prefix_printed = false;
+        self.streaming_start_index = None;
+        self.streaming_line_index = None;
+    }
+
+    /// Mark the start of a fresh streaming session from the engine.
+    pub fn begin_streaming_session(&mut self) {
+        self.finish_streaming();
+        self.suppress_stream_until_next_start = false;
+    }
+
+    /// Stop the current stream locally and ignore stale deltas until the next start event.
+    pub fn interrupt_stream(&mut self) {
+        self.finish_streaming();
+        self.suppress_stream_until_next_start = true;
     }
 
     /// Queue a user input to be executed after the current turn completes.
@@ -238,9 +332,10 @@ impl FawxApp {
         if width == 0 {
             return 1;
         }
-        // Use char count (display columns) instead of byte length so
-        // multi-byte characters like `›` don't inflate the calculation.
-        let content_len = PROMPT.chars().count() + self.input_text.chars().count();
+        let display_text = self.input_display_text();
+        // Use char count instead of byte length so multi-byte characters like
+        // `›` don't inflate the calculation.
+        let content_len = PROMPT.chars().count() + display_text.chars().count();
         (content_len as u16).div_ceil(width).max(1)
     }
 }
@@ -292,96 +387,276 @@ fn wrap_lines_to_width(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'sta
     out
 }
 
+#[derive(Debug)]
+struct WrapToken {
+    content: String,
+    style: Style,
+    whitespace: bool,
+}
+
 /// Width-aware wrapping for a single-span line.
 fn wrap_single_span(span: &Span<'_>, width: usize, out: &mut Vec<Line<'static>>) {
-    let style = span.style;
-    let chars: Vec<char> = span.content.chars().collect();
-    let mut current_width = 0;
-    let mut chunk_start = 0;
-    for (i, &ch) in chars.iter().enumerate() {
-        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if current_width + w > width && chunk_start < i {
-            let s: String = chars[chunk_start..i].iter().collect();
-            out.push(Line::from(Span::styled(s, style)));
-            current_width = w;
-            chunk_start = i;
-        } else {
-            current_width += w;
-        }
-    }
-    if chunk_start < chars.len() {
-        let s: String = chars[chunk_start..].iter().collect();
-        out.push(Line::from(Span::styled(s, style)));
-    }
+    let tokens = tokenize_span(span);
+    wrap_tokens_to_lines(tokens, width, out);
 }
 
 /// Width-aware wrapping for a multi-span line.
 fn wrap_multi_span(spans: &[Span<'_>], width: usize, out: &mut Vec<Line<'static>>) {
-    let styled_chars: Vec<(char, Style)> = spans
-        .iter()
-        .flat_map(|s| s.content.chars().map(move |c| (c, s.style)))
-        .collect();
-    let mut current_width = 0;
-    let mut chunk_start = 0;
-    for (i, &(ch, _)) in styled_chars.iter().enumerate() {
-        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if current_width + w > width && chunk_start < i {
-            let row_spans = chunk_to_spans(&styled_chars[chunk_start..i]);
-            out.push(Line::from(row_spans));
-            current_width = w;
-            chunk_start = i;
-        } else {
-            current_width += w;
+    let tokens: Vec<WrapToken> = spans.iter().flat_map(tokenize_span).collect();
+    wrap_tokens_to_lines(tokens, width, out);
+}
+
+fn push_grapheme_to_spans(spans: &mut Vec<Span<'static>>, grapheme: &str, style: Style) {
+    if let Some(last) = spans.last_mut() {
+        if last.style == style {
+            last.content.to_mut().push_str(grapheme);
+            return;
         }
     }
-    if chunk_start < styled_chars.len() {
-        let row_spans = chunk_to_spans(&styled_chars[chunk_start..]);
-        out.push(Line::from(row_spans));
+    spans.push(Span::styled(grapheme.to_string(), style));
+}
+
+fn push_text_to_spans(spans: &mut Vec<Span<'static>>, text: &str, style: Style) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(last) = spans.last_mut() {
+        if last.style == style {
+            last.content.to_mut().push_str(text);
+            return;
+        }
+    }
+    spans.push(Span::styled(text.to_string(), style));
+}
+
+/// Flush the accumulated graphemes into a new token.
+fn flush_token(tokens: &mut Vec<WrapToken>, current: &mut String, style: Style, whitespace: bool) {
+    tokens.push(WrapToken {
+        content: std::mem::take(current),
+        style,
+        whitespace,
+    });
+}
+
+/// Process a single grapheme during span tokenization, accumulating runs
+/// of same-kind (whitespace vs non-whitespace) characters.
+fn accumulate_grapheme(
+    grapheme: &str,
+    tokens: &mut Vec<WrapToken>,
+    current: &mut String,
+    current_whitespace: &mut Option<bool>,
+    style: Style,
+) {
+    let whitespace = grapheme.chars().all(char::is_whitespace);
+    match *current_whitespace {
+        Some(kind) if kind == whitespace => current.push_str(grapheme),
+        Some(kind) => {
+            flush_token(tokens, current, style, kind);
+            current.push_str(grapheme);
+            *current_whitespace = Some(whitespace);
+        }
+        None => {
+            current.push_str(grapheme);
+            *current_whitespace = Some(whitespace);
+        }
     }
 }
 
-/// Group consecutive chars with the same style into Spans.
-fn chunk_to_spans(chars: &[(char, ratatui::style::Style)]) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    if chars.is_empty() {
-        return spans;
+fn tokenize_span(span: &Span<'_>) -> Vec<WrapToken> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut current_whitespace = None;
+
+    for grapheme in span.content.graphemes(true) {
+        accumulate_grapheme(
+            grapheme,
+            &mut tokens,
+            &mut current,
+            &mut current_whitespace,
+            span.style,
+        );
     }
-    let mut buf = String::new();
-    let mut cur_style = chars[0].1;
-    for &(c, style) in chars {
-        if style == cur_style {
-            buf.push(c);
-        } else {
-            spans.push(Span::styled(std::mem::take(&mut buf), cur_style));
-            cur_style = style;
-            buf.push(c);
+
+    if let Some(whitespace) = current_whitespace {
+        flush_token(&mut tokens, &mut current, span.style, whitespace);
+    }
+
+    tokens
+}
+
+fn token_display_width(token: &WrapToken) -> usize {
+    token.content.width()
+}
+
+fn flush_row(row: &mut Vec<Span<'static>>, out: &mut Vec<Line<'static>>) {
+    if !row.is_empty() {
+        out.push(Line::from(std::mem::take(row)));
+    }
+}
+
+fn split_token_across_rows(
+    token: &WrapToken,
+    width: usize,
+    row: &mut Vec<Span<'static>>,
+    current_width: &mut usize,
+    out: &mut Vec<Line<'static>>,
+) {
+    for grapheme in token.content.graphemes(true) {
+        let grapheme_width = grapheme.width();
+        if *current_width + grapheme_width > width && !row.is_empty() {
+            flush_row(row, out);
+            *current_width = 0;
+        }
+        push_grapheme_to_spans(row, grapheme, token.style);
+        *current_width += grapheme_width;
+    }
+}
+
+/// Mutable state carried through the token wrapping loop.
+struct WrapState<'a> {
+    row: Vec<Span<'static>>,
+    current_width: usize,
+    pending_space: Option<WrapToken>,
+    width: usize,
+    out: &'a mut Vec<Line<'static>>,
+}
+
+impl<'a> WrapState<'a> {
+    fn new(width: usize, out: &'a mut Vec<Line<'static>>) -> Self {
+        Self {
+            row: Vec::new(),
+            current_width: 0,
+            pending_space: None,
+            width,
+            out,
         }
     }
-    if !buf.is_empty() {
-        spans.push(Span::styled(buf, cur_style));
+
+    /// Place a whitespace token at the start of a row or defer it.
+    fn place_whitespace(&mut self, token: WrapToken, token_width: usize) {
+        if self.row.is_empty() {
+            if token_width <= self.width {
+                push_text_to_spans(&mut self.row, &token.content, token.style);
+                self.current_width += token_width;
+            } else {
+                split_token_across_rows(
+                    &token,
+                    self.width,
+                    &mut self.row,
+                    &mut self.current_width,
+                    self.out,
+                );
+            }
+        } else {
+            self.pending_space = Some(token);
+        }
     }
-    spans
+
+    /// Place a word token, wrapping or splitting as needed.
+    fn place_word(&mut self, token: &WrapToken, token_width: usize) {
+        let ps_w = self
+            .pending_space
+            .as_ref()
+            .map(token_display_width)
+            .unwrap_or(0);
+        if !self.row.is_empty() && self.current_width + ps_w + token_width > self.width {
+            if self.pending_space.is_some() {
+                flush_row(&mut self.row, self.out);
+                self.current_width = 0;
+                self.pending_space = None;
+            } else {
+                split_token_across_rows(
+                    token,
+                    self.width,
+                    &mut self.row,
+                    &mut self.current_width,
+                    self.out,
+                );
+                return;
+            }
+        }
+
+        if self.row.is_empty() && token_width > self.width {
+            split_token_across_rows(
+                token,
+                self.width,
+                &mut self.row,
+                &mut self.current_width,
+                self.out,
+            );
+            return;
+        }
+
+        self.emit_pending_space();
+        push_text_to_spans(&mut self.row, &token.content, token.style);
+        self.current_width += token_width;
+    }
+
+    /// Flush any deferred whitespace token into the current row.
+    fn emit_pending_space(&mut self) {
+        if let Some(space) = self.pending_space.take() {
+            if !self.row.is_empty() {
+                push_text_to_spans(&mut self.row, &space.content, space.style);
+                self.current_width += token_display_width(&space);
+            }
+        }
+    }
+
+    /// Flush the final row, if non-empty.
+    fn finish(mut self) {
+        flush_row(&mut self.row, self.out);
+    }
+}
+
+fn wrap_tokens_to_lines(tokens: Vec<WrapToken>, width: usize, out: &mut Vec<Line<'static>>) {
+    let mut state = WrapState::new(width, out);
+
+    for token in tokens {
+        let token_width = token_display_width(&token);
+        if token.whitespace {
+            state.place_whitespace(token, token_width);
+        } else {
+            state.place_word(&token, token_width);
+        }
+    }
+
+    state.finish();
+}
+
+fn build_output_lines(app: &FawxApp) -> Vec<Line<'static>> {
+    app.output_lines
+        .iter()
+        .enumerate()
+        .map(|(idx, line)| renderable_output_line(app, idx, line))
+        .collect()
+}
+
+fn renderable_output_line(app: &FawxApp, index: usize, line: &str) -> Line<'static> {
+    let streaming_line = app.streaming_prefix_printed
+        && app
+            .streaming_start_index
+            .is_some_and(|start_index| index >= start_index);
+
+    // Streaming lines skip ANSI parsing because they may contain incomplete
+    // escape sequences mid-delta — parsing partial ANSI would produce garbled
+    // output. ANSI is only applied to finalized (non-streaming) lines.
+    if !streaming_line && crate::ansi::contains_ansi(line) {
+        crate::ansi::ansi_to_line(line)
+    } else {
+        Line::from(line.to_string())
+    }
+}
+
+fn prepare_output_lines_for_render(app: &FawxApp, width: usize) -> (Vec<Line<'static>>, usize) {
+    let render_lines = wrap_lines_to_width(build_output_lines(app), width);
+    let total_visual_rows = render_lines.len();
+    (render_lines, total_visual_rows)
 }
 
 /// Render the scrollable output region.
 fn render_output(frame: &mut Frame, area: ratatui::layout::Rect, app: &FawxApp) {
     let width = area.width as usize;
-
-    let lines: Vec<Line<'static>> = app
-        .output_lines
-        .iter()
-        .map(|s| {
-            if crate::ansi::contains_ansi(s) {
-                crate::ansi::ansi_to_line(s)
-            } else {
-                Line::from(s.to_string())
-            }
-        })
-        .collect();
-
-    // Pre-wrap lines so visual row count is exact.
-    let lines = wrap_lines_to_width(lines, width);
-    let total_visual_rows = lines.len();
+    let (lines, total_visual_rows) = prepare_output_lines_for_render(app, width);
     let visible_height = area.height as usize;
 
     // Scroll: show bottom unless user scrolled up.
@@ -391,7 +666,6 @@ fn render_output(frame: &mut Frame, area: ratatui::layout::Rect, app: &FawxApp) 
 
     let scroll_u16 = u16::try_from(scroll).unwrap_or(u16::MAX);
     let paragraph = Paragraph::new(lines).scroll((scroll_u16, 0));
-    // NOTE: No .wrap() — lines are already pre-wrapped.
 
     frame.render_widget(paragraph, area);
 }
@@ -450,14 +724,19 @@ fn render_separator(frame: &mut Frame, area: ratatui::layout::Rect, app: &FawxAp
         let line = Paragraph::new(Line::from(Span::styled(sep, Style::default().fg(AMBER))));
         frame.render_widget(line, area);
     } else {
-        let indicator_text: String = indicators.iter().map(|s| s.content.as_ref()).collect();
+        let indicator_text: String = indicators
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>()
+            .chars()
+            .take((area.width as usize).saturating_sub(2))
+            .collect();
         let indicator_char_len = indicator_text.chars().count();
         let fill_len = (area.width as usize).saturating_sub(indicator_char_len);
-        let mut spans = vec![Span::styled(
-            "─".repeat(fill_len),
-            Style::default().fg(AMBER),
-        )];
-        spans.extend(indicators);
+        let spans = vec![
+            Span::styled("─".repeat(fill_len), Style::default().fg(AMBER)),
+            Span::raw(indicator_text),
+        ];
         let line = Paragraph::new(Line::from(spans));
         frame.render_widget(line, area);
     }
@@ -479,9 +758,10 @@ fn render_input(frame: &mut Frame, area: ratatui::layout::Rect, app: &FawxApp) {
         Style::default().add_modifier(Modifier::DIM)
     };
 
+    let input_display = app.input_display_text();
     let line = Line::from(vec![
         Span::styled(PROMPT, prompt_style),
-        Span::styled(app.input_text.as_str(), text_style),
+        Span::styled(input_display.as_ref(), text_style),
     ]);
 
     let block = Block::default().style(Style::default().bg(INPUT_BG));
@@ -491,11 +771,45 @@ fn render_input(frame: &mut Frame, area: ratatui::layout::Rect, app: &FawxApp) {
     frame.render_widget(paragraph, area);
 }
 
+fn pasted_line_count(text: &str) -> Option<usize> {
+    let mut line_count = 1usize;
+    let mut saw_line_break = false;
+    let mut chars = text.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\n' => {
+                saw_line_break = true;
+                line_count += 1;
+            }
+            '\r' => {
+                saw_line_break = true;
+                line_count += 1;
+                if matches!(chars.peek(), Some('\n')) {
+                    chars.next();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !saw_line_break {
+        return None;
+    }
+
+    if text.ends_with('\n') || text.ends_with('\r') {
+        line_count = line_count.saturating_sub(1).max(1);
+    }
+
+    Some(line_count)
+}
+
 // ── Tests ──────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};
 
     #[test]
     fn test_app_new_defaults() {
@@ -503,9 +817,13 @@ mod tests {
         assert!(app.output_lines.is_empty());
         assert_eq!(app.scroll_offset, 0);
         assert!(app.input_text.is_empty());
+        assert_eq!(app.pasted_line_count, None);
         assert_eq!(app.state, AppState::Idle);
         assert!(app.command_history.is_empty());
         assert_eq!(app.history_index, None);
+        assert_eq!(app.streaming_start_index, None);
+        assert_eq!(app.streaming_line_index, None);
+        assert!(!app.suppress_stream_until_next_start);
         assert!(!app.user_scrolled);
     }
 
@@ -544,6 +862,69 @@ mod tests {
         let submitted = app.submit_input();
         assert!(submitted.is_empty());
         assert!(app.command_history.is_empty());
+    }
+
+    #[test]
+    fn test_set_pasted_input_shows_multiline_preview() {
+        let mut app = FawxApp::new();
+        app.set_pasted_input("alpha\nbeta\ngamma".into());
+
+        assert_eq!(app.input_text, "alpha\nbeta\ngamma");
+        assert_eq!(app.pasted_line_count, Some(3));
+        assert_eq!(app.input_display_text(), "[pasted 3 lines]");
+    }
+
+    #[test]
+    fn test_set_pasted_input_trailing_newline_uses_single_line_preview() {
+        let mut app = FawxApp::new();
+        app.set_pasted_input("alpha\n".into());
+
+        assert_eq!(app.pasted_line_count, Some(1));
+        assert_eq!(app.input_display_text(), "[pasted 1 line]");
+    }
+
+    #[test]
+    fn test_set_pasted_input_single_line_keeps_plain_text() {
+        let mut app = FawxApp::new();
+        app.set_pasted_input("alpha beta".into());
+
+        assert_eq!(app.pasted_line_count, None);
+        assert_eq!(app.input_display_text(), "alpha beta");
+    }
+
+    #[test]
+    fn test_submit_input_returns_full_multiline_paste() {
+        let mut app = FawxApp::new();
+        app.set_pasted_input("alpha\nbeta".into());
+
+        let submitted = app.submit_input();
+
+        assert_eq!(submitted, "alpha\nbeta");
+        assert!(app.input_text.is_empty());
+        assert_eq!(app.pasted_line_count, None);
+        assert_eq!(app.command_history, vec!["alpha\nbeta".to_string()]);
+    }
+
+    #[test]
+    fn test_typing_clears_multiline_paste_preview() {
+        let mut app = FawxApp::new();
+        app.set_pasted_input("alpha\nbeta".into());
+
+        app.append_input_char('x');
+
+        assert_eq!(app.input_text, "x");
+        assert_eq!(app.pasted_line_count, None);
+    }
+
+    #[test]
+    fn test_backspace_clears_multiline_paste_preview() {
+        let mut app = FawxApp::new();
+        app.set_pasted_input("alpha\nbeta".into());
+
+        app.backspace_input();
+
+        assert!(app.input_text.is_empty());
+        assert_eq!(app.pasted_line_count, None);
     }
 
     #[test]
@@ -663,6 +1044,14 @@ mod tests {
     }
 
     #[test]
+    fn test_calculate_input_height_uses_paste_preview_text() {
+        let mut app = FawxApp::new();
+        app.set_pasted_input("alpha\nbeta\ngamma".into());
+
+        assert_eq!(app.calculate_input_height(20), 2);
+    }
+
+    #[test]
     fn test_state_transitions() {
         let mut app = FawxApp::new();
         assert_eq!(app.state, AppState::Idle);
@@ -738,6 +1127,127 @@ mod tests {
         assert!(!app.abort_requested);
     }
 
+    #[test]
+    fn test_start_streaming_tracks_streaming_start_index() {
+        let mut app = FawxApp::new();
+        app.add_output("existing".into());
+        app.start_streaming();
+        assert_eq!(app.streaming_start_index, Some(2));
+        assert_eq!(app.streaming_line_index, Some(2));
+        assert_eq!(app.output_lines[2], "fawx › ");
+    }
+
+    #[test]
+    fn test_append_streaming_delta_normalizes_carriage_return_and_tab() {
+        let mut app = FawxApp::new();
+        app.start_streaming();
+        app.append_streaming_delta("hello\r\tworld\r\nnext");
+        assert_eq!(app.output_lines[1], "fawx › hello    world");
+        assert_eq!(app.output_lines[2], "next");
+        assert_eq!(app.streaming_line_index, Some(2));
+    }
+
+    #[test]
+    fn test_append_streaming_delta_inserts_before_non_stream_output() {
+        let mut app = FawxApp::new();
+        app.start_streaming();
+        app.append_streaming_delta("hello");
+        app.add_output("queued".into());
+
+        app.append_streaming_delta("\nworld");
+
+        assert_eq!(app.output_lines[1], "fawx › hello");
+        assert_eq!(app.output_lines[2], "world");
+        assert_eq!(app.output_lines[3], "queued");
+        assert_eq!(app.streaming_line_index, Some(2));
+    }
+
+    #[test]
+    fn test_build_output_lines_keeps_active_stream_raw_until_finished() {
+        let mut app = FawxApp::new();
+        app.add_output("\x1b[38;2;255;0;0mstable\x1b[0m".into());
+        app.start_streaming();
+        app.append_streaming_delta("\x1b[38;2;255");
+
+        let lines = build_output_lines(&app);
+        assert_eq!(lines[0].spans[0].content.as_ref(), "stable");
+        assert_eq!(lines[2].spans.len(), 1);
+        assert_eq!(lines[2].spans[0].content.as_ref(), "fawx › \x1b[38;2;255");
+
+        app.finish_streaming();
+        let lines = build_output_lines(&app);
+        assert_eq!(lines[2].spans[0].content.as_ref(), "fawx › ");
+    }
+
+    #[test]
+    fn test_interrupt_stream_suppresses_old_deltas_until_next_session() {
+        let mut app = FawxApp::new();
+        app.start_streaming();
+        app.append_streaming_delta("hello");
+
+        app.interrupt_stream();
+        app.append_streaming_delta("ignored");
+        assert_eq!(app.output_lines[1], "fawx › hello");
+        assert!(app.streaming_line_index.is_none());
+        assert!(app.suppress_stream_until_next_start);
+
+        app.begin_streaming_session();
+        app.append_streaming_delta("fresh");
+        assert_eq!(app.output_lines[3], "fawx › fresh");
+        assert!(!app.suppress_stream_until_next_start);
+    }
+
+    #[test]
+    fn test_render_output_replaces_rows_when_scrolling_to_latest_wrap() {
+        let backend = TestBackend::new(5, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = FawxApp::new();
+        app.add_output("abcde".into());
+
+        terminal
+            .draw(|frame| render_output(frame, frame.area(), &app))
+            .unwrap();
+
+        app.output_lines[0].push('f');
+        terminal
+            .draw(|frame| render_output(frame, frame.area(), &app))
+            .unwrap();
+
+        terminal
+            .backend()
+            .assert_buffer(&Buffer::with_lines(["f    "]));
+    }
+
+    #[test]
+    fn test_prepare_output_lines_for_render_counts_wrapped_stream_rows() {
+        let mut app = FawxApp::new();
+        app.start_streaming();
+        app.append_streaming_delta("abcdef");
+
+        let (lines, total_visual_rows) = prepare_output_lines_for_render(&app, 4);
+
+        assert_eq!(lines.len(), 5);
+        assert_eq!(total_visual_rows, 5);
+        assert!(lines[0].spans.is_empty() || lines[0].spans[0].content.is_empty());
+        assert_eq!(lines[1].spans[0].content.as_ref(), "fawx");
+        assert_eq!(lines[2].spans[0].content.as_ref(), "›");
+        assert_eq!(lines[3].spans[0].content.as_ref(), "abcd");
+        assert_eq!(lines[4].spans[0].content.as_ref(), "ef");
+    }
+
+    #[test]
+    fn test_prepare_output_lines_for_render_keeps_completed_lines_prewrapped() {
+        let mut app = FawxApp::new();
+        app.add_output("abcdefgh".into());
+
+        let (lines, total_visual_rows) = prepare_output_lines_for_render(&app, 4);
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(total_visual_rows, 2);
+        assert_eq!(lines[0].spans[0].content.as_ref(), "abcd");
+        assert_eq!(lines[1].spans[0].content.as_ref(), "efgh");
+    }
+
     // ── wrap_lines_to_width tests ──────────────────────────────
 
     #[test]
@@ -757,6 +1267,18 @@ mod tests {
         assert_eq!(result[0].spans[0].content.as_ref(), "abcd");
         assert_eq!(result[1].spans[0].content.as_ref(), "efgh");
         assert_eq!(result[2].spans[0].content.as_ref(), "ij");
+    }
+
+    #[test]
+    fn test_wrap_prefers_breaking_at_spaces() {
+        let lines = vec![Line::from("policy engine allows deny confirm")];
+        let result = wrap_lines_to_width(lines, 12);
+
+        let text: Vec<&str> = result
+            .iter()
+            .map(|line| line.spans[0].content.as_ref())
+            .collect();
+        assert_eq!(text, vec!["policy", "engine", "allows deny", "confirm"]);
     }
 
     #[test]
@@ -852,6 +1374,25 @@ mod tests {
         assert_eq!(result[0].spans[0].content.as_ref(), "abc");
         assert_eq!(result[1].spans[0].content.as_ref(), "def");
         assert_eq!(result[2].spans[0].content.as_ref(), "gh");
+    }
+
+    #[test]
+    fn test_wrap_keeps_combining_mark_with_base_character() {
+        let lines = vec![Line::from("e\u{301}e\u{301}")];
+        let result = wrap_lines_to_width(lines, 1);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].spans[0].content.as_ref(), "e\u{301}");
+        assert_eq!(result[1].spans[0].content.as_ref(), "e\u{301}");
+    }
+
+    #[test]
+    fn test_wrap_keeps_zwj_emoji_grapheme_together() {
+        let family = "👨‍👩‍👧‍👦";
+        let lines = vec![Line::from(format!("{family}{family}"))];
+        let result = wrap_lines_to_width(lines, family.width());
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].spans[0].content.as_ref(), family);
+        assert_eq!(result[1].spans[0].content.as_ref(), family);
     }
 
     // ── user_scrolled tests ────────────────────────────────────

@@ -1,7 +1,9 @@
 use crate::auth_store::{migrate_if_needed, AuthStore};
 use crate::ui;
 use async_trait::async_trait;
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
+};
 use crossterm::style::Stylize;
 use crossterm::{cursor, event, style, terminal, ExecutableCommand};
 use futures::StreamExt;
@@ -83,6 +85,8 @@ for a listing or search results, present it cleanly formatted.";
 const MAX_SYNTHESIS_INSTRUCTION_LENGTH: usize = 500;
 const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const CANCELLED_INPUT_MESSAGE: &str = "input cancelled";
+const USER_ECHO_PREFIX: &str = "you › ";
+const USER_CONTINUATION_PREFIX: &str = "      ";
 
 type SharedMemoryStore = Arc<Mutex<dyn MemoryStore>>;
 
@@ -320,15 +324,35 @@ fn spinner_frame(index: usize) -> char {
 // ---------------------------------------------------------------------------
 
 /// Install a panic hook that restores the terminal on panic.
+/// Restore the terminal to its pre-TUI state (best-effort, for panic/signal paths).
+fn restore_ratatui_terminal() {
+    let _ = crossterm::terminal::disable_raw_mode();
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        DisableBracketedPaste,
+        crossterm::terminal::LeaveAlternateScreen,
+        crossterm::cursor::Show
+    );
+}
+
+/// Restore the terminal to its pre-TUI state, propagating errors on the
+/// normal exit path so callers know if restoration failed.
+fn try_restore_ratatui_terminal() -> std::io::Result<()> {
+    crossterm::terminal::disable_raw_mode()?;
+    crossterm::execute!(
+        std::io::stdout(),
+        DisableBracketedPaste,
+        crossterm::terminal::LeaveAlternateScreen,
+        crossterm::cursor::Show
+    )?;
+    Ok(())
+}
+
+/// Install a panic hook that restores the terminal on panic.
 fn install_ratatui_panic_hook() {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = crossterm::terminal::disable_raw_mode();
-        let _ = crossterm::execute!(
-            std::io::stdout(),
-            crossterm::terminal::LeaveAlternateScreen,
-            crossterm::cursor::Show
-        );
+        restore_ratatui_terminal();
         original_hook(info);
     }));
 }
@@ -355,6 +379,7 @@ fn drain_bus_events(
 fn route_bus_message_to_app(msg: InternalMessage, app: &mut ui::FawxApp, streamed: &mut bool) {
     match msg {
         InternalMessage::StreamingStarted { .. } => {
+            app.begin_streaming_session();
             app.set_state(ui::AppState::Streaming);
             *streamed = true;
         }
@@ -362,7 +387,10 @@ fn route_bus_message_to_app(msg: InternalMessage, app: &mut ui::FawxApp, streame
             app.append_streaming_delta(&delta);
             *streamed = true;
         }
-        InternalMessage::StreamingFinished { .. } => {}
+        InternalMessage::StreamingFinished { .. } => {
+            app.finish_streaming();
+            app.set_state(ui::AppState::Executing { spinner_frame: 0 });
+        }
         _ => {}
     }
 }
@@ -392,11 +420,11 @@ fn handle_idle_key(key: KeyEvent, app: &mut ui::FawxApp) -> Option<String> {
             if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'c' {
                 return None; // handled by signal handler
             }
-            app.input_text.push(c);
+            app.append_input_char(c);
             None
         }
         KeyCode::Backspace => {
-            app.input_text.pop();
+            app.backspace_input();
             None
         }
         KeyCode::PageUp => {
@@ -405,6 +433,17 @@ fn handle_idle_key(key: KeyEvent, app: &mut ui::FawxApp) -> Option<String> {
         }
         KeyCode::PageDown => {
             app.scroll_down();
+            None
+        }
+        _ => None,
+    }
+}
+
+fn handle_idle_event(event: Event, app: &mut ui::FawxApp) -> Option<String> {
+    match event {
+        Event::Key(key) => handle_idle_key(key, app),
+        Event::Paste(text) => {
+            app.set_pasted_input(text);
             None
         }
         _ => None,
@@ -420,17 +459,16 @@ fn is_idle_control_command(input: &str) -> bool {
     trimmed.eq_ignore_ascii_case("/stop") || trimmed.eq_ignore_ascii_case("/abort")
 }
 
-/// Poll for key events during execution and route them.
-fn poll_execution_keys(
+/// Poll for input events during execution and route them.
+fn poll_execution_events(
     app: &mut ui::FawxApp,
     cancel_token: &CancellationToken,
     input_sender: &Option<LoopInputSender>,
 ) {
     while crossterm::event::poll(Duration::ZERO).unwrap_or(false) {
-        if let Ok(Event::Key(key)) = crossterm::event::read() {
-            handle_execution_key(key, app, cancel_token, input_sender);
-        } else {
-            break;
+        match crossterm::event::read() {
+            Ok(event) => handle_execution_event(event, app, cancel_token, input_sender),
+            Err(_) => break,
         }
     }
 }
@@ -461,15 +499,50 @@ fn handle_execution_key(
         }
         KeyCode::Char(c) => {
             if !key.modifiers.contains(KeyModifiers::CONTROL) {
-                app.input_text.push(c);
+                app.append_input_char(c);
             }
         }
         KeyCode::Backspace => {
-            app.input_text.pop();
+            app.backspace_input();
         }
         KeyCode::PageUp => app.scroll_up(),
         KeyCode::PageDown => app.scroll_down(),
         _ => {}
+    }
+}
+
+fn handle_execution_event(
+    event: Event,
+    app: &mut ui::FawxApp,
+    cancel_token: &CancellationToken,
+    input_sender: &Option<LoopInputSender>,
+) {
+    match event {
+        Event::Key(key) => handle_execution_key(key, app, cancel_token, input_sender),
+        Event::Paste(text) => app.set_pasted_input(text),
+        _ => {}
+    }
+}
+
+fn append_user_message_output(app: &mut ui::FawxApp, text: &str) {
+    app.add_output(String::new());
+
+    let normalized = text
+        .trim_end_matches(['\r', '\n'])
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+
+    if normalized.is_empty() {
+        app.add_output(USER_ECHO_PREFIX.to_string());
+        return;
+    }
+
+    for (index, line) in normalized.split('\n').enumerate() {
+        if index == 0 {
+            app.add_output(format!("{USER_ECHO_PREFIX}{line}"));
+        } else {
+            app.add_output(format!("{USER_CONTINUATION_PREFIX}{line}"));
+        }
     }
 }
 
@@ -493,7 +566,14 @@ fn route_execution_input(
             LoopCommand::Steer(ref steer_text) => {
                 if let Some(sender) = input_sender {
                     let _ = sender.send(LoopCommand::Steer(steer_text.clone()));
-                    app.add_output(format!("↪ Steer sent: {steer_text}"));
+                    if matches!(app.state, ui::AppState::Streaming) || app.streaming_prefix_printed
+                    {
+                        app.interrupt_stream();
+                        app.set_state(ui::AppState::Executing { spinner_frame: 0 });
+                        append_user_message_output(app, steer_text);
+                    } else {
+                        app.add_output(format!("↪ Steer sent: {steer_text}"));
+                    }
                 } else {
                     // No channel available — store for forwarding at next cycle start
                     app.set_steer(steer_text.clone());
@@ -907,8 +987,12 @@ impl TuiApp {
         install_ratatui_panic_hook();
 
         crossterm::terminal::enable_raw_mode().map_err(TuiError::Io)?;
-        crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)
-            .map_err(TuiError::Io)?;
+        crossterm::execute!(
+            std::io::stdout(),
+            crossterm::terminal::EnterAlternateScreen,
+            EnableBracketedPaste
+        )
+        .map_err(TuiError::Io)?;
         let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
         let mut terminal = ratatui::Terminal::new(backend).map_err(TuiError::Io)?;
         let mut app = ui::FawxApp::new();
@@ -923,12 +1007,7 @@ impl TuiApp {
             tokio::signal::ctrl_c().await.ok();
             cancel_for_signal.cancel();
             tokio::signal::ctrl_c().await.ok();
-            let _ = crossterm::terminal::disable_raw_mode();
-            let _ = crossterm::execute!(
-                std::io::stdout(),
-                crossterm::terminal::LeaveAlternateScreen,
-                crossterm::cursor::Show
-            );
+            restore_ratatui_terminal();
             eprintln!("\n\u{23f9} Force quit.");
             std::process::exit(130);
         });
@@ -947,18 +1026,21 @@ impl TuiApp {
             };
 
             if crossterm::event::poll(poll_duration).map_err(TuiError::Io)? {
-                match crossterm::event::read().map_err(TuiError::Io)? {
+                let event = crossterm::event::read().map_err(TuiError::Io)?;
+                match event {
                     Event::Key(key) => {
-                        if let Some(input) = handle_idle_key(key, &mut app) {
+                        let should_break = key.code == KeyCode::Char('c')
+                            && key.modifiers.contains(KeyModifiers::CONTROL);
+                        if let Some(input) = handle_idle_event(Event::Key(key), &mut app) {
                             self.process_input_line_tui(&input, &mut terminal, &mut app)
                                 .await?;
                         }
-                        // Handle Ctrl+C during idle as quit
-                        if key.code == KeyCode::Char('c')
-                            && key.modifiers.contains(KeyModifiers::CONTROL)
-                        {
+                        if should_break {
                             break;
                         }
+                    }
+                    Event::Paste(text) => {
+                        handle_idle_event(Event::Paste(text), &mut app);
                     }
                     Event::Resize(_w, _h) => {
                         // Terminal size changed — the next draw() call
@@ -969,13 +1051,7 @@ impl TuiApp {
             }
         }
 
-        crossterm::terminal::disable_raw_mode().map_err(TuiError::Io)?;
-        crossterm::execute!(
-            std::io::stdout(),
-            crossterm::terminal::LeaveAlternateScreen,
-            crossterm::cursor::Show
-        )
-        .map_err(TuiError::Io)?;
+        try_restore_ratatui_terminal().map_err(TuiError::Io)?;
         Ok(())
     }
 
@@ -1011,16 +1087,14 @@ impl TuiApp {
         }
 
         // Echo user message
-        app.add_output(String::new());
-        app.add_output(format!("you \u{203a} {}", trimmed));
+        append_user_message_output(app, trimmed);
 
         // Run agent cycle with rendering
         self.run_agent_cycle_tui(trimmed, terminal, app).await?;
 
         // After cycle completes, drain queued inputs (one per cycle)
         while let Some(queued) = app.drain_next_input() {
-            app.add_output(String::new());
-            app.add_output(format!("you \u{203a} {}", queued));
+            append_user_message_output(app, &queued);
             self.run_agent_cycle_tui(&queued, terminal, app).await?;
         }
 
@@ -1108,7 +1182,7 @@ impl TuiApp {
                         *spinner_frame += 1;
                     }
                     // Handle key events during execution (steer/abort/queue)
-                    poll_execution_keys(
+                    poll_execution_events(
                         ctx.app,
                         ctx.cancel_token,
                         &ctx.input_sender,
@@ -7775,6 +7849,83 @@ mod tests {
     }
 
     #[test]
+    fn route_execution_input_steer_interrupts_active_stream_for_clean_restart() {
+        let (sender, mut receiver) = fx_kernel::input::loop_input_channel();
+        let sender_opt = Some(sender);
+        let mut app = ui::FawxApp::new();
+        app.set_state(ui::AppState::Streaming);
+        app.start_streaming();
+        app.append_streaming_delta("partial");
+
+        let cancel = CancellationToken::new();
+        route_execution_input("/steer pivot now", &mut app, &cancel, &sender_opt);
+
+        assert_eq!(
+            receiver.try_recv(),
+            Some(LoopCommand::Steer("pivot now".to_string()))
+        );
+        assert!(!app.streaming_prefix_printed);
+        assert!(app.suppress_stream_until_next_start);
+        assert_eq!(app.output_lines[1], "fawx › partial");
+        assert_eq!(app.output_lines[3], "you › pivot now");
+        assert_eq!(app.state, ui::AppState::Executing { spinner_frame: 0 });
+    }
+
+    #[test]
+    fn route_bus_message_to_app_resets_stream_between_interrupted_segments() {
+        let mut app = ui::FawxApp::new();
+        let mut streamed = false;
+
+        route_bus_message_to_app(
+            InternalMessage::StreamingStarted {
+                phase: fx_core::message::StreamPhase::Reason,
+            },
+            &mut app,
+            &mut streamed,
+        );
+        route_bus_message_to_app(
+            InternalMessage::StreamDelta {
+                delta: "first".to_string(),
+                phase: fx_core::message::StreamPhase::Reason,
+            },
+            &mut app,
+            &mut streamed,
+        );
+        route_bus_message_to_app(
+            InternalMessage::StreamingFinished {
+                phase: fx_core::message::StreamPhase::Reason,
+            },
+            &mut app,
+            &mut streamed,
+        );
+
+        let (sender, _) = fx_kernel::input::loop_input_channel();
+        let cancel = CancellationToken::new();
+        route_execution_input("/steer pivot", &mut app, &cancel, &Some(sender));
+
+        route_bus_message_to_app(
+            InternalMessage::StreamingStarted {
+                phase: fx_core::message::StreamPhase::Reason,
+            },
+            &mut app,
+            &mut streamed,
+        );
+        route_bus_message_to_app(
+            InternalMessage::StreamDelta {
+                delta: "second".to_string(),
+                phase: fx_core::message::StreamPhase::Reason,
+            },
+            &mut app,
+            &mut streamed,
+        );
+
+        assert_eq!(app.output_lines[1], "fawx › first");
+        assert_eq!(app.output_lines[2], "↪ Steer sent: pivot");
+        assert_eq!(app.output_lines[4], "fawx › second");
+        assert_eq!(app.streaming_start_index, Some(4));
+    }
+
+    #[test]
     fn queued_inputs_drain_in_order() {
         let mut app = ui::FawxApp::new();
         app.queue_input("first".into());
@@ -7832,6 +7983,45 @@ mod tests {
         assert!(!is_idle_control_command("hello"));
         assert!(!is_idle_control_command("/steer something"));
         assert!(!is_idle_control_command("status"));
+    }
+
+    #[test]
+    fn handle_idle_event_paste_buffers_multiline_input() {
+        let mut app = ui::FawxApp::new();
+
+        let submitted = handle_idle_event(Event::Paste("alpha\nbeta".into()), &mut app);
+
+        assert!(submitted.is_none());
+        assert_eq!(app.submit_input(), "alpha\nbeta");
+    }
+
+    #[test]
+    fn handle_execution_event_paste_buffers_multiline_input() {
+        let mut app = ui::FawxApp::new();
+        let cancel = CancellationToken::new();
+
+        handle_execution_event(Event::Paste("alpha\nbeta".into()), &mut app, &cancel, &None);
+
+        assert_eq!(app.submit_input(), "alpha\nbeta");
+        assert!(!cancel.is_cancelled());
+        assert!(app.pending_inputs.is_empty());
+    }
+
+    #[test]
+    fn append_user_message_output_splits_multiline_blocks() {
+        let mut app = ui::FawxApp::new();
+
+        append_user_message_output(&mut app, "alpha\r\nbeta\ngamma");
+
+        assert_eq!(
+            app.output_lines,
+            vec![
+                String::new(),
+                "you › alpha".to_string(),
+                "      beta".to_string(),
+                "      gamma".to_string(),
+            ]
+        );
     }
 
     #[test]
