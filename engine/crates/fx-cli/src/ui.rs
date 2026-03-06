@@ -8,7 +8,7 @@ use ratatui::{
     layout::{Constraint, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Paragraph, Wrap},
+    widgets::{Block, Clear, Paragraph, Wrap},
     Frame,
 };
 use std::borrow::Cow;
@@ -705,6 +705,7 @@ fn render_output(frame: &mut Frame, area: ratatui::layout::Rect, app: &FawxApp) 
     let lines = pad_visible_output_lines(lines, width, height);
     let paragraph = Paragraph::new(lines);
 
+    frame.render_widget(Clear, area);
     frame.render_widget(paragraph, area);
 }
 
@@ -760,6 +761,7 @@ fn render_separator(frame: &mut Frame, area: ratatui::layout::Rect, app: &FawxAp
     if indicators.is_empty() {
         let sep = "─".repeat(area.width as usize);
         let line = Paragraph::new(Line::from(Span::styled(sep, Style::default().fg(AMBER))));
+        frame.render_widget(Clear, area);
         frame.render_widget(line, area);
     } else {
         let indicator_text: String = indicators
@@ -776,6 +778,7 @@ fn render_separator(frame: &mut Frame, area: ratatui::layout::Rect, app: &FawxAp
             Span::raw(indicator_text),
         ];
         let line = Paragraph::new(Line::from(spans));
+        frame.render_widget(Clear, area);
         frame.render_widget(line, area);
     }
 }
@@ -806,6 +809,7 @@ fn render_input(frame: &mut Frame, area: ratatui::layout::Rect, app: &FawxApp) {
 
     let paragraph = Paragraph::new(line).block(block).wrap(Wrap { trim: false });
 
+    frame.render_widget(Clear, area);
     frame.render_widget(paragraph, area);
 }
 
@@ -1428,6 +1432,43 @@ mod tests {
             .collect();
 
         assert_eq!(actual_rows, expected_rows);
+    }
+
+    #[test]
+    fn test_draw_clears_regions_when_layout_heights_change_between_frames() {
+        let backend = TestBackend::new(20, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = FawxApp::new();
+        app.add_output("alpha".into());
+        app.set_state(AppState::Executing { spinner_frame: 0 });
+        app.input_text = "this input is long enough to wrap".into();
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        app.set_state(AppState::Idle);
+        app.input_text.clear();
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let actual_rows: Vec<String> = (0..5)
+            .map(|row| {
+                (0..20)
+                    .map(|col| terminal.backend().buffer()[(col, row)].symbol())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect();
+
+        assert_eq!(
+            actual_rows,
+            vec![
+                "alpha               ".to_string(),
+                "                    ".to_string(),
+                "                    ".to_string(),
+                "────────────────────".to_string(),
+                "you ›               ".to_string(),
+            ]
+        );
     }
 
     // ── wrap_lines_to_width tests ──────────────────────────────
