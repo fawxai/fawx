@@ -912,6 +912,7 @@ impl TuiApp {
         } = deps;
         let base_data_dir = fawx_data_dir();
         let data_dir = configured_data_dir(&base_data_dir, &config);
+        let _ = std::fs::create_dir_all(&data_dir);
         let auth_store = AuthStore::open(&data_dir)
             .map_err(|e| TuiError::Auth(format!("failed to open auth store: {e}")))?;
         let mut conversation_store = ConversationStore::new(&data_dir).map_err(TuiError::Store)?;
@@ -8272,5 +8273,15 @@ mod tests {
         let lines = format_github_token_result(&token, &info);
         assert_eq!(lines.len(), 2);
         assert!(lines[1].contains("Missing recommended scopes"));
+    }
+
+    #[test]
+    fn auto_creates_data_dir_on_startup() {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let data_dir = tmp.path().join("nested").join(".fawx");
+        assert!(!data_dir.exists());
+        let _ = std::fs::create_dir_all(&data_dir);
+        assert!(data_dir.exists());
+        assert!(data_dir.is_dir());
     }
 }
