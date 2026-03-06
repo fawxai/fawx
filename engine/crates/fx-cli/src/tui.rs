@@ -1,7 +1,9 @@
 use crate::auth_store::{migrate_if_needed, AuthStore};
 use crate::ui;
 use async_trait::async_trait;
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
+};
 use crossterm::style::Stylize;
 use crossterm::{cursor, event, style, terminal, ExecutableCommand};
 use futures::StreamExt;
@@ -30,7 +32,7 @@ use fx_kernel::loop_engine::{
 };
 use fx_kernel::signals::{LoopStep, Signal, SignalCollector};
 use fx_kernel::types::PerceptionSnapshot;
-use fx_kernel::CachingExecutor;
+use fx_kernel::{CachingExecutor, ProposalGateExecutor, ProposalGateState};
 use fx_llm::{
     AnthropicProvider, CompletionRequest, Message, ModelCatalog, ModelInfo, ModelRouter,
     OpenAiProvider, OpenAiResponsesProvider, ProviderError, RouterError, StreamChunk,
@@ -83,6 +85,8 @@ for a listing or search results, present it cleanly formatted.";
 const MAX_SYNTHESIS_INSTRUCTION_LENGTH: usize = 500;
 const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const CANCELLED_INPUT_MESSAGE: &str = "input cancelled";
+const USER_ECHO_PREFIX: &str = "you › ";
+const USER_CONTINUATION_PREFIX: &str = "      ";
 
 type SharedMemoryStore = Arc<Mutex<dyn MemoryStore>>;
 
@@ -320,17 +324,60 @@ fn spinner_frame(index: usize) -> char {
 // ---------------------------------------------------------------------------
 
 /// Install a panic hook that restores the terminal on panic.
+/// Restore the terminal to its pre-TUI state (best-effort, for panic/signal paths).
+fn restore_ratatui_terminal() {
+    let _ = crossterm::terminal::disable_raw_mode();
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        DisableBracketedPaste,
+        crossterm::terminal::LeaveAlternateScreen,
+        crossterm::cursor::Show
+    );
+}
+
+/// Restore the terminal to its pre-TUI state, propagating errors on the
+/// normal exit path so callers know if restoration failed.
+fn try_restore_ratatui_terminal() -> std::io::Result<()> {
+    crossterm::terminal::disable_raw_mode()?;
+    crossterm::execute!(
+        std::io::stdout(),
+        DisableBracketedPaste,
+        crossterm::terminal::LeaveAlternateScreen,
+        crossterm::cursor::Show
+    )?;
+    Ok(())
+}
+
+/// Install a panic hook that restores the terminal on panic.
 fn install_ratatui_panic_hook() {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = crossterm::terminal::disable_raw_mode();
-        let _ = crossterm::execute!(
-            std::io::stdout(),
-            crossterm::terminal::LeaveAlternateScreen,
-            crossterm::cursor::Show
-        );
+        restore_ratatui_terminal();
         original_hook(info);
     }));
+}
+
+fn draw_ratatui_frame(
+    terminal: &mut DefaultTerminal,
+    app: &ui::FawxApp,
+    last_metrics: &mut Option<ui::FrameRedrawMetrics>,
+) -> Result<(), TuiError> {
+    let size = terminal.size().map_err(TuiError::Io)?;
+    let metrics = ui::frame_redraw_metrics(size.width, size.height, app);
+
+    // Ratatui's Clear widget only resets cells in the back buffer. When the
+    // rendered layout changes, force a full terminal clear so reflow frames
+    // don't depend on the diff engine to scrub stale cells from the real
+    // terminal.
+    if last_metrics.as_ref() != Some(&metrics) {
+        terminal.clear().map_err(TuiError::Io)?;
+    }
+
+    terminal
+        .draw(|frame| ui::draw(frame, app))
+        .map_err(TuiError::Io)?;
+    *last_metrics = Some(metrics);
+    Ok(())
 }
 
 /// Drain streaming events from the event bus into the FawxApp.
@@ -355,6 +402,7 @@ fn drain_bus_events(
 fn route_bus_message_to_app(msg: InternalMessage, app: &mut ui::FawxApp, streamed: &mut bool) {
     match msg {
         InternalMessage::StreamingStarted { .. } => {
+            app.begin_streaming_session();
             app.set_state(ui::AppState::Streaming);
             *streamed = true;
         }
@@ -362,7 +410,10 @@ fn route_bus_message_to_app(msg: InternalMessage, app: &mut ui::FawxApp, streame
             app.append_streaming_delta(&delta);
             *streamed = true;
         }
-        InternalMessage::StreamingFinished { .. } => {}
+        InternalMessage::StreamingFinished { .. } => {
+            app.finish_streaming();
+            app.set_state(ui::AppState::Executing { spinner_frame: 0 });
+        }
         _ => {}
     }
 }
@@ -392,11 +443,11 @@ fn handle_idle_key(key: KeyEvent, app: &mut ui::FawxApp) -> Option<String> {
             if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'c' {
                 return None; // handled by signal handler
             }
-            app.input_text.push(c);
+            app.append_input_char(c);
             None
         }
         KeyCode::Backspace => {
-            app.input_text.pop();
+            app.backspace_input();
             None
         }
         KeyCode::PageUp => {
@@ -405,6 +456,17 @@ fn handle_idle_key(key: KeyEvent, app: &mut ui::FawxApp) -> Option<String> {
         }
         KeyCode::PageDown => {
             app.scroll_down();
+            None
+        }
+        _ => None,
+    }
+}
+
+fn handle_idle_event(event: Event, app: &mut ui::FawxApp) -> Option<String> {
+    match event {
+        Event::Key(key) => handle_idle_key(key, app),
+        Event::Paste(text) => {
+            app.insert_pasted_input(text);
             None
         }
         _ => None,
@@ -420,17 +482,16 @@ fn is_idle_control_command(input: &str) -> bool {
     trimmed.eq_ignore_ascii_case("/stop") || trimmed.eq_ignore_ascii_case("/abort")
 }
 
-/// Poll for key events during execution and route them.
-fn poll_execution_keys(
+/// Poll for input events during execution and route them.
+fn poll_execution_events(
     app: &mut ui::FawxApp,
     cancel_token: &CancellationToken,
     input_sender: &Option<LoopInputSender>,
 ) {
     while crossterm::event::poll(Duration::ZERO).unwrap_or(false) {
-        if let Ok(Event::Key(key)) = crossterm::event::read() {
-            handle_execution_key(key, app, cancel_token, input_sender);
-        } else {
-            break;
+        match crossterm::event::read() {
+            Ok(event) => handle_execution_event(event, app, cancel_token, input_sender),
+            Err(_) => break,
         }
     }
 }
@@ -461,15 +522,50 @@ fn handle_execution_key(
         }
         KeyCode::Char(c) => {
             if !key.modifiers.contains(KeyModifiers::CONTROL) {
-                app.input_text.push(c);
+                app.append_input_char(c);
             }
         }
         KeyCode::Backspace => {
-            app.input_text.pop();
+            app.backspace_input();
         }
         KeyCode::PageUp => app.scroll_up(),
         KeyCode::PageDown => app.scroll_down(),
         _ => {}
+    }
+}
+
+fn handle_execution_event(
+    event: Event,
+    app: &mut ui::FawxApp,
+    cancel_token: &CancellationToken,
+    input_sender: &Option<LoopInputSender>,
+) {
+    match event {
+        Event::Key(key) => handle_execution_key(key, app, cancel_token, input_sender),
+        Event::Paste(text) => app.insert_pasted_input(text),
+        _ => {}
+    }
+}
+
+fn append_user_message_output(app: &mut ui::FawxApp, text: &str) {
+    app.add_output(String::new());
+
+    let normalized = text
+        .trim_end_matches(['\r', '\n'])
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+
+    if normalized.is_empty() {
+        app.add_output(USER_ECHO_PREFIX.to_string());
+        return;
+    }
+
+    for (index, line) in normalized.split('\n').enumerate() {
+        if index == 0 {
+            app.add_output(format!("{USER_ECHO_PREFIX}{line}"));
+        } else {
+            app.add_output(format!("{USER_CONTINUATION_PREFIX}{line}"));
+        }
     }
 }
 
@@ -493,7 +589,14 @@ fn route_execution_input(
             LoopCommand::Steer(ref steer_text) => {
                 if let Some(sender) = input_sender {
                     let _ = sender.send(LoopCommand::Steer(steer_text.clone()));
-                    app.add_output(format!("↪ Steer sent: {steer_text}"));
+                    if matches!(app.state, ui::AppState::Streaming) || app.streaming_prefix_printed
+                    {
+                        app.interrupt_stream();
+                        app.set_state(ui::AppState::Executing { spinner_frame: 0 });
+                        append_user_message_output(app, steer_text);
+                    } else {
+                        app.add_output(format!("↪ Steer sent: {steer_text}"));
+                    }
                 } else {
                     // No channel available — store for forwarding at next cycle start
                     app.set_steer(steer_text.clone());
@@ -786,6 +889,7 @@ struct CycleRenderingContext<'a> {
     active_model: String,
     terminal: &'a mut DefaultTerminal,
     app: &'a mut ui::FawxApp,
+    last_draw_metrics: &'a mut Option<ui::FrameRedrawMetrics>,
     bus_rx: &'a mut broadcast::Receiver<InternalMessage>,
     cancel_token: &'a CancellationToken,
     streamed: &'a mut bool,
@@ -832,6 +936,7 @@ impl TuiApp {
         } = deps;
         let base_data_dir = fawx_data_dir();
         let data_dir = configured_data_dir(&base_data_dir, &config);
+        let _ = std::fs::create_dir_all(&data_dir);
         let auth_store = AuthStore::open(&data_dir)
             .map_err(|e| TuiError::Auth(format!("failed to open auth store: {e}")))?;
         let mut conversation_store = ConversationStore::new(&data_dir).map_err(TuiError::Store)?;
@@ -872,9 +977,10 @@ impl TuiApp {
         Ok(app)
     }
 
-    /// Write a line to the output buffer (collected and flushed to UI later).
+    /// Write one or more logical lines to the output buffer.
     fn tui_println(&mut self, line: impl Into<String>) {
-        self.output_buffer.push(line.into());
+        let line = line.into();
+        self.output_buffer.extend(split_output_block(&line));
     }
 
     /// Return a reference to the credential store, or an error if unavailable.
@@ -907,8 +1013,12 @@ impl TuiApp {
         install_ratatui_panic_hook();
 
         crossterm::terminal::enable_raw_mode().map_err(TuiError::Io)?;
-        crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)
-            .map_err(TuiError::Io)?;
+        crossterm::execute!(
+            std::io::stdout(),
+            crossterm::terminal::EnterAlternateScreen,
+            EnableBracketedPaste
+        )
+        .map_err(TuiError::Io)?;
         let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
         let mut terminal = ratatui::Terminal::new(backend).map_err(TuiError::Io)?;
         let mut app = ui::FawxApp::new();
@@ -923,23 +1033,17 @@ impl TuiApp {
             tokio::signal::ctrl_c().await.ok();
             cancel_for_signal.cancel();
             tokio::signal::ctrl_c().await.ok();
-            let _ = crossterm::terminal::disable_raw_mode();
-            let _ = crossterm::execute!(
-                std::io::stdout(),
-                crossterm::terminal::LeaveAlternateScreen,
-                crossterm::cursor::Show
-            );
+            restore_ratatui_terminal();
             eprintln!("\n\u{23f9} Force quit.");
             std::process::exit(130);
         });
 
         self.loop_engine.set_cancel_token(self.cancel_token.clone());
         self.sync_completer_model_ids();
+        let mut last_draw_metrics = None;
 
         while self.running {
-            terminal
-                .draw(|frame| ui::draw(frame, &app))
-                .map_err(TuiError::Io)?;
+            draw_ratatui_frame(&mut terminal, &app, &mut last_draw_metrics)?;
 
             let poll_duration = match app.state {
                 ui::AppState::Idle => Duration::from_secs(3600),
@@ -947,18 +1051,26 @@ impl TuiApp {
             };
 
             if crossterm::event::poll(poll_duration).map_err(TuiError::Io)? {
-                match crossterm::event::read().map_err(TuiError::Io)? {
+                let event = crossterm::event::read().map_err(TuiError::Io)?;
+                match event {
                     Event::Key(key) => {
-                        if let Some(input) = handle_idle_key(key, &mut app) {
-                            self.process_input_line_tui(&input, &mut terminal, &mut app)
-                                .await?;
+                        let should_break = key.code == KeyCode::Char('c')
+                            && key.modifiers.contains(KeyModifiers::CONTROL);
+                        if let Some(input) = handle_idle_event(Event::Key(key), &mut app) {
+                            self.process_input_line_tui(
+                                &input,
+                                &mut terminal,
+                                &mut app,
+                                &mut last_draw_metrics,
+                            )
+                            .await?;
                         }
-                        // Handle Ctrl+C during idle as quit
-                        if key.code == KeyCode::Char('c')
-                            && key.modifiers.contains(KeyModifiers::CONTROL)
-                        {
+                        if should_break {
                             break;
                         }
+                    }
+                    Event::Paste(text) => {
+                        handle_idle_event(Event::Paste(text), &mut app);
                     }
                     Event::Resize(_w, _h) => {
                         // Terminal size changed — the next draw() call
@@ -969,13 +1081,7 @@ impl TuiApp {
             }
         }
 
-        crossterm::terminal::disable_raw_mode().map_err(TuiError::Io)?;
-        crossterm::execute!(
-            std::io::stdout(),
-            crossterm::terminal::LeaveAlternateScreen,
-            crossterm::cursor::Show
-        )
-        .map_err(TuiError::Io)?;
+        try_restore_ratatui_terminal().map_err(TuiError::Io)?;
         Ok(())
     }
 
@@ -985,6 +1091,7 @@ impl TuiApp {
         input: &str,
         terminal: &mut DefaultTerminal,
         app: &mut ui::FawxApp,
+        last_draw_metrics: &mut Option<ui::FrameRedrawMetrics>,
     ) -> Result<(), TuiError> {
         let trimmed = input.trim();
         if trimmed.is_empty() {
@@ -1011,17 +1118,17 @@ impl TuiApp {
         }
 
         // Echo user message
-        app.add_output(String::new());
-        app.add_output(format!("you \u{203a} {}", trimmed));
+        append_user_message_output(app, trimmed);
 
         // Run agent cycle with rendering
-        self.run_agent_cycle_tui(trimmed, terminal, app).await?;
+        self.run_agent_cycle_tui(trimmed, terminal, app, last_draw_metrics)
+            .await?;
 
         // After cycle completes, drain queued inputs (one per cycle)
         while let Some(queued) = app.drain_next_input() {
-            app.add_output(String::new());
-            app.add_output(format!("you \u{203a} {}", queued));
-            self.run_agent_cycle_tui(&queued, terminal, app).await?;
+            append_user_message_output(app, &queued);
+            self.run_agent_cycle_tui(&queued, terminal, app, last_draw_metrics)
+                .await?;
         }
 
         Ok(())
@@ -1034,6 +1141,7 @@ impl TuiApp {
         input: &str,
         terminal: &mut DefaultTerminal,
         app: &mut ui::FawxApp,
+        last_draw_metrics: &mut Option<ui::FrameRedrawMetrics>,
     ) -> Result<(), TuiError> {
         app.set_state(ui::AppState::Executing { spinner_frame: 0 });
         app.reset_cycle_state();
@@ -1064,6 +1172,7 @@ impl TuiApp {
             active_model,
             terminal,
             app,
+            last_draw_metrics,
             bus_rx: &mut bus_rx,
             cancel_token: &cancel_token,
             streamed: &mut streamed,
@@ -1093,9 +1202,7 @@ impl TuiApp {
         tokio::pin!(cycle_future);
 
         loop {
-            ctx.terminal
-                .draw(|frame| ui::draw(frame, ctx.app))
-                .map_err(TuiError::Io)?;
+            draw_ratatui_frame(ctx.terminal, ctx.app, ctx.last_draw_metrics)?;
 
             tokio::select! {
                 biased;
@@ -1108,7 +1215,7 @@ impl TuiApp {
                         *spinner_frame += 1;
                     }
                     // Handle key events during execution (steer/abort/queue)
-                    poll_execution_keys(
+                    poll_execution_events(
                         ctx.app,
                         ctx.cancel_token,
                         &ctx.input_sender,
@@ -2688,7 +2795,7 @@ fn build_loop_engine_with_config(
     let budget = BudgetTracker::new(BudgetConfig::default(), current_time_ms(), 0);
     let context = ContextCompactor::new(DEFAULT_CONTEXT_MAX_TOKENS, DEFAULT_CONTEXT_COMPACT_TARGET);
     let working_dir = configured_working_dir(&config);
-    let skills = build_skill_registry(working_dir, &data_dir, &config);
+    let skills = build_skill_registry(working_dir.clone(), &data_dir, &config);
     let synthesis = config
         .model
         .synthesis_instruction
@@ -2700,11 +2807,19 @@ fn build_loop_engine_with_config(
     });
 
     let caching_registry = CachingExecutor::new(skills.registry);
+
+    // Build ProposalGateExecutor to wrap the CachingExecutor.
+    // Chain: kernel → ProposalGateExecutor → CachingExecutor → SkillRegistry
+    let self_modify_config = crate::config_bridge::to_core_self_modify(&config.self_modify);
+    let proposals_dir = data_dir.join("proposals");
+    let gate_state = ProposalGateState::new(self_modify_config, working_dir.clone(), proposals_dir);
+    let gated_executor = ProposalGateExecutor::new(caching_registry, gate_state);
+
     let mut builder = LoopEngine::builder()
         .budget(budget)
         .context(context)
         .max_iterations(config.general.max_iterations)
-        .tool_executor(std::sync::Arc::new(caching_registry))
+        .tool_executor(std::sync::Arc::new(gated_executor))
         .synthesis_instruction(synthesis)
         .event_bus(event_bus.clone())
         .iteration_counter(Arc::clone(&skills.iteration_counter))
@@ -3167,6 +3282,28 @@ fn sanitize_history_text(text: &str) -> String {
         .join("\n")
         .trim()
         .to_string()
+}
+
+fn split_output_block(text: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut chars = text.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' => {
+                lines.push(std::mem::take(&mut current));
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+            }
+            '\n' => lines.push(std::mem::take(&mut current)),
+            _ => current.push(ch),
+        }
+    }
+
+    lines.push(current);
+    lines
 }
 
 fn strip_ansi_csi_sequences(text: &str) -> String {
@@ -4109,6 +4246,19 @@ fn to_strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_string()).collect()
 }
 
+/// Run a closure on the normal terminal screen.
+///
+/// Leaves the ratatui alternate screen before executing `f` so that raw
+/// `eprint!`/`stdin` I/O renders correctly, then re-enters the alternate
+/// screen afterward.  Both transitions are best-effort: if the terminal
+/// does not support them the prompt still works (graceful degradation).
+fn with_normal_screen<T>(f: impl FnOnce() -> Result<T, TuiError>) -> Result<T, TuiError> {
+    let _ = crossterm::execute!(io::stdout(), terminal::LeaveAlternateScreen);
+    let result = f();
+    let _ = crossterm::execute!(io::stdout(), terminal::EnterAlternateScreen);
+    result
+}
+
 fn prompt_line(prompt: &str) -> Result<String, TuiError> {
     ensure_cooked_mode();
 
@@ -4215,9 +4365,11 @@ where
 }
 
 fn confirm_provider_removal(provider: &str) -> Result<bool, TuiError> {
-    let prompt = format!("Remove {provider}? [y/N]: ");
-    let response = prompt_line(&prompt)?;
-    Ok(removal_confirmation_accepted(&response))
+    with_normal_screen(|| {
+        let prompt = format!("Remove {provider}? [y/N]: ");
+        let response = prompt_line(&prompt)?;
+        Ok(removal_confirmation_accepted(&response))
+    })
 }
 
 fn removal_confirmation_accepted(response: &str) -> bool {
@@ -4255,6 +4407,18 @@ fn prompt_choice<T, F>(
 where
     F: Fn(&str) -> Option<T>,
 {
+    with_normal_screen(|| prompt_choice_inner(prompt, invalid_message, context, parser))
+}
+
+fn prompt_choice_inner<T, F>(
+    prompt: &str,
+    invalid_message: &str,
+    context: &str,
+    parser: F,
+) -> Result<T, TuiError>
+where
+    F: Fn(&str) -> Option<T>,
+{
     for _ in 0..MAX_PROMPT_RETRIES {
         let value = prompt_line(prompt)?;
         if let Some(parsed) = parser(&value) {
@@ -4272,6 +4436,14 @@ fn prompt_non_empty_line(
     empty_message: &str,
     context: &str,
 ) -> Result<String, TuiError> {
+    with_normal_screen(|| prompt_non_empty_line_inner(prompt, empty_message, context))
+}
+
+fn prompt_non_empty_line_inner(
+    prompt: &str,
+    empty_message: &str,
+    context: &str,
+) -> Result<String, TuiError> {
     for _ in 0..MAX_PROMPT_RETRIES {
         let value = prompt_line(prompt)?;
         if !value.is_empty() {
@@ -4285,30 +4457,32 @@ fn prompt_non_empty_line(
 }
 
 fn prompt_api_key_provider() -> Result<String, TuiError> {
-    eprintln!("Which provider?");
-    eprintln!("  [1] Anthropic");
-    eprintln!("  [2] OpenAI");
-    eprintln!("  [3] OpenRouter");
-    eprintln!("  [4] Other (OpenAI-compatible)");
-    eprintln!();
+    with_normal_screen(|| {
+        eprintln!("Which provider?");
+        eprintln!("  [1] Anthropic");
+        eprintln!("  [2] OpenAI");
+        eprintln!("  [3] OpenRouter");
+        eprintln!("  [4] Other (OpenAI-compatible)");
+        eprintln!();
 
-    let choice = prompt_choice(
-        "> ",
-        "Please choose 1, 2, 3, or 4.",
-        "API key provider selection",
-        parse_api_key_provider_selection,
-    )?;
+        let choice = prompt_choice_inner(
+            "> ",
+            "Please choose 1, 2, 3, or 4.",
+            "API key provider selection",
+            parse_api_key_provider_selection,
+        )?;
 
-    match choice {
-        ApiKeyProvider::Anthropic => Ok("anthropic".to_string()),
-        ApiKeyProvider::OpenAi => Ok("openai".to_string()),
-        ApiKeyProvider::OpenRouter => Ok("openrouter".to_string()),
-        ApiKeyProvider::Other => prompt_non_empty_line(
-            "Provider name: ",
-            "Provider name cannot be empty.",
-            "API key provider name",
-        ),
-    }
+        match choice {
+            ApiKeyProvider::Anthropic => Ok("anthropic".to_string()),
+            ApiKeyProvider::OpenAi => Ok("openai".to_string()),
+            ApiKeyProvider::OpenRouter => Ok("openrouter".to_string()),
+            ApiKeyProvider::Other => prompt_non_empty_line_inner(
+                "Provider name: ",
+                "Provider name cannot be empty.",
+                "API key provider name",
+            ),
+        }
+    })
 }
 
 fn prompt_non_empty_secret(
@@ -4316,16 +4490,18 @@ fn prompt_non_empty_secret(
     empty_message: &str,
     context: &str,
 ) -> Result<String, TuiError> {
-    for _ in 0..MAX_PROMPT_RETRIES {
-        let value = prompt_secret(prompt)?;
-        if !value.is_empty() {
-            return Ok(value);
+    with_normal_screen(|| {
+        for _ in 0..MAX_PROMPT_RETRIES {
+            let value = prompt_secret(prompt)?;
+            if !value.is_empty() {
+                return Ok(value);
+            }
+
+            eprint!("{empty_message}");
         }
 
-        eprint!("{empty_message}");
-    }
-
-    Err(retry_limit_error(context))
+        Err(retry_limit_error(context))
+    })
 }
 
 fn prompt_secret(prompt: &str) -> Result<String, TuiError> {
@@ -6051,6 +6227,57 @@ mod tests {
     }
 
     #[test]
+    fn classify_secret_input_key_handles_all_action_types() {
+        // Submit on Enter
+        let enter = event::KeyEvent::new(event::KeyCode::Enter, event::KeyModifiers::NONE);
+        assert_eq!(
+            super::classify_secret_input_key(&enter),
+            super::SecretInputKeyAction::Submit
+        );
+
+        // Type on printable characters
+        let char_a = event::KeyEvent::new(event::KeyCode::Char('a'), event::KeyModifiers::NONE);
+        assert_eq!(
+            super::classify_secret_input_key(&char_a),
+            super::SecretInputKeyAction::Type('a')
+        );
+        let char_z = event::KeyEvent::new(event::KeyCode::Char('Z'), event::KeyModifiers::SHIFT);
+        assert_eq!(
+            super::classify_secret_input_key(&char_z),
+            super::SecretInputKeyAction::Type('Z')
+        );
+        let digit = event::KeyEvent::new(event::KeyCode::Char('9'), event::KeyModifiers::NONE);
+        assert_eq!(
+            super::classify_secret_input_key(&digit),
+            super::SecretInputKeyAction::Type('9')
+        );
+
+        // Delete on Backspace
+        let backspace = event::KeyEvent::new(event::KeyCode::Backspace, event::KeyModifiers::NONE);
+        assert_eq!(
+            super::classify_secret_input_key(&backspace),
+            super::SecretInputKeyAction::Delete
+        );
+
+        // Ignore on unhandled keys (arrows, function keys, etc.)
+        let left = event::KeyEvent::new(event::KeyCode::Left, event::KeyModifiers::NONE);
+        assert_eq!(
+            super::classify_secret_input_key(&left),
+            super::SecretInputKeyAction::Ignore
+        );
+        let f1 = event::KeyEvent::new(event::KeyCode::F(1), event::KeyModifiers::NONE);
+        assert_eq!(
+            super::classify_secret_input_key(&f1),
+            super::SecretInputKeyAction::Ignore
+        );
+        let tab = event::KeyEvent::new(event::KeyCode::Tab, event::KeyModifiers::NONE);
+        assert_eq!(
+            super::classify_secret_input_key(&tab),
+            super::SecretInputKeyAction::Ignore
+        );
+    }
+
+    #[test]
     fn parse_provider_selection_rejects_out_of_range_and_invalid_values() {
         assert_eq!(super::parse_provider_selection("0", 3), None);
         assert_eq!(super::parse_provider_selection("4", 3), None);
@@ -7275,6 +7502,19 @@ mod tests {
         assert_eq!(sanitized, "Answer\nwarning");
     }
 
+    #[test]
+    fn split_output_block_normalizes_crlf_and_cr_without_losing_trailing_lines() {
+        assert_eq!(
+            split_output_block("alpha\r\nbeta\rgamma\n"),
+            vec![
+                "alpha".to_string(),
+                "beta".to_string(),
+                "gamma".to_string(),
+                String::new(),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn generate_streaming_prints_tokens_incrementally() {
         let chunks = vec![
@@ -7767,6 +8007,83 @@ mod tests {
     }
 
     #[test]
+    fn route_execution_input_steer_interrupts_active_stream_for_clean_restart() {
+        let (sender, mut receiver) = fx_kernel::input::loop_input_channel();
+        let sender_opt = Some(sender);
+        let mut app = ui::FawxApp::new();
+        app.set_state(ui::AppState::Streaming);
+        app.start_streaming();
+        app.append_streaming_delta("partial");
+
+        let cancel = CancellationToken::new();
+        route_execution_input("/steer pivot now", &mut app, &cancel, &sender_opt);
+
+        assert_eq!(
+            receiver.try_recv(),
+            Some(LoopCommand::Steer("pivot now".to_string()))
+        );
+        assert!(!app.streaming_prefix_printed);
+        assert!(app.suppress_stream_until_next_start);
+        assert_eq!(app.output_lines[1], "fawx › partial");
+        assert_eq!(app.output_lines[3], "you › pivot now");
+        assert_eq!(app.state, ui::AppState::Executing { spinner_frame: 0 });
+    }
+
+    #[test]
+    fn route_bus_message_to_app_resets_stream_between_interrupted_segments() {
+        let mut app = ui::FawxApp::new();
+        let mut streamed = false;
+
+        route_bus_message_to_app(
+            InternalMessage::StreamingStarted {
+                phase: fx_core::message::StreamPhase::Reason,
+            },
+            &mut app,
+            &mut streamed,
+        );
+        route_bus_message_to_app(
+            InternalMessage::StreamDelta {
+                delta: "first".to_string(),
+                phase: fx_core::message::StreamPhase::Reason,
+            },
+            &mut app,
+            &mut streamed,
+        );
+        route_bus_message_to_app(
+            InternalMessage::StreamingFinished {
+                phase: fx_core::message::StreamPhase::Reason,
+            },
+            &mut app,
+            &mut streamed,
+        );
+
+        let (sender, _) = fx_kernel::input::loop_input_channel();
+        let cancel = CancellationToken::new();
+        route_execution_input("/steer pivot", &mut app, &cancel, &Some(sender));
+
+        route_bus_message_to_app(
+            InternalMessage::StreamingStarted {
+                phase: fx_core::message::StreamPhase::Reason,
+            },
+            &mut app,
+            &mut streamed,
+        );
+        route_bus_message_to_app(
+            InternalMessage::StreamDelta {
+                delta: "second".to_string(),
+                phase: fx_core::message::StreamPhase::Reason,
+            },
+            &mut app,
+            &mut streamed,
+        );
+
+        assert_eq!(app.output_lines[1], "fawx › first");
+        assert_eq!(app.output_lines[2], "↪ Steer sent: pivot");
+        assert_eq!(app.output_lines[4], "fawx › second");
+        assert_eq!(app.streaming_start_index, Some(4));
+    }
+
+    #[test]
     fn queued_inputs_drain_in_order() {
         let mut app = ui::FawxApp::new();
         app.queue_input("first".into());
@@ -7824,6 +8141,104 @@ mod tests {
         assert!(!is_idle_control_command("hello"));
         assert!(!is_idle_control_command("/steer something"));
         assert!(!is_idle_control_command("status"));
+    }
+
+    #[test]
+    fn handle_idle_event_paste_buffers_multiline_input() {
+        let mut app = ui::FawxApp::new();
+
+        let submitted = handle_idle_event(Event::Paste("alpha\nbeta".into()), &mut app);
+
+        assert!(submitted.is_none());
+        assert_eq!(app.submit_input(), "alpha\nbeta");
+    }
+
+    #[test]
+    fn handle_idle_event_paste_appends_to_existing_input() {
+        let mut app = ui::FawxApp::new();
+        app.input_text = "hello world ".into();
+
+        let submitted = handle_idle_event(Event::Paste("AAAA".into()), &mut app);
+
+        assert!(submitted.is_none());
+        assert_eq!(app.submit_input(), "hello world AAAA");
+    }
+
+    #[test]
+    fn handle_execution_event_paste_buffers_multiline_input() {
+        let mut app = ui::FawxApp::new();
+        let cancel = CancellationToken::new();
+
+        handle_execution_event(Event::Paste("alpha\nbeta".into()), &mut app, &cancel, &None);
+
+        assert_eq!(app.submit_input(), "alpha\nbeta");
+        assert!(!cancel.is_cancelled());
+        assert!(app.pending_inputs.is_empty());
+    }
+
+    #[test]
+    fn handle_execution_event_paste_appends_to_existing_input() {
+        let mut app = ui::FawxApp::new();
+        let cancel = CancellationToken::new();
+        app.input_text = "hello world ".into();
+
+        handle_execution_event(Event::Paste("AAAA".into()), &mut app, &cancel, &None);
+
+        assert_eq!(app.submit_input(), "hello world AAAA");
+        assert!(!cancel.is_cancelled());
+        assert!(app.pending_inputs.is_empty());
+    }
+
+    #[test]
+    fn append_user_message_output_splits_multiline_blocks() {
+        let mut app = ui::FawxApp::new();
+
+        append_user_message_output(&mut app, "alpha\r\nbeta\ngamma");
+
+        assert_eq!(
+            app.output_lines,
+            vec![
+                String::new(),
+                "you › alpha".to_string(),
+                "      beta".to_string(),
+                "      gamma".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn tui_println_splits_multiline_blocks_into_logical_lines() {
+        let (mut app, _temp_dir) = new_test_app();
+
+        app.tui_println("alpha\r\nbeta\n\ngamma");
+
+        assert_eq!(
+            app.output_buffer,
+            vec![
+                "alpha".to_string(),
+                "beta".to_string(),
+                String::new(),
+                "gamma".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn flush_output_to_preserves_logical_lines_for_multiline_blocks() {
+        let (mut tui_app, _temp_dir) = new_test_app();
+        let mut ui_app = ui::FawxApp::new();
+
+        tui_app.tui_println("fawx › first line\nsecond line\n");
+        tui_app.flush_output_to(&mut ui_app);
+
+        assert_eq!(
+            ui_app.output_lines,
+            vec![
+                "fawx › first line".to_string(),
+                "second line".to_string(),
+                String::new(),
+            ]
+        );
     }
 
     #[test]
@@ -8074,5 +8489,15 @@ mod tests {
         let lines = format_github_token_result(&token, &info);
         assert_eq!(lines.len(), 2);
         assert!(lines[1].contains("Missing recommended scopes"));
+    }
+
+    #[test]
+    fn auto_creates_data_dir_on_startup() {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let data_dir = tmp.path().join("nested").join(".fawx");
+        assert!(!data_dir.exists());
+        let _ = std::fs::create_dir_all(&data_dir);
+        assert!(data_dir.exists());
+        assert!(data_dir.is_dir());
     }
 }

@@ -44,6 +44,7 @@ pub mod loop_engine;
 pub mod perceive;
 pub mod permissions;
 pub mod policy;
+pub mod proposal_gate;
 pub mod reason;
 pub mod rollback;
 pub mod signals;
@@ -67,6 +68,7 @@ pub use input::{loop_input_channel, LoopCommand, LoopInputChannel, LoopInputSend
 pub use learn::Learning;
 pub use loop_engine::{LoopEngine, LoopEngineBuilder, LoopResult, LoopStatus, ScratchpadProvider};
 pub use perceive::ProcessedPerception;
+pub use proposal_gate::{ProposalGateExecutor, ProposalGateState};
 pub use signals::{LoopStep, Signal, SignalCollector, SignalKind};
 pub use types::{ContinuationDecision, EscalationContext, LoopError, LoopEvidence};
 pub use verify::Verification;

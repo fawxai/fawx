@@ -19,6 +19,20 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
 
+/// Expand a leading `~` or `~/` prefix to the user's home directory.
+fn expand_tilde(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    } else if path == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    }
+    PathBuf::from(path)
+}
+
 const MAX_RECURSION_DEPTH: usize = 5;
 const MAX_SEARCH_MATCHES: usize = 100;
 const DEFAULT_MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
@@ -156,7 +170,11 @@ impl FawxToolExecutor {
 
     fn handle_read_file(&self, args: &serde_json::Value) -> Result<String, String> {
         let parsed: ReadFileArgs = parse_args(args)?;
-        let path = self.jailed_path(&parsed.path)?;
+        let expanded = expand_tilde(&parsed.path);
+        let expanded_str = expanded
+            .to_str()
+            .ok_or_else(|| "home directory path is not valid UTF-8".to_string())?;
+        let path = self.jailed_path(expanded_str)?;
         let metadata = fs::metadata(&path).map_err(|error| error.to_string())?;
         if metadata.len() > self.config.max_read_size {
             return Err("file exceeds maximum allowed size".to_string());
@@ -171,8 +189,16 @@ impl FawxToolExecutor {
         if len > self.config.max_file_size {
             return Err("content exceeds maximum allowed size".to_string());
         }
-        let path = self.jailed_path(&parsed.path)?;
+        let expanded = expand_tilde(&parsed.path);
+        let expanded_str = expanded
+            .to_str()
+            .ok_or_else(|| "home directory path is not valid UTF-8".to_string())?;
+        let path = self.jailed_path(expanded_str)?;
 
+        // Defense-in-depth: ProposalGateExecutor in the kernel is the primary
+        // enforcement layer for self-modify policy. This tool-level check is
+        // retained as a secondary guard in case the kernel gate is bypassed or
+        // misconfigured.
         if let Some(ref sm_config) = self.self_modify {
             let tier = classify_path(&path, &self.working_dir, sm_config);
             match tier {
@@ -241,7 +267,11 @@ impl FawxToolExecutor {
 
     fn handle_list_directory(&self, args: &serde_json::Value) -> Result<String, String> {
         let parsed: ListDirectoryArgs = parse_args(args)?;
-        let path = self.jailed_path(&parsed.path)?;
+        let expanded = expand_tilde(&parsed.path);
+        let expanded_str = expanded
+            .to_str()
+            .ok_or_else(|| "home directory path is not valid UTF-8".to_string())?;
+        let path = self.jailed_path(expanded_str)?;
         let recursive = parsed.recursive.unwrap_or(false);
         if recursive {
             return self.list_recursive(&path, 0);
@@ -359,10 +389,14 @@ impl FawxToolExecutor {
     fn resolve_search_root(&self, requested: Option<&str>) -> Result<PathBuf, String> {
         let default_root = self.working_dir.to_string_lossy().to_string();
         let requested = requested.unwrap_or(&default_root);
+        let expanded = expand_tilde(requested);
+        let expanded_str = expanded
+            .to_str()
+            .ok_or_else(|| "home directory path is not valid UTF-8".to_string())?;
         if !self.config.jail_to_working_dir {
-            return canonicalize_existing_or_parent(Path::new(requested));
+            return canonicalize_existing_or_parent(Path::new(expanded_str));
         }
-        validate_path(&self.working_dir, requested)
+        validate_path(&self.working_dir, expanded_str)
     }
 
     fn search_path(
@@ -699,7 +733,8 @@ pub fn fawx_tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "read_file".to_string(),
-            description: "Read a UTF-8 text file from disk".to_string(),
+            description: "Read a UTF-8 text file from disk. Supports `~` to reference the home directory."
+                .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -710,7 +745,8 @@ pub fn fawx_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "write_file".to_string(),
-            description: "Write UTF-8 content to a file on disk".to_string(),
+            description: "Write UTF-8 content to a file on disk. Supports `~` to reference the home directory."
+                .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -722,7 +758,9 @@ pub fn fawx_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "list_directory".to_string(),
-            description: "List files and directories, optionally recursively".to_string(),
+            description:
+                "List files and directories, optionally recursively. Supports `~` to reference the home directory."
+                    .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -747,7 +785,9 @@ pub fn fawx_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "search_text".to_string(),
-            description: "Search text in files and return file:line matches".to_string(),
+            description:
+                "Search text in files and return file:line matches. Supports `~` to reference the home directory."
+                    .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -2393,5 +2433,55 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(!results[0].success);
         assert!(results[0].output.contains("timed out"));
+    }
+
+    #[test]
+    fn expand_tilde_with_home() {
+        let result = expand_tilde("~/foo");
+        let home = dirs::home_dir().expect("home dir should exist in test env");
+        assert_eq!(result, home.join("foo"));
+    }
+
+    #[test]
+    fn expand_tilde_bare() {
+        let result = expand_tilde("~");
+        let home = dirs::home_dir().expect("home dir should exist in test env");
+        assert_eq!(result, home);
+    }
+
+    #[test]
+    fn expand_tilde_no_tilde() {
+        let result = expand_tilde("/absolute/path");
+        assert_eq!(result, PathBuf::from("/absolute/path"));
+    }
+
+    #[test]
+    fn expand_tilde_relative() {
+        let result = expand_tilde("relative/path");
+        assert_eq!(result, PathBuf::from("relative/path"));
+    }
+
+    #[test]
+    fn expand_tilde_other_user_not_expanded() {
+        let result = expand_tilde("~otheruser/foo");
+        assert_eq!(result, PathBuf::from("~otheruser/foo"));
+    }
+
+    #[test]
+    fn tilde_expansion_respects_jail() {
+        let jail = TempDir::new().expect("jail");
+        let executor = test_executor(jail.path());
+
+        // ~/something expands to $HOME/something which is outside the jail
+        let result = executor.handle_read_file(&serde_json::json!({"path": "~/something"}));
+        assert!(
+            result.is_err(),
+            "tilde-expanded path outside jail should be rejected"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("escapes working directory") || err.contains("No such file"),
+            "expected jail escape error, got: {err}"
+        );
     }
 }
