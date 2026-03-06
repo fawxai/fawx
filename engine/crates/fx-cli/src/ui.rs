@@ -337,9 +337,7 @@ impl FawxApp {
             return 1;
         }
         let display_text = self.input_display_text();
-        // Use char count instead of byte length so multi-byte characters like
-        // `›` don't inflate the calculation.
-        let content_len = PROMPT.chars().count() + display_text.chars().count();
+        let content_len = PROMPT.width() + display_text.width();
         (content_len as u16).div_ceil(width).max(1)
     }
 }
@@ -351,6 +349,32 @@ impl Default for FawxApp {
 }
 
 // ── Drawing ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameRedrawMetrics {
+    pub terminal_width: u16,
+    pub terminal_height: u16,
+    pub input_height: u16,
+    pub output_height: u16,
+    pub state: FrameRedrawState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameRedrawState {
+    Idle,
+    Executing,
+    Streaming,
+}
+
+impl From<&AppState> for FrameRedrawState {
+    fn from(state: &AppState) -> Self {
+        match state {
+            AppState::Idle => Self::Idle,
+            AppState::Executing { .. } => Self::Executing,
+            AppState::Streaming => Self::Streaming,
+        }
+    }
+}
 
 /// Render the entire TUI frame.
 pub fn draw(frame: &mut Frame, app: &FawxApp) {
@@ -657,6 +681,30 @@ fn prepare_output_lines_for_render(app: &FawxApp, width: usize) -> (Vec<Line<'st
     (render_lines, total_visual_rows)
 }
 
+pub fn frame_redraw_metrics(
+    terminal_width: u16,
+    terminal_height: u16,
+    app: &FawxApp,
+) -> FrameRedrawMetrics {
+    let area = ratatui::layout::Rect::new(0, 0, terminal_width, terminal_height);
+    let input_height = app.calculate_input_height(terminal_width);
+    let layout = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(input_height),
+    ])
+    .split(area);
+    let output_height = layout[0].height;
+
+    FrameRedrawMetrics {
+        terminal_width,
+        terminal_height,
+        input_height,
+        output_height,
+        state: FrameRedrawState::from(&app.state),
+    }
+}
+
 fn visible_output_lines_for_render(
     app: &FawxApp,
     width: usize,
@@ -695,6 +743,74 @@ fn pad_visible_output_lines(
     }
 
     lines
+}
+
+fn truncate_to_display_width(text: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+
+    let mut out = String::new();
+    let mut width = 0;
+
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = grapheme.width();
+        if width + grapheme_width > max_width {
+            break;
+        }
+        out.push_str(grapheme);
+        width += grapheme_width;
+    }
+
+    out
+}
+
+fn truncate_spans_to_display_width(spans: &[Span<'_>], max_width: usize) -> Vec<Span<'static>> {
+    if max_width == 0 {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let mut width = 0;
+
+    for span in spans {
+        if width >= max_width {
+            break;
+        }
+
+        let truncated = truncate_to_display_width(&span.content, max_width.saturating_sub(width));
+
+        if !truncated.is_empty() {
+            width += truncated.width();
+            out.push(Span::styled(truncated, span.style));
+        }
+    }
+
+    out
+}
+
+fn build_separator_line(area_width: usize, indicators: &[Span<'_>]) -> Line<'static> {
+    if indicators.is_empty() {
+        return Line::from(Span::styled(
+            "─".repeat(area_width),
+            Style::default().fg(AMBER),
+        ));
+    }
+
+    let indicator_spans = truncate_spans_to_display_width(indicators, area_width.saturating_sub(2));
+    let indicator_width = indicator_spans
+        .iter()
+        .map(|span| span.content.width())
+        .sum::<usize>();
+    let fill_len = area_width.saturating_sub(indicator_width);
+    let mut line_spans = Vec::with_capacity(1 + indicator_spans.len());
+    line_spans.push(Span::styled(
+        "─".repeat(fill_len),
+        Style::default().fg(AMBER),
+    ));
+    line_spans.extend(indicator_spans);
+
+    Line::from(line_spans)
 }
 
 /// Render the scrollable output region.
@@ -757,30 +873,9 @@ fn build_status_indicators(app: &FawxApp) -> Vec<Span<'_>> {
 /// Render the amber separator line with optional status indicators.
 fn render_separator(frame: &mut Frame, area: ratatui::layout::Rect, app: &FawxApp) {
     let indicators = build_status_indicators(app);
-
-    if indicators.is_empty() {
-        let sep = "─".repeat(area.width as usize);
-        let line = Paragraph::new(Line::from(Span::styled(sep, Style::default().fg(AMBER))));
-        frame.render_widget(Clear, area);
-        frame.render_widget(line, area);
-    } else {
-        let indicator_text: String = indicators
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect::<String>()
-            .chars()
-            .take((area.width as usize).saturating_sub(2))
-            .collect();
-        let indicator_char_len = indicator_text.chars().count();
-        let fill_len = (area.width as usize).saturating_sub(indicator_char_len);
-        let spans = vec![
-            Span::styled("─".repeat(fill_len), Style::default().fg(AMBER)),
-            Span::raw(indicator_text),
-        ];
-        let line = Paragraph::new(Line::from(spans));
-        frame.render_widget(Clear, area);
-        frame.render_widget(line, area);
-    }
+    let line = Paragraph::new(build_separator_line(area.width as usize, &indicators));
+    frame.render_widget(Clear, area);
+    frame.render_widget(line, area);
 }
 
 /// Render the input bar with prompt and current text.
@@ -1090,19 +1185,16 @@ mod tests {
     #[test]
     fn test_calculate_input_height() {
         let app = FawxApp::new();
-        // PROMPT is "you › " = 6 chars (byte-wise more, but char count matters
-        // for terminal columns). With empty input and width 80, should be 1 row.
+        // PROMPT is 6 display columns. With empty input and width 80, it fits
+        // on a single row.
         assert_eq!(app.calculate_input_height(80), 1);
 
         let mut app2 = FawxApp::new();
-        // Input that forces wrapping: prompt (6 bytes visible) + 80 chars = 86
-        // At width 40, that's ceil(86/40) = 3 rows
+        // Input that forces wrapping: prompt (6 columns) + 80 chars = 86
+        // display columns. At width 40, that's ceil(86/40) = 3 rows.
         app2.input_text = "x".repeat(80);
-        // PROMPT bytes: "you › " — the › is multi-byte UTF-8 but 1 column.
-        // For simplicity the calculation uses byte length which may
-        // over-count, but the result should be >= 3.
         let height = app2.calculate_input_height(40);
-        assert!(height >= 2, "expected at least 2 rows, got {height}");
+        assert_eq!(height, 3);
 
         // Width 0 edge case
         assert_eq!(app2.calculate_input_height(0), 1);
@@ -1114,6 +1206,14 @@ mod tests {
         app.insert_pasted_input("alpha\nbeta\ngamma".into());
 
         assert_eq!(app.calculate_input_height(20), 2);
+    }
+
+    #[test]
+    fn test_calculate_input_height_uses_display_width() {
+        let mut app = FawxApp::new();
+        app.input_text = "📡📡📡".into();
+
+        assert_eq!(app.calculate_input_height(10), 2);
     }
 
     #[test]
@@ -1469,6 +1569,68 @@ mod tests {
                 "you ›               ".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn test_build_separator_line_clamps_wide_status_to_area_width() {
+        let mut app = FawxApp::new();
+        app.set_state(AppState::Streaming);
+        app.queue_input("queued".into());
+
+        let indicators = build_status_indicators(&app);
+        let line = build_separator_line(12, &indicators);
+        let rendered = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert_eq!(line_display_width(&line), 12);
+        assert!(rendered.contains("📡"));
+    }
+
+    #[test]
+    fn test_build_separator_line_preserves_indicator_style_when_truncated() {
+        let indicators = vec![Span::styled(
+            " ⏳ Thinking... ",
+            Style::default().fg(Color::Yellow),
+        )];
+
+        let line = build_separator_line(12, &indicators);
+
+        assert!(line
+            .spans
+            .iter()
+            .any(|span| span.style.fg == Some(Color::Yellow)));
+    }
+
+    #[test]
+    fn test_truncate_to_display_width_handles_grapheme_boundaries() {
+        assert_eq!(truncate_to_display_width("", 4), "");
+        assert_eq!(truncate_to_display_width("alpha", 0), "");
+        assert_eq!(truncate_to_display_width("alpha", 3), "alp");
+        assert_eq!(truncate_to_display_width("📡ok", 1), "");
+        assert_eq!(truncate_to_display_width("📡ok", 2), "📡");
+        assert_eq!(truncate_to_display_width("e\u{301}x", 1), "e\u{301}");
+    }
+
+    #[test]
+    fn test_frame_redraw_metrics_ignore_spinner_frame_and_streaming_content() {
+        let mut app = FawxApp::new();
+        app.set_state(AppState::Executing { spinner_frame: 0 });
+        app.add_output("alpha".into());
+
+        let baseline = frame_redraw_metrics(80, 24, &app);
+
+        app.set_state(AppState::Executing { spinner_frame: 9 });
+        app.add_output("beta".into());
+        app.queue_input("queued".into());
+        app.steer_message = Some("steer".into());
+        app.abort_requested = true;
+
+        let updated = frame_redraw_metrics(80, 24, &app);
+
+        assert_eq!(baseline, updated);
     }
 
     // ── wrap_lines_to_width tests ──────────────────────────────

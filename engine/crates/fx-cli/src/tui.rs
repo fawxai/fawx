@@ -357,6 +357,29 @@ fn install_ratatui_panic_hook() {
     }));
 }
 
+fn draw_ratatui_frame(
+    terminal: &mut DefaultTerminal,
+    app: &ui::FawxApp,
+    last_metrics: &mut Option<ui::FrameRedrawMetrics>,
+) -> Result<(), TuiError> {
+    let size = terminal.size().map_err(TuiError::Io)?;
+    let metrics = ui::frame_redraw_metrics(size.width, size.height, app);
+
+    // Ratatui's Clear widget only resets cells in the back buffer. When the
+    // rendered layout changes, force a full terminal clear so reflow frames
+    // don't depend on the diff engine to scrub stale cells from the real
+    // terminal.
+    if last_metrics.as_ref() != Some(&metrics) {
+        terminal.clear().map_err(TuiError::Io)?;
+    }
+
+    terminal
+        .draw(|frame| ui::draw(frame, app))
+        .map_err(TuiError::Io)?;
+    *last_metrics = Some(metrics);
+    Ok(())
+}
+
 /// Drain streaming events from the event bus into the FawxApp.
 fn drain_bus_events(
     bus_rx: &mut broadcast::Receiver<InternalMessage>,
@@ -866,6 +889,7 @@ struct CycleRenderingContext<'a> {
     active_model: String,
     terminal: &'a mut DefaultTerminal,
     app: &'a mut ui::FawxApp,
+    last_draw_metrics: &'a mut Option<ui::FrameRedrawMetrics>,
     bus_rx: &'a mut broadcast::Receiver<InternalMessage>,
     cancel_token: &'a CancellationToken,
     streamed: &'a mut bool,
@@ -953,9 +977,10 @@ impl TuiApp {
         Ok(app)
     }
 
-    /// Write a line to the output buffer (collected and flushed to UI later).
+    /// Write one or more logical lines to the output buffer.
     fn tui_println(&mut self, line: impl Into<String>) {
-        self.output_buffer.push(line.into());
+        let line = line.into();
+        self.output_buffer.extend(split_output_block(&line));
     }
 
     /// Return a reference to the credential store, or an error if unavailable.
@@ -1015,11 +1040,10 @@ impl TuiApp {
 
         self.loop_engine.set_cancel_token(self.cancel_token.clone());
         self.sync_completer_model_ids();
+        let mut last_draw_metrics = None;
 
         while self.running {
-            terminal
-                .draw(|frame| ui::draw(frame, &app))
-                .map_err(TuiError::Io)?;
+            draw_ratatui_frame(&mut terminal, &app, &mut last_draw_metrics)?;
 
             let poll_duration = match app.state {
                 ui::AppState::Idle => Duration::from_secs(3600),
@@ -1033,8 +1057,13 @@ impl TuiApp {
                         let should_break = key.code == KeyCode::Char('c')
                             && key.modifiers.contains(KeyModifiers::CONTROL);
                         if let Some(input) = handle_idle_event(Event::Key(key), &mut app) {
-                            self.process_input_line_tui(&input, &mut terminal, &mut app)
-                                .await?;
+                            self.process_input_line_tui(
+                                &input,
+                                &mut terminal,
+                                &mut app,
+                                &mut last_draw_metrics,
+                            )
+                            .await?;
                         }
                         if should_break {
                             break;
@@ -1062,6 +1091,7 @@ impl TuiApp {
         input: &str,
         terminal: &mut DefaultTerminal,
         app: &mut ui::FawxApp,
+        last_draw_metrics: &mut Option<ui::FrameRedrawMetrics>,
     ) -> Result<(), TuiError> {
         let trimmed = input.trim();
         if trimmed.is_empty() {
@@ -1091,12 +1121,14 @@ impl TuiApp {
         append_user_message_output(app, trimmed);
 
         // Run agent cycle with rendering
-        self.run_agent_cycle_tui(trimmed, terminal, app).await?;
+        self.run_agent_cycle_tui(trimmed, terminal, app, last_draw_metrics)
+            .await?;
 
         // After cycle completes, drain queued inputs (one per cycle)
         while let Some(queued) = app.drain_next_input() {
             append_user_message_output(app, &queued);
-            self.run_agent_cycle_tui(&queued, terminal, app).await?;
+            self.run_agent_cycle_tui(&queued, terminal, app, last_draw_metrics)
+                .await?;
         }
 
         Ok(())
@@ -1109,6 +1141,7 @@ impl TuiApp {
         input: &str,
         terminal: &mut DefaultTerminal,
         app: &mut ui::FawxApp,
+        last_draw_metrics: &mut Option<ui::FrameRedrawMetrics>,
     ) -> Result<(), TuiError> {
         app.set_state(ui::AppState::Executing { spinner_frame: 0 });
         app.reset_cycle_state();
@@ -1139,6 +1172,7 @@ impl TuiApp {
             active_model,
             terminal,
             app,
+            last_draw_metrics,
             bus_rx: &mut bus_rx,
             cancel_token: &cancel_token,
             streamed: &mut streamed,
@@ -1168,9 +1202,7 @@ impl TuiApp {
         tokio::pin!(cycle_future);
 
         loop {
-            ctx.terminal
-                .draw(|frame| ui::draw(frame, ctx.app))
-                .map_err(TuiError::Io)?;
+            draw_ratatui_frame(ctx.terminal, ctx.app, ctx.last_draw_metrics)?;
 
             tokio::select! {
                 biased;
@@ -3250,6 +3282,28 @@ fn sanitize_history_text(text: &str) -> String {
         .join("\n")
         .trim()
         .to_string()
+}
+
+fn split_output_block(text: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut chars = text.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' => {
+                lines.push(std::mem::take(&mut current));
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+            }
+            '\n' => lines.push(std::mem::take(&mut current)),
+            _ => current.push(ch),
+        }
+    }
+
+    lines.push(current);
+    lines
 }
 
 fn strip_ansi_csi_sequences(text: &str) -> String {
@@ -7448,6 +7502,19 @@ mod tests {
         assert_eq!(sanitized, "Answer\nwarning");
     }
 
+    #[test]
+    fn split_output_block_normalizes_crlf_and_cr_without_losing_trailing_lines() {
+        assert_eq!(
+            split_output_block("alpha\r\nbeta\rgamma\n"),
+            vec![
+                "alpha".to_string(),
+                "beta".to_string(),
+                "gamma".to_string(),
+                String::new(),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn generate_streaming_prints_tokens_incrementally() {
         let chunks = vec![
@@ -8135,6 +8202,41 @@ mod tests {
                 "you › alpha".to_string(),
                 "      beta".to_string(),
                 "      gamma".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn tui_println_splits_multiline_blocks_into_logical_lines() {
+        let (mut app, _temp_dir) = new_test_app();
+
+        app.tui_println("alpha\r\nbeta\n\ngamma");
+
+        assert_eq!(
+            app.output_buffer,
+            vec![
+                "alpha".to_string(),
+                "beta".to_string(),
+                String::new(),
+                "gamma".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn flush_output_to_preserves_logical_lines_for_multiline_blocks() {
+        let (mut tui_app, _temp_dir) = new_test_app();
+        let mut ui_app = ui::FawxApp::new();
+
+        tui_app.tui_println("fawx › first line\nsecond line\n");
+        tui_app.flush_output_to(&mut ui_app);
+
+        assert_eq!(
+            ui_app.output_lines,
+            vec![
+                "fawx › first line".to_string(),
+                "second line".to_string(),
+                String::new(),
             ]
         );
     }
