@@ -357,26 +357,116 @@ fn install_ratatui_panic_hook() {
     }));
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RowScrub {
+    row: u16,
+    start_col: u16,
+}
+
+fn collect_row_scrubs(
+    previous: Option<&ui::FrameRenderRows>,
+    current: &ui::FrameRenderRows,
+) -> Vec<RowScrub> {
+    let current_width = current.width as usize;
+    if current_width == 0 {
+        return Vec::new();
+    }
+
+    current
+        .rows
+        .iter()
+        .enumerate()
+        .filter_map(|(row_index, _)| {
+            let start = match previous.filter(|rows| rows.rows.get(row_index).is_some()) {
+                None => Some(0),
+                Some(previous_rows) => {
+                    scrub_start_for_existing_row(previous_rows, current, row_index, current_width)
+                }
+            }?;
+
+            (start < current_width).then_some(RowScrub {
+                row: row_index as u16,
+                start_col: start as u16,
+            })
+        })
+        .collect()
+}
+
+fn scrub_start_for_existing_row(
+    previous_rows: &ui::FrameRenderRows,
+    current: &ui::FrameRenderRows,
+    row_index: usize,
+    current_width: usize,
+) -> Option<usize> {
+    let previous_width = previous_rows.width as usize;
+    let previous_content_width = previous_rows
+        .content_columns
+        .get(row_index)
+        .copied()
+        .unwrap_or(0) as usize;
+    let current_content_width =
+        current.content_columns.get(row_index).copied().unwrap_or(0) as usize;
+    let mut scrub_start = None;
+
+    if current_content_width < previous_content_width {
+        scrub_start = Some(current_content_width);
+    }
+    if current_width > previous_width {
+        scrub_start = Some(scrub_start.map_or(previous_width, |start| start.min(previous_width)));
+    }
+
+    scrub_start
+}
+
+fn scrub_disappeared_cells(
+    terminal: &mut DefaultTerminal,
+    frame_rows: &ui::FrameRenderRows,
+    scrubs: &[RowScrub],
+) -> io::Result<()> {
+    // These writes intentionally bypass ratatui's front-buffer bookkeeping.
+    // The scrubbed cells are either overwritten by the next draw() diff or
+    // left blank because that content truly disappeared from the frame.
+    for scrub in scrubs {
+        if scrub.start_col >= frame_rows.width {
+            continue;
+        }
+
+        let background = match frame_rows
+            .fills
+            .get(scrub.row as usize)
+            .copied()
+            .unwrap_or(ui::FrameRowFill::Default)
+        {
+            ui::FrameRowFill::Default => style::Color::Reset,
+            ui::FrameRowFill::InputBackground => style::Color::AnsiValue(ui::INPUT_BG_INDEX),
+        };
+
+        crossterm::queue!(
+            terminal.backend_mut(),
+            cursor::MoveTo(scrub.start_col, scrub.row),
+            style::SetBackgroundColor(background),
+            style::Print(" ".repeat((frame_rows.width - scrub.start_col) as usize)),
+            style::ResetColor
+        )?;
+    }
+
+    Ok(())
+}
+
 fn draw_ratatui_frame(
     terminal: &mut DefaultTerminal,
     app: &ui::FawxApp,
-    last_metrics: &mut Option<ui::FrameRedrawMetrics>,
+    last_rows: &mut Option<ui::FrameRenderRows>,
 ) -> Result<(), TuiError> {
     let size = terminal.size().map_err(TuiError::Io)?;
-    let metrics = ui::frame_redraw_metrics(size.width, size.height, app);
-
-    // Ratatui's Clear widget only resets cells in the back buffer. When the
-    // rendered layout changes, force a full terminal clear so reflow frames
-    // don't depend on the diff engine to scrub stale cells from the real
-    // terminal.
-    if last_metrics.as_ref() != Some(&metrics) {
-        terminal.clear().map_err(TuiError::Io)?;
-    }
+    let frame_rows = ui::frame_render_rows(size.width, size.height, app);
+    let scrubs = collect_row_scrubs(last_rows.as_ref(), &frame_rows);
+    scrub_disappeared_cells(terminal, &frame_rows, &scrubs).map_err(TuiError::Io)?;
 
     terminal
         .draw(|frame| ui::draw(frame, app))
         .map_err(TuiError::Io)?;
-    *last_metrics = Some(metrics);
+    *last_rows = Some(frame_rows);
     Ok(())
 }
 
@@ -889,7 +979,7 @@ struct CycleRenderingContext<'a> {
     active_model: String,
     terminal: &'a mut DefaultTerminal,
     app: &'a mut ui::FawxApp,
-    last_draw_metrics: &'a mut Option<ui::FrameRedrawMetrics>,
+    last_frame_rows: &'a mut Option<ui::FrameRenderRows>,
     bus_rx: &'a mut broadcast::Receiver<InternalMessage>,
     cancel_token: &'a CancellationToken,
     streamed: &'a mut bool,
@@ -1040,10 +1130,10 @@ impl TuiApp {
 
         self.loop_engine.set_cancel_token(self.cancel_token.clone());
         self.sync_completer_model_ids();
-        let mut last_draw_metrics = None;
+        let mut last_frame_rows = None;
 
         while self.running {
-            draw_ratatui_frame(&mut terminal, &app, &mut last_draw_metrics)?;
+            draw_ratatui_frame(&mut terminal, &app, &mut last_frame_rows)?;
 
             let poll_duration = match app.state {
                 ui::AppState::Idle => Duration::from_secs(3600),
@@ -1061,7 +1151,7 @@ impl TuiApp {
                                 &input,
                                 &mut terminal,
                                 &mut app,
-                                &mut last_draw_metrics,
+                                &mut last_frame_rows,
                             )
                             .await?;
                         }
@@ -1091,7 +1181,7 @@ impl TuiApp {
         input: &str,
         terminal: &mut DefaultTerminal,
         app: &mut ui::FawxApp,
-        last_draw_metrics: &mut Option<ui::FrameRedrawMetrics>,
+        last_frame_rows: &mut Option<ui::FrameRenderRows>,
     ) -> Result<(), TuiError> {
         let trimmed = input.trim();
         if trimmed.is_empty() {
@@ -1121,13 +1211,13 @@ impl TuiApp {
         append_user_message_output(app, trimmed);
 
         // Run agent cycle with rendering
-        self.run_agent_cycle_tui(trimmed, terminal, app, last_draw_metrics)
+        self.run_agent_cycle_tui(trimmed, terminal, app, last_frame_rows)
             .await?;
 
         // After cycle completes, drain queued inputs (one per cycle)
         while let Some(queued) = app.drain_next_input() {
             append_user_message_output(app, &queued);
-            self.run_agent_cycle_tui(&queued, terminal, app, last_draw_metrics)
+            self.run_agent_cycle_tui(&queued, terminal, app, last_frame_rows)
                 .await?;
         }
 
@@ -1141,7 +1231,7 @@ impl TuiApp {
         input: &str,
         terminal: &mut DefaultTerminal,
         app: &mut ui::FawxApp,
-        last_draw_metrics: &mut Option<ui::FrameRedrawMetrics>,
+        last_frame_rows: &mut Option<ui::FrameRenderRows>,
     ) -> Result<(), TuiError> {
         app.set_state(ui::AppState::Executing { spinner_frame: 0 });
         app.reset_cycle_state();
@@ -1172,7 +1262,7 @@ impl TuiApp {
             active_model,
             terminal,
             app,
-            last_draw_metrics,
+            last_frame_rows,
             bus_rx: &mut bus_rx,
             cancel_token: &cancel_token,
             streamed: &mut streamed,
@@ -1202,7 +1292,7 @@ impl TuiApp {
         tokio::pin!(cycle_future);
 
         loop {
-            draw_ratatui_frame(ctx.terminal, ctx.app, ctx.last_draw_metrics)?;
+            draw_ratatui_frame(ctx.terminal, ctx.app, ctx.last_frame_rows)?;
 
             tokio::select! {
                 biased;
@@ -7500,6 +7590,102 @@ mod tests {
         let sanitized = sanitize_history_text(text);
 
         assert_eq!(sanitized, "Answer\nwarning");
+    }
+
+    #[test]
+    fn collect_row_scrubs_only_blanks_trailing_disappearances() {
+        let previous = ui::FrameRenderRows {
+            width: 6,
+            rows: vec!["abc   ".to_string()],
+            fills: vec![ui::FrameRowFill::Default],
+            content_columns: vec![3],
+        };
+        let current = ui::FrameRenderRows {
+            width: 6,
+            rows: vec!["ab    ".to_string()],
+            fills: vec![ui::FrameRowFill::Default],
+            content_columns: vec![2],
+        };
+
+        assert_eq!(
+            collect_row_scrubs(Some(&previous), &current),
+            vec![RowScrub {
+                row: 0,
+                start_col: 2
+            }]
+        );
+    }
+
+    #[test]
+    fn collect_row_scrubs_skips_rows_that_only_grow() {
+        let previous = ui::FrameRenderRows {
+            width: 6,
+            rows: vec!["ab    ".to_string()],
+            fills: vec![ui::FrameRowFill::Default],
+            content_columns: vec![2],
+        };
+        let current = ui::FrameRenderRows {
+            width: 6,
+            rows: vec!["abc   ".to_string()],
+            fills: vec![ui::FrameRowFill::Default],
+            content_columns: vec![3],
+        };
+
+        assert!(collect_row_scrubs(Some(&previous), &current).is_empty());
+    }
+
+    #[test]
+    fn collect_row_scrubs_counts_wide_cells_by_terminal_column() {
+        let previous = ui::FrameRenderRows {
+            width: 4,
+            rows: vec!["中 a ".to_string()],
+            fills: vec![ui::FrameRowFill::Default],
+            content_columns: vec![3],
+        };
+        let current = ui::FrameRenderRows {
+            width: 4,
+            rows: vec!["中   ".to_string()],
+            fills: vec![ui::FrameRowFill::Default],
+            content_columns: vec![2],
+        };
+
+        assert_eq!(
+            collect_row_scrubs(Some(&previous), &current),
+            vec![RowScrub {
+                row: 0,
+                start_col: 2
+            }]
+        );
+    }
+
+    #[test]
+    fn collect_row_scrubs_blanks_newly_visible_rows_and_columns() {
+        let previous = ui::FrameRenderRows {
+            width: 4,
+            rows: vec!["abcd".to_string()],
+            fills: vec![ui::FrameRowFill::Default],
+            content_columns: vec![4],
+        };
+        let current = ui::FrameRenderRows {
+            width: 6,
+            rows: vec!["abcd  ".to_string(), "xy    ".to_string()],
+            fills: vec![ui::FrameRowFill::Default, ui::FrameRowFill::InputBackground],
+            content_columns: vec![4, 2],
+        };
+
+        assert_eq!(
+            collect_row_scrubs(Some(&previous), &current),
+            vec![
+                RowScrub {
+                    row: 0,
+                    start_col: 4
+                },
+                RowScrub {
+                    row: 1,
+                    start_col: 0
+                },
+            ]
+        );
     }
 
     #[test]
