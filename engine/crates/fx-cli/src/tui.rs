@@ -30,7 +30,7 @@ use fx_kernel::loop_engine::{
 };
 use fx_kernel::signals::{LoopStep, Signal, SignalCollector};
 use fx_kernel::types::PerceptionSnapshot;
-use fx_kernel::CachingExecutor;
+use fx_kernel::{CachingExecutor, ProposalGateExecutor, ProposalGateState};
 use fx_llm::{
     AnthropicProvider, CompletionRequest, Message, ModelCatalog, ModelInfo, ModelRouter,
     OpenAiProvider, OpenAiResponsesProvider, ProviderError, RouterError, StreamChunk,
@@ -2688,7 +2688,7 @@ fn build_loop_engine_with_config(
     let budget = BudgetTracker::new(BudgetConfig::default(), current_time_ms(), 0);
     let context = ContextCompactor::new(DEFAULT_CONTEXT_MAX_TOKENS, DEFAULT_CONTEXT_COMPACT_TARGET);
     let working_dir = configured_working_dir(&config);
-    let skills = build_skill_registry(working_dir, &data_dir, &config);
+    let skills = build_skill_registry(working_dir.clone(), &data_dir, &config);
     let synthesis = config
         .model
         .synthesis_instruction
@@ -2700,11 +2700,19 @@ fn build_loop_engine_with_config(
     });
 
     let caching_registry = CachingExecutor::new(skills.registry);
+
+    // Build ProposalGateExecutor to wrap the CachingExecutor.
+    // Chain: kernel → ProposalGateExecutor → CachingExecutor → SkillRegistry
+    let self_modify_config = crate::config_bridge::to_core_self_modify(&config.self_modify);
+    let proposals_dir = data_dir.join("proposals");
+    let gate_state = ProposalGateState::new(self_modify_config, working_dir.clone(), proposals_dir);
+    let gated_executor = ProposalGateExecutor::new(caching_registry, gate_state);
+
     let mut builder = LoopEngine::builder()
         .budget(budget)
         .context(context)
         .max_iterations(config.general.max_iterations)
-        .tool_executor(std::sync::Arc::new(caching_registry))
+        .tool_executor(std::sync::Arc::new(gated_executor))
         .synthesis_instruction(synthesis)
         .event_bus(event_bus.clone())
         .iteration_counter(Arc::clone(&skills.iteration_counter))

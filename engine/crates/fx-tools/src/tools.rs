@@ -173,6 +173,10 @@ impl FawxToolExecutor {
         }
         let path = self.jailed_path(&parsed.path)?;
 
+        // Defense-in-depth: ProposalGateExecutor in the kernel is the primary
+        // enforcement layer for self-modify policy. This tool-level check is
+        // retained as a secondary guard in case the kernel gate is bypassed or
+        // misconfigured.
         if let Some(ref sm_config) = self.self_modify {
             let tier = classify_path(&path, &self.working_dir, sm_config);
             match tier {

@@ -1,0 +1,894 @@
+//! Kernel-level write enforcement via the proposal gate.
+//!
+//! `ProposalGateExecutor` wraps any `ToolExecutor` and intercepts write
+//! operations, classifying target paths against the self-modification policy
+//! and compiled Tier 3 invariants. Writes to immutable paths are blocked;
+//! writes to propose-tier paths create proposals instead of executing; writes
+//! to allow-tier paths pass through.
+
+use crate::act::{
+    ConcurrencyPolicy, ToolCacheStats, ToolCacheability, ToolExecutor, ToolExecutorError,
+    ToolResult,
+};
+use crate::cancellation::CancellationToken;
+use async_trait::async_trait;
+use fx_core::self_modify::{classify_path, PathTier, SelfModifyConfig};
+use fx_llm::{ToolCall, ToolDefinition};
+use fx_propose::{Proposal, ProposalWriter};
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Tool names that represent write operations subject to gating.
+const WRITE_TOOLS: &[&str] = &["write_file", "git_checkpoint"];
+
+/// Tier 3 immutable paths — blocked regardless of configuration.
+/// These are compiled kernel invariants that cannot be overridden.
+const TIER3_PATHS: &[&str] = &[
+    "engine/crates/fx-kernel/",
+    "engine/crates/fx-auth/src/crypto/",
+    ".github/",
+    "fawx-ripcord/",
+    "tests/invariant/",
+    "prompt-ledger/",
+    "snapshots/",
+];
+
+/// An approved proposal that allows writes to specific paths.
+#[derive(Debug, Clone)]
+pub struct ActiveProposal {
+    pub id: String,
+    pub allowed_paths: Vec<PathBuf>,
+    pub approved_at: u64,
+    pub expires_at: Option<u64>,
+}
+
+/// Mutable state for the proposal gate.
+#[derive(Debug)]
+pub struct ProposalGateState {
+    active: Option<ActiveProposal>,
+    config: SelfModifyConfig,
+    working_dir: PathBuf,
+    proposals_dir: PathBuf,
+}
+
+impl ProposalGateState {
+    #[must_use]
+    pub fn new(config: SelfModifyConfig, working_dir: PathBuf, proposals_dir: PathBuf) -> Self {
+        Self {
+            active: None,
+            config,
+            working_dir,
+            proposals_dir,
+        }
+    }
+
+    /// Set an active approved proposal.
+    pub fn set_active_proposal(&mut self, proposal: ActiveProposal) {
+        self.active = Some(proposal);
+    }
+
+    /// Clear the active proposal.
+    pub fn clear_active_proposal(&mut self) {
+        self.active = None;
+    }
+}
+
+/// A `ToolExecutor` wrapper that enforces the self-modification proposal gate.
+///
+/// Sits between the kernel and the inner executor (typically `CachingExecutor`).
+/// All tool calls pass through; write operations are classified and gated.
+///
+/// # Mutex note
+/// Uses `std::sync::Mutex` (not `tokio::sync::Mutex`) because the lock is never
+/// held across `.await` points — `classify_calls` is fully synchronous. If future
+/// changes require holding the lock across an await, switch to `tokio::sync::Mutex`
+/// to avoid deadlocks in the async runtime.
+#[derive(Debug)]
+pub struct ProposalGateExecutor<T: ToolExecutor> {
+    inner: T,
+    state: std::sync::Mutex<ProposalGateState>,
+}
+
+impl<T: ToolExecutor> ProposalGateExecutor<T> {
+    #[must_use]
+    pub fn new(inner: T, state: ProposalGateState) -> Self {
+        Self {
+            inner,
+            state: std::sync::Mutex::new(state),
+        }
+    }
+}
+
+/// Outcome of classifying a single tool call through the gate.
+enum GateDecision {
+    /// Pass through to inner executor.
+    PassThrough,
+    /// Block with an error result (Tier 3 or Deny).
+    Block(ToolResult),
+    /// Create a proposal instead of executing.
+    Propose(ToolResult),
+}
+
+fn is_write_tool(name: &str) -> bool {
+    WRITE_TOOLS.contains(&name)
+}
+
+fn is_tier3_path(relative_path: &str) -> bool {
+    let normalized = normalize_relative(relative_path);
+    TIER3_PATHS
+        .iter()
+        .any(|prefix| normalized.starts_with(prefix))
+}
+
+fn normalize_relative(path: &str) -> String {
+    let unified = path.replace('\\', "/");
+    // Strip leading ./ prefix
+    let stripped = unified.strip_prefix("./").unwrap_or(&unified);
+    // Strip leading / (absolute paths treated as relative to working dir)
+    let stripped = stripped.strip_prefix('/').unwrap_or(stripped);
+    // Collapse ../ segments
+    let mut parts: Vec<&str> = Vec::new();
+    for segment in stripped.split('/') {
+        match segment {
+            "" | "." => continue,
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    parts.join("/")
+}
+
+fn extract_write_path(call: &ToolCall) -> Option<String> {
+    call.arguments
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .map(String::from)
+}
+
+fn blocked_result(call: &ToolCall, path: &str, reason: &str) -> ToolResult {
+    ToolResult {
+        tool_call_id: call.id.clone(),
+        tool_name: call.name.clone(),
+        success: false,
+        output: format!("BLOCKED: write to '{path}' denied. {reason}"),
+    }
+}
+
+fn proposal_result(call: &ToolCall, path: &str, proposal_path: &Path) -> ToolResult {
+    ToolResult {
+        tool_call_id: call.id.clone(),
+        tool_name: call.name.clone(),
+        success: true,
+        output: format!(
+            "PROPOSAL CREATED: write to '{path}' requires approval. \
+             Proposal saved to: {}",
+            proposal_path.display()
+        ),
+    }
+}
+
+fn epoch_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Default risk level for proposals. Future iterations should derive risk
+/// from path tier context (e.g., Tier 2 propose paths vs config changes).
+const DEFAULT_RISK_LEVEL: &str = "medium";
+
+fn build_proposal(call: &ToolCall, path: &str) -> Proposal {
+    let content = call
+        .arguments
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    Proposal {
+        title: format!("Write to {path}"),
+        description: format!("Agent requested {tool} on {path}", tool = call.name),
+        target_path: PathBuf::from(path),
+        proposed_content: content,
+        risk: DEFAULT_RISK_LEVEL.to_string(),
+        timestamp: epoch_seconds(),
+    }
+}
+
+fn classify_and_gate(
+    call: &ToolCall,
+    config: &SelfModifyConfig,
+    working_dir: &Path,
+    proposals_dir: &Path,
+    active: &Option<ActiveProposal>,
+) -> GateDecision {
+    if !is_write_tool(&call.name) {
+        return GateDecision::PassThrough;
+    }
+
+    let Some(path) = extract_write_path(call) else {
+        return GateDecision::PassThrough;
+    };
+
+    // Tier 3 always blocked — compiled kernel invariant that cannot be
+    // disabled by config or overridden by active proposals.
+    if is_tier3_path(&path) {
+        return GateDecision::Block(blocked_result(
+            call,
+            &path,
+            "Tier 3 immutable path (kernel invariant).",
+        ));
+    }
+
+    // When self-modify gating is disabled, non-Tier-3 writes pass through.
+    if !config.enabled {
+        return GateDecision::PassThrough;
+    }
+
+    // Active proposal covers this path → allow
+    if covers_path(active, &path) {
+        return GateDecision::PassThrough;
+    }
+
+    let tier = classify_path(Path::new(&path), working_dir, config);
+    apply_tier(call, &path, tier, proposals_dir)
+}
+
+fn covers_path(active: &Option<ActiveProposal>, path: &str) -> bool {
+    let Some(proposal) = active else {
+        return false;
+    };
+    // Reject expired proposals
+    if let Some(expires) = proposal.expires_at {
+        if epoch_seconds() > expires {
+            return false;
+        }
+    }
+    let normalized = normalize_relative(path);
+    proposal
+        .allowed_paths
+        .iter()
+        .any(|p| normalize_relative(&p.to_string_lossy()) == normalized)
+}
+
+fn apply_tier(call: &ToolCall, path: &str, tier: PathTier, proposals_dir: &Path) -> GateDecision {
+    match tier {
+        PathTier::Allow => GateDecision::PassThrough,
+        PathTier::Deny => {
+            GateDecision::Block(blocked_result(call, path, "Path is in the deny tier."))
+        }
+        PathTier::Propose => create_proposal_decision(call, path, proposals_dir),
+    }
+}
+
+fn create_proposal_decision(call: &ToolCall, path: &str, proposals_dir: &Path) -> GateDecision {
+    let proposal = build_proposal(call, path);
+    let writer = ProposalWriter::new(proposals_dir.to_path_buf());
+    match writer.write(&proposal) {
+        Ok(proposal_path) => GateDecision::Propose(proposal_result(call, path, &proposal_path)),
+        Err(err) => GateDecision::Block(blocked_result(
+            call,
+            path,
+            &format!("Failed to create proposal: {err}"),
+        )),
+    }
+}
+
+#[async_trait]
+impl<T: ToolExecutor> ToolExecutor for ProposalGateExecutor<T> {
+    async fn execute_tools(
+        &self,
+        calls: &[ToolCall],
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Vec<ToolResult>, ToolExecutorError> {
+        let (decisions, pass_through) = self.classify_calls(calls);
+        self.execute_with_decisions(calls, decisions, &pass_through, cancel)
+            .await
+    }
+
+    fn tool_definitions(&self) -> Vec<ToolDefinition> {
+        self.inner.tool_definitions()
+    }
+
+    fn cacheability(&self, tool_name: &str) -> ToolCacheability {
+        self.inner.cacheability(tool_name)
+    }
+
+    fn clear_cache(&self) {
+        self.inner.clear_cache();
+    }
+
+    fn cache_stats(&self) -> Option<ToolCacheStats> {
+        self.inner.cache_stats()
+    }
+
+    fn concurrency_policy(&self) -> ConcurrencyPolicy {
+        self.inner.concurrency_policy()
+    }
+}
+
+impl<T: ToolExecutor> ProposalGateExecutor<T> {
+    fn classify_calls(&self, calls: &[ToolCall]) -> (Vec<GateDecision>, Vec<ToolCall>) {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut decisions = Vec::with_capacity(calls.len());
+        let mut pass_through = Vec::new();
+
+        for call in calls {
+            let decision = classify_and_gate(
+                call,
+                &state.config,
+                &state.working_dir,
+                &state.proposals_dir,
+                &state.active,
+            );
+            if matches!(decision, GateDecision::PassThrough) {
+                pass_through.push(call.clone());
+            }
+            decisions.push(decision);
+        }
+
+        (decisions, pass_through)
+    }
+
+    async fn execute_with_decisions(
+        &self,
+        calls: &[ToolCall],
+        decisions: Vec<GateDecision>,
+        pass_through: &[ToolCall],
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Vec<ToolResult>, ToolExecutorError> {
+        let inner_results = if pass_through.is_empty() {
+            Vec::new()
+        } else {
+            self.inner.execute_tools(pass_through, cancel).await?
+        };
+
+        assemble_results(calls, decisions, inner_results)
+    }
+}
+
+fn assemble_results(
+    calls: &[ToolCall],
+    decisions: Vec<GateDecision>,
+    mut inner_results: Vec<ToolResult>,
+) -> Result<Vec<ToolResult>, ToolExecutorError> {
+    // inner_results is ordered matching pass_through calls; drain from front
+    inner_results.reverse();
+    let mut results = Vec::with_capacity(calls.len());
+
+    for decision in decisions {
+        match decision {
+            GateDecision::PassThrough => {
+                let result = inner_results.pop().ok_or_else(|| ToolExecutorError {
+                    message: "proposal gate: missing inner result".to_string(),
+                    recoverable: false,
+                })?;
+                results.push(result);
+            }
+            GateDecision::Block(result) | GateDecision::Propose(result) => {
+                results.push(result);
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::act::{ToolCacheStats, ToolCacheability, ToolExecutorError, ToolResult};
+    use async_trait::async_trait;
+    use fx_llm::ToolCall;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug, Clone)]
+    struct MockInner {
+        calls: Arc<Mutex<Vec<ToolCall>>>,
+        definitions: Vec<ToolDefinition>,
+    }
+
+    impl MockInner {
+        fn new() -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                definitions: vec![ToolDefinition {
+                    name: "write_file".to_string(),
+                    description: "write a file".to_string(),
+                    parameters: serde_json::json!({"type":"object"}),
+                }],
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.lock().unwrap().len()
+        }
+    }
+
+    #[async_trait]
+    impl ToolExecutor for MockInner {
+        async fn execute_tools(
+            &self,
+            calls: &[ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<ToolResult>, ToolExecutorError> {
+            self.calls.lock().unwrap().extend(calls.iter().cloned());
+            Ok(calls
+                .iter()
+                .map(|c| ToolResult {
+                    tool_call_id: c.id.clone(),
+                    tool_name: c.name.clone(),
+                    success: true,
+                    output: format!("executed:{}", c.name),
+                })
+                .collect())
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            self.definitions.clone()
+        }
+
+        fn cacheability(&self, _tool_name: &str) -> ToolCacheability {
+            ToolCacheability::NeverCache
+        }
+
+        fn clear_cache(&self) {}
+
+        fn cache_stats(&self) -> Option<ToolCacheStats> {
+            Some(ToolCacheStats {
+                hits: 42,
+                misses: 7,
+                entries: 10,
+                evictions: 1,
+            })
+        }
+    }
+
+    fn enabled_config() -> SelfModifyConfig {
+        SelfModifyConfig {
+            enabled: true,
+            allow_paths: vec!["docs/**".to_string()],
+            propose_paths: vec!["config/**".to_string()],
+            deny_paths: vec![
+                ".git/**".to_string(),
+                "*.key".to_string(),
+                "*.pem".to_string(),
+                "credentials.*".to_string(),
+            ],
+            ..SelfModifyConfig::default()
+        }
+    }
+
+    fn make_executor(config: SelfModifyConfig) -> (ProposalGateExecutor<MockInner>, MockInner) {
+        let inner = MockInner::new();
+        let probe = inner.clone();
+        let tmp = std::env::temp_dir().join(format!("fx-proposal-gate-test-{}", epoch_seconds()));
+        let state = ProposalGateState::new(config, PathBuf::from(""), tmp);
+        (ProposalGateExecutor::new(inner, state), probe)
+    }
+
+    fn write_call(id: &str, path: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({"path": path, "content": "data"}),
+        }
+    }
+
+    fn read_call(id: &str, path: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path": path}),
+        }
+    }
+
+    fn checkpoint_call(id: &str, path: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: "git_checkpoint".to_string(),
+            arguments: serde_json::json!({"path": path}),
+        }
+    }
+
+    // Test 1: Tier 3 path always blocked regardless of config
+    #[tokio::test]
+    async fn tier3_path_always_blocked_regardless_of_config() {
+        let mut config = enabled_config();
+        config.allow_paths = vec!["**".to_string()];
+        let (executor, probe) = make_executor(config);
+
+        let results = executor
+            .execute_tools(
+                &[write_call("1", "engine/crates/fx-kernel/src/lib.rs")],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(!results[0].success);
+        assert!(results[0].output.contains("BLOCKED"));
+        assert!(results[0].output.contains("Tier 3"));
+        assert_eq!(probe.call_count(), 0);
+    }
+
+    // Test 2: Propose tier creates proposal without executing
+    #[tokio::test]
+    async fn propose_tier_creates_proposal_without_executing() {
+        let (executor, probe) = make_executor(enabled_config());
+
+        let results = executor
+            .execute_tools(&[write_call("1", "config/settings.toml")], None)
+            .await
+            .unwrap();
+
+        assert!(results[0].success);
+        assert!(results[0].output.contains("PROPOSAL CREATED"));
+        assert_eq!(probe.call_count(), 0);
+    }
+
+    // Test 3: Allow tier passes through to inner
+    #[tokio::test]
+    async fn allow_tier_passes_through_to_inner() {
+        let (executor, probe) = make_executor(enabled_config());
+
+        let results = executor
+            .execute_tools(&[write_call("1", "docs/readme.md")], None)
+            .await
+            .unwrap();
+
+        assert!(results[0].success);
+        assert!(results[0].output.contains("executed:write_file"));
+        assert_eq!(probe.call_count(), 1);
+    }
+
+    // Test 4: Deny tier blocked with error
+    #[tokio::test]
+    async fn deny_tier_blocked_with_error() {
+        let (executor, probe) = make_executor(enabled_config());
+
+        let results = executor
+            .execute_tools(&[write_call("1", "server.key")], None)
+            .await
+            .unwrap();
+
+        assert!(!results[0].success);
+        assert!(results[0].output.contains("BLOCKED"));
+        assert!(results[0].output.contains("deny tier"));
+        assert_eq!(probe.call_count(), 0);
+    }
+
+    // Test 5: Read-only tools always pass through
+    #[tokio::test]
+    async fn read_only_tools_always_pass_through() {
+        let (executor, probe) = make_executor(enabled_config());
+
+        let read_tools = vec![
+            ToolCall {
+                id: "1".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "engine/crates/fx-kernel/src/lib.rs"}),
+            },
+            ToolCall {
+                id: "2".to_string(),
+                name: "list_directory".to_string(),
+                arguments: serde_json::json!({"path": ".github/"}),
+            },
+            ToolCall {
+                id: "3".to_string(),
+                name: "search_text".to_string(),
+                arguments: serde_json::json!({"query": "test", "path": "src/"}),
+            },
+            ToolCall {
+                id: "4".to_string(),
+                name: "memory_read".to_string(),
+                arguments: serde_json::json!({"key": "notes"}),
+            },
+            ToolCall {
+                id: "5".to_string(),
+                name: "memory_list".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "6".to_string(),
+                name: "current_time".to_string(),
+                arguments: serde_json::json!({}),
+            },
+        ];
+
+        let results = executor.execute_tools(&read_tools, None).await.unwrap();
+
+        assert_eq!(results.len(), 6);
+        for result in &results {
+            assert!(result.success);
+        }
+        assert_eq!(probe.call_count(), 6);
+    }
+
+    // Test 6: git_checkpoint gated by tier
+    #[tokio::test]
+    async fn git_checkpoint_gated_by_tier() {
+        let (executor, probe) = make_executor(enabled_config());
+
+        let results = executor
+            .execute_tools(
+                &[checkpoint_call("1", "engine/crates/fx-kernel/src/act.rs")],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(!results[0].success);
+        assert!(results[0].output.contains("BLOCKED"));
+        assert!(results[0].output.contains("Tier 3"));
+        assert_eq!(probe.call_count(), 0);
+    }
+
+    // Test 7: Disabled config allows non-Tier-3 writes (Tier 3 still blocked)
+    #[tokio::test]
+    async fn disabled_config_allows_non_tier3_writes() {
+        let config = SelfModifyConfig::default(); // enabled=false
+        let (executor, probe) = make_executor(config);
+
+        let results = executor
+            .execute_tools(
+                &[
+                    write_call("1", "server.key"),
+                    write_call("2", "docs/readme.md"),
+                ],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(results[0].success);
+        assert!(results[1].success);
+        assert_eq!(probe.call_count(), 2);
+    }
+
+    // Test 7b: Tier 3 blocked even when config disabled (regression for bypass bug)
+    #[tokio::test]
+    async fn tier3_blocked_even_when_config_disabled() {
+        let config = SelfModifyConfig::default(); // enabled=false
+        let (executor, probe) = make_executor(config);
+
+        let results = executor
+            .execute_tools(
+                &[write_call("1", "engine/crates/fx-kernel/src/lib.rs")],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(!results[0].success);
+        assert!(results[0].output.contains("BLOCKED"));
+        assert!(results[0].output.contains("Tier 3"));
+        assert_eq!(probe.call_count(), 0);
+    }
+
+    // Test 8: Mixed batch gates individually
+    #[tokio::test]
+    async fn mixed_batch_gates_individually() {
+        let (executor, probe) = make_executor(enabled_config());
+
+        let calls = vec![
+            read_call("1", "docs/readme.md"),
+            write_call("2", "docs/guide.md"),
+            write_call("3", "server.key"),
+        ];
+
+        let results = executor.execute_tools(&calls, None).await.unwrap();
+
+        assert_eq!(results.len(), 3);
+        // read passes
+        assert!(results[0].success);
+        assert_eq!(results[0].tool_call_id, "1");
+        // allow-tier write passes
+        assert!(results[1].success);
+        assert_eq!(results[1].tool_call_id, "2");
+        assert!(results[1].output.contains("executed:write_file"));
+        // deny-tier write blocked
+        assert!(!results[2].success);
+        assert_eq!(results[2].tool_call_id, "3");
+        assert!(results[2].output.contains("BLOCKED"));
+        // Inner only saw 2 calls (read + allow write)
+        assert_eq!(probe.call_count(), 2);
+    }
+
+    // Test 9: Tool definitions delegated from inner
+    #[tokio::test]
+    async fn tool_definitions_delegated_from_inner() {
+        let (executor, _) = make_executor(enabled_config());
+        let defs = executor.tool_definitions();
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].name, "write_file");
+    }
+
+    // Test 10: Cache operations delegated
+    #[tokio::test]
+    async fn cache_operations_delegated() {
+        let (executor, _) = make_executor(enabled_config());
+
+        assert_eq!(
+            executor.cacheability("write_file"),
+            ToolCacheability::NeverCache
+        );
+
+        let stats = executor.cache_stats().unwrap();
+        assert_eq!(stats.hits, 42);
+        assert_eq!(stats.misses, 7);
+
+        // clear_cache should not panic
+        executor.clear_cache();
+    }
+
+    // Test 11: Active proposal allows covered path
+    #[tokio::test]
+    async fn active_proposal_allows_covered_path() {
+        let inner = MockInner::new();
+        let probe = inner.clone();
+        let tmp =
+            std::env::temp_dir().join(format!("fx-proposal-gate-test-active-{}", epoch_seconds()));
+        let mut state = ProposalGateState::new(enabled_config(), PathBuf::from(""), tmp);
+        state.set_active_proposal(ActiveProposal {
+            id: "p-1".to_string(),
+            allowed_paths: vec![PathBuf::from("config/settings.toml")],
+            approved_at: epoch_seconds(),
+            expires_at: None,
+        });
+        let executor = ProposalGateExecutor::new(inner, state);
+
+        let results = executor
+            .execute_tools(&[write_call("1", "config/settings.toml")], None)
+            .await
+            .unwrap();
+
+        assert!(results[0].success);
+        assert!(results[0].output.contains("executed:write_file"));
+        assert_eq!(probe.call_count(), 1);
+    }
+
+    // Test 12: Active proposal does not cover other paths
+    #[tokio::test]
+    async fn active_proposal_does_not_cover_other_paths() {
+        let inner = MockInner::new();
+        let probe = inner.clone();
+        let tmp =
+            std::env::temp_dir().join(format!("fx-proposal-gate-test-nocover-{}", epoch_seconds()));
+        let mut state = ProposalGateState::new(enabled_config(), PathBuf::from(""), tmp);
+        state.set_active_proposal(ActiveProposal {
+            id: "p-1".to_string(),
+            allowed_paths: vec![PathBuf::from("config/a.toml")],
+            approved_at: epoch_seconds(),
+            expires_at: None,
+        });
+        let executor = ProposalGateExecutor::new(inner, state);
+
+        let results = executor
+            .execute_tools(&[write_call("1", "config/b.toml")], None)
+            .await
+            .unwrap();
+
+        // config/b.toml is propose-tier, not covered by proposal → proposal created
+        assert!(results[0].success);
+        assert!(results[0].output.contains("PROPOSAL CREATED"));
+        assert_eq!(probe.call_count(), 0);
+    }
+
+    // Test 13: Expired proposal does not grant access (regression for expiry bug)
+    #[tokio::test]
+    async fn expired_proposal_does_not_grant_access() {
+        let inner = MockInner::new();
+        let probe = inner.clone();
+        let tmp =
+            std::env::temp_dir().join(format!("fx-proposal-gate-test-expired-{}", epoch_seconds()));
+        let mut state = ProposalGateState::new(enabled_config(), PathBuf::from(""), tmp);
+        state.set_active_proposal(ActiveProposal {
+            id: "p-expired".to_string(),
+            allowed_paths: vec![PathBuf::from("config/settings.toml")],
+            approved_at: 1000,
+            expires_at: Some(1001), // expired in the past
+        });
+        let executor = ProposalGateExecutor::new(inner, state);
+
+        let results = executor
+            .execute_tools(&[write_call("1", "config/settings.toml")], None)
+            .await
+            .unwrap();
+
+        // Expired proposal → falls through to propose tier → creates proposal
+        assert!(results[0].success);
+        assert!(results[0].output.contains("PROPOSAL CREATED"));
+        assert_eq!(probe.call_count(), 0);
+    }
+
+    // Test 14: Tier 3 blocked even with active proposal
+    #[tokio::test]
+    async fn tier3_blocked_even_with_active_proposal() {
+        let inner = MockInner::new();
+        let probe = inner.clone();
+        let tmp = std::env::temp_dir().join(format!(
+            "fx-proposal-gate-test-tier3-proposal-{}",
+            epoch_seconds()
+        ));
+        let mut state = ProposalGateState::new(enabled_config(), PathBuf::from(""), tmp);
+        state.set_active_proposal(ActiveProposal {
+            id: "p-1".to_string(),
+            allowed_paths: vec![PathBuf::from("engine/crates/fx-kernel/src/lib.rs")],
+            approved_at: epoch_seconds(),
+            expires_at: None,
+        });
+        let executor = ProposalGateExecutor::new(inner, state);
+
+        let results = executor
+            .execute_tools(
+                &[write_call("1", "engine/crates/fx-kernel/src/lib.rs")],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(!results[0].success);
+        assert!(results[0].output.contains("BLOCKED"));
+        assert!(results[0].output.contains("Tier 3"));
+        assert_eq!(probe.call_count(), 0);
+    }
+
+    // Test 15: Tier 3 caught via ../ path traversal
+    #[tokio::test]
+    async fn tier3_caught_via_dotdot_traversal() {
+        let (executor, probe) = make_executor(enabled_config());
+
+        let results = executor
+            .execute_tools(
+                &[write_call(
+                    "1",
+                    "engine/../engine/crates/fx-kernel/src/lib.rs",
+                )],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(!results[0].success);
+        assert!(results[0].output.contains("BLOCKED"));
+        assert!(results[0].output.contains("Tier 3"));
+        assert_eq!(probe.call_count(), 0);
+    }
+
+    // Test 16: Tier 3 caught via absolute path
+    #[tokio::test]
+    async fn tier3_caught_via_absolute_path() {
+        let (executor, probe) = make_executor(enabled_config());
+
+        let results = executor
+            .execute_tools(
+                &[write_call("1", "/engine/crates/fx-kernel/src/lib.rs")],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(!results[0].success);
+        assert!(results[0].output.contains("BLOCKED"));
+        assert!(results[0].output.contains("Tier 3"));
+        assert_eq!(probe.call_count(), 0);
+    }
+
+    // Test 17: normalize_relative unit tests
+    #[test]
+    fn normalize_relative_handles_variants() {
+        assert_eq!(normalize_relative("./foo/bar"), "foo/bar");
+        assert_eq!(normalize_relative("a/../b/c"), "b/c");
+        assert_eq!(normalize_relative("/absolute/path"), "absolute/path");
+        assert_eq!(
+            normalize_relative("engine/../engine/crates/fx-kernel/src/lib.rs"),
+            "engine/crates/fx-kernel/src/lib.rs"
+        );
+        assert_eq!(normalize_relative("a/./b/../c"), "a/c");
+        assert_eq!(normalize_relative("foo\\bar\\baz"), "foo/bar/baz");
+    }
+}
