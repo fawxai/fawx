@@ -443,7 +443,7 @@ fn handle_idle_event(event: Event, app: &mut ui::FawxApp) -> Option<String> {
     match event {
         Event::Key(key) => handle_idle_key(key, app),
         Event::Paste(text) => {
-            app.set_pasted_input(text);
+            app.insert_pasted_input(text);
             None
         }
         _ => None,
@@ -519,7 +519,7 @@ fn handle_execution_event(
 ) {
     match event {
         Event::Key(key) => handle_execution_key(key, app, cancel_token, input_sender),
-        Event::Paste(text) => app.set_pasted_input(text),
+        Event::Paste(text) => app.insert_pasted_input(text),
         _ => {}
     }
 }
@@ -4192,6 +4192,19 @@ fn to_strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_string()).collect()
 }
 
+/// Run a closure on the normal terminal screen.
+///
+/// Leaves the ratatui alternate screen before executing `f` so that raw
+/// `eprint!`/`stdin` I/O renders correctly, then re-enters the alternate
+/// screen afterward.  Both transitions are best-effort: if the terminal
+/// does not support them the prompt still works (graceful degradation).
+fn with_normal_screen<T>(f: impl FnOnce() -> Result<T, TuiError>) -> Result<T, TuiError> {
+    let _ = crossterm::execute!(io::stdout(), terminal::LeaveAlternateScreen);
+    let result = f();
+    let _ = crossterm::execute!(io::stdout(), terminal::EnterAlternateScreen);
+    result
+}
+
 fn prompt_line(prompt: &str) -> Result<String, TuiError> {
     ensure_cooked_mode();
 
@@ -4298,9 +4311,11 @@ where
 }
 
 fn confirm_provider_removal(provider: &str) -> Result<bool, TuiError> {
-    let prompt = format!("Remove {provider}? [y/N]: ");
-    let response = prompt_line(&prompt)?;
-    Ok(removal_confirmation_accepted(&response))
+    with_normal_screen(|| {
+        let prompt = format!("Remove {provider}? [y/N]: ");
+        let response = prompt_line(&prompt)?;
+        Ok(removal_confirmation_accepted(&response))
+    })
 }
 
 fn removal_confirmation_accepted(response: &str) -> bool {
@@ -4338,6 +4353,18 @@ fn prompt_choice<T, F>(
 where
     F: Fn(&str) -> Option<T>,
 {
+    with_normal_screen(|| prompt_choice_inner(prompt, invalid_message, context, parser))
+}
+
+fn prompt_choice_inner<T, F>(
+    prompt: &str,
+    invalid_message: &str,
+    context: &str,
+    parser: F,
+) -> Result<T, TuiError>
+where
+    F: Fn(&str) -> Option<T>,
+{
     for _ in 0..MAX_PROMPT_RETRIES {
         let value = prompt_line(prompt)?;
         if let Some(parsed) = parser(&value) {
@@ -4355,6 +4382,14 @@ fn prompt_non_empty_line(
     empty_message: &str,
     context: &str,
 ) -> Result<String, TuiError> {
+    with_normal_screen(|| prompt_non_empty_line_inner(prompt, empty_message, context))
+}
+
+fn prompt_non_empty_line_inner(
+    prompt: &str,
+    empty_message: &str,
+    context: &str,
+) -> Result<String, TuiError> {
     for _ in 0..MAX_PROMPT_RETRIES {
         let value = prompt_line(prompt)?;
         if !value.is_empty() {
@@ -4368,30 +4403,32 @@ fn prompt_non_empty_line(
 }
 
 fn prompt_api_key_provider() -> Result<String, TuiError> {
-    eprintln!("Which provider?");
-    eprintln!("  [1] Anthropic");
-    eprintln!("  [2] OpenAI");
-    eprintln!("  [3] OpenRouter");
-    eprintln!("  [4] Other (OpenAI-compatible)");
-    eprintln!();
+    with_normal_screen(|| {
+        eprintln!("Which provider?");
+        eprintln!("  [1] Anthropic");
+        eprintln!("  [2] OpenAI");
+        eprintln!("  [3] OpenRouter");
+        eprintln!("  [4] Other (OpenAI-compatible)");
+        eprintln!();
 
-    let choice = prompt_choice(
-        "> ",
-        "Please choose 1, 2, 3, or 4.",
-        "API key provider selection",
-        parse_api_key_provider_selection,
-    )?;
+        let choice = prompt_choice_inner(
+            "> ",
+            "Please choose 1, 2, 3, or 4.",
+            "API key provider selection",
+            parse_api_key_provider_selection,
+        )?;
 
-    match choice {
-        ApiKeyProvider::Anthropic => Ok("anthropic".to_string()),
-        ApiKeyProvider::OpenAi => Ok("openai".to_string()),
-        ApiKeyProvider::OpenRouter => Ok("openrouter".to_string()),
-        ApiKeyProvider::Other => prompt_non_empty_line(
-            "Provider name: ",
-            "Provider name cannot be empty.",
-            "API key provider name",
-        ),
-    }
+        match choice {
+            ApiKeyProvider::Anthropic => Ok("anthropic".to_string()),
+            ApiKeyProvider::OpenAi => Ok("openai".to_string()),
+            ApiKeyProvider::OpenRouter => Ok("openrouter".to_string()),
+            ApiKeyProvider::Other => prompt_non_empty_line_inner(
+                "Provider name: ",
+                "Provider name cannot be empty.",
+                "API key provider name",
+            ),
+        }
+    })
 }
 
 fn prompt_non_empty_secret(
@@ -4399,16 +4436,18 @@ fn prompt_non_empty_secret(
     empty_message: &str,
     context: &str,
 ) -> Result<String, TuiError> {
-    for _ in 0..MAX_PROMPT_RETRIES {
-        let value = prompt_secret(prompt)?;
-        if !value.is_empty() {
-            return Ok(value);
+    with_normal_screen(|| {
+        for _ in 0..MAX_PROMPT_RETRIES {
+            let value = prompt_secret(prompt)?;
+            if !value.is_empty() {
+                return Ok(value);
+            }
+
+            eprint!("{empty_message}");
         }
 
-        eprint!("{empty_message}");
-    }
-
-    Err(retry_limit_error(context))
+        Err(retry_limit_error(context))
+    })
 }
 
 fn prompt_secret(prompt: &str) -> Result<String, TuiError> {
@@ -6130,6 +6169,57 @@ mod tests {
         assert_eq!(
             super::classify_secret_input_key(&ctrl_c),
             super::SecretInputKeyAction::Cancel
+        );
+    }
+
+    #[test]
+    fn classify_secret_input_key_handles_all_action_types() {
+        // Submit on Enter
+        let enter = event::KeyEvent::new(event::KeyCode::Enter, event::KeyModifiers::NONE);
+        assert_eq!(
+            super::classify_secret_input_key(&enter),
+            super::SecretInputKeyAction::Submit
+        );
+
+        // Type on printable characters
+        let char_a = event::KeyEvent::new(event::KeyCode::Char('a'), event::KeyModifiers::NONE);
+        assert_eq!(
+            super::classify_secret_input_key(&char_a),
+            super::SecretInputKeyAction::Type('a')
+        );
+        let char_z = event::KeyEvent::new(event::KeyCode::Char('Z'), event::KeyModifiers::SHIFT);
+        assert_eq!(
+            super::classify_secret_input_key(&char_z),
+            super::SecretInputKeyAction::Type('Z')
+        );
+        let digit = event::KeyEvent::new(event::KeyCode::Char('9'), event::KeyModifiers::NONE);
+        assert_eq!(
+            super::classify_secret_input_key(&digit),
+            super::SecretInputKeyAction::Type('9')
+        );
+
+        // Delete on Backspace
+        let backspace = event::KeyEvent::new(event::KeyCode::Backspace, event::KeyModifiers::NONE);
+        assert_eq!(
+            super::classify_secret_input_key(&backspace),
+            super::SecretInputKeyAction::Delete
+        );
+
+        // Ignore on unhandled keys (arrows, function keys, etc.)
+        let left = event::KeyEvent::new(event::KeyCode::Left, event::KeyModifiers::NONE);
+        assert_eq!(
+            super::classify_secret_input_key(&left),
+            super::SecretInputKeyAction::Ignore
+        );
+        let f1 = event::KeyEvent::new(event::KeyCode::F(1), event::KeyModifiers::NONE);
+        assert_eq!(
+            super::classify_secret_input_key(&f1),
+            super::SecretInputKeyAction::Ignore
+        );
+        let tab = event::KeyEvent::new(event::KeyCode::Tab, event::KeyModifiers::NONE);
+        assert_eq!(
+            super::classify_secret_input_key(&tab),
+            super::SecretInputKeyAction::Ignore
         );
     }
 
@@ -7997,6 +8087,17 @@ mod tests {
     }
 
     #[test]
+    fn handle_idle_event_paste_appends_to_existing_input() {
+        let mut app = ui::FawxApp::new();
+        app.input_text = "hello world ".into();
+
+        let submitted = handle_idle_event(Event::Paste("AAAA".into()), &mut app);
+
+        assert!(submitted.is_none());
+        assert_eq!(app.submit_input(), "hello world AAAA");
+    }
+
+    #[test]
     fn handle_execution_event_paste_buffers_multiline_input() {
         let mut app = ui::FawxApp::new();
         let cancel = CancellationToken::new();
@@ -8004,6 +8105,19 @@ mod tests {
         handle_execution_event(Event::Paste("alpha\nbeta".into()), &mut app, &cancel, &None);
 
         assert_eq!(app.submit_input(), "alpha\nbeta");
+        assert!(!cancel.is_cancelled());
+        assert!(app.pending_inputs.is_empty());
+    }
+
+    #[test]
+    fn handle_execution_event_paste_appends_to_existing_input() {
+        let mut app = ui::FawxApp::new();
+        let cancel = CancellationToken::new();
+        app.input_text = "hello world ".into();
+
+        handle_execution_event(Event::Paste("AAAA".into()), &mut app, &cancel, &None);
+
+        assert_eq!(app.submit_input(), "hello world AAAA");
         assert!(!cancel.is_cancelled());
         assert!(app.pending_inputs.is_empty());
     }

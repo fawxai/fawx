@@ -178,9 +178,13 @@ impl FawxApp {
         self.history_index = None;
     }
 
-    /// Store pasted input, showing a compact preview if it spans multiple lines.
-    pub fn set_pasted_input(&mut self, pasted: String) {
-        self.input_text = pasted;
+    /// Insert pasted input at the active insertion point.
+    ///
+    /// The ratatui input bar currently only supports appending at the end of
+    /// the buffer, so bracketed paste follows the same rule instead of
+    /// replacing the entire input.
+    pub fn insert_pasted_input(&mut self, pasted: String) {
+        self.input_text.push_str(&pasted);
         self.pasted_line_count = pasted_line_count(&self.input_text);
         self.history_index = None;
     }
@@ -653,19 +657,53 @@ fn prepare_output_lines_for_render(app: &FawxApp, width: usize) -> (Vec<Line<'st
     (render_lines, total_visual_rows)
 }
 
+fn visible_output_lines_for_render(
+    app: &FawxApp,
+    width: usize,
+    height: usize,
+) -> (Vec<Line<'static>>, usize) {
+    let (render_lines, total_visual_rows) = prepare_output_lines_for_render(app, width);
+    let max_scroll = total_visual_rows.saturating_sub(height);
+    let clamped_offset = app.scroll_offset.min(max_scroll);
+    let start = max_scroll.saturating_sub(clamped_offset);
+    let visible_lines = render_lines.into_iter().skip(start).take(height).collect();
+    (visible_lines, total_visual_rows)
+}
+
+fn line_display_width(line: &Line<'_>) -> usize {
+    line.spans.iter().map(|span| span.content.width()).sum()
+}
+
+fn pad_visible_output_lines(
+    mut lines: Vec<Line<'static>>,
+    width: usize,
+    height: usize,
+) -> Vec<Line<'static>> {
+    if width == 0 || height == 0 {
+        return lines;
+    }
+
+    for line in &mut lines {
+        let padding = width.saturating_sub(line_display_width(line));
+        if padding > 0 {
+            line.spans.push(Span::raw(" ".repeat(padding)));
+        }
+    }
+
+    while lines.len() < height {
+        lines.push(Line::from(" ".repeat(width)));
+    }
+
+    lines
+}
+
 /// Render the scrollable output region.
 fn render_output(frame: &mut Frame, area: ratatui::layout::Rect, app: &FawxApp) {
     let width = area.width as usize;
-    let (lines, total_visual_rows) = prepare_output_lines_for_render(app, width);
-    let visible_height = area.height as usize;
-
-    // Scroll: show bottom unless user scrolled up.
-    let max_scroll = total_visual_rows.saturating_sub(visible_height);
-    let clamped_offset = app.scroll_offset.min(max_scroll);
-    let scroll = max_scroll.saturating_sub(clamped_offset);
-
-    let scroll_u16 = u16::try_from(scroll).unwrap_or(u16::MAX);
-    let paragraph = Paragraph::new(lines).scroll((scroll_u16, 0));
+    let height = area.height as usize;
+    let (lines, _) = visible_output_lines_for_render(app, width, height);
+    let lines = pad_visible_output_lines(lines, width, height);
+    let paragraph = Paragraph::new(lines);
 
     frame.render_widget(paragraph, area);
 }
@@ -865,9 +903,9 @@ mod tests {
     }
 
     #[test]
-    fn test_set_pasted_input_shows_multiline_preview() {
+    fn test_insert_pasted_input_shows_multiline_preview() {
         let mut app = FawxApp::new();
-        app.set_pasted_input("alpha\nbeta\ngamma".into());
+        app.insert_pasted_input("alpha\nbeta\ngamma".into());
 
         assert_eq!(app.input_text, "alpha\nbeta\ngamma");
         assert_eq!(app.pasted_line_count, Some(3));
@@ -875,18 +913,18 @@ mod tests {
     }
 
     #[test]
-    fn test_set_pasted_input_trailing_newline_uses_single_line_preview() {
+    fn test_insert_pasted_input_trailing_newline_uses_single_line_preview() {
         let mut app = FawxApp::new();
-        app.set_pasted_input("alpha\n".into());
+        app.insert_pasted_input("alpha\n".into());
 
         assert_eq!(app.pasted_line_count, Some(1));
         assert_eq!(app.input_display_text(), "[pasted 1 line]");
     }
 
     #[test]
-    fn test_set_pasted_input_single_line_keeps_plain_text() {
+    fn test_insert_pasted_input_single_line_keeps_plain_text() {
         let mut app = FawxApp::new();
-        app.set_pasted_input("alpha beta".into());
+        app.insert_pasted_input("alpha beta".into());
 
         assert_eq!(app.pasted_line_count, None);
         assert_eq!(app.input_display_text(), "alpha beta");
@@ -895,7 +933,7 @@ mod tests {
     #[test]
     fn test_submit_input_returns_full_multiline_paste() {
         let mut app = FawxApp::new();
-        app.set_pasted_input("alpha\nbeta".into());
+        app.insert_pasted_input("alpha\nbeta".into());
 
         let submitted = app.submit_input();
 
@@ -908,7 +946,7 @@ mod tests {
     #[test]
     fn test_typing_clears_multiline_paste_preview() {
         let mut app = FawxApp::new();
-        app.set_pasted_input("alpha\nbeta".into());
+        app.insert_pasted_input("alpha\nbeta".into());
 
         app.append_input_char('x');
 
@@ -919,12 +957,35 @@ mod tests {
     #[test]
     fn test_backspace_clears_multiline_paste_preview() {
         let mut app = FawxApp::new();
-        app.set_pasted_input("alpha\nbeta".into());
+        app.insert_pasted_input("alpha\nbeta".into());
 
         app.backspace_input();
 
         assert!(app.input_text.is_empty());
         assert_eq!(app.pasted_line_count, None);
+    }
+
+    #[test]
+    fn test_insert_pasted_input_appends_to_existing_text() {
+        let mut app = FawxApp::new();
+        app.input_text = "hello world ".into();
+
+        app.insert_pasted_input("AAAA".into());
+
+        assert_eq!(app.input_text, "hello world AAAA");
+        assert_eq!(app.pasted_line_count, None);
+    }
+
+    #[test]
+    fn test_insert_pasted_input_appends_multiline_paste_to_existing_text() {
+        let mut app = FawxApp::new();
+        app.input_text = "hello world ".into();
+
+        app.insert_pasted_input("alpha\nbeta".into());
+
+        assert_eq!(app.input_text, "hello world alpha\nbeta");
+        assert_eq!(app.pasted_line_count, Some(2));
+        assert_eq!(app.input_display_text(), "[pasted 2 lines]");
     }
 
     #[test]
@@ -1046,7 +1107,7 @@ mod tests {
     #[test]
     fn test_calculate_input_height_uses_paste_preview_text() {
         let mut app = FawxApp::new();
-        app.set_pasted_input("alpha\nbeta\ngamma".into());
+        app.insert_pasted_input("alpha\nbeta\ngamma".into());
 
         assert_eq!(app.calculate_input_height(20), 2);
     }
@@ -1219,6 +1280,70 @@ mod tests {
     }
 
     #[test]
+    fn test_render_output_matches_visible_slice_for_long_stream() {
+        let backend = TestBackend::new(24, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = FawxApp::new();
+        app.start_streaming();
+
+        let stream = "Cooperative yielding keeps evolving as the response grows beyond the viewport height and should still wrap into stable rows without scattering words across the screen.";
+
+        for ch in stream.chars() {
+            app.append_streaming_delta(&ch.to_string());
+            terminal
+                .draw(|frame| render_output(frame, frame.area(), &app))
+                .unwrap();
+            let (visible_lines, _) = visible_output_lines_for_render(&app, 24, 6);
+            let mut expected_rows: Vec<String> = visible_lines
+                .iter()
+                .map(|line| {
+                    let text: String = line
+                        .spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect();
+                    format!("{text:<24}")
+                })
+                .collect();
+            expected_rows.resize(6, " ".repeat(24));
+
+            let actual_rows: Vec<String> = (0..6)
+                .map(|row| {
+                    (0..24)
+                        .map(|col| terminal.backend().buffer()[(col, row)].symbol())
+                        .collect::<Vec<_>>()
+                        .join("")
+                })
+                .collect();
+
+            assert_eq!(actual_rows, expected_rows);
+        }
+    }
+
+    #[test]
+    fn test_render_output_replaces_rows_across_multi_row_scroll_shift() {
+        let backend = TestBackend::new(5, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = FawxApp::new();
+        app.add_output("abcde".into());
+        app.add_output("vwxyz".into());
+        app.add_output("12345".into());
+
+        terminal
+            .draw(|frame| render_output(frame, frame.area(), &app))
+            .unwrap();
+
+        app.add_output("f".into());
+        terminal
+            .draw(|frame| render_output(frame, frame.area(), &app))
+            .unwrap();
+
+        terminal
+            .backend()
+            .assert_buffer(&Buffer::with_lines(["vwxyz", "12345", "f    "]));
+    }
+
+    #[test]
     fn test_prepare_output_lines_for_render_counts_wrapped_stream_rows() {
         let mut app = FawxApp::new();
         app.start_streaming();
@@ -1246,6 +1371,63 @@ mod tests {
         assert_eq!(total_visual_rows, 2);
         assert_eq!(lines[0].spans[0].content.as_ref(), "abcd");
         assert_eq!(lines[1].spans[0].content.as_ref(), "efgh");
+    }
+
+    #[test]
+    fn test_pad_visible_output_lines_fills_short_rows_and_blank_lines() {
+        let padded = pad_visible_output_lines(vec![Line::from("abc"), Line::from("")], 5, 4);
+
+        let rendered: Vec<String> = padded
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+
+        assert_eq!(rendered, vec!["abc  ", "     ", "     ", "     "]);
+    }
+
+    #[test]
+    fn test_render_output_pads_visible_rows_during_long_stream_scroll() {
+        let backend = TestBackend::new(24, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = FawxApp::new();
+        app.start_streaming();
+
+        let stream = "The authentication system supports three authentication methods for LLM providers.\n\n## AuthMethod Enum\n\n**1. ApiKey** - Direct API key authentication (BYO key)\n- Fields: `provider` (string), `key` (string)\n- Used for providers like OpenAI, Anthropic, OpenRouter with user-provided API keys";
+
+        for ch in stream.chars() {
+            app.append_streaming_delta(&ch.to_string());
+            terminal
+                .draw(|frame| render_output(frame, frame.area(), &app))
+                .unwrap();
+        }
+
+        let (visible_lines, _) = visible_output_lines_for_render(&app, 24, 6);
+        let padded_lines = pad_visible_output_lines(visible_lines, 24, 6);
+        let expected_rows: Vec<String> = padded_lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+
+        let actual_rows: Vec<String> = (0..6)
+            .map(|row| {
+                (0..24)
+                    .map(|col| terminal.backend().buffer()[(col, row)].symbol())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect();
+
+        assert_eq!(actual_rows, expected_rows);
     }
 
     // ── wrap_lines_to_width tests ──────────────────────────────
