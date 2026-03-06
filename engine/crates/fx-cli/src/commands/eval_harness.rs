@@ -31,7 +31,7 @@ pub struct Options {
 
 #[derive(Debug, Clone)]
 struct ScenarioCase {
-    #[allow(dead_code)]
+    #[allow(dead_code)] // used in test assertions (duplicate-id check)
     id: &'static str,
     domain: &'static str,
     false_success_claim: bool,

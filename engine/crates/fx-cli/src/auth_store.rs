@@ -8,6 +8,7 @@ use fx_auth::auth::AuthManager;
 use fx_storage::{derive_key, CredentialStore, EncryptedStore, Storage};
 use std::fs;
 use std::path::Path;
+use zeroize::Zeroizing;
 
 /// Key name used to store the serialized `AuthManager` in the credential store.
 ///
@@ -23,6 +24,7 @@ const AUTH_MANAGER_KEY: &str = "auth_manager";
 
 /// Application pepper baked into the key derivation to namespace Fawx keys.
 const APP_PEPPER: &[u8] = b"fawx-auth-store-v1";
+const PROVIDER_TOKEN_SUFFIX: &str = "_token";
 
 /// Encrypted auth credential store backed by `fx-storage`.
 pub struct AuthStore {
@@ -77,6 +79,65 @@ impl AuthStore {
             }
         }
     }
+
+    /// Store a provider token under the `<provider>_token` key.
+    #[allow(dead_code)] // Used by feat/auth-tui-wiring PR #1166
+    pub fn store_provider_token(&self, provider: &str, token: &str) -> Result<(), String> {
+        let key = provider_token_key(provider);
+        self.credential_store
+            .store_credential(&key, token)
+            .map_err(|e| format!("failed to store provider token: {e}"))
+    }
+
+    /// Read a provider token from the `<provider>_token` key.
+    ///
+    /// Returns the token wrapped in [`Zeroizing`] so it is automatically
+    /// zeroed when dropped, preventing secret material from lingering in
+    /// memory.
+    #[allow(dead_code)] // Used by feat/auth-tui-wiring PR #1166
+    pub fn get_provider_token(&self, provider: &str) -> Result<Option<Zeroizing<String>>, String> {
+        let key = provider_token_key(provider);
+        self.credential_store
+            .get_credential(&key)
+            .map(|opt| opt.map(Zeroizing::new))
+            .map_err(|e| format!("failed to read provider token: {e}"))
+    }
+
+    /// Delete a provider token. Returns true when a token existed.
+    #[allow(dead_code)] // Used by feat/auth-tui-wiring PR #1166
+    pub fn clear_provider_token(&self, provider: &str) -> Result<bool, String> {
+        let key = provider_token_key(provider);
+        self.credential_store
+            .delete_credential(&key)
+            .map_err(|e| format!("failed to clear provider token: {e}"))
+    }
+
+    /// List provider names that currently have `<provider>_token` entries.
+    #[allow(dead_code)] // Used by feat/auth-tui-wiring PR #1166
+    pub fn list_provider_tokens(&self) -> Result<Vec<String>, String> {
+        let mut providers = self
+            .credential_store
+            .list_credentials()
+            .map_err(|e| format!("failed to list provider tokens: {e}"))?
+            .into_iter()
+            .filter_map(|key| {
+                key.strip_suffix(PROVIDER_TOKEN_SUFFIX)
+                    .map(|provider| provider.to_string())
+            })
+            .collect::<Vec<_>>();
+        providers.sort();
+        providers.dedup();
+        Ok(providers)
+    }
+}
+
+#[allow(dead_code)] // Used by feat/auth-tui-wiring PR #1166
+fn provider_token_key(provider: &str) -> String {
+    format!(
+        "{}{}",
+        provider.trim().to_ascii_lowercase(),
+        PROVIDER_TOKEN_SUFFIX
+    )
 }
 
 /// Migrate plaintext `auth.json` into the encrypted store, then delete it.

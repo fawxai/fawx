@@ -25,36 +25,121 @@ pub trait HostApi: Send + Sync {
     /// Set the skill's response output.
     fn set_output(&mut self, text: &str);
 
+    /// Make an HTTP request. Returns the response body, or None on failure.
+    ///
+    /// - `method`: HTTP method (GET, POST, etc.)
+    /// - `url`: Target URL (HTTPS only in live implementations)
+    /// - `headers`: JSON-encoded header map (e.g., `{"Content-Type": "application/json"}`)
+    /// - `body`: Request body (empty string for no body)
+    fn http_request(&self, method: &str, url: &str, headers: &str, body: &str) -> Option<String>;
+
+    /// Get the output that was set by the skill.
+    fn get_output(&self) -> String;
+
     /// Downcast to concrete type for accessing implementation-specific methods.
     fn as_any(&self) -> &dyn std::any::Any;
+}
+
+/// Shared base for HostApi implementations.
+///
+/// Provides common storage, input/output, and lock-recovery patterns
+/// used by both `MockHostApi` (testing) and `LiveHostApi` (production).
+#[derive(Debug, Clone)]
+pub struct HostApiBase {
+    storage: Arc<Mutex<HashMap<String, String>>>,
+    input: String,
+    output: Arc<Mutex<String>>,
+}
+
+impl HostApiBase {
+    /// Create a new base with the given input.
+    pub fn new(input: impl Into<String>) -> Self {
+        Self {
+            storage: Arc::new(Mutex::new(HashMap::new())),
+            input: input.into(),
+            output: Arc::new(Mutex::new(String::new())),
+        }
+    }
+
+    /// Get a value from key-value storage.
+    pub fn kv_get(&self, key: &str) -> Option<String> {
+        self.storage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(key)
+            .cloned()
+    }
+
+    /// Set a value in key-value storage.
+    pub fn kv_set(&self, key: &str, value: &str) {
+        self.storage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key.to_string(), value.to_string());
+    }
+
+    /// Get the input text.
+    pub fn get_input(&self) -> String {
+        self.input.clone()
+    }
+
+    /// Set the output text.
+    pub fn set_output(&self, text: &str) {
+        *self
+            .output
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = text.to_string();
+    }
+
+    /// Get the current output text.
+    pub fn get_output(&self) -> String {
+        self.output
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Get the current storage state (for testing/inspection).
+    pub fn get_storage(&self) -> HashMap<String, String> {
+        self.storage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
 }
 
 /// Mock implementation of HostApi for testing.
 #[derive(Debug, Clone)]
 pub struct MockHostApi {
-    storage: Arc<Mutex<HashMap<String, String>>>,
-    input: String,
-    output: Arc<Mutex<String>>,
+    base: HostApiBase,
     logs: Arc<Mutex<Vec<(u32, String)>>>,
+    /// Canned HTTP responses: maps URL to response body.
+    http_responses: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl MockHostApi {
     /// Create a new mock host API with the given input.
     pub fn new(input: impl Into<String>) -> Self {
         Self {
-            storage: Arc::new(Mutex::new(HashMap::new())),
-            input: input.into(),
-            output: Arc::new(Mutex::new(String::new())),
+            base: HostApiBase::new(input),
             logs: Arc::new(Mutex::new(Vec::new())),
+            http_responses: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Register a canned HTTP response for a URL.
+    ///
+    /// When `http_request` is called with this URL, the canned response is returned.
+    pub fn add_http_response(&self, url: impl Into<String>, response: impl Into<String>) {
+        self.http_responses
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(url.into(), response.into());
     }
 
     /// Get the output that was set by the skill.
     pub fn get_output(&self) -> String {
-        self.output
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+        self.base.get_output()
     }
 
     /// Get all logged messages.
@@ -67,10 +152,7 @@ impl MockHostApi {
 
     /// Get the current storage state.
     pub fn get_storage(&self) -> HashMap<String, String> {
-        self.storage
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+        self.base.get_storage()
     }
 }
 
@@ -92,30 +174,38 @@ impl HostApi for MockHostApi {
     }
 
     fn kv_get(&self, key: &str) -> Option<String> {
-        self.storage
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(key)
-            .cloned()
+        self.base.kv_get(key)
     }
 
     fn kv_set(&mut self, key: &str, value: &str) -> Result<(), SkillError> {
-        self.storage
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(key.to_string(), value.to_string());
+        self.base.kv_set(key, value);
         Ok(())
     }
 
     fn get_input(&self) -> String {
-        self.input.clone()
+        self.base.get_input()
     }
 
     fn set_output(&mut self, text: &str) {
-        *self
-            .output
+        self.base.set_output(text);
+    }
+
+    fn http_request(
+        &self,
+        _method: &str,
+        url: &str,
+        _headers: &str,
+        _body: &str,
+    ) -> Option<String> {
+        self.http_responses
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = text.to_string();
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(url)
+            .cloned()
+    }
+
+    fn get_output(&self) -> String {
+        self.base.get_output()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -175,5 +265,53 @@ mod tests {
         let mut api = MockHostApi::new("");
         api.kv_set("key", "").expect("Should set empty value");
         assert_eq!(api.kv_get("key"), Some("".to_string()));
+    }
+
+    #[test]
+    fn test_mock_host_api_http_request_canned_response() {
+        let api = MockHostApi::new("");
+        api.add_http_response("https://api.example.com/data", r#"{"result": "ok"}"#);
+
+        let response = api.http_request("GET", "https://api.example.com/data", "{}", "");
+        assert_eq!(response, Some(r#"{"result": "ok"}"#.to_string()));
+    }
+
+    #[test]
+    fn test_mock_host_api_http_request_unmatched_url() {
+        let api = MockHostApi::new("");
+        api.add_http_response("https://api.example.com/data", "response");
+
+        let response = api.http_request("GET", "https://api.example.com/other", "{}", "");
+        assert_eq!(response, None);
+    }
+
+    #[test]
+    fn test_mock_host_api_http_request_no_canned_responses() {
+        let api = MockHostApi::new("");
+
+        let response = api.http_request("GET", "https://example.com", "{}", "");
+        assert_eq!(response, None);
+    }
+
+    #[test]
+    fn test_host_api_base_kv_operations() {
+        let base = HostApiBase::new("input");
+        assert_eq!(base.kv_get("missing"), None);
+
+        base.kv_set("k", "v");
+        assert_eq!(base.kv_get("k"), Some("v".to_string()));
+
+        base.kv_set("k", "v2");
+        assert_eq!(base.kv_get("k"), Some("v2".to_string()));
+    }
+
+    #[test]
+    fn test_host_api_base_io() {
+        let base = HostApiBase::new("hello");
+        assert_eq!(base.get_input(), "hello");
+        assert_eq!(base.get_output(), "");
+
+        base.set_output("world");
+        assert_eq!(base.get_output(), "world");
     }
 }

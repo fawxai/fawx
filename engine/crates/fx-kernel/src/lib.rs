@@ -65,7 +65,7 @@ pub use fx_decompose::{
 };
 pub use input::{loop_input_channel, LoopCommand, LoopInputChannel, LoopInputSender};
 pub use learn::Learning;
-pub use loop_engine::{LoopEngine, LoopEngineBuilder, LoopResult, LoopStatus};
+pub use loop_engine::{LoopEngine, LoopEngineBuilder, LoopResult, LoopStatus, ScratchpadProvider};
 pub use perceive::ProcessedPerception;
 pub use signals::{LoopStep, Signal, SignalCollector, SignalKind};
 pub use types::{ContinuationDecision, EscalationContext, LoopError, LoopEvidence};

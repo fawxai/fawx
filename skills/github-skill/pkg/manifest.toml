@@ -1,0 +1,26 @@
+name = "github-skill"
+version = "1.0.0"
+description = """Manage pull requests and issues via the GitHub API.
+
+Input must be a JSON string with an "action" field. Available actions:
+
+1. list_prs: List pull requests.
+   {"action":"list_prs","owner":"<owner>","repo":"<repo>","state":"open|closed|all","per_page":10}
+
+2. view_pr: View a single PR with details.
+   {"action":"view_pr","owner":"<owner>","repo":"<repo>","pr_number":123}
+
+3. create_pr: Create a pull request.
+   {"action":"create_pr","owner":"<owner>","repo":"<repo>","title":"<title>","head":"<branch>","base":"main","body":"<description>","draft":false}
+
+4. comment_pr: Add a comment to a PR.
+   {"action":"comment_pr","owner":"<owner>","repo":"<repo>","pr_number":123,"body":"<comment>"}
+
+5. list_issues: List repository issues.
+   {"action":"list_issues","owner":"<owner>","repo":"<repo>","state":"open|closed|all","labels":"bug,enhancement","per_page":10}
+
+Required fields: action, owner, repo. Other fields vary by action (see above)."""
+author = "fawx"
+api_version = "host_api_v1"
+capabilities = ["network", "storage"]
+entry_point = "run"

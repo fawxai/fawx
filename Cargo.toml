@@ -19,6 +19,7 @@ members = [
     "engine/crates/fx-memory",
     "engine/crates/fx-improve",
     "engine/crates/fx-transactions",
+    "engine/crates/fx-scratchpad",
     "engine/crates/llama-cpp-sys",
 ]
 resolver = "2"
@@ -44,7 +45,9 @@ async-trait = "0.1"
 
 # CLI
 clap = { version = "4.5", features = ["derive"] }
-crossterm = "0.27"
+crossterm = "0.28"
+ratatui = "0.29"
+tui-textarea = "0.7"
 
 # Logging
 tracing = "0.1"
@@ -61,11 +64,13 @@ semver = "1.0"
 redb = "2.4"
 zeroize = "1.8"
 
-# WASM runtime
-wasmtime = "40.0.3"
+# WASM runtime (pinned exact to keep wasmtime + wasmtime-wasi in lockstep)
+wasmtime = "=40.0.4"
+wasmtime-wasi = "=40.0.4"
 
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+ureq = { version = "2", features = ["json"] }
 futures = "0.3"
 http = "1"
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
@@ -88,3 +93,4 @@ fx-transactions = { path = "engine/crates/fx-transactions" }
 fx-analysis = { path = "engine/crates/fx-analysis" }
 fx-memory = { path = "engine/crates/fx-memory" }
 fx-improve = { path = "engine/crates/fx-improve" }
+fx-scratchpad = { path = "engine/crates/fx-scratchpad" }

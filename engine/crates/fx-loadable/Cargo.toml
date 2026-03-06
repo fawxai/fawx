@@ -10,6 +10,7 @@ description = "Fawx loadable layer — skill registry, plugin loading, built-in 
 fx-core = { workspace = true }
 fx-kernel = { workspace = true }
 fx-llm = { path = "../fx-llm" }
+fx-skills = { path = "../fx-skills" }
 fx-transactions = { path = "../fx-transactions" }
 
 async-trait.workspace = true
@@ -24,3 +25,4 @@ futures.workspace = true
 [dev-dependencies]
 tempfile = "3"
 tokio.workspace = true
+zeroize.workspace = true

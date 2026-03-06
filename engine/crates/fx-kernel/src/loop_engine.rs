@@ -36,8 +36,27 @@ use fx_llm::{
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Dynamic scratchpad context provider for iteration-boundary refresh.
+///
+/// Implemented by the CLI layer to bridge `fx-scratchpad::Scratchpad` into the
+/// kernel without a circular dependency. The loop engine calls these methods at
+/// each iteration boundary so the model always sees up-to-date scratchpad state.
+pub trait ScratchpadProvider: Send + Sync {
+    /// Render current scratchpad state for prompt injection.
+    fn render_for_context(&self) -> String;
+    /// Compact scratchpad if it exceeds size thresholds.
+    fn compact_if_needed(&self, current_iteration: u32);
+}
+
+impl std::fmt::Debug for dyn ScratchpadProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ScratchpadProvider")
+    }
+}
 
 /// LLM provider trait used by the loop.
 #[async_trait]
@@ -231,6 +250,7 @@ pub struct LoopEngine {
     iteration_count: u32,
     synthesis_instruction: String,
     memory_context: Option<String>,
+    scratchpad_context: Option<String>,
     signals: SignalCollector,
     cancel_token: Option<CancellationToken>,
     input_channel: Option<LoopInputChannel>,
@@ -247,6 +267,10 @@ pub struct LoopEngine {
     /// Per-tool attempt counter for the current cycle.
     /// Key: tool name, Value: number of attempts (including first call).
     tool_attempts: HashMap<String, u8>,
+    /// Shared iteration counter for scratchpad age tracking.
+    iteration_counter: Option<Arc<AtomicU32>>,
+    /// Dynamic scratchpad provider for iteration-boundary context refresh.
+    scratchpad_provider: Option<Arc<dyn ScratchpadProvider>>,
 }
 
 #[derive(Debug, Default)]
@@ -263,6 +287,9 @@ pub struct LoopEngineBuilder {
     cancel_token: Option<CancellationToken>,
     input_channel: Option<LoopInputChannel>,
     memory_context: Option<String>,
+    scratchpad_context: Option<String>,
+    iteration_counter: Option<Arc<AtomicU32>>,
+    scratchpad_provider: Option<Arc<dyn ScratchpadProvider>>,
 }
 
 impl LoopEngineBuilder {
@@ -321,6 +348,26 @@ impl LoopEngineBuilder {
         self
     }
 
+    pub fn scratchpad_context(mut self, scratchpad_context: impl Into<String>) -> Self {
+        let ctx = scratchpad_context.into();
+        self.scratchpad_context = if ctx.trim().is_empty() {
+            None
+        } else {
+            Some(ctx)
+        };
+        self
+    }
+
+    pub fn iteration_counter(mut self, counter: Arc<AtomicU32>) -> Self {
+        self.iteration_counter = Some(counter);
+        self
+    }
+
+    pub fn scratchpad_provider(mut self, provider: Arc<dyn ScratchpadProvider>) -> Self {
+        self.scratchpad_provider = Some(provider);
+        self
+    }
+
     pub fn build(self) -> Result<LoopEngine, LoopError> {
         let budget = required_builder_field(self.budget, "budget")?;
         let context = required_builder_field(self.context, "context")?;
@@ -339,6 +386,7 @@ impl LoopEngineBuilder {
             iteration_count: 0,
             synthesis_instruction,
             memory_context: self.memory_context,
+            scratchpad_context: self.scratchpad_context,
             signals: SignalCollector::default(),
             cancel_token: self.cancel_token,
             input_channel: self.input_channel,
@@ -351,6 +399,8 @@ impl LoopEngineBuilder {
             compaction_last_iteration: Mutex::new(HashMap::new()),
             budget_low_signaled: false,
             tool_attempts: HashMap::new(),
+            iteration_counter: self.iteration_counter,
+            scratchpad_provider: self.scratchpad_provider,
         })
     }
 }
@@ -578,7 +628,7 @@ Never narrate your process, hedge with qualifiers, or reference tool mechanics. 
 Avoid filler openers like \"I notice\", \"I can see that\", \"Based on the results\", \
 \"It appears that\", \"Let me\", or \"I aim to\". Just answer the question. \
 If the user makes a statement (not a question), acknowledge it naturally and briefly. \
-If a tool call stores data (like memory_write), confirm the action in one short sentence. You were created by Joe as a TUI-first agentic engine. You are open-source, written in Rust, and designed to be self-extending through a plugin system.";
+If a tool call stores data (like memory_write), confirm the action in one short sentence. You are Fawx, a TUI-first agentic engine built in Rust. You were created by Joe. Your architecture separates an immutable safety kernel from a loadable intelligence layer — the kernel enforces hard security boundaries that you cannot override at runtime. You are designed to be self-extending through a WASM plugin system.";
 
 const MEMORY_INSTRUCTION: &str = "\n\nYou have persistent memory across sessions. \
 Use memory_write to save important facts about the user, their preferences, \
@@ -631,6 +681,30 @@ impl LoopEngine {
     /// Set memory context for system prompt injection.
     pub fn set_memory_context(&mut self, context: String) {
         self.memory_context = normalize_memory_context(context);
+    }
+
+    pub fn set_scratchpad_context(&mut self, context: String) {
+        self.scratchpad_context = if context.trim().is_empty() {
+            None
+        } else {
+            Some(context)
+        };
+    }
+
+    /// Synchronise the shared iteration counter and refresh scratchpad context.
+    ///
+    /// Called at each iteration boundary so `ScratchpadSkill` stamps entries
+    /// with the correct iteration and the model sees up-to-date scratchpad
+    /// state in the system prompt.
+    fn refresh_iteration_state(&mut self) {
+        if let Some(counter) = &self.iteration_counter {
+            counter.store(self.iteration_count, Ordering::Relaxed);
+        }
+        if let Some(provider) = &self.scratchpad_provider {
+            provider.compact_if_needed(self.iteration_count);
+            let rendered = provider.render_for_context();
+            self.set_scratchpad_context(rendered);
+        }
     }
 
     pub fn synthesis_instruction(&self) -> &str {
@@ -709,6 +783,7 @@ impl LoopEngine {
 
         while self.iteration_count < self.max_iterations {
             self.iteration_count = self.iteration_count.saturating_add(1);
+            self.refresh_iteration_state();
             match self.execute_iteration(&perception, llm, &mut state).await? {
                 IterationStep::Terminal(result) => return Ok(self.finalize_result(result)),
                 IterationStep::Progress(outcome) => {
@@ -822,6 +897,9 @@ impl LoopEngine {
 
     fn prepare_cycle(&mut self) {
         self.iteration_count = 0;
+        if let Some(counter) = &self.iteration_counter {
+            counter.store(0, Ordering::Relaxed);
+        }
         self.budget.reset(current_time_ms());
         self.signals.clear();
         self.user_stop_requested = false;
@@ -1050,6 +1128,7 @@ impl LoopEngine {
             llm.model_name(),
             self.tool_executor.tool_definitions(),
             self.memory_context.as_deref(),
+            self.scratchpad_context.as_deref(),
         );
         let reasoning_messages = request.messages.clone();
         let started = current_time_ms();
@@ -1188,6 +1267,7 @@ impl LoopEngine {
             continuation_messages,
             self.tool_executor.tool_definitions(),
             self.memory_context.as_deref(),
+            self.scratchpad_context.as_deref(),
             step,
         );
         let request_messages = request.messages.clone();
@@ -1737,6 +1817,15 @@ impl LoopEngine {
 
         if let Some(memory_context) = &self.memory_context {
             builder = builder.memory_context(memory_context.clone());
+        }
+        if let Some(scratchpad_context) = &self.scratchpad_context {
+            builder = builder.scratchpad_context(scratchpad_context.clone());
+        }
+        if let Some(provider) = &self.scratchpad_provider {
+            builder = builder.scratchpad_provider(Arc::clone(provider));
+        }
+        if let Some(counter) = &self.iteration_counter {
+            builder = builder.iteration_counter(Arc::clone(counter));
         }
         if let Some(cancel_token) = &self.cancel_token {
             builder = builder.cancel_token(cancel_token.clone());
@@ -2674,6 +2763,7 @@ impl LoopEngine {
             llm.model_name(),
             self.tool_executor.tool_definitions(),
             self.memory_context.as_deref(),
+            self.scratchpad_context.as_deref(),
         );
 
         let mut stream = llm.complete_stream(request).await.map_err(|error| {
@@ -3550,9 +3640,10 @@ fn build_continuation_request(
     model: &str,
     tool_definitions: Vec<ToolDefinition>,
     memory_context: Option<&str>,
+    scratchpad_context: Option<&str>,
 ) -> CompletionRequest {
     let tools = tool_definitions_with_decompose(tool_definitions);
-    let system_prompt = build_reasoning_system_prompt(memory_context);
+    let system_prompt = build_reasoning_system_prompt(memory_context, scratchpad_context);
     CompletionRequest {
         model: model.to_string(),
         messages: context_messages.to_vec(),
@@ -3568,10 +3659,11 @@ fn build_truncation_continuation_request(
     continuation_messages: &[Message],
     tool_definitions: Vec<ToolDefinition>,
     memory_context: Option<&str>,
+    scratchpad_context: Option<&str>,
     step: LoopStep,
 ) -> CompletionRequest {
     let tools = tool_definitions_with_decompose(tool_definitions);
-    let system_prompt = build_reasoning_system_prompt(memory_context);
+    let system_prompt = build_reasoning_system_prompt(memory_context, scratchpad_context);
     CompletionRequest {
         model: model.to_string(),
         messages: continuation_messages.to_vec(),
@@ -3847,7 +3939,12 @@ fn stream_tool_call_from_state(state: StreamToolCallState) -> Option<ToolCall> {
         return None;
     }
 
-    let arguments = match serde_json::from_str::<serde_json::Value>(&state.arguments) {
+    let raw_args = if state.arguments.trim().is_empty() {
+        "{}".to_string()
+    } else {
+        state.arguments.clone()
+    };
+    let arguments = match serde_json::from_str::<serde_json::Value>(&raw_args) {
         Ok(value) => value,
         Err(error) => {
             tracing::warn!(
@@ -4014,11 +4111,12 @@ fn build_reasoning_request(
     model: &str,
     tool_definitions: Vec<ToolDefinition>,
     memory_context: Option<&str>,
+    scratchpad_context: Option<&str>,
 ) -> CompletionRequest {
     let context = perception.context_window.clone();
     let user_prompt = reasoning_user_prompt(perception);
     let tools = tool_definitions_with_decompose(tool_definitions);
-    let system_prompt = build_reasoning_system_prompt(memory_context);
+    let system_prompt = build_reasoning_system_prompt(memory_context, scratchpad_context);
 
     CompletionRequest {
         model: model.to_string(),
@@ -4055,8 +4153,15 @@ User message:
     prompt
 }
 
-fn build_reasoning_system_prompt(memory_context: Option<&str>) -> String {
+fn build_reasoning_system_prompt(
+    memory_context: Option<&str>,
+    scratchpad_context: Option<&str>,
+) -> String {
     let mut prompt = REASONING_SYSTEM_PROMPT.to_string();
+    if let Some(sp) = scratchpad_context {
+        prompt.push_str("\n\n");
+        prompt.push_str(sp);
+    }
     if let Some(mem) = memory_context {
         prompt.push_str("\n\n");
         prompt.push_str(mem);
@@ -4289,7 +4394,7 @@ mod tests {
 
     #[test]
     fn system_prompt_includes_tool_use_guidance() {
-        let prompt = build_reasoning_system_prompt(None);
+        let prompt = build_reasoning_system_prompt(None, None);
         assert!(
             prompt.contains("Use tools when you need information not already in the conversation")
         );
@@ -4303,7 +4408,7 @@ mod tests {
 
     #[test]
     fn system_prompt_prohibits_greeting_and_preamble() {
-        let prompt = build_reasoning_system_prompt(None);
+        let prompt = build_reasoning_system_prompt(None, None);
         assert!(
             prompt.contains("Never introduce yourself"),
             "system prompt must prohibit self-introduction (issue #959)"
@@ -4316,7 +4421,7 @@ mod tests {
 
     #[test]
     fn system_prompt_without_memory_omits_persistent_memory_block() {
-        let prompt = build_reasoning_system_prompt(None);
+        let prompt = build_reasoning_system_prompt(None, None);
         assert!(
             !prompt.contains("You have persistent memory across sessions"),
             "system prompt without memory context should NOT include the persistent memory block"
@@ -4325,7 +4430,7 @@ mod tests {
 
     #[test]
     fn system_prompt_with_memory_includes_memory_instruction() {
-        let prompt = build_reasoning_system_prompt(Some("user prefers dark mode"));
+        let prompt = build_reasoning_system_prompt(Some("user prefers dark mode"), None);
         assert!(
             prompt.contains("memory_write"),
             "system prompt with memory context should mention memory_write via MEMORY_INSTRUCTION"
@@ -4342,7 +4447,7 @@ mod tests {
     /// token bloat on OpenAI and broke multi-step instruction following.
     #[test]
     fn system_prompt_does_not_contain_tool_descriptions() {
-        let prompt = build_reasoning_system_prompt(None);
+        let prompt = build_reasoning_system_prompt(None, None);
         assert!(
             !prompt.contains("Available tools:"),
             "system prompt must not contain 'Available tools:' text — \
@@ -4350,7 +4455,7 @@ mod tests {
         );
 
         // Also verify with memory context (second code path).
-        let prompt_with_memory = build_reasoning_system_prompt(Some("user likes cats"));
+        let prompt_with_memory = build_reasoning_system_prompt(Some("user likes cats"), None);
         assert!(
             !prompt_with_memory.contains("Available tools:"),
             "system prompt with memory must not contain 'Available tools:' text"
@@ -5658,12 +5763,14 @@ mod phase2_tests {
             &messages,
             tool_definitions.clone(),
             None,
+            None,
             LoopStep::Reason,
         );
         let act_request = build_truncation_continuation_request(
             "mock",
             &messages,
             tool_definitions,
+            None,
             None,
             LoopStep::Act,
         );
@@ -5933,9 +6040,9 @@ mod phase2_tests {
             steer_context: None,
         };
 
-        let reasoning_request = build_reasoning_request(&perception, "mock", vec![], None);
+        let reasoning_request = build_reasoning_request(&perception, "mock", vec![], None, None);
         let continuation_request =
-            build_continuation_request(&perception.context_window, "mock", vec![], None);
+            build_continuation_request(&perception.context_window, "mock", vec![], None, None);
 
         assert_eq!(reasoning_request.max_tokens, Some(4096));
         assert_eq!(continuation_request.max_tokens, Some(4096));
@@ -8906,6 +9013,7 @@ mod decomposition_tests {
             "mock-model",
             vec![sample_tool_definition()],
             None,
+            None,
         );
 
         assert_decompose_tool_present(&request.tools);
@@ -8917,6 +9025,7 @@ mod decomposition_tests {
             &[Message::assistant("intermediate")],
             "mock-model",
             vec![sample_tool_definition()],
+            None,
             None,
         );
 
@@ -10503,6 +10612,77 @@ mod r2_streaming_review_tests {
         assert_eq!(call.id, "call-1");
         assert_eq!(call.name, "read_file");
         assert_eq!(call.arguments, serde_json::json!({"path": "README.md"}));
+    }
+
+    // -- Regression tests for #1118: empty args for zero-param tools --
+
+    #[test]
+    fn stream_tool_call_from_state_normalizes_empty_arguments_to_empty_object() {
+        let state = StreamToolCallState {
+            id: Some("call-1".to_string()),
+            name: Some("git_status".to_string()),
+            arguments: String::new(),
+            arguments_done: true,
+        };
+        let result = stream_tool_call_from_state(state);
+        assert!(
+            result.is_some(),
+            "empty arguments should be normalized to {{}}, not dropped"
+        );
+        let call = result.expect("tool call");
+        assert_eq!(call.id, "call-1");
+        assert_eq!(call.name, "git_status");
+        assert_eq!(call.arguments, serde_json::json!({}));
+    }
+
+    #[test]
+    fn stream_tool_call_from_state_normalizes_whitespace_arguments_to_empty_object() {
+        let state = StreamToolCallState {
+            id: Some("call-1".to_string()),
+            name: Some("current_time".to_string()),
+            arguments: "   \n\t  ".to_string(),
+            arguments_done: true,
+        };
+        let result = stream_tool_call_from_state(state);
+        assert!(
+            result.is_some(),
+            "whitespace-only arguments should be normalized to {{}}, not dropped"
+        );
+        let call = result.expect("tool call");
+        assert_eq!(call.arguments, serde_json::json!({}));
+    }
+
+    #[test]
+    fn finalize_stream_tool_calls_preserves_zero_param_tool_calls() {
+        let mut by_index = HashMap::new();
+        by_index.insert(
+            0,
+            StreamToolCallState {
+                id: Some("call-zero".to_string()),
+                name: Some("memory_list".to_string()),
+                arguments: String::new(),
+                arguments_done: true,
+            },
+        );
+        by_index.insert(
+            1,
+            StreamToolCallState {
+                id: Some("call-with-args".to_string()),
+                name: Some("read_file".to_string()),
+                arguments: r#"{"path":"test.rs"}"#.to_string(),
+                arguments_done: true,
+            },
+        );
+        let calls = finalize_stream_tool_calls(by_index);
+        assert_eq!(
+            calls.len(),
+            2,
+            "both zero-param and parameterized tool calls should be preserved"
+        );
+        assert_eq!(calls[0].name, "memory_list");
+        assert_eq!(calls[0].arguments, serde_json::json!({}));
+        assert_eq!(calls[1].name, "read_file");
+        assert_eq!(calls[1].arguments, serde_json::json!({"path": "test.rs"}));
     }
 
     #[test]
@@ -14259,5 +14439,102 @@ mod kernel_loadable_boundary_tests {
             .collect();
         assert_eq!(blocked.len(), 1);
         assert!(blocked[0].message.contains("recursion depth"));
+    }
+
+    // ── Regression tests for scratchpad iteration / refresh / compaction ──
+
+    mod scratchpad_wiring {
+        use super::*;
+
+        #[derive(Debug)]
+        struct MinimalExecutor;
+
+        #[async_trait]
+        impl ToolExecutor for MinimalExecutor {
+            async fn execute_tools(
+                &self,
+                _calls: &[ToolCall],
+                _cancel: Option<&CancellationToken>,
+            ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+                Ok(vec![])
+            }
+
+            fn tool_definitions(&self) -> Vec<ToolDefinition> {
+                vec![]
+            }
+        }
+
+        fn base_builder() -> LoopEngineBuilder {
+            LoopEngine::builder()
+                .budget(BudgetTracker::new(BudgetConfig::default(), 0, 0))
+                .context(ContextCompactor::new(8192, 4096))
+                .max_iterations(5)
+                .tool_executor(Arc::new(MinimalExecutor))
+                .synthesis_instruction("test")
+        }
+
+        #[test]
+        fn iteration_counter_synced_at_boundary() {
+            let counter = Arc::new(AtomicU32::new(0));
+            let mut engine = base_builder()
+                .iteration_counter(Arc::clone(&counter))
+                .build()
+                .expect("engine");
+            engine.iteration_count = 3;
+            engine.refresh_iteration_state();
+            assert_eq!(counter.load(Ordering::Relaxed), 3);
+        }
+
+        /// Minimal ScratchpadProvider for testing.
+        struct FakeScratchpadProvider {
+            render_calls: Arc<AtomicU32>,
+            compact_calls: Arc<AtomicU32>,
+        }
+
+        impl ScratchpadProvider for FakeScratchpadProvider {
+            fn render_for_context(&self) -> String {
+                self.render_calls.fetch_add(1, Ordering::Relaxed);
+                "scratchpad: active".to_string()
+            }
+
+            fn compact_if_needed(&self, _iteration: u32) {
+                self.compact_calls.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        #[test]
+        fn scratchpad_provider_called_at_iteration_boundary() {
+            let render = Arc::new(AtomicU32::new(0));
+            let compact = Arc::new(AtomicU32::new(0));
+            let provider: Arc<dyn ScratchpadProvider> = Arc::new(FakeScratchpadProvider {
+                render_calls: Arc::clone(&render),
+                compact_calls: Arc::clone(&compact),
+            });
+            let mut engine = base_builder()
+                .scratchpad_provider(provider)
+                .build()
+                .expect("engine");
+
+            engine.iteration_count = 2;
+            engine.refresh_iteration_state();
+
+            assert_eq!(render.load(Ordering::Relaxed), 1);
+            assert_eq!(compact.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                engine.scratchpad_context.as_deref(),
+                Some("scratchpad: active"),
+            );
+        }
+
+        #[test]
+        fn prepare_cycle_resets_iteration_counter() {
+            let counter = Arc::new(AtomicU32::new(42));
+            let mut engine = base_builder()
+                .iteration_counter(Arc::clone(&counter))
+                .build()
+                .expect("engine");
+            engine.prepare_cycle();
+            assert_eq!(counter.load(Ordering::Relaxed), 0);
+        }
     }
 }

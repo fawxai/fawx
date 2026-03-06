@@ -1,11 +1,18 @@
 //! Fawx CLI - Management interface for the Fawx agent.
 
+mod ansi;
 mod auth_store;
 mod commands;
 mod config_bridge;
 mod confirmation;
+#[allow(dead_code)] // TODO(#1148): Phase 3 will wire markdown rendering into ratatui
 mod markdown;
+// Phase 2: many rendering/history utilities are currently test-only while we
+// wire ratatui. Phase 3 (polish) will re-connect markdown rendering, banner
+// art, and history persistence. Suppress dead-code warnings until then.
+#[allow(dead_code)] // TODO(#1148): Phase 3 reconnects history, banner art, and markdown
 mod tui;
+mod ui;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -158,15 +165,17 @@ async fn run_tui() -> anyhow::Result<i32> {
     let router = tui::build_router(&auth_manager)?;
     let config = tui::load_config()?;
     let bundle = tui::build_loop_engine_from_config(&config)?;
-    let mut app = tui::TuiApp::new_with_memory(
+    let mut app = tui::TuiApp::new_with_deps(tui::TuiAppDeps {
         auth_manager,
         router,
-        bundle.engine,
-        bundle.runtime_info,
+        loop_engine: bundle.engine,
+        runtime_info: bundle.runtime_info,
         config,
-        bundle.memory,
-        bundle.event_bus,
-    )?;
+        memory: bundle.memory,
+        event_bus: bundle.event_bus,
+        scratchpad: bundle.scratchpad,
+        credential_store: bundle.credential_store,
+    })?;
     app.run().await?;
     Ok(0)
 }

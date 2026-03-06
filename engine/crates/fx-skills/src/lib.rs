@@ -16,6 +16,7 @@
 pub mod cache;
 pub mod capabilities;
 pub mod host_api;
+pub mod live_host_api;
 pub mod loader;
 pub mod manifest;
 pub mod registry;
@@ -26,7 +27,8 @@ pub mod storage;
 // Re-export commonly used types
 pub use cache::{cache_stats, clear_cache, compile_module, has_cached_module, CacheStats};
 pub use capabilities::CapabilityChecker;
-pub use host_api::{HostApi, MockHostApi};
+pub use host_api::{HostApi, HostApiBase, MockHostApi};
+pub use live_host_api::{LiveHostApi, LiveHostApiConfig};
 pub use loader::{LoadedSkill, SkillLoader};
 pub use manifest::{parse_manifest, validate_manifest, Capability, SkillManifest};
 pub use registry::SkillRegistry;

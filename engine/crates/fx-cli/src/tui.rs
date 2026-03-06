@@ -1,10 +1,13 @@
 use crate::auth_store::{migrate_if_needed, AuthStore};
+use crate::ui;
 use async_trait::async_trait;
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::style::Stylize;
 use crossterm::{cursor, event, style, terminal, ExecutableCommand};
 use futures::StreamExt;
 use fx_analysis::{AnalysisEngine, AnalysisError, AnalysisFinding, Confidence};
 use fx_auth::auth::{AuthManager, AuthMethod};
+use fx_auth::credential_store::CredentialStore as CredentialStoreTrait;
 use fx_auth::oauth::{PkceFlow, TokenExchangeRequest, TokenResponse};
 use fx_config::FawxConfig;
 use fx_conversation::{
@@ -12,7 +15,7 @@ use fx_conversation::{
 };
 use fx_core::error::LlmError as CoreLlmError;
 use fx_core::memory::{MemoryProvider, MemoryStore};
-use fx_core::message::{InternalMessage, StreamPhase};
+use fx_core::message::InternalMessage;
 use fx_core::runtime_info::{ConfigSummary, RuntimeInfo, SkillInfo};
 use fx_core::types::{InputSource, ScreenState, UserInput};
 use fx_core::EventBus;
@@ -21,9 +24,9 @@ use fx_kernel::act::TokenUsage;
 use fx_kernel::budget::{BudgetConfig, BudgetTracker};
 use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::context_manager::ContextCompactor;
-use fx_kernel::input::LoopCommand;
+use fx_kernel::input::{loop_input_channel, LoopCommand, LoopInputSender};
 use fx_kernel::loop_engine::{
-    LlmProvider as LoopLlmProvider, LoopEngine, LoopEngineBuilder, LoopResult,
+    LlmProvider as LoopLlmProvider, LoopEngine, LoopEngineBuilder, LoopResult, ScratchpadProvider,
 };
 use fx_kernel::signals::{LoopStep, Signal, SignalCollector};
 use fx_kernel::types::PerceptionSnapshot;
@@ -34,23 +37,18 @@ use fx_llm::{
 };
 use fx_loadable::{SkillRegistry, TransactionSkill};
 use fx_memory::{JsonFileMemory, JsonMemoryConfig, SignalStore};
+use fx_scratchpad::skill::ScratchpadSkill;
+use fx_scratchpad::Scratchpad;
+use fx_skills::live_host_api::CredentialProvider;
 use fx_tools::{BuiltinToolsSkill, FawxToolExecutor, GitSkill, ToolConfig};
-use rustyline::completion::{Completer, Pair};
-use rustyline::config::CompletionType;
-use rustyline::error::ReadlineError;
-use rustyline::highlight::Highlighter;
-use rustyline::hint::{Hinter, HistoryHinter};
-use rustyline::history::DefaultHistory;
-use rustyline::validate::Validator;
-use rustyline::{Context, Editor, Helper};
+use ratatui::DefaultTerminal;
 use std::collections::hash_map::DefaultHasher;
 use std::fmt;
-use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+
 use std::sync::LazyLock;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -61,16 +59,15 @@ use syntect::util::as_24_bit_terminal_escaped;
 use termimad::crossterm::style::{Attribute as MadAttribute, Color as MadColor};
 use termimad::{MadSkin, StyledChar};
 use tokio::sync::broadcast;
-use tokio::sync::oneshot;
 use tokio::time::{sleep, Duration};
 
 const BANNER_ART: &str = r#"   ___
   / _/__ __    ____  __
  / _/ _ `/ |/|/ /\ \/ /
 /_/ \_,_/|__,__/ /_/\_\"#;
-#[allow(dead_code)]
 /// Pre-rendered braille+truecolor ANSI banner (via ascii-image-converter).
-const FAWX_BANNER_ANSI: &str = include_str!("../../../../scripts/fawx-banner.ans");
+/// Plain-text source art lives in `docs/fawx-hero.txt` (no ANSI escapes).
+const FAWX_BANNER_ANSI: &str = include_str!("../../../../docs/fawx-hero-ansi.txt");
 
 const DEFAULT_OPENAI_TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
 const MAX_PROMPT_RETRIES: usize = 10;
@@ -318,254 +315,206 @@ fn spinner_frame(index: usize) -> char {
     SPINNER_FRAMES[index % SPINNER_FRAMES.len()]
 }
 
-fn clear_spinner_line() {
-    eprint!("\r\x1b[2K");
-}
-
 // ---------------------------------------------------------------------------
-// Streaming renderer
+// Ratatui event loop helpers
 // ---------------------------------------------------------------------------
 
-/// Renders streaming LLM output token-by-token to stdout.
-///
-/// Tracks phase transitions (Reason → Synthesize) and prints the
-/// `assistant ›` prefix exactly once per user cycle.
-struct StreamRenderer {
-    /// Whether the assistant prefix has been printed for this cycle.
-    prefix_printed: bool,
-    /// Current streaming phase.
-    current_phase: Option<StreamPhase>,
-    /// Token count accumulated so far.
-    token_count: usize,
-    /// Accumulated raw text for markdown reprint on finalize.
-    buffer: String,
-    /// Incremental markdown renderer for ANSI-formatted streaming output.
-    md: crate::markdown::MarkdownRenderer,
-}
-
-impl StreamRenderer {
-    fn new() -> Self {
-        Self {
-            prefix_printed: false,
-            current_phase: None,
-            token_count: 0,
-            buffer: String::new(),
-            md: crate::markdown::MarkdownRenderer::new(),
-        }
-    }
-
-    /// Handle a `StreamingStarted` event.
-    fn handle_started(&mut self, phase: StreamPhase) {
-        self.current_phase = Some(phase);
-    }
-
-    /// Handle a `StreamDelta` event — render markdown incrementally.
-    fn handle_delta(&mut self, delta: &str) {
-        if !self.prefix_printed {
-            self.print_prefix();
-        }
-        self.token_count += 1;
-        self.buffer.push_str(delta);
-        let formatted = self.md.push(delta);
-        if !formatted.is_empty() {
-            self.write_delta(&formatted);
-        }
-    }
-
-    /// Handle a `StreamingFinished` event.
-    fn handle_finished(&mut self, _phase: StreamPhase) {
-        self.current_phase = None;
-    }
-
-    /// Print any trailing markdown content and a final newline.
-    fn finalize(&mut self) {
-        if self.prefix_printed {
-            let tail = self.md.flush();
-            if !tail.is_empty() {
-                print!("{tail}");
-                let _ = io::stdout().flush();
-            }
-            println!();
-        }
-    }
-
-    fn print_prefix(&mut self) {
-        print!(
-            "\n{} ",
-            "assistant \u{203a}"
-                .bold()
-                .with(theme_color(255, 165, 0, 214))
+/// Install a panic hook that restores the terminal on panic.
+fn install_ratatui_panic_hook() {
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::terminal::LeaveAlternateScreen,
+            crossterm::cursor::Show
         );
-        let _ = io::stdout().flush();
-        self.prefix_printed = true;
-    }
-
-    fn write_delta(&self, delta: &str) {
-        print!("{delta}");
-        let _ = io::stdout().flush();
-    }
-
-    /// Print the `[interrupted]` marker when a stream is cancelled.
-    ///
-    /// Associated function (no `&self`) because the renderer may already
-    /// be dropped by the time the caller decides to print the marker.
-    fn print_interrupted_marker() {
-        eprint!(" \x1b[33m[interrupted]\x1b[0m");
-        let _ = io::stderr().flush();
-    }
+        original_hook(info);
+    }));
 }
 
-/// Run a future with a combined thinking spinner + streaming display.
-///
-/// Shows a spinner until `StreamingStarted` arrives, then switches to
-/// token-by-token rendering. Returns `(result, streamed)` where `streamed`
-/// indicates whether streaming output was rendered.
-async fn run_with_streaming_display<F, T>(event_bus: &EventBus, future: F) -> (T, bool)
-where
-    F: Future<Output = T>,
-{
-    let receiver = event_bus.subscribe();
-    let streamed = Arc::new(AtomicBool::new(false));
-    let streamed_inner = Arc::clone(&streamed);
-    let (stop_tx, stop_rx) = oneshot::channel::<()>();
-
-    let display_handle = tokio::spawn(async move {
-        streaming_display_loop(receiver, stop_rx, streamed_inner).await;
-    });
-
-    let result = future.await;
-    let _ = stop_tx.send(());
-    let _ = display_handle.await;
-    (result, streamed.load(Ordering::Relaxed))
-}
-
-/// Mutable state carried through each tick of the display loop.
-struct DisplayLoopState {
-    renderer: StreamRenderer,
-    spinner_active: bool,
-    frame_index: usize,
-    streamed: Arc<AtomicBool>,
-}
-
-impl DisplayLoopState {
-    fn new(streamed: Arc<AtomicBool>) -> Self {
-        Self {
-            renderer: StreamRenderer::new(),
-            spinner_active: true,
-            frame_index: 0,
-            streamed,
-        }
-    }
-}
-
-/// Event loop that drives the spinner → streaming transition.
-async fn streaming_display_loop(
-    mut receiver: broadcast::Receiver<InternalMessage>,
-    mut stop: oneshot::Receiver<()>,
-    streamed: Arc<AtomicBool>,
+/// Drain streaming events from the event bus into the FawxApp.
+fn drain_bus_events(
+    bus_rx: &mut broadcast::Receiver<InternalMessage>,
+    app: &mut ui::FawxApp,
+    streamed: &mut bool,
 ) {
-    let mut state = DisplayLoopState::new(streamed);
-
     loop {
-        if !dispatch_streaming_event(&mut receiver, &mut stop, &mut state).await {
-            break;
-        }
-    }
-
-    if state.spinner_active {
-        clear_spinner_line();
-    }
-    state.renderer.finalize();
-}
-
-/// Process one tick of the streaming display loop.
-///
-/// Returns `false` when the loop should exit.
-async fn dispatch_streaming_event(
-    receiver: &mut broadcast::Receiver<InternalMessage>,
-    stop: &mut oneshot::Receiver<()>,
-    state: &mut DisplayLoopState,
-) -> bool {
-    tokio::select! {
-        biased;
-        _ = &mut *stop => false,
-        msg = receiver.recv() => {
-            handle_bus_message(
-                msg,
-                &mut state.renderer,
-                &mut state.spinner_active,
-                &state.streamed,
-            );
-            true
-        }
-        _ = sleep(Duration::from_millis(80)), if state.spinner_active => {
-            eprint!("\r\x1b[2K{} thinking...", spinner_frame(state.frame_index));
-            let _ = io::stderr().flush();
-            state.frame_index += 1;
-            true
+        match bus_rx.try_recv() {
+            Ok(msg) => route_bus_message_to_app(msg, app, streamed),
+            Err(broadcast::error::TryRecvError::Empty) => break,
+            Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                tracing::warn!(skipped = n, "stream display lagged");
+            }
+            Err(broadcast::error::TryRecvError::Closed) => break,
         }
     }
 }
 
-/// Route a single bus message to the renderer.
-fn handle_bus_message(
-    msg: Result<InternalMessage, broadcast::error::RecvError>,
-    renderer: &mut StreamRenderer,
-    spinner_active: &mut bool,
-    streamed: &Arc<AtomicBool>,
-) {
-    let message = match msg {
-        Ok(m) => m,
-        Err(broadcast::error::RecvError::Lagged(n)) => {
-            tracing::warn!(skipped = n, "stream display lagged, events skipped");
-            // Future enhancement: print an inline `[...{n} events skipped...]`
-            // marker so the user knows displayed text may be incomplete.
-            return;
-        }
-        Err(broadcast::error::RecvError::Closed) => return,
-    };
-    match message {
-        InternalMessage::StreamingStarted { phase } => {
-            stop_spinner_if_active(spinner_active);
-            renderer.handle_started(phase);
-            streamed.store(true, Ordering::Relaxed);
+/// Route a single bus message to the FawxApp output.
+fn route_bus_message_to_app(msg: InternalMessage, app: &mut ui::FawxApp, streamed: &mut bool) {
+    match msg {
+        InternalMessage::StreamingStarted { .. } => {
+            app.set_state(ui::AppState::Streaming);
+            *streamed = true;
         }
         InternalMessage::StreamDelta { delta, .. } => {
-            stop_spinner_if_active(spinner_active);
-            renderer.handle_delta(&delta);
-            streamed.store(true, Ordering::Relaxed);
+            app.append_streaming_delta(&delta);
+            *streamed = true;
         }
-        InternalMessage::StreamingFinished { phase } => {
-            renderer.handle_finished(phase);
-        }
+        InternalMessage::StreamingFinished { .. } => {}
         _ => {}
     }
 }
 
-fn stop_spinner_if_active(spinner_active: &mut bool) {
-    if *spinner_active {
-        clear_spinner_line();
-        *spinner_active = false;
-        let _ = io::stderr().flush();
+/// Handle a key event during the idle (input) state.
+///
+/// Returns `Some(text)` if the user submitted input, `None` otherwise.
+fn handle_idle_key(key: KeyEvent, app: &mut ui::FawxApp) -> Option<String> {
+    match key.code {
+        KeyCode::Enter => {
+            let text = app.submit_input();
+            if text.is_empty() {
+                None
+            } else {
+                Some(text)
+            }
+        }
+        KeyCode::Up => {
+            app.history_up();
+            None
+        }
+        KeyCode::Down => {
+            app.history_down();
+            None
+        }
+        KeyCode::Char(c) => {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'c' {
+                return None; // handled by signal handler
+            }
+            app.input_text.push(c);
+            None
+        }
+        KeyCode::Backspace => {
+            app.input_text.pop();
+            None
+        }
+        KeyCode::PageUp => {
+            app.scroll_up();
+            None
+        }
+        KeyCode::PageDown => {
+            app.scroll_down();
+            None
+        }
+        _ => None,
     }
 }
 
-/// Legacy thinking spinner — retained for existing tests.
-#[cfg(test)]
-async fn run_thinking_spinner(mut stop_signal: oneshot::Receiver<()>) {
-    let mut frame_index = 0;
-    loop {
-        tokio::select! {
-            _ = &mut stop_signal => {
-                clear_spinner_line();
-                break;
-            }
-            _ = sleep(Duration::from_millis(80)) => {
-                eprint!("\r\x1b[2K{} thinking...", spinner_frame(frame_index));
-                let _ = io::stderr().flush();
-                frame_index += 1;
+/// Check if input is a control command that only makes sense during execution.
+///
+/// During idle, only `/stop` (with slash) is recognized so that bare words
+/// like "a", "s", "no" are not intercepted as control commands.
+fn is_idle_control_command(input: &str) -> bool {
+    let trimmed = input.trim();
+    trimmed.eq_ignore_ascii_case("/stop") || trimmed.eq_ignore_ascii_case("/abort")
+}
+
+/// Poll for key events during execution and route them.
+fn poll_execution_keys(
+    app: &mut ui::FawxApp,
+    cancel_token: &CancellationToken,
+    input_sender: &Option<LoopInputSender>,
+) {
+    while crossterm::event::poll(Duration::ZERO).unwrap_or(false) {
+        if let Ok(Event::Key(key)) = crossterm::event::read() {
+            handle_execution_key(key, app, cancel_token, input_sender);
+        } else {
+            break;
+        }
+    }
+}
+
+/// Handle key events during execution, routing input to steer/abort/queue.
+///
+/// Returns `true` if an abort was requested (Ctrl+C or `/stop`).
+fn handle_execution_key(
+    key: KeyEvent,
+    app: &mut ui::FawxApp,
+    cancel_token: &CancellationToken,
+    input_sender: &Option<LoopInputSender>,
+) {
+    match key.code {
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.request_abort();
+            cancel_token.cancel();
+            if let Some(sender) = input_sender {
+                let _ = sender.send(LoopCommand::Abort);
             }
         }
+        KeyCode::Enter => {
+            let text = app.submit_input();
+            if text.is_empty() {
+                return;
+            }
+            route_execution_input(&text, app, cancel_token, input_sender);
+        }
+        KeyCode::Char(c) => {
+            if !key.modifiers.contains(KeyModifiers::CONTROL) {
+                app.input_text.push(c);
+            }
+        }
+        KeyCode::Backspace => {
+            app.input_text.pop();
+        }
+        KeyCode::PageUp => app.scroll_up(),
+        KeyCode::PageDown => app.scroll_down(),
+        _ => {}
+    }
+}
+
+/// Route submitted text during execution to the appropriate handler.
+fn route_execution_input(
+    text: &str,
+    app: &mut ui::FawxApp,
+    cancel_token: &CancellationToken,
+    input_sender: &Option<LoopInputSender>,
+) {
+    if let Some(cmd) = parse_bare_command(text) {
+        match cmd {
+            LoopCommand::Stop | LoopCommand::Abort => {
+                app.request_abort();
+                cancel_token.cancel();
+                if let Some(sender) = input_sender {
+                    let _ = sender.send(LoopCommand::Abort);
+                }
+                app.add_output(format!("⛔ {text}"));
+            }
+            LoopCommand::Steer(ref steer_text) => {
+                if let Some(sender) = input_sender {
+                    let _ = sender.send(LoopCommand::Steer(steer_text.clone()));
+                    app.add_output(format!("↪ Steer sent: {steer_text}"));
+                } else {
+                    // No channel available — store for forwarding at next cycle start
+                    app.set_steer(steer_text.clone());
+                    app.add_output(format!("↪ Steer queued: {steer_text}"));
+                }
+            }
+            LoopCommand::StatusQuery => {
+                if let Some(sender) = input_sender {
+                    let _ = sender.send(LoopCommand::StatusQuery);
+                }
+            }
+            other => {
+                if let Some(sender) = input_sender {
+                    let _ = sender.send(other);
+                }
+            }
+        }
+    } else {
+        // Not a command — queue for the next turn
+        app.queue_input(text.to_string());
+        app.add_output(format!("📋 Queued: {text}"));
     }
 }
 
@@ -695,109 +644,6 @@ const TUI_COMMANDS: &[&str] = &[
 const PROMPT_COLOR_START: &str = "\x1b[38;2;255;204;0m";
 const PROMPT_COLOR_END: &str = "\x1b[0m";
 
-struct FawxReadlineHelper {
-    hinter: HistoryHinter,
-    model_ids: Arc<Mutex<Vec<String>>>,
-}
-
-impl Default for FawxReadlineHelper {
-    fn default() -> Self {
-        Self {
-            hinter: HistoryHinter {},
-            model_ids: Arc::new(Mutex::new(Vec::new())),
-        }
-    }
-}
-
-impl Helper for FawxReadlineHelper {}
-impl Highlighter for FawxReadlineHelper {}
-impl Validator for FawxReadlineHelper {}
-
-impl Hinter for FawxReadlineHelper {
-    type Hint = String;
-
-    fn hint(&self, line: &str, pos: usize, context: &Context<'_>) -> Option<String> {
-        if line.len() < 2 {
-            return None;
-        }
-        self.hinter.hint(line, pos, context)
-    }
-}
-
-impl Completer for FawxReadlineHelper {
-    type Candidate = Pair;
-
-    fn complete(
-        &self,
-        line: &str,
-        pos: usize,
-        _context: &Context<'_>,
-    ) -> rustyline::Result<(usize, Vec<Pair>)> {
-        let line_end = pos.min(line.len());
-
-        // Complete model IDs after "/model "
-        if let Some(model_prefix) = line[..line_end].strip_prefix("/model ") {
-            return Ok((
-                "/model ".len(),
-                model_completion_matches(model_prefix, &self.model_ids),
-            ));
-        }
-
-        let start = token_start(line, line_end);
-        if start != 0 {
-            return Ok((start, Vec::new()));
-        }
-
-        let prefix = &line[start..line_end];
-        if !prefix.starts_with('/') {
-            return Ok((start, Vec::new()));
-        }
-
-        Ok((start, command_completion_matches(prefix)))
-    }
-}
-
-fn token_start(line: &str, cursor: usize) -> usize {
-    line[..cursor]
-        .char_indices()
-        .rev()
-        .find_map(|(idx, ch)| ch.is_whitespace().then_some(idx + ch.len_utf8()))
-        .unwrap_or(0)
-}
-
-fn command_completion_matches(prefix: &str) -> Vec<Pair> {
-    if !prefix.starts_with('/') {
-        return Vec::new();
-    }
-
-    TUI_COMMANDS
-        .iter()
-        .filter(|command| command.starts_with(prefix))
-        .map(|command| Pair {
-            display: (*command).to_string(),
-            replacement: (*command).to_string(),
-        })
-        .collect()
-}
-
-fn model_completion_matches(prefix: &str, model_ids: &Arc<Mutex<Vec<String>>>) -> Vec<Pair> {
-    let ids = match model_ids.lock() {
-        Ok(guard) => guard.clone(),
-        Err(_) => {
-            eprintln!("warning: model completion list mutex poisoned; returning no suggestions");
-            return Vec::new();
-        }
-    };
-    let normalized_prefix = prefix.to_lowercase();
-    ids.iter()
-        .filter(|id| id.to_lowercase().starts_with(&normalized_prefix))
-        .map(|id| Pair {
-            display: id.clone(),
-            replacement: id.clone(),
-        })
-        .collect()
-}
-
 /// Group models by provider name, preserving insertion order.
 fn group_models_by_provider(models: &[ModelInfo]) -> Vec<(String, Vec<&ModelInfo>)> {
     let mut groups: Vec<(String, Vec<&ModelInfo>)> = Vec::new();
@@ -850,69 +696,43 @@ fn history_namespace_for_cwd(home: &Path, cwd: &Path) -> Option<String> {
     Some(format!("{:016x}", hasher.finish()))
 }
 
-fn build_tui_prompt() -> String {
-    format!("{PROMPT_COLOR_START}you › {PROMPT_COLOR_END}")
-}
-
-fn load_history_with_warning(
-    editor: &mut Editor<FawxReadlineHelper, DefaultHistory>,
-    path: &Path,
-) -> bool {
-    match editor.load_history(path) {
-        Ok(()) => true,
-        Err(error) => {
-            eprintln!(
-                "warning: failed to load command history from {}: {}",
-                path.display(),
-                error
-            );
-            false
-        }
-    }
-}
-
-fn configure_line_editor(
-    model_ids: Arc<Mutex<Vec<String>>>,
-) -> Result<Editor<FawxReadlineHelper, DefaultHistory>, TuiError> {
-    let config = rustyline::Config::builder()
-        .completion_type(CompletionType::List)
-        .build();
-    let mut editor =
-        Editor::with_config(config).map_err(|error| TuiError::Auth(error.to_string()))?;
-    editor.set_helper(Some(FawxReadlineHelper {
-        hinter: HistoryHinter {},
-        model_ids,
-    }));
-
-    if let Some(path) = history_path() {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(TuiError::Io)?;
-        }
-        if path.exists() {
-            load_history_with_warning(&mut editor, &path);
-        }
-    }
-
-    Ok(editor)
-}
-
-fn save_line_editor_history(editor: &mut Editor<FawxReadlineHelper, DefaultHistory>) {
-    if let Some(path) = history_path() {
-        if let Err(error) = editor.save_history(&path) {
-            eprintln!("failed to save command history: {error}");
-        }
-    }
-}
-
-/// Parse a bare-word command typed during spinner/thinking phase.
-#[allow(dead_code)] // Wired into readline handoff in a follow-up.
+/// Parse a bare-word command typed during execution.
+///
+/// Returns `Some(LoopCommand)` for recognized commands, `None` for
+/// unrecognized text (callers decide whether to steer or queue).
 pub(crate) fn parse_bare_command(input: &str) -> Option<LoopCommand> {
-    match input.trim().to_lowercase().as_str() {
-        "stop" | "s" => Some(LoopCommand::Stop),
-        "abort" | "a" | "cancel" => Some(LoopCommand::Abort),
+    let trimmed = input.trim();
+    let lower = trimmed.to_lowercase();
+
+    // Handle "/steer <text>" and "steer <text>" with a single strip_prefix chain
+    let steer_text = lower
+        .strip_prefix("/steer ")
+        .or_else(|| lower.strip_prefix("steer "))
+        .and_then(|_| {
+            // Use the original (non-lowercased) text for the steer payload
+            let prefix_len = if trimmed.starts_with('/') {
+                "/steer ".len()
+            } else {
+                "steer ".len()
+            };
+            let text = trimmed[prefix_len..].trim();
+            if text.is_empty() {
+                None
+            } else {
+                Some(text)
+            }
+        });
+    if let Some(text) = steer_text {
+        return Some(LoopCommand::Steer(text.to_string()));
+    }
+
+    match lower.as_str() {
+        "stop" | "s" | "/stop" => Some(LoopCommand::Stop),
+        "abort" | "a" | "cancel" | "/abort" => Some(LoopCommand::Abort),
         "no" => Some(LoopCommand::Stop),
-        "wait" | "pause" | "w" => Some(LoopCommand::Wait),
-        "go" | "resume" | "continue" => Some(LoopCommand::Resume),
+        "wait" | "pause" | "w" | "/wait" => Some(LoopCommand::Wait),
+        "go" | "resume" | "continue" | "/resume" => Some(LoopCommand::Resume),
+        "status" | "st" | "/status" => Some(LoopCommand::StatusQuery),
         _ => None,
     }
 }
@@ -921,6 +741,7 @@ pub(crate) fn parse_bare_command(input: &str) -> Option<LoopCommand> {
 pub struct TuiApp {
     router: ModelRouter,
     auth_manager: AuthManager,
+    auth_store: AuthStore,
     catalog: ModelCatalog,
     loop_engine: LoopEngine,
     running: bool,
@@ -934,10 +755,41 @@ pub struct TuiApp {
     max_history: usize,
     memory: Option<SharedMemoryStore>,
     runtime_info: Arc<RwLock<RuntimeInfo>>,
-    /// Shared model ID list for readline tab-completion.
+    /// Shared model ID list for tab-completion.
     completer_model_ids: Arc<Mutex<Vec<String>>>,
     /// Event bus for streaming events from the kernel.
     event_bus: EventBus,
+    scratchpad: Arc<Mutex<Scratchpad>>,
+    /// Single encrypted credential store instance (opened once at startup, shared via Arc).
+    credential_store: Option<Arc<fx_auth::credential_store::EncryptedFileCredentialStore>>,
+    /// Buffer for command output that will be flushed to FawxApp.
+    output_buffer: Vec<String>,
+}
+
+/// Dependencies for constructing a [`TuiApp`]. Avoids > 5 bare parameters.
+pub struct TuiAppDeps {
+    pub auth_manager: AuthManager,
+    pub router: ModelRouter,
+    pub loop_engine: LoopEngine,
+    pub runtime_info: Arc<RwLock<RuntimeInfo>>,
+    pub config: FawxConfig,
+    pub memory: Option<SharedMemoryStore>,
+    pub event_bus: EventBus,
+    pub scratchpad: Arc<Mutex<Scratchpad>>,
+    pub credential_store: Option<Arc<fx_auth::credential_store::EncryptedFileCredentialStore>>,
+}
+
+/// Bundles mutable references needed by [`TuiApp::run_cycle_rendering`],
+/// keeping the parameter count within the 4-5 limit.
+struct CycleRenderingContext<'a> {
+    snapshot: Option<PerceptionSnapshot>,
+    active_model: String,
+    terminal: &'a mut DefaultTerminal,
+    app: &'a mut ui::FawxApp,
+    bus_rx: &'a mut broadcast::Receiver<InternalMessage>,
+    cancel_token: &'a CancellationToken,
+    streamed: &'a mut bool,
+    input_sender: Option<LoopInputSender>,
 }
 
 impl TuiApp {
@@ -951,29 +803,37 @@ impl TuiApp {
         config: FawxConfig,
     ) -> Result<Self, TuiError> {
         let event_bus = EventBus::new(EVENT_BUS_CAPACITY);
-        Self::new_with_memory(
+        let scratchpad = Arc::new(Mutex::new(Scratchpad::new()));
+        Self::new_with_deps(TuiAppDeps {
             auth_manager,
             router,
             loop_engine,
             runtime_info,
             config,
-            None,
+            memory: None,
             event_bus,
-        )
+            scratchpad,
+            credential_store: None,
+        })
     }
 
-    /// Create a new TUI application with shared memory context support.
-    pub fn new_with_memory(
-        auth_manager: AuthManager,
-        router: ModelRouter,
-        loop_engine: LoopEngine,
-        runtime_info: Arc<RwLock<RuntimeInfo>>,
-        config: FawxConfig,
-        memory: Option<SharedMemoryStore>,
-        event_bus: EventBus,
-    ) -> Result<Self, TuiError> {
+    /// Create a new TUI application with full dependency injection.
+    pub fn new_with_deps(deps: TuiAppDeps) -> Result<Self, TuiError> {
+        let TuiAppDeps {
+            auth_manager,
+            router,
+            loop_engine,
+            runtime_info,
+            config,
+            memory,
+            event_bus,
+            scratchpad,
+            credential_store,
+        } = deps;
         let base_data_dir = fawx_data_dir();
         let data_dir = configured_data_dir(&base_data_dir, &config);
+        let auth_store = AuthStore::open(&data_dir)
+            .map_err(|e| TuiError::Auth(format!("failed to open auth store: {e}")))?;
         let mut conversation_store = ConversationStore::new(&data_dir).map_err(TuiError::Store)?;
         let session_id = conversation_store
             .ensure_active()
@@ -985,10 +845,10 @@ impl TuiApp {
         }
         let max_history = config.general.max_history;
         let conversation_history = load_startup_conversation_history(&conversation_store, &config);
-
         let mut app = Self {
             router,
             auth_manager,
+            auth_store,
             catalog: ModelCatalog::new(),
             loop_engine,
             running: true,
@@ -1004,62 +864,288 @@ impl TuiApp {
             runtime_info,
             completer_model_ids: Arc::new(Mutex::new(Vec::new())),
             event_bus,
+            scratchpad,
+            credential_store,
+            output_buffer: Vec::new(),
         };
         app.select_first_available_model_without_refresh();
         Ok(app)
     }
 
-    /// Run the TUI main loop.
+    /// Write a line to the output buffer (collected and flushed to UI later).
+    fn tui_println(&mut self, line: impl Into<String>) {
+        self.output_buffer.push(line.into());
+    }
+
+    /// Return a reference to the credential store, or an error if unavailable.
+    fn get_credential_store(
+        &self,
+    ) -> Result<&Arc<fx_auth::credential_store::EncryptedFileCredentialStore>, TuiError> {
+        self.credential_store
+            .as_ref()
+            .ok_or_else(|| TuiError::Auth("credential store not available".into()))
+    }
+
+    /// Persist the current auth manager to the encrypted store.
+    fn persist_auth_manager(&self) -> Result<(), TuiError> {
+        self.auth_store
+            .save_auth_manager(&self.auth_manager)
+            .map_err(TuiError::Auth)
+    }
+
+    /// Drain the output buffer into the FawxApp.
+    fn flush_output_to(&mut self, app: &mut ui::FawxApp) {
+        for line in self.output_buffer.drain(..) {
+            app.add_output(line);
+        }
+    }
+
+    /// Run the TUI main loop using ratatui rendering.
     pub async fn run(&mut self) -> Result<(), TuiError> {
         self.select_first_available_model().await;
-        self.show_welcome();
 
-        // Ctrl+C signals cancellation instead of killing the process.
-        // First press: graceful cancel. Second press: force exit (NB1).
+        install_ratatui_panic_hook();
+
+        crossterm::terminal::enable_raw_mode().map_err(TuiError::Io)?;
+        crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)
+            .map_err(TuiError::Io)?;
+        let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
+        let mut terminal = ratatui::Terminal::new(backend).map_err(TuiError::Io)?;
+        let mut app = ui::FawxApp::new();
+
+        // Show welcome banner
+        self.show_welcome();
+        self.flush_output_to(&mut app);
+
+        // Ctrl+C: first press = cancel, second = force exit.
         let cancel_for_signal = self.cancel_token.clone();
         tokio::spawn(async move {
-            // First Ctrl+C: graceful cancel
             tokio::signal::ctrl_c().await.ok();
             cancel_for_signal.cancel();
-            // Second Ctrl+C: force exit
             tokio::signal::ctrl_c().await.ok();
-            eprintln!("\n⏹ Force quit.");
+            let _ = crossterm::terminal::disable_raw_mode();
+            let _ = crossterm::execute!(
+                std::io::stdout(),
+                crossterm::terminal::LeaveAlternateScreen,
+                crossterm::cursor::Show
+            );
+            eprintln!("\n\u{23f9} Force quit.");
             std::process::exit(130);
         });
 
-        // Wire the cancellation token into the loop engine.
         self.loop_engine.set_cancel_token(self.cancel_token.clone());
-
         self.sync_completer_model_ids();
-        let mut editor = configure_line_editor(Arc::clone(&self.completer_model_ids))?;
-        let prompt = build_tui_prompt();
+
         while self.running {
-            match editor.readline(&prompt) {
-                Ok(line) => {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    // Only persist recognized slash commands and chat messages in history.
-                    // Mistyped commands (e.g. /ex, /halp) are excluded to keep the
-                    // HistoryHinter from suggesting invalid completions.
-                    if should_add_to_history(trimmed) {
-                        if let Err(error) = editor.add_history_entry(trimmed) {
-                            eprintln!("failed to add command history entry: {error}");
+            terminal
+                .draw(|frame| ui::draw(frame, &app))
+                .map_err(TuiError::Io)?;
+
+            let poll_duration = match app.state {
+                ui::AppState::Idle => Duration::from_secs(3600),
+                _ => Duration::from_millis(50),
+            };
+
+            if crossterm::event::poll(poll_duration).map_err(TuiError::Io)? {
+                match crossterm::event::read().map_err(TuiError::Io)? {
+                    Event::Key(key) => {
+                        if let Some(input) = handle_idle_key(key, &mut app) {
+                            self.process_input_line_tui(&input, &mut terminal, &mut app)
+                                .await?;
+                        }
+                        // Handle Ctrl+C during idle as quit
+                        if key.code == KeyCode::Char('c')
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            break;
                         }
                     }
-                    self.process_input_line(trimmed).await?;
+                    Event::Resize(_w, _h) => {
+                        // Terminal size changed — the next draw() call
+                        // queries the new dimensions automatically.
+                    }
+                    _ => {}
                 }
-                Err(ReadlineError::Interrupted) => {
-                    println!("^C");
-                }
-                Err(ReadlineError::Eof) => break,
-                Err(error) => return Err(TuiError::Auth(error.to_string())),
             }
         }
 
-        save_line_editor_history(&mut editor);
+        crossterm::terminal::disable_raw_mode().map_err(TuiError::Io)?;
+        crossterm::execute!(
+            std::io::stdout(),
+            crossterm::terminal::LeaveAlternateScreen,
+            crossterm::cursor::Show
+        )
+        .map_err(TuiError::Io)?;
         Ok(())
+    }
+
+    /// Process user input and run the agent cycle with ratatui rendering.
+    async fn process_input_line_tui(
+        &mut self,
+        input: &str,
+        terminal: &mut DefaultTerminal,
+        app: &mut ui::FawxApp,
+    ) -> Result<(), TuiError> {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+
+        // Add to history
+        if should_add_to_history(trimmed) {
+            app.push_history(trimmed.to_string());
+        }
+
+        // Handle control commands when idle (e.g. /stop shows "nothing running")
+        if is_idle_control_command(trimmed) {
+            app.add_output("ℹ Nothing is running.".to_string());
+            return Ok(());
+        }
+
+        if trimmed.starts_with('/') {
+            if let Err(error) = self.handle_command(trimmed).await {
+                self.tui_println(format_error_message(&error.to_string()));
+            }
+            self.flush_output_to(app);
+            return Ok(());
+        }
+
+        // Echo user message
+        app.add_output(String::new());
+        app.add_output(format!("you \u{203a} {}", trimmed));
+
+        // Run agent cycle with rendering
+        self.run_agent_cycle_tui(trimmed, terminal, app).await?;
+
+        // After cycle completes, drain queued inputs (one per cycle)
+        while let Some(queued) = app.drain_next_input() {
+            app.add_output(String::new());
+            app.add_output(format!("you \u{203a} {}", queued));
+            self.run_agent_cycle_tui(&queued, terminal, app).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Run a single agent cycle with ratatui rendering for the spinner
+    /// and streaming output.
+    async fn run_agent_cycle_tui(
+        &mut self,
+        input: &str,
+        terminal: &mut DefaultTerminal,
+        app: &mut ui::FawxApp,
+    ) -> Result<(), TuiError> {
+        app.set_state(ui::AppState::Executing { spinner_frame: 0 });
+        app.reset_cycle_state();
+
+        let mut bus_rx = self.event_bus.subscribe();
+        let cancel_token = self.cancel_token.clone();
+        let mut streamed = false;
+        let started = Instant::now();
+
+        // Wire up the input channel so the engine can receive commands
+        let (sender, channel) = loop_input_channel();
+        self.loop_engine.set_input_channel(channel);
+
+        // Forward any leftover steer from a previous cycle
+        if let Some(steer) = app.take_steer() {
+            let _ = sender.send(LoopCommand::Steer(steer));
+        }
+
+        self.ensure_message_auth().await?;
+        let active_model = self.resolve_active_model()?;
+        self.update_memory_context_for_input(input);
+        let snapshot = self.build_perception_snapshot(input);
+
+        // Run cycle — blocks on the engine but tokio::select! lets us
+        // interleave rendering ticks and keyboard checks.
+        let mut ctx = CycleRenderingContext {
+            snapshot: Some(snapshot),
+            active_model,
+            terminal,
+            app,
+            bus_rx: &mut bus_rx,
+            cancel_token: &cancel_token,
+            streamed: &mut streamed,
+            input_sender: Some(sender),
+        };
+        let result = self.run_cycle_rendering(&mut ctx).await;
+
+        // Drain any remaining bus events
+        drain_bus_events(&mut bus_rx, app, &mut streamed);
+        app.finish_streaming();
+        app.set_state(ui::AppState::Idle);
+
+        self.handle_cycle_result(input, result, streamed, started, app);
+        Ok(())
+    }
+
+    /// Rendering + cycle select loop. Isolated to satisfy the borrow checker:
+    /// borrows of `self.loop_engine` and `self.router` end at the loop exit.
+    async fn run_cycle_rendering(
+        &mut self,
+        ctx: &mut CycleRenderingContext<'_>,
+    ) -> Result<LoopResult, TuiError> {
+        let snapshot = ctx.snapshot.take().expect("snapshot must be provided");
+        let active_model = std::mem::take(&mut ctx.active_model);
+        let llm = RouterLoopLlmProvider::new(&self.router, active_model);
+        let cycle_future = self.loop_engine.run_cycle(snapshot, &llm);
+        tokio::pin!(cycle_future);
+
+        loop {
+            ctx.terminal
+                .draw(|frame| ui::draw(frame, ctx.app))
+                .map_err(TuiError::Io)?;
+
+            tokio::select! {
+                biased;
+                result = &mut cycle_future => {
+                    return result.map_err(|e| TuiError::Loop(e.reason));
+                }
+                _ = sleep(Duration::from_millis(50)) => {
+                    drain_bus_events(ctx.bus_rx, ctx.app, ctx.streamed);
+                    if let ui::AppState::Executing { ref mut spinner_frame } = ctx.app.state {
+                        *spinner_frame += 1;
+                    }
+                    // Handle key events during execution (steer/abort/queue)
+                    poll_execution_keys(
+                        ctx.app,
+                        ctx.cancel_token,
+                        &ctx.input_sender,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Post-cycle: bookkeeping + output.
+    fn handle_cycle_result(
+        &mut self,
+        input: &str,
+        result: Result<LoopResult, TuiError>,
+        streamed: bool,
+        started: Instant,
+        app: &mut ui::FawxApp,
+    ) {
+        match result {
+            Ok(ref loop_result) => {
+                if let Err(e) = self.post_cycle_bookkeeping(input, loop_result) {
+                    self.tui_println(format_error_message(&e.to_string()));
+                }
+                if !streamed {
+                    let rendered = render_loop_result(loop_result.clone(), started.elapsed());
+                    self.tui_println(rendered);
+                } else if let Some(m) =
+                    format_loop_metadata_for_result(loop_result, started.elapsed())
+                {
+                    self.tui_println(m);
+                }
+            }
+            Err(ref error) => {
+                self.tui_println(format_error_message(&error.to_string()));
+            }
+        }
+        self.flush_output_to(app);
     }
 
     async fn process_input_line(&mut self, input: &str) -> Result<(), TuiError> {
@@ -1069,57 +1155,52 @@ impl TuiApp {
 
         if input.starts_with('/') {
             if let Err(error) = self.handle_command(input).await {
-                println!("{}\n", format_error_message(&error.to_string()));
+                self.tui_println(format_error_message(&error.to_string()));
             }
             return Ok(());
         }
 
+        self.tui_println(format!("you \u{203a} {input}"));
+
         match self.handle_message(input).await {
             Ok(Some(response)) => self.display_response(&response)?,
             Ok(None) => {} // streaming already rendered inline
-            Err(error) => println!("{}\n", format_error_message(&error.to_string())),
+            Err(error) => self.tui_println(format_error_message(&error.to_string())),
         }
 
         Ok(())
     }
 
     /// Display the welcome banner.
-    fn show_welcome(&self) {
-        let mut stdout = io::stdout();
-        if let Err(error) = stdout.execute(terminal::Clear(terminal::ClearType::CurrentLine)) {
-            eprintln!("failed to clear terminal line: {error}");
+    fn show_welcome(&mut self) {
+        // Show ANSI hero art on truecolor terminals, plain ASCII fallback otherwise.
+        let banner = if supports_truecolor() {
+            FAWX_BANNER_ANSI
+        } else {
+            BANNER_ART
+        };
+        for line in banner.lines() {
+            self.tui_println(line.to_string());
         }
-
-        let amber = theme_color(255, 165, 0, 214);
-        let burnt = theme_color(210, 112, 10, 166);
-
-        println!();
-        print!("{}", render_banner(supports_truecolor(), amber));
-        println!();
-        println!(
-            "  {}",
-            "fawx \u{00b7} agentic engine \u{00b7} type /help for commands"
-                .with(burnt)
-                .attribute(style::Attribute::Dim)
+        self.tui_println(String::new());
+        self.tui_println(
+            "  fawx \u{00b7} agentic engine \u{00b7} type /help for commands".to_string(),
         );
         if !self.auth_manager.has_any() {
-            println!(
-                "  {}",
-                "Not authenticated · /auth to set up or just send a message"
-                    .with(burnt)
-                    .attribute(style::Attribute::Dim)
+            self.tui_println(
+                "  Not authenticated \u{00b7} /auth to set up or just send a message".to_string(),
             );
         }
-        println!();
+        self.tui_println(String::new());
     }
 
     /// Run the first-time auth wizard if no credentials exist.
     async fn auth_wizard(&mut self) -> Result<(), TuiError> {
-        println!("Welcome to Fawx.\n");
+        self.tui_println("Welcome to Fawx.\n");
         if self.auth_manager.providers().is_empty() {
-            println!("No credentials found. Let's set up authentication.\n");
+            self.tui_println("No credentials found. Let's set up authentication.\n");
         } else {
-            println!("Add another provider.\n");
+            self.tui_println("Add another provider.\n");
         }
 
         let result = self.run_auth_wizard_flow().await;
@@ -1137,12 +1218,12 @@ impl TuiApp {
         self.persist_and_activate_model(&preferred_provider).await
     }
 
-    fn run_auth_selection(&self) -> Result<AuthSelection, TuiError> {
-        println!("How would you like to authenticate?");
-        println!("  [1] Claude subscription (paste setup-token)");
-        println!("  [2] ChatGPT subscription (browser sign-in)");
-        println!("  [3] API key (any provider)");
-        println!();
+    fn run_auth_selection(&mut self) -> Result<AuthSelection, TuiError> {
+        self.tui_println("How would you like to authenticate?");
+        self.tui_println("  [1] Claude subscription (paste setup-token)");
+        self.tui_println("  [2] ChatGPT subscription (browser sign-in)");
+        self.tui_println("  [3] API key (any provider)");
+        self.tui_println(String::new());
 
         prompt_choice(
             "> ",
@@ -1162,7 +1243,7 @@ impl TuiApp {
         self.auth_manager
             .store("anthropic", AuthMethod::SetupToken { token });
 
-        println!("✓ Authenticated. Token stored.\n");
+        self.tui_println("✓ Authenticated. Token stored.\n");
         Ok("anthropic".to_string())
     }
 
@@ -1174,11 +1255,11 @@ impl TuiApp {
         let auth_url = flow.authorization_url(&client_id);
         let auth_code = obtain_oauth_authorization_code(&flow, &auth_url).await?;
 
-        println!("Exchanging authorization code for tokens...");
+        self.tui_println("Exchanging authorization code for tokens...");
         let token_response = exchange_oauth_code_for_tokens(&flow, &client_id, &auth_code).await?;
         self.store_openai_oauth_tokens(token_response);
 
-        println!("✓ Authenticated. Tokens stored.\n");
+        self.tui_println("✓ Authenticated. Tokens stored.\n");
         Ok("openai".to_string())
     }
 
@@ -1216,7 +1297,7 @@ impl TuiApp {
             },
         );
 
-        println!("✓ API key stored.\n");
+        self.tui_println("✓ API key stored.\n");
         Ok(provider)
     }
 
@@ -1224,7 +1305,7 @@ impl TuiApp {
         &mut self,
         preferred_provider: &str,
     ) -> Result<(), TuiError> {
-        persist_auth_manager(&self.auth_manager)?;
+        self.persist_auth_manager()?;
 
         let preferred_models = self.get_models_for_provider(preferred_provider).await;
         self.refresh_router_models().await?;
@@ -1234,7 +1315,7 @@ impl TuiApp {
         Ok(())
     }
 
-    fn print_active_model(&self) {
+    fn print_active_model(&mut self) {
         if let Some(active_model) = self.router.active_model() {
             let model_info = self
                 .router
@@ -1243,12 +1324,12 @@ impl TuiApp {
                 .find(|model| model.model_id == active_model);
 
             if let Some(model_info) = model_info {
-                println!(
-                    "Active model: {} ({} {})\n",
+                self.tui_println(format!(
+                    "Active model: {} ({} {})",
                     active_model, model_info.provider_name, model_info.auth_method
-                );
+                ));
             } else {
-                println!("Active model: {active_model}\n");
+                self.tui_println(format!("Active model: {active_model}\n"));
             }
         }
     }
@@ -1267,15 +1348,25 @@ impl TuiApp {
                         if let Err(error) = self.config.save(&fawx_data_dir()) {
                             eprintln!("Warning: couldn't save model preference: {error}");
                         }
-                        println!("Active model set to: {resolved_model}");
+                        self.tui_println(format!("Active model set to: {resolved_model}"));
                     }
                     Err(error) => {
-                        println!("Couldn't select model: {error}");
+                        self.tui_println(format!("Couldn't select model: {error}"));
                         self.show_model_menu();
                     }
                 }
             }
-            ParsedCommand::Auth => self.handle_auth_command().await?,
+            ParsedCommand::Auth {
+                subcommand,
+                action,
+                value,
+                has_extra_args,
+            } => {
+                if has_extra_args {
+                    self.tui_println("Note: extra arguments ignored.");
+                }
+                self.handle_auth_command(subcommand, action, value).await?;
+            }
             ParsedCommand::Budget => self.show_budget_status(),
             ParsedCommand::Loop => self.show_loop_status(),
             ParsedCommand::Status => self.show_status(),
@@ -1299,18 +1390,18 @@ impl TuiApp {
                     .create_new()
                     .map_err(TuiError::Store)?;
                 self.conversation_history.clear();
-                println!("Started new conversation: {id}");
+                self.tui_println(format!("Started new conversation: {id}"));
             }
             ParsedCommand::History => self.show_conversation_history(),
             ParsedCommand::Config(action) => self.handle_config_command(action)?,
             ParsedCommand::Help => self.show_help(),
             ParsedCommand::Quit => {
                 self.running = false;
-                println!("Goodbye!");
+                self.tui_println("Goodbye!");
             }
             ParsedCommand::Unknown(command) => {
-                println!("Unknown command: /{command}");
-                println!("Type /help for available commands.");
+                self.tui_println(format!("Unknown command: /{command}"));
+                self.tui_println("Type /help for available commands.");
             }
         }
 
@@ -1328,10 +1419,13 @@ impl TuiApp {
         let snapshot = self.build_perception_snapshot(input);
         let started = Instant::now();
 
-        let (loop_result, streamed) = self.run_cycle_with_display(snapshot, active_model).await?;
+        let loop_result = self.run_cycle(snapshot, active_model).await?;
 
         self.post_cycle_bookkeeping(input, &loop_result)?;
-        self.finalize_streaming_display(&loop_result, streamed, started.elapsed())
+        // In the ratatui path, streaming is handled by run_agent_cycle_tui.
+        // For the legacy path (tests), we pass streamed=false so the
+        // response is returned as a batch string.
+        self.finalize_streaming_display(&loop_result, false, started.elapsed())
     }
 
     /// Resolve the currently active model ID.
@@ -1342,24 +1436,17 @@ impl TuiApp {
             .ok_or_else(|| TuiError::Router("no active model selected".to_string()))
     }
 
-    /// Run the loop engine cycle with streaming display or a fallback
-    /// thinking spinner.
-    async fn run_cycle_with_display(
+    /// Run the loop engine cycle (no display — callers handle rendering).
+    async fn run_cycle(
         &mut self,
         snapshot: PerceptionSnapshot,
         active_model: String,
-    ) -> Result<(LoopResult, bool), TuiError> {
-        let event_bus = &self.event_bus;
-        let (result, streamed) = run_with_streaming_display(event_bus, async {
-            let router = &self.router;
-            let llm = RouterLoopLlmProvider::new(router, active_model);
-            self.loop_engine
-                .run_cycle(snapshot, &llm)
-                .await
-                .map_err(|error| TuiError::Loop(error.reason))
-        })
-        .await;
-        Ok((result?, streamed))
+    ) -> Result<LoopResult, TuiError> {
+        let llm = RouterLoopLlmProvider::new(&self.router, active_model);
+        self.loop_engine
+            .run_cycle(snapshot, &llm)
+            .await
+            .map_err(|error| TuiError::Loop(error.reason))
     }
 
     /// Persist signals, conversation turn, and signal store after a cycle.
@@ -1382,20 +1469,20 @@ impl TuiApp {
     /// Decide whether to return a batch-rendered response or `None`
     /// (streaming already displayed the text).
     fn finalize_streaming_display(
-        &self,
+        &mut self,
         loop_result: &LoopResult,
         streamed: bool,
         wall_time: std::time::Duration,
     ) -> Result<Option<String>, TuiError> {
         if streamed {
             if matches!(loop_result, LoopResult::UserStopped { .. }) {
-                StreamRenderer::print_interrupted_marker();
+                self.tui_println(" [interrupted]".to_string());
             }
             let metadata = format_loop_metadata_for_result(loop_result, wall_time);
             if let Some(meta) = metadata {
-                println!("{meta}");
+                self.tui_println(meta);
             }
-            println!();
+            self.tui_println(String::new());
             Ok(None)
         } else {
             Ok(Some(render_loop_result(loop_result.clone(), wall_time)))
@@ -1405,6 +1492,18 @@ impl TuiApp {
     fn update_memory_context_for_input(&mut self, input: &str) {
         let memory_context = self.relevant_memory_context(input).unwrap_or_default();
         self.loop_engine.set_memory_context(memory_context);
+        self.update_scratchpad_context();
+    }
+
+    fn update_scratchpad_context(&mut self) {
+        let context = match self.scratchpad.lock() {
+            Ok(sp) => sp.render_for_context(),
+            Err(e) => {
+                eprintln!("warning: failed to lock scratchpad: {e}");
+                return;
+            }
+        };
+        self.loop_engine.set_scratchpad_context(context);
     }
 
     fn relevant_memory_context(&self, input: &str) -> Option<String> {
@@ -1517,24 +1616,24 @@ impl TuiApp {
         }
     }
 
-    fn show_signals_summary(&self) {
+    fn show_signals_summary(&mut self) {
         if self.last_signals.is_empty() {
-            println!("No signals from last turn.");
+            self.tui_println("No signals from last turn.");
             return;
         }
 
         let collector = SignalCollector::from_signals(self.last_signals.clone());
-        println!("{}", collector.summary());
+        self.tui_println(collector.summary().to_string());
     }
 
-    fn show_signals_debug(&self) {
+    fn show_signals_debug(&mut self) {
         if self.last_signals.is_empty() {
-            println!("No signals from last turn.");
+            self.tui_println("No signals from last turn.");
             return;
         }
 
         let collector = SignalCollector::from_signals(self.last_signals.clone());
-        println!("{}", collector.debug_dump());
+        self.tui_println(collector.debug_dump().to_string());
     }
 
     async fn handle_analyze_command(&mut self) -> Result<(), TuiError> {
@@ -1543,25 +1642,34 @@ impl TuiApp {
             .active_model()
             .ok_or_else(|| TuiError::Router("no active model for analysis".to_string()))?
             .to_string();
-        let provider = AnalysisCompletionProvider::new(&self.router, active_model);
-        let engine = AnalysisEngine::new(&self.signal_store);
+        self.tui_println("Analyzing signals across all sessions...");
 
-        println!("Analyzing signals across all sessions...");
-        match engine.analyze(&provider).await {
+        // Create provider and engine in a block so the borrow of self.router
+        // and self.signal_store ends before we call self.tui_println.
+        let analysis_result = {
+            let provider = AnalysisCompletionProvider::new(&self.router, active_model);
+            let engine = AnalysisEngine::new(&self.signal_store);
+            engine.analyze(&provider).await
+        };
+
+        match analysis_result {
             Ok(findings) if findings.is_empty() => {
-                println!("No patterns found. Collect more signals first.");
+                self.tui_println("No patterns found. Collect more signals first.");
             }
             Ok(findings) => {
+                let memory_ref = self.memory.as_ref().cloned();
                 let (stored, surfaced, logged) =
-                    Self::route_findings_by_confidence(&findings, self.memory.as_ref());
-                Self::print_analysis_findings(&findings);
-                println!(
+                    self.route_findings_by_confidence(&findings, memory_ref.as_ref());
+                self.print_analysis_findings(&findings);
+                self.tui_println(format!(
                     "Wrote {} patterns to memory, surfaced {} for review, logged {}",
                     stored, surfaced, logged
-                );
+                ));
             }
             Err(AnalysisError::ParseError(error)) => {
-                eprintln!("Analysis model responded, but output was unparseable JSON: {error}");
+                self.tui_println(format!(
+                    "Analysis model responded, but output was unparseable JSON: {error}"
+                ));
             }
             Err(error) => return Err(error.into()),
         }
@@ -1571,8 +1679,8 @@ impl TuiApp {
 
     async fn handle_improve_command(&mut self, flags: ImproveFlags) -> Result<(), TuiError> {
         if let Some(unknown) = &flags.has_unknown_flag {
-            println!("Unknown flag: {unknown}");
-            println!("Usage: /improve [--dry-run]");
+            self.tui_println(format!("Unknown flag: {unknown}"));
+            self.tui_println("Usage: /improve [--dry-run]");
             return Ok(());
         }
 
@@ -1589,14 +1697,14 @@ impl TuiApp {
             repo_root: &repo_root,
             proposals_dir: &proposals_dir,
         };
-        let provider = AnalysisCompletionProvider::new(&self.router, active_model);
+        self.tui_println("⚡ Analyzing signals...");
+        self.tui_println("⚡ Planning improvements...");
 
-        eprintln!("⚡ Analyzing signals...");
-        eprintln!("⚡ Planning improvements...");
+        let provider = AnalysisCompletionProvider::new(&self.router, active_model);
         let result =
             fx_improve::run_improvement_cycle(&self.signal_store, &provider, &config, &paths)
                 .await?;
-        Self::print_improve_result(&result, flags.dry_run);
+        self.print_improve_result(&result, flags.dry_run);
 
         Ok(())
     }
@@ -1618,47 +1726,48 @@ impl TuiApp {
         (config, data_dir, repo_root)
     }
 
-    fn print_improve_result(result: &fx_improve::ExecutionResult, dry_run: bool) {
+    fn print_improve_result(&mut self, result: &fx_improve::ExecutionResult, dry_run: bool) {
         if dry_run {
-            println!("⚡ Dry run complete.");
+            self.tui_println("⚡ Dry run complete.");
         } else {
-            println!("⚡ Improvement cycle complete.");
+            self.tui_println("⚡ Improvement cycle complete.");
         }
 
         if result.proposals_written.is_empty()
             && result.branches_created.is_empty()
             && result.skipped.is_empty()
         {
-            println!("  No actionable improvements found.");
+            self.tui_println("  No actionable improvements found.");
             return;
         }
 
         for path in &result.proposals_written {
-            println!("  Proposal: {}", path.display());
+            self.tui_println(format!("  Proposal: {}", path.display()));
         }
         for branch in &result.branches_created {
-            println!("  Branch: {branch}");
+            self.tui_println(format!("  Branch: {branch}"));
         }
         for (name, reason) in &result.skipped {
-            println!("  Skipped: {name} — {reason}");
+            self.tui_println(format!("  Skipped: {name} — {reason}"));
         }
     }
 
-    fn print_analysis_findings(findings: &[AnalysisFinding]) {
+    fn print_analysis_findings(&mut self, findings: &[AnalysisFinding]) {
         for finding in findings {
             let badge = Self::confidence_badge(finding.confidence);
-            println!("\n{badge} | {}", finding.pattern_name);
-            println!("  {}", finding.description);
-            println!("  Evidence: {} signals", finding.evidence.len());
+            self.tui_println(format!("\n{badge} | {}", finding.pattern_name));
+            self.tui_println(format!("  {}", finding.description));
+            self.tui_println(format!("  Evidence: {} signals", finding.evidence.len()));
             if let Some(action) = &finding.suggested_action {
-                println!("  Suggested: {action}");
+                self.tui_println(format!("  Suggested: {action}"));
             }
         }
 
-        println!("\nFound {} patterns total.", findings.len());
+        self.tui_println(format!("\nFound {} patterns total.", findings.len()));
     }
 
     fn route_findings_by_confidence(
+        &mut self,
         findings: &[AnalysisFinding],
         memory: Option<&SharedMemoryStore>,
     ) -> (usize, usize, usize) {
@@ -1674,14 +1783,14 @@ impl TuiApp {
                     }
                 }
                 Confidence::Medium => {
-                    println!(
+                    self.tui_println(format!(
                         "Consider: {} — {}",
                         finding.pattern_name, finding.description
-                    );
+                    ));
                     surfaced += 1;
                 }
                 Confidence::Low => {
-                    eprintln!("log: {} — {}", finding.pattern_name, finding.description);
+                    tracing::debug!("log: {} — {}", finding.pattern_name, finding.description);
                     logged += 1;
                 }
             }
@@ -1729,34 +1838,40 @@ impl TuiApp {
 
     fn update_synthesis_instruction(&mut self, instruction: Option<String>) {
         match instruction {
-            None => println!("Usage: /synthesis <instruction> or /synthesis reset"),
+            None => self.tui_println("Usage: /synthesis <instruction> or /synthesis reset"),
             Some(value) if value.trim().is_empty() => {
-                println!("Synthesis instruction cannot be empty.");
+                self.tui_println("Synthesis instruction cannot be empty.");
             }
             Some(value) if value.eq_ignore_ascii_case("reset") => {
                 if let Err(error) = self
                     .loop_engine
                     .set_synthesis_instruction(DEFAULT_SYNTHESIS_INSTRUCTION.to_string())
                 {
-                    println!("Failed to reset synthesis instruction: {}", error.reason);
+                    self.tui_println(format!(
+                        "Failed to reset synthesis instruction: {}",
+                        error.reason
+                    ));
                     return;
                 }
-                println!("Synthesis instruction reset to default.");
+                self.tui_println("Synthesis instruction reset to default.");
             }
             Some(value) => {
                 if value.len() > MAX_SYNTHESIS_INSTRUCTION_LENGTH {
-                    println!(
+                    self.tui_println(format!(
                         "Synthesis instruction exceeds {} characters.",
                         MAX_SYNTHESIS_INSTRUCTION_LENGTH
-                    );
+                    ));
                     return;
                 }
 
                 match self.loop_engine.set_synthesis_instruction(value.clone()) {
-                    Ok(()) => println!("Synthesis instruction updated: {}", value.trim()),
-                    Err(error) => {
-                        println!("Failed to update synthesis instruction: {}", error.reason)
+                    Ok(()) => {
+                        self.tui_println(format!("Synthesis instruction updated: {}", value.trim()))
                     }
+                    Err(error) => self.tui_println(format!(
+                        "Failed to update synthesis instruction: {}",
+                        error.reason
+                    )),
                 }
             }
         }
@@ -1793,14 +1908,14 @@ impl TuiApp {
         match action.as_deref() {
             None => self.show_config(),
             Some("init") => self.init_config_file()?,
-            Some(other) => {
-                println!("Unknown /config action: {other}. Use /config or /config init.")
-            }
+            Some(other) => self.tui_println(format!(
+                "Unknown /config action: {other}. Use /config or /config init."
+            )),
         }
         Ok(())
     }
 
-    fn show_config(&self) {
+    fn show_config(&mut self) {
         let fields: &[(&str, String)] = &[
             (
                 "general.max_iterations",
@@ -1855,13 +1970,13 @@ impl TuiApp {
         for (key, value) in fields {
             output.push_str(&format!("  {key} = {value}\n"));
         }
-        print!("{output}");
+        self.tui_println(output);
     }
 
     fn init_config_file(&mut self) -> Result<(), TuiError> {
         let base_data_dir = fawx_data_dir();
         let created = FawxConfig::write_default(&base_data_dir).map_err(TuiError::Store)?;
-        println!("Created default config at {}", created.display());
+        self.tui_println(format!("Created default config at {}", created.display()));
         Ok(())
     }
 
@@ -1875,61 +1990,53 @@ impl TuiApp {
             .to_string()
     }
 
-    fn show_conversation_history(&self) {
+    fn show_conversation_history(&mut self) {
         let conversations = self.conversation_store.list_conversations();
         if conversations.is_empty() {
-            println!("No saved conversations yet.");
+            self.tui_println("No saved conversations yet.");
             return;
         }
 
-        println!("Saved conversations:");
+        self.tui_println("Saved conversations:");
         for (id, count) in conversations {
-            println!("  - {id}: {count} messages");
+            self.tui_println(format!("  - {id}: {count} messages"));
         }
     }
 
-    /// Display formatted output to the terminal.
-    fn display_response(&self, response: &str) -> Result<(), TuiError> {
-        let mut stdout = io::stdout();
-        move_cursor_to_start(&mut stdout)?;
-
-        println!();
-        print!(
-            "{} ",
-            "assistant \u{203a}"
-                .bold()
-                .with(theme_color(255, 165, 0, 214))
-        );
-        let rendered = render_markdown(response);
-        println!("{rendered}");
-        println!();
-
+    /// Display formatted output to the output buffer.
+    fn display_response(&mut self, response: &str) -> Result<(), TuiError> {
+        self.tui_println(String::new());
+        self.tui_println(format!("fawx \u{203a} {response}"));
+        self.tui_println(String::new());
         Ok(())
     }
 
     /// Display the model selection menu grouped by provider.
-    fn show_model_menu(&self) {
-        let active = self.router.active_model();
+    fn show_model_menu(&mut self) {
+        let active = self.router.active_model().map(|s| s.to_string());
         let models = self.router.available_models();
 
         if models.is_empty() {
-            println!("No models available. Use /auth to configure credentials.");
+            self.tui_println("No models available. Use /auth to configure credentials.");
             return;
         }
 
         let grouped = group_models_by_provider(&models);
 
-        println!("Available models:");
+        self.tui_println("Available models:");
         for (provider, group) in &grouped {
-            println!();
-            println!("{provider}:");
+            self.tui_println(String::new());
+            self.tui_println(format!("{provider}:"));
             for model in group {
-                let marker = if Some(model.model_id.as_str()) == active {
+                let marker = if active.as_deref() == Some(model.model_id.as_str()) {
                     "*"
                 } else {
                     " "
                 };
-                println!("  {marker} {} ({})", model.model_id, model.auth_method);
+                self.tui_println(format!(
+                    "  {marker} {} ({})",
+                    model.model_id, model.auth_method
+                ));
             }
         }
     }
@@ -2063,145 +2170,405 @@ impl TuiApp {
         }
     }
 
-    fn show_help(&self) {
-        println!("{}", "Commands".bold().with(theme_color(255, 165, 0, 214)));
-        println!("  /model         List models and switch active model");
-        println!("  /model <name>  Switch to a specific model");
-        println!("  /auth          Show credentials / run auth wizard");
-        println!("  /status        Show model, tokens, budget summary");
-        println!("  /budget        Show detailed budget usage");
-        println!("  /loop          Show loop iteration details");
-        println!("  /signals       Show condensed signal summary for last turn");
-        println!("  /debug         Show full signal dump for last turn");
-        println!("  /analyze       Analyze persisted signals across sessions");
-        println!("  /improve       Run self-improvement cycle");
-        println!("  /synthesis     Set or reset synthesis instruction");
-        println!("  /clear         Clear the screen and active conversation");
-        println!("  /new           Start a new conversation");
-        println!("  /history       List saved conversations");
-        println!("  /config        Show loaded config values");
-        println!("  /config init   Create ~/.fawx/config.toml template");
-        println!("  /help          Show this help");
-        println!("  /quit          Exit");
+    fn show_help(&mut self) {
+        self.tui_println(format!(
+            "{}",
+            "Commands".bold().with(theme_color(255, 165, 0, 214))
+        ));
+        self.tui_println("  /model         List models and switch active model");
+        self.tui_println("  /model <name>  Switch to a specific model");
+        self.tui_println("  /auth          Show credential status + auth help");
+        self.tui_println("  /auth <provider> set-token <TOKEN>");
+        self.tui_println("                 Save API key or PAT for a provider");
+        self.tui_println("  /status        Show model, tokens, budget summary");
+        self.tui_println("  /budget        Show detailed budget usage");
+        self.tui_println("  /loop          Show loop iteration details");
+        self.tui_println("  /signals       Show condensed signal summary for last turn");
+        self.tui_println("  /debug         Show full signal dump for last turn");
+        self.tui_println("  /analyze       Analyze persisted signals across sessions");
+        self.tui_println("  /improve       Run self-improvement cycle");
+        self.tui_println("  /synthesis     Set or reset synthesis instruction");
+        self.tui_println("  /clear         Clear the screen and active conversation");
+        self.tui_println("  /new           Start a new conversation");
+        self.tui_println("  /history       List saved conversations");
+        self.tui_println("  /config        Show loaded config values");
+        self.tui_println("  /config init   Create ~/.fawx/config.toml template");
+        self.tui_println("  /help          Show this help");
+        self.tui_println("  /quit          Exit");
     }
 
-    fn show_auth_status(&self) {
-        let providers = self.auth_manager.providers();
-        if providers.is_empty() {
-            println!("No credentials configured.");
-            return;
-        }
-
-        println!("Configured credentials:");
-        for provider in providers {
-            if let Some(method) = self.auth_manager.get(&provider) {
-                match method {
-                    AuthMethod::SetupToken { .. } => {
-                        println!("  - {provider}: Claude setup-token (subscription)");
-                    }
-                    AuthMethod::OAuth { account_id, .. } => {
-                        if let Some(account_id) = account_id {
-                            println!("  - {provider}: OAuth subscription ({account_id})");
-                        } else {
-                            println!("  - {provider}: OAuth subscription");
-                        }
-                    }
-                    AuthMethod::ApiKey { .. } => {
-                        println!("  - {provider}: API key");
-                    }
+    /// Display status for all known providers.
+    fn show_auth_status(&mut self) {
+        match self.provider_status_rows() {
+            Ok(rows) if rows.is_empty() => {
+                self.tui_println("No credentials configured.");
+            }
+            Ok(rows) => {
+                self.tui_println("Configured credentials:");
+                for (provider, status, configured) in rows {
+                    let marker = if configured { "✓" } else { "✗" };
+                    self.tui_println(format!("  {marker} {provider}: {status}"));
                 }
+            }
+            Err(error) => {
+                self.tui_println(format!("Error loading credential status: {error}"));
             }
         }
     }
-    async fn handle_auth_command(&mut self) -> Result<(), TuiError> {
-        self.show_auth_status();
-        println!();
-        println!("[1] Add/update credentials");
-        println!("[2] Remove a provider");
-        println!("[3] Cancel");
 
-        let choice = prompt_choice(
-            "> ",
-            "Please choose 1, 2, or 3.",
-            "auth menu selection",
-            parse_auth_menu_selection,
-        )?;
-
-        match choice {
-            AuthMenuSelection::AddOrUpdate => self.auth_wizard().await,
-            AuthMenuSelection::RemoveProvider => self.remove_auth_provider().await,
-            AuthMenuSelection::Cancel => Ok(()),
-        }
+    /// Gather status rows for all known providers.
+    fn provider_status_rows(&self) -> Result<Vec<(String, String, bool)>, TuiError> {
+        let providers = self.collect_provider_names();
+        Ok(providers
+            .into_iter()
+            .map(|p| self.single_provider_status(&p))
+            .collect())
     }
 
-    async fn remove_auth_provider(&mut self) -> Result<(), TuiError> {
-        let providers = self.auth_manager.providers();
-        if providers.is_empty() {
-            println!("No providers to remove.");
-            return Ok(());
+    /// Gather de-duplicated, sorted provider names from all sources.
+    fn collect_provider_names(&self) -> Vec<String> {
+        let mut providers = vec![
+            "anthropic".to_string(),
+            "openai".to_string(),
+            "github".to_string(),
+        ];
+        providers.extend(
+            self.auth_manager
+                .providers()
+                .into_iter()
+                .map(|p| normalize_provider_name(&p)),
+        );
+        if let Ok(tokens) = self.auth_store.list_provider_tokens() {
+            providers.extend(tokens);
         }
+        providers.sort();
+        providers.dedup();
+        providers
+    }
 
-        println!("Select a provider to remove:");
-        for (idx, provider) in providers.iter().enumerate() {
-            println!("  [{}] {}", idx + 1, provider);
+    /// Determine the status string for a single provider.
+    fn single_provider_status(&self, provider: &str) -> (String, String, bool) {
+        let github_pat = self.github_pat_configured();
+        let status = self.provider_status_label(provider, github_pat);
+        let configured = status != "not configured";
+        (provider.to_string(), status.to_string(), configured)
+    }
+
+    /// Check whether a GitHub PAT exists in the credential store.
+    fn github_pat_configured(&self) -> bool {
+        let Some(store) = self.credential_store.as_ref() else {
+            return false;
+        };
+        CredentialStoreTrait::status(
+            store.as_ref(),
+            fx_auth::credential_store::AuthProvider::GitHub,
+        )
+        .map(|s| s.configured)
+        .unwrap_or(false)
+    }
+
+    /// Return a human label for a provider's auth status.
+    fn provider_status_label(&self, provider: &str, github_pat: bool) -> &str {
+        if provider == "github" && github_pat {
+            return "configured";
         }
-
-        let provider = prompt_provider_selection(&providers)?;
-        if !confirm_provider_removal(&provider)? {
-            println!("Removal cancelled.");
-            return Ok(());
+        if let Some(method) = self.auth_manager.get(provider) {
+            return match method {
+                AuthMethod::OAuth { .. } => "configured (OAuth)",
+                AuthMethod::SetupToken { .. } | AuthMethod::ApiKey { .. } => "configured",
+            };
         }
+        if self
+            .auth_store
+            .get_provider_token(provider)
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return "configured";
+        }
+        "not configured"
+    }
 
-        self.auth_manager.remove(&provider);
-        persist_auth_manager(&self.auth_manager)?;
-        self.refresh_router_models().await?;
-        println!("Removed provider: {provider}");
+    /// Dispatch `/auth` subcommands.
+    async fn handle_auth_command(
+        &mut self,
+        subcommand: Option<String>,
+        action: Option<String>,
+        value: Option<String>,
+    ) -> Result<(), TuiError> {
+        let norm_sub = subcommand.as_deref().map(normalize_provider_name);
+        let norm_act = action.as_deref().map(|a| a.to_ascii_lowercase());
+
+        match (norm_sub.as_deref(), norm_act.as_deref(), value.as_deref()) {
+            (None, _, _) => {
+                self.show_auth_status();
+                self.show_auth_help();
+            }
+            (Some("list-providers"), _, _) => self.show_auth_status(),
+            (Some("github"), Some("set-token"), t) => {
+                self.handle_github_set_token(t).await?;
+            }
+            (Some(p), Some("set-token"), Some(t)) => {
+                self.handle_provider_set_token(p, t).await?;
+            }
+            (Some(_), Some("set-token"), None) => {
+                self.tui_println("Usage: /auth <provider> set-token <TOKEN>");
+            }
+            (Some("github"), Some("show-status"), _) => {
+                self.handle_github_show_status();
+            }
+            (Some(p), Some("show-status"), _) => {
+                self.handle_provider_show_status(p);
+            }
+            (Some("github"), Some("clear-token"), _) => {
+                self.handle_github_clear_token().await?;
+            }
+            (Some(p), Some("clear-token"), _) => {
+                self.handle_provider_clear_token(p).await?;
+            }
+            (Some(p), _, _) => {
+                self.tui_println(format!("Unknown auth action for provider: {p}"));
+                self.show_provider_auth_help(p);
+            }
+        }
         Ok(())
     }
 
-    fn show_budget_status(&self) {
-        let status = self.loop_engine.status(current_time_ms());
-        println!("Budget usage:");
-        println!("  - LLM calls used: {}", status.llm_calls_used);
-        println!("  - Tool calls used: {}", status.tool_invocations_used);
-        println!("  - Tokens used: {}", status.tokens_used);
-        println!("  - Cost used (cents): {}", status.cost_cents_used);
-        println!("  - Tokens remaining: {}", status.remaining.tokens);
-        println!("  - LLM calls remaining: {}", status.remaining.llm_calls);
+    /// Print auth help text.
+    fn show_auth_help(&mut self) {
+        self.tui_println(String::new());
+        self.tui_println("Auth commands:");
+        self.tui_println("  /auth list-providers                  Show all providers");
+        self.tui_println("  /auth <provider> set-token <TOKEN>    Save API key or token");
+        self.tui_println("  /auth <provider> show-status          Check provider auth status");
+        self.tui_println("  /auth <provider> clear-token          Remove stored credentials");
+        self.tui_println(String::new());
+        self.tui_println("Examples:");
+        self.tui_println("  /auth anthropic set-token sk-ant-xxxxx");
+        self.tui_println("  /auth openai set-token sk-xxxxx");
+        self.tui_println("  /auth github set-token ghp_xxxxx");
     }
 
-    fn show_loop_status(&self) {
+    /// Print per-provider usage hint.
+    fn show_provider_auth_help(&mut self, provider: &str) {
+        self.tui_println(format!(
+            "Usage: /auth {provider} <set-token|show-status|clear-token> [TOKEN]"
+        ));
+    }
+
+    /// `/auth github set-token <TOKEN>` — validate and store a GitHub PAT.
+    async fn handle_github_set_token(&mut self, token: Option<&str>) -> Result<(), TuiError> {
+        let Some(token) = token else {
+            self.tui_println("Usage: /auth github set-token <TOKEN>");
+            return Ok(());
+        };
+        let token = token.trim();
+        if token.is_empty() {
+            self.tui_println("Usage: /auth github set-token <TOKEN>");
+            return Ok(());
+        }
+        let token = zeroize::Zeroizing::new(token.to_string());
+        self.tui_println("Validating token...");
+        match fx_auth::github::validate_github_pat(&token).await {
+            Ok(info) => {
+                self.store_github_pat(&token, &info)?;
+                self.tui_println("✓ github: token saved.");
+                self.tui_println(format!("  Login: {}", info.login));
+                for line in format_github_token_result(&token, &info) {
+                    self.tui_println(line);
+                }
+            }
+            Err(error) => {
+                self.tui_println(format!("✗ Token validation failed: {error}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Store a validated GitHub PAT in the credential store.
+    fn store_github_pat(
+        &self,
+        token: &zeroize::Zeroizing<String>,
+        info: &fx_auth::github::GitHubTokenInfo,
+    ) -> Result<(), TuiError> {
+        let store = self.get_credential_store()?;
+        store_github_pat_in(store, token, info)
+    }
+
+    /// `/auth <provider> set-token <TOKEN>` — generic key storage.
+    async fn handle_provider_set_token(
+        &mut self,
+        provider: &str,
+        token: &str,
+    ) -> Result<(), TuiError> {
+        // Provider name is already normalized by the dispatcher.
+        let token = token.trim();
+        if token.is_empty() {
+            self.tui_println("Usage: /auth <provider> set-token <TOKEN>");
+            return Ok(());
+        }
+        let token = zeroize::Zeroizing::new(token.to_string());
+        self.auth_store
+            .store_provider_token(provider, &token)
+            .map_err(TuiError::Auth)?;
+        if provider != "github" {
+            self.auth_manager.store(
+                provider,
+                AuthMethod::ApiKey {
+                    provider: provider.to_string(),
+                    key: (*token).clone(),
+                },
+            );
+            self.persist_auth_manager()?;
+            self.refresh_router_models().await?;
+        }
+        self.tui_println(format!("✓ {provider}: token saved."));
+        Ok(())
+    }
+
+    /// `/auth github show-status` — display GitHub credential status.
+    fn handle_github_show_status(&mut self) {
+        let lines = match self.credential_store.as_ref() {
+            Some(store) => format_github_status_lines(store),
+            None => vec!["Error: credential store not available".to_string()],
+        };
+        for line in lines {
+            self.tui_println(line);
+        }
+    }
+
+    /// `/auth <provider> show-status` — generic status check.
+    fn handle_provider_show_status(&mut self, provider: &str) {
+        let provider = normalize_provider_name(provider);
+        let configured = self
+            .auth_store
+            .get_provider_token(&provider)
+            .ok()
+            .flatten()
+            .is_some();
+        self.tui_println(format!("{provider} auth status:"));
+        if let Some(method) = self.auth_manager.get(&provider) {
+            match method {
+                AuthMethod::OAuth { .. } => {
+                    self.tui_println("  Status: configured (OAuth)");
+                }
+                AuthMethod::SetupToken { .. } | AuthMethod::ApiKey { .. } => {
+                    self.tui_println("  Status: configured");
+                }
+            }
+        } else if configured {
+            self.tui_println("  Status: configured");
+        } else {
+            self.tui_println("  Status: not configured");
+        }
+    }
+
+    /// `/auth github clear-token` — remove GitHub credentials.
+    async fn handle_github_clear_token(&mut self) -> Result<(), TuiError> {
+        let removed_pat = self.clear_github_credential()?;
+        let removed_token = self
+            .auth_store
+            .clear_provider_token("github")
+            .map_err(TuiError::Auth)?;
+        let removed_auth = self.auth_manager.get("github").is_some();
+        if removed_auth {
+            self.auth_manager.remove("github");
+            self.persist_auth_manager()?;
+            self.refresh_router_models().await?;
+        }
+        if removed_pat || removed_token || removed_auth {
+            self.tui_println("✓ github: credentials removed.");
+        } else {
+            self.tui_println("github: not configured");
+        }
+        Ok(())
+    }
+
+    /// Clear the GitHub PAT from the encrypted credential store.
+    fn clear_github_credential(&self) -> Result<bool, TuiError> {
+        let store = self.get_credential_store()?;
+        store
+            .clear(
+                fx_auth::credential_store::AuthProvider::GitHub,
+                fx_auth::credential_store::CredentialMethod::Pat,
+            )
+            .map_err(|e| TuiError::Auth(format!("failed to clear credential: {e}")))
+    }
+
+    /// `/auth <provider> clear-token` — generic credential removal.
+    async fn handle_provider_clear_token(&mut self, provider: &str) -> Result<(), TuiError> {
+        let provider = normalize_provider_name(provider);
+        let removed_token = self
+            .auth_store
+            .clear_provider_token(&provider)
+            .map_err(TuiError::Auth)?;
+        let removed_auth = self.auth_manager.get(&provider).is_some();
+        if removed_auth {
+            self.auth_manager.remove(&provider);
+            self.persist_auth_manager()?;
+            self.refresh_router_models().await?;
+        }
+        if removed_token || removed_auth {
+            self.tui_println(format!("✓ {provider}: credentials removed."));
+        } else {
+            self.tui_println(format!("{provider}: not configured."));
+        }
+        Ok(())
+    }
+
+    fn show_budget_status(&mut self) {
         let status = self.loop_engine.status(current_time_ms());
-        println!("Loop status:");
-        println!(
+        self.tui_println("Budget usage:");
+        self.tui_println(format!("  - LLM calls used: {}", status.llm_calls_used));
+        self.tui_println(format!(
+            "  - Tool calls used: {}",
+            status.tool_invocations_used
+        ));
+        self.tui_println(format!("  - Tokens used: {}", status.tokens_used));
+        self.tui_println(format!("  - Cost used (cents): {}", status.cost_cents_used));
+        self.tui_println(format!("  - Tokens remaining: {}", status.remaining.tokens));
+        self.tui_println(format!(
+            "  - LLM calls remaining: {}",
+            status.remaining.llm_calls
+        ));
+    }
+
+    fn show_loop_status(&mut self) {
+        let status = self.loop_engine.status(current_time_ms());
+        self.tui_println("Loop status:");
+        self.tui_println(format!(
             "  - Iterations (last cycle): {}/{}",
             status.iteration_count, status.max_iterations
-        );
-        println!("  - Tokens used (tracker): {}", status.tokens_used);
-        println!("  - Tokens remaining: {}", status.remaining.tokens);
-        println!("  - LLM calls remaining: {}", status.remaining.llm_calls);
-        println!(
+        ));
+        self.tui_println(format!("  - Tokens used (tracker): {}", status.tokens_used));
+        self.tui_println(format!("  - Tokens remaining: {}", status.remaining.tokens));
+        self.tui_println(format!(
+            "  - LLM calls remaining: {}",
+            status.remaining.llm_calls
+        ));
+        self.tui_println(format!(
             "  - Tool calls remaining: {}",
             status.remaining.tool_invocations
-        );
-        println!(
+        ));
+        self.tui_println(format!(
             "  - Wall time remaining (ms): {}",
             status.remaining.wall_time_ms
-        );
+        ));
     }
 
-    fn show_status(&self) {
-        let model = self.current_model();
+    fn show_status(&mut self) {
+        let model = self.current_model().to_string();
         let status = self.loop_engine.status(current_time_ms());
         let providers = self.auth_manager.providers();
-        println!(
-            "{}",
-            "Fawx Status".bold().with(theme_color(255, 165, 0, 214))
-        );
-        println!("  model:     {model}");
-        println!("  providers: {}", providers.join(", "));
-        println!("  tokens:    {} used", status.tokens_used);
-        println!("  budget:    {} tokens remaining", status.remaining.tokens);
+        self.tui_println("Fawx Status");
+        self.tui_println(format!("  model:     {model}"));
+        self.tui_println(format!("  providers: {}", providers.join(", ")));
+        self.tui_println(format!("  tokens:    {} used", status.tokens_used));
+        self.tui_println(format!(
+            "  budget:    {} tokens remaining",
+            status.remaining.tokens
+        ));
     }
 
     fn current_model(&self) -> &str {
@@ -2299,6 +2666,8 @@ pub struct LoopEngineBundle {
     pub memory: Option<SharedMemoryStore>,
     pub runtime_info: Arc<RwLock<RuntimeInfo>>,
     pub event_bus: EventBus,
+    pub scratchpad: Arc<Mutex<Scratchpad>>,
+    pub credential_store: Option<Arc<fx_auth::credential_store::EncryptedFileCredentialStore>>,
 }
 
 /// Build a loop engine from an already-loaded config.
@@ -2319,32 +2688,39 @@ fn build_loop_engine_with_config(
     let budget = BudgetTracker::new(BudgetConfig::default(), current_time_ms(), 0);
     let context = ContextCompactor::new(DEFAULT_CONTEXT_MAX_TOKENS, DEFAULT_CONTEXT_COMPACT_TARGET);
     let working_dir = configured_working_dir(&config);
-    let (registry, memory, memory_snapshot, runtime_info) =
-        build_skill_registry(working_dir, &data_dir, &config);
+    let skills = build_skill_registry(working_dir, &data_dir, &config);
     let synthesis = config
         .model
         .synthesis_instruction
         .clone()
         .unwrap_or_else(|| DEFAULT_SYNTHESIS_INSTRUCTION.to_string());
 
-    let caching_registry = CachingExecutor::new(registry);
+    let bridge: Arc<dyn ScratchpadProvider> = Arc::new(ScratchpadBridge {
+        scratchpad: Arc::clone(&skills.scratchpad),
+    });
+
+    let caching_registry = CachingExecutor::new(skills.registry);
     let mut builder = LoopEngine::builder()
         .budget(budget)
         .context(context)
         .max_iterations(config.general.max_iterations)
         .tool_executor(std::sync::Arc::new(caching_registry))
         .synthesis_instruction(synthesis)
-        .event_bus(event_bus.clone());
-    if let Some(snapshot_text) = memory_snapshot {
+        .event_bus(event_bus.clone())
+        .iteration_counter(Arc::clone(&skills.iteration_counter))
+        .scratchpad_provider(bridge);
+    if let Some(snapshot_text) = skills.memory_snapshot {
         builder = builder.memory_context(snapshot_text);
     }
 
     let engine = build_loop_engine_from_builder(builder)?;
     Ok(LoopEngineBundle {
         engine,
-        memory,
-        runtime_info,
+        memory: skills.memory,
+        runtime_info: skills.runtime_info,
         event_bus,
+        scratchpad: skills.scratchpad,
+        credential_store: skills.credential_store,
     })
 }
 
@@ -2357,16 +2733,75 @@ fn build_loop_engine_from_builder(builder: LoopEngineBuilder) -> Result<LoopEngi
     })
 }
 
+/// Bridges `fx_scratchpad::Scratchpad` into the kernel's [`ScratchpadProvider`]
+/// trait without introducing a circular crate dependency.
+struct ScratchpadBridge {
+    scratchpad: Arc<Mutex<Scratchpad>>,
+}
+
+impl ScratchpadProvider for ScratchpadBridge {
+    fn render_for_context(&self) -> String {
+        match self.scratchpad.lock() {
+            Ok(sp) => sp.render_for_context(),
+            Err(_) => String::new(),
+        }
+    }
+
+    fn compact_if_needed(&self, current_iteration: u32) {
+        let Ok(mut sp) = self.scratchpad.lock() else {
+            return;
+        };
+        let rendered_len = sp.render_for_context().len();
+        if rendered_len > fx_scratchpad::SCRATCHPAD_COMPACT_THRESHOLD_CHARS {
+            sp.compact(
+                fx_scratchpad::SCRATCHPAD_COMPACT_TARGET_TOKENS,
+                current_iteration,
+                fx_scratchpad::SCRATCHPAD_AGE_THRESHOLD,
+            );
+        }
+    }
+}
+
+/// Bridges the encrypted credential store to the [`CredentialProvider`]
+/// trait so WASM skills can retrieve secrets via `kv_get`.
+///
+/// Maps well-known key names to credential store lookups:
+/// - `"github_token"` → GitHub PAT from the encrypted store
+struct CredentialStoreBridge {
+    store: Arc<fx_auth::credential_store::EncryptedFileCredentialStore>,
+}
+
+impl CredentialProvider for CredentialStoreBridge {
+    fn get_credential(&self, key: &str) -> Option<zeroize::Zeroizing<String>> {
+        use fx_auth::credential_store::{AuthProvider, CredentialMethod};
+        match key {
+            "github_token" => self
+                .store
+                .get(AuthProvider::GitHub, CredentialMethod::Pat)
+                .ok()
+                .flatten(),
+            _ => None,
+        }
+    }
+}
+
+/// Result of [`build_skill_registry`]: groups related outputs to avoid a
+/// large tuple return type.
+struct SkillRegistryBundle {
+    registry: SkillRegistry,
+    memory: Option<SharedMemoryStore>,
+    memory_snapshot: Option<String>,
+    runtime_info: Arc<RwLock<RuntimeInfo>>,
+    scratchpad: Arc<Mutex<Scratchpad>>,
+    iteration_counter: Arc<std::sync::atomic::AtomicU32>,
+    credential_store: Option<Arc<fx_auth::credential_store::EncryptedFileCredentialStore>>,
+}
+
 fn build_skill_registry(
     working_dir: PathBuf,
     data_dir: &Path,
     config: &FawxConfig,
-) -> (
-    SkillRegistry,
-    Option<SharedMemoryStore>,
-    Option<String>,
-    Arc<RwLock<RuntimeInfo>>,
-) {
+) -> SkillRegistryBundle {
     let tool_config = ToolConfig {
         max_read_size: config.tools.max_read_size,
         search_exclude: config.tools.search_exclude.clone(),
@@ -2391,9 +2826,52 @@ fn build_skill_registry(
     registry.register(Box::new(git_skill));
     let tx_skill = TransactionSkill::new(working_dir.clone(), sm);
     registry.register(Box::new(tx_skill));
+    let scratchpad = Arc::new(Mutex::new(Scratchpad::new()));
+    let iteration_counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let scratchpad_skill =
+        ScratchpadSkill::new(Arc::clone(&scratchpad), Arc::clone(&iteration_counter));
+    registry.register(Box::new(scratchpad_skill));
+
+    // Open the credential store once and share via Arc between TuiApp and WASM bridge.
+    let credential_store: Option<Arc<fx_auth::credential_store::EncryptedFileCredentialStore>> =
+        match fx_auth::credential_store::EncryptedFileCredentialStore::open(data_dir) {
+            Ok(store) => Some(Arc::new(store)),
+            Err(e) => {
+                tracing::warn!("credential store unavailable: {e}");
+                None
+            }
+        };
+
+    let credential_provider: Option<Arc<dyn CredentialProvider>> =
+        credential_store.as_ref().map(|store| {
+            Arc::new(CredentialStoreBridge {
+                store: Arc::clone(store),
+            }) as Arc<dyn CredentialProvider>
+        });
+
+    // Load WASM skills from ~/.fawx/skills/
+    match fx_loadable::wasm_skill::load_wasm_skills(credential_provider) {
+        Ok(wasm_skills) => {
+            for skill in wasm_skills {
+                registry.register(skill);
+            }
+        }
+        Err(e) => {
+            eprintln!("warning: failed to load WASM skills: {e}");
+        }
+    }
+
     apply_skill_summaries(&runtime_info, &registry);
 
-    (registry, memory, snapshot_text, runtime_info)
+    SkillRegistryBundle {
+        registry,
+        memory,
+        memory_snapshot: snapshot_text,
+        runtime_info,
+        scratchpad,
+        iteration_counter,
+        credential_store,
+    }
 }
 
 fn attach_memory(
@@ -2983,15 +3461,10 @@ fn format_wall_time(wall_time: std::time::Duration) -> String {
     }
 }
 
+/// Spawn a background task that listens for terminal resize signals
+/// (SIGWINCH on Unix) and re-applies the scroll region.
 fn format_error_message(error: &str) -> String {
-    format!("\x1b[31m  \u{2717} {error}\x1b[0m")
-}
-
-fn move_cursor_to_start(stdout: &mut impl Write) -> Result<(), TuiError> {
-    stdout
-        .execute(cursor::MoveToColumn(0))
-        .map(|_| ())
-        .map_err(TuiError::Io)
+    format!("  \u{2717} {error}")
 }
 
 /// User-facing TUI errors.
@@ -3153,14 +3626,14 @@ async fn oauth_code_with_callback_server<F>(
 where
     F: std::future::Future<Output = Result<String, TuiError>>,
 {
-    println!("Opening browser for ChatGPT sign-in...");
+    eprintln!("Opening browser for ChatGPT sign-in...");
     if let Err(error) = open_browser(auth_url) {
-        println!(
+        eprintln!(
             "Couldn't open browser automatically ({error}). Open this URL manually:\n{auth_url}"
         );
     }
-    println!("Waiting for callback on http://localhost:1455/auth/callback...");
-    println!("(Or paste the redirect URL/code below if browser didn't work)\n");
+    eprintln!("Waiting for callback on http://localhost:1455/auth/callback...");
+    eprintln!("(Or paste the redirect URL/code below if browser didn't work)\n");
 
     tokio::select! {
         result = server => result.or_else(|_| prompt_for_oauth_code(flow)),
@@ -3168,8 +3641,8 @@ where
 }
 
 fn oauth_code_manual_fallback(flow: &PkceFlow, auth_url: &str) -> Result<String, TuiError> {
-    println!("Couldn't start local server. Open this URL in your browser:\n");
-    println!("  {auth_url}\n");
+    eprintln!("Couldn't start local server. Open this URL in your browser:\n");
+    eprintln!("  {auth_url}\n");
     prompt_for_oauth_code(flow)
 }
 
@@ -3639,7 +4112,7 @@ fn to_strings(values: &[&str]) -> Vec<String> {
 fn prompt_line(prompt: &str) -> Result<String, TuiError> {
     ensure_cooked_mode();
 
-    print!("{prompt}");
+    eprint!("{prompt}");
     io::stdout().flush().map_err(TuiError::Io)?;
 
     let mut input = String::new();
@@ -3788,7 +4261,7 @@ where
             return Ok(parsed);
         }
 
-        println!("{invalid_message}");
+        eprint!("{invalid_message}");
     }
 
     Err(retry_limit_error(context))
@@ -3805,19 +4278,19 @@ fn prompt_non_empty_line(
             return Ok(value);
         }
 
-        println!("{empty_message}");
+        eprint!("{empty_message}");
     }
 
     Err(retry_limit_error(context))
 }
 
 fn prompt_api_key_provider() -> Result<String, TuiError> {
-    println!("Which provider?");
-    println!("  [1] Anthropic");
-    println!("  [2] OpenAI");
-    println!("  [3] OpenRouter");
-    println!("  [4] Other (OpenAI-compatible)");
-    println!();
+    eprintln!("Which provider?");
+    eprintln!("  [1] Anthropic");
+    eprintln!("  [2] OpenAI");
+    eprintln!("  [3] OpenRouter");
+    eprintln!("  [4] Other (OpenAI-compatible)");
+    eprintln!();
 
     let choice = prompt_choice(
         "> ",
@@ -3849,14 +4322,14 @@ fn prompt_non_empty_secret(
             return Ok(value);
         }
 
-        println!("{empty_message}");
+        eprint!("{empty_message}");
     }
 
     Err(retry_limit_error(context))
 }
 
 fn prompt_secret(prompt: &str) -> Result<String, TuiError> {
-    print!("{prompt}");
+    eprint!("{prompt}");
     io::stdout().flush().map_err(TuiError::Io)?;
 
     let _guard = RawModeGuard::new()?;
@@ -3865,9 +4338,9 @@ fn prompt_secret(prompt: &str) -> Result<String, TuiError> {
 
     let trimmed = value.trim().to_string();
     if trimmed.is_empty() {
-        println!();
+        eprintln!();
     } else {
-        println!(" ({} chars)", trimmed.len());
+        eprint!(" ({} chars)", trimmed.len());
     }
 
     Ok(trimmed)
@@ -3886,13 +4359,13 @@ fn read_secret_input(value: &mut String) -> Result<(), TuiError> {
                 SecretInputKeyAction::Type(ch) => {
                     value.push(ch);
                     display_len += 1;
-                    print!("•");
+                    eprint!("•");
                     io::stdout().flush().map_err(TuiError::Io)?;
                 }
                 SecretInputKeyAction::Delete => {
                     if value.pop().is_some() && display_len > 0 {
                         display_len -= 1;
-                        print!("\x08 \x08");
+                        eprint!("\x08 \x08");
                         io::stdout().flush().map_err(TuiError::Io)?;
                     }
                 }
@@ -4042,7 +4515,12 @@ fn parse_api_key_provider_selection(value: &str) -> Option<ApiKeyProvider> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ParsedCommand {
     Model(Option<String>),
-    Auth,
+    Auth {
+        subcommand: Option<String>,
+        action: Option<String>,
+        value: Option<String>,
+        has_extra_args: bool,
+    },
     Budget,
     Loop,
     Status,
@@ -4080,7 +4558,18 @@ fn parse_command(value: &str) -> ParsedCommand {
 
     match command {
         "model" => ParsedCommand::Model(parts.next().map(ToString::to_string)),
-        "auth" => ParsedCommand::Auth,
+        "auth" => {
+            let subcommand = parts.next().map(ToString::to_string);
+            let action = parts.next().map(ToString::to_string);
+            let value = parts.next().map(ToString::to_string);
+            let has_extra_args = parts.next().is_some();
+            ParsedCommand::Auth {
+                subcommand,
+                action,
+                value,
+                has_extra_args,
+            }
+        }
         "budget" => ParsedCommand::Budget,
         "loop" => ParsedCommand::Loop,
         "status" => ParsedCommand::Status,
@@ -4140,6 +4629,227 @@ impl Drop for RawModeGuard {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Auth helper free functions
+// ---------------------------------------------------------------------------
+
+/// Normalize a provider name to lowercase for consistent lookups.
+fn normalize_provider_name(value: &str) -> String {
+    let lower = value.trim().to_ascii_lowercase();
+    match lower.as_str() {
+        "gh" => "github".to_string(),
+        other => other.to_string(),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitHubPatKind {
+    Classic,
+    FineGrained,
+    Unknown,
+}
+
+/// Classify a GitHub PAT by its prefix.
+fn classify_github_pat(token: &str) -> GitHubPatKind {
+    if token.starts_with("github_pat_") {
+        GitHubPatKind::FineGrained
+    } else if token.starts_with("ghp_") {
+        GitHubPatKind::Classic
+    } else {
+        GitHubPatKind::Unknown
+    }
+}
+
+/// Serialize a [`GitHubPatKind`] to a metadata label string.
+fn pat_kind_label(kind: GitHubPatKind) -> &'static str {
+    match kind {
+        GitHubPatKind::Classic => "classic",
+        GitHubPatKind::FineGrained => "fine_grained",
+        GitHubPatKind::Unknown => "unknown",
+    }
+}
+
+/// Deserialize a metadata label string back to [`GitHubPatKind`].
+fn pat_kind_from_label(label: &str) -> GitHubPatKind {
+    match label {
+        "classic" => GitHubPatKind::Classic,
+        "fine_grained" => GitHubPatKind::FineGrained,
+        _ => GitHubPatKind::Unknown,
+    }
+}
+
+/// Infer the PAT kind from prefix and scope heuristics.
+fn infer_github_pat_kind(token: &str, scopes: &[String]) -> GitHubPatKind {
+    let prefix_kind = classify_github_pat(token);
+    if prefix_kind != GitHubPatKind::Unknown {
+        return prefix_kind;
+    }
+    // Fine-grained PATs report empty scopes via the API.
+    if scopes.is_empty() {
+        GitHubPatKind::FineGrained
+    } else {
+        GitHubPatKind::Classic
+    }
+}
+
+/// Build scope display string.
+fn github_scope_display(scopes: &[String], kind: GitHubPatKind) -> String {
+    if kind == GitHubPatKind::FineGrained {
+        return "(fine-grained — scopes N/A)".to_string();
+    }
+    if scopes.is_empty() {
+        "(none)".to_string()
+    } else {
+        scopes.join(", ")
+    }
+}
+
+/// Format token info lines after successful validation.
+fn format_github_token_result(
+    token: &zeroize::Zeroizing<String>,
+    info: &fx_auth::github::GitHubTokenInfo,
+) -> Vec<String> {
+    let token_kind = infer_github_pat_kind(token.as_str(), &info.scopes);
+    let mut lines = Vec::new();
+    if token_kind == GitHubPatKind::FineGrained {
+        lines.push("  Type: fine-grained PAT".to_string());
+    } else {
+        lines.push(format!(
+            "  Scopes: {}",
+            github_scope_display(&info.scopes, token_kind)
+        ));
+    }
+    if token_kind == GitHubPatKind::Classic && !info.missing_scopes.is_empty() {
+        lines.push(format!(
+            "  ⚠ Missing recommended scopes: {}",
+            info.missing_scopes.join(", ")
+        ));
+    }
+    lines
+}
+
+/// Build display lines for GitHub credential status.
+fn format_github_status_lines(
+    store: &fx_auth::credential_store::EncryptedFileCredentialStore,
+) -> Vec<String> {
+    match store.status(fx_auth::credential_store::AuthProvider::GitHub) {
+        Ok(status) if status.configured => format_github_configured_status(store, status.metadata),
+        Ok(_) => vec![
+            "GitHub: not configured".to_string(),
+            "  Use /auth github set-token <TOKEN> to configure.".to_string(),
+        ],
+        Err(e) => vec![format!("Error reading status: {e}")],
+    }
+}
+
+/// Format lines for a configured GitHub credential.
+fn format_github_configured_status(
+    store: &fx_auth::credential_store::EncryptedFileCredentialStore,
+    metadata: Option<fx_auth::credential_store::CredentialMetadata>,
+) -> Vec<String> {
+    let Some(meta) = metadata else {
+        return vec!["GitHub: configured".to_string()];
+    };
+    let token_kind = github_pat_kind_from_store(store);
+    let mut lines = vec![
+        "GitHub credential status:".to_string(),
+        format!("  Login: {}", meta.login.as_deref().unwrap_or("(unknown)")),
+        format!("  Method: {}", meta.method),
+        format!(
+            "  Scopes: {}",
+            github_scope_display(&meta.scopes, token_kind)
+        ),
+    ];
+    if meta.last_validated_ms > 0 {
+        let age_ms = fx_auth::credential_store::current_timestamp_ms()
+            .saturating_sub(meta.last_validated_ms);
+        lines.push(format!("  Last validated: {}", humanize_elapsed_ms(age_ms)));
+    }
+    lines
+}
+
+/// Determine the PAT kind from stored metadata (avoids decrypting the secret).
+fn github_pat_kind_from_store(
+    store: &fx_auth::credential_store::EncryptedFileCredentialStore,
+) -> GitHubPatKind {
+    use fx_auth::credential_store::{AuthProvider, CredentialStore};
+    store
+        .status(AuthProvider::GitHub)
+        .ok()
+        .and_then(|s| s.metadata)
+        .and_then(|m| m.token_kind)
+        .map(|kind| pat_kind_from_label(&kind))
+        .unwrap_or(GitHubPatKind::Unknown)
+}
+
+/// Persist a GitHub PAT and verify the round-trip.
+fn store_github_pat_in(
+    store: &fx_auth::credential_store::EncryptedFileCredentialStore,
+    token: &zeroize::Zeroizing<String>,
+    info: &fx_auth::github::GitHubTokenInfo,
+) -> Result<(), TuiError> {
+    use fx_auth::credential_store::{
+        AuthProvider, CredentialMetadata, CredentialMethod, CredentialStore,
+    };
+    let pat_kind = infer_github_pat_kind(token.as_str(), &info.scopes);
+    let metadata = CredentialMetadata {
+        provider: AuthProvider::GitHub,
+        method: CredentialMethod::Pat,
+        last_validated_ms: fx_auth::credential_store::current_timestamp_ms(),
+        login: Some(info.login.clone()),
+        scopes: info.scopes.clone(),
+        token_kind: Some(pat_kind_label(pat_kind).to_string()),
+    };
+    store
+        .set(
+            AuthProvider::GitHub,
+            CredentialMethod::Pat,
+            token,
+            &metadata,
+        )
+        .map_err(|e| TuiError::Auth(format!("failed to store credential: {e}")))?;
+    // Always verify: encrypted storage round-trip catches silent corruption
+    verify_github_pat_stored(store, token)
+}
+
+/// Verify a stored GitHub PAT matches the expected value.
+fn verify_github_pat_stored(
+    store: &fx_auth::credential_store::EncryptedFileCredentialStore,
+    token: &zeroize::Zeroizing<String>,
+) -> Result<(), TuiError> {
+    use fx_auth::credential_store::{AuthProvider, CredentialMethod, CredentialStore};
+    let persisted = store
+        .get(AuthProvider::GitHub, CredentialMethod::Pat)
+        .map_err(|e| TuiError::Auth(format!("failed to verify stored credential: {e}")))?;
+    match persisted {
+        Some(saved) if saved.as_str() == token.as_str() => Ok(()),
+        Some(_) => Err(TuiError::Auth(
+            "credential verification failed (token mismatch)".to_string(),
+        )),
+        None => Err(TuiError::Auth(
+            "credential verification failed (token missing)".to_string(),
+        )),
+    }
+}
+
+/// Human-friendly elapsed time label.
+fn humanize_elapsed_ms(ms: u64) -> String {
+    let secs = ms / 1000;
+    if secs < 60 {
+        return "just now".to_string();
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{mins}m ago");
+    }
+    let hours = mins / 60;
+    if hours < 24 {
+        return format!("{hours}h ago");
+    }
+    let days = hours / 24;
+    format!("{days}d ago")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4186,16 +4896,29 @@ mod tests {
         (bundle.engine, bundle.runtime_info)
     }
 
-    fn new_test_app() -> TuiApp {
+    /// Returns a `FawxConfig` whose `data_dir` points at a fresh temporary
+    /// directory.  The caller **must** keep the returned `TempDir` alive for
+    /// as long as the `TuiApp` (or anything else using the directory) is in
+    /// scope – dropping it deletes the directory and the SQLite files inside.
+    fn test_config_with_temp_dir() -> (FawxConfig, tempfile::TempDir) {
+        let temp_dir = tempfile::tempdir().expect("create temp data dir for test");
+        let mut config = FawxConfig::default();
+        config.general.data_dir = Some(temp_dir.path().to_path_buf());
+        (config, temp_dir)
+    }
+
+    fn new_test_app() -> (TuiApp, tempfile::TempDir) {
+        let (config, temp_dir) = test_config_with_temp_dir();
         let (loop_engine, runtime_info) = test_engine_and_runtime_info();
-        TuiApp::new(
+        let app = TuiApp::new(
             AuthManager::new(),
             ModelRouter::new(),
             loop_engine,
             runtime_info,
-            FawxConfig::default(),
+            config,
         )
-        .expect("new test app")
+        .expect("new test app");
+        (app, temp_dir)
     }
 
     #[test]
@@ -4338,7 +5061,8 @@ mod tests {
         let (memory, writes) = mock_memory_store();
         let findings = vec![test_finding("Retry Storm", Confidence::High)];
 
-        let summary = TuiApp::route_findings_by_confidence(&findings, Some(&memory));
+        let (mut app, _temp_dir) = new_test_app();
+        let summary = app.route_findings_by_confidence(&findings, Some(&memory));
 
         let writes = writes.lock().expect("lock writes");
         assert_eq!(summary, (1, 0, 0));
@@ -4352,7 +5076,8 @@ mod tests {
         let (memory, writes) = mock_memory_store();
         let findings = vec![test_finding("Needs Follow Up", Confidence::Medium)];
 
-        let summary = TuiApp::route_findings_by_confidence(&findings, Some(&memory));
+        let (mut app, _temp_dir) = new_test_app();
+        let summary = app.route_findings_by_confidence(&findings, Some(&memory));
 
         assert_eq!(summary, (0, 1, 0));
         assert!(writes.lock().expect("lock writes").is_empty());
@@ -4363,7 +5088,8 @@ mod tests {
         let (memory, writes) = mock_memory_store();
         let findings = vec![test_finding("Loose Correlation", Confidence::Low)];
 
-        let summary = TuiApp::route_findings_by_confidence(&findings, Some(&memory));
+        let (mut app, _temp_dir) = new_test_app();
+        let summary = app.route_findings_by_confidence(&findings, Some(&memory));
 
         assert_eq!(summary, (0, 0, 1));
         assert!(writes.lock().expect("lock writes").is_empty());
@@ -4374,7 +5100,8 @@ mod tests {
         let (memory, writes) = mock_memory_store();
         let findings = vec![test_finding("Tool-Timeout Loop", Confidence::High)];
 
-        TuiApp::route_findings_by_confidence(&findings, Some(&memory));
+        let (mut app, _temp_dir) = new_test_app();
+        app.route_findings_by_confidence(&findings, Some(&memory));
 
         let writes = writes.lock().expect("lock writes");
         assert_eq!(writes.len(), 1);
@@ -4391,7 +5118,8 @@ mod tests {
             test_finding("Context Drift", Confidence::High),
         ];
 
-        let summary = TuiApp::route_findings_by_confidence(&findings, Some(&memory));
+        let (mut app, _temp_dir) = new_test_app();
+        let summary = app.route_findings_by_confidence(&findings, Some(&memory));
 
         let writes = writes.lock().expect("lock writes");
         let keys: Vec<String> = writes.iter().map(|(key, _)| key.clone()).collect();
@@ -4407,7 +5135,8 @@ mod tests {
             test_finding("Loose Correlation", Confidence::Low),
         ];
 
-        let summary = TuiApp::route_findings_by_confidence(&findings, None);
+        let (mut app, _temp_dir) = new_test_app();
+        let summary = app.route_findings_by_confidence(&findings, None);
 
         assert_eq!(summary, (0, 1, 1));
     }
@@ -4429,7 +5158,8 @@ mod tests {
             test_finding("Loose Correlation", Confidence::Low),
         ];
 
-        let summary = TuiApp::route_findings_by_confidence(&findings, Some(&memory));
+        let (mut app, _temp_dir) = new_test_app();
+        let summary = app.route_findings_by_confidence(&findings, Some(&memory));
 
         assert_eq!(summary, (0, 1, 1));
         assert!(writes.lock().expect("lock writes").is_empty());
@@ -4827,7 +5557,8 @@ mod tests {
         );
     }
 
-    fn app_with_mock_model(response: &str) -> TuiApp {
+    fn app_with_mock_model(response: &str) -> (TuiApp, tempfile::TempDir) {
+        let (config, temp_dir) = test_config_with_temp_dir();
         let mut router = ModelRouter::new();
         router.register_provider_with_auth(
             Box::new(StaticCompletionProvider::new("mock-loop-model", response)),
@@ -4838,14 +5569,15 @@ mod tests {
             .expect("set active mock model");
 
         let (loop_engine, runtime_info) = test_engine_and_runtime_info();
-        TuiApp::new(
+        let app = TuiApp::new(
             test_provider_auth_manager(),
             router,
             loop_engine,
             runtime_info,
-            FawxConfig::default(),
+            config,
         )
-        .expect("mock app")
+        .expect("mock app");
+        (app, temp_dir)
     }
 
     fn test_provider_auth_manager() -> AuthManager {
@@ -4875,7 +5607,8 @@ mod tests {
         auth_manager
     }
 
-    fn app_with_two_models() -> TuiApp {
+    fn app_with_two_models() -> (TuiApp, tempfile::TempDir) {
+        let (config, temp_dir) = test_config_with_temp_dir();
         let mut router = ModelRouter::new();
         router.register_provider_with_auth(
             Box::new(ModelEchoProvider {
@@ -4892,14 +5625,15 @@ mod tests {
             .expect("set initial active model");
 
         let (loop_engine, runtime_info) = test_engine_and_runtime_info();
-        TuiApp::new(
+        let app = TuiApp::new(
             test_provider_auth_manager(),
             router,
             loop_engine,
             runtime_info,
-            FawxConfig::default(),
+            config,
         )
-        .expect("mock app")
+        .expect("mock app");
+        (app, temp_dir)
     }
 
     fn router_with_canonical_claude_models(initial_model: &str) -> ModelRouter {
@@ -5522,18 +6256,6 @@ mod tests {
     }
 
     #[test]
-    fn stream_renderer_buffers_deltas() {
-        let mut renderer = StreamRenderer::new();
-        renderer.handle_delta("Hello ");
-        renderer.handle_delta("**world**\n");
-        renderer.handle_delta("Second line");
-
-        assert!(renderer.prefix_printed);
-        assert_eq!(renderer.token_count, 3);
-        assert_eq!(renderer.buffer, "Hello **world**\nSecond line");
-    }
-
-    #[test]
     fn build_markdown_skin_returns_valid_skin() {
         let skin = build_markdown_skin();
         let text = skin.term_text("**test**");
@@ -5701,38 +6423,6 @@ mod tests {
         assert_eq!(preferred_default_model(&model_ids), None);
     }
 
-    #[tokio::test]
-    async fn spinner_stops_when_signaled() {
-        let (stop_tx, stop_rx) = oneshot::channel();
-        let spinner = tokio::spawn(run_thinking_spinner(stop_rx));
-
-        let _ = stop_tx.send(());
-
-        tokio::time::timeout(Duration::from_millis(200), spinner)
-            .await
-            .expect("spinner should stop quickly")
-            .expect("spinner task should join");
-    }
-
-    #[test]
-    fn format_error_message_uses_ansi_escape_sequences() {
-        let message = format_error_message("boom");
-
-        assert!(message.contains("\x1b[31m"));
-        assert!(message.contains("\u{2717} boom"));
-        assert!(message.contains("\x1b[0m"));
-    }
-
-    #[test]
-    fn move_cursor_to_start_returns_error_when_terminal_write_fails() {
-        let mut writer = FailingWriter;
-
-        let error = move_cursor_to_start(&mut writer).expect_err("terminal error expected");
-        assert!(
-            matches!(error, TuiError::Io(io_error) if io_error.to_string().contains("write failed"))
-        );
-    }
-
     #[test]
     fn parse_oauth_callback_request_extracts_path_and_query() {
         let request =
@@ -5853,106 +6543,6 @@ mod tests {
     }
 
     #[test]
-    fn command_completer_matches_slash_commands() {
-        let matches = command_completion_matches("/st");
-
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].replacement, "/status");
-    }
-
-    #[test]
-    fn command_completer_empty_for_non_slash() {
-        let matches = command_completion_matches("hello");
-
-        assert!(matches.is_empty());
-    }
-
-    #[test]
-    fn readline_completer_matches_first_token_prefix() {
-        let helper = FawxReadlineHelper::default();
-        let history = DefaultHistory::new();
-        let context = rustyline::Context::new(&history);
-
-        let (start, matches) = helper
-            .complete("/h", 2, &context)
-            .expect("completion should succeed");
-
-        assert_eq!(start, 0);
-        assert!(matches.iter().any(|pair| pair.replacement == "/help"));
-    }
-
-    #[test]
-    fn readline_completer_returns_no_matches_after_first_token() {
-        let helper = FawxReadlineHelper::default();
-        let history = DefaultHistory::new();
-        let context = rustyline::Context::new(&history);
-        let line = "/help arg";
-
-        let (start, matches) = helper
-            .complete(line, line.len(), &context)
-            .expect("completion should succeed");
-
-        assert_eq!(start, 6);
-        assert!(matches.is_empty());
-    }
-
-    #[test]
-    fn readline_completer_keeps_start_at_zero_inside_first_token() {
-        let helper = FawxReadlineHelper::default();
-        let history = DefaultHistory::new();
-        let context = rustyline::Context::new(&history);
-
-        let (start, matches) = helper
-            .complete("/help", 2, &context)
-            .expect("completion should succeed");
-
-        assert_eq!(start, 0);
-        assert!(matches.iter().any(|pair| pair.replacement == "/help"));
-    }
-
-    #[test]
-    fn hinter_suppresses_hints_for_single_char_input() {
-        let helper = FawxReadlineHelper::default();
-        let history = DefaultHistory::new();
-        let context = rustyline::Context::new(&history);
-
-        assert!(
-            helper.hint("/", 1, &context).is_none(),
-            "single char should not trigger hint"
-        );
-        assert!(
-            helper.hint("", 0, &context).is_none(),
-            "empty input should not trigger hint"
-        );
-    }
-
-    #[test]
-    fn hinter_allows_hints_for_two_or_more_chars() {
-        let helper = FawxReadlineHelper::default();
-        let history = DefaultHistory::new();
-        let context = rustyline::Context::new(&history);
-
-        // With no history loaded, hint returns None regardless,
-        // but the gate should not block the call.
-        let _ = helper.hint("/h", 2, &context);
-        let _ = helper.hint("/he", 3, &context);
-        // No panic = gate allows through.
-    }
-
-    #[test]
-    fn token_start_returns_zero_for_first_token() {
-        assert_eq!(token_start("/help", 5), 0);
-        assert_eq!(token_start("/h", 2), 0);
-        assert_eq!(token_start("", 0), 0);
-    }
-
-    #[test]
-    fn token_start_returns_position_after_whitespace() {
-        assert_eq!(token_start("/help arg", 9), 6);
-        assert_eq!(token_start("a b c", 5), 4);
-        assert_eq!(token_start("hello  world", 12), 7);
-    }
-    #[test]
     fn should_add_to_history_accepts_valid_commands() {
         assert!(should_add_to_history("/help"));
         assert!(should_add_to_history("/quit"));
@@ -6022,149 +6612,6 @@ mod tests {
         assert!(file_name == "history.txt" || file_name.starts_with("history-"));
     }
 
-    #[test]
-    fn load_history_with_warning_returns_false_for_unreadable_history_path() {
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
-        let history_path = tempdir.path().join("history-as-directory");
-        std::fs::create_dir(&history_path).expect("history path directory should be created");
-
-        let mut editor = Editor::new().expect("editor should be created");
-        editor.set_helper(Some(FawxReadlineHelper::default()));
-
-        let loaded = load_history_with_warning(&mut editor, &history_path);
-
-        assert!(!loaded);
-    }
-
-    #[test]
-    fn tui_prompt_contains_ansi_color_codes() {
-        let prompt = build_tui_prompt();
-        assert!(
-            !prompt.contains("\x01"),
-            "prompt should not contain readline markers"
-        );
-        assert!(
-            !prompt.contains("\x02"),
-            "prompt should not contain readline markers"
-        );
-        assert!(prompt.contains(PROMPT_COLOR_START));
-        assert!(prompt.contains(PROMPT_COLOR_END));
-    }
-
-    #[tokio::test]
-    async fn handle_command_dispatches_help_without_stopping() {
-        let mut app = new_test_app();
-
-        app.handle_command("/help").await.unwrap();
-
-        assert!(app.running);
-    }
-
-    #[tokio::test]
-    async fn tui_runs_without_auth_configured() {
-        let mut app = new_test_app();
-
-        app.process_input_line("/help").await.unwrap();
-        app.process_input_line("/status").await.unwrap();
-
-        assert!(app.running);
-        assert!(!app.auth_manager.has_any());
-    }
-
-    #[tokio::test]
-    async fn help_command_works_without_auth() {
-        let mut app = new_test_app();
-
-        app.process_input_line("/help").await.unwrap();
-
-        assert!(app.running);
-        assert!(!app.auth_manager.has_any());
-    }
-
-    #[tokio::test]
-    async fn quit_command_works_without_auth() {
-        let mut app = new_test_app();
-
-        app.process_input_line("/quit").await.unwrap();
-
-        assert!(!app.running);
-        assert!(!app.auth_manager.has_any());
-    }
-
-    #[tokio::test]
-    async fn run_exits_immediately_when_not_running() {
-        let (loop_engine, runtime_info) = test_engine_and_runtime_info();
-        let mut app = TuiApp::new(
-            test_auth_manager(),
-            ModelRouter::new(),
-            loop_engine,
-            runtime_info,
-            FawxConfig::default(),
-        )
-        .expect("app");
-        app.running = false;
-
-        let result = app.run().await;
-
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn handle_command_dispatches_quit_and_stops() {
-        let mut app = new_test_app();
-
-        app.handle_command("/quit").await.unwrap();
-
-        assert!(!app.running);
-    }
-
-    #[tokio::test]
-    async fn message_triggers_auth_when_not_configured() {
-        let mut app = new_test_app();
-
-        let error = app
-            .handle_message("hello")
-            .await
-            .expect_err("message should trigger auth wizard without configured credentials");
-
-        assert!(
-            matches!(error, TuiError::Auth(message) if message.contains("stdin closed unexpectedly"))
-        );
-    }
-
-    #[test]
-    fn persisted_model_used_on_startup() {
-        let mut router = ModelRouter::new();
-        router.register_provider_with_auth(
-            Box::new(ModelEchoProvider {
-                provider_name: "echo-provider".to_string(),
-                models: vec![
-                    "claude-opus-4-6-20250929".to_string(),
-                    "claude-sonnet-4-6-20250929".to_string(),
-                ],
-            }),
-            "test",
-        );
-        router
-            .set_active("claude-opus-4-6-20250929")
-            .expect("set router default model");
-
-        let mut config = FawxConfig::default();
-        config.model.default_model = Some("claude-sonnet-4-6-20250929".to_string());
-
-        let (loop_engine, runtime_info) = test_engine_and_runtime_info();
-        let app = TuiApp::new(
-            test_provider_auth_manager(),
-            router,
-            loop_engine,
-            runtime_info,
-            config,
-        )
-        .expect("mock app");
-
-        assert_eq!(app.current_model(), "claude-sonnet-4-6-20250929");
-    }
-
     #[tokio::test]
     async fn startup_refresh_restores_saved_model_missing_from_initial_router() {
         let mut router = ModelRouter::new();
@@ -6179,7 +6626,7 @@ mod tests {
             .set_active("gpt-4o-mini")
             .expect("set initial active model");
 
-        let mut config = FawxConfig::default();
+        let (mut config, _temp_dir) = test_config_with_temp_dir();
         config.model.default_model = Some("gpt-5.3-codex".to_string());
 
         let (loop_engine, runtime_info) = test_engine_and_runtime_info();
@@ -6221,13 +6668,14 @@ mod tests {
             .set_active("claude-opus-4-20250514")
             .expect("set initial active model");
 
+        let (config, _temp_dir) = test_config_with_temp_dir();
         let (loop_engine, runtime_info) = test_engine_and_runtime_info();
         let mut app = TuiApp::new(
             test_provider_auth_manager(),
             router,
             loop_engine,
             runtime_info,
-            FawxConfig::default(),
+            config,
         )
         .expect("mock app");
 
@@ -6280,6 +6728,10 @@ mod tests {
             Some("claude-opus-4-20250514")
         );
 
+        // Drop the first app to release the auth store SQLite lock before
+        // creating the second instance pointing at the same data directory.
+        drop(app);
+
         let (loop_engine, runtime_info) = test_engine_and_runtime_info();
         let restarted = TuiApp::new(
             AuthManager::new(),
@@ -6310,7 +6762,7 @@ mod tests {
             .set_active("claude-opus-4-6-20250929")
             .expect("set router default model");
 
-        let mut config = FawxConfig::default();
+        let (mut config, _temp_dir) = test_config_with_temp_dir();
         config.model.default_model = Some("claude-retired-0".to_string());
 
         let (loop_engine, runtime_info) = test_engine_and_runtime_info();
@@ -6328,7 +6780,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_reflects_switched_model() {
-        let mut app = app_with_two_models();
+        let (mut app, _temp_dir) = app_with_two_models();
 
         app.handle_command("/model claude-sonnet-4-6")
             .await
@@ -6339,7 +6791,7 @@ mod tests {
 
     #[tokio::test]
     async fn model_command_resolves_prefix_to_full_model_id() {
-        let mut app = app_with_two_models();
+        let (mut app, _temp_dir) = app_with_two_models();
 
         let resolved = app
             .set_active_model_from_selector("claude-sonnet-4-6")
@@ -6350,7 +6802,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_message_uses_current_active_model() {
-        let mut app = app_with_two_models();
+        let (mut app, _temp_dir) = app_with_two_models();
 
         app.handle_command("/model claude-sonnet-4-6")
             .await
@@ -6366,7 +6818,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_message_returns_loop_result_not_raw_completion_payload() {
-        let mut app = app_with_mock_model(
+        let (mut app, _temp_dir) = app_with_mock_model(
             r#"{"action":{"Respond":{"text":"Loop-integrated reply"}},"rationale":"direct","confidence":0.91,"expected_outcome":null,"sub_goals":[]}"#,
         );
 
@@ -6382,7 +6834,7 @@ mod tests {
 
     #[tokio::test]
     async fn conversation_history_accumulates_across_messages() {
-        let mut app = app_with_mock_model(
+        let (mut app, _temp_dir) = app_with_mock_model(
             r#"{"action":{"Respond":{"text":"hello"}},"rationale":"r","confidence":0.9,"expected_outcome":null,"sub_goals":[]}"#,
         );
 
@@ -6405,7 +6857,7 @@ mod tests {
 
     #[tokio::test]
     async fn model_switch_preserves_conversation_history() {
-        let mut app = app_with_two_models();
+        let (mut app, _temp_dir) = app_with_two_models();
 
         app.handle_message("remember the launch code")
             .await
@@ -6431,7 +6883,7 @@ mod tests {
 
     #[tokio::test]
     async fn conversation_history_respects_max_limit() {
-        let mut app = app_with_mock_model(
+        let (mut app, _temp_dir) = app_with_mock_model(
             r#"{"action":{"Respond":{"text":"ok"}},"rationale":"r","confidence":0.9,"expected_outcome":null,"sub_goals":[]}"#,
         );
 
@@ -6499,7 +6951,7 @@ mod tests {
 
     #[tokio::test]
     async fn synthesis_command_updates_instruction() {
-        let mut app = new_test_app();
+        let (mut app, _temp_dir) = new_test_app();
 
         app.handle_command("/synthesis Show raw output verbatim")
             .await
@@ -6520,7 +6972,7 @@ mod tests {
 
     #[tokio::test]
     async fn synthesis_command_rejects_whitespace_only_instruction() {
-        let mut app = new_test_app();
+        let (mut app, _temp_dir) = new_test_app();
 
         app.handle_command("/synthesis    ")
             .await
@@ -6534,7 +6986,7 @@ mod tests {
 
     #[tokio::test]
     async fn synthesis_command_rejects_instruction_over_max_length() {
-        let mut app = new_test_app();
+        let (mut app, _temp_dir) = new_test_app();
         let long_value = "x".repeat(MAX_SYNTHESIS_INSTRUCTION_LENGTH + 1);
 
         app.handle_command(&format!("/synthesis {long_value}"))
@@ -6549,7 +7001,7 @@ mod tests {
 
     #[tokio::test]
     async fn clear_command_resets_conversation_history() {
-        let mut app = app_with_mock_model(
+        let (mut app, _temp_dir) = app_with_mock_model(
             r#"{"action":{"Respond":{"text":"ok"}},"rationale":"r","confidence":0.9,"expected_outcome":null,"sub_goals":[]}"#,
         );
 
@@ -6894,7 +7346,7 @@ mod tests {
     async fn handle_message_passes_plain_text_response_through() {
         // Verify that a normal plain-text LLM response renders correctly.
         let plain_text = "Hello! How can I help you today?";
-        let mut app = app_with_mock_model(plain_text);
+        let (mut app, _temp_dir) = app_with_mock_model(plain_text);
 
         let rendered = app
             .handle_message("Hey!")
@@ -6913,7 +7365,7 @@ mod tests {
         // When the LLM follows the schema correctly, the Respond text
         // should appear in the rendered output.
         let valid_json = r#"{"action":{"Respond":{"text":"Hey there! How can I help?"}},"rationale":"greeting","confidence":0.95,"expected_outcome":null,"sub_goals":[]}"#;
-        let mut app = app_with_mock_model(valid_json);
+        let (mut app, _temp_dir) = app_with_mock_model(valid_json);
 
         let rendered = app
             .handle_message("Hey!")
@@ -7055,86 +7507,6 @@ mod tests {
     }
 
     #[test]
-    fn completer_returns_model_matches() {
-        let ids = Arc::new(Mutex::new(vec![
-            "Claude-sonnet-4-20260514".to_string(),
-            "Claude-opus-4-20260514".to_string(),
-            "gpt-4o".to_string(),
-        ]));
-        let helper = FawxReadlineHelper {
-            hinter: HistoryHinter {},
-            model_ids: Arc::clone(&ids),
-        };
-        let history = DefaultHistory::new();
-        let ctx = rustyline::Context::new(&history);
-        let (pos, matches) = helper.complete("/model clau", 11, &ctx).unwrap();
-        assert_eq!(pos, "/model ".len());
-        assert_eq!(matches.len(), 2);
-        assert_eq!(matches[0].replacement, "Claude-sonnet-4-20260514");
-        assert_eq!(matches[1].replacement, "Claude-opus-4-20260514");
-    }
-
-    #[test]
-    fn completer_returns_empty_for_no_model_match() {
-        let ids = Arc::new(Mutex::new(vec![
-            "claude-sonnet-4-20260514".to_string(),
-            "gpt-4o".to_string(),
-        ]));
-        let helper = FawxReadlineHelper {
-            hinter: HistoryHinter {},
-            model_ids: Arc::clone(&ids),
-        };
-        let history = DefaultHistory::new();
-        let ctx = rustyline::Context::new(&history);
-        let (pos, matches) = helper.complete("/model xyz", 10, &ctx).unwrap();
-        assert_eq!(pos, "/model ".len());
-        assert!(matches.is_empty());
-    }
-
-    #[test]
-    fn completer_returns_all_models_for_empty_model_prefix() {
-        let ids = Arc::new(Mutex::new(vec![
-            "claude-sonnet-4-20260514".to_string(),
-            "gpt-4o".to_string(),
-        ]));
-        let helper = FawxReadlineHelper {
-            hinter: HistoryHinter {},
-            model_ids: Arc::clone(&ids),
-        };
-        let history = DefaultHistory::new();
-        let ctx = rustyline::Context::new(&history);
-        let (pos, matches) = helper.complete("/model ", 7, &ctx).unwrap();
-        assert_eq!(pos, "/model ".len());
-        assert_eq!(matches.len(), 2);
-        assert_eq!(matches[0].replacement, "claude-sonnet-4-20260514");
-        assert_eq!(matches[1].replacement, "gpt-4o");
-    }
-
-    #[test]
-    fn completer_returns_empty_when_no_models_registered() {
-        let ids = Arc::new(Mutex::new(Vec::new()));
-        let helper = FawxReadlineHelper {
-            hinter: HistoryHinter {},
-            model_ids: Arc::clone(&ids),
-        };
-        let history = DefaultHistory::new();
-        let ctx = rustyline::Context::new(&history);
-        let (pos, matches) = helper.complete("/model ", 7, &ctx).unwrap();
-        assert_eq!(pos, "/model ".len());
-        assert!(matches.is_empty());
-    }
-
-    #[test]
-    fn completer_still_completes_slash_commands() {
-        let helper = FawxReadlineHelper::default();
-        let history = DefaultHistory::new();
-        let ctx = rustyline::Context::new(&history);
-        let (pos, matches) = helper.complete("/mo", 3, &ctx).unwrap();
-        assert_eq!(pos, 0);
-        assert!(matches.iter().any(|m| m.replacement == "/model"));
-    }
-
-    #[test]
     fn group_models_by_provider_groups_correctly() {
         let models = vec![
             ModelInfo {
@@ -7229,133 +7601,478 @@ mod tests {
         assert!(!super::is_benign_stdin_flush_error(&error));
     }
 
-    // ---------------------------------------------------------------
-    // Streaming renderer tests
-    // ---------------------------------------------------------------
+    // ── Restored functional tests (review #1147) ────────────────
 
-    #[test]
-    fn stream_renderer_prints_prefix_once_per_cycle() {
-        let mut renderer = StreamRenderer::new();
+    #[tokio::test]
+    async fn handle_command_dispatches_help_without_stopping() {
+        let (mut app, _temp_dir) = new_test_app();
 
-        // First delta prints the prefix.
-        renderer.handle_delta("Hello");
-        assert!(renderer.prefix_printed);
+        app.handle_command("/help").await.unwrap();
 
-        // Second delta does NOT re-print the prefix (flag stays true).
-        let before = renderer.prefix_printed;
-        renderer.handle_delta(" world");
-        assert_eq!(renderer.prefix_printed, before);
-        assert_eq!(renderer.token_count, 2);
-    }
-
-    #[test]
-    fn stream_renderer_handles_multi_phase() {
-        let mut renderer = StreamRenderer::new();
-
-        // Reason phase
-        renderer.handle_started(StreamPhase::Reason);
-        assert_eq!(renderer.current_phase, Some(StreamPhase::Reason));
-        renderer.handle_delta("reasoning");
-        renderer.handle_finished(StreamPhase::Reason);
-        assert_eq!(renderer.current_phase, None);
-
-        // Synthesize phase
-        renderer.handle_started(StreamPhase::Synthesize);
-        assert_eq!(renderer.current_phase, Some(StreamPhase::Synthesize));
-        renderer.handle_delta(" final");
-        renderer.handle_finished(StreamPhase::Synthesize);
-        assert_eq!(renderer.current_phase, None);
-
-        // Prefix was printed exactly once.
-        assert!(renderer.prefix_printed);
-        assert_eq!(renderer.token_count, 2);
-    }
-
-    #[test]
-    fn stream_renderer_increments_token_count_per_delta() {
-        // Verify that each `handle_delta` call increments `token_count`.
-        let mut renderer = StreamRenderer::new();
-        renderer.handle_delta("a");
-        assert_eq!(renderer.token_count, 1);
-        renderer.handle_delta("b");
-        assert_eq!(renderer.token_count, 2);
-        renderer.handle_delta("c");
-        assert_eq!(renderer.token_count, 3);
-    }
-
-    #[test]
-    fn stream_interrupted_marker_does_not_panic() {
-        // Verify the associated function doesn't panic.
-        // Actual stderr content is verified via integration tests.
-        StreamRenderer::print_interrupted_marker();
-    }
-
-    #[test]
-    fn stream_renderer_resets_between_turns() {
-        // Turn 1
-        let mut r1 = StreamRenderer::new();
-        r1.handle_started(StreamPhase::Reason);
-        r1.handle_delta("first turn");
-        r1.handle_finished(StreamPhase::Reason);
-        r1.finalize();
-        assert!(r1.prefix_printed);
-        assert_eq!(r1.token_count, 1);
-
-        // Turn 2 — fresh renderer, all state reset
-        let r2 = StreamRenderer::new();
-        assert!(!r2.prefix_printed);
-        assert_eq!(r2.token_count, 0);
-        assert_eq!(r2.current_phase, None);
+        assert!(app.running);
     }
 
     #[tokio::test]
-    async fn display_loop_processes_streaming_events_end_to_end() {
-        use std::sync::atomic::Ordering;
+    async fn tui_runs_without_auth_configured() {
+        let (mut app, _temp_dir) = new_test_app();
 
-        let bus = EventBus::new(16);
-        let mut receiver = bus.subscribe();
-        let streamed = Arc::new(AtomicBool::new(false));
-        let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
-        let mut state = DisplayLoopState::new(Arc::clone(&streamed));
+        app.process_input_line("/help").await.unwrap();
+        app.process_input_line("/status").await.unwrap();
 
-        // Before any events: spinner is active, nothing streamed.
-        assert!(state.spinner_active);
-        assert!(!streamed.load(Ordering::Relaxed));
+        assert!(app.running);
+        assert!(!app.auth_manager.has_any());
+    }
 
-        // Publish StreamingStarted → deactivates spinner.
-        bus.publish(InternalMessage::StreamingStarted {
-            phase: StreamPhase::Synthesize,
-        })
-        .unwrap();
-        let cont = dispatch_streaming_event(&mut receiver, &mut stop_rx, &mut state).await;
-        assert!(cont);
-        assert!(!state.spinner_active);
-        assert!(streamed.load(Ordering::Relaxed));
-        assert_eq!(state.renderer.current_phase, Some(StreamPhase::Synthesize),);
+    #[tokio::test]
+    async fn help_command_works_without_auth() {
+        let (mut app, _temp_dir) = new_test_app();
 
-        // Publish StreamDelta → renderer accumulates token.
-        bus.publish(InternalMessage::StreamDelta {
-            delta: "hello".into(),
-            phase: StreamPhase::Synthesize,
-        })
-        .unwrap();
-        let cont = dispatch_streaming_event(&mut receiver, &mut stop_rx, &mut state).await;
-        assert!(cont);
-        assert_eq!(state.renderer.token_count, 1);
-        assert!(state.renderer.prefix_printed);
+        app.process_input_line("/help").await.unwrap();
 
-        // Publish StreamingFinished → phase cleared.
-        bus.publish(InternalMessage::StreamingFinished {
-            phase: StreamPhase::Synthesize,
-        })
-        .unwrap();
-        let cont = dispatch_streaming_event(&mut receiver, &mut stop_rx, &mut state).await;
-        assert!(cont);
-        assert_eq!(state.renderer.current_phase, None);
+        assert!(app.running);
+        assert!(!app.auth_manager.has_any());
+    }
 
-        // Stop signal → loop exits.
-        let _ = stop_tx.send(());
-        let cont = dispatch_streaming_event(&mut receiver, &mut stop_rx, &mut state).await;
-        assert!(!cont);
+    #[tokio::test]
+    async fn quit_command_works_without_auth() {
+        let (mut app, _temp_dir) = new_test_app();
+
+        app.process_input_line("/quit").await.unwrap();
+
+        assert!(!app.running);
+        assert!(!app.auth_manager.has_any());
+    }
+
+    #[tokio::test]
+    async fn handle_command_dispatches_quit_and_stops() {
+        let (mut app, _temp_dir) = new_test_app();
+
+        app.handle_command("/quit").await.unwrap();
+
+        assert!(!app.running);
+    }
+
+    #[tokio::test]
+    async fn message_triggers_auth_when_not_configured() {
+        let (mut app, _temp_dir) = new_test_app();
+
+        let error = app
+            .handle_message("hello")
+            .await
+            .expect_err("should trigger auth without credentials");
+
+        assert!(
+            matches!(error, TuiError::Auth(message) if message.contains("stdin closed unexpectedly"))
+        );
+    }
+
+    #[test]
+    fn persisted_model_used_on_startup() {
+        let mut router = ModelRouter::new();
+        router.register_provider_with_auth(
+            Box::new(ModelEchoProvider {
+                provider_name: "echo-provider".to_string(),
+                models: vec![
+                    "claude-opus-4-6-20250929".to_string(),
+                    "claude-sonnet-4-6-20250929".to_string(),
+                ],
+            }),
+            "test",
+        );
+        router
+            .set_active("claude-opus-4-6-20250929")
+            .expect("set router default model");
+
+        let (mut config, _temp_dir) = test_config_with_temp_dir();
+        config.model.default_model = Some("claude-sonnet-4-6-20250929".to_string());
+
+        let (loop_engine, runtime_info) = test_engine_and_runtime_info();
+        let app = TuiApp::new(
+            test_provider_auth_manager(),
+            router,
+            loop_engine,
+            runtime_info,
+            config,
+        )
+        .expect("mock app");
+
+        assert_eq!(app.current_model(), "claude-sonnet-4-6-20250929");
+    }
+
+    // ── Steer / Abort / Queue tests ────────────────────────────
+
+    #[test]
+    fn parse_bare_command_recognizes_status_aliases() {
+        use fx_kernel::input::LoopCommand;
+        assert_eq!(parse_bare_command("status"), Some(LoopCommand::StatusQuery));
+        assert_eq!(parse_bare_command("st"), Some(LoopCommand::StatusQuery));
+        assert_eq!(
+            parse_bare_command("/status"),
+            Some(LoopCommand::StatusQuery)
+        );
+    }
+
+    #[test]
+    fn parse_bare_command_recognizes_slash_stop() {
+        use fx_kernel::input::LoopCommand;
+        assert_eq!(parse_bare_command("/stop"), Some(LoopCommand::Stop));
+        assert_eq!(parse_bare_command("/abort"), Some(LoopCommand::Abort));
+    }
+
+    #[test]
+    fn parse_bare_command_steer_with_text() {
+        use fx_kernel::input::LoopCommand;
+        assert_eq!(
+            parse_bare_command("/steer try harder"),
+            Some(LoopCommand::Steer("try harder".to_string()))
+        );
+        assert_eq!(
+            parse_bare_command("steer use a different approach"),
+            Some(LoopCommand::Steer("use a different approach".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_bare_command_steer_empty_returns_none() {
+        // "/steer " with no message text should return None
+        assert_eq!(parse_bare_command("/steer "), None);
+        assert_eq!(parse_bare_command("steer "), None);
+    }
+
+    #[test]
+    fn route_execution_input_stop_sets_abort() {
+        let mut app = ui::FawxApp::new();
+        let cancel = CancellationToken::new();
+        route_execution_input("/stop", &mut app, &cancel, &None);
+        assert!(app.abort_requested);
+        assert!(cancel.is_cancelled());
+    }
+
+    #[test]
+    fn route_execution_input_steer_sets_message() {
+        let mut app = ui::FawxApp::new();
+        let cancel = CancellationToken::new();
+        route_execution_input("/steer foo bar", &mut app, &cancel, &None);
+        assert_eq!(app.steer_message.as_deref(), Some("foo bar"));
+        assert!(!app.abort_requested);
+    }
+
+    #[test]
+    fn route_execution_input_plain_text_queues() {
+        let mut app = ui::FawxApp::new();
+        let cancel = CancellationToken::new();
+        route_execution_input("hello world", &mut app, &cancel, &None);
+        assert_eq!(app.pending_inputs, vec!["hello world".to_string()]);
+        assert!(!app.abort_requested);
+    }
+
+    #[test]
+    fn queued_inputs_drain_in_order() {
+        let mut app = ui::FawxApp::new();
+        app.queue_input("first".into());
+        app.queue_input("second".into());
+        app.queue_input("third".into());
+        assert_eq!(app.drain_next_input(), Some("first".into()));
+        assert_eq!(app.drain_next_input(), Some("second".into()));
+        assert_eq!(app.drain_next_input(), Some("third".into()));
+        assert_eq!(app.drain_next_input(), None);
+    }
+
+    #[test]
+    fn steer_clears_after_take() {
+        let mut app = ui::FawxApp::new();
+        app.set_steer("redirect".into());
+        assert_eq!(app.take_steer(), Some("redirect".into()));
+        assert!(app.take_steer().is_none());
+    }
+
+    #[test]
+    fn multiple_steers_last_wins() {
+        let mut app = ui::FawxApp::new();
+        app.set_steer("first".into());
+        app.set_steer("second".into());
+        app.set_steer("third".into());
+        assert_eq!(app.steer_message.as_deref(), Some("third"));
+    }
+
+    #[test]
+    fn abort_plus_steer_abort_takes_priority() {
+        let mut app = ui::FawxApp::new();
+        let cancel = CancellationToken::new();
+        // Steer first, then stop
+        route_execution_input("/steer try again", &mut app, &cancel, &None);
+        route_execution_input("/stop", &mut app, &cancel, &None);
+        // Abort should be set even though steer was set first
+        assert!(app.abort_requested);
+        assert!(cancel.is_cancelled());
+    }
+
+    #[test]
+    fn idle_stop_detected_as_control_command() {
+        // Only slash-prefixed commands are recognized during idle
+        assert!(is_idle_control_command("/stop"));
+        assert!(is_idle_control_command("/abort"));
+        assert!(is_idle_control_command("/STOP"));
+        assert!(is_idle_control_command(" /stop "));
+        // Bare aliases must NOT be intercepted during idle — they are
+        // valid user messages (e.g. "a", "s", "no").
+        assert!(!is_idle_control_command("stop"));
+        assert!(!is_idle_control_command("abort"));
+        assert!(!is_idle_control_command("a"));
+        assert!(!is_idle_control_command("s"));
+        assert!(!is_idle_control_command("no"));
+        assert!(!is_idle_control_command("hello"));
+        assert!(!is_idle_control_command("/steer something"));
+        assert!(!is_idle_control_command("status"));
+    }
+
+    #[test]
+    fn route_execution_input_sends_to_channel() {
+        let (sender, mut receiver) = fx_kernel::input::loop_input_channel();
+        let mut app = ui::FawxApp::new();
+        let cancel = CancellationToken::new();
+        let sender_opt = Some(sender);
+
+        route_execution_input("/steer try plan B", &mut app, &cancel, &sender_opt);
+        let cmd = receiver.try_recv();
+        assert_eq!(cmd, Some(LoopCommand::Steer("try plan B".to_string())));
+
+        route_execution_input("/stop", &mut app, &cancel, &sender_opt);
+        let cmd = receiver.try_recv();
+        assert_eq!(cmd, Some(LoopCommand::Abort));
+    }
+
+    #[test]
+    fn steer_with_channel_does_not_store_in_app() {
+        let (sender, mut receiver) = fx_kernel::input::loop_input_channel();
+        let mut app = ui::FawxApp::new();
+        let cancel = CancellationToken::new();
+        let sender_opt = Some(sender);
+
+        route_execution_input("/steer try harder", &mut app, &cancel, &sender_opt);
+
+        // Message sent via channel
+        let cmd = receiver.try_recv();
+        assert_eq!(cmd, Some(LoopCommand::Steer("try harder".to_string())));
+        // Must NOT be stored in app (prevents duplicate injection via take_steer)
+        assert!(app.steer_message.is_none());
+    }
+
+    #[test]
+    fn steer_without_channel_falls_back_to_app_storage() {
+        let mut app = ui::FawxApp::new();
+        let cancel = CancellationToken::new();
+
+        route_execution_input("/steer fallback msg", &mut app, &cancel, &None);
+
+        // No channel — stored in app for forwarding at next cycle start
+        assert_eq!(app.steer_message.as_deref(), Some("fallback msg"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Auth command tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn normalize_provider_name_lowercase() {
+        assert_eq!(normalize_provider_name("GitHub"), "github");
+    }
+
+    #[test]
+    fn normalize_provider_name_trims() {
+        assert_eq!(normalize_provider_name("  openai  "), "openai");
+    }
+
+    #[test]
+    fn normalize_provider_name_gh_alias() {
+        assert_eq!(normalize_provider_name("gh"), "github");
+        assert_eq!(normalize_provider_name("GH"), "github");
+    }
+
+    #[test]
+    fn normalize_provider_name_passthrough() {
+        assert_eq!(normalize_provider_name("anthropic"), "anthropic");
+        assert_eq!(normalize_provider_name("openai"), "openai");
+    }
+
+    #[test]
+    fn parse_auth_bare() {
+        let cmd = parse_command("/auth");
+        assert!(matches!(
+            cmd,
+            ParsedCommand::Auth {
+                subcommand: None,
+                action: None,
+                value: None,
+                has_extra_args: false,
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_auth_github_set_token() {
+        let cmd = parse_command("/auth github set-token ghp_xxxxx");
+        assert!(matches!(
+            cmd,
+            ParsedCommand::Auth {
+                subcommand: Some(ref s),
+                action: Some(ref a),
+                value: Some(ref v),
+                has_extra_args: false,
+            } if s == "github" && a == "set-token" && v == "ghp_xxxxx"
+        ));
+    }
+
+    #[test]
+    fn parse_auth_github_show_status() {
+        let cmd = parse_command("/auth github show-status");
+        assert!(matches!(
+            cmd,
+            ParsedCommand::Auth {
+                subcommand: Some(ref s),
+                action: Some(ref a),
+                value: None,
+                has_extra_args: false,
+            } if s == "github" && a == "show-status"
+        ));
+    }
+
+    #[test]
+    fn parse_auth_github_clear_token() {
+        let cmd = parse_command("/auth github clear-token");
+        assert!(matches!(
+            cmd,
+            ParsedCommand::Auth {
+                subcommand: Some(ref s),
+                action: Some(ref a),
+                value: None,
+                has_extra_args: false,
+            } if s == "github" && a == "clear-token"
+        ));
+    }
+
+    #[test]
+    fn parse_auth_list_providers() {
+        let cmd = parse_command("/auth list-providers");
+        assert!(matches!(
+            cmd,
+            ParsedCommand::Auth {
+                subcommand: Some(ref s),
+                action: None,
+                value: None,
+                has_extra_args: false,
+            } if s == "list-providers"
+        ));
+    }
+
+    #[test]
+    fn parse_auth_unknown_provider() {
+        let cmd = parse_command("/auth foobar");
+        assert!(matches!(
+            cmd,
+            ParsedCommand::Auth {
+                subcommand: Some(ref s),
+                action: None,
+                value: None,
+                has_extra_args: false,
+            } if s == "foobar"
+        ));
+    }
+
+    #[test]
+    fn parse_auth_extra_args_detected() {
+        let cmd = parse_command("/auth github set-token ghp_xxx extra stuff");
+        assert!(matches!(
+            cmd,
+            ParsedCommand::Auth {
+                has_extra_args: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn show_auth_status_no_credentials_no_panic() {
+        let (mut app, _temp_dir) = new_test_app();
+        app.show_auth_status();
+        // Should produce output without panicking.
+        assert!(!app.output_buffer.is_empty());
+    }
+
+    #[test]
+    fn classify_github_pat_classic() {
+        assert_eq!(classify_github_pat("ghp_abc123"), GitHubPatKind::Classic);
+    }
+
+    #[test]
+    fn classify_github_pat_fine_grained() {
+        assert_eq!(
+            classify_github_pat("github_pat_abc123"),
+            GitHubPatKind::FineGrained
+        );
+    }
+
+    #[test]
+    fn classify_github_pat_unknown() {
+        assert_eq!(classify_github_pat("other_token"), GitHubPatKind::Unknown);
+    }
+
+    #[test]
+    fn humanize_elapsed_ms_just_now() {
+        assert_eq!(humanize_elapsed_ms(5000), "just now");
+    }
+
+    #[test]
+    fn humanize_elapsed_ms_minutes() {
+        assert_eq!(humanize_elapsed_ms(300_000), "5m ago");
+    }
+
+    #[test]
+    fn humanize_elapsed_ms_hours() {
+        assert_eq!(humanize_elapsed_ms(7_200_000), "2h ago");
+    }
+
+    #[test]
+    fn humanize_elapsed_ms_days() {
+        assert_eq!(humanize_elapsed_ms(172_800_000), "2d ago");
+    }
+
+    #[test]
+    fn format_github_token_result_classic_with_scopes() {
+        let token = zeroize::Zeroizing::new("ghp_abc123".to_string());
+        let info = fx_auth::github::GitHubTokenInfo {
+            login: "testuser".to_string(),
+            scopes: vec!["repo".to_string(), "workflow".to_string()],
+            missing_scopes: vec![],
+        };
+        let lines = format_github_token_result(&token, &info);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("repo, workflow"));
+    }
+
+    #[test]
+    fn format_github_token_result_fine_grained() {
+        let token = zeroize::Zeroizing::new("github_pat_abc123".to_string());
+        let info = fx_auth::github::GitHubTokenInfo {
+            login: "testuser".to_string(),
+            scopes: vec![],
+            missing_scopes: vec![],
+        };
+        let lines = format_github_token_result(&token, &info);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("fine-grained"));
+    }
+
+    #[test]
+    fn format_github_token_result_missing_scopes() {
+        let token = zeroize::Zeroizing::new("ghp_abc123".to_string());
+        let info = fx_auth::github::GitHubTokenInfo {
+            login: "testuser".to_string(),
+            scopes: vec!["repo".to_string()],
+            missing_scopes: vec!["workflow".to_string()],
+        };
+        let lines = format_github_token_result(&token, &info);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].contains("Missing recommended scopes"));
     }
 }
