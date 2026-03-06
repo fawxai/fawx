@@ -1,6 +1,6 @@
 //! GitHub skill — Manage pull requests and issues via the GitHub API.
 //!
-//! Actions: `create_pr`, `comment_pr`, `list_prs`, `view_pr`, `list_issues`.
+//! Actions: `create_pr`, `comment_pr`, `list_prs`, `view_pr`, `list_issues`, `create_issue`.
 
 use serde::{Deserialize, Serialize};
 
@@ -114,6 +114,8 @@ enum Input {
     ViewPr(ViewPrInput),
     #[serde(rename = "list_issues", alias = "list_issue")]
     ListIssues(ListIssuesInput),
+    #[serde(rename = "create_issue", alias = "file_issue", alias = "open_issue")]
+    CreateIssue(CreateIssueInput),
 }
 
 #[derive(Deserialize)]
@@ -157,6 +159,16 @@ struct ListIssuesInput {
     state: Option<String>,
     labels: Option<String>,
     per_page: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct CreateIssueInput {
+    owner: String,
+    repo: String,
+    title: String,
+    body: Option<String>,
+    labels: Option<Vec<String>>,
+    assignees: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -243,6 +255,23 @@ struct CommentPrOutput {
     error: Option<String>,
 }
 
+#[derive(Serialize)]
+struct CreateIssueOutput {
+    success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    issue_number: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    html_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GitHubIssueResponse {
+    number: u64,
+    html_url: String,
+}
+
 #[derive(Deserialize)]
 struct GitHubPrResponse {
     number: u64,
@@ -257,6 +286,18 @@ struct GitHubCommentResponse {
 #[derive(Deserialize)]
 struct GitHubErrorResponse {
     message: Option<String>,
+    errors: Option<Vec<GitHubErrorDetail>>,
+}
+
+#[derive(Deserialize)]
+struct GitHubErrorDetail {
+    message: Option<String>,
+    /// Deserialized from the GitHub API response for completeness;
+    /// not currently rendered in error messages.
+    #[allow(dead_code)]
+    resource: Option<String>,
+    field: Option<String>,
+    code: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -338,10 +379,37 @@ fn simple_url_encode(input: &str) -> String {
 }
 
 fn error_from_response(response: &str) -> String {
-    serde_json::from_str::<GitHubErrorResponse>(response)
-        .ok()
-        .and_then(|e| e.message)
-        .unwrap_or_else(|| format!("Unknown error: {response}"))
+    let parsed = match serde_json::from_str::<GitHubErrorResponse>(response) {
+        Ok(p) => p,
+        Err(_) => return format!("Unknown error: {response}"),
+    };
+
+    let base = match parsed.message {
+        Some(m) => m,
+        None => return format!("Unknown error: {response}"),
+    };
+
+    let details = match parsed.errors {
+        Some(ref errs) if !errs.is_empty() => format_error_details(errs),
+        _ => return base,
+    };
+
+    format!("{base}: {details}")
+}
+
+fn format_error_details(errors: &[GitHubErrorDetail]) -> String {
+    let parts: Vec<String> = errors
+        .iter()
+        .map(|e| {
+            if let Some(msg) = &e.message {
+                return msg.clone();
+            }
+            let field = e.field.as_deref().unwrap_or("unknown");
+            let code = e.code.as_deref().unwrap_or("unknown");
+            format!("[field: '{field}', code: '{code}']")
+        })
+        .collect();
+    parts.join(", ")
 }
 
 // ── Blocked Branches ────────────────────────────────────────────────────────
@@ -423,34 +491,17 @@ fn build_create_pr_request(input: &CreatePrInput) -> (String, String) {
 
 fn handle_create_pr(input: CreatePrInput) -> String {
     if let Err(e) = check_owner_repo(&input.owner, &input.repo) {
-        return serialize_output(&CreatePrOutput {
-            success: false,
-            pr_number: None,
-            html_url: None,
-            error: Some(e),
-        });
+        return create_pr_error(e);
     }
 
     let base = input.base.as_deref().unwrap_or(DEFAULT_BASE);
     if let Err(e) = validate_base(base) {
-        return serialize_output(&CreatePrOutput {
-            success: false,
-            pr_number: None,
-            html_url: None,
-            error: Some(e),
-        });
+        return create_pr_error(e);
     }
 
     let token = match get_token() {
         Ok(t) => t,
-        Err(e) => {
-            return serialize_output(&CreatePrOutput {
-                success: false,
-                pr_number: None,
-                html_url: None,
-                error: Some(e),
-            });
-        }
+        Err(e) => return create_pr_error(e),
     };
 
     let (url, body) = build_create_pr_request(&input);
@@ -474,12 +525,7 @@ fn handle_create_pr(input: CreatePrInput) -> String {
 
 fn parse_create_pr_response(response: Option<String>) -> String {
     let Some(response) = response else {
-        return serialize_output(&CreatePrOutput {
-            success: false,
-            pr_number: None,
-            html_url: None,
-            error: Some("HTTP request failed".into()),
-        });
+        return create_pr_error("HTTP request failed".into());
     };
 
     if let Ok(pr) = serde_json::from_str::<GitHubPrResponse>(&response) {
@@ -493,33 +539,18 @@ fn parse_create_pr_response(response: Option<String>) -> String {
     } else {
         let err_msg = error_from_response(&response);
         log(4, &format!("PR creation failed: {err_msg}"));
-        serialize_output(&CreatePrOutput {
-            success: false,
-            pr_number: None,
-            html_url: None,
-            error: Some(err_msg),
-        })
+        create_pr_error(err_msg)
     }
 }
 
 fn handle_comment_pr(input: CommentPrInput) -> String {
     if let Err(e) = check_owner_repo(&input.owner, &input.repo) {
-        return serialize_output(&CommentPrOutput {
-            success: false,
-            comment_id: None,
-            error: Some(e),
-        });
+        return comment_pr_error(e);
     }
 
     let token = match get_token() {
         Ok(t) => t,
-        Err(e) => {
-            return serialize_output(&CommentPrOutput {
-                success: false,
-                comment_id: None,
-                error: Some(e),
-            });
-        }
+        Err(e) => return comment_pr_error(e),
     };
 
     let url = format!(
@@ -548,11 +579,7 @@ fn handle_comment_pr(input: CommentPrInput) -> String {
 
 fn parse_comment_pr_response(response: Option<String>) -> String {
     let Some(response) = response else {
-        return serialize_output(&CommentPrOutput {
-            success: false,
-            comment_id: None,
-            error: Some("HTTP request failed".into()),
-        });
+        return comment_pr_error("HTTP request failed".into());
     };
 
     if let Ok(comment) = serde_json::from_str::<GitHubCommentResponse>(&response) {
@@ -565,11 +592,7 @@ fn parse_comment_pr_response(response: Option<String>) -> String {
     } else {
         let err_msg = error_from_response(&response);
         log(4, &format!("Comment failed: {err_msg}"));
-        serialize_output(&CommentPrOutput {
-            success: false,
-            comment_id: None,
-            error: Some(err_msg),
-        })
+        comment_pr_error(err_msg)
     }
 }
 
@@ -858,6 +881,110 @@ fn issue_summary_from_api(item: GitHubIssueItem) -> IssueSummary {
     }
 }
 
+// ── Create Issue ────────────────────────────────────────────────────────────
+
+fn handle_create_issue(input: CreateIssueInput) -> String {
+    if let Err(e) = check_owner_repo(&input.owner, &input.repo) {
+        return create_issue_error(e);
+    }
+
+    let token = match get_token() {
+        Ok(t) => t,
+        Err(e) => return create_issue_error(e),
+    };
+
+    let url = format!(
+        "https://api.github.com/repos/{}/{}/issues",
+        input.owner, input.repo
+    );
+    let body = build_create_issue_body(&input);
+    let headers = auth_headers(&token);
+
+    log(
+        2,
+        &format!(
+            "Creating issue '{}' in {}/{}",
+            input.title, input.owner, input.repo
+        ),
+    );
+
+    let req = HttpReq {
+        method: "POST",
+        url: &url,
+        headers: &headers,
+        body: &body,
+    };
+    parse_create_issue_response(http_request(&req))
+}
+
+fn create_pr_error(msg: String) -> String {
+    serialize_output(&CreatePrOutput {
+        success: false,
+        pr_number: None,
+        html_url: None,
+        error: Some(msg),
+    })
+}
+
+fn comment_pr_error(msg: String) -> String {
+    serialize_output(&CommentPrOutput {
+        success: false,
+        comment_id: None,
+        error: Some(msg),
+    })
+}
+
+fn create_issue_error(err: String) -> String {
+    serialize_output(&CreateIssueOutput {
+        success: false,
+        issue_number: None,
+        html_url: None,
+        error: Some(err),
+    })
+}
+
+fn build_create_issue_body(input: &CreateIssueInput) -> String {
+    let mut body = serde_json::json!({ "title": input.title });
+    if let Some(b) = &input.body {
+        body["body"] = serde_json::Value::String(b.clone());
+    }
+    if let Some(labels) = &input.labels {
+        body["labels"] = serde_json::json!(labels);
+    }
+    if let Some(assignees) = &input.assignees {
+        body["assignees"] = serde_json::json!(assignees);
+    }
+    body.to_string()
+}
+
+fn parse_create_issue_response(response: Option<String>) -> String {
+    let Some(response) = response else {
+        return create_issue_error("HTTP request failed".into());
+    };
+
+    if let Ok(issue) = serde_json::from_str::<GitHubIssueResponse>(&response) {
+        log(
+            2,
+            &format!("Issue #{} created: {}", issue.number, issue.html_url),
+        );
+        serialize_output(&CreateIssueOutput {
+            success: true,
+            issue_number: Some(issue.number),
+            html_url: Some(issue.html_url),
+            error: None,
+        })
+    } else {
+        let err_msg = error_from_response(&response);
+        log(4, &format!("Issue creation failed: {err_msg}"));
+        serialize_output(&CreateIssueOutput {
+            success: false,
+            issue_number: None,
+            html_url: None,
+            error: Some(err_msg),
+        })
+    }
+}
+
 // ── Entry Point ─────────────────────────────────────────────────────────────
 
 #[no_mangle]
@@ -865,7 +992,7 @@ pub extern "C" fn run() {
     let raw = get_input();
     if raw.is_empty() {
         set_output(
-            r#"{"error":"No input provided. Expected JSON with 'action': 'create_pr', 'comment_pr', 'list_prs', 'view_pr', or 'list_issues'."}"#,
+            r#"{"error":"No input provided. Expected JSON with 'action': 'create_pr', 'comment_pr', 'list_prs', 'view_pr', 'list_issues', or 'create_issue'."}"#,
         );
         return;
     }
@@ -876,10 +1003,11 @@ pub extern "C" fn run() {
         Ok(Input::ListPrs(input)) => handle_list_prs(input),
         Ok(Input::ViewPr(input)) => handle_view_pr(input),
         Ok(Input::ListIssues(input)) => handle_list_issues(input),
+        Ok(Input::CreateIssue(input)) => handle_create_issue(input),
         Err(e) => {
             log(4, &format!("Failed to parse input: {e}"));
             serialize_output(&serde_json::json!({
-                "error": format!("Invalid input: {e}. Expected 'action': 'create_pr', 'comment_pr', 'list_prs', 'view_pr', or 'list_issues'.")
+                "error": format!("Invalid input: {e}. Expected 'action': 'create_pr', 'comment_pr', 'list_prs', 'view_pr', 'list_issues', or 'create_issue'.")
             }))
         }
     };
@@ -1654,5 +1782,216 @@ mod tests {
     #[test]
     fn simple_url_encode_preserves_unreserved() {
         assert_eq!(simple_url_encode("a-b_c.d~e"), "a-b_c.d~e");
+    }
+
+    // ── Create Issue Input Parsing ──────────────────────────────────────
+
+    #[test]
+    fn parse_create_issue_input() {
+        let json = r#"{
+            "action": "create_issue",
+            "owner": "acme",
+            "repo": "widgets",
+            "title": "Bug: crash on startup"
+        }"#;
+        let input: Input = serde_json::from_str(json).unwrap();
+        match input {
+            Input::CreateIssue(ci) => {
+                assert_eq!(ci.owner, "acme");
+                assert_eq!(ci.repo, "widgets");
+                assert_eq!(ci.title, "Bug: crash on startup");
+                assert!(ci.body.is_none());
+                assert!(ci.labels.is_none());
+                assert!(ci.assignees.is_none());
+            }
+            _ => panic!("expected CreateIssue variant"),
+        }
+    }
+
+    #[test]
+    fn parse_create_issue_with_labels() {
+        let json = r#"{
+            "action": "create_issue",
+            "owner": "acme",
+            "repo": "widgets",
+            "title": "Add dark mode",
+            "body": "Please add dark mode support",
+            "labels": ["enhancement", "ui"],
+            "assignees": ["dev1", "dev2"]
+        }"#;
+        let input: Input = serde_json::from_str(json).unwrap();
+        match input {
+            Input::CreateIssue(ci) => {
+                assert_eq!(ci.title, "Add dark mode");
+                assert_eq!(ci.body.as_deref(), Some("Please add dark mode support"));
+                assert_eq!(
+                    ci.labels.as_deref(),
+                    Some(vec!["enhancement".to_string(), "ui".to_string()]).as_deref()
+                );
+                assert_eq!(
+                    ci.assignees.as_deref(),
+                    Some(vec!["dev1".to_string(), "dev2".to_string()]).as_deref()
+                );
+            }
+            _ => panic!("expected CreateIssue variant"),
+        }
+    }
+
+    #[test]
+    fn parse_create_issue_alias_file_issue() {
+        let json = r#"{
+            "action": "file_issue",
+            "owner": "acme",
+            "repo": "widgets",
+            "title": "Filed via alias"
+        }"#;
+        let input: Input = serde_json::from_str(json).unwrap();
+        assert!(matches!(input, Input::CreateIssue(_)));
+    }
+
+    #[test]
+    fn parse_create_issue_alias_open_issue() {
+        let json = r#"{
+            "action": "open_issue",
+            "owner": "acme",
+            "repo": "widgets",
+            "title": "Opened via alias"
+        }"#;
+        let input: Input = serde_json::from_str(json).unwrap();
+        assert!(matches!(input, Input::CreateIssue(_)));
+    }
+
+    // ── Create Issue Response Parsing ───────────────────────────────────
+
+    #[test]
+    fn parse_create_issue_response_success() {
+        let response =
+            r#"{"number": 123, "html_url": "https://github.com/acme/widgets/issues/123"}"#;
+        let result = parse_create_issue_response(Some(response.into()));
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], true);
+        assert_eq!(parsed["issue_number"], 123);
+        assert_eq!(
+            parsed["html_url"],
+            "https://github.com/acme/widgets/issues/123"
+        );
+    }
+
+    #[test]
+    fn parse_create_issue_response_api_error() {
+        let response = r#"{"message": "Validation Failed"}"#;
+        let result = parse_create_issue_response(Some(response.into()));
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], false);
+        assert_eq!(parsed["error"], "Validation Failed");
+    }
+
+    #[test]
+    fn parse_create_issue_response_http_failure() {
+        let result = parse_create_issue_response(None);
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], false);
+        assert_eq!(parsed["error"], "HTTP request failed");
+    }
+
+    // ── Create Issue Output Serialization ───────────────────────────────
+
+    #[test]
+    fn serialize_create_issue_success() {
+        let output = CreateIssueOutput {
+            success: true,
+            issue_number: Some(42),
+            html_url: Some("https://github.com/acme/widgets/issues/42".into()),
+            error: None,
+        };
+        let json = serialize_output(&output);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["success"], true);
+        assert_eq!(parsed["issue_number"], 42);
+        assert!(parsed.get("error").is_none());
+    }
+
+    // ── Create Issue Body Building ──────────────────────────────────────
+
+    #[test]
+    fn build_create_issue_body_minimal() {
+        let input = CreateIssueInput {
+            owner: "acme".into(),
+            repo: "widgets".into(),
+            title: "Test".into(),
+            body: None,
+            labels: None,
+            assignees: None,
+        };
+        let body = build_create_issue_body(&input);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["title"], "Test");
+        assert!(parsed.get("body").is_none());
+        assert!(parsed.get("labels").is_none());
+        assert!(parsed.get("assignees").is_none());
+    }
+
+    #[test]
+    fn build_create_issue_body_full() {
+        let input = CreateIssueInput {
+            owner: "acme".into(),
+            repo: "widgets".into(),
+            title: "Full".into(),
+            body: Some("Description".into()),
+            labels: Some(vec!["bug".into()]),
+            assignees: Some(vec!["dev1".into()]),
+        };
+        let body = build_create_issue_body(&input);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["title"], "Full");
+        assert_eq!(parsed["body"], "Description");
+        assert_eq!(parsed["labels"][0], "bug");
+        assert_eq!(parsed["assignees"][0], "dev1");
+    }
+
+    // ── Enhanced Error Response ─────────────────────────────────────────
+
+    #[test]
+    fn error_from_response_with_errors_array() {
+        let response = r#"{
+            "message": "Validation Failed",
+            "errors": [
+                {"field": "head", "code": "invalid"},
+                {"field": "base", "code": "missing_field"}
+            ]
+        }"#;
+        let result = error_from_response(response);
+        assert!(result.starts_with("Validation Failed: "));
+        assert!(result.contains("[field: 'head', code: 'invalid']"));
+        assert!(result.contains("[field: 'base', code: 'missing_field']"));
+    }
+
+    #[test]
+    fn error_from_response_with_error_message_detail() {
+        let response = r#"{
+            "message": "Validation Failed",
+            "errors": [
+                {"message": "No commits between main and feat/x"}
+            ]
+        }"#;
+        let result = error_from_response(response);
+        assert_eq!(
+            result,
+            "Validation Failed: No commits between main and feat/x"
+        );
+    }
+
+    #[test]
+    fn error_from_response_with_empty_errors_array() {
+        let response = r#"{"message": "Validation Failed", "errors": []}"#;
+        let result = error_from_response(response);
+        assert_eq!(result, "Validation Failed");
+    }
+
+    #[test]
+    fn error_from_response_without_errors_field() {
+        let response = r#"{"message": "Not Found"}"#;
+        let result = error_from_response(response);
+        assert_eq!(result, "Not Found");
     }
 }
