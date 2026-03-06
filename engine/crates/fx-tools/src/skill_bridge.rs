@@ -86,6 +86,7 @@ mod tests {
     use super::*;
     use crate::tools::ToolConfig;
     use fx_memory::JsonFileMemory;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     fn build_memory_executor(temp: &TempDir) -> FawxToolExecutor {
@@ -191,8 +192,8 @@ mod tests {
     #[tokio::test]
     async fn registry_dispatches_to_builtin_tools_skill() {
         let temp = TempDir::new().expect("tempdir");
-        let mut registry = SkillRegistry::new();
-        registry.register(Box::new(BuiltinToolsSkill::new(build_memory_executor(
+        let registry = SkillRegistry::new();
+        registry.register(Arc::new(BuiltinToolsSkill::new(build_memory_executor(
             &temp,
         ))));
 

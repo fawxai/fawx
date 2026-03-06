@@ -15,6 +15,8 @@ use fx_skills::live_host_api::CredentialProvider;
 use fx_skills::loader::LoadedSkill;
 use fx_skills::manifest::SkillManifest;
 use fx_skills::runtime::SkillRuntime;
+use sha2::{Digest, Sha256};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 /// A WASM skill adapted to the kernel's [`Skill`] trait.
@@ -64,6 +66,11 @@ impl WasmSkill {
             runtime: Arc::new(Mutex::new(runtime)),
             credential_provider,
         })
+    }
+
+    /// The skill version from the manifest.
+    pub fn version(&self) -> &str {
+        &self.manifest.version
     }
 
     /// Build a [`ToolDefinition`] from the skill manifest.
@@ -163,8 +170,62 @@ impl Skill for WasmSkill {
     }
 }
 
+/// Load a single WASM skill from a directory.
+///
+/// Reads `manifest.toml` and `{name}.wasm` from `skill_dir`, computes
+/// a SHA-256 hash of the WASM bytes, compiles and validates the module,
+/// and returns the constructed [`WasmSkill`] alongside the content hash.
+///
+/// Used by both startup loading ([`load_wasm_skills`]) and the hot-reload
+/// watcher to ensure a single validation path.
+pub fn load_wasm_skill_from_dir(
+    skill_dir: &Path,
+    credential_provider: Option<Arc<dyn CredentialProvider>>,
+) -> Result<(WasmSkill, [u8; 32]), SkillError> {
+    let manifest = read_manifest(skill_dir)?;
+    let wasm_bytes = read_wasm_bytes(skill_dir, &manifest.name)?;
+    let hash = compute_wasm_hash(&wasm_bytes);
+    let loaded = compile_skill(&wasm_bytes, &manifest)?;
+    let wasm_skill = WasmSkill::new(loaded, credential_provider)?;
+    Ok((wasm_skill, hash))
+}
+
+/// Read and parse `manifest.toml` from a skill directory.
+pub(crate) fn read_manifest(skill_dir: &Path) -> Result<SkillManifest, SkillError> {
+    let manifest_path = skill_dir.join("manifest.toml");
+    let content = std::fs::read_to_string(&manifest_path).map_err(|e| {
+        format!(
+            "failed to read manifest at {}: {e}",
+            manifest_path.display()
+        )
+    })?;
+    fx_skills::manifest::parse_manifest(&content)
+        .map_err(|e| format!("invalid manifest in {}: {e}", skill_dir.display()))
+}
+
+/// Read `{name}.wasm` from a skill directory.
+fn read_wasm_bytes(skill_dir: &Path, name: &str) -> Result<Vec<u8>, SkillError> {
+    let wasm_path = skill_dir.join(format!("{name}.wasm"));
+    std::fs::read(&wasm_path)
+        .map_err(|e| format!("failed to read WASM at {}: {e}", wasm_path.display()))
+}
+
+/// Compute SHA-256 hash of WASM bytes.
+pub fn compute_wasm_hash(wasm_bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(wasm_bytes);
+    hasher.finalize().into()
+}
+
+/// Compile a WASM skill from bytes and manifest.
+fn compile_skill(wasm_bytes: &[u8], manifest: &SkillManifest) -> Result<LoadedSkill, SkillError> {
+    fx_skills::loader::SkillLoader::new(vec![])
+        .load(wasm_bytes, manifest, None)
+        .map_err(|e| format!("failed to compile skill '{}': {e}", manifest.name))
+}
+
 /// Load all installed WASM skills from `~/.fawx/skills/` and return
-/// them as boxed [`Skill`] trait objects ready for registry insertion.
+/// them as [`Arc<dyn Skill>`] trait objects ready for registry insertion.
 ///
 /// The optional `credential_provider` bridges the encrypted credential
 /// store so skills can retrieve secrets (e.g., GitHub PAT) via `kv_get`.
@@ -173,29 +234,47 @@ impl Skill for WasmSkill {
 /// directory-level failure propagates as an error.
 pub fn load_wasm_skills(
     credential_provider: Option<Arc<dyn CredentialProvider>>,
-) -> Result<Vec<Box<dyn Skill>>, SkillError> {
-    let wasm_registry = fx_skills::registry::SkillRegistry::new()
-        .map_err(|e| format!("failed to create WASM skill registry: {e}"))?;
+) -> Result<Vec<Arc<dyn Skill>>, SkillError> {
+    let skills_dir = skills_directory()?;
+    let entries = read_skill_directories(&skills_dir)?;
 
-    let loaded = wasm_registry
-        .load_all()
-        .map_err(|e| format!("failed to load WASM skills: {e}"))?;
+    let mut skills: Vec<Arc<dyn Skill>> = Vec::new();
 
-    let mut skills: Vec<Box<dyn Skill>> = Vec::new();
-
-    for (name, loaded_skill) in loaded {
-        match WasmSkill::new(loaded_skill, credential_provider.clone()) {
-            Ok(wasm_skill) => {
-                tracing::info!(skill = %name, "loaded WASM skill");
-                skills.push(Box::new(wasm_skill));
+    for entry in entries {
+        let skill_dir = entry.path();
+        match load_wasm_skill_from_dir(&skill_dir, credential_provider.clone()) {
+            Ok((wasm_skill, _hash)) => {
+                tracing::info!(skill = %wasm_skill.name(), "loaded WASM skill");
+                skills.push(Arc::new(wasm_skill));
             }
             Err(e) => {
-                tracing::warn!(skill = %name, error = %e, "skipping WASM skill");
+                tracing::warn!(dir = %skill_dir.display(), error = %e, "skipping WASM skill");
             }
         }
     }
 
     Ok(skills)
+}
+
+/// Resolve the `~/.fawx/skills/` directory path.
+fn skills_directory() -> Result<std::path::PathBuf, SkillError> {
+    let home = dirs::home_dir().ok_or_else(|| "failed to determine home directory".to_string())?;
+    Ok(home.join(".fawx").join("skills"))
+}
+
+/// Read subdirectories from the skills directory.
+fn read_skill_directories(skills_dir: &Path) -> Result<Vec<std::fs::DirEntry>, SkillError> {
+    match std::fs::read_dir(skills_dir) {
+        Ok(entries) => Ok(entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_dir())
+            .collect()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(format!(
+            "failed to read skills directory {}: {e}",
+            skills_dir.display()
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -316,5 +395,127 @@ mod tests {
         // Default ~/.fawx/skills/ may be empty or have skills — just verify no panic
         let result = load_wasm_skills(None);
         assert!(result.is_ok());
+    }
+
+    fn setup_skill_dir(dir: &std::path::Path, name: &str) {
+        let skill_dir = dir.join(name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let manifest = test_manifest(name);
+        let toml_str = format!(
+            r#"name = "{}"
+version = "{}"
+description = "{}"
+author = "{}"
+api_version = "{}"
+entry_point = "{}"
+"#,
+            manifest.name,
+            manifest.version,
+            manifest.description,
+            manifest.author,
+            manifest.api_version,
+            manifest.entry_point,
+        );
+        std::fs::write(skill_dir.join("manifest.toml"), toml_str).unwrap();
+        std::fs::write(
+            skill_dir.join(format!("{name}.wasm")),
+            invocable_wasm_bytes(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn load_wasm_skill_from_dir_valid_directory() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        setup_skill_dir(tmp.path(), "testskill");
+        let result = load_wasm_skill_from_dir(&tmp.path().join("testskill"), None);
+        assert!(result.is_ok());
+        let (skill, hash) = result.unwrap();
+        assert_eq!(skill.name(), "testskill");
+        assert_eq!(hash, compute_wasm_hash(&invocable_wasm_bytes()));
+    }
+
+    #[test]
+    fn load_wasm_skill_from_dir_missing_manifest() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let skill_dir = tmp.path().join("nomanifest");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("nomanifest.wasm"), invocable_wasm_bytes()).unwrap();
+
+        let result = load_wasm_skill_from_dir(&skill_dir, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("manifest"));
+    }
+
+    #[test]
+    fn load_wasm_skill_from_dir_missing_wasm() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let skill_dir = tmp.path().join("nowasm");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let manifest = test_manifest("nowasm");
+        let toml_str = format!(
+            r#"name = "{}"
+version = "{}"
+description = "{}"
+author = "{}"
+api_version = "{}"
+entry_point = "{}"
+"#,
+            manifest.name,
+            manifest.version,
+            manifest.description,
+            manifest.author,
+            manifest.api_version,
+            manifest.entry_point,
+        );
+        std::fs::write(skill_dir.join("manifest.toml"), toml_str).unwrap();
+
+        let result = load_wasm_skill_from_dir(&skill_dir, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("WASM"));
+    }
+
+    #[test]
+    fn load_wasm_skill_from_dir_invalid_wasm() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let skill_dir = tmp.path().join("badwasm");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let manifest = test_manifest("badwasm");
+        let toml_str = format!(
+            r#"name = "{}"
+version = "{}"
+description = "{}"
+author = "{}"
+api_version = "{}"
+entry_point = "{}"
+"#,
+            manifest.name,
+            manifest.version,
+            manifest.description,
+            manifest.author,
+            manifest.api_version,
+            manifest.entry_point,
+        );
+        std::fs::write(skill_dir.join("manifest.toml"), toml_str).unwrap();
+        std::fs::write(skill_dir.join("badwasm.wasm"), b"not wasm").unwrap();
+
+        let result = load_wasm_skill_from_dir(&skill_dir, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("compile"));
+    }
+
+    #[test]
+    fn compute_wasm_hash_deterministic() {
+        let bytes = invocable_wasm_bytes();
+        let hash1 = compute_wasm_hash(&bytes);
+        let hash2 = compute_wasm_hash(&bytes);
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn compute_wasm_hash_different_for_different_bytes() {
+        let hash1 = compute_wasm_hash(b"hello");
+        let hash2 = compute_wasm_hash(b"world");
+        assert_ne!(hash1, hash2);
     }
 }

@@ -165,17 +165,8 @@ async fn run_tui() -> anyhow::Result<i32> {
     let router = tui::build_router(&auth_manager)?;
     let config = tui::load_config()?;
     let bundle = tui::build_loop_engine_from_config(&config)?;
-    let mut app = tui::TuiApp::new_with_deps(tui::TuiAppDeps {
-        auth_manager,
-        router,
-        loop_engine: bundle.engine,
-        runtime_info: bundle.runtime_info,
-        config,
-        memory: bundle.memory,
-        event_bus: bundle.event_bus,
-        scratchpad: bundle.scratchpad,
-        credential_store: bundle.credential_store,
-    })?;
+    let deps = bundle.into_tui_deps(auth_manager, router, config);
+    let mut app = tui::TuiApp::new_with_deps(deps)?;
     app.run().await?;
     Ok(0)
 }

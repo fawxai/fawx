@@ -2,7 +2,8 @@ use crate::auth_store::{migrate_if_needed, AuthStore};
 use crate::ui;
 use async_trait::async_trait;
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
+    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEvent,
+    KeyModifiers,
 };
 use crossterm::style::Stylize;
 use crossterm::{cursor, event, style, terminal, ExecutableCommand};
@@ -22,7 +23,7 @@ use fx_core::runtime_info::{ConfigSummary, RuntimeInfo, SkillInfo};
 use fx_core::types::{InputSource, ScreenState, UserInput};
 use fx_core::EventBus;
 use fx_improve::{CyclePaths, ImprovementConfig, OutputMode};
-use fx_kernel::act::TokenUsage;
+use fx_kernel::act::{TokenUsage, ToolExecutor};
 use fx_kernel::budget::{BudgetConfig, BudgetTracker};
 use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::context_manager::ContextCompactor;
@@ -37,7 +38,7 @@ use fx_llm::{
     AnthropicProvider, CompletionRequest, Message, ModelCatalog, ModelInfo, ModelRouter,
     OpenAiProvider, OpenAiResponsesProvider, ProviderError, RouterError, StreamChunk,
 };
-use fx_loadable::{SkillRegistry, TransactionSkill};
+use fx_loadable::{ReloadEvent, SkillRegistry, SkillWatcher, TransactionSkill};
 use fx_memory::{JsonFileMemory, JsonMemoryConfig, SignalStore};
 use fx_scratchpad::skill::ScratchpadSkill;
 use fx_scratchpad::Scratchpad;
@@ -46,6 +47,7 @@ use fx_tools::{BuiltinToolsSkill, FawxToolExecutor, GitSkill, ToolConfig};
 use ratatui::DefaultTerminal;
 use std::collections::hash_map::DefaultHasher;
 use std::fmt;
+use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -89,6 +91,11 @@ const USER_ECHO_PREFIX: &str = "you › ";
 const USER_CONTINUATION_PREFIX: &str = "      ";
 
 type SharedMemoryStore = Arc<Mutex<dyn MemoryStore>>;
+
+enum IdleLoopEvent {
+    Reload(ReloadEvent),
+    Terminal(Event),
+}
 
 const DEFAULT_ANTHROPIC_MODELS: &[&str] = &[
     "claude-opus-4-6",
@@ -563,6 +570,62 @@ fn handle_idle_event(event: Event, app: &mut ui::FawxApp) -> Option<String> {
     }
 }
 
+async fn next_idle_terminal_event(event_stream: &mut EventStream) -> io::Result<Event> {
+    match event_stream.next().await {
+        Some(result) => result,
+        None => Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "terminal event stream closed",
+        )),
+    }
+}
+
+async fn wait_for_idle_loop_event<TerminalEventFuture>(
+    terminal_event: TerminalEventFuture,
+    reload_rx: &mut tokio::sync::mpsc::Receiver<ReloadEvent>,
+) -> Result<IdleLoopEvent, TuiError>
+where
+    TerminalEventFuture: Future<Output = io::Result<Event>>,
+{
+    let reload_open = !reload_rx.is_closed();
+    tokio::select! {
+        event = terminal_event => event.map(IdleLoopEvent::Terminal).map_err(TuiError::Io),
+        Some(reload_event) = reload_rx.recv(), if reload_open => Ok(IdleLoopEvent::Reload(reload_event)),
+    }
+}
+
+fn process_reload_event(app: &mut ui::FawxApp, executor: &dyn ToolExecutor, event: ReloadEvent) {
+    app.add_output(reload_event_message(&event));
+    if reload_event_requires_cache_clear(&event) {
+        executor.clear_cache();
+    }
+}
+
+fn reload_event_message(event: &ReloadEvent) -> String {
+    match event {
+        ReloadEvent::Loaded {
+            skill_name,
+            version,
+        } => format!("🔌 Loaded skill: {skill_name} v{version}"),
+        ReloadEvent::Updated {
+            skill_name,
+            new_version,
+            ..
+        } => format!("🔄 Updated skill: {skill_name} v{new_version}"),
+        ReloadEvent::Removed { skill_name } => format!("🗑️ Removed skill: {skill_name}"),
+        ReloadEvent::Error { skill_name, error } => {
+            format!("⚠️ Skill error ({skill_name}): {error}")
+        }
+    }
+}
+
+fn reload_event_requires_cache_clear(event: &ReloadEvent) -> bool {
+    matches!(
+        event,
+        ReloadEvent::Loaded { .. } | ReloadEvent::Updated { .. } | ReloadEvent::Removed { .. }
+    )
+}
+
 /// Check if input is a control command that only makes sense during execution.
 ///
 /// During idle, only `/stop` (with slash) is recognized so that bare words
@@ -572,16 +635,14 @@ fn is_idle_control_command(input: &str) -> bool {
     trimmed.eq_ignore_ascii_case("/stop") || trimmed.eq_ignore_ascii_case("/abort")
 }
 
-/// Poll for input events during execution and route them.
 fn poll_execution_events(
     app: &mut ui::FawxApp,
     cancel_token: &CancellationToken,
     input_sender: &Option<LoopInputSender>,
 ) {
     while crossterm::event::poll(Duration::ZERO).unwrap_or(false) {
-        match crossterm::event::read() {
-            Ok(event) => handle_execution_event(event, app, cancel_token, input_sender),
-            Err(_) => break,
+        if let Ok(event) = crossterm::event::read() {
+            handle_execution_event(event, app, cancel_token, input_sender);
         }
     }
 }
@@ -953,6 +1014,9 @@ pub struct TuiApp {
     /// Event bus for streaming events from the kernel.
     event_bus: EventBus,
     scratchpad: Arc<Mutex<Scratchpad>>,
+    skill_registry: Arc<SkillRegistry>,
+    credential_provider: Option<Arc<dyn CredentialProvider>>,
+    tool_executor: Arc<dyn ToolExecutor>,
     /// Single encrypted credential store instance (opened once at startup, shared via Arc).
     credential_store: Option<Arc<fx_auth::credential_store::EncryptedFileCredentialStore>>,
     /// Buffer for command output that will be flushed to FawxApp.
@@ -969,6 +1033,9 @@ pub struct TuiAppDeps {
     pub memory: Option<SharedMemoryStore>,
     pub event_bus: EventBus,
     pub scratchpad: Arc<Mutex<Scratchpad>>,
+    pub skill_registry: Arc<SkillRegistry>,
+    pub credential_provider: Option<Arc<dyn CredentialProvider>>,
+    pub tool_executor: Arc<dyn ToolExecutor>,
     pub credential_store: Option<Arc<fx_auth::credential_store::EncryptedFileCredentialStore>>,
 }
 
@@ -980,6 +1047,7 @@ struct CycleRenderingContext<'a> {
     terminal: &'a mut DefaultTerminal,
     app: &'a mut ui::FawxApp,
     last_frame_rows: &'a mut Option<ui::FrameRenderRows>,
+    reload_rx: &'a mut tokio::sync::mpsc::Receiver<ReloadEvent>,
     bus_rx: &'a mut broadcast::Receiver<InternalMessage>,
     cancel_token: &'a CancellationToken,
     streamed: &'a mut bool,
@@ -998,6 +1066,9 @@ impl TuiApp {
     ) -> Result<Self, TuiError> {
         let event_bus = EventBus::new(EVENT_BUS_CAPACITY);
         let scratchpad = Arc::new(Mutex::new(Scratchpad::new()));
+        let skill_registry = Arc::new(SkillRegistry::new());
+        let tool_executor: Arc<dyn ToolExecutor> =
+            Arc::new(SharedSkillRegistry::new(Arc::clone(&skill_registry)));
         Self::new_with_deps(TuiAppDeps {
             auth_manager,
             router,
@@ -1007,6 +1078,9 @@ impl TuiApp {
             memory: None,
             event_bus,
             scratchpad,
+            skill_registry,
+            credential_provider: None,
+            tool_executor,
             credential_store: None,
         })
     }
@@ -1022,6 +1096,9 @@ impl TuiApp {
             memory,
             event_bus,
             scratchpad,
+            skill_registry,
+            credential_provider,
+            tool_executor,
             credential_store,
         } = deps;
         let base_data_dir = fawx_data_dir();
@@ -1060,6 +1137,9 @@ impl TuiApp {
             completer_model_ids: Arc::new(Mutex::new(Vec::new())),
             event_bus,
             scratchpad,
+            skill_registry,
+            credential_provider,
+            tool_executor,
             credential_store,
             output_buffer: Vec::new(),
         };
@@ -1096,6 +1176,90 @@ impl TuiApp {
         }
     }
 
+    fn spawn_skill_watcher(&self) -> tokio::sync::mpsc::Receiver<ReloadEvent> {
+        let (reload_tx, reload_rx) = tokio::sync::mpsc::channel(32);
+        let skills_dir = fawx_skills_dir();
+        if let Err(error) = std::fs::create_dir_all(&skills_dir) {
+            tracing::warn!(
+                error = %error,
+                path = %skills_dir.display(),
+                "failed to ensure skills dir exists before starting watcher"
+            );
+        }
+        let mut watcher = SkillWatcher::new(
+            skills_dir,
+            Arc::clone(&self.skill_registry),
+            reload_tx,
+            self.credential_provider.clone(),
+        );
+        watcher.initialize_hashes();
+        tokio::spawn(async move {
+            if let Err(error) = watcher.run().await {
+                tracing::error!(error = %error, "skill watcher exited");
+            }
+        });
+        reload_rx
+    }
+
+    fn install_force_quit_handler(&self) {
+        let cancel_for_signal = self.cancel_token.clone();
+        tokio::spawn(async move {
+            tokio::signal::ctrl_c().await.ok();
+            cancel_for_signal.cancel();
+            tokio::signal::ctrl_c().await.ok();
+            restore_ratatui_terminal();
+            eprintln!("\n\u{23f9} Force quit.");
+            std::process::exit(130);
+        });
+    }
+
+    async fn handle_idle_loop_event(
+        &mut self,
+        event: IdleLoopEvent,
+        terminal: &mut DefaultTerminal,
+        app: &mut ui::FawxApp,
+        last_frame_rows: &mut Option<ui::FrameRenderRows>,
+        reload_rx: &mut tokio::sync::mpsc::Receiver<ReloadEvent>,
+    ) -> Result<bool, TuiError> {
+        match event {
+            IdleLoopEvent::Reload(reload_event) => {
+                process_reload_event(app, self.tool_executor.as_ref(), reload_event);
+                Ok(false)
+            }
+            IdleLoopEvent::Terminal(event) => {
+                self.handle_idle_terminal_event(event, terminal, app, last_frame_rows, reload_rx)
+                    .await
+            }
+        }
+    }
+
+    async fn handle_idle_terminal_event(
+        &mut self,
+        event: Event,
+        terminal: &mut DefaultTerminal,
+        app: &mut ui::FawxApp,
+        last_frame_rows: &mut Option<ui::FrameRenderRows>,
+        reload_rx: &mut tokio::sync::mpsc::Receiver<ReloadEvent>,
+    ) -> Result<bool, TuiError> {
+        match event {
+            Event::Key(key) => {
+                let should_break =
+                    key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+                if let Some(input) = handle_idle_event(Event::Key(key), app) {
+                    self.process_input_line_tui(&input, terminal, app, last_frame_rows, reload_rx)
+                        .await?;
+                }
+                Ok(should_break)
+            }
+            Event::Paste(text) => {
+                handle_idle_event(Event::Paste(text), app);
+                Ok(false)
+            }
+            Event::Resize(_, _) => Ok(false),
+            _ => Ok(false),
+        }
+    }
+
     /// Run the TUI main loop using ratatui rendering.
     pub async fn run(&mut self) -> Result<(), TuiError> {
         self.select_first_available_model().await;
@@ -1111,22 +1275,15 @@ impl TuiApp {
         .map_err(TuiError::Io)?;
         let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
         let mut terminal = ratatui::Terminal::new(backend).map_err(TuiError::Io)?;
+        let mut terminal_events = EventStream::new();
         let mut app = ui::FawxApp::new();
 
         // Show welcome banner
         self.show_welcome();
         self.flush_output_to(&mut app);
+        let mut reload_rx = self.spawn_skill_watcher();
 
-        // Ctrl+C: first press = cancel, second = force exit.
-        let cancel_for_signal = self.cancel_token.clone();
-        tokio::spawn(async move {
-            tokio::signal::ctrl_c().await.ok();
-            cancel_for_signal.cancel();
-            tokio::signal::ctrl_c().await.ok();
-            restore_ratatui_terminal();
-            eprintln!("\n\u{23f9} Force quit.");
-            std::process::exit(130);
-        });
+        self.install_force_quit_handler();
 
         self.loop_engine.set_cancel_token(self.cancel_token.clone());
         self.sync_completer_model_ids();
@@ -1134,40 +1291,22 @@ impl TuiApp {
 
         while self.running {
             draw_ratatui_frame(&mut terminal, &app, &mut last_frame_rows)?;
-
-            let poll_duration = match app.state {
-                ui::AppState::Idle => Duration::from_secs(3600),
-                _ => Duration::from_millis(50),
-            };
-
-            if crossterm::event::poll(poll_duration).map_err(TuiError::Io)? {
-                let event = crossterm::event::read().map_err(TuiError::Io)?;
-                match event {
-                    Event::Key(key) => {
-                        let should_break = key.code == KeyCode::Char('c')
-                            && key.modifiers.contains(KeyModifiers::CONTROL);
-                        if let Some(input) = handle_idle_event(Event::Key(key), &mut app) {
-                            self.process_input_line_tui(
-                                &input,
-                                &mut terminal,
-                                &mut app,
-                                &mut last_frame_rows,
-                            )
-                            .await?;
-                        }
-                        if should_break {
-                            break;
-                        }
-                    }
-                    Event::Paste(text) => {
-                        handle_idle_event(Event::Paste(text), &mut app);
-                    }
-                    Event::Resize(_w, _h) => {
-                        // Terminal size changed — the next draw() call
-                        // queries the new dimensions automatically.
-                    }
-                    _ => {}
-                }
+            let event = wait_for_idle_loop_event(
+                next_idle_terminal_event(&mut terminal_events),
+                &mut reload_rx,
+            )
+            .await?;
+            if self
+                .handle_idle_loop_event(
+                    event,
+                    &mut terminal,
+                    &mut app,
+                    &mut last_frame_rows,
+                    &mut reload_rx,
+                )
+                .await?
+            {
+                break;
             }
         }
 
@@ -1182,6 +1321,7 @@ impl TuiApp {
         terminal: &mut DefaultTerminal,
         app: &mut ui::FawxApp,
         last_frame_rows: &mut Option<ui::FrameRenderRows>,
+        reload_rx: &mut tokio::sync::mpsc::Receiver<ReloadEvent>,
     ) -> Result<(), TuiError> {
         let trimmed = input.trim();
         if trimmed.is_empty() {
@@ -1211,13 +1351,13 @@ impl TuiApp {
         append_user_message_output(app, trimmed);
 
         // Run agent cycle with rendering
-        self.run_agent_cycle_tui(trimmed, terminal, app, last_frame_rows)
+        self.run_agent_cycle_tui(trimmed, terminal, app, last_frame_rows, reload_rx)
             .await?;
 
         // After cycle completes, drain queued inputs (one per cycle)
         while let Some(queued) = app.drain_next_input() {
             append_user_message_output(app, &queued);
-            self.run_agent_cycle_tui(&queued, terminal, app, last_frame_rows)
+            self.run_agent_cycle_tui(&queued, terminal, app, last_frame_rows, reload_rx)
                 .await?;
         }
 
@@ -1232,6 +1372,7 @@ impl TuiApp {
         terminal: &mut DefaultTerminal,
         app: &mut ui::FawxApp,
         last_frame_rows: &mut Option<ui::FrameRenderRows>,
+        reload_rx: &mut tokio::sync::mpsc::Receiver<ReloadEvent>,
     ) -> Result<(), TuiError> {
         app.set_state(ui::AppState::Executing { spinner_frame: 0 });
         app.reset_cycle_state();
@@ -1263,6 +1404,7 @@ impl TuiApp {
             terminal,
             app,
             last_frame_rows,
+            reload_rx,
             bus_rx: &mut bus_rx,
             cancel_token: &cancel_token,
             streamed: &mut streamed,
@@ -1293,23 +1435,22 @@ impl TuiApp {
 
         loop {
             draw_ratatui_frame(ctx.terminal, ctx.app, ctx.last_frame_rows)?;
+            let reload_open = !ctx.reload_rx.is_closed();
 
             tokio::select! {
                 biased;
                 result = &mut cycle_future => {
                     return result.map_err(|e| TuiError::Loop(e.reason));
                 }
+                Some(reload_event) = ctx.reload_rx.recv(), if reload_open => {
+                    process_reload_event(ctx.app, self.tool_executor.as_ref(), reload_event);
+                }
                 _ = sleep(Duration::from_millis(50)) => {
                     drain_bus_events(ctx.bus_rx, ctx.app, ctx.streamed);
                     if let ui::AppState::Executing { ref mut spinner_frame } = ctx.app.state {
                         *spinner_frame += 1;
                     }
-                    // Handle key events during execution (steer/abort/queue)
-                    poll_execution_events(
-                        ctx.app,
-                        ctx.cancel_token,
-                        &ctx.input_sender,
-                    );
+                    poll_execution_events(ctx.app, ctx.cancel_token, &ctx.input_sender);
                 }
             }
         }
@@ -2864,7 +3005,34 @@ pub struct LoopEngineBundle {
     pub runtime_info: Arc<RwLock<RuntimeInfo>>,
     pub event_bus: EventBus,
     pub scratchpad: Arc<Mutex<Scratchpad>>,
+    pub skill_registry: Arc<SkillRegistry>,
+    pub credential_provider: Option<Arc<dyn CredentialProvider>>,
+    pub tool_executor: Arc<dyn ToolExecutor>,
     pub credential_store: Option<Arc<fx_auth::credential_store::EncryptedFileCredentialStore>>,
+}
+
+impl LoopEngineBundle {
+    pub fn into_tui_deps(
+        self,
+        auth_manager: AuthManager,
+        router: ModelRouter,
+        config: FawxConfig,
+    ) -> TuiAppDeps {
+        TuiAppDeps {
+            auth_manager,
+            router,
+            loop_engine: self.engine,
+            runtime_info: self.runtime_info,
+            config,
+            memory: self.memory,
+            event_bus: self.event_bus,
+            scratchpad: self.scratchpad,
+            skill_registry: self.skill_registry,
+            credential_provider: self.credential_provider,
+            tool_executor: self.tool_executor,
+            credential_store: self.credential_store,
+        }
+    }
 }
 
 /// Build a loop engine from an already-loaded config.
@@ -2896,20 +3064,22 @@ fn build_loop_engine_with_config(
         scratchpad: Arc::clone(&skills.scratchpad),
     });
 
-    let caching_registry = CachingExecutor::new(skills.registry);
+    let caching_registry =
+        CachingExecutor::new(SharedSkillRegistry::new(Arc::clone(&skills.registry)));
 
     // Build ProposalGateExecutor to wrap the CachingExecutor.
     // Chain: kernel → ProposalGateExecutor → CachingExecutor → SkillRegistry
     let self_modify_config = crate::config_bridge::to_core_self_modify(&config.self_modify);
     let proposals_dir = data_dir.join("proposals");
     let gate_state = ProposalGateState::new(self_modify_config, working_dir.clone(), proposals_dir);
-    let gated_executor = ProposalGateExecutor::new(caching_registry, gate_state);
+    let tool_executor: Arc<dyn ToolExecutor> =
+        Arc::new(ProposalGateExecutor::new(caching_registry, gate_state));
 
     let mut builder = LoopEngine::builder()
         .budget(budget)
         .context(context)
         .max_iterations(config.general.max_iterations)
-        .tool_executor(std::sync::Arc::new(gated_executor))
+        .tool_executor(Arc::clone(&tool_executor))
         .synthesis_instruction(synthesis)
         .event_bus(event_bus.clone())
         .iteration_counter(Arc::clone(&skills.iteration_counter))
@@ -2925,6 +3095,9 @@ fn build_loop_engine_with_config(
         runtime_info: skills.runtime_info,
         event_bus,
         scratchpad: skills.scratchpad,
+        skill_registry: skills.registry,
+        credential_provider: skills.credential_provider,
+        tool_executor,
         credential_store: skills.credential_store,
     })
 }
@@ -2990,15 +3163,54 @@ impl CredentialProvider for CredentialStoreBridge {
     }
 }
 
+#[derive(Debug, Clone)]
+struct SharedSkillRegistry {
+    registry: Arc<SkillRegistry>,
+}
+
+impl SharedSkillRegistry {
+    fn new(registry: Arc<SkillRegistry>) -> Self {
+        Self { registry }
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for SharedSkillRegistry {
+    async fn execute_tools(
+        &self,
+        calls: &[fx_llm::ToolCall],
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Vec<fx_kernel::act::ToolResult>, fx_kernel::act::ToolExecutorError> {
+        self.registry.execute_tools(calls, cancel).await
+    }
+
+    fn concurrency_policy(&self) -> fx_kernel::act::ConcurrencyPolicy {
+        self.registry.concurrency_policy()
+    }
+
+    fn tool_definitions(&self) -> Vec<fx_llm::ToolDefinition> {
+        self.registry.tool_definitions()
+    }
+
+    fn cacheability(&self, tool_name: &str) -> fx_kernel::act::ToolCacheability {
+        self.registry.cacheability(tool_name)
+    }
+
+    fn cache_stats(&self) -> Option<fx_kernel::act::ToolCacheStats> {
+        self.registry.cache_stats()
+    }
+}
+
 /// Result of [`build_skill_registry`]: groups related outputs to avoid a
 /// large tuple return type.
 struct SkillRegistryBundle {
-    registry: SkillRegistry,
+    registry: Arc<SkillRegistry>,
     memory: Option<SharedMemoryStore>,
     memory_snapshot: Option<String>,
     runtime_info: Arc<RwLock<RuntimeInfo>>,
     scratchpad: Arc<Mutex<Scratchpad>>,
     iteration_counter: Arc<std::sync::atomic::AtomicU32>,
+    credential_provider: Option<Arc<dyn CredentialProvider>>,
     credential_store: Option<Arc<fx_auth::credential_store::EncryptedFileCredentialStore>>,
 }
 
@@ -3025,17 +3237,17 @@ fn build_skill_registry(
     let runtime_info = new_runtime_info(config, memory_enabled);
     executor = executor.with_runtime_info(Arc::clone(&runtime_info));
 
-    let mut registry = SkillRegistry::new();
-    registry.register(Box::new(BuiltinToolsSkill::new(executor)));
+    let registry = Arc::new(SkillRegistry::new());
+    registry.register(Arc::new(BuiltinToolsSkill::new(executor)));
     let git_skill = GitSkill::new(working_dir.clone(), sm.clone());
-    registry.register(Box::new(git_skill));
+    registry.register(Arc::new(git_skill));
     let tx_skill = TransactionSkill::new(working_dir.clone(), sm);
-    registry.register(Box::new(tx_skill));
+    registry.register(Arc::new(tx_skill));
     let scratchpad = Arc::new(Mutex::new(Scratchpad::new()));
     let iteration_counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let scratchpad_skill =
         ScratchpadSkill::new(Arc::clone(&scratchpad), Arc::clone(&iteration_counter));
-    registry.register(Box::new(scratchpad_skill));
+    registry.register(Arc::new(scratchpad_skill));
 
     // Open the credential store once and share via Arc between TuiApp and WASM bridge.
     let credential_store: Option<Arc<fx_auth::credential_store::EncryptedFileCredentialStore>> =
@@ -3055,7 +3267,7 @@ fn build_skill_registry(
         });
 
     // Load WASM skills from ~/.fawx/skills/
-    match fx_loadable::wasm_skill::load_wasm_skills(credential_provider) {
+    match fx_loadable::wasm_skill::load_wasm_skills(credential_provider.clone()) {
         Ok(wasm_skills) => {
             for skill in wasm_skills {
                 registry.register(skill);
@@ -3066,7 +3278,7 @@ fn build_skill_registry(
         }
     }
 
-    apply_skill_summaries(&runtime_info, &registry);
+    apply_skill_summaries(&runtime_info, registry.as_ref());
 
     SkillRegistryBundle {
         registry,
@@ -3075,6 +3287,7 @@ fn build_skill_registry(
         runtime_info,
         scratchpad,
         iteration_counter,
+        credential_provider,
         credential_store,
     }
 }
@@ -3430,6 +3643,10 @@ fn fawx_data_dir() -> PathBuf {
     dirs::home_dir()
         .map(|home| home.join(".fawx"))
         .unwrap_or_else(|| PathBuf::from(".fawx"))
+}
+
+fn fawx_skills_dir() -> PathBuf {
+    fawx_data_dir().join("skills")
 }
 
 fn configured_data_dir(base_data_dir: &Path, config: &FawxConfig) -> PathBuf {
@@ -5121,6 +5338,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use fx_core::memory::{MemoryProvider, MemoryTouchProvider};
+    use fx_kernel::act::ToolExecutorError;
     use fx_llm::ContentBlock;
     use std::collections::BTreeMap;
     use std::ffi::OsString;
@@ -6709,6 +6927,114 @@ mod tests {
 
         let picked = preferred_default_model(&models);
         assert_eq!(picked, Some("x-ai/grok-3"));
+    }
+
+    #[derive(Debug, Default)]
+    struct CacheCountingExecutor {
+        clear_count: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    fn sample_reload_events() -> Vec<fx_loadable::ReloadEvent> {
+        vec![
+            fx_loadable::ReloadEvent::Loaded {
+                skill_name: "alpha".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            fx_loadable::ReloadEvent::Updated {
+                skill_name: "alpha".to_string(),
+                old_version: "1.0.0".to_string(),
+                new_version: "1.1.0".to_string(),
+            },
+            fx_loadable::ReloadEvent::Removed {
+                skill_name: "alpha".to_string(),
+            },
+            fx_loadable::ReloadEvent::Error {
+                skill_name: "alpha".to_string(),
+                error: "bad wasm".to_string(),
+            },
+        ]
+    }
+
+    async fn queue_reload_events(reload_tx: &tokio::sync::mpsc::Sender<fx_loadable::ReloadEvent>) {
+        for event in sample_reload_events() {
+            reload_tx.send(event).await.expect("queue reload event");
+        }
+    }
+
+    fn assert_reload_outputs(app: &ui::FawxApp, executor: &CacheCountingExecutor) {
+        assert_eq!(
+            app.output_lines,
+            vec![
+                "🔌 Loaded skill: alpha v1.0.0".to_string(),
+                "🔄 Updated skill: alpha v1.1.0".to_string(),
+                "🗑️ Removed skill: alpha".to_string(),
+                "⚠️ Skill error (alpha): bad wasm".to_string(),
+            ]
+        );
+        assert_eq!(
+            executor
+                .clear_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            3
+        );
+    }
+
+    #[async_trait]
+    impl ToolExecutor for CacheCountingExecutor {
+        async fn execute_tools(
+            &self,
+            _calls: &[fx_llm::ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<fx_kernel::act::ToolResult>, ToolExecutorError> {
+            Ok(Vec::new())
+        }
+
+        fn clear_cache(&self) {
+            self.clear_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_for_idle_loop_event_reports_changes_and_clears_cache() {
+        let executor = CacheCountingExecutor::default();
+        let mut app = ui::FawxApp::new();
+        let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel(4);
+        queue_reload_events(&reload_tx).await;
+
+        for _ in 0..4 {
+            let event = wait_for_idle_loop_event(
+                std::future::pending::<io::Result<Event>>(),
+                &mut reload_rx,
+            )
+            .await
+            .expect("receive reload event");
+            let IdleLoopEvent::Reload(reload_event) = event else {
+                panic!("expected reload event");
+            };
+            process_reload_event(&mut app, &executor, reload_event);
+        }
+
+        assert_reload_outputs(&app, &executor);
+    }
+
+    #[tokio::test]
+    async fn wait_for_idle_loop_event_reads_terminal_events_without_reload_polling() {
+        let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel(1);
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        drop(reload_tx);
+
+        let event =
+            wait_for_idle_loop_event(std::future::ready(Ok(Event::Key(key))), &mut reload_rx)
+                .await
+                .expect("receive terminal event");
+
+        match event {
+            IdleLoopEvent::Terminal(Event::Key(received)) => {
+                assert_eq!(received.code, KeyCode::Enter);
+            }
+            _ => panic!("expected terminal key event"),
+        }
     }
 
     #[test]
