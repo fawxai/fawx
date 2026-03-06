@@ -633,7 +633,9 @@ If a tool call stores data (like memory_write), confirm the action in one short 
 const MEMORY_INSTRUCTION: &str = "\n\nYou have persistent memory across sessions. \
 Use memory_write to save important facts about the user, their preferences, \
 and project context. Use memory_read to recall specific details. \
-Memories survive restart \u{2014} write anything worth remembering.";
+Memories survive restart \u{2014} write anything worth remembering. \
+You lose all context between sessions. Your memory tools are how future-you \
+understands what present-you built. Write what you wish past-you had left behind.";
 
 const BUDGET_LOW_WRAP_UP_DIRECTIVE: &str = "You are running low on budget. \
 Do not call any tools. Do not decompose. \
