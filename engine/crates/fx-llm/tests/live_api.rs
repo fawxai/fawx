@@ -102,11 +102,15 @@ fn read_file_tool() -> ToolDefinition {
     }
 }
 
+/// Result of collecting a `CompletionStream` into its constituent parts.
+struct StreamResult {
+    chunks: Vec<StreamChunk>,
+    text: String,
+    stop_reason: Option<String>,
+}
+
 /// Collect a `CompletionStream` into text, tool deltas, and the final stop reason.
-async fn collect_stream(
-    provider: &AnthropicProvider,
-    request: CompletionRequest,
-) -> (Vec<StreamChunk>, String, Option<String>) {
+async fn collect_stream(provider: &AnthropicProvider, request: CompletionRequest) -> StreamResult {
     let mut stream = provider.complete_stream(request).await.unwrap();
     let mut chunks = Vec::new();
     let mut text = String::new();
@@ -123,7 +127,11 @@ async fn collect_stream(
         chunks.push(chunk);
     }
 
-    (chunks, text, stop_reason)
+    StreamResult {
+        chunks,
+        text,
+        stop_reason,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -131,7 +139,7 @@ async fn collect_stream(
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore]
+#[ignore = "live API test — see #1229"]
 async fn live_text_response() {
     skip_without_api_key!();
 
@@ -164,7 +172,7 @@ async fn live_text_response() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "live API test — see #1229"]
 async fn live_tool_call() {
     skip_without_api_key!();
 
@@ -195,38 +203,39 @@ async fn live_tool_call() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "live API test — see #1229"]
 async fn live_streaming_text() {
     skip_without_api_key!();
 
     let provider = make_provider();
     let request = text_request(HAIKU_MODEL, "Reply with exactly: hello world");
-    let (chunks, text, stop_reason) = collect_stream(&provider, request).await;
+    let result = collect_stream(&provider, request).await;
 
-    assert!(!text.is_empty(), "assembled text must be non-empty");
+    assert!(!result.text.is_empty(), "assembled text must be non-empty");
     assert!(
-        chunks.len() >= 2,
+        result.chunks.len() >= 2,
         "must receive at least 2 chunks to prove streaming, got {}",
-        chunks.len()
+        result.chunks.len()
     );
     assert_eq!(
-        stop_reason.as_deref(),
+        result.stop_reason.as_deref(),
         Some("end_turn"),
         "final stop_reason must be end_turn"
     );
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "live API test — see #1229"]
 async fn live_streaming_tool_call() {
     skip_without_api_key!();
 
     let provider = make_provider();
     let request = tool_request(HAIKU_MODEL, "Read the file at path src/main.rs");
-    let (chunks, _text, stop_reason) = collect_stream(&provider, request).await;
+    let result = collect_stream(&provider, request).await;
 
     // Find tool-use deltas
-    let tool_start = chunks
+    let tool_start = result
+        .chunks
         .iter()
         .flat_map(|c| &c.tool_use_deltas)
         .find(|d| d.name.is_some());
@@ -241,7 +250,8 @@ async fn live_streaming_tool_call() {
     );
 
     // Assemble arguments from deltas
-    let args_json: String = chunks
+    let args_json: String = result
+        .chunks
         .iter()
         .flat_map(|c| &c.tool_use_deltas)
         .filter_map(|d| d.arguments_delta.as_deref())
@@ -255,7 +265,7 @@ async fn live_streaming_tool_call() {
     );
 
     assert_eq!(
-        stop_reason.as_deref(),
+        result.stop_reason.as_deref(),
         Some("tool_use"),
         "stop_reason must be tool_use"
     );
@@ -266,12 +276,12 @@ async fn live_streaming_tool_call() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore]
+#[ignore = "live API test — see #1229"]
 async fn live_thinking_text() {
     skip_without_api_key!();
 
     let provider = make_provider();
-    let request = thinking_text_request("What is 7 * 8? Reply with just the number.");
+    let request = thinking_text_request("What is 7 * 8? Think step by step.");
     let response = provider.complete(request).await.unwrap();
 
     let text: String = response
@@ -302,7 +312,7 @@ async fn live_thinking_text() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "live API test — see #1229"]
 async fn live_thinking_tool_call() {
     skip_without_api_key!();
 
@@ -326,44 +336,52 @@ async fn live_thinking_tool_call() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "live API test — see #1229"]
 async fn live_streaming_thinking_text() {
     skip_without_api_key!();
 
     let provider = make_provider();
-    let request = thinking_text_request("What is 7 * 8? Reply with just the number.");
-    let (chunks, text, stop_reason) = collect_stream(&provider, request).await;
+    let request = thinking_text_request("What is 7 * 8? Think step by step.");
+    let result = collect_stream(&provider, request).await;
 
-    assert!(!text.is_empty(), "assembled text must be non-empty");
+    assert!(!result.text.is_empty(), "assembled text must be non-empty");
+    assert!(result.text.contains("56"), "response must contain '56'");
 
-    // Thinking chunks are NOT included in delta_content by the provider,
-    // so the assembled text should not contain thinking artifacts.
-    // The text should contain the answer.
-    assert!(text.contains("56"), "response must contain '56'");
+    // Verify thinking blocks don't leak into assembled text output
+    let text_lower = result.text.to_lowercase();
+    assert!(
+        !text_lower.contains("<thinking>"),
+        "thinking tags should not appear in text"
+    );
+    assert!(
+        !text_lower.contains("</thinking>"),
+        "thinking tags should not appear in text"
+    );
 
     assert!(
-        chunks.len() >= 2,
+        result.chunks.len() >= 2,
         "must receive multiple chunks, got {}",
-        chunks.len()
+        result.chunks.len()
     );
     assert_eq!(
-        stop_reason.as_deref(),
+        result.stop_reason.as_deref(),
         Some("end_turn"),
         "final stop_reason must be end_turn"
     );
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "live API test — see #1229"]
 async fn live_streaming_thinking_tool_call() {
     skip_without_api_key!();
 
     let provider = make_provider();
     let request = thinking_tool_request("Think about what file to read, then read src/main.rs");
-    let (chunks, _text, stop_reason) = collect_stream(&provider, request).await;
+    let result = collect_stream(&provider, request).await;
 
     // Tool call assembled from deltas
-    let tool_start = chunks
+    let tool_start = result
+        .chunks
         .iter()
         .flat_map(|c| &c.tool_use_deltas)
         .find(|d| d.name.is_some());
@@ -377,10 +395,23 @@ async fn live_streaming_thinking_tool_call() {
         "tool name must be read_file"
     );
 
-    // Thinking chunks excluded from text (delta_content only has real text)
-    // Just verify stop reason is correct
+    // Assemble and validate tool arguments from deltas
+    let args_json: String = result
+        .chunks
+        .iter()
+        .flat_map(|c| &c.tool_use_deltas)
+        .filter_map(|d| d.arguments_delta.as_deref())
+        .collect();
+    assert!(!args_json.is_empty(), "tool arguments must be non-empty");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&args_json).expect("assembled arguments must be valid JSON");
+    assert!(
+        parsed.get("path").is_some(),
+        "arguments must contain 'path' key"
+    );
+
     assert_eq!(
-        stop_reason.as_deref(),
+        result.stop_reason.as_deref(),
         Some("tool_use"),
         "stop_reason must be tool_use"
     );
