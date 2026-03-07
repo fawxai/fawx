@@ -6,9 +6,12 @@ authors.workspace = true
 license.workspace = true
 
 [features]
+# Enable the HTTP API server for headless mode (`fawx serve --http`).
+# Tailscale-only binding. Pulls in axum.
+http = ["dep:axum"]
 # Enable the OAuth bridge HTTP server subcommand (`fawx oauth-bridge`).
 # Pulls in axum and crypto dependencies. Disabled by default to reduce build times.
-oauth-bridge = ["dep:axum", "dep:sha2", "dep:base64", "dep:rand", "dep:subtle"]
+oauth-bridge = ["dep:axum", "dep:base64", "dep:rand", "dep:subtle"]
 
 [[bin]]
 name = "fawx"
@@ -16,7 +19,7 @@ path = "src/main.rs"
 
 [dependencies]
 fx-config.workspace = true
-fx-tools.workspace = true
+fx-tools = { workspace = true, features = ["improvement"] }
 fx-core.workspace = true
 fx-kernel.workspace = true
 fx-auth.workspace = true
@@ -37,7 +40,7 @@ async-trait.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
-crossterm.workspace = true
+crossterm = { workspace = true, features = ["event-stream"] }
 ratatui.workspace = true
 tui-textarea.workspace = true
 libc = "0.2"
@@ -49,7 +52,7 @@ reqwest.workspace = true
 axum = { version = "0.8", optional = true }
 uuid = { version = "1.13", features = ["v4"] }
 rand = { version = "0.8", optional = true }
-sha2 = { version = "0.10", optional = true }
+sha2 = "0.10"
 base64 = { version = "0.22", optional = true }
 dirs = "6.0"
 chrono = "0.4"
@@ -57,6 +60,8 @@ unicode-width = "0.2"
 unicode-segmentation = "1.12"
 zeroize.workspace = true
 
+# subtle: used by oauth-bridge for constant-time comparison. The http feature
+# now uses ring::hmac instead (no length-leak timing side-channel).
 subtle = { version = "2.6", optional = true }
 urlencoding = "2.1"
 # termimad: markdown rendering for terminal output.

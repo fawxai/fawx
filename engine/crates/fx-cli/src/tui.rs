@@ -2,7 +2,8 @@ use crate::auth_store::{migrate_if_needed, AuthStore};
 use crate::ui;
 use async_trait::async_trait;
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
+    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEvent,
+    KeyModifiers,
 };
 use crossterm::style::Stylize;
 use crossterm::{cursor, event, style, terminal, ExecutableCommand};
@@ -11,7 +12,7 @@ use fx_analysis::{AnalysisEngine, AnalysisError, AnalysisFinding, Confidence};
 use fx_auth::auth::{AuthManager, AuthMethod};
 use fx_auth::credential_store::CredentialStore as CredentialStoreTrait;
 use fx_auth::oauth::{PkceFlow, TokenExchangeRequest, TokenResponse};
-use fx_config::FawxConfig;
+use fx_config::{save_default_model, FawxConfig, ImprovementToolsConfig};
 use fx_conversation::{
     ConversationMessage, ConversationStore, TokenUsage as ConversationTokenUsage,
 };
@@ -22,7 +23,7 @@ use fx_core::runtime_info::{ConfigSummary, RuntimeInfo, SkillInfo};
 use fx_core::types::{InputSource, ScreenState, UserInput};
 use fx_core::EventBus;
 use fx_improve::{CyclePaths, ImprovementConfig, OutputMode};
-use fx_kernel::act::TokenUsage;
+use fx_kernel::act::{TokenUsage, ToolExecutor};
 use fx_kernel::budget::{BudgetConfig, BudgetTracker};
 use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::context_manager::ContextCompactor;
@@ -37,17 +38,21 @@ use fx_llm::{
     AnthropicProvider, CompletionRequest, Message, ModelCatalog, ModelInfo, ModelRouter,
     OpenAiProvider, OpenAiResponsesProvider, ProviderError, RouterError, StreamChunk,
 };
-use fx_loadable::{SkillRegistry, TransactionSkill};
+use fx_loadable::{ReloadEvent, SignaturePolicy, SkillRegistry, SkillWatcher, TransactionSkill};
 use fx_memory::{JsonFileMemory, JsonMemoryConfig, SignalStore};
 use fx_scratchpad::skill::ScratchpadSkill;
 use fx_scratchpad::Scratchpad;
 use fx_skills::live_host_api::CredentialProvider;
-use fx_tools::{BuiltinToolsSkill, FawxToolExecutor, GitSkill, ToolConfig};
+use fx_tools::{BuiltinToolsSkill, FawxToolExecutor, GitSkill, ImprovementToolsState, ToolConfig};
 use ratatui::DefaultTerminal;
+use sha2::{Digest, Sha256};
 use std::collections::hash_map::DefaultHasher;
 use std::fmt;
+use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -88,17 +93,23 @@ const CANCELLED_INPUT_MESSAGE: &str = "input cancelled";
 const USER_ECHO_PREFIX: &str = "you › ";
 const USER_CONTINUATION_PREFIX: &str = "      ";
 
-type SharedMemoryStore = Arc<Mutex<dyn MemoryStore>>;
+pub(crate) type SharedMemoryStore = Arc<Mutex<dyn MemoryStore>>;
+
+enum IdleLoopEvent {
+    Reload(ReloadEvent),
+    Terminal(Event),
+}
 
 const DEFAULT_ANTHROPIC_MODELS: &[&str] = &[
+    "claude-opus-4-6-20250929",
     "claude-opus-4-6",
+    "claude-sonnet-4-6-20250929",
     "claude-sonnet-4-6",
     "claude-opus-4-5-20251101",
     "claude-sonnet-4-5-20250929",
     "claude-haiku-4-5-20251001",
     "claude-opus-4-20250514",
     "claude-sonnet-4-20250514",
-    "claude-3-7-sonnet-latest",
 ];
 const DEFAULT_OPENAI_MODELS: &[&str] = &["gpt-4.1", "gpt-4o", "gpt-4o-mini"];
 const DEFAULT_OPENAI_SUBSCRIPTION_MODELS: &[&str] =
@@ -357,26 +368,116 @@ fn install_ratatui_panic_hook() {
     }));
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RowScrub {
+    row: u16,
+    start_col: u16,
+}
+
+fn collect_row_scrubs(
+    previous: Option<&ui::FrameRenderRows>,
+    current: &ui::FrameRenderRows,
+) -> Vec<RowScrub> {
+    let current_width = current.width as usize;
+    if current_width == 0 {
+        return Vec::new();
+    }
+
+    current
+        .rows
+        .iter()
+        .enumerate()
+        .filter_map(|(row_index, _)| {
+            let start = match previous.filter(|rows| rows.rows.get(row_index).is_some()) {
+                None => Some(0),
+                Some(previous_rows) => {
+                    scrub_start_for_existing_row(previous_rows, current, row_index, current_width)
+                }
+            }?;
+
+            (start < current_width).then_some(RowScrub {
+                row: row_index as u16,
+                start_col: start as u16,
+            })
+        })
+        .collect()
+}
+
+fn scrub_start_for_existing_row(
+    previous_rows: &ui::FrameRenderRows,
+    current: &ui::FrameRenderRows,
+    row_index: usize,
+    current_width: usize,
+) -> Option<usize> {
+    let previous_width = previous_rows.width as usize;
+    let previous_content_width = previous_rows
+        .content_columns
+        .get(row_index)
+        .copied()
+        .unwrap_or(0) as usize;
+    let current_content_width =
+        current.content_columns.get(row_index).copied().unwrap_or(0) as usize;
+    let mut scrub_start = None;
+
+    if current_content_width < previous_content_width {
+        scrub_start = Some(current_content_width);
+    }
+    if current_width > previous_width {
+        scrub_start = Some(scrub_start.map_or(previous_width, |start| start.min(previous_width)));
+    }
+
+    scrub_start
+}
+
+fn scrub_disappeared_cells(
+    terminal: &mut DefaultTerminal,
+    frame_rows: &ui::FrameRenderRows,
+    scrubs: &[RowScrub],
+) -> io::Result<()> {
+    // These writes intentionally bypass ratatui's front-buffer bookkeeping.
+    // The scrubbed cells are either overwritten by the next draw() diff or
+    // left blank because that content truly disappeared from the frame.
+    for scrub in scrubs {
+        if scrub.start_col >= frame_rows.width {
+            continue;
+        }
+
+        let background = match frame_rows
+            .fills
+            .get(scrub.row as usize)
+            .copied()
+            .unwrap_or(ui::FrameRowFill::Default)
+        {
+            ui::FrameRowFill::Default => style::Color::Reset,
+            ui::FrameRowFill::InputBackground => style::Color::AnsiValue(ui::INPUT_BG_INDEX),
+        };
+
+        crossterm::queue!(
+            terminal.backend_mut(),
+            cursor::MoveTo(scrub.start_col, scrub.row),
+            style::SetBackgroundColor(background),
+            style::Print(" ".repeat((frame_rows.width - scrub.start_col) as usize)),
+            style::ResetColor
+        )?;
+    }
+
+    Ok(())
+}
+
 fn draw_ratatui_frame(
     terminal: &mut DefaultTerminal,
     app: &ui::FawxApp,
-    last_metrics: &mut Option<ui::FrameRedrawMetrics>,
+    last_rows: &mut Option<ui::FrameRenderRows>,
 ) -> Result<(), TuiError> {
     let size = terminal.size().map_err(TuiError::Io)?;
-    let metrics = ui::frame_redraw_metrics(size.width, size.height, app);
-
-    // Ratatui's Clear widget only resets cells in the back buffer. When the
-    // rendered layout changes, force a full terminal clear so reflow frames
-    // don't depend on the diff engine to scrub stale cells from the real
-    // terminal.
-    if last_metrics.as_ref() != Some(&metrics) {
-        terminal.clear().map_err(TuiError::Io)?;
-    }
+    let frame_rows = ui::frame_render_rows(size.width, size.height, app);
+    let scrubs = collect_row_scrubs(last_rows.as_ref(), &frame_rows);
+    scrub_disappeared_cells(terminal, &frame_rows, &scrubs).map_err(TuiError::Io)?;
 
     terminal
         .draw(|frame| ui::draw(frame, app))
         .map_err(TuiError::Io)?;
-    *last_metrics = Some(metrics);
+    *last_rows = Some(frame_rows);
     Ok(())
 }
 
@@ -473,6 +574,61 @@ fn handle_idle_event(event: Event, app: &mut ui::FawxApp) -> Option<String> {
     }
 }
 
+async fn next_idle_terminal_event(event_stream: &mut EventStream) -> io::Result<Event> {
+    match event_stream.next().await {
+        Some(result) => result,
+        None => Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "terminal event stream closed",
+        )),
+    }
+}
+
+async fn wait_for_idle_loop_event<TerminalEventFuture>(
+    terminal_event: TerminalEventFuture,
+    reload_rx: &mut tokio::sync::mpsc::Receiver<ReloadEvent>,
+) -> Result<IdleLoopEvent, TuiError>
+where
+    TerminalEventFuture: Future<Output = io::Result<Event>>,
+{
+    let reload_open = !reload_rx.is_closed();
+    tokio::select! {
+        event = terminal_event => event.map(IdleLoopEvent::Terminal).map_err(TuiError::Io),
+        Some(reload_event) = reload_rx.recv(), if reload_open => Ok(IdleLoopEvent::Reload(reload_event)),
+    }
+}
+
+fn process_reload_event(app: &mut ui::FawxApp, executor: &dyn ToolExecutor, event: ReloadEvent) {
+    app.add_output(reload_event_message(&event));
+    if reload_event_requires_cache_clear(&event) {
+        executor.clear_cache();
+    }
+}
+
+fn reload_event_message(event: &ReloadEvent) -> String {
+    match event {
+        ReloadEvent::Loaded {
+            skill_name,
+            version,
+        } => format!("🔌 Loaded skill: {skill_name} v{version}"),
+        ReloadEvent::Updated {
+            skill_name,
+            new_version,
+            ..
+        } => format!("🔄 Updated skill: {skill_name} v{new_version}"),
+        ReloadEvent::Removed { skill_name } => format!("🗑️ Removed skill: {skill_name}"),
+        ReloadEvent::Error { skill_name, error } => {
+            format!("⚠️ Skill error ({skill_name}): {error}")
+        }
+    }
+}
+
+fn reload_event_requires_cache_clear(event: &ReloadEvent) -> bool {
+    matches!(
+        event,
+        ReloadEvent::Loaded { .. } | ReloadEvent::Updated { .. } | ReloadEvent::Removed { .. }
+    )
+}
 /// Check if input is a control command that only makes sense during execution.
 ///
 /// During idle, only `/stop` (with slash) is recognized so that bare words
@@ -735,6 +891,8 @@ const TUI_COMMANDS: &[&str] = &[
     "/status",
     "/model",
     "/auth",
+    "/keys",
+    "/sign",
     "/loop",
     "/budget",
     "/signals",
@@ -863,10 +1021,16 @@ pub struct TuiApp {
     /// Event bus for streaming events from the kernel.
     event_bus: EventBus,
     scratchpad: Arc<Mutex<Scratchpad>>,
+    skill_registry: Arc<SkillRegistry>,
+    credential_provider: Option<Arc<dyn CredentialProvider>>,
+    tool_executor: Arc<dyn ToolExecutor>,
     /// Single encrypted credential store instance (opened once at startup, shared via Arc).
     credential_store: Option<Arc<fx_auth::credential_store::EncryptedFileCredentialStore>>,
     /// Buffer for command output that will be flushed to FawxApp.
     output_buffer: Vec<String>,
+    /// Signature verification policy, loaded once at startup and shared with the
+    /// hot-reload watcher to avoid redundant `load_trusted_keys()` calls.
+    signature_policy: SignaturePolicy,
 }
 
 /// Dependencies for constructing a [`TuiApp`]. Avoids > 5 bare parameters.
@@ -879,7 +1043,11 @@ pub struct TuiAppDeps {
     pub memory: Option<SharedMemoryStore>,
     pub event_bus: EventBus,
     pub scratchpad: Arc<Mutex<Scratchpad>>,
+    pub skill_registry: Arc<SkillRegistry>,
+    pub credential_provider: Option<Arc<dyn CredentialProvider>>,
+    pub tool_executor: Arc<dyn ToolExecutor>,
     pub credential_store: Option<Arc<fx_auth::credential_store::EncryptedFileCredentialStore>>,
+    pub signature_policy: SignaturePolicy,
 }
 
 /// Bundles mutable references needed by [`TuiApp::run_cycle_rendering`],
@@ -889,7 +1057,8 @@ struct CycleRenderingContext<'a> {
     active_model: String,
     terminal: &'a mut DefaultTerminal,
     app: &'a mut ui::FawxApp,
-    last_draw_metrics: &'a mut Option<ui::FrameRedrawMetrics>,
+    last_frame_rows: &'a mut Option<ui::FrameRenderRows>,
+    reload_rx: &'a mut tokio::sync::mpsc::Receiver<ReloadEvent>,
     bus_rx: &'a mut broadcast::Receiver<InternalMessage>,
     cancel_token: &'a CancellationToken,
     streamed: &'a mut bool,
@@ -908,6 +1077,9 @@ impl TuiApp {
     ) -> Result<Self, TuiError> {
         let event_bus = EventBus::new(EVENT_BUS_CAPACITY);
         let scratchpad = Arc::new(Mutex::new(Scratchpad::new()));
+        let skill_registry = Arc::new(SkillRegistry::new());
+        let tool_executor: Arc<dyn ToolExecutor> =
+            Arc::new(SharedSkillRegistry::new(Arc::clone(&skill_registry)));
         Self::new_with_deps(TuiAppDeps {
             auth_manager,
             router,
@@ -917,7 +1089,11 @@ impl TuiApp {
             memory: None,
             event_bus,
             scratchpad,
+            skill_registry,
+            credential_provider: None,
+            tool_executor,
             credential_store: None,
+            signature_policy: SignaturePolicy::default(),
         })
     }
 
@@ -932,7 +1108,11 @@ impl TuiApp {
             memory,
             event_bus,
             scratchpad,
+            skill_registry,
+            credential_provider,
+            tool_executor,
             credential_store,
+            signature_policy,
         } = deps;
         let base_data_dir = fawx_data_dir();
         let data_dir = configured_data_dir(&base_data_dir, &config);
@@ -970,8 +1150,12 @@ impl TuiApp {
             completer_model_ids: Arc::new(Mutex::new(Vec::new())),
             event_bus,
             scratchpad,
+            skill_registry,
+            credential_provider,
+            tool_executor,
             credential_store,
             output_buffer: Vec::new(),
+            signature_policy,
         };
         app.select_first_available_model_without_refresh();
         Ok(app)
@@ -1006,6 +1190,91 @@ impl TuiApp {
         }
     }
 
+    fn spawn_skill_watcher(&self) -> tokio::sync::mpsc::Receiver<ReloadEvent> {
+        let (reload_tx, reload_rx) = tokio::sync::mpsc::channel(32);
+        let skills_dir = fawx_skills_dir();
+        if let Err(error) = std::fs::create_dir_all(&skills_dir) {
+            tracing::warn!(
+                error = %error,
+                path = %skills_dir.display(),
+                "failed to ensure skills dir exists before starting watcher"
+            );
+        }
+        let mut watcher = SkillWatcher::new(
+            skills_dir,
+            Arc::clone(&self.skill_registry),
+            reload_tx,
+            self.credential_provider.clone(),
+            self.signature_policy.clone(),
+        );
+        watcher.initialize_hashes();
+        tokio::spawn(async move {
+            if let Err(error) = watcher.run().await {
+                tracing::error!(error = %error, "skill watcher exited");
+            }
+        });
+        reload_rx
+    }
+
+    fn install_force_quit_handler(&self) {
+        let cancel_for_signal = self.cancel_token.clone();
+        tokio::spawn(async move {
+            tokio::signal::ctrl_c().await.ok();
+            cancel_for_signal.cancel();
+            tokio::signal::ctrl_c().await.ok();
+            restore_ratatui_terminal();
+            eprintln!("\n\u{23f9} Force quit.");
+            std::process::exit(130);
+        });
+    }
+
+    async fn handle_idle_loop_event(
+        &mut self,
+        event: IdleLoopEvent,
+        terminal: &mut DefaultTerminal,
+        app: &mut ui::FawxApp,
+        last_frame_rows: &mut Option<ui::FrameRenderRows>,
+        reload_rx: &mut tokio::sync::mpsc::Receiver<ReloadEvent>,
+    ) -> Result<bool, TuiError> {
+        match event {
+            IdleLoopEvent::Reload(reload_event) => {
+                process_reload_event(app, self.tool_executor.as_ref(), reload_event);
+                Ok(false)
+            }
+            IdleLoopEvent::Terminal(event) => {
+                self.handle_idle_terminal_event(event, terminal, app, last_frame_rows, reload_rx)
+                    .await
+            }
+        }
+    }
+
+    async fn handle_idle_terminal_event(
+        &mut self,
+        event: Event,
+        terminal: &mut DefaultTerminal,
+        app: &mut ui::FawxApp,
+        last_frame_rows: &mut Option<ui::FrameRenderRows>,
+        reload_rx: &mut tokio::sync::mpsc::Receiver<ReloadEvent>,
+    ) -> Result<bool, TuiError> {
+        match event {
+            Event::Key(key) => {
+                let should_break =
+                    key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+                if let Some(input) = handle_idle_event(Event::Key(key), app) {
+                    self.process_input_line_tui(&input, terminal, app, last_frame_rows, reload_rx)
+                        .await?;
+                }
+                Ok(should_break)
+            }
+            Event::Paste(text) => {
+                handle_idle_event(Event::Paste(text), app);
+                Ok(false)
+            }
+            Event::Resize(_, _) => Ok(false),
+            _ => Ok(false),
+        }
+    }
+
     /// Run the TUI main loop using ratatui rendering.
     pub async fn run(&mut self) -> Result<(), TuiError> {
         self.select_first_available_model().await;
@@ -1021,63 +1290,38 @@ impl TuiApp {
         .map_err(TuiError::Io)?;
         let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
         let mut terminal = ratatui::Terminal::new(backend).map_err(TuiError::Io)?;
+        let mut terminal_events = EventStream::new();
         let mut app = ui::FawxApp::new();
 
         // Show welcome banner
         self.show_welcome();
         self.flush_output_to(&mut app);
+        let mut reload_rx = self.spawn_skill_watcher();
 
-        // Ctrl+C: first press = cancel, second = force exit.
-        let cancel_for_signal = self.cancel_token.clone();
-        tokio::spawn(async move {
-            tokio::signal::ctrl_c().await.ok();
-            cancel_for_signal.cancel();
-            tokio::signal::ctrl_c().await.ok();
-            restore_ratatui_terminal();
-            eprintln!("\n\u{23f9} Force quit.");
-            std::process::exit(130);
-        });
+        self.install_force_quit_handler();
 
         self.loop_engine.set_cancel_token(self.cancel_token.clone());
         self.sync_completer_model_ids();
-        let mut last_draw_metrics = None;
+        let mut last_frame_rows = None;
 
         while self.running {
-            draw_ratatui_frame(&mut terminal, &app, &mut last_draw_metrics)?;
-
-            let poll_duration = match app.state {
-                ui::AppState::Idle => Duration::from_secs(3600),
-                _ => Duration::from_millis(50),
-            };
-
-            if crossterm::event::poll(poll_duration).map_err(TuiError::Io)? {
-                let event = crossterm::event::read().map_err(TuiError::Io)?;
-                match event {
-                    Event::Key(key) => {
-                        let should_break = key.code == KeyCode::Char('c')
-                            && key.modifiers.contains(KeyModifiers::CONTROL);
-                        if let Some(input) = handle_idle_event(Event::Key(key), &mut app) {
-                            self.process_input_line_tui(
-                                &input,
-                                &mut terminal,
-                                &mut app,
-                                &mut last_draw_metrics,
-                            )
-                            .await?;
-                        }
-                        if should_break {
-                            break;
-                        }
-                    }
-                    Event::Paste(text) => {
-                        handle_idle_event(Event::Paste(text), &mut app);
-                    }
-                    Event::Resize(_w, _h) => {
-                        // Terminal size changed — the next draw() call
-                        // queries the new dimensions automatically.
-                    }
-                    _ => {}
-                }
+            draw_ratatui_frame(&mut terminal, &app, &mut last_frame_rows)?;
+            let event = wait_for_idle_loop_event(
+                next_idle_terminal_event(&mut terminal_events),
+                &mut reload_rx,
+            )
+            .await?;
+            if self
+                .handle_idle_loop_event(
+                    event,
+                    &mut terminal,
+                    &mut app,
+                    &mut last_frame_rows,
+                    &mut reload_rx,
+                )
+                .await?
+            {
+                break;
             }
         }
 
@@ -1091,7 +1335,8 @@ impl TuiApp {
         input: &str,
         terminal: &mut DefaultTerminal,
         app: &mut ui::FawxApp,
-        last_draw_metrics: &mut Option<ui::FrameRedrawMetrics>,
+        last_frame_rows: &mut Option<ui::FrameRenderRows>,
+        reload_rx: &mut tokio::sync::mpsc::Receiver<ReloadEvent>,
     ) -> Result<(), TuiError> {
         let trimmed = input.trim();
         if trimmed.is_empty() {
@@ -1121,13 +1366,13 @@ impl TuiApp {
         append_user_message_output(app, trimmed);
 
         // Run agent cycle with rendering
-        self.run_agent_cycle_tui(trimmed, terminal, app, last_draw_metrics)
+        self.run_agent_cycle_tui(trimmed, terminal, app, last_frame_rows, reload_rx)
             .await?;
 
         // After cycle completes, drain queued inputs (one per cycle)
         while let Some(queued) = app.drain_next_input() {
             append_user_message_output(app, &queued);
-            self.run_agent_cycle_tui(&queued, terminal, app, last_draw_metrics)
+            self.run_agent_cycle_tui(&queued, terminal, app, last_frame_rows, reload_rx)
                 .await?;
         }
 
@@ -1141,7 +1386,8 @@ impl TuiApp {
         input: &str,
         terminal: &mut DefaultTerminal,
         app: &mut ui::FawxApp,
-        last_draw_metrics: &mut Option<ui::FrameRedrawMetrics>,
+        last_frame_rows: &mut Option<ui::FrameRenderRows>,
+        reload_rx: &mut tokio::sync::mpsc::Receiver<ReloadEvent>,
     ) -> Result<(), TuiError> {
         app.set_state(ui::AppState::Executing { spinner_frame: 0 });
         app.reset_cycle_state();
@@ -1172,7 +1418,8 @@ impl TuiApp {
             active_model,
             terminal,
             app,
-            last_draw_metrics,
+            last_frame_rows,
+            reload_rx,
             bus_rx: &mut bus_rx,
             cancel_token: &cancel_token,
             streamed: &mut streamed,
@@ -1202,24 +1449,23 @@ impl TuiApp {
         tokio::pin!(cycle_future);
 
         loop {
-            draw_ratatui_frame(ctx.terminal, ctx.app, ctx.last_draw_metrics)?;
+            draw_ratatui_frame(ctx.terminal, ctx.app, ctx.last_frame_rows)?;
+            let reload_open = !ctx.reload_rx.is_closed();
 
             tokio::select! {
                 biased;
                 result = &mut cycle_future => {
                     return result.map_err(|e| TuiError::Loop(e.reason));
                 }
+                Some(reload_event) = ctx.reload_rx.recv(), if reload_open => {
+                    process_reload_event(ctx.app, self.tool_executor.as_ref(), reload_event);
+                }
                 _ = sleep(Duration::from_millis(50)) => {
                     drain_bus_events(ctx.bus_rx, ctx.app, ctx.streamed);
                     if let ui::AppState::Executing { ref mut spinner_frame } = ctx.app.state {
                         *spinner_frame += 1;
                     }
-                    // Handle key events during execution (steer/abort/queue)
-                    poll_execution_events(
-                        ctx.app,
-                        ctx.cancel_token,
-                        &ctx.input_sender,
-                    );
+                    poll_execution_events(ctx.app, ctx.cancel_token, &ctx.input_sender);
                 }
             }
         }
@@ -1452,7 +1698,7 @@ impl TuiApp {
                 match self.set_active_model_with_refresh(&model).await {
                     Ok(resolved_model) => {
                         self.config.model.default_model = Some(resolved_model.clone());
-                        if let Err(error) = self.config.save(&fawx_data_dir()) {
+                        if let Err(error) = save_default_model(&fawx_data_dir(), &resolved_model) {
                             eprintln!("Warning: couldn't save model preference: {error}");
                         }
                         self.tui_println(format!("Active model set to: {resolved_model}"));
@@ -1473,6 +1719,20 @@ impl TuiApp {
                     self.tui_println("Note: extra arguments ignored.");
                 }
                 self.handle_auth_command(subcommand, action, value).await?;
+            }
+            ParsedCommand::Keys {
+                subcommand,
+                value,
+                option,
+                has_extra_args,
+            } => {
+                self.handle_keys_command(subcommand, value, option, has_extra_args)?;
+            }
+            ParsedCommand::Sign {
+                target,
+                has_extra_args,
+            } => {
+                self.handle_sign_command(target, has_extra_args)?;
             }
             ParsedCommand::Budget => self.show_budget_status(),
             ParsedCommand::Loop => self.show_loop_status(),
@@ -2287,6 +2547,13 @@ impl TuiApp {
         self.tui_println("  /auth          Show credential status + auth help");
         self.tui_println("  /auth <provider> set-token <TOKEN>");
         self.tui_println("                 Save API key or PAT for a provider");
+        self.tui_println("  /keys          Manage WASM signing keys");
+        self.tui_println("  /keys generate [--force]");
+        self.tui_println("  /keys list     List trusted public keys");
+        self.tui_println("  /keys trust <path>");
+        self.tui_println("  /keys revoke <fingerprint>");
+        self.tui_println("  /sign <skill>  Sign one WASM skill");
+        self.tui_println("  /sign --all    Sign all installed WASM skills");
         self.tui_println("  /status        Show model, tokens, budget summary");
         self.tui_println("  /budget        Show detailed budget usage");
         self.tui_println("  /loop          Show loop iteration details");
@@ -2624,6 +2891,171 @@ impl TuiApp {
         Ok(())
     }
 
+    fn handle_keys_command(
+        &mut self,
+        subcommand: Option<String>,
+        value: Option<String>,
+        option: Option<String>,
+        has_extra_args: bool,
+    ) -> Result<(), TuiError> {
+        match subcommand.as_deref() {
+            None => self.show_keys_help(),
+            Some("generate") => {
+                self.handle_keys_generate(value.as_deref(), option.as_deref(), has_extra_args)?
+            }
+            Some("list") if value.is_none() && option.is_none() && !has_extra_args => {
+                self.handle_keys_list()?;
+            }
+            Some("list") => self.tui_println("Usage: /keys list"),
+            Some("trust") if option.is_none() && !has_extra_args => {
+                self.handle_keys_trust(value.as_deref())?;
+            }
+            Some("trust") => self.tui_println("Usage: /keys trust <path>"),
+            Some("revoke") if option.is_none() && !has_extra_args => {
+                self.handle_keys_revoke(value.as_deref())?;
+            }
+            Some("revoke") => self.tui_println("Usage: /keys revoke <fingerprint>"),
+            Some(other) => {
+                self.tui_println(format!("Unknown keys command: {other}"));
+                self.show_keys_help();
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_sign_command(
+        &mut self,
+        target: Option<String>,
+        has_extra_args: bool,
+    ) -> Result<(), TuiError> {
+        match (target.as_deref(), has_extra_args) {
+            (Some("--all"), false) => self.handle_sign_all()?,
+            (Some(skill_name), false) => self.handle_sign_skill(skill_name)?,
+            _ => self.show_sign_help(),
+        }
+        Ok(())
+    }
+
+    fn show_keys_help(&mut self) {
+        self.tui_println(String::new());
+        self.tui_println("WASM signing key commands:");
+        self.tui_println("  /keys generate [--force]       Generate a new Ed25519 keypair");
+        self.tui_println("  /keys list                     List trusted public keys");
+        self.tui_println("  /keys trust <path>             Trust a public key file");
+        self.tui_println("  /keys revoke <fingerprint>     Revoke a trusted public key");
+    }
+
+    fn show_sign_help(&mut self) {
+        self.tui_println(String::new());
+        self.tui_println("WASM signing commands:");
+        self.tui_println("  /sign <skill_name>             Sign one installed WASM skill");
+        self.tui_println("  /sign --all                    Sign all installed WASM skills");
+    }
+
+    fn handle_keys_generate(
+        &mut self,
+        value: Option<&str>,
+        option: Option<&str>,
+        has_extra_args: bool,
+    ) -> Result<(), TuiError> {
+        let force = match (value, option, has_extra_args) {
+            (None, None, false) => false,
+            (Some("--force"), None, false) => true,
+            _ => {
+                self.tui_println("Usage: /keys generate [--force]");
+                return Ok(());
+            }
+        };
+        let base_dir = fawx_data_dir();
+        let fingerprint = generate_signing_keypair_in(&base_dir, force)?;
+        self.tui_println("Generated WASM signing keypair.");
+        self.tui_println(format!("  Fingerprint: {fingerprint}"));
+        self.tui_println(format!(
+            "  Private key: {}",
+            signing_private_key_path_in(&base_dir).display()
+        ));
+        self.tui_println(format!(
+            "  Public key: {}",
+            signing_public_key_path_in(&base_dir).display()
+        ));
+        Ok(())
+    }
+
+    fn handle_keys_list(&mut self) -> Result<(), TuiError> {
+        let keys = trusted_key_entries_from_dir(&fawx_trusted_keys_dir())?;
+        if keys.is_empty() {
+            self.tui_println("No trusted public keys.");
+            return Ok(());
+        }
+        self.tui_println("Trusted public keys:");
+        for key in keys {
+            self.tui_println(format!(
+                "  {} {} {} bytes",
+                display_file_name(&key.path),
+                key.fingerprint,
+                key.file_size
+            ));
+        }
+        Ok(())
+    }
+
+    fn handle_keys_trust(&mut self, path: Option<&str>) -> Result<(), TuiError> {
+        let Some(path) = path else {
+            self.tui_println("Usage: /keys trust <path>");
+            return Ok(());
+        };
+        let fingerprint = trust_public_key_in(&fawx_data_dir(), Path::new(path))?;
+        self.tui_println(format!("Trusted public key from {path}."));
+        self.tui_println(format!("  Fingerprint: {fingerprint}"));
+        Ok(())
+    }
+
+    fn handle_keys_revoke(&mut self, fingerprint: Option<&str>) -> Result<(), TuiError> {
+        let Some(fingerprint) = fingerprint else {
+            self.tui_println("Usage: /keys revoke <fingerprint>");
+            return Ok(());
+        };
+        let removed = revoke_trusted_key_in(&fawx_data_dir(), fingerprint)?;
+        self.tui_println(format!(
+            "Revoked {removed} trusted key(s) for fingerprint {}.",
+            fingerprint.to_ascii_lowercase()
+        ));
+        Ok(())
+    }
+
+    fn handle_sign_skill(&mut self, skill_name: &str) -> Result<(), TuiError> {
+        let signed = sign_skill(skill_name)?;
+        self.print_signed_skill(&signed, true);
+        Ok(())
+    }
+
+    fn handle_sign_all(&mut self) -> Result<(), TuiError> {
+        let signed = sign_all_skills()?;
+        if signed.is_empty() {
+            self.tui_println("No WASM skills found to sign.");
+            return Ok(());
+        }
+        for skill in &signed {
+            self.print_signed_skill(skill, false);
+        }
+        self.tui_println(format!("Signed {} skill(s).", signed.len()));
+        Ok(())
+    }
+
+    fn print_signed_skill(&mut self, signed: &SignedSkill, include_path: bool) {
+        self.tui_println(format!(
+            "Signed {} (fingerprint: {})",
+            signed.name, signed.fingerprint
+        ));
+        self.tui_println(format!(
+            "Verified: signature valid (key: {})",
+            signed.fingerprint
+        ));
+        if include_path {
+            self.tui_println(format!("  Signature: {}", signed.signature_path.display()));
+        }
+    }
+
     fn show_budget_status(&mut self) {
         let status = self.loop_engine.status(current_time_ms());
         self.tui_println("Budget usage:");
@@ -2764,7 +3196,7 @@ fn build_loop_engine_bundle() -> LoopEngineBundle {
         eprintln!("warning: failed to load config: {error}");
         FawxConfig::default()
     });
-    build_loop_engine_from_config(&config).expect("loop engine config should be valid")
+    build_loop_engine_from_config(&config, None).expect("loop engine config should be valid")
 }
 
 /// Bundle returned by the loop engine builder functions.
@@ -2774,14 +3206,47 @@ pub struct LoopEngineBundle {
     pub runtime_info: Arc<RwLock<RuntimeInfo>>,
     pub event_bus: EventBus,
     pub scratchpad: Arc<Mutex<Scratchpad>>,
+    pub skill_registry: Arc<SkillRegistry>,
+    pub credential_provider: Option<Arc<dyn CredentialProvider>>,
+    pub tool_executor: Arc<dyn ToolExecutor>,
     pub credential_store: Option<Arc<fx_auth::credential_store::EncryptedFileCredentialStore>>,
+    /// Signature policy loaded once at startup, shared with skill watcher.
+    pub signature_policy: SignaturePolicy,
+}
+
+impl LoopEngineBundle {
+    pub fn into_tui_deps(
+        self,
+        auth_manager: AuthManager,
+        router: ModelRouter,
+        config: FawxConfig,
+    ) -> TuiAppDeps {
+        TuiAppDeps {
+            auth_manager,
+            router,
+            loop_engine: self.engine,
+            runtime_info: self.runtime_info,
+            config,
+            memory: self.memory,
+            event_bus: self.event_bus,
+            scratchpad: self.scratchpad,
+            skill_registry: self.skill_registry,
+            credential_provider: self.credential_provider,
+            tool_executor: self.tool_executor,
+            credential_store: self.credential_store,
+            signature_policy: self.signature_policy,
+        }
+    }
 }
 
 /// Build a loop engine from an already-loaded config.
-pub fn build_loop_engine_from_config(config: &FawxConfig) -> Result<LoopEngineBundle, TuiError> {
+pub fn build_loop_engine_from_config(
+    config: &FawxConfig,
+    improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
+) -> Result<LoopEngineBundle, TuiError> {
     let base_data_dir = fawx_data_dir();
     let data_dir = configured_data_dir(&base_data_dir, config);
-    build_loop_engine_with_config(data_dir, config.clone())
+    build_loop_engine_with_config(data_dir, config.clone(), improvement_provider)
 }
 
 /// Capacity of the streaming event bus broadcast channel.
@@ -2790,12 +3255,18 @@ const EVENT_BUS_CAPACITY: usize = 256;
 fn build_loop_engine_with_config(
     data_dir: PathBuf,
     config: FawxConfig,
+    improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
 ) -> Result<LoopEngineBundle, TuiError> {
     let event_bus = EventBus::new(EVENT_BUS_CAPACITY);
     let budget = BudgetTracker::new(BudgetConfig::default(), current_time_ms(), 0);
     let context = ContextCompactor::new(DEFAULT_CONTEXT_MAX_TOKENS, DEFAULT_CONTEXT_COMPACT_TARGET);
     let working_dir = configured_working_dir(&config);
-    let skills = build_skill_registry(working_dir.clone(), &data_dir, &config);
+    let skills = build_skill_registry(
+        working_dir.clone(),
+        &data_dir,
+        &config,
+        improvement_provider,
+    );
     let synthesis = config
         .model
         .synthesis_instruction
@@ -2806,20 +3277,22 @@ fn build_loop_engine_with_config(
         scratchpad: Arc::clone(&skills.scratchpad),
     });
 
-    let caching_registry = CachingExecutor::new(skills.registry);
+    let caching_registry =
+        CachingExecutor::new(SharedSkillRegistry::new(Arc::clone(&skills.registry)));
 
     // Build ProposalGateExecutor to wrap the CachingExecutor.
     // Chain: kernel → ProposalGateExecutor → CachingExecutor → SkillRegistry
     let self_modify_config = crate::config_bridge::to_core_self_modify(&config.self_modify);
     let proposals_dir = data_dir.join("proposals");
     let gate_state = ProposalGateState::new(self_modify_config, working_dir.clone(), proposals_dir);
-    let gated_executor = ProposalGateExecutor::new(caching_registry, gate_state);
+    let tool_executor: Arc<dyn ToolExecutor> =
+        Arc::new(ProposalGateExecutor::new(caching_registry, gate_state));
 
     let mut builder = LoopEngine::builder()
         .budget(budget)
         .context(context)
         .max_iterations(config.general.max_iterations)
-        .tool_executor(std::sync::Arc::new(gated_executor))
+        .tool_executor(Arc::clone(&tool_executor))
         .synthesis_instruction(synthesis)
         .event_bus(event_bus.clone())
         .iteration_counter(Arc::clone(&skills.iteration_counter))
@@ -2835,7 +3308,11 @@ fn build_loop_engine_with_config(
         runtime_info: skills.runtime_info,
         event_bus,
         scratchpad: skills.scratchpad,
+        skill_registry: skills.registry,
+        credential_provider: skills.credential_provider,
+        tool_executor,
         credential_store: skills.credential_store,
+        signature_policy: skills.signature_policy,
     })
 }
 
@@ -2900,22 +3377,65 @@ impl CredentialProvider for CredentialStoreBridge {
     }
 }
 
+#[derive(Debug, Clone)]
+struct SharedSkillRegistry {
+    registry: Arc<SkillRegistry>,
+}
+
+impl SharedSkillRegistry {
+    fn new(registry: Arc<SkillRegistry>) -> Self {
+        Self { registry }
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for SharedSkillRegistry {
+    async fn execute_tools(
+        &self,
+        calls: &[fx_llm::ToolCall],
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Vec<fx_kernel::act::ToolResult>, fx_kernel::act::ToolExecutorError> {
+        self.registry.execute_tools(calls, cancel).await
+    }
+
+    fn concurrency_policy(&self) -> fx_kernel::act::ConcurrencyPolicy {
+        self.registry.concurrency_policy()
+    }
+
+    fn tool_definitions(&self) -> Vec<fx_llm::ToolDefinition> {
+        self.registry.tool_definitions()
+    }
+
+    fn cacheability(&self, tool_name: &str) -> fx_kernel::act::ToolCacheability {
+        self.registry.cacheability(tool_name)
+    }
+
+    fn cache_stats(&self) -> Option<fx_kernel::act::ToolCacheStats> {
+        self.registry.cache_stats()
+    }
+}
+
 /// Result of [`build_skill_registry`]: groups related outputs to avoid a
 /// large tuple return type.
 struct SkillRegistryBundle {
-    registry: SkillRegistry,
+    registry: Arc<SkillRegistry>,
     memory: Option<SharedMemoryStore>,
     memory_snapshot: Option<String>,
     runtime_info: Arc<RwLock<RuntimeInfo>>,
     scratchpad: Arc<Mutex<Scratchpad>>,
     iteration_counter: Arc<std::sync::atomic::AtomicU32>,
+    credential_provider: Option<Arc<dyn CredentialProvider>>,
     credential_store: Option<Arc<fx_auth::credential_store::EncryptedFileCredentialStore>>,
+    /// Signature policy loaded once at startup, shared with the skill watcher
+    /// to avoid redundant filesystem reads.
+    signature_policy: SignaturePolicy,
 }
 
 fn build_skill_registry(
     working_dir: PathBuf,
     data_dir: &Path,
     config: &FawxConfig,
+    improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
 ) -> SkillRegistryBundle {
     let tool_config = ToolConfig {
         max_read_size: config.tools.max_read_size,
@@ -2935,17 +3455,31 @@ fn build_skill_registry(
     let runtime_info = new_runtime_info(config, memory_enabled);
     executor = executor.with_runtime_info(Arc::clone(&runtime_info));
 
-    let mut registry = SkillRegistry::new();
-    registry.register(Box::new(BuiltinToolsSkill::new(executor)));
+    // Wire improvement tools when enabled and a provider is available.
+    if config.improvement.enabled {
+        if let Some(provider) = improvement_provider {
+            match wire_improvement_tools(data_dir, provider, &config.improvement) {
+                Ok(state) => {
+                    executor = executor.with_improvement(state);
+                }
+                Err(e) => {
+                    eprintln!("warning: improvement tools unavailable: {e}");
+                }
+            }
+        }
+    }
+
+    let registry = Arc::new(SkillRegistry::new());
+    registry.register(Arc::new(BuiltinToolsSkill::new(executor)));
     let git_skill = GitSkill::new(working_dir.clone(), sm.clone());
-    registry.register(Box::new(git_skill));
+    registry.register(Arc::new(git_skill));
     let tx_skill = TransactionSkill::new(working_dir.clone(), sm);
-    registry.register(Box::new(tx_skill));
+    registry.register(Arc::new(tx_skill));
     let scratchpad = Arc::new(Mutex::new(Scratchpad::new()));
     let iteration_counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let scratchpad_skill =
         ScratchpadSkill::new(Arc::clone(&scratchpad), Arc::clone(&iteration_counter));
-    registry.register(Box::new(scratchpad_skill));
+    registry.register(Arc::new(scratchpad_skill));
 
     // Open the credential store once and share via Arc between TuiApp and WASM bridge.
     let credential_store: Option<Arc<fx_auth::credential_store::EncryptedFileCredentialStore>> =
@@ -2965,7 +3499,16 @@ fn build_skill_registry(
         });
 
     // Load WASM skills from ~/.fawx/skills/
-    match fx_loadable::wasm_skill::load_wasm_skills(credential_provider) {
+    let trusted_keys = fx_loadable::wasm_skill::load_trusted_keys().unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "failed to load trusted keys");
+        vec![]
+    });
+    let signature_policy = SignaturePolicy {
+        trusted_keys,
+        require_signatures: config.security.require_signatures,
+    };
+    match fx_loadable::wasm_skill::load_wasm_skills(credential_provider.clone(), &signature_policy)
+    {
         Ok(wasm_skills) => {
             for skill in wasm_skills {
                 registry.register(skill);
@@ -2976,7 +3519,7 @@ fn build_skill_registry(
         }
     }
 
-    apply_skill_summaries(&runtime_info, &registry);
+    apply_skill_summaries(&runtime_info, registry.as_ref());
 
     SkillRegistryBundle {
         registry,
@@ -2985,8 +3528,28 @@ fn build_skill_registry(
         runtime_info,
         scratchpad,
         iteration_counter,
+        credential_provider,
         credential_store,
+        signature_policy,
     }
+}
+
+/// Build `ImprovementToolsState` from a dedicated provider and data directory.
+///
+/// Creates its own `SignalStore` (reads from the same on-disk directory as
+/// `TuiApp`'s store, so all signals are visible to analysis).
+fn wire_improvement_tools(
+    data_dir: &Path,
+    provider: Arc<dyn fx_llm::CompletionProvider + Send + Sync>,
+    config: &ImprovementToolsConfig,
+) -> Result<ImprovementToolsState, String> {
+    let signal_store = SignalStore::new(data_dir, "improvement-analysis")
+        .map_err(|e| format!("signal store for improvement tools: {e}"))?;
+    Ok(ImprovementToolsState::new(
+        Arc::new(signal_store),
+        provider,
+        config.clone(),
+    ))
 }
 
 fn attach_memory(
@@ -3050,7 +3613,10 @@ fn apply_skill_summaries(runtime_info: &Arc<RwLock<RuntimeInfo>>, registry: &Ski
     }
 }
 
-fn format_memory_for_prompt(entries: &[(String, String)], max_chars: usize) -> Option<String> {
+pub(crate) fn format_memory_for_prompt(
+    entries: &[(String, String)],
+    max_chars: usize,
+) -> Option<String> {
     if entries.is_empty() {
         return None;
     }
@@ -3132,6 +3698,56 @@ impl fx_llm::CompletionProvider for AnalysisCompletionProvider<'_> {
     }
 }
 
+/// Owned `CompletionProvider` wrapping a dedicated `ModelRouter` for
+/// improvement tools. Unlike `AnalysisCompletionProvider` (which borrows),
+/// this owns its router so it can be stored in `ImprovementToolsState`.
+struct OwnedRouterProvider {
+    router: ModelRouter,
+}
+
+impl fmt::Debug for OwnedRouterProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OwnedRouterProvider")
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl fx_llm::CompletionProvider for OwnedRouterProvider {
+    async fn complete(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<fx_llm::CompletionResponse, fx_llm::ProviderError> {
+        self.router.complete(request).await
+    }
+
+    async fn complete_stream(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<fx_llm::CompletionStream, fx_llm::ProviderError> {
+        self.router.complete_stream(request).await
+    }
+
+    fn name(&self) -> &str {
+        "improvement"
+    }
+
+    fn supported_models(&self) -> Vec<String> {
+        self.router
+            .available_models()
+            .into_iter()
+            .map(|m| m.model_id)
+            .collect()
+    }
+
+    fn capabilities(&self) -> fx_llm::ProviderCapabilities {
+        fx_llm::ProviderCapabilities {
+            supports_temperature: true,
+            requires_streaming: false,
+        }
+    }
+}
+
 impl<'a> fmt::Debug for RouterLoopLlmProvider<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RouterLoopLlmProvider")
@@ -3139,13 +3755,13 @@ impl<'a> fmt::Debug for RouterLoopLlmProvider<'a> {
             .finish()
     }
 }
-struct RouterLoopLlmProvider<'a> {
+pub(crate) struct RouterLoopLlmProvider<'a> {
     router: &'a ModelRouter,
     active_model: String,
 }
 
 impl<'a> RouterLoopLlmProvider<'a> {
-    fn new(router: &'a ModelRouter, active_model: String) -> Self {
+    pub(crate) fn new(router: &'a ModelRouter, active_model: String) -> Self {
         Self {
             router,
             active_model,
@@ -3327,7 +3943,7 @@ fn strip_ansi_csi_sequences(text: &str) -> String {
     output
 }
 
-fn trim_history(history: &mut Vec<Message>, max_history: usize) {
+pub(crate) fn trim_history(history: &mut Vec<Message>, max_history: usize) {
     if history.len() <= max_history {
         return;
     }
@@ -3336,10 +3952,407 @@ fn trim_history(history: &mut Vec<Message>, max_history: usize) {
     history.drain(0..remove_count);
 }
 
-fn fawx_data_dir() -> PathBuf {
+pub(crate) fn fawx_data_dir() -> PathBuf {
     dirs::home_dir()
         .map(|home| home.join(".fawx"))
         .unwrap_or_else(|| PathBuf::from(".fawx"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrustedKeyEntry {
+    path: PathBuf,
+    fingerprint: String,
+    file_size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SignedSkill {
+    name: String,
+    signature_path: PathBuf,
+    fingerprint: String,
+}
+
+fn fawx_skills_dir() -> PathBuf {
+    fawx_skills_dir_in(&fawx_data_dir())
+}
+
+fn fawx_skills_dir_in(base_dir: &Path) -> PathBuf {
+    base_dir.join("skills")
+}
+
+fn fawx_keys_dir_in(base_dir: &Path) -> PathBuf {
+    base_dir.join("keys")
+}
+
+fn fawx_trusted_keys_dir() -> PathBuf {
+    fawx_trusted_keys_dir_in(&fawx_data_dir())
+}
+
+fn fawx_trusted_keys_dir_in(base_dir: &Path) -> PathBuf {
+    base_dir.join("trusted_keys")
+}
+
+fn signing_private_key_path_in(base_dir: &Path) -> PathBuf {
+    fawx_keys_dir_in(base_dir).join("signing.key")
+}
+
+fn signing_public_key_path_in(base_dir: &Path) -> PathBuf {
+    fawx_keys_dir_in(base_dir).join("signing.pub")
+}
+
+fn trusted_signing_public_key_path_in(base_dir: &Path) -> PathBuf {
+    fawx_trusted_keys_dir_in(base_dir).join("signing.pub")
+}
+
+fn generate_signing_keypair_in(base_dir: &Path, force: bool) -> Result<String, TuiError> {
+    let private_key_path = signing_private_key_path_in(base_dir);
+    let public_key_path = signing_public_key_path_in(base_dir);
+    let trusted_key_path = trusted_signing_public_key_path_in(base_dir);
+    ensure_paths_do_not_exist(
+        &[&private_key_path, &public_key_path, &trusted_key_path],
+        force,
+    )?;
+    let (private_key, public_key) = fx_skills::signing::generate_keypair()
+        .map_err(|error| store_error(format!("failed to generate signing keypair: {error}")))?;
+    write_binary_file(&private_key_path, &private_key)?;
+    set_private_key_permissions(&private_key_path)?;
+    write_binary_file(&public_key_path, &public_key)?;
+    set_public_key_permissions(&public_key_path)?;
+    write_binary_file(&trusted_key_path, &public_key)?;
+    set_public_key_permissions(&trusted_key_path)?;
+    Ok(public_key_fingerprint(&public_key))
+}
+
+fn ensure_paths_do_not_exist(paths: &[&Path], force: bool) -> Result<(), TuiError> {
+    if force {
+        return Ok(());
+    }
+    if let Some(path) = paths.iter().find(|path| path.exists()) {
+        return Err(store_error(format!(
+            "refusing to overwrite {} without --force",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn write_binary_file(path: &Path, bytes: &[u8]) -> Result<(), TuiError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, bytes)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_key_permissions(path: &Path) -> Result<(), TuiError> {
+    let mut permissions = std::fs::metadata(path)?.permissions();
+    permissions.set_mode(0o600);
+    std::fs::set_permissions(path, permissions)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_private_key_permissions(_path: &Path) -> Result<(), TuiError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_public_key_permissions(path: &Path) -> Result<(), TuiError> {
+    let mut permissions = std::fs::metadata(path)?.permissions();
+    permissions.set_mode(0o644);
+    std::fs::set_permissions(path, permissions)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_public_key_permissions(_path: &Path) -> Result<(), TuiError> {
+    Ok(())
+}
+
+fn trusted_key_entries_from_dir(trusted_dir: &Path) -> Result<Vec<TrustedKeyEntry>, TuiError> {
+    let mut keys = Vec::new();
+    if !trusted_dir.exists() {
+        return Ok(keys);
+    }
+    for entry in std::fs::read_dir(trusted_dir)? {
+        let path = entry?.path();
+        if is_public_key_path(&path) {
+            keys.push(trusted_key_entry_from_path(&path)?);
+        }
+    }
+    keys.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(keys)
+}
+
+fn trusted_key_entry_from_path(path: &Path) -> Result<TrustedKeyEntry, TuiError> {
+    let public_key = read_public_key_file(path)?;
+    let file_size = std::fs::metadata(path)?.len();
+    Ok(TrustedKeyEntry {
+        path: path.to_path_buf(),
+        fingerprint: public_key_fingerprint(&public_key),
+        file_size,
+    })
+}
+
+fn trust_public_key_in(base_dir: &Path, source_path: &Path) -> Result<String, TuiError> {
+    ensure_public_key_extension(source_path)?;
+    let public_key = read_public_key_file(source_path)?;
+    let file_name = source_path.file_name().ok_or_else(|| {
+        store_error(format!(
+            "invalid public key path: {}",
+            source_path.display()
+        ))
+    })?;
+    let destination = fawx_trusted_keys_dir_in(base_dir).join(file_name);
+    if destination.exists() && !paths_refer_to_same_file(source_path, &destination) {
+        return Err(store_error(format!(
+            "trusted key already exists: {}",
+            destination.display()
+        )));
+    }
+    if !paths_refer_to_same_file(source_path, &destination) {
+        write_binary_file(&destination, &public_key)?;
+        set_public_key_permissions(&destination)?;
+    }
+    Ok(public_key_fingerprint(&public_key))
+}
+
+fn revoke_trusted_key_in(base_dir: &Path, fingerprint: &str) -> Result<usize, TuiError> {
+    let target = fingerprint.to_ascii_lowercase();
+    let matches: Vec<PathBuf> = trusted_key_entries_from_dir(&fawx_trusted_keys_dir_in(base_dir))?
+        .into_iter()
+        .filter(|entry| entry.fingerprint == target)
+        .map(|entry| entry.path)
+        .collect();
+    if matches.is_empty() {
+        return Err(store_error(format!("trusted key not found: {target}")));
+    }
+    for path in &matches {
+        std::fs::remove_file(path)?;
+    }
+    Ok(matches.len())
+}
+
+fn sign_skill(skill_name: &str) -> Result<SignedSkill, TuiError> {
+    let base_dir = fawx_data_dir();
+    let trusted_keys = load_default_trusted_keys()?;
+    sign_skill_with_keys(&base_dir, skill_name, &trusted_keys)
+}
+
+fn sign_skill_in(base_dir: &Path, skill_name: &str) -> Result<SignedSkill, TuiError> {
+    let trusted_dir = fawx_trusted_keys_dir_in(base_dir);
+    let trusted_keys = load_trusted_keys_from_dir(&trusted_dir)?;
+    sign_skill_with_keys(base_dir, skill_name, &trusted_keys)
+}
+
+fn sign_skill_with_keys(
+    base_dir: &Path,
+    skill_name: &str,
+    trusted_keys: &[Vec<u8>],
+) -> Result<SignedSkill, TuiError> {
+    let private_key = read_signing_private_key(base_dir)?;
+    let sig_path = skill_signature_path_in(base_dir, skill_name);
+    let wasm_bytes = read_skill_wasm(base_dir, skill_name)?;
+    let signature = fx_skills::signing::sign_skill(&wasm_bytes, &private_key)
+        .map_err(|error| store_error(format!("failed to sign skill '{skill_name}': {error}")))?;
+    let fingerprint = write_verified_signature(&sig_path, &signature, &wasm_bytes, trusted_keys)?;
+    Ok(SignedSkill {
+        name: skill_name.to_string(),
+        signature_path: sig_path,
+        fingerprint,
+    })
+}
+
+fn sign_all_skills() -> Result<Vec<SignedSkill>, TuiError> {
+    let base_dir = fawx_data_dir();
+    let trusted_keys = load_default_trusted_keys()?;
+    sign_all_skills_with_keys(&base_dir, &trusted_keys)
+}
+
+fn sign_all_skills_in(base_dir: &Path) -> Result<Vec<SignedSkill>, TuiError> {
+    let trusted_dir = fawx_trusted_keys_dir_in(base_dir);
+    let trusted_keys = load_trusted_keys_from_dir(&trusted_dir)?;
+    sign_all_skills_with_keys(base_dir, &trusted_keys)
+}
+
+fn sign_all_skills_with_keys(
+    base_dir: &Path,
+    trusted_keys: &[Vec<u8>],
+) -> Result<Vec<SignedSkill>, TuiError> {
+    let skill_names = installed_skill_names(&fawx_skills_dir_in(base_dir))?;
+    let mut signed = Vec::new();
+    for skill_name in skill_names {
+        signed.push(sign_skill_with_keys(base_dir, &skill_name, trusted_keys)?);
+    }
+    Ok(signed)
+}
+
+fn installed_skill_names(skills_dir: &Path) -> Result<Vec<String>, TuiError> {
+    let mut names = Vec::new();
+    if !skills_dir.exists() {
+        return Ok(names);
+    }
+    for entry in std::fs::read_dir(skills_dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if entry.path().join(format!("{name}.wasm")).exists() {
+                names.push(name);
+            }
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+fn skill_wasm_path_in(base_dir: &Path, skill_name: &str) -> PathBuf {
+    fawx_skills_dir_in(base_dir)
+        .join(skill_name)
+        .join(format!("{skill_name}.wasm"))
+}
+
+fn skill_signature_path_in(base_dir: &Path, skill_name: &str) -> PathBuf {
+    fawx_skills_dir_in(base_dir)
+        .join(skill_name)
+        .join(format!("{skill_name}.wasm.sig"))
+}
+
+fn write_verified_signature(
+    sig_path: &Path,
+    signature: &[u8],
+    wasm_bytes: &[u8],
+    trusted_keys: &[Vec<u8>],
+) -> Result<String, TuiError> {
+    write_binary_file(sig_path, signature)?;
+    match verify_signature_with_keys(wasm_bytes, signature, trusted_keys) {
+        Ok(fingerprint) => Ok(fingerprint),
+        Err(error) => {
+            let _ = std::fs::remove_file(sig_path);
+            Err(error)
+        }
+    }
+}
+
+fn verify_signature_with_keys(
+    wasm_bytes: &[u8],
+    signature: &[u8],
+    trusted_keys: &[Vec<u8>],
+) -> Result<String, TuiError> {
+    if trusted_keys.is_empty() {
+        return Err(store_error("no trusted public keys configured"));
+    }
+    for public_key in trusted_keys {
+        let valid = fx_skills::signing::verify_skill(wasm_bytes, signature, public_key)
+            .map_err(|error| store_error(format!("failed to verify signature: {error}")))?;
+        if valid {
+            return Ok(public_key_fingerprint(public_key));
+        }
+    }
+    Err(store_error(
+        "signature verification failed against trusted keys",
+    ))
+}
+
+fn read_signing_private_key(base_dir: &Path) -> Result<zeroize::Zeroizing<Vec<u8>>, TuiError> {
+    let path = signing_private_key_path_in(base_dir);
+    match std::fs::read(&path) {
+        Ok(private_key) => Ok(zeroize::Zeroizing::new(private_key)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(store_error(
+            "No signing key found. Run /keys generate first.",
+        )),
+        Err(error) => Err(store_error(format!(
+            "failed to read signing private key at {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn read_skill_wasm(base_dir: &Path, skill_name: &str) -> Result<Vec<u8>, TuiError> {
+    let wasm_path = skill_wasm_path_in(base_dir, skill_name);
+    match std::fs::read(&wasm_path) {
+        Ok(wasm_bytes) => Ok(wasm_bytes),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(store_error(format!(
+            "No WASM skill found for '{skill_name}'. Expected {}",
+            wasm_path.display()
+        ))),
+        Err(error) => Err(store_error(format!(
+            "failed to read skill WASM at {}: {error}",
+            wasm_path.display()
+        ))),
+    }
+}
+
+fn load_default_trusted_keys() -> Result<Vec<Vec<u8>>, TuiError> {
+    fx_loadable::wasm_skill::load_trusted_keys()
+        .map_err(|error| store_error(format!("failed to load trusted keys: {error}")))
+}
+
+fn load_trusted_keys_from_dir(trusted_dir: &Path) -> Result<Vec<Vec<u8>>, TuiError> {
+    fx_loadable::wasm_skill::load_trusted_keys_from(trusted_dir)
+        .map_err(|error| store_error(format!("failed to load trusted keys: {error}")))
+}
+
+fn read_binary_file(path: &Path, context: &str) -> Result<Vec<u8>, TuiError> {
+    std::fs::read(path)
+        .map_err(|error| store_error(format!("{context} at {}: {error}", path.display())))
+}
+
+fn read_public_key_file(path: &Path) -> Result<Vec<u8>, TuiError> {
+    let public_key = read_binary_file(path, "failed to read public key")?;
+    ensure_public_key_length(&public_key, path)?;
+    Ok(public_key)
+}
+
+fn ensure_public_key_length(public_key: &[u8], path: &Path) -> Result<(), TuiError> {
+    if public_key.len() == 32 {
+        return Ok(());
+    }
+    Err(store_error(format!(
+        "invalid public key length at {}: expected 32 bytes, found {}",
+        path.display(),
+        public_key.len()
+    )))
+}
+
+fn ensure_public_key_extension(path: &Path) -> Result<(), TuiError> {
+    if is_public_key_path(path) {
+        return Ok(());
+    }
+    Err(store_error(format!(
+        "public key path must end with .pub: {}",
+        path.display()
+    )))
+}
+
+fn is_public_key_path(path: &Path) -> bool {
+    path.extension().and_then(|ext| ext.to_str()) == Some("pub")
+}
+
+fn public_key_fingerprint(public_key: &[u8]) -> String {
+    let digest = Sha256::digest(public_key);
+    hex_encode(&digest[..8])
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn display_file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn store_error(message: impl Into<String>) -> TuiError {
+    TuiError::Store(message.into())
 }
 
 fn configured_data_dir(base_data_dir: &Path, config: &FawxConfig) -> PathBuf {
@@ -3674,6 +4687,27 @@ pub fn load_auth_manager() -> Result<AuthManager, TuiError> {
 }
 
 /// Build a model router from stored authentication credentials.
+/// Build an optional `CompletionProvider` for improvement tools.
+///
+/// Returns `None` when `[improvement] enabled = false` in config. Otherwise,
+/// builds a dedicated `ModelRouter` (separate from the main TUI router) so
+/// the improvement tools can own their LLM access without borrowing.
+pub fn build_improvement_provider(
+    auth_manager: &AuthManager,
+    config: &FawxConfig,
+) -> Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>> {
+    if !config.improvement.enabled {
+        return None;
+    }
+    match build_router(auth_manager) {
+        Ok(router) => Some(Arc::new(OwnedRouterProvider { router })),
+        Err(e) => {
+            eprintln!("warning: improvement tools LLM unavailable: {e}");
+            None
+        }
+    }
+}
+
 pub fn build_router(auth_manager: &AuthManager) -> Result<ModelRouter, TuiError> {
     let mut router = ModelRouter::new();
 
@@ -4697,6 +5731,16 @@ enum ParsedCommand {
         value: Option<String>,
         has_extra_args: bool,
     },
+    Keys {
+        subcommand: Option<String>,
+        value: Option<String>,
+        option: Option<String>,
+        has_extra_args: bool,
+    },
+    Sign {
+        target: Option<String>,
+        has_extra_args: bool,
+    },
     Budget,
     Loop,
     Status,
@@ -4746,6 +5790,22 @@ fn parse_command(value: &str) -> ParsedCommand {
                 has_extra_args,
             }
         }
+        "keys" => {
+            let subcommand = parts.next().map(ToString::to_string);
+            let value = parts.next().map(ToString::to_string);
+            let option = parts.next().map(ToString::to_string);
+            let has_extra_args = parts.next().is_some();
+            ParsedCommand::Keys {
+                subcommand,
+                value,
+                option,
+                has_extra_args,
+            }
+        }
+        "sign" => ParsedCommand::Sign {
+            target: parts.next().map(ToString::to_string),
+            has_extra_args: parts.next().is_some(),
+        },
         "budget" => ParsedCommand::Budget,
         "loop" => ParsedCommand::Loop,
         "status" => ParsedCommand::Status,
@@ -5031,6 +6091,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use fx_core::memory::{MemoryProvider, MemoryTouchProvider};
+    use fx_kernel::act::ToolExecutorError;
     use fx_llm::ContentBlock;
     use std::collections::BTreeMap;
     use std::ffi::OsString;
@@ -5095,6 +6156,21 @@ mod tests {
         )
         .expect("new test app");
         (app, temp_dir)
+    }
+
+    fn sample_wasm_bytes() -> Vec<u8> {
+        vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]
+    }
+
+    fn write_test_skill(base_dir: &Path, skill_name: &str, wasm_bytes: &[u8]) {
+        let skill_dir = fawx_skills_dir_in(base_dir).join(skill_name);
+        std::fs::create_dir_all(&skill_dir).expect("skill dir");
+        std::fs::write(skill_dir.join(format!("{skill_name}.wasm")), wasm_bytes).expect("wasm");
+    }
+
+    fn create_temp_home_guard(temp_home: &TempDir) -> ScopedEnvVar {
+        let home = temp_home.path().to_string_lossy().to_string();
+        ScopedEnvVar::set("HOME", &home)
     }
 
     #[test]
@@ -6621,6 +7697,114 @@ mod tests {
         assert_eq!(picked, Some("x-ai/grok-3"));
     }
 
+    #[derive(Debug, Default)]
+    struct CacheCountingExecutor {
+        clear_count: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    fn sample_reload_events() -> Vec<fx_loadable::ReloadEvent> {
+        vec![
+            fx_loadable::ReloadEvent::Loaded {
+                skill_name: "alpha".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            fx_loadable::ReloadEvent::Updated {
+                skill_name: "alpha".to_string(),
+                old_version: "1.0.0".to_string(),
+                new_version: "1.1.0".to_string(),
+            },
+            fx_loadable::ReloadEvent::Removed {
+                skill_name: "alpha".to_string(),
+            },
+            fx_loadable::ReloadEvent::Error {
+                skill_name: "alpha".to_string(),
+                error: "bad wasm".to_string(),
+            },
+        ]
+    }
+
+    async fn queue_reload_events(reload_tx: &tokio::sync::mpsc::Sender<fx_loadable::ReloadEvent>) {
+        for event in sample_reload_events() {
+            reload_tx.send(event).await.expect("queue reload event");
+        }
+    }
+
+    fn assert_reload_outputs(app: &ui::FawxApp, executor: &CacheCountingExecutor) {
+        assert_eq!(
+            app.output_lines,
+            vec![
+                "🔌 Loaded skill: alpha v1.0.0".to_string(),
+                "🔄 Updated skill: alpha v1.1.0".to_string(),
+                "🗑️ Removed skill: alpha".to_string(),
+                "⚠️ Skill error (alpha): bad wasm".to_string(),
+            ]
+        );
+        assert_eq!(
+            executor
+                .clear_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            3
+        );
+    }
+
+    #[async_trait]
+    impl ToolExecutor for CacheCountingExecutor {
+        async fn execute_tools(
+            &self,
+            _calls: &[fx_llm::ToolCall],
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<Vec<fx_kernel::act::ToolResult>, ToolExecutorError> {
+            Ok(Vec::new())
+        }
+
+        fn clear_cache(&self) {
+            self.clear_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_for_idle_loop_event_reports_changes_and_clears_cache() {
+        let executor = CacheCountingExecutor::default();
+        let mut app = ui::FawxApp::new();
+        let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel(4);
+        queue_reload_events(&reload_tx).await;
+
+        for _ in 0..4 {
+            let event = wait_for_idle_loop_event(
+                std::future::pending::<io::Result<Event>>(),
+                &mut reload_rx,
+            )
+            .await
+            .expect("receive reload event");
+            let IdleLoopEvent::Reload(reload_event) = event else {
+                panic!("expected reload event");
+            };
+            process_reload_event(&mut app, &executor, reload_event);
+        }
+
+        assert_reload_outputs(&app, &executor);
+    }
+
+    #[tokio::test]
+    async fn wait_for_idle_loop_event_reads_terminal_events_without_reload_polling() {
+        let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel(1);
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        drop(reload_tx);
+
+        let event =
+            wait_for_idle_loop_event(std::future::ready(Ok(Event::Key(key))), &mut reload_rx)
+                .await
+                .expect("receive terminal event");
+
+        match event {
+            IdleLoopEvent::Terminal(Event::Key(received)) => {
+                assert_eq!(received.code, KeyCode::Enter);
+            }
+            _ => panic!("expected terminal key event"),
+        }
+    }
+
     #[test]
     fn default_model_falls_back_to_highest_version() {
         let model_ids = vec![
@@ -7500,6 +8684,102 @@ mod tests {
         let sanitized = sanitize_history_text(text);
 
         assert_eq!(sanitized, "Answer\nwarning");
+    }
+
+    #[test]
+    fn collect_row_scrubs_only_blanks_trailing_disappearances() {
+        let previous = ui::FrameRenderRows {
+            width: 6,
+            rows: vec!["abc   ".to_string()],
+            fills: vec![ui::FrameRowFill::Default],
+            content_columns: vec![3],
+        };
+        let current = ui::FrameRenderRows {
+            width: 6,
+            rows: vec!["ab    ".to_string()],
+            fills: vec![ui::FrameRowFill::Default],
+            content_columns: vec![2],
+        };
+
+        assert_eq!(
+            collect_row_scrubs(Some(&previous), &current),
+            vec![RowScrub {
+                row: 0,
+                start_col: 2
+            }]
+        );
+    }
+
+    #[test]
+    fn collect_row_scrubs_skips_rows_that_only_grow() {
+        let previous = ui::FrameRenderRows {
+            width: 6,
+            rows: vec!["ab    ".to_string()],
+            fills: vec![ui::FrameRowFill::Default],
+            content_columns: vec![2],
+        };
+        let current = ui::FrameRenderRows {
+            width: 6,
+            rows: vec!["abc   ".to_string()],
+            fills: vec![ui::FrameRowFill::Default],
+            content_columns: vec![3],
+        };
+
+        assert!(collect_row_scrubs(Some(&previous), &current).is_empty());
+    }
+
+    #[test]
+    fn collect_row_scrubs_counts_wide_cells_by_terminal_column() {
+        let previous = ui::FrameRenderRows {
+            width: 4,
+            rows: vec!["中 a ".to_string()],
+            fills: vec![ui::FrameRowFill::Default],
+            content_columns: vec![3],
+        };
+        let current = ui::FrameRenderRows {
+            width: 4,
+            rows: vec!["中   ".to_string()],
+            fills: vec![ui::FrameRowFill::Default],
+            content_columns: vec![2],
+        };
+
+        assert_eq!(
+            collect_row_scrubs(Some(&previous), &current),
+            vec![RowScrub {
+                row: 0,
+                start_col: 2
+            }]
+        );
+    }
+
+    #[test]
+    fn collect_row_scrubs_blanks_newly_visible_rows_and_columns() {
+        let previous = ui::FrameRenderRows {
+            width: 4,
+            rows: vec!["abcd".to_string()],
+            fills: vec![ui::FrameRowFill::Default],
+            content_columns: vec![4],
+        };
+        let current = ui::FrameRenderRows {
+            width: 6,
+            rows: vec!["abcd  ".to_string(), "xy    ".to_string()],
+            fills: vec![ui::FrameRowFill::Default, ui::FrameRowFill::InputBackground],
+            content_columns: vec![4, 2],
+        };
+
+        assert_eq!(
+            collect_row_scrubs(Some(&previous), &current),
+            vec![
+                RowScrub {
+                    row: 0,
+                    start_col: 4
+                },
+                RowScrub {
+                    row: 1,
+                    start_col: 0
+                },
+            ]
+        );
     }
 
     #[test]
@@ -8407,11 +9687,300 @@ mod tests {
     }
 
     #[test]
+    fn parse_keys_generate_force() {
+        let cmd = parse_command("/keys generate --force");
+        assert!(matches!(
+            cmd,
+            ParsedCommand::Keys {
+                subcommand: Some(ref s),
+                value: Some(ref v),
+                option: None,
+                has_extra_args: false,
+            } if s == "generate" && v == "--force"
+        ));
+    }
+
+    #[test]
+    fn parse_keys_trust_path() {
+        let cmd = parse_command("/keys trust /tmp/alice.pub");
+        assert!(matches!(
+            cmd,
+            ParsedCommand::Keys {
+                subcommand: Some(ref s),
+                value: Some(ref v),
+                option: None,
+                has_extra_args: false,
+            } if s == "trust" && v == "/tmp/alice.pub"
+        ));
+    }
+
+    #[test]
+    fn parse_sign_all() {
+        let cmd = parse_command("/sign --all");
+        assert!(matches!(
+            cmd,
+            ParsedCommand::Sign {
+                target: Some(ref target),
+                has_extra_args: false,
+            } if target == "--all"
+        ));
+    }
+
+    #[test]
+    fn should_add_keys_and_sign_to_history() {
+        assert!(should_add_to_history("/keys generate"));
+        assert!(should_add_to_history("/sign demo"));
+    }
+
+    #[test]
     fn show_auth_status_no_credentials_no_panic() {
         let (mut app, _temp_dir) = new_test_app();
         app.show_auth_status();
         // Should produce output without panicking.
         assert!(!app.output_buffer.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generate_signing_keypair_in_writes_expected_files_and_permissions() {
+        let temp = TempDir::new().expect("tempdir");
+        let fingerprint =
+            generate_signing_keypair_in(temp.path(), false).expect("keypair should generate");
+
+        assert_eq!(fingerprint.len(), 16);
+        assert!(signing_private_key_path_in(temp.path()).exists());
+        assert!(signing_public_key_path_in(temp.path()).exists());
+        assert!(trusted_signing_public_key_path_in(temp.path()).exists());
+
+        let mode = std::fs::metadata(signing_private_key_path_in(temp.path()))
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let public_mode = std::fs::metadata(signing_public_key_path_in(temp.path()))
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(public_mode, 0o644);
+
+        let trusted_mode = std::fs::metadata(trusted_signing_public_key_path_in(temp.path()))
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(trusted_mode, 0o644);
+    }
+
+    #[test]
+    fn generate_signing_keypair_in_requires_force_to_overwrite() {
+        let temp = TempDir::new().expect("tempdir");
+        generate_signing_keypair_in(temp.path(), false).expect("first keypair");
+
+        let error = generate_signing_keypair_in(temp.path(), false).expect_err("must refuse");
+        assert!(error.to_string().contains("--force"));
+    }
+
+    #[test]
+    fn trust_public_key_in_rejects_invalid_length_key() {
+        let temp = TempDir::new().expect("tempdir");
+        let invalid_key = temp.path().join("invalid.pub");
+        std::fs::write(&invalid_key, [1u8; 31]).expect("invalid key");
+
+        let error = trust_public_key_in(temp.path(), &invalid_key).expect_err("must reject");
+        assert!(error.to_string().contains("expected 32 bytes"));
+    }
+
+    #[test]
+    fn keys_list_and_revoke_use_fingerprints() {
+        let temp = TempDir::new().expect("tempdir");
+        let (_, public_key) = fx_skills::signing::generate_keypair().expect("keypair");
+        let trusted_dir = fawx_trusted_keys_dir_in(temp.path());
+        std::fs::create_dir_all(&trusted_dir).expect("trusted dir");
+        std::fs::write(trusted_dir.join("alice.pub"), &public_key).expect("pub");
+
+        let keys = trusted_key_entries_from_dir(&trusted_dir).expect("trusted keys");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].file_size, 32);
+
+        let removed = revoke_trusted_key_in(temp.path(), &keys[0].fingerprint)
+            .expect("revoke by fingerprint");
+        assert_eq!(removed, 1);
+        assert!(trusted_key_entries_from_dir(&trusted_dir)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn public_key_fingerprint_is_deterministic_for_same_key() {
+        let (_, public_key) = fx_skills::signing::generate_keypair().expect("keypair");
+
+        assert_eq!(
+            public_key_fingerprint(&public_key),
+            public_key_fingerprint(&public_key)
+        );
+    }
+
+    #[test]
+    fn public_key_fingerprint_differs_for_distinct_keys() {
+        let (_, left) = fx_skills::signing::generate_keypair().expect("left keypair");
+        let (_, right) = fx_skills::signing::generate_keypair().expect("right keypair");
+
+        assert_ne!(
+            public_key_fingerprint(&left),
+            public_key_fingerprint(&right)
+        );
+    }
+
+    #[test]
+    fn sign_skill_in_writes_signature_and_verifies() {
+        let temp = TempDir::new().expect("tempdir");
+        generate_signing_keypair_in(temp.path(), false).expect("keypair");
+        write_test_skill(temp.path(), "demo", &sample_wasm_bytes());
+
+        let signed = sign_skill_in(temp.path(), "demo").expect("sign skill");
+        let signature = std::fs::read(&signed.signature_path).expect("signature");
+        let wasm_bytes =
+            std::fs::read(fawx_skills_dir_in(temp.path()).join("demo/demo.wasm")).expect("wasm");
+        let public_key = std::fs::read(signing_public_key_path_in(temp.path())).expect("pub");
+
+        assert_eq!(signature.len(), 64);
+        assert_eq!(signed.name, "demo");
+        assert_eq!(signed.fingerprint, public_key_fingerprint(&public_key));
+        assert!(
+            fx_skills::signing::verify_skill(&wasm_bytes, &signature, &public_key).expect("verify"),
+        );
+    }
+
+    #[test]
+    fn sign_all_skills_in_writes_signatures_for_each_skill() {
+        let temp = TempDir::new().expect("tempdir");
+        generate_signing_keypair_in(temp.path(), false).expect("keypair");
+        write_test_skill(temp.path(), "alpha", &sample_wasm_bytes());
+        write_test_skill(temp.path(), "beta", &sample_wasm_bytes());
+        std::fs::create_dir_all(fawx_skills_dir_in(temp.path()).join("source_only"))
+            .expect("source only dir");
+
+        let signed = sign_all_skills_in(temp.path()).expect("sign all");
+        let signed_names: Vec<String> = signed.iter().map(|skill| skill.name.clone()).collect();
+
+        assert_eq!(signed_names, vec!["alpha".to_string(), "beta".to_string()]);
+        assert!(fawx_skills_dir_in(temp.path())
+            .join("alpha/alpha.wasm.sig")
+            .exists());
+        assert!(fawx_skills_dir_in(temp.path())
+            .join("beta/beta.wasm.sig")
+            .exists());
+        assert!(!fawx_skills_dir_in(temp.path())
+            .join("source_only/source_only.wasm.sig")
+            .exists());
+    }
+
+    #[test]
+    fn sign_skill_in_requires_private_key() {
+        let temp = TempDir::new().expect("tempdir");
+        write_test_skill(temp.path(), "demo", &sample_wasm_bytes());
+        let (_, public_key) = fx_skills::signing::generate_keypair().expect("keypair");
+        let trusted_dir = fawx_trusted_keys_dir_in(temp.path());
+        std::fs::create_dir_all(&trusted_dir).expect("trusted dir");
+        std::fs::write(trusted_dir.join("demo.pub"), &public_key).expect("pub");
+
+        let error = sign_skill_in(temp.path(), "demo").expect_err("missing private key");
+        assert_eq!(
+            error.to_string(),
+            "store error: No signing key found. Run /keys generate first."
+        );
+    }
+
+    #[test]
+    fn sign_skill_in_reports_missing_skill_error() {
+        let temp = TempDir::new().expect("tempdir");
+        generate_signing_keypair_in(temp.path(), false).expect("keypair");
+
+        let error = sign_skill_in(temp.path(), "missing").expect_err("missing skill");
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "store error: No WASM skill found for 'missing'. Expected {}",
+                fawx_skills_dir_in(temp.path())
+                    .join("missing/missing.wasm")
+                    .display()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_keys_generate_uses_home_directory() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let temp_home = TempDir::new().expect("tempdir");
+        let _home = create_temp_home_guard(&temp_home);
+        let (mut app, _temp_dir) = new_test_app();
+
+        app.handle_command("/keys generate")
+            .await
+            .expect("keys generate");
+
+        assert!(temp_home.path().join(".fawx/keys/signing.key").exists());
+        assert!(temp_home
+            .path()
+            .join(".fawx/trusted_keys/signing.pub")
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn handle_sign_all_signs_skills_under_home_directory() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let temp_home = TempDir::new().expect("tempdir");
+        let _home = create_temp_home_guard(&temp_home);
+        let base_dir = temp_home.path().join(".fawx");
+        generate_signing_keypair_in(&base_dir, false).expect("keypair");
+        write_test_skill(&base_dir, "demo", &sample_wasm_bytes());
+        let (mut app, _temp_dir) = new_test_app();
+
+        app.handle_command("/sign --all").await.expect("sign all");
+
+        assert!(base_dir.join("skills/demo/demo.wasm.sig").exists());
+    }
+
+    #[tokio::test]
+    async fn handle_sign_reports_fingerprint_and_verification_output() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let temp_home = TempDir::new().expect("tempdir");
+        let _home = create_temp_home_guard(&temp_home);
+        let base_dir = temp_home.path().join(".fawx");
+        generate_signing_keypair_in(&base_dir, false).expect("keypair");
+        write_test_skill(&base_dir, "demo", &sample_wasm_bytes());
+        let (mut app, _temp_dir) = new_test_app();
+
+        app.handle_command("/sign demo").await.expect("sign demo");
+
+        let output = app.output_buffer.join("\n");
+        assert!(output.contains("Signed demo (fingerprint:"));
+        assert!(output.contains("Verified: signature valid (key:"));
+    }
+
+    #[tokio::test]
+    async fn handle_keys_list_includes_filename_fingerprint_and_size() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let temp_home = TempDir::new().expect("tempdir");
+        let _home = create_temp_home_guard(&temp_home);
+        let base_dir = temp_home.path().join(".fawx");
+        let (_, public_key) = fx_skills::signing::generate_keypair().expect("keypair");
+        let trusted_dir = fawx_trusted_keys_dir_in(&base_dir);
+        std::fs::create_dir_all(&trusted_dir).expect("trusted dir");
+        std::fs::write(trusted_dir.join("alice.pub"), &public_key).expect("public key");
+        let expected_fingerprint = public_key_fingerprint(&public_key);
+        let (mut app, _temp_dir) = new_test_app();
+
+        app.handle_command("/keys list").await.expect("keys list");
+
+        let output = app.output_buffer.join("\n");
+        assert!(output.contains("alice.pub"));
+        assert!(output.contains(&expected_fingerprint));
+        assert!(output.contains("32 bytes"));
     }
 
     #[test]

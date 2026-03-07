@@ -26,6 +26,7 @@ pub mod skill;
 pub mod transaction_skill;
 pub mod wasm_host;
 pub mod wasm_skill;
+pub mod watcher;
 
 pub(crate) mod ab_slots;
 pub(crate) mod config;
@@ -38,6 +39,8 @@ pub use loader::{SkillLoader, SkillManifest};
 pub use registry::SkillRegistry;
 pub use skill::{Skill, SkillError};
 pub use transaction_skill::TransactionSkill;
+pub use wasm_skill::SignaturePolicy;
+pub use watcher::{ReloadEvent, SkillWatcher};
 
 /// A strategy identifier for A/B slot management.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

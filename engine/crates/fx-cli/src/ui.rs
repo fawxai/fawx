@@ -5,10 +5,10 @@
 //! `tui.rs` event loop or `scroll_region.rs`.
 
 use ratatui::{
-    layout::{Constraint, Layout},
+    layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Clear, Paragraph, Wrap},
+    widgets::{Block, Clear, Paragraph},
     Frame,
 };
 use std::borrow::Cow;
@@ -21,7 +21,8 @@ use unicode_width::UnicodeWidthStr;
 const AMBER: Color = Color::Rgb(255, 204, 0);
 
 /// Dark-gray background for the input region.
-const INPUT_BG: Color = Color::Indexed(236);
+pub const INPUT_BG_INDEX: u8 = 236;
+const INPUT_BG: Color = Color::Indexed(INPUT_BG_INDEX);
 
 /// Prompt prefix shown in the input bar.
 const PROMPT: &str = "you › ";
@@ -351,29 +352,24 @@ impl Default for FawxApp {
 // ── Drawing ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FrameRedrawMetrics {
-    pub terminal_width: u16,
-    pub terminal_height: u16,
-    pub input_height: u16,
-    pub output_height: u16,
-    pub state: FrameRedrawState,
+pub struct FrameRenderRows {
+    pub width: u16,
+    pub rows: Vec<String>,
+    pub fills: Vec<FrameRowFill>,
+    pub content_columns: Vec<u16>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FrameRedrawState {
-    Idle,
-    Executing,
-    Streaming,
+pub enum FrameRowFill {
+    Default,
+    InputBackground,
 }
 
-impl From<&AppState> for FrameRedrawState {
-    fn from(state: &AppState) -> Self {
-        match state {
-            AppState::Idle => Self::Idle,
-            AppState::Executing { .. } => Self::Executing,
-            AppState::Streaming => Self::Streaming,
-        }
-    }
+struct FrameSection {
+    lines: Vec<Line<'static>>,
+    width: usize,
+    height: usize,
+    fill: FrameRowFill,
 }
 
 /// Render the entire TUI frame.
@@ -681,12 +677,12 @@ fn prepare_output_lines_for_render(app: &FawxApp, width: usize) -> (Vec<Line<'st
     (render_lines, total_visual_rows)
 }
 
-pub fn frame_redraw_metrics(
+pub fn frame_render_rows(
     terminal_width: u16,
     terminal_height: u16,
     app: &FawxApp,
-) -> FrameRedrawMetrics {
-    let area = ratatui::layout::Rect::new(0, 0, terminal_width, terminal_height);
+) -> FrameRenderRows {
+    let area = Rect::new(0, 0, terminal_width, terminal_height);
     let input_height = app.calculate_input_height(terminal_width);
     let layout = Layout::vertical([
         Constraint::Min(1),
@@ -694,15 +690,63 @@ pub fn frame_redraw_metrics(
         Constraint::Length(input_height),
     ])
     .split(area);
-    let output_height = layout[0].height;
+    let mut rows = Vec::new();
+    let mut fills = Vec::new();
+    let mut content_columns = Vec::new();
 
-    FrameRedrawMetrics {
-        terminal_width,
-        terminal_height,
-        input_height,
-        output_height,
-        state: FrameRedrawState::from(&app.state),
+    for section in build_frame_sections(app, &layout) {
+        append_frame_section(
+            &mut rows,
+            &mut fills,
+            &mut content_columns,
+            section.lines,
+            section.width,
+            section.height,
+            section.fill,
+        );
     }
+
+    FrameRenderRows {
+        width: terminal_width,
+        rows,
+        fills,
+        content_columns,
+    }
+}
+
+fn build_frame_sections(app: &FawxApp, layout: &[Rect]) -> [FrameSection; 3] {
+    let output_width = layout[0].width as usize;
+    let output_height = layout[0].height as usize;
+    let (output_lines, _) = visible_output_lines_for_render(app, output_width, output_height);
+
+    [
+        FrameSection {
+            lines: output_lines,
+            width: output_width,
+            height: output_height,
+            fill: FrameRowFill::Default,
+        },
+        FrameSection {
+            lines: vec![build_separator_line(
+                layout[1].width as usize,
+                &build_status_indicators(app),
+            )],
+            width: layout[1].width as usize,
+            height: layout[1].height as usize,
+            fill: FrameRowFill::Default,
+        },
+        FrameSection {
+            lines: build_input_lines(
+                app,
+                layout[2].width as usize,
+                Style::default(),
+                Style::default(),
+            ),
+            width: layout[2].width as usize,
+            height: layout[2].height as usize,
+            fill: FrameRowFill::InputBackground,
+        },
+    ]
 }
 
 fn visible_output_lines_for_render(
@@ -722,12 +766,31 @@ fn line_display_width(line: &Line<'_>) -> usize {
     line.spans.iter().map(|span| span.content.width()).sum()
 }
 
-fn pad_visible_output_lines(
+fn line_to_string(line: &Line<'_>) -> String {
+    let mut rendered = String::new();
+
+    for span in &line.spans {
+        for grapheme in span.content.graphemes(true) {
+            rendered.push_str(grapheme);
+            let filler_width = grapheme.width().saturating_sub(1);
+            if filler_width > 0 {
+                rendered.push_str(&" ".repeat(filler_width));
+            }
+        }
+    }
+
+    rendered
+}
+
+fn pad_lines_to_area(
     mut lines: Vec<Line<'static>>,
     width: usize,
     height: usize,
 ) -> Vec<Line<'static>> {
-    if width == 0 || height == 0 {
+    if height == 0 {
+        return Vec::new();
+    }
+    if width == 0 {
         return lines;
     }
 
@@ -745,6 +808,49 @@ fn pad_visible_output_lines(
     lines
 }
 
+fn pad_visible_output_lines(
+    lines: Vec<Line<'static>>,
+    width: usize,
+    height: usize,
+) -> Vec<Line<'static>> {
+    pad_lines_to_area(lines, width, height)
+}
+
+fn render_section_rows(
+    lines: Vec<Line<'static>>,
+    width: usize,
+    height: usize,
+    fill: FrameRowFill,
+) -> (Vec<String>, Vec<FrameRowFill>, Vec<u16>) {
+    let mut content_columns = lines
+        .iter()
+        .map(|line| line_display_width(line) as u16)
+        .collect::<Vec<_>>();
+    let rows = pad_lines_to_area(lines, width, height)
+        .iter()
+        .map(line_to_string)
+        .collect::<Vec<_>>();
+    content_columns.resize(rows.len(), 0);
+    let fills = vec![fill; rows.len()];
+
+    (rows, fills, content_columns)
+}
+
+fn append_frame_section(
+    rows: &mut Vec<String>,
+    fills: &mut Vec<FrameRowFill>,
+    content_columns: &mut Vec<u16>,
+    lines: Vec<Line<'static>>,
+    width: usize,
+    height: usize,
+    fill: FrameRowFill,
+) {
+    let (section_rows, section_fills, section_columns) =
+        render_section_rows(lines, width, height, fill);
+    rows.extend(section_rows);
+    fills.extend(section_fills);
+    content_columns.extend(section_columns);
+}
 fn truncate_to_display_width(text: &str, max_width: usize) -> String {
     if max_width == 0 {
         return String::new();
@@ -811,6 +917,21 @@ fn build_separator_line(area_width: usize, indicators: &[Span<'_>]) -> Line<'sta
     line_spans.extend(indicator_spans);
 
     Line::from(line_spans)
+}
+
+fn build_input_lines(
+    app: &FawxApp,
+    width: usize,
+    prompt_style: Style,
+    text_style: Style,
+) -> Vec<Line<'static>> {
+    // Keep the scrub snapshot and the live input widget on the same wrapping path.
+    let input_display = app.input_display_text();
+    let line = Line::from(vec![
+        Span::styled(PROMPT, prompt_style),
+        Span::styled(input_display.into_owned(), text_style),
+    ]);
+    wrap_lines_to_width(vec![line], width)
 }
 
 /// Render the scrollable output region.
@@ -893,17 +1014,10 @@ fn render_input(frame: &mut Frame, area: ratatui::layout::Rect, app: &FawxApp) {
     } else {
         Style::default().add_modifier(Modifier::DIM)
     };
-
-    let input_display = app.input_display_text();
-    let line = Line::from(vec![
-        Span::styled(PROMPT, prompt_style),
-        Span::styled(input_display.as_ref(), text_style),
-    ]);
-
     let block = Block::default().style(Style::default().bg(INPUT_BG));
-
-    let paragraph = Paragraph::new(line).block(block).wrap(Wrap { trim: false });
-
+    let lines = build_input_lines(app, area.width as usize, prompt_style, text_style);
+    let lines = pad_lines_to_area(lines, area.width as usize, area.height as usize);
+    let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(Clear, area);
     frame.render_widget(paragraph, area);
 }
@@ -1478,8 +1592,8 @@ mod tests {
     }
 
     #[test]
-    fn test_pad_visible_output_lines_fills_short_rows_and_blank_lines() {
-        let padded = pad_visible_output_lines(vec![Line::from("abc"), Line::from("")], 5, 4);
+    fn test_pad_lines_to_area_fills_short_rows_and_blank_lines() {
+        let padded = pad_lines_to_area(vec![Line::from("abc"), Line::from("")], 5, 4);
 
         let rendered: Vec<String> = padded
             .iter()
@@ -1615,22 +1729,95 @@ mod tests {
     }
 
     #[test]
-    fn test_frame_redraw_metrics_ignore_spinner_frame_and_streaming_content() {
+    fn test_frame_render_rows_matches_drawn_buffer() {
+        let backend = TestBackend::new(20, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
         let mut app = FawxApp::new();
+        app.add_output("alpha beta gamma".into());
         app.set_state(AppState::Executing { spinner_frame: 0 });
-        app.add_output("alpha".into());
-
-        let baseline = frame_redraw_metrics(80, 24, &app);
-
-        app.set_state(AppState::Executing { spinner_frame: 9 });
-        app.add_output("beta".into());
         app.queue_input("queued".into());
         app.steer_message = Some("steer".into());
-        app.abort_requested = true;
+        app.input_text = "this input wraps".into();
 
-        let updated = frame_redraw_metrics(80, 24, &app);
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
 
-        assert_eq!(baseline, updated);
+        let snapshot = frame_render_rows(20, 6, &app);
+        let actual_rows: Vec<String> = (0..6)
+            .map(|row| {
+                (0..20)
+                    .map(|col| terminal.backend().buffer()[(col, row)].symbol())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect();
+
+        assert_eq!(snapshot.rows, actual_rows);
+        assert_eq!(
+            snapshot.fills,
+            vec![
+                FrameRowFill::Default,
+                FrameRowFill::Default,
+                FrameRowFill::Default,
+                FrameRowFill::Default,
+                FrameRowFill::InputBackground,
+                FrameRowFill::InputBackground,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_frame_render_rows_matches_drawn_buffer_with_wide_content() {
+        let backend = TestBackend::new(16, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = FawxApp::new();
+        app.add_output("中 alpha 📡".into());
+        app.set_state(AppState::Streaming);
+        app.input_text = "码🙂".into();
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let snapshot = frame_render_rows(16, 6, &app);
+        let actual_rows: Vec<String> = (0..6)
+            .map(|row| {
+                (0..16)
+                    .map(|col| terminal.backend().buffer()[(col, row)].symbol())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect();
+
+        assert_eq!(snapshot.rows, actual_rows);
+    }
+
+    #[test]
+    fn test_render_input_matches_wrapped_lines_with_wide_chars_and_spaces() {
+        let backend = TestBackend::new(10, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = FawxApp::new();
+        app.input_text = "码🙂  wrap".into();
+
+        terminal
+            .draw(|frame| render_input(frame, frame.area(), &app))
+            .unwrap();
+
+        let expected_rows: Vec<String> = pad_lines_to_area(
+            build_input_lines(&app, 10, Style::default().fg(AMBER), Style::default()),
+            10,
+            3,
+        )
+        .iter()
+        .map(line_to_string)
+        .collect();
+        let actual_rows: Vec<String> = (0..3)
+            .map(|row| {
+                (0..10)
+                    .map(|col| terminal.backend().buffer()[(col, row)].symbol())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect();
+
+        assert_eq!(actual_rows, expected_rows);
     }
 
     // ── wrap_lines_to_width tests ──────────────────────────────

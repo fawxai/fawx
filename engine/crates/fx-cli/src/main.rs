@@ -5,6 +5,9 @@ mod auth_store;
 mod commands;
 mod config_bridge;
 mod confirmation;
+mod headless;
+#[cfg(feature = "http")]
+mod http_serve;
 #[allow(dead_code)] // TODO(#1148): Phase 3 will wire markdown rendering into ratatui
 mod markdown;
 // Phase 2: many rendering/history utilities are currently test-only while we
@@ -39,6 +42,25 @@ enum Commands {
 
     /// Interactive chat with the agent
     Chat,
+
+    /// Run headless mode (stdin/stdout, no TUI)
+    Serve {
+        /// Process single input and exit
+        #[arg(long)]
+        single: bool,
+        /// JSON input/output mode
+        #[arg(long)]
+        json: bool,
+        /// Path to a custom system prompt file (default: ~/.fawx/system_prompt.md)
+        #[arg(long)]
+        system_prompt: Option<std::path::PathBuf>,
+        /// Start HTTP API server (Tailscale-only)
+        #[arg(long)]
+        http: bool,
+        /// HTTP server port (default: 8400)
+        #[arg(long, default_value = "8400")]
+        port: u16,
+    },
 
     /// Run system diagnostics
     Doctor,
@@ -164,20 +186,74 @@ async fn run_tui() -> anyhow::Result<i32> {
     let auth_manager = tui::load_auth_manager()?;
     let router = tui::build_router(&auth_manager)?;
     let config = tui::load_config()?;
-    let bundle = tui::build_loop_engine_from_config(&config)?;
-    let mut app = tui::TuiApp::new_with_deps(tui::TuiAppDeps {
-        auth_manager,
-        router,
-        loop_engine: bundle.engine,
-        runtime_info: bundle.runtime_info,
-        config,
-        memory: bundle.memory,
-        event_bus: bundle.event_bus,
-        scratchpad: bundle.scratchpad,
-        credential_store: bundle.credential_store,
-    })?;
+    let improvement_provider = tui::build_improvement_provider(&auth_manager, &config);
+    let bundle = tui::build_loop_engine_from_config(&config, improvement_provider)?;
+    let deps = bundle.into_tui_deps(auth_manager, router, config);
+    let mut app = tui::TuiApp::new_with_deps(deps)?;
     app.run().await?;
     Ok(0)
+}
+
+async fn run_headless(
+    single: bool,
+    json: bool,
+    system_prompt: Option<std::path::PathBuf>,
+) -> anyhow::Result<i32> {
+    let auth_manager = tui::load_auth_manager()?;
+    let router = tui::build_router(&auth_manager)?;
+    let config = tui::load_config()?;
+    let improvement_provider = tui::build_improvement_provider(&auth_manager, &config);
+    let bundle = tui::build_loop_engine_from_config(&config, improvement_provider)?;
+
+    let deps = headless::HeadlessAppDeps {
+        loop_engine: bundle.engine,
+        router,
+        config,
+        memory: bundle.memory,
+        system_prompt_path: system_prompt,
+    };
+
+    let mut app = headless::HeadlessApp::new(deps)?;
+    if single {
+        app.run_single(json).await
+    } else {
+        app.run(json).await
+    }
+}
+
+#[cfg(feature = "http")]
+async fn run_http_server(
+    system_prompt: Option<std::path::PathBuf>,
+    port: u16,
+) -> anyhow::Result<i32> {
+    let auth_manager = tui::load_auth_manager()?;
+    let router = tui::build_router(&auth_manager)?;
+    let config = tui::load_config()?;
+    let http_config = config.http.clone();
+    let improvement_provider = tui::build_improvement_provider(&auth_manager, &config);
+    let bundle = tui::build_loop_engine_from_config(&config, improvement_provider)?;
+
+    let deps = headless::HeadlessAppDeps {
+        loop_engine: bundle.engine,
+        router,
+        config,
+        memory: bundle.memory,
+        system_prompt_path: system_prompt,
+    };
+
+    let mut app = headless::HeadlessApp::new(deps)?;
+    app.initialize();
+    http_serve::run(app, port, &http_config).await
+}
+
+#[cfg(not(feature = "http"))]
+async fn run_http_server(
+    _system_prompt: Option<std::path::PathBuf>,
+    _port: u16,
+) -> anyhow::Result<i32> {
+    eprintln!("Error: the http feature is not enabled in this build.");
+    eprintln!("Rebuild with: cargo build -p fx-cli --features http");
+    Ok(1)
 }
 
 fn run_stub(action: &str) -> i32 {
@@ -219,6 +295,19 @@ async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
         Commands::Start => Ok(run_stub("Starting")),
         Commands::Stop => Ok(run_stub("Stopping")),
         Commands::Chat => Ok(commands::chat::run().await?),
+        Commands::Serve {
+            single,
+            json,
+            system_prompt,
+            http,
+            port,
+        } => {
+            if http {
+                run_http_server(system_prompt, port).await
+            } else {
+                run_headless(single, json, system_prompt).await
+            }
+        }
         Commands::Doctor => Ok(commands::doctor::run().await?),
         Commands::Config => {
             commands::config::run().await?;

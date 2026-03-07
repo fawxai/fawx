@@ -47,6 +47,8 @@ pub struct FawxToolExecutor {
     runtime_info: Option<Arc<RwLock<RuntimeInfo>>>,
     self_modify: Option<SelfModifyConfig>,
     concurrency_policy: ConcurrencyPolicy,
+    #[cfg(feature = "improvement")]
+    improvement: Option<crate::improvement_tools::ImprovementToolsState>,
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +86,8 @@ impl FawxToolExecutor {
             runtime_info: None,
             self_modify: None,
             concurrency_policy: ConcurrencyPolicy::default(),
+            #[cfg(feature = "improvement")]
+            improvement: None,
         }
     }
 
@@ -112,6 +116,22 @@ impl FawxToolExecutor {
         self
     }
 
+    /// Attach self-improvement tools (analyze_signals, propose_improvement).
+    #[cfg(feature = "improvement")]
+    pub fn with_improvement(
+        mut self,
+        state: crate::improvement_tools::ImprovementToolsState,
+    ) -> Self {
+        self.improvement = Some(state);
+        self
+    }
+
+    /// Whether improvement tools are configured and enabled.
+    #[cfg(feature = "improvement")]
+    fn improvement_tools_enabled(&self) -> bool {
+        self.improvement.as_ref().is_some_and(|s| s.config.enabled)
+    }
+
     fn cacheability_for(tool_name: &str) -> ToolCacheability {
         match tool_name {
             "read_file" | "list_directory" | "search_text" | "memory_read" | "memory_list" => {
@@ -120,7 +140,9 @@ impl FawxToolExecutor {
             "write_file" | "memory_write" | "memory_delete" | "run_command" => {
                 ToolCacheability::SideEffect
             }
-            "current_time" | "self_info" => ToolCacheability::NeverCache,
+            "current_time" | "self_info" | "analyze_signals" | "propose_improvement" => {
+                ToolCacheability::NeverCache
+            }
             _ => ToolCacheability::NeverCache,
         }
     }
@@ -145,6 +167,14 @@ impl FawxToolExecutor {
             "memory_read" => self.handle_memory_read(&call.arguments),
             "memory_list" => self.handle_memory_list(),
             "memory_delete" => self.handle_memory_delete(&call.arguments),
+            #[cfg(feature = "improvement")]
+            "analyze_signals" => {
+                return self.dispatch_analyze_signals(call).await;
+            }
+            #[cfg(feature = "improvement")]
+            "propose_improvement" => {
+                return self.dispatch_propose_improvement(call).await;
+            }
             _ => Err(format!("unknown tool: {}", call.name)),
         };
         to_tool_result(&call.id, &call.name, output)
@@ -523,6 +553,43 @@ impl FawxToolExecutor {
         }
     }
 
+    #[cfg(feature = "improvement")]
+    async fn dispatch_analyze_signals(&self, call: &ToolCall) -> ToolResult {
+        let state = match &self.improvement {
+            Some(s) if s.config.enabled => s,
+            _ => {
+                return to_tool_result(
+                    &call.id,
+                    &call.name,
+                    Err("improvement tools not enabled".to_string()),
+                );
+            }
+        };
+        let output = crate::improvement_tools::handle_analyze_signals(state, &call.arguments).await;
+        to_tool_result(&call.id, &call.name, output)
+    }
+
+    #[cfg(feature = "improvement")]
+    async fn dispatch_propose_improvement(&self, call: &ToolCall) -> ToolResult {
+        let state = match &self.improvement {
+            Some(s) if s.config.enabled => s,
+            _ => {
+                return to_tool_result(
+                    &call.id,
+                    &call.name,
+                    Err("improvement tools not enabled".to_string()),
+                );
+            }
+        };
+        let output = crate::improvement_tools::handle_propose_improvement(
+            state,
+            &call.arguments,
+            &self.working_dir,
+        )
+        .await;
+        to_tool_result(&call.id, &call.name, output)
+    }
+
     async fn execute_single_tool(
         &self,
         call: &ToolCall,
@@ -642,6 +709,10 @@ impl ToolExecutor for FawxToolExecutor {
         let mut defs = fawx_tool_definitions();
         if self.memory.is_some() {
             defs.extend(memory_tool_definitions());
+        }
+        #[cfg(feature = "improvement")]
+        if self.improvement_tools_enabled() {
+            defs.extend(crate::improvement_tools::improvement_tool_definitions());
         }
         defs
     }
