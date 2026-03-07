@@ -808,6 +808,14 @@ fn pad_lines_to_area(
     lines
 }
 
+fn pad_visible_output_lines(
+    lines: Vec<Line<'static>>,
+    width: usize,
+    height: usize,
+) -> Vec<Line<'static>> {
+    pad_lines_to_area(lines, width, height)
+}
+
 fn render_section_rows(
     lines: Vec<Line<'static>>,
     width: usize,
@@ -843,7 +851,6 @@ fn append_frame_section(
     fills.extend(section_fills);
     content_columns.extend(section_columns);
 }
-
 fn truncate_to_display_width(text: &str, max_width: usize) -> String {
     if max_width == 0 {
         return String::new();
@@ -932,7 +939,7 @@ fn render_output(frame: &mut Frame, area: ratatui::layout::Rect, app: &FawxApp) 
     let width = area.width as usize;
     let height = area.height as usize;
     let (lines, _) = visible_output_lines_for_render(app, width, height);
-    let lines = pad_lines_to_area(lines, width, height);
+    let lines = pad_visible_output_lines(lines, width, height);
     let paragraph = Paragraph::new(lines);
 
     frame.render_widget(Clear, area);
@@ -1007,12 +1014,10 @@ fn render_input(frame: &mut Frame, area: ratatui::layout::Rect, app: &FawxApp) {
     } else {
         Style::default().add_modifier(Modifier::DIM)
     };
-
     let block = Block::default().style(Style::default().bg(INPUT_BG));
     let lines = build_input_lines(app, area.width as usize, prompt_style, text_style);
     let lines = pad_lines_to_area(lines, area.width as usize, area.height as usize);
     let paragraph = Paragraph::new(lines).block(block);
-
     frame.render_widget(Clear, area);
     frame.render_widget(paragraph, area);
 }
@@ -1620,7 +1625,7 @@ mod tests {
         }
 
         let (visible_lines, _) = visible_output_lines_for_render(&app, 24, 6);
-        let padded_lines = pad_lines_to_area(visible_lines, 24, 6);
+        let padded_lines = pad_visible_output_lines(visible_lines, 24, 6);
         let expected_rows: Vec<String> = padded_lines
             .iter()
             .map(|line| {

@@ -629,7 +629,6 @@ fn reload_event_requires_cache_clear(event: &ReloadEvent) -> bool {
         ReloadEvent::Loaded { .. } | ReloadEvent::Updated { .. } | ReloadEvent::Removed { .. }
     )
 }
-
 /// Check if input is a control command that only makes sense during execution.
 ///
 /// During idle, only `/stop` (with slash) is recognized so that bare words
@@ -639,14 +638,16 @@ fn is_idle_control_command(input: &str) -> bool {
     trimmed.eq_ignore_ascii_case("/stop") || trimmed.eq_ignore_ascii_case("/abort")
 }
 
+/// Poll for input events during execution and route them.
 fn poll_execution_events(
     app: &mut ui::FawxApp,
     cancel_token: &CancellationToken,
     input_sender: &Option<LoopInputSender>,
 ) {
     while crossterm::event::poll(Duration::ZERO).unwrap_or(false) {
-        if let Ok(event) = crossterm::event::read() {
-            handle_execution_event(event, app, cancel_token, input_sender);
+        match crossterm::event::read() {
+            Ok(event) => handle_execution_event(event, app, cancel_token, input_sender),
+            Err(_) => break,
         }
     }
 }
