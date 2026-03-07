@@ -195,6 +195,24 @@ enum SkillCommands {
         /// Skill name
         name: String,
     },
+
+    /// Build a skill from source (compile, sign, install)
+    Build {
+        /// Path to skill project directory
+        path: String,
+        /// Skip signing even if key exists
+        #[arg(long)]
+        no_sign: bool,
+        /// Build only, don't install to ~/.fawx/skills/
+        #[arg(long)]
+        no_install: bool,
+    },
+
+    /// Scaffold a new skill project
+    New {
+        /// Name for the new skill
+        name: String,
+    },
 }
 
 async fn run_tui() -> anyhow::Result<i32> {
@@ -299,6 +317,18 @@ async fn dispatch_skill(command: SkillCommands) -> anyhow::Result<i32> {
         }
         SkillCommands::Remove { name } => {
             commands::skills::remove(&name).await?;
+            Ok(0)
+        }
+        SkillCommands::Build {
+            path,
+            no_sign,
+            no_install,
+        } => {
+            commands::skills::build(&path, no_sign, no_install)?;
+            Ok(0)
+        }
+        SkillCommands::New { name } => {
+            commands::skills::scaffold(&name)?;
             Ok(0)
         }
     }

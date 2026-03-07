@@ -1,6 +1,7 @@
 //! Skill management commands.
 
 use anyhow::{Context, Result};
+use fx_author::{BuildConfig, BuildResult};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -285,4 +286,55 @@ pub async fn remove(name: &str) -> Result<()> {
 
     println!("✓ Removed skill '{}'", name);
     Ok(())
+}
+
+/// Build a skill from source.
+pub fn build(path: &str, no_sign: bool, no_install: bool) -> Result<()> {
+    let project_path = PathBuf::from(path)
+        .canonicalize()
+        .with_context(|| format!("Invalid project path: {path}"))?;
+
+    let data_dir = resolve_data_dir()?;
+
+    let config = BuildConfig {
+        project_path,
+        data_dir,
+        no_sign,
+        no_install,
+    };
+
+    let result = fx_author::build_skill(&config).map_err(|e| anyhow::anyhow!("{e}"))?;
+    print_build_summary(&result);
+    Ok(())
+}
+
+/// Scaffold a new skill project.
+pub fn scaffold(name: &str) -> Result<()> {
+    let cwd = std::env::current_dir().context("Failed to get current directory")?;
+    let path = fx_author::scaffold_skill(name, &cwd).map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!("✓ Created skill project at {}", path.display());
+    println!("  Next steps:");
+    println!("    cd {name}");
+    println!("    # edit src/lib.rs");
+    println!("    fawx skill build .");
+    Ok(())
+}
+
+fn resolve_data_dir() -> Result<PathBuf> {
+    let home = dirs::home_dir().context("Failed to get home directory")?;
+    Ok(home.join(".fawx"))
+}
+
+fn print_build_summary(result: &BuildResult) {
+    let size_kb = result.wasm_size_bytes / 1024;
+    let signed_str = if result.signed { "signed" } else { "unsigned" };
+
+    println!(
+        "✓ Built {} v{} ({} KB, {})",
+        result.skill_name, result.version, size_kb, signed_str
+    );
+
+    if let Some(ref path) = result.install_path {
+        println!("  Installed to: {}", path.display());
+    }
 }
