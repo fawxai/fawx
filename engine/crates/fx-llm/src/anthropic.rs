@@ -252,6 +252,12 @@ impl AnthropicProvider {
                         content: result,
                     });
                 }
+                AnthropicContentBlock::Thinking { .. } => {
+                    // Extended thinking block — skip (not surfaced to user)
+                }
+                AnthropicContentBlock::RedactedThinking { .. } => {
+                    // Redacted thinking block — skip (content-policy redaction)
+                }
             }
         }
 
@@ -666,6 +672,12 @@ enum AnthropicContentBlock {
         tool_use_id: String,
         content: Value,
     },
+    Thinking {
+        thinking: String,
+    },
+    RedactedThinking {
+        data: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -710,6 +722,11 @@ struct AnthropicStreamDelta {
     text: Option<String>,
     #[serde(default)]
     partial_json: Option<String>,
+    /// Captures `thinking_delta` content; intentionally unused (thinking
+    /// blocks are silently skipped, but the field must exist so serde
+    /// does not reject the payload).
+    #[serde(default, rename = "thinking")]
+    _thinking: Option<String>,
     #[serde(default)]
     stop_reason: Option<String>,
 }
@@ -1333,6 +1350,108 @@ mod tests {
         assert_eq!(
             max_tokens, 20000,
             "max_tokens must stay at explicitly set value when it already exceeds budget"
+        );
+    }
+
+    #[test]
+    fn thinking_block_skipped_in_response() {
+        let response = AnthropicResponseBody {
+            content: vec![
+                AnthropicContentBlock::Thinking {
+                    thinking: "Let me reason about this...".to_string(),
+                },
+                AnthropicContentBlock::Text {
+                    text: "The answer is 42.".to_string(),
+                },
+            ],
+            stop_reason: Some("end_turn".to_string()),
+            usage: Some(AnthropicUsage {
+                input_tokens: 10,
+                output_tokens: 20,
+            }),
+        };
+
+        let mapped = AnthropicProvider::parse_completion_response(response);
+
+        assert_eq!(mapped.content.len(), 1, "thinking block must be skipped");
+        assert!(
+            matches!(&mapped.content[0], ContentBlock::Text { text } if text == "The answer is 42."),
+            "only the text block should remain"
+        );
+        assert!(mapped.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn redacted_thinking_block_skipped_in_response() {
+        let response = AnthropicResponseBody {
+            content: vec![
+                AnthropicContentBlock::RedactedThinking {
+                    data: "base64-redacted-content".to_string(),
+                },
+                AnthropicContentBlock::Text {
+                    text: "The answer is 42.".to_string(),
+                },
+            ],
+            stop_reason: Some("end_turn".to_string()),
+            usage: Some(AnthropicUsage {
+                input_tokens: 10,
+                output_tokens: 20,
+            }),
+        };
+
+        let mapped = AnthropicProvider::parse_completion_response(response);
+
+        assert_eq!(
+            mapped.content.len(),
+            1,
+            "redacted thinking block must be skipped"
+        );
+        assert!(
+            matches!(&mapped.content[0], ContentBlock::Text { text } if text == "The answer is 42."),
+            "only the text block should remain"
+        );
+        assert!(mapped.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn thinking_block_skipped_in_stream() {
+        let payload = r#"
+            data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}
+
+            data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me reason..."}}
+
+            data: {"type":"content_block_stop","index":0}
+
+            data: {"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"base64-redacted"}}
+
+            data: {"type":"content_block_stop","index":1}
+
+            data: {"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}
+
+            data: {"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"Hello!"}}
+
+            data: {"type":"content_block_stop","index":2}
+
+            data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}
+
+            data: [DONE]
+        "#;
+
+        let chunks = AnthropicProvider::parse_sse_payload(payload).unwrap();
+
+        // Only the text delta and the message_delta (stop_reason) should produce chunks.
+        // Thinking start/delta/stop must produce nothing.
+        let text_chunks: Vec<_> = chunks
+            .iter()
+            .filter(|c| c.delta_content.is_some())
+            .collect();
+        assert_eq!(text_chunks.len(), 1);
+        assert_eq!(text_chunks[0].delta_content.as_deref(), Some("Hello!"));
+
+        // No tool calls from thinking blocks
+        assert!(
+            chunks.iter().all(|c| c.tool_use_deltas.is_empty()),
+            "thinking blocks must not produce tool use deltas"
         );
     }
 }
