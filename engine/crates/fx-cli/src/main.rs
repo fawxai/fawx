@@ -6,6 +6,8 @@ mod commands;
 mod config_bridge;
 mod confirmation;
 mod headless;
+#[cfg(feature = "http")]
+mod http_serve;
 #[allow(dead_code)] // TODO(#1148): Phase 3 will wire markdown rendering into ratatui
 mod markdown;
 // Phase 2: many rendering/history utilities are currently test-only while we
@@ -52,6 +54,12 @@ enum Commands {
         /// Path to a custom system prompt file (default: ~/.fawx/system_prompt.md)
         #[arg(long)]
         system_prompt: Option<std::path::PathBuf>,
+        /// Start HTTP API server (Tailscale-only)
+        #[arg(long)]
+        http: bool,
+        /// HTTP server port (default: 8400)
+        #[arg(long, default_value = "8400")]
+        port: u16,
     },
 
     /// Run system diagnostics
@@ -211,6 +219,39 @@ async fn run_headless(
     }
 }
 
+#[cfg(feature = "http")]
+async fn run_http_server(
+    system_prompt: Option<std::path::PathBuf>,
+    port: u16,
+) -> anyhow::Result<i32> {
+    let auth_manager = tui::load_auth_manager()?;
+    let router = tui::build_router(&auth_manager)?;
+    let config = tui::load_config()?;
+    let bundle = tui::build_loop_engine_from_config(&config)?;
+
+    let deps = headless::HeadlessAppDeps {
+        loop_engine: bundle.engine,
+        router,
+        config,
+        memory: bundle.memory,
+        system_prompt_path: system_prompt,
+    };
+
+    let mut app = headless::HeadlessApp::new(deps)?;
+    app.initialize();
+    http_serve::run(app, port).await
+}
+
+#[cfg(not(feature = "http"))]
+async fn run_http_server(
+    _system_prompt: Option<std::path::PathBuf>,
+    _port: u16,
+) -> anyhow::Result<i32> {
+    eprintln!("Error: the http feature is not enabled in this build.");
+    eprintln!("Rebuild with: cargo build -p fx-cli --features http");
+    Ok(1)
+}
+
 fn run_stub(action: &str) -> i32 {
     println!("{action} Fawx agent daemon...");
     println!("(Implementation pending - Epic 9)");
@@ -254,7 +295,15 @@ async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
             single,
             json,
             system_prompt,
-        } => run_headless(single, json, system_prompt).await,
+            http,
+            port,
+        } => {
+            if http {
+                run_http_server(system_prompt, port).await
+            } else {
+                run_headless(single, json, system_prompt).await
+            }
+        }
         Commands::Doctor => Ok(commands::doctor::run().await?),
         Commands::Config => {
             commands::config::run().await?;

@@ -35,6 +35,18 @@ struct JsonOutput {
     iterations: u32,
 }
 
+// ── CycleResult ─────────────────────────────────────────────────────────────
+
+/// Result of a single agentic cycle, returned by [`HeadlessApp::process_message`].
+pub struct CycleResult {
+    /// The assistant's response text.
+    pub response: String,
+    /// The model identifier used for the cycle.
+    pub model: String,
+    /// Number of loop iterations consumed.
+    pub iterations: u32,
+}
+
 // ── HeadlessApp ─────────────────────────────────────────────────────────────
 
 /// Dependencies for constructing a [`HeadlessApp`]. Avoids > 5 bare params.
@@ -148,9 +160,12 @@ impl HeadlessApp {
         Ok(0)
     }
 
-    // ── internal helpers ────────────────────────────────────────────────
-
-    async fn process_input(&mut self, input: &str, json_mode: bool) -> Result<(), anyhow::Error> {
+    /// Process a single message and return the result.
+    ///
+    /// Shared by the stdin REPL, single-shot mode, and the HTTP server.
+    /// Updates memory context, runs a loop cycle, records the turn in
+    /// conversation history, and returns the extracted response.
+    pub async fn process_message(&mut self, input: &str) -> Result<CycleResult, anyhow::Error> {
         self.update_memory_context(input);
         let snapshot = self.build_perception_snapshot(input);
         let llm = RouterLoopLlmProvider::new(&self.router, self.active_model.clone());
@@ -160,14 +175,48 @@ impl HeadlessApp {
             .await
             .map_err(|e| anyhow::anyhow!("loop error: stage={} reason={}", e.stage, e.reason))?;
 
-        if json_mode {
-            self.emit_json_output(&result)?;
-        } else {
-            self.emit_text_output(&result)?;
-        }
-
         let response = extract_response_text(&result);
+        let iterations = extract_iterations(&result);
         self.record_turn(input, &response);
+
+        Ok(CycleResult {
+            response,
+            model: self.active_model.clone(),
+            iterations,
+        })
+    }
+
+    /// Return the active model identifier.
+    #[cfg(feature = "http")]
+    pub fn active_model(&self) -> &str {
+        &self.active_model
+    }
+
+    /// Apply the custom system prompt (if any). Must be called once
+    /// before the first `process_message` invocation when not using
+    /// the built-in `run()` or `run_single()` methods.
+    #[cfg(feature = "http")]
+    pub fn initialize(&mut self) {
+        self.apply_custom_system_prompt();
+    }
+
+    // ── internal helpers ────────────────────────────────────────────────
+
+    async fn process_input(&mut self, input: &str, json_mode: bool) -> Result<(), anyhow::Error> {
+        let result = self.process_message(input).await?;
+        if json_mode {
+            let output = JsonOutput {
+                response: result.response,
+                model: result.model,
+                iterations: result.iterations,
+            };
+            let json = serde_json::to_string(&output)?;
+            println!("{json}");
+            io::stdout().flush()?;
+        } else {
+            println!("{}", result.response);
+            io::stdout().flush()?;
+        }
         Ok(())
     }
 
@@ -256,25 +305,6 @@ impl HeadlessApp {
     fn parse_json_input(&self, raw: &str) -> Result<String, serde_json::Error> {
         let parsed: JsonInput = serde_json::from_str(raw)?;
         Ok(parsed.message)
-    }
-
-    fn emit_json_output(&self, result: &LoopResult) -> Result<(), anyhow::Error> {
-        let output = JsonOutput {
-            response: extract_response_text(result),
-            model: self.active_model.clone(),
-            iterations: extract_iterations(result),
-        };
-        let json = serde_json::to_string(&output)?;
-        println!("{json}");
-        io::stdout().flush()?;
-        Ok(())
-    }
-
-    fn emit_text_output(&self, result: &LoopResult) -> Result<(), anyhow::Error> {
-        let text = extract_response_text(result);
-        println!("{text}");
-        io::stdout().flush()?;
-        Ok(())
     }
 }
 

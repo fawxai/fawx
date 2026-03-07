@@ -6,6 +6,9 @@ authors.workspace = true
 license.workspace = true
 
 [features]
+# Enable the HTTP API server for headless mode (`fawx serve --http`).
+# Tailscale-only binding. Pulls in axum.
+http = ["dep:axum"]
 # Enable the OAuth bridge HTTP server subcommand (`fawx oauth-bridge`).
 # Pulls in axum and crypto dependencies. Disabled by default to reduce build times.
 oauth-bridge = ["dep:axum", "dep:base64", "dep:rand", "dep:subtle"]
