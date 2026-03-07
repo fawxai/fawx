@@ -4,11 +4,19 @@
 //! message processing, health checks, and status. The server binds
 //! exclusively to the Tailscale interface (100.64.0.0/10 CGNAT range)
 //! and refuses to start if Tailscale is not detected.
+//!
+//! All authenticated endpoints require a `Bearer <token>` header validated
+//! via HMAC-based constant-time comparison (`ring::hmac`). The `/health`
+//! endpoint is public for monitoring.
 
 use axum::extract::{Json, State};
 use axum::http::StatusCode;
+use axum::middleware;
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::Router;
+use fx_config::HttpConfig;
+use ring::hmac;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -61,6 +69,76 @@ struct HttpState {
     app: Arc<Mutex<HeadlessApp>>,
     start_time: Instant,
     tailscale_ip: IpAddr,
+    // TODO(#1203): Token is stored as plaintext String — could appear in heap
+    // dumps. Future hardening: wrap with `secrecy::SecretString` to ensure
+    // zeroization on drop and prevent accidental logging.
+    bearer_token: String,
+}
+
+// ── Token verification ──────────────────────────────────────────────────────
+
+/// Constant-time token comparison using HMAC.
+///
+/// Uses the expected token as the HMAC key, signs the expected value, then
+/// verifies the provided value against that tag. This avoids length-based
+/// timing leaks because HMAC produces fixed-size output and `hmac::verify`
+/// performs constant-time comparison internally.
+///
+/// Shared between production middleware and test helpers (single source of
+/// truth for auth logic — see #1204 review finding #3).
+fn verify_token(expected: &str, provided: &str) -> bool {
+    let key = hmac::Key::new(hmac::HMAC_SHA256, expected.as_bytes());
+    let tag = hmac::sign(&key, expected.as_bytes());
+    hmac::verify(&key, provided.as_bytes(), tag.as_ref()).is_ok()
+}
+
+// ── Authentication middleware ───────────────────────────────────────────────
+
+/// Axum middleware that validates `Authorization: Bearer <token>` headers.
+///
+/// Uses HMAC-based constant-time comparison via [`verify_token`] to prevent
+/// timing side-channel attacks on the bearer token.
+async fn auth_middleware(
+    State(state): State<HttpState>,
+    request: axum::http::Request<axum::body::Body>,
+    next: middleware::Next,
+) -> axum::response::Response {
+    let unauthorized = || {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorBody {
+                error: "unauthorized".to_string(),
+            }),
+        )
+            .into_response()
+    };
+
+    // Log request metadata for audit purposes (review finding #7).
+    // Never log the Authorization header or message content.
+    // Full audit logging is tracked in #1203.
+    let path = request.uri().path().to_string();
+    tracing::info!(endpoint = %path, "HTTP request");
+
+    let header = match request.headers().get("authorization") {
+        Some(h) => h,
+        None => return unauthorized(),
+    };
+
+    let header_str = match header.to_str() {
+        Ok(s) => s,
+        Err(_) => return unauthorized(),
+    };
+
+    let token = match header_str.strip_prefix("Bearer ") {
+        Some(t) => t,
+        None => return unauthorized(),
+    };
+
+    if !verify_token(&state.bearer_token, token) {
+        return unauthorized();
+    }
+
+    next.run(request).await
 }
 
 // ── Tailscale detection ─────────────────────────────────────────────────────
@@ -107,7 +185,6 @@ fn detect_via_tailscale_cli() -> Option<IpAddr> {
 }
 
 fn detect_via_cgnat_scan() -> Result<IpAddr, HttpError> {
-    // Scan common Tailscale interface names via /proc/net or ip command
     let output = std::process::Command::new("ip")
         .args(["-4", "-o", "addr", "show"])
         .output()
@@ -115,7 +192,6 @@ fn detect_via_cgnat_scan() -> Result<IpAddr, HttpError> {
 
     let text = String::from_utf8_lossy(&output.stdout);
     for line in text.lines() {
-        // Lines look like: "4: tailscale0    inet 100.93.251.101/32 ..."
         if let Some(ip) = extract_ip_from_line(line) {
             if is_tailscale_ip(&ip) {
                 return Ok(ip);
@@ -132,7 +208,6 @@ fn detect_via_cgnat_scan() -> Result<IpAddr, HttpError> {
 }
 
 fn extract_ip_from_line(line: &str) -> Option<IpAddr> {
-    // Format: "N: iface    inet A.B.C.D/prefix ..."
     let inet_pos = line.find("inet ")?;
     let after_inet = &line[inet_pos + 5..];
     let addr_str = after_inet.split('/').next()?;
@@ -144,17 +219,47 @@ fn extract_ip_from_line(line: &str) -> Option<IpAddr> {
 #[derive(Debug)]
 enum HttpError {
     NoTailscale(String),
+    MissingBearerToken,
 }
 
 impl std::fmt::Display for HttpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoTailscale(msg) => write!(f, "{msg}"),
+            Self::MissingBearerToken => write!(
+                f,
+                "HTTP API requires a bearer token for authentication.\n\
+                 Add to ~/.fawx/config.toml:\n\n\
+                 [http]\n\
+                 bearer_token = \"your-secret-token\"\n\n\
+                 Generate one with: openssl rand -hex 32"
+            ),
         }
     }
 }
 
 impl std::error::Error for HttpError {}
+
+// ── Token validation ────────────────────────────────────────────────────────
+
+/// Validate that the HTTP config contains a non-empty bearer token.
+///
+/// Trims leading/trailing whitespace from the configured value so that
+/// `bearer_token = "  mytoken  "` compares against `"mytoken"` rather than
+/// silently including the spaces (review finding #4).
+fn validate_bearer_token(config: &HttpConfig) -> Result<String, HttpError> {
+    match &config.bearer_token {
+        Some(token) => {
+            let trimmed = token.trim().to_string();
+            if trimmed.is_empty() {
+                Err(HttpError::MissingBearerToken)
+            } else {
+                Ok(trimmed)
+            }
+        }
+        _ => Err(HttpError::MissingBearerToken),
+    }
+}
 
 // ── Router ──────────────────────────────────────────────────────────────────
 
@@ -162,10 +267,18 @@ impl std::error::Error for HttpError {}
 const MAX_REQUEST_BYTES: usize = 1_048_576;
 
 fn build_router(state: HttpState) -> Router {
-    Router::new()
+    let authenticated = Router::new()
         .route("/message", post(handle_message))
-        .route("/health", get(handle_health))
         .route("/status", get(handle_status))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
+
+    let public = Router::new().route("/health", get(handle_health));
+
+    authenticated
+        .merge(public)
         .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(state)
 }
@@ -187,10 +300,13 @@ async fn handle_message(
 
     let mut app = state.app.lock().await;
     let result = app.process_message(&request.message).await.map_err(|e| {
+        // Log full error details to stderr for debugging; never expose
+        // internal error text to HTTP clients (review finding #2).
+        tracing::error!(error = %e, "message processing failed");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorBody {
-                error: format!("cycle error: {e}"),
+                error: "internal_error".to_string(),
             }),
         )
     })?;
@@ -206,7 +322,6 @@ async fn handle_health(State(state): State<HttpState>) -> Json<HealthResponse> {
     let app = state.app.lock().await;
     let uptime = state.start_time.elapsed().as_secs();
     let model = app.active_model().to_string();
-    // Skills info not available through HeadlessApp; report 0 for v1
     Json(HealthResponse {
         status: "ok",
         model,
@@ -232,9 +347,12 @@ async fn handle_status(State(state): State<HttpState>) -> Json<StatusResponse> {
 
 /// Run the HTTP server for headless mode.
 ///
-/// Detects the Tailscale IP, binds exclusively to it, and serves
-/// requests until the process is terminated.
-pub async fn run(app: HeadlessApp, port: u16) -> anyhow::Result<i32> {
+/// Validates that a bearer token is configured, detects the Tailscale IP,
+/// binds exclusively to it, and serves requests until the process is
+/// terminated.
+pub async fn run(app: HeadlessApp, port: u16, http_config: &HttpConfig) -> anyhow::Result<i32> {
+    let bearer_token = validate_bearer_token(http_config).map_err(|e| anyhow::anyhow!("{e}"))?;
+
     let ip = detect_tailscale_ip().map_err(|e| anyhow::anyhow!("{e}"))?;
     let addr = SocketAddr::new(ip, port);
 
@@ -242,6 +360,7 @@ pub async fn run(app: HeadlessApp, port: u16) -> anyhow::Result<i32> {
         app: Arc::new(Mutex::new(app)),
         start_time: Instant::now(),
         tailscale_ip: ip,
+        bearer_token,
     };
 
     let router = build_router(state);
@@ -251,6 +370,7 @@ pub async fn run(app: HeadlessApp, port: u16) -> anyhow::Result<i32> {
 
     eprintln!("Fawx HTTP API listening on http://{addr}");
     eprintln!("Tailscale-only binding — not accessible from public internet");
+    eprintln!("Bearer token authentication: enabled");
 
     axum::serve(listener, router)
         .await
@@ -270,17 +390,125 @@ mod tests {
     use std::net::Ipv4Addr;
     use tower::ServiceExt;
 
+    const TEST_TOKEN: &str = "test-secret-token-abc123";
+
+    // ── Auth-only state for test middleware ──────────────────────────────
+
+    /// Minimal state used by test routers — only carries the bearer token
+    /// needed by the auth middleware. Mock handlers are stateless.
+    #[derive(Clone)]
+    struct TestAuthState {
+        bearer_token: String,
+    }
+
+    /// Auth middleware for tests — uses the shared [`verify_token`] function
+    /// (single source of truth, review finding #3).
+    async fn test_auth_middleware(
+        State(state): State<TestAuthState>,
+        request: axum::http::Request<axum::body::Body>,
+        next: middleware::Next,
+    ) -> axum::response::Response {
+        let unauthorized = || {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorBody {
+                    error: "unauthorized".to_string(),
+                }),
+            )
+                .into_response()
+        };
+
+        let header = match request.headers().get("authorization") {
+            Some(h) => h,
+            None => return unauthorized(),
+        };
+        let header_str = match header.to_str() {
+            Ok(s) => s,
+            Err(_) => return unauthorized(),
+        };
+        let token = match header_str.strip_prefix("Bearer ") {
+            Some(t) => t,
+            None => return unauthorized(),
+        };
+
+        if !verify_token(&state.bearer_token, token) {
+            return unauthorized();
+        }
+
+        next.run(request).await
+    }
+
+    fn authed_test_router() -> Router {
+        let state = TestAuthState {
+            bearer_token: TEST_TOKEN.to_string(),
+        };
+
+        let authenticated = Router::new()
+            .route("/status", get(mock_status))
+            .route("/message", post(mock_message))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                test_auth_middleware,
+            ));
+
+        let public = Router::new().route("/health", get(mock_health));
+
+        authenticated.merge(public).with_state(state)
+    }
+
+    /// Build a test router WITHOUT auth (for backward-compat endpoint tests).
+    fn test_router() -> Router {
+        Router::new()
+            .route("/health", get(mock_health))
+            .route("/status", get(mock_status))
+            .route("/message", post(mock_message))
+    }
+
+    async fn mock_health() -> Json<HealthResponse> {
+        Json(HealthResponse {
+            status: "ok",
+            model: "test-model".to_string(),
+            uptime_seconds: 42,
+            skills_loaded: 2,
+        })
+    }
+
+    async fn mock_status() -> Json<StatusResponse> {
+        Json(StatusResponse {
+            status: "ok",
+            model: "test-model".to_string(),
+            skills: vec!["skill-a".to_string()],
+            memory_entries: 10,
+            tailscale_ip: "100.64.0.1".to_string(),
+        })
+    }
+
+    async fn mock_message(
+        Json(req): Json<MessageRequest>,
+    ) -> Result<Json<MessageResponse>, (StatusCode, Json<ErrorBody>)> {
+        if req.message.trim().is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorBody {
+                    error: "message must not be empty".to_string(),
+                }),
+            ));
+        }
+        Ok(Json(MessageResponse {
+            response: format!("echo: {}", req.message),
+            model: "test-model".to_string(),
+            iterations: 1,
+        }))
+    }
+
     // ── Tailscale IP validation ─────────────────────────────────────────
 
     #[test]
     fn tailscale_ip_accepts_valid_range() {
-        // 100.64.0.1 — start of CGNAT range
         assert!(is_tailscale_ip(&IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))));
-        // 100.127.255.255 — end of CGNAT range
         assert!(is_tailscale_ip(&IpAddr::V4(Ipv4Addr::new(
             100, 127, 255, 255
         ))));
-        // 100.93.251.101 — typical Tailscale IP
         assert!(is_tailscale_ip(&IpAddr::V4(Ipv4Addr::new(
             100, 93, 251, 101
         ))));
@@ -288,16 +516,11 @@ mod tests {
 
     #[test]
     fn tailscale_ip_rejects_outside_range() {
-        // 100.63.0.0 — just below CGNAT range
         assert!(!is_tailscale_ip(&IpAddr::V4(Ipv4Addr::new(100, 63, 0, 0))));
-        // 100.128.0.0 — just above CGNAT range
         assert!(!is_tailscale_ip(&IpAddr::V4(Ipv4Addr::new(100, 128, 0, 0))));
-        // Private ranges
         assert!(!is_tailscale_ip(&IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
         assert!(!is_tailscale_ip(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
-        // Loopback
         assert!(!is_tailscale_ip(&IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
-        // Wildcard
         assert!(!is_tailscale_ip(&IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))));
     }
 
@@ -311,8 +534,6 @@ mod tests {
 
     #[test]
     fn binding_rejects_non_tailscale_ips() {
-        // detect_tailscale_ip() uses is_tailscale_ip() to validate.
-        // These IPs would be rejected during binding.
         assert!(!is_tailscale_ip(&IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
         assert!(!is_tailscale_ip(&IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))));
         assert!(!is_tailscale_ip(&IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
@@ -403,56 +624,39 @@ mod tests {
         assert!(json["skills"].is_array());
     }
 
-    // ── Endpoint integration tests (using axum test utilities) ──────────
+    // ── Bearer token validation ─────────────────────────────────────────
 
-    /// Build a test router with a mock state (no real HeadlessApp needed
-    /// for endpoint shape tests — we test handlers directly).
-    fn test_router() -> Router {
-        // For endpoint tests that don't need a real HeadlessApp,
-        // we test serialization/deserialization and routing only.
-        // Handler tests that need HeadlessApp require a full engine setup.
-        Router::new()
-            .route("/health", get(mock_health))
-            .route("/status", get(mock_status))
-            .route("/message", post(mock_message))
+    #[test]
+    fn validate_bearer_token_accepts_valid_token() {
+        let config = HttpConfig {
+            bearer_token: Some("my-secret".to_string()),
+        };
+        assert!(validate_bearer_token(&config).is_ok());
     }
 
-    async fn mock_health() -> Json<HealthResponse> {
-        Json(HealthResponse {
-            status: "ok",
-            model: "test-model".to_string(),
-            uptime_seconds: 42,
-            skills_loaded: 2,
-        })
+    #[test]
+    fn validate_bearer_token_rejects_none() {
+        let config = HttpConfig { bearer_token: None };
+        assert!(validate_bearer_token(&config).is_err());
     }
 
-    async fn mock_status() -> Json<StatusResponse> {
-        Json(StatusResponse {
-            status: "ok",
-            model: "test-model".to_string(),
-            skills: vec!["skill-a".to_string()],
-            memory_entries: 10,
-            tailscale_ip: "100.64.0.1".to_string(),
-        })
+    #[test]
+    fn validate_bearer_token_rejects_empty() {
+        let config = HttpConfig {
+            bearer_token: Some(String::new()),
+        };
+        assert!(validate_bearer_token(&config).is_err());
     }
 
-    async fn mock_message(
-        Json(req): Json<MessageRequest>,
-    ) -> Result<Json<MessageResponse>, (StatusCode, Json<ErrorBody>)> {
-        if req.message.trim().is_empty() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(ErrorBody {
-                    error: "message must not be empty".to_string(),
-                }),
-            ));
-        }
-        Ok(Json(MessageResponse {
-            response: format!("echo: {}", req.message),
-            model: "test-model".to_string(),
-            iterations: 1,
-        }))
+    #[test]
+    fn validate_bearer_token_rejects_whitespace_only() {
+        let config = HttpConfig {
+            bearer_token: Some("   ".to_string()),
+        };
+        assert!(validate_bearer_token(&config).is_err());
     }
+
+    // ── Endpoint integration tests (no auth) ────────────────────────────
 
     #[tokio::test]
     async fn health_endpoint_returns_ok() {
@@ -542,7 +746,224 @@ mod tests {
             .expect("request");
 
         let resp = app.oneshot(req).await.expect("response");
-        // Missing required field → 422 (Unprocessable Entity) from axum
         assert!(resp.status().is_client_error());
+    }
+
+    // ── Auth middleware tests ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn auth_missing_header_returns_401() {
+        let app = authed_test_router();
+        let req = Request::builder()
+            .method("GET")
+            .uri("/status")
+            .body(Body::empty())
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let body = resp.into_body().collect().await.expect("body").to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json["error"], "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn auth_wrong_token_returns_401() {
+        let app = authed_test_router();
+        let req = Request::builder()
+            .method("GET")
+            .uri("/status")
+            .header("authorization", "Bearer wrong-token")
+            .body(Body::empty())
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_correct_token_returns_200() {
+        let app = authed_test_router();
+        let req = Request::builder()
+            .method("GET")
+            .uri("/status")
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .body(Body::empty())
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn auth_bearer_prefix_required() {
+        let app = authed_test_router();
+        // Token without "Bearer " prefix
+        let req = Request::builder()
+            .method("GET")
+            .uri("/status")
+            .header("authorization", TEST_TOKEN)
+            .body(Body::empty())
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_health_endpoint_public() {
+        let app = authed_test_router();
+        // No auth header — health should still work
+        let req = Request::builder()
+            .method("GET")
+            .uri("/health")
+            .body(Body::empty())
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = resp.into_body().collect().await.expect("body").to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn auth_message_endpoint_requires_token() {
+        let app = authed_test_router();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/message")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"message": "hello"}"#))
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_message_with_valid_token_succeeds() {
+        let app = authed_test_router();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/message")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .body(Body::from(r#"{"message": "hello"}"#))
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = resp.into_body().collect().await.expect("body").to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json["response"], "echo: hello");
+    }
+
+    // ── HMAC-based token verification ───────────────────────────────────
+
+    #[test]
+    fn verify_token_correct_token_accepted() {
+        assert!(verify_token("test-token-123", "test-token-123"));
+    }
+
+    #[test]
+    fn verify_token_wrong_token_rejected() {
+        assert!(!verify_token("test-token-123", "wrong-token-456"));
+    }
+
+    #[test]
+    fn verify_token_different_lengths_rejected() {
+        assert!(!verify_token("short", "longer-token"));
+    }
+
+    #[test]
+    fn verify_token_empty_provided_rejected() {
+        assert!(!verify_token("some-token", ""));
+    }
+
+    #[test]
+    fn verify_token_empty_both_accepted() {
+        // Edge case: both empty — HMAC of empty against empty matches.
+        assert!(verify_token("", ""));
+    }
+
+    // ── Bearer token validation (config) ────────────────────────────────
+
+    #[test]
+    fn validate_bearer_token_trims_whitespace() {
+        let config = HttpConfig {
+            bearer_token: Some("  my-secret  ".to_string()),
+        };
+        let result = validate_bearer_token(&config).expect("should accept");
+        assert_eq!(result, "my-secret");
+    }
+
+    // ── Auth edge case tests (review finding #5) ────────────────────────
+
+    #[tokio::test]
+    async fn auth_empty_bearer_value_returns_401() {
+        // "Bearer " with nothing after it → empty token → 401
+        let app = authed_test_router();
+        let req = Request::builder()
+            .method("GET")
+            .uri("/status")
+            .header("authorization", "Bearer ")
+            .body(Body::empty())
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_lowercase_bearer_returns_401() {
+        // RFC 7235 says scheme is case-insensitive, but we enforce exact
+        // "Bearer " prefix for strictness. This is a deliberate security
+        // choice: case-insensitive matching would require additional code
+        // and the only legitimate client is our own CLI/SDK.
+        let app = authed_test_router();
+        let req = Request::builder()
+            .method("GET")
+            .uri("/status")
+            .header("authorization", format!("bearer {TEST_TOKEN}"))
+            .body(Body::empty())
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn auth_null_byte_in_token_rejected_at_http_layer() {
+        // Null bytes in HTTP header values are rejected by the HTTP layer
+        // (hyper/http crate) before reaching our auth middleware. This is
+        // the correct behavior — verify the header value is rejected.
+        let header_bytes = format!("Bearer {TEST_TOKEN}\x00extradata");
+        assert!(
+            axum::http::HeaderValue::from_bytes(header_bytes.as_bytes()).is_err(),
+            "null bytes in header values must be rejected by the HTTP layer"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_non_ascii_header_returns_401() {
+        // Non-ASCII bytes in the Authorization header should fail to_str()
+        // and return 401.
+        let app = authed_test_router();
+        // Build a header value from raw bytes containing non-ASCII (é = 0xC3 0xA9)
+        let header_val =
+            axum::http::HeaderValue::from_bytes(b"Bearer t\xc3\xa9st").expect("raw bytes");
+        let req = Request::builder()
+            .method("GET")
+            .uri("/status")
+            .header("authorization", header_val)
+            .body(Body::empty())
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }

@@ -227,6 +227,7 @@ async fn run_http_server(
     let auth_manager = tui::load_auth_manager()?;
     let router = tui::build_router(&auth_manager)?;
     let config = tui::load_config()?;
+    let http_config = config.http.clone();
     let bundle = tui::build_loop_engine_from_config(&config)?;
 
     let deps = headless::HeadlessAppDeps {
@@ -239,7 +240,7 @@ async fn run_http_server(
 
     let mut app = headless::HeadlessApp::new(deps)?;
     app.initialize();
-    http_serve::run(app, port).await
+    http_serve::run(app, port, &http_config).await
 }
 
 #[cfg(not(feature = "http"))]

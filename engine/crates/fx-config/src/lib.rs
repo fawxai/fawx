@@ -47,6 +47,9 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Fawx Configuration
 # propose = []
 # deny = [".git/**", "*.key", "*.pem", "credentials.*"]
 # proposals_dir = "~/.fawx/proposals"
+
+# [http]
+# bearer_token = "your-secret-token"
 "#;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -58,6 +61,15 @@ pub struct FawxConfig {
     pub memory: MemoryConfig,
     pub security: SecurityConfig,
     pub self_modify: SelfModifyCliConfig,
+    pub http: HttpConfig,
+}
+
+/// HTTP API settings for headless mode (`fawx serve --http`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct HttpConfig {
+    /// Bearer token for HTTP API authentication. Required when using `--http`.
+    pub bearer_token: Option<String>,
 }
 
 /// Security settings for WASM skill signature verification.
@@ -396,6 +408,9 @@ max_relevant_results = 9
             },
             security: SecurityConfig {
                 require_signatures: true,
+            },
+            http: HttpConfig {
+                bearer_token: Some("test-token".to_string()),
             },
         };
 

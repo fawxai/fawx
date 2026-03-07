@@ -60,6 +60,8 @@ unicode-width = "0.2"
 unicode-segmentation = "1.12"
 zeroize.workspace = true
 
+# subtle: used by oauth-bridge for constant-time comparison. The http feature
+# now uses ring::hmac instead (no length-leak timing side-channel).
 subtle = { version = "2.6", optional = true }
 urlencoding = "2.1"
 # termimad: markdown rendering for terminal output.
