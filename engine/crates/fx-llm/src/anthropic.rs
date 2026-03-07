@@ -163,7 +163,12 @@ impl AnthropicProvider {
             model: request.model.clone(),
             messages,
             tools,
-            temperature: request.temperature,
+            // When thinking is enabled, Anthropic requires temperature=1 (or omitted)
+            temperature: if thinking.is_some() {
+                None
+            } else {
+                request.temperature
+            },
             max_tokens: request.max_tokens.unwrap_or(4096),
             system: system_prompt,
             stream,
@@ -1098,6 +1103,69 @@ mod tests {
         assert!(done_ids.contains(&"t1"));
         assert!(done_ids.contains(&"t2"));
         assert!(done_ids.contains(&"t3"));
+    }
+
+    /// Regression test: when thinking is enabled, Anthropic requires
+    /// temperature=1 or omitted. Verify we strip the caller's temperature.
+    #[test]
+    fn thinking_enabled_strips_temperature() {
+        let provider = AnthropicProvider::new("http://localhost:9999", "test-key")
+            .unwrap()
+            .with_supported_models(vec!["claude-sonnet-4-20250514".to_string()]);
+
+        let request = CompletionRequest {
+            model: "claude-sonnet-4-20250514".to_string(),
+            messages: vec![Message::user("hello")],
+            tools: Vec::new(),
+            temperature: Some(0.7),
+            max_tokens: Some(1024),
+            system_prompt: None,
+            thinking: Some(ThinkingConfig::Enabled {
+                budget_tokens: 5000,
+            }),
+        };
+
+        let body = provider.build_request_body(&request, false).unwrap();
+        let serialized = serde_json::to_value(body).unwrap();
+
+        // temperature must be absent (None serializes to null, but
+        // skip_serializing_if = "Option::is_none" omits it entirely)
+        assert!(
+            serialized.get("temperature").is_none(),
+            "temperature must be omitted when thinking is enabled, got: {serialized}"
+        );
+        // thinking must still be present
+        assert_eq!(serialized["thinking"]["type"], "enabled");
+        assert_eq!(serialized["thinking"]["budget_tokens"], 5000);
+    }
+
+    /// Verify temperature is preserved when thinking is NOT enabled.
+    #[test]
+    fn thinking_disabled_preserves_temperature() {
+        let provider = AnthropicProvider::new("http://localhost:9999", "test-key")
+            .unwrap()
+            .with_supported_models(vec!["claude-sonnet-4-20250514".to_string()]);
+
+        let request = CompletionRequest {
+            model: "claude-sonnet-4-20250514".to_string(),
+            messages: vec![Message::user("hello")],
+            tools: Vec::new(),
+            temperature: Some(0.7),
+            max_tokens: Some(1024),
+            system_prompt: None,
+            thinking: None,
+        };
+
+        let body = provider.build_request_body(&request, false).unwrap();
+        let serialized = serde_json::to_value(body).unwrap();
+
+        let temp = serialized["temperature"]
+            .as_f64()
+            .expect("temperature must be present when thinking is disabled");
+        assert!(
+            (temp - 0.7).abs() < 0.001,
+            "temperature must be ~0.7, got {temp}"
+        );
     }
 
     #[test]
