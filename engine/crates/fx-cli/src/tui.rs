@@ -45,11 +45,14 @@ use fx_scratchpad::Scratchpad;
 use fx_skills::live_host_api::CredentialProvider;
 use fx_tools::{BuiltinToolsSkill, FawxToolExecutor, GitSkill, ToolConfig};
 use ratatui::DefaultTerminal;
+use sha2::{Digest, Sha256};
 use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -886,6 +889,8 @@ const TUI_COMMANDS: &[&str] = &[
     "/status",
     "/model",
     "/auth",
+    "/keys",
+    "/sign",
     "/loop",
     "/budget",
     "/signals",
@@ -1713,6 +1718,20 @@ impl TuiApp {
                 }
                 self.handle_auth_command(subcommand, action, value).await?;
             }
+            ParsedCommand::Keys {
+                subcommand,
+                value,
+                option,
+                has_extra_args,
+            } => {
+                self.handle_keys_command(subcommand, value, option, has_extra_args)?;
+            }
+            ParsedCommand::Sign {
+                target,
+                has_extra_args,
+            } => {
+                self.handle_sign_command(target, has_extra_args)?;
+            }
             ParsedCommand::Budget => self.show_budget_status(),
             ParsedCommand::Loop => self.show_loop_status(),
             ParsedCommand::Status => self.show_status(),
@@ -2526,6 +2545,13 @@ impl TuiApp {
         self.tui_println("  /auth          Show credential status + auth help");
         self.tui_println("  /auth <provider> set-token <TOKEN>");
         self.tui_println("                 Save API key or PAT for a provider");
+        self.tui_println("  /keys          Manage WASM signing keys");
+        self.tui_println("  /keys generate [--force]");
+        self.tui_println("  /keys list     List trusted public keys");
+        self.tui_println("  /keys trust <path>");
+        self.tui_println("  /keys revoke <fingerprint>");
+        self.tui_println("  /sign <skill>  Sign one WASM skill");
+        self.tui_println("  /sign --all    Sign all installed WASM skills");
         self.tui_println("  /status        Show model, tokens, budget summary");
         self.tui_println("  /budget        Show detailed budget usage");
         self.tui_println("  /loop          Show loop iteration details");
@@ -2861,6 +2887,171 @@ impl TuiApp {
             self.tui_println(format!("{provider}: not configured."));
         }
         Ok(())
+    }
+
+    fn handle_keys_command(
+        &mut self,
+        subcommand: Option<String>,
+        value: Option<String>,
+        option: Option<String>,
+        has_extra_args: bool,
+    ) -> Result<(), TuiError> {
+        match subcommand.as_deref() {
+            None => self.show_keys_help(),
+            Some("generate") => {
+                self.handle_keys_generate(value.as_deref(), option.as_deref(), has_extra_args)?
+            }
+            Some("list") if value.is_none() && option.is_none() && !has_extra_args => {
+                self.handle_keys_list()?;
+            }
+            Some("list") => self.tui_println("Usage: /keys list"),
+            Some("trust") if option.is_none() && !has_extra_args => {
+                self.handle_keys_trust(value.as_deref())?;
+            }
+            Some("trust") => self.tui_println("Usage: /keys trust <path>"),
+            Some("revoke") if option.is_none() && !has_extra_args => {
+                self.handle_keys_revoke(value.as_deref())?;
+            }
+            Some("revoke") => self.tui_println("Usage: /keys revoke <fingerprint>"),
+            Some(other) => {
+                self.tui_println(format!("Unknown keys command: {other}"));
+                self.show_keys_help();
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_sign_command(
+        &mut self,
+        target: Option<String>,
+        has_extra_args: bool,
+    ) -> Result<(), TuiError> {
+        match (target.as_deref(), has_extra_args) {
+            (Some("--all"), false) => self.handle_sign_all()?,
+            (Some(skill_name), false) => self.handle_sign_skill(skill_name)?,
+            _ => self.show_sign_help(),
+        }
+        Ok(())
+    }
+
+    fn show_keys_help(&mut self) {
+        self.tui_println(String::new());
+        self.tui_println("WASM signing key commands:");
+        self.tui_println("  /keys generate [--force]       Generate a new Ed25519 keypair");
+        self.tui_println("  /keys list                     List trusted public keys");
+        self.tui_println("  /keys trust <path>             Trust a public key file");
+        self.tui_println("  /keys revoke <fingerprint>     Revoke a trusted public key");
+    }
+
+    fn show_sign_help(&mut self) {
+        self.tui_println(String::new());
+        self.tui_println("WASM signing commands:");
+        self.tui_println("  /sign <skill_name>             Sign one installed WASM skill");
+        self.tui_println("  /sign --all                    Sign all installed WASM skills");
+    }
+
+    fn handle_keys_generate(
+        &mut self,
+        value: Option<&str>,
+        option: Option<&str>,
+        has_extra_args: bool,
+    ) -> Result<(), TuiError> {
+        let force = match (value, option, has_extra_args) {
+            (None, None, false) => false,
+            (Some("--force"), None, false) => true,
+            _ => {
+                self.tui_println("Usage: /keys generate [--force]");
+                return Ok(());
+            }
+        };
+        let base_dir = fawx_data_dir();
+        let fingerprint = generate_signing_keypair_in(&base_dir, force)?;
+        self.tui_println("Generated WASM signing keypair.");
+        self.tui_println(format!("  Fingerprint: {fingerprint}"));
+        self.tui_println(format!(
+            "  Private key: {}",
+            signing_private_key_path_in(&base_dir).display()
+        ));
+        self.tui_println(format!(
+            "  Public key: {}",
+            signing_public_key_path_in(&base_dir).display()
+        ));
+        Ok(())
+    }
+
+    fn handle_keys_list(&mut self) -> Result<(), TuiError> {
+        let keys = trusted_key_entries_from_dir(&fawx_trusted_keys_dir())?;
+        if keys.is_empty() {
+            self.tui_println("No trusted public keys.");
+            return Ok(());
+        }
+        self.tui_println("Trusted public keys:");
+        for key in keys {
+            self.tui_println(format!(
+                "  {} {} {} bytes",
+                display_file_name(&key.path),
+                key.fingerprint,
+                key.file_size
+            ));
+        }
+        Ok(())
+    }
+
+    fn handle_keys_trust(&mut self, path: Option<&str>) -> Result<(), TuiError> {
+        let Some(path) = path else {
+            self.tui_println("Usage: /keys trust <path>");
+            return Ok(());
+        };
+        let fingerprint = trust_public_key_in(&fawx_data_dir(), Path::new(path))?;
+        self.tui_println(format!("Trusted public key from {path}."));
+        self.tui_println(format!("  Fingerprint: {fingerprint}"));
+        Ok(())
+    }
+
+    fn handle_keys_revoke(&mut self, fingerprint: Option<&str>) -> Result<(), TuiError> {
+        let Some(fingerprint) = fingerprint else {
+            self.tui_println("Usage: /keys revoke <fingerprint>");
+            return Ok(());
+        };
+        let removed = revoke_trusted_key_in(&fawx_data_dir(), fingerprint)?;
+        self.tui_println(format!(
+            "Revoked {removed} trusted key(s) for fingerprint {}.",
+            fingerprint.to_ascii_lowercase()
+        ));
+        Ok(())
+    }
+
+    fn handle_sign_skill(&mut self, skill_name: &str) -> Result<(), TuiError> {
+        let signed = sign_skill(skill_name)?;
+        self.print_signed_skill(&signed, true);
+        Ok(())
+    }
+
+    fn handle_sign_all(&mut self) -> Result<(), TuiError> {
+        let signed = sign_all_skills()?;
+        if signed.is_empty() {
+            self.tui_println("No WASM skills found to sign.");
+            return Ok(());
+        }
+        for skill in &signed {
+            self.print_signed_skill(skill, false);
+        }
+        self.tui_println(format!("Signed {} skill(s).", signed.len()));
+        Ok(())
+    }
+
+    fn print_signed_skill(&mut self, signed: &SignedSkill, include_path: bool) {
+        self.tui_println(format!(
+            "Signed {} (fingerprint: {})",
+            signed.name, signed.fingerprint
+        ));
+        self.tui_println(format!(
+            "Verified: signature valid (key: {})",
+            signed.fingerprint
+        ));
+        if include_path {
+            self.tui_println(format!("  Signature: {}", signed.signature_path.display()));
+        }
     }
 
     fn show_budget_status(&mut self) {
@@ -3670,8 +3861,401 @@ fn fawx_data_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".fawx"))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrustedKeyEntry {
+    path: PathBuf,
+    fingerprint: String,
+    file_size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SignedSkill {
+    name: String,
+    signature_path: PathBuf,
+    fingerprint: String,
+}
+
 fn fawx_skills_dir() -> PathBuf {
-    fawx_data_dir().join("skills")
+    fawx_skills_dir_in(&fawx_data_dir())
+}
+
+fn fawx_skills_dir_in(base_dir: &Path) -> PathBuf {
+    base_dir.join("skills")
+}
+
+fn fawx_keys_dir_in(base_dir: &Path) -> PathBuf {
+    base_dir.join("keys")
+}
+
+fn fawx_trusted_keys_dir() -> PathBuf {
+    fawx_trusted_keys_dir_in(&fawx_data_dir())
+}
+
+fn fawx_trusted_keys_dir_in(base_dir: &Path) -> PathBuf {
+    base_dir.join("trusted_keys")
+}
+
+fn signing_private_key_path_in(base_dir: &Path) -> PathBuf {
+    fawx_keys_dir_in(base_dir).join("signing.key")
+}
+
+fn signing_public_key_path_in(base_dir: &Path) -> PathBuf {
+    fawx_keys_dir_in(base_dir).join("signing.pub")
+}
+
+fn trusted_signing_public_key_path_in(base_dir: &Path) -> PathBuf {
+    fawx_trusted_keys_dir_in(base_dir).join("signing.pub")
+}
+
+fn generate_signing_keypair_in(base_dir: &Path, force: bool) -> Result<String, TuiError> {
+    let private_key_path = signing_private_key_path_in(base_dir);
+    let public_key_path = signing_public_key_path_in(base_dir);
+    let trusted_key_path = trusted_signing_public_key_path_in(base_dir);
+    ensure_paths_do_not_exist(
+        &[&private_key_path, &public_key_path, &trusted_key_path],
+        force,
+    )?;
+    let (private_key, public_key) = fx_skills::signing::generate_keypair()
+        .map_err(|error| store_error(format!("failed to generate signing keypair: {error}")))?;
+    write_binary_file(&private_key_path, &private_key)?;
+    set_private_key_permissions(&private_key_path)?;
+    write_binary_file(&public_key_path, &public_key)?;
+    set_public_key_permissions(&public_key_path)?;
+    write_binary_file(&trusted_key_path, &public_key)?;
+    set_public_key_permissions(&trusted_key_path)?;
+    Ok(public_key_fingerprint(&public_key))
+}
+
+fn ensure_paths_do_not_exist(paths: &[&Path], force: bool) -> Result<(), TuiError> {
+    if force {
+        return Ok(());
+    }
+    if let Some(path) = paths.iter().find(|path| path.exists()) {
+        return Err(store_error(format!(
+            "refusing to overwrite {} without --force",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn write_binary_file(path: &Path, bytes: &[u8]) -> Result<(), TuiError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, bytes)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_key_permissions(path: &Path) -> Result<(), TuiError> {
+    let mut permissions = std::fs::metadata(path)?.permissions();
+    permissions.set_mode(0o600);
+    std::fs::set_permissions(path, permissions)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_private_key_permissions(_path: &Path) -> Result<(), TuiError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_public_key_permissions(path: &Path) -> Result<(), TuiError> {
+    let mut permissions = std::fs::metadata(path)?.permissions();
+    permissions.set_mode(0o644);
+    std::fs::set_permissions(path, permissions)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_public_key_permissions(_path: &Path) -> Result<(), TuiError> {
+    Ok(())
+}
+
+fn trusted_key_entries_from_dir(trusted_dir: &Path) -> Result<Vec<TrustedKeyEntry>, TuiError> {
+    let mut keys = Vec::new();
+    if !trusted_dir.exists() {
+        return Ok(keys);
+    }
+    for entry in std::fs::read_dir(trusted_dir)? {
+        let path = entry?.path();
+        if is_public_key_path(&path) {
+            keys.push(trusted_key_entry_from_path(&path)?);
+        }
+    }
+    keys.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(keys)
+}
+
+fn trusted_key_entry_from_path(path: &Path) -> Result<TrustedKeyEntry, TuiError> {
+    let public_key = read_public_key_file(path)?;
+    let file_size = std::fs::metadata(path)?.len();
+    Ok(TrustedKeyEntry {
+        path: path.to_path_buf(),
+        fingerprint: public_key_fingerprint(&public_key),
+        file_size,
+    })
+}
+
+fn trust_public_key_in(base_dir: &Path, source_path: &Path) -> Result<String, TuiError> {
+    ensure_public_key_extension(source_path)?;
+    let public_key = read_public_key_file(source_path)?;
+    let file_name = source_path.file_name().ok_or_else(|| {
+        store_error(format!(
+            "invalid public key path: {}",
+            source_path.display()
+        ))
+    })?;
+    let destination = fawx_trusted_keys_dir_in(base_dir).join(file_name);
+    if destination.exists() && !paths_refer_to_same_file(source_path, &destination) {
+        return Err(store_error(format!(
+            "trusted key already exists: {}",
+            destination.display()
+        )));
+    }
+    if !paths_refer_to_same_file(source_path, &destination) {
+        write_binary_file(&destination, &public_key)?;
+        set_public_key_permissions(&destination)?;
+    }
+    Ok(public_key_fingerprint(&public_key))
+}
+
+fn revoke_trusted_key_in(base_dir: &Path, fingerprint: &str) -> Result<usize, TuiError> {
+    let target = fingerprint.to_ascii_lowercase();
+    let matches: Vec<PathBuf> = trusted_key_entries_from_dir(&fawx_trusted_keys_dir_in(base_dir))?
+        .into_iter()
+        .filter(|entry| entry.fingerprint == target)
+        .map(|entry| entry.path)
+        .collect();
+    if matches.is_empty() {
+        return Err(store_error(format!("trusted key not found: {target}")));
+    }
+    for path in &matches {
+        std::fs::remove_file(path)?;
+    }
+    Ok(matches.len())
+}
+
+fn sign_skill(skill_name: &str) -> Result<SignedSkill, TuiError> {
+    let base_dir = fawx_data_dir();
+    let trusted_keys = load_default_trusted_keys()?;
+    sign_skill_with_keys(&base_dir, skill_name, &trusted_keys)
+}
+
+fn sign_skill_in(base_dir: &Path, skill_name: &str) -> Result<SignedSkill, TuiError> {
+    let trusted_dir = fawx_trusted_keys_dir_in(base_dir);
+    let trusted_keys = load_trusted_keys_from_dir(&trusted_dir)?;
+    sign_skill_with_keys(base_dir, skill_name, &trusted_keys)
+}
+
+fn sign_skill_with_keys(
+    base_dir: &Path,
+    skill_name: &str,
+    trusted_keys: &[Vec<u8>],
+) -> Result<SignedSkill, TuiError> {
+    let private_key = read_signing_private_key(base_dir)?;
+    let sig_path = skill_signature_path_in(base_dir, skill_name);
+    let wasm_bytes = read_skill_wasm(base_dir, skill_name)?;
+    let signature = fx_skills::signing::sign_skill(&wasm_bytes, &private_key)
+        .map_err(|error| store_error(format!("failed to sign skill '{skill_name}': {error}")))?;
+    let fingerprint = write_verified_signature(&sig_path, &signature, &wasm_bytes, trusted_keys)?;
+    Ok(SignedSkill {
+        name: skill_name.to_string(),
+        signature_path: sig_path,
+        fingerprint,
+    })
+}
+
+fn sign_all_skills() -> Result<Vec<SignedSkill>, TuiError> {
+    let base_dir = fawx_data_dir();
+    let trusted_keys = load_default_trusted_keys()?;
+    sign_all_skills_with_keys(&base_dir, &trusted_keys)
+}
+
+fn sign_all_skills_in(base_dir: &Path) -> Result<Vec<SignedSkill>, TuiError> {
+    let trusted_dir = fawx_trusted_keys_dir_in(base_dir);
+    let trusted_keys = load_trusted_keys_from_dir(&trusted_dir)?;
+    sign_all_skills_with_keys(base_dir, &trusted_keys)
+}
+
+fn sign_all_skills_with_keys(
+    base_dir: &Path,
+    trusted_keys: &[Vec<u8>],
+) -> Result<Vec<SignedSkill>, TuiError> {
+    let skill_names = installed_skill_names(&fawx_skills_dir_in(base_dir))?;
+    let mut signed = Vec::new();
+    for skill_name in skill_names {
+        signed.push(sign_skill_with_keys(base_dir, &skill_name, trusted_keys)?);
+    }
+    Ok(signed)
+}
+
+fn installed_skill_names(skills_dir: &Path) -> Result<Vec<String>, TuiError> {
+    let mut names = Vec::new();
+    if !skills_dir.exists() {
+        return Ok(names);
+    }
+    for entry in std::fs::read_dir(skills_dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if entry.path().join(format!("{name}.wasm")).exists() {
+                names.push(name);
+            }
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+fn skill_wasm_path_in(base_dir: &Path, skill_name: &str) -> PathBuf {
+    fawx_skills_dir_in(base_dir)
+        .join(skill_name)
+        .join(format!("{skill_name}.wasm"))
+}
+
+fn skill_signature_path_in(base_dir: &Path, skill_name: &str) -> PathBuf {
+    fawx_skills_dir_in(base_dir)
+        .join(skill_name)
+        .join(format!("{skill_name}.wasm.sig"))
+}
+
+fn write_verified_signature(
+    sig_path: &Path,
+    signature: &[u8],
+    wasm_bytes: &[u8],
+    trusted_keys: &[Vec<u8>],
+) -> Result<String, TuiError> {
+    write_binary_file(sig_path, signature)?;
+    match verify_signature_with_keys(wasm_bytes, signature, trusted_keys) {
+        Ok(fingerprint) => Ok(fingerprint),
+        Err(error) => {
+            let _ = std::fs::remove_file(sig_path);
+            Err(error)
+        }
+    }
+}
+
+fn verify_signature_with_keys(
+    wasm_bytes: &[u8],
+    signature: &[u8],
+    trusted_keys: &[Vec<u8>],
+) -> Result<String, TuiError> {
+    if trusted_keys.is_empty() {
+        return Err(store_error("no trusted public keys configured"));
+    }
+    for public_key in trusted_keys {
+        let valid = fx_skills::signing::verify_skill(wasm_bytes, signature, public_key)
+            .map_err(|error| store_error(format!("failed to verify signature: {error}")))?;
+        if valid {
+            return Ok(public_key_fingerprint(public_key));
+        }
+    }
+    Err(store_error(
+        "signature verification failed against trusted keys",
+    ))
+}
+
+fn read_signing_private_key(base_dir: &Path) -> Result<zeroize::Zeroizing<Vec<u8>>, TuiError> {
+    let path = signing_private_key_path_in(base_dir);
+    match std::fs::read(&path) {
+        Ok(private_key) => Ok(zeroize::Zeroizing::new(private_key)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(store_error(
+            "No signing key found. Run /keys generate first.",
+        )),
+        Err(error) => Err(store_error(format!(
+            "failed to read signing private key at {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn read_skill_wasm(base_dir: &Path, skill_name: &str) -> Result<Vec<u8>, TuiError> {
+    let wasm_path = skill_wasm_path_in(base_dir, skill_name);
+    match std::fs::read(&wasm_path) {
+        Ok(wasm_bytes) => Ok(wasm_bytes),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(store_error(format!(
+            "No WASM skill found for '{skill_name}'. Expected {}",
+            wasm_path.display()
+        ))),
+        Err(error) => Err(store_error(format!(
+            "failed to read skill WASM at {}: {error}",
+            wasm_path.display()
+        ))),
+    }
+}
+
+fn load_default_trusted_keys() -> Result<Vec<Vec<u8>>, TuiError> {
+    fx_loadable::wasm_skill::load_trusted_keys()
+        .map_err(|error| store_error(format!("failed to load trusted keys: {error}")))
+}
+
+fn load_trusted_keys_from_dir(trusted_dir: &Path) -> Result<Vec<Vec<u8>>, TuiError> {
+    fx_loadable::wasm_skill::load_trusted_keys_from(trusted_dir)
+        .map_err(|error| store_error(format!("failed to load trusted keys: {error}")))
+}
+
+fn read_binary_file(path: &Path, context: &str) -> Result<Vec<u8>, TuiError> {
+    std::fs::read(path)
+        .map_err(|error| store_error(format!("{context} at {}: {error}", path.display())))
+}
+
+fn read_public_key_file(path: &Path) -> Result<Vec<u8>, TuiError> {
+    let public_key = read_binary_file(path, "failed to read public key")?;
+    ensure_public_key_length(&public_key, path)?;
+    Ok(public_key)
+}
+
+fn ensure_public_key_length(public_key: &[u8], path: &Path) -> Result<(), TuiError> {
+    if public_key.len() == 32 {
+        return Ok(());
+    }
+    Err(store_error(format!(
+        "invalid public key length at {}: expected 32 bytes, found {}",
+        path.display(),
+        public_key.len()
+    )))
+}
+
+fn ensure_public_key_extension(path: &Path) -> Result<(), TuiError> {
+    if is_public_key_path(path) {
+        return Ok(());
+    }
+    Err(store_error(format!(
+        "public key path must end with .pub: {}",
+        path.display()
+    )))
+}
+
+fn is_public_key_path(path: &Path) -> bool {
+    path.extension().and_then(|ext| ext.to_str()) == Some("pub")
+}
+
+fn public_key_fingerprint(public_key: &[u8]) -> String {
+    let digest = Sha256::digest(public_key);
+    hex_encode(&digest[..8])
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn display_file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn store_error(message: impl Into<String>) -> TuiError {
+    TuiError::Store(message.into())
 }
 
 fn configured_data_dir(base_data_dir: &Path, config: &FawxConfig) -> PathBuf {
@@ -5029,6 +5613,16 @@ enum ParsedCommand {
         value: Option<String>,
         has_extra_args: bool,
     },
+    Keys {
+        subcommand: Option<String>,
+        value: Option<String>,
+        option: Option<String>,
+        has_extra_args: bool,
+    },
+    Sign {
+        target: Option<String>,
+        has_extra_args: bool,
+    },
     Budget,
     Loop,
     Status,
@@ -5078,6 +5672,22 @@ fn parse_command(value: &str) -> ParsedCommand {
                 has_extra_args,
             }
         }
+        "keys" => {
+            let subcommand = parts.next().map(ToString::to_string);
+            let value = parts.next().map(ToString::to_string);
+            let option = parts.next().map(ToString::to_string);
+            let has_extra_args = parts.next().is_some();
+            ParsedCommand::Keys {
+                subcommand,
+                value,
+                option,
+                has_extra_args,
+            }
+        }
+        "sign" => ParsedCommand::Sign {
+            target: parts.next().map(ToString::to_string),
+            has_extra_args: parts.next().is_some(),
+        },
         "budget" => ParsedCommand::Budget,
         "loop" => ParsedCommand::Loop,
         "status" => ParsedCommand::Status,
@@ -5428,6 +6038,21 @@ mod tests {
         )
         .expect("new test app");
         (app, temp_dir)
+    }
+
+    fn sample_wasm_bytes() -> Vec<u8> {
+        vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]
+    }
+
+    fn write_test_skill(base_dir: &Path, skill_name: &str, wasm_bytes: &[u8]) {
+        let skill_dir = fawx_skills_dir_in(base_dir).join(skill_name);
+        std::fs::create_dir_all(&skill_dir).expect("skill dir");
+        std::fs::write(skill_dir.join(format!("{skill_name}.wasm")), wasm_bytes).expect("wasm");
+    }
+
+    fn create_temp_home_guard(temp_home: &TempDir) -> ScopedEnvVar {
+        let home = temp_home.path().to_string_lossy().to_string();
+        ScopedEnvVar::set("HOME", &home)
     }
 
     #[test]
@@ -8944,11 +9569,300 @@ mod tests {
     }
 
     #[test]
+    fn parse_keys_generate_force() {
+        let cmd = parse_command("/keys generate --force");
+        assert!(matches!(
+            cmd,
+            ParsedCommand::Keys {
+                subcommand: Some(ref s),
+                value: Some(ref v),
+                option: None,
+                has_extra_args: false,
+            } if s == "generate" && v == "--force"
+        ));
+    }
+
+    #[test]
+    fn parse_keys_trust_path() {
+        let cmd = parse_command("/keys trust /tmp/alice.pub");
+        assert!(matches!(
+            cmd,
+            ParsedCommand::Keys {
+                subcommand: Some(ref s),
+                value: Some(ref v),
+                option: None,
+                has_extra_args: false,
+            } if s == "trust" && v == "/tmp/alice.pub"
+        ));
+    }
+
+    #[test]
+    fn parse_sign_all() {
+        let cmd = parse_command("/sign --all");
+        assert!(matches!(
+            cmd,
+            ParsedCommand::Sign {
+                target: Some(ref target),
+                has_extra_args: false,
+            } if target == "--all"
+        ));
+    }
+
+    #[test]
+    fn should_add_keys_and_sign_to_history() {
+        assert!(should_add_to_history("/keys generate"));
+        assert!(should_add_to_history("/sign demo"));
+    }
+
+    #[test]
     fn show_auth_status_no_credentials_no_panic() {
         let (mut app, _temp_dir) = new_test_app();
         app.show_auth_status();
         // Should produce output without panicking.
         assert!(!app.output_buffer.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generate_signing_keypair_in_writes_expected_files_and_permissions() {
+        let temp = TempDir::new().expect("tempdir");
+        let fingerprint =
+            generate_signing_keypair_in(temp.path(), false).expect("keypair should generate");
+
+        assert_eq!(fingerprint.len(), 16);
+        assert!(signing_private_key_path_in(temp.path()).exists());
+        assert!(signing_public_key_path_in(temp.path()).exists());
+        assert!(trusted_signing_public_key_path_in(temp.path()).exists());
+
+        let mode = std::fs::metadata(signing_private_key_path_in(temp.path()))
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let public_mode = std::fs::metadata(signing_public_key_path_in(temp.path()))
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(public_mode, 0o644);
+
+        let trusted_mode = std::fs::metadata(trusted_signing_public_key_path_in(temp.path()))
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(trusted_mode, 0o644);
+    }
+
+    #[test]
+    fn generate_signing_keypair_in_requires_force_to_overwrite() {
+        let temp = TempDir::new().expect("tempdir");
+        generate_signing_keypair_in(temp.path(), false).expect("first keypair");
+
+        let error = generate_signing_keypair_in(temp.path(), false).expect_err("must refuse");
+        assert!(error.to_string().contains("--force"));
+    }
+
+    #[test]
+    fn trust_public_key_in_rejects_invalid_length_key() {
+        let temp = TempDir::new().expect("tempdir");
+        let invalid_key = temp.path().join("invalid.pub");
+        std::fs::write(&invalid_key, [1u8; 31]).expect("invalid key");
+
+        let error = trust_public_key_in(temp.path(), &invalid_key).expect_err("must reject");
+        assert!(error.to_string().contains("expected 32 bytes"));
+    }
+
+    #[test]
+    fn keys_list_and_revoke_use_fingerprints() {
+        let temp = TempDir::new().expect("tempdir");
+        let (_, public_key) = fx_skills::signing::generate_keypair().expect("keypair");
+        let trusted_dir = fawx_trusted_keys_dir_in(temp.path());
+        std::fs::create_dir_all(&trusted_dir).expect("trusted dir");
+        std::fs::write(trusted_dir.join("alice.pub"), &public_key).expect("pub");
+
+        let keys = trusted_key_entries_from_dir(&trusted_dir).expect("trusted keys");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].file_size, 32);
+
+        let removed = revoke_trusted_key_in(temp.path(), &keys[0].fingerprint)
+            .expect("revoke by fingerprint");
+        assert_eq!(removed, 1);
+        assert!(trusted_key_entries_from_dir(&trusted_dir)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn public_key_fingerprint_is_deterministic_for_same_key() {
+        let (_, public_key) = fx_skills::signing::generate_keypair().expect("keypair");
+
+        assert_eq!(
+            public_key_fingerprint(&public_key),
+            public_key_fingerprint(&public_key)
+        );
+    }
+
+    #[test]
+    fn public_key_fingerprint_differs_for_distinct_keys() {
+        let (_, left) = fx_skills::signing::generate_keypair().expect("left keypair");
+        let (_, right) = fx_skills::signing::generate_keypair().expect("right keypair");
+
+        assert_ne!(
+            public_key_fingerprint(&left),
+            public_key_fingerprint(&right)
+        );
+    }
+
+    #[test]
+    fn sign_skill_in_writes_signature_and_verifies() {
+        let temp = TempDir::new().expect("tempdir");
+        generate_signing_keypair_in(temp.path(), false).expect("keypair");
+        write_test_skill(temp.path(), "demo", &sample_wasm_bytes());
+
+        let signed = sign_skill_in(temp.path(), "demo").expect("sign skill");
+        let signature = std::fs::read(&signed.signature_path).expect("signature");
+        let wasm_bytes =
+            std::fs::read(fawx_skills_dir_in(temp.path()).join("demo/demo.wasm")).expect("wasm");
+        let public_key = std::fs::read(signing_public_key_path_in(temp.path())).expect("pub");
+
+        assert_eq!(signature.len(), 64);
+        assert_eq!(signed.name, "demo");
+        assert_eq!(signed.fingerprint, public_key_fingerprint(&public_key));
+        assert!(
+            fx_skills::signing::verify_skill(&wasm_bytes, &signature, &public_key).expect("verify"),
+        );
+    }
+
+    #[test]
+    fn sign_all_skills_in_writes_signatures_for_each_skill() {
+        let temp = TempDir::new().expect("tempdir");
+        generate_signing_keypair_in(temp.path(), false).expect("keypair");
+        write_test_skill(temp.path(), "alpha", &sample_wasm_bytes());
+        write_test_skill(temp.path(), "beta", &sample_wasm_bytes());
+        std::fs::create_dir_all(fawx_skills_dir_in(temp.path()).join("source_only"))
+            .expect("source only dir");
+
+        let signed = sign_all_skills_in(temp.path()).expect("sign all");
+        let signed_names: Vec<String> = signed.iter().map(|skill| skill.name.clone()).collect();
+
+        assert_eq!(signed_names, vec!["alpha".to_string(), "beta".to_string()]);
+        assert!(fawx_skills_dir_in(temp.path())
+            .join("alpha/alpha.wasm.sig")
+            .exists());
+        assert!(fawx_skills_dir_in(temp.path())
+            .join("beta/beta.wasm.sig")
+            .exists());
+        assert!(!fawx_skills_dir_in(temp.path())
+            .join("source_only/source_only.wasm.sig")
+            .exists());
+    }
+
+    #[test]
+    fn sign_skill_in_requires_private_key() {
+        let temp = TempDir::new().expect("tempdir");
+        write_test_skill(temp.path(), "demo", &sample_wasm_bytes());
+        let (_, public_key) = fx_skills::signing::generate_keypair().expect("keypair");
+        let trusted_dir = fawx_trusted_keys_dir_in(temp.path());
+        std::fs::create_dir_all(&trusted_dir).expect("trusted dir");
+        std::fs::write(trusted_dir.join("demo.pub"), &public_key).expect("pub");
+
+        let error = sign_skill_in(temp.path(), "demo").expect_err("missing private key");
+        assert_eq!(
+            error.to_string(),
+            "store error: No signing key found. Run /keys generate first."
+        );
+    }
+
+    #[test]
+    fn sign_skill_in_reports_missing_skill_error() {
+        let temp = TempDir::new().expect("tempdir");
+        generate_signing_keypair_in(temp.path(), false).expect("keypair");
+
+        let error = sign_skill_in(temp.path(), "missing").expect_err("missing skill");
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "store error: No WASM skill found for 'missing'. Expected {}",
+                fawx_skills_dir_in(temp.path())
+                    .join("missing/missing.wasm")
+                    .display()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_keys_generate_uses_home_directory() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let temp_home = TempDir::new().expect("tempdir");
+        let _home = create_temp_home_guard(&temp_home);
+        let (mut app, _temp_dir) = new_test_app();
+
+        app.handle_command("/keys generate")
+            .await
+            .expect("keys generate");
+
+        assert!(temp_home.path().join(".fawx/keys/signing.key").exists());
+        assert!(temp_home
+            .path()
+            .join(".fawx/trusted_keys/signing.pub")
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn handle_sign_all_signs_skills_under_home_directory() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let temp_home = TempDir::new().expect("tempdir");
+        let _home = create_temp_home_guard(&temp_home);
+        let base_dir = temp_home.path().join(".fawx");
+        generate_signing_keypair_in(&base_dir, false).expect("keypair");
+        write_test_skill(&base_dir, "demo", &sample_wasm_bytes());
+        let (mut app, _temp_dir) = new_test_app();
+
+        app.handle_command("/sign --all").await.expect("sign all");
+
+        assert!(base_dir.join("skills/demo/demo.wasm.sig").exists());
+    }
+
+    #[tokio::test]
+    async fn handle_sign_reports_fingerprint_and_verification_output() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let temp_home = TempDir::new().expect("tempdir");
+        let _home = create_temp_home_guard(&temp_home);
+        let base_dir = temp_home.path().join(".fawx");
+        generate_signing_keypair_in(&base_dir, false).expect("keypair");
+        write_test_skill(&base_dir, "demo", &sample_wasm_bytes());
+        let (mut app, _temp_dir) = new_test_app();
+
+        app.handle_command("/sign demo").await.expect("sign demo");
+
+        let output = app.output_buffer.join("\n");
+        assert!(output.contains("Signed demo (fingerprint:"));
+        assert!(output.contains("Verified: signature valid (key:"));
+    }
+
+    #[tokio::test]
+    async fn handle_keys_list_includes_filename_fingerprint_and_size() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let temp_home = TempDir::new().expect("tempdir");
+        let _home = create_temp_home_guard(&temp_home);
+        let base_dir = temp_home.path().join(".fawx");
+        let (_, public_key) = fx_skills::signing::generate_keypair().expect("keypair");
+        let trusted_dir = fawx_trusted_keys_dir_in(&base_dir);
+        std::fs::create_dir_all(&trusted_dir).expect("trusted dir");
+        std::fs::write(trusted_dir.join("alice.pub"), &public_key).expect("public key");
+        let expected_fingerprint = public_key_fingerprint(&public_key);
+        let (mut app, _temp_dir) = new_test_app();
+
+        app.handle_command("/keys list").await.expect("keys list");
+
+        let output = app.output_buffer.join("\n");
+        assert!(output.contains("alice.pub"));
+        assert!(output.contains(&expected_fingerprint));
+        assert!(output.contains("32 bytes"));
     }
 
     #[test]

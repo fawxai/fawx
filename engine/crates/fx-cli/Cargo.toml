@@ -8,7 +8,7 @@ license.workspace = true
 [features]
 # Enable the OAuth bridge HTTP server subcommand (`fawx oauth-bridge`).
 # Pulls in axum and crypto dependencies. Disabled by default to reduce build times.
-oauth-bridge = ["dep:axum", "dep:sha2", "dep:base64", "dep:rand", "dep:subtle"]
+oauth-bridge = ["dep:axum", "dep:base64", "dep:rand", "dep:subtle"]
 
 [[bin]]
 name = "fawx"
@@ -49,7 +49,7 @@ reqwest.workspace = true
 axum = { version = "0.8", optional = true }
 uuid = { version = "1.13", features = ["v4"] }
 rand = { version = "0.8", optional = true }
-sha2 = { version = "0.10", optional = true }
+sha2 = "0.10"
 base64 = { version = "0.22", optional = true }
 dirs = "6.0"
 chrono = "0.4"
