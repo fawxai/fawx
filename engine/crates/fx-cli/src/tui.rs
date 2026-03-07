@@ -12,7 +12,7 @@ use fx_analysis::{AnalysisEngine, AnalysisError, AnalysisFinding, Confidence};
 use fx_auth::auth::{AuthManager, AuthMethod};
 use fx_auth::credential_store::CredentialStore as CredentialStoreTrait;
 use fx_auth::oauth::{PkceFlow, TokenExchangeRequest, TokenResponse};
-use fx_config::{save_default_model, FawxConfig};
+use fx_config::{save_default_model, FawxConfig, ImprovementToolsConfig};
 use fx_conversation::{
     ConversationMessage, ConversationStore, TokenUsage as ConversationTokenUsage,
 };
@@ -43,7 +43,7 @@ use fx_memory::{JsonFileMemory, JsonMemoryConfig, SignalStore};
 use fx_scratchpad::skill::ScratchpadSkill;
 use fx_scratchpad::Scratchpad;
 use fx_skills::live_host_api::CredentialProvider;
-use fx_tools::{BuiltinToolsSkill, FawxToolExecutor, GitSkill, ToolConfig};
+use fx_tools::{BuiltinToolsSkill, FawxToolExecutor, GitSkill, ImprovementToolsState, ToolConfig};
 use ratatui::DefaultTerminal;
 use sha2::{Digest, Sha256};
 use std::collections::hash_map::DefaultHasher;
@@ -3196,7 +3196,7 @@ fn build_loop_engine_bundle() -> LoopEngineBundle {
         eprintln!("warning: failed to load config: {error}");
         FawxConfig::default()
     });
-    build_loop_engine_from_config(&config).expect("loop engine config should be valid")
+    build_loop_engine_from_config(&config, None).expect("loop engine config should be valid")
 }
 
 /// Bundle returned by the loop engine builder functions.
@@ -3240,10 +3240,13 @@ impl LoopEngineBundle {
 }
 
 /// Build a loop engine from an already-loaded config.
-pub fn build_loop_engine_from_config(config: &FawxConfig) -> Result<LoopEngineBundle, TuiError> {
+pub fn build_loop_engine_from_config(
+    config: &FawxConfig,
+    improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
+) -> Result<LoopEngineBundle, TuiError> {
     let base_data_dir = fawx_data_dir();
     let data_dir = configured_data_dir(&base_data_dir, config);
-    build_loop_engine_with_config(data_dir, config.clone())
+    build_loop_engine_with_config(data_dir, config.clone(), improvement_provider)
 }
 
 /// Capacity of the streaming event bus broadcast channel.
@@ -3252,12 +3255,18 @@ const EVENT_BUS_CAPACITY: usize = 256;
 fn build_loop_engine_with_config(
     data_dir: PathBuf,
     config: FawxConfig,
+    improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
 ) -> Result<LoopEngineBundle, TuiError> {
     let event_bus = EventBus::new(EVENT_BUS_CAPACITY);
     let budget = BudgetTracker::new(BudgetConfig::default(), current_time_ms(), 0);
     let context = ContextCompactor::new(DEFAULT_CONTEXT_MAX_TOKENS, DEFAULT_CONTEXT_COMPACT_TARGET);
     let working_dir = configured_working_dir(&config);
-    let skills = build_skill_registry(working_dir.clone(), &data_dir, &config);
+    let skills = build_skill_registry(
+        working_dir.clone(),
+        &data_dir,
+        &config,
+        improvement_provider,
+    );
     let synthesis = config
         .model
         .synthesis_instruction
@@ -3426,6 +3435,7 @@ fn build_skill_registry(
     working_dir: PathBuf,
     data_dir: &Path,
     config: &FawxConfig,
+    improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
 ) -> SkillRegistryBundle {
     let tool_config = ToolConfig {
         max_read_size: config.tools.max_read_size,
@@ -3444,6 +3454,20 @@ fn build_skill_registry(
 
     let runtime_info = new_runtime_info(config, memory_enabled);
     executor = executor.with_runtime_info(Arc::clone(&runtime_info));
+
+    // Wire improvement tools when enabled and a provider is available.
+    if config.improvement.enabled {
+        if let Some(provider) = improvement_provider {
+            match wire_improvement_tools(data_dir, provider, &config.improvement) {
+                Ok(state) => {
+                    executor = executor.with_improvement(state);
+                }
+                Err(e) => {
+                    eprintln!("warning: improvement tools unavailable: {e}");
+                }
+            }
+        }
+    }
 
     let registry = Arc::new(SkillRegistry::new());
     registry.register(Arc::new(BuiltinToolsSkill::new(executor)));
@@ -3508,6 +3532,24 @@ fn build_skill_registry(
         credential_store,
         signature_policy,
     }
+}
+
+/// Build `ImprovementToolsState` from a dedicated provider and data directory.
+///
+/// Creates its own `SignalStore` (reads from the same on-disk directory as
+/// `TuiApp`'s store, so all signals are visible to analysis).
+fn wire_improvement_tools(
+    data_dir: &Path,
+    provider: Arc<dyn fx_llm::CompletionProvider + Send + Sync>,
+    config: &ImprovementToolsConfig,
+) -> Result<ImprovementToolsState, String> {
+    let signal_store = SignalStore::new(data_dir, "improvement-analysis")
+        .map_err(|e| format!("signal store for improvement tools: {e}"))?;
+    Ok(ImprovementToolsState::new(
+        Arc::new(signal_store),
+        provider,
+        config.clone(),
+    ))
 }
 
 fn attach_memory(
@@ -3646,6 +3688,56 @@ impl fx_llm::CompletionProvider for AnalysisCompletionProvider<'_> {
 
     fn supported_models(&self) -> Vec<String> {
         vec![self.active_model.clone()]
+    }
+
+    fn capabilities(&self) -> fx_llm::ProviderCapabilities {
+        fx_llm::ProviderCapabilities {
+            supports_temperature: true,
+            requires_streaming: false,
+        }
+    }
+}
+
+/// Owned `CompletionProvider` wrapping a dedicated `ModelRouter` for
+/// improvement tools. Unlike `AnalysisCompletionProvider` (which borrows),
+/// this owns its router so it can be stored in `ImprovementToolsState`.
+struct OwnedRouterProvider {
+    router: ModelRouter,
+}
+
+impl fmt::Debug for OwnedRouterProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OwnedRouterProvider")
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl fx_llm::CompletionProvider for OwnedRouterProvider {
+    async fn complete(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<fx_llm::CompletionResponse, fx_llm::ProviderError> {
+        self.router.complete(request).await
+    }
+
+    async fn complete_stream(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<fx_llm::CompletionStream, fx_llm::ProviderError> {
+        self.router.complete_stream(request).await
+    }
+
+    fn name(&self) -> &str {
+        "improvement"
+    }
+
+    fn supported_models(&self) -> Vec<String> {
+        self.router
+            .available_models()
+            .into_iter()
+            .map(|m| m.model_id)
+            .collect()
     }
 
     fn capabilities(&self) -> fx_llm::ProviderCapabilities {
@@ -4595,6 +4687,27 @@ pub fn load_auth_manager() -> Result<AuthManager, TuiError> {
 }
 
 /// Build a model router from stored authentication credentials.
+/// Build an optional `CompletionProvider` for improvement tools.
+///
+/// Returns `None` when `[improvement] enabled = false` in config. Otherwise,
+/// builds a dedicated `ModelRouter` (separate from the main TUI router) so
+/// the improvement tools can own their LLM access without borrowing.
+pub fn build_improvement_provider(
+    auth_manager: &AuthManager,
+    config: &FawxConfig,
+) -> Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>> {
+    if !config.improvement.enabled {
+        return None;
+    }
+    match build_router(auth_manager) {
+        Ok(router) => Some(Arc::new(OwnedRouterProvider { router })),
+        Err(e) => {
+            eprintln!("warning: improvement tools LLM unavailable: {e}");
+            None
+        }
+    }
+}
+
 pub fn build_router(auth_manager: &AuthManager) -> Result<ModelRouter, TuiError> {
     let mut router = ModelRouter::new();
 

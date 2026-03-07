@@ -51,6 +51,12 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Fawx Configuration
 
 # [http]
 # bearer_token = "your-secret-token"
+
+# [improvement]
+# enabled = false
+# max_analyses_per_hour = 10
+# max_proposals_per_day = 3
+# auto_branch_prefix = "fawx/improve"
 "#;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -63,6 +69,7 @@ pub struct FawxConfig {
     pub security: SecurityConfig,
     pub self_modify: SelfModifyCliConfig,
     pub http: HttpConfig,
+    pub improvement: ImprovementToolsConfig,
 }
 
 /// HTTP API settings for headless mode (`fawx serve --http`).
@@ -162,6 +169,34 @@ pub struct SelfModifyPathsCliConfig {
     pub allow: Vec<String>,
     pub propose: Vec<String>,
     pub deny: Vec<String>,
+}
+
+/// Configuration for the self-improvement tool interfaces.
+///
+/// Controls whether Fawx can analyze its own runtime signals and propose
+/// improvements. Disabled by default — requires explicit opt-in.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ImprovementToolsConfig {
+    /// Whether improvement tools appear in the tool definitions.
+    pub enabled: bool,
+    /// Maximum analysis calls per hour per session.
+    pub max_analyses_per_hour: u32,
+    /// Maximum improvement proposals per day.
+    pub max_proposals_per_day: u32,
+    /// Branch prefix for improvement proposals.
+    pub auto_branch_prefix: String,
+}
+
+impl Default for ImprovementToolsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_analyses_per_hour: 10,
+            max_proposals_per_day: 3,
+            auto_branch_prefix: "fawx/improve".to_string(),
+        }
+    }
 }
 
 impl Default for SelfModifyCliConfig {
@@ -501,6 +536,12 @@ max_relevant_results = 9
             },
             http: HttpConfig {
                 bearer_token: Some("test-token".to_string()),
+            },
+            improvement: ImprovementToolsConfig {
+                enabled: true,
+                max_analyses_per_hour: 5,
+                max_proposals_per_day: 2,
+                auto_branch_prefix: "test/improve".to_string(),
             },
         };
 

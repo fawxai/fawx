@@ -186,7 +186,8 @@ async fn run_tui() -> anyhow::Result<i32> {
     let auth_manager = tui::load_auth_manager()?;
     let router = tui::build_router(&auth_manager)?;
     let config = tui::load_config()?;
-    let bundle = tui::build_loop_engine_from_config(&config)?;
+    let improvement_provider = tui::build_improvement_provider(&auth_manager, &config);
+    let bundle = tui::build_loop_engine_from_config(&config, improvement_provider)?;
     let deps = bundle.into_tui_deps(auth_manager, router, config);
     let mut app = tui::TuiApp::new_with_deps(deps)?;
     app.run().await?;
@@ -201,7 +202,8 @@ async fn run_headless(
     let auth_manager = tui::load_auth_manager()?;
     let router = tui::build_router(&auth_manager)?;
     let config = tui::load_config()?;
-    let bundle = tui::build_loop_engine_from_config(&config)?;
+    let improvement_provider = tui::build_improvement_provider(&auth_manager, &config);
+    let bundle = tui::build_loop_engine_from_config(&config, improvement_provider)?;
 
     let deps = headless::HeadlessAppDeps {
         loop_engine: bundle.engine,
@@ -228,7 +230,8 @@ async fn run_http_server(
     let router = tui::build_router(&auth_manager)?;
     let config = tui::load_config()?;
     let http_config = config.http.clone();
-    let bundle = tui::build_loop_engine_from_config(&config)?;
+    let improvement_provider = tui::build_improvement_provider(&auth_manager, &config);
+    let bundle = tui::build_loop_engine_from_config(&config, improvement_provider)?;
 
     let deps = headless::HeadlessAppDeps {
         loop_engine: bundle.engine,
