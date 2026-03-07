@@ -72,6 +72,42 @@ pub struct FawxConfig {
     pub http: HttpConfig,
     pub improvement: ImprovementToolsConfig,
     pub preprocess: PreprocessDedup,
+    pub fleet: FleetConfig,
+}
+
+/// Fleet configuration for multi-node coordination.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct FleetConfig {
+    /// Whether this node acts as a coordinator.
+    pub coordinator: bool,
+    /// Seconds before a node is considered stale.
+    pub stale_timeout_seconds: u64,
+    /// Nodes to auto-register (for coordinator).
+    pub nodes: Vec<NodeConfig>,
+}
+
+impl Default for FleetConfig {
+    fn default() -> Self {
+        Self {
+            coordinator: false,
+            stale_timeout_seconds: 60,
+            nodes: Vec::new(),
+        }
+    }
+}
+
+/// Configuration for a known node in the fleet.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeConfig {
+    /// Human-readable name.
+    pub name: String,
+    /// HTTP API endpoint.
+    pub endpoint: String,
+    /// Bearer token for authentication.
+    pub auth_token: Option<String>,
+    /// Capability strings (e.g., "agentic_loop", "skill_build").
+    pub capabilities: Vec<String>,
 }
 
 /// Preprocessing deduplication settings.
@@ -654,6 +690,16 @@ max_relevant_results = 9
                 dedup_enabled: true,
                 dedup_min_length: 200,
                 dedup_preserve_recent: 3,
+            },
+            fleet: FleetConfig {
+                coordinator: true,
+                stale_timeout_seconds: 120,
+                nodes: vec![NodeConfig {
+                    name: "test-node".to_string(),
+                    endpoint: "https://10.0.0.1:8400".to_string(),
+                    auth_token: Some("token123".to_string()),
+                    capabilities: vec!["agentic_loop".to_string()],
+                }],
             },
         };
 
