@@ -877,7 +877,7 @@
       <div class="wave-icon" style="background: var(--accent-glow); color: var(--accent);">8</div>
       <div class="wave-info">
         <div class="wave-title">Wave 8: Polish, Testing &amp; Launch <span class="wave-badge badge-active">Next</span></div>
-        <div class="wave-desc">Contract tests, reflective memory, org transfer, website, docs, launch prep</div>
+        <div class="wave-desc">Contract tests, reflective memory, dogfooding, TUI fork, org transfer, website, docs, launch prep</div>
       </div>
       <div class="wave-meta">
         <span class="wave-count">0/8 done</span>
@@ -930,11 +930,26 @@
         </div>
         <div class="tree-item">
           <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-planned"></div>
+            <div class="node-status status-complete"></div>
             <div class="node-content">
-              <div class="node-title">Reflective memory</div>
+              <div class="node-title">Reflective memory ✅</div>
               <div class="node-detail">
                 Discovered, not forced. journal_write tool, mentioned in system prompt, model uses selectively. Live codebase index for self-awareness. Orchestration playbook with outcome tracking. Design doc: docs/design/reflective-memory.md
+              </div>
+            </div>
+            <div class="node-expand">›</div>
+          </div>
+        </div>
+        <div class="tree-item">
+          <div class="tree-node" onclick="toggleNode(this)">
+            <div class="node-status status-active"></div>
+            <div class="node-content">
+              <div class="node-title">Dogfooding Phase 0: Fawx as Worker Node</div>
+              <div class="node-detail">
+                Run <code>fawx serve --http</code> on VPS port 8400. OpenClaw sends tasks via HTTP — Fawx is a real worker. Phase 1: VPS + MacBook (distributed fleet over Tailscale). Phase 2: + Mac Mini (three-node fleet). Phase 3: Subagent parity. Phase 4: Full cutover. Every phase independently useful.
+              </div>
+              <div class="node-deps">
+                <span class="dep-tag">reflective memory</span>
               </div>
             </div>
             <div class="node-expand">›</div>
