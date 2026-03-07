@@ -30,6 +30,7 @@ members = [
     "engine/crates/fx-fleet",
     "engine/crates/fx-channel-webhook",
     "engine/crates/fx-orchestrator",
+    "engine/crates/fx-journal",
 ]
 resolver = "2"
 
