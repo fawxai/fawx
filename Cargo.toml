@@ -22,6 +22,7 @@ members = [
     "engine/crates/fx-scratchpad",
     "engine/crates/llama-cpp-sys",
     "engine/crates/fx-preprocess",
+    "engine/crates/fawx-ripcord",
 ]
 resolver = "2"
 
