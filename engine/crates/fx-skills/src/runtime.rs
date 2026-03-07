@@ -326,6 +326,7 @@ impl SkillRuntime {
             .map_err(|e| SkillError::Execution(format!("Failed to link set_output: {}", e)))?;
 
         Self::link_http_request(linker)?;
+        Self::link_v2_host_functions(linker)?;
 
         Ok(())
     }
@@ -429,6 +430,128 @@ impl SkillRuntime {
             )
             .map_err(|e| SkillError::Execution(format!("Failed to link http_request: {}", e)))?;
 
+        Ok(())
+    }
+
+    /// Link host_api_v2 functions to the WASM linker.
+    fn link_v2_host_functions(linker: &mut Linker<HostState>) -> Result<(), SkillError> {
+        Self::link_v2_get_context(linker)?;
+        Self::link_v2_register_channel(linker)?;
+        Self::link_v2_emit_event(linker)?;
+        Self::link_v2_send_to_channel(linker)?;
+        Ok(())
+    }
+
+    fn link_v2_get_context(linker: &mut Linker<HostState>) -> Result<(), SkillError> {
+        linker
+            .func_wrap(
+                "host_api_v2",
+                "get_context",
+                |mut caller: Caller<'_, HostState>| -> u32 {
+                    let json = caller.data().api.get_context();
+                    let memory = match caller.data().memory {
+                        Some(m) => m,
+                        None => return 0,
+                    };
+                    let mut off = caller.data().alloc_offset;
+                    match HostState::write_to_memory(memory, &mut caller, &json, &mut off) {
+                        Ok(ptr) => {
+                            caller.data_mut().alloc_offset = off;
+                            ptr
+                        }
+                        Err(_) => 0,
+                    }
+                },
+            )
+            .map_err(|e| SkillError::Execution(format!("Failed to link get_context: {e}")))?;
+        Ok(())
+    }
+
+    fn link_v2_register_channel(linker: &mut Linker<HostState>) -> Result<(), SkillError> {
+        linker
+            .func_wrap(
+                "host_api_v2",
+                "register_channel",
+                |mut caller: Caller<'_, HostState>,
+                 id_ptr: u32,
+                 id_len: u32,
+                 name_ptr: u32,
+                 name_len: u32|
+                 -> i32 {
+                    let id = match caller.data().read_string(&caller, id_ptr, id_len) {
+                        Ok(s) => s,
+                        Err(_) => return -1,
+                    };
+                    let name = match caller.data().read_string(&caller, name_ptr, name_len) {
+                        Ok(s) => s,
+                        Err(_) => return -1,
+                    };
+                    match caller.data_mut().api.register_channel(&id, &name) {
+                        Ok(()) => 0,
+                        Err(_) => -1,
+                    }
+                },
+            )
+            .map_err(|e| SkillError::Execution(format!("Failed to link register_channel: {e}")))?;
+        Ok(())
+    }
+
+    fn link_v2_emit_event(linker: &mut Linker<HostState>) -> Result<(), SkillError> {
+        linker
+            .func_wrap(
+                "host_api_v2",
+                "emit_event",
+                |mut caller: Caller<'_, HostState>,
+                 type_ptr: u32,
+                 type_len: u32,
+                 payload_ptr: u32,
+                 payload_len: u32|
+                 -> i32 {
+                    let etype = match caller.data().read_string(&caller, type_ptr, type_len) {
+                        Ok(s) => s,
+                        Err(_) => return -1,
+                    };
+                    let payload = match caller.data().read_string(&caller, payload_ptr, payload_len)
+                    {
+                        Ok(s) => s,
+                        Err(_) => return -1,
+                    };
+                    match caller.data_mut().api.emit_event(&etype, &payload) {
+                        Ok(()) => 0,
+                        Err(_) => -1,
+                    }
+                },
+            )
+            .map_err(|e| SkillError::Execution(format!("Failed to link emit_event: {e}")))?;
+        Ok(())
+    }
+
+    fn link_v2_send_to_channel(linker: &mut Linker<HostState>) -> Result<(), SkillError> {
+        linker
+            .func_wrap(
+                "host_api_v2",
+                "send_to_channel",
+                |caller: Caller<'_, HostState>,
+                 id_ptr: u32,
+                 id_len: u32,
+                 msg_ptr: u32,
+                 msg_len: u32|
+                 -> i32 {
+                    let ch = match caller.data().read_string(&caller, id_ptr, id_len) {
+                        Ok(s) => s,
+                        Err(_) => return -1,
+                    };
+                    let msg = match caller.data().read_string(&caller, msg_ptr, msg_len) {
+                        Ok(s) => s,
+                        Err(_) => return -1,
+                    };
+                    match caller.data().api.send_to_channel(&ch, &msg) {
+                        Ok(()) => 0,
+                        Err(_) => -1,
+                    }
+                },
+            )
+            .map_err(|e| SkillError::Execution(format!("Failed to link send_to_channel: {e}")))?;
         Ok(())
     }
 
@@ -1029,5 +1152,36 @@ mod tests {
         // Without Network capability, http_request returns 0 → "no_response"
         let output = runtime.invoke("no_net", "input").expect("Should invoke");
         assert_eq!(output, "no_response");
+    }
+
+    #[test]
+    fn v1_skill_loads_with_v2_host() {
+        let mut runtime = SkillRuntime::new().expect("create runtime");
+        let loader = SkillLoader::with_engine(runtime.engine().clone(), vec![]);
+        let manifest = create_test_manifest("v1_skill");
+        let wasm = create_invocable_wasm(runtime.engine());
+        let skill = loader.load(&wasm, &manifest, None).expect("load");
+        runtime.register_skill(skill).expect("register");
+        let output = runtime.invoke("v1_skill", "hello").expect("invoke");
+        assert_eq!(output, "ok");
+    }
+
+    #[test]
+    fn execution_context_serialization() {
+        use fx_core::types::ExecutionContext;
+        let ctx = ExecutionContext {
+            channel_id: Some("telegram".to_string()),
+            node_id: Some("node-1".to_string()),
+            user_id: Some("user-42".to_string()),
+            timestamp_ms: 1_700_000_000_000,
+            api_version: "host_api_v2".to_string(),
+        };
+        let json = serde_json::to_string(&ctx).expect("serialize");
+        let parsed: ExecutionContext = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.channel_id, Some("telegram".to_string()));
+        assert_eq!(parsed.node_id, Some("node-1".to_string()));
+        assert_eq!(parsed.user_id, Some("user-42".to_string()));
+        assert_eq!(parsed.timestamp_ms, 1_700_000_000_000);
+        assert_eq!(parsed.api_version, "host_api_v2");
     }
 }

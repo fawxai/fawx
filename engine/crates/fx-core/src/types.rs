@@ -6,6 +6,24 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Context available to skills during execution.
+///
+/// Provides metadata about the current invocation: which channel triggered it,
+/// which node is running it, who sent the request, and the API version.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionContext {
+    /// Which channel this request came from
+    pub channel_id: Option<String>,
+    /// Node identifier (for multi-node setups)
+    pub node_id: Option<String>,
+    /// User/sender identifier (channel-specific)
+    pub user_id: Option<String>,
+    /// Timestamp of the request (ms since epoch)
+    pub timestamp_ms: u64,
+    /// API version the skill was compiled against
+    pub api_version: String,
+}
+
 /// User input received from voice, text, or other sources.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserInput {
