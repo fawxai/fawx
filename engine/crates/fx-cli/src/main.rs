@@ -80,6 +80,21 @@ enum Commands {
         command: SkillCommands,
     },
 
+    /// Search the skill registry
+    Search {
+        /// Search query
+        query: String,
+    },
+
+    /// Install a skill from the registry
+    Install {
+        /// Skill name to install
+        name: String,
+    },
+
+    /// List installed skills (local)
+    List,
+
     /// Run OAuth bridge server for Android Codex sign-in
     #[cfg(feature = "oauth-bridge")]
     OauthBridge {
@@ -178,6 +193,24 @@ enum SkillCommands {
     /// Remove a skill
     Remove {
         /// Skill name
+        name: String,
+    },
+
+    /// Build a skill from source (compile, sign, install)
+    Build {
+        /// Path to skill project directory
+        path: String,
+        /// Skip signing even if key exists
+        #[arg(long)]
+        no_sign: bool,
+        /// Build only, don't install to ~/.fawx/skills/
+        #[arg(long)]
+        no_install: bool,
+    },
+
+    /// Scaffold a new skill project
+    New {
+        /// Name for the new skill
         name: String,
     },
 }
@@ -286,6 +319,18 @@ async fn dispatch_skill(command: SkillCommands) -> anyhow::Result<i32> {
             commands::skills::remove(&name).await?;
             Ok(0)
         }
+        SkillCommands::Build {
+            path,
+            no_sign,
+            no_install,
+        } => {
+            commands::skills::build(&path, no_sign, no_install)?;
+            Ok(0)
+        }
+        SkillCommands::New { name } => {
+            commands::skills::scaffold(&name)?;
+            Ok(0)
+        }
     }
 }
 
@@ -315,6 +360,18 @@ async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
         }
         Commands::Audit { command } => dispatch_audit(command).await,
         Commands::Skill { command } => dispatch_skill(command).await,
+        Commands::Search { query } => {
+            commands::marketplace::search_cmd(&query)?;
+            Ok(0)
+        }
+        Commands::Install { name } => {
+            commands::marketplace::install_cmd(&name)?;
+            Ok(0)
+        }
+        Commands::List => {
+            commands::marketplace::list_cmd()?;
+            Ok(0)
+        }
         #[cfg(not(feature = "oauth-bridge"))]
         Commands::OauthBridge => {
             eprintln!("Error: the oauth-bridge feature is not enabled in this build.");

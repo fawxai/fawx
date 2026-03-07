@@ -23,6 +23,10 @@ members = [
     "engine/crates/llama-cpp-sys",
     "engine/crates/fx-preprocess",
     "engine/crates/fawx-ripcord",
+    "engine/crates/fx-author",
+    "engine/crates/fx-marketplace",
+    "engine/crates/fawx-test",
+    "engine/crates/fx-canary",
 ]
 resolver = "2"
 
@@ -97,3 +101,7 @@ fx-analysis = { path = "engine/crates/fx-analysis" }
 fx-memory = { path = "engine/crates/fx-memory" }
 fx-improve = { path = "engine/crates/fx-improve" }
 fx-scratchpad = { path = "engine/crates/fx-scratchpad" }
+fx-llm = { path = "engine/crates/fx-llm" }
+fx-preprocess = { path = "engine/crates/fx-preprocess" }
+fx-author = { path = "engine/crates/fx-author" }
+fx-marketplace = { path = "engine/crates/fx-marketplace" }

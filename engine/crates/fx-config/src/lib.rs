@@ -20,6 +20,7 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Fawx Configuration
 # data_dir = "~/.fawx"
 # max_iterations = 10
 # max_history = 20
+# thinking = "adaptive"  # "high" | "low" | "adaptive" | "off"
 
 [model]
 # default_model = "anthropic/claude-sonnet-4-20250514"
@@ -70,6 +71,88 @@ pub struct FawxConfig {
     pub self_modify: SelfModifyCliConfig,
     pub http: HttpConfig,
     pub improvement: ImprovementToolsConfig,
+    pub preprocess: PreprocessDedup,
+}
+
+/// Preprocessing deduplication settings.
+///
+/// Controls cross-turn conversation deduplication. Disabled by default —
+/// requires explicit opt-in via `dedup_enabled = true`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct PreprocessDedup {
+    /// Enable cross-turn deduplication (default: false).
+    pub dedup_enabled: bool,
+    /// Minimum content length in characters to consider for dedup (default: 100).
+    pub dedup_min_length: usize,
+    /// Number of recent turns to always preserve intact (default: 2).
+    pub dedup_preserve_recent: usize,
+}
+
+impl Default for PreprocessDedup {
+    fn default() -> Self {
+        Self {
+            dedup_enabled: false,
+            dedup_min_length: 100,
+            dedup_preserve_recent: 2,
+        }
+    }
+}
+
+/// Thinking budget for extended thinking support.
+///
+/// Controls how much reasoning budget the model gets per request.
+/// `None` is treated as `Adaptive` (the default).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub enum ThinkingBudget {
+    #[default]
+    #[serde(rename = "adaptive")]
+    Adaptive,
+    #[serde(rename = "high")]
+    High,
+    #[serde(rename = "low")]
+    Low,
+    #[serde(rename = "off")]
+    Off,
+}
+
+impl std::fmt::Display for ThinkingBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Adaptive => write!(f, "adaptive"),
+            Self::High => write!(f, "high"),
+            Self::Low => write!(f, "low"),
+            Self::Off => write!(f, "off"),
+        }
+    }
+}
+
+impl ThinkingBudget {
+    /// Map a budget level to its token count, or `None` for `Off`.
+    pub fn budget_tokens(&self) -> Option<u32> {
+        match self {
+            Self::High => Some(10_000),
+            Self::Adaptive => Some(5_000),
+            Self::Low => Some(1_024),
+            Self::Off => None,
+        }
+    }
+}
+
+impl std::str::FromStr for ThinkingBudget {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "adaptive" => Ok(Self::Adaptive),
+            "high" => Ok(Self::High),
+            "low" => Ok(Self::Low),
+            "off" => Ok(Self::Off),
+            other => Err(format!(
+                "unknown thinking budget \'{other}\'; expected adaptive, high, low, or off"
+            )),
+        }
+    }
 }
 
 /// HTTP API settings for headless mode (`fawx serve --http`).
@@ -96,6 +179,8 @@ pub struct GeneralConfig {
     pub data_dir: Option<PathBuf>,
     pub max_iterations: u32,
     pub max_history: usize,
+    /// Extended thinking budget. `None` is treated as `Adaptive`.
+    pub thinking: Option<ThinkingBudget>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -128,6 +213,7 @@ impl Default for GeneralConfig {
             data_dir: None,
             max_iterations: 10,
             max_history: 20,
+            thinking: None,
         }
     }
 }
@@ -291,6 +377,26 @@ pub fn save_default_model(data_dir: &Path, default_model: &str) -> Result<(), St
         return update_default_model(&config_path, default_model);
     }
     create_model_config(data_dir, default_model)
+}
+
+/// Persist the thinking budget to `config.toml`, preserving comments.
+pub fn save_thinking_budget(data_dir: &Path, budget: ThinkingBudget) -> Result<(), String> {
+    let config_path = data_dir.join("config.toml");
+    fs::create_dir_all(data_dir).map_err(|error| format!("failed to write config: {error}"))?;
+    if config_path.exists() {
+        return update_thinking_budget(&config_path, budget);
+    }
+    let mut config = FawxConfig::default();
+    config.general.thinking = Some(budget);
+    config.save(data_dir)
+}
+
+fn update_thinking_budget(config_path: &Path, budget: ThinkingBudget) -> Result<(), String> {
+    let content = fs::read_to_string(config_path)
+        .map_err(|error| format!("failed to read config: {error}"))?;
+    let mut document = parse_config_document(&content)?;
+    set_string_field(&mut document, &["general"], "thinking", &budget.to_string())?;
+    write_config_file(config_path, document.to_string())
 }
 
 fn create_model_config(data_dir: &Path, default_model: &str) -> Result<(), String> {
@@ -504,6 +610,7 @@ max_relevant_results = 9
                 data_dir: Some(PathBuf::from("/tmp/data")),
                 max_iterations: 9,
                 max_history: 99,
+                thinking: None,
             },
             model: ModelConfig {
                 default_model: Some("claude-sonnet".to_string()),
@@ -542,6 +649,11 @@ max_relevant_results = 9
                 max_analyses_per_hour: 5,
                 max_proposals_per_day: 2,
                 auto_branch_prefix: "test/improve".to_string(),
+            },
+            preprocess: PreprocessDedup {
+                dedup_enabled: true,
+                dedup_min_length: 200,
+                dedup_preserve_recent: 3,
             },
         };
 
@@ -819,5 +931,71 @@ deny = ["[invalid"]
             DEFAULT_CONFIG_TEMPLATE.contains("require_signatures"),
             "template should mention require_signatures"
         );
+    }
+
+    #[test]
+    fn thinking_budget_serialization() {
+        let config = GeneralConfig {
+            thinking: Some(ThinkingBudget::High),
+            ..GeneralConfig::default()
+        };
+        let encoded = toml::to_string(&config).expect("serialize");
+        assert!(encoded.contains(r#"thinking = "high""#));
+        let decoded: GeneralConfig = toml::from_str(&encoded).expect("deserialize");
+        assert_eq!(decoded.thinking, Some(ThinkingBudget::High));
+
+        // Round-trip all variants
+        for variant in [
+            ThinkingBudget::Adaptive,
+            ThinkingBudget::Low,
+            ThinkingBudget::Off,
+        ] {
+            let cfg = GeneralConfig {
+                thinking: Some(variant),
+                ..GeneralConfig::default()
+            };
+            let enc = toml::to_string(&cfg).expect("serialize");
+            let dec: GeneralConfig = toml::from_str(&enc).expect("deserialize");
+            assert_eq!(dec.thinking, Some(variant));
+        }
+    }
+
+    #[test]
+    fn thinking_budget_default_is_adaptive() {
+        let config = GeneralConfig::default();
+        assert_eq!(config.thinking, None);
+        // None should be treated as Adaptive
+        let effective = config.thinking.unwrap_or_default();
+        assert_eq!(effective, ThinkingBudget::Adaptive);
+    }
+
+    #[test]
+    fn thinking_command_persists() {
+        let temp = TempDir::new().expect("tempdir");
+        let content = r#"[general]
+# keep comment
+max_iterations = 10
+"#;
+        write_config(&temp, content);
+
+        save_thinking_budget(temp.path(), ThinkingBudget::High).expect("save thinking");
+
+        let saved = read_config(&temp);
+        assert!(saved.contains("# keep comment"));
+        assert!(saved.contains(r#"thinking = "high""#));
+
+        // Update again
+        save_thinking_budget(temp.path(), ThinkingBudget::Low).expect("save thinking");
+        let saved = read_config(&temp);
+        assert!(saved.contains(r#"thinking = "low""#));
+        assert!(!saved.contains(r#"thinking = "high""#));
+    }
+
+    #[test]
+    fn thinking_budget_tokens_maps_correctly() {
+        assert_eq!(ThinkingBudget::High.budget_tokens(), Some(10_000));
+        assert_eq!(ThinkingBudget::Adaptive.budget_tokens(), Some(5_000));
+        assert_eq!(ThinkingBudget::Low.budget_tokens(), Some(1_024));
+        assert_eq!(ThinkingBudget::Off.budget_tokens(), None);
     }
 }

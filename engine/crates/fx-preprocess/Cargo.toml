@@ -9,5 +9,6 @@ description = "Deterministic prompt preprocessing for token reduction"
 [dependencies]
 serde_json.workspace = true
 regex.workspace = true
+fx-llm.workspace = true
 
 [dev-dependencies]

@@ -3,6 +3,7 @@
 //! Provides zero-cost, algorithmic transforms that reduce prompt token usage
 //! by 15-30% on tool-heavy conversations. No LLM required.
 
+pub mod dedup;
 mod json_minify;
 mod noise;
 mod whitespace;

@@ -705,6 +705,7 @@ mod tests {
             temperature: Some(0.1),
             max_tokens: Some(128),
             system_prompt: Some("Be concise".to_string()),
+            thinking: None,
         };
 
         let body = provider.build_request_body(&request, false).unwrap();
@@ -969,6 +970,7 @@ mod tests {
             temperature: None,
             max_tokens: Some(128),
             system_prompt: None,
+            thinking: None,
         };
 
         let result = provider.build_request_body(&request, false);

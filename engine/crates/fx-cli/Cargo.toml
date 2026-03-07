@@ -32,6 +32,8 @@ fx-improve.workspace = true
 fx-security.workspace = true
 fx-scratchpad = { path = "../fx-scratchpad" }
 fx-skills = { path = "../fx-skills" }
+fx-author = { path = "../fx-author" }
+fx-marketplace = { path = "../fx-marketplace" }
 fx-storage.workspace = true
 ring.workspace = true
 clap.workspace = true

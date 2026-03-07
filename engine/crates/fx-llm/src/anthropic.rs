@@ -12,7 +12,7 @@ use crate::provider::{CompletionStream, LlmProvider, ProviderCapabilities};
 use crate::sse::{SseFrame, SseFramer};
 use crate::types::{
     CompletionRequest, CompletionResponse, ContentBlock, LlmError, Message, MessageRole,
-    StreamChunk, ToolCall, ToolUseDelta, Usage,
+    StreamChunk, ThinkingConfig, ToolCall, ToolUseDelta, Usage,
 };
 
 /// Anthropic auth mode — determines how credentials are sent.
@@ -151,6 +151,14 @@ impl AnthropicProvider {
             })
             .collect::<Vec<_>>();
 
+        let thinking = match &request.thinking {
+            Some(ThinkingConfig::Enabled { budget_tokens }) => Some(AnthropicThinking {
+                thinking_type: "enabled".to_string(),
+                budget_tokens: *budget_tokens,
+            }),
+            Some(ThinkingConfig::Off) | None => None,
+        };
+
         Ok(AnthropicRequestBody {
             model: request.model.clone(),
             messages,
@@ -159,6 +167,7 @@ impl AnthropicProvider {
             max_tokens: request.max_tokens.unwrap_or(4096),
             system: system_prompt,
             stream,
+            thinking,
         })
     }
 
@@ -587,6 +596,16 @@ struct AnthropicRequestBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<String>,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<AnthropicThinking>,
+}
+
+/// Anthropic extended thinking parameter.
+#[derive(Debug, Serialize)]
+struct AnthropicThinking {
+    #[serde(rename = "type")]
+    thinking_type: String,
+    budget_tokens: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -728,6 +747,7 @@ mod tests {
             temperature: Some(0.2),
             max_tokens: Some(256),
             system_prompt: Some("System prelude".to_string()),
+            thinking: None,
         };
 
         let body = provider.build_request_body(&request, false).unwrap();
@@ -904,6 +924,7 @@ mod tests {
             temperature: None,
             max_tokens: Some(64),
             system_prompt: None,
+            thinking: None,
         };
 
         let result = provider.build_request_body(&request, false);
