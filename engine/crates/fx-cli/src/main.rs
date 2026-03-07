@@ -80,6 +80,21 @@ enum Commands {
         command: SkillCommands,
     },
 
+    /// Search the skill registry
+    Search {
+        /// Search query
+        query: String,
+    },
+
+    /// Install a skill from the registry
+    Install {
+        /// Skill name to install
+        name: String,
+    },
+
+    /// List installed skills (local)
+    List,
+
     /// Run OAuth bridge server for Android Codex sign-in
     #[cfg(feature = "oauth-bridge")]
     OauthBridge {
@@ -315,6 +330,18 @@ async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
         }
         Commands::Audit { command } => dispatch_audit(command).await,
         Commands::Skill { command } => dispatch_skill(command).await,
+        Commands::Search { query } => {
+            commands::marketplace::search_cmd(&query)?;
+            Ok(0)
+        }
+        Commands::Install { name } => {
+            commands::marketplace::install_cmd(&name)?;
+            Ok(0)
+        }
+        Commands::List => {
+            commands::marketplace::list_cmd()?;
+            Ok(0)
+        }
         #[cfg(not(feature = "oauth-bridge"))]
         Commands::OauthBridge => {
             eprintln!("Error: the oauth-bridge feature is not enabled in this build.");
