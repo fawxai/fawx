@@ -1,0 +1,9 @@
+[package]
+name = "fx-canary"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+fx-kernel = { path = "../fx-kernel" }
+serde = { workspace = true }
+serde_json = { workspace = true }
