@@ -70,6 +70,32 @@ pub struct FawxConfig {
     pub self_modify: SelfModifyCliConfig,
     pub http: HttpConfig,
     pub improvement: ImprovementToolsConfig,
+    pub preprocess: PreprocessDedup,
+}
+
+/// Preprocessing deduplication settings.
+///
+/// Controls cross-turn conversation deduplication. Disabled by default —
+/// requires explicit opt-in via `dedup_enabled = true`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct PreprocessDedup {
+    /// Enable cross-turn deduplication (default: false).
+    pub dedup_enabled: bool,
+    /// Minimum content length in characters to consider for dedup (default: 100).
+    pub dedup_min_length: usize,
+    /// Number of recent turns to always preserve intact (default: 2).
+    pub dedup_preserve_recent: usize,
+}
+
+impl Default for PreprocessDedup {
+    fn default() -> Self {
+        Self {
+            dedup_enabled: false,
+            dedup_min_length: 100,
+            dedup_preserve_recent: 2,
+        }
+    }
 }
 
 /// HTTP API settings for headless mode (`fawx serve --http`).
@@ -542,6 +568,11 @@ max_relevant_results = 9
                 max_analyses_per_hour: 5,
                 max_proposals_per_day: 2,
                 auto_branch_prefix: "test/improve".to_string(),
+            },
+            preprocess: PreprocessDedup {
+                dedup_enabled: true,
+                dedup_min_length: 200,
+                dedup_preserve_recent: 3,
             },
         };
 
