@@ -283,32 +283,57 @@ mod tests {
     }
 
     #[test]
-    fn thinking_budget_to_token_count() {
+    fn thinking_budget_constants_match_expected_values() {
         assert_eq!(THINKING_BUDGET_HIGH, 10_000);
         assert_eq!(THINKING_BUDGET_ADAPTIVE, 5_000);
         assert_eq!(THINKING_BUDGET_LOW, 1_024);
+    }
 
-        let high = ThinkingConfig::Enabled {
+    #[test]
+    fn thinking_config_enabled_stores_budget() {
+        let config = ThinkingConfig::Enabled {
             budget_tokens: THINKING_BUDGET_HIGH,
         };
-        let low = ThinkingConfig::Enabled {
-            budget_tokens: THINKING_BUDGET_LOW,
-        };
-        let adaptive = ThinkingConfig::Enabled {
-            budget_tokens: THINKING_BUDGET_ADAPTIVE,
-        };
-
-        match high {
+        match config {
             ThinkingConfig::Enabled { budget_tokens } => assert_eq!(budget_tokens, 10_000),
             ThinkingConfig::Off => panic!("expected Enabled"),
         }
-        match low {
-            ThinkingConfig::Enabled { budget_tokens } => assert_eq!(budget_tokens, 1_024),
-            ThinkingConfig::Off => panic!("expected Enabled"),
-        }
-        match adaptive {
-            ThinkingConfig::Enabled { budget_tokens } => assert_eq!(budget_tokens, 5_000),
-            ThinkingConfig::Off => panic!("expected Enabled"),
-        }
+    }
+
+    #[test]
+    fn thinking_config_off_has_no_budget() {
+        let config = ThinkingConfig::Off;
+        assert_eq!(config, ThinkingConfig::Off);
+    }
+
+    #[test]
+    fn thinking_config_completion_request_defaults_to_none() {
+        let request = CompletionRequest {
+            model: "test".to_string(),
+            messages: vec![],
+            tools: vec![],
+            temperature: None,
+            max_tokens: None,
+            system_prompt: None,
+            thinking: None,
+        };
+        assert!(request.thinking.is_none());
+    }
+
+    #[test]
+    fn thinking_config_roundtrips_through_completion_request() {
+        let thinking = Some(ThinkingConfig::Enabled {
+            budget_tokens: THINKING_BUDGET_ADAPTIVE,
+        });
+        let request = CompletionRequest {
+            model: "test".to_string(),
+            messages: vec![],
+            tools: vec![],
+            temperature: None,
+            max_tokens: None,
+            system_prompt: None,
+            thinking: thinking.clone(),
+        };
+        assert_eq!(request.thinking, thinking);
     }
 }

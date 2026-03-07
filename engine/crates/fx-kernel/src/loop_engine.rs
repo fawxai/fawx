@@ -271,6 +271,8 @@ pub struct LoopEngine {
     iteration_counter: Option<Arc<AtomicU32>>,
     /// Dynamic scratchpad provider for iteration-boundary context refresh.
     scratchpad_provider: Option<Arc<dyn ScratchpadProvider>>,
+    /// Extended thinking configuration forwarded to completion requests.
+    thinking_config: Option<fx_llm::ThinkingConfig>,
 }
 
 #[derive(Debug, Default)]
@@ -290,6 +292,7 @@ pub struct LoopEngineBuilder {
     scratchpad_context: Option<String>,
     iteration_counter: Option<Arc<AtomicU32>>,
     scratchpad_provider: Option<Arc<dyn ScratchpadProvider>>,
+    thinking_config: Option<fx_llm::ThinkingConfig>,
 }
 
 impl LoopEngineBuilder {
@@ -368,6 +371,11 @@ impl LoopEngineBuilder {
         self
     }
 
+    pub fn thinking_config(mut self, config: fx_llm::ThinkingConfig) -> Self {
+        self.thinking_config = Some(config);
+        self
+    }
+
     pub fn build(self) -> Result<LoopEngine, LoopError> {
         let budget = required_builder_field(self.budget, "budget")?;
         let context = required_builder_field(self.context, "context")?;
@@ -401,6 +409,7 @@ impl LoopEngineBuilder {
             tool_attempts: HashMap::new(),
             iteration_counter: self.iteration_counter,
             scratchpad_provider: self.scratchpad_provider,
+            thinking_config: self.thinking_config,
         })
     }
 }
@@ -701,6 +710,11 @@ impl LoopEngine {
         } else {
             Some(context)
         };
+    }
+
+    /// Set the extended thinking configuration for completion requests.
+    pub fn set_thinking_config(&mut self, config: Option<fx_llm::ThinkingConfig>) {
+        self.thinking_config = config;
     }
 
     /// Synchronise the shared iteration counter and refresh scratchpad context.
@@ -1141,6 +1155,7 @@ impl LoopEngine {
             self.tool_executor.tool_definitions(),
             self.memory_context.as_deref(),
             self.scratchpad_context.as_deref(),
+            self.thinking_config.clone(),
         );
         let reasoning_messages = request.messages.clone();
         let started = current_time_ms();
@@ -1281,6 +1296,7 @@ impl LoopEngine {
             self.memory_context.as_deref(),
             self.scratchpad_context.as_deref(),
             step,
+            self.thinking_config.clone(),
         );
         let request_messages = request.messages.clone();
         let stage = step_stage(step);
@@ -2776,6 +2792,7 @@ impl LoopEngine {
             self.tool_executor.tool_definitions(),
             self.memory_context.as_deref(),
             self.scratchpad_context.as_deref(),
+            self.thinking_config.clone(),
         );
 
         let mut stream = llm.complete_stream(request).await.map_err(|error| {
@@ -3653,6 +3670,7 @@ fn build_continuation_request(
     tool_definitions: Vec<ToolDefinition>,
     memory_context: Option<&str>,
     scratchpad_context: Option<&str>,
+    thinking: Option<fx_llm::ThinkingConfig>,
 ) -> CompletionRequest {
     let tools = tool_definitions_with_decompose(tool_definitions);
     let system_prompt = build_reasoning_system_prompt(memory_context, scratchpad_context);
@@ -3663,7 +3681,7 @@ fn build_continuation_request(
         temperature: Some(REASONING_TEMPERATURE),
         max_tokens: Some(REASONING_MAX_OUTPUT_TOKENS),
         system_prompt: Some(system_prompt),
-        thinking: None,
+        thinking,
     }
 }
 
@@ -3674,6 +3692,7 @@ fn build_truncation_continuation_request(
     memory_context: Option<&str>,
     scratchpad_context: Option<&str>,
     step: LoopStep,
+    thinking: Option<fx_llm::ThinkingConfig>,
 ) -> CompletionRequest {
     let tools = tool_definitions_with_decompose(tool_definitions);
     let system_prompt = build_reasoning_system_prompt(memory_context, scratchpad_context);
@@ -3684,7 +3703,7 @@ fn build_truncation_continuation_request(
         temperature: Some(REASONING_TEMPERATURE),
         max_tokens: Some(REASONING_MAX_OUTPUT_TOKENS),
         system_prompt: Some(system_prompt),
-        thinking: None,
+        thinking,
     }
 }
 
@@ -4126,6 +4145,7 @@ fn build_reasoning_request(
     tool_definitions: Vec<ToolDefinition>,
     memory_context: Option<&str>,
     scratchpad_context: Option<&str>,
+    thinking: Option<fx_llm::ThinkingConfig>,
 ) -> CompletionRequest {
     let context = perception.context_window.clone();
     let user_prompt = reasoning_user_prompt(perception);
@@ -4139,7 +4159,7 @@ fn build_reasoning_request(
         temperature: Some(REASONING_TEMPERATURE),
         max_tokens: Some(REASONING_MAX_OUTPUT_TOKENS),
         system_prompt: Some(system_prompt),
-        thinking: None,
+        thinking,
     }
 }
 
@@ -5780,6 +5800,7 @@ mod phase2_tests {
             None,
             None,
             LoopStep::Reason,
+            None,
         );
         let act_request = build_truncation_continuation_request(
             "mock",
@@ -5788,6 +5809,7 @@ mod phase2_tests {
             None,
             None,
             LoopStep::Act,
+            None,
         );
 
         assert!(reason_request
@@ -6055,9 +6077,16 @@ mod phase2_tests {
             steer_context: None,
         };
 
-        let reasoning_request = build_reasoning_request(&perception, "mock", vec![], None, None);
-        let continuation_request =
-            build_continuation_request(&perception.context_window, "mock", vec![], None, None);
+        let reasoning_request =
+            build_reasoning_request(&perception, "mock", vec![], None, None, None);
+        let continuation_request = build_continuation_request(
+            &perception.context_window,
+            "mock",
+            vec![],
+            None,
+            None,
+            None,
+        );
 
         assert_eq!(reasoning_request.max_tokens, Some(4096));
         assert_eq!(continuation_request.max_tokens, Some(4096));
@@ -9029,6 +9058,7 @@ mod decomposition_tests {
             vec![sample_tool_definition()],
             None,
             None,
+            None,
         );
 
         assert_decompose_tool_present(&request.tools);
@@ -9040,6 +9070,7 @@ mod decomposition_tests {
             &[Message::assistant("intermediate")],
             "mock-model",
             vec![sample_tool_definition()],
+            None,
             None,
             None,
         );

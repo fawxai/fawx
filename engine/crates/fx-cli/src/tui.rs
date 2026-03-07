@@ -39,6 +39,7 @@ use fx_kernel::{CachingExecutor, ProposalGateExecutor, ProposalGateState};
 use fx_llm::{
     AnthropicProvider, CompletionRequest, Message, ModelCatalog, ModelInfo, ModelRouter,
     OpenAiProvider, OpenAiResponsesProvider, ProviderError, RouterError, StreamChunk,
+    ThinkingConfig,
 };
 use fx_loadable::{ReloadEvent, SignaturePolicy, SkillRegistry, SkillWatcher, TransactionSkill};
 use fx_memory::{JsonFileMemory, JsonMemoryConfig, SignalStore};
@@ -2288,6 +2289,8 @@ impl TuiApp {
             .map_err(|error: String| TuiError::Router(error))?;
 
         self.config.general.thinking = Some(budget);
+        self.loop_engine
+            .set_thinking_config(thinking_config_from_budget(&budget));
         if let Err(error) = save_thinking_budget(&fawx_data_dir(), budget) {
             self.tui_println(format!(
                 "Warning: couldn\'t save thinking preference: {error}"
@@ -3276,6 +3279,16 @@ pub fn build_loop_engine_from_config(
     build_loop_engine_with_config(data_dir, config.clone(), improvement_provider)
 }
 
+/// Convert a [`ThinkingBudget`] to the wire-level [`ThinkingConfig`].
+///
+/// Returns `None` when thinking is disabled (`Off`), which keeps the
+/// `CompletionRequest.thinking` field empty.
+fn thinking_config_from_budget(budget: &ThinkingBudget) -> Option<ThinkingConfig> {
+    budget
+        .budget_tokens()
+        .map(|budget_tokens| ThinkingConfig::Enabled { budget_tokens })
+}
+
 /// Capacity of the streaming event bus broadcast channel.
 const EVENT_BUS_CAPACITY: usize = 256;
 
@@ -3326,6 +3339,10 @@ fn build_loop_engine_with_config(
         .scratchpad_provider(bridge);
     if let Some(snapshot_text) = skills.memory_snapshot {
         builder = builder.memory_context(snapshot_text);
+    }
+    let thinking_budget = config.general.thinking.unwrap_or_default();
+    if let Some(thinking) = thinking_config_from_budget(&thinking_budget) {
+        builder = builder.thinking_config(thinking);
     }
 
     let engine = build_loop_engine_from_builder(builder)?;

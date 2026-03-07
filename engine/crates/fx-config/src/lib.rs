@@ -127,6 +127,18 @@ impl std::fmt::Display for ThinkingBudget {
     }
 }
 
+impl ThinkingBudget {
+    /// Map a budget level to its token count, or `None` for `Off`.
+    pub fn budget_tokens(&self) -> Option<u32> {
+        match self {
+            Self::High => Some(10_000),
+            Self::Adaptive => Some(5_000),
+            Self::Low => Some(1_024),
+            Self::Off => None,
+        }
+    }
+}
+
 impl std::str::FromStr for ThinkingBudget {
     type Err = String;
 
@@ -977,5 +989,13 @@ max_iterations = 10
         let saved = read_config(&temp);
         assert!(saved.contains(r#"thinking = "low""#));
         assert!(!saved.contains(r#"thinking = "high""#));
+    }
+
+    #[test]
+    fn thinking_budget_tokens_maps_correctly() {
+        assert_eq!(ThinkingBudget::High.budget_tokens(), Some(10_000));
+        assert_eq!(ThinkingBudget::Adaptive.budget_tokens(), Some(5_000));
+        assert_eq!(ThinkingBudget::Low.budget_tokens(), Some(1_024));
+        assert_eq!(ThinkingBudget::Off.budget_tokens(), None);
     }
 }
