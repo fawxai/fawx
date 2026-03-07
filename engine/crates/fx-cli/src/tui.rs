@@ -93,7 +93,7 @@ const CANCELLED_INPUT_MESSAGE: &str = "input cancelled";
 const USER_ECHO_PREFIX: &str = "you › ";
 const USER_CONTINUATION_PREFIX: &str = "      ";
 
-type SharedMemoryStore = Arc<Mutex<dyn MemoryStore>>;
+pub(crate) type SharedMemoryStore = Arc<Mutex<dyn MemoryStore>>;
 
 enum IdleLoopEvent {
     Reload(ReloadEvent),
@@ -3569,7 +3569,10 @@ fn apply_skill_summaries(runtime_info: &Arc<RwLock<RuntimeInfo>>, registry: &Ski
     }
 }
 
-fn format_memory_for_prompt(entries: &[(String, String)], max_chars: usize) -> Option<String> {
+pub(crate) fn format_memory_for_prompt(
+    entries: &[(String, String)],
+    max_chars: usize,
+) -> Option<String> {
     if entries.is_empty() {
         return None;
     }
@@ -3658,13 +3661,13 @@ impl<'a> fmt::Debug for RouterLoopLlmProvider<'a> {
             .finish()
     }
 }
-struct RouterLoopLlmProvider<'a> {
+pub(crate) struct RouterLoopLlmProvider<'a> {
     router: &'a ModelRouter,
     active_model: String,
 }
 
 impl<'a> RouterLoopLlmProvider<'a> {
-    fn new(router: &'a ModelRouter, active_model: String) -> Self {
+    pub(crate) fn new(router: &'a ModelRouter, active_model: String) -> Self {
         Self {
             router,
             active_model,
@@ -3846,7 +3849,7 @@ fn strip_ansi_csi_sequences(text: &str) -> String {
     output
 }
 
-fn trim_history(history: &mut Vec<Message>, max_history: usize) {
+pub(crate) fn trim_history(history: &mut Vec<Message>, max_history: usize) {
     if history.len() <= max_history {
         return;
     }
@@ -3855,7 +3858,7 @@ fn trim_history(history: &mut Vec<Message>, max_history: usize) {
     history.drain(0..remove_count);
 }
 
-fn fawx_data_dir() -> PathBuf {
+pub(crate) fn fawx_data_dir() -> PathBuf {
     dirs::home_dir()
         .map(|home| home.join(".fawx"))
         .unwrap_or_else(|| PathBuf::from(".fawx"))

@@ -5,6 +5,7 @@ mod auth_store;
 mod commands;
 mod config_bridge;
 mod confirmation;
+mod headless;
 #[allow(dead_code)] // TODO(#1148): Phase 3 will wire markdown rendering into ratatui
 mod markdown;
 // Phase 2: many rendering/history utilities are currently test-only while we
@@ -39,6 +40,19 @@ enum Commands {
 
     /// Interactive chat with the agent
     Chat,
+
+    /// Run headless mode (stdin/stdout, no TUI)
+    Serve {
+        /// Process single input and exit
+        #[arg(long)]
+        single: bool,
+        /// JSON input/output mode
+        #[arg(long)]
+        json: bool,
+        /// Path to a custom system prompt file (default: ~/.fawx/system_prompt.md)
+        #[arg(long)]
+        system_prompt: Option<std::path::PathBuf>,
+    },
 
     /// Run system diagnostics
     Doctor,
@@ -171,6 +185,32 @@ async fn run_tui() -> anyhow::Result<i32> {
     Ok(0)
 }
 
+async fn run_headless(
+    single: bool,
+    json: bool,
+    system_prompt: Option<std::path::PathBuf>,
+) -> anyhow::Result<i32> {
+    let auth_manager = tui::load_auth_manager()?;
+    let router = tui::build_router(&auth_manager)?;
+    let config = tui::load_config()?;
+    let bundle = tui::build_loop_engine_from_config(&config)?;
+
+    let deps = headless::HeadlessAppDeps {
+        loop_engine: bundle.engine,
+        router,
+        config,
+        memory: bundle.memory,
+        system_prompt_path: system_prompt,
+    };
+
+    let mut app = headless::HeadlessApp::new(deps)?;
+    if single {
+        app.run_single(json).await
+    } else {
+        app.run(json).await
+    }
+}
+
 fn run_stub(action: &str) -> i32 {
     println!("{action} Fawx agent daemon...");
     println!("(Implementation pending - Epic 9)");
@@ -210,6 +250,11 @@ async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
         Commands::Start => Ok(run_stub("Starting")),
         Commands::Stop => Ok(run_stub("Stopping")),
         Commands::Chat => Ok(commands::chat::run().await?),
+        Commands::Serve {
+            single,
+            json,
+            system_prompt,
+        } => run_headless(single, json, system_prompt).await,
         Commands::Doctor => Ok(commands::doctor::run().await?),
         Commands::Config => {
             commands::config::run().await?;
