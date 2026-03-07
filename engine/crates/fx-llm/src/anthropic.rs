@@ -15,6 +15,15 @@ use crate::types::{
     StreamChunk, ThinkingConfig, ToolCall, ToolUseDelta, Usage,
 };
 
+/// Maximum allowed thinking budget tokens — prevents token exhaustion attacks.
+/// Even if a caller constructs ThinkingConfig::Enabled with an arbitrary budget,
+/// the wire request is capped at this ceiling.
+const MAX_THINKING_BUDGET: u32 = 32_000;
+
+/// Minimum token headroom reserved for the model's response output
+/// when thinking is enabled. Ensures max_tokens > budget_tokens.
+const MIN_RESPONSE_TOKENS: u32 = 1024;
+
 /// Anthropic auth mode — determines how credentials are sent.
 #[derive(Debug, Clone)]
 pub enum AnthropicAuthMode {
@@ -152,10 +161,20 @@ impl AnthropicProvider {
             .collect::<Vec<_>>();
 
         let thinking = match &request.thinking {
-            Some(ThinkingConfig::Enabled { budget_tokens }) => Some(AnthropicThinking {
-                thinking_type: "enabled".to_string(),
-                budget_tokens: *budget_tokens,
-            }),
+            Some(ThinkingConfig::Enabled { budget_tokens }) => {
+                let capped = (*budget_tokens).min(MAX_THINKING_BUDGET);
+                if *budget_tokens > MAX_THINKING_BUDGET {
+                    tracing::warn!(
+                        requested = budget_tokens,
+                        capped = capped,
+                        "thinking budget exceeds maximum, capping at {MAX_THINKING_BUDGET}"
+                    );
+                }
+                Some(AnthropicThinking {
+                    thinking_type: "enabled".to_string(),
+                    budget_tokens: capped,
+                })
+            }
             Some(ThinkingConfig::Off) | None => None,
         };
 
@@ -163,8 +182,19 @@ impl AnthropicProvider {
             model: request.model.clone(),
             messages,
             tools,
-            temperature: request.temperature,
-            max_tokens: request.max_tokens.unwrap_or(4096),
+            // When thinking is enabled, Anthropic requires temperature=1 (or omitted)
+            temperature: if thinking.is_some() {
+                None
+            } else {
+                request.temperature
+            },
+            max_tokens: match &thinking {
+                Some(t) => request
+                    .max_tokens
+                    .unwrap_or(4096)
+                    .max(t.budget_tokens + MIN_RESPONSE_TOKENS),
+                None => request.max_tokens.unwrap_or(4096),
+            },
             system: system_prompt,
             stream,
             thinking,
@@ -221,6 +251,12 @@ impl AnthropicProvider {
                         tool_use_id,
                         content: result,
                     });
+                }
+                AnthropicContentBlock::Thinking { .. } => {
+                    // Extended thinking block — skip (not surfaced to user)
+                }
+                AnthropicContentBlock::RedactedThinking { .. } => {
+                    // Redacted thinking block — skip (content-policy redaction)
                 }
             }
         }
@@ -636,6 +672,12 @@ enum AnthropicContentBlock {
         tool_use_id: String,
         content: Value,
     },
+    Thinking {
+        thinking: String,
+    },
+    RedactedThinking {
+        data: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -680,6 +722,11 @@ struct AnthropicStreamDelta {
     text: Option<String>,
     #[serde(default)]
     partial_json: Option<String>,
+    /// Captures `thinking_delta` content; intentionally unused (thinking
+    /// blocks are silently skipped, but the field must exist so serde
+    /// does not reject the payload).
+    #[serde(default, rename = "thinking")]
+    _thinking: Option<String>,
     #[serde(default)]
     stop_reason: Option<String>,
 }
@@ -1100,6 +1147,69 @@ mod tests {
         assert!(done_ids.contains(&"t3"));
     }
 
+    /// Regression test: when thinking is enabled, Anthropic requires
+    /// temperature=1 or omitted. Verify we strip the caller's temperature.
+    #[test]
+    fn thinking_enabled_strips_temperature() {
+        let provider = AnthropicProvider::new("http://localhost:9999", "test-key")
+            .unwrap()
+            .with_supported_models(vec!["claude-sonnet-4-20250514".to_string()]);
+
+        let request = CompletionRequest {
+            model: "claude-sonnet-4-20250514".to_string(),
+            messages: vec![Message::user("hello")],
+            tools: Vec::new(),
+            temperature: Some(0.7),
+            max_tokens: Some(1024),
+            system_prompt: None,
+            thinking: Some(ThinkingConfig::Enabled {
+                budget_tokens: 5000,
+            }),
+        };
+
+        let body = provider.build_request_body(&request, false).unwrap();
+        let serialized = serde_json::to_value(body).unwrap();
+
+        // temperature must be absent (None serializes to null, but
+        // skip_serializing_if = "Option::is_none" omits it entirely)
+        assert!(
+            serialized.get("temperature").is_none(),
+            "temperature must be omitted when thinking is enabled, got: {serialized}"
+        );
+        // thinking must still be present
+        assert_eq!(serialized["thinking"]["type"], "enabled");
+        assert_eq!(serialized["thinking"]["budget_tokens"], 5000);
+    }
+
+    /// Verify temperature is preserved when thinking is NOT enabled.
+    #[test]
+    fn thinking_disabled_preserves_temperature() {
+        let provider = AnthropicProvider::new("http://localhost:9999", "test-key")
+            .unwrap()
+            .with_supported_models(vec!["claude-sonnet-4-20250514".to_string()]);
+
+        let request = CompletionRequest {
+            model: "claude-sonnet-4-20250514".to_string(),
+            messages: vec![Message::user("hello")],
+            tools: Vec::new(),
+            temperature: Some(0.7),
+            max_tokens: Some(1024),
+            system_prompt: None,
+            thinking: None,
+        };
+
+        let body = provider.build_request_body(&request, false).unwrap();
+        let serialized = serde_json::to_value(body).unwrap();
+
+        let temp = serialized["temperature"]
+            .as_f64()
+            .expect("temperature must be present when thinking is disabled");
+        assert!(
+            (temp - 0.7).abs() < 0.001,
+            "temperature must be ~0.7, got {temp}"
+        );
+    }
+
     #[test]
     fn multi_tool_streaming_preserves_separate_arguments() {
         let payload = r#"
@@ -1136,6 +1246,212 @@ mod tests {
             tool_deltas[1].id.as_deref(),
             Some("toolu_02"),
             "second argument delta must carry toolu_02 id"
+        );
+    }
+
+    /// Regression test: when thinking budget exceeds default max_tokens,
+    /// max_tokens must be raised to at least budget_tokens + 1024.
+    #[test]
+    fn thinking_budget_increases_max_tokens() {
+        let provider = AnthropicProvider::new("http://localhost:9999", "test-key")
+            .unwrap()
+            .with_supported_models(vec!["claude-sonnet-4-20250514".to_string()]);
+
+        let request = CompletionRequest {
+            model: "claude-sonnet-4-20250514".to_string(),
+            messages: vec![Message::user("hello")],
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: None, // defaults to 4096, which is < 10000
+            system_prompt: None,
+            thinking: Some(ThinkingConfig::Enabled {
+                budget_tokens: 10000,
+            }),
+        };
+
+        let body = provider.build_request_body(&request, false).unwrap();
+        let serialized = serde_json::to_value(body).unwrap();
+
+        let max_tokens = serialized["max_tokens"]
+            .as_u64()
+            .expect("max_tokens must be present");
+        assert!(
+            max_tokens >= 10000 + MIN_RESPONSE_TOKENS as u64,
+            "max_tokens must be at least budget_tokens + MIN_RESPONSE_TOKENS, got {max_tokens}"
+        );
+    }
+
+    /// Regression test: thinking budget_tokens must be capped at MAX_THINKING_BUDGET
+    /// to prevent token exhaustion attacks via absurdly high values.
+    #[test]
+    fn thinking_budget_capped_at_maximum() {
+        let provider = AnthropicProvider::new("http://localhost:9999", "test-key")
+            .unwrap()
+            .with_supported_models(vec!["claude-sonnet-4-20250514".to_string()]);
+
+        let request = CompletionRequest {
+            model: "claude-sonnet-4-20250514".to_string(),
+            messages: vec![Message::user("hello")],
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: Some(8192),
+            system_prompt: None,
+            thinking: Some(ThinkingConfig::Enabled {
+                budget_tokens: 500_000,
+            }),
+        };
+
+        let body = provider.build_request_body(&request, false).unwrap();
+        let serialized = serde_json::to_value(body).unwrap();
+
+        // budget_tokens must be capped at MAX_THINKING_BUDGET
+        assert_eq!(
+            serialized["thinking"]["budget_tokens"], MAX_THINKING_BUDGET,
+            "budget_tokens must be capped at {MAX_THINKING_BUDGET}, got {}",
+            serialized["thinking"]["budget_tokens"]
+        );
+
+        // max_tokens must be based on the capped budget, not the original 500_000
+        let max_tokens = serialized["max_tokens"]
+            .as_u64()
+            .expect("max_tokens must be present");
+        assert_eq!(
+            max_tokens,
+            (MAX_THINKING_BUDGET + MIN_RESPONSE_TOKENS) as u64,
+            "max_tokens must be based on capped budget ({MAX_THINKING_BUDGET} + {MIN_RESPONSE_TOKENS}), got {max_tokens}",
+        );
+    }
+
+    /// Verify max_tokens is NOT increased when it already exceeds the thinking budget.
+    #[test]
+    fn thinking_budget_preserves_sufficient_max_tokens() {
+        let provider = AnthropicProvider::new("http://localhost:9999", "test-key")
+            .unwrap()
+            .with_supported_models(vec!["claude-sonnet-4-20250514".to_string()]);
+
+        let request = CompletionRequest {
+            model: "claude-sonnet-4-20250514".to_string(),
+            messages: vec![Message::user("hello")],
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: Some(20000),
+            system_prompt: None,
+            thinking: Some(ThinkingConfig::Enabled {
+                budget_tokens: 5000,
+            }),
+        };
+
+        let body = provider.build_request_body(&request, false).unwrap();
+        let serialized = serde_json::to_value(body).unwrap();
+
+        let max_tokens = serialized["max_tokens"]
+            .as_u64()
+            .expect("max_tokens must be present");
+        assert_eq!(
+            max_tokens, 20000,
+            "max_tokens must stay at explicitly set value when it already exceeds budget"
+        );
+    }
+
+    #[test]
+    fn thinking_block_skipped_in_response() {
+        let response = AnthropicResponseBody {
+            content: vec![
+                AnthropicContentBlock::Thinking {
+                    thinking: "Let me reason about this...".to_string(),
+                },
+                AnthropicContentBlock::Text {
+                    text: "The answer is 42.".to_string(),
+                },
+            ],
+            stop_reason: Some("end_turn".to_string()),
+            usage: Some(AnthropicUsage {
+                input_tokens: 10,
+                output_tokens: 20,
+            }),
+        };
+
+        let mapped = AnthropicProvider::parse_completion_response(response);
+
+        assert_eq!(mapped.content.len(), 1, "thinking block must be skipped");
+        assert!(
+            matches!(&mapped.content[0], ContentBlock::Text { text } if text == "The answer is 42."),
+            "only the text block should remain"
+        );
+        assert!(mapped.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn redacted_thinking_block_skipped_in_response() {
+        let response = AnthropicResponseBody {
+            content: vec![
+                AnthropicContentBlock::RedactedThinking {
+                    data: "base64-redacted-content".to_string(),
+                },
+                AnthropicContentBlock::Text {
+                    text: "The answer is 42.".to_string(),
+                },
+            ],
+            stop_reason: Some("end_turn".to_string()),
+            usage: Some(AnthropicUsage {
+                input_tokens: 10,
+                output_tokens: 20,
+            }),
+        };
+
+        let mapped = AnthropicProvider::parse_completion_response(response);
+
+        assert_eq!(
+            mapped.content.len(),
+            1,
+            "redacted thinking block must be skipped"
+        );
+        assert!(
+            matches!(&mapped.content[0], ContentBlock::Text { text } if text == "The answer is 42."),
+            "only the text block should remain"
+        );
+        assert!(mapped.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn thinking_block_skipped_in_stream() {
+        let payload = r#"
+            data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}
+
+            data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me reason..."}}
+
+            data: {"type":"content_block_stop","index":0}
+
+            data: {"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"base64-redacted"}}
+
+            data: {"type":"content_block_stop","index":1}
+
+            data: {"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}
+
+            data: {"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"Hello!"}}
+
+            data: {"type":"content_block_stop","index":2}
+
+            data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}
+
+            data: [DONE]
+        "#;
+
+        let chunks = AnthropicProvider::parse_sse_payload(payload).unwrap();
+
+        // Only the text delta and the message_delta (stop_reason) should produce chunks.
+        // Thinking start/delta/stop must produce nothing.
+        let text_chunks: Vec<_> = chunks
+            .iter()
+            .filter(|c| c.delta_content.is_some())
+            .collect();
+        assert_eq!(text_chunks.len(), 1);
+        assert_eq!(text_chunks[0].delta_content.as_deref(), Some("Hello!"));
+
+        // No tool calls from thinking blocks
+        assert!(
+            chunks.iter().all(|c| c.tool_use_deltas.is_empty()),
+            "thinking blocks must not produce tool use deltas"
         );
     }
 }

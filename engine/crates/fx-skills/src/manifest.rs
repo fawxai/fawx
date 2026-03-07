@@ -106,9 +106,9 @@ pub fn validate_manifest(manifest: &SkillManifest) -> Result<(), SkillError> {
     }
 
     // Validate api_version
-    if manifest.api_version != "host_api_v1" {
+    if manifest.api_version != "host_api_v1" && manifest.api_version != "host_api_v2" {
         return Err(SkillError::InvalidManifest(format!(
-            "Unsupported api_version '{}', expected 'host_api_v1'",
+            "Unsupported api_version '{}', expected 'host_api_v1' or 'host_api_v2'",
             manifest.api_version
         )));
     }
@@ -172,6 +172,20 @@ name = "broken
         let result = validate_manifest(&manifest);
         assert!(result.is_err());
         assert!(matches!(result, Err(SkillError::InvalidManifest(_))));
+    }
+
+    #[test]
+    fn v2_manifest_accepted() {
+        let manifest = SkillManifest {
+            name: "v2_skill".to_string(),
+            version: "1.0.0".to_string(),
+            description: "A v2 skill".to_string(),
+            author: "Fawx".to_string(),
+            api_version: "host_api_v2".to_string(),
+            capabilities: vec![],
+            entry_point: "run".to_string(),
+        };
+        assert!(validate_manifest(&manifest).is_ok());
     }
 
     #[test]

@@ -32,6 +32,7 @@ pub mod act;
 pub mod budget;
 pub mod caching_executor;
 pub mod cancellation;
+pub mod channels;
 pub mod checkpoint;
 pub mod context_manager;
 pub mod continuation;
@@ -58,6 +59,7 @@ pub use act::{
 };
 pub use caching_executor::CachingExecutor;
 pub use cancellation::CancellationToken;
+pub use channels::{ChannelRegistry, HttpChannel, ResponseRouter, TuiChannel};
 pub use continuation::Continuation;
 pub use decide::Decision;
 pub use event_bus::{CompletionEvent, EventBus, Observer, TaskResult};

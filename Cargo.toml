@@ -27,6 +27,9 @@ members = [
     "engine/crates/fx-marketplace",
     "engine/crates/fawx-test",
     "engine/crates/fx-canary",
+    "engine/crates/fx-fleet",
+    "engine/crates/fx-channel-webhook",
+    "engine/crates/fx-orchestrator",
 ]
 resolver = "2"
 
@@ -105,3 +108,5 @@ fx-llm = { path = "engine/crates/fx-llm" }
 fx-preprocess = { path = "engine/crates/fx-preprocess" }
 fx-author = { path = "engine/crates/fx-author" }
 fx-marketplace = { path = "engine/crates/fx-marketplace" }
+fx-fleet = { path = "engine/crates/fx-fleet" }
+fx-orchestrator = { path = "engine/crates/fx-orchestrator" }

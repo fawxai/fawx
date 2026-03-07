@@ -38,6 +38,38 @@ pub trait HostApi: Send + Sync {
 
     /// Downcast to concrete type for accessing implementation-specific methods.
     fn as_any(&self) -> &dyn std::any::Any;
+
+    // === host_api_v2 additions ===
+
+    /// Get metadata about the current execution context.
+    fn get_context(&self) -> String {
+        "{}".to_string()
+    }
+
+    /// Register this skill as the message handler for a channel.
+    fn register_channel(
+        &mut self,
+        _channel_id: &str,
+        _display_name: &str,
+    ) -> Result<(), SkillError> {
+        Err(SkillError::Unsupported(
+            "register_channel requires host_api_v2".into(),
+        ))
+    }
+
+    /// Emit an event for other skills or the orchestrator.
+    fn emit_event(&mut self, _event_type: &str, _payload: &str) -> Result<(), SkillError> {
+        Err(SkillError::Unsupported(
+            "emit_event requires host_api_v2".into(),
+        ))
+    }
+
+    /// Send a response to a specific channel.
+    fn send_to_channel(&self, _channel_id: &str, _message: &str) -> Result<(), SkillError> {
+        Err(SkillError::Unsupported(
+            "send_to_channel requires host_api_v2".into(),
+        ))
+    }
 }
 
 /// Shared base for HostApi implementations.
@@ -303,6 +335,39 @@ mod tests {
 
         base.kv_set("k", "v2");
         assert_eq!(base.kv_get("k"), Some("v2".to_string()));
+    }
+
+    #[test]
+    fn register_channel_v1_fails() {
+        let mut api = MockHostApi::new("test");
+        let result = api.register_channel("telegram", "Telegram");
+        assert!(result.is_err());
+        assert!(matches!(result, Err(SkillError::Unsupported(_))));
+    }
+
+    #[test]
+    fn send_to_channel_v1_fails() {
+        let api = MockHostApi::new("test");
+        let result = api.send_to_channel("telegram", "hello");
+        assert!(result.is_err());
+        assert!(matches!(result, Err(SkillError::Unsupported(_))));
+    }
+
+    #[test]
+    fn emit_event_v1_fails() {
+        let mut api = MockHostApi::new("test");
+        let result = api.emit_event("some.event", r#"{"key":"value"}"#);
+        assert!(result.is_err());
+        assert!(matches!(result, Err(SkillError::Unsupported(_))));
+    }
+
+    #[test]
+    fn get_context_returns_json() {
+        let api = MockHostApi::new("test");
+        let ctx = api.get_context();
+        assert_eq!(ctx, "{}");
+        let parsed: serde_json::Value = serde_json::from_str(&ctx).expect("valid JSON");
+        assert!(parsed.is_object());
     }
 
     #[test]

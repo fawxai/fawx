@@ -97,6 +97,10 @@ pub enum SkillError {
     /// Invalid skill manifest
     #[error("Invalid skill manifest: {0}")]
     InvalidManifest(String),
+
+    /// Feature not supported by this API version
+    #[error("Unsupported: {0}")]
+    Unsupported(String),
 }
 
 /// Phone action errors (Android-specific for PoC, abstracted for OS)
