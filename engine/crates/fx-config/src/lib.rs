@@ -391,6 +391,42 @@ impl Default for SelfModifyPathsCliConfig {
     }
 }
 
+/// Expand a leading `~` in a path to the user's home directory.
+///
+/// Only expands `~` at the very start of the path (i.e., `~/.fawx` becomes
+/// `/home/user/.fawx`). Paths like `foo/~/bar` or absolute paths are returned
+/// unchanged. Returns the original path if the home directory cannot be
+/// determined.
+fn expand_tilde(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    if s == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    } else if let Some(rest) = s.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    // ~user paths and everything else: return as-is
+    path.to_path_buf()
+}
+
+/// Apply tilde expansion to an optional path field.
+fn expand_tilde_opt(path: &mut Option<PathBuf>) {
+    if let Some(p) = path.as_mut() {
+        let original = p.clone();
+        *p = expand_tilde(&original);
+        if *p != original {
+            tracing::debug!(
+                "config path expanded: {} -> {}",
+                original.display(),
+                p.display()
+            );
+        }
+    }
+}
+
 impl FawxConfig {
     pub fn load(data_dir: &Path) -> Result<Self, String> {
         let config_path = data_dir.join("config.toml");
@@ -399,10 +435,18 @@ impl FawxConfig {
         }
         let content = fs::read_to_string(&config_path)
             .map_err(|error| format!("failed to read config: {error}"))?;
-        let config: Self =
+        let mut config: Self =
             toml::from_str(&content).map_err(|error| format!("invalid config: {error}"))?;
         config.validate()?;
+        config.expand_paths();
         Ok(config)
+    }
+
+    /// Expand `~` to the user's home directory in all user-facing path configs.
+    fn expand_paths(&mut self) {
+        expand_tilde_opt(&mut self.general.data_dir);
+        expand_tilde_opt(&mut self.tools.working_dir);
+        expand_tilde_opt(&mut self.self_modify.proposals_dir);
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -1105,5 +1149,94 @@ max_iterations = 10
         assert_eq!(ThinkingBudget::Adaptive.budget_tokens(), Some(5_000));
         assert_eq!(ThinkingBudget::Low.budget_tokens(), Some(1_024));
         assert_eq!(ThinkingBudget::Off.budget_tokens(), None);
+    }
+
+    #[test]
+    fn tilde_expansion_resolves_home() {
+        let path = PathBuf::from("~/.fawx");
+        let expanded = expand_tilde(&path);
+        let home = dirs::home_dir().expect("home dir should exist in test");
+        assert_eq!(expanded, home.join(".fawx"));
+    }
+
+    #[test]
+    fn tilde_expansion_preserves_absolute() {
+        let path = PathBuf::from("/absolute/path");
+        let expanded = expand_tilde(&path);
+        assert_eq!(expanded, PathBuf::from("/absolute/path"));
+    }
+
+    #[test]
+    fn tilde_expansion_preserves_relative() {
+        let path = PathBuf::from("relative/path");
+        let expanded = expand_tilde(&path);
+        assert_eq!(expanded, PathBuf::from("relative/path"));
+    }
+
+    #[test]
+    fn tilde_expansion_preserves_tilde_in_middle() {
+        let path = PathBuf::from("foo/~/bar");
+        let expanded = expand_tilde(&path);
+        assert_eq!(expanded, PathBuf::from("foo/~/bar"));
+    }
+
+    #[test]
+    fn tilde_expansion_does_not_expand_tilde_user() {
+        let path = PathBuf::from("~joe/.config");
+        let expanded = expand_tilde(&path);
+        assert_eq!(expanded, PathBuf::from("~joe/.config"));
+    }
+
+    #[test]
+    fn tilde_expansion_bare_tilde_resolves_to_home() {
+        let path = PathBuf::from("~");
+        let expanded = expand_tilde(&path);
+        let home = dirs::home_dir().expect("home dir should exist in test");
+        assert_eq!(expanded, home);
+    }
+
+    #[test]
+    fn load_expands_tilde_in_config_paths() {
+        let temp = TempDir::new().expect("tempdir");
+        let content = r#"
+[general]
+data_dir = "~/.fawx"
+
+[tools]
+working_dir = "~/projects"
+
+[self_modify]
+proposals_dir = "~/.fawx/proposals"
+"#;
+        write_config(&temp, content);
+        let loaded = FawxConfig::load(temp.path()).expect("load config");
+
+        let home = dirs::home_dir().expect("home dir should exist in test");
+        assert_eq!(loaded.general.data_dir, Some(home.join(".fawx")),);
+        assert_eq!(loaded.tools.working_dir, Some(home.join("projects")),);
+        assert_eq!(
+            loaded.self_modify.proposals_dir,
+            Some(home.join(".fawx/proposals")),
+        );
+    }
+
+    #[test]
+    fn load_preserves_absolute_config_paths() {
+        let temp = TempDir::new().expect("tempdir");
+        let content = r#"
+[general]
+data_dir = "/tmp/fawx-data"
+
+[tools]
+working_dir = "/tmp/work"
+"#;
+        write_config(&temp, content);
+        let loaded = FawxConfig::load(temp.path()).expect("load config");
+
+        assert_eq!(
+            loaded.general.data_dir,
+            Some(PathBuf::from("/tmp/fawx-data")),
+        );
+        assert_eq!(loaded.tools.working_dir, Some(PathBuf::from("/tmp/work")),);
     }
 }
