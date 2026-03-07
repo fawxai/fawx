@@ -73,6 +73,7 @@ pub struct FawxConfig {
     pub improvement: ImprovementToolsConfig,
     pub preprocess: PreprocessDedup,
     pub fleet: FleetConfig,
+    pub webhook: WebhookConfig,
 }
 
 /// Fleet configuration for multi-node coordination.
@@ -108,6 +109,27 @@ pub struct NodeConfig {
     pub auth_token: Option<String>,
     /// Capability strings (e.g., "agentic_loop", "skill_build").
     pub capabilities: Vec<String>,
+}
+
+/// Webhook channel configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct WebhookConfig {
+    /// Whether webhook channels are enabled.
+    pub enabled: bool,
+    /// Configured webhook channels.
+    pub channels: Vec<WebhookChannelConfig>,
+}
+
+/// Configuration for a single webhook channel.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebhookChannelConfig {
+    /// Unique channel identifier.
+    pub id: String,
+    /// Human-readable name.
+    pub name: String,
+    /// Optional callback URL for response delivery.
+    pub callback_url: Option<String>,
 }
 
 /// Preprocessing deduplication settings.
@@ -699,6 +721,14 @@ max_relevant_results = 9
                     endpoint: "https://10.0.0.1:8400".to_string(),
                     auth_token: Some("token123".to_string()),
                     capabilities: vec!["agentic_loop".to_string()],
+                }],
+            },
+            webhook: WebhookConfig {
+                enabled: true,
+                channels: vec![WebhookChannelConfig {
+                    id: "wh-test".to_string(),
+                    name: "Test Webhook".to_string(),
+                    callback_url: Some("https://example.com/cb".to_string()),
                 }],
             },
         };

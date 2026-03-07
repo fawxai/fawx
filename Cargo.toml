@@ -28,6 +28,7 @@ members = [
     "engine/crates/fawx-test",
     "engine/crates/fx-canary",
     "engine/crates/fx-fleet",
+    "engine/crates/fx-channel-webhook",
 ]
 resolver = "2"
 
