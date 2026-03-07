@@ -23,7 +23,7 @@ pub struct UserInput {
 }
 
 /// Source of user input.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum InputSource {
     /// Voice command
     Voice,
@@ -33,6 +33,10 @@ pub enum InputSource {
     Notification,
     /// Scheduled/proactive action
     Scheduled,
+    /// Message from an external channel (id identifies which).
+    Channel(String),
+    /// Message from HTTP API.
+    Http,
 }
 
 /// Classified intent from user input.

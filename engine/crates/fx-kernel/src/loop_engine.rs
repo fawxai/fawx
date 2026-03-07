@@ -7,6 +7,7 @@ use crate::budget::{
     BudgetTracker, DepthMode, DEFAULT_LLM_CALL_COST_CENTS, DEFAULT_TOOL_INVOCATION_COST_CENTS,
 };
 use crate::cancellation::CancellationToken;
+use crate::channels::ChannelRegistry;
 use crate::context_manager::ContextCompactor;
 use crate::continuation::Continuation;
 use crate::conversation_compactor::{
@@ -273,6 +274,8 @@ pub struct LoopEngine {
     scratchpad_provider: Option<Arc<dyn ScratchpadProvider>>,
     /// Extended thinking configuration forwarded to completion requests.
     thinking_config: Option<fx_llm::ThinkingConfig>,
+    /// Registry of active input/output channels.
+    channel_registry: ChannelRegistry,
 }
 
 #[derive(Debug, Default)]
@@ -410,6 +413,7 @@ impl LoopEngineBuilder {
             iteration_counter: self.iteration_counter,
             scratchpad_provider: self.scratchpad_provider,
             thinking_config: self.thinking_config,
+            channel_registry: ChannelRegistry::new(),
         })
     }
 }
@@ -715,6 +719,16 @@ impl LoopEngine {
     /// Set the extended thinking configuration for completion requests.
     pub fn set_thinking_config(&mut self, config: Option<fx_llm::ThinkingConfig>) {
         self.thinking_config = config;
+    }
+
+    /// Return a reference to the channel registry.
+    pub fn channel_registry(&self) -> &ChannelRegistry {
+        &self.channel_registry
+    }
+
+    /// Return a mutable reference to the channel registry.
+    pub fn channel_registry_mut(&mut self) -> &mut ChannelRegistry {
+        &mut self.channel_registry
     }
 
     /// Synchronise the shared iteration counter and refresh scratchpad context.

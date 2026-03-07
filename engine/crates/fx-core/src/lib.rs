@@ -11,6 +11,7 @@
 //!   the agent and phone hardware. All phone control goes through this trait,
 //!   enabling the same agent code to work with real Android devices.
 
+pub mod channel;
 pub mod config;
 pub mod error;
 pub mod event;
