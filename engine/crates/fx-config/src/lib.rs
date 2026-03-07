@@ -74,6 +74,7 @@ pub struct FawxConfig {
     pub preprocess: PreprocessDedup,
     pub fleet: FleetConfig,
     pub webhook: WebhookConfig,
+    pub orchestrator: OrchestratorConfig,
 }
 
 /// Fleet configuration for multi-node coordination.
@@ -130,6 +131,31 @@ pub struct WebhookChannelConfig {
     pub name: String,
     /// Optional callback URL for response delivery.
     pub callback_url: Option<String>,
+}
+
+/// Orchestrator configuration for distributed task coordination.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct OrchestratorConfig {
+    /// Whether the orchestrator is enabled.
+    pub enabled: bool,
+    /// Maximum number of pending tasks before rejecting new ones.
+    pub max_pending_tasks: usize,
+    /// Default task timeout in milliseconds (0 = no timeout).
+    pub default_timeout_ms: u64,
+    /// Default max retries for tasks (0 = no retry).
+    pub default_max_retries: u32,
+}
+
+impl Default for OrchestratorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_pending_tasks: 100,
+            default_timeout_ms: 30_000,
+            default_max_retries: 1,
+        }
+    }
 }
 
 /// Preprocessing deduplication settings.
@@ -730,6 +756,12 @@ max_relevant_results = 9
                     name: "Test Webhook".to_string(),
                     callback_url: Some("https://example.com/cb".to_string()),
                 }],
+            },
+            orchestrator: OrchestratorConfig {
+                enabled: true,
+                max_pending_tasks: 50,
+                default_timeout_ms: 15_000,
+                default_max_retries: 3,
             },
         };
 

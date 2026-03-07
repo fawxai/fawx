@@ -29,6 +29,7 @@ members = [
     "engine/crates/fx-canary",
     "engine/crates/fx-fleet",
     "engine/crates/fx-channel-webhook",
+    "engine/crates/fx-orchestrator",
 ]
 resolver = "2"
 
@@ -108,3 +109,4 @@ fx-preprocess = { path = "engine/crates/fx-preprocess" }
 fx-author = { path = "engine/crates/fx-author" }
 fx-marketplace = { path = "engine/crates/fx-marketplace" }
 fx-fleet = { path = "engine/crates/fx-fleet" }
+fx-orchestrator = { path = "engine/crates/fx-orchestrator" }
