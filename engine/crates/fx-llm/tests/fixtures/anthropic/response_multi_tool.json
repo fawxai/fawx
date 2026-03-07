@@ -1,0 +1,13 @@
+{
+  "id": "msg_multi_tool_01",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-sonnet-4-20250514",
+  "content": [
+    {"type": "text", "text": "Let me check both."},
+    {"type": "tool_use", "id": "toolu_01ABC", "name": "read_file", "input": {"path": "src/main.rs"}},
+    {"type": "tool_use", "id": "toolu_02DEF", "name": "list_directory", "input": {"path": "src/"}}
+  ],
+  "stop_reason": "tool_use",
+  "usage": {"input_tokens": 25, "output_tokens": 20}
+}
