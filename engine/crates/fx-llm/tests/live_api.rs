@@ -14,7 +14,7 @@ use fx_llm::{
 use serde_json::json;
 
 const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
-const HAIKU_MODEL: &str = "claude-haiku-3-5-20241022";
+const HAIKU_MODEL: &str = "claude-3-5-haiku-20241022";
 const SONNET_MODEL: &str = "claude-sonnet-4-20250514";
 
 /// Skip the test (via early return) when `ANTHROPIC_API_KEY` is not set.
