@@ -178,7 +178,7 @@ impl AnthropicProvider {
             Some(ThinkingConfig::Off) | None => None,
         };
 
-        Ok(AnthropicRequestBody {
+        let body = AnthropicRequestBody {
             model: request.model.clone(),
             messages,
             tools,
@@ -198,7 +198,12 @@ impl AnthropicProvider {
             system: system_prompt,
             stream,
             thinking,
-        })
+        };
+
+        #[cfg(debug_assertions)]
+        validate_request(&body);
+
+        Ok(body)
     }
 
     fn map_message_to_anthropic(&self, message: &Message) -> Result<AnthropicMessage, LlmError> {
@@ -760,6 +765,39 @@ impl AnthropicSseState {
             finished: false,
             tool_ids_by_index: HashMap::new(),
         }
+    }
+}
+
+/// Validates an Anthropic request body against known API constraints.
+/// Debug-only: panics on violation with a clear message.
+#[cfg(debug_assertions)]
+fn validate_request(body: &AnthropicRequestBody) {
+    assert!(body.max_tokens > 0, "max_tokens must be > 0");
+    assert!(!body.model.is_empty(), "model must be non-empty");
+    assert!(!body.messages.is_empty(), "messages must be non-empty");
+
+    if let Some(thinking) = &body.thinking {
+        assert!(
+            body.temperature.is_none(),
+            "temperature must be None when thinking is enabled \
+             (Anthropic requires temperature=1 or omitted)"
+        );
+        assert!(
+            thinking.budget_tokens > 0,
+            "thinking.budget_tokens must be > 0 when thinking is enabled"
+        );
+        assert!(
+            thinking.budget_tokens <= MAX_THINKING_BUDGET,
+            "thinking.budget_tokens ({}) must be <= MAX_THINKING_BUDGET ({MAX_THINKING_BUDGET})",
+            thinking.budget_tokens
+        );
+        assert!(
+            body.max_tokens > thinking.budget_tokens,
+            "max_tokens must be greater than thinking.budget_tokens \
+             ({} <= {})",
+            body.max_tokens,
+            thinking.budget_tokens
+        );
     }
 }
 
@@ -1453,5 +1491,112 @@ mod tests {
             chunks.iter().all(|c| c.tool_use_deltas.is_empty()),
             "thinking blocks must not produce tool use deltas"
         );
+    }
+
+    // --- Contract tests: Layer 1 request validation ---
+
+    /// Helper to build a minimal valid `AnthropicRequestBody` for validation tests.
+    fn valid_request_body(thinking: Option<AnthropicThinking>) -> AnthropicRequestBody {
+        AnthropicRequestBody {
+            model: "claude-sonnet-4-20250514".to_string(),
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: vec![AnthropicContentBlock::Text {
+                    text: "hello".to_string(),
+                }],
+            }],
+            tools: Vec::new(),
+            temperature: if thinking.is_some() { None } else { Some(0.7) },
+            max_tokens: match &thinking {
+                Some(t) => t.budget_tokens + MIN_RESPONSE_TOKENS,
+                None => 4096,
+            },
+            system: None,
+            stream: false,
+            thinking,
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "temperature must be None")]
+    fn validate_request_rejects_temperature_with_thinking() {
+        let mut body = valid_request_body(Some(AnthropicThinking {
+            thinking_type: "enabled".to_string(),
+            budget_tokens: 5000,
+        }));
+        body.temperature = Some(0.7); // violates constraint
+        validate_request(&body);
+    }
+
+    #[test]
+    #[should_panic(expected = "max_tokens must be greater")]
+    fn validate_request_rejects_low_max_tokens() {
+        let mut body = valid_request_body(Some(AnthropicThinking {
+            thinking_type: "enabled".to_string(),
+            budget_tokens: 5000,
+        }));
+        body.max_tokens = 5000; // equal, not greater — violates constraint
+        validate_request(&body);
+    }
+
+    #[test]
+    fn validate_request_accepts_valid_thinking_request() {
+        let body = valid_request_body(Some(AnthropicThinking {
+            thinking_type: "enabled".to_string(),
+            budget_tokens: 5000,
+        }));
+        validate_request(&body); // should not panic
+    }
+
+    #[test]
+    fn validate_request_accepts_valid_non_thinking_request() {
+        let body = valid_request_body(None);
+        validate_request(&body); // should not panic
+    }
+
+    #[test]
+    #[should_panic(expected = "model must be non-empty")]
+    fn validate_request_rejects_empty_model() {
+        let mut body = valid_request_body(None);
+        body.model = String::new();
+        validate_request(&body);
+    }
+
+    #[test]
+    #[should_panic(expected = "messages must be non-empty")]
+    fn validate_request_rejects_empty_messages() {
+        let mut body = valid_request_body(None);
+        body.messages = Vec::new();
+        validate_request(&body);
+    }
+
+    #[test]
+    #[should_panic(expected = "max_tokens must be > 0")]
+    fn validate_request_rejects_zero_max_tokens() {
+        let mut body = valid_request_body(None);
+        body.max_tokens = 0;
+        validate_request(&body);
+    }
+
+    #[test]
+    #[should_panic(expected = "budget_tokens must be > 0")]
+    fn validate_request_rejects_zero_budget() {
+        let mut body = valid_request_body(Some(AnthropicThinking {
+            thinking_type: "enabled".to_string(),
+            budget_tokens: 0,
+        }));
+        body.max_tokens = 4096;
+        validate_request(&body);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be <= MAX_THINKING_BUDGET")]
+    fn validate_request_rejects_budget_over_cap() {
+        let mut body = valid_request_body(Some(AnthropicThinking {
+            thinking_type: "enabled".to_string(),
+            budget_tokens: MAX_THINKING_BUDGET + 1,
+        }));
+        body.max_tokens = MAX_THINKING_BUDGET + 1 + MIN_RESPONSE_TOKENS;
+        validate_request(&body);
     }
 }
