@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use toml_edit::{value, DocumentMut, Item, Table};
 
 const MAX_SYNTHESIS_INSTRUCTION_LENGTH: usize = 500;
 const MIN_MAX_READ_SIZE: u64 = 1024;
@@ -227,12 +228,13 @@ impl FawxConfig {
 
     pub fn save(&self, data_dir: &Path) -> Result<(), String> {
         let config_path = data_dir.join("config.toml");
+        fs::create_dir_all(data_dir).map_err(|error| format!("failed to write config: {error}"))?;
+        if config_path.exists() {
+            return Err("config.toml already exists; use targeted update helpers".to_string());
+        }
         let content = toml::to_string_pretty(self)
             .map_err(|error| format!("failed to serialize config: {error}"))?;
-        fs::create_dir_all(data_dir).map_err(|error| format!("failed to write config: {error}"))?;
-        fs::write(&config_path, content)
-            .map_err(|error| format!("failed to write config: {error}"))?;
-        Ok(())
+        write_config_file(&config_path, content)
     }
 
     pub fn write_default(data_dir: &Path) -> Result<PathBuf, String> {
@@ -245,6 +247,90 @@ impl FawxConfig {
             .map_err(|error| format!("failed to write config: {error}"))?;
         Ok(config_path)
     }
+}
+
+pub fn save_default_model(data_dir: &Path, default_model: &str) -> Result<(), String> {
+    let config_path = data_dir.join("config.toml");
+    fs::create_dir_all(data_dir).map_err(|error| format!("failed to write config: {error}"))?;
+    if config_path.exists() {
+        return update_default_model(&config_path, default_model);
+    }
+    create_model_config(data_dir, default_model)
+}
+
+fn create_model_config(data_dir: &Path, default_model: &str) -> Result<(), String> {
+    let mut config = FawxConfig::default();
+    config.model.default_model = Some(default_model.to_string());
+    config.save(data_dir)
+}
+
+fn update_default_model(config_path: &Path, default_model: &str) -> Result<(), String> {
+    let content = fs::read_to_string(config_path)
+        .map_err(|error| format!("failed to read config: {error}"))?;
+    let mut document = parse_config_document(&content)?;
+    set_string_field(&mut document, &["model"], "default_model", default_model)?;
+    write_config_file(config_path, document.to_string())
+}
+
+fn parse_config_document(content: &str) -> Result<DocumentMut, String> {
+    content
+        .parse::<DocumentMut>()
+        .map_err(|error| format!("invalid config: {error}"))
+}
+
+fn set_string_field(
+    document: &mut DocumentMut,
+    sections: &[&str],
+    key: &str,
+    field_value: &str,
+) -> Result<(), String> {
+    let table = get_or_insert_table(document, sections)?;
+    if let Some(item) = table.get_mut(key) {
+        return update_string_item(item, key, field_value);
+    }
+    table[key] = value(field_value);
+    Ok(())
+}
+
+fn update_string_item(item: &mut Item, key: &str, field_value: &str) -> Result<(), String> {
+    let decor = item
+        .as_value()
+        .ok_or_else(|| format!("config field '{key}' must be a value"))?
+        .decor()
+        .clone();
+    *item = value(field_value);
+    item.as_value_mut()
+        .ok_or_else(|| format!("config field '{key}' must be a value"))?
+        .decor_mut()
+        .clone_from(&decor);
+    Ok(())
+}
+
+fn get_or_insert_table<'a>(
+    document: &'a mut DocumentMut,
+    sections: &[&str],
+) -> Result<&'a mut Table, String> {
+    get_or_insert_table_in(document.as_table_mut(), sections)
+}
+
+fn get_or_insert_table_in<'a>(
+    table: &'a mut Table,
+    sections: &[&str],
+) -> Result<&'a mut Table, String> {
+    let Some((section, rest)) = sections.split_first() else {
+        return Ok(table);
+    };
+    if !table.contains_key(section) {
+        table[*section] = Item::Table(Table::new());
+    }
+    let child = table[*section]
+        .as_table_mut()
+        .ok_or_else(|| format!("config section '{section}' must be a table"))?;
+    get_or_insert_table_in(child, rest)
+}
+
+fn write_config_file(config_path: &Path, content: String) -> Result<(), String> {
+    fs::write(config_path, content).map_err(|error| format!("failed to write config: {error}"))
 }
 
 fn validate_glob_patterns(self_modify: &SelfModifyCliConfig) -> Result<(), String> {
@@ -267,6 +353,14 @@ fn validate_glob_patterns(self_modify: &SelfModifyCliConfig) -> Result<(), Strin
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn write_config(temp: &TempDir, content: &str) {
+        fs::write(temp.path().join("config.toml"), content).expect("write config");
+    }
+
+    fn read_config(temp: &TempDir) -> String {
+        fs::read_to_string(temp.path().join("config.toml")).expect("read config")
+    }
 
     #[test]
     fn load_default_when_no_file() {
@@ -298,7 +392,7 @@ max_value_size = 555
 max_snapshot_chars = 777
 max_relevant_results = 9
 "#;
-        fs::write(temp.path().join("config.toml"), content).expect("write config");
+        write_config(&temp, content);
         let loaded = FawxConfig::load(temp.path()).expect("load config");
 
         assert_eq!(loaded.general.max_iterations, 15);
@@ -313,7 +407,7 @@ max_relevant_results = 9
     fn load_partial_config_uses_defaults() {
         let temp = TempDir::new().expect("tempdir");
         let content = "[general]\nmax_iterations = 42\n";
-        fs::write(temp.path().join("config.toml"), content).expect("write config");
+        write_config(&temp, content);
         let loaded = FawxConfig::load(temp.path()).expect("load config");
 
         assert_eq!(loaded.general.max_iterations, 42);
@@ -326,11 +420,7 @@ max_relevant_results = 9
     #[test]
     fn load_invalid_toml_returns_error() {
         let temp = TempDir::new().expect("tempdir");
-        fs::write(
-            temp.path().join("config.toml"),
-            "[general\nmax_iterations = 5",
-        )
-        .expect("write config");
+        write_config(&temp, "[general\nmax_iterations = 5");
         let error = FawxConfig::load(temp.path()).expect_err("should fail");
         assert!(error.contains("invalid config"));
     }
@@ -355,7 +445,7 @@ max_relevant_results = 9
     #[test]
     fn write_default_refuses_overwrite() {
         let temp = TempDir::new().expect("tempdir");
-        fs::write(temp.path().join("config.toml"), "[general]\n").expect("write config");
+        write_config(&temp, "[general]\n");
         let error = FawxConfig::write_default(temp.path()).expect_err("should refuse overwrite");
         assert!(error.contains("already exists"));
     }
@@ -435,10 +525,145 @@ max_relevant_results = 9
     }
 
     #[test]
+    fn config_save_refuses_existing_config() {
+        let temp = TempDir::new().expect("tempdir");
+        write_config(&temp, "[general]\nmax_iterations = 12\n");
+
+        let error = FawxConfig::default()
+            .save(temp.path())
+            .expect_err("save should refuse overwrite");
+
+        assert!(error.contains("targeted update helpers"));
+    }
+
+    #[test]
+    fn save_default_model_preserves_comments() {
+        let temp = TempDir::new().expect("tempdir");
+        let content = r#"# keep header
+
+[model]
+# keep comment
+default_model = "old-model"
+"#;
+        write_config(&temp, content);
+
+        save_default_model(temp.path(), "new-model").expect("save model");
+
+        let saved = read_config(&temp);
+        assert!(saved.contains("# keep header"));
+        assert!(saved.contains("# keep comment"));
+        assert!(saved.contains("default_model = \"new-model\""));
+    }
+
+    #[test]
+    fn save_default_model_preserves_inline_comment() {
+        let temp = TempDir::new().expect("tempdir");
+        let content = "[model]\ndefault_model = \"old-model\" # keep me\n";
+        write_config(&temp, content);
+
+        save_default_model(temp.path(), "new-model").expect("save model");
+
+        let saved = read_config(&temp);
+        assert!(saved.contains("default_model = \"new-model\" # keep me"));
+    }
+
+    #[test]
+    fn save_default_model_preserves_manual_http_section() {
+        let temp = TempDir::new().expect("tempdir");
+        let content = r#"[model]
+default_model = "old-model"
+
+[http]
+bearer_token = "manual-token"
+"#;
+        write_config(&temp, content);
+
+        save_default_model(temp.path(), "new-model").expect("save model");
+
+        let saved = read_config(&temp);
+        assert!(saved.contains("[http]"));
+        assert!(saved.contains("bearer_token = \"manual-token\""));
+    }
+
+    #[test]
+    fn save_default_model_creates_file_when_missing() {
+        let temp = TempDir::new().expect("tempdir");
+
+        save_default_model(temp.path(), "claude-opus-4-6").expect("save model");
+
+        let saved = read_config(&temp);
+        assert!(saved.contains("[model]"));
+        assert!(saved.contains("default_model = \"claude-opus-4-6\""));
+    }
+
+    #[test]
+    fn save_default_model_creates_model_section_when_missing() {
+        let temp = TempDir::new().expect("tempdir");
+        write_config(&temp, "[general]\nmax_iterations = 12\n");
+
+        save_default_model(temp.path(), "claude-opus-4-6").expect("save model");
+
+        let saved = read_config(&temp);
+        assert!(saved.contains("[model]"));
+        assert!(saved.contains("default_model = \"claude-opus-4-6\""));
+    }
+
+    #[test]
+    fn save_default_model_creates_model_key_when_missing() {
+        let temp = TempDir::new().expect("tempdir");
+        write_config(&temp, "[model]\n# keep section comment\n");
+
+        save_default_model(temp.path(), "claude-opus-4-6").expect("save model");
+
+        let saved = read_config(&temp);
+        assert!(saved.contains("# keep section comment"));
+        assert!(saved.contains("default_model = \"claude-opus-4-6\""));
+    }
+
+    #[test]
+    fn save_default_model_multiple_times_preserves_formatting() {
+        let temp = TempDir::new().expect("tempdir");
+        let content = r#"# keep this header
+
+[model]
+# keep model comment
+default_model = "old-model"
+"#;
+        write_config(&temp, content);
+
+        save_default_model(temp.path(), "mid-model").expect("save model");
+        save_default_model(temp.path(), "final-model").expect("save model");
+
+        let saved = read_config(&temp);
+        assert!(saved.contains("# keep this header"));
+        assert!(saved.contains("# keep model comment"));
+        assert_eq!(saved.matches("[model]").count(), 1);
+        assert!(saved.contains("default_model = \"final-model\""));
+    }
+
+    #[test]
+    fn save_default_model_preserves_unrelated_known_sections() {
+        let temp = TempDir::new().expect("tempdir");
+        let content = r#"[tools]
+max_read_size = 4096
+
+[model]
+default_model = "old-model"
+"#;
+        write_config(&temp, content);
+
+        save_default_model(temp.path(), "new-model").expect("save model");
+
+        let saved = read_config(&temp);
+        assert!(saved.contains("max_read_size = 4096"));
+        assert!(saved.contains("default_model = \"new-model\""));
+    }
+
+    #[test]
     fn load_rejects_zero_max_iterations() {
         let temp = TempDir::new().expect("tempdir");
         let content = "[general]\nmax_iterations = 0\n";
-        fs::write(temp.path().join("config.toml"), content).expect("write config");
+        write_config(&temp, content);
         let error = FawxConfig::load(temp.path()).expect_err("should reject zero");
         assert!(error.contains("max_iterations must be >= 1"));
     }
@@ -447,7 +672,7 @@ max_relevant_results = 9
     fn load_rejects_zero_max_history() {
         let temp = TempDir::new().expect("tempdir");
         let content = "[general]\nmax_history = 0\n";
-        fs::write(temp.path().join("config.toml"), content).expect("write config");
+        write_config(&temp, content);
         let error = FawxConfig::load(temp.path()).expect_err("should reject zero");
         assert!(error.contains("max_history must be >= 1"));
     }
@@ -456,7 +681,7 @@ max_relevant_results = 9
     fn load_rejects_tiny_max_read_size() {
         let temp = TempDir::new().expect("tempdir");
         let content = "[tools]\nmax_read_size = 100\n";
-        fs::write(temp.path().join("config.toml"), content).expect("write config");
+        write_config(&temp, content);
         let error = FawxConfig::load(temp.path()).expect_err("should reject small value");
         assert!(error.contains("max_read_size must be >= 1024"));
     }
@@ -465,7 +690,7 @@ max_relevant_results = 9
     fn load_rejects_zero_max_entries() {
         let temp = TempDir::new().expect("tempdir");
         let content = "[memory]\nmax_entries = 0\n";
-        fs::write(temp.path().join("config.toml"), content).expect("write config");
+        write_config(&temp, content);
         let error = FawxConfig::load(temp.path()).expect_err("should reject zero");
         assert!(error.contains("max_entries must be >= 1"));
     }
@@ -475,7 +700,7 @@ max_relevant_results = 9
         let temp = TempDir::new().expect("tempdir");
         let long_value = "x".repeat(501);
         let content = format!("[model]\nsynthesis_instruction = \"{}\"\n", long_value);
-        fs::write(temp.path().join("config.toml"), content).expect("write config");
+        write_config(&temp, &content);
         let error = FawxConfig::load(temp.path()).expect_err("should reject long instruction");
         assert!(error.contains("synthesis_instruction exceeds 500 characters"));
     }
@@ -485,7 +710,7 @@ max_relevant_results = 9
         let temp = TempDir::new().expect("tempdir");
         let value = "x".repeat(500);
         let content = format!("[model]\nsynthesis_instruction = \"{}\"\n", value);
-        fs::write(temp.path().join("config.toml"), content).expect("write config");
+        write_config(&temp, &content);
         let config = FawxConfig::load(temp.path()).expect("should accept 500 chars");
         assert_eq!(config.model.synthesis_instruction.unwrap().len(), 500);
     }
@@ -504,7 +729,7 @@ allow = ["src/**"]
 propose = ["kernel/**"]
 deny = [".git/**", "*.key"]
 "#;
-        fs::write(temp.path().join("config.toml"), content).expect("write config");
+        write_config(&temp, content);
         let loaded = FawxConfig::load(temp.path()).expect("load config");
 
         assert!(loaded.self_modify.enabled);
@@ -522,7 +747,7 @@ deny = [".git/**", "*.key"]
 [self_modify.paths]
 deny = ["[invalid"]
 "#;
-        fs::write(temp.path().join("config.toml"), content).expect("write config");
+        write_config(&temp, content);
         let error = FawxConfig::load(temp.path()).expect_err("should reject invalid glob");
         assert!(
             error.contains("invalid glob"),

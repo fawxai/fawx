@@ -12,7 +12,7 @@ use fx_analysis::{AnalysisEngine, AnalysisError, AnalysisFinding, Confidence};
 use fx_auth::auth::{AuthManager, AuthMethod};
 use fx_auth::credential_store::CredentialStore as CredentialStoreTrait;
 use fx_auth::oauth::{PkceFlow, TokenExchangeRequest, TokenResponse};
-use fx_config::FawxConfig;
+use fx_config::{save_default_model, FawxConfig};
 use fx_conversation::{
     ConversationMessage, ConversationStore, TokenUsage as ConversationTokenUsage,
 };
@@ -1697,7 +1697,7 @@ impl TuiApp {
                 match self.set_active_model_with_refresh(&model).await {
                     Ok(resolved_model) => {
                         self.config.model.default_model = Some(resolved_model.clone());
-                        if let Err(error) = self.config.save(&fawx_data_dir()) {
+                        if let Err(error) = save_default_model(&fawx_data_dir(), &resolved_model) {
                             eprintln!("Warning: couldn't save model preference: {error}");
                         }
                         self.tui_println(format!("Active model set to: {resolved_model}"));
