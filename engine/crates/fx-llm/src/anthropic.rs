@@ -178,7 +178,7 @@ impl AnthropicProvider {
             Some(ThinkingConfig::Off) | None => None,
         };
 
-        Ok(AnthropicRequestBody {
+        let body = AnthropicRequestBody {
             model: request.model.clone(),
             messages,
             tools,
@@ -198,7 +198,12 @@ impl AnthropicProvider {
             system: system_prompt,
             stream,
             thinking,
-        })
+        };
+
+        #[cfg(debug_assertions)]
+        validate_request(&body);
+
+        Ok(body)
     }
 
     fn map_message_to_anthropic(&self, message: &Message) -> Result<AnthropicMessage, LlmError> {
@@ -760,6 +765,39 @@ impl AnthropicSseState {
             finished: false,
             tool_ids_by_index: HashMap::new(),
         }
+    }
+}
+
+/// Validates an Anthropic request body against known API constraints.
+/// Debug-only: panics on violation with a clear message.
+#[cfg(debug_assertions)]
+fn validate_request(body: &AnthropicRequestBody) {
+    assert!(body.max_tokens > 0, "max_tokens must be > 0");
+    assert!(!body.model.is_empty(), "model must be non-empty");
+    assert!(!body.messages.is_empty(), "messages must be non-empty");
+
+    if let Some(thinking) = &body.thinking {
+        assert!(
+            body.temperature.is_none(),
+            "temperature must be None when thinking is enabled \
+             (Anthropic requires temperature=1 or omitted)"
+        );
+        assert!(
+            thinking.budget_tokens > 0,
+            "thinking.budget_tokens must be > 0 when thinking is enabled"
+        );
+        assert!(
+            thinking.budget_tokens <= MAX_THINKING_BUDGET,
+            "thinking.budget_tokens ({}) must be <= MAX_THINKING_BUDGET ({MAX_THINKING_BUDGET})",
+            thinking.budget_tokens
+        );
+        assert!(
+            body.max_tokens > thinking.budget_tokens,
+            "max_tokens must be greater than thinking.budget_tokens \
+             ({} <= {})",
+            body.max_tokens,
+            thinking.budget_tokens
+        );
     }
 }
 
@@ -1453,5 +1491,338 @@ mod tests {
             chunks.iter().all(|c| c.tool_use_deltas.is_empty()),
             "thinking blocks must not produce tool use deltas"
         );
+    }
+
+    // --- Contract tests: Layer 1 request validation ---
+
+    /// Helper to build a minimal valid `AnthropicRequestBody` for validation tests.
+    fn valid_request_body(thinking: Option<AnthropicThinking>) -> AnthropicRequestBody {
+        AnthropicRequestBody {
+            model: "claude-sonnet-4-20250514".to_string(),
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: vec![AnthropicContentBlock::Text {
+                    text: "hello".to_string(),
+                }],
+            }],
+            tools: Vec::new(),
+            temperature: if thinking.is_some() { None } else { Some(0.7) },
+            max_tokens: match &thinking {
+                Some(t) => t.budget_tokens + MIN_RESPONSE_TOKENS,
+                None => 4096,
+            },
+            system: None,
+            stream: false,
+            thinking,
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "temperature must be None")]
+    fn validate_request_rejects_temperature_with_thinking() {
+        let mut body = valid_request_body(Some(AnthropicThinking {
+            thinking_type: "enabled".to_string(),
+            budget_tokens: 5000,
+        }));
+        body.temperature = Some(0.7); // violates constraint
+        validate_request(&body);
+    }
+
+    #[test]
+    #[should_panic(expected = "max_tokens must be greater")]
+    fn validate_request_rejects_low_max_tokens() {
+        let mut body = valid_request_body(Some(AnthropicThinking {
+            thinking_type: "enabled".to_string(),
+            budget_tokens: 5000,
+        }));
+        body.max_tokens = 5000; // equal, not greater — violates constraint
+        validate_request(&body);
+    }
+
+    #[test]
+    fn validate_request_accepts_valid_thinking_request() {
+        let body = valid_request_body(Some(AnthropicThinking {
+            thinking_type: "enabled".to_string(),
+            budget_tokens: 5000,
+        }));
+        validate_request(&body); // should not panic
+    }
+
+    #[test]
+    fn validate_request_accepts_valid_non_thinking_request() {
+        let body = valid_request_body(None);
+        validate_request(&body); // should not panic
+    }
+
+    #[test]
+    #[should_panic(expected = "model must be non-empty")]
+    fn validate_request_rejects_empty_model() {
+        let mut body = valid_request_body(None);
+        body.model = String::new();
+        validate_request(&body);
+    }
+
+    #[test]
+    #[should_panic(expected = "messages must be non-empty")]
+    fn validate_request_rejects_empty_messages() {
+        let mut body = valid_request_body(None);
+        body.messages = Vec::new();
+        validate_request(&body);
+    }
+
+    #[test]
+    #[should_panic(expected = "max_tokens must be > 0")]
+    fn validate_request_rejects_zero_max_tokens() {
+        let mut body = valid_request_body(None);
+        body.max_tokens = 0;
+        validate_request(&body);
+    }
+
+    #[test]
+    #[should_panic(expected = "budget_tokens must be > 0")]
+    fn validate_request_rejects_zero_budget() {
+        let mut body = valid_request_body(Some(AnthropicThinking {
+            thinking_type: "enabled".to_string(),
+            budget_tokens: 0,
+        }));
+        body.max_tokens = 4096;
+        validate_request(&body);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be <= MAX_THINKING_BUDGET")]
+    fn validate_request_rejects_budget_over_cap() {
+        let mut body = valid_request_body(Some(AnthropicThinking {
+            thinking_type: "enabled".to_string(),
+            budget_tokens: MAX_THINKING_BUDGET + 1,
+        }));
+        body.max_tokens = MAX_THINKING_BUDGET + 1 + MIN_RESPONSE_TOKENS;
+        validate_request(&body);
+    }
+
+    // --- Contract tests: Layer 2 response fixtures ---
+
+    #[test]
+    fn fixture_response_text() {
+        let json = include_str!("../tests/fixtures/anthropic/response_text.json");
+        let body: AnthropicResponseBody =
+            serde_json::from_str(json).expect("response_text.json must deserialize");
+        assert_eq!(body.content.len(), 1);
+        assert!(
+            matches!(&body.content[0], AnthropicContentBlock::Text { text } if text == "Hello, world!")
+        );
+        assert_eq!(body.stop_reason.as_deref(), Some("end_turn"));
+        let usage = body.usage.expect("usage must be present");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 5);
+    }
+
+    #[test]
+    fn fixture_response_thinking() {
+        let json = include_str!("../tests/fixtures/anthropic/response_thinking.json");
+        let body: AnthropicResponseBody =
+            serde_json::from_str(json).expect("response_thinking.json must deserialize");
+        assert_eq!(body.content.len(), 2);
+        assert!(
+            matches!(&body.content[0], AnthropicContentBlock::Thinking { thinking } if thinking == "Let me reason about this...")
+        );
+        assert!(
+            matches!(&body.content[1], AnthropicContentBlock::Text { text } if text == "The answer is 42.")
+        );
+        assert_eq!(body.stop_reason.as_deref(), Some("end_turn"));
+    }
+
+    #[test]
+    fn fixture_response_tool_call() {
+        let json = include_str!("../tests/fixtures/anthropic/response_tool_call.json");
+        let body: AnthropicResponseBody =
+            serde_json::from_str(json).expect("response_tool_call.json must deserialize");
+        assert_eq!(body.content.len(), 2);
+        assert!(
+            matches!(&body.content[0], AnthropicContentBlock::Text { text } if text == "I'll search for that.")
+        );
+        match &body.content[1] {
+            AnthropicContentBlock::ToolUse { id, name, input } => {
+                assert_eq!(id, "toolu_01ABC");
+                assert_eq!(name, "search_text");
+                assert_eq!(input["query"], "hello world");
+                assert_eq!(input["path"], ".");
+            }
+            other => panic!("expected ToolUse, got {other:?}"),
+        }
+        assert_eq!(body.stop_reason.as_deref(), Some("tool_use"));
+    }
+
+    #[test]
+    fn fixture_response_multi_tool() {
+        let json = include_str!("../tests/fixtures/anthropic/response_multi_tool.json");
+        let body: AnthropicResponseBody =
+            serde_json::from_str(json).expect("response_multi_tool.json must deserialize");
+        assert_eq!(body.content.len(), 3);
+        assert!(
+            matches!(&body.content[0], AnthropicContentBlock::Text { text } if text == "Let me check both.")
+        );
+        match &body.content[1] {
+            AnthropicContentBlock::ToolUse { id, name, .. } => {
+                assert_eq!(id, "toolu_01ABC");
+                assert_eq!(name, "read_file");
+            }
+            other => panic!("expected ToolUse, got {other:?}"),
+        }
+        match &body.content[2] {
+            AnthropicContentBlock::ToolUse { id, name, .. } => {
+                assert_eq!(id, "toolu_02DEF");
+                assert_eq!(name, "list_directory");
+            }
+            other => panic!("expected ToolUse, got {other:?}"),
+        }
+        assert_eq!(body.stop_reason.as_deref(), Some("tool_use"));
+    }
+
+    #[test]
+    fn fixture_response_thinking_tool() {
+        let json = include_str!("../tests/fixtures/anthropic/response_thinking_tool.json");
+        let body: AnthropicResponseBody =
+            serde_json::from_str(json).expect("response_thinking_tool.json must deserialize");
+        assert_eq!(body.content.len(), 3);
+        assert!(
+            matches!(&body.content[0], AnthropicContentBlock::Thinking { thinking } if thinking == "I should read the file to understand the structure.")
+        );
+        assert!(
+            matches!(&body.content[1], AnthropicContentBlock::Text { text } if text == "Let me check that file.")
+        );
+        match &body.content[2] {
+            AnthropicContentBlock::ToolUse { id, name, input } => {
+                assert_eq!(id, "toolu_01XYZ");
+                assert_eq!(name, "read_file");
+                assert_eq!(input["path"], "Cargo.toml");
+            }
+            other => panic!("expected ToolUse, got {other:?}"),
+        }
+        assert_eq!(body.stop_reason.as_deref(), Some("tool_use"));
+    }
+
+    #[test]
+    fn fixture_response_redacted_thinking() {
+        let json = include_str!("../tests/fixtures/anthropic/response_redacted_thinking.json");
+        let body: AnthropicResponseBody =
+            serde_json::from_str(json).expect("response_redacted_thinking.json must deserialize");
+        assert_eq!(body.content.len(), 2);
+        match &body.content[0] {
+            AnthropicContentBlock::RedactedThinking { data } => {
+                assert_eq!(data, "base64-redacted-content");
+            }
+            other => panic!("expected RedactedThinking, got {other:?}"),
+        }
+        assert!(
+            matches!(&body.content[1], AnthropicContentBlock::Text { text } if text == "I can't share my internal reasoning, but here's the result.")
+        );
+        assert_eq!(body.stop_reason.as_deref(), Some("end_turn"));
+        let usage = body.usage.expect("usage must be present");
+        assert_eq!(usage.input_tokens, 12);
+        assert_eq!(usage.output_tokens, 9);
+    }
+
+    #[test]
+    fn fixture_stream_text() {
+        let sse = include_str!("../tests/fixtures/anthropic/stream_text.sse");
+        let chunks = AnthropicProvider::parse_sse_payload(sse).expect("stream_text.sse must parse");
+        let text: String = chunks
+            .iter()
+            .filter_map(|c| c.delta_content.as_deref())
+            .collect();
+        assert_eq!(text, "Hello, world!");
+        let stop = chunks
+            .iter()
+            .find_map(|c| c.stop_reason.as_deref())
+            .expect("stop_reason must be present");
+        assert_eq!(stop, "end_turn");
+    }
+
+    #[test]
+    fn fixture_stream_thinking() {
+        let sse = include_str!("../tests/fixtures/anthropic/stream_thinking.sse");
+        let chunks =
+            AnthropicProvider::parse_sse_payload(sse).expect("stream_thinking.sse must parse");
+        // Thinking deltas are silently skipped — only text should come through
+        let text: String = chunks
+            .iter()
+            .filter_map(|c| c.delta_content.as_deref())
+            .collect();
+        assert_eq!(text, "The answer is 42.");
+        let stop = chunks
+            .iter()
+            .find_map(|c| c.stop_reason.as_deref())
+            .expect("stop_reason must be present");
+        assert_eq!(stop, "end_turn");
+    }
+
+    #[test]
+    fn fixture_stream_tool_call() {
+        let sse = include_str!("../tests/fixtures/anthropic/stream_tool_call.sse");
+        let chunks =
+            AnthropicProvider::parse_sse_payload(sse).expect("stream_tool_call.sse must parse");
+        // Text delta
+        let text: String = chunks
+            .iter()
+            .filter_map(|c| c.delta_content.as_deref())
+            .collect();
+        assert_eq!(text, "I'll search.");
+        // Tool use start
+        let tool_start = chunks
+            .iter()
+            .flat_map(|c| &c.tool_use_deltas)
+            .find(|d| d.name.is_some())
+            .expect("tool start must be present");
+        assert_eq!(tool_start.id.as_deref(), Some("toolu_01ABC"));
+        assert_eq!(tool_start.name.as_deref(), Some("search_text"));
+        // Tool argument deltas
+        let args: String = chunks
+            .iter()
+            .flat_map(|c| &c.tool_use_deltas)
+            .filter_map(|d| d.arguments_delta.as_deref())
+            .collect();
+        assert_eq!(args, r#"{"query":"hello"}"#);
+        // Stop reason
+        let stop = chunks
+            .iter()
+            .find_map(|c| c.stop_reason.as_deref())
+            .expect("stop_reason must be present");
+        assert_eq!(stop, "tool_use");
+    }
+
+    #[test]
+    fn fixture_stream_multi_tool() {
+        let sse = include_str!("../tests/fixtures/anthropic/stream_multi_tool.sse");
+        let chunks =
+            AnthropicProvider::parse_sse_payload(sse).expect("stream_multi_tool.sse must parse");
+        // Text delta
+        let text: String = chunks
+            .iter()
+            .filter_map(|c| c.delta_content.as_deref())
+            .collect();
+        assert_eq!(text, "Let me check both.");
+        // Two tool starts
+        let tool_starts: Vec<_> = chunks
+            .iter()
+            .flat_map(|c| &c.tool_use_deltas)
+            .filter(|d| d.name.is_some())
+            .collect();
+        assert_eq!(tool_starts.len(), 2);
+        assert_eq!(tool_starts[0].name.as_deref(), Some("read_file"));
+        assert_eq!(tool_starts[1].name.as_deref(), Some("list_directory"));
+    }
+
+    #[test]
+    fn fixture_error_invalid_request() {
+        let json = include_str!("../tests/fixtures/anthropic/error_invalid_request.json");
+        let value: serde_json::Value =
+            serde_json::from_str(json).expect("error_invalid_request.json must be valid JSON");
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["error"]["type"], "invalid_request_error");
+        assert!(value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("max_tokens"));
     }
 }
