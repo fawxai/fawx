@@ -101,14 +101,15 @@ enum IdleLoopEvent {
 }
 
 const DEFAULT_ANTHROPIC_MODELS: &[&str] = &[
+    "claude-opus-4-6-20250929",
     "claude-opus-4-6",
+    "claude-sonnet-4-6-20250929",
     "claude-sonnet-4-6",
     "claude-opus-4-5-20251101",
     "claude-sonnet-4-5-20250929",
     "claude-haiku-4-5-20251001",
     "claude-opus-4-20250514",
     "claude-sonnet-4-20250514",
-    "claude-3-7-sonnet-latest",
 ];
 const DEFAULT_OPENAI_MODELS: &[&str] = &["gpt-4.1", "gpt-4o", "gpt-4o-mini"];
 const DEFAULT_OPENAI_SUBSCRIPTION_MODELS: &[&str] =
