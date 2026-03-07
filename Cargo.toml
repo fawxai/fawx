@@ -23,6 +23,7 @@ members = [
     "engine/crates/llama-cpp-sys",
     "engine/crates/fx-preprocess",
     "engine/crates/fawx-ripcord",
+    "engine/crates/fawx-test",
     "engine/crates/fx-canary",
 ]
 resolver = "2"
