@@ -1220,6 +1220,7 @@ mod tests {
             tools: vec![],
             temperature: None,
             max_tokens: None,
+            thinking: None,
         }
     }
 
@@ -1239,6 +1240,7 @@ mod tests {
             tools: vec![],
             temperature: None,
             max_tokens: None,
+            thinking: None,
         };
 
         let body = provider.build_request_body(&request, false).unwrap();
@@ -1311,6 +1313,7 @@ mod tests {
             tools: vec![],
             temperature: None,
             max_tokens: None,
+            thinking: None,
         };
 
         let body = provider.build_request_body(&request, false).unwrap();
@@ -1339,6 +1342,7 @@ mod tests {
             tools: vec![],
             temperature: None,
             max_tokens: None,
+            thinking: None,
         };
 
         let body = provider.build_request_body(&request, false).unwrap();
@@ -1366,6 +1370,7 @@ mod tests {
             }],
             temperature: None,
             max_tokens: None,
+            thinking: None,
         };
 
         let body = provider.build_request_body(&request, false).unwrap();
@@ -1385,6 +1390,7 @@ mod tests {
             tools: vec![],
             temperature: None,
             max_tokens: None,
+            thinking: None,
         };
 
         let body = provider.build_request_body(&request, false).unwrap();
@@ -1406,6 +1412,7 @@ mod tests {
             }],
             temperature: None,
             max_tokens: None,
+            thinking: None,
         };
 
         let body = provider.build_request_body(&request, false).unwrap();
@@ -1423,6 +1430,7 @@ mod tests {
             tools: vec![],
             temperature: None,
             max_tokens: None,
+            thinking: None,
         };
 
         let body = provider.build_request_body(&request, false).unwrap();
@@ -1470,6 +1478,7 @@ mod tests {
             tools: vec![],
             temperature: None,
             max_tokens: None,
+            thinking: None,
         };
 
         let payload = provider.build_ws_create_payload(&request).unwrap();
@@ -1880,6 +1889,7 @@ mod tests {
             tools: vec![],
             temperature: None,
             max_tokens: None,
+            thinking: None,
         };
 
         let body = provider.build_request_body(&request, false).unwrap();

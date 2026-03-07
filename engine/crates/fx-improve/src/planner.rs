@@ -109,6 +109,7 @@ async fn plan_single(
         temperature: None,
         max_tokens: Some(4096),
         system_prompt: Some(PLANNER_SYSTEM_PROMPT.to_string()),
+        thinking: None,
     };
 
     let response = provider.complete(request).await?;

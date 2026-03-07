@@ -11,6 +11,22 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+/// Token budget for "high" thinking mode.
+pub const THINKING_BUDGET_HIGH: u32 = 10_000;
+/// Token budget for "adaptive" thinking mode.
+pub const THINKING_BUDGET_ADAPTIVE: u32 = 5_000;
+/// Token budget for "low" thinking mode.
+pub const THINKING_BUDGET_LOW: u32 = 1_024;
+
+/// Extended thinking configuration for a completion request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ThinkingConfig {
+    /// Enable extended thinking with the given token budget.
+    Enabled { budget_tokens: u32 },
+    /// Disable extended thinking entirely.
+    Off,
+}
+
 /// A model completion request.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CompletionRequest {
@@ -27,6 +43,9 @@ pub struct CompletionRequest {
     pub max_tokens: Option<u32>,
     /// Optional top-level system prompt.
     pub system_prompt: Option<String>,
+    /// Extended thinking configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingConfig>,
 }
 
 /// A model completion response.
@@ -261,5 +280,35 @@ mod tests {
         assert!(chunk.tool_use_deltas.is_empty());
         assert!(chunk.usage.is_none());
         assert!(chunk.stop_reason.is_none());
+    }
+
+    #[test]
+    fn thinking_budget_to_token_count() {
+        assert_eq!(THINKING_BUDGET_HIGH, 10_000);
+        assert_eq!(THINKING_BUDGET_ADAPTIVE, 5_000);
+        assert_eq!(THINKING_BUDGET_LOW, 1_024);
+
+        let high = ThinkingConfig::Enabled {
+            budget_tokens: THINKING_BUDGET_HIGH,
+        };
+        let low = ThinkingConfig::Enabled {
+            budget_tokens: THINKING_BUDGET_LOW,
+        };
+        let adaptive = ThinkingConfig::Enabled {
+            budget_tokens: THINKING_BUDGET_ADAPTIVE,
+        };
+
+        match high {
+            ThinkingConfig::Enabled { budget_tokens } => assert_eq!(budget_tokens, 10_000),
+            ThinkingConfig::Off => panic!("expected Enabled"),
+        }
+        match low {
+            ThinkingConfig::Enabled { budget_tokens } => assert_eq!(budget_tokens, 1_024),
+            ThinkingConfig::Off => panic!("expected Enabled"),
+        }
+        match adaptive {
+            ThinkingConfig::Enabled { budget_tokens } => assert_eq!(budget_tokens, 5_000),
+            ThinkingConfig::Off => panic!("expected Enabled"),
+        }
     }
 }

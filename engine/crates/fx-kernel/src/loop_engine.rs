@@ -3663,6 +3663,7 @@ fn build_continuation_request(
         temperature: Some(REASONING_TEMPERATURE),
         max_tokens: Some(REASONING_MAX_OUTPUT_TOKENS),
         system_prompt: Some(system_prompt),
+        thinking: None,
     }
 }
 
@@ -3683,6 +3684,7 @@ fn build_truncation_continuation_request(
         temperature: Some(REASONING_TEMPERATURE),
         max_tokens: Some(REASONING_MAX_OUTPUT_TOKENS),
         system_prompt: Some(system_prompt),
+        thinking: None,
     }
 }
 
@@ -4137,6 +4139,7 @@ fn build_reasoning_request(
         temperature: Some(REASONING_TEMPERATURE),
         max_tokens: Some(REASONING_MAX_OUTPUT_TOKENS),
         system_prompt: Some(system_prompt),
+        thinking: None,
     }
 }
 

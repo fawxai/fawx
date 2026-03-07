@@ -620,6 +620,7 @@ mod model_router_tests {
             temperature,
             max_tokens: Some(256),
             system_prompt: None,
+            thinking: None,
         }
     }
 

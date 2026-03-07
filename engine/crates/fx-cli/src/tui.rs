@@ -12,7 +12,9 @@ use fx_analysis::{AnalysisEngine, AnalysisError, AnalysisFinding, Confidence};
 use fx_auth::auth::{AuthManager, AuthMethod};
 use fx_auth::credential_store::CredentialStore as CredentialStoreTrait;
 use fx_auth::oauth::{PkceFlow, TokenExchangeRequest, TokenResponse};
-use fx_config::{save_default_model, FawxConfig, ImprovementToolsConfig};
+use fx_config::{
+    save_default_model, save_thinking_budget, FawxConfig, ImprovementToolsConfig, ThinkingBudget,
+};
 use fx_conversation::{
     ConversationMessage, ConversationStore, TokenUsage as ConversationTokenUsage,
 };
@@ -900,6 +902,7 @@ const TUI_COMMANDS: &[&str] = &[
     "/analyze",
     "/improve",
     "/synthesis",
+    "/thinking",
 ];
 
 const PROMPT_COLOR_START: &str = "\x1b[38;2;255;204;0m";
@@ -1760,6 +1763,7 @@ impl TuiApp {
                 self.tui_println(format!("Started new conversation: {id}"));
             }
             ParsedCommand::History => self.show_conversation_history(),
+            ParsedCommand::Thinking(level) => self.handle_thinking_command(level)?,
             ParsedCommand::Config(action) => self.handle_config_command(action)?,
             ParsedCommand::Help => self.show_help(),
             ParsedCommand::Quit => {
@@ -2271,6 +2275,28 @@ impl TuiApp {
         self.conversation_store.save_message(&assistant_message)
     }
 
+    fn handle_thinking_command(&mut self, level: Option<String>) -> Result<(), TuiError> {
+        let current = self.config.general.thinking.unwrap_or_default();
+
+        let Some(level_str) = level else {
+            self.tui_println(format!("Current thinking budget: {current}"));
+            return Ok(());
+        };
+
+        let budget: ThinkingBudget = level_str
+            .parse()
+            .map_err(|error: String| TuiError::Router(error))?;
+
+        self.config.general.thinking = Some(budget);
+        if let Err(error) = save_thinking_budget(&fawx_data_dir(), budget) {
+            self.tui_println(format!(
+                "Warning: couldn\'t save thinking preference: {error}"
+            ));
+        }
+        self.tui_println(format!("Thinking budget set to: {budget}"));
+        Ok(())
+    }
+
     fn handle_config_command(&mut self, action: Option<String>) -> Result<(), TuiError> {
         match action.as_deref() {
             None => self.show_config(),
@@ -2562,6 +2588,7 @@ impl TuiApp {
         self.tui_println("  /analyze       Analyze persisted signals across sessions");
         self.tui_println("  /improve       Run self-improvement cycle");
         self.tui_println("  /synthesis     Set or reset synthesis instruction");
+        self.tui_println("  /thinking      Show or set thinking budget (high|low|adaptive|off)");
         self.tui_println("  /clear         Clear the screen and active conversation");
         self.tui_println("  /new           Start a new conversation");
         self.tui_println("  /history       List saved conversations");
@@ -3779,6 +3806,7 @@ impl LoopLlmProvider for RouterLoopLlmProvider<'_> {
             temperature: None, // Codex Responses API does not support temperature
             max_tokens: Some(max_tokens),
             system_prompt: Some(prompt.to_string()),
+            thinking: None,
         };
 
         let mut stream = self
@@ -3811,6 +3839,7 @@ impl LoopLlmProvider for RouterLoopLlmProvider<'_> {
             temperature: None,
             max_tokens: Some(max_tokens),
             system_prompt: Some(prompt.to_string()),
+            thinking: None,
         };
 
         let mut stream = self
@@ -5752,6 +5781,7 @@ enum ParsedCommand {
     Clear,
     New,
     History,
+    Thinking(Option<String>),
     Config(Option<String>),
     Help,
     Quit,
@@ -5824,6 +5854,7 @@ fn parse_command(value: &str) -> ParsedCommand {
         "clear" | "cls" => ParsedCommand::Clear,
         "new" => ParsedCommand::New,
         "history" => ParsedCommand::History,
+        "thinking" => ParsedCommand::Thinking(parts.next().map(ToString::to_string)),
         "config" => ParsedCommand::Config(parts.next().map(ToString::to_string)),
         "help" => ParsedCommand::Help,
         "quit" | "exit" => ParsedCommand::Quit,
@@ -7061,6 +7092,7 @@ mod tests {
             temperature: None,
             max_tokens: Some(32),
             system_prompt: None,
+            thinking: None,
         };
 
         let response = provider
@@ -7094,6 +7126,7 @@ mod tests {
             temperature: None,
             max_tokens: Some(32),
             system_prompt: None,
+            thinking: None,
         };
 
         let error = provider
