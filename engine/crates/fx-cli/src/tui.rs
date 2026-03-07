@@ -25,6 +25,7 @@ use fx_core::runtime_info::{ConfigSummary, RuntimeInfo, SkillInfo};
 use fx_core::types::{InputSource, ScreenState, UserInput};
 use fx_core::EventBus;
 use fx_improve::{CyclePaths, ImprovementConfig, OutputMode};
+use fx_journal::JournalSkill;
 use fx_kernel::act::{TokenUsage, ToolExecutor};
 use fx_kernel::budget::{BudgetConfig, BudgetTracker};
 use fx_kernel::cancellation::CancellationToken;
@@ -3524,6 +3525,18 @@ fn build_skill_registry(
     let scratchpad_skill =
         ScratchpadSkill::new(Arc::clone(&scratchpad), Arc::clone(&iteration_counter));
     registry.register(Arc::new(scratchpad_skill));
+
+    // Load reflective journal for cross-session learning.
+    let journal_path = data_dir.join("journal.jsonl");
+    match fx_journal::Journal::load(journal_path) {
+        Ok(journal) => {
+            let journal_skill = JournalSkill::new(Arc::new(Mutex::new(journal)));
+            registry.register(Arc::new(journal_skill));
+        }
+        Err(e) => {
+            tracing::warn!("journal unavailable: {e}");
+        }
+    }
 
     // Open the credential store once and share via Arc between TuiApp and WASM bridge.
     let credential_store: Option<Arc<fx_auth::credential_store::EncryptedFileCredentialStore>> =

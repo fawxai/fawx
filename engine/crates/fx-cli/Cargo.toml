@@ -30,6 +30,7 @@ fx-memory.workspace = true
 fx-analysis.workspace = true
 fx-improve.workspace = true
 fx-security.workspace = true
+fx-journal.workspace = true
 fx-scratchpad = { path = "../fx-scratchpad" }
 fx-skills = { path = "../fx-skills" }
 fx-author = { path = "../fx-author" }
