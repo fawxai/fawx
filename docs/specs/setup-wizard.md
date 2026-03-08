@@ -2,7 +2,7 @@
 
 **Issue:** #1253  
 **Priority:** Launch Blocker  
-**Estimated size:** ~400 lines (new file + main.rs wiring)  
+**Estimated size:** ~500 lines (new files + main.rs wiring)  
 **Crate:** `fx-cli` (new module: `commands/setup.rs`)
 
 ---
@@ -73,14 +73,30 @@ Step 2/4: Model Selection
   > 1
   ✓ Default model: anthropic/claude-sonnet-4-20250514
 
-Step 3/4: HTTP API (for Telegram, webhooks, remote access)
+Step 3/5: HTTP API (for channels, webhooks, remote access)
   Enable HTTP API? [Y/n]: y
   ✓ Bearer token generated and stored (encrypted)
   ✓ Port: 8400 (Tailscale-only binding)
 
-Step 4/4: Validation
+Step 4/5: Channels
+  Set up a messaging channel? [y/N]: y
+    [1] Telegram
+    [2] Webhook (generic HTTP)
+    [3] Skip
+  > 1
+
+  Telegram bot token (from @BotFather): ****
+  Restrict to specific chat IDs? (comma-separated, or Enter to allow all): 
+  ✓ Telegram channel configured (token encrypted)
+  ✓ Webhook secret generated for validation
+
+  Add another channel? [y/N]: n
+
+Step 5/5: Validation
   Testing API connection...
   ✓ anthropic: connected (claude-sonnet-4-20250514)
+  Testing Telegram...
+  ✓ Telegram: bot @YourBot connected (getMe OK)
   ✓ Config written: ~/.fawx/config.toml
   ✓ Credential store: healthy
 
@@ -118,8 +134,25 @@ Setup complete! Next steps:
 - If yes: auto-generate bearer token (`rand::thread_rng().gen::<[u8; 32]>()` → hex)
 - Store bearer token in credential store (same path as `/auth http set-bearer`)
 - Write `[http]` section to config with port
+- Note: HTTP API is required for channels — if user says no to HTTP but yes to channels, auto-enable HTTP
 
-#### Validation (Step 4)
+#### Channel setup (Step 4)
+- Only offered if HTTP is enabled (channels require the HTTP server)
+- **Telegram:**
+  - Prompt for bot token (from @BotFather) — secret input, stored encrypted
+  - Optional: restrict to specific chat IDs (comma-separated)
+  - Auto-generate webhook secret for request validation
+  - Validate token immediately via `getMe` API call
+  - Write `[telegram]` section: `enabled = true`, `allowed_chat_ids`, `webhook_secret`
+  - Bot token stored in credential store, NOT in config.toml
+- **Webhook (generic):**
+  - Prompt for channel name/ID
+  - Prompt for callback URL
+  - Write to `[webhook]` section
+- Loop: "Add another channel?" until user says no
+- Each channel validated on setup (fail → warn but continue, user can fix later)
+
+#### Validation (Step 5)
 - Test API connection: send a minimal completion request (similar to `fawx doctor`)
 - Verify response parses correctly
 - Write final `config.toml` (only if validation passes)
@@ -185,7 +218,6 @@ directly write to the credential store / auth manager.
 - OAuth PKCE flow from CLI (keep in TUI only — needs browser interaction)
 - Multi-provider setup in single wizard run (run setup again to add more)
 - Fleet/node configuration (separate concern)
-- Telegram bot token setup (separate, requires BotFather interaction)
 
 ---
 
@@ -197,3 +229,5 @@ directly write to the credential store / auth manager.
 4. `fawx auth set-token <provider> <key>` works without TUI
 5. After setup, `fawx tui` launches with working model (no additional config needed)
 6. After setup with HTTP enabled, `fawx serve --http` works with bearer auth
+7. After setup with Telegram, `fawx serve --http` starts polling and bot responds
+8. `fawx auth set-token telegram <BOT_TOKEN>` works without wizard
