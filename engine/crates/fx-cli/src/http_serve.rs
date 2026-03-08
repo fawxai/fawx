@@ -367,6 +367,89 @@ async fn handle_status(State(state): State<HttpState>) -> Json<StatusResponse> {
     })
 }
 
+// ── Telegram long-polling loop ──────────────────────────────────────────────
+
+/// Process a single Telegram update through the agentic loop.
+///
+/// Parses the update, sends a typing indicator, processes the message,
+/// and sends the response. Errors are logged but not propagated so the
+/// polling loop continues.
+async fn handle_telegram_update(
+    telegram: &TelegramChannel,
+    app: &Arc<Mutex<HeadlessApp>>,
+    raw_update: &serde_json::Value,
+) {
+    let payload = raw_update.to_string();
+    let incoming = match telegram.parse_update(&payload) {
+        Ok(Some(msg)) => msg,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!("Telegram poll parse error: {e}");
+            return;
+        }
+    };
+
+    tracing::info!(
+        chat_id = incoming.chat_id,
+        from = ?incoming.from_name,
+        "Telegram poll: message received"
+    );
+
+    let _ = telegram.send_typing(incoming.chat_id).await;
+    telegram.set_last_chat_id(incoming.chat_id);
+
+    let mut app_guard = app.lock().await;
+    let response_msg = match app_guard.process_message(&incoming.text).await {
+        Ok(result) => OutgoingMessage {
+            chat_id: incoming.chat_id,
+            text: result.response,
+            parse_mode: Some("Markdown".to_string()),
+            reply_to_message_id: Some(incoming.message_id),
+        },
+        Err(e) => {
+            tracing::error!("Telegram poll loop error: {e}");
+            OutgoingMessage {
+                chat_id: incoming.chat_id,
+                text: format!("⚠️ Error: {e}"),
+                parse_mode: None,
+                reply_to_message_id: Some(incoming.message_id),
+            }
+        }
+    };
+    drop(app_guard);
+
+    if let Err(e) = telegram.send_message(&response_msg).await {
+        tracing::error!("Telegram poll: failed to send response: {e}");
+    }
+}
+
+/// Run the Telegram long-polling loop.
+///
+/// Calls `get_updates` in a loop with a 30-second long-poll timeout.
+/// Errors are logged and the loop continues — it never crashes.
+async fn run_telegram_polling(telegram: Arc<TelegramChannel>, app: Arc<Mutex<HeadlessApp>>) {
+    // Delete any existing webhook so Telegram sends updates via getUpdates.
+    if let Err(e) = telegram.delete_webhook().await {
+        tracing::error!("Telegram poll: failed to delete webhook: {e}");
+    }
+
+    let mut offset: i64 = 0;
+    loop {
+        match telegram.get_updates(offset, 30).await {
+            Ok((updates, next_offset)) => {
+                for update in &updates {
+                    handle_telegram_update(&telegram, &app, update).await;
+                }
+                offset = next_offset;
+            }
+            Err(e) => {
+                tracing::error!("Telegram poll error: {e}");
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        }
+    }
+}
+
 // ── Telegram webhook handler ────────────────────────────────────────────────
 
 async fn handle_telegram_webhook(
@@ -466,8 +549,10 @@ pub async fn run(
     let ip = detect_tailscale_ip().map_err(|e| anyhow::anyhow!("{e}"))?;
     let addr = SocketAddr::new(ip, port);
 
+    let shared_app = Arc::new(Mutex::new(app));
+
     let state = HttpState {
-        app: Arc::new(Mutex::new(app)),
+        app: Arc::clone(&shared_app),
         start_time: Instant::now(),
         tailscale_ip: ip,
         bearer_token,
@@ -496,6 +581,14 @@ pub async fn run(
                 );
             }
         }
+    }
+
+    // Spawn Telegram long-polling loop if configured.
+    if let Some(ref tg) = telegram {
+        let tg_clone = Arc::clone(tg);
+        let app_clone = Arc::clone(&shared_app);
+        tokio::spawn(run_telegram_polling(tg_clone, app_clone));
+        eprintln!("Telegram long-polling loop: started");
     }
 
     axum::serve(listener, router)
@@ -1154,5 +1247,272 @@ mod tests {
         };
         let result = validate_bearer_token(&config, Some(&store)).expect("should succeed");
         assert_eq!(result, "config-fallback");
+    }
+
+    // ── handle_telegram_update tests ────────────────────────────────────
+
+    mod telegram_update {
+        use super::*;
+        use async_trait::async_trait;
+        use fx_channel_telegram::TelegramConfig;
+        use fx_kernel::act::{ToolExecutor, ToolExecutorError, ToolResult};
+        use fx_kernel::budget::{BudgetConfig, BudgetTracker};
+        use fx_kernel::cancellation::CancellationToken;
+        use fx_kernel::context_manager::ContextCompactor;
+        use fx_kernel::loop_engine::LoopEngine;
+        use fx_llm::{
+            CompletionProvider, CompletionRequest, CompletionResponse, CompletionStream,
+            ContentBlock, ModelRouter, ProviderCapabilities, ProviderError as LlmError,
+            StreamChunk,
+        };
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        // ── Stub tool executor (no tools in headless tests) ─────────────
+
+        #[derive(Debug)]
+        struct StubToolExecutor;
+
+        #[async_trait]
+        impl ToolExecutor for StubToolExecutor {
+            async fn execute_tools(
+                &self,
+                _calls: &[fx_llm::ToolCall],
+                _cancel: Option<&CancellationToken>,
+            ) -> Result<Vec<ToolResult>, ToolExecutorError> {
+                Ok(Vec::new())
+            }
+        }
+
+        // ── Mock completion provider (returns canned response) ──────────
+
+        struct MockProvider;
+
+        #[async_trait]
+        impl CompletionProvider for MockProvider {
+            async fn complete(
+                &self,
+                _request: CompletionRequest,
+            ) -> Result<CompletionResponse, LlmError> {
+                Ok(CompletionResponse {
+                    content: vec![ContentBlock::Text {
+                        text: "Mock response".to_string(),
+                    }],
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    stop_reason: Some("end_turn".to_string()),
+                })
+            }
+
+            async fn complete_stream(
+                &self,
+                _request: CompletionRequest,
+            ) -> Result<CompletionStream, LlmError> {
+                let chunk = StreamChunk {
+                    delta_content: Some("Mock response".to_string()),
+                    stop_reason: Some("end_turn".to_string()),
+                    ..Default::default()
+                };
+                let stream = futures::stream::once(async move { Ok(chunk) });
+                Ok(Box::pin(stream))
+            }
+
+            fn name(&self) -> &str {
+                "mock"
+            }
+
+            fn supported_models(&self) -> Vec<String> {
+                vec!["mock-model".to_string()]
+            }
+
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities {
+                    supports_temperature: false,
+                    requires_streaming: false,
+                }
+            }
+        }
+
+        // ── Failing completion provider (always errors) ─────────────────
+
+        struct FailingProvider;
+
+        #[async_trait]
+        impl CompletionProvider for FailingProvider {
+            async fn complete(
+                &self,
+                _request: CompletionRequest,
+            ) -> Result<CompletionResponse, LlmError> {
+                Err(LlmError::Provider("simulated LLM failure".to_string()))
+            }
+
+            async fn complete_stream(
+                &self,
+                _request: CompletionRequest,
+            ) -> Result<CompletionStream, LlmError> {
+                Err(LlmError::Provider("simulated LLM failure".to_string()))
+            }
+
+            fn name(&self) -> &str {
+                "failing"
+            }
+
+            fn supported_models(&self) -> Vec<String> {
+                vec!["failing-model".to_string()]
+            }
+
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities {
+                    supports_temperature: false,
+                    requires_streaming: false,
+                }
+            }
+        }
+
+        // ── Mock Telegram API server ────────────────────────────────────
+
+        /// Spin up a minimal HTTP server that returns `{"ok": true}` for
+        /// all POSTs (mimics the Telegram Bot API enough for unit tests).
+        async fn mock_telegram_server() -> (String, tokio::task::JoinHandle<()>) {
+            let app = axum::Router::new().fallback(axum::routing::any(|| async {
+                axum::Json(serde_json::json!({ "ok": true }))
+            }));
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind mock server");
+            let addr = listener.local_addr().expect("local addr");
+            let base_url = format!("http://{addr}");
+            let handle = tokio::spawn(async move {
+                axum::serve(listener, app).await.ok();
+            });
+            (base_url, handle)
+        }
+
+        // ── Test helpers ────────────────────────────────────────────────
+
+        fn test_telegram_config() -> TelegramConfig {
+            TelegramConfig {
+                bot_token: "000000:TESTTOKEN".to_string(),
+                allowed_chat_ids: Vec::new(),
+                webhook_secret: None,
+            }
+        }
+
+        fn test_engine() -> LoopEngine {
+            LoopEngine::builder()
+                .budget(BudgetTracker::new(BudgetConfig::default(), 0, 0))
+                .context(ContextCompactor::new(2048, 256))
+                .max_iterations(3)
+                .tool_executor(Arc::new(StubToolExecutor))
+                .synthesis_instruction("Summarize".to_string())
+                .build()
+                .expect("test engine")
+        }
+
+        fn make_test_app(router: ModelRouter) -> HeadlessApp {
+            use crate::headless::HeadlessAppDeps;
+
+            HeadlessApp::new(HeadlessAppDeps {
+                loop_engine: test_engine(),
+                router,
+                config: fx_config::FawxConfig::default(),
+                memory: None,
+                system_prompt_path: None,
+            })
+            .expect("test app")
+        }
+
+        fn mock_router() -> ModelRouter {
+            let mut router = ModelRouter::new();
+            router.register_provider(Box::new(MockProvider));
+            router.set_active("mock-model").expect("set active");
+            router
+        }
+
+        fn failing_router() -> ModelRouter {
+            let mut router = ModelRouter::new();
+            router.register_provider(Box::new(FailingProvider));
+            router.set_active("failing-model").expect("set active");
+            router
+        }
+
+        fn sample_update(chat_id: i64, text: &str) -> serde_json::Value {
+            serde_json::json!({
+                "update_id": 1001,
+                "message": {
+                    "message_id": 42,
+                    "chat": { "id": chat_id },
+                    "from": { "first_name": "TestUser" },
+                    "text": text
+                }
+            })
+        }
+
+        // ── Tests ───────────────────────────────────────────────────────
+
+        /// Happy path: valid update is processed, response is sent.
+        #[tokio::test]
+        async fn happy_path_valid_update_processed() {
+            let (base_url, _server) = mock_telegram_server().await;
+            let telegram = TelegramChannel::new_with_base_url(test_telegram_config(), base_url);
+            let app = Arc::new(Mutex::new(make_test_app(mock_router())));
+
+            let update = sample_update(12345, "hello bot");
+
+            // Should not panic; processes the message and sends response.
+            handle_telegram_update(&telegram, &app, &update).await;
+
+            // Verify the last_chat_id was set (proves we reached the
+            // message-processing path, not an early return).
+            assert_eq!(
+                telegram.last_chat_id(),
+                Some(12345),
+                "chat_id should be set after successful processing"
+            );
+        }
+
+        /// Parse error: invalid update JSON is handled gracefully.
+        #[tokio::test]
+        async fn parse_error_handled_gracefully() {
+            let telegram = TelegramChannel::new(test_telegram_config());
+            // App is never touched — parse fails before reaching it.
+            let app = Arc::new(Mutex::new(make_test_app(mock_router())));
+
+            // JSON that is valid serde_json::Value but fails to
+            // deserialize into a Telegram Update with required fields.
+            let invalid_update = serde_json::json!({
+                "message": { "bad_field": true }
+            });
+
+            // Should return early without panicking.
+            handle_telegram_update(&telegram, &app, &invalid_update).await;
+
+            // Verify we never reached the message-processing path.
+            assert!(
+                telegram.last_chat_id().is_none(),
+                "chat_id should not be set on parse error"
+            );
+        }
+
+        /// process_message error: app returns error, error message sent.
+        #[tokio::test]
+        async fn process_message_error_sends_error_response() {
+            let (base_url, _server) = mock_telegram_server().await;
+            let telegram = TelegramChannel::new_with_base_url(test_telegram_config(), base_url);
+            let app = Arc::new(Mutex::new(make_test_app(failing_router())));
+
+            let update = sample_update(12345, "trigger error");
+
+            // Should not panic; processes the error and sends error message.
+            handle_telegram_update(&telegram, &app, &update).await;
+
+            // Verify the last_chat_id was set (proves we reached the
+            // processing path, even though the LLM failed).
+            assert_eq!(
+                telegram.last_chat_id(),
+                Some(12345),
+                "chat_id should be set even on error path"
+            );
+        }
     }
 }

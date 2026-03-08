@@ -176,10 +176,11 @@ async fn check_api_response(resp: reqwest::Response) -> Result<(), TelegramError
 /// Send a single message via the Bot API (no splitting).
 async fn send_single_message(
     client: &reqwest::Client,
+    base_url: &str,
     bot_token: &str,
     msg: &OutgoingMessage,
 ) -> Result<(), TelegramError> {
-    let url = format!("https://api.telegram.org/bot{bot_token}/sendMessage");
+    let url = format!("{base_url}/bot{bot_token}/sendMessage");
     let resp = client
         .post(&url)
         .json(msg)
@@ -244,25 +245,36 @@ pub struct TelegramChannel {
     client: reqwest::Client,
     active: AtomicBool,
     last_chat_id: Mutex<Option<i64>>,
+    /// Base URL for the Telegram Bot API. Defaults to `https://api.telegram.org`.
+    /// Overridable for testing via [`TelegramChannel::new_with_base_url`].
+    base_url: String,
 }
+
+/// Default Telegram Bot API base URL.
+const DEFAULT_BASE_URL: &str = "https://api.telegram.org";
 
 impl TelegramChannel {
     /// Create a new Telegram channel with the given configuration.
     pub fn new(config: TelegramConfig) -> Self {
+        Self::new_with_base_url(config, DEFAULT_BASE_URL.to_string())
+    }
+
+    /// Create a Telegram channel pointing at a custom API base URL.
+    ///
+    /// Used in tests to redirect Bot API calls to a local mock server.
+    pub fn new_with_base_url(config: TelegramConfig, base_url: String) -> Self {
         Self {
             config,
             client: reqwest::Client::new(),
             active: AtomicBool::new(true),
             last_chat_id: Mutex::new(None),
+            base_url,
         }
     }
 
     /// Build the Bot API URL for a given method.
     fn bot_url(&self, method: &str) -> String {
-        format!(
-            "https://api.telegram.org/bot{}/{method}",
-            self.config.bot_token
-        )
+        format!("{}/bot{}/{method}", self.base_url, self.config.bot_token)
     }
 
     /// Parse a Telegram webhook Update JSON payload.
@@ -301,6 +313,11 @@ impl TelegramChannel {
         }
     }
 
+    /// Get the last chat ID, if set.
+    pub fn last_chat_id(&self) -> Option<i64> {
+        self.last_chat_id.lock().ok().and_then(|g| *g)
+    }
+
     // Finding #1: Webhook secret validation
 
     /// Get the configured webhook secret (for external validation).
@@ -329,7 +346,13 @@ impl TelegramChannel {
                 parse_mode: msg.parse_mode.clone(),
                 reply_to_message_id: msg.reply_to_message_id,
             };
-            send_single_message(&self.client, &self.config.bot_token, &chunk_msg).await?;
+            send_single_message(
+                &self.client,
+                &self.base_url,
+                &self.config.bot_token,
+                &chunk_msg,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -491,6 +514,7 @@ impl Channel for TelegramChannel {
 
         let chunks = split_message(message);
         let client = self.client.clone();
+        let base_url = self.base_url.clone();
         let token = self.config.bot_token.clone();
 
         tokio::spawn(async move {
@@ -501,7 +525,7 @@ impl Channel for TelegramChannel {
                     parse_mode: Some("Markdown".to_string()),
                     reply_to_message_id: None,
                 };
-                if let Err(e) = send_single_message(&client, &token, &msg).await {
+                if let Err(e) = send_single_message(&client, &base_url, &token, &msg).await {
                     tracing::error!("Telegram send failed: {e}");
                     break;
                 }
