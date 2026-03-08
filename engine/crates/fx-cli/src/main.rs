@@ -12,7 +12,6 @@ mod headless_http;
 mod http_serve;
 #[allow(dead_code)] // TODO(#1148): Phase 3 will wire markdown rendering into ratatui
 mod markdown;
-mod prompts;
 // Phase 2: many rendering/history utilities are currently test-only while we
 // wire ratatui. Phase 3 (polish) will re-connect markdown rendering, banner
 // art, and history persistence. Suppress dead-code warnings until then.
@@ -68,19 +67,6 @@ enum Commands {
 
     /// Run system diagnostics
     Doctor,
-
-    /// Interactive first-run setup wizard
-    Setup {
-        /// Re-run setup even if already configured
-        #[arg(long)]
-        force: bool,
-    },
-
-    /// Manage authentication credentials
-    Auth {
-        #[command(subcommand)]
-        command: commands::auth::AuthCommands,
-    },
 
     /// Show current configuration
     Config,
@@ -460,9 +446,9 @@ fn build_telegram_channel(
         );
     }
 
-    // Webhook secret priority: credential store → env var → config file.
-    let webhook_secret = telegram_webhook_secret_from_credential_store(auth_store)
-        .or_else(|| std::env::var("FAWX_TELEGRAM_WEBHOOK_SECRET").ok())
+    // Webhook secret: prefer env var, fall back to config file.
+    let webhook_secret = std::env::var("FAWX_TELEGRAM_WEBHOOK_SECRET")
+        .ok()
         .or_else(|| config.webhook_secret.clone())
         .filter(|s| !s.trim().is_empty());
 
@@ -482,27 +468,12 @@ fn build_telegram_channel(
 /// Returns `None` if no store is provided or it contains no token.
 #[cfg(feature = "http")]
 fn telegram_token_from_credential_store(store: Option<&auth_store::AuthStore>) -> Option<String> {
-    provider_token_from_credential_store(store, "telegram_bot_token")
-}
-
-#[cfg(feature = "http")]
-fn telegram_webhook_secret_from_credential_store(
-    store: Option<&auth_store::AuthStore>,
-) -> Option<String> {
-    provider_token_from_credential_store(store, "telegram_webhook_secret")
-}
-
-#[cfg(feature = "http")]
-fn provider_token_from_credential_store(
-    store: Option<&auth_store::AuthStore>,
-    provider: &str,
-) -> Option<String> {
     store?
-        .get_provider_token(provider)
+        .get_provider_token("telegram_bot_token")
         .ok()
         .flatten()
         .map(|token| token.to_string())
-        .filter(|token| !token.trim().is_empty())
+        .filter(|t| !t.trim().is_empty())
 }
 
 #[cfg(not(feature = "http"))]
@@ -580,8 +551,6 @@ async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
             }
         }
         Commands::Doctor => Ok(commands::doctor::run().await?),
-        Commands::Setup { force } => Ok(commands::setup::run(force).await?),
-        Commands::Auth { command } => Ok(commands::auth::run(command).await?),
         Commands::Config => {
             commands::config::run().await?;
             Ok(0)
@@ -674,29 +643,10 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "http")]
-    use super::{build_telegram_channel, telegram_webhook_secret_from_credential_store};
-    use super::{dispatch_command, Cli, Commands};
     use crate::auth_store::AuthStore;
-    use clap::Parser;
 
     fn test_auth_store() -> AuthStore {
         AuthStore::open_for_testing().expect("test auth store")
-    }
-
-    #[test]
-    fn cli_parses_setup_command() {
-        let cli = Cli::parse_from(["fawx", "setup", "--force"]);
-        assert!(matches!(cli.command, Some(Commands::Setup { force: true })));
-    }
-
-    #[tokio::test]
-    async fn setup_command_dispatches_to_setup_runner() {
-        crate::commands::setup::set_test_exit_code(240);
-        let exit_code = dispatch_command(Commands::Setup { force: true })
-            .await
-            .expect("dispatch");
-        assert_eq!(exit_code, 241);
     }
 
     #[test]
@@ -755,39 +705,5 @@ mod tests {
 
         assert_eq!(*tg, "tg-token");
         assert_eq!(*http, "http-token");
-    }
-
-    #[cfg(feature = "http")]
-    #[test]
-    fn telegram_webhook_secret_credential_store_roundtrip() {
-        let store = test_auth_store();
-        store
-            .store_provider_token("telegram_webhook_secret", "webhook-secret")
-            .expect("store webhook secret");
-
-        let retrieved = telegram_webhook_secret_from_credential_store(Some(&store));
-        assert_eq!(retrieved.as_deref(), Some("webhook-secret"));
-    }
-
-    #[cfg(feature = "http")]
-    #[test]
-    fn build_telegram_channel_prefers_stored_webhook_secret() {
-        let store = test_auth_store();
-        store
-            .store_provider_token("telegram_bot_token", "tg-token")
-            .expect("store telegram token");
-        store
-            .store_provider_token("telegram_webhook_secret", "stored-secret")
-            .expect("store webhook secret");
-        let config = fx_config::TelegramChannelConfig {
-            enabled: true,
-            bot_token: Some("config-token".to_string()),
-            allowed_chat_ids: vec![123],
-            webhook_secret: Some("config-secret".to_string()),
-        };
-
-        let channel = build_telegram_channel(&config, Some(&store)).expect("channel should build");
-
-        assert_eq!(channel.webhook_secret(), Some("stored-secret"));
     }
 }

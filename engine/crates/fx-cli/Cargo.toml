@@ -6,7 +6,6 @@ authors.workspace = true
 license.workspace = true
 
 [features]
-default = ["http"]
 # Enable the HTTP API server for headless mode (`fawx serve --http`).
 # Tailscale-only binding. Pulls in axum.
 http = ["dep:axum", "dep:fx-channel-telegram"]
@@ -55,7 +54,6 @@ futures.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
-toml_edit = "0.22"
 reqwest.workspace = true
 axum = { version = "0.8", optional = true }
 fx-channel-telegram = { path = "../fx-channel-telegram", optional = true }
