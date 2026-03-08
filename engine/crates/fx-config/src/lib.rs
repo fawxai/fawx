@@ -103,14 +103,23 @@ impl Default for FleetConfig {
 /// Configuration for a known node in the fleet.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NodeConfig {
+    /// Unique node identifier (required by spec).
+    pub id: String,
     /// Human-readable name.
     pub name: String,
     /// HTTP API endpoint.
-    pub endpoint: String,
+    pub endpoint: Option<String>,
     /// Bearer token for authentication.
     pub auth_token: Option<String>,
     /// Capability strings (e.g., "agentic_loop", "skill_build").
+    #[serde(default)]
     pub capabilities: Vec<String>,
+    /// SSH address (IP or hostname) for SSH transport.
+    pub address: Option<String>,
+    /// SSH username.
+    pub user: Option<String>,
+    /// Path to SSH private key.
+    pub ssh_key: Option<String>,
 }
 
 /// Webhook channel configuration.
@@ -804,10 +813,14 @@ max_relevant_results = 9
                 coordinator: true,
                 stale_timeout_seconds: 120,
                 nodes: vec![NodeConfig {
+                    id: "test-node".to_string(),
                     name: "test-node".to_string(),
-                    endpoint: "https://10.0.0.1:8400".to_string(),
+                    endpoint: Some("https://10.0.0.1:8400".to_string()),
                     auth_token: Some("token123".to_string()),
                     capabilities: vec!["agentic_loop".to_string()],
+                    address: Some("10.0.0.1".to_string()),
+                    user: Some("deploy".to_string()),
+                    ssh_key: Some("~/.ssh/id_ed25519".to_string()),
                 }],
             },
             webhook: WebhookConfig {

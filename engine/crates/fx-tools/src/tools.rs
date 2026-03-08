@@ -47,6 +47,7 @@ pub struct FawxToolExecutor {
     runtime_info: Option<Arc<RwLock<RuntimeInfo>>>,
     self_modify: Option<SelfModifyConfig>,
     concurrency_policy: ConcurrencyPolicy,
+    node_run: Option<crate::node_run::NodeRunState>,
     #[cfg(feature = "improvement")]
     improvement: Option<crate::improvement_tools::ImprovementToolsState>,
 }
@@ -86,6 +87,7 @@ impl FawxToolExecutor {
             runtime_info: None,
             self_modify: None,
             concurrency_policy: ConcurrencyPolicy::default(),
+            node_run: None,
             #[cfg(feature = "improvement")]
             improvement: None,
         }
@@ -116,6 +118,12 @@ impl FawxToolExecutor {
         self
     }
 
+    /// Attach node_run tool state for remote command execution.
+    pub fn with_node_run(mut self, state: crate::node_run::NodeRunState) -> Self {
+        self.node_run = Some(state);
+        self
+    }
+
     /// Attach self-improvement tools (analyze_signals, propose_improvement).
     #[cfg(feature = "improvement")]
     pub fn with_improvement(
@@ -137,7 +145,7 @@ impl FawxToolExecutor {
             "read_file" | "list_directory" | "search_text" | "memory_read" | "memory_list" => {
                 ToolCacheability::Cacheable
             }
-            "write_file" | "memory_write" | "memory_delete" | "run_command" => {
+            "write_file" | "memory_write" | "memory_delete" | "run_command" | "node_run" => {
                 ToolCacheability::SideEffect
             }
             "current_time" | "self_info" | "analyze_signals" | "propose_improvement" => {
@@ -167,6 +175,9 @@ impl FawxToolExecutor {
             "memory_read" => self.handle_memory_read(&call.arguments),
             "memory_list" => self.handle_memory_list(),
             "memory_delete" => self.handle_memory_delete(&call.arguments),
+            "node_run" => {
+                return self.dispatch_node_run(call).await;
+            }
             #[cfg(feature = "improvement")]
             "analyze_signals" => {
                 return self.dispatch_analyze_signals(call).await;
@@ -590,6 +601,21 @@ impl FawxToolExecutor {
         to_tool_result(&call.id, &call.name, output)
     }
 
+    async fn dispatch_node_run(&self, call: &ToolCall) -> ToolResult {
+        let state = match &self.node_run {
+            Some(s) => s,
+            None => {
+                return to_tool_result(
+                    &call.id,
+                    &call.name,
+                    Err("node_run not configured".to_string()),
+                );
+            }
+        };
+        let output = crate::node_run::handle_node_run(state, &call.arguments).await;
+        to_tool_result(&call.id, &call.name, output)
+    }
+
     async fn execute_single_tool(
         &self,
         call: &ToolCall,
@@ -709,6 +735,9 @@ impl ToolExecutor for FawxToolExecutor {
         let mut defs = fawx_tool_definitions();
         if self.memory.is_some() {
             defs.extend(memory_tool_definitions());
+        }
+        if self.node_run.is_some() {
+            defs.push(crate::node_run::node_run_tool_definition());
         }
         #[cfg(feature = "improvement")]
         if self.improvement_tools_enabled() {
@@ -1239,6 +1268,28 @@ mod tests {
     use super::*;
     use fx_core::memory::MemoryProvider;
     use tempfile::TempDir;
+
+    /// Minimal no-op transport for testing tool_definitions() inclusion.
+    struct StubNodeTransport;
+
+    #[async_trait::async_trait]
+    impl fx_fleet::NodeTransport for StubNodeTransport {
+        async fn execute(
+            &self,
+            _node: &fx_fleet::NodeInfo,
+            _command: &str,
+            _timeout: Duration,
+        ) -> Result<fx_fleet::CommandResult, fx_fleet::TransportError> {
+            Err(fx_fleet::TransportError::Other("stub".to_string()))
+        }
+
+        async fn ping(
+            &self,
+            _node: &fx_fleet::NodeInfo,
+        ) -> Result<Duration, fx_fleet::TransportError> {
+            Err(fx_fleet::TransportError::Other("stub".to_string()))
+        }
+    }
 
     fn test_executor(root: &Path) -> FawxToolExecutor {
         FawxToolExecutor::new(root.to_path_buf(), ToolConfig::default())
@@ -1996,6 +2047,38 @@ mod tests {
         let results = executor.execute_tools(&calls, None).await.expect("results");
         assert!(!results[0].success);
         assert!(results[0].output.contains("unknown tool"));
+    }
+
+    #[test]
+    fn node_run_appears_in_definitions_when_configured() {
+        let temp = TempDir::new().expect("temp");
+        let registry = Arc::new(tokio::sync::RwLock::new(fx_fleet::NodeRegistry::new()));
+        let transport: Arc<dyn fx_fleet::NodeTransport> = Arc::new(StubNodeTransport);
+        let state = crate::node_run::NodeRunState {
+            registry,
+            transport,
+        };
+        let executor = test_executor(temp.path()).with_node_run(state);
+
+        let defs = executor.tool_definitions();
+        let names: Vec<_> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert!(
+            names.contains(&"node_run"),
+            "node_run should be present when configured"
+        );
+    }
+
+    #[test]
+    fn node_run_absent_in_definitions_when_not_configured() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+
+        let defs = executor.tool_definitions();
+        let names: Vec<_> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert!(
+            !names.contains(&"node_run"),
+            "node_run should be absent when not configured"
+        );
     }
 
     #[test]

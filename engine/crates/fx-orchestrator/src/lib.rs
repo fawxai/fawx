@@ -424,6 +424,9 @@ mod tests {
             status,
             last_heartbeat_ms: 1000,
             registered_at_ms: 1000,
+            address: None,
+            ssh_user: None,
+            ssh_key: None,
         }
     }
 

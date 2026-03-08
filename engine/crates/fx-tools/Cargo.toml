@@ -10,6 +10,7 @@ improvement = ["dep:fx-analysis", "dep:fx-improve", "dep:fx-memory", "dep:fx-con
 
 [dependencies]
 fx-core.workspace = true
+fx-fleet.workspace = true
 fx-propose.workspace = true
 fx-kernel.workspace = true
 fx-llm = { path = "../fx-llm" }
