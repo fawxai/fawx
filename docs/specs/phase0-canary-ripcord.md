@@ -1,34 +1,99 @@
 # Spec: Phase 0 PR 2 — Canary → Ripcord Wiring
 
-**Gap:** Signal canary and ripcord exist but aren't connected  
-**Estimated size:** ~150 lines  
-**Risk:** Low — standalone safety infrastructure
+**Gap:** Canary (signal quality monitor) and Ripcord (rollback binary) exist but neither runs nor connects to the other  
+**Estimated size:** ~350 lines  
+**Risk:** Medium — three pieces of new wiring, but all built on existing tested primitives
 
 ---
 
 ## Problem
 
-Two safety components exist independently:
-- **fx-canary** (`engine/crates/fx-canary/`): Monitors signal quality ratios 
-  post-deploy. 24hr baseline, 2x spike threshold, 1hr grace period.
-- **fawx-ripcord** (`fawx-ripcord/`): Standalone binary that copies last 
-  known-good snapshot and restarts the process.
+Three safety components exist independently but none is wired:
 
-Neither knows the other exists. When canary detects a regression, nothing happens.
+1. **fx-canary** (`engine/crates/fx-canary/`): Pure computation — `Canary::evaluate(&[Signal]) -> Verdict`. Has `Healthy`, `Warning`, `Degraded` verdicts with rollback recommendation. 10 tests. **Never called from anywhere.**
 
-## Solution
+2. **SignalCollector** (`engine/crates/fx-kernel/src/signals.rs`): Accumulates signals per loop cycle, max 200. Drained into `LoopResult` at cycle end, then cleared. **Signals vanish after each cycle — no cross-cycle accumulation.**
 
-### Canary → ripcord trigger
+3. **fawx-ripcord** (`engine/crates/fawx-ripcord/`): Standalone binary. Creates/restores snapshots of `config.toml` + `skills/`. Has `--create`, `restore`, `--list`. 7 tests. **Only triggered manually.**
 
-When canary's signal ratio exceeds the threshold:
-1. Log the regression detection with details (signal type, ratio, threshold)
-2. Write a pre-rollback snapshot marker (so ripcord knows what to restore)
-3. Invoke ripcord binary as a subprocess
-4. If ripcord binary not found → log warning, do NOT crash
+Result: If a skill install degrades signal quality, nobody notices and nothing rolls back.
 
-### Implementation
+## Solution: Three Pieces
 
-Add a `RollbackTrigger` trait to fx-canary:
+### Piece 1: Cross-Cycle Signal Accumulator (~80 lines)
+
+**New struct: `SignalWindow`** in `fx-canary/src/window.rs`
+
+```rust
+/// Rolling window of signals across multiple loop cycles.
+/// Ring buffer with time-based expiry.
+pub struct SignalWindow {
+    signals: VecDeque<Signal>,
+    max_signals: usize,     // hard cap (default 2000)
+    max_age_secs: u64,      // time-based expiry (default 3600 = 1hr)
+}
+
+impl SignalWindow {
+    pub fn new(max_signals: usize, max_age_secs: u64) -> Self;
+    
+    /// Ingest signals from a completed loop cycle.
+    pub fn ingest(&mut self, signals: Vec<Signal>);
+    
+    /// Get all signals within the window (pruned on read).
+    pub fn signals(&mut self) -> &[Signal];
+    
+    /// Prune expired signals.
+    fn prune(&mut self);
+}
+```
+
+- Lives in fx-canary (not fx-kernel) — canary owns its own accumulation
+- `ingest()` called after every `LoopResult` is returned
+- `prune()` drops signals older than `max_age_secs` on every read
+- Ring buffer with hard cap prevents unbounded growth
+
+### Piece 2: Canary Evaluation Hook (~120 lines)
+
+**Where to call canary:** After every loop cycle completes, in the caller that processes `LoopResult`.
+
+For HTTP mode, this is `http_serve.rs` — the `/message` handler calls the loop engine and gets back a `LoopResult` with signals.
+
+For TUI mode, this is `TuiApp::process_message()` — same flow.
+
+**New component: `CanaryMonitor`** in `fx-canary/src/monitor.rs`
+
+```rust
+/// Manages canary lifecycle: baseline capture, periodic evaluation, rollback trigger.
+pub struct CanaryMonitor {
+    canary: Canary,
+    window: SignalWindow,
+    trigger: Option<Arc<dyn RollbackTrigger>>,
+    baseline_captured: bool,
+    cycles_since_eval: u32,
+    eval_interval: u32,       // evaluate every N cycles (default 10)
+    min_cycles_for_baseline: u32,  // capture baseline after N cycles (default 20)
+}
+
+impl CanaryMonitor {
+    pub fn new(config: CanaryConfig, trigger: Option<Arc<dyn RollbackTrigger>>) -> Self;
+    
+    /// Called after every loop cycle. Ingests signals, evaluates if interval reached.
+    /// Returns the verdict if evaluation was performed.
+    pub fn on_cycle_complete(&mut self, signals: Vec<Signal>) -> Option<Verdict>;
+}
+```
+
+**Lifecycle:**
+1. First N cycles: accumulate signals, no evaluation (building baseline)
+2. After N cycles: capture baseline from window
+3. Every M cycles thereafter: evaluate current window against baseline
+4. On `Verdict::Warning`: log at WARN level with details
+5. On `Verdict::Degraded { rollback_recommended: true }`: trigger rollback if trigger is Some, log at ERROR either way
+6. On `Verdict::Degraded { rollback_recommended: false }`: log at ERROR, no rollback
+
+### Piece 3: Rollback Trigger + Auto-Snapshot (~100 lines)
+
+**`RollbackTrigger` trait** in `fx-canary/src/trigger.rs`:
 
 ```rust
 pub trait RollbackTrigger: Send + Sync {
@@ -36,62 +101,98 @@ pub trait RollbackTrigger: Send + Sync {
 }
 
 pub struct RollbackReason {
-    pub signal_type: String,
-    pub current_ratio: f64,
-    pub baseline_ratio: f64,
-    pub threshold_multiplier: f64,
-    pub timestamp: u64,
+    pub verdict_message: String,
+    pub current_success_rate: f64,
+    pub baseline_success_rate: f64,
+    pub timestamp_epoch_secs: u64,
 }
 ```
 
-Default implementation `RipcordTrigger`:
+**`RipcordTrigger`** implementation:
+
 ```rust
 pub struct RipcordTrigger {
-    ripcord_path: PathBuf,  // e.g. ~/.fawx/bin/fawx-ripcord
-    snapshot_dir: PathBuf,  // e.g. ~/.fawx/snapshots/
+    ripcord_path: PathBuf,
+    data_dir: PathBuf,
+}
+
+impl RollbackTrigger for RipcordTrigger {
+    fn trigger_rollback(&self, reason: &RollbackReason) -> Result<(), RollbackError> {
+        // 1. Write rollback-reason.json to data_dir (audit trail)
+        // 2. Invoke: fawx-ripcord restore --yes
+        //    - Uses Command::new with stdout/stderr captured
+        //    - Does NOT use .spawn() (fire-and-forget) — we need the exit code
+        // 3. If ripcord exits 0: log success, return Ok
+        // 4. If ripcord fails: log error with stderr, return Err
+    }
 }
 ```
 
-`trigger_rollback()`:
-1. Write `rollback-reason.json` to snapshot dir (audit trail)
-2. `Command::new(&self.ripcord_path).arg("--auto").spawn()`
-3. Return Ok if spawn succeeds (ripcord handles the rest)
+**Auto-snapshot before ripcord:** The ripcord binary already supports `--create`. But the trigger should ensure a recent snapshot exists before restoring. Add to `RipcordTrigger::trigger_rollback()`:
+- Check if a snapshot exists from the last 24 hours (read manifest timestamps)
+- If not, run `fawx-ripcord --create` first, then `fawx-ripcord restore --yes`
+- This way we never restore to a stale snapshot
 
-### Canary integration
+### Wiring in fx-cli (~50 lines)
 
-In the canary's threshold check (wherever it runs — needs investigation):
-- Accept `Option<Arc<dyn RollbackTrigger>>` 
-- On threshold breach: call `trigger.trigger_rollback()` if Some
-- On None: log warning only (current behavior, just louder)
+**HTTP mode** (`http_serve.rs` or `main.rs`):
+```rust
+// During startup:
+let ripcord_path = which::which("fawx-ripcord").ok()
+    .or_else(|| data_dir.join("bin/fawx-ripcord").exists_then());
+let trigger: Option<Arc<dyn RollbackTrigger>> = ripcord_path.map(|p| {
+    Arc::new(RipcordTrigger::new(p, data_dir.clone())) as Arc<dyn RollbackTrigger>
+});
+let canary_monitor = Arc::new(Mutex::new(CanaryMonitor::new(
+    CanaryConfig::default(),
+    trigger,
+)));
 
-### Wiring in fx-cli
+// After each loop cycle completes:
+if let Ok(mut monitor) = canary_monitor.lock() {
+    let signals = extract_signals_from_result(&result);
+    if let Some(verdict) = monitor.on_cycle_complete(signals) {
+        log::info!("canary verdict: {:?}", verdict);
+    }
+}
+```
 
-In the HTTP server startup (where canary would run as background task):
-- Check if ripcord binary exists at expected path
-- If yes: create `RipcordTrigger`, pass to canary
-- If no: pass None, log that auto-rollback is disabled
+**TUI mode**: Same pattern. `CanaryMonitor` passed into `TuiApp`, called after `process_message()`.
 
-### Pre-investigation needed
+## Implementation Gates
 
-Before implementation, the implementer needs to determine:
-1. Where does the canary currently run? (Background task? On-demand via `/signals`?)
-2. Does it run continuously or on-demand? If on-demand only, we may need to add 
-   a periodic check loop.
-3. Where does ripcord expect its snapshot? Need to verify the snapshot format 
-   matches what ripcord reads.
+### Gate 1: LoopResult signal extraction
+Verify that all `LoopResult` variants expose their signals in a uniform way. If extracting signals requires matching on all 5 variants, add a `LoopResult::signals(&self) -> &[Signal]` helper method. If adding that method to fx-kernel requires touching many tests, **stop and report** — we'll add it as a separate prep PR.
 
-## Files touched
+### Gate 2: Ripcord binary location
+The trigger needs to find `fawx-ripcord`. Check: is it built as a separate binary in the workspace? Is it installed alongside `fawx`? If it's never built/installed by default (only `cargo build -p fawx-ripcord` builds it), **note this** — we need to add it to the default build targets or the trigger will always be None.
+
+### Gate 3: Ripcord kills fawx
+`fawx-ripcord restore` calls `kill_fawx()` which sends SIGKILL to the fawx process. If canary triggers ripcord from *within* the fawx process, ripcord will kill its own parent mid-restore. Verify this is safe (ripcord is a separate process, should survive parent death). If there's a race condition, **stop and report**.
+
+## Files Touched
 
 | File | Change |
 |------|--------|
-| `fx-canary/src/lib.rs` | Add `RollbackTrigger` trait, `RollbackReason` |
-| `fx-canary/src/trigger.rs` | **New** — `RipcordTrigger` implementation |
-| `fx-cli/src/http_serve.rs` | Wire canary + trigger on startup |
-| Tests | Unit test for trigger (mock ripcord binary path) |
+| `fx-canary/src/lib.rs` | Re-export new modules |
+| `fx-canary/src/window.rs` | **New** — `SignalWindow` ring buffer |
+| `fx-canary/src/monitor.rs` | **New** — `CanaryMonitor` lifecycle |
+| `fx-canary/src/trigger.rs` | **New** — `RollbackTrigger` trait + `RipcordTrigger` impl |
+| `fx-cli/src/main.rs` or `http_serve.rs` | Wire CanaryMonitor on startup, feed after cycles |
+| `fx-cli/src/tui.rs` | Same wiring for TUI mode |
+| Tests | SignalWindow (capacity, expiry, prune), CanaryMonitor (lifecycle, baseline capture, evaluation intervals), RipcordTrigger (mock binary) |
+
+## Testing
+
+- **SignalWindow**: capacity limits, time-based expiry, empty window behavior
+- **CanaryMonitor**: baseline not captured until min_cycles, evaluation at interval, Warning/Degraded routing, None trigger logs only
+- **RipcordTrigger**: mock binary (shell script that exits 0/1), reason file written, exit code handling
+- **Integration**: feed N+M cycles of signals through CanaryMonitor, verify baseline captured and evaluation runs
 
 ## Security
 
-- Ripcord binary path is hardcoded or from config — never from agent input
-- Rollback reason is logged but never sent to the agent (no information leak)
-- The agent cannot invoke ripcord directly — only canary can trigger it
-- Tier 3: ripcord binary is in `TIER3_PATHS` (already protected from agent modification)
+- Ripcord binary path discovered at startup, never from agent input
+- Rollback reason logged locally, never sent to agent (no information leak)
+- Agent cannot invoke ripcord or canary directly — fully automatic
+- `fawx-ripcord` binary is in TIER3_PATHS (protected from agent modification)
+- Signal window is capped (2000 signals, 1hr) — no memory exhaustion
