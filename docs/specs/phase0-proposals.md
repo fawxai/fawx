@@ -1,8 +1,8 @@
 # Spec: Phase 0 PR 4 — Proposal Approval Flow
 
 **Gap:** Proposals write to disk but no review/approve/reject UI exists  
-**Estimated size:** ~300 lines  
-**Risk:** Medium — new TUI commands + file manipulation + state mutation
+**Estimated size:** ~250 lines  
+**Risk:** Medium — new TUI commands + file manipulation
 
 ---
 
@@ -12,12 +12,26 @@ The self-improvement pipeline dead-ends:
 1. ✅ `/analyze` — analyzes signals, works
 2. ✅ `/improve` — generates proposals, writes to `~/.fawx/proposals/`
 3. ❌ No way to list pending proposals
-4. ❌ No way to approve (calls `set_active_proposal()`)
-5. ❌ No way to reject (delete proposal)
-6. ❌ No way to apply (write the proposed content to the target file)
+4. ❌ No way to approve and apply a proposal
+5. ❌ No way to reject a proposal
 
 `ProposalGateState.set_active_proposal()` and `ActiveProposal` exist but are 
 only used in tests.
+
+## Design Correction (from pressure test)
+
+**`/approve` does NOT need ProposalGateState.**
+
+`set_active_proposal()` is designed for the *agent* — it tells the 
+ProposalGateExecutor "the next agent write to path X is approved, let it 
+through the gate." But `/approve` is a *human* action. The human reads the 
+proposal, decides to apply it, and writes the file directly. This bypasses 
+the agent's tool executor entirely — no gate involvement needed.
+
+This simplifies the PR significantly:
+- No `Arc<Mutex<ProposalGateState>>` threading through TuiApp
+- No refactoring `ProposalGateExecutor::new()`  
+- Just: read proposal → validate → write file → move to applied/
 
 ## Solution
 
@@ -31,14 +45,14 @@ Add to `KNOWN_SLASH_COMMANDS`:
 Add to `ParsedCommand` enum:
 ```rust
 Proposals,
-Approve(String),  // proposal ID (timestamp prefix or filename)
+Approve(String),  // proposal ID (number from list or timestamp prefix)
 Reject(String),
 ```
 
 ### /proposals — List pending
 
 1. Read `~/.fawx/proposals/` directory
-2. Parse each `.md` file: extract title, target path, risk, timestamp
+2. Parse each `.md` file using JSON sidecar (see below)
 3. Display numbered list:
 
 ```
@@ -53,96 +67,93 @@ If no proposals: "No pending proposals."
 
 ### /approve <id> — Approve and apply
 
-1. Resolve `<id>` to proposal file (by number from list, or by timestamp prefix)
-2. Parse proposal markdown → extract target_path + proposed_content
-3. Validate target path:
-   - NOT in TIER3_PATHS (compiled kernel invariant — cannot be overridden even by approval)
-   - Path exists (or creation is expected)
-   - Path is within working directory
-4. Create `ActiveProposal`:
-   ```rust
-   ActiveProposal {
-       paths: vec![target_path.clone()],
-       approved_at: current_time_ms(),
-       expires_at: Some(current_time_ms() + 300_000), // 5 minute window
-   }
-   ```
-5. Call `proposal_gate_state.set_active_proposal(active_proposal)`
-6. Write proposed content to target file
-7. Clear active proposal
-8. Move proposal file to `~/.fawx/proposals/applied/` (audit trail)
-9. Print: "✓ Applied proposal: {title} → {target_path}"
+1. Resolve `<id>` to proposal (by number from list, or timestamp prefix)
+2. Read JSON sidecar for target_path, proposed_content, file_hash
+3. **Staleness check:** compute current hash of target file, compare to 
+   `file_hash_at_creation` in sidecar
+   - If match (or file didn't exist at creation and still doesn't): proceed
+   - If mismatch: warn and require `/approve <id> --force`
+     ```
+     ⚠ Target file changed since proposal was created.
+     Use /approve <id> --force to apply anyway.
+     ```
+4. **Tier 3 check:** verify target_path is NOT in TIER3_PATHS
+   - If Tier 3: reject with "Cannot apply: {path} is Tier 3 (kernel immutable)"
+5. Write proposed_content to target_path
+6. Move proposal files (.md + .json) to `~/.fawx/proposals/applied/`
+7. Print: "✓ Applied proposal: {title} → {target_path}"
 
-### /reject <id> — Reject and delete
+### /reject <id> — Reject and archive
 
-1. Resolve `<id>` to proposal file
+1. Resolve `<id>` to proposal
 2. Move to `~/.fawx/proposals/rejected/` (audit trail, not hard delete)
 3. Print: "✗ Rejected proposal: {title}"
 
-### Proposal parsing
+### JSON sidecar (machine-readable)
 
-Add to a new module `engine/crates/fx-cli/src/proposal_review.rs`:
+`ProposalWriter::write()` currently writes only markdown. Extend it to also 
+write a JSON sidecar alongside each proposal:
 
-```rust
-pub struct ParsedProposal {
-    pub filename: String,
-    pub timestamp: u64,
-    pub title: String,
-    pub target_path: PathBuf,
-    pub proposed_content: String,
-    pub risk: String,
+**Filename:** `{timestamp}-{sanitized-title}.json` (same stem as .md)
+
+```json
+{
+  "version": 1,
+  "timestamp": 1710000000,
+  "title": "Modify kernel/loop.rs",
+  "description": "Refine loop behavior",
+  "target_path": "kernel/loop.rs",
+  "proposed_content": "fn tick() {}",
+  "risk": "low",
+  "file_hash_at_creation": "sha256:abcdef1234..."
 }
-
-pub fn parse_proposal_file(path: &Path) -> Result<ParsedProposal, String>;
-pub fn list_pending_proposals(proposals_dir: &Path) -> Vec<ParsedProposal>;
 ```
 
-Parse the markdown format that `ProposalWriter::format_proposal()` generates:
-```markdown
-# Proposal: {title}
+- `file_hash_at_creation`: SHA-256 of the target file at proposal time. 
+  `null` if target file doesn't exist yet.
+- Markdown stays human-readable. JSON is what `/approve` reads.
+- Machine parsing never touches the markdown format — no fragile regex.
 
-## What and Why
-{description}
+**Change to ProposalWriter:** The `write()` method needs the current content 
+of the target file to compute the hash. Two options:
+- (a) `write()` reads the file itself (adds I/O to a currently I/O-light struct)
+- (b) Caller passes `Option<&[u8]>` for current file content (or hash directly)
 
-## Proposed Diff
-{target_path}:
-```
-{content}
-```
+**Preferred: option (b)** — pass `file_hash: Option<String>` to `write()`. 
+The caller (ProposalGateExecutor, which already has the file path) computes 
+the hash and passes it in. Keeps ProposalWriter focused on writing.
 
-## Risk
-{risk}
-```
+### Backward compatibility
 
-### Access to ProposalGateState
+Old proposals (written before this PR) won't have JSON sidecars. 
+`/proposals` and `/approve` must handle this:
+- If `.json` sidecar exists: use it
+- If only `.md` exists: fall back to markdown parsing (extract title from 
+  `# Proposal:` line, target from `## Proposed Diff` section)
+- Staleness check skipped for legacy proposals (no hash available)
 
-`TuiApp` needs access to the `ProposalGateState` for `set_active_proposal()`.
-Currently, `ProposalGateExecutor` wraps the state in a `Mutex<ProposalGateState>`.
+## Implementation Gate
 
-Options:
-1. **Preferred:** Store `Arc<Mutex<ProposalGateState>>` separately, share between 
-   `ProposalGateExecutor` and `TuiApp`
-2. Add a method to `ProposalGateExecutor` that exposes `set_active_proposal()`
-
-Option 1 requires refactoring `ProposalGateExecutor::new()` to accept 
-`Arc<Mutex<ProposalGateState>>` instead of owned `ProposalGateState`. This is 
-the cleaner approach — the state is shared, not hidden.
+### Gate 1: ProposalWriter signature change
+Adding `file_hash: Option<String>` to `ProposalWriter::write()` changes its 
+public API. Check all callers — currently only `ProposalGateExecutor` calls it. 
+If other callers exist, **stop and report** before changing the signature.
 
 ## Files touched
 
 | File | Change |
 |------|--------|
-| `tui.rs` | Add slash commands, ParsedCommand variants, handlers |
-| `proposal_review.rs` | **New** — proposal parsing + listing |
-| `fx-kernel/src/proposal_gate.rs` | Refactor to accept `Arc<Mutex<ProposalGateState>>` |
-| Tests | Parse proposal markdown, list proposals, approve/reject flow |
+| `fx-propose/src/lib.rs` | Add JSON sidecar to `write()`, accept `file_hash` param |
+| `fx-cli/src/tui.rs` | Add slash commands, ParsedCommand variants, handlers |
+| `fx-cli/src/proposal_review.rs` | **New** — proposal listing, parsing (JSON + markdown fallback), apply/reject |
+| `fx-kernel/src/proposal_gate.rs` | Compute file hash before calling ProposalWriter::write() |
+| Tests | JSON sidecar write, staleness check, approve/reject flow, legacy fallback |
 
 ## Security
 
 - **TIER3_PATHS check on approve:** Even human approval cannot override Tier 3 
-  immutability. If a proposal targets a Tier 3 path, `/approve` must reject it 
-  with a clear message: "Cannot apply: {path} is in Tier 3 (kernel immutable)."
+  immutability. Proposals targeting kernel paths are rejected.
 - Proposals are moved, not deleted (audit trail in applied/ and rejected/)
-- Active proposal has a 5-minute TTL — auto-expires if not used
-- Proposal content is applied as a file write — same security as `write_file` tool
+- `/approve` writes the file directly as the human — no agent gate involvement
+- File hash staleness check prevents silent overwrites of concurrent changes
 - No proposal can modify TIER3_PATHS regardless of how it was created
