@@ -313,6 +313,11 @@
         </div>
       </div>
 
+      <div class="tree-divider">⚡ Phase 1b — TUI Unification <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1252">#1252</a> <span class="wave-badge" style="background:var(--purple-glow);color:var(--purple);border:1px solid rgba(188,140,255,0.3);">Deferred</span></div>
+      <div class="tree">
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">Replace old TUI with ratatui fawxtui</div><div class="node-detail">Old TUI (<code>tui.rs</code>, 3,600 lines) mixes engine + rendering. New ratatui TUI (fawxtui, 877 lines) has rendering infrastructure but uses simulated responses. Fix: add <code>EngineBackend</code> to fawxtui that spawns <code>fawx serve --json</code> as child process, speaks headless JSON protocol. <code>fawx tui</code> launches fawxtui instead of old inline TUI. Two modes: spawn (default, starts engine as child) and attach (<code>--connect</code>, joins running server). ~300 lines in fawxtui + ~50 in fx-cli.</div></div><div class="node-expand">›</div></div></div>
+      </div>
+
       <div class="tree-divider">⚡ Phase 2 — New Capabilities (parallel tracks)</div>
       <div class="tree">
         <div class="tree-item">
