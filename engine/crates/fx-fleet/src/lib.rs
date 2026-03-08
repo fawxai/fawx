@@ -1,3 +1,9 @@
+pub mod ssh;
+pub mod transport;
+
+pub use ssh::SshTransport;
+pub use transport::{CommandResult, NodeTransport, TransportError};
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -20,6 +26,12 @@ pub struct NodeInfo {
     pub last_heartbeat_ms: u64,
     /// When this node registered (unix ms).
     pub registered_at_ms: u64,
+    /// SSH address (IP or hostname) for SSH transport.
+    pub address: Option<String>,
+    /// SSH username for SSH transport.
+    pub ssh_user: Option<String>,
+    /// SSH key path override (uses transport default if `None`).
+    pub ssh_key: Option<String>,
 }
 
 /// What a node can do.
@@ -315,6 +327,9 @@ mod tests {
             status: NodeStatus::Online,
             last_heartbeat_ms: 1000,
             registered_at_ms: 1000,
+            address: None,
+            ssh_user: None,
+            ssh_key: None,
         }
     }
 
@@ -424,6 +439,9 @@ mod tests {
             status,
             last_heartbeat_ms: heartbeat,
             registered_at_ms: 1000,
+            address: None,
+            ssh_user: None,
+            ssh_key: None,
         }
     }
 

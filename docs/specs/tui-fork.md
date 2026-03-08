@@ -11,6 +11,8 @@
 
 Fork the Codex CLI TUI crate into the Fawx repo, replacing the `codex-core` backend with an HTTP client adapter that talks to `fawx serve --http` on `localhost:8400`. The result is a production-quality terminal UI powered by Fawx's engine.
 
+`fawx serve --http` always binds `127.0.0.1:8400` for local clients. When a Tailscale interface is available it also binds the Tailscale address on the same port, but localhost remains the guaranteed endpoint.
+
 ## Phase 1 — Basic Chat (MVP)
 
 Get the TUI compiling and running with basic chat functionality:
@@ -159,7 +161,7 @@ Response: { "status": "ok" }
 Response: { "model": "claude-opus-4-6", "memory_entries": 12, "tools": [...] }
 ```
 
-Note: The exact SSE format depends on what `fawx serve --http` actually sends. Read `engine/crates/fx-cli/src/headless_http.rs` to understand the actual wire format before building the adapter.
+Note: The exact HTTP wire format depends on what `fawx serve --http` actually sends. Read `engine/crates/fx-cli/src/http_serve.rs` to understand the current implementation before building the adapter.
 
 ---
 

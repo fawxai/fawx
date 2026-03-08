@@ -623,8 +623,7 @@ const MAX_CONTINUATION_ATTEMPTS: u32 = 3;
 const DEFAULT_LLM_ACTION_COST_CENTS: u64 = 2;
 const SAFE_FALLBACK_RESPONSE: &str = "I wasn't able to process that. Could you try rephrasing?";
 const DECOMPOSE_TOOL_NAME: &str = "decompose";
-const DECOMPOSE_TOOL_DESCRIPTION: &str =
-    "Break a complex task into 2-4 high-level sub-goals. Each sub-goal should be substantial enough to justify its own execution context. Do NOT create more than 5 sub-goals. Prefer fewer, broader goals over many narrow ones. Only use this for tasks that genuinely cannot be handled with direct tool calls.";
+const DECOMPOSE_TOOL_DESCRIPTION: &str = "Break a complex task into 2-4 high-level sub-goals. Each sub-goal should be substantial enough to justify its own execution context. Do NOT create more than 5 sub-goals. Prefer fewer, broader goals over many narrow ones. Only use this for tasks that genuinely cannot be handled with direct tool calls.";
 const MAX_SUB_GOALS: usize = 5;
 const DECOMPOSITION_DEPTH_LIMIT_RESPONSE: &str =
     "I can't decompose this request further because the recursion depth limit was reached.";
@@ -2207,6 +2206,35 @@ impl LoopEngine {
         }
     }
 
+    fn publish_tool_calls(&self, calls: &[ToolCall]) {
+        let Some(bus) = &self.event_bus else {
+            return;
+        };
+
+        for call in calls {
+            let _ = bus.publish(InternalMessage::ToolUse {
+                call_id: call.id.clone(),
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
+            });
+        }
+    }
+
+    fn publish_tool_results(&self, results: &[ToolResult]) {
+        let Some(bus) = &self.event_bus else {
+            return;
+        };
+
+        for result in results {
+            let _ = bus.publish(InternalMessage::ToolResult {
+                call_id: result.tool_call_id.clone(),
+                name: result.tool_name.clone(),
+                success: result.success,
+                content: result.output.clone(),
+            });
+        }
+    }
+
     fn emit_verification_signals(&mut self, verification: &Verification) {
         self.emit_signal(
             LoopStep::Verify,
@@ -2700,7 +2728,9 @@ impl LoopEngine {
         state: &mut ToolRoundState,
     ) -> Result<ToolRoundOutcome, LoopError> {
         let round_started = current_time_ms();
+        self.publish_tool_calls(&state.current_calls);
         let results = self.execute_tool_calls(&state.current_calls).await?;
+        self.publish_tool_results(&results);
         self.record_tool_execution_cost(results.len());
 
         let round_result_bytes: usize = results.iter().map(|r| r.output.len()).sum();
@@ -3523,14 +3553,16 @@ fn tool_synthesis_prompt(tool_results: &[ToolResult], instruction: &str) -> Stri
         .collect::<Vec<_>>()
         .join("\n");
 
-    format!("You are Fawx. Never introduce yourself, greet the user, or add preamble. Answer the user's question using these tool results. \
+    format!(
+        "You are Fawx. Never introduce yourself, greet the user, or add preamble. Answer the user's question using these tool results. \
 Do NOT describe what tools were called, narrate the process, or comment on how you got the information. \
 Just provide the answer directly. \
 If the user asked for a specific format or value type, preserve that exact format. \
 Do not convert timestamps to human-readable, counts to lists, or raw values to prose \
 unless the user explicitly asked for that.{error_relay_instruction}\n\n\
 {instruction}\n\n\
-Tool results:\n{tool_summary}")
+Tool results:\n{tool_summary}"
+    )
 }
 
 fn join_streamed_chunks(chunks: &Arc<Mutex<Vec<String>>>) -> Result<String, LoopError> {
@@ -9666,6 +9698,8 @@ mod context_compaction_tests {
     use tracing_subscriber::prelude::*;
     use tracing_subscriber::Registry;
 
+    static TRACE_SUBSCRIBER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn words(count: usize) -> String {
         std::iter::repeat_n("a", count)
             .collect::<Vec<_>>()
@@ -10519,6 +10553,7 @@ mod context_compaction_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn compaction_emits_observability_fields() {
+        let _trace_lock = TRACE_SUBSCRIBER_LOCK.lock().await;
         let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
         let engine = engine_with(
             ContextCompactor::new(2_048, 256),

@@ -1,12 +1,18 @@
 use crate::auth_store::{migrate_if_needed, AuthStore};
+use crate::prompts::{
+    open_browser, parse_auth_selection, prompt_api_key_provider, prompt_choice, prompt_line,
+    prompt_non_empty_line, prompt_non_empty_secret, with_normal_screen, AuthSelection,
+};
 use crate::ui;
 use async_trait::async_trait;
+#[cfg(test)]
+use crossterm::event;
 use crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEvent,
     KeyModifiers,
 };
 use crossterm::style::Stylize;
-use crossterm::{cursor, event, style, terminal, ExecutableCommand};
+use crossterm::{cursor, style, terminal, ExecutableCommand};
 use futures::StreamExt;
 use fx_analysis::{AnalysisEngine, AnalysisError, AnalysisFinding, Confidence};
 use fx_auth::auth::{AuthManager, AuthMethod};
@@ -25,6 +31,7 @@ use fx_core::runtime_info::{ConfigSummary, RuntimeInfo, SkillInfo};
 use fx_core::types::{InputSource, ScreenState, UserInput};
 use fx_core::EventBus;
 use fx_improve::{CyclePaths, ImprovementConfig, OutputMode};
+use fx_journal::JournalSkill;
 use fx_kernel::act::{TokenUsage, ToolExecutor};
 use fx_kernel::budget::{BudgetConfig, BudgetTracker};
 use fx_kernel::cancellation::CancellationToken;
@@ -46,7 +53,11 @@ use fx_memory::{JsonFileMemory, JsonMemoryConfig, SignalStore};
 use fx_scratchpad::skill::ScratchpadSkill;
 use fx_scratchpad::Scratchpad;
 use fx_skills::live_host_api::CredentialProvider;
-use fx_tools::{BuiltinToolsSkill, FawxToolExecutor, GitSkill, ImprovementToolsState, ToolConfig};
+use fx_subagent::SubagentControl;
+use fx_tools::{
+    BuiltinToolsSkill, FawxToolExecutor, GitSkill, ImprovementToolsState, SessionToolsSkill,
+    ToolConfig,
+};
 use ratatui::DefaultTerminal;
 use sha2::{Digest, Sha256};
 use std::collections::hash_map::DefaultHasher;
@@ -57,7 +68,6 @@ use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use std::sync::LazyLock;
 use std::sync::{Arc, Mutex, RwLock};
@@ -80,7 +90,6 @@ const BANNER_ART: &str = r#"   ___
 const FAWX_BANNER_ANSI: &str = include_str!("../../../../docs/fawx-hero-ansi.txt");
 
 const DEFAULT_OPENAI_TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
-const MAX_PROMPT_RETRIES: usize = 10;
 const DEFAULT_CONTEXT_MAX_TOKENS: usize = 8_000;
 const DEFAULT_CONTEXT_COMPACT_TARGET: usize = 6_000;
 const DEFAULT_SYNTHESIS_INSTRUCTION: &str =
@@ -2713,6 +2722,12 @@ impl TuiApp {
             (Some("github"), Some("set-token"), t) => {
                 self.handle_github_set_token(t).await?;
             }
+            (Some("telegram"), Some("set-token"), Some(t)) => {
+                self.handle_telegram_set_token(t)?;
+            }
+            (Some("telegram"), Some("set-token"), None) => {
+                self.tui_println("Usage: /auth telegram set-token <TOKEN>");
+            }
             (Some(p), Some("set-token"), Some(t)) => {
                 self.handle_provider_set_token(p, t).await?;
             }
@@ -2731,6 +2746,18 @@ impl TuiApp {
             (Some(p), Some("clear-token"), _) => {
                 self.handle_provider_clear_token(p).await?;
             }
+            (Some("http"), Some("set-bearer"), Some(t)) => {
+                self.handle_http_set_bearer(t)?;
+            }
+            (Some("http"), Some("set-bearer"), None) => {
+                self.tui_println("Usage: /auth http set-bearer <TOKEN>");
+            }
+            (Some("http"), Some("show"), _) => {
+                self.handle_http_show_bearer();
+            }
+            (Some("telegram"), Some("show"), _) => {
+                self.handle_telegram_show();
+            }
             (Some(p), _, _) => {
                 self.tui_println(format!("Unknown auth action for provider: {p}"));
                 self.show_provider_auth_help(p);
@@ -2747,11 +2774,23 @@ impl TuiApp {
         self.tui_println("  /auth <provider> set-token <TOKEN>    Save API key or token");
         self.tui_println("  /auth <provider> show-status          Check provider auth status");
         self.tui_println("  /auth <provider> clear-token          Remove stored credentials");
+        self.tui_println(
+            "  /auth http set-bearer <TOKEN>          Save HTTP bearer token (encrypted)",
+        );
+        self.tui_println("  /auth http show                       Check HTTP bearer token status");
+        self.tui_println(
+            "  /auth telegram set-token <TOKEN>       Save Telegram bot token (encrypted)",
+        );
+        self.tui_println(
+            "  /auth telegram show                    Check Telegram bot token status",
+        );
         self.tui_println(String::new());
         self.tui_println("Examples:");
         self.tui_println("  /auth anthropic set-token sk-ant-xxxxx");
         self.tui_println("  /auth openai set-token sk-xxxxx");
         self.tui_println("  /auth github set-token ghp_xxxxx");
+        self.tui_println("  /auth http set-bearer mytoken123");
+        self.tui_println("  /auth telegram set-token 123456:ABC-DEF...");
     }
 
     /// Print per-provider usage hint.
@@ -2919,6 +2958,112 @@ impl TuiApp {
             self.tui_println(format!("{provider}: not configured."));
         }
         Ok(())
+    }
+
+    /// `/auth http set-bearer <TOKEN>` — store HTTP bearer token in encrypted credential store.
+    fn handle_http_set_bearer(&mut self, token: &str) -> Result<(), TuiError> {
+        let token = token.trim();
+        if token.is_empty() {
+            self.tui_println("Usage: /auth http set-bearer <TOKEN>");
+            return Ok(());
+        }
+        self.auth_store
+            .store_provider_token("http_bearer", token)
+            .map_err(TuiError::Auth)?;
+        self.tui_println("✓ HTTP bearer token saved to encrypted credential store.");
+        Ok(())
+    }
+
+    /// `/auth http show` — show whether an HTTP bearer token is configured.
+    ///
+    /// Reports the effective source the HTTP server would use: credential store
+    /// (preferred) → config.toml fallback → not set.
+    fn handle_http_show_bearer(&mut self) {
+        let in_store = self
+            .auth_store
+            .get_provider_token("http_bearer")
+            .ok()
+            .flatten()
+            .filter(|t| !t.trim().is_empty())
+            .is_some();
+
+        let in_config = self
+            .config
+            .http
+            .bearer_token
+            .as_ref()
+            .filter(|t| !t.trim().is_empty())
+            .is_some();
+
+        if in_store {
+            self.tui_println("HTTP bearer token: set (credential store)");
+        } else if in_config {
+            self.tui_println(
+                "HTTP bearer token: set (config.toml fallback \
+                 — consider migrating to /auth http set-bearer)",
+            );
+        } else {
+            self.tui_println("HTTP bearer token: not set");
+            self.tui_println(
+                "  Use /auth http set-bearer <TOKEN> to store securely, or set \
+                 bearer_token in [http] config.",
+            );
+        }
+    }
+
+    /// `/auth telegram set-token <TOKEN>` — store Telegram bot token in encrypted credential store.
+    fn handle_telegram_set_token(&mut self, token: &str) -> Result<(), TuiError> {
+        let token = token.trim();
+        if token.is_empty() {
+            self.tui_println("Usage: /auth telegram set-token <TOKEN>");
+            return Ok(());
+        }
+        self.auth_store
+            .store_provider_token("telegram_bot_token", token)
+            .map_err(TuiError::Auth)?;
+        self.tui_println("✓ Telegram bot token saved to encrypted credential store.");
+        Ok(())
+    }
+
+    /// `/auth telegram show` — show whether a Telegram bot token is configured.
+    ///
+    /// Reports the effective source: credential store (preferred) →
+    /// env var → config.toml fallback → not set.
+    fn handle_telegram_show(&mut self) {
+        let in_store = self
+            .auth_store
+            .get_provider_token("telegram_bot_token")
+            .ok()
+            .flatten()
+            .filter(|t| !t.trim().is_empty())
+            .is_some();
+
+        let in_env = std::env::var("FAWX_TELEGRAM_TOKEN")
+            .ok()
+            .filter(|t| !t.trim().is_empty())
+            .is_some();
+
+        let in_config = self
+            .config
+            .telegram
+            .bot_token
+            .as_ref()
+            .filter(|t| !t.trim().is_empty())
+            .is_some();
+
+        if in_store {
+            self.tui_println("Bot token: set (credential store)");
+        } else if in_env {
+            self.tui_println("Bot token: set (FAWX_TELEGRAM_TOKEN env var)");
+        } else if in_config {
+            self.tui_println(
+                "Bot token: set (config.toml fallback \
+                 — consider migrating to /auth telegram set-token)",
+            );
+        } else {
+            self.tui_println("Bot token: not set");
+            self.tui_println("  Use /auth telegram set-token <TOKEN> to store securely.");
+        }
     }
 
     fn handle_keys_command(
@@ -3244,6 +3389,41 @@ pub struct LoopEngineBundle {
     pub signature_policy: SignaturePolicy,
 }
 
+#[derive(Clone, Default)]
+pub struct HeadlessLoopBuildOptions {
+    pub working_dir: Option<PathBuf>,
+    pub memory_enabled: bool,
+    pub subagent_control: Option<Arc<dyn SubagentControl>>,
+    pub cancel_token: Option<CancellationToken>,
+}
+
+impl HeadlessLoopBuildOptions {
+    pub fn parent(subagent_control: Arc<dyn SubagentControl>) -> Self {
+        Self {
+            working_dir: None,
+            memory_enabled: true,
+            subagent_control: Some(subagent_control),
+            cancel_token: None,
+        }
+    }
+
+    pub fn subagent(working_dir: Option<PathBuf>, cancel_token: CancellationToken) -> Self {
+        Self {
+            working_dir,
+            memory_enabled: false,
+            subagent_control: None,
+            cancel_token: Some(cancel_token),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SkillRegistryBuildOptions {
+    working_dir: PathBuf,
+    memory_enabled: bool,
+    subagent_control: Option<Arc<dyn SubagentControl>>,
+}
+
 impl LoopEngineBundle {
     pub fn into_tui_deps(
         self,
@@ -3276,7 +3456,25 @@ pub fn build_loop_engine_from_config(
 ) -> Result<LoopEngineBundle, TuiError> {
     let base_data_dir = fawx_data_dir();
     let data_dir = configured_data_dir(&base_data_dir, config);
-    build_loop_engine_with_config(data_dir, config.clone(), improvement_provider)
+    build_loop_engine_with_options(
+        data_dir,
+        config.clone(),
+        improvement_provider,
+        HeadlessLoopBuildOptions {
+            memory_enabled: true,
+            ..HeadlessLoopBuildOptions::default()
+        },
+    )
+}
+
+pub fn build_headless_loop_engine_bundle(
+    config: &FawxConfig,
+    improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
+    options: HeadlessLoopBuildOptions,
+) -> Result<LoopEngineBundle, TuiError> {
+    let base_data_dir = fawx_data_dir();
+    let data_dir = configured_data_dir(&base_data_dir, config);
+    build_loop_engine_with_options(data_dir, config.clone(), improvement_provider, options)
 }
 
 /// Convert a [`ThinkingBudget`] to the wire-level [`ThinkingConfig`].
@@ -3292,21 +3490,18 @@ fn thinking_config_from_budget(budget: &ThinkingBudget) -> Option<ThinkingConfig
 /// Capacity of the streaming event bus broadcast channel.
 const EVENT_BUS_CAPACITY: usize = 256;
 
-fn build_loop_engine_with_config(
+fn build_loop_engine_with_options(
     data_dir: PathBuf,
     config: FawxConfig,
     improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
+    options: HeadlessLoopBuildOptions,
 ) -> Result<LoopEngineBundle, TuiError> {
     let event_bus = EventBus::new(EVENT_BUS_CAPACITY);
     let budget = BudgetTracker::new(BudgetConfig::default(), current_time_ms(), 0);
     let context = ContextCompactor::new(DEFAULT_CONTEXT_MAX_TOKENS, DEFAULT_CONTEXT_COMPACT_TARGET);
-    let working_dir = configured_working_dir(&config);
-    let skills = build_skill_registry(
-        working_dir.clone(),
-        &data_dir,
-        &config,
-        improvement_provider,
-    );
+    let registry_options = build_skill_registry_options(&config, &options);
+    let working_dir = registry_options.working_dir.clone();
+    let skills = build_skill_registry(&data_dir, &config, improvement_provider, registry_options);
     let synthesis = config
         .model
         .synthesis_instruction
@@ -3337,6 +3532,9 @@ fn build_loop_engine_with_config(
         .event_bus(event_bus.clone())
         .iteration_counter(Arc::clone(&skills.iteration_counter))
         .scratchpad_provider(bridge);
+    if let Some(cancel_token) = options.cancel_token {
+        builder = builder.cancel_token(cancel_token);
+    }
     if let Some(snapshot_text) = skills.memory_snapshot {
         builder = builder.memory_context(snapshot_text);
     }
@@ -3358,6 +3556,20 @@ fn build_loop_engine_with_config(
         credential_store: skills.credential_store,
         signature_policy: skills.signature_policy,
     })
+}
+
+fn build_skill_registry_options(
+    config: &FawxConfig,
+    options: &HeadlessLoopBuildOptions,
+) -> SkillRegistryBuildOptions {
+    SkillRegistryBuildOptions {
+        working_dir: options
+            .working_dir
+            .clone()
+            .unwrap_or_else(|| configured_working_dir(config)),
+        memory_enabled: options.memory_enabled,
+        subagent_control: options.subagent_control.clone(),
+    }
 }
 
 fn build_loop_engine_from_builder(builder: LoopEngineBuilder) -> Result<LoopEngine, TuiError> {
@@ -3476,19 +3688,19 @@ struct SkillRegistryBundle {
 }
 
 fn build_skill_registry(
-    working_dir: PathBuf,
     data_dir: &Path,
     config: &FawxConfig,
     improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
+    options: SkillRegistryBuildOptions,
 ) -> SkillRegistryBundle {
     let tool_config = ToolConfig {
         max_read_size: config.tools.max_read_size,
         search_exclude: config.tools.search_exclude.clone(),
         ..ToolConfig::default()
     };
-    let executor = FawxToolExecutor::new(working_dir.clone(), tool_config);
+    let executor = FawxToolExecutor::new(options.working_dir.clone(), tool_config);
     let (mut executor, memory, snapshot_text, memory_enabled) =
-        attach_memory(executor, data_dir, config);
+        attach_memory_if_enabled(executor, data_dir, config, options.memory_enabled);
 
     let self_modify_config = crate::config_bridge::to_core_self_modify(&config.self_modify);
     let sm = self_modify_config.enabled.then_some(self_modify_config);
@@ -3498,6 +3710,9 @@ fn build_skill_registry(
 
     let runtime_info = new_runtime_info(config, memory_enabled);
     executor = executor.with_runtime_info(Arc::clone(&runtime_info));
+    if let Some(control) = options.subagent_control {
+        executor = executor.with_subagent_control(control);
+    }
 
     // Wire improvement tools when enabled and a provider is available.
     if config.improvement.enabled {
@@ -3515,15 +3730,47 @@ fn build_skill_registry(
 
     let registry = Arc::new(SkillRegistry::new());
     registry.register(Arc::new(BuiltinToolsSkill::new(executor)));
-    let git_skill = GitSkill::new(working_dir.clone(), sm.clone());
+    let git_skill = GitSkill::new(options.working_dir.clone(), sm.clone());
     registry.register(Arc::new(git_skill));
-    let tx_skill = TransactionSkill::new(working_dir.clone(), sm);
+    let tx_skill = TransactionSkill::new(options.working_dir.clone(), sm);
     registry.register(Arc::new(tx_skill));
     let scratchpad = Arc::new(Mutex::new(Scratchpad::new()));
     let iteration_counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let scratchpad_skill =
         ScratchpadSkill::new(Arc::clone(&scratchpad), Arc::clone(&iteration_counter));
     registry.register(Arc::new(scratchpad_skill));
+
+    // Register session management tools.
+    let session_db_path = data_dir.join("sessions.redb");
+    match fx_storage::Storage::open(&session_db_path) {
+        Ok(storage) => {
+            let store = fx_session::SessionStore::new(storage);
+            match fx_session::SessionRegistry::new(store) {
+                Ok(session_registry) => {
+                    let session_skill = SessionToolsSkill::new(session_registry);
+                    registry.register(Arc::new(session_skill));
+                }
+                Err(e) => {
+                    tracing::warn!("session registry unavailable: {e}");
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("session storage unavailable: {e}");
+        }
+    }
+
+    // Load reflective journal for cross-session learning.
+    let journal_path = data_dir.join("journal.jsonl");
+    match fx_journal::Journal::load(journal_path) {
+        Ok(journal) => {
+            let journal_skill = JournalSkill::new(Arc::new(Mutex::new(journal)));
+            registry.register(Arc::new(journal_skill));
+        }
+        Err(e) => {
+            tracing::warn!("journal unavailable: {e}");
+        }
+    }
 
     // Open the credential store once and share via Arc between TuiApp and WASM bridge.
     let credential_store: Option<Arc<fx_auth::credential_store::EncryptedFileCredentialStore>> =
@@ -3596,16 +3843,20 @@ fn wire_improvement_tools(
     ))
 }
 
-fn attach_memory(
+fn attach_memory_if_enabled(
     mut executor: FawxToolExecutor,
     data_dir: &Path,
     config: &FawxConfig,
+    enabled: bool,
 ) -> (
     FawxToolExecutor,
     Option<SharedMemoryStore>,
     Option<String>,
     bool,
 ) {
+    if !enabled {
+        return (executor, None, None, false);
+    }
     let memory_config = JsonMemoryConfig {
         max_entries: config.memory.max_entries,
         max_value_size: config.memory.max_value_size,
@@ -5332,118 +5583,6 @@ fn to_strings(values: &[&str]) -> Vec<String> {
 /// `eprint!`/`stdin` I/O renders correctly, then re-enters the alternate
 /// screen afterward.  Both transitions are best-effort: if the terminal
 /// does not support them the prompt still works (graceful degradation).
-fn with_normal_screen<T>(f: impl FnOnce() -> Result<T, TuiError>) -> Result<T, TuiError> {
-    let _ = crossterm::execute!(io::stdout(), terminal::LeaveAlternateScreen);
-    let result = f();
-    let _ = crossterm::execute!(io::stdout(), terminal::EnterAlternateScreen);
-    result
-}
-
-fn prompt_line(prompt: &str) -> Result<String, TuiError> {
-    ensure_cooked_mode();
-
-    eprint!("{prompt}");
-    io::stdout().flush().map_err(TuiError::Io)?;
-
-    let mut input = String::new();
-    let bytes = io::stdin().read_line(&mut input).map_err(TuiError::Io)?;
-    if bytes == 0 {
-        return Err(TuiError::Auth("stdin closed unexpectedly".to_string()));
-    }
-
-    Ok(input.trim().to_string())
-}
-
-fn ensure_cooked_mode() {
-    ensure_cooked_mode_with(
-        || {
-            terminal::disable_raw_mode().ok();
-        },
-        drain_stdin,
-    );
-}
-
-fn ensure_cooked_mode_with<DisableRawMode, DrainStdin>(
-    mut disable_raw_mode: DisableRawMode,
-    mut drain_stdin: DrainStdin,
-) where
-    DisableRawMode: FnMut(),
-    DrainStdin: FnMut(),
-{
-    // Ensure cooked mode so stdin.read_line() handles Enter correctly even after raw-mode input paths.
-    disable_raw_mode();
-    drain_stdin();
-}
-
-/// Flush pending bytes from the terminal input queue.
-///
-/// After disabling raw mode the kernel tty buffer may still hold
-/// stale CR/LF bytes from the previous raw-mode session. Flushing
-/// prevents those bytes from being echoed as `^M` when cooked mode
-/// re-enables terminal echo.
-fn drain_stdin() {
-    #[cfg(unix)]
-    {
-        drain_stdin_with(drain_stdin_input_queue, log_drain_stdin_error);
-    }
-}
-
-#[cfg(unix)]
-fn drain_stdin_with<Drain, Log>(mut drain: Drain, mut log_error: Log)
-where
-    Drain: FnMut() -> io::Result<()>,
-    Log: FnMut(&io::Error),
-{
-    if let Err(error) = drain() {
-        log_error(&error);
-    }
-}
-
-#[cfg(unix)]
-fn drain_stdin_input_queue() -> io::Result<()> {
-    flush_stdin_input_queue_with(|fd, queue_selector| {
-        // SAFETY: tcflush is a standard POSIX call that discards
-        // data received but not yet read.
-        unsafe { libc::tcflush(fd, queue_selector) }
-    })
-}
-
-#[cfg(unix)]
-fn log_drain_stdin_error(error: &io::Error) {
-    if is_benign_stdin_flush_error(error) {
-        tracing::debug!(
-            errno = ?error.raw_os_error(),
-            error = %error,
-            "skipping stdin input queue flush because stdin is not a tty"
-        );
-        return;
-    }
-
-    tracing::warn!(
-        errno = ?error.raw_os_error(),
-        error = %error,
-        "failed to flush stdin input queue"
-    );
-}
-
-#[cfg(unix)]
-fn is_benign_stdin_flush_error(error: &io::Error) -> bool {
-    error.raw_os_error() == Some(libc::ENOTTY)
-}
-
-#[cfg(unix)]
-fn flush_stdin_input_queue_with<F>(mut flush: F) -> io::Result<()>
-where
-    F: FnMut(i32, i32) -> i32,
-{
-    let status = flush(libc::STDIN_FILENO, libc::TCIFLUSH);
-    if status == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
 fn confirm_provider_removal(provider: &str) -> Result<bool, TuiError> {
     with_normal_screen(|| {
         let prompt = format!("Remove {provider}? [y/N]: ");
@@ -5474,244 +5613,19 @@ fn finalize_auth_wizard_result_with_writer(
     result
 }
 
-fn retry_limit_error(context: &str) -> TuiError {
-    TuiError::Auth(format!("maximum input retries exceeded for {context}"))
-}
-
-fn prompt_choice<T, F>(
-    prompt: &str,
-    invalid_message: &str,
-    context: &str,
-    parser: F,
-) -> Result<T, TuiError>
-where
-    F: Fn(&str) -> Option<T>,
-{
-    with_normal_screen(|| prompt_choice_inner(prompt, invalid_message, context, parser))
-}
-
-fn prompt_choice_inner<T, F>(
-    prompt: &str,
-    invalid_message: &str,
-    context: &str,
-    parser: F,
-) -> Result<T, TuiError>
-where
-    F: Fn(&str) -> Option<T>,
-{
-    for _ in 0..MAX_PROMPT_RETRIES {
-        let value = prompt_line(prompt)?;
-        if let Some(parsed) = parser(&value) {
-            return Ok(parsed);
-        }
-
-        eprint!("{invalid_message}");
-    }
-
-    Err(retry_limit_error(context))
-}
-
-fn prompt_non_empty_line(
-    prompt: &str,
-    empty_message: &str,
-    context: &str,
-) -> Result<String, TuiError> {
-    with_normal_screen(|| prompt_non_empty_line_inner(prompt, empty_message, context))
-}
-
-fn prompt_non_empty_line_inner(
-    prompt: &str,
-    empty_message: &str,
-    context: &str,
-) -> Result<String, TuiError> {
-    for _ in 0..MAX_PROMPT_RETRIES {
-        let value = prompt_line(prompt)?;
-        if !value.is_empty() {
-            return Ok(value);
-        }
-
-        eprint!("{empty_message}");
-    }
-
-    Err(retry_limit_error(context))
-}
-
-fn prompt_api_key_provider() -> Result<String, TuiError> {
-    with_normal_screen(|| {
-        eprintln!("Which provider?");
-        eprintln!("  [1] Anthropic");
-        eprintln!("  [2] OpenAI");
-        eprintln!("  [3] OpenRouter");
-        eprintln!("  [4] Other (OpenAI-compatible)");
-        eprintln!();
-
-        let choice = prompt_choice_inner(
-            "> ",
-            "Please choose 1, 2, 3, or 4.",
-            "API key provider selection",
-            parse_api_key_provider_selection,
-        )?;
-
-        match choice {
-            ApiKeyProvider::Anthropic => Ok("anthropic".to_string()),
-            ApiKeyProvider::OpenAi => Ok("openai".to_string()),
-            ApiKeyProvider::OpenRouter => Ok("openrouter".to_string()),
-            ApiKeyProvider::Other => prompt_non_empty_line_inner(
-                "Provider name: ",
-                "Provider name cannot be empty.",
-                "API key provider name",
-            ),
-        }
-    })
-}
-
-fn prompt_non_empty_secret(
-    prompt: &str,
-    empty_message: &str,
-    context: &str,
-) -> Result<String, TuiError> {
-    with_normal_screen(|| {
-        for _ in 0..MAX_PROMPT_RETRIES {
-            let value = prompt_secret(prompt)?;
-            if !value.is_empty() {
-                return Ok(value);
-            }
-
-            eprint!("{empty_message}");
-        }
-
-        Err(retry_limit_error(context))
-    })
-}
-
-fn prompt_secret(prompt: &str) -> Result<String, TuiError> {
-    eprint!("{prompt}");
-    io::stdout().flush().map_err(TuiError::Io)?;
-
-    let _guard = RawModeGuard::new()?;
-    let mut value = String::new();
-    read_secret_input(&mut value)?;
-
-    let trimmed = value.trim().to_string();
-    if trimmed.is_empty() {
-        eprintln!();
-    } else {
-        eprint!(" ({} chars)", trimmed.len());
-    }
-
-    Ok(trimmed)
-}
-
-fn read_secret_input(value: &mut String) -> Result<(), TuiError> {
-    let mut display_len: usize = 0;
-
-    loop {
-        let event = event::read().map_err(TuiError::Io)?;
-        if let event::Event::Key(key_event) = event {
-            match classify_secret_input_key(&key_event) {
-                SecretInputKeyAction::Submit => return Ok(()),
-                SecretInputKeyAction::Cancel => return Err(TuiError::Cancelled),
-                SecretInputKeyAction::Ignore => {}
-                SecretInputKeyAction::Type(ch) => {
-                    value.push(ch);
-                    display_len += 1;
-                    eprint!("•");
-                    io::stdout().flush().map_err(TuiError::Io)?;
-                }
-                SecretInputKeyAction::Delete => {
-                    if value.pop().is_some() && display_len > 0 {
-                        display_len -= 1;
-                        eprint!("\x08 \x08");
-                        io::stdout().flush().map_err(TuiError::Io)?;
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SecretInputKeyAction {
-    Submit,
-    Cancel,
-    Type(char),
-    Delete,
-    Ignore,
-}
-
-fn classify_secret_input_key(key_event: &event::KeyEvent) -> SecretInputKeyAction {
-    if is_ctrl_c(key_event) {
-        return SecretInputKeyAction::Cancel;
-    }
-
-    match key_event.code {
-        event::KeyCode::Enter => SecretInputKeyAction::Submit,
-        event::KeyCode::Esc => SecretInputKeyAction::Cancel,
-        event::KeyCode::Char(ch) => SecretInputKeyAction::Type(ch),
-        event::KeyCode::Backspace => SecretInputKeyAction::Delete,
-        _ => SecretInputKeyAction::Ignore,
-    }
-}
-
-fn open_browser(url: &str) -> io::Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        let status = Command::new("open").arg(url).status()?;
-        if status.success() {
-            return Ok(());
-        }
-        Err(io::Error::other("open command failed"))
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let status = Command::new("cmd").args(["/C", "start", url]).status()?;
-        if status.success() {
-            return Ok(());
-        }
-        return Err(io::Error::other("start command failed"));
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        let status = Command::new("xdg-open").arg(url).status()?;
-        if status.success() {
-            return Ok(());
-        }
-        Err(io::Error::other("xdg-open command failed"))
-    }
-}
-
 fn current_time_ms() -> u64 {
-    SystemTime::now()
+    let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+        .unwrap_or_default();
+    duration_millis_u64(elapsed)
+}
+
+fn duration_millis_u64(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn is_cancelled_error(result: &Result<(), TuiError>) -> bool {
     matches!(result, Err(TuiError::Cancelled))
-}
-
-fn is_ctrl_c(key_event: &event::KeyEvent) -> bool {
-    key_event.code == event::KeyCode::Char('c')
-        && key_event.modifiers.contains(event::KeyModifiers::CONTROL)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AuthSelection {
-    ClaudeSubscription,
-    ChatGptSubscription,
-    ApiKey,
-}
-
-fn parse_auth_selection(value: &str) -> Option<AuthSelection> {
-    match value.trim() {
-        "1" => Some(AuthSelection::ClaudeSubscription),
-        "2" => Some(AuthSelection::ChatGptSubscription),
-        "3" => Some(AuthSelection::ApiKey),
-        _ => None,
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5748,24 +5662,6 @@ fn parse_provider_selection(value: &str, provider_count: usize) -> Option<usize>
         .ok()
         .filter(|selected| (1..=provider_count).contains(selected))
         .map(|selected| selected - 1)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ApiKeyProvider {
-    Anthropic,
-    OpenAi,
-    OpenRouter,
-    Other,
-}
-
-fn parse_api_key_provider_selection(value: &str) -> Option<ApiKeyProvider> {
-    match value.trim() {
-        "1" => Some(ApiKeyProvider::Anthropic),
-        "2" => Some(ApiKeyProvider::OpenAi),
-        "3" => Some(ApiKeyProvider::OpenRouter),
-        "4" => Some(ApiKeyProvider::Other),
-        _ => None,
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6139,8 +6035,9 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use fx_core::memory::{MemoryProvider, MemoryTouchProvider};
-    use fx_kernel::act::ToolExecutorError;
+    use fx_kernel::act::{ToolExecutor, ToolExecutorError};
     use fx_llm::ContentBlock;
+    use fx_subagent::test_support::StubSubagentControl;
     use std::collections::BTreeMap;
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -6208,6 +6105,47 @@ mod tests {
 
     fn sample_wasm_bytes() -> Vec<u8> {
         vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]
+    }
+
+    #[test]
+    fn headless_bundle_includes_subagent_tools_when_control_attached() {
+        let (config, _temp_dir) = test_config_with_temp_dir();
+        let control = Arc::new(StubSubagentControl::new());
+        let bundle = build_headless_loop_engine_bundle(
+            &config,
+            None,
+            HeadlessLoopBuildOptions::parent(control),
+        )
+        .expect("bundle should build");
+        let names = bundle
+            .skill_registry
+            .tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"spawn_agent".to_string()));
+        assert!(names.contains(&"subagent_status".to_string()));
+    }
+
+    #[test]
+    fn headless_subagent_bundle_excludes_subagent_tools() {
+        let (config, _temp_dir) = test_config_with_temp_dir();
+        let bundle = build_headless_loop_engine_bundle(
+            &config,
+            None,
+            HeadlessLoopBuildOptions::subagent(None, CancellationToken::new()),
+        )
+        .expect("bundle should build");
+        let names = bundle
+            .skill_registry
+            .tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+
+        assert!(!names.contains(&"spawn_agent".to_string()));
+        assert!(!names.contains(&"subagent_status".to_string()));
     }
 
     fn write_test_skill(base_dir: &Path, skill_name: &str, wasm_bytes: &[u8]) {
@@ -7306,7 +7244,7 @@ mod tests {
             return;
         }
 
-        super::ensure_cooked_mode();
+        crate::prompts::ensure_cooked_mode();
 
         assert!(!terminal::is_raw_mode_enabled().unwrap_or(false));
     }
@@ -7343,12 +7281,12 @@ mod tests {
         let ctrl_c = event::KeyEvent::new(event::KeyCode::Char('c'), event::KeyModifiers::CONTROL);
 
         assert_eq!(
-            super::classify_secret_input_key(&esc),
-            super::SecretInputKeyAction::Cancel
+            crate::prompts::classify_secret_input_key(&esc),
+            crate::prompts::SecretInputKeyAction::Cancel
         );
         assert_eq!(
-            super::classify_secret_input_key(&ctrl_c),
-            super::SecretInputKeyAction::Cancel
+            crate::prompts::classify_secret_input_key(&ctrl_c),
+            crate::prompts::SecretInputKeyAction::Cancel
         );
     }
 
@@ -7357,49 +7295,49 @@ mod tests {
         // Submit on Enter
         let enter = event::KeyEvent::new(event::KeyCode::Enter, event::KeyModifiers::NONE);
         assert_eq!(
-            super::classify_secret_input_key(&enter),
-            super::SecretInputKeyAction::Submit
+            crate::prompts::classify_secret_input_key(&enter),
+            crate::prompts::SecretInputKeyAction::Submit
         );
 
         // Type on printable characters
         let char_a = event::KeyEvent::new(event::KeyCode::Char('a'), event::KeyModifiers::NONE);
         assert_eq!(
-            super::classify_secret_input_key(&char_a),
-            super::SecretInputKeyAction::Type('a')
+            crate::prompts::classify_secret_input_key(&char_a),
+            crate::prompts::SecretInputKeyAction::Type('a')
         );
         let char_z = event::KeyEvent::new(event::KeyCode::Char('Z'), event::KeyModifiers::SHIFT);
         assert_eq!(
-            super::classify_secret_input_key(&char_z),
-            super::SecretInputKeyAction::Type('Z')
+            crate::prompts::classify_secret_input_key(&char_z),
+            crate::prompts::SecretInputKeyAction::Type('Z')
         );
         let digit = event::KeyEvent::new(event::KeyCode::Char('9'), event::KeyModifiers::NONE);
         assert_eq!(
-            super::classify_secret_input_key(&digit),
-            super::SecretInputKeyAction::Type('9')
+            crate::prompts::classify_secret_input_key(&digit),
+            crate::prompts::SecretInputKeyAction::Type('9')
         );
 
         // Delete on Backspace
         let backspace = event::KeyEvent::new(event::KeyCode::Backspace, event::KeyModifiers::NONE);
         assert_eq!(
-            super::classify_secret_input_key(&backspace),
-            super::SecretInputKeyAction::Delete
+            crate::prompts::classify_secret_input_key(&backspace),
+            crate::prompts::SecretInputKeyAction::Delete
         );
 
         // Ignore on unhandled keys (arrows, function keys, etc.)
         let left = event::KeyEvent::new(event::KeyCode::Left, event::KeyModifiers::NONE);
         assert_eq!(
-            super::classify_secret_input_key(&left),
-            super::SecretInputKeyAction::Ignore
+            crate::prompts::classify_secret_input_key(&left),
+            crate::prompts::SecretInputKeyAction::Ignore
         );
         let f1 = event::KeyEvent::new(event::KeyCode::F(1), event::KeyModifiers::NONE);
         assert_eq!(
-            super::classify_secret_input_key(&f1),
-            super::SecretInputKeyAction::Ignore
+            crate::prompts::classify_secret_input_key(&f1),
+            crate::prompts::SecretInputKeyAction::Ignore
         );
         let tab = event::KeyEvent::new(event::KeyCode::Tab, event::KeyModifiers::NONE);
         assert_eq!(
-            super::classify_secret_input_key(&tab),
-            super::SecretInputKeyAction::Ignore
+            crate::prompts::classify_secret_input_key(&tab),
+            crate::prompts::SecretInputKeyAction::Ignore
         );
     }
 
@@ -9107,7 +9045,7 @@ mod tests {
     fn ensure_cooked_mode_disables_raw_mode_before_draining_stdin() {
         let calls = std::cell::RefCell::new(Vec::new());
 
-        super::ensure_cooked_mode_with(
+        crate::prompts::ensure_cooked_mode_with(
             || calls.borrow_mut().push("disable_raw_mode"),
             || calls.borrow_mut().push("drain_stdin"),
         );
@@ -9121,7 +9059,7 @@ mod tests {
         let captured_fd = std::cell::Cell::new(-1);
         let captured_selector = std::cell::Cell::new(-1);
 
-        let result = super::flush_stdin_input_queue_with(|fd, queue_selector| {
+        let result = crate::prompts::flush_stdin_input_queue_with(|fd, queue_selector| {
             captured_fd.set(fd);
             captured_selector.set(queue_selector);
             0
@@ -9137,7 +9075,7 @@ mod tests {
     fn drain_stdin_reports_flush_errors() {
         let captured_errno = std::cell::Cell::new(None);
 
-        super::drain_stdin_with(
+        crate::prompts::drain_stdin_with(
             || Err(io::Error::from_raw_os_error(libc::EIO)),
             |error| captured_errno.set(error.raw_os_error()),
         );
@@ -9150,7 +9088,7 @@ mod tests {
     fn drain_stdin_does_not_report_successful_flush() {
         let report_count = std::cell::Cell::new(0);
 
-        super::drain_stdin_with(|| Ok(()), |_| report_count.set(report_count.get() + 1));
+        crate::prompts::drain_stdin_with(|| Ok(()), |_| report_count.set(report_count.get() + 1));
 
         assert_eq!(report_count.get(), 0);
     }
@@ -9160,7 +9098,7 @@ mod tests {
     fn stdin_flush_enotty_errors_are_benign() {
         let error = io::Error::from_raw_os_error(libc::ENOTTY);
 
-        assert!(super::is_benign_stdin_flush_error(&error));
+        assert!(crate::prompts::is_benign_stdin_flush_error(&error));
     }
 
     #[cfg(unix)]
@@ -9168,7 +9106,7 @@ mod tests {
     fn stdin_flush_non_enotty_errors_are_not_benign() {
         let error = io::Error::from_raw_os_error(libc::EIO);
 
-        assert!(!super::is_benign_stdin_flush_error(&error));
+        assert!(!crate::prompts::is_benign_stdin_flush_error(&error));
     }
 
     // ── Restored functional tests (review #1147) ────────────────
@@ -10108,6 +10046,14 @@ mod tests {
         let lines = format_github_token_result(&token, &info);
         assert_eq!(lines.len(), 2);
         assert!(lines[1].contains("Missing recommended scopes"));
+    }
+
+    #[test]
+    fn duration_millis_u64_clamps_on_overflow() {
+        assert_eq!(
+            duration_millis_u64(std::time::Duration::from_secs(u64::MAX)),
+            u64::MAX
+        );
     }
 
     #[test]

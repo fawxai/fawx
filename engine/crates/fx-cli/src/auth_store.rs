@@ -5,9 +5,9 @@
 //! so credentials are unreadable if the database file is copied elsewhere.
 
 use fx_auth::auth::AuthManager;
-use fx_storage::{derive_key, CredentialStore, EncryptedStore, Storage};
+use fx_storage::{derive_key, CredentialStore, EncryptedStore, EncryptionKey, Storage};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
 /// Key name used to store the serialized `AuthManager` in the credential store.
@@ -27,29 +27,80 @@ const APP_PEPPER: &[u8] = b"fawx-auth-store-v1";
 const PROVIDER_TOKEN_SUFFIX: &str = "_token";
 
 /// Encrypted auth credential store backed by `fx-storage`.
+///
+/// Uses an **open-per-operation** pattern: the database path and encryption
+/// key are stored, and a fresh `CredentialStore` connection is opened for
+/// each read/write operation. This avoids holding a `redb` exclusive file
+/// lock for the process lifetime, which previously blocked concurrent
+/// access from the HTTP server and model router.
 pub struct AuthStore {
-    credential_store: CredentialStore,
+    db_path: PathBuf,
+    key: EncryptionKey,
+    /// Holds the temp directory for test instances so it is cleaned up on drop.
+    #[cfg(test)]
+    _temp_dir: Option<tempfile::TempDir>,
+}
+
+pub struct RecoveredAuthStore {
+    pub store: AuthStore,
+    pub recreated: bool,
 }
 
 impl AuthStore {
     /// Open (or create) the encrypted auth store in `data_dir`.
     ///
     /// Creates `auth.db` and `.auth-salt` inside `data_dir` on first run.
+    /// The database is opened briefly to verify accessibility, then closed
+    /// immediately — no long-lived file lock is held.
     pub fn open(data_dir: &Path) -> Result<Self, String> {
         let key = get_or_create_auth_key(data_dir)?;
         let db_path = data_dir.join("auth.db");
-        let storage =
+
+        // Verify the DB can be opened (creates if needed), then close.
+        let _verify =
             Storage::open(&db_path).map_err(|e| format!("failed to open auth database: {e}"))?;
-        let encrypted = EncryptedStore::new(storage, key);
+
         Ok(Self {
-            credential_store: CredentialStore::new(encrypted),
+            db_path,
+            key,
+            #[cfg(test)]
+            _temp_dir: None,
         })
+    }
+
+    /// Open a temporary on-disk auth store for testing.
+    ///
+    /// Creates a `tempfile::TempDir` that is automatically cleaned up when
+    /// the returned `AuthStore` is dropped, so test temp files don't leak.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn open_for_testing() -> Result<Self, String> {
+        let temp_dir =
+            tempfile::TempDir::new().map_err(|e| format!("failed to create temp dir: {e}"))?;
+        let db_path = temp_dir.path().join("auth-test.db");
+        let key = EncryptionKey::from_bytes(&[42u8; 32]);
+        // Create the DB file so subsequent open_store calls succeed.
+        let _verify = Storage::open(&db_path).map_err(|e| format!("test storage: {e}"))?;
+        Ok(Self {
+            db_path,
+            key,
+            _temp_dir: Some(temp_dir),
+        })
+    }
+
+    /// Open a short-lived connection for a single operation.
+    fn open_store(&self) -> Result<CredentialStore, String> {
+        let storage = Storage::open(&self.db_path)
+            .map_err(|e| format!("failed to open auth database: {e}"))?;
+        let encrypted = EncryptedStore::new(storage, self.key.clone());
+        Ok(CredentialStore::new(encrypted))
     }
 
     /// Persist an `AuthManager` into the encrypted store.
     pub fn save_auth_manager(&self, auth: &AuthManager) -> Result<(), String> {
+        let store = self.open_store()?;
         let json = auth.to_json().map_err(|e| e.to_string())?;
-        self.credential_store
+        store
             .store_credential(AUTH_MANAGER_KEY, &json)
             .map_err(|e| format!("failed to store credentials: {e}"))
     }
@@ -58,33 +109,22 @@ impl AuthStore {
     ///
     /// Returns an empty `AuthManager` when no data has been stored yet.
     pub fn load_auth_manager(&self) -> Result<AuthManager, String> {
-        match self.credential_store.get_credential(AUTH_MANAGER_KEY) {
+        let store = self.open_store()?;
+        match store.get_credential(AUTH_MANAGER_KEY) {
             Ok(Some(json)) => {
                 AuthManager::from_json(&json).map_err(|e| format!("corrupted credential data: {e}"))
             }
             Ok(None) => Ok(AuthManager::new()),
-            Err(e) => {
-                let msg = e.to_string();
-                // NB3: When decryption fails, it is likely a key mismatch
-                // caused by hostname/username change. Provide an actionable hint.
-                if msg.contains("decrypt") || msg.contains("ncrypt") {
-                    Err(
-                        "credentials encrypted with a different machine identity \u{2014} \
-                         delete ~/.fawx/auth.db and ~/.fawx/.auth-salt to re-authenticate"
-                            .to_string(),
-                    )
-                } else {
-                    Err(format!("failed to read credentials: {e}"))
-                }
-            }
+            Err(e) => decode_credential_error(e),
         }
     }
 
     /// Store a provider token under the `<provider>_token` key.
     #[allow(dead_code)] // Used by feat/auth-tui-wiring PR #1166
     pub fn store_provider_token(&self, provider: &str, token: &str) -> Result<(), String> {
+        let store = self.open_store()?;
         let key = provider_token_key(provider);
-        self.credential_store
+        store
             .store_credential(&key, token)
             .map_err(|e| format!("failed to store provider token: {e}"))
     }
@@ -96,8 +136,9 @@ impl AuthStore {
     /// memory.
     #[allow(dead_code)] // Used by feat/auth-tui-wiring PR #1166
     pub fn get_provider_token(&self, provider: &str) -> Result<Option<Zeroizing<String>>, String> {
+        let store = self.open_store()?;
         let key = provider_token_key(provider);
-        self.credential_store
+        store
             .get_credential(&key)
             .map(|opt| opt.map(Zeroizing::new))
             .map_err(|e| format!("failed to read provider token: {e}"))
@@ -106,8 +147,9 @@ impl AuthStore {
     /// Delete a provider token. Returns true when a token existed.
     #[allow(dead_code)] // Used by feat/auth-tui-wiring PR #1166
     pub fn clear_provider_token(&self, provider: &str) -> Result<bool, String> {
+        let store = self.open_store()?;
         let key = provider_token_key(provider);
-        self.credential_store
+        store
             .delete_credential(&key)
             .map_err(|e| format!("failed to clear provider token: {e}"))
     }
@@ -115,19 +157,77 @@ impl AuthStore {
     /// List provider names that currently have `<provider>_token` entries.
     #[allow(dead_code)] // Used by feat/auth-tui-wiring PR #1166
     pub fn list_provider_tokens(&self) -> Result<Vec<String>, String> {
-        let mut providers = self
-            .credential_store
+        let store = self.open_store()?;
+        let mut providers = store
             .list_credentials()
             .map_err(|e| format!("failed to list provider tokens: {e}"))?
             .into_iter()
             .filter_map(|key| {
                 key.strip_suffix(PROVIDER_TOKEN_SUFFIX)
-                    .map(|provider| provider.to_string())
+                    .map(|p| p.to_string())
             })
             .collect::<Vec<_>>();
         providers.sort();
         providers.dedup();
         Ok(providers)
+    }
+}
+
+pub fn open_auth_store_with_recovery(data_dir: &Path) -> Result<RecoveredAuthStore, String> {
+    match open_verified_auth_store(data_dir) {
+        Ok(store) => Ok(RecoveredAuthStore {
+            store,
+            recreated: false,
+        }),
+        Err(error) if should_recreate_auth_store(&error) => recreate_auth_store(data_dir),
+        Err(error) => Err(error),
+    }
+}
+
+fn open_verified_auth_store(data_dir: &Path) -> Result<AuthStore, String> {
+    let store = AuthStore::open(data_dir)?;
+    store.load_auth_manager().map(|_| store)
+}
+
+fn recreate_auth_store(data_dir: &Path) -> Result<RecoveredAuthStore, String> {
+    remove_if_exists(&data_dir.join("auth.db"))?;
+    remove_if_exists(&data_dir.join(".auth-salt"))?;
+    let store = AuthStore::open(data_dir)?;
+    Ok(RecoveredAuthStore {
+        store,
+        recreated: true,
+    })
+}
+
+fn should_recreate_auth_store(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("different machine identity")
+        || error.contains("decrypt")
+        || error.contains("failed to open auth database")
+        || error.contains("key derivation failed")
+}
+
+fn remove_if_exists(path: &Path) -> Result<(), String> {
+    if path.exists() {
+        fs::remove_file(path)
+            .map_err(|error| format!("failed to remove {}: {error}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Decode a credential-read error, providing actionable hints for key mismatches.
+fn decode_credential_error(e: impl std::fmt::Display) -> Result<AuthManager, String> {
+    let msg = e.to_string();
+    // NB3: When decryption fails, it is likely a key mismatch
+    // caused by hostname/username change. Provide an actionable hint.
+    if msg.contains("decrypt") || msg.contains("ncrypt") {
+        Err(
+            "credentials encrypted with a different machine identity \u{2014} \
+             delete ~/.fawx/auth.db and ~/.fawx/.auth-salt to re-authenticate"
+                .to_string(),
+        )
+    } else {
+        Err(format!("failed to read credentials: {e}"))
     }
 }
 
@@ -538,6 +638,40 @@ mod tests {
     }
 
     #[test]
+    fn open_auth_store_with_recovery_recreates_store_after_salt_mismatch() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = AuthStore::open(dir.path()).expect("open");
+        store
+            .save_auth_manager(&sample_auth_manager())
+            .expect("save");
+        drop(store);
+        fs::write(dir.path().join(".auth-salt"), b"short").expect("corrupt salt");
+
+        let recovered = open_auth_store_with_recovery(dir.path()).expect("recover");
+        let loaded = recovered.store.load_auth_manager().expect("load");
+
+        assert!(recovered.recreated);
+        assert!(loaded.providers().is_empty());
+    }
+
+    #[test]
+    fn open_auth_store_with_recovery_recreates_store_after_db_corruption() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = AuthStore::open(dir.path()).expect("open");
+        store
+            .save_auth_manager(&sample_auth_manager())
+            .expect("save");
+        drop(store);
+        fs::write(dir.path().join("auth.db"), b"not a sqlite database").expect("corrupt db");
+
+        let recovered = open_auth_store_with_recovery(dir.path()).expect("recover");
+        let loaded = recovered.store.load_auth_manager().expect("load");
+
+        assert!(recovered.recreated);
+        assert!(loaded.providers().is_empty());
+    }
+
+    #[test]
     fn migration_with_invalid_json_skips() {
         let dir = TempDir::new().expect("tempdir");
         let plaintext_path = dir.path().join("auth.json");
@@ -554,5 +688,36 @@ mod tests {
         // The encrypted store should have no data.
         let loaded = store.load_auth_manager().expect("load");
         assert!(loaded.providers().is_empty());
+    }
+
+    /// Regression test: two `AuthStore` instances can coexist on the same
+    /// directory because the open-per-operation pattern only holds the DB
+    /// lock for individual reads/writes, not for the store lifetime.
+    #[test]
+    fn concurrent_stores_do_not_block() {
+        let dir = TempDir::new().expect("tempdir");
+        let store1 = AuthStore::open(dir.path()).expect("first open");
+        let store2 = AuthStore::open(dir.path()).expect("second open (concurrent)");
+
+        // Both stores can read and write without blocking each other.
+        let auth = sample_auth_manager();
+        store1.save_auth_manager(&auth).expect("store1 save");
+        let loaded = store2.load_auth_manager().expect("store2 load");
+        assert_eq!(loaded, auth);
+    }
+
+    /// Verify that the store works correctly after drop + reopen (sequential).
+    #[test]
+    fn drop_and_reopen_succeeds() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = AuthStore::open(dir.path()).expect("first open");
+        store
+            .save_auth_manager(&sample_auth_manager())
+            .expect("save");
+        drop(store);
+
+        let store2 = AuthStore::open(dir.path()).expect("reopen");
+        let loaded = store2.load_auth_manager().expect("load after reopen");
+        assert_eq!(loaded, sample_auth_manager());
     }
 }

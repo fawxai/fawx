@@ -21,70 +21,35 @@
     --purple: #bc8cff;
     --purple-glow: rgba(188, 140, 255, 0.15);
     --red: #f85149;
+    --red-glow: rgba(248, 81, 73, 0.15);
     --yellow: #d29922;
     --yellow-glow: rgba(210, 153, 34, 0.15);
   }
-
   * { margin: 0; padding: 0; box-sizing: border-box; }
-
   body {
-    background: var(--bg);
-    color: var(--text);
+    background: var(--bg); color: var(--text);
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
-    line-height: 1.6;
-    padding: 0;
-    overflow-x: hidden;
+    line-height: 1.6; padding: 0; overflow-x: hidden;
   }
-
-  /* ── Header ── */
   .header {
-    text-align: center;
-    padding: 48px 24px 32px;
+    text-align: center; padding: 48px 24px 32px;
     background: linear-gradient(180deg, var(--surface) 0%, var(--bg) 100%);
     border-bottom: 1px solid var(--border);
   }
-  .header h1 {
-    font-size: 2.4em;
-    font-weight: 700;
-    letter-spacing: -0.02em;
-    margin-bottom: 8px;
-  }
+  .header h1 { font-size: 2.4em; font-weight: 700; letter-spacing: -0.02em; margin-bottom: 8px; }
   .header h1 span { color: var(--accent); }
-  .header .subtitle {
-    color: var(--text-dim);
-    font-size: 1.1em;
-    max-width: 600px;
-    margin: 0 auto;
-  }
+  .header .subtitle { color: var(--text-dim); font-size: 1.1em; max-width: 600px; margin: 0 auto; }
   .header .thesis {
-    margin-top: 16px;
-    padding: 12px 20px;
-    background: var(--accent-glow);
-    border: 1px solid rgba(240, 136, 62, 0.3);
-    border-radius: 8px;
-    display: inline-block;
-    font-size: 0.95em;
-    color: var(--accent);
-    font-weight: 500;
+    margin-top: 16px; padding: 12px 20px;
+    background: var(--accent-glow); border: 1px solid rgba(240, 136, 62, 0.3);
+    border-radius: 8px; display: inline-block; font-size: 0.95em; color: var(--accent); font-weight: 500;
   }
-
-  /* ── Progress Bar ── */
   .progress-bar {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 0;
-    padding: 32px 24px 16px;
-    max-width: 900px;
-    margin: 0 auto;
+    display: flex; align-items: center; justify-content: center; gap: 0;
+    padding: 32px 24px 16px; max-width: 900px; margin: 0 auto;
   }
   .progress-segment {
-    flex: 1;
-    height: 6px;
-    background: var(--border);
-    position: relative;
-    cursor: pointer;
-    transition: all 0.3s;
+    flex: 1; height: 6px; background: var(--border); position: relative; cursor: pointer; transition: all 0.3s;
   }
   .progress-segment:first-child { border-radius: 3px 0 0 3px; }
   .progress-segment:last-child { border-radius: 0 3px 3px 0; }
@@ -92,321 +57,97 @@
   .progress-segment.active { background: var(--accent); animation: pulse-bar 2s ease-in-out infinite; }
   .progress-segment:hover { transform: scaleY(2); }
   .progress-label {
-    position: absolute;
-    top: -24px;
-    left: 50%;
-    transform: translateX(-50%);
-    font-size: 0.7em;
-    color: var(--text-dim);
-    white-space: nowrap;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
+    position: absolute; top: -24px; left: 50%; transform: translateX(-50%);
+    font-size: 0.7em; color: var(--text-dim); white-space: nowrap;
+    font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;
   }
-  @keyframes pulse-bar {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.6; }
-  }
-
-  /* ── Wave Container ── */
-  .waves {
-    max-width: 1000px;
-    margin: 24px auto;
-    padding: 0 24px;
-  }
-
-  /* ── Wave Card ── */
+  @keyframes pulse-bar { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+  .waves { max-width: 1000px; margin: 24px auto; padding: 0 24px; }
   .wave {
-    margin-bottom: 24px;
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    overflow: hidden;
-    transition: all 0.3s;
+    margin-bottom: 24px; border: 1px solid var(--border); border-radius: 12px;
+    overflow: hidden; transition: all 0.3s;
   }
   .wave:hover { border-color: rgba(255,255,255,0.1); }
   .wave.expanded { box-shadow: 0 0 30px rgba(0,0,0,0.3); }
-
   .wave-header {
-    display: flex;
-    align-items: center;
-    gap: 16px;
-    padding: 20px 24px;
-    background: var(--surface);
-    cursor: pointer;
-    user-select: none;
-    transition: background 0.2s;
+    display: flex; align-items: center; gap: 16px; padding: 20px 24px;
+    background: var(--surface); cursor: pointer; user-select: none; transition: background 0.2s;
   }
   .wave-header:hover { background: var(--surface2); }
-
   .wave-icon {
-    width: 44px;
-    height: 44px;
-    border-radius: 10px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 1.4em;
-    flex-shrink: 0;
+    width: 44px; height: 44px; border-radius: 10px;
+    display: flex; align-items: center; justify-content: center; font-size: 1.4em; flex-shrink: 0;
   }
-
   .wave-info { flex: 1; }
-  .wave-title {
-    font-size: 1.15em;
-    font-weight: 600;
-    display: flex;
-    align-items: center;
-    gap: 10px;
-  }
-  .wave-desc {
-    color: var(--text-dim);
-    font-size: 0.85em;
-    margin-top: 2px;
-  }
-
-  .wave-meta {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    flex-shrink: 0;
-  }
-  .wave-count {
-    font-size: 0.8em;
-    color: var(--text-dim);
-    background: var(--bg);
-    padding: 4px 10px;
-    border-radius: 12px;
-  }
-  .wave-chevron {
-    color: var(--text-dim);
-    font-size: 1.2em;
-    transition: transform 0.3s;
-  }
+  .wave-title { font-size: 1.15em; font-weight: 600; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .wave-desc { color: var(--text-dim); font-size: 0.85em; margin-top: 2px; }
+  .wave-meta { display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
+  .wave-count { font-size: 0.8em; color: var(--text-dim); background: var(--bg); padding: 4px 10px; border-radius: 12px; }
+  .wave-chevron { color: var(--text-dim); font-size: 1.2em; transition: transform 0.3s; }
   .wave.expanded .wave-chevron { transform: rotate(90deg); }
-
   .wave-badge {
-    font-size: 0.65em;
-    padding: 3px 8px;
-    border-radius: 4px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
+    font-size: 0.65em; padding: 3px 8px; border-radius: 4px;
+    font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;
   }
   .badge-done { background: var(--green-glow); color: var(--green); border: 1px solid rgba(63,185,80,0.3); }
   .badge-active { background: var(--accent-glow); color: var(--accent); border: 1px solid rgba(240,136,62,0.3); }
   .badge-planned { background: var(--blue-glow); color: var(--blue); border: 1px solid rgba(88,166,255,0.3); }
   .badge-vision { background: var(--purple-glow); color: var(--purple); border: 1px solid rgba(188,140,255,0.3); }
-
-  /* ── Wave Body (tree) ── */
-  .wave-body {
-    display: none;
-    padding: 0 24px 24px;
-    background: var(--surface);
-    border-top: 1px solid var(--border);
-  }
+  .badge-blocker { background: var(--red-glow); color: var(--red); border: 1px solid rgba(248,81,73,0.3); }
+  .badge-debt { background: var(--yellow-glow); color: var(--yellow); border: 1px solid rgba(210,153,34,0.3); }
+  .wave-body { display: none; padding: 0 24px 24px; background: var(--surface); border-top: 1px solid var(--border); }
   .wave.expanded .wave-body { display: block; }
-
-  /* ── Tree ── */
-  .tree {
-    padding-top: 16px;
-  }
-  .tree-item {
-    position: relative;
-    padding-left: 28px;
-    margin-bottom: 4px;
-  }
-  .tree-item::before {
-    content: '';
-    position: absolute;
-    left: 8px;
-    top: 0;
-    bottom: 0;
-    width: 1px;
-    background: var(--border);
-  }
-  .tree-item:last-child::before {
-    bottom: 50%;
-  }
-  .tree-item::after {
-    content: '';
-    position: absolute;
-    left: 8px;
-    top: 18px;
-    width: 14px;
-    height: 1px;
-    background: var(--border);
-  }
-
+  .tree { padding-top: 16px; }
+  .tree-item { position: relative; padding-left: 28px; margin-bottom: 4px; }
+  .tree-item::before { content: ''; position: absolute; left: 8px; top: 0; bottom: 0; width: 1px; background: var(--border); }
+  .tree-item:last-child::before { bottom: 50%; }
+  .tree-item::after { content: ''; position: absolute; left: 8px; top: 18px; width: 14px; height: 1px; background: var(--border); }
   .tree-node {
-    padding: 10px 14px;
-    border-radius: 8px;
-    background: var(--bg);
-    border: 1px solid var(--border);
-    cursor: pointer;
-    transition: all 0.2s;
-    display: flex;
-    align-items: flex-start;
-    gap: 10px;
+    padding: 10px 14px; border-radius: 8px; background: var(--bg); border: 1px solid var(--border);
+    cursor: pointer; transition: all 0.2s; display: flex; align-items: flex-start; gap: 10px;
   }
-  .tree-node:hover {
-    border-color: rgba(255,255,255,0.15);
-    background: var(--surface2);
-  }
-
-  .node-status {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    margin-top: 7px;
-    flex-shrink: 0;
-  }
+  .tree-node:hover { border-color: rgba(255,255,255,0.15); background: var(--surface2); }
+  .node-status { width: 8px; height: 8px; border-radius: 50%; margin-top: 7px; flex-shrink: 0; }
   .status-done { background: var(--green); box-shadow: 0 0 6px var(--green); }
   .status-active { background: var(--accent); box-shadow: 0 0 6px var(--accent); animation: pulse-dot 2s ease-in-out infinite; }
   .status-planned { background: var(--blue); }
   .status-vision { background: var(--purple); }
-
-  @keyframes pulse-dot {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.4; }
-  }
-
+  .status-blocker { background: var(--red); box-shadow: 0 0 6px var(--red); animation: pulse-dot 2s ease-in-out infinite; }
+  .status-debt { background: var(--yellow); box-shadow: 0 0 6px var(--yellow); }
+  @keyframes pulse-dot { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
   .node-content { flex: 1; min-width: 0; }
-  .node-title {
-    font-weight: 600;
-    font-size: 0.9em;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    flex-wrap: wrap;
-  }
-  .node-title .issue-link {
-    font-size: 0.8em;
-    color: var(--text-dim);
-    text-decoration: none;
-    font-weight: 400;
-  }
+  .node-title { font-weight: 600; font-size: 0.9em; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .node-title .issue-link { font-size: 0.8em; color: var(--text-dim); text-decoration: none; font-weight: 400; }
   .node-title .issue-link:hover { color: var(--blue); }
-
-  .node-detail {
-    display: none;
-    margin-top: 8px;
-    padding-top: 8px;
-    border-top: 1px solid var(--border);
-    font-size: 0.85em;
-    color: var(--text-dim);
-    line-height: 1.7;
-  }
+  .node-detail { display: none; margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border); font-size: 0.85em; color: var(--text-dim); line-height: 1.7; }
   .tree-node.open .node-detail { display: block; }
-
-  .node-deps {
-    margin-top: 8px;
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-  }
-  .dep-tag {
-    font-size: 0.7em;
-    padding: 2px 8px;
-    border-radius: 4px;
-    background: var(--surface);
-    border: 1px solid var(--border);
-    color: var(--text-dim);
-  }
-  .dep-tag.dep-done { border-color: rgba(63,185,80,0.3); color: var(--green); }
-
-  .node-expand {
-    color: var(--text-dim);
-    font-size: 0.85em;
-    flex-shrink: 0;
-    margin-top: 3px;
-    transition: transform 0.2s;
-  }
+  .node-expand { color: var(--text-dim); font-size: 0.85em; flex-shrink: 0; margin-top: 3px; transition: transform 0.2s; }
   .tree-node.open .node-expand { transform: rotate(90deg); }
-
-  /* ── Dependency Graph Section ── */
-  .dep-graph-section {
-    max-width: 1000px;
-    margin: 40px auto;
-    padding: 0 24px;
-  }
-  .dep-graph-section h2 {
-    font-size: 1.3em;
-    margin-bottom: 16px;
-    color: var(--text-dim);
-    font-weight: 500;
-  }
-  .dep-graph {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 32px;
-    overflow-x: auto;
-  }
-  .dep-flow {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    min-width: max-content;
-    padding: 8px 0;
-  }
-  .dep-flow-node {
-    padding: 8px 16px;
-    border-radius: 8px;
-    font-size: 0.8em;
-    font-weight: 600;
-    white-space: nowrap;
-    border: 1px solid;
-  }
-  .dep-arrow {
-    color: var(--text-dim);
-    font-size: 1.2em;
-    flex-shrink: 0;
-  }
-
-  /* ── Stats Banner ── */
+  .tree-divider { padding: 12px 0 8px 28px; font-size: 0.7em; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-dim); font-weight: 600; }
+  .parallel-badge { font-size: 0.6em; padding: 2px 6px; border-radius: 3px; background: var(--blue-glow); color: var(--blue); border: 1px solid rgba(88,166,255,0.2); margin-left: 6px; vertical-align: middle; }
   .stats-banner {
-    max-width: 1000px;
-    margin: 24px auto 0;
-    padding: 0 24px;
-    display: flex;
-    gap: 16px;
-    flex-wrap: wrap;
-    justify-content: center;
+    max-width: 1000px; margin: 24px auto 0; padding: 0 24px;
+    display: flex; gap: 16px; flex-wrap: wrap; justify-content: center;
   }
   .stat-card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 16px 24px;
-    text-align: center;
-    flex: 1;
-    min-width: 140px;
-    max-width: 200px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px 24px; text-align: center; flex: 1; min-width: 140px; max-width: 200px;
   }
-  .stat-value {
-    font-size: 1.8em;
-    font-weight: 700;
-    color: var(--accent);
-  }
-  .stat-label {
-    font-size: 0.75em;
-    color: var(--text-dim);
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    margin-top: 4px;
-  }
-
-  /* ── Footer ── */
+  .stat-value { font-size: 1.8em; font-weight: 700; color: var(--accent); }
+  .stat-label { font-size: 0.75em; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.05em; margin-top: 4px; }
+  .dep-graph-section { max-width: 1000px; margin: 40px auto; padding: 0 24px; }
+  .dep-graph-section h2 { font-size: 1.3em; margin-bottom: 16px; color: var(--text-dim); font-weight: 500; }
+  .dep-graph { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 32px; overflow-x: auto; }
+  .dep-flow { display: flex; align-items: center; gap: 8px; min-width: max-content; padding: 8px 0; flex-wrap: wrap; }
+  .dep-flow-node { padding: 8px 14px; border-radius: 8px; font-size: 0.78em; font-weight: 600; white-space: nowrap; border: 1px solid; }
+  .dep-arrow { color: var(--text-dim); font-size: 1.1em; flex-shrink: 0; }
+  .dep-parallel { display: flex; flex-direction: column; gap: 4px; align-items: center; }
+  .dep-parallel-label { font-size: 0.6em; color: var(--blue); text-transform: uppercase; letter-spacing: 0.06em; }
   .footer {
-    text-align: center;
-    padding: 48px 24px;
-    color: var(--text-dim);
-    font-size: 0.8em;
-    border-top: 1px solid var(--border);
-    margin-top: 48px;
+    text-align: center; padding: 48px 24px; color: var(--text-dim);
+    font-size: 0.8em; border-top: 1px solid var(--border); margin-top: 48px;
   }
   .footer strong { color: var(--accent); }
-
-  /* ── Responsive ── */
   @media (max-width: 600px) {
     .header h1 { font-size: 1.6em; }
     .wave-header { padding: 16px; gap: 12px; }
@@ -427,476 +168,174 @@
   <div class="thesis">Fully Autonomous WASM eXtensible — the engine that builds itself</div>
 </div>
 
-<!-- Stats Banner -->
 <div class="stats-banner">
-  <div class="stat-card">
-    <div class="stat-value">7</div>
-    <div class="stat-label">Waves Shipped</div>
-  </div>
-  <div class="stat-card">
-    <div class="stat-value">50+</div>
-    <div class="stat-label">PRs Merged</div>
-  </div>
-  <div class="stat-card">
-    <div class="stat-value">15k+</div>
-    <div class="stat-label">Lines of Code</div>
-  </div>
-  <div class="stat-card">
-    <div class="stat-value">179</div>
-    <div class="stat-label">Tests (fx-llm)</div>
-  </div>
+  <div class="stat-card"><div class="stat-value">8</div><div class="stat-label">Waves</div></div>
+  <div class="stat-card"><div class="stat-value">65+</div><div class="stat-label">PRs Merged</div></div>
+  <div class="stat-card"><div class="stat-value">108k</div><div class="stat-label">Lines of Rust</div></div>
+  <div class="stat-card"><div class="stat-value">1,900+</div><div class="stat-label">Tests</div></div>
 </div>
 
-<!-- Progress Bar -->
 <div class="progress-bar">
   <div class="progress-segment done"><span class="progress-label">W1-4</span></div>
   <div class="progress-segment done"><span class="progress-label">W5</span></div>
   <div class="progress-segment done"><span class="progress-label">W6</span></div>
   <div class="progress-segment done"><span class="progress-label">W7</span></div>
   <div class="progress-segment active"><span class="progress-label">W8</span></div>
+  <div class="progress-segment"><span class="progress-label">W9</span></div>
 </div>
 
 <div class="waves">
 
-  <!-- ═══════════ WAVE 1-4 (Collapsed summary) ═══════════ -->
-  <div class="wave" id="wave-1-4">
-    <div class="wave-header" onclick="toggleWave('wave-1-4')">
+  <!-- ═══════════ WAVES 1-7 (collapsed) ═══════════ -->
+  <div class="wave" id="wave-1-7">
+    <div class="wave-header" onclick="toggleWave('wave-1-7')">
       <div class="wave-icon" style="background: var(--green-glow); color: var(--green);">✓</div>
       <div class="wave-info">
-        <div class="wave-title">Waves 1–4: Engine Foundation <span class="wave-badge badge-done">Complete</span></div>
-        <div class="wave-desc">Agentic loop, tool calling, memory, plugins, streaming, security model</div>
+        <div class="wave-title">Waves 1–7: Engine → Self-Improvement → Distributed OS <span class="wave-badge badge-done">Complete</span></div>
+        <div class="wave-desc">Agentic loop, tools, memory, plugins, WASM, signing, headless, marketplace, fleet, orchestrator, channels, thinking</div>
       </div>
-      <div class="wave-meta">
-        <span class="wave-count">23 PRs merged</span>
-        <span class="wave-chevron">›</span>
-      </div>
+      <div class="wave-meta"><span class="wave-count">54+ items shipped</span><span class="wave-chevron">›</span></div>
     </div>
     <div class="wave-body">
       <div class="tree">
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-done"></div>
-            <div class="node-content">
-              <div class="node-title">7-step agentic loop with native tool calling</div>
-              <div class="node-detail">Loop V2 — all 4 phases merged. 10 iterations/60-90s → 1 iteration/4-9s.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-done"></div>
-            <div class="node-content">
-              <div class="node-title">13 tools through SkillRegistry</div>
-              <div class="node-detail">BuiltinToolsSkill (10) + GitSkill (3). All dispatch through fx-loadable plugin registry.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-done"></div>
-            <div class="node-content">
-              <div class="node-title">fx-loadable plugin system</div>
-              <div class="node-detail">Skill trait, SkillRegistry (implements ToolExecutor), SkillLoader, BuiltinSkill. Adding new skills = implement Skill trait + register.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-done"></div>
-            <div class="node-content">
-              <div class="node-title">Encrypted credentials (AES-256-GCM)</div>
-              <div class="node-detail">Machine-specific HKDF key, auto-migration, zeroizing throughout.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-done"></div>
-            <div class="node-content">
-              <div class="node-title">Structured memory with cross-session recall</div>
-              <div class="node-detail">MemoryProvider trait, JsonFileMemory, 4 tools, hybrid startup injection, conversation persistence (JSONL, training-ready).</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-done"></div>
-            <div class="node-content">
-              <div class="node-title">Streaming + TUI stability</div>
-              <div class="node-detail">FrameRedrawMetrics, row scrubbing, scroll fix, alternate screen lifecycle. 1,100+ tests.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-done"></div>
-            <div class="node-content">
-              <div class="node-title">Security model — 14 attack surfaces documented</div>
-              <div class="node-detail">12 attack surfaces (6 AI-native-unique), kernel/loadable separation, Tier 3 immutability, boundary tests.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- ═══════════ WAVE 5 ═══════════ -->
-  <div class="wave" id="wave-5">
-    <div class="wave-header" onclick="toggleWave('wave-5')">
-      <div class="wave-icon" style="background: var(--green-glow); color: var(--green);">✓</div>
-      <div class="wave-info">
-        <div class="wave-title">Wave 5: Self-Improvement Foundation <span class="wave-badge badge-done">Complete</span></div>
-        <div class="wave-desc">WASM hot-reload, signing, auth, steer/abort, ratatui TUI, headless mode</div>
-      </div>
-      <div class="wave-meta">
-        <span class="wave-count">12 items shipped</span>
-        <span class="wave-chevron">›</span>
-      </div>
-    </div>
-    <div class="wave-body">
-      <div class="tree">
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-done"></div>
-            <div class="node-content">
-              <div class="node-title">WASM bridge <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1135">#1135</a></div>
-              <div class="node-detail">Wasmtime runtime, host_api_v1, capability gating. fx-skills: 3,587 lines of WASM infrastructure.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-done"></div>
-            <div class="node-content">
-              <div class="node-title">Steer/abort controls <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1150">#1150</a></div>
-              <div class="node-detail">Mid-cycle steering, abort, queue. Ratatui event loop with tokio::select.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-done"></div>
-            <div class="node-content">
-              <div class="node-title">Structured scratchpad <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1143">#1143</a></div>
-              <div class="node-detail">Cross-turn working memory for complex reasoning tasks.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-done"></div>
-            <div class="node-content">
-              <div class="node-title">Auth + credential store <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1165">#1165</a></div>
-              <div class="node-detail">EncryptedFileCredentialStore, GitHub PAT validation, /auth commands, KV bridge for WASM skills.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-done"></div>
-            <div class="node-content">
-              <div class="node-title">WASM hot-reload <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1193">#1193</a></div>
-              <div class="node-detail">RwLock registry with replace/remove, SkillWatcher with 500ms debounce + SHA-256 dedup. Hot-swap skills without restart.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-done"></div>
-            <div class="node-content">
-              <div class="node-title">WASM signature verification + signing CLI <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1195">#1195</a> <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1197">#1197</a></div>
-              <div class="node-detail">Ed25519 verification wired into load path. /keys and /sign CLI commands. SignaturePolicy, validate_signature_policy.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-done"></div>
-            <div class="node-content">
-              <div class="node-title">Ratatui TUI migration <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1147">#1147</a></div>
-              <div class="node-detail">Full ratatui migration with streaming stability, paste support, secret input masking.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-done"></div>
-            <div class="node-content">
-              <div class="node-title">Headless mode + HTTP API <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1198">#1198</a> <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1202">#1202</a></div>
-              <div class="node-detail">fawx serve for stdin/stdout operation. HTTP API with Tailscale-only binding + bearer token auth (#1204). Endpoints: POST /message, GET /status, GET /health.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-done"></div>
-            <div class="node-content">
-              <div class="node-title">Deterministic prompt preprocessing <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1199">#1199</a></div>
-              <div class="node-detail">fx-preprocess crate: JSON minification, whitespace collapsing, noise stripping. 15-30% token savings on tool-heavy prompts.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- ═══════════ WAVE 6 ═══════════ -->
-  <div class="wave" id="wave-6">
-    <div class="wave-header" onclick="toggleWave('wave-6')">
-      <div class="wave-icon" style="background: var(--green-glow); color: var(--green);">✓</div>
-      <div class="wave-info">
-        <div class="wave-title">Wave 6: Self-Improvement Loop + Marketplace <span class="wave-badge badge-done">Complete</span></div>
-        <div class="wave-desc">Improvement tools, skill authoring, fawx-test harness, marketplace v1, thinking config</div>
-      </div>
-      <div class="wave-meta">
-        <span class="wave-count">10 items shipped</span>
-        <span class="wave-chevron">›</span>
-      </div>
-    </div>
-    <div class="wave-body">
-      <div class="tree">
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-done"></div>
-            <div class="node-content">
-              <div class="node-title">analyze_signals + propose_improvement tools <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1208">#1208</a></div>
-              <div class="node-detail">Self-improvement tools exposed to the model. Rate-limited: 10 analyses/hour, 3 proposals/day. Enabled=false by default.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-done"></div>
-            <div class="node-content">
-              <div class="node-title">Emergency rollback — fawx-ripcord <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1209">#1209</a></div>
-              <div class="node-detail">Standalone binary. Copies last known-good snapshot, restarts process. Fire extinguisher behind glass. Tier 3 immutable.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-done"></div>
-            <div class="node-content">
-              <div class="node-title">Signal quality canary <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1212">#1212</a></div>
-              <div class="node-detail">Signal ratio monitoring post-deploy. 24hr baseline, 2x spike threshold, 1hr grace period.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-done"></div>
-            <div class="node-content">
-              <div class="node-title">fawx-test behavioral harness <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1213">#1213</a></div>
-              <div class="node-detail">Scenario-based smoke testing against real LLMs. TOML scenarios, behavioral assertions.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-done"></div>
-            <div class="node-content">
-              <div class="node-title">Marketplace skill registry client <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1214">#1214</a></div>
-              <div class="node-detail">fawx install/search. Skill registry discovery API. The marketplace client side.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-done"></div>
-            <div class="node-content">
-              <div class="node-title">fx-author skill build pipeline <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1215">#1215</a></div>
-              <div class="node-detail">Skill scaffolding + build + packaging. Fawx can create and build new WASM skills.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-done"></div>
-            <div class="node-content">
-              <div class="node-title">Conversation deduplication <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1216">#1216</a></div>
-              <div class="node-detail">Cross-turn token savings. Detects repeated content, replaces with references. 15-30% token reduction on tool-heavy sessions.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-done"></div>
-            <div class="node-content">
-              <div class="node-title">Thinking budget config <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1217">#1217</a> <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1218">#1218</a></div>
-              <div class="node-detail">/thinking high|low|adaptive|off command. Configurable reasoning budget per session. Wired through to completion requests.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- ═══════════ WAVE 7 ═══════════ -->
-  <div class="wave expanded" id="wave-7">
-    <div class="wave-header" onclick="toggleWave('wave-7')">
-      <div class="wave-icon" style="background: var(--green-glow); color: var(--green);">✓</div>
-      <div class="wave-info">
-        <div class="wave-title">Wave 7: SuperFawx — Distributed Agentic OS <span class="wave-badge badge-done">Complete</span></div>
-        <div class="wave-desc">Channel abstraction, node fleet, task routing, orchestration, webhook I/O + thinking hardening</div>
-      </div>
-      <div class="wave-meta">
-        <span class="wave-count">9 items shipped</span>
-        <span class="wave-chevron">›</span>
-      </div>
-    </div>
-    <div class="wave-body">
-      <div class="tree">
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-done"></div>
-            <div class="node-content">
-              <div class="node-title">Channel trait + response routing <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1221">#1221</a></div>
-              <div class="node-detail">Pluggable I/O abstraction for multi-surface communication. Channel trait, ChannelRegistry, ResponseRouter with InputSource → channel mapping. ~350 lines.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-done"></div>
-            <div class="node-content">
-              <div class="node-title">Webhook channel <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1224">#1224</a></div>
-              <div class="node-detail">Generic webhook Channel implementation. fx-channel-webhook crate. HTTP-based I/O for external integrations. ~240 lines. Clean APPROVE first try.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-done"></div>
-            <div class="node-content">
-              <div class="node-title">host_api_v2 — expanded WASM capabilities <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1222">#1222</a></div>
-              <div class="node-detail">New host functions for WASM skills: register_channel, schedule_timer, listen_http. Path B execution model (host-driven invocation). ~340 lines.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-done"></div>
-            <div class="node-content">
-              <div class="node-title">fx-fleet — node registry <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1220">#1220</a></div>
-              <div class="node-detail">Node capabilities, heartbeat, stale detection. NodeInfo with capability tags, register/heartbeat/get_available/check_stale. ~350 lines.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-done"></div>
-            <div class="node-content">
-              <div class="node-title">Task router — capability-based selection <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1223">#1223</a></div>
-              <div class="node-detail">TaskRouter with RoutingStrategy (capability match, round-robin, least-loaded). Score-based node selection for distributed tasks. ~340 lines. Clean APPROVE first try.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-done"></div>
-            <div class="node-content">
-              <div class="node-title">Orchestrator — distributed coordination <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1225">#1225</a></div>
-              <div class="node-detail">
-                Task lifecycle: submit → route → complete/retry/timeout. CompletionOutcome enum (Delivered/Retried/Exhausted). Pure synchronous state machine — decisions only, no async. check_timeouts() mirrors check_stale(). ~450 lines.
-                <div class="node-deps">
-                  <span class="dep-tag dep-done">fx-fleet</span>
-                  <span class="dep-tag dep-done">task router</span>
-                  <span class="dep-tag dep-done">channel trait</span>
-                </div>
-              </div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-done"></div>
-            <div class="node-content">
-              <div class="node-title">Thinking: temperature fix <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1226">#1226</a></div>
-              <div class="node-detail">Strip temperature when Anthropic thinking is enabled. API requires temperature=1 or omitted.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-done"></div>
-            <div class="node-content">
-              <div class="node-title">Thinking: max_tokens + budget cap <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1227">#1227</a></div>
-              <div class="node-detail">Ensure max_tokens exceeds thinking budget. Security hardening: MAX_THINKING_BUDGET=32K cap prevents token exhaustion attacks. MIN_RESPONSE_TOKENS=1024 named constant. tracing::warn on cap.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-done"></div>
-            <div class="node-content">
-              <div class="node-title">Thinking: content block handling <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1228">#1228</a></div>
-              <div class="node-detail">Handle thinking + redacted_thinking content blocks in streaming and non-streaming responses. Added Thinking and RedactedThinking variants to AnthropicContentBlock enum.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-done"></div><div class="node-content"><div class="node-title">W1-4: 7-step agentic loop, 13 tools, fx-loadable, encrypted credentials, structured memory, streaming, security model (14 attack surfaces)</div></div><div class="node-expand">›</div></div></div>
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-done"></div><div class="node-content"><div class="node-title">W5: WASM bridge + hot-reload + signing, steer/abort, scratchpad, auth + credential store, headless + HTTP API, prompt preprocessing</div></div><div class="node-expand">›</div></div></div>
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-done"></div><div class="node-content"><div class="node-title">W6: Self-improvement tools, canary, ripcord, fawx-test, marketplace client, fx-author, dedup, thinking config</div></div><div class="node-expand">›</div></div></div>
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-done"></div><div class="node-content"><div class="node-title">W7: Channel trait, webhook channel, host_api_v2, fx-fleet, task router, orchestrator, thinking hardening (3 PRs)</div></div><div class="node-expand">›</div></div></div>
       </div>
     </div>
   </div>
 
   <!-- ═══════════ WAVE 8 ═══════════ -->
-  <div class="wave" id="wave-8">
+  <div class="wave expanded" id="wave-8">
     <div class="wave-header" onclick="toggleWave('wave-8')">
       <div class="wave-icon" style="background: var(--accent-glow); color: var(--accent);">8</div>
       <div class="wave-info">
-        <div class="wave-title">Wave 8: Polish, Testing &amp; Launch <span class="wave-badge badge-active">Next</span></div>
-        <div class="wave-desc">Contract tests, reflective memory, org transfer, website, docs, launch prep</div>
+        <div class="wave-title">Wave 8: Polish, Parity &amp; Launch <span class="wave-badge badge-active">Active</span></div>
+        <div class="wave-desc">Wire existing features, setup wizard, engine tools, skills, docs, launch</div>
       </div>
-      <div class="wave-meta">
-        <span class="wave-count">0/8 done</span>
-        <span class="wave-chevron">›</span>
-      </div>
+      <div class="wave-meta"><span class="wave-count">14 done · 5 phases remaining</span><span class="wave-chevron">›</span></div>
     </div>
     <div class="wave-body">
+
+      <div class="tree-divider">✅ Shipped (14)</div>
+      <div class="tree">
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-done"></div><div class="node-content"><div class="node-title">API contract tests L1–L3 (199+ tests) · Reflective memory (fx-journal) · TUI fork (Sparx)</div></div><div class="node-expand">›</div></div></div>
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-done"></div><div class="node-content"><div class="node-title">Telegram channel (4 PRs) · Credential store fix · Subagent spawning · Node commands · Sessions · Config management</div></div><div class="node-expand">›</div></div></div>
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-done"></div><div class="node-content"><div class="node-title">3 marketplace skills · Tilde fix · Dogfooding Phase 0 proven · 9 parity specs</div></div><div class="node-expand">›</div></div></div>
+      </div>
+
+      <div class="tree-divider">🟡 Phase 0 — Wire Existing Features (5 PRs, ~1,150 lines) <span class="wave-badge badge-debt">Tech Debt</span></div>
+      <div class="tree">
+        <div class="tree-item">
+          <div class="tree-node" onclick="toggleNode(this)">
+            <div class="node-status status-debt"></div>
+            <div class="node-content">
+              <div class="node-title"><code>node_run</code> tool — wire to TUI + HTTP</div>
+              <div class="node-detail">Tool exists in fx-tools/node_run.rs. FawxToolExecutor has <code>with_node_run()</code>. But nobody calls it — NodeRunState is never attached. SshTransport is implemented but never instantiated. The tool will always return "node_run not configured." Fix: instantiate SshTransport from fleet config, attach via <code>with_node_run()</code> in build_skill_registry.</div>
+            </div>
+            <div class="node-expand">›</div>
+          </div>
+        </div>
+        <div class="tree-item">
+          <div class="tree-node" onclick="toggleNode(this)">
+            <div class="node-status status-debt"></div>
+            <div class="node-content">
+              <div class="node-title"><code>spawn_agent</code> / <code>subagent_status</code> — wire to TUI mode</div>
+              <div class="node-detail">Subagent tools work in headless/HTTP mode (SubagentManager + SubagentControl attached). TUI mode uses <code>HeadlessLoopBuildOptions::default()</code> which has <code>subagent_control: None</code> — so spawn_agent is excluded from the tool list entirely. Fix: create SubagentManager in <code>run_tui()</code> and pass it through <code>HeadlessLoopBuildOptions::parent()</code>.</div>
+            </div>
+            <div class="node-expand">›</div>
+          </div>
+        </div>
+        <div class="tree-item">
+          <div class="tree-node" onclick="toggleNode(this)">
+            <div class="node-status status-debt"></div>
+            <div class="node-content">
+              <div class="node-title">Proposal approval flow — <code>/proposals</code>, <code>/approve</code>, <code>/reject</code></div>
+              <div class="node-detail">ProposalGateExecutor writes proposals to <code>~/.fawx/proposals/</code>. ProposalGateState has <code>set_active_proposal()</code>. But no TUI commands exist to list, review, approve, or reject proposals. <code>set_active_proposal()</code> is only called in tests. The self-improvement loop dead-ends at proposal generation. Fix: add /proposals (list pending), /approve &lt;id&gt; (set active + apply), /reject &lt;id&gt; (delete).</div>
+            </div>
+            <div class="node-expand">›</div>
+          </div>
+        </div>
+        <div class="tree-item">
+          <div class="tree-node" onclick="toggleNode(this)">
+            <div class="node-status status-debt"></div>
+            <div class="node-content">
+              <div class="node-title">ChannelRegistry + ResponseRouter — wire the abstraction</div>
+              <div class="node-detail">Built in fx-kernel/channels.rs. Never instantiated in fx-cli. Telegram is wired directly in http_serve.rs bypassing the Channel trait. WebhookChannel (fx-channel-webhook) is a complete implementation that's never used. Fix: instantiate ChannelRegistry, register Telegram + Webhook channels, route through ResponseRouter instead of direct wiring.</div>
+            </div>
+            <div class="node-expand">›</div>
+          </div>
+        </div>
+        <div class="tree-item">
+          <div class="tree-node" onclick="toggleNode(this)">
+            <div class="node-status status-debt"></div>
+            <div class="node-content">
+              <div class="node-title">fx-fleet — wire NodeRegistry + TaskRouter + Orchestrator <span class="wave-badge" style="background:var(--purple-glow);color:var(--purple);border:1px solid rgba(188,140,255,0.3);">Deferred</span></div>
+              <div class="node-detail">Deferred from Phase 0 — fleet model assumes Fawx nodes that heartbeat in, but we only have SSH machines. <code>node_run</code> (PR 3) covers current needs. Full fleet wiring requires: (1) fleet client agent for remote nodes, (2) task dispatch protocol, (3) heartbeat infrastructure. Moved to post-launch. See Phase 5.</div>
+            </div>
+            <div class="node-expand">›</div>
+          </div>
+        </div>
+        <div class="tree-item">
+          <div class="tree-node" onclick="toggleNode(this)">
+            <div class="node-status status-debt"></div>
+            <div class="node-content">
+              <div class="node-title">ConfigManager — wire to TUI mode</div>
+              <div class="node-detail">ConfigManager + SIGHUP graceful restart wired in headless/HTTP mode only. TUI's <code>run_tui()</code> doesn't create a ConfigManager, so <code>config_get</code>/<code>config_set</code> model-callable tools may not have the manager to work with. Fix: create ConfigManager in run_tui, pass through TuiAppDeps.</div>
+            </div>
+            <div class="node-expand">›</div>
+          </div>
+        </div>
+        <div class="tree-item">
+          <div class="tree-node" onclick="toggleNode(this)">
+            <div class="node-status status-debt"></div>
+            <div class="node-content">
+              <div class="node-title">Canary + ripcord — wire together</div>
+              <div class="node-detail">Signal quality canary (fx-canary) and emergency rollback (fawx-ripcord) both exist as standalone components. Never connected — canary detects regression but doesn't trigger ripcord. Fix: canary threshold breach → invoke ripcord binary automatically.</div>
+            </div>
+            <div class="node-expand">›</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="tree-divider">🔴 Phase 1 — Setup Wizard + Server Fix <span class="wave-badge badge-blocker">Launch Blocker</span></div>
+      <div class="tree">
+        <div class="tree-item">
+          <div class="tree-node" onclick="toggleNode(this)">
+            <div class="node-status status-inprogress"></div>
+            <div class="node-content">
+              <div class="node-title"><code>fawx setup</code> — interactive first-run wizard <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1253">#1253</a> <span class="wave-badge badge-blocker">Launch Blocker</span></div>
+              <div class="node-detail">Provider auth, model selection, channel config (Telegram), HTTP API setup. Smoke tested on Mac Mini — wizard flow works. PR #1254 reviewed + approved, reverted for clippy fixes (derive Default, MutexGuard across await). Re-landing as new PR.</div>
+            </div>
+            <div class="node-expand">›</div>
+          </div>
+        </div>
+        <div class="tree-item">
+          <div class="tree-node" onclick="toggleNode(this)">
+            <div class="node-status status-debt"></div>
+            <div class="node-content">
+              <div class="node-title">Localhost binding for HTTP server <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1256">#1256</a> <span class="wave-badge badge-blocker">Launch Blocker</span></div>
+              <div class="node-detail"><code>fawx serve --http</code> binds Tailscale-only (100.x.x.x) but <code>fawx-tui</code> expects localhost:8400. Blocks the setup→serve→TUI flow. Also: <code>headless_http.rs</code> (localhost server) is entirely dead code — 18 clippy errors. Fix: dual-bind (Tailscale + localhost) or merge localhost binding into <code>http_serve.rs</code>. Must also clean up dead <code>headless_http.rs</code> and unused streaming code in <code>headless.rs</code>.</div>
+            </div>
+            <div class="node-expand">›</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="tree-divider">⚡ Phase 1b — TUI Unification <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1252">#1252</a> <span class="wave-badge" style="background:var(--purple-glow);color:var(--purple);border:1px solid rgba(188,140,255,0.3);">Deferred</span></div>
+      <div class="tree">
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">Wire <code>fawx tui</code> to launch new ratatui TUI</div><div class="node-detail">New ratatui TUI already exists in <code>tui/</code> dir (PR #1243) with <code>FawxBackend</code> that connects via HTTP to the engine. Currently a separate binary (<code>fawx-tui</code>). Old TUI (<code>tui.rs</code>, 3,600 lines) still launches from <code>fawx tui</code>. Fix: make <code>fawx tui</code> launch the new TUI binary or embed it. Smaller scope than originally estimated — backend already works, just needs CLI dispatch. ~50-100 lines in fx-cli.</div></div><div class="node-expand">›</div></div></div>
+      </div>
+
+      <div class="tree-divider">⚡ Phase 2 — New Capabilities (parallel tracks)</div>
       <div class="tree">
         <div class="tree-item">
           <div class="tree-node" onclick="toggleNode(this)">
             <div class="node-status status-active"></div>
             <div class="node-content">
-              <div class="node-title">API contract tests — Layer 1: request validation</div>
-              <div class="node-detail">
-                validate_request() with #[cfg(debug_assertions)] — encodes Anthropic API constraints (temperature+thinking, max_tokens>budget, etc.). Called from build_request_body(). Every cargo test automatically validates. Zero runtime cost. Spec: docs/specs/api-contract-tests.md
-                <div class="node-deps">
-                  <span class="dep-tag dep-done">thinking fixes</span>
-                </div>
-              </div>
+              <div class="node-title"><code>edit</code> tool — surgical file editing <span class="parallel-badge">2a engine</span></div>
+              <div class="node-detail">Replace exact text without rewriting files. Add offset/limit to read_file. Must be added to WRITE_TOOLS in ProposalGateExecutor. Security: Tier 3 immutability, path traversal prevention, proposal flow.</div>
             </div>
             <div class="node-expand">›</div>
           </div>
@@ -905,10 +344,8 @@
           <div class="tree-node" onclick="toggleNode(this)">
             <div class="node-status status-planned"></div>
             <div class="node-content">
-              <div class="node-title">API contract tests — Layer 2: response fixtures</div>
-              <div class="node-detail">
-                Hand-crafted JSON + SSE fixtures from Anthropic API responses. 10 fixture files covering text/thinking/tool/multi-tool/stream/error. Deserialization tests catch schema drift. Spec: docs/specs/api-contract-tests.md
-              </div>
+              <div class="node-title">Background process management <span class="parallel-badge">2a engine</span></div>
+              <div class="node-detail">Background exec, session IDs, poll/log/kill. Security: kernel-level ProcessRegistry, max concurrent, max lifetime, working dir enforcement, session cleanup, output capture.</div>
             </div>
             <div class="node-expand">›</div>
           </div>
@@ -917,13 +354,8 @@
           <div class="tree-node" onclick="toggleNode(this)">
             <div class="node-status status-planned"></div>
             <div class="node-content">
-              <div class="node-title">Live API contract tests <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1229">#1229</a></div>
-              <div class="node-detail">
-                #[ignore] integration tests with real API calls. 6 test cases: text/thinking/tool roundtrips × streaming/non-streaming. ~$0.10-0.30 per run. Manual gate before releases.
-                <div class="node-deps">
-                  <span class="dep-tag">Layer 1+2</span>
-                </div>
-              </div>
+              <div class="node-title">Embedding-based memory search <span class="parallel-badge">2c engine</span></div>
+              <div class="node-detail">Engine-level, not WASM. Local embedding model (nomic/candle). Index on write, vector search on read. Layers on existing CRUD memory. Security: model integrity verification, resource budgeting, poisoning defense (#1137).</div>
             </div>
             <div class="node-expand">›</div>
           </div>
@@ -932,10 +364,8 @@
           <div class="tree-node" onclick="toggleNode(this)">
             <div class="node-status status-planned"></div>
             <div class="node-content">
-              <div class="node-title">Reflective memory</div>
-              <div class="node-detail">
-                Discovered, not forced. journal_write tool, mentioned in system prompt, model uses selectively. Live codebase index for self-awareness. Orchestration playbook with outcome tracking. Design doc: docs/design/reflective-memory.md
-              </div>
+              <div class="node-title">Vision skill — image analysis <span class="parallel-badge">2b skill</span></div>
+              <div class="node-detail">Send images to VLM. WASM skill using Network capability. No engine overlap.</div>
             </div>
             <div class="node-expand">›</div>
           </div>
@@ -944,10 +374,8 @@
           <div class="tree-node" onclick="toggleNode(this)">
             <div class="node-status status-planned"></div>
             <div class="node-content">
-              <div class="node-title">Repo transfer to fawxai org</div>
-              <div class="node-detail">
-                Move abbudjoe/fawx → fawxai/fawx on GitHub. Update all CI, URLs, references. Pre-launch requirement.
-              </div>
+              <div class="node-title">TTS skill — text-to-speech <span class="parallel-badge">2b skill</span></div>
+              <div class="node-detail">Edge TTS / ElevenLabs / OpenAI. WASM skill using Network + FileSystem. No engine overlap.</div>
             </div>
             <div class="node-expand">›</div>
           </div>
@@ -956,13 +384,8 @@
           <div class="tree-node" onclick="toggleNode(this)">
             <div class="node-status status-planned"></div>
             <div class="node-content">
-              <div class="node-title">fawx.ai landing page</div>
-              <div class="node-detail">
-                Product website at fawx.ai. Hero section with value prop, architecture overview, demo GIF/video, feature highlights (WASM skills, distributed fleet, self-improvement, security model). Dark theme matching TUI aesthetic. Static site — no backend needed. Should sell the vision: "the engine that builds itself."
-                <div class="node-deps">
-                  <span class="dep-tag">repo transfer</span>
-                </div>
-              </div>
+              <div class="node-title">Browser skill — web automation <span class="parallel-badge">2b skill</span></div>
+              <div class="node-detail">Headless browser control. WASM + subprocess hybrid. No engine overlap.</div>
             </div>
             <div class="node-expand">›</div>
           </div>
@@ -971,27 +394,46 @@
           <div class="tree-node" onclick="toggleNode(this)">
             <div class="node-status status-planned"></div>
             <div class="node-content">
-              <div class="node-title">GitHub repo docs (fawxai org)</div>
-              <div class="node-detail">
-                README.md with architecture diagram, quickstart, feature overview. CONTRIBUTING.md (closed-source but accepting skill submissions). SECURITY.md (public-facing responsible disclosure). LICENSE file. GitHub org profile README. Issue/PR templates. Make the repo look professional and credible for investors/users.
-                <div class="node-deps">
-                  <span class="dep-tag">repo transfer</span>
-                </div>
-              </div>
+              <div class="node-title">Canvas skill — UI rendering <span class="parallel-badge">2b skill</span></div>
+              <div class="node-detail">HTML/data visualization. Lower priority — CLI-first. No engine overlap.</div>
             </div>
             <div class="node-expand">›</div>
           </div>
         </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-planned"></div>
-            <div class="node-content">
-              <div class="node-title">Launch Fest 2026 prep <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1131">#1131</a></div>
-              <div class="node-detail">Pitch deck, demo recording, landing page. Fawx is closed-source — safety architecture is the moat.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
+      </div>
+
+      <div class="tree-divider">📝 Phase 3 — Polish + Docs (parallel)</div>
+      <div class="tree">
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">Config commands polish <span class="parallel-badge">3a</span></div><div class="node-detail">Clean up config_get/config_set UX. Validation, errors, help text.</div></div><div class="node-expand">›</div></div></div>
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">Repo documentation <span class="parallel-badge">3b</span></div><div class="node-detail">Setup guide, config reference, ripcord docs, command reference. README, CONTRIBUTING, SECURITY, LICENSE.</div></div><div class="node-expand">›</div></div></div>
+      </div>
+
+      <div class="tree-divider">🚀 Phase 4 — Launch (parallel)</div>
+      <div class="tree">
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">Repo transfer to fawxai org <span class="parallel-badge">4a</span></div><div class="node-detail">abbudjoe/fawx → fawxai/fawx. Update CI, URLs, references.</div></div><div class="node-expand">›</div></div></div>
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">fawx.ai landing page <span class="parallel-badge">4b</span></div><div class="node-detail">Product website. Hero, architecture, demo, features. Dark theme. Static site.</div></div><div class="node-expand">›</div></div></div>
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">Launch Fest 2026 prep <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1131">#1131</a></div><div class="node-detail">Pitch deck, demo recording. Safety architecture is the moat.</div></div><div class="node-expand">›</div></div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════ Phase 5: Fleet (Post-Launch) ═══════════ -->
+  <div class="wave" id="phase-5">
+    <div class="wave-header" onclick="toggleWave('phase-5')">
+      <div class="wave-icon" style="background: var(--purple-glow); color: var(--purple);">5</div>
+      <div class="wave-info">
+        <div class="wave-title">Phase 5: Distributed Fleet <span class="wave-badge" style="background:var(--purple-glow);color:var(--purple);border:1px solid rgba(188,140,255,0.3);">Post-Launch</span></div>
+        <div class="wave-desc">Wire fx-fleet for real multi-node orchestration. Deferred from Phase 0 — requires fleet client agent.</div>
+      </div>
+      <div class="wave-meta"><span class="wave-count">0/5 done</span><span class="wave-chevron">›</span></div>
+    </div>
+    <div class="wave-body">
+      <div class="tree">
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-vision"></div><div class="node-content"><div class="node-title">Fleet client agent</div><div class="node-detail">Lightweight daemon that runs on remote nodes (Mac Mini, MacBook, future VPS). Heartbeats to coordinator, receives tasks, reports results. Must be a separate binary (<code>fawx-node</code>), not the full engine.</div></div><div class="node-expand">›</div></div></div>
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-vision"></div><div class="node-content"><div class="node-title">NodeRegistry wiring</div><div class="node-detail">Wire NodeRegistry from config (auto-register known nodes). Heartbeat processing. Stale detection + status reporting. <code>/fleet</code> TUI command for visibility.</div></div><div class="node-expand">›</div></div></div>
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-vision"></div><div class="node-content"><div class="node-title">TaskRouter + Orchestrator wiring</div><div class="node-detail">Capability-based task routing to fleet nodes. Task lifecycle (submit → dispatch → running → complete/failed). Retry on node failure. Complements <code>node_run</code> (SSH) with structured task dispatch.</div></div><div class="node-expand">›</div></div></div>
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-vision"></div><div class="node-content"><div class="node-title">Binary rollback via ripcord</div><div class="node-detail">Extend fawx-ripcord to snapshot + restore the <code>fawx</code> binary itself. Versioned binary storage (keep last 3, symlink swap). Triggered by canary or manual. Deferred from Phase 0 — binary bugs are CI/release failures, not agent-caused regressions.</div></div><div class="node-expand">›</div></div></div>
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-vision"></div><div class="node-content"><div class="node-title">Fleet security hardening</div><div class="node-detail">mTLS between coordinator and nodes. Task signing (coordinator signs, node verifies). Capability allowlists per node. Audit log for cross-node operations.</div></div><div class="node-expand">›</div></div></div>
       </div>
     </div>
   </div>
@@ -1004,137 +446,59 @@
         <div class="wave-title">Wave 9: Training Pipeline — The Model Improves Itself <span class="wave-badge badge-vision">Vision</span></div>
         <div class="wave-desc">GPU cloud skills, LoRA fine-tuning, training data curation, model eval + deployment</div>
       </div>
-      <div class="wave-meta">
-        <span class="wave-count">0/5 done</span>
-        <span class="wave-chevron">›</span>
-      </div>
+      <div class="wave-meta"><span class="wave-count">0/5 done</span><span class="wave-chevron">›</span></div>
     </div>
     <div class="wave-body">
       <div class="tree">
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-vision"></div>
-            <div class="node-content">
-              <div class="node-title">Cloud resource skills</div>
-              <div class="node-detail">
-                WASM skills with Network capability for Lambda, Prime Intellect, RunPod. Provision GPU instances, manage compute jobs. Infrastructure-as-a-skill.
-                <div class="node-deps">
-                  <span class="dep-tag dep-done">orchestrator</span>
-                  <span class="dep-tag dep-done">http_request</span>
-                  <span class="dep-tag dep-done">marketplace</span>
-                </div>
-              </div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-vision"></div>
-            <div class="node-content">
-              <div class="node-title">Training data curation</div>
-              <div class="node-detail">
-                Conversation persistence is already training-ready JSONL. Signal observation labels data quality (friction = bad, success = good). Curate training pairs from successful tool use patterns automatically.
-                <div class="node-deps">
-                  <span class="dep-tag dep-done">conversation persistence</span>
-                  <span class="dep-tag dep-done">signal observation</span>
-                </div>
-              </div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-vision"></div>
-            <div class="node-content">
-              <div class="node-title">LoRA fine-tune orchestration</div>
-              <div class="node-detail">
-                SuperFawx orchestrates: upload curated data → provision GPU → run fine-tune → pull adapter weights. All through signed WASM skills on the GPU node.
-                <div class="node-deps">
-                  <span class="dep-tag">cloud resource skills</span>
-                  <span class="dep-tag">training data curation</span>
-                </div>
-              </div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-vision"></div>
-            <div class="node-content">
-              <div class="node-title">Model eval + behavioral canary</div>
-              <div class="node-detail">
-                Evaluate fine-tuned model against fawx-test scenarios. Behavioral canary compares signal ratios pre/post. Only deploy if eval passes. Same safety model, higher stakes.
-                <div class="node-deps">
-                  <span class="dep-tag dep-done">fawx-test</span>
-                  <span class="dep-tag dep-done">behavioral canary</span>
-                  <span class="dep-tag">LoRA fine-tune</span>
-                </div>
-              </div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-vision"></div>
-            <div class="node-content">
-              <div class="node-title">Adapter deployment — signed + rollback-safe</div>
-              <div class="node-detail">
-                Deploy LoRA adapter through signing pipeline. Signed artifact, verified by kernel, rollback via fawx-ripcord if regression detected. Two axes of self-improvement complete: WASM skills (capability) + LoRA (cognition).
-                <div class="node-deps">
-                  <span class="dep-tag dep-done">WASM signing</span>
-                  <span class="dep-tag dep-done">fawx-ripcord</span>
-                  <span class="dep-tag">model eval</span>
-                </div>
-              </div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-vision"></div><div class="node-content"><div class="node-title">Cloud resource skills · Training data curation · LoRA orchestration · Model eval · Signed adapter deployment</div></div><div class="node-expand">›</div></div></div>
       </div>
     </div>
   </div>
 
 </div>
 
-<!-- ═══════════ Dependency Flow ═══════════ -->
+<!-- ═══════════ Execution Plan ═══════════ -->
 <div class="dep-graph-section">
-  <h2>Critical Path</h2>
+  <h2>Execution Plan</h2>
   <div class="dep-graph">
     <div class="dep-flow">
-      <div class="dep-flow-node" style="background:var(--green-glow);border-color:rgba(63,185,80,0.3);color:var(--green);">Engine ✓</div>
+      <div class="dep-flow-node" style="background:var(--yellow-glow);border-color:rgba(210,153,34,0.3);color:var(--yellow);">P0: Wire 6 gaps (5 PRs) 🟡</div>
       <div class="dep-arrow">→</div>
-      <div class="dep-flow-node" style="background:var(--green-glow);border-color:rgba(63,185,80,0.3);color:var(--green);">WASM + Signing ✓</div>
+      <div class="dep-flow-node" style="background:var(--red-glow);border-color:rgba(248,81,73,0.3);color:var(--red);">P1: fawx setup 🔴</div>
       <div class="dep-arrow">→</div>
-      <div class="dep-flow-node" style="background:var(--green-glow);border-color:rgba(63,185,80,0.3);color:var(--green);">Self-Improvement ✓</div>
+      <div class="dep-parallel">
+        <div class="dep-flow-node" style="background:var(--accent-glow);border-color:rgba(240,136,62,0.3);color:var(--accent);">2a: edit + bg procs</div>
+        <div class="dep-flow-node" style="background:var(--accent-glow);border-color:rgba(240,136,62,0.3);color:var(--accent);">2c: memory embeddings</div>
+        <div class="dep-flow-node" style="background:var(--blue-glow);border-color:rgba(88,166,255,0.3);color:var(--blue);">2b: WASM skills</div>
+        <div class="dep-parallel-label">parallel</div>
+      </div>
       <div class="dep-arrow">→</div>
-      <div class="dep-flow-node" style="background:var(--green-glow);border-color:rgba(63,185,80,0.3);color:var(--green);">SuperFawx ✓</div>
+      <div class="dep-parallel">
+        <div class="dep-flow-node" style="background:var(--accent-glow);border-color:rgba(240,136,62,0.3);color:var(--accent);">3a: config polish</div>
+        <div class="dep-flow-node" style="background:var(--blue-glow);border-color:rgba(88,166,255,0.3);color:var(--blue);">3b: repo docs</div>
+        <div class="dep-parallel-label">parallel</div>
+      </div>
       <div class="dep-arrow">→</div>
-      <div class="dep-flow-node" style="background:var(--accent-glow);border-color:rgba(240,136,62,0.3);color:var(--accent);">Polish + Launch ⚡</div>
+      <div class="dep-parallel">
+        <div class="dep-flow-node" style="background:var(--green-glow);border-color:rgba(63,185,80,0.3);color:var(--green);">4a: repo transfer</div>
+        <div class="dep-flow-node" style="background:var(--green-glow);border-color:rgba(63,185,80,0.3);color:var(--green);">4b: fawx.ai</div>
+        <div class="dep-parallel-label">parallel</div>
+      </div>
       <div class="dep-arrow">→</div>
-      <div class="dep-flow-node" style="background:var(--purple-glow);border-color:rgba(188,140,255,0.3);color:var(--purple);">Self-Training</div>
+      <div class="dep-flow-node" style="background:var(--purple-glow);border-color:rgba(188,140,255,0.3);color:var(--purple);">Launch 🚀</div>
     </div>
   </div>
 </div>
 
 <div class="footer">
   <strong>Fawx</strong> — Built by Joe + Clawdio 🦝<br>
-  7 waves shipped · 50+ PRs merged · ~15,000 lines of Rust<br>
-  Last updated: March 7, 2026
+  8 waves · 65+ PRs merged · 108,000 lines of Rust · 1,900+ tests<br>
+  Last updated: March 8, 2026
 </div>
 
 <script>
-function toggleWave(id) {
-  const wave = document.getElementById(id);
-  wave.classList.toggle('expanded');
-}
-
-function toggleNode(el) {
-  el.classList.toggle('open');
-}
+function toggleWave(id) { document.getElementById(id).classList.toggle('expanded'); }
+function toggleNode(el) { el.classList.toggle('open'); }
 </script>
 
 </body>

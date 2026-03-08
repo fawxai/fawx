@@ -1,9 +1,9 @@
-//! HTTP API server for Fawx headless mode (Tailscale-only).
+//! HTTP API server for Fawx headless mode.
 //!
 //! Provides a thin HTTP adapter over [`HeadlessApp`] with endpoints for
-//! message processing, health checks, and status. The server binds
-//! exclusively to the Tailscale interface (100.64.0.0/10 CGNAT range)
-//! and refuses to start if Tailscale is not detected.
+//! message processing, health checks, and status. The server always binds
+//! to localhost so the local TUI can connect, and also binds to the
+//! Tailscale interface (100.64.0.0/10 CGNAT range) when one is available.
 //!
 //! All authenticated endpoints require a `Bearer <token>` header validated
 //! via HMAC-based constant-time comparison (`ring::hmac`). The `/health`
@@ -25,6 +25,8 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
 use crate::headless::HeadlessApp;
+
+use fx_channel_telegram::{IncomingMessage, OutgoingMessage, TelegramChannel};
 
 // ── Request/Response types ──────────────────────────────────────────────────
 
@@ -54,7 +56,8 @@ struct StatusResponse {
     model: String,
     skills: Vec<String>,
     memory_entries: usize,
-    tailscale_ip: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tailscale_ip: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -68,11 +71,35 @@ struct ErrorBody {
 struct HttpState {
     app: Arc<Mutex<HeadlessApp>>,
     start_time: Instant,
-    tailscale_ip: IpAddr,
+    tailscale_ip: Option<String>,
     // TODO(#1203): Token is stored as plaintext String — could appear in heap
     // dumps. Future hardening: wrap with `secrecy::SecretString` to ensure
     // zeroization on drop and prevent accidental logging.
     bearer_token: String,
+    /// Telegram channel (None if not configured).
+    telegram: Option<Arc<TelegramChannel>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ListenTarget {
+    addr: SocketAddr,
+    label: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ListenPlan {
+    local: ListenTarget,
+    tailscale: Option<ListenTarget>,
+}
+
+struct BoundListener {
+    target: ListenTarget,
+    listener: TcpListener,
+}
+
+struct BoundListeners {
+    local: BoundListener,
+    tailscale: Option<BoundListener>,
 }
 
 // ── Token verification ──────────────────────────────────────────────────────
@@ -159,7 +186,8 @@ pub fn is_tailscale_ip(ip: &IpAddr) -> bool {
 ///
 /// First tries `tailscale ip -4`; falls back to scanning for an address
 /// in the 100.64.0.0/10 CGNAT range. Returns an error if neither method
-/// finds a Tailscale interface.
+/// finds a Tailscale interface. Callers may choose to continue with a
+/// localhost-only binding when detection fails.
 fn detect_tailscale_ip() -> Result<IpAddr, HttpError> {
     if let Some(ip) = detect_via_tailscale_cli() {
         return Ok(ip);
@@ -201,8 +229,7 @@ fn detect_via_cgnat_scan() -> Result<IpAddr, HttpError> {
 
     Err(HttpError::NoTailscale(
         "Could not detect Tailscale interface.\n\
-         fawx serve --http requires Tailscale to be running.\n\
-         The HTTP server only binds to the Tailscale network for security."
+         The HTTP server will continue with a localhost-only binding."
             .to_string(),
     ))
 }
@@ -212,6 +239,33 @@ fn extract_ip_from_line(line: &str) -> Option<IpAddr> {
     let after_inet = &line[inet_pos + 5..];
     let addr_str = after_inet.split('/').next()?;
     addr_str.trim().parse().ok()
+}
+
+fn listen_targets(port: u16, tailscale_ip: Option<IpAddr>) -> ListenPlan {
+    ListenPlan {
+        local: ListenTarget {
+            addr: SocketAddr::from(([127, 0, 0, 1], port)),
+            label: "local",
+        },
+        tailscale: tailscale_ip.map(|ip| ListenTarget {
+            addr: SocketAddr::new(ip, port),
+            label: "Tailscale",
+        }),
+    }
+}
+
+fn optional_tailscale_ip(result: Result<IpAddr, HttpError>) -> Option<IpAddr> {
+    match result {
+        Ok(ip) => Some(ip),
+        Err(error) => {
+            tracing::warn!(error = %error, "tailscale IP not detected; serving localhost only");
+            None
+        }
+    }
+}
+
+fn detect_optional_tailscale_ip() -> Option<IpAddr> {
+    optional_tailscale_ip(detect_tailscale_ip())
 }
 
 // ── Error type ──────────────────────────────────────────────────────────────
@@ -228,11 +282,13 @@ impl std::fmt::Display for HttpError {
             Self::NoTailscale(msg) => write!(f, "{msg}"),
             Self::MissingBearerToken => write!(
                 f,
-                "HTTP API requires a bearer token for authentication.\n\
-                 Add to ~/.fawx/config.toml:\n\n\
-                 [http]\n\
-                 bearer_token = \"your-secret-token\"\n\n\
-                 Generate one with: openssl rand -hex 32"
+                "HTTP API requires a bearer token for authentication.\n\n\
+                 Option 1 (recommended): Use the TUI command:\n\
+                 \x20 /auth http set-bearer <TOKEN>\n\n\
+                 Option 2 (deprecated): Add to ~/.fawx/config.toml:\n\
+                 \x20 [http]\n\
+                 \x20 bearer_token = \"your-secret-token\"\n\n\
+                 Generate a token with: openssl rand -hex 32"
             ),
         }
     }
@@ -242,12 +298,26 @@ impl std::error::Error for HttpError {}
 
 // ── Token validation ────────────────────────────────────────────────────────
 
-/// Validate that the HTTP config contains a non-empty bearer token.
+/// Resolve the bearer token, preferring the encrypted credential store over config.
 ///
-/// Trims leading/trailing whitespace from the configured value so that
-/// `bearer_token = "  mytoken  "` compares against `"mytoken"` rather than
-/// silently including the spaces (review finding #4).
-fn validate_bearer_token(config: &HttpConfig) -> Result<String, HttpError> {
+/// Checks the credential store first (token stored via `/auth http set-bearer`),
+/// then falls back to `config.bearer_token` for backward compatibility.
+/// Trims leading/trailing whitespace from configured values.
+fn validate_bearer_token(
+    config: &HttpConfig,
+    auth_store: Option<&crate::auth_store::AuthStore>,
+) -> Result<String, HttpError> {
+    // 1. Check encrypted credential store first.
+    if let Some(store) = auth_store {
+        if let Ok(Some(token)) = store.get_provider_token("http_bearer") {
+            let trimmed = token.trim().to_string();
+            if !trimmed.is_empty() {
+                return Ok(trimmed);
+            }
+        }
+    }
+
+    // 2. Fall back to config.toml (deprecated).
     match &config.bearer_token {
         Some(token) => {
             let trimmed = token.trim().to_string();
@@ -270,12 +340,17 @@ fn build_router(state: HttpState) -> Router {
     let authenticated = Router::new()
         .route("/message", post(handle_message))
         .route("/status", get(handle_status))
+        .route("/config", get(handle_config_get).post(handle_config_set))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
         ));
 
-    let public = Router::new().route("/health", get(handle_health));
+    // Telegram webhook is public (Telegram servers POST to it).
+    // Security is handled by webhook secret_token validation inside the handler.
+    let public = Router::new()
+        .route("/health", get(handle_health))
+        .route("/telegram/webhook", post(handle_telegram_webhook));
 
     authenticated
         .merge(public)
@@ -330,6 +405,70 @@ async fn handle_health(State(state): State<HttpState>) -> Json<HealthResponse> {
     })
 }
 
+// ── Config request/response types ────────────────────────────────────────────
+
+use fx_tools::ConfigSetRequest;
+
+async fn handle_config_get(
+    State(state): State<HttpState>,
+    query: axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
+    let section = query.get("section").map(|s| s.as_str()).unwrap_or("all");
+    let app = state.app.lock().await;
+    let mgr = app.config_manager().ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorBody {
+                error: "config manager not available".to_string(),
+            }),
+        )
+    })?;
+    let guard = mgr.lock().map_err(|e| {
+        tracing::error!(error = %e, "config manager lock failed");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                error: "internal_error".to_string(),
+            }),
+        )
+    })?;
+    let value = guard
+        .get(section)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })))?;
+    Ok(Json(value))
+}
+
+async fn handle_config_set(
+    State(state): State<HttpState>,
+    Json(request): Json<ConfigSetRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
+    let app = state.app.lock().await;
+    let mgr = app.config_manager().ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorBody {
+                error: "config manager not available".to_string(),
+            }),
+        )
+    })?;
+    let mut guard = mgr.lock().map_err(|e| {
+        tracing::error!(error = %e, "config manager lock failed");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                error: "internal_error".to_string(),
+            }),
+        )
+    })?;
+    guard
+        .set(&request.key, &request.value)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })))?;
+    Ok(Json(serde_json::json!({
+        "updated": request.key,
+        "value": request.value,
+    })))
+}
+
 async fn handle_status(State(state): State<HttpState>) -> Json<StatusResponse> {
     let app = state.app.lock().await;
     let model = app.active_model().to_string();
@@ -339,44 +478,493 @@ async fn handle_status(State(state): State<HttpState>) -> Json<StatusResponse> {
         model,
         skills: Vec::new(),
         memory_entries: 0,
-        tailscale_ip: state.tailscale_ip.to_string(),
+        tailscale_ip: state.tailscale_ip.clone(),
     })
+}
+
+// ── Telegram photo helpers ──────────────────────────────────────────────────
+
+/// Return the media inbound directory (`~/.fawx/media/inbound/`).
+fn media_inbound_dir() -> std::path::PathBuf {
+    crate::tui::fawx_data_dir().join("media").join("inbound")
+}
+
+/// Download photos and build the final message text.
+///
+/// If the incoming message has photos, downloads each one and prepends
+/// `[Image: /path/to/file.jpg]\n` to the text. Creates the media directory
+/// on first use.
+async fn build_text_with_photos(
+    telegram: &TelegramChannel,
+    incoming: &mut IncomingMessage,
+) -> String {
+    if incoming.photos.is_empty() {
+        return incoming.text.clone();
+    }
+
+    let media_dir = media_inbound_dir();
+    if let Err(e) = std::fs::create_dir_all(&media_dir) {
+        tracing::error!("Failed to create media dir: {e}");
+        return incoming.text.clone();
+    }
+
+    let mut prefix = String::new();
+    for photo in &mut incoming.photos {
+        match telegram
+            .download_file(&photo.file_id, incoming.message_id, &media_dir)
+            .await
+        {
+            Ok(path) => {
+                prefix.push_str(&format!("[Image: {}]\n", path.display()));
+                photo.file_path = Some(path);
+            }
+            Err(e) => {
+                tracing::error!("Failed to download photo {}: {e}", photo.file_id);
+            }
+        }
+    }
+
+    if prefix.is_empty() {
+        incoming.text.clone()
+    } else {
+        format!("{prefix}{}", incoming.text)
+    }
+}
+
+// ── Telegram long-polling loop ──────────────────────────────────────────────
+
+/// Process a single Telegram update through the agentic loop.
+///
+/// Parses the update, sends a typing indicator, processes the message,
+/// and sends the response. Errors are logged but not propagated so the
+/// polling loop continues.
+async fn handle_telegram_update(
+    telegram: &TelegramChannel,
+    app: &Arc<Mutex<HeadlessApp>>,
+    raw_update: &serde_json::Value,
+) {
+    let payload = raw_update.to_string();
+    let mut incoming = match telegram.parse_update(&payload) {
+        Ok(Some(msg)) => msg,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!("Telegram poll parse error: {e}");
+            return;
+        }
+    };
+
+    tracing::info!(
+        chat_id = incoming.chat_id,
+        from = ?incoming.from_name,
+        photos = incoming.photos.len(),
+        "Telegram poll: message received"
+    );
+
+    let _ = telegram.send_typing(incoming.chat_id).await;
+    telegram.set_last_chat_id(incoming.chat_id);
+
+    let message_text = build_text_with_photos(telegram, &mut incoming).await;
+
+    let mut app_guard = app.lock().await;
+    let response_msg = match app_guard.process_message(&message_text).await {
+        Ok(result) => OutgoingMessage {
+            chat_id: incoming.chat_id,
+            text: result.response,
+            parse_mode: Some("Markdown".to_string()),
+            reply_to_message_id: Some(incoming.message_id),
+        },
+        Err(e) => {
+            tracing::error!("Telegram poll loop error: {e}");
+            OutgoingMessage {
+                chat_id: incoming.chat_id,
+                text: format!("⚠️ Error: {e}"),
+                parse_mode: None,
+                reply_to_message_id: Some(incoming.message_id),
+            }
+        }
+    };
+    drop(app_guard);
+
+    if let Err(e) = telegram.send_message(&response_msg).await {
+        tracing::error!("Telegram poll: failed to send response: {e}");
+    }
+}
+
+/// Run the Telegram long-polling loop.
+///
+/// Calls `get_updates` in a loop with a 30-second long-poll timeout.
+/// Errors are logged and the loop continues — it never crashes.
+async fn run_telegram_polling(telegram: Arc<TelegramChannel>, app: Arc<Mutex<HeadlessApp>>) {
+    // Delete any existing webhook so Telegram sends updates via getUpdates.
+    if let Err(e) = telegram.delete_webhook().await {
+        tracing::error!("Telegram poll: failed to delete webhook: {e}");
+    }
+
+    let mut offset: i64 = 0;
+    loop {
+        match telegram.get_updates(offset, 30).await {
+            Ok((updates, next_offset)) => {
+                for update in &updates {
+                    handle_telegram_update(&telegram, &app, update).await;
+                }
+                offset = next_offset;
+            }
+            Err(e) => {
+                tracing::error!("Telegram poll error: {e}");
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        }
+    }
+}
+
+// ── Telegram webhook handler ────────────────────────────────────────────────
+
+async fn handle_telegram_webhook(
+    State(state): State<HttpState>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> impl IntoResponse {
+    let telegram = match &state.telegram {
+        Some(t) => Arc::clone(t),
+        None => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    // Finding #1: Validate webhook secret_token header.
+    let secret_header = headers
+        .get("x-telegram-bot-api-secret-token")
+        .and_then(|v| v.to_str().ok());
+
+    if !telegram.validate_webhook_secret(secret_header) {
+        tracing::warn!("Telegram webhook: invalid or missing secret token");
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let mut incoming = match telegram.parse_update(&body) {
+        Ok(Some(msg)) => msg,
+        Ok(None) => return StatusCode::OK.into_response(),
+        Err(e) => {
+            tracing::warn!("Telegram parse error: {e:?}");
+            return StatusCode::OK.into_response();
+        }
+    };
+
+    tracing::info!(
+        chat_id = incoming.chat_id,
+        from = ?incoming.from_name,
+        photos = incoming.photos.len(),
+        "Telegram message received"
+    );
+
+    // Send typing indicator (best-effort)
+    let _ = telegram.send_typing(incoming.chat_id).await;
+
+    // Update last_chat_id for Channel::send_response
+    telegram.set_last_chat_id(incoming.chat_id);
+
+    // Download photos and build message text with image paths
+    let message_text = build_text_with_photos(&telegram, &mut incoming).await;
+
+    // Process through the agentic loop
+    let mut app = state.app.lock().await;
+    match app.process_message(&message_text).await {
+        Ok(result) => {
+            let response = OutgoingMessage {
+                chat_id: incoming.chat_id,
+                text: result.response,
+                parse_mode: Some("Markdown".to_string()),
+                reply_to_message_id: Some(incoming.message_id),
+            };
+            if let Err(e) = telegram.send_message(&response).await {
+                tracing::error!("Failed to send Telegram response: {e:?}");
+            }
+        }
+        Err(e) => {
+            tracing::error!("Loop error: {e}");
+            let error_msg = OutgoingMessage {
+                chat_id: incoming.chat_id,
+                text: format!("⚠️ Error: {e}"),
+                parse_mode: None,
+                reply_to_message_id: Some(incoming.message_id),
+            };
+            let _ = telegram.send_message(&error_msg).await;
+        }
+    }
+
+    StatusCode::OK.into_response()
 }
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
 /// Run the HTTP server for headless mode.
 ///
-/// Validates that a bearer token is configured, detects the Tailscale IP,
-/// binds exclusively to it, and serves requests until the process is
-/// terminated.
-pub async fn run(app: HeadlessApp, port: u16, http_config: &HttpConfig) -> anyhow::Result<i32> {
-    let bearer_token = validate_bearer_token(http_config).map_err(|e| anyhow::anyhow!("{e}"))?;
+/// Validates that a bearer token is configured, always binds localhost for
+/// local clients, optionally binds Tailscale for remote access, and serves
+/// requests until the process is terminated.
+pub async fn run(
+    app: HeadlessApp,
+    port: u16,
+    http_config: &HttpConfig,
+    telegram: Option<Arc<fx_channel_telegram::TelegramChannel>>,
+) -> anyhow::Result<i32> {
+    let data_dir = crate::tui::fawx_data_dir();
+    let auth_store = match crate::auth_store::AuthStore::open(&data_dir) {
+        Ok(store) => Some(store),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not open credential store; falling back to config-only bearer token");
+            None
+        }
+    };
+    let bearer_token = validate_bearer_token(http_config, auth_store.as_ref())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let ip = detect_tailscale_ip().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let addr = SocketAddr::new(ip, port);
-
+    let listen_plan = listen_targets(port, detect_optional_tailscale_ip());
+    let listeners = bind_listeners(listen_plan).await?;
+    let shared_app = Arc::new(Mutex::new(app));
     let state = HttpState {
-        app: Arc::new(Mutex::new(app)),
+        app: Arc::clone(&shared_app),
         start_time: Instant::now(),
-        tailscale_ip: ip,
+        tailscale_ip: active_tailscale_ip(&listeners),
         bearer_token,
+        telegram: telegram.clone(),
+    };
+    let router = build_router(state);
+
+    print_startup_targets(&listeners);
+    eprintln!("Bearer token authentication: enabled");
+    validate_telegram_startup(telegram.as_ref()).await;
+    start_telegram_polling(telegram.as_ref(), &shared_app);
+
+    run_listeners(router, listeners).await?;
+    Ok(0)
+}
+
+fn active_tailscale_ip(listeners: &BoundListeners) -> Option<String> {
+    listeners
+        .tailscale
+        .as_ref()
+        .map(|listener| listener.target.addr.ip().to_string())
+}
+
+fn print_startup_targets(listeners: &BoundListeners) {
+    eprintln!("Fawx HTTP API listening on:");
+    eprintln!(
+        "  http://{} ({})",
+        listeners.local.target.addr, listeners.local.target.label
+    );
+    match &listeners.tailscale {
+        Some(listener) => {
+            eprintln!(
+                "  http://{} ({})",
+                listener.target.addr, listener.target.label
+            );
+        }
+        None => {
+            eprintln!("  Tailscale not detected or unavailable; serving localhost only");
+        }
+    }
+}
+
+async fn validate_telegram_startup(telegram: Option<&Arc<TelegramChannel>>) {
+    let Some(tg) = telegram else {
+        return;
     };
 
-    let router = build_router(state);
-    let listener = TcpListener::bind(addr)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to bind HTTP server on {addr}: {e}"))?;
+    match tg.get_me().await {
+        Ok(()) => {
+            eprintln!("Telegram channel: enabled (token valid, webhook at /telegram/webhook)")
+        }
+        Err(e) => {
+            eprintln!("Warning: Telegram get_me failed: {e}");
+            eprintln!(
+                "Telegram channel: enabled (webhook at /telegram/webhook) — token may be invalid"
+            );
+        }
+    }
+}
 
-    eprintln!("Fawx HTTP API listening on http://{addr}");
-    eprintln!("Tailscale-only binding — not accessible from public internet");
-    eprintln!("Bearer token authentication: enabled");
+fn start_telegram_polling(
+    telegram: Option<&Arc<TelegramChannel>>,
+    shared_app: &Arc<Mutex<HeadlessApp>>,
+) {
+    let Some(tg) = telegram else {
+        return;
+    };
 
+    tokio::spawn(run_telegram_polling(Arc::clone(tg), Arc::clone(shared_app)));
+    eprintln!("Telegram long-polling loop: started");
+}
+
+async fn run_listeners(router: Router, listeners: BoundListeners) -> anyhow::Result<()> {
+    match listeners.tailscale {
+        Some(tailscale) => run_listener_pair(router, listeners.local, tailscale).await,
+        None => {
+            serve_listener(
+                listeners.local.listener,
+                router,
+                listeners.local.target.label,
+            )
+            .await
+        }
+    }
+}
+
+async fn bind_listeners(plan: ListenPlan) -> anyhow::Result<BoundListeners> {
+    let local = bind_required_listener(plan.local).await?;
+    let tailscale = bind_optional_listener(plan.tailscale).await;
+    Ok(BoundListeners { local, tailscale })
+}
+
+async fn bind_required_listener(target: ListenTarget) -> anyhow::Result<BoundListener> {
+    let listener = bind_listener(target).await?;
+    Ok(BoundListener { target, listener })
+}
+
+async fn bind_optional_listener(target: Option<ListenTarget>) -> Option<BoundListener> {
+    let target = target?;
+    optional_bound_listener(target, bind_listener(target).await)
+}
+
+fn optional_bound_listener(
+    target: ListenTarget,
+    result: anyhow::Result<TcpListener>,
+) -> Option<BoundListener> {
+    match result {
+        Ok(listener) => Some(BoundListener { target, listener }),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                addr = %target.addr,
+                "Tailscale bind failed; continuing with localhost only"
+            );
+            eprintln!(
+                "  Warning: Tailscale bind failed on {}, serving localhost only",
+                target.addr
+            );
+            None
+        }
+    }
+}
+
+async fn run_listener_pair(
+    router: Router,
+    local: BoundListener,
+    tailscale: BoundListener,
+) -> anyhow::Result<()> {
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let local_label = local.target.label;
+    let tailscale_label = tailscale.target.label;
+    let local_server = tokio::spawn(serve_listener_with_shutdown(
+        local,
+        router.clone(),
+        shutdown_rx.clone(),
+    ));
+    let tailscale_server =
+        tokio::spawn(serve_listener_with_shutdown(tailscale, router, shutdown_rx));
+
+    wait_for_server_pair(
+        local_label,
+        local_server,
+        tailscale_label,
+        tailscale_server,
+        shutdown_tx,
+    )
+    .await
+}
+
+async fn bind_listener(target: ListenTarget) -> anyhow::Result<TcpListener> {
+    TcpListener::bind(target.addr).await.map_err(|e| {
+        anyhow::anyhow!(
+            "failed to bind {} HTTP server on {}: {e}",
+            target.label,
+            target.addr
+        )
+    })
+}
+
+async fn serve_listener(
+    listener: TcpListener,
+    router: Router,
+    label: &'static str,
+) -> anyhow::Result<()> {
     axum::serve(listener, router)
         .await
-        .map_err(|e| anyhow::anyhow!("HTTP server error: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("{label} HTTP server error: {e}"))
+}
 
-    Ok(0)
+async fn serve_listener_with_shutdown(
+    listener: BoundListener,
+    router: Router,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let label = listener.target.label;
+    axum::serve(listener.listener, router)
+        .with_graceful_shutdown(async move {
+            if !*shutdown.borrow() {
+                let _ = shutdown.changed().await;
+            }
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("{label} HTTP server error: {e}"))
+}
+
+async fn wait_for_server_pair(
+    local_label: &'static str,
+    local_server: tokio::task::JoinHandle<anyhow::Result<()>>,
+    tailscale_label: &'static str,
+    tailscale_server: tokio::task::JoinHandle<anyhow::Result<()>>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+) -> anyhow::Result<()> {
+    let mut local_server = local_server;
+    let mut tailscale_server = tailscale_server;
+
+    tokio::select! {
+        result = &mut local_server => {
+            finalize_server_exit(local_label, result, tailscale_label, tailscale_server, shutdown_tx).await
+        }
+        result = &mut tailscale_server => {
+            finalize_server_exit(tailscale_label, result, local_label, local_server, shutdown_tx).await
+        }
+    }
+}
+
+async fn finalize_server_exit(
+    exited_label: &'static str,
+    exited_result: Result<anyhow::Result<()>, tokio::task::JoinError>,
+    peer_label: &'static str,
+    peer_server: tokio::task::JoinHandle<anyhow::Result<()>>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+) -> anyhow::Result<()> {
+    let exited = join_server_result(exited_label, exited_result);
+    log_server_exit(
+        exited_label,
+        &exited,
+        "HTTP server exited; shutting down peer",
+    );
+    let _ = shutdown_tx.send(true);
+    let peer = join_server_result(peer_label, peer_server.await);
+    log_server_exit(
+        peer_label,
+        &peer,
+        "Peer HTTP server stopped after shutdown signal",
+    );
+    exited.and(peer)
+}
+
+fn log_server_exit(label: &str, result: &anyhow::Result<()>, message: &str) {
+    match result {
+        Ok(()) => tracing::warn!(server = label, "{message}"),
+        Err(error) => tracing::warn!(server = label, error = %error, "{message}"),
+    }
+}
+
+fn join_server_result(
+    label: &str,
+    result: Result<anyhow::Result<()>, tokio::task::JoinError>,
+) -> anyhow::Result<()> {
+    match result {
+        Ok(inner) => inner,
+        Err(error) => Err(anyhow::anyhow!("{label} HTTP server task failed: {error}")),
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -479,7 +1067,7 @@ mod tests {
             model: "test-model".to_string(),
             skills: vec!["skill-a".to_string()],
             memory_entries: 10,
-            tailscale_ip: "100.64.0.1".to_string(),
+            tailscale_ip: Some("100.64.0.1".to_string()),
         })
     }
 
@@ -533,17 +1121,95 @@ mod tests {
     // ── Binding validation ──────────────────────────────────────────────
 
     #[test]
-    fn binding_rejects_non_tailscale_ips() {
-        assert!(!is_tailscale_ip(&IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
-        assert!(!is_tailscale_ip(&IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))));
-        assert!(!is_tailscale_ip(&IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
+    fn listen_targets_bind_localhost_and_tailscale() {
+        let plan = listen_targets(8400, Some(IpAddr::V4(Ipv4Addr::new(100, 93, 251, 101))));
+        let tailscale = plan.tailscale.expect("tailscale target");
+
+        assert_eq!(plan.local.addr, SocketAddr::from(([127, 0, 0, 1], 8400)));
+        assert_eq!(plan.local.label, "local");
+        assert_eq!(
+            tailscale.addr,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 93, 251, 101)), 8400)
+        );
+        assert_eq!(tailscale.label, "Tailscale");
     }
 
     #[test]
-    fn binding_accepts_tailscale_ip() {
-        assert!(is_tailscale_ip(&IpAddr::V4(Ipv4Addr::new(
-            100, 93, 251, 101
-        ))));
+    fn listen_targets_fall_back_to_localhost_only() {
+        let plan = listen_targets(8400, None);
+
+        assert_eq!(plan.local.addr, SocketAddr::from(([127, 0, 0, 1], 8400)));
+        assert_eq!(plan.local.label, "local");
+        assert!(plan.tailscale.is_none());
+    }
+
+    #[test]
+    fn optional_tailscale_ip_returns_none_when_detection_fails() {
+        let result = optional_tailscale_ip(Err(HttpError::NoTailscale("missing".to_string())));
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn tailscale_bind_failure_falls_back_to_localhost_server() {
+        let local_target = ListenTarget {
+            addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            label: "local",
+        };
+        let local_listener = bind_listener(local_target).await.expect("bind localhost");
+        let local_addr = local_listener.local_addr().expect("local addr");
+        let tailscale_target = ListenTarget {
+            addr: SocketAddr::from(([100, 93, 251, 101], 8400)),
+            label: "Tailscale",
+        };
+        let listeners = BoundListeners {
+            local: BoundListener {
+                target: ListenTarget {
+                    addr: local_addr,
+                    label: "local",
+                },
+                listener: local_listener,
+            },
+            tailscale: optional_bound_listener(
+                tailscale_target,
+                Err(anyhow::anyhow!("bind failed")),
+            ),
+        };
+
+        let server = tokio::spawn(run_listeners(
+            Router::new().route("/health", get(mock_health)),
+            listeners,
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let response = reqwest::get(format!("http://{local_addr}/health"))
+            .await
+            .expect("request localhost health");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn wait_for_server_pair_shuts_down_peer_when_one_server_exits() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let local_server = tokio::spawn(async { Ok(()) });
+        let tailscale_server = tokio::spawn(async move {
+            let mut shutdown_rx = shutdown_rx;
+            let _ = shutdown_rx.changed().await;
+            Ok(())
+        });
+
+        let result = wait_for_server_pair(
+            "local",
+            local_server,
+            "Tailscale",
+            tailscale_server,
+            shutdown_tx,
+        )
+        .await;
+
+        assert!(result.is_ok());
     }
 
     // ── IP extraction from `ip addr` output ─────────────────────────────
@@ -614,7 +1280,7 @@ mod tests {
             model: "claude-3".to_string(),
             skills: vec!["read_file".to_string()],
             memory_entries: 42,
-            tailscale_ip: "100.93.251.101".to_string(),
+            tailscale_ip: Some("100.93.251.101".to_string()),
         };
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&resp).expect("serialize")).expect("parse");
@@ -624,6 +1290,21 @@ mod tests {
         assert!(json["skills"].is_array());
     }
 
+    #[test]
+    fn status_response_omits_tailscale_ip_when_unavailable() {
+        let resp = StatusResponse {
+            status: "ok",
+            model: "claude-3".to_string(),
+            skills: vec!["read_file".to_string()],
+            memory_entries: 42,
+            tailscale_ip: None,
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&resp).expect("serialize")).expect("parse");
+        assert_eq!(json["status"], "ok");
+        assert!(json.get("tailscale_ip").is_none());
+    }
+
     // ── Bearer token validation ─────────────────────────────────────────
 
     #[test]
@@ -631,13 +1312,13 @@ mod tests {
         let config = HttpConfig {
             bearer_token: Some("my-secret".to_string()),
         };
-        assert!(validate_bearer_token(&config).is_ok());
+        assert!(validate_bearer_token(&config, None).is_ok());
     }
 
     #[test]
     fn validate_bearer_token_rejects_none() {
         let config = HttpConfig { bearer_token: None };
-        assert!(validate_bearer_token(&config).is_err());
+        assert!(validate_bearer_token(&config, None).is_err());
     }
 
     #[test]
@@ -645,7 +1326,7 @@ mod tests {
         let config = HttpConfig {
             bearer_token: Some(String::new()),
         };
-        assert!(validate_bearer_token(&config).is_err());
+        assert!(validate_bearer_token(&config, None).is_err());
     }
 
     #[test]
@@ -653,7 +1334,7 @@ mod tests {
         let config = HttpConfig {
             bearer_token: Some("   ".to_string()),
         };
-        assert!(validate_bearer_token(&config).is_err());
+        assert!(validate_bearer_token(&config, None).is_err());
     }
 
     // ── Endpoint integration tests (no auth) ────────────────────────────
@@ -897,7 +1578,7 @@ mod tests {
         let config = HttpConfig {
             bearer_token: Some("  my-secret  ".to_string()),
         };
-        let result = validate_bearer_token(&config).expect("should accept");
+        let result = validate_bearer_token(&config, None).expect("should accept");
         assert_eq!(result, "my-secret");
     }
 
@@ -965,5 +1646,506 @@ mod tests {
 
         let resp = app.oneshot(req).await.expect("response");
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ── Credential store bearer token tests ─────────────────────────────
+
+    fn test_auth_store() -> crate::auth_store::AuthStore {
+        crate::auth_store::AuthStore::open_for_testing().expect("should create test auth store")
+    }
+
+    #[test]
+    fn validate_bearer_token_prefers_credential_store() {
+        let store = test_auth_store();
+        store
+            .store_provider_token("http_bearer", "store-token")
+            .expect("store");
+        let config = HttpConfig {
+            bearer_token: Some("config-token".to_string()),
+        };
+        let result = validate_bearer_token(&config, Some(&store)).expect("should succeed");
+        assert_eq!(result, "store-token");
+    }
+
+    #[test]
+    fn validate_bearer_token_falls_back_to_config() {
+        let store = test_auth_store();
+        let config = HttpConfig {
+            bearer_token: Some("config-token".to_string()),
+        };
+        let result = validate_bearer_token(&config, Some(&store)).expect("should succeed");
+        assert_eq!(result, "config-token");
+    }
+
+    #[test]
+    fn validate_bearer_token_fails_when_neither_source_has_token() {
+        let store = test_auth_store();
+        let config = HttpConfig { bearer_token: None };
+        assert!(validate_bearer_token(&config, Some(&store)).is_err());
+    }
+
+    #[test]
+    fn validate_bearer_token_store_roundtrip() {
+        let store = test_auth_store();
+        let token = "my-secret-bearer-token-abc123";
+        store
+            .store_provider_token("http_bearer", token)
+            .expect("store");
+        let retrieved = store
+            .get_provider_token("http_bearer")
+            .expect("get")
+            .expect("should have value");
+        assert_eq!(*retrieved, token);
+    }
+
+    #[test]
+    fn validate_bearer_token_store_ignores_empty() {
+        let store = test_auth_store();
+        store
+            .store_provider_token("http_bearer", "  ")
+            .expect("store");
+        let config = HttpConfig {
+            bearer_token: Some("config-fallback".to_string()),
+        };
+        let result = validate_bearer_token(&config, Some(&store)).expect("should succeed");
+        assert_eq!(result, "config-fallback");
+    }
+
+    // ── Config endpoint tests ────────────────────────────────────────────
+
+    mod config_endpoint {
+        use super::*;
+        use fx_config::manager::ConfigManager;
+        use std::sync::{Arc, Mutex as StdMutex};
+        use tempfile::TempDir;
+
+        /// State for config endpoint tests.
+        #[derive(Clone)]
+        struct ConfigTestState {
+            config_mgr: Arc<StdMutex<ConfigManager>>,
+        }
+
+        async fn test_config_get(
+            State(state): State<ConfigTestState>,
+            query: axum::extract::Query<std::collections::HashMap<String, String>>,
+        ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
+            let section = query.get("section").map(|s| s.as_str()).unwrap_or("all");
+            let guard = state.config_mgr.lock().map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorBody {
+                        error: format!("{e}"),
+                    }),
+                )
+            })?;
+            let value = guard
+                .get(section)
+                .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })))?;
+            Ok(Json(value))
+        }
+
+        async fn test_config_set(
+            State(state): State<ConfigTestState>,
+            Json(request): Json<ConfigSetRequest>,
+        ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
+            let mut guard = state.config_mgr.lock().map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorBody {
+                        error: format!("{e}"),
+                    }),
+                )
+            })?;
+            guard
+                .set(&request.key, &request.value)
+                .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })))?;
+            Ok(Json(serde_json::json!({
+                "updated": request.key,
+                "value": request.value,
+            })))
+        }
+
+        fn config_test_router(dir: &std::path::Path) -> Router {
+            let mgr = ConfigManager::new(dir).expect("config manager");
+            let state = ConfigTestState {
+                config_mgr: Arc::new(StdMutex::new(mgr)),
+            };
+            Router::new()
+                .route("/config", get(test_config_get).post(test_config_set))
+                .with_state(state)
+        }
+
+        #[tokio::test]
+        async fn config_get_returns_full_config() {
+            let temp = TempDir::new().expect("tempdir");
+            std::fs::write(
+                temp.path().join("config.toml"),
+                "[model]\ndefault_model = \"test-model\"\n",
+            )
+            .unwrap();
+            let app = config_test_router(temp.path());
+            let req = Request::builder()
+                .method("GET")
+                .uri("/config")
+                .body(Body::empty())
+                .expect("request");
+            let resp = app.oneshot(req).await.expect("response");
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = resp.into_body().collect().await.expect("body").to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            assert!(json.get("model").is_some());
+            assert!(json.get("general").is_some());
+        }
+
+        #[tokio::test]
+        async fn config_get_section_filter() {
+            let temp = TempDir::new().expect("tempdir");
+            std::fs::write(
+                temp.path().join("config.toml"),
+                "[model]\ndefault_model = \"my-model\"\n",
+            )
+            .unwrap();
+            let app = config_test_router(temp.path());
+            let req = Request::builder()
+                .method("GET")
+                .uri("/config?section=model")
+                .body(Body::empty())
+                .expect("request");
+            let resp = app.oneshot(req).await.expect("response");
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = resp.into_body().collect().await.expect("body").to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            assert_eq!(json["default_model"], "my-model");
+        }
+
+        #[tokio::test]
+        async fn config_get_unknown_section_returns_400() {
+            let temp = TempDir::new().expect("tempdir");
+            let app = config_test_router(temp.path());
+            let req = Request::builder()
+                .method("GET")
+                .uri("/config?section=bogus")
+                .body(Body::empty())
+                .expect("request");
+            let resp = app.oneshot(req).await.expect("response");
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn config_set_updates_value() {
+            let temp = TempDir::new().expect("tempdir");
+            std::fs::write(
+                temp.path().join("config.toml"),
+                "[model]\ndefault_model = \"old\"\n",
+            )
+            .unwrap();
+            let app = config_test_router(temp.path());
+            let req = Request::builder()
+                .method("POST")
+                .uri("/config")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"key":"model.default_model","value":"new"}"#))
+                .expect("request");
+            let resp = app.oneshot(req).await.expect("response");
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = resp.into_body().collect().await.expect("body").to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            assert_eq!(json["updated"], "model.default_model");
+            assert_eq!(json["value"], "new");
+        }
+
+        #[tokio::test]
+        async fn config_set_rejects_immutable() {
+            let temp = TempDir::new().expect("tempdir");
+            let app = config_test_router(temp.path());
+            let req = Request::builder()
+                .method("POST")
+                .uri("/config")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"key":"general.data_dir","value":"/tmp"}"#))
+                .expect("request");
+            let resp = app.oneshot(req).await.expect("response");
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    // ── handle_telegram_update tests ────────────────────────────────────
+
+    mod telegram_update {
+        use super::*;
+        use async_trait::async_trait;
+        use fx_channel_telegram::TelegramConfig;
+        use fx_kernel::act::{ToolExecutor, ToolExecutorError, ToolResult};
+        use fx_kernel::budget::{BudgetConfig, BudgetTracker};
+        use fx_kernel::cancellation::CancellationToken;
+        use fx_kernel::context_manager::ContextCompactor;
+        use fx_kernel::loop_engine::LoopEngine;
+        use fx_llm::{
+            CompletionProvider, CompletionRequest, CompletionResponse, CompletionStream,
+            ContentBlock, ModelRouter, ProviderCapabilities, ProviderError as LlmError,
+            StreamChunk,
+        };
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        // ── Stub tool executor (no tools in headless tests) ─────────────
+
+        #[derive(Debug)]
+        struct StubToolExecutor;
+
+        #[async_trait]
+        impl ToolExecutor for StubToolExecutor {
+            async fn execute_tools(
+                &self,
+                _calls: &[fx_llm::ToolCall],
+                _cancel: Option<&CancellationToken>,
+            ) -> Result<Vec<ToolResult>, ToolExecutorError> {
+                Ok(Vec::new())
+            }
+        }
+
+        // ── Mock completion provider (returns canned response) ──────────
+
+        struct MockProvider;
+
+        #[async_trait]
+        impl CompletionProvider for MockProvider {
+            async fn complete(
+                &self,
+                _request: CompletionRequest,
+            ) -> Result<CompletionResponse, LlmError> {
+                Ok(CompletionResponse {
+                    content: vec![ContentBlock::Text {
+                        text: "Mock response".to_string(),
+                    }],
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    stop_reason: Some("end_turn".to_string()),
+                })
+            }
+
+            async fn complete_stream(
+                &self,
+                _request: CompletionRequest,
+            ) -> Result<CompletionStream, LlmError> {
+                let chunk = StreamChunk {
+                    delta_content: Some("Mock response".to_string()),
+                    stop_reason: Some("end_turn".to_string()),
+                    ..Default::default()
+                };
+                let stream = futures::stream::once(async move { Ok(chunk) });
+                Ok(Box::pin(stream))
+            }
+
+            fn name(&self) -> &str {
+                "mock"
+            }
+
+            fn supported_models(&self) -> Vec<String> {
+                vec!["mock-model".to_string()]
+            }
+
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities {
+                    supports_temperature: false,
+                    requires_streaming: false,
+                }
+            }
+        }
+
+        // ── Failing completion provider (always errors) ─────────────────
+
+        struct FailingProvider;
+
+        #[async_trait]
+        impl CompletionProvider for FailingProvider {
+            async fn complete(
+                &self,
+                _request: CompletionRequest,
+            ) -> Result<CompletionResponse, LlmError> {
+                Err(LlmError::Provider("simulated LLM failure".to_string()))
+            }
+
+            async fn complete_stream(
+                &self,
+                _request: CompletionRequest,
+            ) -> Result<CompletionStream, LlmError> {
+                Err(LlmError::Provider("simulated LLM failure".to_string()))
+            }
+
+            fn name(&self) -> &str {
+                "failing"
+            }
+
+            fn supported_models(&self) -> Vec<String> {
+                vec!["failing-model".to_string()]
+            }
+
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities {
+                    supports_temperature: false,
+                    requires_streaming: false,
+                }
+            }
+        }
+
+        // ── Mock Telegram API server ────────────────────────────────────
+
+        /// Spin up a minimal HTTP server that returns `{"ok": true}` for
+        /// all POSTs (mimics the Telegram Bot API enough for unit tests).
+        async fn mock_telegram_server() -> (String, tokio::task::JoinHandle<()>) {
+            let app = axum::Router::new().fallback(axum::routing::any(|| async {
+                axum::Json(serde_json::json!({ "ok": true }))
+            }));
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind mock server");
+            let addr = listener.local_addr().expect("local addr");
+            let base_url = format!("http://{addr}");
+            let handle = tokio::spawn(async move {
+                axum::serve(listener, app).await.ok();
+            });
+            (base_url, handle)
+        }
+
+        // ── Test helpers ────────────────────────────────────────────────
+
+        fn test_telegram_config() -> TelegramConfig {
+            TelegramConfig {
+                bot_token: "000000:TESTTOKEN".to_string(),
+                allowed_chat_ids: Vec::new(),
+                webhook_secret: None,
+            }
+        }
+
+        fn test_engine() -> LoopEngine {
+            LoopEngine::builder()
+                .budget(BudgetTracker::new(BudgetConfig::default(), 0, 0))
+                .context(ContextCompactor::new(2048, 256))
+                .max_iterations(3)
+                .tool_executor(Arc::new(StubToolExecutor))
+                .synthesis_instruction("Summarize".to_string())
+                .build()
+                .expect("test engine")
+        }
+
+        fn make_test_app(router: ModelRouter) -> HeadlessApp {
+            use crate::headless::HeadlessAppDeps;
+            use fx_subagent::{
+                test_support::DisabledSubagentFactory, SubagentLimits, SubagentManager,
+                SubagentManagerDeps,
+            };
+            use std::sync::Arc;
+
+            let subagent_manager = Arc::new(SubagentManager::new(SubagentManagerDeps {
+                factory: Arc::new(DisabledSubagentFactory::new("disabled")),
+                limits: SubagentLimits::default(),
+            }));
+
+            HeadlessApp::new(HeadlessAppDeps {
+                loop_engine: test_engine(),
+                router: Arc::new(router),
+                config: fx_config::FawxConfig::default(),
+                memory: None,
+                system_prompt_path: None,
+                config_manager: None,
+                system_prompt_text: None,
+                subagent_manager,
+            })
+            .expect("test app")
+        }
+
+        fn mock_router() -> ModelRouter {
+            let mut router = ModelRouter::new();
+            router.register_provider(Box::new(MockProvider));
+            router.set_active("mock-model").expect("set active");
+            router
+        }
+
+        fn failing_router() -> ModelRouter {
+            let mut router = ModelRouter::new();
+            router.register_provider(Box::new(FailingProvider));
+            router.set_active("failing-model").expect("set active");
+            router
+        }
+
+        fn sample_update(chat_id: i64, text: &str) -> serde_json::Value {
+            serde_json::json!({
+                "update_id": 1001,
+                "message": {
+                    "message_id": 42,
+                    "chat": { "id": chat_id },
+                    "from": { "first_name": "TestUser" },
+                    "text": text
+                }
+            })
+        }
+
+        // ── Tests ───────────────────────────────────────────────────────
+
+        /// Happy path: valid update is processed, response is sent.
+        #[tokio::test]
+        async fn happy_path_valid_update_processed() {
+            let (base_url, _server) = mock_telegram_server().await;
+            let telegram = TelegramChannel::new_with_base_url(test_telegram_config(), base_url);
+            let app = Arc::new(Mutex::new(make_test_app(mock_router())));
+
+            let update = sample_update(12345, "hello bot");
+
+            // Should not panic; processes the message and sends response.
+            handle_telegram_update(&telegram, &app, &update).await;
+
+            // Verify the last_chat_id was set (proves we reached the
+            // message-processing path, not an early return).
+            assert_eq!(
+                telegram.last_chat_id(),
+                Some(12345),
+                "chat_id should be set after successful processing"
+            );
+        }
+
+        /// Parse error: invalid update JSON is handled gracefully.
+        #[tokio::test]
+        async fn parse_error_handled_gracefully() {
+            let telegram = TelegramChannel::new(test_telegram_config());
+            // App is never touched — parse fails before reaching it.
+            let app = Arc::new(Mutex::new(make_test_app(mock_router())));
+
+            // JSON that is valid serde_json::Value but fails to
+            // deserialize into a Telegram Update with required fields.
+            let invalid_update = serde_json::json!({
+                "message": { "bad_field": true }
+            });
+
+            // Should return early without panicking.
+            handle_telegram_update(&telegram, &app, &invalid_update).await;
+
+            // Verify we never reached the message-processing path.
+            assert!(
+                telegram.last_chat_id().is_none(),
+                "chat_id should not be set on parse error"
+            );
+        }
+
+        /// process_message error: app returns error, error message sent.
+        #[tokio::test]
+        async fn process_message_error_sends_error_response() {
+            let (base_url, _server) = mock_telegram_server().await;
+            let telegram = TelegramChannel::new_with_base_url(test_telegram_config(), base_url);
+            let app = Arc::new(Mutex::new(make_test_app(failing_router())));
+
+            let update = sample_update(12345, "trigger error");
+
+            // Should not panic; processes the error and sends error message.
+            handle_telegram_update(&telegram, &app, &update).await;
+
+            // Verify the last_chat_id was set (proves we reached the
+            // processing path, even though the LLM failed).
+            assert_eq!(
+                telegram.last_chat_id(),
+                Some(12345),
+                "chat_id should be set even on error path"
+            );
+        }
     }
 }

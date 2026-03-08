@@ -1,3 +1,5 @@
+pub mod manager;
+
 use serde::{Deserialize, Serialize};
 use toml_edit::{value, DocumentMut, Item, Table};
 
@@ -75,6 +77,7 @@ pub struct FawxConfig {
     pub fleet: FleetConfig,
     pub webhook: WebhookConfig,
     pub orchestrator: OrchestratorConfig,
+    pub telegram: TelegramChannelConfig,
 }
 
 /// Fleet configuration for multi-node coordination.
@@ -102,14 +105,23 @@ impl Default for FleetConfig {
 /// Configuration for a known node in the fleet.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NodeConfig {
+    /// Unique node identifier (required by spec).
+    pub id: String,
     /// Human-readable name.
     pub name: String,
     /// HTTP API endpoint.
-    pub endpoint: String,
+    pub endpoint: Option<String>,
     /// Bearer token for authentication.
     pub auth_token: Option<String>,
     /// Capability strings (e.g., "agentic_loop", "skill_build").
+    #[serde(default)]
     pub capabilities: Vec<String>,
+    /// SSH address (IP or hostname) for SSH transport.
+    pub address: Option<String>,
+    /// SSH username.
+    pub user: Option<String>,
+    /// Path to SSH private key.
+    pub ssh_key: Option<String>,
 }
 
 /// Webhook channel configuration.
@@ -156,6 +168,22 @@ impl Default for OrchestratorConfig {
             default_max_retries: 1,
         }
     }
+}
+
+/// Telegram channel configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct TelegramChannelConfig {
+    /// Whether the Telegram channel is enabled.
+    pub enabled: bool,
+    /// Bot token (from BotFather). Can also be set via FAWX_TELEGRAM_TOKEN env var.
+    pub bot_token: Option<String>,
+    /// Restrict to specific Telegram chat IDs. Empty = accept all.
+    pub allowed_chat_ids: Vec<i64>,
+    /// Secret token for webhook validation. If set, the webhook handler
+    /// validates the `X-Telegram-Bot-Api-Secret-Token` header on every
+    /// incoming request. Can also be set via FAWX_TELEGRAM_WEBHOOK_SECRET.
+    pub webhook_secret: Option<String>,
 }
 
 /// Preprocessing deduplication settings.
@@ -391,6 +419,42 @@ impl Default for SelfModifyPathsCliConfig {
     }
 }
 
+/// Expand a leading `~` in a path to the user's home directory.
+///
+/// Only expands `~` at the very start of the path (i.e., `~/.fawx` becomes
+/// `/home/user/.fawx`). Paths like `foo/~/bar` or absolute paths are returned
+/// unchanged. Returns the original path if the home directory cannot be
+/// determined.
+fn expand_tilde(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    if s == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    } else if let Some(rest) = s.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    // ~user paths and everything else: return as-is
+    path.to_path_buf()
+}
+
+/// Apply tilde expansion to an optional path field.
+fn expand_tilde_opt(path: &mut Option<PathBuf>) {
+    if let Some(p) = path.as_mut() {
+        let original = p.clone();
+        *p = expand_tilde(&original);
+        if *p != original {
+            tracing::debug!(
+                "config path expanded: {} -> {}",
+                original.display(),
+                p.display()
+            );
+        }
+    }
+}
+
 impl FawxConfig {
     pub fn load(data_dir: &Path) -> Result<Self, String> {
         let config_path = data_dir.join("config.toml");
@@ -399,10 +463,18 @@ impl FawxConfig {
         }
         let content = fs::read_to_string(&config_path)
             .map_err(|error| format!("failed to read config: {error}"))?;
-        let config: Self =
+        let mut config: Self =
             toml::from_str(&content).map_err(|error| format!("invalid config: {error}"))?;
         config.validate()?;
+        config.expand_paths();
         Ok(config)
+    }
+
+    /// Expand `~` to the user's home directory in all user-facing path configs.
+    fn expand_paths(&mut self) {
+        expand_tilde_opt(&mut self.general.data_dir);
+        expand_tilde_opt(&mut self.tools.working_dir);
+        expand_tilde_opt(&mut self.self_modify.proposals_dir);
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -497,13 +569,20 @@ fn update_default_model(config_path: &Path, default_model: &str) -> Result<(), S
     write_config_file(config_path, document.to_string())
 }
 
-fn parse_config_document(content: &str) -> Result<DocumentMut, String> {
+pub(crate) fn parse_config_document(content: &str) -> Result<DocumentMut, String> {
     content
         .parse::<DocumentMut>()
         .map_err(|error| format!("invalid config: {error}"))
 }
 
-fn set_string_field(
+/// Set a field in a TOML document, inferring the correct value type.
+///
+/// Attempts to parse `field_value` as an integer, float, or boolean before
+/// falling back to a string. When updating an existing key the original
+/// value's type is preferred (e.g. an existing integer stays integer even
+/// if the new value could be read as a string). Inline comments/decor on
+/// the original value are preserved.
+pub(crate) fn set_typed_field(
     document: &mut DocumentMut,
     sections: &[&str],
     key: &str,
@@ -511,23 +590,80 @@ fn set_string_field(
 ) -> Result<(), String> {
     let table = get_or_insert_table(document, sections)?;
     if let Some(item) = table.get_mut(key) {
-        return update_string_item(item, key, field_value);
+        return update_typed_item(item, key, field_value);
     }
-    table[key] = value(field_value);
+    // New key — infer type from the raw string.
+    table[key] = infer_typed_value(field_value);
     Ok(())
 }
 
-fn update_string_item(item: &mut Item, key: &str, field_value: &str) -> Result<(), String> {
-    let decor = item
+/// Infer a `toml_edit::Value` from a raw string, trying integer → bool → string.
+fn infer_typed_value(raw: &str) -> Item {
+    if let Ok(n) = raw.parse::<i64>() {
+        return value(n);
+    }
+    match raw {
+        "true" => return value(true),
+        "false" => return value(false),
+        _ => {}
+    }
+    value(raw)
+}
+
+fn update_typed_item(item: &mut Item, key: &str, field_value: &str) -> Result<(), String> {
+    let existing = item
         .as_value()
-        .ok_or_else(|| format!("config field '{key}' must be a value"))?
-        .decor()
-        .clone();
-    *item = value(field_value);
+        .ok_or_else(|| format!("config field '{key}' must be a value"))?;
+    let decor = existing.decor().clone();
+
+    // Match the existing value's type when possible.
+    let new_item = if existing.is_integer() {
+        if let Ok(n) = field_value.parse::<i64>() {
+            value(n)
+        } else {
+            // Fall back to string if the new value isn't numeric.
+            value(field_value)
+        }
+    } else if existing.is_bool() {
+        match field_value {
+            "true" => value(true),
+            "false" => value(false),
+            _ => value(field_value),
+        }
+    } else {
+        value(field_value)
+    };
+
+    *item = new_item;
     item.as_value_mut()
         .ok_or_else(|| format!("config field '{key}' must be a value"))?
         .decor_mut()
         .clone_from(&decor);
+    Ok(())
+}
+
+// Keep the old name as a thin wrapper for callers that always want strings.
+pub(crate) fn set_string_field(
+    document: &mut DocumentMut,
+    sections: &[&str],
+    key: &str,
+    field_value: &str,
+) -> Result<(), String> {
+    let table = get_or_insert_table(document, sections)?;
+    if let Some(item) = table.get_mut(key) {
+        let decor = item
+            .as_value()
+            .ok_or_else(|| format!("config field '{key}' must be a value"))?
+            .decor()
+            .clone();
+        *item = value(field_value);
+        item.as_value_mut()
+            .ok_or_else(|| format!("config field '{key}' must be a value"))?
+            .decor_mut()
+            .clone_from(&decor);
+        return Ok(());
+    }
+    table[key] = value(field_value);
     Ok(())
 }
 
@@ -554,7 +690,7 @@ fn get_or_insert_table_in<'a>(
     get_or_insert_table_in(child, rest)
 }
 
-fn write_config_file(config_path: &Path, content: String) -> Result<(), String> {
+pub(crate) fn write_config_file(config_path: &Path, content: String) -> Result<(), String> {
     fs::write(config_path, content).map_err(|error| format!("failed to write config: {error}"))
 }
 
@@ -743,10 +879,14 @@ max_relevant_results = 9
                 coordinator: true,
                 stale_timeout_seconds: 120,
                 nodes: vec![NodeConfig {
+                    id: "test-node".to_string(),
                     name: "test-node".to_string(),
-                    endpoint: "https://10.0.0.1:8400".to_string(),
+                    endpoint: Some("https://10.0.0.1:8400".to_string()),
                     auth_token: Some("token123".to_string()),
                     capabilities: vec!["agentic_loop".to_string()],
+                    address: Some("10.0.0.1".to_string()),
+                    user: Some("deploy".to_string()),
+                    ssh_key: Some("~/.ssh/id_ed25519".to_string()),
                 }],
             },
             webhook: WebhookConfig {
@@ -762,6 +902,12 @@ max_relevant_results = 9
                 max_pending_tasks: 50,
                 default_timeout_ms: 15_000,
                 default_max_retries: 3,
+            },
+            telegram: TelegramChannelConfig {
+                enabled: true,
+                bot_token: Some("123456:ABC-DEF".to_string()),
+                allowed_chat_ids: vec![100, 200],
+                webhook_secret: Some("test-webhook-secret".to_string()),
             },
         };
 
@@ -1105,5 +1251,94 @@ max_iterations = 10
         assert_eq!(ThinkingBudget::Adaptive.budget_tokens(), Some(5_000));
         assert_eq!(ThinkingBudget::Low.budget_tokens(), Some(1_024));
         assert_eq!(ThinkingBudget::Off.budget_tokens(), None);
+    }
+
+    #[test]
+    fn tilde_expansion_resolves_home() {
+        let path = PathBuf::from("~/.fawx");
+        let expanded = expand_tilde(&path);
+        let home = dirs::home_dir().expect("home dir should exist in test");
+        assert_eq!(expanded, home.join(".fawx"));
+    }
+
+    #[test]
+    fn tilde_expansion_preserves_absolute() {
+        let path = PathBuf::from("/absolute/path");
+        let expanded = expand_tilde(&path);
+        assert_eq!(expanded, PathBuf::from("/absolute/path"));
+    }
+
+    #[test]
+    fn tilde_expansion_preserves_relative() {
+        let path = PathBuf::from("relative/path");
+        let expanded = expand_tilde(&path);
+        assert_eq!(expanded, PathBuf::from("relative/path"));
+    }
+
+    #[test]
+    fn tilde_expansion_preserves_tilde_in_middle() {
+        let path = PathBuf::from("foo/~/bar");
+        let expanded = expand_tilde(&path);
+        assert_eq!(expanded, PathBuf::from("foo/~/bar"));
+    }
+
+    #[test]
+    fn tilde_expansion_does_not_expand_tilde_user() {
+        let path = PathBuf::from("~joe/.config");
+        let expanded = expand_tilde(&path);
+        assert_eq!(expanded, PathBuf::from("~joe/.config"));
+    }
+
+    #[test]
+    fn tilde_expansion_bare_tilde_resolves_to_home() {
+        let path = PathBuf::from("~");
+        let expanded = expand_tilde(&path);
+        let home = dirs::home_dir().expect("home dir should exist in test");
+        assert_eq!(expanded, home);
+    }
+
+    #[test]
+    fn load_expands_tilde_in_config_paths() {
+        let temp = TempDir::new().expect("tempdir");
+        let content = r#"
+[general]
+data_dir = "~/.fawx"
+
+[tools]
+working_dir = "~/projects"
+
+[self_modify]
+proposals_dir = "~/.fawx/proposals"
+"#;
+        write_config(&temp, content);
+        let loaded = FawxConfig::load(temp.path()).expect("load config");
+
+        let home = dirs::home_dir().expect("home dir should exist in test");
+        assert_eq!(loaded.general.data_dir, Some(home.join(".fawx")),);
+        assert_eq!(loaded.tools.working_dir, Some(home.join("projects")),);
+        assert_eq!(
+            loaded.self_modify.proposals_dir,
+            Some(home.join(".fawx/proposals")),
+        );
+    }
+
+    #[test]
+    fn load_preserves_absolute_config_paths() {
+        let temp = TempDir::new().expect("tempdir");
+        let content = r#"
+[general]
+data_dir = "/tmp/fawx-data"
+
+[tools]
+working_dir = "/tmp/work"
+"#;
+        write_config(&temp, content);
+        let loaded = FawxConfig::load(temp.path()).expect("load config");
+
+        assert_eq!(
+            loaded.general.data_dir,
+            Some(PathBuf::from("/tmp/fawx-data")),
+        );
+        assert_eq!(loaded.tools.working_dir, Some(PathBuf::from("/tmp/work")),);
     }
 }

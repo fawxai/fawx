@@ -72,6 +72,28 @@ pub enum InternalMessage {
         phase: StreamPhase,
     },
 
+    /// A tool call is about to be executed.
+    ToolUse {
+        /// Tool call identifier.
+        call_id: String,
+        /// Tool/function name.
+        name: String,
+        /// Structured arguments.
+        arguments: serde_json::Value,
+    },
+
+    /// A tool execution result is available.
+    ToolResult {
+        /// Tool call identifier.
+        call_id: String,
+        /// Tool/function name.
+        name: String,
+        /// Whether the tool call succeeded.
+        success: bool,
+        /// Human-readable output.
+        content: String,
+    },
+
     /// A sub-goal has started execution within a decomposition plan.
     SubGoalStarted {
         /// Zero-based index within the plan.
@@ -179,6 +201,51 @@ mod tests {
             InternalMessage::StreamingFinished {
                 phase: StreamPhase::Reason
             }
+        ));
+    }
+
+    #[test]
+    fn tool_use_roundtrip_serde() {
+        let msg = InternalMessage::ToolUse {
+            call_id: "call-1".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path": "src/main.rs"}),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let decoded: InternalMessage = serde_json::from_str(&json).expect("deserialize");
+        assert!(matches!(
+            decoded,
+            InternalMessage::ToolUse {
+                call_id,
+                name,
+                arguments
+            } if call_id == "call-1"
+                && name == "read_file"
+                && arguments == serde_json::json!({"path": "src/main.rs"})
+        ));
+    }
+
+    #[test]
+    fn tool_result_roundtrip_serde() {
+        let msg = InternalMessage::ToolResult {
+            call_id: "call-1".to_string(),
+            name: "read_file".to_string(),
+            success: false,
+            content: "fn main() {}".to_string(),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let decoded: InternalMessage = serde_json::from_str(&json).expect("deserialize");
+        assert!(matches!(
+            decoded,
+            InternalMessage::ToolResult {
+                call_id,
+                name,
+                success,
+                content
+            } if call_id == "call-1"
+                && name == "read_file"
+                && !success
+                && content == "fn main() {}"
         ));
     }
 }

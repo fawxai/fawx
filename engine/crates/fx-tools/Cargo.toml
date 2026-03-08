@@ -6,28 +6,34 @@ authors.workspace = true
 license.workspace = true
 
 [features]
-improvement = ["dep:fx-analysis", "dep:fx-improve", "dep:fx-memory", "dep:fx-config", "dep:uuid"]
+improvement = ["dep:fx-analysis", "dep:fx-improve", "dep:fx-memory", "dep:uuid"]
 
 [dependencies]
 fx-core.workspace = true
+fx-session.workspace = true
+fx-fleet.workspace = true
 fx-propose.workspace = true
 fx-kernel.workspace = true
 fx-llm = { path = "../fx-llm" }
 fx-loadable.workspace = true
+fx-config.workspace = true
+fx-subagent = { path = "../fx-subagent" }
 async-trait.workspace = true
 tokio.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing.workspace = true
 dirs = "6.0"
+nix = { version = "0.29", features = ["signal"] }
 
 # Optional improvement dependencies
 fx-analysis = { workspace = true, optional = true }
 fx-improve = { workspace = true, optional = true }
 fx-memory = { workspace = true, optional = true }
-fx-config = { workspace = true, optional = true }
 uuid = { version = "1.13", features = ["v4"], optional = true }
 
 [dev-dependencies]
 tempfile = "3.14"
 fx-memory.workspace = true
+fx-subagent = { path = "../fx-subagent", features = ["test-support"] }
+fx-storage.workspace = true
