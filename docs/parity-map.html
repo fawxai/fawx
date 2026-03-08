@@ -1,0 +1,645 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Fawx vs OpenClaw — Capability Parity Map</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --surface2: #1c2333;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text-dim: #8b949e;
+    --accent: #f0883e;
+    --green: #3fb950;
+    --green-glow: rgba(63, 185, 80, 0.15);
+    --red: #f85149;
+    --red-glow: rgba(248, 81, 73, 0.15);
+    --yellow: #d29922;
+    --yellow-glow: rgba(210, 153, 34, 0.12);
+    --blue: #58a6ff;
+    --blue-glow: rgba(88, 166, 255, 0.12);
+    --purple: #bc8cff;
+    --purple-glow: rgba(188, 140, 255, 0.12);
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    line-height: 1.6;
+    padding: 0;
+  }
+
+  .header {
+    text-align: center;
+    padding: 40px 24px 28px;
+    background: linear-gradient(180deg, var(--surface) 0%, var(--bg) 100%);
+    border-bottom: 1px solid var(--border);
+  }
+  .header h1 { font-size: 2em; font-weight: 700; letter-spacing: -0.02em; }
+  .header h1 .fox { color: var(--accent); }
+  .header h1 .claw { color: var(--blue); }
+  .header .subtitle { color: var(--text-dim); font-size: 1em; margin-top: 6px; }
+
+  /* ── Summary cards ── */
+  .summary {
+    max-width: 900px;
+    margin: 24px auto;
+    padding: 0 24px;
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  .summary-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 20px;
+    text-align: center;
+    flex: 1;
+    min-width: 120px;
+    max-width: 180px;
+  }
+  .summary-card .val { font-size: 1.6em; font-weight: 700; }
+  .summary-card .lbl { font-size: 0.7em; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.05em; margin-top: 2px; }
+  .val-green { color: var(--green); }
+  .val-yellow { color: var(--yellow); }
+  .val-red { color: var(--red); }
+  .val-purple { color: var(--purple); }
+
+  /* ── Legend ── */
+  .legend {
+    max-width: 900px;
+    margin: 8px auto 20px;
+    padding: 0 24px;
+    display: flex;
+    gap: 20px;
+    flex-wrap: wrap;
+    justify-content: center;
+    font-size: 0.8em;
+    color: var(--text-dim);
+  }
+  .legend-item { display: flex; align-items: center; gap: 6px; }
+  .legend-dot {
+    width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0;
+  }
+
+  /* ── Table ── */
+  .table-wrap {
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 0 24px;
+    overflow-x: auto;
+  }
+  table {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+    background: var(--surface);
+    border-radius: 12px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    margin-bottom: 40px;
+  }
+  thead th {
+    background: var(--surface2);
+    padding: 14px 16px;
+    text-align: left;
+    font-size: 0.75em;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-dim);
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+    z-index: 1;
+  }
+  thead th:first-child { border-radius: 12px 0 0 0; }
+  thead th:last-child { border-radius: 0 12px 0 0; }
+  tbody td {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+    font-size: 0.88em;
+  }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover { background: rgba(255,255,255,0.02); }
+
+  /* Category rows */
+  .cat-row td {
+    background: var(--bg);
+    font-weight: 700;
+    font-size: 0.8em;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--accent);
+    padding: 10px 16px;
+  }
+
+  /* Status badges */
+  .status {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.8em;
+    font-weight: 600;
+    padding: 3px 10px;
+    border-radius: 6px;
+    white-space: nowrap;
+  }
+  .status-parity { background: var(--green-glow); color: var(--green); border: 1px solid rgba(63,185,80,0.25); }
+  .status-partial { background: var(--yellow-glow); color: var(--yellow); border: 1px solid rgba(210,153,34,0.25); }
+  .status-gap { background: var(--red-glow); color: var(--red); border: 1px solid rgba(248,81,73,0.25); }
+  .status-ahead { background: var(--purple-glow); color: var(--purple); border: 1px solid rgba(188,140,255,0.25); }
+
+  .tools-list {
+    font-size: 0.85em;
+    color: var(--text-dim);
+    margin-top: 4px;
+    line-height: 1.5;
+  }
+  .tools-list code {
+    background: var(--bg);
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-size: 0.9em;
+    color: var(--text);
+  }
+  .gap-note {
+    font-size: 0.82em;
+    color: var(--text-dim);
+    font-style: italic;
+    margin-top: 4px;
+  }
+
+  /* ── Priorities section ── */
+  .priorities {
+    max-width: 960px;
+    margin: 0 auto 40px;
+    padding: 0 24px;
+  }
+  .priorities h2 {
+    font-size: 1.2em;
+    color: var(--text-dim);
+    font-weight: 500;
+    margin-bottom: 16px;
+  }
+  .priority-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .priority-item {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 18px;
+    display: flex;
+    align-items: flex-start;
+    gap: 14px;
+  }
+  .priority-rank {
+    font-size: 1.3em;
+    font-weight: 700;
+    color: var(--accent);
+    min-width: 28px;
+    text-align: center;
+  }
+  .priority-content { flex: 1; }
+  .priority-title { font-weight: 600; font-size: 0.95em; }
+  .priority-desc { font-size: 0.82em; color: var(--text-dim); margin-top: 3px; }
+  .priority-tag {
+    font-size: 0.65em;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-weight: 600;
+    text-transform: uppercase;
+    margin-left: 8px;
+  }
+  .tag-blocker { background: var(--red-glow); color: var(--red); border: 1px solid rgba(248,81,73,0.3); }
+  .tag-skill { background: var(--blue-glow); color: var(--blue); border: 1px solid rgba(88,166,255,0.3); }
+  .tag-engine { background: var(--accent-glow); color: var(--accent); border: 1px solid rgba(240,136,62,0.3); }
+
+  .footer {
+    text-align: center;
+    padding: 32px 24px;
+    color: var(--text-dim);
+    font-size: 0.78em;
+    border-top: 1px solid var(--border);
+  }
+
+  @media (max-width: 600px) {
+    .header h1 { font-size: 1.4em; }
+    thead th, tbody td { padding: 10px 10px; font-size: 0.8em; }
+    .summary-card { min-width: 90px; padding: 10px 12px; }
+    .summary-card .val { font-size: 1.2em; }
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>🦊 <span class="fox">Fawx</span> vs <span class="claw">OpenClaw</span></h1>
+  <div class="subtitle">Capability parity map — what Fawx has, what it's missing, what it does better</div>
+</div>
+
+<div class="summary">
+  <div class="summary-card"><div class="val val-green">8</div><div class="lbl">At Parity</div></div>
+  <div class="summary-card"><div class="val val-yellow">4</div><div class="lbl">Partial</div></div>
+  <div class="summary-card"><div class="val val-red">4</div><div class="lbl">Gaps</div></div>
+  <div class="summary-card"><div class="val val-purple">4</div><div class="lbl">Fawx Ahead</div></div>
+</div>
+
+<div class="legend">
+  <div class="legend-item"><div class="legend-dot" style="background:var(--green)"></div> Parity — equivalent or better</div>
+  <div class="legend-item"><div class="legend-dot" style="background:var(--yellow)"></div> Partial — basic coverage, gaps remain</div>
+  <div class="legend-item"><div class="legend-dot" style="background:var(--red)"></div> Gap — OpenClaw has it, Fawx doesn't</div>
+  <div class="legend-item"><div class="legend-dot" style="background:var(--purple)"></div> Fawx Ahead — unique to Fawx</div>
+</div>
+
+<div class="table-wrap">
+<table>
+<thead>
+  <tr>
+    <th style="width:20%">Capability</th>
+    <th style="width:28%">OpenClaw</th>
+    <th style="width:28%">Fawx</th>
+    <th style="width:24%">Status</th>
+  </tr>
+</thead>
+<tbody>
+
+  <!-- ═══ FILE SYSTEM ═══ -->
+  <tr class="cat-row"><td colspan="4">📁 File System</td></tr>
+  <tr>
+    <td><strong>Read / Write / Edit</strong></td>
+    <td>
+      <code>read</code> <code>write</code> <code>edit</code> <code>apply_patch</code>
+      <div class="tools-list">Surgical line edits, multi-hunk patches, offset/limit pagination</div>
+    </td>
+    <td>
+      <code>read_file</code> <code>write_file</code> <code>list_directory</code> <code>search_text</code>
+      <div class="tools-list">Full file read/write, directory listing, grep-like search</div>
+    </td>
+    <td>
+      <span class="status status-partial">⚠ Partial</span>
+      <div class="gap-note">Missing: surgical edit (replace exact text), multi-hunk apply_patch, offset/limit for large files</div>
+    </td>
+  </tr>
+
+  <!-- ═══ SHELL / RUNTIME ═══ -->
+  <tr class="cat-row"><td colspan="4">⚡ Shell / Runtime</td></tr>
+  <tr>
+    <td><strong>Command execution</strong></td>
+    <td>
+      <code>exec</code> <code>process</code>
+      <div class="tools-list">Background sessions, PTY, yieldMs, poll/log/write/kill, host/node targeting</div>
+    </td>
+    <td>
+      <code>run_command</code>
+      <div class="tools-list">Synchronous shell execution, working dir, timeout</div>
+    </td>
+    <td>
+      <span class="status status-partial">⚠ Partial</span>
+      <div class="gap-note">Missing: background sessions, PTY, process management (poll/kill), host/node targeting</div>
+    </td>
+  </tr>
+
+  <!-- ═══ WEB ═══ -->
+  <tr class="cat-row"><td colspan="4">🌐 Web</td></tr>
+  <tr>
+    <td><strong>Search</strong></td>
+    <td>
+      <code>web_search</code>
+      <div class="tools-list">Brave/Perplexity/Gemini/Grok, region/language, freshness filters</div>
+    </td>
+    <td>
+      <code>brave-search</code> <span style="font-size:0.75em;color:var(--blue)">(WASM skill)</span>
+      <div class="tools-list">Brave Search API via marketplace skill</div>
+    </td>
+    <td><span class="status status-parity">✓ Parity</span></td>
+  </tr>
+  <tr>
+    <td><strong>Fetch / Scrape</strong></td>
+    <td>
+      <code>web_fetch</code>
+      <div class="tools-list">URL → markdown/text extraction, maxChars, caching</div>
+    </td>
+    <td>
+      <code>web-fetch</code> <span style="font-size:0.75em;color:var(--blue)">(WASM skill)</span>
+      <div class="tools-list">URL → text extraction via marketplace skill</div>
+    </td>
+    <td><span class="status status-parity">✓ Parity</span></td>
+  </tr>
+  <tr>
+    <td><strong>Browser automation</strong></td>
+    <td>
+      <code>browser</code>
+      <div class="tools-list">Playwright: snapshot, screenshot, click/type/press, multi-tab, profiles, node-targeting</div>
+    </td>
+    <td>
+      ❌ None
+    </td>
+    <td>
+      <span class="status status-gap">✗ Gap</span>
+      <div class="gap-note">No browser automation. Spec exists for WASM browser skill.</div>
+    </td>
+  </tr>
+
+  <!-- ═══ MEDIA / MULTIMODAL ═══ -->
+  <tr class="cat-row"><td colspan="4">🎨 Media / Multimodal</td></tr>
+  <tr>
+    <td><strong>Vision / Image</strong></td>
+    <td>
+      <code>image</code>
+      <div class="tools-list">Analyze images with vision model, multi-image, configurable model</div>
+    </td>
+    <td>
+      ❌ None
+      <div class="tools-list">Telegram photo receive exists but no vision analysis tool</div>
+    </td>
+    <td>
+      <span class="status status-gap">✗ Gap</span>
+      <div class="gap-note">Spec written for VLM skill (#1016). Needs WASM skill or engine integration.</div>
+    </td>
+  </tr>
+  <tr>
+    <td><strong>TTS / Voice</strong></td>
+    <td>
+      <code>tts</code>
+      <div class="tools-list">Edge, ElevenLabs, OpenAI providers. Auto-voice on inbound audio.</div>
+    </td>
+    <td>
+      ❌ None
+    </td>
+    <td>
+      <span class="status status-gap">✗ Gap</span>
+      <div class="gap-note">Spec exists for STT/TTS skill (#1017).</div>
+    </td>
+  </tr>
+  <tr>
+    <td><strong>PDF analysis</strong></td>
+    <td>
+      <code>pdf</code>
+      <div class="tools-list">Native PDF for Anthropic/Google, text/image fallback, page ranges</div>
+    </td>
+    <td>
+      ❌ None
+    </td>
+    <td>
+      <span class="status status-gap">✗ Gap</span>
+      <div class="gap-note">Could be a WASM skill or leverage vision model.</div>
+    </td>
+  </tr>
+  <tr>
+    <td><strong>Canvas / UI rendering</strong></td>
+    <td>
+      <code>canvas</code>
+      <div class="tools-list">Present, eval, snapshot, A2UI push/reset</div>
+    </td>
+    <td>
+      ❌ None
+    </td>
+    <td>
+      <span class="status status-partial">⚠ Partial</span>
+      <div class="gap-note">Lower priority for CLI-first product. Canvas spec exists.</div>
+    </td>
+  </tr>
+
+  <!-- ═══ NODES / FLEET ═══ -->
+  <tr class="cat-row"><td colspan="4">🖥️ Nodes / Fleet</td></tr>
+  <tr>
+    <td><strong>Remote node control</strong></td>
+    <td>
+      <code>nodes</code>
+      <div class="tools-list">status, describe, run, notify, camera (snap/clip/list), screen_record, location, device_info/health/permissions, notifications</div>
+    </td>
+    <td>
+      <code>node_run</code> + <strong>fx-fleet</strong>
+      <div class="tools-list">NodeTransport/SSH, node_run tool. Fleet: NodeRegistry, heartbeat, capability tags, task routing, orchestrator</div>
+    </td>
+    <td>
+      <span class="status status-partial">⚠ Partial</span>
+      <div class="gap-note">Fawx has fleet orchestration (ahead of OpenClaw) but missing: camera, screen, notify, location, device introspection tools</div>
+    </td>
+  </tr>
+
+  <!-- ═══ MESSAGING ═══ -->
+  <tr class="cat-row"><td colspan="4">💬 Messaging</td></tr>
+  <tr>
+    <td><strong>Channel messaging</strong></td>
+    <td>
+      <code>message</code>
+      <div class="tools-list">Telegram, Discord, WhatsApp, Signal, Slack, iMessage, Teams, IRC, Google Chat, Line. Polls, reactions, threads, search, moderation.</div>
+    </td>
+    <td>
+      <strong>fx-channel-telegram</strong>
+      <div class="tools-list">Telegram only: long-poll, send/receive, photo receive. Channel trait supports adding more.</div>
+    </td>
+    <td>
+      <span class="status status-partial">⚠ Partial</span>
+      <div class="gap-note">Telegram working. Channel trait makes adding surfaces straightforward. Missing: Discord, WhatsApp, etc.</div>
+    </td>
+  </tr>
+
+  <!-- ═══ SCHEDULING ═══ -->
+  <tr class="cat-row"><td colspan="4">⏰ Scheduling / Cron</td></tr>
+  <tr>
+    <td><strong>Scheduled jobs</strong></td>
+    <td>
+      <code>cron</code>
+      <div class="tools-list">at/every/cron schedules, systemEvent/agentTurn payloads, wake events, announce delivery</div>
+    </td>
+    <td>
+      <code>scheduler</code> <span style="font-size:0.75em;color:var(--blue)">(WASM skill)</span>
+      <div class="tools-list">Marketplace scheduler skill</div>
+    </td>
+    <td><span class="status status-parity">✓ Parity</span></td>
+  </tr>
+
+  <!-- ═══ SELF-MANAGEMENT ═══ -->
+  <tr class="cat-row"><td colspan="4">🔧 Self-Management</td></tr>
+  <tr>
+    <td><strong>Config / Status / Restart</strong></td>
+    <td>
+      <code>gateway</code>
+      <div class="tools-list">config.get, config.apply, config.patch, config.schema.lookup, restart, update.run</div>
+    </td>
+    <td>
+      <code>config_get</code> <code>config_set</code> <code>fawx_status</code> <code>fawx_restart</code>
+      <div class="tools-list">ConfigManager, SIGHUP graceful restart, nix safe signals</div>
+    </td>
+    <td><span class="status status-parity">✓ Parity</span></td>
+  </tr>
+
+  <!-- ═══ SESSIONS / SUBAGENTS ═══ -->
+  <tr class="cat-row"><td colspan="4">🤖 Sessions / Subagents</td></tr>
+  <tr>
+    <td><strong>Multi-session</strong></td>
+    <td>
+      <code>sessions_list</code> <code>sessions_history</code> <code>sessions_send</code> <code>sessions_spawn</code> <code>subagents</code>
+      <div class="tools-list">List, inspect, send, spawn (subagent/ACP), steer, kill</div>
+    </td>
+    <td>
+      <code>session_list</code> <code>session_history</code> <code>session_send</code> <code>spawn_agent</code> <code>subagent_status</code>
+      <div class="tools-list">fx-session + fx-subagent crates. HeadlessStartup pattern.</div>
+    </td>
+    <td><span class="status status-parity">✓ Parity</span></td>
+  </tr>
+
+  <!-- ═══ MEMORY ═══ -->
+  <tr class="cat-row"><td colspan="4">🧠 Memory</td></tr>
+  <tr>
+    <td><strong>Persistent memory</strong></td>
+    <td>
+      <code>memory_search</code> <code>memory_get</code>
+      <div class="tools-list">Semantic search over MEMORY.md + memory/*.md (BM25 + embeddings). Read-only retrieval.</div>
+    </td>
+    <td>
+      <code>memory_write</code> <code>memory_read</code> <code>memory_list</code> <code>memory_delete</code> + <code>journal_write</code> <code>journal_search</code>
+      <div class="tools-list">Full CRUD + reflective journal. Hybrid startup injection. Decay-weighted recall.</div>
+    </td>
+    <td>
+      <span class="status status-parity">✓ Parity</span>
+      <div class="gap-note">Different approaches. Fawx has richer write/journal; OpenClaw has semantic embeddings. Both effective.</div>
+    </td>
+  </tr>
+
+  <!-- ═══ GIT ═══ -->
+  <tr class="cat-row"><td colspan="4">🔀 Git</td></tr>
+  <tr>
+    <td><strong>Version control</strong></td>
+    <td>
+      <em>No native git tools</em>
+      <div class="tools-list">Uses <code>exec</code> + <code>gh</code> CLI</div>
+    </td>
+    <td>
+      <code>git_status</code> <code>git_diff</code> <code>git_checkpoint</code> <code>git_branch_create</code> <code>git_branch_switch</code> <code>git_branch_delete</code> <code>git_merge</code> <code>git_revert</code>
+      <div class="tools-list">8 native git tools. Safe branching, atomic commits, revert.</div>
+    </td>
+    <td><span class="status status-ahead">★ Fawx Ahead</span></td>
+  </tr>
+
+  <!-- ═══ UNIQUE TO FAWX ═══ -->
+  <tr class="cat-row"><td colspan="4">🦊 Unique to Fawx</td></tr>
+  <tr>
+    <td><strong>Scratchpad</strong></td>
+    <td>❌ None</td>
+    <td>
+      <code>scratchpad_add</code> <code>scratchpad_list</code> <code>scratchpad_update</code> <code>scratchpad_remove</code>
+      <div class="tools-list">Cross-turn working memory for complex multi-step reasoning</div>
+    </td>
+    <td><span class="status status-ahead">★ Fawx Ahead</span></td>
+  </tr>
+  <tr>
+    <td><strong>Self-improvement</strong></td>
+    <td>❌ None</td>
+    <td>
+      <code>analyze_signals</code> <code>propose_improvement</code>
+      <div class="tools-list">Signal analysis + improvement proposals. Rate-limited. Kernel-gated.</div>
+    </td>
+    <td><span class="status status-ahead">★ Fawx Ahead</span></td>
+  </tr>
+  <tr>
+    <td><strong>Transactions</strong></td>
+    <td>❌ None</td>
+    <td>
+      <code>begin_transaction</code> <code>stage_file</code> <code>commit_transaction</code> <code>rollback_transaction</code>
+      <div class="tools-list">Atomic multi-file changes with rollback. Kernel-enforced write safety.</div>
+    </td>
+    <td><span class="status status-ahead">★ Fawx Ahead</span></td>
+  </tr>
+
+</tbody>
+</table>
+</div>
+
+<!-- ═══ SKILL PRIORITIES ═══ -->
+<div class="priorities">
+  <h2>Recommended Skill Build Order</h2>
+  <div class="priority-list">
+    <div class="priority-item">
+      <div class="priority-rank">1</div>
+      <div class="priority-content">
+        <div class="priority-title">
+          <code>edit</code> tool — surgical file editing
+          <span class="priority-tag tag-engine">Engine</span>
+        </div>
+        <div class="priority-desc">Replace exact text in files without rewriting the whole file. Core ergonomic need — every coding agent has this. Add offset/limit to read_file for large file support. Engine-level, not a WASM skill.</div>
+      </div>
+    </div>
+    <div class="priority-item">
+      <div class="priority-rank">2</div>
+      <div class="priority-content">
+        <div class="priority-title">
+          Background process management
+          <span class="priority-tag tag-engine">Engine</span>
+        </div>
+        <div class="priority-desc">Extend <code>run_command</code> with background execution, session IDs, poll/log/kill. Needed for long-running builds, dev servers, test suites. Engine-level — WASM can't manage host processes.</div>
+      </div>
+    </div>
+    <div class="priority-item">
+      <div class="priority-rank">3</div>
+      <div class="priority-content">
+        <div class="priority-title">
+          Vision skill — image analysis
+          <span class="priority-tag tag-skill">WASM Skill</span>
+        </div>
+        <div class="priority-desc">Send images to a VLM (GPT-4o, Claude, Gemini). Accepts file path or URL, returns analysis. Spec exists (#1016). WASM skill using Network capability + provider API.</div>
+      </div>
+    </div>
+    <div class="priority-item">
+      <div class="priority-rank">4</div>
+      <div class="priority-content">
+        <div class="priority-title">
+          TTS skill — text-to-speech
+          <span class="priority-tag tag-skill">WASM Skill</span>
+        </div>
+        <div class="priority-desc">Convert text to audio. Edge TTS (free), ElevenLabs, OpenAI providers. Spec exists (#1017). WASM skill using Network + FileSystem capabilities.</div>
+      </div>
+    </div>
+    <div class="priority-item">
+      <div class="priority-rank">5</div>
+      <div class="priority-content">
+        <div class="priority-title">
+          Browser skill — web automation
+          <span class="priority-tag tag-skill">WASM Skill</span>
+        </div>
+        <div class="priority-desc">Headless browser control. Could delegate to a Playwright process or use a simpler HTTP-based approach. Heaviest to implement — may be WASM + subprocess hybrid.</div>
+      </div>
+    </div>
+    <div class="priority-item">
+      <div class="priority-rank">6</div>
+      <div class="priority-content">
+        <div class="priority-title">
+          Memory skill — semantic search
+          <span class="priority-tag tag-skill">WASM Skill</span>
+        </div>
+        <div class="priority-desc">Add embedding-based semantic search to complement Fawx's existing CRUD memory. Could use local embeddings (nomic) or API-based. Improves recall quality over keyword matching.</div>
+      </div>
+    </div>
+    <div class="priority-item">
+      <div class="priority-rank">7</div>
+      <div class="priority-content">
+        <div class="priority-title">
+          Canvas skill — UI rendering
+          <span class="priority-tag tag-skill">WASM Skill</span>
+        </div>
+        <div class="priority-desc">Render HTML/data visualizations for the user. Lower priority — Fawx is CLI-first. Useful for reports, dashboards, data exploration.</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="footer">
+  🦊 Fawx: 41 tools (engine) + 3 marketplace skills &nbsp;|&nbsp; OpenClaw: 20 tools + plugins<br>
+  Fawx has more native tools but gaps in media/multimodal. Engine tools (#1-2) are blockers for coding parity.<br>
+  Generated March 8, 2026
+</div>
+
+</body>
+</html>
