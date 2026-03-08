@@ -9,15 +9,16 @@
 ## Problem
 
 `fx-tools/src/node_run.rs` has a complete `node_run` tool implementation with:
-- `NodeRunState` (holds `NodeRegistry` + `NodeTransport`)
+- `NodeRunState` (holds `Arc<RwLock<NodeRegistry>>` + `Arc<dyn NodeTransport>`)
 - `handle_node_run()` async handler
 - `node_run_tool_definition()` 
 - `FawxToolExecutor.with_node_run()` setter
 
-`SshTransport` is implemented in `fx-fleet/src/ssh_transport.rs` with:
-- SSH key, agent, and password auth detection
-- Command execution over SSH
-- Timeout handling
+`SshTransport` is implemented in `fx-fleet/src/ssh.rs` with:
+- SSH key auth (per-node override or default key)
+- `StrictHostKeyChecking=accept-new`, `BatchMode=yes`, `ConnectTimeout=10`
+- Auth failure classification (`TransportError::AuthFailed` vs `Unreachable`)
+- Timeout handling, kill-on-drop
 
 But `with_node_run()` is **never called** — not in `build_skill_registry()`, 
 not in `main.rs`, nowhere. The tool is registered in the definition list but 
@@ -25,31 +26,47 @@ execution always returns "node_run not configured."
 
 ## Solution
 
-### Read fleet config
+### Config → NodeInfo mapping
 
-`FawxConfig` already has `fleet: FleetConfig`:
+`NodeConfig` (fx-config) and `NodeInfo` (fx-fleet) have near-identical fields
+with different names:
+
+| NodeConfig | NodeInfo | Notes |
+|-----------|----------|-------|
+| `id` | `node_id` | rename |
+| `name` | `name` | same |
+| `endpoint` | `endpoint` | same |
+| `auth_token` | `auth_token` | same |
+| `capabilities: Vec<String>` | `capabilities: Vec<NodeCapability>` | parse strings to enum |
+| `address` | `address` | same (Option) |
+| `user` | `ssh_user` | rename |
+| `ssh_key` | `ssh_key` | same (Option) |
+| — | `status` | default `NodeStatus::Online` |
+| — | `last_heartbeat_ms` | default 0 |
+| — | `registered_at_ms` | default now |
+
+Add `impl From<&NodeConfig> for NodeInfo` in fx-fleet (~15 lines).
+
+### Default SSH key path
+
+`SshTransport::new(key_path: PathBuf)` takes a default key path. Per-node 
+`ssh_key` in NodeConfig overrides this in `base_command()`.
+
+**Decision:** Default to `~/.ssh/id_ed25519`. No fleet-level config field 
+needed until someone asks for it.
 
 ```rust
-pub struct FleetConfig {
-    pub nodes: Vec<NodeConfig>,
-}
-
-pub struct NodeConfig {
-    pub name: String,
-    pub host: String,
-    pub port: Option<u16>,
-    pub user: Option<String>,
-    pub auth_token: Option<String>,
-    pub capabilities: Vec<String>,
-}
+let default_key = dirs::home_dir()
+    .unwrap_or_else(|| PathBuf::from("."))
+    .join(".ssh/id_ed25519");
+let transport = Arc::new(SshTransport::new(default_key));
 ```
 
 ### Wire in build_skill_registry
 
-In `build_skill_registry()` (tui.rs), after creating `FawxToolExecutor`:
+In `build_skill_registry()` (`tui.rs`), after creating `FawxToolExecutor`:
 
 ```rust
-// Wire node_run if fleet nodes are configured
 if !config.fleet.nodes.is_empty() {
     match build_node_run_state(config) {
         Ok(state) => {
@@ -64,50 +81,55 @@ if !config.fleet.nodes.is_empty() {
 
 New function:
 ```rust
-fn build_node_run_state(config: &FawxConfig) -> Result<NodeRunState, String> {
+fn build_node_run_state(config: &FawxConfig) -> anyhow::Result<NodeRunState> {
     let mut registry = NodeRegistry::new();
     for node_config in &config.fleet.nodes {
-        let node_info = NodeInfo {
-            name: node_config.name.clone(),
-            host: node_config.host.clone(),
-            port: node_config.port.unwrap_or(22),
-            user: node_config.user.clone(),
-            capabilities: node_config.capabilities.clone(),
-        };
+        let node_info = NodeInfo::from(node_config);
         registry.register(node_info);
     }
-    let transport = Arc::new(SshTransport::new());
-    Ok(NodeRunState { registry, transport })
+    
+    let default_key = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".ssh/id_ed25519");
+    let transport = Arc::new(SshTransport::new(default_key));
+    
+    Ok(NodeRunState {
+        registry: Arc::new(RwLock::new(registry)),
+        transport: transport as Arc<dyn NodeTransport>,
+    })
 }
 ```
 
-### SSH auth detection
-
-`SshTransport` should auto-detect auth method:
-1. Check `~/.ssh/id_ed25519`, `~/.ssh/id_rsa` (key auth)
-2. Check `SSH_AUTH_SOCK` (agent auth)
-3. Fall back to config `auth_token` if provided (password/token)
-
-This is already implemented in `SshTransport` — just needs to be instantiated.
+Wire in **both** TUI (`build_skill_registry`) and HTTP (`build_headless_startup`) paths.
 
 ### Verification
 
 - Configure `[fleet]` in config.toml with a test node
 - Run `fawx tui` → agent should have `node_run` in tool list
 - Test: `node_run` with a simple command → verify SSH connection + output
-- Without fleet config: tool should not appear in list (no "not configured" errors)
+- Without fleet config: `with_node_run()` not called, tool doesn't appear
+
+## Implementation Gate
+
+### Gate 1: NodeCapability parsing
+`NodeConfig.capabilities` is `Vec<String>` but `NodeInfo.capabilities` is 
+`Vec<NodeCapability>` (an enum). If `NodeCapability` doesn't have a 
+`from_str()` or the strings don't map cleanly, **stop and report** — 
+we may need to change NodeConfig to use the enum directly.
 
 ## Files touched
 
 | File | Change |
 |------|--------|
-| `tui.rs` | Add `build_node_run_state()`, call `with_node_run()` in `build_skill_registry()` |
-| Tests | Unit test for `build_node_run_state` with mock config |
+| `fx-fleet/src/lib.rs` | `impl From<&NodeConfig> for NodeInfo` |
+| `tui.rs` | `build_node_run_state()`, call `with_node_run()` in `build_skill_registry()` |
+| `main.rs` or `http_serve.rs` | Same wiring for headless/HTTP path |
+| Tests | `build_node_run_state` with mock config, `From<NodeConfig>` mapping |
 
 ## Security
 
-- SSH connections use existing host key verification (system `known_hosts`)
-- Credentials from config only — agent cannot specify SSH credentials
-- Working directory enforcement inherited from node config
-- Command execution is already guarded by the agent's tool calling (same as `run_command`)
+- SSH connections use `BatchMode=yes` (no interactive password prompts)
+- `StrictHostKeyChecking=accept-new` (TOFU model — first connect accepted, changes rejected)
+- Credentials from config only — agent cannot specify SSH credentials or key paths
+- Command execution is guarded by agent's tool calling (same trust model as `run_command`)
 - Fleet node config is in config.toml (operator-controlled, not agent-writable)
