@@ -231,10 +231,14 @@ mod tests {
         config.telegram.bot_token = Some("bot-token".to_string());
         config.telegram.webhook_secret = Some("webhook-secret".to_string());
         config.fleet.nodes.push(fx_config::NodeConfig {
+            id: "node-a".to_string(),
             name: "node-a".to_string(),
-            endpoint: "http://127.0.0.1:9999".to_string(),
+            endpoint: Some("http://127.0.0.1:9999".to_string()),
             auth_token: Some("node-auth".to_string()),
             capabilities: vec!["agentic_loop".to_string()],
+            address: None,
+            user: None,
+            ssh_key: None,
         });
         config.model.default_model = Some("claude-opus-4-6".to_string());
 
