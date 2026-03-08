@@ -1,9 +1,9 @@
-//! HTTP API server for Fawx headless mode (Tailscale-only).
+//! HTTP API server for Fawx headless mode.
 //!
 //! Provides a thin HTTP adapter over [`HeadlessApp`] with endpoints for
-//! message processing, health checks, and status. The server binds
-//! exclusively to the Tailscale interface (100.64.0.0/10 CGNAT range)
-//! and refuses to start if Tailscale is not detected.
+//! message processing, health checks, and status. The server always binds
+//! to localhost so the local TUI can connect, and also binds to the
+//! Tailscale interface (100.64.0.0/10 CGNAT range) when one is available.
 //!
 //! All authenticated endpoints require a `Bearer <token>` header validated
 //! via HMAC-based constant-time comparison (`ring::hmac`). The `/health`
@@ -56,7 +56,8 @@ struct StatusResponse {
     model: String,
     skills: Vec<String>,
     memory_entries: usize,
-    tailscale_ip: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tailscale_ip: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -70,13 +71,35 @@ struct ErrorBody {
 struct HttpState {
     app: Arc<Mutex<HeadlessApp>>,
     start_time: Instant,
-    tailscale_ip: IpAddr,
+    tailscale_ip: Option<String>,
     // TODO(#1203): Token is stored as plaintext String — could appear in heap
     // dumps. Future hardening: wrap with `secrecy::SecretString` to ensure
     // zeroization on drop and prevent accidental logging.
     bearer_token: String,
     /// Telegram channel (None if not configured).
     telegram: Option<Arc<TelegramChannel>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ListenTarget {
+    addr: SocketAddr,
+    label: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ListenPlan {
+    local: ListenTarget,
+    tailscale: Option<ListenTarget>,
+}
+
+struct BoundListener {
+    target: ListenTarget,
+    listener: TcpListener,
+}
+
+struct BoundListeners {
+    local: BoundListener,
+    tailscale: Option<BoundListener>,
 }
 
 // ── Token verification ──────────────────────────────────────────────────────
@@ -163,7 +186,8 @@ pub fn is_tailscale_ip(ip: &IpAddr) -> bool {
 ///
 /// First tries `tailscale ip -4`; falls back to scanning for an address
 /// in the 100.64.0.0/10 CGNAT range. Returns an error if neither method
-/// finds a Tailscale interface.
+/// finds a Tailscale interface. Callers may choose to continue with a
+/// localhost-only binding when detection fails.
 fn detect_tailscale_ip() -> Result<IpAddr, HttpError> {
     if let Some(ip) = detect_via_tailscale_cli() {
         return Ok(ip);
@@ -205,8 +229,7 @@ fn detect_via_cgnat_scan() -> Result<IpAddr, HttpError> {
 
     Err(HttpError::NoTailscale(
         "Could not detect Tailscale interface.\n\
-         fawx serve --http requires Tailscale to be running.\n\
-         The HTTP server only binds to the Tailscale network for security."
+         The HTTP server will continue with a localhost-only binding."
             .to_string(),
     ))
 }
@@ -216,6 +239,33 @@ fn extract_ip_from_line(line: &str) -> Option<IpAddr> {
     let after_inet = &line[inet_pos + 5..];
     let addr_str = after_inet.split('/').next()?;
     addr_str.trim().parse().ok()
+}
+
+fn listen_targets(port: u16, tailscale_ip: Option<IpAddr>) -> ListenPlan {
+    ListenPlan {
+        local: ListenTarget {
+            addr: SocketAddr::from(([127, 0, 0, 1], port)),
+            label: "local",
+        },
+        tailscale: tailscale_ip.map(|ip| ListenTarget {
+            addr: SocketAddr::new(ip, port),
+            label: "Tailscale",
+        }),
+    }
+}
+
+fn optional_tailscale_ip(result: Result<IpAddr, HttpError>) -> Option<IpAddr> {
+    match result {
+        Ok(ip) => Some(ip),
+        Err(error) => {
+            tracing::warn!(error = %error, "tailscale IP not detected; serving localhost only");
+            None
+        }
+    }
+}
+
+fn detect_optional_tailscale_ip() -> Option<IpAddr> {
+    optional_tailscale_ip(detect_tailscale_ip())
 }
 
 // ── Error type ──────────────────────────────────────────────────────────────
@@ -428,7 +478,7 @@ async fn handle_status(State(state): State<HttpState>) -> Json<StatusResponse> {
         model,
         skills: Vec::new(),
         memory_entries: 0,
-        tailscale_ip: state.tailscale_ip.to_string(),
+        tailscale_ip: state.tailscale_ip.clone(),
     })
 }
 
@@ -647,9 +697,9 @@ async fn handle_telegram_webhook(
 
 /// Run the HTTP server for headless mode.
 ///
-/// Validates that a bearer token is configured, detects the Tailscale IP,
-/// binds exclusively to it, and serves requests until the process is
-/// terminated.
+/// Validates that a bearer token is configured, always binds localhost for
+/// local clients, optionally binds Tailscale for remote access, and serves
+/// requests until the process is terminated.
 pub async fn run(
     app: HeadlessApp,
     port: u16,
@@ -667,56 +717,254 @@ pub async fn run(
     let bearer_token = validate_bearer_token(http_config, auth_store.as_ref())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let ip = detect_tailscale_ip().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let addr = SocketAddr::new(ip, port);
-
+    let listen_plan = listen_targets(port, detect_optional_tailscale_ip());
+    let listeners = bind_listeners(listen_plan).await?;
     let shared_app = Arc::new(Mutex::new(app));
-
     let state = HttpState {
         app: Arc::clone(&shared_app),
         start_time: Instant::now(),
-        tailscale_ip: ip,
+        tailscale_ip: active_tailscale_ip(&listeners),
         bearer_token,
         telegram: telegram.clone(),
     };
-
     let router = build_router(state);
-    let listener = TcpListener::bind(addr)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to bind HTTP server on {addr}: {e}"))?;
 
-    eprintln!("Fawx HTTP API listening on http://{addr}");
-    eprintln!("Tailscale-only binding — not accessible from public internet");
+    print_startup_targets(&listeners);
     eprintln!("Bearer token authentication: enabled");
-    // Finding #8: Validate bot token on startup via get_me.
-    if let Some(ref tg) = telegram {
-        match tg.get_me().await {
-            Ok(()) => {
-                eprintln!("Telegram channel: enabled (token valid, webhook at /telegram/webhook)");
-            }
-            Err(e) => {
-                eprintln!("Warning: Telegram get_me failed: {e}");
-                eprintln!(
-                    "Telegram channel: enabled (webhook at /telegram/webhook) \
-                     — token may be invalid"
-                );
-            }
+    validate_telegram_startup(telegram.as_ref()).await;
+    start_telegram_polling(telegram.as_ref(), &shared_app);
+
+    run_listeners(router, listeners).await?;
+    Ok(0)
+}
+
+fn active_tailscale_ip(listeners: &BoundListeners) -> Option<String> {
+    listeners
+        .tailscale
+        .as_ref()
+        .map(|listener| listener.target.addr.ip().to_string())
+}
+
+fn print_startup_targets(listeners: &BoundListeners) {
+    eprintln!("Fawx HTTP API listening on:");
+    eprintln!(
+        "  http://{} ({})",
+        listeners.local.target.addr, listeners.local.target.label
+    );
+    match &listeners.tailscale {
+        Some(listener) => {
+            eprintln!(
+                "  http://{} ({})",
+                listener.target.addr, listener.target.label
+            );
+        }
+        None => {
+            eprintln!("  Tailscale not detected or unavailable; serving localhost only");
         }
     }
+}
 
-    // Spawn Telegram long-polling loop if configured.
-    if let Some(ref tg) = telegram {
-        let tg_clone = Arc::clone(tg);
-        let app_clone = Arc::clone(&shared_app);
-        tokio::spawn(run_telegram_polling(tg_clone, app_clone));
-        eprintln!("Telegram long-polling loop: started");
+async fn validate_telegram_startup(telegram: Option<&Arc<TelegramChannel>>) {
+    let Some(tg) = telegram else {
+        return;
+    };
+
+    match tg.get_me().await {
+        Ok(()) => {
+            eprintln!("Telegram channel: enabled (token valid, webhook at /telegram/webhook)")
+        }
+        Err(e) => {
+            eprintln!("Warning: Telegram get_me failed: {e}");
+            eprintln!(
+                "Telegram channel: enabled (webhook at /telegram/webhook) — token may be invalid"
+            );
+        }
     }
+}
 
+fn start_telegram_polling(
+    telegram: Option<&Arc<TelegramChannel>>,
+    shared_app: &Arc<Mutex<HeadlessApp>>,
+) {
+    let Some(tg) = telegram else {
+        return;
+    };
+
+    tokio::spawn(run_telegram_polling(Arc::clone(tg), Arc::clone(shared_app)));
+    eprintln!("Telegram long-polling loop: started");
+}
+
+async fn run_listeners(router: Router, listeners: BoundListeners) -> anyhow::Result<()> {
+    match listeners.tailscale {
+        Some(tailscale) => run_listener_pair(router, listeners.local, tailscale).await,
+        None => {
+            serve_listener(
+                listeners.local.listener,
+                router,
+                listeners.local.target.label,
+            )
+            .await
+        }
+    }
+}
+
+async fn bind_listeners(plan: ListenPlan) -> anyhow::Result<BoundListeners> {
+    let local = bind_required_listener(plan.local).await?;
+    let tailscale = bind_optional_listener(plan.tailscale).await;
+    Ok(BoundListeners { local, tailscale })
+}
+
+async fn bind_required_listener(target: ListenTarget) -> anyhow::Result<BoundListener> {
+    let listener = bind_listener(target).await?;
+    Ok(BoundListener { target, listener })
+}
+
+async fn bind_optional_listener(target: Option<ListenTarget>) -> Option<BoundListener> {
+    let target = target?;
+    optional_bound_listener(target, bind_listener(target).await)
+}
+
+fn optional_bound_listener(
+    target: ListenTarget,
+    result: anyhow::Result<TcpListener>,
+) -> Option<BoundListener> {
+    match result {
+        Ok(listener) => Some(BoundListener { target, listener }),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                addr = %target.addr,
+                "Tailscale bind failed; continuing with localhost only"
+            );
+            eprintln!(
+                "  Warning: Tailscale bind failed on {}, serving localhost only",
+                target.addr
+            );
+            None
+        }
+    }
+}
+
+async fn run_listener_pair(
+    router: Router,
+    local: BoundListener,
+    tailscale: BoundListener,
+) -> anyhow::Result<()> {
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let local_label = local.target.label;
+    let tailscale_label = tailscale.target.label;
+    let local_server = tokio::spawn(serve_listener_with_shutdown(
+        local,
+        router.clone(),
+        shutdown_rx.clone(),
+    ));
+    let tailscale_server =
+        tokio::spawn(serve_listener_with_shutdown(tailscale, router, shutdown_rx));
+
+    wait_for_server_pair(
+        local_label,
+        local_server,
+        tailscale_label,
+        tailscale_server,
+        shutdown_tx,
+    )
+    .await
+}
+
+async fn bind_listener(target: ListenTarget) -> anyhow::Result<TcpListener> {
+    TcpListener::bind(target.addr).await.map_err(|e| {
+        anyhow::anyhow!(
+            "failed to bind {} HTTP server on {}: {e}",
+            target.label,
+            target.addr
+        )
+    })
+}
+
+async fn serve_listener(
+    listener: TcpListener,
+    router: Router,
+    label: &'static str,
+) -> anyhow::Result<()> {
     axum::serve(listener, router)
         .await
-        .map_err(|e| anyhow::anyhow!("HTTP server error: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("{label} HTTP server error: {e}"))
+}
 
-    Ok(0)
+async fn serve_listener_with_shutdown(
+    listener: BoundListener,
+    router: Router,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let label = listener.target.label;
+    axum::serve(listener.listener, router)
+        .with_graceful_shutdown(async move {
+            if !*shutdown.borrow() {
+                let _ = shutdown.changed().await;
+            }
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("{label} HTTP server error: {e}"))
+}
+
+async fn wait_for_server_pair(
+    local_label: &'static str,
+    local_server: tokio::task::JoinHandle<anyhow::Result<()>>,
+    tailscale_label: &'static str,
+    tailscale_server: tokio::task::JoinHandle<anyhow::Result<()>>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+) -> anyhow::Result<()> {
+    let mut local_server = local_server;
+    let mut tailscale_server = tailscale_server;
+
+    tokio::select! {
+        result = &mut local_server => {
+            finalize_server_exit(local_label, result, tailscale_label, tailscale_server, shutdown_tx).await
+        }
+        result = &mut tailscale_server => {
+            finalize_server_exit(tailscale_label, result, local_label, local_server, shutdown_tx).await
+        }
+    }
+}
+
+async fn finalize_server_exit(
+    exited_label: &'static str,
+    exited_result: Result<anyhow::Result<()>, tokio::task::JoinError>,
+    peer_label: &'static str,
+    peer_server: tokio::task::JoinHandle<anyhow::Result<()>>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+) -> anyhow::Result<()> {
+    let exited = join_server_result(exited_label, exited_result);
+    log_server_exit(
+        exited_label,
+        &exited,
+        "HTTP server exited; shutting down peer",
+    );
+    let _ = shutdown_tx.send(true);
+    let peer = join_server_result(peer_label, peer_server.await);
+    log_server_exit(
+        peer_label,
+        &peer,
+        "Peer HTTP server stopped after shutdown signal",
+    );
+    exited.and(peer)
+}
+
+fn log_server_exit(label: &str, result: &anyhow::Result<()>, message: &str) {
+    match result {
+        Ok(()) => tracing::warn!(server = label, "{message}"),
+        Err(error) => tracing::warn!(server = label, error = %error, "{message}"),
+    }
+}
+
+fn join_server_result(
+    label: &str,
+    result: Result<anyhow::Result<()>, tokio::task::JoinError>,
+) -> anyhow::Result<()> {
+    match result {
+        Ok(inner) => inner,
+        Err(error) => Err(anyhow::anyhow!("{label} HTTP server task failed: {error}")),
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -819,7 +1067,7 @@ mod tests {
             model: "test-model".to_string(),
             skills: vec!["skill-a".to_string()],
             memory_entries: 10,
-            tailscale_ip: "100.64.0.1".to_string(),
+            tailscale_ip: Some("100.64.0.1".to_string()),
         })
     }
 
@@ -873,17 +1121,95 @@ mod tests {
     // ── Binding validation ──────────────────────────────────────────────
 
     #[test]
-    fn binding_rejects_non_tailscale_ips() {
-        assert!(!is_tailscale_ip(&IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
-        assert!(!is_tailscale_ip(&IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))));
-        assert!(!is_tailscale_ip(&IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
+    fn listen_targets_bind_localhost_and_tailscale() {
+        let plan = listen_targets(8400, Some(IpAddr::V4(Ipv4Addr::new(100, 93, 251, 101))));
+        let tailscale = plan.tailscale.expect("tailscale target");
+
+        assert_eq!(plan.local.addr, SocketAddr::from(([127, 0, 0, 1], 8400)));
+        assert_eq!(plan.local.label, "local");
+        assert_eq!(
+            tailscale.addr,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 93, 251, 101)), 8400)
+        );
+        assert_eq!(tailscale.label, "Tailscale");
     }
 
     #[test]
-    fn binding_accepts_tailscale_ip() {
-        assert!(is_tailscale_ip(&IpAddr::V4(Ipv4Addr::new(
-            100, 93, 251, 101
-        ))));
+    fn listen_targets_fall_back_to_localhost_only() {
+        let plan = listen_targets(8400, None);
+
+        assert_eq!(plan.local.addr, SocketAddr::from(([127, 0, 0, 1], 8400)));
+        assert_eq!(plan.local.label, "local");
+        assert!(plan.tailscale.is_none());
+    }
+
+    #[test]
+    fn optional_tailscale_ip_returns_none_when_detection_fails() {
+        let result = optional_tailscale_ip(Err(HttpError::NoTailscale("missing".to_string())));
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn tailscale_bind_failure_falls_back_to_localhost_server() {
+        let local_target = ListenTarget {
+            addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            label: "local",
+        };
+        let local_listener = bind_listener(local_target).await.expect("bind localhost");
+        let local_addr = local_listener.local_addr().expect("local addr");
+        let tailscale_target = ListenTarget {
+            addr: SocketAddr::from(([100, 93, 251, 101], 8400)),
+            label: "Tailscale",
+        };
+        let listeners = BoundListeners {
+            local: BoundListener {
+                target: ListenTarget {
+                    addr: local_addr,
+                    label: "local",
+                },
+                listener: local_listener,
+            },
+            tailscale: optional_bound_listener(
+                tailscale_target,
+                Err(anyhow::anyhow!("bind failed")),
+            ),
+        };
+
+        let server = tokio::spawn(run_listeners(
+            Router::new().route("/health", get(mock_health)),
+            listeners,
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let response = reqwest::get(format!("http://{local_addr}/health"))
+            .await
+            .expect("request localhost health");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn wait_for_server_pair_shuts_down_peer_when_one_server_exits() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let local_server = tokio::spawn(async { Ok(()) });
+        let tailscale_server = tokio::spawn(async move {
+            let mut shutdown_rx = shutdown_rx;
+            let _ = shutdown_rx.changed().await;
+            Ok(())
+        });
+
+        let result = wait_for_server_pair(
+            "local",
+            local_server,
+            "Tailscale",
+            tailscale_server,
+            shutdown_tx,
+        )
+        .await;
+
+        assert!(result.is_ok());
     }
 
     // ── IP extraction from `ip addr` output ─────────────────────────────
@@ -954,7 +1280,7 @@ mod tests {
             model: "claude-3".to_string(),
             skills: vec!["read_file".to_string()],
             memory_entries: 42,
-            tailscale_ip: "100.93.251.101".to_string(),
+            tailscale_ip: Some("100.93.251.101".to_string()),
         };
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&resp).expect("serialize")).expect("parse");
@@ -962,6 +1288,21 @@ mod tests {
         assert_eq!(json["tailscale_ip"], "100.93.251.101");
         assert_eq!(json["memory_entries"], 42);
         assert!(json["skills"].is_array());
+    }
+
+    #[test]
+    fn status_response_omits_tailscale_ip_when_unavailable() {
+        let resp = StatusResponse {
+            status: "ok",
+            model: "claude-3".to_string(),
+            skills: vec!["read_file".to_string()],
+            memory_entries: 42,
+            tailscale_ip: None,
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&resp).expect("serialize")).expect("parse");
+        assert_eq!(json["status"], "ok");
+        assert!(json.get("tailscale_ip").is_none());
     }
 
     // ── Bearer token validation ─────────────────────────────────────────

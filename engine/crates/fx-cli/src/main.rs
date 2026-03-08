@@ -7,9 +7,6 @@ mod config_bridge;
 mod confirmation;
 mod headless;
 #[cfg(feature = "http")]
-#[allow(dead_code)] // TODO(#1256): dead code until localhost binding is wired.
-mod headless_http;
-#[cfg(feature = "http")]
 mod http_serve;
 #[allow(dead_code)] // TODO(#1148): Phase 3 will wire markdown rendering into ratatui
 mod markdown;
