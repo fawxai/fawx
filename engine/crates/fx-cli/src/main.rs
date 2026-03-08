@@ -263,6 +263,7 @@ async fn run_http_server(
     let router = tui::build_router(&auth_manager)?;
     let config = tui::load_config()?;
     let http_config = config.http.clone();
+    let telegram_config = config.telegram.clone();
     let improvement_provider = tui::build_improvement_provider(&auth_manager, &config);
     let bundle = tui::build_loop_engine_from_config(&config, improvement_provider)?;
 
@@ -276,7 +277,60 @@ async fn run_http_server(
 
     let mut app = headless::HeadlessApp::new(deps)?;
     app.initialize();
-    http_serve::run(app, port, &http_config).await
+
+    // Build Telegram channel if configured.
+    let telegram = build_telegram_channel(&telegram_config);
+
+    http_serve::run(app, port, &http_config, telegram).await
+}
+
+#[cfg(feature = "http")]
+fn build_telegram_channel(
+    config: &fx_config::TelegramChannelConfig,
+) -> Option<std::sync::Arc<fx_channel_telegram::TelegramChannel>> {
+    if !config.enabled {
+        return None;
+    }
+
+    // Bot token: prefer env var, fall back to config file.
+    let bot_token = std::env::var("FAWX_TELEGRAM_TOKEN")
+        .ok()
+        .or_else(|| config.bot_token.clone())
+        .filter(|t| !t.trim().is_empty());
+
+    let bot_token = match bot_token {
+        Some(t) => t,
+        None => {
+            eprintln!(
+                "Warning: telegram.enabled = true but no bot token configured.\n\
+                 Set FAWX_TELEGRAM_TOKEN env var or telegram.bot_token in config.toml."
+            );
+            return None;
+        }
+    };
+
+    if config.allowed_chat_ids.is_empty() {
+        eprintln!(
+            "Warning: Telegram channel has no allowed_chat_ids configured.\n\
+             All chats will be accepted. Set telegram.allowed_chat_ids for security."
+        );
+    }
+
+    // Webhook secret: prefer env var, fall back to config file.
+    let webhook_secret = std::env::var("FAWX_TELEGRAM_WEBHOOK_SECRET")
+        .ok()
+        .or_else(|| config.webhook_secret.clone())
+        .filter(|s| !s.trim().is_empty());
+
+    let tg_config = fx_channel_telegram::TelegramConfig {
+        bot_token,
+        allowed_chat_ids: config.allowed_chat_ids.clone(),
+        webhook_secret,
+    };
+
+    Some(std::sync::Arc::new(
+        fx_channel_telegram::TelegramChannel::new(tg_config),
+    ))
 }
 
 #[cfg(not(feature = "http"))]

@@ -75,6 +75,7 @@ pub struct FawxConfig {
     pub fleet: FleetConfig,
     pub webhook: WebhookConfig,
     pub orchestrator: OrchestratorConfig,
+    pub telegram: TelegramChannelConfig,
 }
 
 /// Fleet configuration for multi-node coordination.
@@ -156,6 +157,22 @@ impl Default for OrchestratorConfig {
             default_max_retries: 1,
         }
     }
+}
+
+/// Telegram channel configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct TelegramChannelConfig {
+    /// Whether the Telegram channel is enabled.
+    pub enabled: bool,
+    /// Bot token (from BotFather). Can also be set via FAWX_TELEGRAM_TOKEN env var.
+    pub bot_token: Option<String>,
+    /// Restrict to specific Telegram chat IDs. Empty = accept all.
+    pub allowed_chat_ids: Vec<i64>,
+    /// Secret token for webhook validation. If set, the webhook handler
+    /// validates the `X-Telegram-Bot-Api-Secret-Token` header on every
+    /// incoming request. Can also be set via FAWX_TELEGRAM_WEBHOOK_SECRET.
+    pub webhook_secret: Option<String>,
 }
 
 /// Preprocessing deduplication settings.
@@ -806,6 +823,12 @@ max_relevant_results = 9
                 max_pending_tasks: 50,
                 default_timeout_ms: 15_000,
                 default_max_retries: 3,
+            },
+            telegram: TelegramChannelConfig {
+                enabled: true,
+                bot_token: Some("123456:ABC-DEF".to_string()),
+                allowed_chat_ids: vec![100, 200],
+                webhook_secret: Some("test-webhook-secret".to_string()),
             },
         };
 

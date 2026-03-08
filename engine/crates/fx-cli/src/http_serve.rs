@@ -26,6 +26,8 @@ use tokio::sync::Mutex;
 
 use crate::headless::HeadlessApp;
 
+use fx_channel_telegram::{OutgoingMessage, TelegramChannel};
+
 // ── Request/Response types ──────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -73,6 +75,8 @@ struct HttpState {
     // dumps. Future hardening: wrap with `secrecy::SecretString` to ensure
     // zeroization on drop and prevent accidental logging.
     bearer_token: String,
+    /// Telegram channel (None if not configured).
+    telegram: Option<Arc<TelegramChannel>>,
 }
 
 // ── Token verification ──────────────────────────────────────────────────────
@@ -291,7 +295,11 @@ fn build_router(state: HttpState) -> Router {
             auth_middleware,
         ));
 
-    let public = Router::new().route("/health", get(handle_health));
+    // Telegram webhook is public (Telegram servers POST to it).
+    // Security is handled by webhook secret_token validation inside the handler.
+    let public = Router::new()
+        .route("/health", get(handle_health))
+        .route("/telegram/webhook", post(handle_telegram_webhook));
 
     authenticated
         .merge(public)
@@ -359,6 +367,78 @@ async fn handle_status(State(state): State<HttpState>) -> Json<StatusResponse> {
     })
 }
 
+// ── Telegram webhook handler ────────────────────────────────────────────────
+
+async fn handle_telegram_webhook(
+    State(state): State<HttpState>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> impl IntoResponse {
+    let telegram = match &state.telegram {
+        Some(t) => Arc::clone(t),
+        None => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    // Finding #1: Validate webhook secret_token header.
+    let secret_header = headers
+        .get("x-telegram-bot-api-secret-token")
+        .and_then(|v| v.to_str().ok());
+
+    if !telegram.validate_webhook_secret(secret_header) {
+        tracing::warn!("Telegram webhook: invalid or missing secret token");
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let incoming = match telegram.parse_update(&body) {
+        Ok(Some(msg)) => msg,
+        Ok(None) => return StatusCode::OK.into_response(),
+        Err(e) => {
+            tracing::warn!("Telegram parse error: {e:?}");
+            return StatusCode::OK.into_response();
+        }
+    };
+
+    tracing::info!(
+        chat_id = incoming.chat_id,
+        from = ?incoming.from_name,
+        "Telegram message received"
+    );
+
+    // Send typing indicator (best-effort)
+    let _ = telegram.send_typing(incoming.chat_id).await;
+
+    // Update last_chat_id for Channel::send_response
+    telegram.set_last_chat_id(incoming.chat_id);
+
+    // Process through the agentic loop
+    let mut app = state.app.lock().await;
+    match app.process_message(&incoming.text).await {
+        Ok(result) => {
+            let response = OutgoingMessage {
+                chat_id: incoming.chat_id,
+                text: result.response,
+                parse_mode: Some("Markdown".to_string()),
+                reply_to_message_id: Some(incoming.message_id),
+            };
+            if let Err(e) = telegram.send_message(&response).await {
+                tracing::error!("Failed to send Telegram response: {e:?}");
+            }
+        }
+        Err(e) => {
+            tracing::error!("Loop error: {e}");
+            let error_msg = OutgoingMessage {
+                chat_id: incoming.chat_id,
+                text: format!("⚠️ Error: {e}"),
+                parse_mode: None,
+                reply_to_message_id: Some(incoming.message_id),
+            };
+            let _ = telegram.send_message(&error_msg).await;
+        }
+    }
+
+    StatusCode::OK.into_response()
+}
+
 // ── Public API ──────────────────────────────────────────────────────────────
 
 /// Run the HTTP server for headless mode.
@@ -386,6 +466,7 @@ pub async fn run(app: HeadlessApp, port: u16, http_config: &HttpConfig) -> anyho
         start_time: Instant::now(),
         tailscale_ip: ip,
         bearer_token,
+        telegram: telegram.clone(),
     };
 
     let router = build_router(state);
@@ -396,6 +477,21 @@ pub async fn run(app: HeadlessApp, port: u16, http_config: &HttpConfig) -> anyho
     eprintln!("Fawx HTTP API listening on http://{addr}");
     eprintln!("Tailscale-only binding — not accessible from public internet");
     eprintln!("Bearer token authentication: enabled");
+    // Finding #8: Validate bot token on startup via get_me.
+    if let Some(ref tg) = telegram {
+        match tg.get_me().await {
+            Ok(()) => {
+                eprintln!("Telegram channel: enabled (token valid, webhook at /telegram/webhook)");
+            }
+            Err(e) => {
+                eprintln!("Warning: Telegram get_me failed: {e}");
+                eprintln!(
+                    "Telegram channel: enabled (webhook at /telegram/webhook) \
+                     — token may be invalid"
+                );
+            }
+        }
+    }
 
     axum::serve(listener, router)
         .await

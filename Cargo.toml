@@ -29,6 +29,7 @@ members = [
     "engine/crates/fx-canary",
     "engine/crates/fx-fleet",
     "engine/crates/fx-channel-webhook",
+    "engine/crates/fx-channel-telegram",
     "engine/crates/fx-orchestrator",
     "engine/crates/fx-journal",
 ]
