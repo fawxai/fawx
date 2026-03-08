@@ -225,7 +225,7 @@
         <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-done"></div><div class="node-content"><div class="node-title">3 marketplace skills · Tilde fix · Dogfooding Phase 0 proven · 9 parity specs</div></div><div class="node-expand">›</div></div></div>
       </div>
 
-      <div class="tree-divider">🟡 Phase 0 — Wire Existing Features <span class="wave-badge badge-debt">Tech Debt</span></div>
+      <div class="tree-divider">🟡 Phase 0 — Wire Existing Features (5 PRs, ~1,150 lines) <span class="wave-badge badge-debt">Tech Debt</span></div>
       <div class="tree">
         <div class="tree-item">
           <div class="tree-node" onclick="toggleNode(this)">
@@ -271,8 +271,8 @@
           <div class="tree-node" onclick="toggleNode(this)">
             <div class="node-status status-debt"></div>
             <div class="node-content">
-              <div class="node-title">fx-fleet — wire NodeRegistry + TaskRouter + Orchestrator</div>
-              <div class="node-detail">Complete distributed orchestration system: NodeRegistry with heartbeat + stale detection, TaskRouter with capability-based routing, Orchestrator with task lifecycle management. All pure library code, never instantiated in any CLI path. Fix: create NodeRegistry from config, wire to HTTP server for fleet-aware task dispatch.</div>
+              <div class="node-title">fx-fleet — wire NodeRegistry + TaskRouter + Orchestrator <span class="wave-badge" style="background:var(--purple-glow);color:var(--purple);border:1px solid rgba(188,140,255,0.3);">Deferred</span></div>
+              <div class="node-detail">Deferred from Phase 0 — fleet model assumes Fawx nodes that heartbeat in, but we only have SSH machines. <code>node_run</code> (PR 3) covers current needs. Full fleet wiring requires: (1) fleet client agent for remote nodes, (2) task dispatch protocol, (3) heartbeat infrastructure. Moved to post-launch. See Phase 5.</div>
             </div>
             <div class="node-expand">›</div>
           </div>
@@ -402,6 +402,27 @@
     </div>
   </div>
 
+  <!-- ═══════════ Phase 5: Fleet (Post-Launch) ═══════════ -->
+  <div class="wave" id="phase-5">
+    <div class="wave-header" onclick="toggleWave('phase-5')">
+      <div class="wave-icon" style="background: var(--purple-glow); color: var(--purple);">5</div>
+      <div class="wave-info">
+        <div class="wave-title">Phase 5: Distributed Fleet <span class="wave-badge" style="background:var(--purple-glow);color:var(--purple);border:1px solid rgba(188,140,255,0.3);">Post-Launch</span></div>
+        <div class="wave-desc">Wire fx-fleet for real multi-node orchestration. Deferred from Phase 0 — requires fleet client agent.</div>
+      </div>
+      <div class="wave-meta"><span class="wave-count">0/5 done</span><span class="wave-chevron">›</span></div>
+    </div>
+    <div class="wave-body">
+      <div class="tree">
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-vision"></div><div class="node-content"><div class="node-title">Fleet client agent</div><div class="node-detail">Lightweight daemon that runs on remote nodes (Mac Mini, MacBook, future VPS). Heartbeats to coordinator, receives tasks, reports results. Must be a separate binary (<code>fawx-node</code>), not the full engine.</div></div><div class="node-expand">›</div></div></div>
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-vision"></div><div class="node-content"><div class="node-title">NodeRegistry wiring</div><div class="node-detail">Wire NodeRegistry from config (auto-register known nodes). Heartbeat processing. Stale detection + status reporting. <code>/fleet</code> TUI command for visibility.</div></div><div class="node-expand">›</div></div></div>
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-vision"></div><div class="node-content"><div class="node-title">TaskRouter + Orchestrator wiring</div><div class="node-detail">Capability-based task routing to fleet nodes. Task lifecycle (submit → dispatch → running → complete/failed). Retry on node failure. Complements <code>node_run</code> (SSH) with structured task dispatch.</div></div><div class="node-expand">›</div></div></div>
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-vision"></div><div class="node-content"><div class="node-title">Binary rollback via ripcord</div><div class="node-detail">Extend fawx-ripcord to snapshot + restore the <code>fawx</code> binary itself. Versioned binary storage (keep last 3, symlink swap). Triggered by canary or manual. Deferred from Phase 0 — binary bugs are CI/release failures, not agent-caused regressions.</div></div><div class="node-expand">›</div></div></div>
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-vision"></div><div class="node-content"><div class="node-title">Fleet security hardening</div><div class="node-detail">mTLS between coordinator and nodes. Task signing (coordinator signs, node verifies). Capability allowlists per node. Audit log for cross-node operations.</div></div><div class="node-expand">›</div></div></div>
+      </div>
+    </div>
+  </div>
+
   <!-- ═══════════ WAVE 9 ═══════════ -->
   <div class="wave" id="wave-9">
     <div class="wave-header" onclick="toggleWave('wave-9')">
@@ -426,7 +447,7 @@
   <h2>Execution Plan</h2>
   <div class="dep-graph">
     <div class="dep-flow">
-      <div class="dep-flow-node" style="background:var(--yellow-glow);border-color:rgba(210,153,34,0.3);color:var(--yellow);">P0: Wire 7 gaps 🟡</div>
+      <div class="dep-flow-node" style="background:var(--yellow-glow);border-color:rgba(210,153,34,0.3);color:var(--yellow);">P0: Wire 6 gaps (5 PRs) 🟡</div>
       <div class="dep-arrow">→</div>
       <div class="dep-flow-node" style="background:var(--red-glow);border-color:rgba(248,81,73,0.3);color:var(--red);">P1: fawx setup 🔴</div>
       <div class="dep-arrow">→</div>
