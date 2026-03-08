@@ -299,14 +299,24 @@
         </div>
       </div>
 
-      <div class="tree-divider">🔴 Phase 1 — Setup Wizard <span class="wave-badge badge-blocker">Launch Blocker</span></div>
+      <div class="tree-divider">🔴 Phase 1 — Setup Wizard + Server Fix <span class="wave-badge badge-blocker">Launch Blocker</span></div>
       <div class="tree">
         <div class="tree-item">
           <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-blocker"></div>
+            <div class="node-status status-inprogress"></div>
             <div class="node-content">
               <div class="node-title"><code>fawx setup</code> — interactive first-run wizard <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1253">#1253</a> <span class="wave-badge badge-blocker">Launch Blocker</span></div>
-              <div class="node-detail">Provider selection, API key input (encrypted), model selection, config generation, health check. No user should need to hand-edit config.toml.</div>
+              <div class="node-detail">Provider auth, model selection, channel config (Telegram), HTTP API setup. Smoke tested on Mac Mini — wizard flow works. PR #1254 reviewed + approved, reverted for clippy fixes (derive Default, MutexGuard across await). Re-landing as new PR.</div>
+            </div>
+            <div class="node-expand">›</div>
+          </div>
+        </div>
+        <div class="tree-item">
+          <div class="tree-node" onclick="toggleNode(this)">
+            <div class="node-status status-debt"></div>
+            <div class="node-content">
+              <div class="node-title">Localhost binding for HTTP server <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1256">#1256</a> <span class="wave-badge badge-blocker">Launch Blocker</span></div>
+              <div class="node-detail"><code>fawx serve --http</code> binds Tailscale-only (100.x.x.x) but <code>fawx-tui</code> expects localhost:8400. Blocks the setup→serve→TUI flow. Also: <code>headless_http.rs</code> (localhost server) is entirely dead code — 18 clippy errors. Fix: dual-bind (Tailscale + localhost) or merge localhost binding into <code>http_serve.rs</code>. Must also clean up dead <code>headless_http.rs</code> and unused streaming code in <code>headless.rs</code>.</div>
             </div>
             <div class="node-expand">›</div>
           </div>
@@ -315,7 +325,7 @@
 
       <div class="tree-divider">⚡ Phase 1b — TUI Unification <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1252">#1252</a> <span class="wave-badge" style="background:var(--purple-glow);color:var(--purple);border:1px solid rgba(188,140,255,0.3);">Deferred</span></div>
       <div class="tree">
-        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">Replace old TUI with ratatui fawxtui</div><div class="node-detail">Old TUI (<code>tui.rs</code>, 3,600 lines) mixes engine + rendering. New ratatui TUI (fawxtui, 877 lines) has rendering infrastructure but uses simulated responses. Fix: add <code>EngineBackend</code> to fawxtui that spawns <code>fawx serve --json</code> as child process, speaks headless JSON protocol. <code>fawx tui</code> launches fawxtui instead of old inline TUI. Two modes: spawn (default, starts engine as child) and attach (<code>--connect</code>, joins running server). ~300 lines in fawxtui + ~50 in fx-cli.</div></div><div class="node-expand">›</div></div></div>
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">Wire <code>fawx tui</code> to launch new ratatui TUI</div><div class="node-detail">New ratatui TUI already exists in <code>tui/</code> dir (PR #1243) with <code>FawxBackend</code> that connects via HTTP to the engine. Currently a separate binary (<code>fawx-tui</code>). Old TUI (<code>tui.rs</code>, 3,600 lines) still launches from <code>fawx tui</code>. Fix: make <code>fawx tui</code> launch the new TUI binary or embed it. Smaller scope than originally estimated — backend already works, just needs CLI dispatch. ~50-100 lines in fx-cli.</div></div><div class="node-expand">›</div></div></div>
       </div>
 
       <div class="tree-divider">⚡ Phase 2 — New Capabilities (parallel tracks)</div>
