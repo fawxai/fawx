@@ -10,6 +10,7 @@ use fx_core::channel::{Channel, ChannelError};
 use fx_core::types::InputSource;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
@@ -50,6 +51,8 @@ pub enum TelegramError {
     ApiError(String),
     /// Chat not in allowlist.
     Unauthorized(i64),
+    /// File system I/O error (e.g., saving downloaded media).
+    IoError(String),
 }
 
 impl fmt::Display for TelegramError {
@@ -58,6 +61,7 @@ impl fmt::Display for TelegramError {
             Self::ParseError(msg) => write!(f, "parse error: {msg}"),
             Self::ApiError(msg) => write!(f, "API error: {msg}"),
             Self::Unauthorized(id) => write!(f, "unauthorized chat: {id}"),
+            Self::IoError(msg) => write!(f, "I/O error: {msg}"),
         }
     }
 }
@@ -72,7 +76,7 @@ impl From<TelegramError> for ChannelError {
     fn from(err: TelegramError) -> Self {
         match err {
             TelegramError::Unauthorized(_) => ChannelError::NotConnected,
-            other => ChannelError::DeliveryFailed(other.to_string()),
+            other => ChannelError::DeliveryFailed(format!("{other}")),
         }
     }
 }
@@ -81,17 +85,34 @@ impl From<TelegramError> for ChannelError {
 // Message types
 // ---------------------------------------------------------------------------
 
+/// A photo attachment parsed from a Telegram message.
+#[derive(Debug, Clone)]
+pub struct PhotoAttachment {
+    /// Telegram file ID (used to download the file).
+    pub file_id: String,
+    /// Image width in pixels.
+    pub width: u32,
+    /// Image height in pixels.
+    pub height: u32,
+    /// MIME type of the photo (e.g., "image/jpeg").
+    pub mime_type: String,
+    /// Local file path after download (None until downloaded).
+    pub file_path: Option<PathBuf>,
+}
+
 /// Parsed incoming message from Telegram.
 #[derive(Debug, Clone)]
 pub struct IncomingMessage {
     /// Telegram chat ID (used for responses).
     pub chat_id: i64,
-    /// Message text content.
+    /// Message text content (caption if photo-only message).
     pub text: String,
     /// Telegram message ID (for reply_to).
     pub message_id: i64,
     /// Sender's first name (for logging/context).
     pub from_name: Option<String>,
+    /// Photo attachments (empty if no photos).
+    pub photos: Vec<PhotoAttachment>,
 }
 
 /// Outgoing message to Telegram.
@@ -133,6 +154,20 @@ struct TgMessage {
     from: Option<TgUser>,
     #[serde(default)]
     text: Option<String>,
+    #[serde(default)]
+    photo: Option<Vec<TgPhotoSize>>,
+    #[serde(default)]
+    caption: Option<String>,
+}
+
+/// Subset of Telegram PhotoSize for deserialization.
+#[derive(Debug, Deserialize)]
+struct TgPhotoSize {
+    file_id: String,
+    #[serde(default)]
+    width: u32,
+    #[serde(default)]
+    height: u32,
 }
 
 /// Subset of Telegram Chat for deserialization.
@@ -151,6 +186,51 @@ struct TgUser {
 // ---------------------------------------------------------------------------
 // Finding #4: Shared API response helper
 // ---------------------------------------------------------------------------
+
+/// Pick the largest photo from a Telegram photo array by pixel count.
+///
+/// Returns a single-element vec with the largest photo, or an empty vec
+/// if no photos are present.
+fn extract_largest_photo(message: &TgMessage) -> Vec<PhotoAttachment> {
+    let sizes = match &message.photo {
+        Some(sizes) if !sizes.is_empty() => sizes,
+        _ => return Vec::new(),
+    };
+
+    let largest = sizes
+        .iter()
+        .max_by_key(|p| u64::from(p.width) * u64::from(p.height));
+
+    match largest {
+        Some(photo) => vec![PhotoAttachment {
+            file_id: photo.file_id.clone(),
+            width: photo.width,
+            height: photo.height,
+            mime_type: "image/jpeg".to_string(),
+            file_path: None,
+        }],
+        None => Vec::new(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Telegram getFile API response types
+// ---------------------------------------------------------------------------
+
+/// Response from the `getFile` Bot API method.
+#[derive(Debug, Deserialize)]
+struct GetFileResponse {
+    ok: bool,
+    #[serde(default)]
+    result: Option<TgFile>,
+}
+
+/// File metadata returned by `getFile`.
+#[derive(Debug, Deserialize)]
+struct TgFile {
+    #[serde(default)]
+    file_path: Option<String>,
+}
 
 /// Check a Telegram Bot API response for errors.
 async fn check_api_response(resp: reqwest::Response) -> Result<(), TelegramError> {
@@ -278,6 +358,10 @@ impl TelegramChannel {
     }
 
     /// Parse a Telegram webhook Update JSON payload.
+    ///
+    /// Handles both text-only and photo messages. For photos, picks the
+    /// largest resolution and uses the caption (if any) as the text.
+    /// Returns `None` if the update has neither text nor photos.
     pub fn parse_update(&self, payload: &str) -> Result<Option<IncomingMessage>, TelegramError> {
         let update: Update =
             serde_json::from_str(payload).map_err(|e| TelegramError::ParseError(e.to_string()))?;
@@ -287,10 +371,12 @@ impl TelegramChannel {
             None => return Ok(None),
         };
 
-        let text = match message.text {
-            Some(t) => t,
-            None => return Ok(None),
-        };
+        let photos = extract_largest_photo(&message);
+        let text = message.text.or(message.caption).unwrap_or_default();
+
+        if text.is_empty() && photos.is_empty() {
+            return Ok(None);
+        }
 
         if !self.is_allowed(message.chat.id) {
             return Err(TelegramError::Unauthorized(message.chat.id));
@@ -303,6 +389,7 @@ impl TelegramChannel {
             text,
             message_id: message.message_id,
             from_name,
+            photos,
         }))
     }
 
@@ -334,6 +421,67 @@ impl TelegramChannel {
             None => true,
             Some(expected) => header_value == Some(expected.as_str()),
         }
+    }
+
+    /// Download a file by `file_id` from Telegram servers.
+    ///
+    /// Calls `getFile` to obtain the server-side path, then downloads the
+    /// file bytes and saves them to `dest_dir/<message_id>-<sanitized_file_id>.jpg`.
+    pub async fn download_file(
+        &self,
+        file_id: &str,
+        message_id: i64,
+        dest_dir: &Path,
+    ) -> Result<PathBuf, TelegramError> {
+        let tg_path = self.fetch_file_path(file_id).await?;
+        let url = format!(
+            "{}/file/bot{}/{}",
+            self.base_url, self.config.bot_token, tg_path
+        );
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| TelegramError::ApiError(e.to_string()))?
+            .error_for_status()
+            .map_err(|e| TelegramError::ApiError(e.to_string()))?;
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| TelegramError::ApiError(e.to_string()))?;
+
+        let safe_name = sanitize_file_id(file_id);
+        let dest = dest_dir.join(format!("{message_id}-{safe_name}.jpg"));
+        std::fs::write(&dest, &bytes).map_err(|e| TelegramError::IoError(e.to_string()))?;
+        Ok(dest)
+    }
+
+    /// Fetch the server-side file path for a given `file_id`.
+    async fn fetch_file_path(&self, file_id: &str) -> Result<String, TelegramError> {
+        let url = self.bot_url("getFile");
+        let body = serde_json::json!({ "file_id": file_id });
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| TelegramError::ApiError(e.to_string()))?;
+
+        let file_resp: GetFileResponse = resp
+            .json()
+            .await
+            .map_err(|e| TelegramError::ApiError(e.to_string()))?;
+
+        if !file_resp.ok {
+            return Err(TelegramError::ApiError("getFile failed".to_string()));
+        }
+
+        file_resp
+            .result
+            .and_then(|r| r.file_path)
+            .ok_or_else(|| TelegramError::ApiError("no file_path in getFile response".to_string()))
     }
 
     /// Send a message via the Telegram Bot API, splitting if needed.
@@ -468,6 +616,22 @@ impl TelegramChannel {
         }
         self.config.allowed_chat_ids.contains(&chat_id)
     }
+}
+
+/// Sanitize a Telegram file_id for use as a filename.
+///
+/// Replaces any character that is not alphanumeric, `-`, or `_` with `_`.
+fn sanitize_file_id(file_id: &str) -> String {
+    file_id
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Compute the next offset from a list of updates.
@@ -620,14 +784,36 @@ mod tests {
     }
 
     #[test]
-    fn parse_update_ignores_non_text() {
+    fn parse_update_handles_photo_without_text() {
         let ch = make_channel();
         let json = r#"{
             "update_id": 1002,
             "message": {
                 "message_id": 43,
                 "chat": { "id": 12345 },
-                "photo": [{"file_id": "abc"}]
+                "photo": [
+                    {"file_id": "small", "width": 90, "height": 90},
+                    {"file_id": "large", "width": 800, "height": 600}
+                ]
+            }
+        }"#;
+        let result = ch.parse_update(json).unwrap().unwrap();
+        assert_eq!(result.photos.len(), 1);
+        assert_eq!(result.photos[0].file_id, "large");
+        assert_eq!(result.photos[0].width, 800);
+        assert_eq!(result.photos[0].height, 600);
+        assert!(result.text.is_empty());
+    }
+
+    #[test]
+    fn parse_update_ignores_no_text_no_photo() {
+        let ch = make_channel();
+        // A message with neither text nor photo should be skipped.
+        let json = r#"{
+            "update_id": 1002,
+            "message": {
+                "message_id": 43,
+                "chat": { "id": 12345 }
             }
         }"#;
         let result = ch.parse_update(json).unwrap();
@@ -681,6 +867,228 @@ mod tests {
         let result = ch.parse_update(&json).unwrap().unwrap();
         assert_eq!(result.chat_id, 100);
         assert_eq!(result.text, "allowed user");
+    }
+
+    // ── Photo parsing tests ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_update_photo_with_caption() {
+        let ch = make_channel();
+        let json = r#"{
+            "update_id": 1003,
+            "message": {
+                "message_id": 44,
+                "chat": { "id": 12345 },
+                "from": { "first_name": "Joe" },
+                "photo": [
+                    {"file_id": "thumb", "width": 90, "height": 90},
+                    {"file_id": "medium", "width": 320, "height": 240},
+                    {"file_id": "full", "width": 1280, "height": 960}
+                ],
+                "caption": "Check this out"
+            }
+        }"#;
+        let result = ch.parse_update(json).unwrap().unwrap();
+        assert_eq!(result.text, "Check this out");
+        assert_eq!(result.photos.len(), 1);
+        assert_eq!(result.photos[0].file_id, "full");
+        assert_eq!(result.photos[0].width, 1280);
+        assert_eq!(result.photos[0].height, 960);
+        assert_eq!(result.photos[0].mime_type, "image/jpeg");
+        assert!(result.photos[0].file_path.is_none());
+    }
+
+    #[test]
+    fn parse_update_selects_largest_photo_by_area() {
+        let ch = make_channel();
+        // Tall-and-narrow vs short-and-wide: area decides.
+        let json = r#"{
+            "update_id": 1004,
+            "message": {
+                "message_id": 45,
+                "chat": { "id": 12345 },
+                "photo": [
+                    {"file_id": "tall", "width": 100, "height": 1000},
+                    {"file_id": "wide", "width": 1000, "height": 200}
+                ]
+            }
+        }"#;
+        let result = ch.parse_update(json).unwrap().unwrap();
+        assert_eq!(result.photos.len(), 1);
+        // wide: 1000*200 = 200_000 > tall: 100*1000 = 100_000
+        assert_eq!(result.photos[0].file_id, "wide");
+    }
+
+    #[test]
+    fn parse_update_text_message_has_empty_photos() {
+        let ch = make_channel();
+        let json = sample_update_json(12345, "just text");
+        let result = ch.parse_update(&json).unwrap().unwrap();
+        assert!(result.photos.is_empty());
+        assert_eq!(result.text, "just text");
+    }
+
+    #[test]
+    fn extract_largest_photo_empty_array() {
+        let message = TgMessage {
+            message_id: 1,
+            chat: TgChat { id: 1 },
+            from: None,
+            text: None,
+            photo: Some(Vec::new()),
+            caption: None,
+        };
+        let photos = extract_largest_photo(&message);
+        assert!(photos.is_empty());
+    }
+
+    #[test]
+    fn extract_largest_photo_none() {
+        let message = TgMessage {
+            message_id: 1,
+            chat: TgChat { id: 1 },
+            from: None,
+            text: None,
+            photo: None,
+            caption: None,
+        };
+        let photos = extract_largest_photo(&message);
+        assert!(photos.is_empty());
+    }
+
+    #[test]
+    fn sanitize_file_id_removes_special_chars() {
+        assert_eq!(sanitize_file_id("AgACAgIAAx0Cf"), "AgACAgIAAx0Cf");
+        assert_eq!(sanitize_file_id("file/path.jpg"), "file_path_jpg");
+        assert_eq!(sanitize_file_id("a-b_c"), "a-b_c");
+    }
+
+    // ── Download file tests ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn download_file_fetches_and_saves() {
+        use axum::routing::any;
+        use tokio::net::TcpListener;
+
+        // Mock server that handles getFile and file download.
+        let app = axum::Router::new()
+            .route(
+                "/bot000000:TESTTOKEN/getFile",
+                any(|| async {
+                    axum::Json(serde_json::json!({
+                        "ok": true,
+                        "result": { "file_path": "photos/test.jpg" }
+                    }))
+                }),
+            )
+            .route(
+                "/file/bot000000:TESTTOKEN/photos/test.jpg",
+                any(|| async { vec![0xFF_u8, 0xD8, 0xFF, 0xE0] }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+        let addr = listener.local_addr().expect("addr");
+        let base_url = format!("http://{addr}");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        let config = TelegramConfig {
+            bot_token: "000000:TESTTOKEN".to_string(),
+            allowed_chat_ids: Vec::new(),
+            webhook_secret: None,
+        };
+        let ch = TelegramChannel::new_with_base_url(config, base_url);
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let result = ch.download_file("AgACAgIAA", 42, tmp.path()).await;
+        assert!(result.is_ok());
+
+        let path = result.unwrap();
+        assert!(path.exists());
+        assert_eq!(path.file_name().unwrap(), "42-AgACAgIAA.jpg");
+        assert_eq!(std::fs::read(&path).unwrap(), vec![0xFF, 0xD8, 0xFF, 0xE0]);
+    }
+
+    #[tokio::test]
+    async fn download_file_handles_api_error() {
+        use axum::routing::any;
+        use tokio::net::TcpListener;
+
+        let app = axum::Router::new().route(
+            "/bot000000:TESTTOKEN/getFile",
+            any(|| async {
+                axum::Json(serde_json::json!({
+                    "ok": false,
+                    "description": "Bad Request: invalid file_id"
+                }))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+        let addr = listener.local_addr().expect("addr");
+        let base_url = format!("http://{addr}");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        let config = TelegramConfig {
+            bot_token: "000000:TESTTOKEN".to_string(),
+            allowed_chat_ids: Vec::new(),
+            webhook_secret: None,
+        };
+        let ch = TelegramChannel::new_with_base_url(config, base_url);
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let result = ch.download_file("bad-id", 99, tmp.path()).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            TelegramError::ApiError(msg) => assert!(msg.contains("getFile failed")),
+            other => panic!("expected ApiError, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn download_file_rejects_non_200_response() {
+        use axum::http::StatusCode;
+        use axum::routing::any;
+        use tokio::net::TcpListener;
+
+        let app = axum::Router::new()
+            .route(
+                "/bot000000:TESTTOKEN/getFile",
+                any(|| async {
+                    axum::Json(serde_json::json!({
+                        "ok": true,
+                        "result": { "file_path": "photos/missing.jpg" }
+                    }))
+                }),
+            )
+            .route(
+                "/file/bot000000:TESTTOKEN/photos/missing.jpg",
+                any(|| async { StatusCode::NOT_FOUND }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+        let addr = listener.local_addr().expect("addr");
+        let base_url = format!("http://{addr}");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        let config = TelegramConfig {
+            bot_token: "000000:TESTTOKEN".to_string(),
+            allowed_chat_ids: Vec::new(),
+            webhook_secret: None,
+        };
+        let ch = TelegramChannel::new_with_base_url(config, base_url);
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let result = ch.download_file("some-file-id", 50, tmp.path()).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            TelegramError::ApiError(msg) => {
+                assert!(msg.contains("404"), "expected 404 in error: {msg}");
+            }
+            other => panic!("expected ApiError for non-200, got: {other:?}"),
+        }
     }
 
     // ── Outgoing message tests ──────────────────────────────────────────
@@ -778,6 +1186,9 @@ mod tests {
 
         let e = TelegramError::Unauthorized(42);
         assert_eq!(format!("{e}"), "unauthorized chat: 42");
+
+        let e = TelegramError::IoError("disk full".to_string());
+        assert_eq!(format!("{e}"), "I/O error: disk full");
     }
 
     // ── Finding #9: From<TelegramError> for ChannelError ────────────────
@@ -797,6 +1208,12 @@ mod tests {
         assert_eq!(
             err,
             ChannelError::DeliveryFailed("parse error: bad".to_string())
+        );
+
+        let err: ChannelError = TelegramError::IoError("disk full".to_string()).into();
+        assert_eq!(
+            err,
+            ChannelError::DeliveryFailed("I/O error: disk full".to_string())
         );
     }
 

@@ -26,7 +26,7 @@ use tokio::sync::Mutex;
 
 use crate::headless::HeadlessApp;
 
-use fx_channel_telegram::{OutgoingMessage, TelegramChannel};
+use fx_channel_telegram::{IncomingMessage, OutgoingMessage, TelegramChannel};
 
 // ── Request/Response types ──────────────────────────────────────────────────
 
@@ -367,6 +367,55 @@ async fn handle_status(State(state): State<HttpState>) -> Json<StatusResponse> {
     })
 }
 
+// ── Telegram photo helpers ──────────────────────────────────────────────────
+
+/// Return the media inbound directory (`~/.fawx/media/inbound/`).
+fn media_inbound_dir() -> std::path::PathBuf {
+    crate::tui::fawx_data_dir().join("media").join("inbound")
+}
+
+/// Download photos and build the final message text.
+///
+/// If the incoming message has photos, downloads each one and prepends
+/// `[Image: /path/to/file.jpg]\n` to the text. Creates the media directory
+/// on first use.
+async fn build_text_with_photos(
+    telegram: &TelegramChannel,
+    incoming: &mut IncomingMessage,
+) -> String {
+    if incoming.photos.is_empty() {
+        return incoming.text.clone();
+    }
+
+    let media_dir = media_inbound_dir();
+    if let Err(e) = std::fs::create_dir_all(&media_dir) {
+        tracing::error!("Failed to create media dir: {e}");
+        return incoming.text.clone();
+    }
+
+    let mut prefix = String::new();
+    for photo in &mut incoming.photos {
+        match telegram
+            .download_file(&photo.file_id, incoming.message_id, &media_dir)
+            .await
+        {
+            Ok(path) => {
+                prefix.push_str(&format!("[Image: {}]\n", path.display()));
+                photo.file_path = Some(path);
+            }
+            Err(e) => {
+                tracing::error!("Failed to download photo {}: {e}", photo.file_id);
+            }
+        }
+    }
+
+    if prefix.is_empty() {
+        incoming.text.clone()
+    } else {
+        format!("{prefix}{}", incoming.text)
+    }
+}
+
 // ── Telegram long-polling loop ──────────────────────────────────────────────
 
 /// Process a single Telegram update through the agentic loop.
@@ -380,7 +429,7 @@ async fn handle_telegram_update(
     raw_update: &serde_json::Value,
 ) {
     let payload = raw_update.to_string();
-    let incoming = match telegram.parse_update(&payload) {
+    let mut incoming = match telegram.parse_update(&payload) {
         Ok(Some(msg)) => msg,
         Ok(None) => return,
         Err(e) => {
@@ -392,14 +441,17 @@ async fn handle_telegram_update(
     tracing::info!(
         chat_id = incoming.chat_id,
         from = ?incoming.from_name,
+        photos = incoming.photos.len(),
         "Telegram poll: message received"
     );
 
     let _ = telegram.send_typing(incoming.chat_id).await;
     telegram.set_last_chat_id(incoming.chat_id);
 
+    let message_text = build_text_with_photos(telegram, &mut incoming).await;
+
     let mut app_guard = app.lock().await;
-    let response_msg = match app_guard.process_message(&incoming.text).await {
+    let response_msg = match app_guard.process_message(&message_text).await {
         Ok(result) => OutgoingMessage {
             chat_id: incoming.chat_id,
             text: result.response,
@@ -472,7 +524,7 @@ async fn handle_telegram_webhook(
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
-    let incoming = match telegram.parse_update(&body) {
+    let mut incoming = match telegram.parse_update(&body) {
         Ok(Some(msg)) => msg,
         Ok(None) => return StatusCode::OK.into_response(),
         Err(e) => {
@@ -484,6 +536,7 @@ async fn handle_telegram_webhook(
     tracing::info!(
         chat_id = incoming.chat_id,
         from = ?incoming.from_name,
+        photos = incoming.photos.len(),
         "Telegram message received"
     );
 
@@ -493,9 +546,12 @@ async fn handle_telegram_webhook(
     // Update last_chat_id for Channel::send_response
     telegram.set_last_chat_id(incoming.chat_id);
 
+    // Download photos and build message text with image paths
+    let message_text = build_text_with_photos(&telegram, &mut incoming).await;
+
     // Process through the agentic loop
     let mut app = state.app.lock().await;
-    match app.process_message(&incoming.text).await {
+    match app.process_message(&message_text).await {
         Ok(result) => {
             let response = OutgoingMessage {
                 chat_id: incoming.chat_id,

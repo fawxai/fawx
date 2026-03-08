@@ -12,3 +12,8 @@ serde_json.workspace = true
 reqwest.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
+
+[dev-dependencies]
+axum = "0.8"
+tempfile = "3"
+tokio = { workspace = true, features = ["full"] }
