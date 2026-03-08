@@ -278,8 +278,14 @@ async fn run_http_server(
     let mut app = headless::HeadlessApp::new(deps)?;
     app.initialize();
 
+    // Open credential store once; pass to channel builders for DI.
+    let auth_store = {
+        let data_dir = tui::fawx_data_dir();
+        auth_store::AuthStore::open(&data_dir).ok()
+    };
+
     // Build Telegram channel if configured.
-    let telegram = build_telegram_channel(&telegram_config);
+    let telegram = build_telegram_channel(&telegram_config, auth_store.as_ref());
 
     http_serve::run(app, port, &http_config, telegram).await
 }
@@ -287,14 +293,15 @@ async fn run_http_server(
 #[cfg(feature = "http")]
 fn build_telegram_channel(
     config: &fx_config::TelegramChannelConfig,
+    auth_store: Option<&auth_store::AuthStore>,
 ) -> Option<std::sync::Arc<fx_channel_telegram::TelegramChannel>> {
     if !config.enabled {
         return None;
     }
 
-    // Bot token: prefer env var, fall back to config file.
-    let bot_token = std::env::var("FAWX_TELEGRAM_TOKEN")
-        .ok()
+    // Bot token priority: credential store → env var → config file.
+    let bot_token = telegram_token_from_credential_store(auth_store)
+        .or_else(|| std::env::var("FAWX_TELEGRAM_TOKEN").ok())
         .or_else(|| config.bot_token.clone())
         .filter(|t| !t.trim().is_empty());
 
@@ -303,7 +310,8 @@ fn build_telegram_channel(
         None => {
             eprintln!(
                 "Warning: telegram.enabled = true but no bot token configured.\n\
-                 Set FAWX_TELEGRAM_TOKEN env var or telegram.bot_token in config.toml."
+                 Use /auth telegram set-token, set FAWX_TELEGRAM_TOKEN env var, \
+                 or telegram.bot_token in config.toml."
             );
             return None;
         }
@@ -331,6 +339,19 @@ fn build_telegram_channel(
     Some(std::sync::Arc::new(
         fx_channel_telegram::TelegramChannel::new(tg_config),
     ))
+}
+
+/// Read the Telegram bot token from the encrypted credential store.
+///
+/// Returns `None` if no store is provided or it contains no token.
+#[cfg(feature = "http")]
+fn telegram_token_from_credential_store(store: Option<&auth_store::AuthStore>) -> Option<String> {
+    store?
+        .get_provider_token("telegram_bot_token")
+        .ok()
+        .flatten()
+        .map(|token| token.to_string())
+        .filter(|t| !t.trim().is_empty())
 }
 
 #[cfg(not(feature = "http"))]
@@ -496,4 +517,71 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let exit_code = dispatch_command(cli.command.unwrap_or(Commands::Tui)).await?;
     std::process::exit(exit_code);
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::auth_store::AuthStore;
+
+    fn test_auth_store() -> AuthStore {
+        AuthStore::open_in_memory().expect("in-memory auth store")
+    }
+
+    #[test]
+    fn telegram_token_credential_store_roundtrip() {
+        let store = test_auth_store();
+        let token = "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11";
+        store
+            .store_provider_token("telegram_bot_token", token)
+            .expect("store");
+        let retrieved = store
+            .get_provider_token("telegram_bot_token")
+            .expect("get")
+            .expect("should have value");
+        assert_eq!(*retrieved, token);
+    }
+
+    #[test]
+    fn telegram_token_credential_store_empty_returns_none() {
+        let store = test_auth_store();
+        let result = store.get_provider_token("telegram_bot_token").expect("get");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn telegram_token_credential_store_whitespace_only() {
+        let store = test_auth_store();
+        store
+            .store_provider_token("telegram_bot_token", "   ")
+            .expect("store");
+        let retrieved = store
+            .get_provider_token("telegram_bot_token")
+            .expect("get")
+            .expect("stored but whitespace");
+        // The store returns the value; filtering is the caller's job.
+        assert_eq!(retrieved.trim(), "");
+    }
+
+    #[test]
+    fn telegram_token_does_not_collide_with_http_bearer() {
+        let store = test_auth_store();
+        store
+            .store_provider_token("telegram_bot_token", "tg-token")
+            .expect("store telegram");
+        store
+            .store_provider_token("http_bearer", "http-token")
+            .expect("store http");
+
+        let tg = store
+            .get_provider_token("telegram_bot_token")
+            .expect("get tg")
+            .expect("should exist");
+        let http = store
+            .get_provider_token("http_bearer")
+            .expect("get http")
+            .expect("should exist");
+
+        assert_eq!(*tg, "tg-token");
+        assert_eq!(*http, "http-token");
+    }
 }

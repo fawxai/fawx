@@ -2714,6 +2714,12 @@ impl TuiApp {
             (Some("github"), Some("set-token"), t) => {
                 self.handle_github_set_token(t).await?;
             }
+            (Some("telegram"), Some("set-token"), Some(t)) => {
+                self.handle_telegram_set_token(t)?;
+            }
+            (Some("telegram"), Some("set-token"), None) => {
+                self.tui_println("Usage: /auth telegram set-token <TOKEN>");
+            }
             (Some(p), Some("set-token"), Some(t)) => {
                 self.handle_provider_set_token(p, t).await?;
             }
@@ -2741,6 +2747,9 @@ impl TuiApp {
             (Some("http"), Some("show"), _) => {
                 self.handle_http_show_bearer();
             }
+            (Some("telegram"), Some("show"), _) => {
+                self.handle_telegram_show();
+            }
             (Some(p), _, _) => {
                 self.tui_println(format!("Unknown auth action for provider: {p}"));
                 self.show_provider_auth_help(p);
@@ -2761,12 +2770,19 @@ impl TuiApp {
             "  /auth http set-bearer <TOKEN>          Save HTTP bearer token (encrypted)",
         );
         self.tui_println("  /auth http show                       Check HTTP bearer token status");
+        self.tui_println(
+            "  /auth telegram set-token <TOKEN>       Save Telegram bot token (encrypted)",
+        );
+        self.tui_println(
+            "  /auth telegram show                    Check Telegram bot token status",
+        );
         self.tui_println(String::new());
         self.tui_println("Examples:");
         self.tui_println("  /auth anthropic set-token sk-ant-xxxxx");
         self.tui_println("  /auth openai set-token sk-xxxxx");
         self.tui_println("  /auth github set-token ghp_xxxxx");
         self.tui_println("  /auth http set-bearer mytoken123");
+        self.tui_println("  /auth telegram set-token 123456:ABC-DEF...");
     }
 
     /// Print per-provider usage hint.
@@ -2984,6 +3000,61 @@ impl TuiApp {
                 "  Use /auth http set-bearer <TOKEN> to store securely, or set \
                  bearer_token in [http] config.",
             );
+        }
+    }
+
+    /// `/auth telegram set-token <TOKEN>` — store Telegram bot token in encrypted credential store.
+    fn handle_telegram_set_token(&mut self, token: &str) -> Result<(), TuiError> {
+        let token = token.trim();
+        if token.is_empty() {
+            self.tui_println("Usage: /auth telegram set-token <TOKEN>");
+            return Ok(());
+        }
+        self.auth_store
+            .store_provider_token("telegram_bot_token", token)
+            .map_err(TuiError::Auth)?;
+        self.tui_println("✓ Telegram bot token saved to encrypted credential store.");
+        Ok(())
+    }
+
+    /// `/auth telegram show` — show whether a Telegram bot token is configured.
+    ///
+    /// Reports the effective source: credential store (preferred) →
+    /// env var → config.toml fallback → not set.
+    fn handle_telegram_show(&mut self) {
+        let in_store = self
+            .auth_store
+            .get_provider_token("telegram_bot_token")
+            .ok()
+            .flatten()
+            .filter(|t| !t.trim().is_empty())
+            .is_some();
+
+        let in_env = std::env::var("FAWX_TELEGRAM_TOKEN")
+            .ok()
+            .filter(|t| !t.trim().is_empty())
+            .is_some();
+
+        let in_config = self
+            .config
+            .telegram
+            .bot_token
+            .as_ref()
+            .filter(|t| !t.trim().is_empty())
+            .is_some();
+
+        if in_store {
+            self.tui_println("Bot token: set (credential store)");
+        } else if in_env {
+            self.tui_println("Bot token: set (FAWX_TELEGRAM_TOKEN env var)");
+        } else if in_config {
+            self.tui_println(
+                "Bot token: set (config.toml fallback \
+                 — consider migrating to /auth telegram set-token)",
+            );
+        } else {
+            self.tui_println("Bot token: not set");
+            self.tui_println("  Use /auth telegram set-token <TOKEN> to store securely.");
         }
     }
 
