@@ -524,7 +524,7 @@ mod tests {
     use crate::auth_store::AuthStore;
 
     fn test_auth_store() -> AuthStore {
-        AuthStore::open_in_memory().expect("in-memory auth store")
+        AuthStore::open_for_testing().expect("test auth store")
     }
 
     #[test]
