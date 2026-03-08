@@ -546,6 +546,11 @@ pub async fn run(
     let bearer_token = validate_bearer_token(http_config, auth_store.as_ref())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
+    // Release the SQLite credential store lock before starting the server.
+    // Holding it across the server lifetime prevents the polling loop from
+    // re-opening the store when resolving API keys for model requests.
+    drop(auth_store);
+
     let ip = detect_tailscale_ip().map_err(|e| anyhow::anyhow!("{e}"))?;
     let addr = SocketAddr::new(ip, port);
 

@@ -72,12 +72,25 @@ pub struct HeadlessApp {
 
 impl HeadlessApp {
     /// Build from the standard startup bundle + router + config.
-    pub fn new(deps: HeadlessAppDeps) -> Result<Self, anyhow::Error> {
+    pub fn new(mut deps: HeadlessAppDeps) -> Result<Self, anyhow::Error> {
         let active_model = deps
             .router
             .active_model()
             .map(ToString::to_string)
+            .or_else(|| deps.config.model.default_model.clone())
             .unwrap_or_default();
+
+        // Seed the router with the config default so providers can resolve it.
+        if !active_model.is_empty() && deps.router.active_model().is_none() {
+            if let Err(e) = deps.router.set_active(&active_model) {
+                tracing::warn!(
+                    error = %e,
+                    model = %active_model,
+                    "config default_model not available in router"
+                );
+            }
+        }
+
         let max_history = deps.config.general.max_history;
         let custom_system_prompt = load_system_prompt(deps.system_prompt_path.as_deref());
 
@@ -551,5 +564,84 @@ mod tests {
         let path = dir.path().join("empty_prompt.md");
         std::fs::write(&path, "   \n  ").expect("write");
         assert!(load_system_prompt(Some(&path)).is_none());
+    }
+
+    #[test]
+    fn new_falls_back_to_config_default_model() {
+        let mut config = FawxConfig::default();
+        config.model.default_model = Some("test-model-fallback".to_string());
+
+        let deps = HeadlessAppDeps {
+            loop_engine: test_engine(),
+            router: ModelRouter::new(),
+            config,
+            memory: None,
+            system_prompt_path: None,
+        };
+
+        let app = HeadlessApp::new(deps).expect("should build");
+        // Router has no providers so set_active will fail, but the
+        // active_model string should still be populated from config.
+        assert_eq!(app.active_model, "test-model-fallback");
+    }
+
+    #[test]
+    fn new_uses_router_model_over_config_default() {
+        use fx_llm::{
+            CompletionProvider, CompletionRequest, CompletionResponse, CompletionStream,
+            ProviderCapabilities, ProviderError,
+        };
+
+        #[derive(Debug)]
+        struct FakeProvider;
+
+        #[async_trait]
+        impl CompletionProvider for FakeProvider {
+            async fn complete(
+                &self,
+                _req: CompletionRequest,
+            ) -> Result<CompletionResponse, ProviderError> {
+                unimplemented!()
+            }
+            async fn complete_stream(
+                &self,
+                _req: CompletionRequest,
+            ) -> Result<CompletionStream, ProviderError> {
+                unimplemented!()
+            }
+            fn name(&self) -> &str {
+                "fake"
+            }
+            fn supported_models(&self) -> Vec<String> {
+                vec!["router-model".to_string()]
+            }
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities {
+                    supports_temperature: false,
+                    requires_streaming: false,
+                }
+            }
+        }
+
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(FakeProvider));
+        router
+            .set_active("router-model")
+            .expect("set active should work");
+
+        let mut config = FawxConfig::default();
+        config.model.default_model = Some("config-model".to_string());
+
+        let deps = HeadlessAppDeps {
+            loop_engine: test_engine(),
+            router,
+            config,
+            memory: None,
+            system_prompt_path: None,
+        };
+
+        let app = HeadlessApp::new(deps).expect("should build");
+        // Router's explicit model wins over config default.
+        assert_eq!(app.active_model, "router-model");
     }
 }

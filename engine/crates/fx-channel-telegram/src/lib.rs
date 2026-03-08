@@ -451,9 +451,10 @@ impl TelegramChannel {
             .map_err(|e| TelegramError::ApiError(e.to_string()))?;
 
         if !api_resp.ok {
-            return Err(TelegramError::ApiError(
-                "getUpdates returned ok=false".to_string(),
-            ));
+            return Err(TelegramError::ApiError(format!(
+                "getUpdates failed: {}",
+                api_resp.description.as_deref().unwrap_or("unknown error")
+            )));
         }
 
         let next_offset = compute_next_offset(&api_resp.result, offset);
@@ -544,6 +545,8 @@ impl Channel for TelegramChannel {
 #[derive(Debug, Deserialize)]
 struct GetUpdatesResponse {
     ok: bool,
+    #[serde(default)]
+    description: Option<String>,
     #[serde(default)]
     result: Vec<serde_json::Value>,
 }
@@ -939,5 +942,22 @@ mod tests {
         };
         let result = ch.send_message(&msg).await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn get_updates_response_deserializes_description() {
+        let json = r#"{"ok": false, "description": "Unauthorized"}"#;
+        let resp: GetUpdatesResponse = serde_json::from_str(json).expect("should deserialize");
+        assert!(!resp.ok);
+        assert_eq!(resp.description.as_deref(), Some("Unauthorized"));
+        assert!(resp.result.is_empty());
+    }
+
+    #[test]
+    fn get_updates_response_missing_description_defaults_none() {
+        let json = r#"{"ok": true, "result": []}"#;
+        let resp: GetUpdatesResponse = serde_json::from_str(json).expect("should deserialize");
+        assert!(resp.ok);
+        assert!(resp.description.is_none());
     }
 }

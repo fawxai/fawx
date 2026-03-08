@@ -570,4 +570,21 @@ mod tests {
         let loaded = store.load_auth_manager().expect("load");
         assert!(loaded.providers().is_empty());
     }
+
+    /// Regression test: dropping an `AuthStore` must release the SQLite lock
+    /// so a second open on the same directory succeeds. Before the fix in
+    /// `http_serve::run()`, the first store was held for the server lifetime,
+    /// blocking the polling loop from re-opening the credential DB.
+    #[test]
+    fn drop_releases_sqlite_lock_for_reopen() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = AuthStore::open(dir.path()).expect("first open");
+        drop(store);
+        let store2 = AuthStore::open(dir.path());
+        assert!(
+            store2.is_ok(),
+            "second open after drop should succeed: {}",
+            store2.err().unwrap_or_default()
+        );
+    }
 }
