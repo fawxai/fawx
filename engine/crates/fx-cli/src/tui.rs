@@ -47,6 +47,7 @@ use fx_memory::{JsonFileMemory, JsonMemoryConfig, SignalStore};
 use fx_scratchpad::skill::ScratchpadSkill;
 use fx_scratchpad::Scratchpad;
 use fx_skills::live_host_api::CredentialProvider;
+use fx_subagent::SubagentControl;
 use fx_tools::{
     BuiltinToolsSkill, FawxToolExecutor, GitSkill, ImprovementToolsState, SessionToolsSkill,
     ToolConfig,
@@ -3384,6 +3385,41 @@ pub struct LoopEngineBundle {
     pub signature_policy: SignaturePolicy,
 }
 
+#[derive(Clone, Default)]
+pub struct HeadlessLoopBuildOptions {
+    pub working_dir: Option<PathBuf>,
+    pub memory_enabled: bool,
+    pub subagent_control: Option<Arc<dyn SubagentControl>>,
+    pub cancel_token: Option<CancellationToken>,
+}
+
+impl HeadlessLoopBuildOptions {
+    pub fn parent(subagent_control: Arc<dyn SubagentControl>) -> Self {
+        Self {
+            working_dir: None,
+            memory_enabled: true,
+            subagent_control: Some(subagent_control),
+            cancel_token: None,
+        }
+    }
+
+    pub fn subagent(working_dir: Option<PathBuf>, cancel_token: CancellationToken) -> Self {
+        Self {
+            working_dir,
+            memory_enabled: false,
+            subagent_control: None,
+            cancel_token: Some(cancel_token),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SkillRegistryBuildOptions {
+    working_dir: PathBuf,
+    memory_enabled: bool,
+    subagent_control: Option<Arc<dyn SubagentControl>>,
+}
+
 impl LoopEngineBundle {
     pub fn into_tui_deps(
         self,
@@ -3416,7 +3452,25 @@ pub fn build_loop_engine_from_config(
 ) -> Result<LoopEngineBundle, TuiError> {
     let base_data_dir = fawx_data_dir();
     let data_dir = configured_data_dir(&base_data_dir, config);
-    build_loop_engine_with_config(data_dir, config.clone(), improvement_provider)
+    build_loop_engine_with_options(
+        data_dir,
+        config.clone(),
+        improvement_provider,
+        HeadlessLoopBuildOptions {
+            memory_enabled: true,
+            ..HeadlessLoopBuildOptions::default()
+        },
+    )
+}
+
+pub fn build_headless_loop_engine_bundle(
+    config: &FawxConfig,
+    improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
+    options: HeadlessLoopBuildOptions,
+) -> Result<LoopEngineBundle, TuiError> {
+    let base_data_dir = fawx_data_dir();
+    let data_dir = configured_data_dir(&base_data_dir, config);
+    build_loop_engine_with_options(data_dir, config.clone(), improvement_provider, options)
 }
 
 /// Convert a [`ThinkingBudget`] to the wire-level [`ThinkingConfig`].
@@ -3432,21 +3486,18 @@ fn thinking_config_from_budget(budget: &ThinkingBudget) -> Option<ThinkingConfig
 /// Capacity of the streaming event bus broadcast channel.
 const EVENT_BUS_CAPACITY: usize = 256;
 
-fn build_loop_engine_with_config(
+fn build_loop_engine_with_options(
     data_dir: PathBuf,
     config: FawxConfig,
     improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
+    options: HeadlessLoopBuildOptions,
 ) -> Result<LoopEngineBundle, TuiError> {
     let event_bus = EventBus::new(EVENT_BUS_CAPACITY);
     let budget = BudgetTracker::new(BudgetConfig::default(), current_time_ms(), 0);
     let context = ContextCompactor::new(DEFAULT_CONTEXT_MAX_TOKENS, DEFAULT_CONTEXT_COMPACT_TARGET);
-    let working_dir = configured_working_dir(&config);
-    let skills = build_skill_registry(
-        working_dir.clone(),
-        &data_dir,
-        &config,
-        improvement_provider,
-    );
+    let registry_options = build_skill_registry_options(&config, &options);
+    let working_dir = registry_options.working_dir.clone();
+    let skills = build_skill_registry(&data_dir, &config, improvement_provider, registry_options);
     let synthesis = config
         .model
         .synthesis_instruction
@@ -3477,6 +3528,9 @@ fn build_loop_engine_with_config(
         .event_bus(event_bus.clone())
         .iteration_counter(Arc::clone(&skills.iteration_counter))
         .scratchpad_provider(bridge);
+    if let Some(cancel_token) = options.cancel_token {
+        builder = builder.cancel_token(cancel_token);
+    }
     if let Some(snapshot_text) = skills.memory_snapshot {
         builder = builder.memory_context(snapshot_text);
     }
@@ -3498,6 +3552,20 @@ fn build_loop_engine_with_config(
         credential_store: skills.credential_store,
         signature_policy: skills.signature_policy,
     })
+}
+
+fn build_skill_registry_options(
+    config: &FawxConfig,
+    options: &HeadlessLoopBuildOptions,
+) -> SkillRegistryBuildOptions {
+    SkillRegistryBuildOptions {
+        working_dir: options
+            .working_dir
+            .clone()
+            .unwrap_or_else(|| configured_working_dir(config)),
+        memory_enabled: options.memory_enabled,
+        subagent_control: options.subagent_control.clone(),
+    }
 }
 
 fn build_loop_engine_from_builder(builder: LoopEngineBuilder) -> Result<LoopEngine, TuiError> {
@@ -3616,19 +3684,19 @@ struct SkillRegistryBundle {
 }
 
 fn build_skill_registry(
-    working_dir: PathBuf,
     data_dir: &Path,
     config: &FawxConfig,
     improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
+    options: SkillRegistryBuildOptions,
 ) -> SkillRegistryBundle {
     let tool_config = ToolConfig {
         max_read_size: config.tools.max_read_size,
         search_exclude: config.tools.search_exclude.clone(),
         ..ToolConfig::default()
     };
-    let executor = FawxToolExecutor::new(working_dir.clone(), tool_config);
+    let executor = FawxToolExecutor::new(options.working_dir.clone(), tool_config);
     let (mut executor, memory, snapshot_text, memory_enabled) =
-        attach_memory(executor, data_dir, config);
+        attach_memory_if_enabled(executor, data_dir, config, options.memory_enabled);
 
     let self_modify_config = crate::config_bridge::to_core_self_modify(&config.self_modify);
     let sm = self_modify_config.enabled.then_some(self_modify_config);
@@ -3638,6 +3706,9 @@ fn build_skill_registry(
 
     let runtime_info = new_runtime_info(config, memory_enabled);
     executor = executor.with_runtime_info(Arc::clone(&runtime_info));
+    if let Some(control) = options.subagent_control {
+        executor = executor.with_subagent_control(control);
+    }
 
     // Wire improvement tools when enabled and a provider is available.
     if config.improvement.enabled {
@@ -3655,9 +3726,9 @@ fn build_skill_registry(
 
     let registry = Arc::new(SkillRegistry::new());
     registry.register(Arc::new(BuiltinToolsSkill::new(executor)));
-    let git_skill = GitSkill::new(working_dir.clone(), sm.clone());
+    let git_skill = GitSkill::new(options.working_dir.clone(), sm.clone());
     registry.register(Arc::new(git_skill));
-    let tx_skill = TransactionSkill::new(working_dir.clone(), sm);
+    let tx_skill = TransactionSkill::new(options.working_dir.clone(), sm);
     registry.register(Arc::new(tx_skill));
     let scratchpad = Arc::new(Mutex::new(Scratchpad::new()));
     let iteration_counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -3768,16 +3839,20 @@ fn wire_improvement_tools(
     ))
 }
 
-fn attach_memory(
+fn attach_memory_if_enabled(
     mut executor: FawxToolExecutor,
     data_dir: &Path,
     config: &FawxConfig,
+    enabled: bool,
 ) -> (
     FawxToolExecutor,
     Option<SharedMemoryStore>,
     Option<String>,
     bool,
 ) {
+    if !enabled {
+        return (executor, None, None, false);
+    }
     let memory_config = JsonMemoryConfig {
         max_entries: config.memory.max_entries,
         max_value_size: config.memory.max_value_size,
@@ -6311,8 +6386,9 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use fx_core::memory::{MemoryProvider, MemoryTouchProvider};
-    use fx_kernel::act::ToolExecutorError;
+    use fx_kernel::act::{ToolExecutor, ToolExecutorError};
     use fx_llm::ContentBlock;
+    use fx_subagent::test_support::StubSubagentControl;
     use std::collections::BTreeMap;
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -6380,6 +6456,47 @@ mod tests {
 
     fn sample_wasm_bytes() -> Vec<u8> {
         vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]
+    }
+
+    #[test]
+    fn headless_bundle_includes_subagent_tools_when_control_attached() {
+        let (config, _temp_dir) = test_config_with_temp_dir();
+        let control = Arc::new(StubSubagentControl::new());
+        let bundle = build_headless_loop_engine_bundle(
+            &config,
+            None,
+            HeadlessLoopBuildOptions::parent(control),
+        )
+        .expect("bundle should build");
+        let names = bundle
+            .skill_registry
+            .tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"spawn_agent".to_string()));
+        assert!(names.contains(&"subagent_status".to_string()));
+    }
+
+    #[test]
+    fn headless_subagent_bundle_excludes_subagent_tools() {
+        let (config, _temp_dir) = test_config_with_temp_dir();
+        let bundle = build_headless_loop_engine_bundle(
+            &config,
+            None,
+            HeadlessLoopBuildOptions::subagent(None, CancellationToken::new()),
+        )
+        .expect("bundle should build");
+        let names = bundle
+            .skill_registry
+            .tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+
+        assert!(!names.contains(&"spawn_agent".to_string()));
+        assert!(!names.contains(&"subagent_status".to_string()));
     }
 
     fn write_test_skill(base_dir: &Path, skill_name: &str, wasm_bytes: &[u8]) {

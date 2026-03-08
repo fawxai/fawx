@@ -9666,6 +9666,8 @@ mod context_compaction_tests {
     use tracing_subscriber::prelude::*;
     use tracing_subscriber::Registry;
 
+    static TRACE_SUBSCRIBER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn words(count: usize) -> String {
         std::iter::repeat_n("a", count)
             .collect::<Vec<_>>()
@@ -10519,6 +10521,7 @@ mod context_compaction_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn compaction_emits_observability_fields() {
+        let _trace_lock = TRACE_SUBSCRIBER_LOCK.lock().await;
         let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
         let engine = engine_with(
             ContextCompactor::new(2_048, 256),

@@ -9,6 +9,9 @@ use fx_kernel::act::{
 use fx_kernel::cancellation::CancellationToken;
 use fx_llm::{ToolCall, ToolDefinition};
 use fx_propose::{Proposal, ProposalWriter};
+use fx_subagent::{
+    SpawnConfig, SpawnMode, SubagentControl, SubagentHandle, SubagentId, SubagentStatus,
+};
 use serde::Deserialize;
 use std::fs;
 use std::io::Read;
@@ -39,7 +42,7 @@ const DEFAULT_MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 const DEFAULT_MAX_READ_SIZE: u64 = 1024 * 1024;
 const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 30;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct FawxToolExecutor {
     working_dir: PathBuf,
     config: ToolConfig,
@@ -47,6 +50,7 @@ pub struct FawxToolExecutor {
     runtime_info: Option<Arc<RwLock<RuntimeInfo>>>,
     self_modify: Option<SelfModifyConfig>,
     concurrency_policy: ConcurrencyPolicy,
+    subagent_control: Option<Arc<dyn SubagentControl>>,
     node_run: Option<crate::node_run::NodeRunState>,
     #[cfg(feature = "improvement")]
     improvement: Option<crate::improvement_tools::ImprovementToolsState>,
@@ -87,6 +91,7 @@ impl FawxToolExecutor {
             runtime_info: None,
             self_modify: None,
             concurrency_policy: ConcurrencyPolicy::default(),
+            subagent_control: None,
             node_run: None,
             #[cfg(feature = "improvement")]
             improvement: None,
@@ -118,6 +123,12 @@ impl FawxToolExecutor {
         self
     }
 
+    /// Attach subagent lifecycle tools (spawn_agent, subagent_status).
+    pub fn with_subagent_control(mut self, control: Arc<dyn SubagentControl>) -> Self {
+        self.subagent_control = Some(control);
+        self
+    }
+
     /// Attach node_run tool state for remote command execution.
     pub fn with_node_run(mut self, state: crate::node_run::NodeRunState) -> Self {
         self.node_run = Some(state);
@@ -145,12 +156,13 @@ impl FawxToolExecutor {
             "read_file" | "list_directory" | "search_text" | "memory_read" | "memory_list" => {
                 ToolCacheability::Cacheable
             }
-            "write_file" | "memory_write" | "memory_delete" | "run_command" | "node_run" => {
-                ToolCacheability::SideEffect
-            }
-            "current_time" | "self_info" | "analyze_signals" | "propose_improvement" => {
-                ToolCacheability::NeverCache
-            }
+            "write_file" | "memory_write" | "memory_delete" | "run_command" | "spawn_agent"
+            | "node_run" => ToolCacheability::SideEffect,
+            "current_time"
+            | "self_info"
+            | "subagent_status"
+            | "analyze_signals"
+            | "propose_improvement" => ToolCacheability::NeverCache,
             _ => ToolCacheability::NeverCache,
         }
     }
@@ -175,6 +187,8 @@ impl FawxToolExecutor {
             "memory_read" => self.handle_memory_read(&call.arguments),
             "memory_list" => self.handle_memory_list(),
             "memory_delete" => self.handle_memory_delete(&call.arguments),
+            "spawn_agent" => self.handle_spawn_agent(&call.arguments).await,
+            "subagent_status" => self.handle_subagent_status(&call.arguments).await,
             "node_run" => {
                 return self.dispatch_node_run(call).await;
             }
@@ -189,6 +203,12 @@ impl FawxToolExecutor {
             _ => Err(format!("unknown tool: {}", call.name)),
         };
         to_tool_result(&call.id, &call.name, output)
+    }
+
+    fn subagent_control(&self) -> Result<&Arc<dyn SubagentControl>, String> {
+        self.subagent_control
+            .as_ref()
+            .ok_or_else(|| "subagent control not configured".to_string())
     }
 
     fn jailed_path(&self, requested: &str) -> Result<PathBuf, String> {
@@ -564,6 +584,32 @@ impl FawxToolExecutor {
         }
     }
 
+    async fn handle_spawn_agent(&self, args: &serde_json::Value) -> Result<String, String> {
+        let control = self.subagent_control()?;
+        let parsed: SpawnAgentArgs = parse_args(args)?;
+        let config = parsed.into_spawn_config()?;
+        let handle = control
+            .spawn(config)
+            .await
+            .map_err(|error| error.to_string())?;
+        serialize_output(spawned_handle_value(&handle))
+    }
+
+    async fn handle_subagent_status(&self, args: &serde_json::Value) -> Result<String, String> {
+        let control = self.subagent_control()?;
+        let parsed: SubagentStatusArgs = parse_args(args)?;
+        let action = parse_subagent_action(&parsed.action)?;
+        let output = match action {
+            SubagentAction::List => list_subagents_output(control).await?,
+            SubagentAction::Status => status_subagent_output(control, parsed.id).await?,
+            SubagentAction::Cancel => cancel_subagent_output(control, parsed.id).await?,
+            SubagentAction::Send => {
+                send_subagent_output(control, parsed.id, parsed.message).await?
+            }
+        };
+        serialize_output(output)
+    }
+
     #[cfg(feature = "improvement")]
     async fn dispatch_analyze_signals(&self, call: &ToolCall) -> ToolResult {
         let state = match &self.improvement {
@@ -732,7 +778,7 @@ impl ToolExecutor for FawxToolExecutor {
     }
 
     fn tool_definitions(&self) -> Vec<ToolDefinition> {
-        let mut defs = fawx_tool_definitions();
+        let mut defs = fawx_tool_definitions(self.subagent_control.is_some());
         if self.memory.is_some() {
             defs.extend(memory_tool_definitions());
         }
@@ -748,6 +794,23 @@ impl ToolExecutor for FawxToolExecutor {
 
     fn cacheability(&self, tool_name: &str) -> ToolCacheability {
         Self::cacheability_for(tool_name)
+    }
+}
+
+impl std::fmt::Debug for FawxToolExecutor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("FawxToolExecutor");
+        debug
+            .field("working_dir", &self.working_dir)
+            .field("config", &self.config)
+            .field("memory", &self.memory.is_some())
+            .field("runtime_info", &self.runtime_info.is_some())
+            .field("self_modify", &self.self_modify)
+            .field("concurrency_policy", &self.concurrency_policy)
+            .field("subagent_control", &self.subagent_control.is_some());
+        #[cfg(feature = "improvement")]
+        debug.field("improvement", &self.improvement.is_some());
+        debug.finish()
     }
 }
 
@@ -829,8 +892,8 @@ async fn collect_ordered_results(
     Ok(indexed.into_iter().map(|(_, result)| result).collect())
 }
 
-pub fn fawx_tool_definitions() -> Vec<ToolDefinition> {
-    vec![
+pub fn fawx_tool_definitions(include_subagent_tools: bool) -> Vec<ToolDefinition> {
+    let mut definitions = vec![
         ToolDefinition {
             name: "read_file".to_string(),
             description: "Read a UTF-8 text file from disk. Supports `~` to reference the home directory."
@@ -921,7 +984,205 @@ pub fn fawx_tool_definitions() -> Vec<ToolDefinition> {
                 .to_string(),
             parameters: serde_json::json!({"type": "object", "properties": {}, "required": []}),
         },
-    ]
+    ];
+    if include_subagent_tools {
+        definitions.extend(subagent_tool_definitions());
+    }
+    definitions
+}
+
+fn subagent_tool_definitions() -> Vec<ToolDefinition> {
+    vec![spawn_agent_definition(), subagent_status_definition()]
+}
+
+fn spawn_agent_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "spawn_agent".to_string(),
+        description:
+            "Spawn an isolated subagent to handle a task. Returns a subagent ID for monitoring."
+                .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "The task or prompt for the subagent"
+                },
+                "label": {
+                    "type": "string",
+                    "description": "Human-readable label for identification"
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["run", "session"],
+                    "description": "run = one-shot (default), session = persistent"
+                },
+                "timeout_seconds": {
+                    "type": "integer",
+                    "description": "Maximum execution time in seconds (default: 600)"
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Working directory for the subagent"
+                }
+            },
+            "required": ["task"]
+        }),
+    }
+}
+
+fn subagent_status_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "subagent_status".to_string(),
+        description: "Check status of a subagent, list all subagents, or cancel one.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["status", "list", "cancel", "send"],
+                    "description": "Action to perform"
+                },
+                "id": {
+                    "type": "string",
+                    "description": "Subagent ID (required for status/cancel/send)"
+                },
+                "message": {
+                    "type": "string",
+                    "description": "Message to send (required for send action)"
+                }
+            },
+            "required": ["action"]
+        }),
+    }
+}
+
+fn serialize_output(value: serde_json::Value) -> Result<String, String> {
+    serde_json::to_string(&value).map_err(|error| error.to_string())
+}
+
+fn spawned_handle_value(handle: &SubagentHandle) -> serde_json::Value {
+    serde_json::json!({
+        "id": handle.id.0.clone(),
+        "label": handle.label.clone(),
+        "mode": spawn_mode_name(&handle.mode),
+        "status": subagent_status_value(&handle.status),
+        "initial_response": handle.initial_response.clone(),
+    })
+}
+
+fn subagent_status_value(status: &SubagentStatus) -> serde_json::Value {
+    match status {
+        SubagentStatus::Running => serde_json::json!({ "state": "running" }),
+        SubagentStatus::Completed {
+            result,
+            tokens_used,
+        } => serde_json::json!({
+            "state": "completed",
+            "result": result,
+            "tokens_used": tokens_used,
+        }),
+        SubagentStatus::Failed { error } => {
+            serde_json::json!({ "state": "failed", "error": error })
+        }
+        SubagentStatus::Cancelled => serde_json::json!({ "state": "cancelled" }),
+        SubagentStatus::TimedOut => serde_json::json!({ "state": "timed_out" }),
+    }
+}
+
+fn spawn_mode_name(mode: &SpawnMode) -> &'static str {
+    match mode {
+        SpawnMode::Run => "run",
+        SpawnMode::Session => "session",
+    }
+}
+
+async fn list_subagents_output(
+    control: &Arc<dyn SubagentControl>,
+) -> Result<serde_json::Value, String> {
+    let handles = control.list().await.map_err(|error| error.to_string())?;
+    let subagents = handles.iter().map(spawned_handle_value).collect::<Vec<_>>();
+    Ok(serde_json::json!({ "subagents": subagents }))
+}
+
+async fn status_subagent_output(
+    control: &Arc<dyn SubagentControl>,
+    id: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let id = required_subagent_id(id, "status")?;
+    let handle = require_subagent_handle(control, &id).await?;
+    Ok(spawned_handle_value(&handle))
+}
+
+async fn cancel_subagent_output(
+    control: &Arc<dyn SubagentControl>,
+    id: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let id = required_subagent_id(id, "cancel")?;
+    control
+        .cancel(&id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let handle = require_subagent_handle(control, &id).await?;
+    Ok(spawned_handle_value(&handle))
+}
+
+async fn send_subagent_output(
+    control: &Arc<dyn SubagentControl>,
+    id: Option<String>,
+    message: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let id = required_subagent_id(id, "send")?;
+    let message = required_send_message(message)?;
+    let response = control
+        .send(&id, &message)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(serde_json::json!({
+        "id": id.0,
+        "response": response,
+    }))
+}
+
+fn required_subagent_id(id: Option<String>, action: &str) -> Result<SubagentId, String> {
+    let id = id.ok_or_else(|| format!("id is required for '{action}' action"))?;
+    if id.trim().is_empty() {
+        return Err(format!("id is required for '{action}' action"));
+    }
+    Ok(SubagentId(id))
+}
+
+fn required_send_message(message: Option<String>) -> Result<String, String> {
+    let message = message.ok_or_else(|| "message is required for 'send' action".to_string())?;
+    if message.trim().is_empty() {
+        return Err("message is required for 'send' action".to_string());
+    }
+    Ok(message)
+}
+
+async fn require_subagent_handle(
+    control: &Arc<dyn SubagentControl>,
+    id: &SubagentId,
+) -> Result<SubagentHandle, String> {
+    control
+        .list()
+        .await
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|handle| &handle.id == id)
+        .ok_or_else(|| format!("subagent '{id}' not found"))
+}
+
+fn parse_subagent_action(action: &str) -> Result<SubagentAction, String> {
+    match action {
+        "status" => Ok(SubagentAction::Status),
+        "list" => Ok(SubagentAction::List),
+        "cancel" => Ok(SubagentAction::Cancel),
+        "send" => Ok(SubagentAction::Send),
+        other => Err(format!(
+            "unknown subagent action '{other}', valid actions: status, list, cancel, send"
+        )),
+    }
 }
 
 pub fn memory_tool_definitions() -> Vec<ToolDefinition> {
@@ -1263,10 +1524,68 @@ struct MemoryDeleteArgs {
     key: String,
 }
 
+#[derive(Deserialize)]
+struct SpawnAgentArgs {
+    task: String,
+    label: Option<String>,
+    model: Option<String>,
+    mode: Option<String>,
+    timeout_seconds: Option<u64>,
+    cwd: Option<String>,
+}
+
+impl SpawnAgentArgs {
+    fn into_spawn_config(self) -> Result<SpawnConfig, String> {
+        reject_model_override(self.model.as_deref())?;
+        Ok(SpawnConfig {
+            label: self.label,
+            task: self.task,
+            model: None,
+            mode: parse_spawn_mode(self.mode.as_deref())?,
+            timeout: Duration::from_secs(self.timeout_seconds.unwrap_or(600)),
+            max_tokens: None,
+            cwd: self.cwd.map(PathBuf::from),
+            system_prompt: None,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct SubagentStatusArgs {
+    action: String,
+    id: Option<String>,
+    message: Option<String>,
+}
+
+enum SubagentAction {
+    Status,
+    List,
+    Cancel,
+    Send,
+}
+
+fn parse_spawn_mode(mode: Option<&str>) -> Result<SpawnMode, String> {
+    match mode.unwrap_or("run") {
+        "run" => Ok(SpawnMode::Run),
+        "session" => Ok(SpawnMode::Session),
+        other => Err(format!(
+            "unknown spawn mode '{other}', valid modes: run, session"
+        )),
+    }
+}
+
+fn reject_model_override(model: Option<&str>) -> Result<(), String> {
+    if model.is_some() {
+        return Err("model override is not supported for headless subagents".to_string());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use fx_core::memory::MemoryProvider;
+    use fx_subagent::{test_support::StubSubagentControl, SubagentStatus};
     use tempfile::TempDir;
 
     /// Minimal no-op transport for testing tool_definitions() inclusion.
@@ -1314,6 +1633,17 @@ mod tests {
 
     fn parse_json_output(output: &str) -> serde_json::Value {
         serde_json::from_str(output).expect("valid json output")
+    }
+
+    fn test_executor_with_subagents(root: &Path) -> FawxToolExecutor {
+        test_executor_with_control(root, Arc::new(StubSubagentControl::new()))
+    }
+
+    fn test_executor_with_control(
+        root: &Path,
+        control: Arc<dyn SubagentControl>,
+    ) -> FawxToolExecutor {
+        test_executor(root).with_subagent_control(control)
     }
 
     #[test]
@@ -1866,7 +2196,7 @@ mod tests {
 
     #[test]
     fn current_time_appears_in_definitions() {
-        let definitions = fawx_tool_definitions();
+        let definitions = fawx_tool_definitions(false);
         assert!(definitions.iter().any(|tool| tool.name == "current_time"));
     }
 
@@ -1892,6 +2222,10 @@ mod tests {
             ToolCacheability::SideEffect
         );
         assert_eq!(
+            executor.cacheability("spawn_agent"),
+            ToolCacheability::SideEffect
+        );
+        assert_eq!(
             executor.cacheability("current_time"),
             ToolCacheability::NeverCache
         );
@@ -1900,9 +2234,188 @@ mod tests {
             ToolCacheability::NeverCache
         );
         assert_eq!(
+            executor.cacheability("subagent_status"),
+            ToolCacheability::NeverCache
+        );
+        assert_eq!(
             executor.cacheability("unknown_tool"),
             ToolCacheability::NeverCache
         );
+    }
+
+    #[test]
+    fn subagent_tools_appear_when_control_is_configured() {
+        let temp = TempDir::new().expect("temp");
+        let names = test_executor_with_subagents(temp.path())
+            .tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"spawn_agent".to_string()));
+        assert!(names.contains(&"subagent_status".to_string()));
+    }
+
+    #[test]
+    fn subagent_tools_absent_without_control() {
+        let temp = TempDir::new().expect("temp");
+        let names = test_executor(temp.path())
+            .tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+        assert!(!names.contains(&"spawn_agent".to_string()));
+        assert!(!names.contains(&"subagent_status".to_string()));
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_dispatches_to_subagent_control() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor_with_subagents(temp.path());
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "spawn_agent".to_string(),
+            arguments: serde_json::json!({"task": "Review this", "mode": "session"}),
+        };
+
+        let result = executor.execute_call(&call, None).await;
+        let output = parse_json_output(&result.output);
+        assert!(result.success);
+        assert_eq!(output["id"], "agent-1");
+        assert_eq!(output["status"]["state"], "running");
+    }
+
+    #[tokio::test]
+    async fn subagent_status_dispatches_send_action() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor_with_subagents(temp.path());
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "subagent_status".to_string(),
+            arguments: serde_json::json!({
+                "action": "send",
+                "id": "agent-1",
+                "message": "try again"
+            }),
+        };
+
+        let result = executor.execute_call(&call, None).await;
+        let output = parse_json_output(&result.output);
+        assert!(result.success);
+        assert_eq!(output["response"], "reply");
+    }
+
+    #[tokio::test]
+    async fn subagent_status_rejects_missing_id() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor_with_subagents(temp.path());
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "subagent_status".to_string(),
+            arguments: serde_json::json!({"action": "status"}),
+        };
+
+        let result = executor.execute_call(&call, None).await;
+        assert!(!result.success);
+        assert!(result.output.contains("id is required"));
+    }
+
+    #[tokio::test]
+    async fn subagent_status_rejects_missing_message_for_send() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor_with_subagents(temp.path());
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "subagent_status".to_string(),
+            arguments: serde_json::json!({"action": "send", "id": "agent-1"}),
+        };
+
+        let result = executor.execute_call(&call, None).await;
+        assert!(!result.success);
+        assert!(result.output.contains("message is required"));
+    }
+
+    #[tokio::test]
+    async fn subagent_cancel_returns_actual_post_cancel_status() {
+        let temp = TempDir::new().expect("temp");
+        let control = Arc::new(
+            StubSubagentControl::new().with_status(SubagentStatus::Completed {
+                result: "done".to_string(),
+                tokens_used: 42,
+            }),
+        );
+        let executor = test_executor_with_control(temp.path(), control);
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "subagent_status".to_string(),
+            arguments: serde_json::json!({"action": "cancel", "id": "agent-1"}),
+        };
+
+        let result = executor.execute_call(&call, None).await;
+        let output = parse_json_output(&result.output);
+        assert!(result.success);
+        assert_eq!(output["status"]["state"], "completed");
+        assert_eq!(output["status"]["result"], "done");
+        assert_eq!(output["status"]["tokens_used"], 42);
+    }
+
+    #[tokio::test]
+    async fn subagent_status_includes_initial_response_when_available() {
+        let temp = TempDir::new().expect("temp");
+        let control = Arc::new(StubSubagentControl::new().with_initial_response("initial"));
+        let executor = test_executor_with_control(temp.path(), control);
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "subagent_status".to_string(),
+            arguments: serde_json::json!({"action": "status", "id": "agent-1"}),
+        };
+
+        let result = executor.execute_call(&call, None).await;
+        let output = parse_json_output(&result.output);
+        assert!(result.success);
+        assert_eq!(output["initial_response"], "initial");
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_rejects_invalid_mode() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor_with_subagents(temp.path());
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "spawn_agent".to_string(),
+            arguments: serde_json::json!({"task": "Review this", "mode": "bad"}),
+        };
+
+        let result = executor.execute_call(&call, None).await;
+        assert!(!result.success);
+        assert!(result.output.contains("unknown spawn mode"));
+    }
+
+    #[test]
+    fn spawn_agent_schema_omits_model_override() {
+        let definition = spawn_agent_definition();
+        let properties = definition.parameters["properties"]
+            .as_object()
+            .expect("spawn properties object");
+
+        assert!(!properties.contains_key("model"));
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_rejects_model_override() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor_with_subagents(temp.path());
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "spawn_agent".to_string(),
+            arguments: serde_json::json!({
+                "task": "Review this",
+                "model": "anthropic/claude-opus-4-6"
+            }),
+        };
+
+        let result = executor.execute_call(&call, None).await;
+        assert!(!result.success);
+        assert!(result.output.contains("model override is not supported"));
     }
 
     #[test]
@@ -1994,7 +2507,7 @@ mod tests {
 
     #[test]
     fn self_info_appears_in_tool_definitions() {
-        let definitions = fawx_tool_definitions();
+        let definitions = fawx_tool_definitions(false);
         assert!(definitions.iter().any(|tool| tool.name == "self_info"));
     }
 

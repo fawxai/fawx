@@ -18,6 +18,7 @@ mod tui;
 mod ui;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use std::sync::Arc;
 
 pub use confirmation::ConfirmationUi;
 
@@ -227,26 +228,76 @@ async fn run_tui() -> anyhow::Result<i32> {
     Ok(0)
 }
 
-async fn run_headless(
-    single: bool,
-    json: bool,
-    system_prompt: Option<std::path::PathBuf>,
-) -> anyhow::Result<i32> {
-    let auth_manager = tui::load_auth_manager()?;
-    let router = tui::build_router(&auth_manager)?;
-    let config = tui::load_config()?;
-    let improvement_provider = tui::build_improvement_provider(&auth_manager, &config);
-    let bundle = tui::build_loop_engine_from_config(&config, improvement_provider)?;
+struct HeadlessStartup {
+    app: headless::HeadlessApp,
+    #[cfg(feature = "http")]
+    http_config: fx_config::HttpConfig,
+    #[cfg(feature = "http")]
+    telegram_config: fx_config::TelegramChannelConfig,
+}
 
-    let deps = headless::HeadlessAppDeps {
+fn build_headless_startup(
+    system_prompt: Option<std::path::PathBuf>,
+) -> anyhow::Result<HeadlessStartup> {
+    let auth_manager = tui::load_auth_manager()?;
+    let router = Arc::new(tui::build_router(&auth_manager)?);
+    let config = tui::load_config()?;
+    #[cfg(feature = "http")]
+    let http_config = config.http.clone();
+    #[cfg(feature = "http")]
+    let telegram_config = config.telegram.clone();
+    let improvement_provider = tui::build_improvement_provider(&auth_manager, &config);
+    let app = build_headless_app(router, config, improvement_provider, system_prompt)?;
+    Ok(HeadlessStartup {
+        app,
+        #[cfg(feature = "http")]
+        http_config,
+        #[cfg(feature = "http")]
+        telegram_config,
+    })
+}
+
+fn build_headless_app(
+    router: Arc<fx_llm::ModelRouter>,
+    config: fx_config::FawxConfig,
+    improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
+    system_prompt: Option<std::path::PathBuf>,
+) -> anyhow::Result<headless::HeadlessApp> {
+    let factory = headless::HeadlessSubagentFactory::new(headless::HeadlessSubagentFactoryDeps {
+        router: Arc::clone(&router),
+        config: config.clone(),
+        improvement_provider: improvement_provider.clone(),
+    });
+    let subagent_manager = Arc::new(fx_subagent::SubagentManager::new(
+        fx_subagent::SubagentManagerDeps {
+            factory: Arc::new(factory),
+            limits: fx_subagent::SubagentLimits::default(),
+        },
+    ));
+    let bundle = tui::build_headless_loop_engine_bundle(
+        &config,
+        improvement_provider,
+        tui::HeadlessLoopBuildOptions::parent(
+            Arc::clone(&subagent_manager) as Arc<dyn fx_subagent::SubagentControl>
+        ),
+    )?;
+    headless::HeadlessApp::new(headless::HeadlessAppDeps {
         loop_engine: bundle.engine,
         router,
         config,
         memory: bundle.memory,
         system_prompt_path: system_prompt,
-    };
+        system_prompt_text: None,
+        subagent_manager,
+    })
+}
 
-    let mut app = headless::HeadlessApp::new(deps)?;
+async fn run_headless(
+    single: bool,
+    json: bool,
+    system_prompt: Option<std::path::PathBuf>,
+) -> anyhow::Result<i32> {
+    let HeadlessStartup { mut app, .. } = build_headless_startup(system_prompt)?;
     if single {
         app.run_single(json).await
     } else {
@@ -259,23 +310,11 @@ async fn run_http_server(
     system_prompt: Option<std::path::PathBuf>,
     port: u16,
 ) -> anyhow::Result<i32> {
-    let auth_manager = tui::load_auth_manager()?;
-    let router = tui::build_router(&auth_manager)?;
-    let config = tui::load_config()?;
-    let http_config = config.http.clone();
-    let telegram_config = config.telegram.clone();
-    let improvement_provider = tui::build_improvement_provider(&auth_manager, &config);
-    let bundle = tui::build_loop_engine_from_config(&config, improvement_provider)?;
-
-    let deps = headless::HeadlessAppDeps {
-        loop_engine: bundle.engine,
-        router,
-        config,
-        memory: bundle.memory,
-        system_prompt_path: system_prompt,
-    };
-
-    let mut app = headless::HeadlessApp::new(deps)?;
+    let HeadlessStartup {
+        mut app,
+        http_config,
+        telegram_config,
+    } = build_headless_startup(system_prompt)?;
     app.initialize();
 
     // Open credential store once; pass to channel builders for DI.

@@ -22,6 +22,7 @@ fx-config.workspace = true
 fx-tools = { workspace = true, features = ["improvement"] }
 fx-core.workspace = true
 fx-kernel.workspace = true
+fx-subagent.workspace = true
 fx-auth.workspace = true
 fx-conversation.workspace = true
 fx-llm = { path = "../fx-llm" }
@@ -78,6 +79,7 @@ termimad = { git = "https://github.com/abbudjoe/termimad.git", rev = "f93824f301
 syntect = { git = "https://github.com/abbudjoe/syntect.git", rev = "6271d7dd8a63f13df08c151840f2358bf116cdcc", default-features = false, features = ["default-fancy"] }
 
 [dev-dependencies]
+fx-subagent = { workspace = true, features = ["test-support"] }
 tempfile = "3.14"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

@@ -1467,13 +1467,25 @@ mod tests {
 
         fn make_test_app(router: ModelRouter) -> HeadlessApp {
             use crate::headless::HeadlessAppDeps;
+            use fx_subagent::{
+                test_support::DisabledSubagentFactory, SubagentLimits, SubagentManager,
+                SubagentManagerDeps,
+            };
+            use std::sync::Arc;
+
+            let subagent_manager = Arc::new(SubagentManager::new(SubagentManagerDeps {
+                factory: Arc::new(DisabledSubagentFactory::new("disabled")),
+                limits: SubagentLimits::default(),
+            }));
 
             HeadlessApp::new(HeadlessAppDeps {
                 loop_engine: test_engine(),
-                router,
+                router: Arc::new(router),
                 config: fx_config::FawxConfig::default(),
                 memory: None,
                 system_prompt_path: None,
+                system_prompt_text: None,
+                subagent_manager,
             })
             .expect("test app")
         }

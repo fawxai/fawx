@@ -86,6 +86,7 @@ mod tests {
     use super::*;
     use crate::tools::ToolConfig;
     use fx_memory::JsonFileMemory;
+    use fx_subagent::test_support::StubSubagentControl;
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -210,5 +211,38 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(results[0].success);
         assert!(results[0].output.contains("day_of_week:"));
+    }
+
+    #[test]
+    fn builtin_tools_skill_adds_subagent_tools_when_control_is_attached() {
+        let temp = TempDir::new().expect("tempdir");
+        let control = Arc::new(StubSubagentControl::new());
+        let skill =
+            BuiltinToolsSkill::new(build_memory_executor(&temp).with_subagent_control(control));
+        let names = skill
+            .tool_definitions()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"spawn_agent".to_string()));
+        assert!(names.contains(&"subagent_status".to_string()));
+    }
+
+    #[tokio::test]
+    async fn builtin_tools_skill_forwards_spawn_agent() {
+        let temp = TempDir::new().expect("tempdir");
+        let control = Arc::new(StubSubagentControl::new());
+        let skill =
+            BuiltinToolsSkill::new(build_memory_executor(&temp).with_subagent_control(control));
+
+        let result = skill
+            .execute("spawn_agent", r#"{"task":"review this"}"#, None)
+            .await;
+        let output = result
+            .expect("known tool should return Some")
+            .expect("spawn should succeed");
+        let json: serde_json::Value =
+            serde_json::from_str(&output).expect("spawn output should be valid json");
+        assert_eq!(json["id"], "agent-1");
     }
 }
