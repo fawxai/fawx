@@ -47,7 +47,10 @@ use fx_memory::{JsonFileMemory, JsonMemoryConfig, SignalStore};
 use fx_scratchpad::skill::ScratchpadSkill;
 use fx_scratchpad::Scratchpad;
 use fx_skills::live_host_api::CredentialProvider;
-use fx_tools::{BuiltinToolsSkill, FawxToolExecutor, GitSkill, ImprovementToolsState, ToolConfig};
+use fx_tools::{
+    BuiltinToolsSkill, FawxToolExecutor, GitSkill, ImprovementToolsState, SessionToolsSkill,
+    ToolConfig,
+};
 use ratatui::DefaultTerminal;
 use sha2::{Digest, Sha256};
 use std::collections::hash_map::DefaultHasher;
@@ -3661,6 +3664,26 @@ fn build_skill_registry(
     let scratchpad_skill =
         ScratchpadSkill::new(Arc::clone(&scratchpad), Arc::clone(&iteration_counter));
     registry.register(Arc::new(scratchpad_skill));
+
+    // Register session management tools.
+    let session_db_path = data_dir.join("sessions.redb");
+    match fx_storage::Storage::open(&session_db_path) {
+        Ok(storage) => {
+            let store = fx_session::SessionStore::new(storage);
+            match fx_session::SessionRegistry::new(store) {
+                Ok(session_registry) => {
+                    let session_skill = SessionToolsSkill::new(session_registry);
+                    registry.register(Arc::new(session_skill));
+                }
+                Err(e) => {
+                    tracing::warn!("session registry unavailable: {e}");
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("session storage unavailable: {e}");
+        }
+    }
 
     // Load reflective journal for cross-session learning.
     let journal_path = data_dir.join("journal.jsonl");

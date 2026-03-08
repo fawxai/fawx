@@ -10,6 +10,7 @@ improvement = ["dep:fx-analysis", "dep:fx-improve", "dep:fx-memory", "dep:fx-con
 
 [dependencies]
 fx-core.workspace = true
+fx-session.workspace = true
 fx-fleet.workspace = true
 fx-propose.workspace = true
 fx-kernel.workspace = true
@@ -32,3 +33,4 @@ uuid = { version = "1.13", features = ["v4"], optional = true }
 [dev-dependencies]
 tempfile = "3.14"
 fx-memory.workspace = true
+fx-storage.workspace = true

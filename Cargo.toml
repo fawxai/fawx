@@ -32,6 +32,7 @@ members = [
     "engine/crates/fx-channel-telegram",
     "engine/crates/fx-orchestrator",
     "engine/crates/fx-journal",
+    "engine/crates/fx-session",
 ]
 resolver = "2"
 
@@ -113,3 +114,4 @@ fx-author = { path = "engine/crates/fx-author" }
 fx-marketplace = { path = "engine/crates/fx-marketplace" }
 fx-fleet = { path = "engine/crates/fx-fleet" }
 fx-orchestrator = { path = "engine/crates/fx-orchestrator" }
+fx-session = { path = "engine/crates/fx-session" }
