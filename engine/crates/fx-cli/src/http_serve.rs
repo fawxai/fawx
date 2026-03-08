@@ -446,7 +446,12 @@ async fn handle_telegram_webhook(
 /// Validates that a bearer token is configured, detects the Tailscale IP,
 /// binds exclusively to it, and serves requests until the process is
 /// terminated.
-pub async fn run(app: HeadlessApp, port: u16, http_config: &HttpConfig) -> anyhow::Result<i32> {
+pub async fn run(
+    app: HeadlessApp,
+    port: u16,
+    http_config: &HttpConfig,
+    telegram: Option<Arc<fx_channel_telegram::TelegramChannel>>,
+) -> anyhow::Result<i32> {
     let data_dir = crate::tui::fawx_data_dir();
     let auth_store = match crate::auth_store::AuthStore::open(&data_dir) {
         Ok(store) => Some(store),
