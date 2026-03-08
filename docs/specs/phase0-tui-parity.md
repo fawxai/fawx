@@ -1,7 +1,7 @@
 # Spec: Phase 0 PR 1 — TUI Feature Parity
 
 **Gaps:** SubagentManager + ConfigManager missing from TUI mode  
-**Estimated size:** ~80 lines  
+**Estimated size:** ~100 lines  
 **Risk:** Low — plumbing only
 
 ---
@@ -83,6 +83,28 @@ Pass through `TuiAppDeps` (add field if not present) or through `LoopEngineBundl
 | `main.rs` | Create SubagentManager + ConfigManager in `run_tui()` |
 | `tui.rs` | Accept SubagentControl in build options, add ConfigManager to TuiAppDeps |
 | Tests | Verify tool list includes subagent tools when control is attached |
+
+## Implementation Gates (stop and report if triggered)
+
+### Gate 1: Arc wrapping for ModelRouter
+`run_tui()` creates `ModelRouter` as a bare value, but `HeadlessSubagentFactory` 
+needs `Arc<ModelRouter>`. Check if `TuiApp` can work with `Arc<ModelRouter>` 
+(read-only after init). If TuiApp needs mutable access for model switching 
+(e.g., `/model` command), that requires `Arc<RwLock<ModelRouter>>` which 
+touches more of TuiApp's ownership model.
+
+**Rule:** If Arc wrapping requires >20 lines of changes to TuiApp's existing 
+ModelRouter usage, **stop and report back** with what needs refactoring. 
+Do not refactor TuiApp's ownership model in this PR — that's a separate scope.
+
+### Gate 2: Subagent I/O isolation
+`HeadlessSubagentFactory` spawns child `fawx serve` processes. In TUI mode, 
+ratatui owns the alternate screen. If child processes inherit the parent's TTY 
+file descriptors, they could corrupt terminal output.
+
+**Rule:** Verify that `HeadlessSubagentFactory` uses explicit piped stdin/stdout 
+(not inherited parent TTY). If it inherits the parent TTY, **stop and report** — 
+that's a HeadlessSubagentFactory fix, not a TUI parity fix.
 
 ## Security
 
