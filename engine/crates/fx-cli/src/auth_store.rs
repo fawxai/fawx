@@ -41,6 +41,11 @@ pub struct AuthStore {
     _temp_dir: Option<tempfile::TempDir>,
 }
 
+pub struct RecoveredAuthStore {
+    pub store: AuthStore,
+    pub recreated: bool,
+}
+
 impl AuthStore {
     /// Open (or create) the encrypted auth store in `data_dir`.
     ///
@@ -166,6 +171,48 @@ impl AuthStore {
         providers.dedup();
         Ok(providers)
     }
+}
+
+pub fn open_auth_store_with_recovery(data_dir: &Path) -> Result<RecoveredAuthStore, String> {
+    match open_verified_auth_store(data_dir) {
+        Ok(store) => Ok(RecoveredAuthStore {
+            store,
+            recreated: false,
+        }),
+        Err(error) if should_recreate_auth_store(&error) => recreate_auth_store(data_dir),
+        Err(error) => Err(error),
+    }
+}
+
+fn open_verified_auth_store(data_dir: &Path) -> Result<AuthStore, String> {
+    let store = AuthStore::open(data_dir)?;
+    store.load_auth_manager().map(|_| store)
+}
+
+fn recreate_auth_store(data_dir: &Path) -> Result<RecoveredAuthStore, String> {
+    remove_if_exists(&data_dir.join("auth.db"))?;
+    remove_if_exists(&data_dir.join(".auth-salt"))?;
+    let store = AuthStore::open(data_dir)?;
+    Ok(RecoveredAuthStore {
+        store,
+        recreated: true,
+    })
+}
+
+fn should_recreate_auth_store(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("different machine identity")
+        || error.contains("decrypt")
+        || error.contains("failed to open auth database")
+        || error.contains("key derivation failed")
+}
+
+fn remove_if_exists(path: &Path) -> Result<(), String> {
+    if path.exists() {
+        fs::remove_file(path)
+            .map_err(|error| format!("failed to remove {}: {error}", path.display()))?;
+    }
+    Ok(())
 }
 
 /// Decode a credential-read error, providing actionable hints for key mismatches.
@@ -588,6 +635,40 @@ mod tests {
             result.is_err(),
             "opening corrupt database should return an error"
         );
+    }
+
+    #[test]
+    fn open_auth_store_with_recovery_recreates_store_after_salt_mismatch() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = AuthStore::open(dir.path()).expect("open");
+        store
+            .save_auth_manager(&sample_auth_manager())
+            .expect("save");
+        drop(store);
+        fs::write(dir.path().join(".auth-salt"), b"short").expect("corrupt salt");
+
+        let recovered = open_auth_store_with_recovery(dir.path()).expect("recover");
+        let loaded = recovered.store.load_auth_manager().expect("load");
+
+        assert!(recovered.recreated);
+        assert!(loaded.providers().is_empty());
+    }
+
+    #[test]
+    fn open_auth_store_with_recovery_recreates_store_after_db_corruption() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = AuthStore::open(dir.path()).expect("open");
+        store
+            .save_auth_manager(&sample_auth_manager())
+            .expect("save");
+        drop(store);
+        fs::write(dir.path().join("auth.db"), b"not a sqlite database").expect("corrupt db");
+
+        let recovered = open_auth_store_with_recovery(dir.path()).expect("recover");
+        let loaded = recovered.store.load_auth_manager().expect("load");
+
+        assert!(recovered.recreated);
+        assert!(loaded.providers().is_empty());
     }
 
     #[test]

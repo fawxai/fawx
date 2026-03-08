@@ -71,17 +71,19 @@ pub struct CycleResult {
     pub iterations: u32,
     /// Estimated input tokens used during the cycle, when available.
     /// Read only when the `http` feature is active (streaming endpoint).
-    #[cfg_attr(not(feature = "http"), allow(dead_code))]
+    #[allow(dead_code)] // TODO(#1256): dead code until localhost binding is wired.
     pub input_tokens: Option<u64>,
     /// Estimated output tokens used during the cycle, when available.
     /// Read only when the `http` feature is active (streaming endpoint).
-    #[cfg_attr(not(feature = "http"), allow(dead_code))]
+    #[allow(dead_code)] // TODO(#1256): dead code until localhost binding is wired.
     pub output_tokens: Option<u64>,
+
     /// Total input + output tokens reported for the cycle.
     pub tokens_used: u64,
 }
 
 #[cfg(feature = "http")]
+#[allow(dead_code)] // TODO(#1256): dead code until localhost binding is wired.
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HeadlessStreamEvent {
@@ -266,6 +268,7 @@ impl HeadlessApp {
     }
 
     #[cfg(feature = "http")]
+    #[allow(dead_code)] // TODO(#1256): dead code until localhost binding is wired.
     pub fn memory_entry_count(&self) -> usize {
         let Some(memory) = &self.memory else {
             return 0;
@@ -280,6 +283,7 @@ impl HeadlessApp {
     }
 
     #[cfg(feature = "http")]
+    #[allow(dead_code)] // TODO(#1256): dead code until localhost binding is wired.
     pub fn config(&self) -> &FawxConfig {
         &self.config
     }
@@ -330,6 +334,7 @@ impl HeadlessApp {
     }
 
     #[cfg(feature = "http")]
+    #[allow(dead_code)] // TODO(#1256): dead code until localhost binding is wired.
     pub async fn process_message_streaming(
         &mut self,
         input: &str,
@@ -751,6 +756,7 @@ fn sum_token_usage(tokens: &fx_kernel::act::TokenUsage) -> u64 {
 }
 
 #[cfg(feature = "http")]
+#[allow(dead_code)] // TODO(#1256): dead code until localhost binding is wired.
 #[derive(Clone, Copy, Debug, Default)]
 struct StreamRelayState {
     streamed_any: bool,
@@ -758,6 +764,7 @@ struct StreamRelayState {
 }
 
 #[cfg(feature = "http")]
+#[allow(dead_code)] // TODO(#1256): dead code until localhost binding is wired.
 async fn send_stream_event(
     tx: &tokio::sync::mpsc::Sender<HeadlessStreamEvent>,
     event: HeadlessStreamEvent,
@@ -776,6 +783,7 @@ async fn send_stream_event(
 }
 
 #[cfg(feature = "http")]
+#[allow(dead_code)] // TODO(#1256): dead code until localhost binding is wired.
 async fn handle_stream_message(
     message: Result<InternalMessage, tokio::sync::broadcast::error::RecvError>,
     tx: &tokio::sync::mpsc::Sender<HeadlessStreamEvent>,

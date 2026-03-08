@@ -101,8 +101,8 @@ Step 5/5: Validation
   ✓ Credential store: healthy
 
 Setup complete! Next steps:
-  fawx tui          — interactive terminal
-  fawx serve --http — headless HTTP API
+  fawx serve --http    — start the engine
+  fawx-tui             — connect the terminal UI (requires engine running)
 ```
 
 ### 3. Implementation Details
@@ -141,10 +141,10 @@ Setup complete! Next steps:
 - **Telegram:**
   - Prompt for bot token (from @BotFather) — secret input, stored encrypted
   - Optional: restrict to specific chat IDs (comma-separated)
-  - Auto-generate webhook secret for request validation
+  - Auto-generate webhook secret for request validation and store it encrypted
   - Validate token immediately via `getMe` API call
-  - Write `[telegram]` section: `enabled = true`, `allowed_chat_ids`, `webhook_secret`
-  - Bot token stored in credential store, NOT in config.toml
+  - Write `[telegram]` section: `enabled = true`, `allowed_chat_ids`
+  - Bot token and webhook secret are stored in the credential store, NOT in `config.toml`
 - **Webhook (generic):**
   - Prompt for channel name/ID
   - Prompt for callback URL
@@ -215,7 +215,7 @@ directly write to the credential store / auth manager.
 
 ### 9. Out of scope
 
-- OAuth PKCE flow from CLI (keep in TUI only — needs browser interaction)
+- Fully automatic OAuth callback handling without a browser-assisted paste-back flow
 - Multi-provider setup in single wizard run (run setup again to add more)
 - Fleet/node configuration (separate concern)
 
