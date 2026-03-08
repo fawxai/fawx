@@ -8,12 +8,16 @@
 use async_trait::async_trait;
 use fx_config::manager::ConfigManager;
 use fx_config::FawxConfig;
+#[cfg(feature = "http")]
+use fx_core::message::InternalMessage;
 use fx_core::types::{InputSource, ScreenState, UserInput};
 use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::loop_engine::{LoopEngine, LoopResult};
 use fx_kernel::types::PerceptionSnapshot;
 use fx_llm::CompletionProvider;
 use fx_llm::{Message, ModelRouter};
+#[cfg(feature = "http")]
+use serde_json::Value;
 
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -29,6 +33,15 @@ use fx_subagent::{
     CreatedSubagentSession, SpawnConfig, SubagentError, SubagentFactory, SubagentLimits,
     SubagentManager, SubagentManagerDeps, SubagentSession, SubagentTurn,
 };
+
+/// Fallback model when `config.model.default_model` is `None`.
+///
+/// [`HeadlessApp::apply_http_defaults`] reads the configured default first;
+/// this constant is only used when no config value is set (e.g. fresh install
+/// without a `config.toml`). Keeping a hardcoded fallback avoids a startup
+/// failure when the config file is absent.
+#[cfg(feature = "http")]
+const DEFAULT_HTTP_MODEL: &str = "claude-opus-4-6";
 
 // ── JSON I/O types ──────────────────────────────────────────────────────────
 
@@ -56,8 +69,43 @@ pub struct CycleResult {
     pub model: String,
     /// Number of loop iterations consumed.
     pub iterations: u32,
+    /// Estimated input tokens used during the cycle, when available.
+    /// Read only when the `http` feature is active (streaming endpoint).
+    #[cfg_attr(not(feature = "http"), allow(dead_code))]
+    pub input_tokens: Option<u64>,
+    /// Estimated output tokens used during the cycle, when available.
+    /// Read only when the `http` feature is active (streaming endpoint).
+    #[cfg_attr(not(feature = "http"), allow(dead_code))]
+    pub output_tokens: Option<u64>,
     /// Total input + output tokens reported for the cycle.
     pub tokens_used: u64,
+}
+
+#[cfg(feature = "http")]
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum HeadlessStreamEvent {
+    TextDelta {
+        content: String,
+    },
+    ToolUse {
+        name: String,
+        arguments: Value,
+    },
+    ToolResult {
+        name: String,
+        success: bool,
+        content: String,
+    },
+    Done {
+        model: Option<String>,
+        iterations: Option<u32>,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+    },
+    Error {
+        error: String,
+    },
 }
 
 // ── HeadlessApp ─────────────────────────────────────────────────────────────
@@ -208,32 +256,32 @@ impl HeadlessApp {
     /// Updates memory context, runs a loop cycle, records the turn in
     /// conversation history, and returns the extracted response.
     pub async fn process_message(&mut self, input: &str) -> Result<CycleResult, anyhow::Error> {
-        self.update_memory_context(input);
-        let snapshot = self.build_perception_snapshot(input);
-        let llm = RouterLoopLlmProvider::new(&self.router, self.active_model.clone());
-        let result = self
-            .loop_engine
-            .run_cycle(snapshot, &llm)
-            .await
-            .map_err(|e| anyhow::anyhow!("loop error: stage={} reason={}", e.stage, e.reason))?;
-
-        let response = extract_response_text(&result);
-        let iterations = extract_iterations(&result);
-        let tokens_used = extract_tokens_used(&result);
-        self.record_turn(input, &response);
-
-        Ok(CycleResult {
-            response,
-            model: self.active_model.clone(),
-            iterations,
-            tokens_used,
-        })
+        self.run_cycle_result(input).await
     }
 
     /// Return the active model identifier.
     #[cfg(feature = "http")]
     pub fn active_model(&self) -> &str {
         &self.active_model
+    }
+
+    #[cfg(feature = "http")]
+    pub fn memory_entry_count(&self) -> usize {
+        let Some(memory) = &self.memory else {
+            return 0;
+        };
+        match memory.lock() {
+            Ok(store) => (*store).list().len(),
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to lock memory store for status");
+                0
+            }
+        }
+    }
+
+    #[cfg(feature = "http")]
+    pub fn config(&self) -> &FawxConfig {
+        &self.config
     }
 
     /// Return the shared config manager (if configured).
@@ -248,6 +296,107 @@ impl HeadlessApp {
     #[cfg(feature = "http")]
     pub fn initialize(&mut self) {
         self.apply_custom_system_prompt();
+    }
+
+    #[cfg(feature = "http")]
+    pub fn apply_http_defaults(&mut self) {
+        let selector = self
+            .config
+            .model
+            .default_model
+            .as_deref()
+            .unwrap_or(DEFAULT_HTTP_MODEL);
+
+        let Some(router) = Arc::get_mut(&mut self.router) else {
+            tracing::warn!("cannot set HTTP default model: router is shared");
+            return;
+        };
+
+        if let Err(error) = router.set_active(selector) {
+            tracing::warn!(
+                model = selector,
+                error = %error,
+                "failed to set HTTP default model"
+            );
+            return;
+        }
+
+        if let Some(active_model) = self.router.active_model() {
+            self.active_model = active_model.to_string();
+            if self.config.model.default_model.is_none() {
+                self.config.model.default_model = Some(active_model.to_string());
+            }
+        }
+    }
+
+    #[cfg(feature = "http")]
+    pub async fn process_message_streaming(
+        &mut self,
+        input: &str,
+        tx: &tokio::sync::mpsc::Sender<HeadlessStreamEvent>,
+    ) -> Result<CycleResult, anyhow::Error> {
+        self.update_memory_context(input);
+        let snapshot = self.build_perception_snapshot(input);
+        let llm = RouterLoopLlmProvider::new(&self.router, self.active_model.clone());
+        let bus = fx_core::EventBus::new(128);
+        let mut rx = bus.subscribe();
+        self.loop_engine.set_event_bus(bus);
+        let mut streamed_any = false;
+        let mut relay_closed = false;
+
+        let result = {
+            let run = self.loop_engine.run_cycle(snapshot, &llm);
+            tokio::pin!(run);
+            let result = loop {
+                tokio::select! {
+                    result = &mut run => break result,
+                    message = rx.recv(), if !relay_closed => {
+                        let relay = handle_stream_message(message, tx).await;
+                        streamed_any |= relay.streamed_any;
+                        relay_closed = relay.receiver_dropped;
+                    }
+                }
+            };
+
+            while !relay_closed {
+                let Ok(message) = rx.try_recv() else {
+                    break;
+                };
+                let relay = handle_stream_message(Ok(message), tx).await;
+                streamed_any |= relay.streamed_any;
+                if relay.receiver_dropped {
+                    relay_closed = true;
+                }
+            }
+
+            result
+                .map_err(|e| anyhow::anyhow!("loop error: stage={} reason={}", e.stage, e.reason))?
+        };
+        let cycle = self.finalize_cycle(input, &result);
+        if !relay_closed && !streamed_any && !cycle.response.is_empty() {
+            relay_closed = !send_stream_event(
+                tx,
+                HeadlessStreamEvent::TextDelta {
+                    content: cycle.response.clone(),
+                },
+                "text_delta",
+            )
+            .await;
+        }
+        if !relay_closed {
+            let _ = send_stream_event(
+                tx,
+                HeadlessStreamEvent::Done {
+                    model: Some(cycle.model.clone()),
+                    iterations: Some(cycle.iterations),
+                    input_tokens: cycle.input_tokens,
+                    output_tokens: cycle.output_tokens,
+                },
+                "done",
+            )
+            .await;
+        }
+        Ok(cycle)
     }
 
     // ── internal helpers ────────────────────────────────────────────────
@@ -268,6 +417,34 @@ impl HeadlessApp {
             io::stdout().flush()?;
         }
         Ok(())
+    }
+
+    async fn run_cycle_result(&mut self, input: &str) -> Result<CycleResult, anyhow::Error> {
+        self.update_memory_context(input);
+        let snapshot = self.build_perception_snapshot(input);
+        let llm = RouterLoopLlmProvider::new(&self.router, self.active_model.clone());
+        let result = self
+            .loop_engine
+            .run_cycle(snapshot, &llm)
+            .await
+            .map_err(|e| anyhow::anyhow!("loop error: stage={} reason={}", e.stage, e.reason))?;
+        Ok(self.finalize_cycle(input, &result))
+    }
+
+    fn finalize_cycle(&mut self, input: &str, result: &LoopResult) -> CycleResult {
+        let response = extract_response_text(result);
+        let iterations = extract_iterations(result);
+        let (input_tokens, output_tokens) = extract_token_usage(result);
+        let tokens_used = extract_tokens_used(result);
+        self.record_turn(input, &response);
+        CycleResult {
+            response,
+            model: self.active_model.clone(),
+            iterations,
+            input_tokens,
+            output_tokens,
+            tokens_used,
+        }
     }
 
     fn apply_custom_system_prompt(&mut self) {
@@ -552,6 +729,16 @@ fn extract_iterations(result: &LoopResult) -> u32 {
     }
 }
 
+fn extract_token_usage(result: &LoopResult) -> (Option<u64>, Option<u64>) {
+    match result {
+        LoopResult::Complete { tokens_used, .. } => (
+            Some(tokens_used.input_tokens),
+            Some(tokens_used.output_tokens),
+        ),
+        _ => (None, None),
+    }
+}
+
 fn extract_tokens_used(result: &LoopResult) -> u64 {
     match result {
         LoopResult::Complete { tokens_used, .. } => sum_token_usage(tokens_used),
@@ -561,6 +748,88 @@ fn extract_tokens_used(result: &LoopResult) -> u64 {
 
 fn sum_token_usage(tokens: &fx_kernel::act::TokenUsage) -> u64 {
     tokens.input_tokens + tokens.output_tokens
+}
+
+#[cfg(feature = "http")]
+#[derive(Clone, Copy, Debug, Default)]
+struct StreamRelayState {
+    streamed_any: bool,
+    receiver_dropped: bool,
+}
+
+#[cfg(feature = "http")]
+async fn send_stream_event(
+    tx: &tokio::sync::mpsc::Sender<HeadlessStreamEvent>,
+    event: HeadlessStreamEvent,
+    event_type: &'static str,
+) -> bool {
+    if let Err(error) = tx.send(event).await {
+        tracing::debug!(
+            event_type,
+            error = %error,
+            "headless HTTP stream receiver dropped; stopping stream relay"
+        );
+        return false;
+    }
+
+    true
+}
+
+#[cfg(feature = "http")]
+async fn handle_stream_message(
+    message: Result<InternalMessage, tokio::sync::broadcast::error::RecvError>,
+    tx: &tokio::sync::mpsc::Sender<HeadlessStreamEvent>,
+) -> StreamRelayState {
+    match message {
+        Ok(InternalMessage::StreamDelta { delta, .. }) => {
+            let sent = send_stream_event(
+                tx,
+                HeadlessStreamEvent::TextDelta { content: delta },
+                "text_delta",
+            )
+            .await;
+            StreamRelayState {
+                streamed_any: sent,
+                receiver_dropped: !sent,
+            }
+        }
+        Ok(InternalMessage::ToolUse {
+            name, arguments, ..
+        }) => StreamRelayState {
+            receiver_dropped: !send_stream_event(
+                tx,
+                HeadlessStreamEvent::ToolUse { name, arguments },
+                "tool_use",
+            )
+            .await,
+            ..StreamRelayState::default()
+        },
+        Ok(InternalMessage::ToolResult {
+            name,
+            success,
+            content,
+            ..
+        }) => StreamRelayState {
+            receiver_dropped: !send_stream_event(
+                tx,
+                HeadlessStreamEvent::ToolResult {
+                    name,
+                    success,
+                    content,
+                },
+                "tool_result",
+            )
+            .await,
+            ..StreamRelayState::default()
+        },
+        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+            tracing::warn!(skipped, "headless HTTP stream receiver lagged");
+            StreamRelayState::default()
+        }
+        Err(tokio::sync::broadcast::error::RecvError::Closed) | Ok(_) => {
+            StreamRelayState::default()
+        }
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -843,6 +1112,78 @@ mod tests {
         let path = dir.path().join("empty_prompt.md");
         std::fs::write(&path, "   \n  ").expect("write");
         assert!(load_system_prompt(Some(&path)).is_none());
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn headless_stream_done_serializes_for_tui_backend() {
+        let value = serde_json::to_value(HeadlessStreamEvent::Done {
+            model: Some("mock-model".to_string()),
+            iterations: Some(2),
+            input_tokens: Some(1200),
+            output_tokens: Some(3400),
+        })
+        .expect("serialize");
+
+        assert_eq!(value["type"], "done");
+        assert_eq!(value["model"], "mock-model");
+        assert_eq!(value["iterations"], 2);
+        assert_eq!(value["input_tokens"], 1200);
+        assert_eq!(value["output_tokens"], 3400);
+        assert!(value.get("response").is_none());
+        assert!(value.get("stop_reason").is_none());
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn headless_stream_error_serializes_with_error_field() {
+        let value = serde_json::to_value(HeadlessStreamEvent::Error {
+            error: "boom".to_string(),
+        })
+        .expect("serialize");
+
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["error"], "boom");
+    }
+
+    #[cfg(feature = "http")]
+    #[tokio::test]
+    async fn handle_stream_message_relays_text_delta() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let relay = handle_stream_message(
+            Ok(InternalMessage::StreamDelta {
+                delta: "hello".to_string(),
+                phase: fx_core::message::StreamPhase::Synthesize,
+            }),
+            &tx,
+        )
+        .await;
+
+        assert!(relay.streamed_any);
+        assert!(!relay.receiver_dropped);
+        match rx.recv().await {
+            Some(HeadlessStreamEvent::TextDelta { content }) => assert_eq!(content, "hello"),
+            other => panic!("expected text delta event, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "http")]
+    #[tokio::test]
+    async fn handle_stream_message_stops_when_receiver_is_dropped() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+
+        let relay = handle_stream_message(
+            Ok(InternalMessage::StreamDelta {
+                delta: "hello".to_string(),
+                phase: fx_core::message::StreamPhase::Synthesize,
+            }),
+            &tx,
+        )
+        .await;
+
+        assert!(!relay.streamed_any);
+        assert!(relay.receiver_dropped);
     }
 
     #[test]

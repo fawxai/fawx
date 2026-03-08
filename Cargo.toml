@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "tui",
     "engine/crates/fx-config",
     "engine/crates/fx-core",
     "engine/crates/fx-propose",

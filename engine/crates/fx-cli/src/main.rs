@@ -7,6 +7,8 @@ mod config_bridge;
 mod confirmation;
 mod headless;
 #[cfg(feature = "http")]
+mod headless_http;
+#[cfg(feature = "http")]
 mod http_serve;
 #[allow(dead_code)] // TODO(#1148): Phase 3 will wire markdown rendering into ratatui
 mod markdown;
@@ -55,7 +57,7 @@ enum Commands {
         /// Path to a custom system prompt file (default: ~/.fawx/system_prompt.md)
         #[arg(long)]
         system_prompt: Option<std::path::PathBuf>,
-        /// Start HTTP API server (Tailscale-only)
+        /// Start local HTTP API server with SSE streaming
         #[arg(long)]
         http: bool,
         /// HTTP server port (default: 8400)
@@ -341,6 +343,7 @@ async fn run_http_server(
         data_dir,
     } = build_headless_startup(system_prompt)?;
     app.initialize();
+    app.apply_http_defaults();
 
     // Install SIGHUP handler for graceful restart.
     install_sighup_handler();
