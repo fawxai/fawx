@@ -228,11 +228,13 @@ impl std::fmt::Display for HttpError {
             Self::NoTailscale(msg) => write!(f, "{msg}"),
             Self::MissingBearerToken => write!(
                 f,
-                "HTTP API requires a bearer token for authentication.\n\
-                 Add to ~/.fawx/config.toml:\n\n\
-                 [http]\n\
-                 bearer_token = \"your-secret-token\"\n\n\
-                 Generate one with: openssl rand -hex 32"
+                "HTTP API requires a bearer token for authentication.\n\n\
+                 Option 1 (recommended): Use the TUI command:\n\
+                 \x20 /auth http set-bearer <TOKEN>\n\n\
+                 Option 2 (deprecated): Add to ~/.fawx/config.toml:\n\
+                 \x20 [http]\n\
+                 \x20 bearer_token = \"your-secret-token\"\n\n\
+                 Generate a token with: openssl rand -hex 32"
             ),
         }
     }
@@ -242,12 +244,26 @@ impl std::error::Error for HttpError {}
 
 // ── Token validation ────────────────────────────────────────────────────────
 
-/// Validate that the HTTP config contains a non-empty bearer token.
+/// Resolve the bearer token, preferring the encrypted credential store over config.
 ///
-/// Trims leading/trailing whitespace from the configured value so that
-/// `bearer_token = "  mytoken  "` compares against `"mytoken"` rather than
-/// silently including the spaces (review finding #4).
-fn validate_bearer_token(config: &HttpConfig) -> Result<String, HttpError> {
+/// Checks the credential store first (token stored via `/auth http set-bearer`),
+/// then falls back to `config.bearer_token` for backward compatibility.
+/// Trims leading/trailing whitespace from configured values.
+fn validate_bearer_token(
+    config: &HttpConfig,
+    auth_store: Option<&crate::auth_store::AuthStore>,
+) -> Result<String, HttpError> {
+    // 1. Check encrypted credential store first.
+    if let Some(store) = auth_store {
+        if let Ok(Some(token)) = store.get_provider_token("http_bearer") {
+            let trimmed = token.trim().to_string();
+            if !trimmed.is_empty() {
+                return Ok(trimmed);
+            }
+        }
+    }
+
+    // 2. Fall back to config.toml (deprecated).
     match &config.bearer_token {
         Some(token) => {
             let trimmed = token.trim().to_string();
@@ -351,7 +367,16 @@ async fn handle_status(State(state): State<HttpState>) -> Json<StatusResponse> {
 /// binds exclusively to it, and serves requests until the process is
 /// terminated.
 pub async fn run(app: HeadlessApp, port: u16, http_config: &HttpConfig) -> anyhow::Result<i32> {
-    let bearer_token = validate_bearer_token(http_config).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let data_dir = crate::tui::fawx_data_dir();
+    let auth_store = match crate::auth_store::AuthStore::open(&data_dir) {
+        Ok(store) => Some(store),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not open credential store; falling back to config-only bearer token");
+            None
+        }
+    };
+    let bearer_token = validate_bearer_token(http_config, auth_store.as_ref())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let ip = detect_tailscale_ip().map_err(|e| anyhow::anyhow!("{e}"))?;
     let addr = SocketAddr::new(ip, port);
@@ -631,13 +656,13 @@ mod tests {
         let config = HttpConfig {
             bearer_token: Some("my-secret".to_string()),
         };
-        assert!(validate_bearer_token(&config).is_ok());
+        assert!(validate_bearer_token(&config, None).is_ok());
     }
 
     #[test]
     fn validate_bearer_token_rejects_none() {
         let config = HttpConfig { bearer_token: None };
-        assert!(validate_bearer_token(&config).is_err());
+        assert!(validate_bearer_token(&config, None).is_err());
     }
 
     #[test]
@@ -645,7 +670,7 @@ mod tests {
         let config = HttpConfig {
             bearer_token: Some(String::new()),
         };
-        assert!(validate_bearer_token(&config).is_err());
+        assert!(validate_bearer_token(&config, None).is_err());
     }
 
     #[test]
@@ -653,7 +678,7 @@ mod tests {
         let config = HttpConfig {
             bearer_token: Some("   ".to_string()),
         };
-        assert!(validate_bearer_token(&config).is_err());
+        assert!(validate_bearer_token(&config, None).is_err());
     }
 
     // ── Endpoint integration tests (no auth) ────────────────────────────
@@ -897,7 +922,7 @@ mod tests {
         let config = HttpConfig {
             bearer_token: Some("  my-secret  ".to_string()),
         };
-        let result = validate_bearer_token(&config).expect("should accept");
+        let result = validate_bearer_token(&config, None).expect("should accept");
         assert_eq!(result, "my-secret");
     }
 
@@ -965,5 +990,68 @@ mod tests {
 
         let resp = app.oneshot(req).await.expect("response");
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ── Credential store bearer token tests ─────────────────────────────
+
+    fn test_auth_store() -> crate::auth_store::AuthStore {
+        crate::auth_store::AuthStore::open_in_memory().expect("should create in-memory auth store")
+    }
+
+    #[test]
+    fn validate_bearer_token_prefers_credential_store() {
+        let store = test_auth_store();
+        store
+            .store_provider_token("http_bearer", "store-token")
+            .expect("store");
+        let config = HttpConfig {
+            bearer_token: Some("config-token".to_string()),
+        };
+        let result = validate_bearer_token(&config, Some(&store)).expect("should succeed");
+        assert_eq!(result, "store-token");
+    }
+
+    #[test]
+    fn validate_bearer_token_falls_back_to_config() {
+        let store = test_auth_store();
+        let config = HttpConfig {
+            bearer_token: Some("config-token".to_string()),
+        };
+        let result = validate_bearer_token(&config, Some(&store)).expect("should succeed");
+        assert_eq!(result, "config-token");
+    }
+
+    #[test]
+    fn validate_bearer_token_fails_when_neither_source_has_token() {
+        let store = test_auth_store();
+        let config = HttpConfig { bearer_token: None };
+        assert!(validate_bearer_token(&config, Some(&store)).is_err());
+    }
+
+    #[test]
+    fn validate_bearer_token_store_roundtrip() {
+        let store = test_auth_store();
+        let token = "my-secret-bearer-token-abc123";
+        store
+            .store_provider_token("http_bearer", token)
+            .expect("store");
+        let retrieved = store
+            .get_provider_token("http_bearer")
+            .expect("get")
+            .expect("should have value");
+        assert_eq!(*retrieved, token);
+    }
+
+    #[test]
+    fn validate_bearer_token_store_ignores_empty() {
+        let store = test_auth_store();
+        store
+            .store_provider_token("http_bearer", "  ")
+            .expect("store");
+        let config = HttpConfig {
+            bearer_token: Some("config-fallback".to_string()),
+        };
+        let result = validate_bearer_token(&config, Some(&store)).expect("should succeed");
+        assert_eq!(result, "config-fallback");
     }
 }

@@ -46,6 +46,21 @@ impl AuthStore {
         })
     }
 
+    /// Open an in-memory auth store (for testing).
+    ///
+    /// Used by `http_serve::tests` — cross-module test usage triggers false
+    /// `dead_code` warning in the binary crate.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn open_in_memory() -> Result<Self, String> {
+        let key = fx_storage::EncryptionKey::from_bytes(&[42u8; 32]);
+        let storage = Storage::open_in_memory().map_err(|e| format!("in-memory storage: {e}"))?;
+        let encrypted = EncryptedStore::new(storage, key);
+        Ok(Self {
+            credential_store: CredentialStore::new(encrypted),
+        })
+    }
+
     /// Persist an `AuthManager` into the encrypted store.
     pub fn save_auth_manager(&self, auth: &AuthManager) -> Result<(), String> {
         let json = auth.to_json().map_err(|e| e.to_string())?;
