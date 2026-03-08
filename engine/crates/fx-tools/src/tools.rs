@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use fx_config::manager::ConfigManager;
 use fx_core::memory::MemoryStore;
 use fx_core::runtime_info::RuntimeInfo;
 use fx_core::self_modify::{classify_path, format_tier_violation, PathTier, SelfModifyConfig};
@@ -50,6 +51,8 @@ pub struct FawxToolExecutor {
     runtime_info: Option<Arc<RwLock<RuntimeInfo>>>,
     self_modify: Option<SelfModifyConfig>,
     concurrency_policy: ConcurrencyPolicy,
+    config_manager: Option<Arc<Mutex<ConfigManager>>>,
+    start_time: std::time::Instant,
     subagent_control: Option<Arc<dyn SubagentControl>>,
     node_run: Option<crate::node_run::NodeRunState>,
     #[cfg(feature = "improvement")]
@@ -91,6 +94,8 @@ impl FawxToolExecutor {
             runtime_info: None,
             self_modify: None,
             concurrency_policy: ConcurrencyPolicy::default(),
+            config_manager: None,
+            start_time: std::time::Instant::now(),
             subagent_control: None,
             node_run: None,
             #[cfg(feature = "improvement")]
@@ -120,6 +125,12 @@ impl FawxToolExecutor {
     /// Attach a self-modification path enforcement config.
     pub fn with_self_modify(mut self, config: SelfModifyConfig) -> Self {
         self.self_modify = Some(config);
+        self
+    }
+
+    /// Attach a config manager for runtime config read/write tools.
+    pub fn with_config_manager(mut self, mgr: Arc<Mutex<ConfigManager>>) -> Self {
+        self.config_manager = Some(mgr);
         self
     }
 
@@ -156,10 +167,12 @@ impl FawxToolExecutor {
             "read_file" | "list_directory" | "search_text" | "memory_read" | "memory_list" => {
                 ToolCacheability::Cacheable
             }
-            "write_file" | "memory_write" | "memory_delete" | "run_command" | "spawn_agent"
-            | "node_run" => ToolCacheability::SideEffect,
+            "write_file" | "memory_write" | "memory_delete" | "run_command" | "config_set"
+            | "fawx_restart" | "spawn_agent" | "node_run" => ToolCacheability::SideEffect,
             "current_time"
             | "self_info"
+            | "config_get"
+            | "fawx_status"
             | "subagent_status"
             | "analyze_signals"
             | "propose_improvement" => ToolCacheability::NeverCache,
@@ -183,6 +196,10 @@ impl FawxToolExecutor {
             "search_text" => self.handle_search_text(&call.arguments),
             "current_time" => self.handle_current_time(),
             "self_info" => self.handle_self_info(&call.arguments),
+            "config_get" => self.handle_config_get(&call.arguments),
+            "config_set" => self.handle_config_set(&call.arguments),
+            "fawx_status" => self.handle_fawx_status(),
+            "fawx_restart" => self.handle_fawx_restart(&call.arguments),
             "memory_write" => self.handle_memory_write(&call.arguments),
             "memory_read" => self.handle_memory_read(&call.arguments),
             "memory_list" => self.handle_memory_list(),
@@ -438,6 +455,93 @@ impl FawxToolExecutor {
             .map_err(|error| format!("failed to read runtime info: {error}"))?;
         let section = parsed.section.as_deref().unwrap_or("all");
         serialize_section(&info, section)
+    }
+
+    fn handle_config_get(&self, args: &serde_json::Value) -> Result<String, String> {
+        let parsed: ConfigGetArgs = parse_args(args)?;
+        let mgr = self.locked_config_manager()?;
+        let section = parsed.section.as_deref().unwrap_or("all");
+        let value = mgr.get(section)?;
+        serde_json::to_string_pretty(&value).map_err(|e| format!("failed to format config: {e}"))
+    }
+
+    fn handle_config_set(&self, args: &serde_json::Value) -> Result<String, String> {
+        let parsed: ConfigSetRequest = parse_args(args)?;
+        let mut mgr = self
+            .config_manager
+            .as_ref()
+            .ok_or_else(|| "config manager not configured".to_string())?
+            .lock()
+            .map_err(|e| format!("failed to lock config manager: {e}"))?;
+        mgr.set(&parsed.key, &parsed.value)?;
+        Ok(format!("updated {} = {}", parsed.key, parsed.value))
+    }
+
+    fn handle_fawx_status(&self) -> Result<String, String> {
+        let uptime = self.start_time.elapsed();
+        let model = self.active_model_name();
+        let memory_entries = self.memory_entry_count();
+        let skills_loaded = self.skills_loaded_count();
+        let sessions = self.active_session_count();
+        let status = serde_json::json!({
+            "status": "running",
+            "uptime_seconds": uptime.as_secs(),
+            "model": model,
+            "memory_entries": memory_entries,
+            "skills_loaded": skills_loaded,
+            "sessions": sessions,
+        });
+        serde_json::to_string_pretty(&status).map_err(|e| format!("failed to format status: {e}"))
+    }
+
+    fn handle_fawx_restart(&self, args: &serde_json::Value) -> Result<String, String> {
+        let parsed: FawxRestartArgs = parse_args(args)?;
+        let delay = parsed.delay_seconds.unwrap_or(2);
+        let reason = parsed.reason.as_deref().unwrap_or("requested by agent");
+        tracing::info!(reason, delay, "scheduling SIGHUP restart");
+        schedule_sighup_restart(delay, reason.to_string())?;
+        let clamped = delay.min(MAX_RESTART_DELAY_SECS);
+        Ok(format!(
+            "restart scheduled in {clamped}s (reason: {reason})"
+        ))
+    }
+
+    fn locked_config_manager(&self) -> Result<std::sync::MutexGuard<'_, ConfigManager>, String> {
+        self.config_manager
+            .as_ref()
+            .ok_or_else(|| "config manager not configured".to_string())?
+            .lock()
+            .map_err(|e| format!("failed to lock config manager: {e}"))
+    }
+
+    fn active_model_name(&self) -> String {
+        self.runtime_info
+            .as_ref()
+            .and_then(|info| info.read().ok())
+            .map(|info| info.active_model.clone())
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    fn memory_entry_count(&self) -> usize {
+        self.memory
+            .as_ref()
+            .and_then(|m| m.lock().ok())
+            .map(|store| store.list().len())
+            .unwrap_or(0)
+    }
+
+    fn skills_loaded_count(&self) -> usize {
+        self.runtime_info
+            .as_ref()
+            .and_then(|info| info.read().ok())
+            .map(|info| info.skills.len())
+            .unwrap_or(0)
+    }
+
+    /// Stub: session count is not yet tracked in the tool executor.
+    /// Returns 0 until fx-session wiring is complete.
+    fn active_session_count(&self) -> usize {
+        0
     }
 
     fn is_ignored_directory(&self, name: &str) -> bool {
@@ -782,6 +886,9 @@ impl ToolExecutor for FawxToolExecutor {
         if self.memory.is_some() {
             defs.extend(memory_tool_definitions());
         }
+        if self.config_manager.is_some() {
+            defs.extend(config_tool_definitions());
+        }
         if self.node_run.is_some() {
             defs.push(crate::node_run::node_run_tool_definition());
         }
@@ -807,6 +914,7 @@ impl std::fmt::Debug for FawxToolExecutor {
             .field("runtime_info", &self.runtime_info.is_some())
             .field("self_modify", &self.self_modify)
             .field("concurrency_policy", &self.concurrency_policy)
+            .field("config_manager", &self.config_manager.is_some())
             .field("subagent_control", &self.subagent_control.is_some());
         #[cfg(feature = "improvement")]
         debug.field("improvement", &self.improvement.is_some());
@@ -1525,6 +1633,76 @@ struct MemoryDeleteArgs {
 }
 
 #[derive(Deserialize)]
+struct ConfigGetArgs {
+    section: Option<String>,
+}
+
+/// Shared request type for config set — used by both the tool handler and
+/// the HTTP endpoint (re-exported for fx-cli).
+#[derive(Deserialize)]
+pub struct ConfigSetRequest {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Deserialize)]
+struct FawxRestartArgs {
+    reason: Option<String>,
+    delay_seconds: Option<u64>,
+}
+
+/// Maximum allowed restart delay in seconds. Prevents the agent from
+/// scheduling restarts hours into the future.
+const MAX_RESTART_DELAY_SECS: u64 = 30;
+
+/// Guard preventing concurrent restart scheduling. Only one restart can
+/// be in-flight at a time.
+static RESTART_IN_PROGRESS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Schedule a SIGHUP signal to self after a delay (Unix only).
+///
+/// Returns an error if a restart is already in progress. The delay is
+/// clamped to [`MAX_RESTART_DELAY_SECS`].
+///
+/// On non-Unix platforms this is a no-op with a warning.
+fn schedule_sighup_restart(delay_secs: u64, reason: String) -> Result<(), String> {
+    if RESTART_IN_PROGRESS.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return Err("a restart is already in progress".to_string());
+    }
+    let clamped = delay_secs.min(MAX_RESTART_DELAY_SECS);
+    if clamped != delay_secs {
+        tracing::info!(
+            requested = delay_secs,
+            clamped = clamped,
+            "restart delay clamped to maximum"
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(clamped));
+            tracing::info!(reason, "sending SIGHUP for graceful restart");
+            // Use nix::sys::signal to avoid raw unsafe libc calls.
+            use nix::sys::signal::{self, Signal};
+            use nix::unistd::Pid;
+            if let Err(e) = signal::kill(Pid::this(), Signal::SIGHUP) {
+                tracing::error!(error = %e, "failed to send SIGHUP");
+                RESTART_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (clamped, reason);
+        tracing::warn!("SIGHUP restart not supported on this platform");
+        RESTART_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
 struct SpawnAgentArgs {
     task: String,
     label: Option<String>,
@@ -1579,6 +1757,71 @@ fn reject_model_override(model: Option<&str>) -> Result<(), String> {
         return Err("model override is not supported for headless subagents".to_string());
     }
     Ok(())
+}
+
+pub fn config_tool_definitions() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: "config_get".to_string(),
+            description: "Read current Fawx configuration".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "section": {
+                        "type": "string",
+                        "description": "Config section (model, general, tools, memory, http, telegram, etc.) or 'all'"
+                    }
+                },
+                "required": []
+            }),
+        },
+        ToolDefinition {
+            name: "config_set".to_string(),
+            description: "Update a configuration value. Validates before applying.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "key": {
+                        "type": "string",
+                        "description": "Dot-separated path (e.g. 'model.default_model')"
+                    },
+                    "value": {
+                        "type": "string",
+                        "description": "New value"
+                    }
+                },
+                "required": ["key", "value"]
+            }),
+        },
+        ToolDefinition {
+            name: "fawx_status".to_string(),
+            description: "Get server status: uptime, model, memory entries".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        },
+        ToolDefinition {
+            name: "fawx_restart".to_string(),
+            description: "Gracefully restart the Fawx server. Use after config changes."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "Why restarting"
+                    },
+                    "delay_seconds": {
+                        "type": "integer",
+                        "description": "Delay before restart (default: 2)"
+                    }
+                },
+                "required": []
+            }),
+        },
+    ]
 }
 
 #[cfg(test)]
@@ -3150,5 +3393,159 @@ mod tests {
             err.contains("escapes working directory") || err.contains("No such file"),
             "expected jail escape error, got: {err}"
         );
+    }
+
+    // ── config_get tests ────────────────────────────────────────────────
+
+    fn executor_with_config(dir: &Path) -> FawxToolExecutor {
+        let mgr = fx_config::manager::ConfigManager::new(dir).expect("create config manager");
+        test_executor(dir).with_config_manager(Arc::new(Mutex::new(mgr)))
+    }
+
+    #[test]
+    fn config_get_returns_all_sections() {
+        let temp = TempDir::new().expect("tempdir");
+        std::fs::write(
+            temp.path().join("config.toml"),
+            "[model]\ndefault_model = \"test-model\"\n",
+        )
+        .unwrap();
+        let exec = executor_with_config(temp.path());
+        let result = exec
+            .handle_config_get(&serde_json::json!({}))
+            .expect("config_get all");
+        let json: serde_json::Value = serde_json::from_str(&result).expect("parse json");
+        assert!(json.get("model").is_some());
+        assert!(json.get("general").is_some());
+    }
+
+    #[test]
+    fn config_get_returns_single_section() {
+        let temp = TempDir::new().expect("tempdir");
+        std::fs::write(
+            temp.path().join("config.toml"),
+            "[model]\ndefault_model = \"my-model\"\n",
+        )
+        .unwrap();
+        let exec = executor_with_config(temp.path());
+        let result = exec
+            .handle_config_get(&serde_json::json!({"section": "model"}))
+            .expect("config_get model");
+        let json: serde_json::Value = serde_json::from_str(&result).expect("parse json");
+        assert_eq!(json["default_model"], "my-model");
+    }
+
+    #[test]
+    fn config_get_rejects_unknown_section() {
+        let temp = TempDir::new().expect("tempdir");
+        let exec = executor_with_config(temp.path());
+        let err = exec
+            .handle_config_get(&serde_json::json!({"section": "nonexistent"}))
+            .expect_err("should fail");
+        assert!(err.contains("unknown config section"));
+    }
+
+    // ── config_set tests ────────────────────────────────────────────────
+
+    #[test]
+    fn config_set_updates_and_persists() {
+        let temp = TempDir::new().expect("tempdir");
+        std::fs::write(
+            temp.path().join("config.toml"),
+            "[model]\ndefault_model = \"old\"\n",
+        )
+        .unwrap();
+        let exec = executor_with_config(temp.path());
+        let result = exec
+            .handle_config_set(&serde_json::json!({"key": "model.default_model", "value": "new"}));
+        assert!(result.is_ok());
+        // Verify persisted
+        let content = std::fs::read_to_string(temp.path().join("config.toml")).expect("read");
+        assert!(content.contains("new"));
+    }
+
+    #[test]
+    fn config_set_rejects_immutable_field() {
+        let temp = TempDir::new().expect("tempdir");
+        let exec = executor_with_config(temp.path());
+        let err = exec
+            .handle_config_set(&serde_json::json!({"key": "general.data_dir", "value": "/tmp"}))
+            .expect_err("should reject immutable");
+        assert!(err.contains("immutable"));
+    }
+
+    #[test]
+    fn config_set_preserves_numeric_type() {
+        let temp = TempDir::new().expect("tempdir");
+        std::fs::write(
+            temp.path().join("config.toml"),
+            "[general]\nmax_iterations = 10\n",
+        )
+        .unwrap();
+        let exec = executor_with_config(temp.path());
+        exec.handle_config_set(
+            &serde_json::json!({"key": "general.max_iterations", "value": "20"}),
+        )
+        .expect("set iterations");
+        let content = std::fs::read_to_string(temp.path().join("config.toml")).expect("read");
+        // Should be unquoted integer, not "20"
+        assert!(
+            content.contains("max_iterations = 20"),
+            "expected unquoted integer in: {content}"
+        );
+    }
+
+    // ── fawx_status tests ───────────────────────────────────────────────
+
+    #[test]
+    fn fawx_status_returns_json_with_required_fields() {
+        let temp = TempDir::new().expect("tempdir");
+        let exec = test_executor(temp.path()).with_runtime_info(sample_runtime_info("test-model"));
+        let result = exec.handle_fawx_status().expect("status");
+        let json: serde_json::Value = serde_json::from_str(&result).expect("parse json");
+        assert_eq!(json["status"], "running");
+        assert!(json["uptime_seconds"].is_number());
+        assert_eq!(json["model"], "test-model");
+        assert!(json.get("memory_entries").is_some());
+        assert!(json.get("skills_loaded").is_some());
+        assert!(json.get("sessions").is_some());
+    }
+
+    #[test]
+    fn fawx_status_skills_loaded_matches_runtime_info() {
+        let temp = TempDir::new().expect("tempdir");
+        let exec = test_executor(temp.path()).with_runtime_info(sample_runtime_info("m"));
+        let result = exec.handle_fawx_status().expect("status");
+        let json: serde_json::Value = serde_json::from_str(&result).expect("parse json");
+        // sample_runtime_info has 1 skill
+        assert_eq!(json["skills_loaded"], 1);
+    }
+
+    // ── fawx_restart tests ──────────────────────────────────────────────
+
+    #[test]
+    fn fawx_restart_clamps_large_delay() {
+        let temp = TempDir::new().expect("tempdir");
+        let exec = test_executor(temp.path());
+        // Reset the global guard for test isolation
+        RESTART_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+        let result = exec
+            .handle_fawx_restart(&serde_json::json!({"delay_seconds": 999}))
+            .expect("restart");
+        assert!(result.contains("30s"), "should clamp to 30s, got: {result}");
+        // Reset for other tests
+        RESTART_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[test]
+    fn fawx_restart_rejects_concurrent() {
+        let temp = TempDir::new().expect("tempdir");
+        let exec = test_executor(temp.path());
+        RESTART_IN_PROGRESS.store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = exec
+            .handle_fawx_restart(&serde_json::json!({}))
+            .expect_err("should reject concurrent");
+        assert!(err.contains("already in progress"));
+        RESTART_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }

@@ -12,4 +12,4 @@ pub use improvement_tools::ImprovementToolsState;
 pub use node_run::NodeRunState;
 pub use session_tools::SessionToolsSkill;
 pub use skill_bridge::BuiltinToolsSkill;
-pub use tools::{FawxToolExecutor, ToolConfig};
+pub use tools::{ConfigSetRequest, FawxToolExecutor, ToolConfig};

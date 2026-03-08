@@ -49,6 +49,7 @@ crossterm = { workspace = true, features = ["event-stream"] }
 ratatui.workspace = true
 tui-textarea.workspace = true
 libc = "0.2"
+nix = { version = "0.29", features = ["process"] }
 futures.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }

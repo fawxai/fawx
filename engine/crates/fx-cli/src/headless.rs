@@ -6,6 +6,7 @@
 //! downstream consumers can safely pipe stdout.
 
 use async_trait::async_trait;
+use fx_config::manager::ConfigManager;
 use fx_config::FawxConfig;
 use fx_core::types::{InputSource, ScreenState, UserInput};
 use fx_kernel::cancellation::CancellationToken;
@@ -16,7 +17,7 @@ use fx_llm::{Message, ModelRouter};
 
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -68,6 +69,7 @@ pub struct HeadlessAppDeps {
     pub config: FawxConfig,
     pub memory: Option<SharedMemoryStore>,
     pub system_prompt_path: Option<PathBuf>,
+    pub config_manager: Option<Arc<Mutex<ConfigManager>>>,
     pub system_prompt_text: Option<String>,
     pub subagent_manager: Arc<SubagentManager>,
 }
@@ -83,6 +85,10 @@ pub struct HeadlessApp {
     conversation_history: Vec<Message>,
     max_history: usize,
     custom_system_prompt: Option<String>,
+    /// Config manager for runtime config tools. Read via `config_manager()`
+    /// when the `http` feature is enabled.
+    #[cfg_attr(not(feature = "http"), allow(dead_code))]
+    config_manager: Option<Arc<Mutex<ConfigManager>>>,
 }
 
 #[derive(Clone)]
@@ -125,6 +131,7 @@ impl HeadlessApp {
             conversation_history: Vec::new(),
             max_history,
             custom_system_prompt,
+            config_manager: deps.config_manager,
         })
     }
 
@@ -227,6 +234,12 @@ impl HeadlessApp {
     #[cfg(feature = "http")]
     pub fn active_model(&self) -> &str {
         &self.active_model
+    }
+
+    /// Return the shared config manager (if configured).
+    #[cfg(feature = "http")]
+    pub fn config_manager(&self) -> Option<&Arc<Mutex<ConfigManager>>> {
+        self.config_manager.as_ref()
     }
 
     /// Apply the custom system prompt (if any). Must be called once
@@ -404,6 +417,7 @@ impl SubagentFactory for HeadlessSubagentFactory {
             config: self.deps.config.clone(),
             memory: None,
             system_prompt_path: None,
+            config_manager: None,
             system_prompt_text: config.system_prompt.clone(),
             subagent_manager: Arc::clone(&self.disabled_manager),
         };
@@ -601,6 +615,7 @@ mod tests {
             conversation_history: Vec::new(),
             max_history: 20,
             custom_system_prompt: None,
+            config_manager: None,
         }
     }
 
@@ -734,6 +749,7 @@ mod tests {
             conversation_history: Vec::new(),
             max_history: 20,
             custom_system_prompt: None,
+            config_manager: None,
         };
 
         let result = app.process_message("hello").await.expect("process message");
@@ -849,6 +865,7 @@ mod tests {
             config,
             memory: None,
             system_prompt_path: None,
+            config_manager: None,
             system_prompt_text: None,
             subagent_manager: new_disabled_subagent_manager(),
         };
@@ -912,6 +929,7 @@ mod tests {
             config,
             memory: None,
             system_prompt_path: None,
+            config_manager: None,
             system_prompt_text: None,
             subagent_manager: new_disabled_subagent_manager(),
         };

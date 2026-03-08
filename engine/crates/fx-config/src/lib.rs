@@ -1,3 +1,5 @@
+pub mod manager;
+
 use serde::{Deserialize, Serialize};
 use toml_edit::{value, DocumentMut, Item, Table};
 
@@ -567,13 +569,20 @@ fn update_default_model(config_path: &Path, default_model: &str) -> Result<(), S
     write_config_file(config_path, document.to_string())
 }
 
-fn parse_config_document(content: &str) -> Result<DocumentMut, String> {
+pub(crate) fn parse_config_document(content: &str) -> Result<DocumentMut, String> {
     content
         .parse::<DocumentMut>()
         .map_err(|error| format!("invalid config: {error}"))
 }
 
-fn set_string_field(
+/// Set a field in a TOML document, inferring the correct value type.
+///
+/// Attempts to parse `field_value` as an integer, float, or boolean before
+/// falling back to a string. When updating an existing key the original
+/// value's type is preferred (e.g. an existing integer stays integer even
+/// if the new value could be read as a string). Inline comments/decor on
+/// the original value are preserved.
+pub(crate) fn set_typed_field(
     document: &mut DocumentMut,
     sections: &[&str],
     key: &str,
@@ -581,23 +590,80 @@ fn set_string_field(
 ) -> Result<(), String> {
     let table = get_or_insert_table(document, sections)?;
     if let Some(item) = table.get_mut(key) {
-        return update_string_item(item, key, field_value);
+        return update_typed_item(item, key, field_value);
     }
-    table[key] = value(field_value);
+    // New key — infer type from the raw string.
+    table[key] = infer_typed_value(field_value);
     Ok(())
 }
 
-fn update_string_item(item: &mut Item, key: &str, field_value: &str) -> Result<(), String> {
-    let decor = item
+/// Infer a `toml_edit::Value` from a raw string, trying integer → bool → string.
+fn infer_typed_value(raw: &str) -> Item {
+    if let Ok(n) = raw.parse::<i64>() {
+        return value(n);
+    }
+    match raw {
+        "true" => return value(true),
+        "false" => return value(false),
+        _ => {}
+    }
+    value(raw)
+}
+
+fn update_typed_item(item: &mut Item, key: &str, field_value: &str) -> Result<(), String> {
+    let existing = item
         .as_value()
-        .ok_or_else(|| format!("config field '{key}' must be a value"))?
-        .decor()
-        .clone();
-    *item = value(field_value);
+        .ok_or_else(|| format!("config field '{key}' must be a value"))?;
+    let decor = existing.decor().clone();
+
+    // Match the existing value's type when possible.
+    let new_item = if existing.is_integer() {
+        if let Ok(n) = field_value.parse::<i64>() {
+            value(n)
+        } else {
+            // Fall back to string if the new value isn't numeric.
+            value(field_value)
+        }
+    } else if existing.is_bool() {
+        match field_value {
+            "true" => value(true),
+            "false" => value(false),
+            _ => value(field_value),
+        }
+    } else {
+        value(field_value)
+    };
+
+    *item = new_item;
     item.as_value_mut()
         .ok_or_else(|| format!("config field '{key}' must be a value"))?
         .decor_mut()
         .clone_from(&decor);
+    Ok(())
+}
+
+// Keep the old name as a thin wrapper for callers that always want strings.
+pub(crate) fn set_string_field(
+    document: &mut DocumentMut,
+    sections: &[&str],
+    key: &str,
+    field_value: &str,
+) -> Result<(), String> {
+    let table = get_or_insert_table(document, sections)?;
+    if let Some(item) = table.get_mut(key) {
+        let decor = item
+            .as_value()
+            .ok_or_else(|| format!("config field '{key}' must be a value"))?
+            .decor()
+            .clone();
+        *item = value(field_value);
+        item.as_value_mut()
+            .ok_or_else(|| format!("config field '{key}' must be a value"))?
+            .decor_mut()
+            .clone_from(&decor);
+        return Ok(());
+    }
+    table[key] = value(field_value);
     Ok(())
 }
 
@@ -624,7 +690,7 @@ fn get_or_insert_table_in<'a>(
     get_or_insert_table_in(child, rest)
 }
 
-fn write_config_file(config_path: &Path, content: String) -> Result<(), String> {
+pub(crate) fn write_config_file(config_path: &Path, content: String) -> Result<(), String> {
     fs::write(config_path, content).map_err(|error| format!("failed to write config: {error}"))
 }
 

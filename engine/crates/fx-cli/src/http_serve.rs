@@ -290,6 +290,7 @@ fn build_router(state: HttpState) -> Router {
     let authenticated = Router::new()
         .route("/message", post(handle_message))
         .route("/status", get(handle_status))
+        .route("/config", get(handle_config_get).post(handle_config_set))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -352,6 +353,70 @@ async fn handle_health(State(state): State<HttpState>) -> Json<HealthResponse> {
         uptime_seconds: uptime,
         skills_loaded: 0,
     })
+}
+
+// ── Config request/response types ────────────────────────────────────────────
+
+use fx_tools::ConfigSetRequest;
+
+async fn handle_config_get(
+    State(state): State<HttpState>,
+    query: axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
+    let section = query.get("section").map(|s| s.as_str()).unwrap_or("all");
+    let app = state.app.lock().await;
+    let mgr = app.config_manager().ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorBody {
+                error: "config manager not available".to_string(),
+            }),
+        )
+    })?;
+    let guard = mgr.lock().map_err(|e| {
+        tracing::error!(error = %e, "config manager lock failed");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                error: "internal_error".to_string(),
+            }),
+        )
+    })?;
+    let value = guard
+        .get(section)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })))?;
+    Ok(Json(value))
+}
+
+async fn handle_config_set(
+    State(state): State<HttpState>,
+    Json(request): Json<ConfigSetRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
+    let app = state.app.lock().await;
+    let mgr = app.config_manager().ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorBody {
+                error: "config manager not available".to_string(),
+            }),
+        )
+    })?;
+    let mut guard = mgr.lock().map_err(|e| {
+        tracing::error!(error = %e, "config manager lock failed");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                error: "internal_error".to_string(),
+            }),
+        )
+    })?;
+    guard
+        .set(&request.key, &request.value)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })))?;
+    Ok(Json(serde_json::json!({
+        "updated": request.key,
+        "value": request.value,
+    })))
 }
 
 async fn handle_status(State(state): State<HttpState>) -> Json<StatusResponse> {
@@ -1305,6 +1370,164 @@ mod tests {
         assert_eq!(result, "config-fallback");
     }
 
+    // ── Config endpoint tests ────────────────────────────────────────────
+
+    mod config_endpoint {
+        use super::*;
+        use fx_config::manager::ConfigManager;
+        use std::sync::{Arc, Mutex as StdMutex};
+        use tempfile::TempDir;
+
+        /// State for config endpoint tests.
+        #[derive(Clone)]
+        struct ConfigTestState {
+            config_mgr: Arc<StdMutex<ConfigManager>>,
+        }
+
+        async fn test_config_get(
+            State(state): State<ConfigTestState>,
+            query: axum::extract::Query<std::collections::HashMap<String, String>>,
+        ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
+            let section = query.get("section").map(|s| s.as_str()).unwrap_or("all");
+            let guard = state.config_mgr.lock().map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorBody {
+                        error: format!("{e}"),
+                    }),
+                )
+            })?;
+            let value = guard
+                .get(section)
+                .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })))?;
+            Ok(Json(value))
+        }
+
+        async fn test_config_set(
+            State(state): State<ConfigTestState>,
+            Json(request): Json<ConfigSetRequest>,
+        ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
+            let mut guard = state.config_mgr.lock().map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorBody {
+                        error: format!("{e}"),
+                    }),
+                )
+            })?;
+            guard
+                .set(&request.key, &request.value)
+                .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })))?;
+            Ok(Json(serde_json::json!({
+                "updated": request.key,
+                "value": request.value,
+            })))
+        }
+
+        fn config_test_router(dir: &std::path::Path) -> Router {
+            let mgr = ConfigManager::new(dir).expect("config manager");
+            let state = ConfigTestState {
+                config_mgr: Arc::new(StdMutex::new(mgr)),
+            };
+            Router::new()
+                .route("/config", get(test_config_get).post(test_config_set))
+                .with_state(state)
+        }
+
+        #[tokio::test]
+        async fn config_get_returns_full_config() {
+            let temp = TempDir::new().expect("tempdir");
+            std::fs::write(
+                temp.path().join("config.toml"),
+                "[model]\ndefault_model = \"test-model\"\n",
+            )
+            .unwrap();
+            let app = config_test_router(temp.path());
+            let req = Request::builder()
+                .method("GET")
+                .uri("/config")
+                .body(Body::empty())
+                .expect("request");
+            let resp = app.oneshot(req).await.expect("response");
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = resp.into_body().collect().await.expect("body").to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            assert!(json.get("model").is_some());
+            assert!(json.get("general").is_some());
+        }
+
+        #[tokio::test]
+        async fn config_get_section_filter() {
+            let temp = TempDir::new().expect("tempdir");
+            std::fs::write(
+                temp.path().join("config.toml"),
+                "[model]\ndefault_model = \"my-model\"\n",
+            )
+            .unwrap();
+            let app = config_test_router(temp.path());
+            let req = Request::builder()
+                .method("GET")
+                .uri("/config?section=model")
+                .body(Body::empty())
+                .expect("request");
+            let resp = app.oneshot(req).await.expect("response");
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = resp.into_body().collect().await.expect("body").to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            assert_eq!(json["default_model"], "my-model");
+        }
+
+        #[tokio::test]
+        async fn config_get_unknown_section_returns_400() {
+            let temp = TempDir::new().expect("tempdir");
+            let app = config_test_router(temp.path());
+            let req = Request::builder()
+                .method("GET")
+                .uri("/config?section=bogus")
+                .body(Body::empty())
+                .expect("request");
+            let resp = app.oneshot(req).await.expect("response");
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn config_set_updates_value() {
+            let temp = TempDir::new().expect("tempdir");
+            std::fs::write(
+                temp.path().join("config.toml"),
+                "[model]\ndefault_model = \"old\"\n",
+            )
+            .unwrap();
+            let app = config_test_router(temp.path());
+            let req = Request::builder()
+                .method("POST")
+                .uri("/config")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"key":"model.default_model","value":"new"}"#))
+                .expect("request");
+            let resp = app.oneshot(req).await.expect("response");
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = resp.into_body().collect().await.expect("body").to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            assert_eq!(json["updated"], "model.default_model");
+            assert_eq!(json["value"], "new");
+        }
+
+        #[tokio::test]
+        async fn config_set_rejects_immutable() {
+            let temp = TempDir::new().expect("tempdir");
+            let app = config_test_router(temp.path());
+            let req = Request::builder()
+                .method("POST")
+                .uri("/config")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"key":"general.data_dir","value":"/tmp"}"#))
+                .expect("request");
+            let resp = app.oneshot(req).await.expect("response");
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
     // ── handle_telegram_update tests ────────────────────────────────────
 
     mod telegram_update {
@@ -1484,6 +1707,7 @@ mod tests {
                 config: fx_config::FawxConfig::default(),
                 memory: None,
                 system_prompt_path: None,
+                config_manager: None,
                 system_prompt_text: None,
                 subagent_manager,
             })

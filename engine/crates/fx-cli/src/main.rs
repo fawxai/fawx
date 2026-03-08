@@ -234,6 +234,8 @@ struct HeadlessStartup {
     http_config: fx_config::HttpConfig,
     #[cfg(feature = "http")]
     telegram_config: fx_config::TelegramChannelConfig,
+    #[cfg(feature = "http")]
+    data_dir: std::path::PathBuf,
 }
 
 fn build_headless_startup(
@@ -246,14 +248,34 @@ fn build_headless_startup(
     let http_config = config.http.clone();
     #[cfg(feature = "http")]
     let telegram_config = config.telegram.clone();
+    #[cfg(feature = "http")]
+    let data_dir = tui::fawx_data_dir();
+    #[cfg(feature = "http")]
+    let config_manager = {
+        let config_mgr = fx_config::manager::ConfigManager::from_config(
+            config.clone(),
+            data_dir.join("config.toml"),
+        );
+        Some(Arc::new(std::sync::Mutex::new(config_mgr)))
+    };
+    #[cfg(not(feature = "http"))]
+    let config_manager = None;
     let improvement_provider = tui::build_improvement_provider(&auth_manager, &config);
-    let app = build_headless_app(router, config, improvement_provider, system_prompt)?;
+    let app = build_headless_app(
+        router,
+        config,
+        improvement_provider,
+        system_prompt,
+        config_manager,
+    )?;
     Ok(HeadlessStartup {
         app,
         #[cfg(feature = "http")]
         http_config,
         #[cfg(feature = "http")]
         telegram_config,
+        #[cfg(feature = "http")]
+        data_dir,
     })
 }
 
@@ -262,6 +284,7 @@ fn build_headless_app(
     config: fx_config::FawxConfig,
     improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
     system_prompt: Option<std::path::PathBuf>,
+    config_manager: Option<Arc<std::sync::Mutex<fx_config::manager::ConfigManager>>>,
 ) -> anyhow::Result<headless::HeadlessApp> {
     let factory = headless::HeadlessSubagentFactory::new(headless::HeadlessSubagentFactoryDeps {
         router: Arc::clone(&router),
@@ -287,6 +310,7 @@ fn build_headless_app(
         config,
         memory: bundle.memory,
         system_prompt_path: system_prompt,
+        config_manager,
         system_prompt_text: None,
         subagent_manager,
     })
@@ -314,19 +338,75 @@ async fn run_http_server(
         mut app,
         http_config,
         telegram_config,
+        data_dir,
     } = build_headless_startup(system_prompt)?;
     app.initialize();
 
+    // Install SIGHUP handler for graceful restart.
+    install_sighup_handler();
+
     // Open credential store once; pass to channel builders for DI.
-    let auth_store = {
-        let data_dir = tui::fawx_data_dir();
-        auth_store::AuthStore::open(&data_dir).ok()
-    };
+    let auth_store = { auth_store::AuthStore::open(&data_dir).ok() };
 
     // Build Telegram channel if configured.
     let telegram = build_telegram_channel(&telegram_config, auth_store.as_ref());
 
     http_serve::run(app, port, &http_config, telegram).await
+}
+
+/// Install a SIGHUP handler that logs and triggers a graceful process restart.
+///
+/// On non-Unix platforms this is a no-op.
+#[cfg(feature = "http")]
+fn install_sighup_handler() {
+    #[cfg(unix)]
+    {
+        tokio::spawn(async {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut stream = match signal(SignalKind::hangup()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to install SIGHUP handler");
+                    return;
+                }
+            };
+            loop {
+                stream.recv().await;
+                tracing::info!("received SIGHUP — initiating graceful restart");
+                eprintln!("SIGHUP received — restarting...");
+                // Re-exec ourselves with the same arguments.
+                let args: Vec<String> = std::env::args().collect();
+                if let Some(exe) = args.first() {
+                    let err = exec_replace(exe, &args);
+                    tracing::error!(error = %err, "exec failed");
+                }
+            }
+        });
+    }
+}
+
+/// Replace the current process with a new instance (Unix only).
+///
+/// Uses `nix::unistd::execvp` (safe wrapper) to replace the process image.
+/// Only returns on error.
+#[cfg(all(feature = "http", unix))]
+fn exec_replace(exe: &str, args: &[String]) -> std::io::Error {
+    use std::ffi::CString;
+    let c_exe = match CString::new(exe.as_bytes()) {
+        Ok(s) => s,
+        Err(e) => return std::io::Error::new(std::io::ErrorKind::InvalidInput, e),
+    };
+    let c_args: Result<Vec<CString>, _> = args.iter().map(|a| CString::new(a.as_bytes())).collect();
+    let c_args = match c_args {
+        Ok(a) => a,
+        Err(e) => return std::io::Error::new(std::io::ErrorKind::InvalidInput, e),
+    };
+    // nix::unistd::execvp is a safe wrapper around libc::execvp.
+    // On success it never returns; on failure we convert the nix::Errno.
+    match nix::unistd::execvp(&c_exe, &c_args) {
+        Ok(_infallible) => unreachable!("execvp does not return on success"),
+        Err(errno) => std::io::Error::from_raw_os_error(errno as i32),
+    }
 }
 
 #[cfg(feature = "http")]
