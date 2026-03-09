@@ -19,7 +19,9 @@ use fx_kernel::budget::{BudgetConfig, BudgetTracker};
 use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::context_manager::ContextCompactor;
 use fx_kernel::loop_engine::{LoopEngine, LoopEngineBuilder, ScratchpadProvider};
-use fx_kernel::{CachingExecutor, ProposalGateExecutor, ProposalGateState};
+use fx_kernel::{
+    CachingExecutor, ProcessConfig, ProcessRegistry, ProposalGateExecutor, ProposalGateState,
+};
 use fx_llm::{
     AnthropicProvider, CompletionRequest, ModelRouter, OpenAiProvider, OpenAiResponsesProvider,
 };
@@ -603,7 +605,13 @@ fn build_skill_registry(
         search_exclude: config.tools.search_exclude.clone(),
         ..ToolConfig::default()
     };
-    let executor = FawxToolExecutor::new(options.working_dir.clone(), tool_config);
+    let process_registry = Arc::new(ProcessRegistry::new(ProcessConfig {
+        allowed_dirs: vec![options.working_dir.clone()],
+        ..ProcessConfig::default()
+    }));
+    ProcessRegistry::spawn_cleanup_task(&process_registry);
+    let executor = FawxToolExecutor::new(options.working_dir.clone(), tool_config)
+        .with_process_registry(process_registry);
     let (mut executor, memory, snapshot_text, memory_enabled) =
         attach_memory_if_enabled(executor, data_dir, config, options.memory_enabled);
 

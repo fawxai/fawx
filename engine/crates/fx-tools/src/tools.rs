@@ -8,6 +8,7 @@ use fx_kernel::act::{
     ToolExecutor, ToolExecutorError, ToolResult,
 };
 use fx_kernel::cancellation::CancellationToken;
+use fx_kernel::{ListEntry, ProcessConfig, ProcessRegistry, SpawnResult, StatusResult};
 use fx_llm::{ToolCall, ToolDefinition};
 use fx_propose::{current_file_hash, Proposal, ProposalWriter};
 use fx_subagent::{
@@ -43,10 +44,18 @@ const DEFAULT_MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 const DEFAULT_MAX_READ_SIZE: u64 = 1024 * 1024;
 const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 30;
 
+fn default_process_registry(working_dir: &Path) -> Arc<ProcessRegistry> {
+    Arc::new(ProcessRegistry::new(ProcessConfig {
+        allowed_dirs: vec![working_dir.to_path_buf()],
+        ..ProcessConfig::default()
+    }))
+}
+
 #[derive(Clone)]
 pub struct FawxToolExecutor {
     working_dir: PathBuf,
     config: ToolConfig,
+    process_registry: Arc<ProcessRegistry>,
     memory: Option<Arc<Mutex<dyn MemoryStore>>>,
     runtime_info: Option<Arc<RwLock<RuntimeInfo>>>,
     self_modify: Option<SelfModifyConfig>,
@@ -87,9 +96,11 @@ impl Default for ToolConfig {
 
 impl FawxToolExecutor {
     pub fn new(working_dir: PathBuf, config: ToolConfig) -> Self {
+        let process_registry = default_process_registry(&working_dir);
         Self {
             working_dir,
             config,
+            process_registry,
             memory: None,
             runtime_info: None,
             self_modify: None,
@@ -146,6 +157,12 @@ impl FawxToolExecutor {
         self
     }
 
+    /// Attach a background process registry shared with the engine lifecycle.
+    pub fn with_process_registry(mut self, registry: Arc<ProcessRegistry>) -> Self {
+        self.process_registry = registry;
+        self
+    }
+
     /// Attach self-improvement tools (analyze_signals, propose_improvement).
     #[cfg(feature = "improvement")]
     pub fn with_improvement(
@@ -168,13 +185,13 @@ impl FawxToolExecutor {
                 ToolCacheability::Cacheable
             }
             "write_file" | "edit_file" | "memory_write" | "memory_delete" | "run_command"
-            | "config_set" | "fawx_restart" | "spawn_agent" | "node_run" => {
-                ToolCacheability::SideEffect
-            }
+            | "exec_background" | "exec_kill" | "config_set" | "fawx_restart" | "spawn_agent"
+            | "node_run" => ToolCacheability::SideEffect,
             "current_time"
             | "self_info"
             | "config_get"
             | "fawx_status"
+            | "exec_status"
             | "subagent_status"
             | "analyze_signals"
             | "propose_improvement" => ToolCacheability::NeverCache,
@@ -196,6 +213,9 @@ impl FawxToolExecutor {
             "edit_file" => self.handle_edit_file(&call.arguments),
             "list_directory" => self.handle_list_directory(&call.arguments),
             "run_command" => self.handle_run_command(&call.arguments).await,
+            "exec_background" => self.handle_exec_background(&call.arguments),
+            "exec_status" => self.handle_exec_status(&call.arguments),
+            "exec_kill" => self.handle_exec_kill(&call.arguments).await,
             "search_text" => self.handle_search_text(&call.arguments),
             "current_time" => self.handle_current_time(),
             "self_info" => self.handle_self_info(&call.arguments),
@@ -441,6 +461,37 @@ impl FawxToolExecutor {
             .map_err(|error| error.to_string())?;
         let output = wait_with_timeout(child, self.config.command_timeout).await?;
         Ok(format_command_output(output, parsed.shell.unwrap_or(false)))
+    }
+
+    fn handle_exec_background(&self, args: &serde_json::Value) -> Result<String, String> {
+        let parsed: ExecBackgroundArgs = parse_args(args)?;
+        let working_dir = self.resolve_command_dir(parsed.working_dir.as_deref())?;
+        let result = self
+            .process_registry
+            .spawn(parsed.command, working_dir, parsed.label)?;
+        serialize_output(exec_spawn_value(result))
+    }
+
+    fn handle_exec_status(&self, args: &serde_json::Value) -> Result<String, String> {
+        let parsed: ExecStatusArgs = parse_args(args)?;
+        let tail = parsed.tail.unwrap_or(20);
+        if let Some(session_id) = parsed.session_id.as_deref() {
+            let status = self
+                .process_registry
+                .status(session_id, tail)
+                .ok_or_else(|| format!("unknown session_id: {session_id}"))?;
+            return serialize_output(exec_status_value(status));
+        }
+        serialize_output(exec_list_value(self.process_registry.list()))
+    }
+
+    async fn handle_exec_kill(&self, args: &serde_json::Value) -> Result<String, String> {
+        let parsed: ExecKillArgs = parse_args(args)?;
+        self.process_registry.kill(&parsed.session_id).await?;
+        serialize_output(serde_json::json!({
+            "session_id": parsed.session_id,
+            "status": "killed",
+        }))
     }
 
     fn resolve_command_dir(&self, requested: Option<&str>) -> Result<PathBuf, String> {
@@ -1100,6 +1151,7 @@ impl std::fmt::Debug for FawxToolExecutor {
         debug
             .field("working_dir", &self.working_dir)
             .field("config", &self.config)
+            .field("process_registry", &true)
             .field("memory", &self.memory.is_some())
             .field("runtime_info", &self.runtime_info.is_some())
             .field("self_modify", &self.self_modify)
@@ -1267,6 +1319,42 @@ pub fn fawx_tool_definitions(include_subagent_tools: bool) -> Vec<ToolDefinition
             }),
         },
         ToolDefinition {
+            name: "exec_background".to_string(),
+            description: "Start a command in the background and return a session ID for monitoring.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string" },
+                    "working_dir": { "type": "string" },
+                    "label": { "type": "string" }
+                },
+                "required": ["command"]
+            }),
+        },
+        ToolDefinition {
+            name: "exec_status".to_string(),
+            description: "Check one background process or list all background processes.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "tail": { "type": "integer" }
+                },
+                "required": []
+            }),
+        },
+        ToolDefinition {
+            name: "exec_kill".to_string(),
+            description: "Kill a background process by session ID.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" }
+                },
+                "required": ["session_id"]
+            }),
+        },
+        ToolDefinition {
             name: "search_text".to_string(),
             description:
                 "Search text in files and return file:line matches. Supports `~` to reference the home directory."
@@ -1379,6 +1467,48 @@ fn subagent_status_definition() -> ToolDefinition {
 
 fn serialize_output(value: serde_json::Value) -> Result<String, String> {
     serde_json::to_string(&value).map_err(|error| error.to_string())
+}
+
+fn exec_spawn_value(result: SpawnResult) -> serde_json::Value {
+    serde_json::json!({
+        "session_id": result.session_id,
+        "pid": result.pid,
+        "label": result.label,
+        "status": result.status,
+    })
+}
+
+fn exec_status_value(status: StatusResult) -> serde_json::Value {
+    serde_json::json!({
+        "session_id": status.session_id,
+        "label": status.label,
+        "working_dir": status.working_dir,
+        "status": status.status.name(),
+        "exit_code": status.status.exit_code(),
+        "runtime_seconds": status.runtime_seconds,
+        "output_lines": status.output_lines,
+        "tail": status.tail,
+    })
+}
+
+fn exec_list_value(processes: Vec<ListEntry>) -> serde_json::Value {
+    let items = processes
+        .into_iter()
+        .map(exec_list_entry_value)
+        .collect::<Vec<_>>();
+    serde_json::json!({ "processes": items })
+}
+
+fn exec_list_entry_value(entry: ListEntry) -> serde_json::Value {
+    serde_json::json!({
+        "session_id": entry.session_id,
+        "label": entry.label,
+        "working_dir": entry.working_dir,
+        "status": entry.status.name(),
+        "exit_code": entry.status.exit_code(),
+        "runtime_seconds": entry.runtime_seconds,
+        "output_lines": entry.output_lines,
+    })
 }
 
 fn spawned_handle_value(handle: &SubagentHandle) -> serde_json::Value {
@@ -1823,6 +1953,24 @@ struct RunCommandArgs {
     command: String,
     working_dir: Option<String>,
     shell: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct ExecBackgroundArgs {
+    command: String,
+    working_dir: Option<String>,
+    label: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ExecStatusArgs {
+    session_id: Option<String>,
+    tail: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct ExecKillArgs {
+    session_id: String,
 }
 
 #[derive(Deserialize)]
@@ -2880,6 +3028,95 @@ three
         assert!(output.is_err());
     }
 
+    #[tokio::test]
+    async fn exec_background_returns_session_id_and_status() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+
+        let output = executor
+            .handle_exec_background(&serde_json::json!({"command": "sleep 1", "label": "build"}))
+            .expect("background spawn");
+        let value = parse_json_output(&output);
+
+        assert_eq!(value["status"], "running");
+        assert_eq!(value["label"], "build");
+        assert!(value["pid"].is_u64());
+        assert!(value["session_id"]
+            .as_str()
+            .expect("session id")
+            .starts_with("bg_"));
+    }
+
+    #[tokio::test]
+    async fn exec_status_with_session_id_returns_tail() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let created = executor
+            .handle_exec_background(&serde_json::json!({"command": "printf 'hello\\nworld\\n'"}))
+            .expect("background spawn");
+        let session_id = parse_json_output(&created)["session_id"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let output = executor
+            .handle_exec_status(&serde_json::json!({"session_id": session_id, "tail": 1}))
+            .expect("status");
+        let value = parse_json_output(&output);
+
+        assert_eq!(value["tail"][0], "world");
+        assert!(value.get("pid").is_none());
+    }
+
+    #[tokio::test]
+    async fn exec_status_without_session_id_lists_all_processes() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        executor
+            .handle_exec_background(&serde_json::json!({"command": "sleep 1", "label": "one"}))
+            .expect("first spawn");
+        executor
+            .handle_exec_background(&serde_json::json!({"command": "sleep 1", "label": "two"}))
+            .expect("second spawn");
+
+        let output = executor
+            .handle_exec_status(&serde_json::json!({}))
+            .expect("status list");
+        let value = parse_json_output(&output);
+        let processes = value["processes"].as_array().expect("process list");
+
+        assert_eq!(processes.len(), 2);
+        assert!(processes.iter().all(|entry| entry.get("pid").is_none()));
+    }
+
+    #[tokio::test]
+    async fn exec_kill_with_invalid_session_id_returns_error() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+
+        let error = executor
+            .handle_exec_kill(&serde_json::json!({"session_id": "bg_missing"}))
+            .await
+            .expect_err("invalid session should fail");
+
+        assert!(error.contains("unknown session_id"));
+    }
+
+    #[test]
+    fn exec_background_validates_working_directory() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+
+        let error = executor
+            .handle_exec_background(
+                &serde_json::json!({"command": "sleep 1", "working_dir": "../"}),
+            )
+            .expect_err("outside working dir should fail");
+
+        assert!(!error.is_empty());
+    }
+
     #[test]
     fn search_text_finds_pattern_with_file_and_line() {
         let temp = TempDir::new().expect("temp");
@@ -3162,6 +3399,16 @@ three
     }
 
     #[test]
+    fn background_process_tools_appear_in_definitions() {
+        let definitions = fawx_tool_definitions(false);
+        assert!(definitions
+            .iter()
+            .any(|tool| tool.name == "exec_background"));
+        assert!(definitions.iter().any(|tool| tool.name == "exec_status"));
+        assert!(definitions.iter().any(|tool| tool.name == "exec_kill"));
+    }
+
+    #[test]
     fn read_file_definition_exposes_offset_and_limit() {
         let definitions = fawx_tool_definitions(false);
         let read_file = definitions
@@ -3198,11 +3445,23 @@ three
             ToolCacheability::SideEffect
         );
         assert_eq!(
+            executor.cacheability("exec_background"),
+            ToolCacheability::SideEffect
+        );
+        assert_eq!(
+            executor.cacheability("exec_kill"),
+            ToolCacheability::SideEffect
+        );
+        assert_eq!(
             executor.cacheability("spawn_agent"),
             ToolCacheability::SideEffect
         );
         assert_eq!(
             executor.cacheability("current_time"),
+            ToolCacheability::NeverCache
+        );
+        assert_eq!(
+            executor.cacheability("exec_status"),
             ToolCacheability::NeverCache
         );
         assert_eq!(
