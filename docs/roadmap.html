@@ -248,14 +248,14 @@
 
       
 
-      <div class="tree-divider">⚡ Phase 2 — New Capabilities (parallel tracks)</div>
+      <div class="tree-divider">⚡ Phase 2a — Engine Capabilities <span class="wave-badge badge-active">Next</span></div>
       <div class="tree">
         <div class="tree-item">
           <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-active"></div>
+            <div class="node-status status-planned"></div>
             <div class="node-content">
-              <div class="node-title"><code>edit</code> tool — surgical file editing <span class="parallel-badge">2a engine</span></div>
-              <div class="node-detail">Replace exact text without rewriting files. Add offset/limit to read_file. Must be added to WRITE_TOOLS in ProposalGateExecutor. Security: Tier 3 immutability, path traversal prevention, proposal flow.</div>
+              <div class="node-title"><code>edit_file</code> tool + <code>read_file</code> offset/limit</div>
+              <div class="node-detail">Surgical text replacement (exact match → replace). Add offset/limit to read_file for partial reads. WRITE_TOOLS in ProposalGateExecutor. ~200-300 lines. <a class="issue-link" href="https://github.com/abbudjoe/fawx/blob/staging/docs/specs/phase2a-edit-tool.md">spec</a></div>
             </div>
             <div class="node-expand">›</div>
           </div>
@@ -264,8 +264,8 @@
           <div class="tree-node" onclick="toggleNode(this)">
             <div class="node-status status-planned"></div>
             <div class="node-content">
-              <div class="node-title">Persistent log files <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1268">#1268</a> <span class="parallel-badge">2a engine</span></div>
-              <div class="node-detail"><code>~/.fawx/logs/</code> with rotation (tracing-appender). Blocks canary debugging, post-incident analysis, headless operation.</div>
+              <div class="node-title">Persistent log files <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1268">#1268</a></div>
+              <div class="node-detail"><code>~/.fawx/logs/</code> with daily rotation (tracing-appender). Multi-writer: file (info) + stderr (warn). 7-day retention. ~150-200 lines. <a class="issue-link" href="https://github.com/abbudjoe/fawx/blob/staging/docs/specs/phase2a-persistent-logs.md">spec</a></div>
             </div>
             <div class="node-expand">›</div>
           </div>
@@ -274,8 +274,8 @@
           <div class="tree-node" onclick="toggleNode(this)">
             <div class="node-status status-planned"></div>
             <div class="node-content">
-              <div class="node-title">Background process management <span class="parallel-badge">2a engine</span></div>
-              <div class="node-detail">Background exec, session IDs, poll/log/kill. Security: kernel-level ProcessRegistry, max concurrent, max lifetime, working dir enforcement, session cleanup, output capture.</div>
+              <div class="node-title">Background process management</div>
+              <div class="node-detail"><code>exec_background</code>, <code>exec_status</code>, <code>exec_kill</code>. Kernel-level ProcessRegistry: max 5 concurrent, 1hr lifetime, ring buffer output. ~400-500 lines. <a class="issue-link" href="https://github.com/abbudjoe/fawx/blob/staging/docs/specs/phase2a-background-processes.md">spec</a></div>
             </div>
             <div class="node-expand">›</div>
           </div>
@@ -284,8 +284,8 @@
           <div class="tree-node" onclick="toggleNode(this)">
             <div class="node-status status-planned"></div>
             <div class="node-content">
-              <div class="node-title">Embedding-based memory search <span class="parallel-badge">2c engine</span></div>
-              <div class="node-detail">Engine-level, not WASM. Local embedding model (nomic/candle). Index on write, vector search on read. Layers on existing CRUD memory. Security: model integrity verification, resource budgeting, poisoning defense (#1137).</div>
+              <div class="node-title">Streaming responses (token-by-token) <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1279">#1279</a></div>
+              <div class="node-detail">5-layer streaming: fx-llm providers → fx-kernel StreamEvent → HTTP SSE → TUI TextDelta → channel buffering. 3 PRs, ~700 lines total. <a class="issue-link" href="https://github.com/abbudjoe/fawx/blob/staging/docs/specs/phase2a-streaming-responses.md">spec</a></div>
             </div>
             <div class="node-expand">›</div>
           </div>
@@ -294,52 +294,26 @@
           <div class="tree-node" onclick="toggleNode(this)">
             <div class="node-status status-planned"></div>
             <div class="node-content">
-              <div class="node-title">Vision skill — image analysis <span class="parallel-badge">2b skill</span></div>
-              <div class="node-detail">Send images to VLM. WASM skill using Network capability. No engine overlap.</div>
+              <div class="node-title">Proposals UX improvement <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1281">#1281</a></div>
+              <div class="node-detail">Stable IDs (not list position), diff preview, age display, line counts, detail view (<code>/proposals &lt;id&gt;</code>). Fix broken numbering/mapping bug. ~200-250 lines. <a class="issue-link" href="https://github.com/abbudjoe/fawx/blob/staging/docs/specs/phase2a-proposals-ux.md">spec</a></div>
             </div>
             <div class="node-expand">›</div>
           </div>
         </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-planned"></div>
-            <div class="node-content">
-              <div class="node-title">TTS skill — text-to-speech <span class="parallel-badge">2b skill</span></div>
-              <div class="node-detail">Edge TTS / ElevenLabs / OpenAI. WASM skill using Network + FileSystem. No engine overlap.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-planned"></div>
-            <div class="node-content">
-              <div class="node-title">Browser skill — web automation <span class="parallel-badge">2b skill</span></div>
-              <div class="node-detail">Headless browser control. WASM + subprocess hybrid. No engine overlap.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-planned"></div>
-            <div class="node-content">
-              <div class="node-title">Canvas skill — UI rendering <span class="parallel-badge">2b skill</span></div>
-              <div class="node-detail">HTML/data visualization. Lower priority — CLI-first. No engine overlap.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
-        <div class="tree-item">
-          <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-planned"></div>
-            <div class="node-content">
-              <div class="node-title">Autonomous experiment loop <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1261">#1261</a> <span class="parallel-badge">2b skill</span></div>
-              <div class="node-detail">Karpathy autoresearch pattern. Agent hypothesizes → experiments → measures → keeps/discards → journals. Depends on edit tool + bg processes + canary. WASM skill.</div>
-            </div>
-            <div class="node-expand">›</div>
-          </div>
-        </div>
+      </div>
+
+      <div class="tree-divider">📦 Phase 2b — WASM Skills</div>
+      <div class="tree">
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">Vision skill — image analysis</div><div class="node-detail">Send images to VLM. WASM skill using Network capability.</div></div><div class="node-expand">›</div></div></div>
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">TTS skill — text-to-speech</div><div class="node-detail">Edge TTS / ElevenLabs / OpenAI. WASM skill using Network + FileSystem.</div></div><div class="node-expand">›</div></div></div>
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">Browser skill — web automation</div><div class="node-detail">Headless browser control. WASM + subprocess hybrid.</div></div><div class="node-expand">›</div></div></div>
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">Canvas skill — UI rendering</div><div class="node-detail">HTML/data visualization. Lower priority — CLI-first.</div></div><div class="node-expand">›</div></div></div>
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">Autonomous experiment loop <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1261">#1261</a></div><div class="node-detail">Karpathy autoresearch pattern. Depends on edit tool + bg processes + canary. WASM skill.</div></div><div class="node-expand">›</div></div></div>
+      </div>
+
+      <div class="tree-divider">🧠 Phase 2c — Engine Intelligence</div>
+      <div class="tree">
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">Embedding-based memory search</div><div class="node-detail">Engine-level, not WASM. Local embedding model (nomic/candle). Index on write, vector search on read. Layers on existing CRUD memory.</div></div><div class="node-expand">›</div></div></div>
       </div>
 
       <div class="tree-divider">📝 Phase 3 — Polish + Docs (parallel)</div>
