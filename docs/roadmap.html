@@ -247,14 +247,7 @@
         <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">Fleet wiring <span class="wave-badge" style="background:var(--purple-glow);color:var(--purple);border:1px solid rgba(188,140,255,0.3);">Deferred → Phase 5</span></div><div class="node-detail">Fleet model assumes Fawx nodes that heartbeat in — we only have SSH machines. <code>node_run</code> covers current needs. Requires fleet client agent, task dispatch protocol, heartbeat infrastructure.</div></div><div class="node-expand">›</div></div></div>
       </div>
 
-      <div class="tree-divider">📋 Backlog — Pre-Launch Issues</div>
-      <div class="tree">
-        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">Unified build script <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1269">#1269</a></div><div class="node-detail">Single <code>scripts/build.sh</code> that builds all production binaries: fawx, fawx-ripcord, fawx-tui. Currently easy to miss one (e.g., ripcord not built → canary can't trigger rollback).</div></div><div class="node-expand">›</div></div></div>
-        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">Persistent log files <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1268">#1268</a></div><div class="node-detail">Currently logs to stderr only. Need <code>~/.fawx/logs/</code> with rotation (tracing-appender). Blocks canary debugging, post-incident analysis, headless operation.</div></div><div class="node-expand">›</div></div></div>
-        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">Canary signal pressure testing <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1267">#1267</a></div><div class="node-detail">Validate signal detection, canary thresholds, ripcord recovery, and edge cases during dogfooding.</div></div><div class="node-expand">›</div></div></div>
-        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">Non-HTTP build profile <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1255">#1255</a></div><div class="node-detail">Document <code>--no-default-features</code> for minimal builds without HTTP server.</div></div><div class="node-expand">›</div></div></div>
-        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">Autonomous experiment loop (WASM skill) <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1261">#1261</a></div><div class="node-detail">Inspired by Karpathy's autoresearch pattern. Agent hypothesizes → experiments → measures → keeps/discards → journals → repeats. Depends on edit tool + background processes + canary signals. Phase 2b.</div></div><div class="node-expand">›</div></div></div>
-      </div>
+      
 
       <div class="tree-divider">⚡ Phase 2 — New Capabilities (parallel tracks)</div>
       <div class="tree">
@@ -264,6 +257,16 @@
             <div class="node-content">
               <div class="node-title"><code>edit</code> tool — surgical file editing <span class="parallel-badge">2a engine</span></div>
               <div class="node-detail">Replace exact text without rewriting files. Add offset/limit to read_file. Must be added to WRITE_TOOLS in ProposalGateExecutor. Security: Tier 3 immutability, path traversal prevention, proposal flow.</div>
+            </div>
+            <div class="node-expand">›</div>
+          </div>
+        </div>
+        <div class="tree-item">
+          <div class="tree-node" onclick="toggleNode(this)">
+            <div class="node-status status-planned"></div>
+            <div class="node-content">
+              <div class="node-title">Persistent log files <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1268">#1268</a> <span class="parallel-badge">2a engine</span></div>
+              <div class="node-detail"><code>~/.fawx/logs/</code> with rotation (tracing-appender). Blocks canary debugging, post-incident analysis, headless operation.</div>
             </div>
             <div class="node-expand">›</div>
           </div>
@@ -328,12 +331,24 @@
             <div class="node-expand">›</div>
           </div>
         </div>
+        <div class="tree-item">
+          <div class="tree-node" onclick="toggleNode(this)">
+            <div class="node-status status-planned"></div>
+            <div class="node-content">
+              <div class="node-title">Autonomous experiment loop <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1261">#1261</a> <span class="parallel-badge">2b skill</span></div>
+              <div class="node-detail">Karpathy autoresearch pattern. Agent hypothesizes → experiments → measures → keeps/discards → journals. Depends on edit tool + bg processes + canary. WASM skill.</div>
+            </div>
+            <div class="node-expand">›</div>
+          </div>
+        </div>
       </div>
 
       <div class="tree-divider">📝 Phase 3 — Polish + Docs (parallel)</div>
       <div class="tree">
         <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">Config commands polish <span class="parallel-badge">3a</span></div><div class="node-detail">Clean up config_get/config_set UX. Validation, errors, help text.</div></div><div class="node-expand">›</div></div></div>
-        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">Repo documentation <span class="parallel-badge">3b</span></div><div class="node-detail">Setup guide, config reference, ripcord docs, command reference. README, CONTRIBUTING, SECURITY, LICENSE.</div></div><div class="node-expand">›</div></div></div>
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">Repo documentation <span class="parallel-badge">3b</span></div><div class="node-detail">Setup guide, config reference, ripcord docs, command reference. README, CONTRIBUTING, SECURITY, LICENSE. Includes non-HTTP build profile docs <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1255">#1255</a>.</div></div><div class="node-expand">›</div></div></div>
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">Unified build script <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1269">#1269</a> <span class="parallel-badge">3a</span></div><div class="node-detail"><code>scripts/build.sh</code> — builds fawx + fawx-ripcord + fawx-tui. Currently easy to miss one (ripcord not built → canary disabled).</div></div><div class="node-expand">›</div></div></div>
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">Canary signal pressure testing <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1267">#1267</a> <span class="parallel-badge">3a</span></div><div class="node-detail">Validate signal detection, canary thresholds, ripcord recovery during dogfooding.</div></div><div class="node-expand">›</div></div></div>
       </div>
 
       <div class="tree-divider">🚀 Phase 4 — Launch (parallel)</div>
