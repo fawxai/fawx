@@ -167,8 +167,10 @@ impl FawxToolExecutor {
             "read_file" | "list_directory" | "search_text" | "memory_read" | "memory_list" => {
                 ToolCacheability::Cacheable
             }
-            "write_file" | "memory_write" | "memory_delete" | "run_command" | "config_set"
-            | "fawx_restart" | "spawn_agent" | "node_run" => ToolCacheability::SideEffect,
+            "write_file" | "edit_file" | "memory_write" | "memory_delete" | "run_command"
+            | "config_set" | "fawx_restart" | "spawn_agent" | "node_run" => {
+                ToolCacheability::SideEffect
+            }
             "current_time"
             | "self_info"
             | "config_get"
@@ -191,6 +193,7 @@ impl FawxToolExecutor {
         let output = match call.name.as_str() {
             "read_file" => self.handle_read_file(&call.arguments),
             "write_file" => self.handle_write_file(&call.arguments),
+            "edit_file" => self.handle_edit_file(&call.arguments),
             "list_directory" => self.handle_list_directory(&call.arguments),
             "run_command" => self.handle_run_command(&call.arguments).await,
             "search_text" => self.handle_search_text(&call.arguments),
@@ -246,61 +249,84 @@ impl FawxToolExecutor {
         }
     }
 
-    fn handle_read_file(&self, args: &serde_json::Value) -> Result<String, String> {
-        let parsed: ReadFileArgs = parse_args(args)?;
-        let expanded = expand_tilde(&parsed.path);
+    fn resolve_tool_path(&self, requested: &str) -> Result<PathBuf, String> {
+        let expanded = expand_tilde(requested);
         let expanded_str = expanded
             .to_str()
             .ok_or_else(|| "home directory path is not valid UTF-8".to_string())?;
-        let path = self.jailed_path(expanded_str)?;
-        let metadata = fs::metadata(&path).map_err(|error| error.to_string())?;
-        if metadata.len() > self.config.max_read_size {
+        self.jailed_path(expanded_str)
+    }
+
+    fn read_utf8_file(&self, path: &Path, size_limit: Option<u64>) -> Result<String, String> {
+        let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+        if size_limit.is_some_and(|limit| metadata.len() > limit) {
             return Err("file exceeds maximum allowed size".to_string());
         }
-        let bytes = fs::read(&path).map_err(|error| error.to_string())?;
+        let bytes = fs::read(path).map_err(|error| error.to_string())?;
         String::from_utf8(bytes).map_err(|_| "file appears to be binary".to_string())
+    }
+
+    fn handle_read_file(&self, args: &serde_json::Value) -> Result<String, String> {
+        let parsed: ReadFileArgs = parse_args(args)?;
+        let path = self.resolve_tool_path(&parsed.path)?;
+        let content = self.read_utf8_file(&path, Some(self.config.max_read_size))?;
+        render_read_output(&content, parsed.offset, parsed.limit)
     }
 
     fn handle_write_file(&self, args: &serde_json::Value) -> Result<String, String> {
         let parsed: WriteFileArgs = parse_args(args)?;
-        let len = parsed.content.len() as u64;
-        if len > self.config.max_file_size {
-            return Err("content exceeds maximum allowed size".to_string());
+        let path = self.resolve_tool_path(&parsed.path)?;
+        if let Some(message) = self.apply_write_policy(&path, &parsed.content)? {
+            return Ok(message);
         }
-        let expanded = expand_tilde(&parsed.path);
-        let expanded_str = expanded
-            .to_str()
-            .ok_or_else(|| "home directory path is not valid UTF-8".to_string())?;
-        let path = self.jailed_path(expanded_str)?;
+        write_text_file(&path, &parsed.content)?;
+        Ok(format!(
+            "wrote {} bytes to {}",
+            parsed.content.len(),
+            path.display()
+        ))
+    }
 
+    fn handle_edit_file(&self, args: &serde_json::Value) -> Result<String, String> {
+        let parsed: EditFileArgs = parse_args(args)?;
+        validate_edit_args(&parsed)?;
+        let path = self.resolve_tool_path(&parsed.path)?;
+        let content = self.read_utf8_file(&path, Some(self.config.max_file_size))?;
+        let plan = plan_exact_edit(&path, &content, &parsed.old_text, &parsed.new_text)?;
+        if let Some(message) = self.apply_write_policy(&path, &plan.updated_content)? {
+            return Ok(message);
+        }
+        write_text_file(&path, &plan.updated_content)?;
+        Ok(format!(
+            "Successfully edited {} (lines {}-{})",
+            path.display(),
+            plan.start_line,
+            plan.end_line
+        ))
+    }
+
+    fn apply_write_policy(&self, path: &Path, content: &str) -> Result<Option<String>, String> {
         // Defense-in-depth: ProposalGateExecutor in the kernel is the primary
         // enforcement layer for self-modify policy. This tool-level check is
         // retained as a secondary guard in case the kernel gate is bypassed or
         // misconfigured.
-        if let Some(ref sm_config) = self.self_modify {
-            let tier = classify_path(&path, &self.working_dir, sm_config);
-            match tier {
-                PathTier::Deny => {
-                    let message = format_tier_violation(&path, tier).unwrap_or_else(|| {
-                        format!(
-                            "Self-modify policy violation [deny]: {}. This path cannot be modified.",
-                            path.display()
-                        )
-                    });
-                    return Err(message);
-                }
-                PathTier::Propose => {
-                    return self.write_proposal(&path, &parsed.content, sm_config);
-                }
-                PathTier::Allow => {}
-            }
+        self.check_max_file_size(content.len())?;
+        let Some(ref config) = self.self_modify else {
+            return Ok(None);
+        };
+        let tier = classify_path(path, &self.working_dir, config);
+        match tier {
+            PathTier::Deny => Err(deny_tier_message(path, tier)),
+            PathTier::Propose => self.write_proposal(path, content, config).map(Some),
+            PathTier::Allow => Ok(None),
         }
+    }
 
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    fn check_max_file_size(&self, len: usize) -> Result<(), String> {
+        if (len as u64) > self.config.max_file_size {
+            return Err("content exceeds maximum allowed size".to_string());
         }
-        fs::write(&path, parsed.content.as_bytes()).map_err(|error| error.to_string())?;
-        Ok(format!("wrote {} bytes to {}", len, path.display()))
+        Ok(())
     }
 
     fn write_proposal(
@@ -833,6 +859,168 @@ fn build_proposed_content(path: &Path, content: &str) -> String {
     )
 }
 
+struct EditPlan {
+    updated_content: String,
+    start_line: usize,
+    end_line: usize,
+}
+
+fn write_text_file(path: &Path, content: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    fs::write(path, content.as_bytes()).map_err(|error| error.to_string())
+}
+
+fn deny_tier_message(path: &Path, tier: PathTier) -> String {
+    format_tier_violation(path, tier).unwrap_or_else(|| {
+        format!(
+            "Self-modify policy violation [deny]: {}. This path cannot be modified.",
+            path.display()
+        )
+    })
+}
+
+fn validate_edit_args(args: &EditFileArgs) -> Result<(), String> {
+    if args.old_text.is_empty() {
+        return Err("old_text must not be empty".to_string());
+    }
+    if args.old_text == args.new_text {
+        return Err("old_text and new_text must differ".to_string());
+    }
+    Ok(())
+}
+
+fn render_read_output(
+    content: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<String, String> {
+    validate_line_window(offset, limit)?;
+    if offset.is_none() && limit.is_none() {
+        return Ok(content.to_string());
+    }
+    let lines = collect_lines(content);
+    let start_line = offset.unwrap_or(1);
+    if start_line > lines.len() {
+        return Ok(offset_past_end_message(start_line, lines.len()));
+    }
+    let start_index = start_line - 1;
+    let end_index = slice_end_index(start_index, limit, lines.len());
+    let body = lines[start_index..end_index].concat();
+    Ok(partial_read_response(
+        start_line,
+        end_index,
+        lines.len(),
+        body,
+    ))
+}
+
+fn validate_line_window(offset: Option<usize>, limit: Option<usize>) -> Result<(), String> {
+    if offset == Some(0) {
+        return Err("offset must be at least 1".to_string());
+    }
+    if limit == Some(0) {
+        return Err("limit must be at least 1".to_string());
+    }
+    Ok(())
+}
+
+fn collect_lines(content: &str) -> Vec<&str> {
+    if content.is_empty() {
+        return Vec::new();
+    }
+    content.split_inclusive('\n').collect()
+}
+
+fn offset_past_end_message(start_line: usize, total_lines: usize) -> String {
+    format!("(no lines returned; offset {start_line} is past end of file with {total_lines} lines)")
+}
+
+fn slice_end_index(start_index: usize, limit: Option<usize>, total_lines: usize) -> usize {
+    match limit {
+        Some(limit) => (start_index + limit).min(total_lines),
+        None => total_lines,
+    }
+}
+
+fn partial_read_response(
+    start_line: usize,
+    end_index: usize,
+    total_lines: usize,
+    body: String,
+) -> String {
+    let header = format!("[Lines {start_line}-{end_index} of {total_lines}]");
+    if body.is_empty() {
+        header
+    } else {
+        format!("{header}\n{body}")
+    }
+}
+
+fn plan_exact_edit(
+    path: &Path,
+    content: &str,
+    old_text: &str,
+    new_text: &str,
+) -> Result<EditPlan, String> {
+    let matches = count_exact_matches(content, old_text);
+    if matches == 0 {
+        return Err(format!(
+            "Could not find the exact text in {}. The old_text must match exactly including all whitespace and newlines.",
+            path.display()
+        ));
+    }
+    if matches > 1 {
+        return Err(format!(
+            "Found {matches} matches for old_text in {}. Please provide more context to uniquely identify the target.",
+            path.display()
+        ));
+    }
+    let start = content.find(old_text).ok_or_else(|| {
+        format!(
+            "Could not find the exact text in {}. The old_text must match exactly including all whitespace and newlines.",
+            path.display()
+        )
+    })?;
+    let (start_line, end_line) = line_span(content, start, old_text);
+    Ok(EditPlan {
+        updated_content: replace_exact_range(content, start, old_text, new_text),
+        start_line,
+        end_line,
+    })
+}
+
+fn count_exact_matches(content: &str, needle: &str) -> usize {
+    let haystack = content.as_bytes();
+    let needle = needle.as_bytes();
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return 0;
+    }
+    haystack
+        .windows(needle.len())
+        .filter(|window| *window == needle)
+        .count()
+}
+
+fn line_span(content: &str, start: usize, old_text: &str) -> (usize, usize) {
+    let start_line = content[..start]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1;
+    let line_count = old_text.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    (start_line, start_line + line_count - 1)
+}
+
+fn replace_exact_range(content: &str, start: usize, old_text: &str, new_text: &str) -> String {
+    let mut updated = String::with_capacity(content.len() - old_text.len() + new_text.len());
+    updated.push_str(&content[..start]);
+    updated.push_str(new_text);
+    updated.push_str(&content[start + old_text.len()..]);
+    updated
+}
+
 fn serialize_section(info: &RuntimeInfo, section: &str) -> Result<String, String> {
     let value = match section {
         "model" => serde_json::json!({
@@ -1011,7 +1199,15 @@ pub fn fawx_tool_definitions(include_subagent_tools: bool) -> Vec<ToolDefinition
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string" }
+                    "path": { "type": "string" },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Line number to start reading from (1-indexed)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of lines to return"
+                    }
                 },
                 "required": ["path"]
             }),
@@ -1027,6 +1223,20 @@ pub fn fawx_tool_definitions(include_subagent_tools: bool) -> Vec<ToolDefinition
                     "content": { "type": "string" }
                 },
                 "required": ["path", "content"]
+            }),
+        },
+        ToolDefinition {
+            name: "edit_file".to_string(),
+            description: "Replace exact text in a file. The old_text must match exactly (including whitespace and newlines). Use for precise, surgical edits."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "old_text": { "type": "string" },
+                    "new_text": { "type": "string" }
+                },
+                "required": ["path", "old_text", "new_text"]
             }),
         },
         ToolDefinition {
@@ -1585,12 +1795,21 @@ fn parse_args<T: for<'de> Deserialize<'de>>(value: &serde_json::Value) -> Result
 #[derive(Deserialize)]
 struct ReadFileArgs {
     path: String,
+    offset: Option<usize>,
+    limit: Option<usize>,
 }
 
 #[derive(Deserialize)]
 struct WriteFileArgs {
     path: String,
     content: String,
+}
+
+#[derive(Deserialize)]
+struct EditFileArgs {
+    path: String,
+    old_text: String,
+    new_text: String,
 }
 
 #[derive(Deserialize)]
@@ -2004,6 +2223,172 @@ mod tests {
     }
 
     #[test]
+    fn read_file_offset_only_returns_requested_tail() {
+        let temp = TempDir::new().expect("temp");
+        fs::write(
+            temp.path().join("a.txt"),
+            "one
+two
+three
+four
+",
+        )
+        .expect("write");
+        let executor = test_executor(temp.path());
+
+        let output = executor
+            .handle_read_file(&serde_json::json!({"path": "a.txt", "offset": 3}))
+            .expect("read");
+        assert_eq!(
+            output,
+            "[Lines 3-4 of 4]
+three
+four
+"
+        );
+    }
+
+    #[test]
+    fn read_file_limit_only_returns_requested_prefix() {
+        let temp = TempDir::new().expect("temp");
+        fs::write(
+            temp.path().join("a.txt"),
+            "one
+two
+three
+four
+",
+        )
+        .expect("write");
+        let executor = test_executor(temp.path());
+
+        let output = executor
+            .handle_read_file(&serde_json::json!({"path": "a.txt", "limit": 2}))
+            .expect("read");
+        assert_eq!(
+            output,
+            "[Lines 1-2 of 4]
+one
+two
+"
+        );
+    }
+
+    #[test]
+    fn read_file_offset_and_limit_returns_requested_window() {
+        let temp = TempDir::new().expect("temp");
+        fs::write(
+            temp.path().join("a.txt"),
+            "one
+two
+three
+four
+",
+        )
+        .expect("write");
+        let executor = test_executor(temp.path());
+
+        let output = executor
+            .handle_read_file(&serde_json::json!({"path": "a.txt", "offset": 2, "limit": 2}))
+            .expect("read");
+        assert_eq!(
+            output,
+            "[Lines 2-3 of 4]
+two
+three
+"
+        );
+    }
+
+    #[test]
+    fn read_file_offset_past_end_returns_note() {
+        let temp = TempDir::new().expect("temp");
+        fs::write(
+            temp.path().join("a.txt"),
+            "one
+two
+",
+        )
+        .expect("write");
+        let executor = test_executor(temp.path());
+
+        let output = executor
+            .handle_read_file(&serde_json::json!({"path": "a.txt", "offset": 3}))
+            .expect("read");
+        assert_eq!(
+            output,
+            "(no lines returned; offset 3 is past end of file with 2 lines)"
+        );
+    }
+
+    #[test]
+    fn read_file_limit_larger_than_file_returns_all_lines_with_header() {
+        let temp = TempDir::new().expect("temp");
+        fs::write(
+            temp.path().join("a.txt"),
+            "one
+two
+three
+",
+        )
+        .expect("write");
+        let executor = test_executor(temp.path());
+
+        let output = executor
+            .handle_read_file(&serde_json::json!({"path": "a.txt", "limit": 100}))
+            .expect("read");
+        assert_eq!(
+            output,
+            "[Lines 1-3 of 3]
+one
+two
+three
+"
+        );
+    }
+
+    #[test]
+    fn read_file_partial_output_includes_header() {
+        let temp = TempDir::new().expect("temp");
+        fs::write(
+            temp.path().join("a.txt"),
+            "one
+two
+three
+",
+        )
+        .expect("write");
+        let executor = test_executor(temp.path());
+
+        let output = executor
+            .handle_read_file(&serde_json::json!({"path": "a.txt", "limit": 1}))
+            .expect("read");
+        assert!(output.starts_with("[Lines 1-1 of 3]"));
+    }
+
+    #[test]
+    fn read_file_rejects_zero_offset_and_limit() {
+        let temp = TempDir::new().expect("temp");
+        fs::write(
+            temp.path().join("a.txt"),
+            "one
+",
+        )
+        .expect("write");
+        let executor = test_executor(temp.path());
+
+        let offset_error = executor
+            .handle_read_file(&serde_json::json!({"path": "a.txt", "offset": 0}))
+            .expect_err("offset should fail");
+        assert!(offset_error.contains("offset must be at least 1"));
+
+        let limit_error = executor
+            .handle_read_file(&serde_json::json!({"path": "a.txt", "limit": 0}))
+            .expect_err("limit should fail");
+        assert!(limit_error.contains("limit must be at least 1"));
+    }
+
+    #[test]
     fn write_file_creates_file_with_content() {
         let temp = TempDir::new().expect("temp");
         let executor = test_executor(temp.path());
@@ -2052,6 +2437,331 @@ mod tests {
         let result =
             executor.handle_write_file(&serde_json::json!({"path": "../x.txt", "content": "no"}));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn edit_file_replaces_exact_match() {
+        let temp = TempDir::new().expect("temp");
+        fs::write(
+            temp.path().join("a.txt"),
+            "alpha
+beta
+gamma
+",
+        )
+        .expect("write");
+        let executor = test_executor(temp.path());
+
+        let result = executor
+            .handle_edit_file(&serde_json::json!({
+                "path": "a.txt",
+                "old_text": "beta",
+                "new_text": "delta"
+            }))
+            .expect("edit");
+        assert!(result.contains("Successfully edited"));
+        assert!(result.contains("lines 2-2"));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("a.txt")).expect("read"),
+            "alpha
+delta
+gamma
+"
+        );
+    }
+
+    #[test]
+    fn edit_file_reports_missing_exact_match() {
+        let temp = TempDir::new().expect("temp");
+        fs::write(
+            temp.path().join("a.txt"),
+            "alpha
+beta
+",
+        )
+        .expect("write");
+        let executor = test_executor(temp.path());
+
+        let error = executor
+            .handle_edit_file(&serde_json::json!({
+                "path": "a.txt",
+                "old_text": "gamma",
+                "new_text": "delta"
+            }))
+            .expect_err("edit should fail");
+        assert!(error.contains("Could not find the exact text"));
+        assert!(error.contains("a.txt"));
+    }
+
+    #[test]
+    fn edit_file_reports_multiple_matches() {
+        let temp = TempDir::new().expect("temp");
+        fs::write(
+            temp.path().join("a.txt"),
+            "repeat
+repeat
+",
+        )
+        .expect("write");
+        let executor = test_executor(temp.path());
+
+        let error = executor
+            .handle_edit_file(&serde_json::json!({
+                "path": "a.txt",
+                "old_text": "repeat",
+                "new_text": "once"
+            }))
+            .expect_err("edit should fail");
+        assert!(error.contains("Found 2 matches"));
+    }
+
+    #[test]
+    fn edit_file_rejects_empty_old_text() {
+        let temp = TempDir::new().expect("temp");
+        fs::write(temp.path().join("a.txt"), "alpha").expect("write");
+        let executor = test_executor(temp.path());
+
+        let error = executor
+            .handle_edit_file(&serde_json::json!({
+                "path": "a.txt",
+                "old_text": "",
+                "new_text": "beta"
+            }))
+            .expect_err("edit should fail");
+        assert!(error.contains("old_text must not be empty"));
+    }
+
+    #[test]
+    fn edit_file_rejects_noop_replacement() {
+        let temp = TempDir::new().expect("temp");
+        fs::write(temp.path().join("a.txt"), "alpha").expect("write");
+        let executor = test_executor(temp.path());
+
+        let error = executor
+            .handle_edit_file(&serde_json::json!({
+                "path": "a.txt",
+                "old_text": "alpha",
+                "new_text": "alpha"
+            }))
+            .expect_err("edit should fail");
+        assert!(error.contains("must differ"));
+    }
+
+    #[test]
+    fn edit_file_rejects_binary_file() {
+        let temp = TempDir::new().expect("temp");
+        fs::write(temp.path().join("bin.dat"), [0, 159, 146, 150]).expect("write");
+        let executor = test_executor(temp.path());
+
+        let error = executor
+            .handle_edit_file(&serde_json::json!({
+                "path": "bin.dat",
+                "old_text": "x",
+                "new_text": "y"
+            }))
+            .expect_err("edit should fail");
+        assert!(error.contains("binary"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edit_file_rejects_symlink_pointing_outside_jail() {
+        use std::os::unix::fs::symlink;
+
+        let jail = TempDir::new().expect("jail");
+        let outside = TempDir::new().expect("outside");
+        let outside_file = outside.path().join("secret.txt");
+        fs::write(&outside_file, "secret").expect("write");
+        symlink(&outside_file, jail.path().join("escape.txt")).expect("symlink");
+
+        let executor = test_executor(jail.path());
+        let result = executor.handle_edit_file(&serde_json::json!({
+            "path": "escape.txt",
+            "old_text": "secret",
+            "new_text": "public"
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn edit_file_rejects_path_traversal() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let result = executor.handle_edit_file(&serde_json::json!({
+            "path": "../escape.txt",
+            "old_text": "x",
+            "new_text": "y"
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn edit_file_reports_missing_file() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let result = executor.handle_edit_file(&serde_json::json!({
+            "path": "missing.txt",
+            "old_text": "x",
+            "new_text": "y"
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn edit_file_allows_deletion_replacement() {
+        let temp = TempDir::new().expect("temp");
+        fs::write(temp.path().join("a.txt"), "alpha beta gamma").expect("write");
+        let executor = test_executor(temp.path());
+
+        executor
+            .handle_edit_file(&serde_json::json!({
+                "path": "a.txt",
+                "old_text": "beta ",
+                "new_text": ""
+            }))
+            .expect("edit");
+        assert_eq!(
+            fs::read_to_string(temp.path().join("a.txt")).expect("read"),
+            "alpha gamma"
+        );
+    }
+
+    #[test]
+    fn edit_file_matches_multiline_text_exactly() {
+        let temp = TempDir::new().expect("temp");
+        fs::write(
+            temp.path().join("a.txt"),
+            "one
+old
+block
+three
+",
+        )
+        .expect("write");
+        let executor = test_executor(temp.path());
+
+        executor
+            .handle_edit_file(&serde_json::json!({
+                "path": "a.txt",
+                "old_text": "old
+block
+",
+                "new_text": "new
+block
+"
+            }))
+            .expect("edit");
+        assert_eq!(
+            fs::read_to_string(temp.path().join("a.txt")).expect("read"),
+            "one
+new
+block
+three
+"
+        );
+    }
+
+    #[test]
+    fn edit_file_rejects_source_file_that_exceeds_max_size() {
+        let temp = TempDir::new().expect("temp");
+        fs::write(temp.path().join("a.txt"), "hello").expect("write");
+        let executor = FawxToolExecutor::new(
+            temp.path().to_path_buf(),
+            ToolConfig {
+                max_file_size: 3,
+                ..ToolConfig::default()
+            },
+        );
+
+        let error = executor
+            .handle_edit_file(&serde_json::json!({
+                "path": "a.txt",
+                "old_text": "h",
+                "new_text": "H"
+            }))
+            .expect_err("edit should fail");
+        assert!(error.contains("file exceeds maximum allowed size"));
+    }
+
+    #[test]
+    fn edit_file_rejects_result_that_exceeds_max_size() {
+        let temp = TempDir::new().expect("temp");
+        fs::write(temp.path().join("a.txt"), "a").expect("write");
+        let executor = FawxToolExecutor::new(
+            temp.path().to_path_buf(),
+            ToolConfig {
+                max_file_size: 3,
+                ..ToolConfig::default()
+            },
+        );
+
+        let error = executor
+            .handle_edit_file(&serde_json::json!({
+                "path": "a.txt",
+                "old_text": "a",
+                "new_text": "long"
+            }))
+            .expect_err("edit should fail");
+        assert!(error.contains("content exceeds maximum allowed size"));
+    }
+
+    #[test]
+    fn edit_file_denied_by_self_modify() {
+        let temp = TempDir::new().expect("temp");
+        fs::write(temp.path().join("secret.txt"), "alpha").expect("write");
+        let config = SelfModifyConfig {
+            enabled: true,
+            deny_paths: vec!["*.txt".to_string()],
+            ..SelfModifyConfig::default()
+        };
+        let executor = FawxToolExecutor::new(temp.path().to_path_buf(), ToolConfig::default())
+            .with_self_modify(config);
+
+        let error = executor
+            .handle_edit_file(&serde_json::json!({
+                "path": "secret.txt",
+                "old_text": "alpha",
+                "new_text": "beta"
+            }))
+            .expect_err("edit should fail");
+        assert!(error.contains("Self-modify policy violation [deny]"));
+    }
+
+    #[test]
+    fn edit_file_propose_tier_creates_proposal_without_modifying_target() {
+        let temp = TempDir::new().expect("temp");
+        let proposals_dir = temp.path().join("proposals");
+        let config = SelfModifyConfig {
+            enabled: true,
+            propose_paths: vec!["kernel/**".to_string()],
+            proposals_dir: proposals_dir.clone(),
+            ..SelfModifyConfig::default()
+        };
+        let kernel_dir = temp.path().join("kernel");
+        fs::create_dir_all(&kernel_dir).expect("mkdir");
+        fs::write(
+            kernel_dir.join("loop.rs"),
+            "fn old() {}
+",
+        )
+        .expect("write");
+        let executor = FawxToolExecutor::new(temp.path().to_path_buf(), ToolConfig::default())
+            .with_self_modify(config);
+
+        let message = executor
+            .handle_edit_file(&serde_json::json!({
+                "path": "kernel/loop.rs",
+                "old_text": "old",
+                "new_text": "new"
+            }))
+            .expect("proposal");
+        assert!(message.contains("Proposal created"));
+        assert_eq!(
+            fs::read_to_string(kernel_dir.join("loop.rs")).expect("read"),
+            "fn old() {}
+"
+        );
+        assert!(proposals_dir.exists());
     }
 
     #[test]
@@ -2446,6 +3156,23 @@ mod tests {
     }
 
     #[test]
+    fn edit_file_appears_in_definitions() {
+        let definitions = fawx_tool_definitions(false);
+        assert!(definitions.iter().any(|tool| tool.name == "edit_file"));
+    }
+
+    #[test]
+    fn read_file_definition_exposes_offset_and_limit() {
+        let definitions = fawx_tool_definitions(false);
+        let read_file = definitions
+            .iter()
+            .find(|tool| tool.name == "read_file")
+            .expect("read_file definition");
+        assert!(read_file.parameters["properties"].get("offset").is_some());
+        assert!(read_file.parameters["properties"].get("limit").is_some());
+    }
+
+    #[test]
     fn cacheability_classifies_builtin_tools() {
         let temp = TempDir::new().expect("temp");
         let executor = test_executor(temp.path());
@@ -2460,6 +3187,10 @@ mod tests {
         );
         assert_eq!(
             executor.cacheability("write_file"),
+            ToolCacheability::SideEffect
+        );
+        assert_eq!(
+            executor.cacheability("edit_file"),
             ToolCacheability::SideEffect
         );
         assert_eq!(

@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Tool names that represent write operations subject to gating.
-const WRITE_TOOLS: &[&str] = &["write_file", "git_checkpoint"];
+const WRITE_TOOLS: &[&str] = &["write_file", "edit_file", "git_checkpoint"];
 
 /// Tier 3 immutable paths — blocked regardless of configuration.
 /// These are compiled kernel invariants that cannot be overridden.
@@ -942,6 +942,11 @@ mod tests {
         assert!(results[0].output.contains("BLOCKED"));
         assert!(results[0].output.contains("Tier 3"));
         assert_eq!(probe.call_count(), 0);
+    }
+
+    #[test]
+    fn edit_file_is_treated_as_write_tool() {
+        assert!(is_write_tool("edit_file"));
     }
 
     // Test 17: normalize_relative unit tests
