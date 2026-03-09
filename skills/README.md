@@ -5,24 +5,29 @@ Example WASM skills for the Fawx AI agent.
 ## Available Skills
 
 ### Weather Skill
-Fetches weather information for a given location.
+Fetches current weather conditions and a 3-day forecast for a given location.
 
-**Capabilities:** `network`, `storage`
+**Capabilities:** `network`
 
 **Input format:**
 ```json
 {
-  "location": "San Francisco"
+  "location": "San Francisco",
+  "units": "fahrenheit"
 }
 ```
 
 **Output format:**
-```json
-{
-  "location": "San Francisco",
-  "temperature": 22.5,
-  "condition": "Sunny"
-}
+```text
+🌤️ Weather for San Francisco
+
+Current: 68°F (20°C), Partly Cloudy
+Humidity: 71% | Wind: 9 mph
+
+📅 3-Day Forecast:
+  Mon: ☀️ 70°F / 55°F — Clear Sky
+  Tue: 🌧️ 63°F / 52°F — Rain
+  Wed: ⛅ 66°F / 53°F — Partly Cloudy
 ```
 
 ### Calculator Skill
@@ -48,10 +53,10 @@ Evaluates simple mathematical expressions.
 ## Building Skills
 
 ### Prerequisites
-- Rust toolchain with `wasm32-wasi` target
+- Rust toolchain with `wasm32-unknown-unknown` target
 
 ```bash
-rustup target add wasm32-wasi
+rustup target add wasm32-unknown-unknown
 ```
 
 ### Build All Skills
@@ -63,10 +68,10 @@ cd skills
 ### Build Individual Skills
 ```bash
 cd weather-skill
-cargo build --target wasm32-wasi --release
+cargo build --target wasm32-unknown-unknown --release
 ```
 
-The compiled WASM binary will be at `target/wasm32-wasi/release/weather_skill.wasm`.
+The compiled WASM binary will be at `target/wasm32-unknown-unknown/release/weather_skill.wasm`.
 
 ## Installing Skills
 
@@ -193,7 +198,7 @@ fn host_api_v1_kv_set(
 
 ## Notes
 
-- Skills must be compiled for `wasm32-wasi` target
+- Skills must be compiled for `wasm32-unknown-unknown` target
 - Skills run in a sandboxed environment
 - Only declared capabilities are granted
 - Skills communicate via JSON input/output

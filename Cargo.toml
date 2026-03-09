@@ -36,6 +36,11 @@ members = [
     "engine/crates/fx-journal",
     "engine/crates/fx-session",
 ]
+exclude = [
+    "skills/calculator-skill",
+    "skills/github-skill",
+    "skills/weather-skill",
+]
 resolver = "2"
 
 [workspace.package]
