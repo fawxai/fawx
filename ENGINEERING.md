@@ -195,6 +195,19 @@ Fawx is a TUI-first agentic engine with pluggable shells. The engine is the auth
 
 Code that doesn't meet the standards above gets rewritten or removed.
 
+### Git Branch Model
+
+```
+feature/* → dev → staging → main
+```
+
+- **feature branches**: cut from `dev`, PRs target `dev`
+- **dev**: integration branch — merge freely after CI + TUI smoke test pass. Multiple features tested together here.
+- **staging**: release candidate — Joe manually promotes `dev → staging` after integration testing passes
+- **main**: production releases only — `staging → main` for releases
+
+All three long-lived branches are protected: no force push, no deletion.
+
 ---
 
 ## 7. Agent Execution Model
