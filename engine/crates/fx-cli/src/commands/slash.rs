@@ -8,7 +8,19 @@ use std::sync::{Arc, Mutex};
 
 use crate::tui::thinking_config_from_budget;
 
+pub(crate) const DEFAULT_SYNTHESIS_INSTRUCTION: &str =
+    "Use the tool output to directly answer the user's question. Be natural and specific — \
+ don't dump raw tool output, but don't hide data either. Match your response format to what \
+ the user asked for: if they asked for a specific format (e.g., a count, a timestamp, a \
+ raw value), use exactly that format — do not reformat into a 'friendlier' version unless \
+ explicitly asked. If they asked a simple question, give a simple answer. If they asked \
+ for a listing or search results, present it cleanly formatted.";
+pub(crate) const MAX_SYNTHESIS_INSTRUCTION_LENGTH: usize = 500;
+
 pub trait CommandHost {
+    fn supports_embedded_slash_commands(&self) -> bool {
+        false
+    }
     fn list_models(&self) -> String;
     fn set_active_model(&mut self, selector: &str) -> Result<String>;
     fn proposals(&self) -> Result<String>;
@@ -21,6 +33,42 @@ pub trait CommandHost {
     fn show_budget_status(&self) -> String;
     fn show_signals_summary(&self) -> String;
     fn handle_thinking(&mut self, level: Option<&str>) -> Result<String>;
+    fn show_history(&self) -> Result<String> {
+        Ok("Conversation history is not available in this mode.".to_string())
+    }
+    fn new_conversation(&mut self) -> Result<String> {
+        Ok("Starting a new conversation is not available in this mode.".to_string())
+    }
+    fn show_loop_status(&self) -> Result<String> {
+        Ok("Loop status is not available in this mode.".to_string())
+    }
+    fn show_debug(&self) -> Result<String> {
+        Ok("Signal debug output is not available in this mode.".to_string())
+    }
+    fn handle_synthesis(&mut self, _instruction: Option<&str>) -> Result<String> {
+        Ok("Synthesis configuration is not available in this mode.".to_string())
+    }
+    fn handle_auth(
+        &self,
+        _subcommand: Option<&str>,
+        _action: Option<&str>,
+        _value: Option<&str>,
+        _has_extra_args: bool,
+    ) -> Result<String> {
+        Ok("Authentication status is not available in this mode.".to_string())
+    }
+    fn handle_keys(
+        &self,
+        _subcommand: Option<&str>,
+        _value: Option<&str>,
+        _option: Option<&str>,
+        _has_extra_args: bool,
+    ) -> Result<String> {
+        Ok("Signing key management is not available in this mode.".to_string())
+    }
+    fn handle_sign(&self, _target: Option<&str>, _has_extra_args: bool) -> Result<String> {
+        Ok("WASM signing is not available in this mode.".to_string())
+    }
 }
 
 pub struct CommandContext<'a, H: CommandHost> {
@@ -138,9 +186,52 @@ pub fn execute_command<H: CommandHost>(
         ParsedCommand::Model(Some(model)) => {
             Some(ctx.app.set_active_model(model).map(model_set_response))
         }
+        ParsedCommand::Auth {
+            subcommand,
+            action,
+            value,
+            has_extra_args,
+        } => execute_embedded_only(ctx.app, |app| {
+            execute_auth(
+                app,
+                subcommand.as_deref(),
+                action.as_deref(),
+                value.as_deref(),
+                *has_extra_args,
+            )
+        }),
+        ParsedCommand::Keys {
+            subcommand,
+            value,
+            option,
+            has_extra_args,
+        } => execute_embedded_only(ctx.app, |app| {
+            execute_keys(
+                app,
+                subcommand.as_deref(),
+                value.as_deref(),
+                option.as_deref(),
+                *has_extra_args,
+            )
+        }),
+        ParsedCommand::Sign {
+            target,
+            has_extra_args,
+        } => execute_embedded_only(ctx.app, |app| {
+            app.handle_sign(target.as_deref(), *has_extra_args)
+                .map(response)
+        }),
         ParsedCommand::Budget => Some(Ok(response(ctx.app.show_budget_status()))),
+        ParsedCommand::Loop => {
+            execute_embedded_only(ctx.app, |app| app.show_loop_status().map(response))
+        }
         ParsedCommand::Status => Some(Ok(response(ctx.app.show_status()))),
         ParsedCommand::Signals => Some(Ok(response(ctx.app.show_signals_summary()))),
+        ParsedCommand::Debug => {
+            execute_embedded_only(ctx.app, |app| app.show_debug().map(response))
+        }
+        ParsedCommand::Analyze => None,
+        ParsedCommand::Improve(_) => None,
         ParsedCommand::Proposals => Some(ctx.app.proposals().map(response)),
         ParsedCommand::Approve {
             id,
@@ -155,24 +246,23 @@ pub fn execute_command<H: CommandHost>(
         ParsedCommand::Reject { id, has_extra_args } => {
             Some(execute_reject(ctx.app, id.as_deref(), *has_extra_args))
         }
+        ParsedCommand::Synthesis(instruction) => execute_embedded_only(ctx.app, |app| {
+            app.handle_synthesis(instruction.as_deref()).map(response)
+        }),
+        ParsedCommand::Clear => None,
+        ParsedCommand::New => {
+            execute_embedded_only(ctx.app, |app| app.new_conversation().map(response))
+        }
+        ParsedCommand::History => {
+            execute_embedded_only(ctx.app, |app| app.show_history().map(response))
+        }
         ParsedCommand::Thinking(level) => {
             Some(ctx.app.handle_thinking(level.as_deref()).map(response))
         }
         ParsedCommand::Config(action) => Some(execute_config(ctx.app, action.as_deref())),
         ParsedCommand::Help => Some(Ok(response(help_text().to_string()))),
+        ParsedCommand::Quit => None,
         ParsedCommand::Unknown(command) => Some(Ok(response(unknown_command_message(command)))),
-        ParsedCommand::Auth { .. }
-        | ParsedCommand::Keys { .. }
-        | ParsedCommand::Sign { .. }
-        | ParsedCommand::Loop
-        | ParsedCommand::Debug
-        | ParsedCommand::Analyze
-        | ParsedCommand::Improve(_)
-        | ParsedCommand::Synthesis(_)
-        | ParsedCommand::Clear
-        | ParsedCommand::New
-        | ParsedCommand::History
-        | ParsedCommand::Quit => None,
     }
 }
 
@@ -267,6 +357,35 @@ pub(crate) fn render_budget_text(status: LoopStatus) -> String {
         format!("  - LLM calls remaining: {}", status.remaining.llm_calls),
     ]
     .join("\n")
+}
+
+pub(crate) fn render_loop_status(status: LoopStatus) -> String {
+    [
+        "Loop status:".to_string(),
+        format!(
+            "  - Iterations (last cycle): {}/{}",
+            status.iteration_count, status.max_iterations
+        ),
+        format!("  - Tokens used (tracker): {}", status.tokens_used),
+        format!("  - Tokens remaining: {}", status.remaining.tokens),
+        format!("  - LLM calls remaining: {}", status.remaining.llm_calls),
+        format!(
+            "  - Tool calls remaining: {}",
+            status.remaining.tool_invocations
+        ),
+        format!(
+            "  - Wall time remaining (ms): {}",
+            status.remaining.wall_time_ms
+        ),
+    ]
+    .join("\n")
+}
+
+pub(crate) fn render_debug_dump(signals: &[Signal]) -> String {
+    if signals.is_empty() {
+        return "No signals from last turn.".to_string();
+    }
+    SignalCollector::from_signals(signals.to_vec()).debug_dump()
 }
 
 pub(crate) fn render_signals_summary(signals: &[Signal]) -> String {
@@ -402,6 +521,36 @@ fn execute_reject<H: CommandHost>(
     }
 }
 
+fn execute_embedded_only<H, F>(app: &mut H, handler: F) -> Option<Result<CommandResult>>
+where
+    H: CommandHost,
+    F: FnOnce(&mut H) -> Result<CommandResult>,
+{
+    app.supports_embedded_slash_commands().then(|| handler(app))
+}
+
+fn execute_auth<H: CommandHost>(
+    app: &mut H,
+    subcommand: Option<&str>,
+    action: Option<&str>,
+    value: Option<&str>,
+    has_extra_args: bool,
+) -> Result<CommandResult> {
+    app.handle_auth(subcommand, action, value, has_extra_args)
+        .map(response)
+}
+
+fn execute_keys<H: CommandHost>(
+    app: &mut H,
+    subcommand: Option<&str>,
+    value: Option<&str>,
+    option: Option<&str>,
+    has_extra_args: bool,
+) -> Result<CommandResult> {
+    app.handle_keys(subcommand, value, option, has_extra_args)
+        .map(response)
+}
+
 fn execute_config<H: CommandHost>(app: &mut H, action: Option<&str>) -> Result<CommandResult> {
     match action {
         None => app.show_config().map(response),
@@ -419,15 +568,7 @@ fn unknown_command_message(command: &str) -> String {
 
 fn client_only_command_name(command: &ParsedCommand) -> Option<&'static str> {
     match command {
-        ParsedCommand::Auth { .. } => Some("auth"),
-        ParsedCommand::Keys { .. } => Some("keys"),
-        ParsedCommand::Sign { .. } => Some("sign"),
-        ParsedCommand::Loop => Some("loop"),
-        ParsedCommand::Debug => Some("debug"),
-        ParsedCommand::Synthesis(_) => Some("synthesis"),
         ParsedCommand::Clear => Some("clear"),
-        ParsedCommand::New => Some("new"),
-        ParsedCommand::History => Some("history"),
         ParsedCommand::Quit => Some("quit"),
         _ => None,
     }
@@ -511,6 +652,10 @@ mod tests {
     }
 
     impl CommandHost for StubHost {
+        fn supports_embedded_slash_commands(&self) -> bool {
+            true
+        }
+
         fn list_models(&self) -> String {
             self.models.clone()
         }
@@ -697,21 +842,49 @@ mod tests {
     }
 
     #[test]
-    fn execute_command_returns_none_for_client_only_commands() {
+    fn execute_command_returns_none_for_remaining_client_only_commands() {
         let mut host = StubHost::default();
         let mut context = CommandContext { app: &mut host };
         assert!(execute_command(&mut context, &ParsedCommand::Quit).is_none());
         assert!(execute_command(&mut context, &ParsedCommand::Clear).is_none());
-        assert!(execute_command(
+    }
+
+    #[test]
+    fn execute_command_routes_new_server_side_commands() {
+        let mut host = StubHost::default();
+        let mut context = CommandContext { app: &mut host };
+
+        let history = execute_command(&mut context, &ParsedCommand::History)
+            .expect("server-side")
+            .expect("ok");
+        assert_eq!(
+            history.response,
+            "Conversation history is not available in this mode."
+        );
+
+        let auth = execute_command(
             &mut context,
             &ParsedCommand::Auth {
                 subcommand: None,
                 action: None,
                 value: None,
                 has_extra_args: false,
-            }
+            },
         )
-        .is_none());
+        .expect("server-side")
+        .expect("ok");
+        assert_eq!(
+            auth.response,
+            "Authentication status is not available in this mode."
+        );
+
+        let loop_status = execute_command(&mut context, &ParsedCommand::Loop)
+            .expect("server-side")
+            .expect("ok");
+        assert_eq!(
+            loop_status.response,
+            "Loop status is not available in this mode."
+        );
     }
 
     #[test]
@@ -774,7 +947,7 @@ mod tests {
     }
 
     #[test]
-    fn analyze_and_improve_are_not_marked_client_only() {
+    fn server_side_commands_are_not_marked_client_only() {
         assert!(client_only_command_message(&ParsedCommand::Analyze).is_none());
         assert!(
             client_only_command_message(&ParsedCommand::Improve(ImproveFlags {
@@ -783,6 +956,15 @@ mod tests {
             }))
             .is_none()
         );
+        assert!(client_only_command_message(&ParsedCommand::Loop).is_none());
+        assert!(client_only_command_message(&ParsedCommand::History).is_none());
+        assert!(client_only_command_message(&ParsedCommand::Auth {
+            subcommand: None,
+            action: None,
+            value: None,
+            has_extra_args: false,
+        })
+        .is_none());
     }
 
     #[test]

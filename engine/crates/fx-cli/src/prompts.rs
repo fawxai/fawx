@@ -10,6 +10,7 @@ const MAX_PROMPT_RETRIES: usize = 10;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PromptSurface {
     AlternateScreen,
+    #[allow(dead_code)] // Used by binary-only setup flows.
     PlainTerminal,
 }
 

@@ -1,13 +1,20 @@
+#[cfg(test)]
+use crate::DEFAULT_ENGINE_URL;
 use anyhow::{anyhow, Context};
+use async_trait::async_trait;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 
-const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8400";
+#[async_trait]
+pub trait EngineBackend: Send + Sync {
+    async fn stream_message(&self, message: String, tx: UnboundedSender<BackendEvent>);
+    async fn check_health(&self, tx: UnboundedSender<BackendEvent>);
+}
 
 #[derive(Clone)]
-pub struct FawxBackend {
+pub struct HttpBackend {
     base_url: String,
     client: reqwest::Client,
     bearer_token: Option<String>,
@@ -254,17 +261,56 @@ fn parse_bearer_token_from_toml(content: &str) -> Option<String> {
     None
 }
 
-impl FawxBackend {
-    pub fn from_env() -> Self {
-        let base_url = std::env::var("FAWX_TUI_BASE_URL")
-            .unwrap_or_else(|_| DEFAULT_BASE_URL.to_string())
-            .trim_end_matches('/')
+pub fn friendly_error_message(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let lower = trimmed.to_ascii_lowercase();
+
+    if trimmed.contains("429") || lower.contains("rate limit") {
+        return "Fawx is rate limited right now. Wait a moment and try again.".to_string();
+    }
+
+    if trimmed.contains("401")
+        || trimmed.contains("403")
+        || lower.contains("unauthorized")
+        || lower.contains("forbidden")
+        || lower.contains("authentication")
+        || lower.contains("auth failure")
+    {
+        return "Fawx could not authenticate with the engine. Check your bearer token or config and try again."
             .to_string();
-        let bearer_token = resolve_bearer_token();
+    }
+
+    if lower.contains("connection refused")
+        || lower.contains("request /health")
+        || lower.contains("request /status")
+        || lower.contains("request /message")
+        || lower.contains("error trying to connect")
+    {
+        return "Fawx could not reach the local engine. Make sure `fawx serve --http` is running."
+            .to_string();
+    }
+
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        return "Fawx hit an unexpected API error. Check the engine logs and try again."
+            .to_string();
+    }
+
+    trimmed.to_string()
+}
+
+impl HttpBackend {
+    #[cfg(test)]
+    pub fn from_env() -> Self {
+        let base_url =
+            std::env::var("FAWX_TUI_BASE_URL").unwrap_or_else(|_| DEFAULT_ENGINE_URL.to_string());
+        Self::new(&base_url)
+    }
+
+    pub fn new(base_url: &str) -> Self {
         Self {
-            base_url,
+            base_url: base_url.trim_end_matches('/').to_string(),
             client: reqwest::Client::new(),
-            bearer_token,
+            bearer_token: resolve_bearer_token(),
         }
     }
 
@@ -277,53 +323,6 @@ impl FawxBackend {
             Some(token) => req.bearer_auth(token),
             None => req,
         }
-    }
-
-    /// Convert a raw error string into a user-friendly message.
-    ///
-    /// This is a **fallback** for contexts where only a raw error string is
-    /// available (e.g. `reqwest::Error::to_string()`, upstream error chains).
-    /// When an HTTP status code is available, prefer [`friendly_http_status_message`]
-    /// which matches on structured `StatusCode` values.
-    ///
-    /// The string-matching here is intentionally broad to catch error messages
-    /// from different HTTP clients and transport layers. Each pattern maps to
-    /// a single user-actionable message rather than exposing internals.
-    pub fn friendly_error_message(raw: &str) -> String {
-        let trimmed = raw.trim();
-        let lower = trimmed.to_ascii_lowercase();
-
-        if trimmed.contains("429") || lower.contains("rate limit") {
-            return "Fawx is rate limited right now. Wait a moment and try again.".to_string();
-        }
-
-        if trimmed.contains("401")
-            || trimmed.contains("403")
-            || lower.contains("unauthorized")
-            || lower.contains("forbidden")
-            || lower.contains("authentication")
-            || lower.contains("auth failure")
-        {
-            return "Fawx could not authenticate with the engine. Check your bearer token or config and try again."
-                .to_string();
-        }
-
-        if lower.contains("connection refused")
-            || lower.contains("request /health")
-            || lower.contains("request /status")
-            || lower.contains("request /message")
-            || lower.contains("error trying to connect")
-        {
-            return "Fawx could not reach the local engine. Make sure `fawx serve --http` is running."
-                .to_string();
-        }
-
-        if trimmed.starts_with('{') || trimmed.starts_with('[') {
-            return "Fawx hit an unexpected API error. Check the engine logs and try again."
-                .to_string();
-        }
-
-        trimmed.to_string()
     }
 
     pub async fn bootstrap(&self) -> anyhow::Result<EngineStatus> {
@@ -359,12 +358,12 @@ impl FawxBackend {
         status.json().await.context("decode /status")
     }
 
-    pub async fn stream_message(&self, message: String, tx: UnboundedSender<BackendEvent>) {
+    async fn send_message(&self, message: String, tx: UnboundedSender<BackendEvent>) {
         let result = self.stream_message_inner(message, tx.clone()).await;
         if let Err(error) = result {
             try_send(
                 &tx,
-                BackendEvent::StreamError(Self::friendly_error_message(&error.to_string())),
+                BackendEvent::StreamError(friendly_error_message(&error.to_string())),
             );
         }
     }
@@ -446,11 +445,26 @@ impl FawxBackend {
     }
 }
 
+#[async_trait]
+impl EngineBackend for HttpBackend {
+    async fn stream_message(&self, message: String, tx: UnboundedSender<BackendEvent>) {
+        self.send_message(message, tx).await;
+    }
+
+    async fn check_health(&self, tx: UnboundedSender<BackendEvent>) {
+        let event = match self.bootstrap().await {
+            Ok(status) => BackendEvent::Connected(status),
+            Err(error) => BackendEvent::ConnectionError(error.to_string()),
+        };
+        try_send(&tx, event);
+    }
+}
+
 /// Send a backend event, logging when the receiver has been dropped.
 ///
 /// Returns `true` if the event was delivered, `false` if the receiver is
 /// gone (the TUI event loop has exited and further sends are pointless).
-fn try_send(tx: &UnboundedSender<BackendEvent>, event: BackendEvent) -> bool {
+pub(crate) fn try_send(tx: &UnboundedSender<BackendEvent>, event: BackendEvent) -> bool {
     if tx.send(event).is_err() {
         tracing::debug!("backend event receiver dropped");
         return false;
@@ -503,7 +517,7 @@ fn handle_sse_frame(frame: &str, tx: &UnboundedSender<BackendEvent>) -> anyhow::
         WireEvent::Error { error } => {
             try_send(
                 tx,
-                BackendEvent::StreamError(FawxBackend::friendly_error_message(&error)),
+                BackendEvent::StreamError(friendly_error_message(&error)),
             );
         }
     }
@@ -518,7 +532,7 @@ mod tests {
 
     #[test]
     fn auth_request_adds_bearer_header_when_token_set() {
-        let backend = FawxBackend {
+        let backend = HttpBackend {
             base_url: "http://localhost:8400".to_string(),
             client: reqwest::Client::new(),
             bearer_token: Some("test-secret-token".to_string()),
@@ -538,7 +552,7 @@ mod tests {
 
     #[test]
     fn auth_request_omits_header_when_no_token() {
-        let backend = FawxBackend {
+        let backend = HttpBackend {
             base_url: "http://localhost:8400".to_string(),
             client: reqwest::Client::new(),
             bearer_token: None,

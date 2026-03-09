@@ -41,6 +41,7 @@ pub struct AuthStore {
     _temp_dir: Option<tempfile::TempDir>,
 }
 
+#[allow(dead_code)] // Used by binary-only auth/setup command flows.
 pub struct RecoveredAuthStore {
     pub store: AuthStore,
     pub recreated: bool,
@@ -173,6 +174,7 @@ impl AuthStore {
     }
 }
 
+#[allow(dead_code)] // Used by binary-only auth/setup command flows.
 pub fn open_auth_store_with_recovery(data_dir: &Path) -> Result<RecoveredAuthStore, String> {
     match open_verified_auth_store(data_dir) {
         Ok(store) => Ok(RecoveredAuthStore {
@@ -184,11 +186,13 @@ pub fn open_auth_store_with_recovery(data_dir: &Path) -> Result<RecoveredAuthSto
     }
 }
 
+#[allow(dead_code)] // Reachable through recovery helpers in binary-only command flows.
 fn open_verified_auth_store(data_dir: &Path) -> Result<AuthStore, String> {
     let store = AuthStore::open(data_dir)?;
     store.load_auth_manager().map(|_| store)
 }
 
+#[allow(dead_code)] // Reachable through recovery helpers in binary-only command flows.
 fn recreate_auth_store(data_dir: &Path) -> Result<RecoveredAuthStore, String> {
     remove_if_exists(&data_dir.join("auth.db"))?;
     remove_if_exists(&data_dir.join(".auth-salt"))?;
@@ -199,6 +203,7 @@ fn recreate_auth_store(data_dir: &Path) -> Result<RecoveredAuthStore, String> {
     })
 }
 
+#[allow(dead_code)] // Reachable through recovery helpers in binary-only command flows.
 fn should_recreate_auth_store(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
     error.contains("different machine identity")
@@ -207,6 +212,7 @@ fn should_recreate_auth_store(error: &str) -> bool {
         || error.contains("key derivation failed")
 }
 
+#[allow(dead_code)] // Reachable through recovery helpers in binary-only command flows.
 fn remove_if_exists(path: &Path) -> Result<(), String> {
     if path.exists() {
         fs::remove_file(path)

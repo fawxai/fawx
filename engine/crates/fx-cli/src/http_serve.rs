@@ -30,11 +30,7 @@ use std::time::Instant;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
-use crate::commands::slash::{
-    client_only_command_message, execute_command, is_command_input, parse_command, CommandContext,
-    ParsedCommand,
-};
-use crate::headless::{CycleResult, HeadlessApp};
+use crate::headless::{process_input_with_commands, CycleResult, HeadlessApp};
 
 // ── Request/Response types ──────────────────────────────────────────────────
 
@@ -386,48 +382,11 @@ async fn process_and_route_message(
     context: ResponseContext,
 ) -> Result<CycleResult, anyhow::Error> {
     let mut guard = app.lock().await;
-    if is_command_input(text) {
-        let parsed = parse_command(text);
-        let response = match execute_headless_async_command(&mut guard, &parsed).await? {
-            Some(response) => response,
-            None => match execute_command(&mut CommandContext { app: &mut *guard }, &parsed) {
-                Some(result) => result?.response,
-                None => client_only_command_message(&parsed)
-                    .unwrap_or_else(|| "This command is only available in the TUI.".to_string()),
-            },
-        };
-        let result = command_cycle_result(&guard, response);
-        router
-            .route(&source, &result.response, &context)
-            .map_err(|error| anyhow::anyhow!("response routing failed: {error}"))?;
-        return Ok(result);
-    }
-
-    let result = guard.process_message_for_source(text, &source).await?;
+    let result = process_input_with_commands(&mut guard, text, Some(&source)).await?;
     router
         .route(&source, &result.response, &context)
         .map_err(|error| anyhow::anyhow!("response routing failed: {error}"))?;
     Ok(result)
-}
-
-async fn execute_headless_async_command(
-    app: &mut HeadlessApp,
-    parsed: &ParsedCommand,
-) -> Result<Option<String>, anyhow::Error> {
-    match parsed {
-        ParsedCommand::Analyze => app.analyze_signals_command().await.map(Some),
-        ParsedCommand::Improve(flags) => app.improve_command(flags).await.map(Some),
-        _ => Ok(None),
-    }
-}
-
-fn command_cycle_result(app: &HeadlessApp, response: String) -> CycleResult {
-    CycleResult {
-        response,
-        model: app.active_model().to_string(),
-        iterations: 0,
-        tokens_used: 0,
-    }
 }
 
 fn sanitize_config(value: serde_json::Value) -> serde_json::Value {
@@ -2207,7 +2166,7 @@ allowed_chat_ids = [123]
         }
 
         #[tokio::test]
-        async fn message_endpoint_returns_client_only_message_for_auth() {
+        async fn message_endpoint_routes_auth_server_side() {
             let app = build_router(test_state(None, Vec::new()));
             let req = Request::builder()
                 .method("POST")
@@ -2225,7 +2184,7 @@ allowed_chat_ids = [123]
             assert_eq!(json["iterations"], 0);
             assert_eq!(
                 json["response"],
-                "/auth is a client-side command (only available in the TUI)"
+                "Configured credentials:\n  ✓ mock: configured (api_key) — 1 model"
             );
         }
 

@@ -12,24 +12,29 @@ use fx_config::manager::ConfigManager;
 use fx_config::FawxConfig;
 use fx_core::types::{InputSource, ScreenState, UserInput};
 use fx_improve::{CyclePaths, ImprovementConfig, OutputMode};
+use fx_kernel::act::TokenUsage;
 use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::loop_engine::{LoopEngine, LoopResult};
 use fx_kernel::signals::Signal;
 use fx_kernel::types::PerceptionSnapshot;
 use fx_llm::CompletionProvider;
-use fx_llm::{Message, ModelRouter};
+use fx_llm::{Message, ModelInfo, ModelRouter};
 use fx_memory::SignalStore;
+use sha2::{Digest, Sha256};
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::commands::slash::{
-    apply_thinking_budget, config_reload_success_message, init_default_config,
-    persist_default_model, reload_runtime_config, render_budget_text, render_signals_summary,
-    CommandHost, ImproveFlags,
+    apply_thinking_budget, client_only_command_message, config_reload_success_message,
+    execute_command, init_default_config, is_command_input, parse_command, persist_default_model,
+    reload_runtime_config, render_budget_text, render_debug_dump, render_loop_status,
+    render_signals_summary, CommandContext, CommandHost, ImproveFlags, ParsedCommand,
+    DEFAULT_SYNTHESIS_INSTRUCTION, MAX_SYNTHESIS_INSTRUCTION_LENGTH,
 };
 use crate::proposal_review::{approve_pending, reject_pending, render_pending, ReviewContext};
 use crate::tui::{
@@ -80,8 +85,8 @@ pub struct CycleResult {
     pub model: String,
     /// Number of loop iterations consumed.
     pub iterations: u32,
-    /// Total input + output tokens reported for the cycle.
-    pub tokens_used: u64,
+    /// Token usage reported for the cycle.
+    pub tokens_used: TokenUsage,
 }
 
 // ── HeadlessApp ─────────────────────────────────────────────────────────────
@@ -137,6 +142,20 @@ struct HeadlessSubagentSession {
 
 #[derive(Debug)]
 struct DisabledSubagentFactory;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuthProviderStatus {
+    provider: String,
+    auth_methods: BTreeSet<String>,
+    model_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrustedKeyEntry {
+    file_name: String,
+    fingerprint: String,
+    file_size: u64,
+}
 
 impl HeadlessApp {
     /// Build from the standard startup bundle + router + config.
@@ -250,7 +269,6 @@ impl HeadlessApp {
     }
 
     /// Return the active model identifier.
-    #[cfg(feature = "http")]
     pub fn active_model(&self) -> &str {
         &self.active_model
     }
@@ -264,7 +282,6 @@ impl HeadlessApp {
     /// Apply the custom system prompt (if any). Must be called once
     /// before the first `process_message` invocation when not using
     /// the built-in `run()` or `run_single()` methods.
-    #[cfg(feature = "http")]
     pub fn initialize(&mut self) {
         self.apply_custom_system_prompt();
     }
@@ -374,7 +391,7 @@ impl HeadlessApp {
     fn finalize_cycle(&mut self, input: &str, result: &LoopResult) -> CycleResult {
         let response = extract_response_text(result);
         let iterations = extract_iterations(result);
-        let tokens_used = extract_tokens_used(result);
+        let tokens_used = extract_token_usage(result);
         self.last_signals = result.signals().to_vec();
         persist_headless_signals(&self.config, &self.last_signals);
         self.record_turn(input, &response);
@@ -484,6 +501,10 @@ impl HeadlessApp {
 }
 
 impl CommandHost for HeadlessApp {
+    fn supports_embedded_slash_commands(&self) -> bool {
+        true
+    }
+
     fn list_models(&self) -> String {
         render_model_menu_text(
             Some(self.active_model.as_str()),
@@ -564,6 +585,301 @@ impl CommandHost for HeadlessApp {
             level,
         )
     }
+
+    fn show_history(&self) -> anyhow::Result<String> {
+        Ok(format!(
+            "Conversation history: {} messages in current session",
+            self.conversation_history.len()
+        ))
+    }
+
+    fn new_conversation(&mut self) -> anyhow::Result<String> {
+        self.conversation_history.clear();
+        Ok("Started a new conversation.".to_string())
+    }
+
+    fn show_loop_status(&self) -> anyhow::Result<String> {
+        Ok(render_loop_status(
+            self.loop_engine.status(current_time_ms()),
+        ))
+    }
+
+    fn show_debug(&self) -> anyhow::Result<String> {
+        Ok(render_debug_dump(&self.last_signals))
+    }
+
+    fn handle_synthesis(&mut self, instruction: Option<&str>) -> anyhow::Result<String> {
+        handle_headless_synthesis_command(&mut self.loop_engine, instruction)
+    }
+
+    fn handle_auth(
+        &self,
+        subcommand: Option<&str>,
+        action: Option<&str>,
+        value: Option<&str>,
+        has_extra_args: bool,
+    ) -> anyhow::Result<String> {
+        handle_headless_auth_command(&self.router, subcommand, action, value, has_extra_args)
+    }
+
+    fn handle_keys(
+        &self,
+        subcommand: Option<&str>,
+        value: Option<&str>,
+        option: Option<&str>,
+        has_extra_args: bool,
+    ) -> anyhow::Result<String> {
+        let data_dir = configured_data_dir(&fawx_data_dir(), &self.config);
+        handle_headless_keys_command(&data_dir, subcommand, value, option, has_extra_args)
+    }
+
+    fn handle_sign(&self, _target: Option<&str>, _has_extra_args: bool) -> anyhow::Result<String> {
+        Ok("Use `fawx sign <skill>` CLI to sign WASM packages.".to_string())
+    }
+}
+
+fn handle_headless_synthesis_command(
+    loop_engine: &mut LoopEngine,
+    instruction: Option<&str>,
+) -> anyhow::Result<String> {
+    match instruction {
+        None => Ok("Usage: /synthesis <instruction> or /synthesis reset".to_string()),
+        Some(value) if value.trim().is_empty() => {
+            Ok("Synthesis instruction cannot be empty.".to_string())
+        }
+        Some(value) if value.eq_ignore_ascii_case("reset") => {
+            loop_engine
+                .set_synthesis_instruction(DEFAULT_SYNTHESIS_INSTRUCTION.to_string())
+                .map_err(|error| anyhow::anyhow!(error.reason))?;
+            Ok("Synthesis instruction reset to default.".to_string())
+        }
+        Some(value) => update_headless_synthesis_instruction(loop_engine, value),
+    }
+}
+
+fn update_headless_synthesis_instruction(
+    loop_engine: &mut LoopEngine,
+    value: &str,
+) -> anyhow::Result<String> {
+    if value.len() > MAX_SYNTHESIS_INSTRUCTION_LENGTH {
+        return Ok(format!(
+            "Synthesis instruction exceeds {} characters.",
+            MAX_SYNTHESIS_INSTRUCTION_LENGTH
+        ));
+    }
+    loop_engine
+        .set_synthesis_instruction(value.to_string())
+        .map_err(|error| anyhow::anyhow!(error.reason))?;
+    Ok(format!("Synthesis instruction updated: {}", value.trim()))
+}
+
+fn handle_headless_auth_command(
+    router: &ModelRouter,
+    subcommand: Option<&str>,
+    action: Option<&str>,
+    value: Option<&str>,
+    has_extra_args: bool,
+) -> anyhow::Result<String> {
+    if is_auth_write_action(action) {
+        return Ok("Use `fawx setup` to manage credentials.".to_string());
+    }
+    match (subcommand, action, value, has_extra_args) {
+        (None, None, None, false) | (Some("list-providers"), None, None, false) => {
+            Ok(render_auth_overview(router))
+        }
+        (Some(provider), Some("show-status"), None, false) => {
+            Ok(render_auth_provider_status(router, provider))
+        }
+        _ => Ok(auth_usage_message()),
+    }
+}
+
+fn is_auth_write_action(action: Option<&str>) -> bool {
+    matches!(action, Some("set-token") | Some("clear-token"))
+}
+
+fn auth_usage_message() -> String {
+    "Usage: /auth {provider} <set-token|show-status|clear-token> [TOKEN]".to_string()
+}
+
+fn render_auth_overview(router: &ModelRouter) -> String {
+    let statuses = auth_provider_statuses(router.available_models());
+    if statuses.is_empty() {
+        return "No credentials configured.".to_string();
+    }
+    let mut lines = vec!["Configured credentials:".to_string()];
+    lines.extend(statuses.iter().map(render_auth_status_line));
+    lines.join("\n")
+}
+
+fn render_auth_status_line(status: &AuthProviderStatus) -> String {
+    format!(
+        "  ✓ {}: configured ({}) — {}",
+        status.provider,
+        format_auth_methods(&status.auth_methods),
+        model_count_label(status.model_count)
+    )
+}
+
+fn render_auth_provider_status(router: &ModelRouter, provider: &str) -> String {
+    let provider = normalize_provider_name(provider);
+    match auth_provider_statuses(router.available_models())
+        .into_iter()
+        .find(|status| status.provider == provider)
+    {
+        Some(status) => format!(
+            "{} auth status:\n  Status: configured ({})\n  Models available: {}",
+            status.provider,
+            format_auth_methods(&status.auth_methods),
+            status.model_count
+        ),
+        None => format!("{provider} auth status:\n  Status: not configured"),
+    }
+}
+
+fn auth_provider_statuses(models: Vec<ModelInfo>) -> Vec<AuthProviderStatus> {
+    let mut statuses = BTreeMap::new();
+    for model in models {
+        update_auth_provider_status(&mut statuses, model);
+    }
+    statuses.into_values().collect()
+}
+
+fn update_auth_provider_status(
+    statuses: &mut BTreeMap<String, AuthProviderStatus>,
+    model: ModelInfo,
+) {
+    let provider = normalize_provider_name(&model.provider_name);
+    let status = statuses
+        .entry(provider.clone())
+        .or_insert_with(|| AuthProviderStatus {
+            provider,
+            auth_methods: BTreeSet::new(),
+            model_count: 0,
+        });
+    status.auth_methods.insert(model.auth_method);
+    status.model_count += 1;
+}
+
+fn format_auth_methods(auth_methods: &BTreeSet<String>) -> String {
+    auth_methods
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn model_count_label(model_count: usize) -> String {
+    match model_count {
+        1 => "1 model".to_string(),
+        count => format!("{count} models"),
+    }
+}
+
+fn normalize_provider_name(value: &str) -> String {
+    let lower = value.trim().to_ascii_lowercase();
+    match lower.as_str() {
+        "gh" => "github".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn handle_headless_keys_command(
+    base_dir: &Path,
+    subcommand: Option<&str>,
+    value: Option<&str>,
+    option: Option<&str>,
+    has_extra_args: bool,
+) -> anyhow::Result<String> {
+    match subcommand {
+        Some("list") if value.is_none() && option.is_none() && !has_extra_args => {
+            render_trusted_key_list(base_dir)
+        }
+        Some("list") => Ok("Usage: /keys list".to_string()),
+        Some(other) => Ok(keys_redirect_message(other)),
+        None => Ok("Usage: /keys list".to_string()),
+    }
+}
+
+fn keys_redirect_message(subcommand: &str) -> String {
+    format!("Use `fawx keys {subcommand}` CLI for key management.")
+}
+
+fn render_trusted_key_list(base_dir: &Path) -> anyhow::Result<String> {
+    let keys = trusted_key_entries_from_dir(&trusted_keys_dir(base_dir))?;
+    if keys.is_empty() {
+        return Ok("No trusted public keys.".to_string());
+    }
+    let mut lines = vec!["Trusted public keys:".to_string()];
+    lines.extend(keys.into_iter().map(render_trusted_key_line));
+    Ok(lines.join("\n"))
+}
+
+fn render_trusted_key_line(key: TrustedKeyEntry) -> String {
+    format!(
+        "  {} {} {} bytes",
+        key.file_name, key.fingerprint, key.file_size
+    )
+}
+
+fn trusted_keys_dir(base_dir: &Path) -> PathBuf {
+    base_dir.join("trusted_keys")
+}
+
+fn trusted_key_entries_from_dir(trusted_dir: &Path) -> anyhow::Result<Vec<TrustedKeyEntry>> {
+    let mut keys = Vec::new();
+    if !trusted_dir.exists() {
+        return Ok(keys);
+    }
+    for entry in std::fs::read_dir(trusted_dir)? {
+        let path = entry?.path();
+        if is_public_key_path(&path) {
+            keys.push(trusted_key_entry_from_path(&path)?);
+        }
+    }
+    keys.sort_by(|left, right| left.file_name.cmp(&right.file_name));
+    Ok(keys)
+}
+
+fn trusted_key_entry_from_path(path: &Path) -> anyhow::Result<TrustedKeyEntry> {
+    let public_key = read_public_key_file(path)?;
+    let file_name = display_file_name(path);
+    Ok(TrustedKeyEntry {
+        file_name,
+        fingerprint: public_key_fingerprint(&public_key),
+        file_size: std::fs::metadata(path)?.len(),
+    })
+}
+
+fn read_public_key_file(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let public_key = std::fs::read(path)?;
+    if public_key.len() != 32 {
+        return Err(anyhow::anyhow!(
+            "invalid public key length at {}: expected 32 bytes, found {}",
+            path.display(),
+            public_key.len()
+        ));
+    }
+    Ok(public_key)
+}
+
+fn is_public_key_path(path: &Path) -> bool {
+    path.extension().and_then(|ext| ext.to_str()) == Some("pub")
+}
+
+fn public_key_fingerprint(public_key: &[u8]) -> String {
+    let digest = Sha256::digest(public_key);
+    hex_encode(&digest[..8])
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn display_file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 fn resolve_headless_model_selector(router: &ModelRouter, selector: &str) -> anyhow::Result<String> {
@@ -869,8 +1185,65 @@ impl SubagentSession for HeadlessSubagentSession {
             .map_err(|error| SubagentError::Execution(error.to_string()))?;
         Ok(SubagentTurn {
             response: result.response,
-            tokens_used: result.tokens_used,
+            tokens_used: result.tokens_used.total_tokens(),
         })
+    }
+}
+
+pub async fn process_input_with_commands(
+    app: &mut HeadlessApp,
+    input: &str,
+    source: Option<&InputSource>,
+) -> Result<CycleResult, anyhow::Error> {
+    if is_command_input(input) {
+        return process_command_input(app, input).await;
+    }
+    match source {
+        Some(source) => app.process_message_for_source(input, source).await,
+        None => app.process_message(input).await,
+    }
+}
+
+async fn process_command_input(
+    app: &mut HeadlessApp,
+    input: &str,
+) -> Result<CycleResult, anyhow::Error> {
+    let parsed = parse_command(input);
+    let response = match execute_headless_async_command(app, &parsed).await? {
+        Some(response) => response,
+        None => run_sync_command(app, &parsed)?,
+    };
+    Ok(command_cycle_result(app, response))
+}
+
+fn run_sync_command(
+    app: &mut HeadlessApp,
+    parsed: &ParsedCommand,
+) -> Result<String, anyhow::Error> {
+    match execute_command(&mut CommandContext { app }, parsed) {
+        Some(result) => result.map(|value| value.response),
+        None => Ok(client_only_command_message(parsed)
+            .unwrap_or_else(|| "This command is only available in the TUI.".to_string())),
+    }
+}
+
+async fn execute_headless_async_command(
+    app: &mut HeadlessApp,
+    parsed: &ParsedCommand,
+) -> Result<Option<String>, anyhow::Error> {
+    match parsed {
+        ParsedCommand::Analyze => app.analyze_signals_command().await.map(Some),
+        ParsedCommand::Improve(flags) => app.improve_command(flags).await.map(Some),
+        _ => Ok(None),
+    }
+}
+
+fn command_cycle_result(app: &HeadlessApp, response: String) -> CycleResult {
+    CycleResult {
+        response,
+        model: app.active_model().to_string(),
+        iterations: 0,
+        tokens_used: TokenUsage::default(),
     }
 }
 
@@ -981,15 +1354,11 @@ fn extract_iterations(result: &LoopResult) -> u32 {
     }
 }
 
-fn extract_tokens_used(result: &LoopResult) -> u64 {
+fn extract_token_usage(result: &LoopResult) -> TokenUsage {
     match result {
-        LoopResult::Complete { tokens_used, .. } => sum_token_usage(tokens_used),
-        _ => 0,
+        LoopResult::Complete { tokens_used, .. } => *tokens_used,
+        _ => TokenUsage::default(),
     }
-}
-
-fn sum_token_usage(tokens: &fx_kernel::act::TokenUsage) -> u64 {
-    tokens.input_tokens + tokens.output_tokens
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -1348,6 +1717,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn process_input_with_commands_handles_server_side_status() {
+        let mut app = test_app();
+
+        let result = process_input_with_commands(&mut app, "/status", None)
+            .await
+            .expect("process status command");
+
+        assert_eq!(result.iterations, 0);
+        assert!(result.response.contains("Fawx Status"));
+    }
+
+    #[tokio::test]
+    async fn process_input_with_commands_returns_client_only_message_for_quit() {
+        let mut app = test_app();
+
+        let result = process_input_with_commands(&mut app, "/quit", None)
+            .await
+            .expect("process quit command");
+
+        assert_eq!(result.iterations, 0);
+        assert_eq!(
+            result.response,
+            "/quit is a client-side command (only available in the TUI)"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_and_new_commands_work_in_headless_mode() {
+        let mut app = test_app();
+        app.conversation_history
+            .push(Message::user("hello".to_string()));
+        app.conversation_history
+            .push(Message::assistant("hi".to_string()));
+
+        let history = process_input_with_commands(&mut app, "/history", None)
+            .await
+            .expect("process history command");
+        assert_eq!(
+            history.response,
+            "Conversation history: 2 messages in current session"
+        );
+
+        let new_conversation = process_input_with_commands(&mut app, "/new", None)
+            .await
+            .expect("process new command");
+        assert_eq!(new_conversation.response, "Started a new conversation.");
+        assert!(app.conversation_history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn loop_and_debug_commands_work_in_headless_mode() {
+        let mut app = test_app();
+        app.last_signals.push(Signal {
+            step: fx_core::signals::LoopStep::Act,
+            kind: fx_core::signals::SignalKind::Friction,
+            message: "tool timed out".to_string(),
+            metadata: serde_json::Value::Null,
+            timestamp_ms: 42,
+        });
+
+        let loop_status = process_input_with_commands(&mut app, "/loop", None)
+            .await
+            .expect("process loop command");
+        assert!(loop_status.response.contains("Loop status:"));
+
+        let debug = process_input_with_commands(&mut app, "/debug", None)
+            .await
+            .expect("process debug command");
+        assert_eq!(debug.response, "[Act/Friction] tool timed out (42)");
+    }
+
+    #[tokio::test]
+    async fn synthesis_command_updates_headless_loop_instruction() {
+        let mut app = test_app();
+
+        let updated = process_input_with_commands(&mut app, "/synthesis Be concise", None)
+            .await
+            .expect("process synthesis update");
+        assert_eq!(
+            updated.response,
+            "Synthesis instruction updated: Be concise"
+        );
+        assert_eq!(app.loop_engine.synthesis_instruction(), "Be concise");
+
+        let reset = process_input_with_commands(&mut app, "/synthesis reset", None)
+            .await
+            .expect("process synthesis reset");
+        assert_eq!(reset.response, "Synthesis instruction reset to default.");
+        assert_eq!(
+            app.loop_engine.synthesis_instruction(),
+            DEFAULT_SYNTHESIS_INSTRUCTION
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_sign_and_keys_commands_work_in_headless_mode() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(temp.path().join("trusted_keys")).expect("trusted keys dir");
+        std::fs::write(
+            temp.path().join("trusted_keys").join("demo.pub"),
+            [7_u8; 32],
+        )
+        .expect("write trusted key");
+
+        let mut app = test_app();
+        app.config.general.data_dir = Some(temp.path().to_path_buf());
+        app.router = test_router();
+
+        let auth = process_input_with_commands(&mut app, "/auth", None)
+            .await
+            .expect("process auth command");
+        assert!(auth.response.contains("Configured credentials:"));
+        assert!(auth.response.contains("usage-reporting"));
+
+        let auth_status =
+            process_input_with_commands(&mut app, "/auth usage-reporting show-status", None)
+                .await
+                .expect("process auth show-status command");
+        assert!(auth_status.response.contains("Status: configured"));
+
+        let auth_write =
+            process_input_with_commands(&mut app, "/auth github set-token ghp_test", None)
+                .await
+                .expect("process auth write command");
+        assert_eq!(
+            auth_write.response,
+            "Use `fawx setup` to manage credentials."
+        );
+
+        let keys = process_input_with_commands(&mut app, "/keys list", None)
+            .await
+            .expect("process keys command");
+        assert!(keys.response.contains("Trusted public keys:"));
+        assert!(keys.response.contains("demo.pub"));
+
+        let keys_redirect = process_input_with_commands(&mut app, "/keys generate", None)
+            .await
+            .expect("process keys redirect command");
+        assert_eq!(
+            keys_redirect.response,
+            "Use `fawx keys generate` CLI for key management."
+        );
+
+        let sign = process_input_with_commands(&mut app, "/sign demo", None)
+            .await
+            .expect("process sign command");
+        assert_eq!(
+            sign.response,
+            "Use `fawx sign <skill>` CLI to sign WASM packages."
+        );
+    }
+
+    #[tokio::test]
     async fn process_message_reports_token_counts() {
         let mut app = HeadlessApp {
             loop_engine: test_engine(),
@@ -1368,7 +1890,7 @@ mod tests {
 
         assert_eq!(result.model, "mock-model");
         assert!(result.iterations > 0);
-        assert!(result.tokens_used >= mock_completion_usage_total());
+        assert!(result.tokens_used.total_tokens() >= mock_completion_usage_total());
     }
 
     #[tokio::test]
@@ -1422,7 +1944,7 @@ mod tests {
         };
         assert_eq!(extract_response_text(&result), "done");
         assert_eq!(extract_iterations(&result), 1);
-        assert_eq!(extract_tokens_used(&result), 5);
+        assert_eq!(extract_token_usage(&result).total_tokens(), 5);
     }
 
     #[test]

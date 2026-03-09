@@ -1,4 +1,8 @@
-use crate::fawx_backend::{BackendEvent, EngineStatus, FawxBackend};
+#[cfg(feature = "embedded")]
+use crate::embedded_backend::EmbeddedBackend;
+use crate::fawx_backend::{
+    friendly_error_message, BackendEvent, EngineBackend, EngineStatus, HttpBackend,
+};
 use crate::markdown_render::render_markdown_text_with_width;
 use crate::render::line_utils::{line_to_static, prefix_lines};
 use crate::wrapping::{adaptive_wrap_line, RtOptions};
@@ -24,6 +28,7 @@ use std::cmp::min;
 use std::fmt;
 use std::io::{self, Stdout};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
@@ -37,8 +42,55 @@ const PHASE1_NOTE: &str =
     "Phase 1 stubs are active for approvals, diffs, file search, multi-agent views, and voice.";
 const INPUT_PLACEHOLDER: &str = "Ask Fawx anything...";
 const SHORTCUT_HINT: &str =
-    "Ctrl+C: cancel | /help: server commands | /clear: clear transcript | /quit: exit";
+    "Ctrl+C: cancel | /help: commands | /clear: clear transcript | /quit: exit";
 const THINKING_FRAMES: [&str; 3] = [".", "..", "..."];
+
+#[derive(Debug, Clone)]
+pub struct RunOptions {
+    pub embedded: bool,
+    pub host: String,
+}
+
+pub async fn run_tui(options: RunOptions) -> anyhow::Result<()> {
+    let (backend, connection_target) = build_backend(&options)?;
+    let (tx, rx) = unbounded_channel();
+    let mut app = App::new(backend, connection_target, tx.clone(), rx);
+    app.spawn_bootstrap();
+
+    let mut terminal = init_terminal()?;
+    let result = app.run(&mut terminal).await;
+    restore_terminal(&mut terminal)?;
+    result
+}
+
+fn build_backend(options: &RunOptions) -> anyhow::Result<(Arc<dyn EngineBackend>, String)> {
+    if options.embedded {
+        return build_embedded_backend();
+    }
+    Ok(build_http_backend(&options.host))
+}
+
+fn build_http_backend(host: &str) -> (Arc<dyn EngineBackend>, String) {
+    let backend = HttpBackend::new(host);
+    let target = backend.base_url().to_string();
+    (Arc::new(backend), target)
+}
+
+#[cfg(feature = "embedded")]
+fn build_embedded_backend() -> anyhow::Result<(Arc<dyn EngineBackend>, String)> {
+    let app = fx_cli::build_headless_app(None)?;
+    Ok((
+        Arc::new(EmbeddedBackend::new(app)),
+        "embedded engine".to_string(),
+    ))
+}
+
+#[cfg(not(feature = "embedded"))]
+fn build_embedded_backend() -> anyhow::Result<(Arc<dyn EngineBackend>, String)> {
+    Err(anyhow::anyhow!(
+        "Embedded mode requires the 'embedded' feature. Build with: cargo build -p fawx-tui --features embedded"
+    ))
+}
 
 #[derive(Clone, Copy)]
 enum EntryRole {
@@ -133,20 +185,9 @@ impl Command for DisableAlternateScroll {
     }
 }
 
-pub async fn run_tui() -> anyhow::Result<()> {
-    let backend = FawxBackend::from_env();
-    let (tx, rx) = unbounded_channel();
-    let mut app = App::new(backend.clone(), tx.clone(), rx);
-    app.spawn_bootstrap();
-
-    let mut terminal = init_terminal()?;
-    let result = app.run(&mut terminal).await;
-    restore_terminal(&mut terminal)?;
-    result
-}
-
 struct App {
-    backend: FawxBackend,
+    backend: Arc<dyn EngineBackend>,
+    connection_target: String,
     tx: UnboundedSender<BackendEvent>,
     rx: UnboundedReceiver<BackendEvent>,
     entries: Vec<Entry>,
@@ -170,12 +211,14 @@ struct App {
 
 impl App {
     fn new(
-        backend: FawxBackend,
+        backend: Arc<dyn EngineBackend>,
+        connection_target: String,
         tx: UnboundedSender<BackendEvent>,
         rx: UnboundedReceiver<BackendEvent>,
     ) -> Self {
         Self {
             backend,
+            connection_target,
             tx,
             rx,
             entries: initial_entries(HERO),
@@ -199,16 +242,10 @@ impl App {
     }
 
     fn spawn_bootstrap(&self) {
-        let backend = self.backend.clone();
+        let backend = Arc::clone(&self.backend);
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let event = match backend.bootstrap().await {
-                Ok(status) => BackendEvent::Connected(status),
-                Err(error) => BackendEvent::ConnectionError(error.to_string()),
-            };
-            if tx.send(event).is_err() {
-                tracing::debug!("backend event receiver dropped during bootstrap");
-            }
+            backend.check_health(tx).await;
         });
     }
 
@@ -348,7 +385,7 @@ impl App {
         self.input.clear();
         self.input_scroll = 0;
 
-        let backend = self.backend.clone();
+        let backend = Arc::clone(&self.backend);
         let tx = self.tx.clone();
         tokio::spawn(async move {
             backend.stream_message(input, tx).await;
@@ -385,13 +422,12 @@ impl App {
             BackendEvent::Connected(status) => {
                 self.push_system(format!(
                     "Connected to Fawx on {} using model {}.",
-                    self.backend.base_url(),
-                    status.model
+                    self.connection_target, status.model
                 ));
                 self.connection = ConnectionState::Connected(status);
             }
             BackendEvent::ConnectionError(error) => {
-                let friendly = FawxBackend::friendly_error_message(&error);
+                let friendly = friendly_error_message(&error);
                 self.push_error(format!("Connection failed: {friendly}"));
                 self.connection = ConnectionState::Error(friendly);
             }
@@ -479,7 +515,7 @@ impl App {
                 self.awaiting_stream_start = false;
                 self.push_error(format!(
                     "Request failed: {}",
-                    FawxBackend::friendly_error_message(&error)
+                    friendly_error_message(&error)
                 ));
             }
         }
@@ -838,7 +874,7 @@ fn initial_entries(logo_art: &str) -> Vec<Entry> {
         },
         Entry {
             role: EntryRole::System,
-            text: "Use /help to see commands handled by the server.".to_string(),
+            text: "Use /help to see available commands.".to_string(),
         },
         Entry {
             role: EntryRole::System,
@@ -975,16 +1011,37 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> anyhow
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::OnceLock;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn test_app() -> App {
-        let backend = FawxBackend::from_env();
+        let backend: Arc<dyn EngineBackend> = Arc::new(HttpBackend::from_env());
         let (tx, rx) = unbounded_channel();
-        let mut app = App::new(backend, tx, rx);
+        let mut app = App::new(backend, crate::DEFAULT_ENGINE_URL.to_string(), tx, rx);
         app.entries.clear();
         app
+    }
+
+    #[derive(Default)]
+    struct TestBackend {
+        health_checks: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl EngineBackend for TestBackend {
+        async fn stream_message(&self, _message: String, _tx: UnboundedSender<BackendEvent>) {}
+
+        async fn check_health(&self, tx: UnboundedSender<BackendEvent>) {
+            self.health_checks.fetch_add(1, Ordering::SeqCst);
+            let _ = tx.send(BackendEvent::Connected(EngineStatus {
+                status: "running".to_string(),
+                model: "test-model".to_string(),
+                memory_entries: 0,
+            }));
+        }
     }
 
     fn line_text(line: &Line<'_>) -> String {
@@ -1042,6 +1099,25 @@ mod tests {
                 None => std::env::remove_var("FAWX_TUI_BASE_URL"),
             }
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn spawn_bootstrap_uses_backend_trait_health_check() {
+        let backend = Arc::new(TestBackend::default());
+        let app_backend: Arc<dyn EngineBackend> = backend.clone();
+        let (tx, rx) = unbounded_channel();
+        let mut app = App::new(app_backend, "embedded engine".to_string(), tx, rx);
+        app.entries.clear();
+
+        app.spawn_bootstrap();
+        let event = app.rx.recv().await.expect("bootstrap event");
+        app.handle_backend_event(event);
+
+        assert_eq!(backend.health_checks.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            last_entry_text(&app),
+            "Connected to Fawx on embedded engine using model test-model."
+        );
     }
 
     async fn spawn_message_server(
@@ -1165,7 +1241,7 @@ mod tests {
         assert_eq!(entries[0].text, "fox art");
         assert!(entries
             .iter()
-            .any(|entry| entry.text == "Use /help to see commands handled by the server."));
+            .any(|entry| entry.text == "Use /help to see available commands."));
     }
 
     #[test]

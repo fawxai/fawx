@@ -4406,7 +4406,7 @@ pub(crate) fn trim_history(history: &mut Vec<Message>, max_history: usize) {
     history.drain(0..remove_count);
 }
 
-pub(crate) fn fawx_data_dir() -> PathBuf {
+pub fn fawx_data_dir() -> PathBuf {
     dirs::home_dir()
         .map(|home| home.join(".fawx"))
         .unwrap_or_else(|| PathBuf::from(".fawx"))

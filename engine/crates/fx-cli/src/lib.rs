@@ -1,0 +1,205 @@
+//! Shared library surface for the Fawx CLI.
+//!
+//! The binary target (`src/main.rs`) keeps the CLI entrypoint. This library
+//! exposes the headless engine and startup helpers for other crates such as
+//! `fawx-tui` embedded mode.
+
+mod ansi;
+mod auth_store;
+#[path = "commands/slash.rs"]
+pub(crate) mod slash_commands;
+mod commands {
+    pub(crate) use super::slash_commands as slash;
+}
+mod config_bridge;
+pub mod headless;
+#[cfg(feature = "http")]
+pub mod http_serve;
+#[cfg(test)]
+mod markdown;
+mod prompts;
+mod proposal_review;
+#[allow(dead_code)] // TODO(#1148): Phase 3 reconnects history, banner art, and markdown
+pub(crate) mod tui;
+mod ui;
+
+use fx_canary::{CanaryConfig, CanaryMonitor, RipcordTrigger, RollbackTrigger};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+struct HeadlessAppBuildConfig {
+    router: Arc<fx_llm::ModelRouter>,
+    config: fx_config::FawxConfig,
+    improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
+    system_prompt: Option<PathBuf>,
+    config_manager: Option<Arc<std::sync::Mutex<fx_config::manager::ConfigManager>>>,
+    data_dir: PathBuf,
+}
+
+/// Build a headless app suitable for embedded use.
+pub fn build_headless_app(system_prompt: Option<PathBuf>) -> anyhow::Result<headless::HeadlessApp> {
+    let auth_manager = tui::load_auth_manager()?;
+    let router = Arc::new(tui::build_router(&auth_manager)?);
+    let config = tui::load_config()?;
+    let build_config = HeadlessAppBuildConfig {
+        data_dir: configured_data_dir(&config),
+        config_manager: Some(build_config_manager(&config)),
+        improvement_provider: tui::build_improvement_provider(&auth_manager, &config),
+        system_prompt,
+        router,
+        config,
+    };
+
+    build_initialized_headless_app(build_config)
+}
+
+fn build_initialized_headless_app(
+    build_config: HeadlessAppBuildConfig,
+) -> anyhow::Result<headless::HeadlessApp> {
+    let mut app = build_app_with_dependencies(build_config)?;
+    app.initialize();
+    Ok(app)
+}
+
+fn build_app_with_dependencies(
+    build_config: HeadlessAppBuildConfig,
+) -> anyhow::Result<headless::HeadlessApp> {
+    let subagent_manager = build_subagent_manager(
+        Arc::clone(&build_config.router),
+        &build_config.config,
+        build_config.improvement_provider.clone(),
+    );
+    let bundle = tui::build_headless_loop_engine_bundle(
+        &build_config.config,
+        build_config.improvement_provider,
+        parent_loop_build_options(&subagent_manager, build_config.config_manager.clone()),
+    )?;
+
+    headless::HeadlessApp::new(headless::HeadlessAppDeps {
+        loop_engine: bundle.engine,
+        router: build_config.router,
+        config: build_config.config,
+        memory: bundle.memory,
+        system_prompt_path: build_config.system_prompt,
+        config_manager: build_config.config_manager,
+        system_prompt_text: None,
+        subagent_manager,
+        canary_monitor: Some(build_canary_monitor(&build_config.data_dir)),
+    })
+}
+
+fn build_config_manager(
+    config: &fx_config::FawxConfig,
+) -> Arc<std::sync::Mutex<fx_config::manager::ConfigManager>> {
+    let data_dir = config
+        .general
+        .data_dir
+        .clone()
+        .unwrap_or_else(tui::fawx_data_dir);
+    let config_path = data_dir.join("config.toml");
+    let manager = fx_config::manager::ConfigManager::from_config(config.clone(), config_path);
+    Arc::new(std::sync::Mutex::new(manager))
+}
+
+fn build_subagent_manager(
+    router: Arc<fx_llm::ModelRouter>,
+    config: &fx_config::FawxConfig,
+    improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
+) -> Arc<fx_subagent::SubagentManager> {
+    let factory = headless::HeadlessSubagentFactory::new(headless::HeadlessSubagentFactoryDeps {
+        router,
+        config: config.clone(),
+        improvement_provider,
+    });
+
+    Arc::new(fx_subagent::SubagentManager::new(
+        fx_subagent::SubagentManagerDeps {
+            factory: Arc::new(factory),
+            limits: fx_subagent::SubagentLimits::default(),
+        },
+    ))
+}
+
+fn parent_loop_build_options(
+    subagent_manager: &Arc<fx_subagent::SubagentManager>,
+    config_manager: Option<Arc<std::sync::Mutex<fx_config::manager::ConfigManager>>>,
+) -> tui::HeadlessLoopBuildOptions {
+    tui::HeadlessLoopBuildOptions {
+        memory_enabled: true,
+        subagent_control: Some(
+            Arc::clone(subagent_manager) as Arc<dyn fx_subagent::SubagentControl>
+        ),
+        config_manager,
+        ..tui::HeadlessLoopBuildOptions::default()
+    }
+}
+
+fn build_canary_monitor(data_dir: &Path) -> CanaryMonitor {
+    let trigger = resolve_ripcord_path(data_dir).map(|path| {
+        Arc::new(RipcordTrigger::new(path, data_dir.to_path_buf())) as Arc<dyn RollbackTrigger>
+    });
+    if trigger.is_none() {
+        tracing::warn!(
+            data_dir = %data_dir.display(),
+            "fawx-ripcord not found; automatic rollback is disabled"
+        );
+    }
+    CanaryMonitor::new(CanaryConfig::default(), trigger)
+}
+
+fn resolve_ripcord_path(data_dir: &Path) -> Option<PathBuf> {
+    resolve_ripcord_path_with(
+        ripcord_current_exe_candidate(),
+        data_dir,
+        std::env::var_os("PATH"),
+    )
+}
+
+fn resolve_ripcord_path_with(
+    current_exe_candidate: Option<PathBuf>,
+    data_dir: &Path,
+    path_env: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    current_exe_candidate
+        .into_iter()
+        .chain(std::iter::once(
+            data_dir.join("bin").join(ripcord_binary_name()),
+        ))
+        .chain(path_candidates_from(path_env))
+        .find(|path| path.is_file())
+}
+
+fn ripcord_current_exe_candidate() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    Some(exe.parent()?.join(ripcord_binary_name()))
+}
+
+fn path_candidates_from(path_env: Option<std::ffi::OsString>) -> Vec<PathBuf> {
+    let Some(paths) = path_env else {
+        return Vec::new();
+    };
+    std::env::split_paths(&paths)
+        .map(|dir| dir.join(ripcord_binary_name()))
+        .collect()
+}
+
+fn ripcord_binary_name() -> &'static str {
+    #[cfg(windows)]
+    {
+        "fawx-ripcord.exe"
+    }
+    #[cfg(not(windows))]
+    {
+        "fawx-ripcord"
+    }
+}
+
+fn configured_data_dir(config: &fx_config::FawxConfig) -> PathBuf {
+    config
+        .general
+        .data_dir
+        .clone()
+        .unwrap_or_else(tui::fawx_data_dir)
+}

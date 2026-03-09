@@ -98,6 +98,7 @@ fx-subagent = { path = "engine/crates/fx-subagent" }
 fx-decompose = { path = "engine/crates/fx-decompose" }
 fx-kernel = { path = "engine/crates/fx-kernel" }
 fx-auth = { path = "engine/crates/fx-auth" }
+fx-cli = { path = "engine/crates/fx-cli" }
 fx-conversation = { path = "engine/crates/fx-conversation" }
 fx-loadable = { path = "engine/crates/fx-loadable" }
 fx-agent = { path = "engine/crates/fx-agent" }
