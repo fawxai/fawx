@@ -18,6 +18,7 @@ use fx_analysis::{AnalysisEngine, AnalysisError, AnalysisFinding, Confidence};
 use fx_auth::auth::{AuthManager, AuthMethod};
 use fx_auth::credential_store::CredentialStore as CredentialStoreTrait;
 use fx_auth::oauth::{PkceFlow, TokenExchangeRequest, TokenResponse};
+use fx_canary::CanaryMonitor;
 use fx_config::manager::ConfigManager;
 use fx_config::{
     save_default_model, save_thinking_budget, FawxConfig, ImprovementToolsConfig, ThinkingBudget,
@@ -1039,6 +1040,7 @@ pub struct TuiApp {
     skill_registry: Arc<SkillRegistry>,
     credential_provider: Option<Arc<dyn CredentialProvider>>,
     tool_executor: Arc<dyn ToolExecutor>,
+    canary_monitor: Option<CanaryMonitor>,
     /// Single encrypted credential store instance (opened once at startup, shared via Arc).
     credential_store: Option<Arc<fx_auth::credential_store::EncryptedFileCredentialStore>>,
     /// Buffer for command output that will be flushed to FawxApp.
@@ -1062,6 +1064,7 @@ pub struct TuiAppDeps {
     pub credential_provider: Option<Arc<dyn CredentialProvider>>,
     pub tool_executor: Arc<dyn ToolExecutor>,
     pub credential_store: Option<Arc<fx_auth::credential_store::EncryptedFileCredentialStore>>,
+    pub canary_monitor: Option<CanaryMonitor>,
     pub signature_policy: SignaturePolicy,
 }
 
@@ -1108,6 +1111,7 @@ impl TuiApp {
             credential_provider: None,
             tool_executor,
             credential_store: None,
+            canary_monitor: None,
             signature_policy: SignaturePolicy::default(),
         })
     }
@@ -1127,6 +1131,7 @@ impl TuiApp {
             credential_provider,
             tool_executor,
             credential_store,
+            canary_monitor,
             signature_policy,
         } = deps;
         let base_data_dir = fawx_data_dir();
@@ -1168,6 +1173,7 @@ impl TuiApp {
             skill_registry,
             credential_provider,
             tool_executor,
+            canary_monitor,
             credential_store,
             output_buffer: Vec::new(),
             signature_policy,
@@ -1838,15 +1844,25 @@ impl TuiApp {
         input: &str,
         loop_result: &LoopResult,
     ) -> Result<(), TuiError> {
-        self.last_signals = loop_result_signals(loop_result).to_vec();
+        self.last_signals = loop_result.signals().to_vec();
         if let Err(e) = self.signal_store.persist(&self.last_signals) {
             eprintln!("warning: signal persist failed: {e}");
         }
+        self.evaluate_canary(loop_result);
         let response_text = loop_result_response_text(loop_result);
         self.record_conversation_turn(input, response_text.clone());
         self.persist_turn(input, &response_text, loop_result)
             .map_err(TuiError::Store)?;
         Ok(())
+    }
+
+    fn evaluate_canary(&mut self, loop_result: &LoopResult) {
+        let Some(monitor) = self.canary_monitor.as_mut() else {
+            return;
+        };
+        if let Some(verdict) = monitor.on_cycle_complete(loop_result.signals().to_vec()) {
+            tracing::info!(?verdict, "canary verdict");
+        }
     }
 
     /// Decide whether to return a batch-rendered response or `None`
@@ -2280,8 +2296,8 @@ impl TuiApp {
             role: "assistant".to_string(),
             content: response.to_string(),
             timestamp_ms: current_time_ms(),
-            signals: Some(signal_labels(loop_result_signals(loop_result))),
-            tool_calls: Some(tool_names(loop_result_signals(loop_result))),
+            signals: Some(signal_labels(loop_result.signals())),
+            tool_calls: Some(tool_names(loop_result.signals())),
             token_usage: token_usage(loop_result),
         };
         self.conversation_store.save_message(&assistant_message)
@@ -3450,6 +3466,7 @@ impl LoopEngineBundle {
             credential_provider: self.credential_provider,
             tool_executor: self.tool_executor,
             credential_store: self.credential_store,
+            canary_monitor: None,
             signature_policy: self.signature_policy,
         }
     }
@@ -4201,16 +4218,6 @@ impl LoopLlmProvider for RouterLoopLlmProvider<'_> {
 
     fn model_name(&self) -> &str {
         &self.active_model
-    }
-}
-
-fn loop_result_signals(result: &LoopResult) -> &[Signal] {
-    match result {
-        LoopResult::Complete { signals, .. }
-        | LoopResult::BudgetExhausted { signals, .. }
-        | LoopResult::NeedsInput { signals, .. }
-        | LoopResult::UserStopped { signals, .. }
-        | LoopResult::Error { signals, .. } => signals,
     }
 }
 
@@ -9022,6 +9029,33 @@ mod tests {
             rendered.contains("Hey there! How can I help?"),
             "expected parsed response text, got: {rendered}"
         );
+    }
+
+    #[tokio::test]
+    async fn handle_message_updates_canary_monitor() {
+        let valid_json = r#"{"action":{"Respond":{"text":"ok"}},"rationale":"r","confidence":0.95,"expected_outcome":null,"sub_goals":[]}"#;
+        let (mut app, _temp_dir) = app_with_mock_model(valid_json);
+        app.canary_monitor = Some(
+            CanaryMonitor::new(
+                fx_canary::CanaryConfig {
+                    min_signals_for_baseline: 1,
+                    ..fx_canary::CanaryConfig::default()
+                },
+                None,
+            )
+            .with_intervals(1, 1),
+        );
+
+        app.handle_message("Hey!")
+            .await
+            .expect("loop result")
+            .expect("batch response");
+
+        assert!(app
+            .canary_monitor
+            .as_ref()
+            .expect("canary monitor")
+            .baseline_captured());
     }
 
     #[test]

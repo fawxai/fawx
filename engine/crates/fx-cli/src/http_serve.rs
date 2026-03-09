@@ -2051,6 +2051,7 @@ mod tests {
                 config_manager: None,
                 system_prompt_text: None,
                 subagent_manager,
+                canary_monitor: None,
             })
             .expect("test app")
         }

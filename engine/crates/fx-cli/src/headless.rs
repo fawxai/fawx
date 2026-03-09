@@ -6,6 +6,7 @@
 //! downstream consumers can safely pipe stdout.
 
 use async_trait::async_trait;
+use fx_canary::CanaryMonitor;
 use fx_config::manager::ConfigManager;
 use fx_config::FawxConfig;
 use fx_core::types::{InputSource, ScreenState, UserInput};
@@ -81,6 +82,7 @@ pub struct HeadlessAppDeps {
     pub config_manager: Option<Arc<Mutex<ConfigManager>>>,
     pub system_prompt_text: Option<String>,
     pub subagent_manager: Arc<SubagentManager>,
+    pub canary_monitor: Option<CanaryMonitor>,
 }
 
 /// Headless Fawx agent: drives `LoopEngine` via stdin/stdout.
@@ -94,6 +96,7 @@ pub struct HeadlessApp {
     conversation_history: Vec<Message>,
     max_history: usize,
     custom_system_prompt: Option<String>,
+    canary_monitor: Option<CanaryMonitor>,
     /// Config manager for runtime config tools. Read via `config_manager()`
     /// when the `http` feature is enabled.
     #[cfg_attr(not(feature = "http"), allow(dead_code))]
@@ -140,6 +143,7 @@ impl HeadlessApp {
             conversation_history: Vec::new(),
             max_history,
             custom_system_prompt,
+            canary_monitor: deps.canary_monitor,
             config_manager: deps.config_manager,
         })
     }
@@ -300,6 +304,7 @@ impl HeadlessApp {
             .run_cycle(snapshot, &llm)
             .await
             .map_err(|e| anyhow::anyhow!("loop error: stage={} reason={}", e.stage, e.reason))?;
+        self.evaluate_canary(&result);
         Ok(self.finalize_cycle(input, &result))
     }
 
@@ -313,6 +318,15 @@ impl HeadlessApp {
             model: self.active_model.clone(),
             iterations,
             tokens_used,
+        }
+    }
+
+    fn evaluate_canary(&mut self, result: &LoopResult) {
+        let Some(monitor) = self.canary_monitor.as_mut() else {
+            return;
+        };
+        if let Some(verdict) = monitor.on_cycle_complete(result.signals().to_vec()) {
+            tracing::info!(?verdict, "canary verdict");
         }
     }
 
@@ -466,6 +480,7 @@ impl SubagentFactory for HeadlessSubagentFactory {
             config_manager: None,
             system_prompt_text: config.system_prompt.clone(),
             subagent_manager: Arc::clone(&self.disabled_manager),
+            canary_monitor: None,
         };
         let app =
             HeadlessApp::new(deps).map_err(|error| SubagentError::Spawn(error.to_string()))?;
@@ -661,6 +676,7 @@ mod tests {
             conversation_history: Vec::new(),
             max_history: 20,
             custom_system_prompt: None,
+            canary_monitor: None,
             config_manager: None,
         }
     }
@@ -795,6 +811,7 @@ mod tests {
             conversation_history: Vec::new(),
             max_history: 20,
             custom_system_prompt: None,
+            canary_monitor: None,
             config_manager: None,
         };
 
@@ -803,6 +820,42 @@ mod tests {
         assert_eq!(result.model, "mock-model");
         assert!(result.iterations > 0);
         assert!(result.tokens_used >= mock_completion_usage_total());
+    }
+
+    #[tokio::test]
+    async fn process_message_updates_canary_monitor() {
+        let mut app = HeadlessApp {
+            loop_engine: test_engine(),
+            router: test_router(),
+            config: FawxConfig::default(),
+            memory: None,
+            _subagent_manager: new_disabled_subagent_manager(),
+            active_model: "mock-model".to_string(),
+            conversation_history: Vec::new(),
+            max_history: 20,
+            custom_system_prompt: None,
+            canary_monitor: Some(
+                CanaryMonitor::new(
+                    fx_canary::CanaryConfig {
+                        min_signals_for_baseline: 1,
+                        ..fx_canary::CanaryConfig::default()
+                    },
+                    None,
+                )
+                .with_intervals(1, 1),
+            ),
+            config_manager: None,
+        };
+
+        app.process_message("hello")
+            .await
+            .expect("process message should succeed");
+
+        assert!(app
+            .canary_monitor
+            .as_ref()
+            .expect("canary monitor")
+            .baseline_captured());
     }
 
     #[test]
@@ -914,6 +967,7 @@ mod tests {
             config_manager: None,
             system_prompt_text: None,
             subagent_manager: new_disabled_subagent_manager(),
+            canary_monitor: None,
         };
 
         let app = HeadlessApp::new(deps).expect("should build");
@@ -978,6 +1032,7 @@ mod tests {
             config_manager: None,
             system_prompt_text: None,
             subagent_manager: new_disabled_subagent_manager(),
+            canary_monitor: None,
         };
 
         let app = HeadlessApp::new(deps).expect("should build");

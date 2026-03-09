@@ -211,6 +211,18 @@ pub enum LoopResult {
     },
 }
 
+impl LoopResult {
+    pub fn signals(&self) -> &[Signal] {
+        match self {
+            Self::Complete { signals, .. }
+            | Self::BudgetExhausted { signals, .. }
+            | Self::NeedsInput { signals, .. }
+            | Self::UserStopped { signals, .. }
+            | Self::Error { signals, .. } => signals,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum CompactionScope {
     Perceive,
@@ -8442,13 +8454,76 @@ mod decomposition_tests {
     }
 
     fn signals_from_result(result: &LoopResult) -> &[Signal] {
-        match result {
-            LoopResult::Complete { signals, .. }
-            | LoopResult::BudgetExhausted { signals, .. }
-            | LoopResult::NeedsInput { signals, .. }
-            | LoopResult::UserStopped { signals, .. }
-            | LoopResult::Error { signals, .. } => signals,
+        result.signals()
+    }
+
+    fn sample_signal(message: &str) -> Signal {
+        Signal {
+            step: LoopStep::Act,
+            kind: SignalKind::Success,
+            message: message.to_string(),
+            metadata: serde_json::json!({"source": "test"}),
+            timestamp_ms: 1,
         }
+    }
+
+    fn assert_loop_result_signals(result: LoopResult, expected: Vec<Signal>) {
+        assert_eq!(result.signals(), expected.as_slice());
+    }
+
+    #[test]
+    fn loop_result_signals_returns_variant_signals() {
+        let complete = vec![sample_signal("complete")];
+        assert_loop_result_signals(
+            LoopResult::Complete {
+                response: "done".to_string(),
+                iterations: 1,
+                tokens_used: TokenUsage::default(),
+                learnings: Vec::new(),
+                signals: complete.clone(),
+            },
+            complete,
+        );
+
+        let budget_exhausted = vec![sample_signal("budget")];
+        assert_loop_result_signals(
+            LoopResult::BudgetExhausted {
+                partial_response: Some("partial".to_string()),
+                iterations: 2,
+                signals: budget_exhausted.clone(),
+            },
+            budget_exhausted,
+        );
+
+        let needs_input = vec![sample_signal("input")];
+        assert_loop_result_signals(
+            LoopResult::NeedsInput {
+                prompt: "next".to_string(),
+                iterations: 3,
+                signals: needs_input.clone(),
+            },
+            needs_input,
+        );
+
+        let stopped = vec![sample_signal("stopped")];
+        assert_loop_result_signals(
+            LoopResult::UserStopped {
+                partial_response: Some("partial".to_string()),
+                iterations: 4,
+                signals: stopped.clone(),
+            },
+            stopped,
+        );
+
+        let error = vec![sample_signal("error")];
+        assert_loop_result_signals(
+            LoopResult::Error {
+                message: "boom".to_string(),
+                recoverable: true,
+                signals: error.clone(),
+            },
+            error,
+        );
     }
 
     async fn run_budget_exhausted_decomposition_cycle() -> (LoopResult, usize) {

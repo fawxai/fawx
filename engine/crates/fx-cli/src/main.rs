@@ -20,6 +20,7 @@ mod ui;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
+use fx_canary::{CanaryConfig, CanaryMonitor, RipcordTrigger, RollbackTrigger};
 use std::{
     ffi::OsStr,
     path::{Path, PathBuf},
@@ -251,6 +252,7 @@ async fn run_tui() -> anyhow::Result<i32> {
     let auth_manager = tui::load_auth_manager()?;
     let router = tui::build_router(&auth_manager)?;
     let config = tui::load_config()?;
+    let data_dir = configured_data_dir(&config);
     let improvement_provider = tui::build_improvement_provider(&auth_manager, &config);
     let config_manager = build_config_manager(&config);
     let subagent_router = Arc::new(tui::build_router(&auth_manager)?);
@@ -261,7 +263,8 @@ async fn run_tui() -> anyhow::Result<i32> {
         improvement_provider,
         parent_loop_build_options(&subagent_manager, Some(Arc::clone(&config_manager))),
     )?;
-    let deps = bundle.into_tui_deps(auth_manager, router, config);
+    let mut deps = bundle.into_tui_deps(auth_manager, router, config);
+    deps.canary_monitor = Some(build_canary_monitor(&data_dir));
     let mut app = tui::TuiApp::new_with_deps(deps)?;
     app.run().await?;
     Ok(0)
@@ -383,7 +386,6 @@ fn build_headless_startup(
     let http_config = config.http.clone();
     #[cfg(feature = "http")]
     let telegram_config = config.telegram.clone();
-    #[cfg(feature = "http")]
     let data_dir = tui::fawx_data_dir();
     let config_manager = Some(build_config_manager(&config));
     let improvement_provider = tui::build_improvement_provider(&auth_manager, &config);
@@ -393,6 +395,7 @@ fn build_headless_startup(
         improvement_provider,
         system_prompt,
         config_manager,
+        data_dir.clone(),
     )?;
     Ok(HeadlessStartup {
         app,
@@ -411,6 +414,7 @@ fn build_headless_app(
     improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
     system_prompt: Option<std::path::PathBuf>,
     config_manager: Option<Arc<std::sync::Mutex<fx_config::manager::ConfigManager>>>,
+    data_dir: PathBuf,
 ) -> anyhow::Result<headless::HeadlessApp> {
     let subagent_manager =
         build_subagent_manager(Arc::clone(&router), &config, improvement_provider.clone());
@@ -428,7 +432,76 @@ fn build_headless_app(
         config_manager,
         system_prompt_text: None,
         subagent_manager,
+        canary_monitor: Some(build_canary_monitor(&data_dir)),
     })
+}
+
+fn build_canary_monitor(data_dir: &Path) -> CanaryMonitor {
+    let trigger = resolve_ripcord_path(data_dir).map(|path| {
+        Arc::new(RipcordTrigger::new(path, data_dir.to_path_buf())) as Arc<dyn RollbackTrigger>
+    });
+    if trigger.is_none() {
+        tracing::warn!(
+            data_dir = %data_dir.display(),
+            "fawx-ripcord not found; automatic rollback is disabled"
+        );
+    }
+    CanaryMonitor::new(CanaryConfig::default(), trigger)
+}
+
+fn resolve_ripcord_path(data_dir: &Path) -> Option<PathBuf> {
+    resolve_ripcord_path_with(
+        ripcord_current_exe_candidate(),
+        data_dir,
+        std::env::var_os("PATH"),
+    )
+}
+
+fn resolve_ripcord_path_with(
+    current_exe_candidate: Option<PathBuf>,
+    data_dir: &Path,
+    path_env: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    current_exe_candidate
+        .into_iter()
+        .chain(std::iter::once(
+            data_dir.join("bin").join(ripcord_binary_name()),
+        ))
+        .chain(path_candidates_from(path_env))
+        .find(|path| path.is_file())
+}
+
+fn ripcord_current_exe_candidate() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    Some(exe.parent()?.join(ripcord_binary_name()))
+}
+
+fn path_candidates_from(path_env: Option<std::ffi::OsString>) -> Vec<PathBuf> {
+    let Some(paths) = path_env else {
+        return Vec::new();
+    };
+    std::env::split_paths(&paths)
+        .map(|dir| dir.join(ripcord_binary_name()))
+        .collect()
+}
+
+fn ripcord_binary_name() -> &'static str {
+    #[cfg(windows)]
+    {
+        "fawx-ripcord.exe"
+    }
+    #[cfg(not(windows))]
+    {
+        "fawx-ripcord"
+    }
+}
+
+fn configured_data_dir(config: &fx_config::FawxConfig) -> PathBuf {
+    config
+        .general
+        .data_dir
+        .clone()
+        .unwrap_or_else(tui::fawx_data_dir)
 }
 
 async fn run_headless(
@@ -778,8 +851,8 @@ mod tests {
     #[cfg(feature = "http")]
     use super::{build_telegram_channel, telegram_webhook_secret_from_credential_store};
     use super::{
-        dispatch_command, fawx_tui_binary_name, find_fawx_tui_binary_from, Cli, Commands,
-        FAWX_TUI_NOT_FOUND_MESSAGE,
+        dispatch_command, fawx_tui_binary_name, find_fawx_tui_binary_from,
+        resolve_ripcord_path_with, ripcord_binary_name, Cli, Commands, FAWX_TUI_NOT_FOUND_MESSAGE,
     };
     use crate::auth_store::AuthStore;
     use clap::Parser;
@@ -789,6 +862,83 @@ mod tests {
 
     fn test_auth_store() -> AuthStore {
         AuthStore::open_for_testing().expect("test auth store")
+    }
+
+    fn touch(path: &std::path::Path) {
+        std::fs::create_dir_all(path.parent().expect("parent path")).expect("create parent");
+        std::fs::write(path, "").expect("write file");
+    }
+
+    #[test]
+    fn resolve_ripcord_path_prefers_current_exe_sibling() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let current = temp_dir.path().join("current").join(ripcord_binary_name());
+        let data = temp_dir
+            .path()
+            .join("data")
+            .join("bin")
+            .join(ripcord_binary_name());
+        let path = temp_dir.path().join("path").join(ripcord_binary_name());
+        touch(&current);
+        touch(&data);
+        touch(&path);
+
+        let resolved = resolve_ripcord_path_with(
+            Some(current.clone()),
+            &temp_dir.path().join("data"),
+            Some(std::env::join_paths([temp_dir.path().join("path")]).expect("join PATH")),
+        );
+
+        assert_eq!(resolved, Some(current));
+    }
+
+    #[test]
+    fn resolve_ripcord_path_falls_back_to_data_dir_bin_before_path() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let data = temp_dir
+            .path()
+            .join("data")
+            .join("bin")
+            .join(ripcord_binary_name());
+        let path = temp_dir.path().join("path").join(ripcord_binary_name());
+        touch(&data);
+        touch(&path);
+
+        let resolved = resolve_ripcord_path_with(
+            None,
+            &temp_dir.path().join("data"),
+            Some(std::env::join_paths([temp_dir.path().join("path")]).expect("join PATH")),
+        );
+
+        assert_eq!(resolved, Some(data));
+    }
+
+    #[test]
+    fn resolve_ripcord_path_uses_path_when_other_locations_are_missing() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let path = temp_dir.path().join("path").join(ripcord_binary_name());
+        touch(&path);
+
+        let resolved = resolve_ripcord_path_with(
+            None,
+            &temp_dir.path().join("data"),
+            Some(std::env::join_paths([temp_dir.path().join("path")]).expect("join PATH")),
+        );
+
+        assert_eq!(resolved, Some(path));
+    }
+
+    #[test]
+    fn resolve_ripcord_path_returns_none_when_binary_is_missing() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+
+        let resolved = resolve_ripcord_path_with(
+            None,
+            &temp_dir.path().join("data"),
+            Some(std::env::join_paths([temp_dir.path().join("path")]).expect("join PATH")),
+        );
+
+        assert!(resolved.is_none());
     }
 
     #[test]
