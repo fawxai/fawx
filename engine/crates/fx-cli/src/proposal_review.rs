@@ -24,6 +24,18 @@ struct StoredProposal {
     sidecar_path: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProposalLoadFailure {
+    file_name: String,
+    error: String,
+}
+
+#[derive(Debug, Default)]
+struct PendingProposals {
+    proposals: Vec<StoredProposal>,
+    failures: Vec<ProposalLoadFailure>,
+}
+
 struct ResolvedTarget {
     absolute_path: PathBuf,
     policy_path: String,
@@ -57,23 +69,18 @@ impl From<io::Error> for ProposalReviewError {
 }
 
 pub(crate) fn render_pending(context: ReviewContext) -> Result<String, ProposalReviewError> {
-    let proposals = load_pending_proposals(&context.proposals_dir)?;
-    if proposals.is_empty() {
+    let pending = load_pending_proposals(&context.proposals_dir)?;
+    if pending.proposals.is_empty() && pending.failures.is_empty() {
         return Ok("No pending proposals.".to_string());
     }
 
     let mut lines = vec!["Pending proposals:".to_string()];
-    for (index, proposal) in proposals.iter().enumerate() {
-        lines.push(format!(
-            "  [{}] {} — {} (risk: {})",
-            index + 1,
-            proposal.stem,
-            proposal.title,
-            proposal.risk
-        ));
+    append_pending_proposals(&mut lines, &pending.proposals);
+    append_parse_failures(&mut lines, &pending.failures);
+    if !pending.proposals.is_empty() {
+        lines.push("".to_string());
+        lines.push("Use /approve <number> or /reject <number>".to_string());
     }
-    lines.push("".to_string());
-    lines.push("Use /approve <number> or /reject <number>".to_string());
     Ok(lines.join("\n"))
 }
 
@@ -119,26 +126,69 @@ pub(crate) fn reject_pending(
     Ok(format!("✗ Rejected proposal: {}", proposal.title))
 }
 
-fn load_pending_proposals(
-    proposals_dir: &Path,
-) -> Result<Vec<StoredProposal>, ProposalReviewError> {
+fn load_pending_proposals(proposals_dir: &Path) -> Result<PendingProposals, ProposalReviewError> {
     if !proposals_dir.exists() {
-        return Ok(Vec::new());
+        return Ok(PendingProposals::default());
     }
 
-    let mut proposals = Vec::new();
+    let mut pending = PendingProposals::default();
     for entry in fs::read_dir(proposals_dir)? {
         let path = entry?.path();
-        if is_markdown_proposal(&path) {
-            proposals.push(load_single_proposal(&path)?);
+        if !is_markdown_proposal(&path) {
+            continue;
+        }
+        match load_single_proposal(&path) {
+            Ok(proposal) => pending.proposals.push(proposal),
+            Err(error) => pending.failures.push(proposal_load_failure(&path, error)),
         }
     }
-    proposals.sort_by(|left, right| {
+    pending.proposals.sort_by(|left, right| {
         left.timestamp
             .cmp(&right.timestamp)
             .then_with(|| left.stem.cmp(&right.stem))
     });
-    Ok(proposals)
+    pending
+        .failures
+        .sort_by(|left, right| left.file_name.cmp(&right.file_name));
+    Ok(pending)
+}
+
+fn append_pending_proposals(lines: &mut Vec<String>, proposals: &[StoredProposal]) {
+    for (index, proposal) in proposals.iter().enumerate() {
+        lines.push(format!(
+            "  [{}] {} — {} (risk: {})",
+            index + 1,
+            proposal.stem,
+            proposal.title,
+            proposal.risk
+        ));
+    }
+}
+
+fn append_parse_failures(lines: &mut Vec<String>, failures: &[ProposalLoadFailure]) {
+    if failures.is_empty() {
+        return;
+    }
+    if lines.len() > 1 {
+        lines.push(String::new());
+    }
+    for failure in failures {
+        lines.push(format!(
+            "  ⚠ {} — could not parse: {}",
+            failure.file_name, failure.error
+        ));
+    }
+}
+
+fn proposal_load_failure(path: &Path, error: ProposalReviewError) -> ProposalLoadFailure {
+    ProposalLoadFailure {
+        file_name: path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| path.display().to_string()),
+        error: error.to_string(),
+    }
 }
 
 fn is_markdown_proposal(path: &Path) -> bool {
@@ -337,7 +387,7 @@ fn resolve_pending_proposal(
     proposals_dir: &Path,
     selector: &str,
 ) -> Result<StoredProposal, ProposalReviewError> {
-    let proposals = load_pending_proposals(proposals_dir)?;
+    let proposals = load_pending_proposals(proposals_dir)?.proposals;
     if proposals.is_empty() {
         return Err(ProposalReviewError::NotFound(
             "No pending proposals.".to_string(),
@@ -512,6 +562,54 @@ mod tests {
 
         assert!(output.contains("[1] 1710000000-first — Update config/a.toml (risk: low)"));
         assert!(output.contains("[2] 1710000100-second — Update config/b.toml (risk: low)"));
+    }
+
+    #[test]
+    fn render_pending_keeps_listing_when_legacy_proposal_is_malformed() {
+        let temp = TempDir::new().expect("tempdir");
+        let proposals_dir = temp.path().join("proposals");
+        fs::create_dir_all(&proposals_dir).expect("create proposals dir");
+        write_sidecar_proposal(
+            &proposals_dir,
+            "1710000000-valid",
+            Path::new("config/a.toml"),
+            "a = 1",
+            None,
+        );
+
+        let malformed = concat!(
+            "# Proposal: Legacy change
+
+",
+            "## What and Why
+Test
+
+",
+            "## Proposed Diff
+",
+            "config/legacy.toml:
+",
+            "legacy = true
+
+",
+            "## Risk
+low
+"
+        );
+        fs::write(proposals_dir.join("1710000001-malformed.md"), malformed)
+            .expect("write malformed proposal");
+
+        let output = render_pending(ReviewContext {
+            proposals_dir: proposals_dir.clone(),
+            working_dir: temp.path().to_path_buf(),
+        })
+        .expect("render pending");
+
+        assert!(output.contains("[1] 1710000000-valid — Update config/a.toml (risk: low)"));
+        assert!(output.contains(
+            "⚠ 1710000001-malformed.md — could not parse: legacy proposal diff fence missing"
+        ));
+        assert!(output.contains("Use /approve <number> or /reject <number>"));
     }
 
     #[test]
