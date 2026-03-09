@@ -4,8 +4,10 @@ pub mod transport;
 pub use ssh::SshTransport;
 pub use transport::{CommandResult, NodeTransport, TransportError};
 
+use fx_config::NodeConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A registered Fawx node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +66,48 @@ pub enum NodeStatus {
     Offline,
     /// Busy with a task.
     Busy,
+}
+
+impl From<&str> for NodeCapability {
+    fn from(value: &str) -> Self {
+        match value.to_ascii_lowercase().as_str() {
+            "agentic_loop" => Self::AgenticLoop,
+            "skill_build" => Self::SkillBuild,
+            "skill_execute" => Self::SkillExecute,
+            "gpu_compute" => Self::GpuCompute,
+            "network" => Self::Network,
+            _ => Self::Custom(value.to_string()),
+        }
+    }
+}
+
+impl From<&NodeConfig> for NodeInfo {
+    fn from(config: &NodeConfig) -> Self {
+        Self {
+            node_id: config.id.clone(),
+            name: config.name.clone(),
+            endpoint: config.endpoint.clone().unwrap_or_default(),
+            auth_token: config.auth_token.clone(),
+            capabilities: config
+                .capabilities
+                .iter()
+                .map(|capability| NodeCapability::from(capability.as_str()))
+                .collect(),
+            status: NodeStatus::Online,
+            last_heartbeat_ms: 0,
+            registered_at_ms: current_time_ms(),
+            address: config.address.clone(),
+            ssh_user: config.user.clone(),
+            ssh_key: config.ssh_key.clone(),
+        }
+    }
+}
+
+fn current_time_ms() -> u64 {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Default stale threshold: 60 seconds in milliseconds.
@@ -331,6 +375,77 @@ mod tests {
             ssh_user: None,
             ssh_key: None,
         }
+    }
+
+    #[test]
+    fn capability_strings_map_known_and_custom_values() {
+        assert_eq!(
+            NodeCapability::from("agentic_loop"),
+            NodeCapability::AgenticLoop
+        );
+        assert_eq!(
+            NodeCapability::from("skill_build"),
+            NodeCapability::SkillBuild
+        );
+        assert_eq!(
+            NodeCapability::from("skill_execute"),
+            NodeCapability::SkillExecute
+        );
+        assert_eq!(
+            NodeCapability::from("gpu_compute"),
+            NodeCapability::GpuCompute
+        );
+        assert_eq!(NodeCapability::from("network"), NodeCapability::Network);
+        assert_eq!(
+            NodeCapability::from("Agentic_Loop"),
+            NodeCapability::AgenticLoop
+        );
+        assert_eq!(
+            NodeCapability::from("SKILL_BUILD"),
+            NodeCapability::SkillBuild
+        );
+        assert_eq!(
+            NodeCapability::from("GPU_COMPUTE"),
+            NodeCapability::GpuCompute
+        );
+        assert_eq!(
+            NodeCapability::from("test"),
+            NodeCapability::Custom("test".to_string())
+        );
+    }
+
+    #[test]
+    fn node_info_from_config_maps_fleet_fields() {
+        let config = NodeConfig {
+            id: "mac-mini".to_string(),
+            name: "Mac Mini".to_string(),
+            endpoint: Some("https://10.0.0.5:8400".to_string()),
+            auth_token: Some("token".to_string()),
+            capabilities: vec!["agentic_loop".to_string(), "test".to_string()],
+            address: Some("10.0.0.5".to_string()),
+            user: Some("joseph".to_string()),
+            ssh_key: Some("~/.ssh/id_ed25519".to_string()),
+        };
+
+        let node = NodeInfo::from(&config);
+
+        assert_eq!(node.node_id, "mac-mini");
+        assert_eq!(node.name, "Mac Mini");
+        assert_eq!(node.endpoint, "https://10.0.0.5:8400");
+        assert_eq!(node.auth_token.as_deref(), Some("token"));
+        assert_eq!(
+            node.capabilities,
+            vec![
+                NodeCapability::AgenticLoop,
+                NodeCapability::Custom("test".to_string()),
+            ]
+        );
+        assert_eq!(node.status, NodeStatus::Online);
+        assert_eq!(node.last_heartbeat_ms, 0);
+        assert!(node.registered_at_ms > 0);
+        assert_eq!(node.address.as_deref(), Some("10.0.0.5"));
+        assert_eq!(node.ssh_user.as_deref(), Some("joseph"));
+        assert_eq!(node.ssh_key.as_deref(), Some("~/.ssh/id_ed25519"));
     }
 
     #[test]

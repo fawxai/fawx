@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+fx-config.workspace = true
 serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

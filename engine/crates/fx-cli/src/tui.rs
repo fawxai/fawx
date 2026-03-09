@@ -31,6 +31,7 @@ use fx_core::message::InternalMessage;
 use fx_core::runtime_info::{ConfigSummary, RuntimeInfo, SkillInfo};
 use fx_core::types::{InputSource, ScreenState, UserInput};
 use fx_core::EventBus;
+use fx_fleet::{NodeRegistry, NodeTransport, SshTransport};
 use fx_improve::{CyclePaths, ImprovementConfig, OutputMode};
 use fx_journal::JournalSkill;
 use fx_kernel::act::{TokenUsage, ToolExecutor};
@@ -56,8 +57,8 @@ use fx_scratchpad::Scratchpad;
 use fx_skills::live_host_api::CredentialProvider;
 use fx_subagent::SubagentControl;
 use fx_tools::{
-    BuiltinToolsSkill, FawxToolExecutor, GitSkill, ImprovementToolsState, SessionToolsSkill,
-    ToolConfig,
+    BuiltinToolsSkill, FawxToolExecutor, GitSkill, ImprovementToolsState, NodeRunState,
+    SessionToolsSkill, ToolConfig,
 };
 use ratatui::DefaultTerminal;
 use sha2::{Digest, Sha256};
@@ -3729,6 +3730,7 @@ fn build_skill_registry(
     if let Some(control) = options.subagent_control {
         executor = executor.with_subagent_control(control);
     }
+    executor = attach_node_run_if_configured(executor, config);
 
     // Wire improvement tools when enabled and a provider is available.
     if config.improvement.enabled {
@@ -3839,6 +3841,45 @@ fn build_skill_registry(
         credential_store,
         signature_policy,
     }
+}
+
+fn attach_node_run_if_configured(
+    executor: FawxToolExecutor,
+    config: &FawxConfig,
+) -> FawxToolExecutor {
+    if config.fleet.nodes.is_empty() {
+        return executor;
+    }
+    let state = build_node_run_state(config);
+    executor.with_node_run(state)
+}
+
+fn build_node_run_state(config: &FawxConfig) -> NodeRunState {
+    let registry = build_node_registry(config);
+    let transport = build_node_transport();
+    NodeRunState {
+        registry: Arc::new(tokio::sync::RwLock::new(registry)),
+        transport,
+    }
+}
+
+fn build_node_registry(config: &FawxConfig) -> NodeRegistry {
+    let threshold_ms = config.fleet.stale_timeout_seconds.saturating_mul(1_000);
+    let mut registry = NodeRegistry::with_stale_threshold(threshold_ms);
+    for node in &config.fleet.nodes {
+        registry.register(node.into());
+    }
+    registry
+}
+
+fn build_node_transport() -> Arc<dyn NodeTransport> {
+    Arc::new(SshTransport::new(default_ssh_key_path()))
+}
+
+fn default_ssh_key_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".ssh/id_ed25519")
 }
 
 /// Build `ImprovementToolsState` from a dedicated provider and data directory.
@@ -6119,6 +6160,19 @@ mod tests {
         (app, temp_dir)
     }
 
+    fn test_fleet_node_config() -> fx_config::NodeConfig {
+        fx_config::NodeConfig {
+            id: "mac-mini".to_string(),
+            name: "Mac Mini".to_string(),
+            endpoint: Some("https://10.0.0.5:8400".to_string()),
+            auth_token: Some("token".to_string()),
+            capabilities: vec!["agentic_loop".to_string(), "test".to_string()],
+            address: Some("10.0.0.5".to_string()),
+            user: Some("joseph".to_string()),
+            ssh_key: Some("~/.ssh/id_ed25519".to_string()),
+        }
+    }
+
     fn sample_wasm_bytes() -> Vec<u8> {
         vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]
     }
@@ -6195,6 +6249,40 @@ mod tests {
 
         assert!(!names.contains(&"spawn_agent".to_string()));
         assert!(!names.contains(&"subagent_status".to_string()));
+    }
+
+    #[test]
+    fn headless_bundle_includes_node_run_when_fleet_nodes_configured() {
+        let (mut config, _temp_dir) = test_config_with_temp_dir();
+        config.fleet.nodes.push(test_fleet_node_config());
+
+        let bundle =
+            build_headless_loop_engine_bundle(&config, None, HeadlessLoopBuildOptions::default())
+                .expect("bundle should build");
+        let names = bundle
+            .skill_registry
+            .tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"node_run".to_string()));
+    }
+
+    #[test]
+    fn headless_bundle_excludes_node_run_without_fleet_nodes() {
+        let (config, _temp_dir) = test_config_with_temp_dir();
+        let bundle =
+            build_headless_loop_engine_bundle(&config, None, HeadlessLoopBuildOptions::default())
+                .expect("bundle should build");
+        let names = bundle
+            .skill_registry
+            .tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+
+        assert!(!names.contains(&"node_run".to_string()));
     }
 
     fn write_test_skill(base_dir: &Path, skill_name: &str, wasm_bytes: &[u8]) {
