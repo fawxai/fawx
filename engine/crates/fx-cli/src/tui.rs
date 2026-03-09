@@ -3,6 +3,7 @@ use crate::prompts::{
     open_browser, parse_auth_selection, prompt_api_key_provider, prompt_choice, prompt_line,
     prompt_non_empty_line, prompt_non_empty_secret, with_normal_screen, AuthSelection,
 };
+use crate::proposal_review::{approve_pending, reject_pending, render_pending, ReviewContext};
 use crate::ui;
 use async_trait::async_trait;
 #[cfg(test)]
@@ -914,6 +915,9 @@ const TUI_COMMANDS: &[&str] = &[
     "/debug",
     "/analyze",
     "/improve",
+    "/proposals",
+    "/approve",
+    "/reject",
     "/synthesis",
     "/thinking",
 ];
@@ -1762,6 +1766,15 @@ impl TuiApp {
             ParsedCommand::Debug => self.show_signals_debug(),
             ParsedCommand::Analyze => self.handle_analyze_command().await?,
             ParsedCommand::Improve(flags) => self.handle_improve_command(flags).await?,
+            ParsedCommand::Proposals => self.handle_proposals_command()?,
+            ParsedCommand::Approve {
+                id,
+                force,
+                has_extra_args,
+            } => self.handle_approve_command(id, force, has_extra_args)?,
+            ParsedCommand::Reject { id, has_extra_args } => {
+                self.handle_reject_command(id, has_extra_args)?;
+            }
             ParsedCommand::Synthesis(instruction) => {
                 self.update_synthesis_instruction(instruction);
             }
@@ -2106,6 +2119,60 @@ impl TuiApp {
         self.print_improve_result(&result, flags.dry_run);
 
         Ok(())
+    }
+
+    fn handle_proposals_command(&mut self) -> Result<(), TuiError> {
+        let message = render_pending(self.proposal_review_context())
+            .unwrap_or_else(|error| format!("Proposal review failed: {error}"));
+        self.tui_println(message);
+        Ok(())
+    }
+
+    fn handle_approve_command(
+        &mut self,
+        id: Option<String>,
+        force: bool,
+        has_extra_args: bool,
+    ) -> Result<(), TuiError> {
+        if id.is_none() || has_extra_args {
+            self.tui_println("Usage: /approve <id> [--force]");
+            return Ok(());
+        }
+        let message = approve_pending(
+            self.proposal_review_context(),
+            id.as_deref().unwrap_or_default(),
+            force,
+        )
+        .unwrap_or_else(|error| format!("Proposal review failed: {error}"));
+        self.tui_println(message);
+        Ok(())
+    }
+
+    fn handle_reject_command(
+        &mut self,
+        id: Option<String>,
+        has_extra_args: bool,
+    ) -> Result<(), TuiError> {
+        if id.is_none() || has_extra_args {
+            self.tui_println("Usage: /reject <id>");
+            return Ok(());
+        }
+        let message = reject_pending(
+            self.proposal_review_context(),
+            id.as_deref().unwrap_or_default(),
+        )
+        .unwrap_or_else(|error| format!("Proposal review failed: {error}"));
+        self.tui_println(message);
+        Ok(())
+    }
+
+    fn proposal_review_context(&self) -> ReviewContext {
+        let base_data_dir = fawx_data_dir();
+        let data_dir = configured_data_dir(&base_data_dir, &self.config);
+        ReviewContext {
+            proposals_dir: data_dir.join("proposals"),
+            working_dir: configured_working_dir(&self.config),
+        }
     }
 
     /// Build the [`ImprovementConfig`], data directory, and repo root for an
@@ -2617,6 +2684,9 @@ impl TuiApp {
         self.tui_println("  /debug         Show full signal dump for last turn");
         self.tui_println("  /analyze       Analyze persisted signals across sessions");
         self.tui_println("  /improve       Run self-improvement cycle");
+        self.tui_println("  /proposals     List pending self-modification proposals");
+        self.tui_println("  /approve       Apply a pending proposal (/approve <id> [--force])");
+        self.tui_println("  /reject        Archive a pending proposal (/reject <id>)");
         self.tui_println("  /synthesis     Set or reset synthesis instruction");
         self.tui_println("  /thinking      Show or set thinking budget (high|low|adaptive|off)");
         self.tui_println("  /clear         Clear the screen and active conversation");
@@ -5754,6 +5824,16 @@ enum ParsedCommand {
     Debug,
     Analyze,
     Improve(ImproveFlags),
+    Proposals,
+    Approve {
+        id: Option<String>,
+        force: bool,
+        has_extra_args: bool,
+    },
+    Reject {
+        id: Option<String>,
+        has_extra_args: bool,
+    },
     Synthesis(Option<String>),
     Clear,
     New,
@@ -5820,6 +5900,9 @@ fn parse_command(value: &str) -> ParsedCommand {
         "debug" => ParsedCommand::Debug,
         "analyze" => ParsedCommand::Analyze,
         "improve" => ParsedCommand::Improve(parse_improve_flags(&mut parts)),
+        "proposals" => ParsedCommand::Proposals,
+        "approve" => parse_approve_command(&mut parts),
+        "reject" => parse_reject_command(&mut parts),
         "synthesis" => {
             let remainder = input[command.len()..].strip_prefix(' ');
             match remainder {
@@ -5854,6 +5937,38 @@ fn parse_improve_flags(parts: &mut std::str::SplitWhitespace<'_>) -> ImproveFlag
         }
     }
     flags
+}
+
+fn parse_approve_command(parts: &mut std::str::SplitWhitespace<'_>) -> ParsedCommand {
+    let first = parts.next();
+    let (id, mut force) = match first {
+        Some("--force") => (None, true),
+        Some(value) => (Some(value.to_string()), false),
+        None => (None, false),
+    };
+    let mut has_extra_args = false;
+
+    for arg in parts {
+        match arg {
+            "--force" if !force => force = true,
+            _ => {
+                has_extra_args = true;
+                break;
+            }
+        }
+    }
+
+    ParsedCommand::Approve {
+        id,
+        force,
+        has_extra_args,
+    }
+}
+
+fn parse_reject_command(parts: &mut std::str::SplitWhitespace<'_>) -> ParsedCommand {
+    let id = parts.next().map(ToString::to_string);
+    let has_extra_args = parts.next().is_some();
+    ParsedCommand::Reject { id, has_extra_args }
 }
 
 struct RawModeGuard;
@@ -8035,6 +8150,22 @@ mod tests {
         assert_eq!(parse_command("/loop"), ParsedCommand::Loop);
         assert_eq!(parse_command("/status"), ParsedCommand::Status);
         assert_eq!(parse_command("/analyze"), ParsedCommand::Analyze);
+        assert_eq!(parse_command("/proposals"), ParsedCommand::Proposals);
+        assert_eq!(
+            parse_command("/approve 7 --force"),
+            ParsedCommand::Approve {
+                id: Some("7".to_string()),
+                force: true,
+                has_extra_args: false,
+            }
+        );
+        assert_eq!(
+            parse_command("/reject 7"),
+            ParsedCommand::Reject {
+                id: Some("7".to_string()),
+                has_extra_args: false,
+            }
+        );
         assert_eq!(
             parse_command("/synthesis Show raw output"),
             ParsedCommand::Synthesis(Some("Show raw output".to_string()))
@@ -8094,6 +8225,9 @@ mod tests {
         assert!(should_add_to_history("/new"));
         assert!(should_add_to_history("/history"));
         assert!(should_add_to_history("/analyze"));
+        assert!(should_add_to_history("/proposals"));
+        assert!(should_add_to_history("/approve 1 --force"));
+        assert!(should_add_to_history("/reject 1"));
     }
 
     #[test]

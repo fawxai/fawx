@@ -11,6 +11,7 @@ mod http_serve;
 #[allow(dead_code)] // TODO(#1148): Phase 3 will wire markdown rendering into ratatui
 mod markdown;
 mod prompts;
+mod proposal_review;
 // Phase 2: many rendering/history utilities are currently test-only while we
 // wire ratatui. Phase 3 (polish) will re-connect markdown rendering, banner
 // art, and history persistence. Suppress dead-code warnings until then.

@@ -9,7 +9,7 @@ use fx_kernel::act::{
 };
 use fx_kernel::cancellation::CancellationToken;
 use fx_llm::{ToolCall, ToolDefinition};
-use fx_propose::{Proposal, ProposalWriter};
+use fx_propose::{current_file_hash, Proposal, ProposalWriter};
 use fx_subagent::{
     SpawnConfig, SpawnMode, SubagentControl, SubagentHandle, SubagentId, SubagentStatus,
 };
@@ -317,8 +317,9 @@ impl FawxToolExecutor {
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("unknown");
-        let path_exists = path.exists();
-        let action = if path_exists { "replace" } else { "create" };
+        let action = if path.exists() { "replace" } else { "create" };
+        let file_hash = current_file_hash(&self.working_dir, path)
+            .map_err(|error| format!("failed to inspect target file: {error}"))?;
         let proposal = Proposal {
             title: format!("Modify {filename}"),
             description: format!(
@@ -332,6 +333,7 @@ impl FawxToolExecutor {
             risk: "This path is classified as propose-tier under self-modification policy."
                 .to_string(),
             timestamp,
+            file_hash,
         };
         let writer = ProposalWriter::new(config.proposals_dir.clone());
         let proposal_path = writer.write(&proposal).map_err(|error| error.to_string())?;
@@ -3030,7 +3032,7 @@ mod tests {
     }
 
     #[test]
-    fn write_file_propose_tier_creates_proposal() {
+    fn write_file_propose_tier_creates_markdown_and_sidecar() {
         let temp = TempDir::new().expect("temp");
         let proposals_dir = temp.path().join("proposals");
         let config = SelfModifyConfig {
@@ -3051,16 +3053,17 @@ mod tests {
         assert!(message.contains("NOT modified"));
         assert!(proposals_dir.exists());
 
-        let entries: Vec<_> = fs::read_dir(&proposals_dir)
+        let proposal_path = fs::read_dir(&proposals_dir)
             .expect("read proposals")
-            .collect();
-        assert_eq!(entries.len(), 1);
-
-        let proposal_path = entries[0].as_ref().expect("entry").path();
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("md"))
+            .expect("markdown proposal");
         let content = fs::read_to_string(&proposal_path).expect("read proposal");
         assert!(content.contains("# Proposal:"));
         assert!(content.contains("fn tick() {}"));
         assert!(content.contains("kernel/loop.rs") || content.contains("loop.rs"));
+        assert!(proposal_path.with_extension("json").exists());
     }
 
     #[test]
@@ -3105,6 +3108,47 @@ mod tests {
         assert!(
             proposal.contains("proposed"),
             "missing proposed label: {proposal}"
+        );
+    }
+
+    #[test]
+    fn write_file_propose_tier_records_target_hash_in_sidecar() {
+        let temp = TempDir::new().expect("temp");
+        let proposals_dir = temp.path().join("proposals");
+        let config = SelfModifyConfig {
+            enabled: true,
+            propose_paths: vec!["kernel/**".to_string()],
+            proposals_dir: proposals_dir.clone(),
+            ..SelfModifyConfig::default()
+        };
+        let kernel_dir = temp.path().join("kernel");
+        let target = kernel_dir.join("loop.rs");
+        fs::create_dir_all(&kernel_dir).expect("create kernel dir");
+        fs::write(&target, "fn old() {}\n").expect("write original");
+        let executor = FawxToolExecutor::new(temp.path().to_path_buf(), ToolConfig::default())
+            .with_self_modify(config);
+
+        executor
+            .handle_write_file(
+                &serde_json::json!({"path": "kernel/loop.rs", "content": "fn new() {}"}),
+            )
+            .expect("propose should succeed");
+
+        let sidecar_path = fs::read_dir(&proposals_dir)
+            .expect("read proposals")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+            .expect("sidecar proposal");
+        let sidecar = fs::read_to_string(sidecar_path).expect("read sidecar");
+        let value: serde_json::Value = serde_json::from_str(&sidecar).expect("parse sidecar");
+
+        assert_eq!(
+            value["file_hash_at_creation"],
+            serde_json::Value::String(format!(
+                "sha256:{}",
+                fx_propose::sha256_hex(b"fn old() {}\n")
+            ))
         );
     }
 

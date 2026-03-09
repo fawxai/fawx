@@ -4,12 +4,18 @@
 //! proposal is written to disk instead. A human must review and approve
 //! the proposal before the change can be applied.
 
+mod target_file;
+
+pub use target_file::{checked_target_path, current_file_hash, sha256_hex};
+
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const MAX_TITLE_LENGTH: usize = 80;
+const SIDECAR_VERSION: u8 = 1;
 
 /// A structured proposal for a self-modification change.
 #[derive(Debug, Clone)]
@@ -20,6 +26,36 @@ pub struct Proposal {
     pub proposed_content: String,
     pub risk: String,
     pub timestamp: u64,
+    pub file_hash: Option<String>,
+}
+
+/// Machine-readable proposal metadata stored alongside markdown proposals.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposalSidecar {
+    pub version: u8,
+    pub timestamp: u64,
+    pub title: String,
+    pub description: String,
+    pub target_path: String,
+    pub proposed_content: String,
+    pub risk: String,
+    pub file_hash_at_creation: Option<String>,
+}
+
+impl ProposalSidecar {
+    #[must_use]
+    pub fn from_proposal(proposal: &Proposal) -> Self {
+        Self {
+            version: SIDECAR_VERSION,
+            timestamp: proposal.timestamp,
+            title: proposal.title.clone(),
+            description: proposal.description.clone(),
+            target_path: proposal.target_path.display().to_string(),
+            proposed_content: proposal.proposed_content.clone(),
+            risk: proposal.risk.clone(),
+            file_hash_at_creation: proposal.file_hash.clone(),
+        }
+    }
 }
 
 /// Error type for proposal operations.
@@ -27,15 +63,23 @@ pub struct Proposal {
 pub enum ProposalError {
     /// Failed to create the proposals directory.
     CreateDir(io::Error),
-    /// Failed to write the proposal file.
-    WriteFile(io::Error),
+    /// Failed to write the markdown proposal file.
+    WriteMarkdown(io::Error),
+    /// Failed to serialize the sidecar JSON.
+    SerializeSidecar(serde_json::Error),
+    /// Failed to write the sidecar JSON file.
+    WriteSidecar(io::Error),
 }
 
 impl fmt::Display for ProposalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::CreateDir(error) => write!(f, "failed to create proposals directory: {error}"),
-            Self::WriteFile(error) => write!(f, "failed to write proposal: {error}"),
+            Self::WriteMarkdown(error) => write!(f, "failed to write proposal markdown: {error}"),
+            Self::SerializeSidecar(error) => {
+                write!(f, "failed to serialize proposal sidecar: {error}")
+            }
+            Self::WriteSidecar(error) => write!(f, "failed to write proposal sidecar: {error}"),
         }
     }
 }
@@ -43,7 +87,10 @@ impl fmt::Display for ProposalError {
 impl std::error::Error for ProposalError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::CreateDir(error) | Self::WriteFile(error) => Some(error),
+            Self::CreateDir(error) | Self::WriteMarkdown(error) | Self::WriteSidecar(error) => {
+                Some(error)
+            }
+            Self::SerializeSidecar(error) => Some(error),
         }
     }
 }
@@ -62,35 +109,82 @@ impl ProposalWriter {
     /// Write a proposal to disk and return the path of the created file.
     pub fn write(&self, proposal: &Proposal) -> Result<PathBuf, ProposalError> {
         fs::create_dir_all(&self.proposals_dir).map_err(ProposalError::CreateDir)?;
-        let sanitized = sanitize_title(&proposal.title);
-        let filename = format!("{}-{}.md", proposal.timestamp, sanitized);
-        let path = self.proposals_dir.join(filename);
-        let content = format_proposal(proposal);
-        fs::write(&path, content).map_err(ProposalError::WriteFile)?;
-        Ok(path)
+        let stem = proposal_stem(proposal);
+        let markdown_path = self.markdown_path(&stem);
+        let sidecar_path = self.sidecar_path(&stem);
+        write_markdown(&markdown_path, proposal)?;
+        write_sidecar(&sidecar_path, proposal)?;
+        Ok(markdown_path)
     }
+
+    fn markdown_path(&self, stem: &str) -> PathBuf {
+        self.proposals_dir.join(format!("{stem}.md"))
+    }
+
+    fn sidecar_path(&self, stem: &str) -> PathBuf {
+        self.proposals_dir.join(format!("{stem}.json"))
+    }
+}
+
+fn proposal_stem(proposal: &Proposal) -> String {
+    let sanitized = sanitize_title(&proposal.title);
+    format!("{}-{sanitized}", proposal.timestamp)
+}
+
+fn write_markdown(path: &Path, proposal: &Proposal) -> Result<(), ProposalError> {
+    let content = format_proposal(proposal);
+    fs::write(path, content).map_err(ProposalError::WriteMarkdown)
+}
+
+fn write_sidecar(path: &Path, proposal: &Proposal) -> Result<(), ProposalError> {
+    let content = serde_json::to_string_pretty(&ProposalSidecar::from_proposal(proposal))
+        .map_err(ProposalError::SerializeSidecar)?;
+    fs::write(path, content).map_err(ProposalError::WriteSidecar)
 }
 
 /// Format a proposal as structured markdown per the git-self-modification spec.
 #[must_use]
 pub(crate) fn format_proposal(proposal: &Proposal) -> String {
+    let fence = proposal_fence(&proposal.proposed_content);
     format!(
         "# Proposal: {title}\n\n\
          ## What and Why\n\
          {description}\n\n\
          ## Proposed Diff\n\
          {target_path}:\n\
-         ```\n\
+         {fence}\n\
          {diff}\n\
-         ```\n\n\
+         {fence}\n\n\
          ## Risk\n\
          {risk}\n",
         title = proposal.title,
         description = proposal.description,
         target_path = proposal.target_path.display(),
+        fence = fence,
         diff = proposal.proposed_content,
         risk = proposal.risk,
     )
+}
+
+fn proposal_fence(content: &str) -> String {
+    let longest_run = content.lines().map(longest_backtick_run).max().unwrap_or(0);
+    "`".repeat((longest_run + 1).max(3))
+}
+
+fn longest_backtick_run(line: &str) -> usize {
+    let mut longest = 0;
+    let mut current = 0;
+
+    for ch in line.chars() {
+        if ch == '`' {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 0;
+        }
+    }
+
+    longest
 }
 
 /// Sanitize a title for use as a filename component.
@@ -159,6 +253,7 @@ mod tests {
             proposed_content: "fn tick() {}".to_string(),
             risk: "low".to_string(),
             timestamp: 1_710_000_000,
+            file_hash: Some("sha256:abcdef1234".to_string()),
         }
     }
 
@@ -217,18 +312,41 @@ mod tests {
     }
 
     #[test]
-    fn proposal_writer_creates_directory_and_file() {
+    fn proposal_fence_uses_standard_triple_backticks_when_content_has_no_backticks() {
+        assert_eq!(proposal_fence("fn tick() {}"), "```");
+    }
+
+    #[test]
+    fn format_proposal_uses_longer_fence_when_content_contains_triple_backticks() {
+        let mut proposal = sample_proposal();
+        proposal.proposed_content = "before\n```rust\nfn demo() {}\n```\nafter".to_string();
+
+        let output = format_proposal(&proposal);
+
+        assert!(output.contains("````"));
+        assert!(output.contains("```rust"));
+    }
+
+    #[test]
+    fn proposal_writer_creates_directory_markdown_and_sidecar() {
         let temp = TempDir::new().expect("tempdir");
         let proposals_dir = temp.path().join("proposals");
         let proposal = sample_proposal();
         let writer = ProposalWriter::new(proposals_dir.clone());
 
-        let file_path = writer.write(&proposal).expect("write proposal");
+        let markdown_path = writer.write(&proposal).expect("write proposal");
+        let sidecar_path = markdown_path.with_extension("json");
 
         assert!(proposals_dir.exists());
-        assert!(file_path.exists());
-        let content = fs::read_to_string(file_path).expect("read proposal");
-        assert_eq!(content, format_proposal(&proposal));
+        assert!(markdown_path.exists());
+        assert!(sidecar_path.exists());
+
+        let markdown = fs::read_to_string(markdown_path).expect("read markdown");
+        assert_eq!(markdown, format_proposal(&proposal));
+
+        let sidecar = fs::read_to_string(sidecar_path).expect("read sidecar");
+        let parsed: ProposalSidecar = serde_json::from_str(&sidecar).expect("parse sidecar");
+        assert_eq!(parsed, ProposalSidecar::from_proposal(&proposal));
     }
 
     #[test]
@@ -245,6 +363,7 @@ mod tests {
             .expect("proposal filename should be utf-8");
 
         assert_eq!(filename, "1710000000-modify-kernel-loop-rs.md");
+        assert!(path.with_extension("json").exists());
     }
 
     #[test]
@@ -258,5 +377,16 @@ mod tests {
 
         assert!(proposals_dir.exists());
         assert!(path.exists());
+        assert!(path.with_extension("json").exists());
+    }
+
+    #[test]
+    fn proposal_sidecar_serializes_null_hash_when_missing() {
+        let mut proposal = sample_proposal();
+        proposal.file_hash = None;
+
+        let sidecar = ProposalSidecar::from_proposal(&proposal);
+
+        assert_eq!(sidecar.file_hash_at_creation, None);
     }
 }

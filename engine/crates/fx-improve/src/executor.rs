@@ -4,7 +4,7 @@ use crate::config::{ImprovementConfig, OutputMode};
 use crate::detector::ImprovementDetector;
 use crate::error::ImprovementError;
 use crate::planner::FixPlan;
-use fx_propose::{Proposal, ProposalWriter};
+use fx_propose::{current_file_hash, Proposal, ProposalWriter};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -111,7 +111,7 @@ impl ImprovementExecutor {
         plan: &FixPlan,
         branch_name: Option<&str>,
     ) -> Result<PathBuf, ImprovementError> {
-        let proposal = build_proposal(plan, branch_name);
+        let proposal = build_proposal(plan, branch_name, &self.repo_root)?;
         Ok(self.proposal_writer.write(&proposal)?)
     }
 
@@ -279,29 +279,47 @@ fn run_git_command(
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn build_proposal(plan: &FixPlan, branch_name: Option<&str>) -> Proposal {
-    let timestamp = match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(duration) => duration.as_secs(),
-        Err(_) => {
-            tracing::warn!("system clock before UNIX epoch, using timestamp 0");
-            0
-        }
-    };
-
+fn build_proposal(
+    plan: &FixPlan,
+    branch_name: Option<&str>,
+    repo_root: &Path,
+) -> Result<Proposal, ImprovementError> {
     let target_path = plan
         .target_files
         .first()
         .cloned()
         .unwrap_or_else(|| PathBuf::from("(unspecified)"));
+    let file_hash = proposal_file_hash(repo_root, &target_path)?;
 
-    Proposal {
+    Ok(Proposal {
         title: format!("Improvement: {}", plan.candidate.finding.pattern_name),
         description: format_proposal_description(plan, branch_name),
         target_path,
         proposed_content: format_proposed_content(plan),
         risk: plan.risk.to_string(),
-        timestamp,
+        timestamp: proposal_timestamp(),
+        file_hash,
+    })
+}
+
+fn proposal_timestamp() -> u64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs(),
+        Err(_) => {
+            tracing::warn!("system clock before UNIX epoch, using timestamp 0");
+            0
+        }
     }
+}
+
+fn proposal_file_hash(
+    repo_root: &Path,
+    target_path: &Path,
+) -> Result<Option<String>, ImprovementError> {
+    if target_path == Path::new("(unspecified)") {
+        return Ok(None);
+    }
+    current_file_hash(repo_root, target_path).map_err(ImprovementError::Io)
 }
 
 fn format_proposal_description(plan: &FixPlan, branch_name: Option<&str>) -> String {
@@ -480,6 +498,37 @@ mod tests {
         assert_eq!(result.proposals_written.len(), 1);
         assert!(result.proposals_written[0].exists());
         assert!(result.branches_created.is_empty());
+    }
+
+    #[test]
+    fn proposal_only_records_target_hash_when_file_exists() {
+        let tmp = TempDir::new().unwrap();
+        let repo_root = tmp.path().join("repo");
+        std::fs::create_dir_all(repo_root.join("src")).unwrap();
+        std::fs::write(repo_root.join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        let executor = ImprovementExecutor::new(
+            ImprovementConfig::default(),
+            tmp.path().join("proposals"),
+            repo_root,
+        );
+        let mut detector =
+            ImprovementDetector::new(ImprovementConfig::default(), tmp.path()).unwrap();
+
+        let result = executor
+            .execute(&[mk_plan("proposal-hash")], &mut detector)
+            .unwrap();
+        let sidecar =
+            std::fs::read_to_string(result.proposals_written[0].with_extension("json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&sidecar).unwrap();
+
+        assert_eq!(
+            value["file_hash_at_creation"],
+            serde_json::Value::String(format!(
+                "sha256:{}",
+                fx_propose::sha256_hex(b"fn main() {}\n")
+            ))
+        );
     }
 
     #[test]

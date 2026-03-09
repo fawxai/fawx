@@ -14,7 +14,7 @@ use crate::cancellation::CancellationToken;
 use async_trait::async_trait;
 use fx_core::self_modify::{classify_path, PathTier, SelfModifyConfig};
 use fx_llm::{ToolCall, ToolDefinition};
-use fx_propose::{Proposal, ProposalWriter};
+use fx_propose::{current_file_hash, Proposal, ProposalWriter};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -113,7 +113,7 @@ fn is_write_tool(name: &str) -> bool {
     WRITE_TOOLS.contains(&name)
 }
 
-fn is_tier3_path(relative_path: &str) -> bool {
+pub fn is_tier3_path(relative_path: &str) -> bool {
     let normalized = normalize_relative(relative_path);
     TIER3_PATHS
         .iter()
@@ -180,7 +180,7 @@ fn epoch_seconds() -> u64 {
 /// from path tier context (e.g., Tier 2 propose paths vs config changes).
 const DEFAULT_RISK_LEVEL: &str = "medium";
 
-fn build_proposal(call: &ToolCall, path: &str) -> Proposal {
+fn build_proposal(call: &ToolCall, path: &str, file_hash: Option<String>) -> Proposal {
     let content = call
         .arguments
         .get("content")
@@ -195,6 +195,7 @@ fn build_proposal(call: &ToolCall, path: &str) -> Proposal {
         proposed_content: content,
         risk: DEFAULT_RISK_LEVEL.to_string(),
         timestamp: epoch_seconds(),
+        file_hash,
     }
 }
 
@@ -234,7 +235,7 @@ fn classify_and_gate(
     }
 
     let tier = classify_path(Path::new(&path), working_dir, config);
-    apply_tier(call, &path, tier, proposals_dir)
+    apply_tier(call, &path, tier, working_dir, proposals_dir)
 }
 
 fn covers_path(active: &Option<ActiveProposal>, path: &str) -> bool {
@@ -254,18 +255,40 @@ fn covers_path(active: &Option<ActiveProposal>, path: &str) -> bool {
         .any(|p| normalize_relative(&p.to_string_lossy()) == normalized)
 }
 
-fn apply_tier(call: &ToolCall, path: &str, tier: PathTier, proposals_dir: &Path) -> GateDecision {
+fn apply_tier(
+    call: &ToolCall,
+    path: &str,
+    tier: PathTier,
+    working_dir: &Path,
+    proposals_dir: &Path,
+) -> GateDecision {
     match tier {
         PathTier::Allow => GateDecision::PassThrough,
         PathTier::Deny => {
             GateDecision::Block(blocked_result(call, path, "Path is in the deny tier."))
         }
-        PathTier::Propose => create_proposal_decision(call, path, proposals_dir),
+        PathTier::Propose => create_proposal_decision(call, path, working_dir, proposals_dir),
     }
 }
 
-fn create_proposal_decision(call: &ToolCall, path: &str, proposals_dir: &Path) -> GateDecision {
-    let proposal = build_proposal(call, path);
+fn create_proposal_decision(
+    call: &ToolCall,
+    path: &str,
+    working_dir: &Path,
+    proposals_dir: &Path,
+) -> GateDecision {
+    let file_hash = match current_file_hash(working_dir, Path::new(path)) {
+        Ok(hash) => hash,
+        Err(err) => {
+            return GateDecision::Block(blocked_result(
+                call,
+                path,
+                &format!("Failed to inspect target file: {err}"),
+            ));
+        }
+    };
+
+    let proposal = build_proposal(call, path, file_hash);
     let writer = ProposalWriter::new(proposals_dir.to_path_buf());
     match writer.write(&proposal) {
         Ok(proposal_path) => GateDecision::Propose(proposal_result(call, path, &proposal_path)),
@@ -383,6 +406,8 @@ mod tests {
     use crate::act::{ToolCacheStats, ToolCacheability, ToolExecutorError, ToolResult};
     use async_trait::async_trait;
     use fx_llm::ToolCall;
+    use fx_propose::sha256_hex;
+    use std::fs;
     use std::sync::{Arc, Mutex};
 
     #[derive(Debug, Clone)]
@@ -463,10 +488,19 @@ mod tests {
     }
 
     fn make_executor(config: SelfModifyConfig) -> (ProposalGateExecutor<MockInner>, MockInner) {
+        let proposals_dir =
+            std::env::temp_dir().join(format!("fx-proposal-gate-test-{}", epoch_seconds()));
+        make_executor_in(config, PathBuf::from(""), proposals_dir)
+    }
+
+    fn make_executor_in(
+        config: SelfModifyConfig,
+        working_dir: PathBuf,
+        proposals_dir: PathBuf,
+    ) -> (ProposalGateExecutor<MockInner>, MockInner) {
         let inner = MockInner::new();
         let probe = inner.clone();
-        let tmp = std::env::temp_dir().join(format!("fx-proposal-gate-test-{}", epoch_seconds()));
-        let state = ProposalGateState::new(config, PathBuf::from(""), tmp);
+        let state = ProposalGateState::new(config, working_dir, proposals_dir);
         (ProposalGateExecutor::new(inner, state), probe)
     }
 
@@ -528,6 +562,38 @@ mod tests {
         assert!(results[0].success);
         assert!(results[0].output.contains("PROPOSAL CREATED"));
         assert_eq!(probe.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn proposal_sidecar_records_target_hash_at_creation() {
+        let working_dir =
+            std::env::temp_dir().join(format!("fx-proposal-gate-work-{}", epoch_seconds()));
+        let proposals_dir =
+            std::env::temp_dir().join(format!("fx-proposal-gate-proposals-{}", epoch_seconds()));
+        fs::create_dir_all(working_dir.join("config")).unwrap();
+        fs::write(working_dir.join("config/settings.toml"), b"before = true\n").unwrap();
+
+        let (executor, _) = make_executor_in(enabled_config(), working_dir.clone(), proposals_dir);
+        let results = executor
+            .execute_tools(&[write_call("1", "config/settings.toml")], None)
+            .await
+            .unwrap();
+
+        assert!(results[0].success);
+        let sidecar_path = std::fs::read_dir(executor.state.lock().unwrap().proposals_dir.clone())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+            .unwrap();
+        let sidecar = std::fs::read_to_string(sidecar_path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&sidecar).unwrap();
+        let expected = format!("sha256:{}", sha256_hex(b"before = true\n"));
+
+        assert_eq!(
+            value["file_hash_at_creation"],
+            serde_json::Value::String(expected)
+        );
     }
 
     // Test 3: Allow tier passes through to inner

@@ -24,6 +24,7 @@ fx-tools = { workspace = true, features = ["improvement"] }
 fx-core.workspace = true
 fx-fleet.workspace = true
 fx-kernel.workspace = true
+fx-propose.workspace = true
 fx-canary = { path = "../fx-canary" }
 fx-subagent.workspace = true
 fx-auth.workspace = true
