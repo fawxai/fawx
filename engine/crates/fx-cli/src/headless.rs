@@ -221,7 +221,16 @@ impl HeadlessApp {
     /// Updates memory context, runs a loop cycle, records the turn in
     /// conversation history, and returns the extracted response.
     pub async fn process_message(&mut self, input: &str) -> Result<CycleResult, anyhow::Error> {
-        self.run_cycle_result(input).await
+        let source = InputSource::Text;
+        self.process_message_for_source(input, &source).await
+    }
+
+    pub async fn process_message_for_source(
+        &mut self,
+        input: &str,
+        source: &InputSource,
+    ) -> Result<CycleResult, anyhow::Error> {
+        self.run_cycle_result(input, source).await
     }
 
     /// Return the active model identifier.
@@ -295,9 +304,13 @@ impl HeadlessApp {
         Ok(())
     }
 
-    async fn run_cycle_result(&mut self, input: &str) -> Result<CycleResult, anyhow::Error> {
+    async fn run_cycle_result(
+        &mut self,
+        input: &str,
+        source: &InputSource,
+    ) -> Result<CycleResult, anyhow::Error> {
         self.update_memory_context(input);
-        let snapshot = self.build_perception_snapshot(input);
+        let snapshot = self.build_perception_snapshot(input, source);
         let llm = RouterLoopLlmProvider::new(&self.router, self.active_model.clone());
         let result = self
             .loop_engine
@@ -381,7 +394,7 @@ impl HeadlessApp {
         }
     }
 
-    fn build_perception_snapshot(&self, input: &str) -> PerceptionSnapshot {
+    fn build_perception_snapshot(&self, input: &str, source: &InputSource) -> PerceptionSnapshot {
         let timestamp_ms = current_time_ms();
         PerceptionSnapshot {
             screen: ScreenState {
@@ -395,7 +408,7 @@ impl HeadlessApp {
             sensor_data: None,
             user_input: Some(UserInput {
                 text: input.to_string(),
-                source: InputSource::Text,
+                source: source.clone(),
                 timestamp: timestamp_ms,
                 context_id: None,
             }),
@@ -900,13 +913,24 @@ mod tests {
     #[test]
     fn perception_snapshot_has_correct_app_id() {
         let app = test_app();
-        let snap = app.build_perception_snapshot("hi");
+        let source = InputSource::Text;
+        let snap = app.build_perception_snapshot("hi", &source);
         assert_eq!(snap.active_app, "fawx.headless");
         assert_eq!(snap.screen.current_app, "fawx.headless");
         assert_eq!(
             snap.user_input.as_ref().map(|u| u.text.as_str()),
             Some("hi")
         );
+    }
+
+    #[test]
+    fn perception_snapshot_clones_borrowed_channel_source() {
+        let app = test_app();
+        let source = InputSource::Channel("telegram".to_string());
+        let snap = app.build_perception_snapshot("hi", &source);
+
+        assert_eq!(source, InputSource::Channel("telegram".to_string()));
+        assert_eq!(snap.user_input.as_ref().map(|u| &u.source), Some(&source));
     }
 
     #[test]

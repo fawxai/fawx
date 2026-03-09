@@ -3,7 +3,7 @@
 //! The [`ChannelRegistry`] tracks all registered input/output channels.
 //! The [`ResponseRouter`] routes kernel responses back to the originating channel.
 
-use fx_core::channel::{Channel, ChannelError};
+use fx_core::channel::{Channel, ChannelError, ResponseContext};
 use fx_core::types::InputSource;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,12 +16,12 @@ use std::sync::{Arc, Mutex};
 ///
 /// Tracks which channels are connected and provides lookup by id.
 pub struct ChannelRegistry {
-    channels: Vec<Box<dyn Channel>>,
+    channels: Vec<Arc<dyn Channel>>,
 }
 
 impl std::fmt::Debug for ChannelRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let ids: Vec<&str> = self.channels.iter().map(|ch| ch.id()).collect();
+        let ids: Vec<&str> = self.channels.iter().map(|channel| channel.id()).collect();
         f.debug_struct("ChannelRegistry")
             .field("channels", &ids)
             .finish()
@@ -39,7 +39,7 @@ impl ChannelRegistry {
     /// Register a new channel.
     ///
     /// If a channel with the same id already exists, it is replaced.
-    pub fn register(&mut self, channel: Box<dyn Channel>) {
+    pub fn register(&mut self, channel: Arc<dyn Channel>) {
         let id = channel.id().to_string();
         self.channels.retain(|existing| existing.id() != id);
         self.channels.push(channel);
@@ -48,7 +48,7 @@ impl ChannelRegistry {
     /// Remove a channel by id. Returns `true` if a channel was removed.
     pub fn remove(&mut self, id: &str) -> bool {
         let before = self.channels.len();
-        self.channels.retain(|ch| ch.id() != id);
+        self.channels.retain(|channel| channel.id() != id);
         self.channels.len() < before
     }
 
@@ -56,21 +56,21 @@ impl ChannelRegistry {
     pub fn get(&self, id: &str) -> Option<&dyn Channel> {
         self.channels
             .iter()
-            .find(|ch| ch.id() == id)
-            .map(|ch| ch.as_ref())
+            .find(|channel| channel.id() == id)
+            .map(Arc::as_ref)
     }
 
     /// List all registered channels.
     pub fn list(&self) -> Vec<&dyn Channel> {
-        self.channels.iter().map(|ch| ch.as_ref()).collect()
+        self.channels.iter().map(Arc::as_ref).collect()
     }
 
     /// List only active channels.
     pub fn active(&self) -> Vec<&dyn Channel> {
         self.channels
             .iter()
-            .filter(|ch| ch.is_active())
-            .map(|ch| ch.as_ref())
+            .filter(|channel| channel.is_active())
+            .map(Arc::as_ref)
             .collect()
     }
 
@@ -110,9 +110,14 @@ impl ResponseRouter {
     /// - `InputSource::Http` -> HTTP channel
     /// - `InputSource::Channel(id)` -> channel with matching id
     /// - Other variants -> `ChannelError::NotFound`
-    pub fn route(&self, source: &InputSource, message: &str) -> Result<(), ChannelError> {
+    pub fn route(
+        &self,
+        source: &InputSource,
+        message: &str,
+        context: &ResponseContext,
+    ) -> Result<(), ChannelError> {
         let channel = self.find_channel_for_source(source)?;
-        channel.send_response(message)
+        channel.send_response(message, context)
     }
 
     fn find_channel_for_source(&self, source: &InputSource) -> Result<&dyn Channel, ChannelError> {
@@ -182,8 +187,11 @@ impl Channel for TuiChannel {
         self.active.load(Ordering::Relaxed)
     }
 
-    fn send_response(&self, _message: &str) -> Result<(), ChannelError> {
-        // TUI renders directly -- no routing needed.
+    fn send_response(
+        &self,
+        _message: &str,
+        _context: &ResponseContext,
+    ) -> Result<(), ChannelError> {
         Ok(())
     }
 }
@@ -210,11 +218,6 @@ impl HttpChannel {
     }
 
     /// Take the pending response (if any). Clears the slot.
-    ///
-    /// A poisoned mutex is treated as "no response available." This is
-    /// deliberate: the response slot is ephemeral, so if another thread
-    /// panicked while holding the lock the pending value is unreliable and
-    /// returning `None` is the safest default.
     pub fn take_response(&self) -> Option<String> {
         self.pending_response
             .lock()
@@ -246,11 +249,11 @@ impl Channel for HttpChannel {
         self.active.load(Ordering::Relaxed)
     }
 
-    fn send_response(&self, message: &str) -> Result<(), ChannelError> {
+    fn send_response(&self, message: &str, _context: &ResponseContext) -> Result<(), ChannelError> {
         let mut slot = self
             .pending_response
             .lock()
-            .map_err(|e| ChannelError::DeliveryFailed(e.to_string()))?;
+            .map_err(|error| ChannelError::DeliveryFailed(error.to_string()))?;
         *slot = Some(message.to_string());
         Ok(())
     }
@@ -272,7 +275,7 @@ mod tests {
         channel_name: String,
         source: InputSource,
         active: AtomicBool,
-        last_response: Arc<Mutex<Option<String>>>,
+        last_response: Arc<Mutex<Option<(String, ResponseContext)>>>,
     }
 
     impl MockChannel {
@@ -286,8 +289,7 @@ mod tests {
             }
         }
 
-        /// Returns a shared handle to the response slot for external inspection.
-        fn response_slot(&self) -> Arc<Mutex<Option<String>>> {
+        fn response_slot(&self) -> Arc<Mutex<Option<(String, ResponseContext)>>> {
             Arc::clone(&self.last_response)
         }
     }
@@ -296,17 +298,26 @@ mod tests {
         fn id(&self) -> &str {
             &self.id
         }
+
         fn name(&self) -> &str {
             &self.channel_name
         }
+
         fn input_source(&self) -> InputSource {
             self.source.clone()
         }
+
         fn is_active(&self) -> bool {
             self.active.load(Ordering::Relaxed)
         }
-        fn send_response(&self, message: &str) -> Result<(), ChannelError> {
-            *self.last_response.lock().unwrap() = Some(message.to_string());
+
+        fn send_response(
+            &self,
+            message: &str,
+            context: &ResponseContext,
+        ) -> Result<(), ChannelError> {
+            let mut slot = self.last_response.lock().expect("response slot");
+            *slot = Some((message.to_string(), context.clone()));
             Ok(())
         }
     }
@@ -316,33 +327,31 @@ mod tests {
         let mut registry = ChannelRegistry::new();
         assert_eq!(registry.count(), 0);
 
-        registry.register(Box::new(TuiChannel::new()));
+        registry.register(Arc::new(TuiChannel::new()));
         assert_eq!(registry.count(), 1);
 
-        registry.register(Box::new(HttpChannel::new()));
+        registry.register(Arc::new(HttpChannel::new()));
         assert_eq!(registry.count(), 2);
     }
 
     #[test]
     fn remove_channel() {
         let mut registry = ChannelRegistry::new();
-        registry.register(Box::new(TuiChannel::new()));
-        registry.register(Box::new(HttpChannel::new()));
+        registry.register(Arc::new(TuiChannel::new()));
+        registry.register(Arc::new(HttpChannel::new()));
         assert_eq!(registry.count(), 2);
 
         assert!(registry.remove("tui"));
         assert_eq!(registry.count(), 1);
         assert!(registry.get("tui").is_none());
-
-        // Removing non-existent id returns false.
         assert!(!registry.remove("nonexistent"));
     }
 
     #[test]
     fn get_channel_by_id() {
         let mut registry = ChannelRegistry::new();
-        registry.register(Box::new(TuiChannel::new()));
-        registry.register(Box::new(HttpChannel::new()));
+        registry.register(Arc::new(TuiChannel::new()));
+        registry.register(Arc::new(HttpChannel::new()));
 
         let tui = registry.get("tui").expect("tui should exist");
         assert_eq!(tui.id(), "tui");
@@ -358,17 +367,17 @@ mod tests {
     #[test]
     fn list_active_channels() {
         let mut registry = ChannelRegistry::new();
-        registry.register(Box::new(MockChannel::new(
+        registry.register(Arc::new(MockChannel::new(
             "active1",
             InputSource::Channel("active1".to_string()),
             true,
         )));
-        registry.register(Box::new(MockChannel::new(
+        registry.register(Arc::new(MockChannel::new(
             "inactive",
             InputSource::Channel("inactive".to_string()),
             false,
         )));
-        registry.register(Box::new(MockChannel::new(
+        registry.register(Arc::new(MockChannel::new(
             "active2",
             InputSource::Channel("active2".to_string()),
             true,
@@ -379,41 +388,37 @@ mod tests {
 
         let active = registry.active();
         assert_eq!(active.len(), 2);
-        assert!(active.iter().all(|ch| ch.is_active()));
+        assert!(active.iter().all(|channel| channel.is_active()));
     }
 
     #[test]
     fn duplicate_id_handling() {
         let mut registry = ChannelRegistry::new();
-        registry.register(Box::new(MockChannel::new(
+        registry.register(Arc::new(MockChannel::new(
             "dup",
             InputSource::Channel("dup".to_string()),
             true,
         )));
         assert_eq!(registry.count(), 1);
 
-        // Registering same id replaces the old one.
-        registry.register(Box::new(MockChannel::new(
+        registry.register(Arc::new(MockChannel::new(
             "dup",
             InputSource::Channel("dup".to_string()),
             false,
         )));
         assert_eq!(registry.count(), 1);
 
-        let ch = registry.get("dup").expect("dup should exist");
-        // The replacement is inactive.
-        assert!(!ch.is_active());
+        let channel = registry.get("dup").expect("dup should exist");
+        assert!(!channel.is_active());
     }
 
     #[test]
     fn input_source_channel_variant() {
         let source = InputSource::Channel("telegram".to_string());
-        // Verify round-trip serialization.
         let json = serde_json::to_string(&source).expect("serialize");
         let deserialized: InputSource = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(source, deserialized);
 
-        // Http variant.
         let http = InputSource::Http;
         let json = serde_json::to_string(&http).expect("serialize");
         let deserialized: InputSource = serde_json::from_str(&json).expect("deserialize");
@@ -421,40 +426,45 @@ mod tests {
     }
 
     #[test]
-    fn response_router_delivers_to_channel() {
-        let mock = MockChannel::new("test-ch", InputSource::Channel("test-ch".to_string()), true);
+    fn response_router_delivers_to_channel_with_context() {
+        let mock = Arc::new(MockChannel::new(
+            "test-ch",
+            InputSource::Channel("test-ch".to_string()),
+            true,
+        ));
         let slot = mock.response_slot();
 
         let mut registry = ChannelRegistry::new();
-        registry.register(Box::new(mock));
+        registry.register(mock);
 
-        let registry = Arc::new(registry);
-        let router = ResponseRouter::new(Arc::clone(&registry));
-
+        let router = ResponseRouter::new(Arc::new(registry));
         let source = InputSource::Channel("test-ch".to_string());
-        let result = router.route(&source, "hello from router");
+        let context = ResponseContext {
+            routing_key: Some("chat-42".to_string()),
+            reply_to: Some("99".to_string()),
+        };
+
+        let result = router.route(&source, "hello from router", &context);
         assert!(result.is_ok());
 
-        // Verify the mock actually received the routed message.
-        let delivered = slot.lock().unwrap().clone();
-        assert_eq!(delivered.as_deref(), Some("hello from router"));
+        let delivered = slot.lock().expect("delivered").clone();
+        assert_eq!(
+            delivered,
+            Some(("hello from router".to_string(), context.clone()))
+        );
 
-        // Also verify NotFound for missing channel.
         let missing = InputSource::Channel("missing".to_string());
-        let err = router.route(&missing, "should fail");
+        let err = router.route(&missing, "should fail", &ResponseContext::default());
         assert!(matches!(err, Err(ChannelError::NotFound(_))));
     }
 
     #[test]
     fn response_router_noop_for_tui() {
         let mut registry = ChannelRegistry::new();
-        registry.register(Box::new(TuiChannel::new()));
+        registry.register(Arc::new(TuiChannel::new()));
 
-        let registry = Arc::new(registry);
-        let router = ResponseRouter::new(Arc::clone(&registry));
-
-        // TUI send_response is a no-op that returns Ok.
-        let result = router.route(&InputSource::Text, "hello tui");
+        let router = ResponseRouter::new(Arc::new(registry));
+        let result = router.route(&InputSource::Text, "hello tui", &ResponseContext::default());
         assert!(result.is_ok());
     }
 }

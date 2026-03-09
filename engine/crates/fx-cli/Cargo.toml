@@ -9,7 +9,7 @@ license.workspace = true
 default = ["http"]
 # Enable the HTTP API server for headless mode (`fawx serve --http`).
 # Tailscale-only binding. Pulls in axum.
-http = ["dep:axum", "dep:fx-channel-telegram"]
+http = ["dep:axum", "dep:fx-channel-telegram", "dep:fx-channel-webhook"]
 # Enable the OAuth bridge HTTP server subcommand (`fawx oauth-bridge`).
 # Pulls in axum and crypto dependencies. Disabled by default to reduce build times.
 oauth-bridge = ["dep:axum", "dep:base64", "dep:rand", "dep:subtle"]
@@ -62,6 +62,7 @@ toml_edit = "0.22"
 reqwest.workspace = true
 axum = { version = "0.8", optional = true }
 fx-channel-telegram = { path = "../fx-channel-telegram", optional = true }
+fx-channel-webhook = { path = "../fx-channel-webhook", optional = true }
 uuid = { version = "1.13", features = ["v4"] }
 rand = { version = "0.8", optional = true }
 sha2 = "0.10"

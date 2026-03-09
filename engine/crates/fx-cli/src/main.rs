@@ -374,6 +374,8 @@ struct HeadlessStartup {
     #[cfg(feature = "http")]
     telegram_config: fx_config::TelegramChannelConfig,
     #[cfg(feature = "http")]
+    webhook_config: fx_config::WebhookConfig,
+    #[cfg(feature = "http")]
     data_dir: std::path::PathBuf,
 }
 
@@ -387,6 +389,8 @@ fn build_headless_startup(
     let http_config = config.http.clone();
     #[cfg(feature = "http")]
     let telegram_config = config.telegram.clone();
+    #[cfg(feature = "http")]
+    let webhook_config = config.webhook.clone();
     let data_dir = tui::fawx_data_dir();
     let config_manager = Some(build_config_manager(&config));
     let improvement_provider = tui::build_improvement_provider(&auth_manager, &config);
@@ -404,6 +408,8 @@ fn build_headless_startup(
         http_config,
         #[cfg(feature = "http")]
         telegram_config,
+        #[cfg(feature = "http")]
+        webhook_config,
         #[cfg(feature = "http")]
         data_dir,
     })
@@ -527,6 +533,7 @@ async fn run_http_server(
         mut app,
         http_config,
         telegram_config,
+        webhook_config,
         data_dir,
     } = build_headless_startup(system_prompt)?;
     app.initialize();
@@ -538,10 +545,11 @@ async fn run_http_server(
     // Open credential store once; pass to channel builders for DI.
     let auth_store = { auth_store::AuthStore::open(&data_dir).ok() };
 
-    // Build Telegram channel if configured.
+    // Build external channels if configured.
     let telegram = build_telegram_channel(&telegram_config, auth_store.as_ref());
+    let webhooks = build_webhook_channels(&webhook_config);
 
-    http_serve::run(app, port, &http_config, telegram).await
+    http_serve::run(app, port, &http_config, telegram, webhooks).await
 }
 
 /// Install a SIGHUP handler that logs and triggers a graceful process restart.
@@ -597,6 +605,27 @@ fn exec_replace(exe: &str, args: &[String]) -> std::io::Error {
         Ok(_infallible) => unreachable!("execvp does not return on success"),
         Err(errno) => std::io::Error::from_raw_os_error(errno as i32),
     }
+}
+
+#[cfg(feature = "http")]
+fn build_webhook_channels(
+    config: &fx_config::WebhookConfig,
+) -> Vec<std::sync::Arc<fx_channel_webhook::WebhookChannel>> {
+    if !config.enabled {
+        return Vec::new();
+    }
+
+    config
+        .channels
+        .iter()
+        .map(|channel| {
+            std::sync::Arc::new(fx_channel_webhook::WebhookChannel::new(
+                channel.id.clone(),
+                channel.name.clone(),
+                channel.callback_url.clone(),
+            ))
+        })
+        .collect()
 }
 
 #[cfg(feature = "http")]

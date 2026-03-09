@@ -6,9 +6,10 @@
 //! responses, and calling the Bot API. No agentic loop logic — that stays
 //! in HeadlessApp.
 
-use fx_core::channel::{Channel, ChannelError};
+use fx_core::channel::{Channel, ChannelError, ResponseContext};
 use fx_core::types::InputSource;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -123,6 +124,15 @@ pub struct OutgoingMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parse_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to_message_id: Option<i64>,
+}
+
+/// Internal queued Telegram response awaiting API delivery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedMessage {
+    pub chat_id: i64,
+    pub text: String,
+    pub parse_mode: Option<String>,
     pub reply_to_message_id: Option<i64>,
 }
 
@@ -324,7 +334,7 @@ pub struct TelegramChannel {
     config: TelegramConfig,
     client: reqwest::Client,
     active: AtomicBool,
-    last_chat_id: Mutex<Option<i64>>,
+    outbound: Mutex<VecDeque<QueuedMessage>>,
     /// Base URL for the Telegram Bot API. Defaults to `https://api.telegram.org`.
     /// Overridable for testing via [`TelegramChannel::new_with_base_url`].
     base_url: String,
@@ -332,6 +342,7 @@ pub struct TelegramChannel {
 
 /// Default Telegram Bot API base URL.
 const DEFAULT_BASE_URL: &str = "https://api.telegram.org";
+const DEFAULT_PARSE_MODE: &str = "Markdown";
 
 impl TelegramChannel {
     /// Create a new Telegram channel with the given configuration.
@@ -347,7 +358,7 @@ impl TelegramChannel {
             config,
             client: reqwest::Client::new(),
             active: AtomicBool::new(true),
-            last_chat_id: Mutex::new(None),
+            outbound: Mutex::new(VecDeque::new()),
             base_url,
         }
     }
@@ -393,16 +404,41 @@ impl TelegramChannel {
         }))
     }
 
-    /// Set the last chat ID (for Channel::send_response return path).
-    pub fn set_last_chat_id(&self, chat_id: i64) {
-        if let Ok(mut guard) = self.last_chat_id.lock() {
-            *guard = Some(chat_id);
+    /// Take all queued outbound messages.
+    pub fn drain_outbound(&self) -> Vec<QueuedMessage> {
+        match self.outbound.lock() {
+            Ok(mut queue) => queue.drain(..).collect(),
+            Err(_) => Vec::new(),
         }
     }
 
-    /// Get the last chat ID, if set.
-    pub fn last_chat_id(&self) -> Option<i64> {
-        self.last_chat_id.lock().ok().and_then(|g| *g)
+    pub fn queue_response(
+        &self,
+        message: &str,
+        context: &ResponseContext,
+        parse_mode: Option<String>,
+    ) -> Result<(), ChannelError> {
+        let chat_id = parse_chat_id(context)?;
+        let reply_to_message_id = parse_reply_to(context)?;
+        self.queue_outbound(QueuedMessage {
+            chat_id,
+            text: message.to_string(),
+            parse_mode,
+            reply_to_message_id,
+        })
+    }
+
+    fn queue_outbound(&self, message: QueuedMessage) -> Result<(), ChannelError> {
+        const MAX_OUTBOUND_MESSAGES: usize = 100;
+        let mut queue = self
+            .outbound
+            .lock()
+            .map_err(|error| ChannelError::DeliveryFailed(error.to_string()))?;
+        if queue.len() >= MAX_OUTBOUND_MESSAGES {
+            queue.pop_front();
+        }
+        queue.push_back(message);
+        Ok(())
     }
 
     // Finding #1: Webhook secret validation
@@ -647,6 +683,26 @@ fn compute_next_offset(updates: &[serde_json::Value], current: i64) -> i64 {
     next
 }
 
+fn parse_chat_id(context: &ResponseContext) -> Result<i64, ChannelError> {
+    let value = context
+        .routing_key
+        .as_deref()
+        .ok_or(ChannelError::NotConnected)?;
+    value.parse::<i64>().map_err(|error| {
+        ChannelError::DeliveryFailed(format!("invalid telegram chat_id `{value}`: {error}"))
+    })
+}
+
+fn parse_reply_to(context: &ResponseContext) -> Result<Option<i64>, ChannelError> {
+    let Some(value) = context.reply_to.as_deref() else {
+        return Ok(None);
+    };
+    let parsed = value.parse::<i64>().map_err(|error| {
+        ChannelError::DeliveryFailed(format!("invalid telegram reply_to `{value}`: {error}"))
+    })?;
+    Ok(Some(parsed))
+}
+
 // ---------------------------------------------------------------------------
 // Channel trait implementation
 // ---------------------------------------------------------------------------
@@ -668,36 +724,8 @@ impl Channel for TelegramChannel {
         self.active.load(Ordering::Relaxed)
     }
 
-    // Finding #3: Reuse send_single_message + split_message
-    fn send_response(&self, message: &str) -> Result<(), ChannelError> {
-        let chat_id = self
-            .last_chat_id
-            .lock()
-            .ok()
-            .and_then(|g| *g)
-            .ok_or(ChannelError::NotConnected)?;
-
-        let chunks = split_message(message);
-        let client = self.client.clone();
-        let base_url = self.base_url.clone();
-        let token = self.config.bot_token.clone();
-
-        tokio::spawn(async move {
-            for chunk in chunks {
-                let msg = OutgoingMessage {
-                    chat_id,
-                    text: chunk,
-                    parse_mode: Some("Markdown".to_string()),
-                    reply_to_message_id: None,
-                };
-                if let Err(e) = send_single_message(&client, &base_url, &token, &msg).await {
-                    tracing::error!("Telegram send failed: {e}");
-                    break;
-                }
-            }
-        });
-
-        Ok(())
+    fn send_response(&self, message: &str, context: &ResponseContext) -> Result<(), ChannelError> {
+        self.queue_response(message, context, Some(DEFAULT_PARSE_MODE.to_string()))
     }
 }
 
@@ -1125,14 +1153,61 @@ mod tests {
     // ── Channel trait tests ─────────────────────────────────────────────
 
     #[test]
-    fn send_response_fails_without_chat_id() {
+    fn send_response_fails_without_routing_key() {
         let ch = make_channel();
-        let result = ch.send_response("hello");
+        let result = ch.send_response("hello", &ResponseContext::default());
         assert!(result.is_err());
         match result.unwrap_err() {
             ChannelError::NotConnected => {}
             other => panic!("expected NotConnected, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn send_response_queues_markdown_message() {
+        let ch = make_channel();
+        let context = ResponseContext {
+            routing_key: Some("12345".to_string()),
+            reply_to: Some("99".to_string()),
+        };
+        ch.send_response("hello", &context).expect("queue response");
+
+        let outbound = ch.drain_outbound();
+        assert_eq!(
+            outbound,
+            vec![QueuedMessage {
+                chat_id: 12345,
+                text: "hello".to_string(),
+                parse_mode: Some(DEFAULT_PARSE_MODE.to_string()),
+                reply_to_message_id: Some(99),
+            }]
+        );
+    }
+
+    #[test]
+    fn queue_response_allows_plain_text_messages() {
+        let ch = make_channel();
+        let context = ResponseContext {
+            routing_key: Some("12345".to_string()),
+            reply_to: Some("99".to_string()),
+        };
+        ch.queue_response("hello_error", &context, None)
+            .expect("queue response");
+
+        let outbound = ch.drain_outbound();
+        assert_eq!(outbound[0].parse_mode, None);
+    }
+
+    #[test]
+    fn send_response_rejects_invalid_routing_key() {
+        let ch = make_channel();
+        let context = ResponseContext {
+            routing_key: Some("not-a-chat".to_string()),
+            reply_to: None,
+        };
+
+        let result = ch.send_response("hello", &context);
+        assert!(matches!(result, Err(ChannelError::DeliveryFailed(_))));
     }
 
     #[test]
@@ -1327,14 +1402,41 @@ mod tests {
         assert_eq!(compute_next_offset(&updates, 0), 104);
     }
 
-    // ── set_last_chat_id ────────────────────────────────────────────────
+    // ── outbound queue ─────────────────────────────────────────────────
 
     #[test]
-    fn set_last_chat_id_enables_send_response() {
+    fn drain_outbound_clears_queue() {
         let ch = make_channel();
-        assert!(ch.send_response("test").is_err());
-        ch.set_last_chat_id(12345);
-        // After setting, send_response would succeed (fire-and-forget spawn).
+        let context = ResponseContext {
+            routing_key: Some("12345".to_string()),
+            reply_to: None,
+        };
+        ch.send_response("first", &context).expect("first response");
+
+        assert_eq!(ch.drain_outbound().len(), 1);
+        assert!(ch.drain_outbound().is_empty());
+    }
+
+    #[test]
+    fn outbound_queue_is_bounded_to_one_hundred_messages() {
+        let ch = make_channel();
+        let context = ResponseContext {
+            routing_key: Some("12345".to_string()),
+            reply_to: None,
+        };
+
+        for idx in 0..101 {
+            ch.send_response(&format!("msg-{idx}"), &context)
+                .expect("queued response");
+        }
+
+        let outbound = ch.drain_outbound();
+        assert_eq!(outbound.len(), 100);
+        assert_eq!(outbound.first().map(|msg| msg.text.as_str()), Some("msg-1"));
+        assert_eq!(
+            outbound.last().map(|msg| msg.text.as_str()),
+            Some("msg-100")
+        );
     }
 
     // ── Integration tests (require real bot token) ──────────────────────

@@ -4,7 +4,7 @@
 //! responses back through originating channels. Pure synchronous
 //! state machine — no async, no networking.
 
-use fx_core::channel::Channel;
+use fx_core::channel::{Channel, ResponseContext};
 use fx_core::types::InputSource;
 use fx_fleet::{NodeRegistry, NodeStatus, RoutingDecision, TaskRequirements, TaskRouter};
 use std::collections::HashMap;
@@ -317,7 +317,7 @@ impl Orchestrator {
             .ok_or_else(|| OrchestratorError::ChannelNotFound(ch_id.clone()))?;
 
         channel
-            .send_response(response)
+            .send_response(response, &ResponseContext::default())
             .map_err(|e| OrchestratorError::RoutingFailed(format!("{e}")))?;
 
         Ok(CompletionOutcome::Delivered(ch_id))
@@ -408,7 +408,11 @@ mod tests {
             true
         }
 
-        fn send_response(&self, message: &str) -> Result<(), fx_core::channel::ChannelError> {
+        fn send_response(
+            &self,
+            message: &str,
+            _context: &ResponseContext,
+        ) -> Result<(), fx_core::channel::ChannelError> {
             self.responses.lock().unwrap().push(message.to_string());
             Ok(())
         }

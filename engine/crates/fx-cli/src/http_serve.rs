@@ -9,24 +9,28 @@
 //! via HMAC-based constant-time comparison (`ring::hmac`). The `/health`
 //! endpoint is public for monitoring.
 
-use axum::extract::{Json, State};
+use axum::extract::{Json, Path, State};
 use axum::http::StatusCode;
 use axum::middleware;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::Router;
+use fx_channel_telegram::{IncomingMessage, OutgoingMessage, TelegramChannel};
+use fx_channel_webhook::{WebhookChannel, WebhookMessage, WebhookResponse};
 use fx_config::HttpConfig;
+use fx_core::channel::{Channel, ResponseContext};
+use fx_core::types::InputSource;
+use fx_kernel::{ChannelRegistry, HttpChannel, ResponseRouter};
 use ring::hmac;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
-use crate::headless::HeadlessApp;
-
-use fx_channel_telegram::{IncomingMessage, OutgoingMessage, TelegramChannel};
+use crate::headless::{CycleResult, HeadlessApp};
 
 // ── Request/Response types ──────────────────────────────────────────────────
 
@@ -58,6 +62,8 @@ struct StatusResponse {
     memory_entries: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     tailscale_ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    config: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -76,8 +82,15 @@ struct HttpState {
     // dumps. Future hardening: wrap with `secrecy::SecretString` to ensure
     // zeroization on drop and prevent accidental logging.
     bearer_token: String,
-    /// Telegram channel (None if not configured).
+    channels: ChannelRuntime,
+}
+
+#[derive(Clone)]
+struct ChannelRuntime {
+    router: Arc<ResponseRouter>,
+    http: Arc<HttpChannel>,
     telegram: Option<Arc<TelegramChannel>>,
+    webhooks: Arc<HashMap<String, Arc<WebhookChannel>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -331,6 +344,116 @@ fn validate_bearer_token(
     }
 }
 
+fn build_channel_runtime(
+    telegram: Option<Arc<TelegramChannel>>,
+    webhook_channels: Vec<Arc<WebhookChannel>>,
+) -> ChannelRuntime {
+    let http = Arc::new(HttpChannel::new());
+    let webhooks = webhook_channels
+        .into_iter()
+        .fold(HashMap::new(), |mut map, channel| {
+            map.insert(channel.id().to_string(), channel);
+            map
+        });
+
+    let mut registry = ChannelRegistry::new();
+    registry.register(http.clone());
+    if let Some(channel) = &telegram {
+        registry.register(channel.clone());
+    }
+    for channel in webhooks.values() {
+        registry.register(channel.clone());
+    }
+
+    let registry = Arc::new(registry);
+    ChannelRuntime {
+        router: Arc::new(ResponseRouter::new(registry)),
+        http,
+        telegram,
+        webhooks: Arc::new(webhooks),
+    }
+}
+
+async fn process_and_route_message(
+    app: &Arc<Mutex<HeadlessApp>>,
+    router: &ResponseRouter,
+    text: &str,
+    source: InputSource,
+    context: ResponseContext,
+) -> Result<CycleResult, anyhow::Error> {
+    let mut guard = app.lock().await;
+    let result = guard.process_message_for_source(text, &source).await?;
+    router
+        .route(&source, &result.response, &context)
+        .map_err(|error| anyhow::anyhow!("response routing failed: {error}"))?;
+    Ok(result)
+}
+
+fn sanitize_config(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => sanitize_config_object(map),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(sanitize_config).collect())
+        }
+        other => other,
+    }
+}
+
+fn sanitize_config_object(map: serde_json::Map<String, serde_json::Value>) -> serde_json::Value {
+    let sanitized = map
+        .into_iter()
+        .map(|(key, value)| {
+            let next = if is_secret_key(&key) {
+                serde_json::Value::String("[REDACTED]".to_string())
+            } else {
+                sanitize_config(value)
+            };
+            (key, next)
+        })
+        .collect();
+    serde_json::Value::Object(sanitized)
+}
+
+fn is_secret_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    let exact = [
+        "access_key",
+        "api_key",
+        "auth_token",
+        "bearer_token",
+        "bot_token",
+        "credential",
+        "password",
+        "private_key",
+        "secret",
+        "ssh_key",
+        "token",
+        "webhook_secret",
+    ];
+    if exact.iter().any(|candidate| key == *candidate) {
+        return true;
+    }
+    [
+        "_access_key",
+        "_api_key",
+        "_credential",
+        "_password",
+        "_private_key",
+        "_secret",
+        "_ssh_key",
+        "_token",
+    ]
+    .iter()
+    .any(|suffix| key.ends_with(suffix))
+}
+
+fn sanitized_status_config(app: &HeadlessApp) -> Option<serde_json::Value> {
+    let manager = app.config_manager()?;
+    let guard = manager.lock().ok()?;
+    let config = guard.get("all").ok()?;
+    Some(sanitize_config(config))
+}
+
 // ── Router ──────────────────────────────────────────────────────────────────
 
 /// Maximum request body size (1 MiB).
@@ -341,6 +464,7 @@ fn build_router(state: HttpState) -> Router {
         .route("/message", post(handle_message))
         .route("/status", get(handle_status))
         .route("/config", get(handle_config_get).post(handle_config_set))
+        .route("/webhook/{channel_id}", post(handle_webhook))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -373,23 +497,78 @@ async fn handle_message(
         ));
     }
 
-    let mut app = state.app.lock().await;
-    let result = app.process_message(&request.message).await.map_err(|e| {
-        // Log full error details to stderr for debugging; never expose
-        // internal error text to HTTP clients (review finding #2).
-        tracing::error!(error = %e, "message processing failed");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorBody {
-                error: "internal_error".to_string(),
-            }),
-        )
-    })?;
+    let result = process_and_route_message(
+        &state.app,
+        state.channels.router.as_ref(),
+        &request.message,
+        InputSource::Http,
+        ResponseContext::default(),
+    )
+    .await
+    .map_err(internal_error)?;
+    let response = state
+        .channels
+        .http
+        .take_response()
+        .unwrap_or_else(|| result.response.clone());
 
     Ok(Json(MessageResponse {
-        response: result.response,
+        response,
         model: result.model,
         iterations: result.iterations,
+    }))
+}
+
+fn internal_error(error: anyhow::Error) -> (StatusCode, Json<ErrorBody>) {
+    tracing::error!(error = %error, "message processing failed");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorBody {
+            error: "internal_error".to_string(),
+        }),
+    )
+}
+
+async fn handle_webhook(
+    State(state): State<HttpState>,
+    Path(channel_id): Path<String>,
+    Json(request): Json<WebhookMessage>,
+) -> Result<Json<WebhookResponse>, (StatusCode, Json<ErrorBody>)> {
+    let Some(channel) = state.channels.webhooks.get(&channel_id) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorBody {
+                error: "webhook channel not found".to_string(),
+            }),
+        ));
+    };
+    if request.text.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: "message must not be empty".to_string(),
+            }),
+        ));
+    }
+
+    let source = InputSource::Channel(channel_id.clone());
+    let result = process_and_route_message(
+        &state.app,
+        state.channels.router.as_ref(),
+        &request.text,
+        source,
+        ResponseContext::default(),
+    )
+    .await
+    .map_err(internal_error)?;
+    let text = channel
+        .take_response()
+        .unwrap_or_else(|| result.response.clone());
+
+    Ok(Json(WebhookResponse {
+        text,
+        channel_id,
+        complete: true,
     }))
 }
 
@@ -472,6 +651,7 @@ async fn handle_config_set(
 async fn handle_status(State(state): State<HttpState>) -> Json<StatusResponse> {
     let app = state.app.lock().await;
     let model = app.active_model().to_string();
+    let config = sanitized_status_config(&app);
 
     Json(StatusResponse {
         status: "ok",
@@ -479,6 +659,7 @@ async fn handle_status(State(state): State<HttpState>) -> Json<StatusResponse> {
         skills: Vec::new(),
         memory_entries: 0,
         tailscale_ip: state.tailscale_ip.clone(),
+        config,
     })
 }
 
@@ -533,22 +714,50 @@ async fn build_text_with_photos(
 
 // ── Telegram long-polling loop ──────────────────────────────────────────────
 
-/// Process a single Telegram update through the agentic loop.
-///
-/// Parses the update, sends a typing indicator, processes the message,
-/// and sends the response. Errors are logged but not propagated so the
-/// polling loop continues.
+fn telegram_context(incoming: &IncomingMessage) -> ResponseContext {
+    ResponseContext {
+        routing_key: Some(incoming.chat_id.to_string()),
+        reply_to: Some(incoming.message_id.to_string()),
+    }
+}
+
+fn queue_telegram_error(
+    telegram: &TelegramChannel,
+    incoming: &IncomingMessage,
+    error: &anyhow::Error,
+) {
+    let context = telegram_context(incoming);
+    let message = format!("⚠️ Error: {error}");
+    let _ = telegram.queue_response(&message, &context, None);
+}
+
+async fn flush_telegram_outbound(telegram: &TelegramChannel) {
+    for outbound in telegram.drain_outbound() {
+        let message = OutgoingMessage {
+            chat_id: outbound.chat_id,
+            text: outbound.text,
+            parse_mode: outbound.parse_mode,
+            reply_to_message_id: outbound.reply_to_message_id,
+        };
+        if let Err(error) = telegram.send_message(&message).await {
+            tracing::error!("Telegram send failed: {error}");
+            break;
+        }
+    }
+}
+
 async fn handle_telegram_update(
     telegram: &TelegramChannel,
     app: &Arc<Mutex<HeadlessApp>>,
+    router: &ResponseRouter,
     raw_update: &serde_json::Value,
 ) {
     let payload = raw_update.to_string();
     let mut incoming = match telegram.parse_update(&payload) {
-        Ok(Some(msg)) => msg,
+        Ok(Some(message)) => message,
         Ok(None) => return,
-        Err(e) => {
-            tracing::warn!("Telegram poll parse error: {e}");
+        Err(error) => {
+            tracing::warn!("Telegram poll parse error: {error}");
             return;
         }
     };
@@ -559,58 +768,44 @@ async fn handle_telegram_update(
         photos = incoming.photos.len(),
         "Telegram poll: message received"
     );
-
     let _ = telegram.send_typing(incoming.chat_id).await;
-    telegram.set_last_chat_id(incoming.chat_id);
 
     let message_text = build_text_with_photos(telegram, &mut incoming).await;
-
-    let mut app_guard = app.lock().await;
-    let response_msg = match app_guard.process_message(&message_text).await {
-        Ok(result) => OutgoingMessage {
-            chat_id: incoming.chat_id,
-            text: result.response,
-            parse_mode: Some("Markdown".to_string()),
-            reply_to_message_id: Some(incoming.message_id),
-        },
-        Err(e) => {
-            tracing::error!("Telegram poll loop error: {e}");
-            OutgoingMessage {
-                chat_id: incoming.chat_id,
-                text: format!("⚠️ Error: {e}"),
-                parse_mode: None,
-                reply_to_message_id: Some(incoming.message_id),
-            }
-        }
-    };
-    drop(app_guard);
-
-    if let Err(e) = telegram.send_message(&response_msg).await {
-        tracing::error!("Telegram poll: failed to send response: {e}");
+    let source = InputSource::Channel("telegram".to_string());
+    let context = telegram_context(&incoming);
+    if let Err(error) = process_and_route_message(app, router, &message_text, source, context).await
+    {
+        tracing::error!("Telegram poll loop error: {error}");
+        queue_telegram_error(telegram, &incoming, &error);
     }
+    flush_telegram_outbound(telegram).await;
 }
 
 /// Run the Telegram long-polling loop.
 ///
 /// Calls `get_updates` in a loop with a 30-second long-poll timeout.
 /// Errors are logged and the loop continues — it never crashes.
-async fn run_telegram_polling(telegram: Arc<TelegramChannel>, app: Arc<Mutex<HeadlessApp>>) {
-    // Delete any existing webhook so Telegram sends updates via getUpdates.
-    if let Err(e) = telegram.delete_webhook().await {
-        tracing::error!("Telegram poll: failed to delete webhook: {e}");
+async fn run_telegram_polling(
+    telegram: Arc<TelegramChannel>,
+    app: Arc<Mutex<HeadlessApp>>,
+    router: Arc<ResponseRouter>,
+) {
+    if let Err(error) = telegram.delete_webhook().await {
+        tracing::error!("Telegram poll: failed to delete webhook: {error}");
     }
 
     let mut offset: i64 = 0;
     loop {
+        flush_telegram_outbound(&telegram).await;
         match telegram.get_updates(offset, 30).await {
             Ok((updates, next_offset)) => {
                 for update in &updates {
-                    handle_telegram_update(&telegram, &app, update).await;
+                    handle_telegram_update(&telegram, &app, router.as_ref(), update).await;
                 }
                 offset = next_offset;
             }
-            Err(e) => {
-                tracing::error!("Telegram poll error: {e}");
+            Err(error) => {
+                tracing::error!("Telegram poll error: {error}");
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             }
         }
@@ -624,26 +819,24 @@ async fn handle_telegram_webhook(
     headers: axum::http::HeaderMap,
     body: String,
 ) -> impl IntoResponse {
-    let telegram = match &state.telegram {
-        Some(t) => Arc::clone(t),
+    let telegram = match &state.channels.telegram {
+        Some(channel) => Arc::clone(channel),
         None => return StatusCode::NOT_FOUND.into_response(),
     };
 
-    // Finding #1: Validate webhook secret_token header.
     let secret_header = headers
         .get("x-telegram-bot-api-secret-token")
-        .and_then(|v| v.to_str().ok());
-
+        .and_then(|value| value.to_str().ok());
     if !telegram.validate_webhook_secret(secret_header) {
         tracing::warn!("Telegram webhook: invalid or missing secret token");
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
     let mut incoming = match telegram.parse_update(&body) {
-        Ok(Some(msg)) => msg,
+        Ok(Some(message)) => message,
         Ok(None) => return StatusCode::OK.into_response(),
-        Err(e) => {
-            tracing::warn!("Telegram parse error: {e:?}");
+        Err(error) => {
+            tracing::warn!("Telegram parse error: {error:?}");
             return StatusCode::OK.into_response();
         }
     };
@@ -654,42 +847,24 @@ async fn handle_telegram_webhook(
         photos = incoming.photos.len(),
         "Telegram message received"
     );
-
-    // Send typing indicator (best-effort)
     let _ = telegram.send_typing(incoming.chat_id).await;
 
-    // Update last_chat_id for Channel::send_response
-    telegram.set_last_chat_id(incoming.chat_id);
-
-    // Download photos and build message text with image paths
     let message_text = build_text_with_photos(&telegram, &mut incoming).await;
-
-    // Process through the agentic loop
-    let mut app = state.app.lock().await;
-    match app.process_message(&message_text).await {
-        Ok(result) => {
-            let response = OutgoingMessage {
-                chat_id: incoming.chat_id,
-                text: result.response,
-                parse_mode: Some("Markdown".to_string()),
-                reply_to_message_id: Some(incoming.message_id),
-            };
-            if let Err(e) = telegram.send_message(&response).await {
-                tracing::error!("Failed to send Telegram response: {e:?}");
-            }
-        }
-        Err(e) => {
-            tracing::error!("Loop error: {e}");
-            let error_msg = OutgoingMessage {
-                chat_id: incoming.chat_id,
-                text: format!("⚠️ Error: {e}"),
-                parse_mode: None,
-                reply_to_message_id: Some(incoming.message_id),
-            };
-            let _ = telegram.send_message(&error_msg).await;
-        }
+    let source = InputSource::Channel("telegram".to_string());
+    let context = telegram_context(&incoming);
+    if let Err(error) = process_and_route_message(
+        &state.app,
+        state.channels.router.as_ref(),
+        &message_text,
+        source,
+        context,
+    )
+    .await
+    {
+        tracing::error!("Telegram loop error: {error:?}");
+        queue_telegram_error(&telegram, &incoming, &error);
     }
-
+    flush_telegram_outbound(&telegram).await;
     StatusCode::OK.into_response()
 }
 
@@ -704,7 +879,8 @@ pub async fn run(
     app: HeadlessApp,
     port: u16,
     http_config: &HttpConfig,
-    telegram: Option<Arc<fx_channel_telegram::TelegramChannel>>,
+    telegram: Option<Arc<TelegramChannel>>,
+    webhook_channels: Vec<Arc<WebhookChannel>>,
 ) -> anyhow::Result<i32> {
     let data_dir = crate::tui::fawx_data_dir();
     let auth_store = match crate::auth_store::AuthStore::open(&data_dir) {
@@ -720,19 +896,20 @@ pub async fn run(
     let listen_plan = listen_targets(port, detect_optional_tailscale_ip());
     let listeners = bind_listeners(listen_plan).await?;
     let shared_app = Arc::new(Mutex::new(app));
+    let channels = build_channel_runtime(telegram.clone(), webhook_channels);
     let state = HttpState {
         app: Arc::clone(&shared_app),
         start_time: Instant::now(),
         tailscale_ip: active_tailscale_ip(&listeners),
         bearer_token,
-        telegram: telegram.clone(),
+        channels: channels.clone(),
     };
     let router = build_router(state);
 
     print_startup_targets(&listeners);
     eprintln!("Bearer token authentication: enabled");
-    validate_telegram_startup(telegram.as_ref()).await;
-    start_telegram_polling(telegram.as_ref(), &shared_app);
+    validate_telegram_startup(channels.telegram.as_ref()).await;
+    start_telegram_polling(&channels, &shared_app);
 
     run_listeners(router, listeners).await?;
     Ok(0)
@@ -782,15 +959,16 @@ async fn validate_telegram_startup(telegram: Option<&Arc<TelegramChannel>>) {
     }
 }
 
-fn start_telegram_polling(
-    telegram: Option<&Arc<TelegramChannel>>,
-    shared_app: &Arc<Mutex<HeadlessApp>>,
-) {
-    let Some(tg) = telegram else {
+fn start_telegram_polling(channels: &ChannelRuntime, shared_app: &Arc<Mutex<HeadlessApp>>) {
+    let Some(telegram) = channels.telegram.as_ref() else {
         return;
     };
 
-    tokio::spawn(run_telegram_polling(Arc::clone(tg), Arc::clone(shared_app)));
+    tokio::spawn(run_telegram_polling(
+        Arc::clone(telegram),
+        Arc::clone(shared_app),
+        Arc::clone(&channels.router),
+    ));
     eprintln!("Telegram long-polling loop: started");
 }
 
@@ -1068,6 +1246,7 @@ mod tests {
             skills: vec!["skill-a".to_string()],
             memory_entries: 10,
             tailscale_ip: Some("100.64.0.1".to_string()),
+            config: None,
         })
     }
 
@@ -1281,6 +1460,7 @@ mod tests {
             skills: vec!["read_file".to_string()],
             memory_entries: 42,
             tailscale_ip: Some("100.93.251.101".to_string()),
+            config: None,
         };
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&resp).expect("serialize")).expect("parse");
@@ -1298,6 +1478,7 @@ mod tests {
             skills: vec!["read_file".to_string()],
             memory_entries: 42,
             tailscale_ip: None,
+            config: None,
         };
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&resp).expect("serialize")).expect("parse");
@@ -1711,6 +1892,277 @@ mod tests {
         assert_eq!(result, "config-fallback");
     }
 
+    mod routing_and_status {
+        use super::*;
+        use async_trait::async_trait;
+        use fx_config::manager::ConfigManager;
+        use fx_kernel::act::{ToolExecutor, ToolExecutorError, ToolResult};
+        use fx_kernel::budget::{BudgetConfig, BudgetTracker};
+        use fx_kernel::cancellation::CancellationToken;
+        use fx_kernel::context_manager::ContextCompactor;
+        use fx_kernel::loop_engine::LoopEngine;
+        use fx_llm::{
+            CompletionProvider, CompletionRequest, CompletionResponse, CompletionStream,
+            ContentBlock, ModelRouter, ProviderCapabilities, ProviderError as LlmError,
+            StreamChunk,
+        };
+        use fx_subagent::{
+            test_support::DisabledSubagentFactory, SubagentLimits, SubagentManager,
+            SubagentManagerDeps,
+        };
+        use std::sync::{Arc, Mutex as StdMutex};
+        use tempfile::TempDir;
+        use tokio::sync::Mutex;
+
+        #[derive(Debug)]
+        struct StubToolExecutor;
+
+        #[async_trait]
+        impl ToolExecutor for StubToolExecutor {
+            async fn execute_tools(
+                &self,
+                _calls: &[fx_llm::ToolCall],
+                _cancel: Option<&CancellationToken>,
+            ) -> Result<Vec<ToolResult>, ToolExecutorError> {
+                Ok(Vec::new())
+            }
+        }
+
+        struct MockProvider;
+
+        #[async_trait]
+        impl CompletionProvider for MockProvider {
+            async fn complete(
+                &self,
+                _request: CompletionRequest,
+            ) -> Result<CompletionResponse, LlmError> {
+                Ok(CompletionResponse {
+                    content: vec![ContentBlock::Text {
+                        text: "Mock response".to_string(),
+                    }],
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    stop_reason: Some("end_turn".to_string()),
+                })
+            }
+
+            async fn complete_stream(
+                &self,
+                _request: CompletionRequest,
+            ) -> Result<CompletionStream, LlmError> {
+                let chunk = StreamChunk {
+                    delta_content: Some("Mock response".to_string()),
+                    stop_reason: Some("end_turn".to_string()),
+                    ..Default::default()
+                };
+                let stream = futures::stream::once(async move { Ok(chunk) });
+                Ok(Box::pin(stream))
+            }
+
+            fn name(&self) -> &str {
+                "mock"
+            }
+
+            fn supported_models(&self) -> Vec<String> {
+                vec!["mock-model".to_string()]
+            }
+
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities {
+                    supports_temperature: false,
+                    requires_streaming: false,
+                }
+            }
+        }
+
+        fn test_engine() -> LoopEngine {
+            LoopEngine::builder()
+                .budget(BudgetTracker::new(BudgetConfig::default(), 0, 0))
+                .context(ContextCompactor::new(2048, 256))
+                .max_iterations(3)
+                .tool_executor(Arc::new(StubToolExecutor))
+                .synthesis_instruction("Summarize".to_string())
+                .build()
+                .expect("test engine")
+        }
+
+        fn mock_router() -> ModelRouter {
+            let mut router = ModelRouter::new();
+            router.register_provider(Box::new(MockProvider));
+            router.set_active("mock-model").expect("set active");
+            router
+        }
+
+        fn make_test_app(config_manager: Option<Arc<StdMutex<ConfigManager>>>) -> HeadlessApp {
+            use crate::headless::HeadlessAppDeps;
+
+            let subagent_manager = Arc::new(SubagentManager::new(SubagentManagerDeps {
+                factory: Arc::new(DisabledSubagentFactory::new("disabled")),
+                limits: SubagentLimits::default(),
+            }));
+
+            HeadlessApp::new(HeadlessAppDeps {
+                loop_engine: test_engine(),
+                router: Arc::new(mock_router()),
+                config: fx_config::FawxConfig::default(),
+                memory: None,
+                system_prompt_path: None,
+                config_manager,
+                system_prompt_text: None,
+                subagent_manager,
+                canary_monitor: None,
+            })
+            .expect("test app")
+        }
+
+        fn test_state(
+            config_manager: Option<Arc<StdMutex<ConfigManager>>>,
+            webhooks: Vec<Arc<WebhookChannel>>,
+        ) -> HttpState {
+            HttpState {
+                app: Arc::new(Mutex::new(make_test_app(config_manager))),
+                start_time: Instant::now(),
+                tailscale_ip: None,
+                bearer_token: TEST_TOKEN.to_string(),
+                channels: build_channel_runtime(None, webhooks),
+            }
+        }
+
+        #[test]
+        fn sanitize_config_redacts_nested_secrets() {
+            let sanitized = sanitize_config(serde_json::json!({
+                "model": { "default_model": "test-model" },
+                "telegram": {
+                    "bot_token": "secret-token",
+                    "allowed_chat_ids": [123],
+                    "nested": { "api_key": "secret-key" }
+                },
+                "http": { "bearer_token": "secret-bearer" },
+                "limits": { "max_tokens": 4096 }
+            }));
+
+            assert_eq!(sanitized["model"]["default_model"], "test-model");
+            assert_eq!(sanitized["telegram"]["bot_token"], "[REDACTED]");
+            assert_eq!(sanitized["telegram"]["allowed_chat_ids"][0], 123);
+            assert_eq!(sanitized["telegram"]["nested"]["api_key"], "[REDACTED]");
+            assert_eq!(sanitized["http"]["bearer_token"], "[REDACTED]");
+            assert_eq!(sanitized["limits"]["max_tokens"], 4096);
+        }
+
+        #[test]
+        fn sanitize_config_redacts_private_access_and_credential_keys() {
+            for key in [
+                "private_key",
+                "service_private_key",
+                "access_key",
+                "aws_access_key",
+                "credential",
+                "db_credential",
+            ] {
+                assert!(is_secret_key(key), "expected `{key}` to be redacted");
+            }
+        }
+
+        #[tokio::test]
+        async fn status_endpoint_returns_sanitized_config() {
+            let temp = TempDir::new().expect("tempdir");
+            std::fs::write(
+                temp.path().join("config.toml"),
+                r#"[model]
+default_model = "test-model"
+
+[http]
+bearer_token = "super-secret"
+
+[telegram]
+bot_token = "telegram-secret"
+allowed_chat_ids = [123]
+"#,
+            )
+            .expect("write config");
+            let manager = Arc::new(StdMutex::new(
+                ConfigManager::new(temp.path()).expect("config manager"),
+            ));
+            let app = build_router(test_state(Some(manager), Vec::new()));
+            let req = Request::builder()
+                .method("GET")
+                .uri("/status")
+                .header("authorization", format!("Bearer {TEST_TOKEN}"))
+                .body(Body::empty())
+                .expect("request");
+
+            let resp = app.oneshot(req).await.expect("response");
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = resp.into_body().collect().await.expect("body").to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            assert_eq!(json["config"]["model"]["default_model"], "test-model");
+            assert_eq!(json["config"]["http"]["bearer_token"], "[REDACTED]");
+            assert_eq!(json["config"]["telegram"]["bot_token"], "[REDACTED]");
+            assert_eq!(json["config"]["telegram"]["allowed_chat_ids"][0], 123);
+        }
+
+        #[tokio::test]
+        async fn generic_webhook_endpoint_routes_response() {
+            let webhook = Arc::new(WebhookChannel::new(
+                "alpha".to_string(),
+                "Alpha".to_string(),
+                None,
+            ));
+            let app = build_router(test_state(None, vec![webhook]));
+            let req = Request::builder()
+                .method("POST")
+                .uri("/webhook/alpha")
+                .header("authorization", format!("Bearer {TEST_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"text":"hello from webhook"}"#))
+                .expect("request");
+
+            let resp = app.oneshot(req).await.expect("response");
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = resp.into_body().collect().await.expect("body").to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            assert_eq!(json["channel_id"], "alpha");
+            assert_eq!(json["text"], "Mock response");
+            assert_eq!(json["complete"], true);
+        }
+
+        #[tokio::test]
+        async fn generic_webhook_handler_uses_webhook_map_for_lookup() {
+            let webhook = Arc::new(WebhookChannel::new(
+                "alpha".to_string(),
+                "Alpha".to_string(),
+                None,
+            ));
+            let mut router_registry = ChannelRegistry::new();
+            router_registry.register(webhook.clone());
+            let mut webhooks = std::collections::HashMap::new();
+            webhooks.insert("alpha".to_string(), webhook);
+            let state = HttpState {
+                app: Arc::new(Mutex::new(make_test_app(None))),
+                start_time: Instant::now(),
+                tailscale_ip: None,
+                bearer_token: TEST_TOKEN.to_string(),
+                channels: ChannelRuntime {
+                    router: Arc::new(ResponseRouter::new(Arc::new(router_registry))),
+                    http: Arc::new(HttpChannel::new()),
+                    telegram: None,
+                    webhooks: Arc::new(webhooks),
+                },
+            };
+            let app = build_router(state);
+            let req = Request::builder()
+                .method("POST")
+                .uri("/webhook/alpha")
+                .header("authorization", format!("Bearer {TEST_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"text":"hello from webhook"}"#))
+                .expect("request");
+
+            let resp = app.oneshot(req).await.expect("response");
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+    }
+
     // ── Config endpoint tests ────────────────────────────────────────────
 
     mod config_endpoint {
@@ -1991,6 +2443,12 @@ mod tests {
 
         // ── Mock Telegram API server ────────────────────────────────────
 
+        #[derive(Debug, Clone)]
+        struct CapturedTelegramRequest {
+            path: String,
+            body: serde_json::Value,
+        }
+
         /// Spin up a minimal HTTP server that returns `{"ok": true}` for
         /// all POSTs (mimics the Telegram Bot API enough for unit tests).
         async fn mock_telegram_server() -> (String, tokio::task::JoinHandle<()>) {
@@ -2000,6 +2458,36 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("bind mock server");
+            let addr = listener.local_addr().expect("local addr");
+            let base_url = format!("http://{addr}");
+            let handle = tokio::spawn(async move {
+                axum::serve(listener, app).await.ok();
+            });
+            (base_url, handle)
+        }
+
+        async fn capturing_telegram_server(
+            captured: Arc<std::sync::Mutex<Vec<CapturedTelegramRequest>>>,
+        ) -> (String, tokio::task::JoinHandle<()>) {
+            let app = axum::Router::new().fallback(axum::routing::any(
+                move |uri: axum::http::Uri, body: String| {
+                    let captured = Arc::clone(&captured);
+                    async move {
+                        let parsed = serde_json::from_str(&body).expect("capture telegram body");
+                        captured
+                            .lock()
+                            .expect("capture lock")
+                            .push(CapturedTelegramRequest {
+                                path: uri.path().to_string(),
+                                body: parsed,
+                            });
+                        axum::Json(serde_json::json!({ "ok": true }))
+                    }
+                },
+            ));
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind capture server");
             let addr = listener.local_addr().expect("local addr");
             let base_url = format!("http://{addr}");
             let handle = tokio::spawn(async move {
@@ -2093,16 +2581,12 @@ mod tests {
 
             let update = sample_update(12345, "hello bot");
 
-            // Should not panic; processes the message and sends response.
-            handle_telegram_update(&telegram, &app, &update).await;
+            let registry = Arc::new(ChannelRegistry::new());
+            let router = ResponseRouter::new(registry);
 
-            // Verify the last_chat_id was set (proves we reached the
-            // message-processing path, not an early return).
-            assert_eq!(
-                telegram.last_chat_id(),
-                Some(12345),
-                "chat_id should be set after successful processing"
-            );
+            handle_telegram_update(&telegram, &app, &router, &update).await;
+
+            assert!(telegram.drain_outbound().is_empty());
         }
 
         /// Parse error: invalid update JSON is handled gracefully.
@@ -2118,14 +2602,12 @@ mod tests {
                 "message": { "bad_field": true }
             });
 
-            // Should return early without panicking.
-            handle_telegram_update(&telegram, &app, &invalid_update).await;
+            let registry = Arc::new(ChannelRegistry::new());
+            let router = ResponseRouter::new(registry);
 
-            // Verify we never reached the message-processing path.
-            assert!(
-                telegram.last_chat_id().is_none(),
-                "chat_id should not be set on parse error"
-            );
+            handle_telegram_update(&telegram, &app, &router, &invalid_update).await;
+
+            assert!(telegram.drain_outbound().is_empty());
         }
 
         /// process_message error: app returns error, error message sent.
@@ -2137,16 +2619,34 @@ mod tests {
 
             let update = sample_update(12345, "trigger error");
 
-            // Should not panic; processes the error and sends error message.
-            handle_telegram_update(&telegram, &app, &update).await;
+            let registry = Arc::new(ChannelRegistry::new());
+            let router = ResponseRouter::new(registry);
 
-            // Verify the last_chat_id was set (proves we reached the
-            // processing path, even though the LLM failed).
-            assert_eq!(
-                telegram.last_chat_id(),
-                Some(12345),
-                "chat_id should be set even on error path"
-            );
+            handle_telegram_update(&telegram, &app, &router, &update).await;
+
+            assert!(telegram.drain_outbound().is_empty());
+        }
+
+        #[tokio::test]
+        async fn process_message_error_sends_plain_text_telegram_error() {
+            let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (base_url, _server) = capturing_telegram_server(Arc::clone(&captured)).await;
+            let telegram = TelegramChannel::new_with_base_url(test_telegram_config(), base_url);
+            let app = Arc::new(Mutex::new(make_test_app(failing_router())));
+            let update = sample_update(12345, "trigger error");
+            let registry = Arc::new(ChannelRegistry::new());
+            let router = ResponseRouter::new(registry);
+
+            handle_telegram_update(&telegram, &app, &router, &update).await;
+
+            let send_message = captured
+                .lock()
+                .expect("capture lock")
+                .iter()
+                .find(|request| request.path.ends_with("/sendMessage"))
+                .expect("sendMessage request")
+                .clone();
+            assert!(send_message.body.get("parse_mode").is_none());
         }
     }
 }

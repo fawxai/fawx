@@ -5,7 +5,7 @@
 //! response formatting only — no networking (no axum, no reqwest). The actual
 //! HTTP server lives in fx-cli.
 
-use fx_core::channel::{Channel, ChannelError};
+use fx_core::channel::{Channel, ChannelError, ResponseContext};
 use fx_core::types::InputSource;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -80,7 +80,7 @@ impl Channel for WebhookChannel {
         self.active.load(Ordering::Relaxed)
     }
 
-    fn send_response(&self, message: &str) -> Result<(), ChannelError> {
+    fn send_response(&self, message: &str, _context: &ResponseContext) -> Result<(), ChannelError> {
         let mut slot = self
             .pending_response
             .lock()
@@ -149,14 +149,16 @@ mod tests {
     #[test]
     fn send_response_stores_pending() {
         let ch = make_channel();
-        ch.send_response("hello webhook").unwrap();
+        ch.send_response("hello webhook", &ResponseContext::default())
+            .unwrap();
         assert_eq!(ch.take_response().as_deref(), Some("hello webhook"));
     }
 
     #[test]
     fn take_response_clears_slot() {
         let ch = make_channel();
-        ch.send_response("first").unwrap();
+        ch.send_response("first", &ResponseContext::default())
+            .unwrap();
         assert!(ch.take_response().is_some());
         assert!(ch.take_response().is_none());
     }
