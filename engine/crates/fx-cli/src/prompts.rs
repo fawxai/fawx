@@ -1,4 +1,4 @@
-use crate::tui::TuiError;
+use crate::startup::StartupError;
 use crossterm::{event, terminal};
 use std::{
     io::{self, Write},
@@ -9,8 +9,6 @@ const MAX_PROMPT_RETRIES: usize = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PromptSurface {
-    AlternateScreen,
-    #[allow(dead_code)] // Used by binary-only setup flows.
     PlainTerminal,
 }
 
@@ -30,31 +28,13 @@ pub(crate) fn parse_auth_selection(value: &str) -> Option<AuthSelection> {
     }
 }
 
-pub(crate) fn prompt_choice<T, F>(
-    prompt: &str,
-    invalid_message: &str,
-    context: &str,
-    parser: F,
-) -> Result<T, TuiError>
-where
-    F: Fn(&str) -> Option<T>,
-{
-    prompt_choice_with_surface(
-        PromptSurface::AlternateScreen,
-        prompt,
-        invalid_message,
-        context,
-        parser,
-    )
-}
-
 pub(crate) fn prompt_choice_with_surface<T, F>(
     surface: PromptSurface,
     prompt: &str,
     invalid_message: &str,
     context: &str,
     parser: F,
-) -> Result<T, TuiError>
+) -> Result<T, StartupError>
 where
     F: Fn(&str) -> Option<T>,
 {
@@ -63,31 +43,20 @@ where
     })
 }
 
-pub(crate) fn prompt_line(prompt: &str) -> Result<String, TuiError> {
+pub(crate) fn prompt_line(prompt: &str) -> Result<String, StartupError> {
     ensure_cooked_mode();
     eprint!("{prompt}");
-    io::stdout().flush().map_err(TuiError::Io)?;
+    io::stdout().flush().map_err(StartupError::Io)?;
 
     let mut input = String::new();
-    let bytes = io::stdin().read_line(&mut input).map_err(TuiError::Io)?;
+    let bytes = io::stdin()
+        .read_line(&mut input)
+        .map_err(StartupError::Io)?;
     if bytes == 0 {
-        return Err(TuiError::Auth("stdin closed unexpectedly".to_string()));
+        return Err(StartupError::Auth("stdin closed unexpectedly".to_string()));
     }
 
     Ok(input.trim().to_string())
-}
-
-pub(crate) fn prompt_non_empty_line(
-    prompt: &str,
-    empty_message: &str,
-    context: &str,
-) -> Result<String, TuiError> {
-    prompt_non_empty_line_with_surface(
-        PromptSurface::AlternateScreen,
-        prompt,
-        empty_message,
-        context,
-    )
 }
 
 pub(crate) fn prompt_non_empty_line_with_surface(
@@ -95,19 +64,15 @@ pub(crate) fn prompt_non_empty_line_with_surface(
     prompt: &str,
     empty_message: &str,
     context: &str,
-) -> Result<String, TuiError> {
+) -> Result<String, StartupError> {
     run_prompt_on_surface(surface, || {
         prompt_non_empty_line_inner(prompt, empty_message, context)
     })
 }
 
-pub(crate) fn prompt_api_key_provider() -> Result<String, TuiError> {
-    prompt_api_key_provider_with_surface(PromptSurface::AlternateScreen)
-}
-
 pub(crate) fn prompt_api_key_provider_with_surface(
     surface: PromptSurface,
-) -> Result<String, TuiError> {
+) -> Result<String, StartupError> {
     run_prompt_on_surface(surface, || {
         eprintln!("Which provider?");
         eprintln!("  [1] Anthropic");
@@ -136,37 +101,15 @@ pub(crate) fn prompt_api_key_provider_with_surface(
     })
 }
 
-pub(crate) fn prompt_non_empty_secret(
-    prompt: &str,
-    empty_message: &str,
-    context: &str,
-) -> Result<String, TuiError> {
-    prompt_non_empty_secret_with_surface(
-        PromptSurface::AlternateScreen,
-        prompt,
-        empty_message,
-        context,
-    )
-}
-
 pub(crate) fn prompt_non_empty_secret_with_surface(
     surface: PromptSurface,
     prompt: &str,
     empty_message: &str,
     context: &str,
-) -> Result<String, TuiError> {
+) -> Result<String, StartupError> {
     run_prompt_on_surface(surface, || {
         prompt_secret_loop(prompt, empty_message, context)
     })
-}
-
-pub(crate) fn with_normal_screen<T>(
-    f: impl FnOnce() -> Result<T, TuiError>,
-) -> Result<T, TuiError> {
-    let _ = crossterm::execute!(io::stdout(), terminal::LeaveAlternateScreen);
-    let result = f();
-    let _ = crossterm::execute!(io::stdout(), terminal::EnterAlternateScreen);
-    result
 }
 
 pub(crate) fn open_browser(url: &str) -> io::Result<()> {
@@ -207,13 +150,10 @@ where
 }
 
 fn run_prompt_on_surface<T>(
-    surface: PromptSurface,
-    f: impl FnOnce() -> Result<T, TuiError>,
-) -> Result<T, TuiError> {
-    match surface {
-        PromptSurface::AlternateScreen => with_normal_screen(f),
-        PromptSurface::PlainTerminal => f(),
-    }
+    _surface: PromptSurface,
+    f: impl FnOnce() -> Result<T, StartupError>,
+) -> Result<T, StartupError> {
+    f()
 }
 
 pub(crate) fn ensure_cooked_mode() {
@@ -230,7 +170,7 @@ fn prompt_choice_inner<T, F>(
     invalid_message: &str,
     context: &str,
     parser: F,
-) -> Result<T, TuiError>
+) -> Result<T, StartupError>
 where
     F: Fn(&str) -> Option<T>,
 {
@@ -249,7 +189,7 @@ fn prompt_non_empty_line_inner(
     prompt: &str,
     empty_message: &str,
     context: &str,
-) -> Result<String, TuiError> {
+) -> Result<String, StartupError> {
     prompt_non_empty_line_with_reader(prompt, empty_message, context, prompt_line)
 }
 
@@ -258,9 +198,9 @@ fn prompt_non_empty_line_with_reader<F>(
     empty_message: &str,
     context: &str,
     mut read: F,
-) -> Result<String, TuiError>
+) -> Result<String, StartupError>
 where
-    F: FnMut(&str) -> Result<String, TuiError>,
+    F: FnMut(&str) -> Result<String, StartupError>,
 {
     for _ in 0..MAX_PROMPT_RETRIES {
         let value = read(prompt)?;
@@ -277,7 +217,7 @@ fn prompt_secret_loop(
     prompt: &str,
     empty_message: &str,
     context: &str,
-) -> Result<String, TuiError> {
+) -> Result<String, StartupError> {
     for _ in 0..MAX_PROMPT_RETRIES {
         let value = prompt_secret(prompt)?;
         if !value.is_empty() {
@@ -289,9 +229,9 @@ fn prompt_secret_loop(
     Err(retry_limit_error(context))
 }
 
-fn prompt_secret(prompt: &str) -> Result<String, TuiError> {
+fn prompt_secret(prompt: &str) -> Result<String, StartupError> {
     eprint!("{prompt}");
-    io::stdout().flush().map_err(TuiError::Io)?;
+    io::stdout().flush().map_err(StartupError::Io)?;
 
     let _guard = RawModeGuard::new()?;
     let mut value = String::new();
@@ -307,27 +247,27 @@ fn prompt_secret(prompt: &str) -> Result<String, TuiError> {
     Ok(trimmed)
 }
 
-fn read_secret_input(value: &mut String) -> Result<(), TuiError> {
+fn read_secret_input(value: &mut String) -> Result<(), StartupError> {
     let mut display_len: usize = 0;
 
     loop {
-        let event = event::read().map_err(TuiError::Io)?;
+        let event = event::read().map_err(StartupError::Io)?;
         if let event::Event::Key(key_event) = event {
             match classify_secret_input_key(&key_event) {
                 SecretInputKeyAction::Submit => return Ok(()),
-                SecretInputKeyAction::Cancel => return Err(TuiError::Cancelled),
+                SecretInputKeyAction::Cancel => return Err(StartupError::Cancelled),
                 SecretInputKeyAction::Ignore => {}
                 SecretInputKeyAction::Type(ch) => {
                     value.push(ch);
                     display_len += 1;
                     eprint!("•");
-                    io::stdout().flush().map_err(TuiError::Io)?;
+                    io::stdout().flush().map_err(StartupError::Io)?;
                 }
                 SecretInputKeyAction::Delete => {
                     if value.pop().is_some() && display_len > 0 {
                         display_len -= 1;
                         eprint!("\x08 \x08");
-                        io::stdout().flush().map_err(TuiError::Io)?;
+                        io::stdout().flush().map_err(StartupError::Io)?;
                     }
                 }
             }
@@ -335,8 +275,8 @@ fn read_secret_input(value: &mut String) -> Result<(), TuiError> {
     }
 }
 
-fn retry_limit_error(context: &str) -> TuiError {
-    TuiError::Auth(format!("maximum input retries exceeded for {context}"))
+fn retry_limit_error(context: &str) -> StartupError {
+    StartupError::Auth(format!("maximum input retries exceeded for {context}"))
 }
 
 pub(crate) fn ensure_cooked_mode_with<DisableRawMode, DrainStdin>(
@@ -530,7 +470,7 @@ mod tests {
         });
 
         assert!(
-            matches!(result, Err(TuiError::Auth(message)) if message.contains("maximum input retries exceeded"))
+            matches!(result, Err(StartupError::Auth(message)) if message.contains("maximum input retries exceeded"))
         );
         assert_eq!(calls, MAX_PROMPT_RETRIES);
     }

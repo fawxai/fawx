@@ -4,7 +4,6 @@
 //! exposes the headless engine and startup helpers for other crates such as
 //! `fawx-tui` embedded mode.
 
-mod ansi;
 mod auth_store;
 #[path = "commands/slash.rs"]
 pub(crate) mod slash_commands;
@@ -13,15 +12,15 @@ mod commands {
 }
 mod config_bridge;
 pub mod headless;
+pub(crate) mod helpers;
 #[cfg(feature = "http")]
 pub mod http_serve;
 #[cfg(test)]
 mod markdown;
-mod prompts;
 mod proposal_review;
-#[allow(dead_code)] // TODO(#1148): Phase 3 reconnects history, banner art, and markdown
-pub(crate) mod tui;
-mod ui;
+#[allow(dead_code)]
+// TODO(#1282): narrow this once embedded/lib and CLI startup paths stop leaving target-specific helpers unused.
+pub(crate) mod startup;
 
 use fx_canary::{CanaryConfig, CanaryMonitor, RipcordTrigger, RollbackTrigger};
 use std::{
@@ -40,13 +39,13 @@ struct HeadlessAppBuildConfig {
 
 /// Build a headless app suitable for embedded use.
 pub fn build_headless_app(system_prompt: Option<PathBuf>) -> anyhow::Result<headless::HeadlessApp> {
-    let auth_manager = tui::load_auth_manager()?;
-    let router = Arc::new(tui::build_router(&auth_manager)?);
-    let config = tui::load_config()?;
+    let auth_manager = startup::load_auth_manager()?;
+    let router = Arc::new(startup::build_router(&auth_manager)?);
+    let config = startup::load_config()?;
     let build_config = HeadlessAppBuildConfig {
         data_dir: configured_data_dir(&config),
         config_manager: Some(build_config_manager(&config)),
-        improvement_provider: tui::build_improvement_provider(&auth_manager, &config),
+        improvement_provider: startup::build_improvement_provider(&auth_manager, &config),
         system_prompt,
         router,
         config,
@@ -71,7 +70,7 @@ fn build_app_with_dependencies(
         &build_config.config,
         build_config.improvement_provider.clone(),
     );
-    let bundle = tui::build_headless_loop_engine_bundle(
+    let bundle = startup::build_headless_loop_engine_bundle(
         &build_config.config,
         build_config.improvement_provider,
         parent_loop_build_options(&subagent_manager, build_config.config_manager.clone()),
@@ -97,7 +96,7 @@ fn build_config_manager(
         .general
         .data_dir
         .clone()
-        .unwrap_or_else(tui::fawx_data_dir);
+        .unwrap_or_else(startup::fawx_data_dir);
     let config_path = data_dir.join("config.toml");
     let manager = fx_config::manager::ConfigManager::from_config(config.clone(), config_path);
     Arc::new(std::sync::Mutex::new(manager))
@@ -125,14 +124,14 @@ fn build_subagent_manager(
 fn parent_loop_build_options(
     subagent_manager: &Arc<fx_subagent::SubagentManager>,
     config_manager: Option<Arc<std::sync::Mutex<fx_config::manager::ConfigManager>>>,
-) -> tui::HeadlessLoopBuildOptions {
-    tui::HeadlessLoopBuildOptions {
+) -> startup::HeadlessLoopBuildOptions {
+    startup::HeadlessLoopBuildOptions {
         memory_enabled: true,
         subagent_control: Some(
             Arc::clone(subagent_manager) as Arc<dyn fx_subagent::SubagentControl>
         ),
         config_manager,
-        ..tui::HeadlessLoopBuildOptions::default()
+        ..startup::HeadlessLoopBuildOptions::default()
     }
 }
 
@@ -201,5 +200,5 @@ fn configured_data_dir(config: &fx_config::FawxConfig) -> PathBuf {
         .general
         .data_dir
         .clone()
-        .unwrap_or_else(tui::fawx_data_dir)
+        .unwrap_or_else(startup::fawx_data_dir)
 }

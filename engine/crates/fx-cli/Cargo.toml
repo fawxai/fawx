@@ -50,8 +50,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
 crossterm = { workspace = true, features = ["event-stream"] }
-ratatui.workspace = true
-tui-textarea.workspace = true
 libc = "0.2"
 nix = { version = "0.29", features = ["process"] }
 futures.workspace = true
@@ -69,21 +67,12 @@ sha2 = "0.10"
 base64 = { version = "0.22", optional = true }
 dirs = "6.0"
 chrono = "0.4"
-unicode-width = "0.2"
-unicode-segmentation = "1.12"
 zeroize.workspace = true
 which = "6.0"
 
 # subtle: used by oauth-bridge for constant-time comparison.
 subtle = { version = "2.6", optional = true }
 urlencoding = "2.1"
-# termimad: markdown rendering for terminal output.
-# Forked to abbudjoe/termimad for supply-chain safety. MIT licensed.
-termimad = { git = "https://github.com/abbudjoe/termimad.git", rev = "f93824f3010e8f7b2650973a2723dd6d36a2f0db" }
-
-# syntect: syntax highlighting for code blocks.
-# Forked to abbudjoe/syntect for supply-chain safety. MIT licensed.
-syntect = { git = "https://github.com/abbudjoe/syntect.git", rev = "6271d7dd8a63f13df08c151840f2358bf116cdcc", default-features = false, features = ["default-fancy"] }
 
 [dev-dependencies]
 fx-subagent = { workspace = true, features = ["test-support"] }

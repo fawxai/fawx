@@ -36,12 +36,15 @@ use crate::commands::slash::{
     render_signals_summary, CommandContext, CommandHost, ImproveFlags, ParsedCommand,
     DEFAULT_SYNTHESIS_INSTRUCTION, MAX_SYNTHESIS_INSTRUCTION_LENGTH,
 };
+use crate::helpers::{
+    available_provider_names, format_memory_for_prompt, render_model_menu_text, render_status_text,
+    resolve_model_alias, thinking_config_from_budget, trim_history, AnalysisCompletionProvider,
+    RouterLoopLlmProvider,
+};
 use crate::proposal_review::{approve_pending, reject_pending, render_pending, ReviewContext};
-use crate::tui::{
-    available_provider_names, build_headless_loop_engine_bundle, configured_data_dir,
-    configured_working_dir, fawx_data_dir, format_memory_for_prompt, render_model_menu_text,
-    render_status_text, resolve_model_alias, thinking_config_from_budget, trim_history,
-    AnalysisCompletionProvider, HeadlessLoopBuildOptions, RouterLoopLlmProvider, SharedMemoryStore,
+use crate::startup::{
+    build_headless_loop_engine_bundle, configured_data_dir, configured_working_dir, fawx_data_dir,
+    HeadlessLoopBuildOptions, SharedMemoryStore,
 };
 use fx_subagent::{
     CreatedSubagentSession, SpawnConfig, SubagentError, SubagentFactory, SubagentLimits,

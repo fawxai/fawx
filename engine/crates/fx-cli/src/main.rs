@@ -1,23 +1,20 @@
 //! Fawx CLI - Management interface for the Fawx agent.
 
-mod ansi;
 mod auth_store;
 mod commands;
 mod config_bridge;
 mod confirmation;
 mod headless;
+pub(crate) mod helpers;
 #[cfg(feature = "http")]
 mod http_serve;
-#[allow(dead_code)] // TODO(#1148): Phase 3 will wire markdown rendering into ratatui
+#[cfg(test)]
 mod markdown;
 mod prompts;
 mod proposal_review;
-// Phase 2: many rendering/history utilities are currently test-only while we
-// wire ratatui. Phase 3 (polish) will re-connect markdown rendering, banner
-// art, and history persistence. Suppress dead-code warnings until then.
-#[allow(dead_code)] // TODO(#1148): Phase 3 reconnects history, banner art, and markdown
-mod tui;
-mod ui;
+#[allow(dead_code)]
+// TODO(#1282): narrow this once embedded/lib and CLI startup paths stop leaving target-specific helpers unused.
+mod startup;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -53,10 +50,6 @@ enum Commands {
         #[arg(hide = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-
-    /// Launch the legacy inline TUI
-    #[command(hide = true)]
-    TuiLegacy,
 
     /// Interactive chat with the agent
     Chat,
@@ -249,28 +242,6 @@ enum SkillCommands {
 const FAWX_TUI_NOT_FOUND_MESSAGE: &str =
     "fawx-tui binary not found. Build it with: cargo build --release -p fawx-tui";
 
-async fn run_tui() -> anyhow::Result<i32> {
-    let auth_manager = tui::load_auth_manager()?;
-    let router = tui::build_router(&auth_manager)?;
-    let config = tui::load_config()?;
-    let data_dir = configured_data_dir(&config);
-    let improvement_provider = tui::build_improvement_provider(&auth_manager, &config);
-    let config_manager = build_config_manager(&config);
-    let subagent_router = Arc::new(tui::build_router(&auth_manager)?);
-    let subagent_manager =
-        build_subagent_manager(subagent_router, &config, improvement_provider.clone());
-    let bundle = tui::build_loop_engine_from_config_with_options(
-        &config,
-        improvement_provider,
-        parent_loop_build_options(&subagent_manager, Some(Arc::clone(&config_manager))),
-    )?;
-    let mut deps = bundle.into_tui_deps(auth_manager, router, config);
-    deps.canary_monitor = Some(build_canary_monitor(&data_dir));
-    let mut app = tui::TuiApp::new_with_deps(deps)?;
-    app.run().await?;
-    Ok(0)
-}
-
 fn build_config_manager(
     config: &fx_config::FawxConfig,
 ) -> Arc<std::sync::Mutex<fx_config::manager::ConfigManager>> {
@@ -278,7 +249,7 @@ fn build_config_manager(
         .general
         .data_dir
         .clone()
-        .unwrap_or_else(tui::fawx_data_dir);
+        .unwrap_or_else(startup::fawx_data_dir);
     let config_path = data_dir.join("config.toml");
     let manager = fx_config::manager::ConfigManager::from_config(config.clone(), config_path);
     Arc::new(std::sync::Mutex::new(manager))
@@ -305,14 +276,14 @@ fn build_subagent_manager(
 fn parent_loop_build_options(
     subagent_manager: &Arc<fx_subagent::SubagentManager>,
     config_manager: Option<Arc<std::sync::Mutex<fx_config::manager::ConfigManager>>>,
-) -> tui::HeadlessLoopBuildOptions {
-    tui::HeadlessLoopBuildOptions {
+) -> startup::HeadlessLoopBuildOptions {
+    startup::HeadlessLoopBuildOptions {
         memory_enabled: true,
         subagent_control: Some(
             Arc::clone(subagent_manager) as Arc<dyn fx_subagent::SubagentControl>
         ),
         config_manager,
-        ..tui::HeadlessLoopBuildOptions::default()
+        ..startup::HeadlessLoopBuildOptions::default()
     }
 }
 
@@ -382,18 +353,18 @@ struct HeadlessStartup {
 fn build_headless_startup(
     system_prompt: Option<std::path::PathBuf>,
 ) -> anyhow::Result<HeadlessStartup> {
-    let auth_manager = tui::load_auth_manager()?;
-    let router = Arc::new(tui::build_router(&auth_manager)?);
-    let config = tui::load_config()?;
+    let auth_manager = startup::load_auth_manager()?;
+    let router = Arc::new(startup::build_router(&auth_manager)?);
+    let config = startup::load_config()?;
     #[cfg(feature = "http")]
     let http_config = config.http.clone();
     #[cfg(feature = "http")]
     let telegram_config = config.telegram.clone();
     #[cfg(feature = "http")]
     let webhook_config = config.webhook.clone();
-    let data_dir = tui::fawx_data_dir();
+    let data_dir = startup::fawx_data_dir();
     let config_manager = Some(build_config_manager(&config));
-    let improvement_provider = tui::build_improvement_provider(&auth_manager, &config);
+    let improvement_provider = startup::build_improvement_provider(&auth_manager, &config);
     let app = build_headless_app(
         router,
         config,
@@ -425,7 +396,7 @@ fn build_headless_app(
 ) -> anyhow::Result<headless::HeadlessApp> {
     let subagent_manager =
         build_subagent_manager(Arc::clone(&router), &config, improvement_provider.clone());
-    let bundle = tui::build_headless_loop_engine_bundle(
+    let bundle = startup::build_headless_loop_engine_bundle(
         &config,
         improvement_provider,
         parent_loop_build_options(&subagent_manager, config_manager.clone()),
@@ -501,14 +472,6 @@ fn ripcord_binary_name() -> &'static str {
     {
         "fawx-ripcord"
     }
-}
-
-fn configured_data_dir(config: &fx_config::FawxConfig) -> PathBuf {
-    config
-        .general
-        .data_dir
-        .clone()
-        .unwrap_or_else(tui::fawx_data_dir)
 }
 
 async fn run_headless(
@@ -765,7 +728,6 @@ async fn dispatch_skill(command: SkillCommands) -> anyhow::Result<i32> {
 async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
     match command {
         Commands::Tui { args } => launch_fawx_tui(&args),
-        Commands::TuiLegacy => run_tui().await,
         Commands::Start => Ok(run_stub("Starting")),
         Commands::Stop => Ok(run_stub("Stopping")),
         Commands::Chat => Ok(commands::chat::run().await?),
@@ -984,12 +946,6 @@ mod tests {
             cli.command,
             Some(Commands::Tui { args }) if args == vec!["--host", "http://127.0.0.1:8400"]
         ));
-    }
-
-    #[test]
-    fn cli_parses_hidden_tui_legacy_command() {
-        let cli = Cli::parse_from(["fawx", "tui-legacy"]);
-        assert!(matches!(cli.command, Some(Commands::TuiLegacy)));
     }
 
     #[test]

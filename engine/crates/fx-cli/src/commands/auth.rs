@@ -1,5 +1,5 @@
 use crate::auth_store::open_auth_store_with_recovery;
-use crate::tui::fawx_data_dir;
+use crate::startup::fawx_data_dir;
 use anyhow::anyhow;
 use clap::Subcommand;
 use fx_auth::auth::{AuthManager, AuthMethod};

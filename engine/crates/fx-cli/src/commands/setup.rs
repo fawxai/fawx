@@ -4,7 +4,7 @@ use crate::prompts::{
     prompt_choice_with_surface, prompt_line, prompt_non_empty_line_with_surface,
     prompt_non_empty_secret_with_surface, PromptSurface,
 };
-use crate::tui::{build_router, fawx_data_dir};
+use crate::startup::{build_router, fawx_data_dir};
 use anyhow::{anyhow, Context};
 use fx_auth::auth::{AuthManager, AuthMethod};
 use fx_auth::oauth::{extract_openai_account_id, PkceFlow, TokenExchangeRequest, TokenResponse};

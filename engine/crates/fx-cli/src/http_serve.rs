@@ -667,7 +667,9 @@ async fn handle_status(State(state): State<HttpState>) -> Json<StatusResponse> {
 
 /// Return the media inbound directory (`~/.fawx/media/inbound/`).
 fn media_inbound_dir() -> std::path::PathBuf {
-    crate::tui::fawx_data_dir().join("media").join("inbound")
+    crate::startup::fawx_data_dir()
+        .join("media")
+        .join("inbound")
 }
 
 /// Download photos and build the final message text.
@@ -882,7 +884,7 @@ pub async fn run(
     telegram: Option<Arc<TelegramChannel>>,
     webhook_channels: Vec<Arc<WebhookChannel>>,
 ) -> anyhow::Result<i32> {
-    let data_dir = crate::tui::fawx_data_dir();
+    let data_dir = crate::startup::fawx_data_dir();
     let auth_store = match crate::auth_store::AuthStore::open(&data_dir) {
         Ok(store) => Some(store),
         Err(e) => {

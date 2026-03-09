@@ -6,7 +6,7 @@ use fx_kernel::signals::{Signal, SignalCollector};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use crate::tui::thinking_config_from_budget;
+use crate::helpers::thinking_config_from_budget;
 
 pub(crate) const DEFAULT_SYNTHESIS_INSTRUCTION: &str =
     "Use the tool output to directly answer the user's question. Be natural and specific — \
@@ -626,7 +626,7 @@ fn parse_reject_command(parts: &mut std::str::SplitWhitespace<'_>) -> ParsedComm
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::{build_headless_loop_engine_bundle, HeadlessLoopBuildOptions};
+    use crate::startup::{build_headless_loop_engine_bundle, HeadlessLoopBuildOptions};
     use anyhow::anyhow;
     use fx_config::manager::ConfigManager;
     use fx_config::{FawxConfig, ThinkingBudget};
