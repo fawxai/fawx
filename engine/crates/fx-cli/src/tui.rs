@@ -18,6 +18,7 @@ use fx_analysis::{AnalysisEngine, AnalysisError, AnalysisFinding, Confidence};
 use fx_auth::auth::{AuthManager, AuthMethod};
 use fx_auth::credential_store::CredentialStore as CredentialStoreTrait;
 use fx_auth::oauth::{PkceFlow, TokenExchangeRequest, TokenResponse};
+use fx_config::manager::ConfigManager;
 use fx_config::{
     save_default_model, save_thinking_budget, FawxConfig, ImprovementToolsConfig, ThinkingBudget,
 };
@@ -3394,6 +3395,7 @@ pub struct HeadlessLoopBuildOptions {
     pub working_dir: Option<PathBuf>,
     pub memory_enabled: bool,
     pub subagent_control: Option<Arc<dyn SubagentControl>>,
+    pub config_manager: Option<Arc<Mutex<ConfigManager>>>,
     pub cancel_token: Option<CancellationToken>,
 }
 
@@ -3403,6 +3405,7 @@ impl HeadlessLoopBuildOptions {
             working_dir: None,
             memory_enabled: true,
             subagent_control: Some(subagent_control),
+            config_manager: None,
             cancel_token: None,
         }
     }
@@ -3412,6 +3415,7 @@ impl HeadlessLoopBuildOptions {
             working_dir,
             memory_enabled: false,
             subagent_control: None,
+            config_manager: None,
             cancel_token: Some(cancel_token),
         }
     }
@@ -3422,6 +3426,7 @@ struct SkillRegistryBuildOptions {
     working_dir: PathBuf,
     memory_enabled: bool,
     subagent_control: Option<Arc<dyn SubagentControl>>,
+    config_manager: Option<Arc<Mutex<ConfigManager>>>,
 }
 
 impl LoopEngineBundle {
@@ -3454,17 +3459,24 @@ pub fn build_loop_engine_from_config(
     config: &FawxConfig,
     improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
 ) -> Result<LoopEngineBundle, TuiError> {
-    let base_data_dir = fawx_data_dir();
-    let data_dir = configured_data_dir(&base_data_dir, config);
-    build_loop_engine_with_options(
-        data_dir,
-        config.clone(),
+    build_loop_engine_from_config_with_options(
+        config,
         improvement_provider,
         HeadlessLoopBuildOptions {
             memory_enabled: true,
             ..HeadlessLoopBuildOptions::default()
         },
     )
+}
+
+pub fn build_loop_engine_from_config_with_options(
+    config: &FawxConfig,
+    improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
+    options: HeadlessLoopBuildOptions,
+) -> Result<LoopEngineBundle, TuiError> {
+    let base_data_dir = fawx_data_dir();
+    let data_dir = configured_data_dir(&base_data_dir, config);
+    build_loop_engine_with_options(data_dir, config.clone(), improvement_provider, options)
 }
 
 pub fn build_headless_loop_engine_bundle(
@@ -3569,6 +3581,7 @@ fn build_skill_registry_options(
             .unwrap_or_else(|| configured_working_dir(config)),
         memory_enabled: options.memory_enabled,
         subagent_control: options.subagent_control.clone(),
+        config_manager: options.config_manager.clone(),
     }
 }
 
@@ -3710,6 +3723,9 @@ fn build_skill_registry(
 
     let runtime_info = new_runtime_info(config, memory_enabled);
     executor = executor.with_runtime_info(Arc::clone(&runtime_info));
+    if let Some(config_manager) = options.config_manager {
+        executor = executor.with_config_manager(config_manager);
+    }
     if let Some(control) = options.subagent_control {
         executor = executor.with_subagent_control(control);
     }
@@ -6105,6 +6121,39 @@ mod tests {
 
     fn sample_wasm_bytes() -> Vec<u8> {
         vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]
+    }
+
+    fn bundle_tool_names(bundle: &LoopEngineBundle) -> Vec<String> {
+        bundle
+            .skill_registry
+            .tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect()
+    }
+
+    #[test]
+    fn loop_engine_from_config_with_options_includes_tui_parity_tools() {
+        let (config, _temp_dir) = test_config_with_temp_dir();
+        let control = Arc::new(StubSubagentControl::new());
+        let config_manager = Arc::new(Mutex::new(ConfigManager::from_config(
+            config.clone(),
+            configured_data_dir(&fawx_data_dir(), &config).join("config.toml"),
+        )));
+        let options = HeadlessLoopBuildOptions {
+            memory_enabled: true,
+            subagent_control: Some(control),
+            config_manager: Some(config_manager),
+            ..HeadlessLoopBuildOptions::default()
+        };
+        let bundle = build_loop_engine_from_config_with_options(&config, None, options)
+            .expect("bundle should build");
+        let names = bundle_tool_names(&bundle);
+
+        assert!(names.contains(&"spawn_agent".to_string()));
+        assert!(names.contains(&"subagent_status".to_string()));
+        assert!(names.contains(&"config_get".to_string()));
+        assert!(names.contains(&"config_set".to_string()));
     }
 
     #[test]

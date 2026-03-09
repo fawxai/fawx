@@ -18,8 +18,13 @@ mod prompts;
 mod tui;
 mod ui;
 
+use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
-use std::sync::Arc;
+use std::{
+    ffi::OsStr,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 pub use confirmation::ConfirmationUi;
 
@@ -39,8 +44,17 @@ enum Commands {
     /// Stop the agent daemon
     Stop,
 
-    /// Run the terminal shell interface (default)
-    Tui,
+    /// Launch the Fawx TUI (connects to a running server)
+    #[command(trailing_var_arg = true)]
+    Tui {
+        /// Extra arguments passed through to fawx-tui
+        #[arg(hide = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Launch the legacy inline TUI
+    #[command(hide = true)]
+    TuiLegacy,
 
     /// Interactive chat with the agent
     Chat,
@@ -230,16 +244,123 @@ enum SkillCommands {
     },
 }
 
+const FAWX_TUI_NOT_FOUND_MESSAGE: &str =
+    "fawx-tui binary not found. Build it with: cargo build --release -p fawx-tui";
+
 async fn run_tui() -> anyhow::Result<i32> {
     let auth_manager = tui::load_auth_manager()?;
     let router = tui::build_router(&auth_manager)?;
     let config = tui::load_config()?;
     let improvement_provider = tui::build_improvement_provider(&auth_manager, &config);
-    let bundle = tui::build_loop_engine_from_config(&config, improvement_provider)?;
+    let config_manager = build_config_manager(&config);
+    let subagent_router = Arc::new(tui::build_router(&auth_manager)?);
+    let subagent_manager =
+        build_subagent_manager(subagent_router, &config, improvement_provider.clone());
+    let bundle = tui::build_loop_engine_from_config_with_options(
+        &config,
+        improvement_provider,
+        parent_loop_build_options(&subagent_manager, Some(Arc::clone(&config_manager))),
+    )?;
     let deps = bundle.into_tui_deps(auth_manager, router, config);
     let mut app = tui::TuiApp::new_with_deps(deps)?;
     app.run().await?;
     Ok(0)
+}
+
+fn build_config_manager(
+    config: &fx_config::FawxConfig,
+) -> Arc<std::sync::Mutex<fx_config::manager::ConfigManager>> {
+    let data_dir = config
+        .general
+        .data_dir
+        .clone()
+        .unwrap_or_else(tui::fawx_data_dir);
+    let config_path = data_dir.join("config.toml");
+    let manager = fx_config::manager::ConfigManager::from_config(config.clone(), config_path);
+    Arc::new(std::sync::Mutex::new(manager))
+}
+
+fn build_subagent_manager(
+    router: Arc<fx_llm::ModelRouter>,
+    config: &fx_config::FawxConfig,
+    improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
+) -> Arc<fx_subagent::SubagentManager> {
+    let factory = headless::HeadlessSubagentFactory::new(headless::HeadlessSubagentFactoryDeps {
+        router,
+        config: config.clone(),
+        improvement_provider,
+    });
+    Arc::new(fx_subagent::SubagentManager::new(
+        fx_subagent::SubagentManagerDeps {
+            factory: Arc::new(factory),
+            limits: fx_subagent::SubagentLimits::default(),
+        },
+    ))
+}
+
+fn parent_loop_build_options(
+    subagent_manager: &Arc<fx_subagent::SubagentManager>,
+    config_manager: Option<Arc<std::sync::Mutex<fx_config::manager::ConfigManager>>>,
+) -> tui::HeadlessLoopBuildOptions {
+    tui::HeadlessLoopBuildOptions {
+        memory_enabled: true,
+        subagent_control: Some(
+            Arc::clone(subagent_manager) as Arc<dyn fx_subagent::SubagentControl>
+        ),
+        config_manager,
+        ..tui::HeadlessLoopBuildOptions::default()
+    }
+}
+
+fn launch_fawx_tui(args: &[String]) -> anyhow::Result<i32> {
+    let tui_binary = find_fawx_tui_binary()?;
+    let status = std::process::Command::new(&tui_binary)
+        .args(args)
+        .status()?;
+    Ok(status.code().unwrap_or(1))
+}
+
+fn find_fawx_tui_binary() -> anyhow::Result<PathBuf> {
+    let current_exe =
+        std::env::current_exe().context("failed to locate current fawx executable")?;
+    find_fawx_tui_binary_from(&current_exe, std::env::var_os("PATH").as_deref())
+}
+
+fn find_fawx_tui_binary_from(
+    current_exe: &Path,
+    path_env: Option<&OsStr>,
+) -> anyhow::Result<PathBuf> {
+    current_exe
+        .parent()
+        .and_then(find_fawx_tui_in_directory)
+        .or_else(|| find_fawx_tui_on_path(path_env))
+        .or_else(|| find_fawx_tui_in_cargo_release_dir(current_exe))
+        .ok_or_else(|| anyhow::anyhow!(FAWX_TUI_NOT_FOUND_MESSAGE))
+}
+
+fn find_fawx_tui_in_directory(directory: &Path) -> Option<PathBuf> {
+    let candidate = directory.join(fawx_tui_binary_name());
+    candidate.is_file().then_some(candidate)
+}
+
+fn find_fawx_tui_on_path(path_env: Option<&OsStr>) -> Option<PathBuf> {
+    let current_dir = std::env::current_dir().ok()?;
+    which::which_in(fawx_tui_binary_name(), path_env, current_dir).ok()
+}
+
+fn find_fawx_tui_in_cargo_release_dir(current_exe: &Path) -> Option<PathBuf> {
+    let target_dir = current_exe
+        .ancestors()
+        .find(|path| path.file_name() == Some(OsStr::new("target")))?;
+    find_fawx_tui_in_directory(&target_dir.join("release"))
+}
+
+fn fawx_tui_binary_name() -> &'static str {
+    if cfg!(windows) {
+        "fawx-tui.exe"
+    } else {
+        "fawx-tui"
+    }
 }
 
 struct HeadlessStartup {
@@ -264,16 +385,7 @@ fn build_headless_startup(
     let telegram_config = config.telegram.clone();
     #[cfg(feature = "http")]
     let data_dir = tui::fawx_data_dir();
-    #[cfg(feature = "http")]
-    let config_manager = {
-        let config_mgr = fx_config::manager::ConfigManager::from_config(
-            config.clone(),
-            data_dir.join("config.toml"),
-        );
-        Some(Arc::new(std::sync::Mutex::new(config_mgr)))
-    };
-    #[cfg(not(feature = "http"))]
-    let config_manager = None;
+    let config_manager = Some(build_config_manager(&config));
     let improvement_provider = tui::build_improvement_provider(&auth_manager, &config);
     let app = build_headless_app(
         router,
@@ -300,23 +412,12 @@ fn build_headless_app(
     system_prompt: Option<std::path::PathBuf>,
     config_manager: Option<Arc<std::sync::Mutex<fx_config::manager::ConfigManager>>>,
 ) -> anyhow::Result<headless::HeadlessApp> {
-    let factory = headless::HeadlessSubagentFactory::new(headless::HeadlessSubagentFactoryDeps {
-        router: Arc::clone(&router),
-        config: config.clone(),
-        improvement_provider: improvement_provider.clone(),
-    });
-    let subagent_manager = Arc::new(fx_subagent::SubagentManager::new(
-        fx_subagent::SubagentManagerDeps {
-            factory: Arc::new(factory),
-            limits: fx_subagent::SubagentLimits::default(),
-        },
-    ));
+    let subagent_manager =
+        build_subagent_manager(Arc::clone(&router), &config, improvement_provider.clone());
     let bundle = tui::build_headless_loop_engine_bundle(
         &config,
         improvement_provider,
-        tui::HeadlessLoopBuildOptions::parent(
-            Arc::clone(&subagent_manager) as Arc<dyn fx_subagent::SubagentControl>
-        ),
+        parent_loop_build_options(&subagent_manager, config_manager.clone()),
     )?;
     headless::HeadlessApp::new(headless::HeadlessAppDeps {
         loop_engine: bundle.engine,
@@ -560,7 +661,8 @@ async fn dispatch_skill(command: SkillCommands) -> anyhow::Result<i32> {
 
 async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
     match command {
-        Commands::Tui => run_tui().await,
+        Commands::Tui { args } => launch_fawx_tui(&args),
+        Commands::TuiLegacy => run_tui().await,
         Commands::Start => Ok(run_stub("Starting")),
         Commands::Stop => Ok(run_stub("Stopping")),
         Commands::Chat => Ok(commands::chat::run().await?),
@@ -666,7 +768,8 @@ fn dispatch_eval(
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
-    let exit_code = dispatch_command(cli.command.unwrap_or(Commands::Tui)).await?;
+    let exit_code =
+        dispatch_command(cli.command.unwrap_or(Commands::Tui { args: Vec::new() })).await?;
     std::process::exit(exit_code);
 }
 
@@ -674,9 +777,15 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     #[cfg(feature = "http")]
     use super::{build_telegram_channel, telegram_webhook_secret_from_credential_store};
-    use super::{dispatch_command, Cli, Commands};
+    use super::{
+        dispatch_command, fawx_tui_binary_name, find_fawx_tui_binary_from, Cli, Commands,
+        FAWX_TUI_NOT_FOUND_MESSAGE,
+    };
     use crate::auth_store::AuthStore;
     use clap::Parser;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::{fs, path::Path};
 
     fn test_auth_store() -> AuthStore {
         AuthStore::open_for_testing().expect("test auth store")
@@ -686,6 +795,96 @@ mod tests {
     fn cli_parses_setup_command() {
         let cli = Cli::parse_from(["fawx", "setup", "--force"]);
         assert!(matches!(cli.command, Some(Commands::Setup { force: true })));
+    }
+
+    #[test]
+    fn cli_parses_tui_passthrough_args() {
+        let cli = Cli::parse_from(["fawx", "tui", "--host", "http://127.0.0.1:8400"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Tui { args }) if args == vec!["--host", "http://127.0.0.1:8400"]
+        ));
+    }
+
+    #[test]
+    fn cli_parses_hidden_tui_legacy_command() {
+        let cli = Cli::parse_from(["fawx", "tui-legacy"]);
+        assert!(matches!(cli.command, Some(Commands::TuiLegacy)));
+    }
+
+    #[test]
+    fn find_fawx_tui_binary_prefers_current_exe_directory() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let current_exe = tempdir.path().join("bin").join("fawx");
+        let same_dir_tui = tempdir.path().join("bin").join(fawx_tui_binary_name());
+        let path_dir = tempdir.path().join("path");
+
+        write_fake_executable(&same_dir_tui);
+        write_fake_executable(&path_dir.join(fawx_tui_binary_name()));
+
+        let found =
+            find_fawx_tui_binary_from(&current_exe, Some(path_dir.as_os_str())).expect("found");
+
+        assert_eq!(found, same_dir_tui);
+    }
+
+    #[test]
+    fn find_fawx_tui_binary_falls_back_to_path() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let current_exe = tempdir.path().join("bin").join("fawx");
+        let path_dir = tempdir.path().join("path");
+        let path_tui = path_dir.join(fawx_tui_binary_name());
+
+        write_fake_executable(&path_tui);
+
+        let found =
+            find_fawx_tui_binary_from(&current_exe, Some(path_dir.as_os_str())).expect("found");
+
+        assert_eq!(found, path_tui);
+    }
+
+    #[test]
+    fn find_fawx_tui_binary_falls_back_to_cargo_release_dir() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let current_exe = tempdir.path().join("target").join("debug").join("fawx");
+        let release_tui = tempdir
+            .path()
+            .join("target")
+            .join("release")
+            .join(fawx_tui_binary_name());
+
+        write_fake_executable(&release_tui);
+
+        let found = find_fawx_tui_binary_from(&current_exe, None).expect("found");
+
+        assert_eq!(found, release_tui);
+    }
+
+    #[test]
+    fn find_fawx_tui_binary_reports_missing_binary() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let current_exe = tempdir.path().join("bin").join("fawx");
+
+        let error = find_fawx_tui_binary_from(&current_exe, None).expect_err("missing binary");
+
+        assert!(error.to_string().contains(FAWX_TUI_NOT_FOUND_MESSAGE));
+    }
+
+    fn write_fake_executable(path: &Path) {
+        fs::create_dir_all(path.parent().expect("parent")).expect("create dirs");
+        fs::write(
+            path,
+            b"#!/bin/sh
+exit 0
+",
+        )
+        .expect("write executable");
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(path).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).expect("set permissions");
+        }
     }
 
     #[tokio::test]

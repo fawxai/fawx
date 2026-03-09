@@ -68,6 +68,7 @@ chrono = "0.4"
 unicode-width = "0.2"
 unicode-segmentation = "1.12"
 zeroize.workspace = true
+which = "6.0"
 
 # subtle: used by oauth-bridge for constant-time comparison.
 subtle = { version = "2.6", optional = true }
