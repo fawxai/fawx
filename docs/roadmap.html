@@ -170,8 +170,8 @@
 
 <div class="stats-banner">
   <div class="stat-card"><div class="stat-value">8</div><div class="stat-label">Waves</div></div>
-  <div class="stat-card"><div class="stat-value">75+</div><div class="stat-label">PRs Merged</div></div>
-  <div class="stat-card"><div class="stat-value">111k</div><div class="stat-label">Lines of Rust</div></div>
+  <div class="stat-card"><div class="stat-value">82+</div><div class="stat-label">PRs Merged</div></div>
+  <div class="stat-card"><div class="stat-value">103k</div><div class="stat-label">Lines of Rust</div></div>
   <div class="stat-card"><div class="stat-value">2,000+</div><div class="stat-label">Tests</div></div>
 </div>
 
@@ -214,7 +214,7 @@
         <div class="wave-title">Wave 8: Polish, Parity &amp; Launch <span class="wave-badge badge-active">Active</span></div>
         <div class="wave-desc">Wire existing features, setup wizard, engine tools, skills, docs, launch</div>
       </div>
-      <div class="wave-meta"><span class="wave-count">14 done · 5 phases remaining</span><span class="wave-chevron">›</span></div>
+      <div class="wave-meta"><span class="wave-count">19 done · 4 phases remaining</span><span class="wave-chevron">›</span></div>
     </div>
     <div class="wave-body">
 
@@ -231,14 +231,13 @@
         <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-done"></div><div class="node-content"><div class="node-title">Dual-bind HTTP server <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1256">#1256</a></div><div class="node-detail">localhost (required) + Tailscale (optional, graceful fallback). Dead <code>headless_http.rs</code> removed. PR #1259 merged.</div></div><div class="node-expand">›</div></div></div>
       </div>
 
-      <div class="tree-divider">⚡ Phase 1b — TUI Unification + Data Integrity <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1252">#1252</a> <span class="wave-badge badge-active">Active (5 PRs)</span></div>
+      <div class="tree-divider">✅ Phase 1b — TUI Unification + Data Integrity <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1252">#1252</a> <span class="wave-badge badge-done">Done (5 PRs)</span></div>
       <div class="tree">
-        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-done"></div><div class="node-content"><div class="node-title"><code>fawx tui</code> launches ratatui TUI · <code>fawx tui-legacy</code> kept as fallback</div><div class="node-detail">Binary lookup (exe dir → PATH → cargo target), arg passthrough. PR #1262 merged.</div></div><div class="node-expand">›</div></div></div>
-        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-active"></div><div class="node-content"><div class="node-title">PR 1: Server-side slash commands + /config reload <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1272">#1272</a> <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1064">#1064</a> <span class="wave-badge badge-active">Fixing</span></div><div class="node-detail">Extract ParsedCommand from tui.rs monolith → commands/slash.rs. Wire into handle_message(). /config reload, /improve, /analyze server-side. Smoke test fixes in progress.</div></div><div class="node-expand">›</div></div></div>
-        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-active"></div><div class="node-content"><div class="node-title">PR 2: Data integrity — signal race condition + proposal parser <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1273">#1273</a> <span class="wave-badge badge-active">Implementing</span></div><div class="node-detail">Signal JSONL: concurrent persist() writes two JSON objects on same line (no newline). Fix: write lock + reader recovery for concatenated objects. Proposals: parser crashes on malformed/legacy files. Fix: graceful per-file error handling.</div></div><div class="node-expand">›</div></div></div>
-        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">PR 3: fawx-tui thin client cleanup</div><div class="node-detail">Remove hardcoded command handling from fawx-tui. All commands go to server via /message. Keep only /quit + /clear locally. Remove credential_reader.rs + local_auth.rs. Archive abbudjoe/fawxtui repo.</div></div><div class="node-expand">›</div></div></div>
-        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">PR 4: Embedded mode — standalone ratatui TUI <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1271">#1271</a></div><div class="node-detail"><code>fawx-tui --embedded</code> runs engine in-process via EmbeddedBackend. No server required. Same UI, smaller attack surface. Feature flag: <code>embedded</code>. Pulled forward from Phase 3.</div></div><div class="node-expand">›</div></div></div>
-        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">PR 5: Remove legacy TUI</div><div class="node-detail">Delete tui.rs (3,600+ lines). Remove <code>fawx tui-legacy</code>. One TUI binary, two modes (server-backed + embedded). Full feature parity achieved.</div></div><div class="node-expand">›</div></div></div>
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-done"></div><div class="node-content"><div class="node-title">PR 1: Server-side slash commands + /config reload <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1272">#1272</a></div><div class="node-detail">Extracted ParsedCommand → commands/slash.rs. All commands wired through handle_message(). /config reload, /improve, /analyze server-side. R5 APPROVE.</div></div><div class="node-expand">›</div></div></div>
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-done"></div><div class="node-content"><div class="node-title">PR 2: Data integrity — signal race condition + proposal parser <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1275">#1275</a></div><div class="node-detail">Signal write mutex + BufWriter. Reader recovers concatenated JSON objects. Proposal parser gracefully handles malformed files. R2 APPROVE.</div></div><div class="node-expand">›</div></div></div>
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-done"></div><div class="node-content"><div class="node-title">PR 3: fawx-tui thin client <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1276">#1276</a></div><div class="node-detail">Removed local command handling. All commands go to server via /message. Only /quit + /clear local. Deleted local_auth.rs. R1 APPROVE.</div></div><div class="node-expand">›</div></div></div>
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-done"></div><div class="node-content"><div class="node-title">PR 4: Embedded mode + command parity <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1278">#1278</a> <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1271">#1271</a></div><div class="node-detail"><code>fawx-tui --embedded</code> runs engine in-process. EngineBackend trait (HTTP + Embedded). All slash commands ported server-side. R3 APPROVE.</div></div><div class="node-expand">›</div></div></div>
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-done"></div><div class="node-content"><div class="node-title">PR 5: Remove legacy TUI — 12,777 lines deleted <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1282">#1282</a></div><div class="node-detail">Deleted tui.rs (10,348 lines), ui.rs (2,040 lines), ansi.rs. Removed 6 deps. Shared code extracted to startup.rs + helpers.rs. One TUI binary, two modes. R2 APPROVE.</div></div><div class="node-expand">›</div></div></div>
       </div>
 
       <div class="tree-divider">✅ Phase 0 — Wire Existing Features (5/5 PRs merged) <span class="wave-badge badge-done">Done</span></div>
@@ -395,6 +394,7 @@
     <div class="wave-body">
       <div class="tree">
         <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-vision"></div><div class="node-content"><div class="node-title">Cloud resource skills · Training data curation · LoRA orchestration · Model eval · Signed adapter deployment</div></div><div class="node-expand">›</div></div></div>
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-vision"></div><div class="node-content"><div class="node-title">Fleet knowledge sharing — beyond git for agent collaboration</div><div class="node-detail">Skill marketplace (publish/subscribe), knowledge federation (structured findings feed), fitness-based propagation, gossip protocol for real-time sharing. Inspired by Karpathy's autoresearch. See <code>docs/ideas/fleet-knowledge-sharing.md</code>.</div></div><div class="node-expand">›</div></div></div>
       </div>
     </div>
   </div>
@@ -406,9 +406,7 @@
   <h2>Execution Plan</h2>
   <div class="dep-graph">
     <div class="dep-flow">
-      <div class="dep-flow-node" style="background:var(--green-glow);border-color:rgba(63,185,80,0.3);color:var(--green);">P1+P0 ✅</div>
-      <div class="dep-arrow">→</div>
-      <div class="dep-flow-node" style="background:var(--accent-glow);border-color:rgba(240,136,62,0.3);color:var(--accent);">P1b: TUI unify (5 PRs) ⚡</div>
+      <div class="dep-flow-node" style="background:var(--green-glow);border-color:rgba(63,185,80,0.3);color:var(--green);">P1+P0+P1b ✅</div>
       <div class="dep-arrow">→</div>
       <div class="dep-parallel">
         <div class="dep-flow-node" style="background:var(--accent-glow);border-color:rgba(240,136,62,0.3);color:var(--accent);">2a: edit + bg procs</div>
@@ -436,8 +434,8 @@
 
 <div class="footer">
   <strong>Fawx</strong> — Built by Joe + Clawdio 🦝<br>
-  8 waves · 75+ PRs merged · 111,000 lines of Rust · 2,000+ tests<br>
-  Last updated: March 9, 2026 (Phase 1b revised)
+  8 waves · 82+ PRs merged · 103,000 lines of Rust · 2,000+ tests<br>
+  Last updated: March 9, 2026 (Phase 1b complete — 12.8k lines deleted)
 </div>
 
 <script>
