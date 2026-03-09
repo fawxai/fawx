@@ -30,6 +30,10 @@ use std::time::Instant;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
+use crate::commands::slash::{
+    client_only_command_message, execute_command, is_command_input, parse_command, CommandContext,
+    ParsedCommand,
+};
 use crate::headless::{CycleResult, HeadlessApp};
 
 // ── Request/Response types ──────────────────────────────────────────────────
@@ -382,11 +386,48 @@ async fn process_and_route_message(
     context: ResponseContext,
 ) -> Result<CycleResult, anyhow::Error> {
     let mut guard = app.lock().await;
+    if is_command_input(text) {
+        let parsed = parse_command(text);
+        let response = match execute_headless_async_command(&mut guard, &parsed).await? {
+            Some(response) => response,
+            None => match execute_command(&mut CommandContext { app: &mut *guard }, &parsed) {
+                Some(result) => result?.response,
+                None => client_only_command_message(&parsed)
+                    .unwrap_or_else(|| "This command is only available in the TUI.".to_string()),
+            },
+        };
+        let result = command_cycle_result(&guard, response);
+        router
+            .route(&source, &result.response, &context)
+            .map_err(|error| anyhow::anyhow!("response routing failed: {error}"))?;
+        return Ok(result);
+    }
+
     let result = guard.process_message_for_source(text, &source).await?;
     router
         .route(&source, &result.response, &context)
         .map_err(|error| anyhow::anyhow!("response routing failed: {error}"))?;
     Ok(result)
+}
+
+async fn execute_headless_async_command(
+    app: &mut HeadlessApp,
+    parsed: &ParsedCommand,
+) -> Result<Option<String>, anyhow::Error> {
+    match parsed {
+        ParsedCommand::Analyze => app.analyze_signals_command().await.map(Some),
+        ParsedCommand::Improve(flags) => app.improve_command(flags).await.map(Some),
+        _ => Ok(None),
+    }
+}
+
+fn command_cycle_result(app: &HeadlessApp, response: String) -> CycleResult {
+    CycleResult {
+        response,
+        model: app.active_model().to_string(),
+        iterations: 0,
+        tokens_used: 0,
+    }
 }
 
 fn sanitize_config(value: serde_json::Value) -> serde_json::Value {
@@ -1994,6 +2035,13 @@ mod tests {
         }
 
         fn make_test_app(config_manager: Option<Arc<StdMutex<ConfigManager>>>) -> HeadlessApp {
+            make_test_app_with_config(fx_config::FawxConfig::default(), config_manager)
+        }
+
+        fn make_test_app_with_config(
+            config: fx_config::FawxConfig,
+            config_manager: Option<Arc<StdMutex<ConfigManager>>>,
+        ) -> HeadlessApp {
             use crate::headless::HeadlessAppDeps;
 
             let subagent_manager = Arc::new(SubagentManager::new(SubagentManagerDeps {
@@ -2004,7 +2052,7 @@ mod tests {
             HeadlessApp::new(HeadlessAppDeps {
                 loop_engine: test_engine(),
                 router: Arc::new(mock_router()),
-                config: fx_config::FawxConfig::default(),
+                config,
                 memory: None,
                 system_prompt_path: None,
                 config_manager,
@@ -2019,8 +2067,19 @@ mod tests {
             config_manager: Option<Arc<StdMutex<ConfigManager>>>,
             webhooks: Vec<Arc<WebhookChannel>>,
         ) -> HttpState {
+            test_state_with_config(fx_config::FawxConfig::default(), config_manager, webhooks)
+        }
+
+        fn test_state_with_config(
+            config: fx_config::FawxConfig,
+            config_manager: Option<Arc<StdMutex<ConfigManager>>>,
+            webhooks: Vec<Arc<WebhookChannel>>,
+        ) -> HttpState {
             HttpState {
-                app: Arc::new(Mutex::new(make_test_app(config_manager))),
+                app: Arc::new(Mutex::new(make_test_app_with_config(
+                    config,
+                    config_manager,
+                ))),
                 start_time: Instant::now(),
                 tailscale_ip: None,
                 bearer_token: TEST_TOKEN.to_string(),
@@ -2099,6 +2158,211 @@ allowed_chat_ids = [123]
             assert_eq!(json["config"]["http"]["bearer_token"], "[REDACTED]");
             assert_eq!(json["config"]["telegram"]["bot_token"], "[REDACTED]");
             assert_eq!(json["config"]["telegram"]["allowed_chat_ids"][0], 123);
+        }
+
+        #[tokio::test]
+        async fn message_endpoint_intercepts_server_side_status_command() {
+            let app = build_router(test_state(None, Vec::new()));
+            let req = Request::builder()
+                .method("POST")
+                .uri("/message")
+                .header("authorization", format!("Bearer {TEST_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"message":"/status"}"#))
+                .expect("request");
+
+            let resp = app.oneshot(req).await.expect("response");
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = resp.into_body().collect().await.expect("body").to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            assert_eq!(json["model"], "mock-model");
+            assert_eq!(json["iterations"], 0);
+            assert!(json["response"]
+                .as_str()
+                .expect("response string")
+                .contains("Fawx Status"));
+        }
+
+        #[tokio::test]
+        async fn message_endpoint_returns_client_only_message_for_quit() {
+            let app = build_router(test_state(None, Vec::new()));
+            let req = Request::builder()
+                .method("POST")
+                .uri("/message")
+                .header("authorization", format!("Bearer {TEST_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"message":"/quit"}"#))
+                .expect("request");
+
+            let resp = app.oneshot(req).await.expect("response");
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = resp.into_body().collect().await.expect("body").to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            assert_eq!(json["model"], "mock-model");
+            assert_eq!(json["iterations"], 0);
+            assert_eq!(
+                json["response"],
+                "/quit is a client-side command (only available in the TUI)"
+            );
+        }
+
+        #[tokio::test]
+        async fn message_endpoint_returns_client_only_message_for_auth() {
+            let app = build_router(test_state(None, Vec::new()));
+            let req = Request::builder()
+                .method("POST")
+                .uri("/message")
+                .header("authorization", format!("Bearer {TEST_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"message":"/auth"}"#))
+                .expect("request");
+
+            let resp = app.oneshot(req).await.expect("response");
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = resp.into_body().collect().await.expect("body").to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            assert_eq!(json["model"], "mock-model");
+            assert_eq!(json["iterations"], 0);
+            assert_eq!(
+                json["response"],
+                "/auth is a client-side command (only available in the TUI)"
+            );
+        }
+
+        #[tokio::test]
+        async fn message_endpoint_routes_plain_text_to_agentic_loop() {
+            let app = build_router(test_state(None, Vec::new()));
+            let req = Request::builder()
+                .method("POST")
+                .uri("/message")
+                .header("authorization", format!("Bearer {TEST_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"message":"hello there"}"#))
+                .expect("request");
+
+            let resp = app.oneshot(req).await.expect("response");
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = resp.into_body().collect().await.expect("body").to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            assert_eq!(json["model"], "mock-model");
+            assert_eq!(json["iterations"], 1);
+            assert_eq!(json["response"], "Mock response");
+        }
+
+        #[tokio::test]
+        async fn message_endpoint_config_reload_updates_runtime_config() {
+            let temp = TempDir::new().expect("tempdir");
+            std::fs::write(
+                temp.path().join("config.toml"),
+                "[model]\ndefault_model = \"mock-model\"\n\n[general]\nmax_history = 3\n",
+            )
+            .expect("write initial config");
+            let manager = Arc::new(StdMutex::new(
+                ConfigManager::new(temp.path()).expect("config manager"),
+            ));
+            let config = fx_config::FawxConfig::load(temp.path()).expect("load config");
+            let app = build_router(test_state_with_config(
+                config,
+                Some(Arc::clone(&manager)),
+                Vec::new(),
+            ));
+
+            std::fs::write(
+                temp.path().join("config.toml"),
+                "[model]\ndefault_model = \"mock-model\"\n\n[general]\nmax_history = 7\n",
+            )
+            .expect("write updated config");
+
+            let reload = Request::builder()
+                .method("POST")
+                .uri("/message")
+                .header("authorization", format!("Bearer {TEST_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"message":"/config reload"}"#))
+                .expect("reload request");
+            let reload_resp = app.clone().oneshot(reload).await.expect("reload response");
+            assert_eq!(reload_resp.status(), StatusCode::OK);
+            let reload_body = reload_resp
+                .into_body()
+                .collect()
+                .await
+                .expect("reload body")
+                .to_bytes();
+            let reload_json: serde_json::Value =
+                serde_json::from_slice(&reload_body).expect("reload json");
+            assert_eq!(
+                reload_json["response"],
+                crate::commands::slash::config_reload_success_message(
+                    &temp.path().join("config.toml")
+                )
+            );
+            assert_eq!(reload_json["model"], "mock-model");
+
+            let show = Request::builder()
+                .method("POST")
+                .uri("/message")
+                .header("authorization", format!("Bearer {TEST_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"message":"/config"}"#))
+                .expect("show request");
+            let show_resp = app.oneshot(show).await.expect("show response");
+            assert_eq!(show_resp.status(), StatusCode::OK);
+            let body = show_resp
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            assert!(json["response"]
+                .as_str()
+                .expect("response string")
+                .contains("\"max_history\": 7"));
+        }
+
+        #[tokio::test]
+        async fn message_endpoint_analyze_runs_server_side() {
+            let temp = TempDir::new().expect("tempdir");
+            let mut config = fx_config::FawxConfig::default();
+            config.general.data_dir = Some(temp.path().to_path_buf());
+            let app = build_router(test_state_with_config(config, None, Vec::new()));
+            let req = Request::builder()
+                .method("POST")
+                .uri("/message")
+                .header("authorization", format!("Bearer {TEST_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"message":"/analyze"}"#))
+                .expect("request");
+
+            let resp = app.oneshot(req).await.expect("response");
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = resp.into_body().collect().await.expect("body").to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            let response = json["response"].as_str().expect("response string");
+            assert_eq!(response, "No patterns found. Collect more signals first.");
+        }
+
+        #[tokio::test]
+        async fn message_endpoint_improve_runs_server_side() {
+            let temp = TempDir::new().expect("tempdir");
+            let mut config = fx_config::FawxConfig::default();
+            config.general.data_dir = Some(temp.path().to_path_buf());
+            let app = build_router(test_state_with_config(config, None, Vec::new()));
+            let req = Request::builder()
+                .method("POST")
+                .uri("/message")
+                .header("authorization", format!("Bearer {TEST_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"message":"/improve"}"#))
+                .expect("request");
+
+            let resp = app.oneshot(req).await.expect("response");
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = resp.into_body().collect().await.expect("body").to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            let response = json["response"].as_str().expect("response string");
+            assert!(response.contains("⚡ Improvement cycle complete."));
+            assert!(response.contains("No actionable improvements found."));
         }
 
         #[tokio::test]
@@ -2587,6 +2851,37 @@ allowed_chat_ids = [123]
             handle_telegram_update(&telegram, &app, &router, &update).await;
 
             assert!(telegram.drain_outbound().is_empty());
+        }
+
+        #[tokio::test]
+        async fn slash_command_update_routes_server_side_response() {
+            let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (base_url, _server) = capturing_telegram_server(Arc::clone(&captured)).await;
+            let telegram = Arc::new(TelegramChannel::new_with_base_url(
+                test_telegram_config(),
+                base_url,
+            ));
+            let app = Arc::new(Mutex::new(make_test_app(mock_router())));
+            let update = sample_update(12345, "/status");
+            let mut registry = ChannelRegistry::new();
+            let telegram_channel: Arc<dyn Channel> = telegram.clone();
+            registry.register(telegram_channel);
+            let router = ResponseRouter::new(Arc::new(registry));
+
+            handle_telegram_update(telegram.as_ref(), &app, &router, &update).await;
+            flush_telegram_outbound(telegram.as_ref()).await;
+
+            let send_message = captured
+                .lock()
+                .expect("capture lock")
+                .iter()
+                .find(|request| request.path.ends_with("/sendMessage"))
+                .expect("sendMessage request")
+                .clone();
+            assert!(send_message.body["text"]
+                .as_str()
+                .expect("text body")
+                .contains("Fawx Status"));
         }
 
         /// Parse error: invalid update JSON is handled gracefully.

@@ -11,3 +11,4 @@ pub mod marketplace;
 pub mod oauth_bridge;
 pub mod setup;
 pub mod skills;
+pub mod slash;

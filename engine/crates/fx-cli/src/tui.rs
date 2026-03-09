@@ -1,4 +1,9 @@
 use crate::auth_store::{migrate_if_needed, AuthStore};
+use crate::commands::slash::{
+    apply_thinking_budget, config_reload_success_message, execute_command, init_default_config,
+    parse_command, persist_default_model, reload_runtime_config, render_budget_text,
+    render_signals_summary, CommandContext, CommandHost, ImproveFlags, ParsedCommand,
+};
 use crate::prompts::{
     open_browser, parse_auth_selection, prompt_api_key_provider, prompt_choice, prompt_line,
     prompt_non_empty_line, prompt_non_empty_secret, with_normal_screen, AuthSelection,
@@ -21,9 +26,7 @@ use fx_auth::credential_store::CredentialStore as CredentialStoreTrait;
 use fx_auth::oauth::{PkceFlow, TokenExchangeRequest, TokenResponse};
 use fx_canary::CanaryMonitor;
 use fx_config::manager::ConfigManager;
-use fx_config::{
-    save_default_model, save_thinking_budget, FawxConfig, ImprovementToolsConfig, ThinkingBudget,
-};
+use fx_config::{FawxConfig, ImprovementToolsConfig, ThinkingBudget};
 use fx_conversation::{
     ConversationMessage, ConversationStore, TokenUsage as ConversationTokenUsage,
 };
@@ -866,7 +869,7 @@ fn version_parts(model_id: &str) -> Vec<u32> {
         .collect()
 }
 
-fn resolve_model_alias(selector: &str, model_ids: &[String]) -> Option<String> {
+pub(crate) fn resolve_model_alias(selector: &str, model_ids: &[String]) -> Option<String> {
     let family_prefix = claude_family_prefix(selector)?;
     let matches = model_ids
         .iter()
@@ -926,7 +929,7 @@ const PROMPT_COLOR_START: &str = "\x1b[38;2;255;204;0m";
 const PROMPT_COLOR_END: &str = "\x1b[0m";
 
 /// Group models by provider name, preserving insertion order.
-fn group_models_by_provider(models: &[ModelInfo]) -> Vec<(String, Vec<&ModelInfo>)> {
+pub(crate) fn group_models_by_provider(models: &[ModelInfo]) -> Vec<(String, Vec<&ModelInfo>)> {
     let mut groups: Vec<(String, Vec<&ModelInfo>)> = Vec::new();
     for model in models {
         if let Some(existing) = groups
@@ -1045,6 +1048,7 @@ pub struct TuiApp {
     credential_provider: Option<Arc<dyn CredentialProvider>>,
     tool_executor: Arc<dyn ToolExecutor>,
     canary_monitor: Option<CanaryMonitor>,
+    config_manager: Option<Arc<Mutex<ConfigManager>>>,
     /// Single encrypted credential store instance (opened once at startup, shared via Arc).
     credential_store: Option<Arc<fx_auth::credential_store::EncryptedFileCredentialStore>>,
     /// Buffer for command output that will be flushed to FawxApp.
@@ -1069,6 +1073,7 @@ pub struct TuiAppDeps {
     pub tool_executor: Arc<dyn ToolExecutor>,
     pub credential_store: Option<Arc<fx_auth::credential_store::EncryptedFileCredentialStore>>,
     pub canary_monitor: Option<CanaryMonitor>,
+    pub config_manager: Option<Arc<Mutex<ConfigManager>>>,
     pub signature_policy: SignaturePolicy,
 }
 
@@ -1116,6 +1121,7 @@ impl TuiApp {
             tool_executor,
             credential_store: None,
             canary_monitor: None,
+            config_manager: None,
             signature_policy: SignaturePolicy::default(),
         })
     }
@@ -1136,6 +1142,7 @@ impl TuiApp {
             tool_executor,
             credential_store,
             canary_monitor,
+            config_manager,
             signature_policy,
         } = deps;
         let base_data_dir = fawx_data_dir();
@@ -1178,6 +1185,7 @@ impl TuiApp {
             credential_provider,
             tool_executor,
             canary_monitor,
+            config_manager,
             credential_store,
             output_buffer: Vec::new(),
             signature_policy,
@@ -1380,6 +1388,7 @@ impl TuiApp {
         }
 
         if trimmed.starts_with('/') {
+            append_user_message_output(app, trimmed);
             if let Err(error) = self.handle_command(trimmed).await {
                 self.tui_println(format_error_message(&error.to_string()));
             }
@@ -1532,6 +1541,7 @@ impl TuiApp {
         }
 
         if input.starts_with('/') {
+            self.tui_println(format!("you › {input}"));
             if let Err(error) = self.handle_command(input).await {
                 self.tui_println(format_error_message(&error.to_string()));
             }
@@ -1714,100 +1724,170 @@ impl TuiApp {
 
     /// Process a user command (starts with `/`).
     async fn handle_command(&mut self, input: &str) -> Result<(), TuiError> {
-        match parse_command(input) {
+        let parsed = parse_command(input);
+        if self.prepare_model_command(&parsed).await? {
+            return Ok(());
+        }
+        if self.handle_server_side_command(&parsed) {
+            return Ok(());
+        }
+        self.handle_client_only_command(parsed).await
+    }
+
+    async fn prepare_model_command(&mut self, parsed: &ParsedCommand) -> Result<bool, TuiError> {
+        match parsed {
+            ParsedCommand::Model(Some(model)) => {
+                self.handle_model_switch(model).await?;
+                Ok(true)
+            }
             ParsedCommand::Model(None) => {
                 self.refresh_router_models().await?;
-                self.show_model_menu();
+                Ok(false)
             }
-            ParsedCommand::Model(Some(model)) => {
-                match self.set_active_model_with_refresh(&model).await {
-                    Ok(resolved_model) => {
-                        self.config.model.default_model = Some(resolved_model.clone());
-                        if let Err(error) = save_default_model(&fawx_data_dir(), &resolved_model) {
-                            eprintln!("Warning: couldn't save model preference: {error}");
-                        }
-                        self.tui_println(format!("Active model set to: {resolved_model}"));
-                    }
-                    Err(error) => {
-                        self.tui_println(format!("Couldn't select model: {error}"));
-                        self.show_model_menu();
-                    }
-                }
+            _ => Ok(false),
+        }
+    }
+
+    async fn handle_model_switch(&mut self, model: &str) -> Result<(), TuiError> {
+        match self.set_active_model_with_refresh(model).await {
+            Ok(resolved_model) => {
+                persist_default_model(
+                    &mut self.config,
+                    self.config_manager.as_ref(),
+                    &fawx_data_dir(),
+                    &resolved_model,
+                )
+                .map_err(|error| TuiError::Store(error.to_string()))?;
+                self.tui_println(format!("Active model set to: {resolved_model}"));
             }
+            Err(error) => {
+                self.tui_println(format!("Couldn't select model: {error}"));
+                self.tui_println(render_model_menu_text(
+                    self.router.active_model(),
+                    &self.router.available_models(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_server_side_command(&mut self, parsed: &ParsedCommand) -> bool {
+        let result = {
+            let mut context = CommandContext { app: self };
+            execute_command(&mut context, parsed)
+        };
+        let Some(result) = result else {
+            return false;
+        };
+        match result {
+            Ok(command_result) => {
+                self.print_server_command_response(parsed, command_result.response)
+            }
+            Err(error) => self.tui_println(format!("Error: {error}")),
+        }
+        true
+    }
+
+    fn print_server_command_response(&mut self, parsed: &ParsedCommand, response: String) {
+        if matches!(parsed, ParsedCommand::Help) {
+            self.print_help_response(&response);
+            return;
+        }
+        self.tui_println(response);
+    }
+
+    fn print_help_response(&mut self, response: &str) {
+        let mut lines = response.lines();
+        if let Some(first_line) = lines.next() {
+            self.tui_println(format!(
+                "{}",
+                first_line.bold().with(theme_color(255, 165, 0, 214))
+            ));
+        }
+        for line in lines {
+            self.tui_println(line.to_string());
+        }
+    }
+
+    async fn handle_client_only_command(&mut self, parsed: ParsedCommand) -> Result<(), TuiError> {
+        match parsed {
             ParsedCommand::Auth {
                 subcommand,
                 action,
                 value,
                 has_extra_args,
             } => {
-                if has_extra_args {
-                    self.tui_println("Note: extra arguments ignored.");
-                }
-                self.handle_auth_command(subcommand, action, value).await?;
+                self.handle_auth_dispatch(subcommand, action, value, has_extra_args)
+                    .await
             }
+            ParsedCommand::Analyze => self.handle_analyze_command().await,
+            ParsedCommand::Improve(flags) => self.handle_improve_command(flags).await,
+            other => self.handle_local_client_command(other),
+        }
+    }
+
+    async fn handle_auth_dispatch(
+        &mut self,
+        subcommand: Option<String>,
+        action: Option<String>,
+        value: Option<String>,
+        has_extra_args: bool,
+    ) -> Result<(), TuiError> {
+        if has_extra_args {
+            self.tui_println("Note: extra arguments ignored.");
+        }
+        self.handle_auth_command(subcommand, action, value).await
+    }
+
+    fn handle_local_client_command(&mut self, parsed: ParsedCommand) -> Result<(), TuiError> {
+        match parsed {
             ParsedCommand::Keys {
                 subcommand,
                 value,
                 option,
                 has_extra_args,
-            } => {
-                self.handle_keys_command(subcommand, value, option, has_extra_args)?;
-            }
+            } => self.handle_keys_command(subcommand, value, option, has_extra_args)?,
             ParsedCommand::Sign {
                 target,
                 has_extra_args,
-            } => {
-                self.handle_sign_command(target, has_extra_args)?;
-            }
-            ParsedCommand::Budget => self.show_budget_status(),
+            } => self.handle_sign_command(target, has_extra_args)?,
             ParsedCommand::Loop => self.show_loop_status(),
-            ParsedCommand::Status => self.show_status(),
-            ParsedCommand::Signals => self.show_signals_summary(),
             ParsedCommand::Debug => self.show_signals_debug(),
-            ParsedCommand::Analyze => self.handle_analyze_command().await?,
-            ParsedCommand::Improve(flags) => self.handle_improve_command(flags).await?,
-            ParsedCommand::Proposals => self.handle_proposals_command()?,
-            ParsedCommand::Approve {
-                id,
-                force,
-                has_extra_args,
-            } => self.handle_approve_command(id, force, has_extra_args)?,
-            ParsedCommand::Reject { id, has_extra_args } => {
-                self.handle_reject_command(id, has_extra_args)?;
-            }
-            ParsedCommand::Synthesis(instruction) => {
-                self.update_synthesis_instruction(instruction);
-            }
-            ParsedCommand::Clear => {
-                self.conversation_store
-                    .clear_active()
-                    .map_err(TuiError::Store)?;
-                self.conversation_history.clear();
-                self.clear_screen()?;
-            }
-            ParsedCommand::New => {
-                let id = self
-                    .conversation_store
-                    .create_new()
-                    .map_err(TuiError::Store)?;
-                self.conversation_history.clear();
-                self.tui_println(format!("Started new conversation: {id}"));
-            }
+            ParsedCommand::Synthesis(instruction) => self.update_synthesis_instruction(instruction),
+            ParsedCommand::Clear => self.clear_active_conversation()?,
+            ParsedCommand::New => self.start_new_conversation()?,
             ParsedCommand::History => self.show_conversation_history(),
-            ParsedCommand::Thinking(level) => self.handle_thinking_command(level)?,
-            ParsedCommand::Config(action) => self.handle_config_command(action)?,
-            ParsedCommand::Help => self.show_help(),
-            ParsedCommand::Quit => {
-                self.running = false;
-                self.tui_println("Goodbye!");
-            }
-            ParsedCommand::Unknown(command) => {
-                self.tui_println(format!("Unknown command: /{command}"));
-                self.tui_println("Type /help for available commands.");
-            }
+            ParsedCommand::Quit => self.quit_command(),
+            other => self.report_unhandled_local_command(&other),
         }
-
         Ok(())
+    }
+
+    fn clear_active_conversation(&mut self) -> Result<(), TuiError> {
+        self.conversation_store
+            .clear_active()
+            .map_err(TuiError::Store)?;
+        self.conversation_history.clear();
+        self.clear_screen()
+    }
+
+    fn start_new_conversation(&mut self) -> Result<(), TuiError> {
+        let id = self
+            .conversation_store
+            .create_new()
+            .map_err(TuiError::Store)?;
+        self.conversation_history.clear();
+        self.tui_println(format!("Started new conversation: {id}"));
+        Ok(())
+    }
+
+    fn quit_command(&mut self) {
+        self.running = false;
+        self.tui_println("Goodbye!");
+    }
+
+    fn report_unhandled_local_command(&mut self, parsed: &ParsedCommand) {
+        self.tui_println(format!("Error: unhandled command variant: {parsed:?}"));
     }
 
     /// Process a user message by running the full loop engine.
@@ -2028,16 +2108,6 @@ impl TuiApp {
         }
     }
 
-    fn show_signals_summary(&mut self) {
-        if self.last_signals.is_empty() {
-            self.tui_println("No signals from last turn.");
-            return;
-        }
-
-        let collector = SignalCollector::from_signals(self.last_signals.clone());
-        self.tui_println(collector.summary().to_string());
-    }
-
     fn show_signals_debug(&mut self) {
         if self.last_signals.is_empty() {
             self.tui_println("No signals from last turn.");
@@ -2118,51 +2188,6 @@ impl TuiApp {
                 .await?;
         self.print_improve_result(&result, flags.dry_run);
 
-        Ok(())
-    }
-
-    fn handle_proposals_command(&mut self) -> Result<(), TuiError> {
-        let message = render_pending(self.proposal_review_context())
-            .unwrap_or_else(|error| format!("Proposal review failed: {error}"));
-        self.tui_println(message);
-        Ok(())
-    }
-
-    fn handle_approve_command(
-        &mut self,
-        id: Option<String>,
-        force: bool,
-        has_extra_args: bool,
-    ) -> Result<(), TuiError> {
-        if id.is_none() || has_extra_args {
-            self.tui_println("Usage: /approve <id> [--force]");
-            return Ok(());
-        }
-        let message = approve_pending(
-            self.proposal_review_context(),
-            id.as_deref().unwrap_or_default(),
-            force,
-        )
-        .unwrap_or_else(|error| format!("Proposal review failed: {error}"));
-        self.tui_println(message);
-        Ok(())
-    }
-
-    fn handle_reject_command(
-        &mut self,
-        id: Option<String>,
-        has_extra_args: bool,
-    ) -> Result<(), TuiError> {
-        if id.is_none() || has_extra_args {
-            self.tui_println("Usage: /reject <id>");
-            return Ok(());
-        }
-        let message = reject_pending(
-            self.proposal_review_context(),
-            id.as_deref().unwrap_or_default(),
-        )
-        .unwrap_or_else(|error| format!("Proposal review failed: {error}"));
-        self.tui_println(message);
         Ok(())
     }
 
@@ -2370,106 +2395,6 @@ impl TuiApp {
         self.conversation_store.save_message(&assistant_message)
     }
 
-    fn handle_thinking_command(&mut self, level: Option<String>) -> Result<(), TuiError> {
-        let current = self.config.general.thinking.unwrap_or_default();
-
-        let Some(level_str) = level else {
-            self.tui_println(format!("Current thinking budget: {current}"));
-            return Ok(());
-        };
-
-        let budget: ThinkingBudget = level_str
-            .parse()
-            .map_err(|error: String| TuiError::Router(error))?;
-
-        self.config.general.thinking = Some(budget);
-        self.loop_engine
-            .set_thinking_config(thinking_config_from_budget(&budget));
-        if let Err(error) = save_thinking_budget(&fawx_data_dir(), budget) {
-            self.tui_println(format!(
-                "Warning: couldn\'t save thinking preference: {error}"
-            ));
-        }
-        self.tui_println(format!("Thinking budget set to: {budget}"));
-        Ok(())
-    }
-
-    fn handle_config_command(&mut self, action: Option<String>) -> Result<(), TuiError> {
-        match action.as_deref() {
-            None => self.show_config(),
-            Some("init") => self.init_config_file()?,
-            Some(other) => self.tui_println(format!(
-                "Unknown /config action: {other}. Use /config or /config init."
-            )),
-        }
-        Ok(())
-    }
-
-    fn show_config(&mut self) {
-        let fields: &[(&str, String)] = &[
-            (
-                "general.max_iterations",
-                self.config.general.max_iterations.to_string(),
-            ),
-            (
-                "general.max_history",
-                self.config.general.max_history.to_string(),
-            ),
-            (
-                "model.default_model",
-                format!("{:?}", self.config.model.default_model),
-            ),
-            (
-                "model.synthesis_instruction",
-                format!("{:?}", self.config.model.synthesis_instruction),
-            ),
-            (
-                "tools.working_dir",
-                format!("{:?}", self.config.tools.working_dir),
-            ),
-            (
-                "tools.search_exclude",
-                format!("{:?}", self.config.tools.search_exclude),
-            ),
-            (
-                "tools.max_read_size",
-                self.config.tools.max_read_size.to_string(),
-            ),
-            (
-                "memory.max_entries",
-                self.config.memory.max_entries.to_string(),
-            ),
-            (
-                "memory.max_value_size",
-                self.config.memory.max_value_size.to_string(),
-            ),
-            (
-                "memory.max_snapshot_chars",
-                self.config.memory.max_snapshot_chars.to_string(),
-            ),
-            (
-                "memory.max_relevant_results",
-                self.config.memory.max_relevant_results.to_string(),
-            ),
-        ];
-        let mut output = format!(
-            "Config path: {}\nRuntime data dir: {}\nLoaded values:\n",
-            self.config_path.display(),
-            self.data_dir_display(),
-        );
-        for (key, value) in fields {
-            output.push_str(&format!("  {key} = {value}\n"));
-        }
-        self.tui_println(output);
-    }
-
-    fn init_config_file(&mut self) -> Result<(), TuiError> {
-        let base_data_dir = fawx_data_dir();
-        let created = FawxConfig::write_default(&base_data_dir).map_err(TuiError::Store)?;
-        self.tui_println(format!("Created default config at {}", created.display()));
-        Ok(())
-    }
-
     fn data_dir_display(&self) -> String {
         self.config
             .general
@@ -2499,36 +2424,6 @@ impl TuiApp {
         self.tui_println(format!("fawx \u{203a} {response}"));
         self.tui_println(String::new());
         Ok(())
-    }
-
-    /// Display the model selection menu grouped by provider.
-    fn show_model_menu(&mut self) {
-        let active = self.router.active_model().map(|s| s.to_string());
-        let models = self.router.available_models();
-
-        if models.is_empty() {
-            self.tui_println("No models available. Use /auth to configure credentials.");
-            return;
-        }
-
-        let grouped = group_models_by_provider(&models);
-
-        self.tui_println("Available models:");
-        for (provider, group) in &grouped {
-            self.tui_println(String::new());
-            self.tui_println(format!("{provider}:"));
-            for model in group {
-                let marker = if active.as_deref() == Some(model.model_id.as_str()) {
-                    "*"
-                } else {
-                    " "
-                };
-                self.tui_println(format!(
-                    "  {marker} {} ({})",
-                    model.model_id, model.auth_method
-                ));
-            }
-        }
     }
 
     // Sync counterpart of `select_first_available_model` for use in non-async contexts
@@ -2658,44 +2553,6 @@ impl TuiApp {
         if let Ok(mut locked) = self.completer_model_ids.lock() {
             *locked = ids;
         }
-    }
-
-    fn show_help(&mut self) {
-        self.tui_println(format!(
-            "{}",
-            "Commands".bold().with(theme_color(255, 165, 0, 214))
-        ));
-        self.tui_println("  /model         List models and switch active model");
-        self.tui_println("  /model <name>  Switch to a specific model");
-        self.tui_println("  /auth          Show credential status + auth help");
-        self.tui_println("  /auth <provider> set-token <TOKEN>");
-        self.tui_println("                 Save API key or PAT for a provider");
-        self.tui_println("  /keys          Manage WASM signing keys");
-        self.tui_println("  /keys generate [--force]");
-        self.tui_println("  /keys list     List trusted public keys");
-        self.tui_println("  /keys trust <path>");
-        self.tui_println("  /keys revoke <fingerprint>");
-        self.tui_println("  /sign <skill>  Sign one WASM skill");
-        self.tui_println("  /sign --all    Sign all installed WASM skills");
-        self.tui_println("  /status        Show model, tokens, budget summary");
-        self.tui_println("  /budget        Show detailed budget usage");
-        self.tui_println("  /loop          Show loop iteration details");
-        self.tui_println("  /signals       Show condensed signal summary for last turn");
-        self.tui_println("  /debug         Show full signal dump for last turn");
-        self.tui_println("  /analyze       Analyze persisted signals across sessions");
-        self.tui_println("  /improve       Run self-improvement cycle");
-        self.tui_println("  /proposals     List pending self-modification proposals");
-        self.tui_println("  /approve       Apply a pending proposal (/approve <id> [--force])");
-        self.tui_println("  /reject        Archive a pending proposal (/reject <id>)");
-        self.tui_println("  /synthesis     Set or reset synthesis instruction");
-        self.tui_println("  /thinking      Show or set thinking budget (high|low|adaptive|off)");
-        self.tui_println("  /clear         Clear the screen and active conversation");
-        self.tui_println("  /new           Start a new conversation");
-        self.tui_println("  /history       List saved conversations");
-        self.tui_println("  /config        Show loaded config values");
-        self.tui_println("  /config init   Create ~/.fawx/config.toml template");
-        self.tui_println("  /help          Show this help");
-        self.tui_println("  /quit          Exit");
     }
 
     /// Display status for all known providers.
@@ -3319,23 +3176,6 @@ impl TuiApp {
         }
     }
 
-    fn show_budget_status(&mut self) {
-        let status = self.loop_engine.status(current_time_ms());
-        self.tui_println("Budget usage:");
-        self.tui_println(format!("  - LLM calls used: {}", status.llm_calls_used));
-        self.tui_println(format!(
-            "  - Tool calls used: {}",
-            status.tool_invocations_used
-        ));
-        self.tui_println(format!("  - Tokens used: {}", status.tokens_used));
-        self.tui_println(format!("  - Cost used (cents): {}", status.cost_cents_used));
-        self.tui_println(format!("  - Tokens remaining: {}", status.remaining.tokens));
-        self.tui_println(format!(
-            "  - LLM calls remaining: {}",
-            status.remaining.llm_calls
-        ));
-    }
-
     fn show_loop_status(&mut self) {
         let status = self.loop_engine.status(current_time_ms());
         self.tui_println("Loop status:");
@@ -3356,20 +3196,6 @@ impl TuiApp {
         self.tui_println(format!(
             "  - Wall time remaining (ms): {}",
             status.remaining.wall_time_ms
-        ));
-    }
-
-    fn show_status(&mut self) {
-        let model = self.current_model().to_string();
-        let status = self.loop_engine.status(current_time_ms());
-        let providers = self.auth_manager.providers();
-        self.tui_println("Fawx Status");
-        self.tui_println(format!("  model:     {model}"));
-        self.tui_println(format!("  providers: {}", providers.join(", ")));
-        self.tui_println(format!("  tokens:    {} used", status.tokens_used));
-        self.tui_println(format!(
-            "  budget:    {} tokens remaining",
-            status.remaining.tokens
         ));
     }
 
@@ -3420,6 +3246,86 @@ impl TuiApp {
     }
 }
 
+impl CommandHost for TuiApp {
+    fn list_models(&self) -> String {
+        render_model_menu_text(self.router.active_model(), &self.router.available_models())
+    }
+
+    fn set_active_model(&mut self, selector: &str) -> anyhow::Result<String> {
+        let resolved = self
+            .set_active_model_from_selector(selector)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        persist_default_model(
+            &mut self.config,
+            self.config_manager.as_ref(),
+            &fawx_data_dir(),
+            &resolved,
+        )?;
+        Ok(resolved)
+    }
+
+    fn proposals(&self) -> anyhow::Result<String> {
+        render_pending(self.proposal_review_context()).map_err(anyhow::Error::new)
+    }
+
+    fn approve(&self, selector: &str, force: bool) -> anyhow::Result<String> {
+        approve_pending(self.proposal_review_context(), selector, force).map_err(anyhow::Error::new)
+    }
+
+    fn reject(&self, selector: &str) -> anyhow::Result<String> {
+        reject_pending(self.proposal_review_context(), selector).map_err(anyhow::Error::new)
+    }
+
+    fn show_config(&self) -> anyhow::Result<String> {
+        Ok(render_tui_config_text(
+            &self.config_path,
+            &self.data_dir_display(),
+            &self.config,
+        ))
+    }
+
+    fn init_config(&mut self) -> anyhow::Result<String> {
+        init_default_config(&fawx_data_dir())
+    }
+
+    fn reload_config(&mut self) -> anyhow::Result<String> {
+        self.config = reload_runtime_config(self.config_manager.as_ref(), &self.config_path)?;
+        self.max_history = self.config.general.max_history;
+        self.loop_engine
+            .set_thinking_config(thinking_config_from_budget(
+                &self.config.general.thinking.unwrap_or_default(),
+            ));
+        sync_model_from_config(self, self.config.model.default_model.clone());
+        Ok(config_reload_success_message(&self.config_path))
+    }
+
+    fn show_status(&self) -> String {
+        render_status_text(
+            self.current_model(),
+            &available_provider_names(&self.router),
+            self.loop_engine.status(current_time_ms()),
+        )
+    }
+
+    fn show_budget_status(&self) -> String {
+        render_budget_text(self.loop_engine.status(current_time_ms()))
+    }
+
+    fn show_signals_summary(&self) -> String {
+        render_signals_summary(&self.last_signals)
+    }
+
+    fn handle_thinking(&mut self, level: Option<&str>) -> anyhow::Result<String> {
+        apply_thinking_budget(
+            &mut self.config,
+            &mut self.loop_engine,
+            self.config_manager.as_ref(),
+            &fawx_data_dir(),
+            level,
+        )
+    }
+}
+
 fn runtime_model_state(router: &ModelRouter) -> (String, String) {
     let Some(active_model) = router.active_model().map(ToString::to_string) else {
         return (String::new(), String::new());
@@ -3438,6 +3344,120 @@ fn runtime_model_state(router: &ModelRouter) -> (String, String) {
         .unwrap_or_default();
 
     (active_model, provider)
+}
+
+pub(crate) fn render_model_menu_text(active: Option<&str>, models: &[ModelInfo]) -> String {
+    if models.is_empty() {
+        return "No models available. Use /auth to configure credentials.".to_string();
+    }
+
+    let grouped = group_models_by_provider(models);
+    let mut lines = vec!["Available models:".to_string()];
+    for (provider, group) in grouped {
+        lines.push(String::new());
+        lines.push(format!("{provider}:"));
+        for model in group {
+            let marker = if active == Some(model.model_id.as_str()) {
+                "*"
+            } else {
+                " "
+            };
+            lines.push(format!(
+                "  {marker} {} ({})",
+                model.model_id, model.auth_method
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
+pub(crate) fn render_status_text(
+    model: &str,
+    providers: &[String],
+    status: fx_kernel::loop_engine::LoopStatus,
+) -> String {
+    [
+        "Fawx Status".to_string(),
+        format!("  model:     {model}"),
+        format!("  providers: {}", providers.join(", ")),
+        format!("  tokens:    {} used", status.tokens_used),
+        format!("  budget:    {} tokens remaining", status.remaining.tokens),
+    ]
+    .join("\n")
+}
+
+pub(crate) fn available_provider_names(router: &ModelRouter) -> Vec<String> {
+    let mut providers = Vec::new();
+    for model in router.available_models() {
+        if !providers.contains(&model.provider_name) {
+            providers.push(model.provider_name);
+        }
+    }
+    providers
+}
+
+fn render_tui_config_text(config_path: &Path, data_dir: &str, config: &FawxConfig) -> String {
+    let fields = [
+        (
+            "general.max_iterations",
+            config.general.max_iterations.to_string(),
+        ),
+        (
+            "general.max_history",
+            config.general.max_history.to_string(),
+        ),
+        (
+            "model.default_model",
+            format!("{:?}", config.model.default_model),
+        ),
+        (
+            "model.synthesis_instruction",
+            format!("{:?}", config.model.synthesis_instruction),
+        ),
+        (
+            "tools.working_dir",
+            format!("{:?}", config.tools.working_dir),
+        ),
+        (
+            "tools.search_exclude",
+            format!("{:?}", config.tools.search_exclude),
+        ),
+        (
+            "tools.max_read_size",
+            config.tools.max_read_size.to_string(),
+        ),
+        ("memory.max_entries", config.memory.max_entries.to_string()),
+        (
+            "memory.max_value_size",
+            config.memory.max_value_size.to_string(),
+        ),
+        (
+            "memory.max_snapshot_chars",
+            config.memory.max_snapshot_chars.to_string(),
+        ),
+        (
+            "memory.max_relevant_results",
+            config.memory.max_relevant_results.to_string(),
+        ),
+    ];
+    let mut output = format!(
+        "Config path: {}\nRuntime data dir: {}\nLoaded values:\n",
+        config_path.display(),
+        data_dir,
+    );
+    for (key, value) in fields {
+        output.push_str(&format!("  {key} = {value}\n"));
+    }
+    output
+}
+
+fn sync_model_from_config(app: &mut TuiApp, default_model: Option<String>) {
+    let Some(selector) = default_model else {
+        return;
+    };
+    if let Err(error) = app.set_active_model_from_selector(&selector) {
+        eprintln!("warning: failed to apply reloaded model {selector}: {error}");
+    }
 }
 
 /// Load the user config from ~/.fawx/config.toml (or return defaults).
@@ -3473,6 +3493,7 @@ pub struct LoopEngineBundle {
     pub credential_provider: Option<Arc<dyn CredentialProvider>>,
     pub tool_executor: Arc<dyn ToolExecutor>,
     pub credential_store: Option<Arc<fx_auth::credential_store::EncryptedFileCredentialStore>>,
+    pub config_manager: Option<Arc<Mutex<ConfigManager>>>,
     /// Signature policy loaded once at startup, shared with skill watcher.
     pub signature_policy: SignaturePolicy,
 }
@@ -3537,6 +3558,7 @@ impl LoopEngineBundle {
             tool_executor: self.tool_executor,
             credential_store: self.credential_store,
             canary_monitor: None,
+            config_manager: self.config_manager,
             signature_policy: self.signature_policy,
         }
     }
@@ -3581,7 +3603,7 @@ pub fn build_headless_loop_engine_bundle(
 ///
 /// Returns `None` when thinking is disabled (`Off`), which keeps the
 /// `CompletionRequest.thinking` field empty.
-fn thinking_config_from_budget(budget: &ThinkingBudget) -> Option<ThinkingConfig> {
+pub(crate) fn thinking_config_from_budget(budget: &ThinkingBudget) -> Option<ThinkingConfig> {
     budget
         .budget_tokens()
         .map(|budget_tokens| ThinkingConfig::Enabled { budget_tokens })
@@ -3654,6 +3676,7 @@ fn build_loop_engine_with_options(
         credential_provider: skills.credential_provider,
         tool_executor,
         credential_store: skills.credential_store,
+        config_manager: options.config_manager.clone(),
         signature_policy: skills.signature_policy,
     })
 }
@@ -4076,7 +4099,7 @@ pub(crate) fn format_memory_for_prompt(
 }
 
 /// Thin wrapper to expose `ModelRouter` as a `CompletionProvider` for analysis.
-struct AnalysisCompletionProvider<'a> {
+pub(crate) struct AnalysisCompletionProvider<'a> {
     router: &'a ModelRouter,
     active_model: String,
 }
@@ -4090,7 +4113,7 @@ impl<'a> fmt::Debug for AnalysisCompletionProvider<'a> {
 }
 
 impl<'a> AnalysisCompletionProvider<'a> {
-    fn new(router: &'a ModelRouter, active_model: String) -> Self {
+    pub(crate) fn new(router: &'a ModelRouter, active_model: String) -> Self {
         Self {
             router,
             active_model,
@@ -4786,7 +4809,7 @@ fn store_error(message: impl Into<String>) -> TuiError {
     TuiError::Store(message.into())
 }
 
-fn configured_data_dir(base_data_dir: &Path, config: &FawxConfig) -> PathBuf {
+pub(crate) fn configured_data_dir(base_data_dir: &Path, config: &FawxConfig) -> PathBuf {
     config
         .general
         .data_dir
@@ -4794,7 +4817,7 @@ fn configured_data_dir(base_data_dir: &Path, config: &FawxConfig) -> PathBuf {
         .unwrap_or_else(|| base_data_dir.to_path_buf())
 }
 
-fn configured_working_dir(config: &FawxConfig) -> PathBuf {
+pub(crate) fn configured_working_dir(config: &FawxConfig) -> PathBuf {
     if let Some(path) = &config.tools.working_dir {
         return path.clone();
     }
@@ -5796,179 +5819,6 @@ fn parse_provider_selection(value: &str, provider_count: usize) -> Option<usize>
         .ok()
         .filter(|selected| (1..=provider_count).contains(selected))
         .map(|selected| selected - 1)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ParsedCommand {
-    Model(Option<String>),
-    Auth {
-        subcommand: Option<String>,
-        action: Option<String>,
-        value: Option<String>,
-        has_extra_args: bool,
-    },
-    Keys {
-        subcommand: Option<String>,
-        value: Option<String>,
-        option: Option<String>,
-        has_extra_args: bool,
-    },
-    Sign {
-        target: Option<String>,
-        has_extra_args: bool,
-    },
-    Budget,
-    Loop,
-    Status,
-    Signals,
-    Debug,
-    Analyze,
-    Improve(ImproveFlags),
-    Proposals,
-    Approve {
-        id: Option<String>,
-        force: bool,
-        has_extra_args: bool,
-    },
-    Reject {
-        id: Option<String>,
-        has_extra_args: bool,
-    },
-    Synthesis(Option<String>),
-    Clear,
-    New,
-    History,
-    Thinking(Option<String>),
-    Config(Option<String>),
-    Help,
-    Quit,
-    Unknown(String),
-}
-
-/// Flags parsed from the `/improve` command.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ImproveFlags {
-    dry_run: bool,
-    has_unknown_flag: Option<String>,
-}
-
-fn parse_command(value: &str) -> ParsedCommand {
-    let input = value.trim_start();
-    let Some(input) = input.strip_prefix('/') else {
-        return ParsedCommand::Unknown(input.to_string());
-    };
-
-    let mut parts = input.split_whitespace();
-    let Some(command) = parts.next() else {
-        return ParsedCommand::Unknown(String::new());
-    };
-
-    match command {
-        "model" => ParsedCommand::Model(parts.next().map(ToString::to_string)),
-        "auth" => {
-            let subcommand = parts.next().map(ToString::to_string);
-            let action = parts.next().map(ToString::to_string);
-            let value = parts.next().map(ToString::to_string);
-            let has_extra_args = parts.next().is_some();
-            ParsedCommand::Auth {
-                subcommand,
-                action,
-                value,
-                has_extra_args,
-            }
-        }
-        "keys" => {
-            let subcommand = parts.next().map(ToString::to_string);
-            let value = parts.next().map(ToString::to_string);
-            let option = parts.next().map(ToString::to_string);
-            let has_extra_args = parts.next().is_some();
-            ParsedCommand::Keys {
-                subcommand,
-                value,
-                option,
-                has_extra_args,
-            }
-        }
-        "sign" => ParsedCommand::Sign {
-            target: parts.next().map(ToString::to_string),
-            has_extra_args: parts.next().is_some(),
-        },
-        "budget" => ParsedCommand::Budget,
-        "loop" => ParsedCommand::Loop,
-        "status" => ParsedCommand::Status,
-        "signals" => ParsedCommand::Signals,
-        "debug" => ParsedCommand::Debug,
-        "analyze" => ParsedCommand::Analyze,
-        "improve" => ParsedCommand::Improve(parse_improve_flags(&mut parts)),
-        "proposals" => ParsedCommand::Proposals,
-        "approve" => parse_approve_command(&mut parts),
-        "reject" => parse_reject_command(&mut parts),
-        "synthesis" => {
-            let remainder = input[command.len()..].strip_prefix(' ');
-            match remainder {
-                None => ParsedCommand::Synthesis(None),
-                Some(raw) if raw.trim().is_empty() => ParsedCommand::Synthesis(Some(String::new())),
-                Some(raw) => ParsedCommand::Synthesis(Some(raw.trim().to_string())),
-            }
-        }
-        "clear" | "cls" => ParsedCommand::Clear,
-        "new" => ParsedCommand::New,
-        "history" => ParsedCommand::History,
-        "thinking" => ParsedCommand::Thinking(parts.next().map(ToString::to_string)),
-        "config" => ParsedCommand::Config(parts.next().map(ToString::to_string)),
-        "help" => ParsedCommand::Help,
-        "quit" | "exit" => ParsedCommand::Quit,
-        other => ParsedCommand::Unknown(other.to_string()),
-    }
-}
-
-fn parse_improve_flags(parts: &mut std::str::SplitWhitespace<'_>) -> ImproveFlags {
-    let mut flags = ImproveFlags {
-        dry_run: false,
-        has_unknown_flag: None,
-    };
-    for arg in parts {
-        match arg {
-            "--dry-run" => flags.dry_run = true,
-            other => {
-                flags.has_unknown_flag = Some(other.to_string());
-                break;
-            }
-        }
-    }
-    flags
-}
-
-fn parse_approve_command(parts: &mut std::str::SplitWhitespace<'_>) -> ParsedCommand {
-    let first = parts.next();
-    let (id, mut force) = match first {
-        Some("--force") => (None, true),
-        Some(value) => (Some(value.to_string()), false),
-        None => (None, false),
-    };
-    let mut has_extra_args = false;
-
-    for arg in parts {
-        match arg {
-            "--force" if !force => force = true,
-            _ => {
-                has_extra_args = true;
-                break;
-            }
-        }
-    }
-
-    ParsedCommand::Approve {
-        id,
-        force,
-        has_extra_args,
-    }
-}
-
-fn parse_reject_command(parts: &mut std::str::SplitWhitespace<'_>) -> ParsedCommand {
-    let id = parts.next().map(ToString::to_string);
-    let has_extra_args = parts.next().is_some();
-    ParsedCommand::Reject { id, has_extra_args }
 }
 
 struct RawModeGuard;
@@ -9423,6 +9273,131 @@ mod tests {
         app.handle_command("/help").await.unwrap();
 
         assert!(app.running);
+    }
+
+    #[tokio::test]
+    async fn process_input_line_echoes_slash_commands() {
+        let (mut app, _temp_dir) = new_test_app();
+
+        app.process_input_line("/status")
+            .await
+            .expect("status command");
+
+        assert_eq!(
+            app.output_buffer.first().map(String::as_str),
+            Some("you › /status")
+        );
+    }
+
+    #[tokio::test]
+    async fn process_input_line_echoes_config_reload_and_updates_model() {
+        let (mut app, temp_dir) = new_test_app();
+        let config_path = temp_dir.path().join("config.toml");
+        std::fs::write(&config_path, "[model]\ndefault_model = \"old-model\"\n")
+            .expect("write initial config");
+
+        let manager = Arc::new(Mutex::new(
+            ConfigManager::new(temp_dir.path()).expect("config manager"),
+        ));
+        app.config = FawxConfig::load(temp_dir.path()).expect("load config");
+        app.config.general.data_dir = Some(temp_dir.path().to_path_buf());
+        app.config_manager = Some(manager);
+        app.config_path = config_path.clone();
+
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(ModelEchoProvider {
+            provider_name: "mock-provider".to_string(),
+            models: vec!["old-model".to_string(), "new-model".to_string()],
+        }));
+        router.set_active("old-model").expect("set old model");
+        app.router = router;
+
+        std::fs::write(&config_path, "[model]\ndefault_model = \"new-model\"\n")
+            .expect("write updated config");
+
+        app.process_input_line("/config reload")
+            .await
+            .expect("reload command");
+
+        let expected = config_reload_success_message(&config_path);
+        assert_eq!(
+            app.output_buffer.first().map(String::as_str),
+            Some("you › /config reload")
+        );
+        assert_eq!(
+            app.output_buffer.last().map(String::as_str),
+            Some(expected.as_str())
+        );
+        assert_eq!(app.current_model(), "new-model");
+    }
+
+    #[tokio::test]
+    async fn help_command_restores_ansi_heading() {
+        let (mut app, _temp_dir) = new_test_app();
+
+        app.handle_command("/help").await.expect("help command");
+
+        let heading = app.output_buffer.first().expect("help heading");
+        assert!(heading.contains("Commands"));
+        assert!(heading.contains("\u{1b}["));
+    }
+
+    #[tokio::test]
+    async fn config_command_uses_curated_key_value_output() {
+        let (mut app, _temp_dir) = new_test_app();
+
+        app.handle_command("/config").await.expect("config command");
+
+        let output = app.output_buffer.join("\n");
+        assert!(output.contains("general.max_history = "));
+        assert!(output.contains("model.default_model = "));
+        assert!(!output.contains("\"general\""));
+    }
+
+    #[test]
+    fn proposal_commands_propagate_errors() {
+        let (app, temp_dir) = new_test_app();
+        std::fs::write(temp_dir.path().join("proposals"), "not a directory")
+            .expect("write broken proposals path");
+
+        assert!(CommandHost::proposals(&app).is_err());
+        assert!(CommandHost::approve(&app, "1", false).is_err());
+        assert!(CommandHost::reject(&app, "1").is_err());
+    }
+
+    #[tokio::test]
+    async fn local_dispatch_reports_unhandled_server_variant() {
+        let (mut app, _temp_dir) = new_test_app();
+
+        app.handle_client_only_command(ParsedCommand::Status)
+            .await
+            .expect("status fallback");
+
+        assert_eq!(
+            app.output_buffer,
+            vec!["Error: unhandled command variant: Status".to_string()]
+        );
+    }
+
+    #[test]
+    fn available_provider_names_deduplicate_available_models() {
+        let (mut app, _temp_dir) = new_test_app();
+        app.router.register_provider(Box::new(ModelEchoProvider {
+            provider_name: "Anthropic".to_string(),
+            models: vec![
+                "claude-opus-4-6".to_string(),
+                "claude-sonnet-4-6".to_string(),
+            ],
+        }));
+        app.router.register_provider(Box::new(ModelEchoProvider {
+            provider_name: "OpenAI".to_string(),
+            models: vec!["gpt-4o".to_string()],
+        }));
+
+        assert_eq!(
+            available_provider_names(&app.router),
+            vec!["Anthropic".to_string(), "OpenAI".to_string()]
+        );
     }
 
     #[tokio::test]

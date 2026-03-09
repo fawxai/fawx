@@ -6,15 +6,19 @@
 //! downstream consumers can safely pipe stdout.
 
 use async_trait::async_trait;
+use fx_analysis::{AnalysisEngine, AnalysisError, AnalysisFinding, Confidence};
 use fx_canary::CanaryMonitor;
 use fx_config::manager::ConfigManager;
 use fx_config::FawxConfig;
 use fx_core::types::{InputSource, ScreenState, UserInput};
+use fx_improve::{CyclePaths, ImprovementConfig, OutputMode};
 use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::loop_engine::{LoopEngine, LoopResult};
+use fx_kernel::signals::Signal;
 use fx_kernel::types::PerceptionSnapshot;
 use fx_llm::CompletionProvider;
 use fx_llm::{Message, ModelRouter};
+use fx_memory::SignalStore;
 
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -22,9 +26,17 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+use crate::commands::slash::{
+    apply_thinking_budget, config_reload_success_message, init_default_config,
+    persist_default_model, reload_runtime_config, render_budget_text, render_signals_summary,
+    CommandHost, ImproveFlags,
+};
+use crate::proposal_review::{approve_pending, reject_pending, render_pending, ReviewContext};
 use crate::tui::{
-    build_headless_loop_engine_bundle, fawx_data_dir, format_memory_for_prompt, trim_history,
-    HeadlessLoopBuildOptions, RouterLoopLlmProvider, SharedMemoryStore,
+    available_provider_names, build_headless_loop_engine_bundle, configured_data_dir,
+    configured_working_dir, fawx_data_dir, format_memory_for_prompt, render_model_menu_text,
+    render_status_text, resolve_model_alias, thinking_config_from_budget, trim_history,
+    AnalysisCompletionProvider, HeadlessLoopBuildOptions, RouterLoopLlmProvider, SharedMemoryStore,
 };
 use fx_subagent::{
     CreatedSubagentSession, SpawnConfig, SubagentError, SubagentFactory, SubagentLimits,
@@ -39,6 +51,8 @@ use fx_subagent::{
 /// failure when the config file is absent.
 #[cfg(feature = "http")]
 const DEFAULT_HTTP_MODEL: &str = "claude-opus-4-6";
+
+const HEADLESS_SIGNAL_SESSION_ID: &str = "headless";
 
 // ── JSON I/O types ──────────────────────────────────────────────────────────
 
@@ -94,6 +108,7 @@ pub struct HeadlessApp {
     _subagent_manager: Arc<SubagentManager>,
     active_model: String,
     conversation_history: Vec<Message>,
+    last_signals: Vec<Signal>,
     max_history: usize,
     custom_system_prompt: Option<String>,
     canary_monitor: Option<CanaryMonitor>,
@@ -141,6 +156,7 @@ impl HeadlessApp {
             _subagent_manager: deps.subagent_manager,
             active_model,
             conversation_history: Vec::new(),
+            last_signals: Vec::new(),
             max_history,
             custom_system_prompt,
             canary_monitor: deps.canary_monitor,
@@ -253,6 +269,40 @@ impl HeadlessApp {
         self.apply_custom_system_prompt();
     }
 
+    pub(crate) async fn analyze_signals_command(&mut self) -> anyhow::Result<String> {
+        let signal_store = headless_signal_store(&self.config)?;
+        let provider = AnalysisCompletionProvider::new(&self.router, self.active_model.clone());
+        let engine = AnalysisEngine::new(&signal_store);
+        match engine.analyze(&provider).await {
+            Ok(findings) => Ok(render_analysis_output(&findings, self.memory.as_ref())),
+            Err(AnalysisError::ParseError(error)) => Ok(format!(
+                "Analysis model responded, but output was unparseable JSON: {error}"
+            )),
+            Err(error) => Err(anyhow::Error::new(error)),
+        }
+    }
+
+    pub(crate) async fn improve_command(&mut self, flags: &ImproveFlags) -> anyhow::Result<String> {
+        if let Some(unknown) = &flags.has_unknown_flag {
+            return Ok(format!(
+                "Unknown flag: {unknown}\nUsage: /improve [--dry-run]"
+            ));
+        }
+        let signal_store = headless_signal_store(&self.config)?;
+        let provider = AnalysisCompletionProvider::new(&self.router, self.active_model.clone());
+        let (config, data_dir, repo_root, proposals_dir) =
+            build_headless_improve_context(&self.config, flags);
+        let paths = CyclePaths {
+            data_dir: &data_dir,
+            repo_root: &repo_root,
+            proposals_dir: &proposals_dir,
+        };
+        let result = fx_improve::run_improvement_cycle(&signal_store, &provider, &config, &paths)
+            .await
+            .map_err(anyhow::Error::from)?;
+        Ok(render_improve_output(&result, flags.dry_run))
+    }
+
     #[cfg(feature = "http")]
     pub fn apply_http_defaults(&mut self) {
         let selector = self
@@ -325,6 +375,8 @@ impl HeadlessApp {
         let response = extract_response_text(result);
         let iterations = extract_iterations(result);
         let tokens_used = extract_tokens_used(result);
+        self.last_signals = result.signals().to_vec();
+        persist_headless_signals(&self.config, &self.last_signals);
         self.record_turn(input, &response);
         CycleResult {
             response,
@@ -429,6 +481,309 @@ impl HeadlessApp {
         let parsed: JsonInput = serde_json::from_str(raw)?;
         Ok(parsed.message)
     }
+}
+
+impl CommandHost for HeadlessApp {
+    fn list_models(&self) -> String {
+        render_model_menu_text(
+            Some(self.active_model.as_str()),
+            &self.router.available_models(),
+        )
+    }
+
+    fn set_active_model(&mut self, selector: &str) -> anyhow::Result<String> {
+        let resolved = resolve_headless_model_selector(&self.router, selector)?;
+        self.active_model = resolved.clone();
+        persist_default_model(
+            &mut self.config,
+            self.config_manager.as_ref(),
+            &fawx_data_dir(),
+            &resolved,
+        )?;
+        Ok(resolved)
+    }
+
+    fn proposals(&self) -> anyhow::Result<String> {
+        render_pending(headless_review_context(&self.config)).map_err(anyhow::Error::new)
+    }
+
+    fn approve(&self, selector: &str, force: bool) -> anyhow::Result<String> {
+        approve_pending(headless_review_context(&self.config), selector, force)
+            .map_err(anyhow::Error::new)
+    }
+
+    fn reject(&self, selector: &str) -> anyhow::Result<String> {
+        reject_pending(headless_review_context(&self.config), selector).map_err(anyhow::Error::new)
+    }
+
+    fn show_config(&self) -> anyhow::Result<String> {
+        let config_path = headless_config_path(&self.config, self.config_manager.as_ref())?;
+        let data_dir = configured_data_dir(&fawx_data_dir(), &self.config);
+        let json = headless_config_json(&self.config, self.config_manager.as_ref())?;
+        render_headless_config(&config_path, &data_dir, &self.active_model, &json)
+    }
+
+    fn init_config(&mut self) -> anyhow::Result<String> {
+        init_default_config(&fawx_data_dir())
+    }
+
+    fn reload_config(&mut self) -> anyhow::Result<String> {
+        let config_path = headless_config_path(&self.config, self.config_manager.as_ref())?;
+        self.config = reload_runtime_config(self.config_manager.as_ref(), &config_path)?;
+        self.max_history = self.config.general.max_history;
+        self.loop_engine
+            .set_thinking_config(thinking_config_from_budget(
+                &self.config.general.thinking.unwrap_or_default(),
+            ));
+        sync_headless_model_from_config(self, self.config.model.default_model.clone())?;
+        Ok(config_reload_success_message(&config_path))
+    }
+
+    fn show_status(&self) -> String {
+        render_status_text(
+            &self.active_model,
+            &available_provider_names(&self.router),
+            self.loop_engine.status(current_time_ms()),
+        )
+    }
+
+    fn show_budget_status(&self) -> String {
+        render_budget_text(self.loop_engine.status(current_time_ms()))
+    }
+
+    fn show_signals_summary(&self) -> String {
+        render_signals_summary(&self.last_signals)
+    }
+
+    fn handle_thinking(&mut self, level: Option<&str>) -> anyhow::Result<String> {
+        apply_thinking_budget(
+            &mut self.config,
+            &mut self.loop_engine,
+            self.config_manager.as_ref(),
+            &fawx_data_dir(),
+            level,
+        )
+    }
+}
+
+fn resolve_headless_model_selector(router: &ModelRouter, selector: &str) -> anyhow::Result<String> {
+    let model_ids = router
+        .available_models()
+        .into_iter()
+        .map(|model| model.model_id)
+        .collect::<Vec<_>>();
+    if model_ids.iter().any(|model_id| model_id == selector) {
+        return Ok(selector.to_string());
+    }
+    resolve_model_alias(selector, &model_ids)
+        .ok_or_else(|| anyhow::anyhow!("model not found: {selector}"))
+}
+
+fn sync_headless_model_from_config(
+    app: &mut HeadlessApp,
+    default_model: Option<String>,
+) -> anyhow::Result<()> {
+    let Some(selector) = default_model else {
+        return Ok(());
+    };
+    let resolved = resolve_headless_model_selector(&app.router, &selector)?;
+    apply_headless_active_model(app, &resolved);
+    Ok(())
+}
+
+fn apply_headless_active_model(app: &mut HeadlessApp, model: &str) {
+    if let Some(router) = Arc::get_mut(&mut app.router) {
+        if let Err(error) = router.set_active(model) {
+            tracing::warn!(error = %error, model, "failed to apply reloaded model to router");
+        }
+    }
+    app.active_model = model.to_string();
+}
+
+fn headless_signal_store(config: &FawxConfig) -> anyhow::Result<SignalStore> {
+    let data_dir = configured_data_dir(&fawx_data_dir(), config);
+    SignalStore::new(&data_dir, HEADLESS_SIGNAL_SESSION_ID).map_err(anyhow::Error::new)
+}
+
+fn persist_headless_signals(config: &FawxConfig, signals: &[Signal]) {
+    if let Ok(signal_store) = headless_signal_store(config) {
+        if let Err(error) = signal_store.persist(signals) {
+            eprintln!("warning: signal persist failed: {error}");
+        }
+        return;
+    }
+    eprintln!("warning: signal store unavailable for headless session");
+}
+
+fn build_headless_improve_context(
+    config: &FawxConfig,
+    flags: &ImproveFlags,
+) -> (ImprovementConfig, PathBuf, PathBuf, PathBuf) {
+    let data_dir = configured_data_dir(&fawx_data_dir(), config);
+    let proposals_dir = data_dir.join("proposals");
+    let repo_root = configured_working_dir(config);
+    let mut improve_config = ImprovementConfig::default();
+    if flags.dry_run {
+        improve_config.output_mode = OutputMode::DryRun;
+    }
+    (improve_config, data_dir, repo_root, proposals_dir)
+}
+
+fn headless_review_context(config: &FawxConfig) -> ReviewContext {
+    let data_dir = configured_data_dir(&fawx_data_dir(), config);
+    ReviewContext {
+        proposals_dir: data_dir.join("proposals"),
+        working_dir: configured_working_dir(config),
+    }
+}
+
+fn headless_config_json(
+    config: &FawxConfig,
+    config_manager: Option<&Arc<Mutex<ConfigManager>>>,
+) -> anyhow::Result<serde_json::Value> {
+    if let Some(manager) = config_manager {
+        let guard = manager
+            .lock()
+            .map_err(|error| anyhow::anyhow!("config manager lock poisoned: {error}"))?;
+        return guard.get("all").map_err(anyhow::Error::msg);
+    }
+    serde_json::to_value(config).map_err(anyhow::Error::from)
+}
+
+fn headless_config_path(
+    config: &FawxConfig,
+    config_manager: Option<&Arc<Mutex<ConfigManager>>>,
+) -> anyhow::Result<PathBuf> {
+    if let Some(manager) = config_manager {
+        let guard = manager
+            .lock()
+            .map_err(|error| anyhow::anyhow!("config manager lock poisoned: {error}"))?;
+        return Ok(guard.config_path().to_path_buf());
+    }
+    Ok(configured_data_dir(&fawx_data_dir(), config).join("config.toml"))
+}
+
+fn render_headless_config(
+    config_path: &std::path::Path,
+    data_dir: &std::path::Path,
+    active_model: &str,
+    json: &serde_json::Value,
+) -> anyhow::Result<String> {
+    let pretty = serde_json::to_string_pretty(json)?;
+    Ok(format!(
+        "Config path: {}\nRuntime data dir: {}\nmodel.active = {}\nLoaded values:\n{}",
+        config_path.display(),
+        data_dir.display(),
+        active_model,
+        pretty
+    ))
+}
+
+fn render_analysis_output(
+    findings: &[AnalysisFinding],
+    memory: Option<&SharedMemoryStore>,
+) -> String {
+    if findings.is_empty() {
+        return "No patterns found. Collect more signals first.".to_string();
+    }
+    let mut lines = render_analysis_findings(findings);
+    let (stored, surfaced, logged) = route_findings_by_confidence(findings, memory);
+    lines.push(format!(
+        "Wrote {} patterns to memory, surfaced {} for review, logged {}",
+        stored, surfaced, logged
+    ));
+    lines.join("\n")
+}
+
+fn render_analysis_findings(findings: &[AnalysisFinding]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for finding in findings {
+        lines.push(format!(
+            "{} | {}",
+            analysis_confidence_badge(finding.confidence),
+            finding.pattern_name
+        ));
+        lines.push(format!("  {}", finding.description));
+        lines.push(format!("  Evidence: {} signals", finding.evidence.len()));
+        if let Some(action) = &finding.suggested_action {
+            lines.push(format!("  Suggested: {action}"));
+        }
+        lines.push(String::new());
+    }
+    lines.push(format!("Found {} patterns total.", findings.len()));
+    lines
+}
+
+fn route_findings_by_confidence(
+    findings: &[AnalysisFinding],
+    memory: Option<&SharedMemoryStore>,
+) -> (usize, usize, usize) {
+    findings
+        .iter()
+        .fold((0, 0, 0), |counts, finding| match finding.confidence {
+            Confidence::High if store_high_confidence_finding(memory, finding) => {
+                (counts.0 + 1, counts.1, counts.2)
+            }
+            Confidence::Medium => (counts.0, counts.1 + 1, counts.2),
+            Confidence::Low => (counts.0, counts.1, counts.2 + 1),
+            Confidence::High => counts,
+        })
+}
+
+fn store_high_confidence_finding(
+    memory: Option<&SharedMemoryStore>,
+    finding: &AnalysisFinding,
+) -> bool {
+    let Some(memory_store) = memory else {
+        return false;
+    };
+    let Ok(mut store) = memory_store.lock() else {
+        return false;
+    };
+    let key = format!("pattern/{}", finding.pattern_name);
+    store.write(&key, &finding.description).is_ok()
+}
+
+fn analysis_confidence_badge(confidence: Confidence) -> &'static str {
+    match confidence {
+        Confidence::High => "🔴 HIGH",
+        Confidence::Medium => "🟡 MEDIUM",
+        Confidence::Low => "🟢 LOW",
+    }
+}
+
+fn render_improve_output(result: &fx_improve::ExecutionResult, dry_run: bool) -> String {
+    let mut lines = vec![if dry_run {
+        "⚡ Dry run complete.".to_string()
+    } else {
+        "⚡ Improvement cycle complete.".to_string()
+    }];
+    if result.proposals_written.is_empty()
+        && result.branches_created.is_empty()
+        && result.skipped.is_empty()
+    {
+        lines.push("  No actionable improvements found.".to_string());
+        return lines.join("\n");
+    }
+    lines.extend(
+        result
+            .proposals_written
+            .iter()
+            .map(|path| format!("  Proposal: {}", path.display())),
+    );
+    lines.extend(
+        result
+            .branches_created
+            .iter()
+            .map(|branch| format!("  Branch: {branch}")),
+    );
+    lines.extend(
+        result
+            .skipped
+            .iter()
+            .map(|(name, reason)| format!("  Skipped: {name} — {reason}")),
+    );
+    lines.join("\n")
 }
 
 impl HeadlessSubagentFactory {
@@ -687,6 +1042,7 @@ mod tests {
             _subagent_manager: new_disabled_subagent_manager(),
             active_model: "mock-model".to_string(),
             conversation_history: Vec::new(),
+            last_signals: Vec::new(),
             max_history: 20,
             custom_system_prompt: None,
             canary_monitor: None,
@@ -786,6 +1142,185 @@ mod tests {
     }
 
     #[test]
+    fn list_models_uses_shared_renderer() {
+        let mut app = test_app();
+        app.router = test_router();
+        app.active_model = "mock-model".to_string();
+
+        assert_eq!(
+            app.list_models(),
+            render_model_menu_text(Some("mock-model"), &app.router.available_models())
+        );
+    }
+
+    #[test]
+    fn proposal_commands_propagate_errors() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp_dir.path().join("proposals"), "not a directory")
+            .expect("write broken proposals path");
+        let mut app = test_app();
+        app.config.general.data_dir = Some(temp_dir.path().to_path_buf());
+
+        assert!(CommandHost::proposals(&app).is_err());
+        assert!(CommandHost::approve(&app, "1", false).is_err());
+        assert!(CommandHost::reject(&app, "1").is_err());
+    }
+
+    #[test]
+    fn show_config_includes_active_model_line() {
+        let mut app = test_app();
+        app.active_model = "runtime-model".to_string();
+        app.config.model.default_model = Some("config-model".to_string());
+
+        let rendered = app.show_config().expect("show config");
+
+        assert!(rendered.contains("model.active = runtime-model"));
+        assert!(rendered.contains("\"default_model\": \"config-model\""));
+    }
+
+    #[test]
+    fn reload_config_updates_active_model_from_reloaded_config() {
+        #[derive(Debug)]
+        struct ReloadProvider;
+
+        #[async_trait]
+        impl fx_llm::CompletionProvider for ReloadProvider {
+            async fn complete(
+                &self,
+                _request: fx_llm::CompletionRequest,
+            ) -> Result<fx_llm::CompletionResponse, fx_llm::ProviderError> {
+                Ok(mock_completion_response())
+            }
+
+            async fn complete_stream(
+                &self,
+                _request: fx_llm::CompletionRequest,
+            ) -> Result<fx_llm::CompletionStream, fx_llm::ProviderError> {
+                let chunk = fx_llm::StreamChunk {
+                    delta_content: Some(mock_completion_text()),
+                    stop_reason: Some("end_turn".to_string()),
+                    ..Default::default()
+                };
+                Ok(Box::pin(futures::stream::iter(vec![Ok(chunk)])))
+            }
+
+            fn name(&self) -> &str {
+                "reload-provider"
+            }
+
+            fn supported_models(&self) -> Vec<String> {
+                vec!["old-model".to_string(), "new-model".to_string()]
+            }
+
+            fn capabilities(&self) -> fx_llm::ProviderCapabilities {
+                fx_llm::ProviderCapabilities {
+                    supports_temperature: false,
+                    requires_streaming: false,
+                }
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            temp.path().join("config.toml"),
+            "[model]\ndefault_model = \"old-model\"\n",
+        )
+        .expect("write initial config");
+        let manager = Arc::new(Mutex::new(
+            ConfigManager::new(temp.path()).expect("config manager"),
+        ));
+        let mut config = FawxConfig::load(temp.path()).expect("load config");
+        config.general.data_dir = Some(temp.path().to_path_buf());
+
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(ReloadProvider));
+        router.set_active("old-model").expect("set old model");
+
+        let mut app = HeadlessApp {
+            loop_engine: test_engine(),
+            router: Arc::new(router),
+            config,
+            memory: None,
+            _subagent_manager: new_disabled_subagent_manager(),
+            active_model: "old-model".to_string(),
+            conversation_history: Vec::new(),
+            last_signals: Vec::new(),
+            max_history: 20,
+            custom_system_prompt: None,
+            canary_monitor: None,
+            config_manager: Some(manager),
+        };
+
+        std::fs::write(
+            temp.path().join("config.toml"),
+            "[model]\ndefault_model = \"new-model\"\n",
+        )
+        .expect("write updated config");
+
+        let response = app.reload_config().expect("reload config");
+
+        assert_eq!(app.active_model, "new-model");
+        assert_eq!(app.router.active_model(), Some("new-model"));
+        assert_eq!(
+            response,
+            crate::commands::slash::config_reload_success_message(&temp.path().join("config.toml"))
+        );
+    }
+
+    #[test]
+    fn show_status_deduplicates_available_model_providers() {
+        #[derive(Debug)]
+        struct MultiModelProvider;
+
+        #[async_trait]
+        impl fx_llm::CompletionProvider for MultiModelProvider {
+            async fn complete(
+                &self,
+                _request: fx_llm::CompletionRequest,
+            ) -> Result<fx_llm::CompletionResponse, fx_llm::ProviderError> {
+                Ok(mock_completion_response())
+            }
+
+            async fn complete_stream(
+                &self,
+                _request: fx_llm::CompletionRequest,
+            ) -> Result<fx_llm::CompletionStream, fx_llm::ProviderError> {
+                let chunk = fx_llm::StreamChunk {
+                    delta_content: Some(mock_completion_text()),
+                    stop_reason: Some("end_turn".to_string()),
+                    ..Default::default()
+                };
+                Ok(Box::pin(futures::stream::iter(vec![Ok(chunk)])))
+            }
+
+            fn name(&self) -> &str {
+                "usage-reporting"
+            }
+
+            fn supported_models(&self) -> Vec<String> {
+                vec!["mock-model".to_string(), "mock-model-2".to_string()]
+            }
+
+            fn capabilities(&self) -> fx_llm::ProviderCapabilities {
+                fx_llm::ProviderCapabilities {
+                    supports_temperature: false,
+                    requires_streaming: false,
+                }
+            }
+        }
+
+        let mut app = test_app();
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(MultiModelProvider));
+        router.set_active("mock-model").expect("set active");
+        app.router = Arc::new(router);
+
+        let status = app.show_status();
+        assert!(status.contains("providers: usage-reporting"));
+        assert!(!status.contains("providers: usage-reporting, usage-reporting"));
+    }
+
+    #[test]
     fn json_input_parses_message() {
         let app = test_app();
         let result = app.parse_json_input(r#"{"message": "hello world"}"#);
@@ -822,6 +1357,7 @@ mod tests {
             _subagent_manager: new_disabled_subagent_manager(),
             active_model: "mock-model".to_string(),
             conversation_history: Vec::new(),
+            last_signals: Vec::new(),
             max_history: 20,
             custom_system_prompt: None,
             canary_monitor: None,
@@ -845,6 +1381,7 @@ mod tests {
             _subagent_manager: new_disabled_subagent_manager(),
             active_model: "mock-model".to_string(),
             conversation_history: Vec::new(),
+            last_signals: Vec::new(),
             max_history: 20,
             custom_system_prompt: None,
             canary_monitor: Some(
