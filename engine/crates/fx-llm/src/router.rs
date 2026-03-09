@@ -6,8 +6,9 @@ use fx_core::error::LlmError;
 use thiserror::Error;
 use tracing::{debug, warn};
 
-use crate::provider::LlmProvider as CompletionProvider;
-use crate::types::{CompletionRequest, CompletionResponse};
+use crate::provider::{CompletionStream, LlmProvider as CompletionProvider};
+use crate::streaming::StreamCallback;
+use crate::types::{CompletionRequest, CompletionResponse, LlmError as ProviderLlmError};
 use crate::LlmProvider;
 
 /// Routes completion requests to the currently active model provider.
@@ -111,7 +112,7 @@ impl ModelRouter {
     pub async fn complete(
         &self,
         request: CompletionRequest,
-    ) -> Result<CompletionResponse, crate::types::LlmError> {
+    ) -> Result<CompletionResponse, ProviderLlmError> {
         let (provider, normalized_request) = self.request_for_active_provider(request)?;
         provider.complete(normalized_request).await
     }
@@ -120,29 +121,36 @@ impl ModelRouter {
     pub async fn complete_stream(
         &self,
         request: CompletionRequest,
-    ) -> Result<crate::provider::CompletionStream, crate::types::LlmError> {
+    ) -> Result<CompletionStream, ProviderLlmError> {
         let (provider, normalized_request) = self.request_for_active_provider(request)?;
         provider.complete_stream(normalized_request).await
+    }
+
+    /// Send a completion request and emit normalized provider stream events.
+    pub async fn stream(
+        &self,
+        request: CompletionRequest,
+        callback: StreamCallback,
+    ) -> Result<CompletionResponse, ProviderLlmError> {
+        let (provider, normalized_request) = self.request_for_active_provider(request)?;
+        provider.stream(normalized_request, callback).await
     }
 
     fn request_for_active_provider(
         &self,
         mut request: CompletionRequest,
-    ) -> Result<(&dyn CompletionProvider, CompletionRequest), crate::types::LlmError> {
-        let active_model = self.active_model.clone().ok_or_else(|| {
-            crate::types::LlmError::Config(RouterError::NoActiveModel.to_string())
-        })?;
+    ) -> Result<(&dyn CompletionProvider, CompletionRequest), ProviderLlmError> {
+        let active_model = self
+            .active_model
+            .clone()
+            .ok_or_else(|| ProviderLlmError::Config(RouterError::NoActiveModel.to_string()))?;
 
         let provider_name = self.model_to_provider.get(&active_model).ok_or_else(|| {
-            crate::types::LlmError::Config(
-                RouterError::ModelNotFound(active_model.clone()).to_string(),
-            )
+            ProviderLlmError::Config(RouterError::ModelNotFound(active_model.clone()).to_string())
         })?;
 
         let provider = self.providers.get(provider_name).ok_or_else(|| {
-            crate::types::LlmError::Provider(format!(
-                "provider '{provider_name}' was not registered"
-            ))
+            ProviderLlmError::Provider(format!("provider '{provider_name}' was not registered"))
         })?;
 
         request.model = active_model;
@@ -182,7 +190,7 @@ pub enum RouterError {
     EmptyModelSelector,
     /// Provider-level request failure.
     #[error("provider error: {0}")]
-    ProviderError(crate::types::LlmError),
+    ProviderError(ProviderLlmError),
 }
 
 fn infer_auth_method(provider_name: &str) -> String {

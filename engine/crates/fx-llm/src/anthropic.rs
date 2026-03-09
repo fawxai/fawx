@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use crate::provider::{CompletionStream, LlmProvider, ProviderCapabilities};
 use crate::sse::{SseFrame, SseFramer};
+use crate::streaming::{collect_completion_stream, StreamCallback};
 use crate::types::{
     CompletionRequest, CompletionResponse, ContentBlock, LlmError, Message, MessageRole,
     StreamChunk, ThinkingConfig, ToolCall, ToolUseDelta, Usage,
@@ -580,6 +581,15 @@ impl LlmProvider for AnthropicProvider {
         Ok(Box::pin(Self::stream_from_sse(response)))
     }
 
+    async fn stream(
+        &self,
+        request: CompletionRequest,
+        callback: StreamCallback,
+    ) -> Result<CompletionResponse, LlmError> {
+        let mut stream = self.complete_stream(request).await?;
+        collect_completion_stream(&mut stream, &callback).await
+    }
+
     fn name(&self) -> &str {
         "anthropic"
     }
@@ -804,6 +814,8 @@ fn validate_request(body: &AnthropicRequestBody) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::streaming::{collect_stream_chunks, StreamEvent};
+    use crate::test_helpers::{callback_events, read_events};
     use crate::types::ToolDefinition;
     use serde_json::json;
 
@@ -916,6 +928,97 @@ mod tests {
 
         assert_eq!(chunks[3].usage.unwrap().output_tokens, 9);
         assert_eq!(chunks[3].stop_reason.as_deref(), Some("end_turn"));
+    }
+
+    #[test]
+    fn anthropic_stream_collection_emits_text_and_tool_events() {
+        let payload = r#"
+            data: {"type":"content_block_delta","index":0,"delta":{"text":"Hi"}}
+
+            data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01","name":"search","input":{}}}
+
+            data: {"type":"content_block_delta","index":1,"delta":{"partial_json":"{\"query\":\"fawx\"}"}}
+
+            data: {"type":"content_block_stop","index":1}
+
+            data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":4}}
+
+            data: [DONE]
+        "#;
+        let chunks = AnthropicProvider::parse_sse_payload(payload).unwrap();
+        let (callback, events) = callback_events();
+
+        let response = collect_stream_chunks(chunks, &callback);
+
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].name, "search");
+        assert_eq!(response.tool_calls[0].arguments["query"], "fawx");
+        assert_eq!(response.stop_reason.as_deref(), Some("tool_use"));
+        assert_eq!(
+            read_events(events),
+            vec![
+                StreamEvent::TextDelta {
+                    text: "Hi".to_string()
+                },
+                StreamEvent::ToolCallStart {
+                    id: "toolu_01".to_string(),
+                    name: "search".to_string()
+                },
+                StreamEvent::ToolCallDelta {
+                    id: "toolu_01".to_string(),
+                    args_delta: "{\"query\":\"fawx\"}".to_string()
+                },
+                StreamEvent::ToolCallComplete {
+                    id: "toolu_01".to_string(),
+                    name: "search".to_string(),
+                    arguments: "{\"query\":\"fawx\"}".to_string()
+                },
+                StreamEvent::Done {
+                    response: "Hi".to_string()
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn anthropic_stream_collection_matches_final_completion_response() {
+        let response = AnthropicResponseBody {
+            content: vec![
+                AnthropicContentBlock::Text {
+                    text: "I'll search".to_string(),
+                },
+                AnthropicContentBlock::ToolUse {
+                    id: "toolu_01".to_string(),
+                    name: "search".to_string(),
+                    input: json!({"query":"fawx"}),
+                },
+            ],
+            stop_reason: Some("tool_use".to_string()),
+            usage: Some(AnthropicUsage {
+                input_tokens: 10,
+                output_tokens: 11,
+            }),
+        };
+        let payload = r#"
+            data: {"type":"content_block_delta","index":0,"delta":{"text":"I'll search"}}
+
+            data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01","name":"search","input":{}}}
+
+            data: {"type":"content_block_delta","index":1,"delta":{"partial_json":"{\"query\":\"fawx\"}"}}
+
+            data: {"type":"content_block_stop","index":1}
+
+            data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"input_tokens":10,"output_tokens":11}}
+
+            data: [DONE]
+        "#;
+        let chunks = AnthropicProvider::parse_sse_payload(payload).unwrap();
+        let (callback, _) = callback_events();
+
+        let streamed = collect_stream_chunks(chunks, &callback);
+        let expected = AnthropicProvider::parse_completion_response(response);
+
+        assert_eq!(streamed, expected);
     }
 
     #[test]

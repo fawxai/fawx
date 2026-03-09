@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use futures::Stream;
 use std::pin::Pin;
 
+use crate::streaming::{emit_default_stream_response, StreamCallback};
 use crate::types::{CompletionRequest, CompletionResponse, LlmError, StreamChunk};
 
 /// Streaming response type for completion APIs.
@@ -29,6 +30,17 @@ pub trait LlmProvider: Send + Sync {
         &self,
         request: CompletionRequest,
     ) -> Result<CompletionStream, LlmError>;
+
+    /// Send a completion request and emit normalized stream events.
+    async fn stream(
+        &self,
+        request: CompletionRequest,
+        callback: StreamCallback,
+    ) -> Result<CompletionResponse, LlmError> {
+        let response = self.complete(request).await?;
+        emit_default_stream_response(&response, &callback);
+        Ok(response)
+    }
 
     /// Provider name for logging/routing.
     fn name(&self) -> &str;
