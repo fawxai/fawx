@@ -3,6 +3,10 @@ name: Live API Contract Tests
 on:
   pull_request:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+      - 'LICENSE'
   workflow_dispatch:
 
 jobs:
