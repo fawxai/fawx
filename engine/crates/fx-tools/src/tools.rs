@@ -10,7 +10,7 @@ use fx_kernel::act::{
 use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::{ListEntry, ProcessConfig, ProcessRegistry, SpawnResult, StatusResult};
 use fx_llm::{ToolCall, ToolDefinition};
-use fx_propose::{current_file_hash, Proposal, ProposalWriter};
+use fx_propose::{build_proposal_content, current_file_hash, Proposal, ProposalWriter};
 use fx_subagent::{
     SpawnConfig, SpawnMode, SubagentControl, SubagentHandle, SubagentId, SubagentStatus,
 };
@@ -895,19 +895,12 @@ impl FawxToolExecutor {
 }
 
 fn build_proposed_content(path: &Path, content: &str) -> String {
-    if !path.exists() {
-        return content.to_string();
-    }
-
-    let original =
-        fs::read_to_string(path).unwrap_or_else(|_| "(binary or unreadable)".to_string());
-    format!(
-        "--- original ({} bytes) ---\n{}\n--- proposed ({} bytes) ---\n{}",
-        original.len(),
-        original,
-        content.len(),
-        content
-    )
+    let original = if path.exists() {
+        Some(fs::read_to_string(path).unwrap_or_else(|_| "(binary or unreadable)".to_string()))
+    } else {
+        None
+    };
+    build_proposal_content(original.as_deref(), content)
 }
 
 struct EditPlan {

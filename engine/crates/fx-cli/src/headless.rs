@@ -534,8 +534,8 @@ impl CommandHost for HeadlessApp {
         Ok(resolved)
     }
 
-    fn proposals(&self) -> anyhow::Result<String> {
-        render_pending(headless_review_context(&self.config)).map_err(anyhow::Error::new)
+    fn proposals(&self, selector: Option<&str>) -> anyhow::Result<String> {
+        render_pending(headless_review_context(&self.config), selector).map_err(anyhow::Error::new)
     }
 
     fn approve(&self, selector: &str, force: bool) -> anyhow::Result<String> {
@@ -1540,7 +1540,7 @@ mod tests {
         let mut app = test_app();
         app.config.general.data_dir = Some(temp_dir.path().to_path_buf());
 
-        assert!(CommandHost::proposals(&app).is_err());
+        assert!(CommandHost::proposals(&app, None).is_err());
         assert!(CommandHost::approve(&app, "1", false).is_err());
         assert!(CommandHost::reject(&app, "1").is_err());
     }

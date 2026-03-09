@@ -14,7 +14,8 @@ use crate::cancellation::CancellationToken;
 use async_trait::async_trait;
 use fx_core::self_modify::{classify_path, PathTier, SelfModifyConfig};
 use fx_llm::{ToolCall, ToolDefinition};
-use fx_propose::{current_file_hash, Proposal, ProposalWriter};
+use fx_propose::{build_proposal_content, current_file_hash, Proposal, ProposalWriter};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -180,23 +181,117 @@ fn epoch_seconds() -> u64 {
 /// from path tier context (e.g., Tier 2 propose paths vs config changes).
 const DEFAULT_RISK_LEVEL: &str = "medium";
 
-fn build_proposal(call: &ToolCall, path: &str, file_hash: Option<String>) -> Proposal {
-    let content = call
-        .arguments
-        .get("content")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
-        .to_string();
-
-    Proposal {
+fn build_proposal(
+    call: &ToolCall,
+    path: &str,
+    working_dir: &Path,
+    file_hash: Option<String>,
+) -> Result<Proposal, String> {
+    Ok(Proposal {
         title: format!("Write to {path}"),
         description: format!("Agent requested {tool} on {path}", tool = call.name),
         target_path: PathBuf::from(path),
-        proposed_content: content,
+        proposed_content: build_proposal_payload(call, path, working_dir)?,
         risk: DEFAULT_RISK_LEVEL.to_string(),
         timestamp: epoch_seconds(),
         file_hash,
+    })
+}
+
+fn build_proposal_payload(
+    call: &ToolCall,
+    path: &str,
+    working_dir: &Path,
+) -> Result<String, String> {
+    match call.name.as_str() {
+        "edit_file" => build_edit_proposal_payload(call, path, working_dir),
+        _ => build_write_proposal_payload(call, path, working_dir),
     }
+}
+
+fn build_write_proposal_payload(
+    call: &ToolCall,
+    path: &str,
+    working_dir: &Path,
+) -> Result<String, String> {
+    let proposed = string_argument(call, "content").unwrap_or_default();
+    let original = read_existing_target(working_dir, path)?;
+    Ok(build_proposal_content(original.as_deref(), &proposed))
+}
+
+fn build_edit_proposal_payload(
+    call: &ToolCall,
+    path: &str,
+    working_dir: &Path,
+) -> Result<String, String> {
+    let original = read_existing_target(working_dir, path)?.ok_or_else(|| {
+        format!("Failed to inspect target file: edit_file target '{path}' does not exist.")
+    })?;
+    let old_text = required_string_argument(call, "old_text")?;
+    let new_text = string_argument(call, "new_text").unwrap_or_default();
+    let updated = apply_exact_edit(&original, &old_text, &new_text)?;
+    Ok(build_proposal_content(Some(&original), &updated))
+}
+
+fn string_argument(call: &ToolCall, key: &str) -> Option<String> {
+    call.arguments
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn required_string_argument(call: &ToolCall, key: &str) -> Result<String, String> {
+    string_argument(call, key)
+        .ok_or_else(|| format!("Failed to inspect target file: missing '{key}' argument."))
+}
+
+fn read_existing_target(working_dir: &Path, path: &str) -> Result<Option<String>, String> {
+    let target_path = resolve_target_path(working_dir, path);
+    match fs::read_to_string(target_path) {
+        Ok(content) => Ok(Some(content)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("Failed to inspect target file: {error}")),
+    }
+}
+
+fn resolve_target_path(working_dir: &Path, path: &str) -> PathBuf {
+    let target_path = Path::new(path);
+    if target_path.is_absolute() {
+        return target_path.to_path_buf();
+    }
+    working_dir.join(target_path)
+}
+
+fn apply_exact_edit(content: &str, old_text: &str, new_text: &str) -> Result<String, String> {
+    if old_text.is_empty() {
+        return Err(
+            "Failed to inspect target file: edit_file old_text cannot be empty.".to_string(),
+        );
+    }
+    let matches = content
+        .match_indices(old_text)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Err(
+            "Failed to inspect target file: edit_file old_text not found in target file."
+                .to_string(),
+        ),
+        [start] => Ok(replace_exact_match(content, *start, old_text, new_text)),
+        _ => Err(
+            "Failed to inspect target file: edit_file old_text matched multiple regions."
+                .to_string(),
+        ),
+    }
+}
+
+fn replace_exact_match(content: &str, start: usize, old_text: &str, new_text: &str) -> String {
+    let end = start + old_text.len();
+    let mut updated = String::with_capacity(content.len() - old_text.len() + new_text.len());
+    updated.push_str(&content[..start]);
+    updated.push_str(new_text);
+    updated.push_str(&content[end..]);
+    updated
 }
 
 fn classify_and_gate(
@@ -288,7 +383,10 @@ fn create_proposal_decision(
         }
     };
 
-    let proposal = build_proposal(call, path, file_hash);
+    let proposal = match build_proposal(call, path, working_dir, file_hash) {
+        Ok(proposal) => proposal,
+        Err(error) => return GateDecision::Block(blocked_result(call, path, &error)),
+    };
     let writer = ProposalWriter::new(proposals_dir.to_path_buf());
     match writer.write(&proposal) {
         Ok(proposal_path) => GateDecision::Propose(proposal_result(call, path, &proposal_path)),
@@ -406,7 +504,7 @@ mod tests {
     use crate::act::{ToolCacheStats, ToolCacheability, ToolExecutorError, ToolResult};
     use async_trait::async_trait;
     use fx_llm::ToolCall;
-    use fx_propose::sha256_hex;
+    use fx_propose::{extract_proposed_content, sha256_hex};
     use std::fs;
     use std::sync::{Arc, Mutex};
 
@@ -528,6 +626,18 @@ mod tests {
         }
     }
 
+    fn edit_call(id: &str, path: &str, old_text: &str, new_text: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: "edit_file".to_string(),
+            arguments: serde_json::json!({
+                "path": path,
+                "old_text": old_text,
+                "new_text": new_text,
+            }),
+        }
+    }
+
     // Test 1: Tier 3 path always blocked regardless of config
     #[tokio::test]
     async fn tier3_path_always_blocked_regardless_of_config() {
@@ -593,6 +703,53 @@ mod tests {
         assert_eq!(
             value["file_hash_at_creation"],
             serde_json::Value::String(expected)
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_file_proposal_captures_updated_content() {
+        let working_dir =
+            std::env::temp_dir().join(format!("fx-proposal-gate-edit-work-{}", epoch_seconds()));
+        let proposals_dir = std::env::temp_dir().join(format!(
+            "fx-proposal-gate-edit-proposals-{}",
+            epoch_seconds()
+        ));
+        fs::create_dir_all(working_dir.join("config")).unwrap();
+        fs::write(
+            working_dir.join("config/settings.toml"),
+            b"name = \"before\"\nmode = \"old\"\n",
+        )
+        .unwrap();
+
+        let (executor, _) = make_executor_in(enabled_config(), working_dir.clone(), proposals_dir);
+        let results = executor
+            .execute_tools(
+                &[edit_call(
+                    "1",
+                    "config/settings.toml",
+                    "mode = \"old\"",
+                    "mode = \"new\"",
+                )],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(results[0].success);
+        let sidecar_path = std::fs::read_dir(executor.state.lock().unwrap().proposals_dir.clone())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+            .unwrap();
+        let sidecar = std::fs::read_to_string(sidecar_path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&sidecar).unwrap();
+        let payload = value["proposed_content"].as_str().unwrap();
+
+        assert!(payload.contains("--- original"));
+        assert_eq!(
+            extract_proposed_content(payload),
+            "name = \"before\"\nmode = \"new\"\n"
         );
     }
 
