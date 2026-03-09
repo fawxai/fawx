@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tracing_appender::non_blocking::WorkerGuard;
 
 use crate::commands::slash::{
     apply_thinking_budget, client_only_command_message, config_reload_success_message,
@@ -158,6 +159,12 @@ struct TrustedKeyEntry {
     file_name: String,
     fingerprint: String,
     file_size: u64,
+}
+
+pub fn init_serve_logging(
+    config: &FawxConfig,
+) -> Result<WorkerGuard, crate::startup::StartupError> {
+    crate::startup::init_logging(&config.logging, crate::startup::LoggingMode::Serve)
 }
 
 impl HeadlessApp {

@@ -1,11 +1,14 @@
 use crate::auth_store::{migrate_if_needed, AuthStore};
 use crate::helpers::{format_memory_for_prompt, thinking_config_from_budget};
 use async_trait::async_trait;
+use chrono::NaiveDate;
 use fx_analysis::AnalysisError;
 use fx_auth::auth::{AuthManager, AuthMethod};
 use fx_auth::credential_store::CredentialStore as CredentialStoreTrait;
 use fx_config::manager::ConfigManager;
-use fx_config::{FawxConfig, ImprovementToolsConfig};
+use fx_config::{
+    parse_log_level as parse_config_log_level, FawxConfig, ImprovementToolsConfig, LoggingConfig,
+};
 use fx_core::memory::{MemoryProvider, MemoryStore};
 use fx_core::runtime_info::{ConfigSummary, RuntimeInfo, SkillInfo};
 use fx_core::EventBus;
@@ -31,10 +34,19 @@ use fx_tools::{
     SessionToolsSkill, ToolConfig,
 };
 use std::fmt;
+use std::fs;
 use std::io;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::Dispatch;
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
+use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::fmt::format::Writer;
+use tracing_subscriber::fmt::time::FormatTime;
+use tracing_subscriber::prelude::*;
 
 const DEFAULT_CONTEXT_MAX_TOKENS: usize = 8_000;
 const DEFAULT_CONTEXT_COMPACT_TARGET: usize = 6_000;
@@ -64,13 +76,212 @@ const DEFAULT_OPENROUTER_MODELS: &[&str] = &[
     "anthropic/claude-3.5-sonnet",
     "google/gemini-2.0-flash-001",
 ];
+const DEFAULT_FILE_LEVEL: &str = "info";
+const DEFAULT_STDERR_LEVEL: &str = "warn";
+const DEFAULT_MAX_LOG_FILES: usize = 7;
+const DEFAULT_LOG_DIR: &str = "~/.fawx/logs";
+const LOG_FILE_PREFIX: &str = "fawx";
+const LOG_FILE_SUFFIX: &str = "log";
 
 pub(crate) type SharedMemoryStore = Arc<Mutex<dyn MemoryStore>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoggingMode {
+    Tui,
+    Serve,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedLoggingConfig {
+    file_logging: bool,
+    file_level: LevelFilter,
+    stderr_level: LevelFilter,
+    max_files: usize,
+    log_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UtcMillisTimer;
+
+impl FormatTime for UtcMillisTimer {
+    fn format_time(&self, writer: &mut Writer<'_>) -> std::fmt::Result {
+        write!(
+            writer,
+            "{}",
+            chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        )
+    }
+}
 
 /// Load the user config from ~/.fawx/config.toml (or return defaults).
 pub fn load_config() -> Result<FawxConfig, StartupError> {
     let base_data_dir = fawx_data_dir();
     FawxConfig::load(&base_data_dir).map_err(StartupError::Store)
+}
+
+pub fn init_logging(
+    config: &LoggingConfig,
+    mode: LoggingMode,
+) -> Result<WorkerGuard, StartupError> {
+    let resolved = resolve_logging_config(config, mode)?;
+    let (dispatch, guard) = build_logging_dispatch(&resolved)?;
+    tracing::dispatcher::set_global_default(dispatch)
+        .map_err(|error| StartupError::Logging(format!("failed to install logger: {error}")))?;
+    Ok(guard)
+}
+
+fn build_logging_dispatch(
+    config: &ResolvedLoggingConfig,
+) -> Result<(Dispatch, WorkerGuard), StartupError> {
+    let (file_writer, guard) = build_file_writer(config)?;
+    let file_level = file_level_filter(config.file_logging, config.file_level);
+    let subscriber = tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_timer(UtcMillisTimer)
+                .with_writer(file_writer)
+                .with_ansi(false)
+                .with_target(true)
+                .with_filter(file_level),
+        )
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_timer(UtcMillisTimer)
+                .with_writer(std::io::stderr)
+                .with_ansi(std::io::stderr().is_terminal())
+                .with_target(true)
+                .with_filter(config.stderr_level),
+        );
+    Ok((Dispatch::new(subscriber), guard))
+}
+
+fn build_file_writer(
+    config: &ResolvedLoggingConfig,
+) -> Result<(tracing_appender::non_blocking::NonBlocking, WorkerGuard), StartupError> {
+    if !config.file_logging {
+        return Ok(tracing_appender::non_blocking(io::sink()));
+    }
+    fs::create_dir_all(&config.log_dir)?;
+    cleanup_old_logs(&config.log_dir, config.max_files);
+    let appender = RollingFileAppender::builder()
+        .rotation(Rotation::DAILY)
+        .filename_prefix(LOG_FILE_PREFIX)
+        .filename_suffix(LOG_FILE_SUFFIX)
+        .max_log_files(config.max_files)
+        .build(&config.log_dir)
+        .map_err(|error| {
+            StartupError::Logging(format!("failed to create log appender: {error}"))
+        })?;
+    Ok(tracing_appender::non_blocking(appender))
+}
+
+/// Retention is enforced in two places: this startup scan catches up on
+/// dated log files that piled up while the process was not running, while
+/// `RollingFileAppender::max_log_files()` trims files during live rotation.
+/// We need both to cover offline accumulation and normal runtime rotation.
+fn cleanup_old_logs(log_dir: &Path, max_files: usize) {
+    let mut log_files = match dated_log_files(log_dir) {
+        Ok(files) => files,
+        Err(error) => {
+            eprintln!(
+                "warning: failed to scan old log files in {}: {error}",
+                log_dir.display()
+            );
+            return;
+        }
+    };
+    if log_files.len() <= max_files {
+        return;
+    }
+    log_files.sort();
+    let remove_count = log_files.len().saturating_sub(max_files);
+    for path in log_files.into_iter().take(remove_count) {
+        if let Err(error) = fs::remove_file(&path) {
+            eprintln!(
+                "warning: failed to remove old log file {}: {error}",
+                path.display()
+            );
+        }
+    }
+}
+
+fn dated_log_files(log_dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    if !log_dir.exists() {
+        return Ok(files);
+    }
+    for entry in fs::read_dir(log_dir)? {
+        let path = entry?.path();
+        if is_dated_log_file(&path) {
+            files.push(path);
+        }
+    }
+    Ok(files)
+}
+
+fn is_dated_log_file(path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(date_part) = file_name
+        .strip_prefix(&format!("{LOG_FILE_PREFIX}."))
+        .and_then(|name| name.strip_suffix(&format!(".{LOG_FILE_SUFFIX}")))
+    else {
+        return false;
+    };
+    is_iso_date(date_part)
+}
+
+fn is_iso_date(value: &str) -> bool {
+    NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok()
+}
+
+fn file_level_filter(enabled: bool, level: LevelFilter) -> LevelFilter {
+    if enabled {
+        level
+    } else {
+        LevelFilter::OFF
+    }
+}
+
+fn resolve_logging_config(
+    config: &LoggingConfig,
+    mode: LoggingMode,
+) -> Result<ResolvedLoggingConfig, StartupError> {
+    Ok(ResolvedLoggingConfig {
+        file_logging: resolve_file_logging(config, mode),
+        file_level: resolve_log_level(config.file_level.as_deref(), DEFAULT_FILE_LEVEL)?,
+        stderr_level: resolve_log_level(config.stderr_level.as_deref(), DEFAULT_STDERR_LEVEL)?,
+        max_files: config.max_files.unwrap_or(DEFAULT_MAX_LOG_FILES),
+        log_dir: resolve_log_dir(config),
+    })
+}
+
+fn resolve_file_logging(config: &LoggingConfig, mode: LoggingMode) -> bool {
+    config
+        .file_logging
+        .unwrap_or(matches!(mode, LoggingMode::Serve))
+}
+
+fn resolve_log_dir(config: &LoggingConfig) -> PathBuf {
+    config
+        .log_dir
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(default_log_dir)
+}
+
+fn default_log_dir() -> PathBuf {
+    let relative = DEFAULT_LOG_DIR.trim_start_matches("~/");
+    dirs::home_dir()
+        .map(|home| home.join(relative))
+        .unwrap_or_else(|| PathBuf::from(relative))
+}
+
+fn resolve_log_level(value: Option<&str>, default: &str) -> Result<LevelFilter, StartupError> {
+    let selected = value.unwrap_or(default);
+    parse_config_log_level(selected)
+        .ok_or_else(|| StartupError::Logging(format!("invalid log level '{}'", selected.trim())))
 }
 
 /// Build a loop engine with sensible defaults for the TUI shell.
@@ -730,6 +941,8 @@ pub enum StartupError {
     Store(String),
     /// Model routing error.
     Router(String),
+    /// Logging initialization error.
+    Logging(String),
     /// Request execution error.
     Loop(String),
 }
@@ -742,6 +955,7 @@ impl fmt::Display for StartupError {
             Self::Cancelled => write!(f, "input cancelled"),
             Self::Store(message) => write!(f, "store error: {message}"),
             Self::Router(message) => write!(f, "router error: {message}"),
+            Self::Logging(message) => write!(f, "logging error: {message}"),
             Self::Loop(message) => write!(f, "loop error: {message}"),
         }
     }
@@ -1025,6 +1239,7 @@ mod tests {
     use fx_config::manager::ConfigManager;
     use fx_subagent::test_support::StubSubagentControl;
     use std::sync::{Arc, Mutex};
+    use tracing_subscriber::filter::LevelFilter;
 
     fn test_config_with_temp_dir() -> (FawxConfig, tempfile::TempDir) {
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -1055,6 +1270,208 @@ mod tests {
             .into_iter()
             .map(|tool| tool.name)
             .collect()
+    }
+
+    fn serve_logging_config(log_dir: &std::path::Path) -> LoggingConfig {
+        LoggingConfig {
+            file_logging: Some(true),
+            file_level: Some("trace".to_string()),
+            stderr_level: Some("error".to_string()),
+            max_files: Some(DEFAULT_MAX_LOG_FILES),
+            log_dir: Some(log_dir.display().to_string()),
+        }
+    }
+
+    fn read_log_output(log_dir: &std::path::Path) -> (Vec<String>, String) {
+        let mut files = std::fs::read_dir(log_dir)
+            .expect("read log dir")
+            .map(|entry| entry.expect("entry").path())
+            .collect::<Vec<_>>();
+        files.sort();
+        let names = files
+            .iter()
+            .filter_map(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .map(ToString::to_string)
+            })
+            .collect::<Vec<_>>();
+        let contents = files
+            .first()
+            .map(|path| std::fs::read_to_string(path).expect("read log file"))
+            .unwrap_or_default();
+        (names, contents)
+    }
+
+    fn emit_test_log(dispatch: &Dispatch, message: &str) {
+        tracing::dispatcher::with_default(dispatch, || {
+            tracing::info!(target: "fx_cli::tests", "{message}");
+        });
+    }
+
+    #[test]
+    fn resolve_logging_config_applies_mode_defaults() {
+        let tui = resolve_logging_config(&LoggingConfig::default(), LoggingMode::Tui)
+            .expect("resolve TUI logging");
+        let serve = resolve_logging_config(&LoggingConfig::default(), LoggingMode::Serve)
+            .expect("resolve serve logging");
+
+        assert!(!tui.file_logging);
+        assert_eq!(tui.file_level, LevelFilter::INFO);
+        assert_eq!(tui.stderr_level, LevelFilter::WARN);
+        assert_eq!(tui.max_files, DEFAULT_MAX_LOG_FILES);
+        assert_eq!(tui.log_dir, default_log_dir());
+        assert!(serve.file_logging);
+    }
+
+    #[test]
+    fn build_logging_dispatch_creates_log_file_in_expected_directory() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config = serve_logging_config(temp_dir.path());
+        let resolved = resolve_logging_config(&config, LoggingMode::Serve).expect("resolve");
+        let (dispatch, guard) = build_logging_dispatch(&resolved).expect("dispatch");
+
+        emit_test_log(&dispatch, "hello persistent logs");
+        drop(guard);
+
+        let (files, contents) = read_log_output(temp_dir.path());
+        assert_eq!(files.len(), 1);
+        assert!(files[0].starts_with("fawx."));
+        assert!(files[0].ends_with(".log"));
+        assert!(contents.contains("hello persistent logs"));
+    }
+
+    #[test]
+    fn build_logging_dispatch_writes_file_output_without_ansi_codes() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config = serve_logging_config(temp_dir.path());
+        let resolved = resolve_logging_config(&config, LoggingMode::Serve).expect("resolve");
+        let (dispatch, guard) = build_logging_dispatch(&resolved).expect("dispatch");
+
+        emit_test_log(&dispatch, "ansi free output");
+        drop(guard);
+
+        let (_, contents) = read_log_output(temp_dir.path());
+        assert!(!contents.contains("\u{1b}["));
+        assert!(contents.contains('T'));
+        assert!(contents.contains('Z'));
+    }
+
+    #[test]
+    fn build_logging_dispatch_skips_files_when_file_logging_disabled() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config = LoggingConfig {
+            file_logging: Some(false),
+            log_dir: Some(temp_dir.path().display().to_string()),
+            ..LoggingConfig::default()
+        };
+        let resolved = resolve_logging_config(&config, LoggingMode::Serve).expect("resolve");
+        let (dispatch, guard) = build_logging_dispatch(&resolved).expect("dispatch");
+
+        emit_test_log(&dispatch, "stderr only");
+        drop(guard);
+
+        let entries = std::fs::read_dir(temp_dir.path())
+            .expect("read temp dir")
+            .map(|entry| entry.expect("entry").path())
+            .collect::<Vec<_>>();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn build_logging_dispatch_creates_missing_log_directory() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let log_dir = temp_dir.path().join("nested").join("logs");
+        let config = serve_logging_config(&log_dir);
+        let resolved = resolve_logging_config(&config, LoggingMode::Serve).expect("resolve");
+        let (_dispatch, guard) = build_logging_dispatch(&resolved).expect("dispatch");
+
+        drop(guard);
+
+        assert!(log_dir.is_dir());
+    }
+
+    #[test]
+    fn cleanup_old_logs_keeps_newest_files() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        for name in [
+            "fawx.2026-03-01.log",
+            "fawx.2026-03-02.log",
+            "fawx.2026-03-03.log",
+            "fawx.2026-03-04.log",
+        ] {
+            std::fs::write(temp_dir.path().join(name), name).expect("write log file");
+        }
+
+        cleanup_old_logs(temp_dir.path(), 2);
+
+        let (files, _) = read_log_output(temp_dir.path());
+        assert_eq!(files, vec!["fawx.2026-03-03.log", "fawx.2026-03-04.log"]);
+    }
+
+    #[test]
+    fn cleanup_old_logs_is_best_effort_when_removal_fails() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let stuck_log = temp_dir.path().join("fawx.2026-03-01.log");
+        std::fs::create_dir(&stuck_log).expect("create stuck log directory");
+        let newest_log = temp_dir.path().join("fawx.2026-03-02.log");
+        std::fs::write(&newest_log, "newest").expect("write newest log file");
+
+        cleanup_old_logs(temp_dir.path(), 1);
+
+        assert!(stuck_log.exists());
+        assert!(newest_log.exists());
+    }
+
+    #[test]
+    fn resolve_log_dir_trusts_config_layer_expansion() {
+        let config = LoggingConfig {
+            log_dir: Some("~/already-handled-by-config".to_string()),
+            ..LoggingConfig::default()
+        };
+
+        assert_eq!(
+            resolve_log_dir(&config),
+            PathBuf::from("~/already-handled-by-config")
+        );
+    }
+
+    #[test]
+    fn resolve_log_level_accepts_all_supported_values() {
+        for value in ["error", "warn", "info", "debug", "trace"] {
+            assert!(
+                resolve_log_level(Some(value), DEFAULT_FILE_LEVEL).is_ok(),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_log_level_rejects_invalid_values() {
+        let error = resolve_log_level(Some("verbose"), DEFAULT_FILE_LEVEL).unwrap_err();
+        assert!(error.to_string().contains("invalid log level 'verbose'"));
+    }
+
+    #[test]
+    fn is_dated_log_file_rejects_invalid_calendar_dates() {
+        assert!(is_dated_log_file(Path::new("fawx.2026-03-09.log")));
+        assert!(!is_dated_log_file(Path::new("fawx.2026-13-09.log")));
+        assert!(!is_dated_log_file(Path::new("fawx.2026-03-32.log")));
+        assert!(!is_dated_log_file(Path::new("fawx.2026-02-30.log")));
+    }
+
+    #[test]
+    fn worker_guard_flushes_pending_logs_on_drop() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config = serve_logging_config(temp_dir.path());
+        let resolved = resolve_logging_config(&config, LoggingMode::Serve).expect("resolve");
+        let (dispatch, guard) = build_logging_dispatch(&resolved).expect("dispatch");
+
+        emit_test_log(&dispatch, "flush on drop");
+        drop(guard);
+
+        let (_, contents) = read_log_output(temp_dir.path());
+        assert!(contents.contains("flush on drop"));
     }
 
     #[test]

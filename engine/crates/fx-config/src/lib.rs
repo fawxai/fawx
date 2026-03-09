@@ -2,9 +2,11 @@ pub mod manager;
 
 use serde::{Deserialize, Serialize};
 use toml_edit::{value, DocumentMut, Item, Table};
+use tracing_subscriber::filter::LevelFilter;
 
 const MAX_SYNTHESIS_INSTRUCTION_LENGTH: usize = 500;
 const MIN_MAX_READ_SIZE: u64 = 1024;
+pub(crate) const VALID_LOG_LEVELS: &str = "error, warn, info, debug, trace";
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -27,6 +29,13 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Fawx Configuration
 [model]
 # default_model = "anthropic/claude-sonnet-4-20250514"
 # synthesis_instruction = "Be concise and direct."
+
+[logging]
+# file_logging = true
+# file_level = "info"
+# stderr_level = "warn"
+# max_files = 7
+# log_dir = "~/.fawx/logs"
 
 [tools]
 # working_dir = "/home/user/projects"
@@ -67,6 +76,7 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Fawx Configuration
 pub struct FawxConfig {
     pub general: GeneralConfig,
     pub model: ModelConfig,
+    pub logging: LoggingConfig,
     pub tools: ToolsConfig,
     pub memory: MemoryConfig,
     pub security: SecurityConfig,
@@ -302,6 +312,16 @@ pub struct ModelConfig {
     pub synthesis_instruction: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct LoggingConfig {
+    pub file_logging: Option<bool>,
+    pub file_level: Option<String>,
+    pub stderr_level: Option<String>,
+    pub max_files: Option<usize>,
+    pub log_dir: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ToolsConfig {
@@ -455,6 +475,39 @@ fn expand_tilde_opt(path: &mut Option<PathBuf>) {
     }
 }
 
+fn expand_tilde_string_opt(path: &mut Option<String>) {
+    if let Some(path_str) = path.as_mut() {
+        let original = path_str.clone();
+        let expanded = expand_tilde(Path::new(&original));
+        let expanded_str = expanded.to_string_lossy().into_owned();
+        if expanded_str != original {
+            tracing::debug!("config path expanded: {} -> {}", original, expanded_str);
+            *path_str = expanded_str;
+        }
+    }
+}
+
+pub fn parse_log_level(value: &str) -> Option<LevelFilter> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "error" => Some(LevelFilter::ERROR),
+        "warn" => Some(LevelFilter::WARN),
+        "info" => Some(LevelFilter::INFO),
+        "debug" => Some(LevelFilter::DEBUG),
+        "trace" => Some(LevelFilter::TRACE),
+        _ => None,
+    }
+}
+
+fn validate_log_level(field: &str, value: &Option<String>) -> Result<(), String> {
+    let Some(level) = value.as_ref() else {
+        return Ok(());
+    };
+    if parse_log_level(level).is_some() {
+        return Ok(());
+    }
+    Err(format!("{field} must be one of: {VALID_LOG_LEVELS}"))
+}
+
 impl FawxConfig {
     pub fn load(data_dir: &Path) -> Result<Self, String> {
         let config_path = data_dir.join("config.toml");
@@ -473,6 +526,7 @@ impl FawxConfig {
     /// Expand `~` to the user's home directory in all user-facing path configs.
     fn expand_paths(&mut self) {
         expand_tilde_opt(&mut self.general.data_dir);
+        expand_tilde_string_opt(&mut self.logging.log_dir);
         expand_tilde_opt(&mut self.tools.working_dir);
         expand_tilde_opt(&mut self.self_modify.proposals_dir);
     }
@@ -500,6 +554,13 @@ impl FawxConfig {
                 ));
             }
         }
+        if let Some(max_files) = self.logging.max_files {
+            if max_files == 0 {
+                return Err("logging.max_files must be >= 1".to_string());
+            }
+        }
+        validate_log_level("logging.file_level", &self.logging.file_level)?;
+        validate_log_level("logging.stderr_level", &self.logging.stderr_level)?;
         validate_glob_patterns(&self.self_modify)
     }
 
@@ -765,6 +826,31 @@ max_relevant_results = 9
     }
 
     #[test]
+    fn load_parses_logging_config() {
+        let temp = TempDir::new().expect("tempdir");
+        let content = r#"
+[logging]
+file_logging = true
+file_level = "trace"
+stderr_level = "error"
+max_files = 14
+log_dir = "~/.fawx/custom-logs"
+"#;
+        write_config(&temp, content);
+        let loaded = FawxConfig::load(temp.path()).expect("load config");
+
+        let home = dirs::home_dir().expect("home dir should exist in test");
+        assert_eq!(loaded.logging.file_logging, Some(true));
+        assert_eq!(loaded.logging.file_level.as_deref(), Some("trace"));
+        assert_eq!(loaded.logging.stderr_level.as_deref(), Some("error"));
+        assert_eq!(loaded.logging.max_files, Some(14));
+        assert_eq!(
+            loaded.logging.log_dir.as_deref(),
+            Some(home.join(".fawx/custom-logs").to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
     fn load_partial_config_uses_defaults() {
         let temp = TempDir::new().expect("tempdir");
         let content = "[general]\nmax_iterations = 42\n";
@@ -773,6 +859,7 @@ max_relevant_results = 9
 
         assert_eq!(loaded.general.max_iterations, 42);
         assert_eq!(loaded.general.max_history, 20);
+        assert_eq!(loaded.logging, LoggingConfig::default());
         assert_eq!(loaded.tools.max_read_size, 1024 * 1024);
         assert_eq!(loaded.memory.max_entries, 1000);
         assert_eq!(loaded.memory.max_relevant_results, 5);
@@ -816,6 +903,7 @@ max_relevant_results = 9
         let defaults = FawxConfig::default();
         assert_eq!(defaults.general.max_iterations, 10);
         assert_eq!(defaults.general.max_history, 20);
+        assert_eq!(defaults.logging, LoggingConfig::default());
         assert_eq!(defaults.tools.max_read_size, 1024 * 1024);
         assert_eq!(defaults.memory.max_entries, 1000);
         assert_eq!(defaults.memory.max_value_size, 10240);
@@ -835,6 +923,13 @@ max_relevant_results = 9
             model: ModelConfig {
                 default_model: Some("claude-sonnet".to_string()),
                 synthesis_instruction: Some("short answers".to_string()),
+            },
+            logging: LoggingConfig {
+                file_logging: Some(true),
+                file_level: Some("debug".to_string()),
+                stderr_level: Some("error".to_string()),
+                max_files: Some(14),
+                log_dir: Some("~/.fawx/custom-logs".to_string()),
             },
             tools: ToolsConfig {
                 working_dir: Some(PathBuf::from("/tmp/work")),
@@ -1103,6 +1198,38 @@ default_model = "old-model"
     }
 
     #[test]
+    fn load_rejects_invalid_logging_level() {
+        let temp = TempDir::new().expect("tempdir");
+        let content = "[logging]\nfile_level = \"verbose\"\n";
+        write_config(&temp, content);
+        let error = FawxConfig::load(temp.path()).expect_err("should reject invalid level");
+        assert!(error.contains("logging.file_level must be one of"));
+    }
+
+    #[test]
+    fn parse_log_level_accepts_supported_values_case_insensitively() {
+        assert_eq!(parse_log_level("error"), Some(LevelFilter::ERROR));
+        assert_eq!(parse_log_level(" Warn "), Some(LevelFilter::WARN));
+        assert_eq!(parse_log_level("INFO"), Some(LevelFilter::INFO));
+        assert_eq!(parse_log_level("Debug"), Some(LevelFilter::DEBUG));
+        assert_eq!(parse_log_level("trace"), Some(LevelFilter::TRACE));
+    }
+
+    #[test]
+    fn parse_log_level_rejects_unknown_values() {
+        assert_eq!(parse_log_level("verbose"), None);
+    }
+
+    #[test]
+    fn load_rejects_zero_max_log_files() {
+        let temp = TempDir::new().expect("tempdir");
+        let content = "[logging]\nmax_files = 0\n";
+        write_config(&temp, content);
+        let error = FawxConfig::load(temp.path()).expect_err("should reject zero");
+        assert!(error.contains("logging.max_files must be >= 1"));
+    }
+
+    #[test]
     fn load_rejects_oversized_synthesis_instruction() {
         let temp = TempDir::new().expect("tempdir");
         let long_value = "x".repeat(501);
@@ -1184,6 +1311,18 @@ deny = ["[invalid"]
         assert!(
             DEFAULT_CONFIG_TEMPLATE.contains("require_signatures"),
             "template should mention require_signatures"
+        );
+    }
+
+    #[test]
+    fn config_template_includes_logging_section() {
+        assert!(
+            DEFAULT_CONFIG_TEMPLATE.contains("[logging]"),
+            "template should contain [logging] section"
+        );
+        assert!(
+            DEFAULT_CONFIG_TEMPLATE.contains("file_level"),
+            "template should mention file_level"
         );
     }
 
@@ -1304,6 +1443,9 @@ max_iterations = 10
 [general]
 data_dir = "~/.fawx"
 
+[logging]
+log_dir = "~/.fawx/logs"
+
 [tools]
 working_dir = "~/projects"
 
@@ -1315,6 +1457,10 @@ proposals_dir = "~/.fawx/proposals"
 
         let home = dirs::home_dir().expect("home dir should exist in test");
         assert_eq!(loaded.general.data_dir, Some(home.join(".fawx")),);
+        assert_eq!(
+            loaded.logging.log_dir.as_deref(),
+            Some(home.join(".fawx/logs").to_string_lossy().as_ref())
+        );
         assert_eq!(loaded.tools.working_dir, Some(home.join("projects")),);
         assert_eq!(
             loaded.self_modify.proposals_dir,

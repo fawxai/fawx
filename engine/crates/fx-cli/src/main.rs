@@ -340,6 +340,7 @@ fn fawx_tui_binary_name() -> &'static str {
 
 struct HeadlessStartup {
     app: headless::HeadlessApp,
+    _logging_guard: tracing_appender::non_blocking::WorkerGuard,
     #[cfg(feature = "http")]
     http_config: fx_config::HttpConfig,
     #[cfg(feature = "http")]
@@ -353,9 +354,10 @@ struct HeadlessStartup {
 fn build_headless_startup(
     system_prompt: Option<std::path::PathBuf>,
 ) -> anyhow::Result<HeadlessStartup> {
+    let config = startup::load_config()?;
+    let logging_guard = headless::init_serve_logging(&config)?;
     let auth_manager = startup::load_auth_manager()?;
     let router = Arc::new(startup::build_router(&auth_manager)?);
-    let config = startup::load_config()?;
     #[cfg(feature = "http")]
     let http_config = config.http.clone();
     #[cfg(feature = "http")]
@@ -375,6 +377,7 @@ fn build_headless_startup(
     )?;
     Ok(HeadlessStartup {
         app,
+        _logging_guard: logging_guard,
         #[cfg(feature = "http")]
         http_config,
         #[cfg(feature = "http")]
@@ -479,7 +482,11 @@ async fn run_headless(
     json: bool,
     system_prompt: Option<std::path::PathBuf>,
 ) -> anyhow::Result<i32> {
-    let HeadlessStartup { mut app, .. } = build_headless_startup(system_prompt)?;
+    let HeadlessStartup {
+        mut app,
+        _logging_guard,
+        ..
+    } = build_headless_startup(system_prompt)?;
     if single {
         app.run_single(json).await
     } else {
@@ -494,6 +501,7 @@ async fn run_http_server(
 ) -> anyhow::Result<i32> {
     let HeadlessStartup {
         mut app,
+        _logging_guard,
         http_config,
         telegram_config,
         webhook_config,
@@ -829,12 +837,29 @@ fn dispatch_eval(
     })
 }
 
+fn init_cli_logging(
+    command: &Commands,
+) -> anyhow::Result<Option<tracing_appender::non_blocking::WorkerGuard>> {
+    if matches!(command, Commands::Serve { .. }) {
+        return Ok(None);
+    }
+    let logging = startup::load_config()
+        .map(|config| config.logging)
+        .unwrap_or_else(|error| {
+            eprintln!("warning: failed to load config for logging: {error}");
+            fx_config::LoggingConfig::default()
+        });
+    startup::init_logging(&logging, startup::LoggingMode::Tui)
+        .map(Some)
+        .map_err(anyhow::Error::from)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
     let cli = Cli::parse();
-    let exit_code =
-        dispatch_command(cli.command.unwrap_or(Commands::Tui { args: Vec::new() })).await?;
+    let command = cli.command.unwrap_or(Commands::Tui { args: Vec::new() });
+    let _logging_guard = init_cli_logging(&command)?;
+    let exit_code = dispatch_command(command).await?;
     std::process::exit(exit_code);
 }
 

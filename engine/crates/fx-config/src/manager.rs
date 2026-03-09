@@ -4,7 +4,10 @@
 //! operations, validation before write, and comment-preserving persistence
 //! using `toml_edit`.
 
-use crate::{parse_config_document, set_typed_field, write_config_file, FawxConfig};
+use crate::{
+    parse_config_document, parse_log_level, set_typed_field, write_config_file, FawxConfig,
+    VALID_LOG_LEVELS,
+};
 use serde_json::Value as JsonValue;
 use std::path::{Path, PathBuf};
 
@@ -158,8 +161,17 @@ fn validate_field_value(key: &str, value: &str) -> Result<(), String> {
         "tools.max_read_size" => validate_min_u64(key, value, 1024),
         "memory.max_entries" => validate_positive_usize(key, value),
         "model.default_model" => validate_model_name(value),
+        "logging.max_files" => validate_positive_usize(key, value),
+        "logging.file_level" | "logging.stderr_level" => validate_log_level(value),
         _ => Ok(()),
     }
+}
+
+fn validate_log_level(value: &str) -> Result<(), String> {
+    if parse_log_level(value).is_some() {
+        return Ok(());
+    }
+    Err(format!("log level must be one of: {VALID_LOG_LEVELS}"))
 }
 
 fn validate_model_name(value: &str) -> Result<(), String> {
@@ -435,6 +447,28 @@ mod tests {
 
         let err = mgr.set("tools.max_read_size", "100").unwrap_err();
         assert!(err.contains("must be >= 1024"));
+    }
+
+    #[test]
+    fn set_accepts_supported_log_level() {
+        let temp = TempDir::new().expect("tempdir");
+        write_config(temp.path(), "[logging]\nfile_level = \"info\"\n");
+        let mut mgr = ConfigManager::new(temp.path()).expect("manager");
+
+        mgr.set("logging.file_level", "TRACE")
+            .expect("set log level");
+
+        assert_eq!(mgr.config().logging.file_level.as_deref(), Some("TRACE"));
+    }
+
+    #[test]
+    fn set_rejects_invalid_log_level() {
+        let temp = TempDir::new().expect("tempdir");
+        write_config(temp.path(), "[logging]\nfile_level = \"info\"\n");
+        let mut mgr = ConfigManager::new(temp.path()).expect("manager");
+
+        let err = mgr.set("logging.file_level", "verbose").unwrap_err();
+        assert!(err.contains("log level must be one of"));
     }
 
     #[test]
