@@ -170,8 +170,8 @@
 
 <div class="stats-banner">
   <div class="stat-card"><div class="stat-value">8</div><div class="stat-label">Waves</div></div>
-  <div class="stat-card"><div class="stat-value">82+</div><div class="stat-label">PRs Merged</div></div>
-  <div class="stat-card"><div class="stat-value">103k</div><div class="stat-label">Lines of Rust</div></div>
+  <div class="stat-card"><div class="stat-value">87+</div><div class="stat-label">PRs Merged</div></div>
+  <div class="stat-card"><div class="stat-value">105k</div><div class="stat-label">Lines of Rust</div></div>
   <div class="stat-card"><div class="stat-value">2,000+</div><div class="stat-label">Tests</div></div>
 </div>
 
@@ -214,7 +214,7 @@
         <div class="wave-title">Wave 8: Polish, Parity &amp; Launch <span class="wave-badge badge-active">Active</span></div>
         <div class="wave-desc">Wire existing features, setup wizard, engine tools, skills, docs, launch</div>
       </div>
-      <div class="wave-meta"><span class="wave-count">19 done · 4 phases remaining</span><span class="wave-chevron">›</span></div>
+      <div class="wave-meta"><span class="wave-count">22 done · 4 phases active</span><span class="wave-chevron">›</span></div>
     </div>
     <div class="wave-body">
 
@@ -248,72 +248,74 @@
 
       
 
-      <div class="tree-divider">⚡ Phase 2a — Engine Capabilities <span class="wave-badge badge-active">Next</span></div>
+      <div class="tree-divider">⚡ Phase 2a — Engine Capabilities <span class="wave-badge badge-active">Active</span></div>
       <div class="tree">
         <div class="tree-item">
           <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-planned"></div>
+            <div class="node-status status-done"></div>
             <div class="node-content">
-              <div class="node-title"><code>edit_file</code> tool + <code>read_file</code> offset/limit</div>
-              <div class="node-detail">Surgical text replacement (exact match → replace). Add offset/limit to read_file for partial reads. WRITE_TOOLS in ProposalGateExecutor. ~200-300 lines. <a class="issue-link" href="https://github.com/abbudjoe/fawx/blob/staging/docs/specs/phase2a-edit-tool.md">spec</a></div>
+              <div class="node-title"><code>edit_file</code> tool + <code>read_file</code> offset/limit <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1283">#1283</a> <span class="wave-badge badge-done">Merged</span></div>
+              <div class="node-detail">Surgical text replacement (exact match → replace). Offset/limit on read_file for partial reads. WRITE_TOOLS in ProposalGateExecutor. R2 APPROVE. +809 lines.</div>
             </div>
             <div class="node-expand">›</div>
           </div>
         </div>
         <div class="tree-item">
           <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-planned"></div>
+            <div class="node-status status-done"></div>
             <div class="node-content">
-              <div class="node-title">Persistent log files <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1268">#1268</a></div>
-              <div class="node-detail"><code>~/.fawx/logs/</code> with daily rotation (tracing-appender). Multi-writer: file (info) + stderr (warn). 7-day retention. ~150-200 lines. <a class="issue-link" href="https://github.com/abbudjoe/fawx/blob/staging/docs/specs/phase2a-persistent-logs.md">spec</a></div>
+              <div class="node-title">Persistent log files <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1284">#1284</a> <span class="wave-badge badge-done">Merged</span></div>
+              <div class="node-detail"><code>~/.fawx/logs/</code> with daily rotation (tracing-appender). Multi-writer: file (info) + stderr (warn). 7-day retention. R3 APPROVE. +605 lines.</div>
             </div>
             <div class="node-expand">›</div>
           </div>
         </div>
         <div class="tree-item">
           <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-planned"></div>
+            <div class="node-status status-done"></div>
             <div class="node-content">
-              <div class="node-title">Background process management</div>
-              <div class="node-detail"><code>exec_background</code>, <code>exec_status</code>, <code>exec_kill</code>. Kernel-level ProcessRegistry: max 5 concurrent, 1hr lifetime, ring buffer output. ~400-500 lines. <a class="issue-link" href="https://github.com/abbudjoe/fawx/blob/staging/docs/specs/phase2a-background-processes.md">spec</a></div>
+              <div class="node-title">Background process management <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1285">#1285</a> <span class="wave-badge badge-done">Merged</span></div>
+              <div class="node-detail"><code>exec_background</code>, <code>exec_status</code>, <code>exec_kill</code>. Kernel-level ProcessRegistry: max 5 concurrent, 1hr lifetime, ring buffer output, graceful shutdown. R2 APPROVE. +1,109 lines.</div>
             </div>
             <div class="node-expand">›</div>
           </div>
         </div>
         <div class="tree-item">
           <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-planned"></div>
+            <div class="node-status status-active"></div>
             <div class="node-content">
-              <div class="node-title">Streaming responses (token-by-token) <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1279">#1279</a></div>
-              <div class="node-detail">5-layer streaming: fx-llm providers → fx-kernel StreamEvent → HTTP SSE → TUI TextDelta → channel buffering. 3 PRs, ~700 lines total. <a class="issue-link" href="https://github.com/abbudjoe/fawx/blob/staging/docs/specs/phase2a-streaming-responses.md">spec</a></div>
+              <div class="node-title">Streaming responses (token-by-token) <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1279">#1279</a> <span class="wave-badge badge-active">PR 1/3 In Progress</span></div>
+              <div class="node-detail">5-layer streaming: fx-llm providers → fx-kernel StreamEvent → HTTP SSE → TUI TextDelta → channel buffering. 3 PRs, ~700 lines total. PR 1: provider streaming (Anthropic + OpenAI). <a class="issue-link" href="https://github.com/abbudjoe/fawx/blob/dev/docs/specs/phase2a-streaming-responses.md">spec</a></div>
             </div>
             <div class="node-expand">›</div>
           </div>
         </div>
         <div class="tree-item">
           <div class="tree-node" onclick="toggleNode(this)">
-            <div class="node-status status-planned"></div>
+            <div class="node-status status-active"></div>
             <div class="node-content">
-              <div class="node-title">Proposals UX improvement <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1281">#1281</a></div>
-              <div class="node-detail">Stable IDs (not list position), diff preview, age display, line counts, detail view (<code>/proposals &lt;id&gt;</code>). Fix broken numbering/mapping bug. ~200-250 lines. <a class="issue-link" href="https://github.com/abbudjoe/fawx/blob/staging/docs/specs/phase2a-proposals-ux.md">spec</a></div>
+              <div class="node-title">Proposals UX improvement <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1281">#1281</a> <span class="wave-badge badge-active">In Progress</span></div>
+              <div class="node-detail">Stable IDs (not list position), diff preview, age display, line counts, detail view (<code>/proposals &lt;id&gt;</code>). Fix broken numbering/mapping bug. ~200-250 lines. <a class="issue-link" href="https://github.com/abbudjoe/fawx/blob/dev/docs/specs/phase2a-proposals-ux.md">spec</a></div>
             </div>
             <div class="node-expand">›</div>
           </div>
         </div>
       </div>
 
-      <div class="tree-divider">📦 Phase 2b — WASM Skills</div>
+      <div class="tree-divider">📦 Phase 2b — WASM Skills &amp; Marketplace <span class="wave-badge badge-active">Active</span></div>
       <div class="tree">
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-active"></div><div class="node-content"><div class="node-title">Weather skill — Open-Meteo API <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1286">#1286</a> <span class="wave-badge badge-active">In Review</span></div><div class="node-detail">Current conditions + 3-day forecast. WMO weather codes. No API key needed. WASM skill using host_api_v1 HTTP. Migrating to fawxai/weather-skill.</div></div><div class="node-expand">›</div></div></div>
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">Skill migration sweep — review + migrate to fawxai org</div><div class="node-detail">Review all 6 skills (brave-search, web-fetch, scheduler shipped without review; calculator, github, weather in-repo). Fix findings. Migrate all to <code>fawxai/</code> repos. Replace <code>abbudjoe/fawx/skills/</code> with README.</div></div><div class="node-expand">›</div></div></div>
         <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">Vision skill — image analysis</div><div class="node-detail">Send images to VLM. WASM skill using Network capability.</div></div><div class="node-expand">›</div></div></div>
         <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">TTS skill — text-to-speech</div><div class="node-detail">Edge TTS / ElevenLabs / OpenAI. WASM skill using Network + FileSystem.</div></div><div class="node-expand">›</div></div></div>
         <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">Browser skill — web automation</div><div class="node-detail">Headless browser control. WASM + subprocess hybrid.</div></div><div class="node-expand">›</div></div></div>
         <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">Canvas skill — UI rendering</div><div class="node-detail">HTML/data visualization. Lower priority — CLI-first.</div></div><div class="node-expand">›</div></div></div>
-        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">Autonomous experiment loop <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1261">#1261</a></div><div class="node-detail">Karpathy autoresearch pattern. Depends on edit tool + bg processes + canary. WASM skill.</div></div><div class="node-expand">›</div></div></div>
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">Autonomous experiment loop <a class="issue-link" href="https://github.com/abbudjoe/fawx/issues/1261">#1261</a> <span class="wave-badge badge-done">Unblocked</span></div><div class="node-detail">Karpathy autoresearch pattern. Depends on edit tool + bg processes (both now merged). WASM skill.</div></div><div class="node-expand">›</div></div></div>
       </div>
 
-      <div class="tree-divider">🧠 Phase 2c — Engine Intelligence</div>
+      <div class="tree-divider">🧠 Phase 2c — Engine Intelligence <span class="wave-badge badge-active">Active</span></div>
       <div class="tree">
-        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-planned"></div><div class="node-content"><div class="node-title">Embedding-based memory search</div><div class="node-detail">Engine-level, not WASM. Local embedding model (nomic/candle). Index on write, vector search on read. Layers on existing CRUD memory.</div></div><div class="node-expand">›</div></div></div>
+        <div class="tree-item"><div class="tree-node" onclick="toggleNode(this)"><div class="node-status status-active"></div><div class="node-content"><div class="node-title">Embedding-based memory search <a class="issue-link" href="https://github.com/abbudjoe/fawx/pull/1287">#1287</a> <span class="wave-badge badge-active">PR 1/3 In Review</span></div><div class="node-detail">Engine-level, not WASM. Local embedding model (nomic-embed-text-v1.5 via candle). PR 1: fx-embeddings crate (EmbeddingModel, cosine similarity, checksum verification). PR 2: EmbeddingIndex in fx-memory. PR 3: memory_search tool + integration. ~750 lines total. <a class="issue-link" href="https://github.com/abbudjoe/fawx/blob/dev/docs/specs/phase2c-embedding-memory.md">spec</a></div></div><div class="node-expand">›</div></div></div>
       </div>
 
       <div class="tree-divider">📝 Phase 3 — Polish + Docs (parallel)</div>
@@ -408,8 +410,9 @@
 
 <div class="footer">
   <strong>Fawx</strong> — Built by Joe + Clawdio 🦝<br>
-  8 waves · 82+ PRs merged · 103,000 lines of Rust · 2,000+ tests<br>
-  Last updated: March 9, 2026 (Phase 1b complete — 12.8k lines deleted)
+  8 waves · 87+ PRs merged · 105,000 lines of Rust · 2,000+ tests<br>
+  Git flow: feature → dev → staging → main<br>
+  Last updated: March 9, 2026 (Phase 2a/2b/2c all active — 4 parallel workstreams)
 </div>
 
 <script>
