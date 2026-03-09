@@ -14,13 +14,6 @@ pub struct FawxBackend {
 }
 
 /// Status payload returned by the engine's `/status` endpoint.
-///
-/// The `config` field is optional and defaults to `None`. The engine's
-/// HTTP handler only includes it when explicitly opted in, and the
-/// server-side serializer must never include secret fields (API keys,
-/// bearer tokens, credential paths). The TUI displays this value
-/// verbatim via the `/config` command, so any field present here is
-/// visible to the user.
 #[derive(Debug, Clone, Deserialize)]
 pub struct EngineStatus {
     #[allow(dead_code)]
@@ -28,16 +21,12 @@ pub struct EngineStatus {
     pub model: String,
     #[serde(default)]
     pub memory_entries: usize,
-    #[serde(default)]
-    pub config: Option<Value>,
 }
 
 #[derive(Debug)]
 pub enum BackendEvent {
     Connected(EngineStatus),
     ConnectionError(String),
-    ModelStatus(EngineStatus),
-    ConfigStatus(EngineStatus),
     ToolUse {
         name: String,
         arguments: Value,
@@ -117,7 +106,7 @@ fn friendly_http_status_message(status: reqwest::StatusCode, body: &str) -> Stri
             "Fawx is rate limited right now. Wait a moment and try again.".to_string()
         }
         reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
-            "Fawx could not authenticate with the engine. Check your local auth and try again."
+            "Fawx could not authenticate with the engine. Check your bearer token or config and try again."
                 .to_string()
         }
         _ if body.trim_start().starts_with('{') || body.trim_start().starts_with('[') => {
@@ -199,7 +188,7 @@ fn parse_sse_payload(frame: &str) -> anyhow::Result<Option<String>> {
 /// Priority:
 /// 1. `FAWX_TUI_BEARER_TOKEN` environment variable (highest, override)
 /// 2. Encrypted credential store (`~/.fawx/auth.db`, key `http_bearer`)
-/// 3. `~/.fawx/config.toml` `[http]` section, `bearer_token` key (plaintext fallback)
+/// 3. `~/.fawx/config.toml` `[http]` section, `bearer_token` key
 /// 4. `None` (server may have auth disabled)
 fn resolve_bearer_token() -> Option<String> {
     if let Ok(token) = std::env::var("FAWX_TUI_BEARER_TOKEN") {
@@ -315,7 +304,7 @@ impl FawxBackend {
             || lower.contains("authentication")
             || lower.contains("auth failure")
         {
-            return "Fawx could not authenticate with the engine. Check your local auth and try again."
+            return "Fawx could not authenticate with the engine. Check your bearer token or config and try again."
                 .to_string();
         }
 
@@ -368,40 +357,6 @@ impl FawxBackend {
             return Err(anyhow!(friendly_http_status_message(code, &body)));
         }
         status.json().await.context("decode /status")
-    }
-
-    pub async fn request_model_status(&self, tx: UnboundedSender<BackendEvent>) {
-        let result = self.fetch_status().await;
-        match result {
-            Ok(status) => {
-                try_send(&tx, BackendEvent::ModelStatus(status));
-            }
-            Err(error) => {
-                try_send(
-                    &tx,
-                    BackendEvent::StreamError(format!(
-                        "Could not load engine model from /status: {error}"
-                    )),
-                );
-            }
-        }
-    }
-
-    pub async fn request_config_status(&self, tx: UnboundedSender<BackendEvent>) {
-        let result = self.fetch_status().await;
-        match result {
-            Ok(status) => {
-                try_send(&tx, BackendEvent::ConfigStatus(status));
-            }
-            Err(error) => {
-                try_send(
-                    &tx,
-                    BackendEvent::StreamError(format!(
-                        "Could not load engine config from /status: {error}"
-                    )),
-                );
-            }
-        }
     }
 
     pub async fn stream_message(&self, message: String, tx: UnboundedSender<BackendEvent>) {
@@ -654,7 +609,7 @@ model = "gpt-4"
         );
         assert_eq!(
             friendly_http_status_message(reqwest::StatusCode::UNAUTHORIZED, ""),
-            "Fawx could not authenticate with the engine. Check your local auth and try again."
+            "Fawx could not authenticate with the engine. Check your bearer token or config and try again."
         );
         assert_eq!(
             friendly_http_status_message(reqwest::StatusCode::BAD_GATEWAY, "{\"error\":\"boom\"}"),

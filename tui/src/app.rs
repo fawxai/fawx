@@ -1,5 +1,4 @@
 use crate::fawx_backend::{BackendEvent, EngineStatus, FawxBackend};
-use crate::local_auth;
 use crate::markdown_render::render_markdown_text_with_width;
 use crate::render::line_utils::{line_to_static, prefix_lines};
 use crate::wrapping::{adaptive_wrap_line, RtOptions};
@@ -38,7 +37,7 @@ const PHASE1_NOTE: &str =
     "Phase 1 stubs are active for approvals, diffs, file search, multi-agent views, and voice.";
 const INPUT_PLACEHOLDER: &str = "Ask Fawx anything...";
 const SHORTCUT_HINT: &str =
-    "Ctrl+C: cancel | /help: commands | /auth: credentials | /model: current model";
+    "Ctrl+C: cancel | /help: server commands | /clear: clear transcript | /quit: exit";
 const THINKING_FRAMES: [&str; 3] = [".", "..", "..."];
 
 #[derive(Clone, Copy)]
@@ -158,7 +157,6 @@ struct App {
     logo_width: Option<u32>,
     pending_request: bool,
     awaiting_stream_start: bool,
-    show_onboarding: bool,
     follow_output: bool,
     scroll: u16,
     input_scroll: u16,
@@ -176,12 +174,11 @@ impl App {
         tx: UnboundedSender<BackendEvent>,
         rx: UnboundedReceiver<BackendEvent>,
     ) -> Self {
-        let show_onboarding = local_auth::first_run_required();
         Self {
             backend,
             tx,
             rx,
-            entries: initial_entries(show_onboarding, HERO),
+            entries: initial_entries(HERO),
             input: String::new(),
             connection: ConnectionState::Connecting,
             streaming_text: None,
@@ -189,7 +186,6 @@ impl App {
             logo_width: None,
             pending_request: false,
             awaiting_stream_start: false,
-            show_onboarding,
             follow_output: true,
             scroll: 0,
             input_scroll: 0,
@@ -360,182 +356,28 @@ impl App {
     }
 
     fn handle_local_command(&mut self, input: &str) -> bool {
-        let mut parts = input.split_whitespace();
-        let Some(command) = parts.next() else {
-            return false;
-        };
-        let args = parts.collect::<Vec<_>>();
-
-        match command {
-            "/help" => {
-                self.push_system(help_text());
+        match input.split_whitespace().next() {
+            Some("/clear") => {
+                self.clear_transcript();
                 true
             }
-            "/auth" => {
-                self.handle_auth_command(&args);
-                true
-            }
-            "/model" => {
-                if args.is_empty() {
-                    let backend = self.backend.clone();
-                    let tx = self.tx.clone();
-                    tokio::spawn(async move {
-                        backend.request_model_status(tx).await;
-                    });
-                } else {
-                    self.push_system(
-                        "Model switching over HTTP is not wired yet. Use /model to inspect the Fawx engine's current model.",
-                    );
-                }
-                true
-            }
-            "/config" => {
-                let backend = self.backend.clone();
-                let tx = self.tx.clone();
-                tokio::spawn(async move {
-                    backend.request_config_status(tx).await;
-                });
-                true
-            }
-            "/clear" => {
-                self.entries = initial_entries(self.show_onboarding, &self.logo_art);
-                self.streaming_text = None;
-                self.pending_request = false;
-                self.awaiting_stream_start = false;
-                self.last_meta = None;
-                self.last_tokens = None;
-                self.input_scroll = 0;
-                self.push_system("Transcript cleared.");
-                true
-            }
-            "/memory" => {
-                self.handle_memory_command(&args);
-                true
-            }
-            "/quit" | "/exit" => {
+            Some("/quit") | Some("/exit") => {
                 self.should_quit = true;
-                true
-            }
-            "/approvals" => {
-                self.push_system(
-                    "Approval overlays are preserved in the forked TUI sources and stubbed in Phase 1.",
-                );
-                true
-            }
-            "/diff" => {
-                self.push_system(
-                    "Diff rendering is preserved in the forked TUI sources and stubbed in Phase 1.",
-                );
-                true
-            }
-            "/search" => {
-                self.push_system(
-                    "File search is preserved in the forked TUI sources and stubbed in Phase 1.",
-                );
-                true
-            }
-            "/agents" => {
-                self.push_system(
-                    "Multi-agent views are preserved in the forked TUI sources and stubbed in Phase 1.",
-                );
-                true
-            }
-            "/voice" => {
-                self.push_system(
-                    "Voice input is preserved in the forked TUI sources and stubbed in Phase 1.",
-                );
                 true
             }
             _ => false,
         }
     }
 
-    fn handle_auth_command(&mut self, args: &[&str]) {
-        match args {
-            [] => {
-                match local_auth::auth_status_lines() {
-                    Ok(lines) => self.push_system(lines.join("\n")),
-                    Err(error) => self.push_error(format!("Auth status failed: {error}")),
-                }
-                self.push_system(auth_help_text());
-            }
-            ["list-providers"] => {
-                self.push_system(
-                    "Available auth providers:\nclaude\n\nUse `/auth claude set-token <your-key>` to configure access.",
-                );
-            }
-            [provider, "show-status"] if is_claude_provider(provider) => {
-                match local_auth::claude_status_line() {
-                    Ok(line) => self.push_system(line),
-                    Err(error) => self.push_error(format!("Auth status failed: {error}")),
-                }
-            }
-            [provider, "clear-token"] if is_claude_provider(provider) => {
-                match local_auth::clear_claude_token() {
-                    Ok(true) => {
-                        self.show_onboarding = true;
-                        self.entries = initial_entries(self.show_onboarding, &self.logo_art);
-                        self.push_system(
-                            "Claude token removed from ~/.fawx/auth.db. Restart `fawx serve --http` if it is already running.",
-                        );
-                    }
-                    Ok(false) => self.push_system("Claude token was not configured."),
-                    Err(error) => self.push_error(format!("Could not clear Claude token: {error}")),
-                }
-            }
-            [provider, "set-token", rest @ ..] if is_claude_provider(provider) => {
-                let token = rest.join(" ");
-                match local_auth::save_claude_token(&token) {
-                    Ok(()) => {
-                        self.show_onboarding = false;
-                        self.entries = initial_entries(self.show_onboarding, &self.logo_art);
-                        self.push_system(
-                            "Claude token saved to ~/.fawx/auth.db. Restart `fawx serve --http` if it is already running.",
-                        );
-                    }
-                    Err(error) => self.push_error(format!("Could not save Claude token: {error}")),
-                }
-            }
-            _ => {
-                self.push_system(auth_help_text());
-            }
-        }
-    }
-
-    fn handle_memory_command(&mut self, args: &[&str]) {
-        let count = match &self.connection {
-            ConnectionState::Connected(status) => Some(status.memory_entries),
-            ConnectionState::Connecting | ConnectionState::Error(_) => None,
-        };
-        match args {
-            [] | ["list"] => {
-                if let Some(count) = count {
-                    self.push_system(format!(
-                        "Engine reports {count} memory entr{}.\nDetailed memory listing is not wired over HTTP yet.",
-                        if count == 1 { "y" } else { "ies" }
-                    ));
-                } else {
-                    self.push_system(
-                        "Memory listing needs an active engine connection. Detailed memory browsing is still stubbed in this Phase 3 shell.",
-                    );
-                }
-            }
-            ["search", query @ ..] if !query.is_empty() => {
-                let query = query.join(" ");
-                if let Some(count) = count {
-                    self.push_system(format!(
-                        "Memory search for \"{query}\" is not wired over HTTP yet.\nEngine reports {count} memory entries available."
-                    ));
-                } else {
-                    self.push_system(format!(
-                        "Memory search for \"{query}\" is not wired yet, and the engine is not currently connected."
-                    ));
-                }
-            }
-            _ => self.push_system(
-                "Usage:\n/memory list    View stored memory entry count\n/memory search <query>    Search memory (stubbed over HTTP for now)",
-            ),
-        }
+    fn clear_transcript(&mut self) {
+        self.entries = initial_entries(&self.logo_art);
+        self.streaming_text = None;
+        self.pending_request = false;
+        self.awaiting_stream_start = false;
+        self.last_meta = None;
+        self.last_tokens = None;
+        self.input_scroll = 0;
+        self.push_system("Transcript cleared.");
     }
 
     fn handle_backend_event(&mut self, event: BackendEvent) {
@@ -546,19 +388,6 @@ impl App {
                     self.backend.base_url(),
                     status.model
                 ));
-                self.connection = ConnectionState::Connected(status);
-            }
-            BackendEvent::ModelStatus(status) => {
-                self.push_system(format!("Engine model: {}.", status.model));
-                self.connection = ConnectionState::Connected(status);
-            }
-            BackendEvent::ConfigStatus(status) => {
-                let rendered = status
-                    .config
-                    .as_ref()
-                    .and_then(|config| serde_json::to_string_pretty(config).ok())
-                    .unwrap_or_else(|| "null".to_string());
-                self.push_system(format!("Engine config (/status):\n{rendered}"));
                 self.connection = ConnectionState::Connected(status);
             }
             BackendEvent::ConnectionError(error) => {
@@ -904,7 +733,7 @@ impl App {
     }
 
     fn should_show_logo_art(&self) -> bool {
-        self.show_onboarding || self.input.trim().is_empty()
+        self.input.trim().is_empty()
     }
 
     fn render_entry(&self, entry: &Entry, width: usize, out: &mut Vec<Line<'static>>) {
@@ -997,71 +826,25 @@ fn fawx_amber() -> Color {
     Color::Rgb(255, 140, 0)
 }
 
-fn initial_entries(show_onboarding: bool, logo_art: &str) -> Vec<Entry> {
-    let mut entries = vec![Entry {
-        role: EntryRole::Hero,
-        text: logo_art.to_string(),
-    }];
-
-    if show_onboarding {
-        entries.extend([
-            Entry {
-                role: EntryRole::System,
-                text: "Welcome to Fawx 🦊".to_string(),
-            },
-            Entry {
-                role: EntryRole::System,
-                text: "To get started, set your API key:".to_string(),
-            },
-            Entry {
-                role: EntryRole::System,
-                text: "  /auth claude set-token <your-key>".to_string(),
-            },
-            Entry {
-                role: EntryRole::System,
-                text: "Once set, you're ready to chat.".to_string(),
-            },
-        ]);
-    } else {
-        entries.push(Entry {
+fn initial_entries(logo_art: &str) -> Vec<Entry> {
+    vec![
+        Entry {
+            role: EntryRole::Hero,
+            text: logo_art.to_string(),
+        },
+        Entry {
             role: EntryRole::System,
             text: "connecting to Fawx...".to_string(),
-        });
-    }
-
-    entries.push(Entry {
-        role: EntryRole::System,
-        text: PHASE1_NOTE.to_string(),
-    });
-    entries
-}
-
-fn help_text() -> String {
-    [
-        "Available commands:",
-        "/auth   Manage API credentials",
-        "/model  Switch or view current model",
-        "/config View/edit configuration",
-        "/memory View memory entries",
-        "/clear  Clear conversation",
-        "/quit   Exit (or press Ctrl+C)",
+        },
+        Entry {
+            role: EntryRole::System,
+            text: "Use /help to see commands handled by the server.".to_string(),
+        },
+        Entry {
+            role: EntryRole::System,
+            text: PHASE1_NOTE.to_string(),
+        },
     ]
-    .join("\n")
-}
-
-fn auth_help_text() -> String {
-    [
-        "Auth commands:",
-        "/auth                        Show current credential status",
-        "/auth claude set-token KEY  Save your Claude API key locally",
-        "/auth claude show-status    Show Claude credential status",
-        "/auth claude clear-token    Remove the stored Claude token",
-    ]
-    .join("\n")
-}
-
-fn is_claude_provider(provider: &str) -> bool {
-    matches!(provider, "claude" | "anthropic")
 }
 
 fn render_logo_art(width: u32) -> anyhow::Result<String> {
@@ -1201,7 +984,6 @@ mod tests {
         let (tx, rx) = unbounded_channel();
         let mut app = App::new(backend, tx, rx);
         app.entries.clear();
-        app.show_onboarding = false;
         app
     }
 
@@ -1262,17 +1044,25 @@ mod tests {
         }
     }
 
-    async fn spawn_status_server(body: serde_json::Value) -> (String, tokio::task::JoinHandle<()>) {
+    async fn spawn_message_server(
+        expected_message: &str,
+        body: serde_json::Value,
+    ) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test server");
         let addr = listener.local_addr().expect("listener addr");
+        let expected_body = format!(
+            "{{\"message\":{}}}",
+            serde_json::to_string(expected_message).expect("serialize message")
+        );
         let handle = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept connection");
             let mut request = vec![0_u8; 4096];
             let read = stream.read(&mut request).await.expect("read request");
             let request = String::from_utf8_lossy(&request[..read]);
-            assert!(request.starts_with("GET /status "));
+            assert!(request.starts_with("POST /message "));
+            assert!(request.contains(&expected_body));
 
             let payload = body.to_string();
             let response = format!(
@@ -1369,24 +1159,13 @@ mod tests {
     }
 
     #[test]
-    fn onboarding_entries_include_welcome_copy() {
-        let entries = initial_entries(true, "fox art");
+    fn initial_entries_point_users_to_server_help() {
+        let entries = initial_entries("fox art");
         assert!(matches!(entries[0].role, EntryRole::Hero));
         assert_eq!(entries[0].text, "fox art");
         assert!(entries
             .iter()
-            .any(|entry| entry.text == "Welcome to Fawx 🦊"));
-        assert!(entries
-            .iter()
-            .any(|entry| entry.text.contains("/auth claude set-token <your-key>")));
-    }
-
-    #[test]
-    fn help_text_mentions_auth_memory_and_quit() {
-        let help = help_text();
-        assert!(help.contains("/auth"));
-        assert!(help.contains("/memory"));
-        assert!(help.contains("/quit"));
+            .any(|entry| entry.text == "Use /help to see commands handled by the server."));
     }
 
     #[test]
@@ -1398,36 +1177,53 @@ mod tests {
     }
 
     #[test]
-    fn help_command_pushes_help_text_into_transcript() {
+    fn only_clear_and_exit_commands_are_handled_locally() {
         let mut app = test_app();
 
-        assert!(app.handle_local_command("/help"));
-        assert!(last_entry_text(&app).contains("/config"));
+        for command in [
+            "/help",
+            "/auth",
+            "/model",
+            "/config",
+            "/memory",
+            "/approvals",
+            "/diff",
+            "/search",
+            "/agents",
+            "/voice",
+        ] {
+            assert!(
+                !app.handle_local_command(command),
+                "{command} should be delegated to the server"
+            );
+        }
+        assert!(app.entries.is_empty());
     }
 
-    #[test]
-    fn auth_commands_cover_list_providers_and_help_fallback() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn help_command_uses_message_endpoint() {
+        let (base_url, server) = spawn_message_server(
+            "/help",
+            json!({
+                "response": "server help",
+                "model": "claude-opus-4-6",
+                "iterations": 1
+            }),
+        )
+        .await;
+        let (_env_guard, _base_url_guard) = BaseUrlGuard::set(&base_url).await;
         let mut app = test_app();
+        app.input = "/help".to_string();
 
-        assert!(app.handle_local_command("/auth list-providers"));
-        assert!(last_entry_text(&app).contains("Available auth providers:"));
+        app.submit_input();
+        let text_delta = app.rx.recv().await.expect("text delta event");
+        app.handle_backend_event(text_delta);
+        let done = app.rx.recv().await.expect("done event");
+        app.handle_backend_event(done);
+        server.await.expect("join message server");
 
-        assert!(app.handle_local_command("/auth something-else"));
-        assert!(last_entry_text(&app).contains("/auth claude show-status"));
-    }
-
-    #[test]
-    fn memory_command_reports_connected_entry_count() {
-        let mut app = test_app();
-        app.connection = ConnectionState::Connected(EngineStatus {
-            status: "ok".to_string(),
-            model: "claude-opus-4-6".to_string(),
-            memory_entries: 2,
-            config: None,
-        });
-
-        assert!(app.handle_local_command("/memory list"));
-        assert!(last_entry_text(&app).contains("Engine reports 2 memory entries."));
+        assert_eq!(app.entries[0].text, "/help");
+        assert_eq!(last_entry_text(&app), "server help");
     }
 
     #[test]
@@ -1467,72 +1263,5 @@ mod tests {
         let mut exit_app = test_app();
         assert!(exit_app.handle_local_command("/exit"));
         assert!(exit_app.should_quit);
-    }
-
-    #[test]
-    fn model_switch_command_is_stubbed_for_now() {
-        let mut app = test_app();
-
-        assert!(app.handle_local_command("/model claude-sonnet-4-6"));
-        assert!(last_entry_text(&app).contains("Model switching over HTTP is not wired yet."));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn model_command_fetches_status_via_http() {
-        let (base_url, server) = spawn_status_server(json!({
-            "status": "ok",
-            "model": "claude-opus-4-6",
-            "memory_entries": 3,
-            "tools": [],
-            "config": null
-        }))
-        .await;
-        let (_env_guard, _base_url_guard) = BaseUrlGuard::set(&base_url).await;
-        let mut app = test_app();
-
-        assert!(app.handle_local_command("/model"));
-        let event = app.rx.recv().await.expect("model status event");
-        match event {
-            BackendEvent::ModelStatus(status) => {
-                assert_eq!(status.model, "claude-opus-4-6");
-                app.handle_backend_event(BackendEvent::ModelStatus(status));
-            }
-            other => panic!("expected model status event, got {other:?}"),
-        }
-        server.await.expect("join model status server");
-
-        assert_eq!(last_entry_text(&app), "Engine model: claude-opus-4-6.");
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn config_command_fetches_status_via_http() {
-        let (base_url, server) = spawn_status_server(json!({
-            "status": "ok",
-            "model": "claude-opus-4-6",
-            "memory_entries": 1,
-            "tools": [],
-            "config": {
-                "engine": {
-                    "default_model": "claude-opus-4-6"
-                }
-            }
-        }))
-        .await;
-        let (_env_guard, _base_url_guard) = BaseUrlGuard::set(&base_url).await;
-        let mut app = test_app();
-
-        assert!(app.handle_local_command("/config"));
-        let event = app.rx.recv().await.expect("config status event");
-        match event {
-            BackendEvent::ConfigStatus(status) => {
-                app.handle_backend_event(BackendEvent::ConfigStatus(status))
-            }
-            other => panic!("expected config status event, got {other:?}"),
-        }
-        server.await.expect("join config status server");
-
-        let text = last_entry_text(&app);
-        assert!(text.contains("Engine config (/status):"));
-        assert!(text.contains("\"default_model\": \"claude-opus-4-6\""));
     }
 }

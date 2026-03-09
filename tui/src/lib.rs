@@ -1,9 +1,8 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
 mod app;
-mod credential_reader;
+pub(crate) mod credential_reader;
 mod fawx_backend;
-mod local_auth;
 mod markdown_render;
 mod render {
     pub mod line_utils;
