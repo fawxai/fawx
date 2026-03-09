@@ -1,9 +1,9 @@
 #!/bin/bash
-# Build script for Nova WASM skills
+# Build script for Fawx WASM skills
 
 set -e
 
-echo "Building Nova skills..."
+echo "Building Fawx skills..."
 
 # Ensure wasm32-unknown-unknown target is installed
 rustup target add wasm32-unknown-unknown
@@ -24,9 +24,18 @@ cp target/wasm32-unknown-unknown/release/calculator_skill.wasm calculator.wasm
 echo "✓ calculator-skill built -> calculator.wasm"
 cd ..
 
+# Build vision skill
+echo "Building vision-skill..."
+cd vision-skill
+cargo build --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/vision_skill.wasm vision.wasm
+echo "✓ vision-skill built -> vision.wasm"
+cd ..
+
 echo ""
 echo "All skills built successfully!"
 echo ""
 echo "To install skills:"
-echo "  nova skill install skills/weather-skill/weather.wasm"
-echo "  nova skill install skills/calculator-skill/calculator.wasm"
+echo "  fawx skill install skills/weather-skill/weather.wasm"
+echo "  fawx skill install skills/calculator-skill/calculator.wasm"
+echo "  fawx skill install skills/vision-skill/vision.wasm"

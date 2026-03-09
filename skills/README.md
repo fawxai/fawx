@@ -50,6 +50,27 @@ Evaluates simple mathematical expressions.
 }
 ```
 
+### Vision Skill
+Analyzes images with vision-capable LLMs using Anthropic Claude or OpenAI GPT-4o.
+
+**Capabilities:** `network`, `storage`
+
+**Input format:**
+```json
+{
+  "image": "https://example.com/cat.png",
+  "prompt": "Describe this image in detail",
+  "provider": "anthropic"
+}
+```
+
+**Output format:**
+```text
+🔍 Image Analysis (Claude):
+
+A black cat sitting on a couch and looking at the camera.
+```
+
 ## Building Skills
 
 ### Prerequisites
@@ -80,6 +101,7 @@ Use the Fawx CLI to install skills:
 ```bash
 fawx skill install skills/weather-skill/weather.wasm
 fawx skill install skills/calculator-skill/calculator.wasm
+fawx skill install skills/vision-skill/vision.wasm
 ```
 
 ## Manifest Format
