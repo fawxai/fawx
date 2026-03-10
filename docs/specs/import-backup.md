@@ -25,25 +25,43 @@ Options:
 
 ### File Mapping
 
-Clean copy. No parsing, no transformation, no data loss.
+Clean copy. No parsing, no transformation, **no data loss**.
+
+**Principle: a migration tool never loses data.** Everything gets copied. Recognized files go to their mapped locations. Everything else goes to `~/.fawx/context/`.
+
+#### Recognized files (mapped to specific locations)
 
 | Source (OpenClaw) | Destination (Fawx) | What it is |
 |---|---|---|
 | `MEMORY.md` | `~/.fawx/memory/MEMORY.md` | Long-term curated memory |
 | `memory/*.md` | `~/.fawx/memory/*.md` | Daily memory logs |
-| `SOUL.md` | `~/.fawx/context/SOUL.md` | Personality / voice |
-| `USER.md` | `~/.fawx/context/USER.md` | User preferences |
-| `AGENTS.md` | `~/.fawx/context/AGENTS.md` | Workflow rules |
-| `IDENTITY.md` | `~/.fawx/context/IDENTITY.md` | Agent identity |
-| `TOOLS.md` | `~/.fawx/context/TOOLS.md` | Tool usage notes |
+| `memory/archive/**/*.md` | `~/.fawx/memory/archive/**/*.md` | Archived memory (preserve structure) |
+
+#### Everything else → context directory
+
+All other `.md` files in the workspace root go to `~/.fawx/context/`:
+
+| Source (OpenClaw) | Destination (Fawx) |
+|---|---|
+| `SOUL.md` | `~/.fawx/context/SOUL.md` |
+| `USER.md` | `~/.fawx/context/USER.md` |
+| `AGENTS.md` | `~/.fawx/context/AGENTS.md` |
+| `IDENTITY.md` | `~/.fawx/context/IDENTITY.md` |
+| `TOOLS.md` | `~/.fawx/context/TOOLS.md` |
+| `ENGINEERING.md` | `~/.fawx/context/ENGINEERING.md` |
+| `BOOTSTRAP.md` | `~/.fawx/context/BOOTSTRAP.md` |
+| `*.md` (any other) | `~/.fawx/context/*.md` |
+
+Fawx loads **all** `.md` files from `~/.fawx/context/` into the system prompt. Users can add, remove, or rename files freely. No hardcoded file list.
 
 ### Behavior
 
-1. Validate source directory exists and contains at least one recognized file
+1. Validate source directory exists and contains at least one `.md` file
 2. Create `~/.fawx/memory/` and `~/.fawx/context/` directories if they don't exist
-3. Copy each file that exists (skip missing files silently)
-4. Never overwrite without `--force`. If a destination file exists, print a skip message
-5. Print a summary at the end
+3. Copy memory files (MEMORY.md, memory/*.md, memory/archive/**) to `~/.fawx/memory/`
+4. Copy all root `.md` files (except MEMORY.md) to `~/.fawx/context/`
+5. Never overwrite without `--force`. If a destination file exists, print a skip message
+6. Print a summary at the end
 
 ### Output
 
@@ -52,16 +70,22 @@ $ fawx import --from openclaw ~/.openclaw/workspace
 
 🦊 Importing from OpenClaw
 
-  ✓ MEMORY.md          → ~/.fawx/memory/MEMORY.md
-  ✓ memory/2026-03-09.md → ~/.fawx/memory/2026-03-09.md
-  ✓ memory/2026-03-10.md → ~/.fawx/memory/2026-03-10.md
-  ✓ SOUL.md            → ~/.fawx/context/SOUL.md
-  ✓ USER.md            → ~/.fawx/context/USER.md
-  ✓ AGENTS.md          → ~/.fawx/context/AGENTS.md
-  ✓ IDENTITY.md        → ~/.fawx/context/IDENTITY.md
-  ○ TOOLS.md           — not found, skipped
+  Memory:
+    ✓ MEMORY.md            → ~/.fawx/memory/MEMORY.md
+    ✓ memory/2026-03-09.md → ~/.fawx/memory/2026-03-09.md
+    ✓ memory/2026-03-10.md → ~/.fawx/memory/2026-03-10.md
 
-  Imported 6 files. Your memory and context are ready.
+  Context:
+    ✓ SOUL.md              → ~/.fawx/context/SOUL.md
+    ✓ USER.md              → ~/.fawx/context/USER.md
+    ✓ AGENTS.md            → ~/.fawx/context/AGENTS.md
+    ✓ IDENTITY.md          → ~/.fawx/context/IDENTITY.md
+    ✓ TOOLS.md             → ~/.fawx/context/TOOLS.md
+    ✓ ENGINEERING.md       → ~/.fawx/context/ENGINEERING.md
+    ✓ BOOTSTRAP.md         → ~/.fawx/context/BOOTSTRAP.md
+
+  Imported 10 files (3 memory, 7 context). Your memory and context are ready.
+  Fawx loads all .md files from ~/.fawx/context/ automatically.
 ```
 
 ### Dry run output
@@ -71,12 +95,15 @@ $ fawx import --from openclaw --dry-run
 
 🦊 Import preview (dry run)
 
-  MEMORY.md          → ~/.fawx/memory/MEMORY.md
-  memory/2026-03-09.md → ~/.fawx/memory/2026-03-09.md
-  SOUL.md            → ~/.fawx/context/SOUL.md
-  ...
+  Memory:
+    MEMORY.md            → ~/.fawx/memory/MEMORY.md
+    memory/2026-03-09.md → ~/.fawx/memory/2026-03-09.md
 
-  Would import 6 files. Run without --dry-run to proceed.
+  Context:
+    SOUL.md              → ~/.fawx/context/SOUL.md
+    ...
+
+  Would import 10 files. Run without --dry-run to proceed.
 ```
 
 ### Skip output (existing files)
@@ -90,7 +117,7 @@ $ fawx import --from openclaw --dry-run
 | Scenario | Behavior |
 |---|---|
 | Source dir doesn't exist | `"Directory not found: ~/.openclaw/workspace"` |
-| Source dir has no recognized files | `"No OpenClaw files found in <path>. Is this an OpenClaw workspace?"` |
+| Source dir has no .md files | `"No markdown files found in <path>. Is this an OpenClaw workspace?"` |
 | Destination file exists (no --force) | Skip with message, continue others |
 | Permission error on copy | Print error for that file, continue others |
 | ~/.fawx doesn't exist | Create it |
@@ -169,13 +196,15 @@ $ fawx backup
 ### Testing
 
 Import:
-1. Import from directory with all files present
+1. Import from directory with all files present (recognized + unrecognized .md)
 2. Import from directory with some files missing (skips gracefully)
 3. Import with existing destination files (skips without --force)
 4. Import with --force overwrites existing files
 5. Import with --dry-run copies nothing
 6. Import from nonexistent directory fails cleanly
 7. Import from empty directory fails cleanly
+8. Unrecognized .md files copied to context/ (no data loss)
+9. memory/archive/ structure preserved recursively
 
 Backup:
 1. Backup creates valid tar.gz
