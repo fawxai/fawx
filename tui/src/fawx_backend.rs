@@ -72,39 +72,64 @@ struct HealthResponse {
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum WireEvent {
-    TextDelta {
-        content: String,
-    },
-    ToolUse {
-        name: String,
-        #[serde(default)]
-        arguments: Value,
-    },
-    ToolResult {
-        #[serde(default)]
-        name: Option<String>,
-        #[serde(default = "default_tool_success")]
-        success: bool,
-        content: String,
-    },
-    Done {
-        #[serde(default)]
-        model: Option<String>,
-        #[serde(default)]
-        iterations: Option<u32>,
-        #[serde(default)]
-        input_tokens: Option<u64>,
-        #[serde(default)]
-        output_tokens: Option<u64>,
-    },
-    Error {
-        error: String,
-    },
+/// SSE event parsed from `event:` + `data:` lines.
+///
+/// Field names match the engine's `serialize_stream_event` output in
+/// `http_serve.rs`.  The `event_type` is set by `parse_sse_frame` from the
+/// `event:` line; serde then only needs to match the data payload.
+struct SseFrame {
+    event_type: String,
+    data: String,
 }
 
-const fn default_tool_success() -> bool {
-    true
+/// Data payload for `text_delta` events.
+#[derive(Deserialize)]
+struct TextDeltaData {
+    text: String,
+}
+
+/// Data payload for `tool_call_start` events.
+#[derive(Deserialize)]
+struct ToolCallStartData {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// Data payload for `tool_call_complete` events.
+#[derive(Deserialize)]
+struct ToolCallCompleteData {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Value,
+}
+
+/// Data payload for `tool_result` events.
+#[derive(Deserialize)]
+struct ToolResultData {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    output: Option<String>,
+    #[serde(default)]
+    is_error: bool,
+}
+
+/// Data payload for `done` events.
+#[derive(Deserialize)]
+struct DoneData {
+    /// The final response text. Currently unused by the TUI (it
+    /// reconstructs the response from streamed deltas) but parsed
+    /// for forward compatibility.
+    #[serde(default)]
+    #[allow(dead_code)]
+    response: Option<String>,
+}
+
+/// Data payload for `error` events.
+#[derive(Deserialize)]
+struct ErrorData {
+    error: String,
 }
 
 fn friendly_http_status_message(status: reqwest::StatusCode, body: &str) -> String {
@@ -151,7 +176,8 @@ fn drain_complete_sse_frames(pending: &mut String) -> Vec<String> {
     frames
 }
 
-fn parse_sse_payload(frame: &str) -> anyhow::Result<Option<String>> {
+fn parse_sse_frame(frame: &str) -> anyhow::Result<Option<SseFrame>> {
+    let mut event_type = String::from("message");
     let mut saw_data = false;
     let mut saw_invalid_content = false;
     let payload = frame
@@ -162,9 +188,12 @@ fn parse_sse_payload(frame: &str) -> anyhow::Result<Option<String>> {
                 saw_data = true;
                 return Some(data.trim_start());
             }
+            if let Some(evt) = line.strip_prefix("event:") {
+                event_type = evt.trim().to_string();
+                return None;
+            }
             if line.is_empty()
                 || line.starts_with(':')
-                || line.starts_with("event:")
                 || line.starts_with("id:")
                 || line.starts_with("retry:")
             {
@@ -180,7 +209,10 @@ fn parse_sse_payload(frame: &str) -> anyhow::Result<Option<String>> {
         if payload.is_empty() || payload == "[DONE]" {
             return Ok(None);
         }
-        return Ok(Some(payload));
+        return Ok(Some(SseFrame {
+            event_type,
+            data: payload,
+        }));
     }
 
     if saw_invalid_content {
@@ -435,12 +467,12 @@ impl HttpBackend {
             let chunk = chunk.context("read SSE chunk")?;
             let chunk = String::from_utf8_lossy(&chunk);
             for frame in push_sse_chunk(&mut pending, &chunk) {
-                handle_sse_frame(&frame, &tx)?;
+                dispatch_sse_frame(&frame, &tx)?;
             }
         }
 
         if !pending.trim().is_empty() {
-            handle_sse_frame(&pending, &tx)?;
+            dispatch_sse_frame(&pending, &tx)?;
         }
         Ok(())
     }
@@ -473,53 +505,74 @@ pub(crate) fn try_send(tx: &UnboundedSender<BackendEvent>, event: BackendEvent) 
     true
 }
 
-fn handle_sse_frame(frame: &str, tx: &UnboundedSender<BackendEvent>) -> anyhow::Result<()> {
-    let Some(payload) = parse_sse_payload(frame)? else {
+fn dispatch_sse_frame(frame: &str, tx: &UnboundedSender<BackendEvent>) -> anyhow::Result<()> {
+    let Some(sse) = parse_sse_frame(frame)? else {
         return Ok(());
     };
 
-    match serde_json::from_str::<WireEvent>(&payload).context("decode SSE frame")? {
-        WireEvent::TextDelta { content } => {
-            try_send(tx, BackendEvent::TextDelta(content));
+    match sse.event_type.as_str() {
+        "text_delta" => {
+            let d: TextDeltaData = serde_json::from_str(&sse.data).context("decode text_delta")?;
+            try_send(tx, BackendEvent::TextDelta(d.text));
         }
-        WireEvent::ToolUse { name, arguments } => {
-            try_send(tx, BackendEvent::ToolUse { name, arguments });
+        "tool_call_start" => {
+            let d: ToolCallStartData =
+                serde_json::from_str(&sse.data).context("decode tool_call_start")?;
+            try_send(
+                tx,
+                BackendEvent::ToolUse {
+                    name: d.name.unwrap_or_default(),
+                    arguments: Value::Null,
+                },
+            );
         }
-        WireEvent::ToolResult {
-            name,
-            success,
-            content,
-        } => {
+        "tool_call_complete" => {
+            let d: ToolCallCompleteData =
+                serde_json::from_str(&sse.data).context("decode tool_call_complete")?;
+            try_send(
+                tx,
+                BackendEvent::ToolUse {
+                    name: d.name.unwrap_or_default(),
+                    arguments: d.arguments,
+                },
+            );
+        }
+        "tool_result" => {
+            let d: ToolResultData =
+                serde_json::from_str(&sse.data).context("decode tool_result")?;
             try_send(
                 tx,
                 BackendEvent::ToolResult {
-                    name,
-                    success,
-                    content,
+                    name: d.id,
+                    success: !d.is_error,
+                    content: d.output.unwrap_or_default(),
                 },
             );
         }
-        WireEvent::Done {
-            model,
-            iterations,
-            input_tokens,
-            output_tokens,
-        } => {
+        "done" => {
+            let _d: DoneData = serde_json::from_str(&sse.data).context("decode done")?;
             try_send(
                 tx,
                 BackendEvent::Done {
-                    model,
-                    iterations,
-                    input_tokens,
-                    output_tokens,
+                    model: None,
+                    iterations: None,
+                    input_tokens: None,
+                    output_tokens: None,
                 },
             );
         }
-        WireEvent::Error { error } => {
+        "phase" => {
+            // Phase changes are informational; TUI doesn't need them yet.
+        }
+        "error" => {
+            let d: ErrorData = serde_json::from_str(&sse.data).context("decode error")?;
             try_send(
                 tx,
-                BackendEvent::StreamError(friendly_error_message(&error)),
+                BackendEvent::StreamError(friendly_error_message(&d.error)),
             );
+        }
+        other => {
+            tracing::debug!("ignoring unknown SSE event type: {other}");
         }
     }
 
@@ -641,20 +694,18 @@ model = "gpt-4"
         let mut pending = String::new();
         let (tx, mut rx) = unbounded_channel();
 
-        assert!(push_sse_chunk(
-            &mut pending,
-            "data: {\"type\":\"text_delta\",\"content\":\"Hel"
-        )
-        .is_empty());
+        assert!(
+            push_sse_chunk(&mut pending, "event: text_delta\ndata: {\"text\":\"Hel").is_empty()
+        );
         let frames = push_sse_chunk(&mut pending, "lo\"}\n");
         assert!(frames.is_empty());
         let frames = push_sse_chunk(&mut pending, "\n");
         assert_eq!(
             frames,
-            vec!["data: {\"type\":\"text_delta\",\"content\":\"Hello\"}"]
+            vec!["event: text_delta\ndata: {\"text\":\"Hello\"}"]
         );
 
-        handle_sse_frame(&frames[0], &tx).expect("frame should decode");
+        dispatch_sse_frame(&frames[0], &tx).expect("frame should decode");
         match rx.try_recv().expect("event should be sent") {
             BackendEvent::TextDelta(content) => assert_eq!(content, "Hello"),
             other => panic!("unexpected event: {other:?}"),
@@ -666,19 +717,19 @@ model = "gpt-4"
         let mut pending = String::new();
         let frames = push_sse_chunk(
             &mut pending,
-            "data: {\"type\":\"text_delta\",\"content\":\"A\"}\r\n",
+            "event: text_delta\r\ndata: {\"text\":\"A\"}\r\n",
         );
         assert!(frames.is_empty());
 
         let frames = push_sse_chunk(
             &mut pending,
-            "\r\ndata: {\"type\":\"text_delta\",\"content\":\"B\"}\r\n\r\n",
+            "\r\nevent: text_delta\r\ndata: {\"text\":\"B\"}\r\n\r\n",
         );
         assert_eq!(
             frames,
             vec![
-                "data: {\"type\":\"text_delta\",\"content\":\"A\"}",
-                "data: {\"type\":\"text_delta\",\"content\":\"B\"}",
+                "event: text_delta\ndata: {\"text\":\"A\"}",
+                "event: text_delta\ndata: {\"text\":\"B\"}",
             ]
         );
         assert!(pending.is_empty());
@@ -687,29 +738,30 @@ model = "gpt-4"
     #[test]
     fn done_frame_is_ignored() {
         let (tx, mut rx) = unbounded_channel();
-        handle_sse_frame("data: [DONE]", &tx).expect("done frame should be ignored");
+        dispatch_sse_frame("data: [DONE]", &tx).expect("done frame should be ignored");
         assert!(rx.try_recv().is_err());
     }
 
     #[test]
     fn invalid_json_frame_returns_error() {
         let (tx, _rx) = unbounded_channel();
-        let error =
-            handle_sse_frame("data: {not valid json}", &tx).expect_err("invalid JSON must fail");
-        assert!(error.to_string().contains("decode SSE frame"));
+        let error = dispatch_sse_frame("event: text_delta\ndata: {not valid json}", &tx)
+            .expect_err("invalid JSON must fail");
+        assert!(error.to_string().contains("decode text_delta"));
     }
 
     #[test]
     fn frame_without_data_prefix_returns_error() {
         let (tx, _rx) = unbounded_channel();
-        let error = handle_sse_frame("payload: nope", &tx).expect_err("malformed frame must fail");
+        let error =
+            dispatch_sse_frame("payload: nope", &tx).expect_err("malformed frame must fail");
         assert!(error.to_string().contains("missing SSE data prefix"));
     }
 
     #[test]
     fn keepalive_comment_frame_is_ignored() {
         let (tx, mut rx) = unbounded_channel();
-        handle_sse_frame(": keep-alive", &tx).expect("comment frame should be ignored");
+        dispatch_sse_frame(": keep-alive", &tx).expect("comment frame should be ignored");
         assert!(rx.try_recv().is_err());
     }
 
