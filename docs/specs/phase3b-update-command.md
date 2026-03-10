@@ -1,4 +1,4 @@
-# Spec: `fawx update` Command
+# Spec: `fawx update` + `fawx restart --rebuild` Enhancement
 
 **Issue:** #1302  
 **Phase:** 3b (Ops)  
@@ -230,6 +230,85 @@ Server ready (pid 42589, port 8400)
 
 ✓ Update complete
 ```
+
+---
+
+## `fawx restart --rebuild` Enhancement
+
+### Current behavior (broken)
+
+`fawx restart --rebuild` only runs `cargo build --release -p fx-cli`. It doesn't build the TUI or skills. After restart, the TUI binary and skills are stale.
+
+### New behavior
+
+`fawx restart --rebuild` builds **everything** — engine, TUI, and skills — then restarts. Same build steps as `fawx update`, minus the git pull.
+
+### How the two commands relate
+
+| | `fawx restart --rebuild` | `fawx update [BRANCH]` |
+|---|---|---|
+| Git pull | ❌ No | ✅ Yes |
+| Build engine | ✅ | ✅ |
+| Build TUI | ✅ (new) | ✅ |
+| Build + install skills | ✅ (new) | ✅ |
+| Restart server | ✅ | ✅ |
+| Branch arg | N/A | Optional (default: current) |
+| Use case | Local changes, same code | Pull new code from remote |
+
+### Implementation
+
+Extract the shared build logic into a `build_all(repo_root, skip_skills)` function that both `restart --rebuild` and `update` call:
+
+```rust
+// In a shared module (e.g., build.rs or update.rs)
+fn build_all(repo_root: &Path, skip_skills: bool) -> anyhow::Result<BuildResult> {
+    build_engine(repo_root)?;
+    build_tui(repo_root)?;
+    if !skip_skills {
+        build_and_install_skills(repo_root)?;
+    }
+    Ok(result)
+}
+```
+
+`restart.rs::run_rebuild` changes from:
+```rust
+// Before: only engine
+cargo build --release -p fx-cli
+```
+To:
+```rust
+// After: full build
+build_all(repo_root, false)
+```
+
+### New flags for `fawx restart --rebuild`
+
+```
+fawx restart --rebuild [OPTIONS]
+
+Options:
+  --no-skills    Skip WASM skill rebuild and install
+```
+
+The `--no-skills` flag is shared with `fawx update`.
+
+### Summary output
+
+```
+$ fawx restart --rebuild
+
+Stopping fawx (pid 42301)...
+Building engine... done (38s)
+Building TUI... done (15s)
+Building skills... 8 skills built and installed
+Starting fawx serve --http...
+Server ready (pid 42589, port 8400)
+
+✓ Restart complete
+```
+
+---
 
 ## Not In Scope
 
