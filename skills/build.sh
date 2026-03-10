@@ -48,6 +48,13 @@ cp target/wasm32-unknown-unknown/release/browser_skill.wasm browser.wasm
 echo "✓ browser-skill built -> browser.wasm"
 cd ..
 
+echo "Building canvas-skill..."
+cd canvas-skill
+cargo build --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/canvas_skill.wasm canvas.wasm
+echo "✓ canvas-skill built -> canvas.wasm"
+cd ..
+
 echo ""
 echo "All skills built successfully!"
 echo ""
@@ -57,3 +64,4 @@ echo "  fawx skill install skills/calculator-skill/calculator.wasm"
 echo "  fawx skill install skills/vision-skill/vision.wasm"
 echo "  fawx skill install skills/tts-skill/tts.wasm"
 echo "  fawx skill install skills/browser-skill/browser.wasm"
+echo "  fawx skill install skills/canvas-skill/canvas.wasm"

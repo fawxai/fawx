@@ -148,6 +148,38 @@ Fetches web pages, extracts readable content, searches the web with Brave Search
 }
 ```
 
+### Canvas Skill
+Generate rich visual content: tables, charts, diagrams, and formatted documents.
+
+**Capabilities:** `storage`
+
+**Input format:**
+```json
+{
+  "tool": "render_table",
+  "headers": "Name,Revenue,Growth",
+  "rows": "[[\\"Widget A\\",\\"$1.2M\\",\\"+12%\\"]]",
+  "title": "Sales Report"
+}
+```
+
+```json
+{
+  "tool": "render_chart",
+  "chart_type": "bar",
+  "data": "{\\"labels\\":[\\"Jan\\",\\"Feb\\",\\"Mar\\"],\\"values\\":[100,150,200]}",
+  "title": "Monthly Revenue"
+}
+```
+
+```json
+{
+  "tool": "render_document",
+  "sections": "[{\\"heading\\":\\"Overview\\",\\"content\\":\\"Introduction text\\",\\"type\\":\\"text\\"}]",
+  "title": "API Reference"
+}
+```
+
 ## Building Skills
 
 ### Prerequisites
