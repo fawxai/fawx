@@ -8,12 +8,13 @@
 
 use fx_core::channel::{Channel, ChannelError, ResponseContext};
 use fx_core::types::InputSource;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -336,6 +337,175 @@ fn find_split_point(text: &str) -> usize {
         idx -= 1;
     }
     idx
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum MarkdownSegment {
+    Text(String),
+    CodeBlock(String),
+}
+
+fn markdown_to_telegram_html(message: &str) -> String {
+    split_markdown_segments(message)
+        .into_iter()
+        .map(render_markdown_segment)
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn split_markdown_segments(message: &str) -> Vec<MarkdownSegment> {
+    let mut segments = Vec::new();
+    let mut cursor = 0;
+
+    while let Some(rel_start) = message[cursor..].find("```") {
+        let start = cursor + rel_start;
+        if start > cursor {
+            segments.push(MarkdownSegment::Text(message[cursor..start].to_string()));
+        }
+        if let Some((end, block)) = take_code_block(message, start) {
+            segments.push(block);
+            cursor = end;
+            continue;
+        }
+        segments.push(MarkdownSegment::Text(message[start..].to_string()));
+        return segments;
+    }
+
+    segments.push(MarkdownSegment::Text(message[cursor..].to_string()));
+    segments
+}
+
+fn take_code_block(message: &str, start: usize) -> Option<(usize, MarkdownSegment)> {
+    let content_start = start + 3;
+    let rel_end = message[content_start..].find("```")?;
+    let content_end = content_start + rel_end;
+    let code = code_block_contents(&message[content_start..content_end]);
+    let end = content_end + 3;
+    Some((end, MarkdownSegment::CodeBlock(code.to_string())))
+}
+
+fn code_block_contents(block: &str) -> &str {
+    let without_language = match block.find('\n') {
+        Some(newline) => &block[newline + 1..],
+        None => block,
+    };
+    without_language
+        .strip_suffix('\n')
+        .unwrap_or(without_language)
+}
+
+fn render_markdown_segment(segment: MarkdownSegment) -> String {
+    match segment {
+        MarkdownSegment::Text(text) => render_text_segment(&text),
+        MarkdownSegment::CodeBlock(code) => format!("<pre>{}</pre>", escape_html(&code)),
+    }
+}
+
+fn render_text_segment(text: &str) -> String {
+    let escaped = escape_html(text);
+    let (protected, codes) = protect_inline_code(&escaped);
+    let bolded = bold_regex()
+        .replace_all(&protected, "<b>$1</b>")
+        .into_owned();
+    let italicized = apply_italic_tags(&bolded);
+    restore_code_tokens(italicized, codes)
+}
+
+fn protect_inline_code(text: &str) -> (String, Vec<String>) {
+    let mut output = String::new();
+    let mut codes = Vec::new();
+    let mut cursor = 0;
+
+    while let Some(rel_start) = text[cursor..].find('`') {
+        let start = cursor + rel_start;
+        output.push_str(&text[cursor..start]);
+        let code_start = start + 1;
+        let Some(rel_end) = text[code_start..].find('`') else {
+            output.push_str(&text[start..]);
+            return (output, codes);
+        };
+        let code_end = code_start + rel_end;
+        if code_end == code_start {
+            output.push('`');
+            cursor = code_start;
+            continue;
+        }
+        push_code_token(&mut output, &mut codes, &text[code_start..code_end]);
+        cursor = code_end + 1;
+    }
+
+    output.push_str(&text[cursor..]);
+    (output, codes)
+}
+
+fn push_code_token(output: &mut String, codes: &mut Vec<String>, code: &str) {
+    let index = codes.len();
+    output.push_str(&format!("\u{E000}CODE{index}\u{E001}"));
+    codes.push(format!("<code>{code}</code>"));
+}
+
+fn restore_code_tokens(mut text: String, codes: Vec<String>) -> String {
+    for (index, code) in codes.into_iter().enumerate() {
+        text = text.replace(&format!("\u{E000}CODE{index}\u{E001}"), &code);
+    }
+    text
+}
+
+fn bold_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"\*\*(.+?)\*\*").expect("valid bold regex"))
+}
+
+fn apply_italic_tags(text: &str) -> String {
+    let mut output = String::new();
+    let mut cursor = 0;
+
+    while let Some(rel_start) = text[cursor..].find('*') {
+        let start = cursor + rel_start;
+        output.push_str(&text[cursor..start]);
+        if !is_single_asterisk(text, start) {
+            output.push('*');
+            cursor = start + 1;
+            continue;
+        }
+        let Some(end) = find_italic_end(text, start + 1) else {
+            output.push('*');
+            cursor = start + 1;
+            continue;
+        };
+        output.push_str("<i>");
+        output.push_str(&text[start + 1..end]);
+        output.push_str("</i>");
+        cursor = end + 1;
+    }
+
+    output.push_str(&text[cursor..]);
+    output
+}
+
+fn is_single_asterisk(text: &str, index: usize) -> bool {
+    let bytes = text.as_bytes();
+    bytes[index] == b'*'
+        && (index == 0 || bytes[index - 1] != b'*')
+        && (index + 1 == bytes.len() || bytes[index + 1] != b'*')
+}
+
+fn find_italic_end(text: &str, start: usize) -> Option<usize> {
+    let mut cursor = start;
+    while let Some(rel_index) = text[cursor..].find('*') {
+        let index = cursor + rel_index;
+        if index > start && is_single_asterisk(text, index) {
+            return Some(index);
+        }
+        cursor = index + 1;
+    }
+    None
+}
+
+fn escape_html(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 // ---------------------------------------------------------------------------
@@ -764,10 +934,8 @@ impl Channel for TelegramChannel {
     }
 
     fn send_response(&self, message: &str, context: &ResponseContext) -> Result<(), ChannelError> {
-        // Send as plain text by default. Telegram's Markdown parser is strict
-        // and breaks on common characters (* _ ` etc.) in tool output and
-        // slash command responses. Plain text is always safe.
-        self.queue_response(message, context, None)
+        let html = markdown_to_telegram_html(message);
+        self.queue_response(&html, context, Some("HTML".to_string()))
     }
 }
 
@@ -837,6 +1005,10 @@ mod tests {
                 }}
             }}"#
         )
+    }
+
+    fn assert_markdown_to_html(input: &str, expected: &str) {
+        assert_eq!(markdown_to_telegram_html(input), expected);
     }
 
     // ── Parse update tests ──────────────────────────────────────────────
@@ -1192,6 +1364,92 @@ mod tests {
         assert!(!json_str.contains("reply_to_message_id"));
     }
 
+    #[test]
+    fn markdown_to_html_converts_bold() {
+        assert_markdown_to_html("**hello**", "<b>hello</b>");
+    }
+
+    #[test]
+    fn markdown_to_html_converts_italic() {
+        assert_markdown_to_html("*hello*", "<i>hello</i>");
+    }
+
+    #[test]
+    fn markdown_to_html_converts_inline_code() {
+        assert_markdown_to_html("`foo`", "<code>foo</code>");
+    }
+
+    #[test]
+    fn markdown_to_html_converts_code_block() {
+        assert_markdown_to_html("```\ncode\n```", "<pre>code</pre>");
+    }
+
+    #[test]
+    fn markdown_to_html_escapes_html_in_plain_text() {
+        assert_markdown_to_html("<script>", "&lt;script&gt;");
+    }
+
+    #[test]
+    fn markdown_to_html_handles_mixed_formatting() {
+        assert_markdown_to_html(
+            "**hello** `foo` world",
+            "<b>hello</b> <code>foo</code> world",
+        );
+    }
+
+    #[test]
+    fn markdown_to_html_leaves_plain_text_unchanged() {
+        assert_markdown_to_html("just plain text", "just plain text");
+    }
+
+    #[test]
+    fn markdown_to_html_keeps_code_blocks_literal() {
+        assert_markdown_to_html("```\n**hello**\n```", "<pre>**hello**</pre>");
+    }
+
+    #[test]
+    fn markdown_to_html_handles_bold_with_inline_code_inside() {
+        assert_markdown_to_html(
+            "**bold with `code` inside**",
+            "<b>bold with <code>code</code> inside</b>",
+        );
+    }
+
+    #[test]
+    fn markdown_to_html_returns_empty_string_for_empty_input() {
+        assert_markdown_to_html("", "");
+    }
+
+    #[test]
+    fn markdown_to_html_escapes_ampersands() {
+        assert_markdown_to_html("AT&T", "AT&amp;T");
+    }
+
+    #[test]
+    fn markdown_to_html_leaves_unclosed_bold_as_plain_text() {
+        assert_markdown_to_html("**hello", "**hello");
+    }
+
+    #[test]
+    fn markdown_to_html_leaves_unclosed_inline_code_as_plain_text() {
+        assert_markdown_to_html("`hello", "`hello");
+    }
+
+    #[test]
+    fn markdown_to_html_leaves_unclosed_code_block_as_plain_text() {
+        assert_markdown_to_html("```\nhello", "```\nhello");
+    }
+
+    #[test]
+    fn markdown_to_html_strips_code_block_language_tag() {
+        assert_markdown_to_html("```rust\nlet x = 1;\n```", "<pre>let x = 1;</pre>");
+    }
+
+    #[test]
+    fn markdown_to_html_double_escapes_existing_html_entities() {
+        assert_markdown_to_html("&amp; &lt;", "&amp;amp; &amp;lt;");
+    }
+
     // ── Channel trait tests ─────────────────────────────────────────────
 
     #[test]
@@ -1206,21 +1464,22 @@ mod tests {
     }
 
     #[test]
-    fn send_response_queues_plain_text_by_default() {
+    fn send_response_queues_html_formatted_message() {
         let ch = make_channel();
         let context = ResponseContext {
             routing_key: Some("12345".to_string()),
             reply_to: Some("99".to_string()),
         };
-        ch.send_response("hello", &context).expect("queue response");
+        ch.send_response("**hello**", &context)
+            .expect("queue response");
 
         let outbound = ch.drain_outbound();
         assert_eq!(
             outbound,
             vec![QueuedMessage {
                 chat_id: 12345,
-                text: "hello".to_string(),
-                parse_mode: None,
+                text: "<b>hello</b>".to_string(),
+                parse_mode: Some("HTML".to_string()),
                 reply_to_message_id: Some(99),
             }]
         );
