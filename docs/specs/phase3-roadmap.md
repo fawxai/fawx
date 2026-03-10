@@ -1,149 +1,146 @@
 # Phase 3 Roadmap — Documentation, Polish & Launch
 
-**Status:** Planning  
-**Prerequisite:** Phase 2 complete (17 PRs merged to dev)  
-**Goal:** Ship-ready codebase — docs, CI, landing page, integration tested, released.
+**Status:** Final Sprint  
+**Prerequisite:** Phase 2 complete (17 PRs), Phase 3a-3b nearly complete  
+**Goal:** Ship-ready codebase — docs, ops, polish, integration tested, released.  
+**Launch target:** Wednesday March 11, 2026
 
 ---
 
-## 3a: Documentation & OSS Prep (no dev dependency — start now)
+## Progress Summary — Session 4 (March 9-10, 2026)
 
-These can all be done against current main/staging since they're docs and content.
+### Phase 2 — ALL COMPLETE ✅ (17 PRs merged)
+- 2a: edit_file, persistent logs, background processes, streaming P1, proposals UX
+- 2a+: Streaming P2 (engine + HTTP SSE)
+- 2b: 7 WASM skills (weather, vision, TTS, STT, browser, canvas, scheduler) + skill migration
+- 2c: Engine intelligence (embeddings, embedding index, memory_search)
 
-### 1. README Rewrite
-The current README references `ct-*` crate names, old architecture, and doesn't reflect the current state. Complete rewrite:
-- Update project description: TUI-first agentic engine, not "phone agent"
-- Fix crate names: `fx-*` not `ct-*`
-- Update architecture diagram (kernel + loadable + TUI + HTTP API)
-- Update features list (streaming, WASM skills, memory, edit_file, etc.)
-- Update getting started (fawx setup, fawx-tui, config.toml)
-- Update test counts (2,000+)
-- Update roadmap to current horizons
-- Remove Android-specific sections (moved to Citros)
-- Add WASM skill marketplace section
+### Phase 3a — Docs ✅ COMPLETE
+- [x] README.md rewrite (315 lines)
+- [x] ARCHITECTURE.md rewrite (34-crate map)
+- [x] CONTRIBUTING.md (new)
+- [x] 63 docs archived
+- [x] Docs index added
 
-### 2. Architecture Docs
-- Update `ARCHITECTURE.md` to reflect current crate map
-- Add HTTP API docs (endpoints, SSE streaming, auth)
-- Add WASM skill development guide (host_api_v1, manifest, testing)
-- Clean up `docs/` — archive obsolete specs, organize by topic
+### Phase 3b — Ops ✅ COMPLETE (7 PRs merged)
+- [x] PR #1304: Build script + `fawx restart`
+- [x] PR #1305: CLI ops (doctor, status, version, logs, security-audit) + Telegram commands + plain text fix
+- [x] PR #1312: `skills/build.sh --install`
+- [x] PR #1313: Proposal gate security fix
+- [x] PR #1315: `fawx update` command + restart --rebuild enhancement
+- [x] PR #1316: `fawx chat` → embedded TUI (no server needed)
+- [x] PR #1317: `fawx import` + `fawx backup` (lossless migration, all .md files)
+- [x] PR #1318: Planner resilience (skip failed candidates instead of aborting)
 
-### 3. Contributing Guide
-- Code standards (link to ENGINEERING.md)
-- PR process (dev → staging → main)
-- Skill development guide
-- Issue templates
+### Hotfixes (direct commits to dev, reviewed)
+- TUI SSE wire format alignment (#1314)
+- SSE dispatch tests + dead serde attr cleanup
+- Slash commands display response
+- Duplicate response text prevention
+- dispatch_sse_frame decomposition (40-line compliance)
+- DEFAULT_OPENAI_MODELS update
+- TUI Accept header fix for streaming
+- Bash empty array expansion on macOS
 
-### 4. fawx.ai Landing Page
-- Hero section: what Fawx is
-- Features grid: skills, streaming, memory, security
-- Quick start
-- Links to GitHub, docs
-
-### 5. Docs Cleanup
-- Archive completed specs to `docs/archive/`
-- Remove deprecated docs
-- Consolidate duplicate content
-- `docs/` README with index
-
----
-
-## 3b: Build & Operations (targets dev branch)
-
-### 6. Unified Build Script (#1269)
-- Single `scripts/build.sh` that builds engine, TUI, and all WASM skills
-- Cross-platform (Linux + macOS)
-- `--release` flag for production builds
-- Outputs version info
-
-### 7. `fawx restart` Command (#1274)
-- Unified stop/build/start command
-- Graceful shutdown (save state, close connections)
-- Build verification before restart
-
-### 8. CI Improvements
-- Add WASM skill build step to CI
-- Add integration test smoke check
-- Ensure CI runs against dev branch too (not just staging/main)
-- Add badge for skill build status
+### Integration Testing (Mac Mini) — PARTIAL
+- [x] Build on Mac Mini
+- [x] `fawx setup` wizard
+- [x] `fawx serve --http` + Telegram channel
+- [x] Skills built (8/8)
+- [x] Model switch mid-conversation
+- [x] SSE streaming in TUI
+- [x] Slash commands in Telegram
+- [x] `fawx update dev` (dirty tree check)
+- [ ] Slash commands in TUI (fix pushed, needs pull+rebuild)
+- [ ] Skill install + WASM skill test
+- [ ] Proposal gate test
+- [ ] File operations test
+- [ ] Background process test
+- [ ] Memory test
 
 ---
 
-## 3c: Integration Testing (needs Joe + Mac Mini)
+## What's Left Before Launch
 
-### 9. Full Integration Test on Dev
-Build dev branch on Mac Mini, run through checklist:
-- Engine capabilities: edit_file, read_file offset, persistent logs, background procs, proposals
-- Streaming: text streaming, tool calls, HTTP SSE
-- Memory: write + semantic search (keyword fallback if no model)
-- WASM skills: weather, vision, TTS, STT, browser, canvas, scheduler
-- Stress: multi-tool calls, interrupt, error recovery
+### Must-Have (Blocking Launch)
 
-### 10. Dev → Staging Promotion
-- Merge dev to staging after integration passes
-- Verify staging CI green
+#### 1. Integration Testing — Finish Checklist
+Pull latest dev on Mac Mini, rebuild, complete remaining tests:
+- Slash commands in TUI
+- WASM skill execution (weather, etc.)
+- Proposal gate (write to protected file, verify proposal)
+- File operations (edit_file, read_file offset)
+- Background processes
+- Memory (journal_write + journal_search)
 
----
+#### 2. Dev → Staging Promotion
+After integration passes, merge dev → staging.
 
-## 3d: Release & Launch
+#### 3. OSS Repo Scrub
+Before making public, remove:
+- `docs/archive/backlog-specs/` (internal planning)
+- `docs/specs/phase3-roadmap.md` (internal roadmap)
+- `TASTE.md` (internal preferences)
+- Any "OS transition" / "Horizon" / VC / Launch Fest references
+- Cleanest approach: fresh `fawxai/fawx` repo with squashed initial commit from dev
 
-### 11. Staging → Main Release
+#### 4. Staging → Main Release
 - Release PR with changelog
 - Version bump
 - Final CI check
 
-### 12. Repo Transfer
-- Transfer `abbudjoe/fawx` to `fawxai/fawx`
-- Update all references (CI, docs, links)
-- Set up GitHub org settings
+#### 5. Repo Transfer to fawxai Org
+- Create `fawxai/fawx` (public)
+- `fawxai/fawxtui` already exists (public)
+- Update references in docs, CI, links
 
-### 13. fawx.ai Deploy
-- Deploy landing page
-- DNS setup
-- SSL cert
+### Nice-to-Have (Can Ship After Launch)
 
-### 14. Launch Fest Prep
-- Demo script
-- Pitch deck updates
-- Recorded demo as backup
+#### 6. Phase 3c — Polish
+- TUI welcome screen redesign (spec: `docs/specs/tui-welcome-screen.md`)
+- CLI output polish V2 (spec: `docs/specs/cli-output-polish.md`)
 
----
+#### 7. fawx.ai Landing Page
+- HTML received from Cowork, needs review/revision
+- Fox mascot ready
+- Deploy after repo is public (links need to resolve)
 
-## Sequencing
+#### 8. Engine Context Loading
+- Load all .md files from `~/.fawx/context/` into system prompt
+- Makes import fully functional (files are copied but not yet read by engine)
 
-```
-NOW (no dev dependency):
-  3a.1 README rewrite
-  3a.2 Architecture docs
-  3a.3 Contributing guide
-  3a.4 Landing page content
-  3a.5 Docs cleanup
-
-PARALLEL (targets dev):
-  3b.6 Build script
-  3b.7 fawx restart
-  3b.8 CI improvements
-
-AFTER DOCS + JOE AVAILABLE:
-  3c.9 Integration testing
-  3c.10 Dev → staging
-
-AFTER INTEGRATION:
-  3d.11 Release
-  3d.12 Repo transfer
-  3d.13 Landing page deploy
-  3d.14 Launch Fest prep
-```
+#### 9. Fast Follow-ups
+- #1298: Shell completions (bash/zsh/fish)
+- #1299: `fawx config set KEY VALUE`
+- #1300: `fawx skill create` scaffolding
 
 ---
 
-## Decisions
-- **Launch date:** Wednesday March 11, 2026
-- **Landing page:** Post repo transfer (not blocking launch)
-- **Launch Fest:** Missed — not blocking
-- **Repo transfer:** Before launch (fawxai/fawx is the public identity)
-- **Public README:** Include everything built. Exclude future roadmap items. Show the safety architecture — it's the moat.
+## CLI Feature Complete ✅
+
+```
+fawx setup          — first-run wizard
+fawx chat           — embedded TUI (no server needed) ← NEW
+fawx serve          — headless/HTTP mode
+fawx tui            — TUI (connects to HTTP server)
+fawx start/stop/restart — daemon control
+fawx update [BRANCH] — pull + build all + restart
+fawx import --from openclaw — migrate from OpenClaw (lossless)
+fawx backup         — backup ~/.fawx/ to tar.gz
+fawx doctor         — diagnostics
+fawx status         — runtime status
+fawx version        — version + git hash + build date
+fawx logs           — tail persistent logs
+fawx security-audit — full security audit
+fawx config         — show config
+fawx auth           — credential management
+fawx skill install/list/sign/verify — skill management
+fawx audit show/verify — audit log
+fawx search/install — marketplace
+```
+
+---
 
 ## Timeline
-- **Tue 3/10:** Docs, cleanup, README rewrite, integration test on Mac Mini
-- **Wed 3/11:** Repo transfer → final checks → launch
+- **Tue 3/10 (now):** Finish integration testing, dev → staging
+- **Wed 3/11:** OSS scrub, repo transfer, release, launch
