@@ -78,6 +78,9 @@ enum Commands {
     /// Restart the running agent daemon
     Restart(restart::RestartArgs),
 
+    /// Pull latest code, rebuild, and restart
+    Update(commands::update::UpdateArgs),
+
     /// Run system diagnostics
     Doctor,
 
@@ -772,6 +775,7 @@ async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
             }
         }
         Commands::Restart(args) => restart::run(args),
+        Commands::Update(args) => commands::update::run(args),
         Commands::Doctor => Ok(commands::doctor::run().await?),
         Commands::Status => Ok(commands::status::run().await?),
         Commands::Version => Ok(commands::version::run()),
@@ -1005,7 +1009,21 @@ mod tests {
             cli.command,
             Some(Commands::Restart(restart::RestartArgs {
                 rebuild: true,
-                hard: false
+                hard: false,
+                no_skills: false,
+            }))
+        ));
+    }
+
+    #[test]
+    fn cli_parses_restart_rebuild_no_skills_flag() {
+        let cli = Cli::parse_from(["fawx", "restart", "--rebuild", "--no-skills"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Restart(restart::RestartArgs {
+                rebuild: true,
+                hard: false,
+                no_skills: true,
             }))
         ));
     }
@@ -1017,8 +1035,24 @@ mod tests {
             cli.command,
             Some(Commands::Restart(restart::RestartArgs {
                 rebuild: false,
-                hard: true
+                hard: true,
+                no_skills: false,
             }))
+        ));
+    }
+
+    #[test]
+    fn cli_parses_update_command() {
+        let cli = Cli::parse_from(["fawx", "update", "dev", "--no-skills", "--no-restart"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Update(crate::commands::update::UpdateArgs {
+                branch,
+                no_pull: false,
+                no_skills: true,
+                no_restart: true,
+                force: false,
+            })) if branch.as_deref() == Some("dev")
         ));
     }
 

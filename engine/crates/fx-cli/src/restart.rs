@@ -11,7 +11,7 @@ use std::{
 };
 
 const PID_FILE_NAME: &str = "fawx.pid";
-const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const RESTART_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const DEFAULT_START_ARGS: &[&str] = &["serve", "--http"];
 
@@ -24,6 +24,10 @@ pub(crate) struct RestartArgs {
     /// Stop the engine and start it again without rebuilding
     #[arg(long, conflicts_with = "rebuild")]
     pub(crate) hard: bool,
+
+    /// Skip WASM skill rebuild and install when using --rebuild
+    #[arg(long, requires = "rebuild")]
+    pub(crate) no_skills: bool,
 }
 
 impl RestartArgs {
@@ -35,13 +39,17 @@ impl RestartArgs {
         } else {
             RestartMode::Graceful
         };
-        RestartRequest { mode }
+        RestartRequest {
+            mode,
+            no_skills: self.no_skills,
+        }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RestartRequest {
     mode: RestartMode,
+    no_skills: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,9 +60,21 @@ enum RestartMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RestartSignal {
+pub(crate) enum RestartSignal {
     Hangup,
     Terminate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BuildOutcome {
+    pub(crate) skill_result: SkillBuildResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SkillBuildResult {
+    Installed,
+    Skipped,
+    Failed(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,7 +106,7 @@ fn restart_config() -> anyhow::Result<RestartConfig> {
     })
 }
 
-fn pid_file_path() -> PathBuf {
+pub(crate) fn pid_file_path() -> PathBuf {
     let base_data_dir = startup::fawx_data_dir();
     let data_dir = startup::load_config()
         .map(|config| startup::configured_data_dir(&base_data_dir, &config))
@@ -99,11 +119,11 @@ fn execute_restart(
     config: &RestartConfig,
     request: RestartRequest,
 ) -> anyhow::Result<()> {
-    let pid = resolve_target_pid(system, &config.pid_file)?;
+    let pid = resolve_target_pid(system, &config.pid_file)?
+        .ok_or_else(|| anyhow!("no running fawx serve process found"))?;
     match request.mode {
         RestartMode::Graceful => graceful_restart(system, pid),
-        RestartMode::Hard => stop_and_start(system, config, pid, false),
-        RestartMode::Rebuild => stop_and_start(system, config, pid, true),
+        RestartMode::Hard | RestartMode::Rebuild => stop_and_start(system, config, pid, request),
     }
 }
 
@@ -117,38 +137,46 @@ fn stop_and_start(
     system: &impl RestartSystem,
     config: &RestartConfig,
     pid: u32,
-    rebuild: bool,
+    request: RestartRequest,
 ) -> anyhow::Result<()> {
     system.send_signal(pid, RestartSignal::Terminate)?;
     wait_for_exit(system, pid, config.stop_timeout)?;
-    if rebuild {
-        rebuild_binary(system, config.repo_root.as_deref())?;
+    if request.mode == RestartMode::Rebuild {
+        rebuild_binary(system, config.repo_root.as_deref(), request.no_skills)?;
     }
-    let executable = executable_to_start(config, rebuild);
-    system.spawn_serve(&executable)?;
-    println!("Started fawx via {}", executable.display());
+    let executable = executable_to_start(config, request.mode == RestartMode::Rebuild);
+    let new_pid = system.spawn_serve(&executable)?;
+    println!("Started fawx via {} (pid {new_pid})", executable.display());
     Ok(())
 }
 
-fn rebuild_binary(system: &impl RestartSystem, repo_root: Option<&Path>) -> anyhow::Result<()> {
+fn rebuild_binary(
+    system: &impl RestartSystem,
+    repo_root: Option<&Path>,
+    skip_skills: bool,
+) -> anyhow::Result<()> {
     let repo_root =
         repo_root.ok_or_else(|| anyhow!("unable to locate the fawx repo for --rebuild"))?;
-    system.run_rebuild(repo_root)
+    let _ = system.build_all(repo_root, skip_skills)?;
+    Ok(())
 }
 
 fn executable_to_start(config: &RestartConfig, rebuild: bool) -> PathBuf {
     if !rebuild {
         return config.current_exe.clone();
     }
-    config
-        .repo_root
-        .as_deref()
-        .map(release_binary_path)
-        .filter(|path| path.is_file())
-        .unwrap_or_else(|| config.current_exe.clone())
+    release_binary_path(&config.repo_root, &config.current_exe)
 }
 
-fn release_binary_path(repo_root: &Path) -> PathBuf {
+pub(crate) fn release_binary_path(repo_root: &Option<PathBuf>, fallback: &Path) -> PathBuf {
+    repo_root
+        .as_deref()
+        .map(release_binary_at_root)
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| fallback.to_path_buf())
+}
+
+fn release_binary_at_root(repo_root: &Path) -> PathBuf {
     repo_root
         .join("target")
         .join("release")
@@ -163,16 +191,17 @@ fn fawx_binary_name() -> &'static str {
     }
 }
 
-fn resolve_target_pid(system: &impl RestartSystem, pid_file: &Path) -> anyhow::Result<u32> {
+pub(crate) fn resolve_target_pid(
+    system: &impl RestartSystem,
+    pid_file: &Path,
+) -> anyhow::Result<Option<u32>> {
     if let Some(pid) = read_pid_file(pid_file)? {
         if system.process_exists(pid)? {
-            return Ok(pid);
+            return Ok(Some(pid));
         }
         remove_pid_file(pid_file)?;
     }
-    system
-        .find_fawx_process(std::process::id())?
-        .ok_or_else(|| anyhow!("no running fawx serve process found"))
+    system.find_fawx_process(std::process::id())
 }
 
 fn read_pid_file(path: &Path) -> anyhow::Result<Option<u32>> {
@@ -217,7 +246,11 @@ fn remove_pid_file_if_owned(path: &Path, pid: u32) -> anyhow::Result<()> {
     }
 }
 
-fn wait_for_exit(system: &impl RestartSystem, pid: u32, timeout: Duration) -> anyhow::Result<()> {
+pub(crate) fn wait_for_exit(
+    system: &impl RestartSystem,
+    pid: u32,
+    timeout: Duration,
+) -> anyhow::Result<()> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if !system.process_exists(pid)? {
@@ -256,15 +289,15 @@ impl Drop for PidFileGuard {
     }
 }
 
-trait RestartSystem {
+pub(crate) trait RestartSystem {
     fn process_exists(&self, pid: u32) -> anyhow::Result<bool>;
     fn find_fawx_process(&self, exclude_pid: u32) -> anyhow::Result<Option<u32>>;
     fn send_signal(&self, pid: u32, signal: RestartSignal) -> anyhow::Result<()>;
-    fn run_rebuild(&self, repo_root: &Path) -> anyhow::Result<()>;
-    fn spawn_serve(&self, executable: &Path) -> anyhow::Result<()>;
+    fn build_all(&self, repo_root: &Path, skip_skills: bool) -> anyhow::Result<BuildOutcome>;
+    fn spawn_serve(&self, executable: &Path) -> anyhow::Result<u32>;
 }
 
-struct LiveRestartSystem;
+pub(crate) struct LiveRestartSystem;
 
 impl RestartSystem for LiveRestartSystem {
     fn process_exists(&self, pid: u32) -> anyhow::Result<bool> {
@@ -279,11 +312,11 @@ impl RestartSystem for LiveRestartSystem {
         send_signal(pid, signal)
     }
 
-    fn run_rebuild(&self, repo_root: &Path) -> anyhow::Result<()> {
-        run_rebuild(repo_root)
+    fn build_all(&self, repo_root: &Path, skip_skills: bool) -> anyhow::Result<BuildOutcome> {
+        build_all(repo_root, skip_skills)
     }
 
-    fn spawn_serve(&self, executable: &Path) -> anyhow::Result<()> {
+    fn spawn_serve(&self, executable: &Path) -> anyhow::Result<u32> {
         spawn_serve(executable)
     }
 }
@@ -320,22 +353,60 @@ fn is_fawx_serve_command(command: &str) -> bool {
     command.contains("fawx") && command.contains(" serve") && !command.contains(" restart")
 }
 
-fn run_rebuild(repo_root: &Path) -> anyhow::Result<()> {
+pub(crate) fn build_all(repo_root: &Path, skip_skills: bool) -> anyhow::Result<BuildOutcome> {
+    build_release_package(repo_root, "fx-cli", "engine")?;
+    build_release_package(repo_root, "fawx-tui", "TUI")?;
+    let skill_result = if skip_skills {
+        SkillBuildResult::Skipped
+    } else {
+        build_skills(repo_root)
+    };
+    Ok(BuildOutcome { skill_result })
+}
+
+fn build_release_package(repo_root: &Path, package: &str, label: &str) -> anyhow::Result<()> {
+    println!("Building {label}...");
     let cargo = cargo_binary()?;
     let status = Command::new(cargo)
         .current_dir(repo_root)
-        .args(["build", "--release", "-p", "fx-cli"])
+        .args(["build", "--release", "-p", package])
         .status()
-        .context("failed to start cargo build for fx-cli")?;
+        .with_context(|| format!("failed to start cargo build for {package}"))?;
     ensure_command_succeeded(status.success(), "cargo build")?;
+    println!("{label} built (release)");
     Ok(())
 }
 
-fn cargo_binary() -> anyhow::Result<PathBuf> {
-    which::which("cargo").context("failed to locate cargo in PATH for --rebuild")
+fn build_skills(repo_root: &Path) -> SkillBuildResult {
+    println!("Building skills...");
+    match run_skill_build(repo_root) {
+        Ok(()) => {
+            println!("Skills built and installed");
+            SkillBuildResult::Installed
+        }
+        Err(error) => {
+            eprintln!("warning: skill build failed: {error}");
+            SkillBuildResult::Failed(error.to_string())
+        }
+    }
 }
 
-fn spawn_serve(executable: &Path) -> anyhow::Result<()> {
+fn run_skill_build(repo_root: &Path) -> anyhow::Result<()> {
+    let script = repo_root.join("skills").join("build.sh");
+    let status = Command::new(&script)
+        .current_dir(repo_root)
+        .arg("--install")
+        .status()
+        .with_context(|| format!("failed to start {} --install", script.display()))?;
+    ensure_command_succeeded(status.success(), "skills/build.sh")?;
+    Ok(())
+}
+
+pub(crate) fn cargo_binary() -> anyhow::Result<PathBuf> {
+    which::which("cargo").context("failed to locate cargo in PATH for rebuild/update")
+}
+
+pub(crate) fn spawn_serve(executable: &Path) -> anyhow::Result<u32> {
     let mut command = Command::new(executable);
     command
         .args(DEFAULT_START_ARGS)
@@ -347,10 +418,10 @@ fn spawn_serve(executable: &Path) -> anyhow::Result<()> {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    command
+    let child = command
         .spawn()
         .with_context(|| format!("failed to start {} serve --http", executable.display()))?;
-    Ok(())
+    Ok(child.id())
 }
 
 #[cfg(unix)]
@@ -371,7 +442,6 @@ fn process_exists(pid: u32) -> anyhow::Result<bool> {
 }
 
 #[cfg(not(unix))]
-/// Non-Unix fallback used by restart pid resolution; always returns `false`.
 fn process_exists(_pid: u32) -> anyhow::Result<bool> {
     Ok(false)
 }
@@ -396,31 +466,33 @@ fn send_signal(_pid: u32, _signal: RestartSignal) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use std::{cell::RefCell, collections::VecDeque};
 
     struct MockRestartSystem {
-        process_exists_responses: RefCell<Vec<bool>>,
+        process_exists_responses: RefCell<VecDeque<bool>>,
         search_result: Option<u32>,
         sent_signals: RefCell<Vec<(u32, RestartSignal)>>,
-        rebuild_roots: RefCell<Vec<PathBuf>>,
+        build_requests: RefCell<Vec<(PathBuf, bool)>>,
         spawned_paths: RefCell<Vec<PathBuf>>,
+        spawn_pid: u32,
     }
 
     impl MockRestartSystem {
         fn new(process_exists_responses: Vec<bool>, search_result: Option<u32>) -> Self {
             Self {
-                process_exists_responses: RefCell::new(process_exists_responses),
+                process_exists_responses: RefCell::new(process_exists_responses.into()),
                 search_result,
                 sent_signals: RefCell::new(Vec::new()),
-                rebuild_roots: RefCell::new(Vec::new()),
+                build_requests: RefCell::new(Vec::new()),
                 spawned_paths: RefCell::new(Vec::new()),
+                spawn_pid: 42_424,
             }
         }
     }
 
     impl RestartSystem for MockRestartSystem {
         fn process_exists(&self, _pid: u32) -> anyhow::Result<bool> {
-            let next = self.process_exists_responses.borrow_mut().pop();
+            let next = self.process_exists_responses.borrow_mut().pop_front();
             Ok(next.unwrap_or(false))
         }
 
@@ -433,18 +505,23 @@ mod tests {
             Ok(())
         }
 
-        fn run_rebuild(&self, repo_root: &Path) -> anyhow::Result<()> {
-            self.rebuild_roots
+        fn build_all(&self, repo_root: &Path, skip_skills: bool) -> anyhow::Result<BuildOutcome> {
+            self.build_requests
                 .borrow_mut()
-                .push(repo_root.to_path_buf());
-            Ok(())
+                .push((repo_root.to_path_buf(), skip_skills));
+            let skill_result = if skip_skills {
+                SkillBuildResult::Skipped
+            } else {
+                SkillBuildResult::Installed
+            };
+            Ok(BuildOutcome { skill_result })
         }
 
-        fn spawn_serve(&self, executable: &Path) -> anyhow::Result<()> {
+        fn spawn_serve(&self, executable: &Path) -> anyhow::Result<u32> {
             self.spawned_paths
                 .borrow_mut()
                 .push(executable.to_path_buf());
-            Ok(())
+            Ok(self.spawn_pid)
         }
     }
 
@@ -481,7 +558,7 @@ mod tests {
 
         let pid = resolve_target_pid(&system, &pid_file).expect("resolve pid");
 
-        assert_eq!(pid, 4242);
+        assert_eq!(pid, Some(4242));
     }
 
     #[test]
@@ -493,7 +570,7 @@ mod tests {
 
         let pid = resolve_target_pid(&system, &pid_file).expect("resolve pid");
 
-        assert_eq!(pid, 77);
+        assert_eq!(pid, Some(77));
         assert_eq!(read_pid_file(&pid_file).expect("read pid file"), None);
     }
 
@@ -505,7 +582,18 @@ mod tests {
 
         let pid = resolve_target_pid(&system, &pid_file).expect("resolve pid");
 
-        assert_eq!(pid, 55);
+        assert_eq!(pid, Some(55));
+    }
+
+    #[test]
+    fn resolve_target_pid_returns_none_when_no_process_exists() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = temp_dir.path().join(PID_FILE_NAME);
+        let system = MockRestartSystem::new(Vec::new(), None);
+
+        let pid = resolve_target_pid(&system, &pid_file).expect("resolve pid");
+
+        assert_eq!(pid, None);
     }
 
     #[test]
@@ -540,6 +628,7 @@ mod tests {
             &config,
             RestartRequest {
                 mode: RestartMode::Graceful,
+                no_skills: false,
             },
         )
         .expect("graceful restart");
@@ -556,13 +645,14 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let config = test_restart_config(&temp_dir);
         write_pid_file(&config.pid_file, 9002).expect("write pid file");
-        let system = MockRestartSystem::new(vec![false, true], None);
+        let system = MockRestartSystem::new(vec![true, false], None);
 
         execute_restart(
             &system,
             &config,
             RestartRequest {
                 mode: RestartMode::Hard,
+                no_skills: false,
             },
         )
         .expect("hard restart");
@@ -578,10 +668,10 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_restart_runs_cargo_then_starts_release_binary() {
+    fn rebuild_restart_runs_full_build_then_starts_release_binary() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let repo_root = temp_dir.path().join("repo");
-        let release_binary = release_binary_path(&repo_root);
+        let release_binary = release_binary_at_root(&repo_root);
         fs::create_dir_all(release_binary.parent().expect("parent")).expect("release dir");
         fs::write(&release_binary, "binary").expect("release binary");
         let config = RestartConfig {
@@ -591,13 +681,14 @@ mod tests {
             stop_timeout: Duration::from_millis(1),
         };
         write_pid_file(&config.pid_file, 9003).expect("write pid file");
-        let system = MockRestartSystem::new(vec![false, true], None);
+        let system = MockRestartSystem::new(vec![true, false], None);
 
         execute_restart(
             &system,
             &config,
             RestartRequest {
                 mode: RestartMode::Rebuild,
+                no_skills: false,
             },
         )
         .expect("rebuild restart");
@@ -606,8 +697,61 @@ mod tests {
             *system.sent_signals.borrow(),
             vec![(9003, RestartSignal::Terminate)]
         );
-        assert_eq!(*system.rebuild_roots.borrow(), vec![repo_root]);
+        assert_eq!(
+            *system.build_requests.borrow(),
+            vec![(repo_root.clone(), false)]
+        );
         assert_eq!(*system.spawned_paths.borrow(), vec![release_binary]);
+    }
+
+    #[test]
+    fn rebuild_restart_can_skip_skills() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = temp_dir.path().join("repo");
+        let release_binary = release_binary_at_root(&repo_root);
+        fs::create_dir_all(release_binary.parent().expect("parent")).expect("release dir");
+        fs::write(&release_binary, "binary").expect("release binary");
+        let config = RestartConfig {
+            pid_file: temp_dir.path().join(PID_FILE_NAME),
+            current_exe: temp_dir.path().join("target").join("debug").join("fawx"),
+            repo_root: Some(repo_root.clone()),
+            stop_timeout: Duration::from_millis(1),
+        };
+        write_pid_file(&config.pid_file, 9004).expect("write pid file");
+        let system = MockRestartSystem::new(vec![true, false], None);
+
+        execute_restart(
+            &system,
+            &config,
+            RestartRequest {
+                mode: RestartMode::Rebuild,
+                no_skills: true,
+            },
+        )
+        .expect("rebuild restart");
+
+        assert_eq!(*system.build_requests.borrow(), vec![(repo_root, true)]);
+    }
+
+    #[test]
+    fn execute_restart_errors_when_no_running_process_exists() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config = test_restart_config(&temp_dir);
+        let system = MockRestartSystem::new(Vec::new(), None);
+
+        let error = execute_restart(
+            &system,
+            &config,
+            RestartRequest {
+                mode: RestartMode::Graceful,
+                no_skills: false,
+            },
+        )
+        .expect_err("missing process should fail");
+
+        assert!(error
+            .to_string()
+            .contains("no running fawx serve process found"));
     }
 
     #[test]

@@ -19,4 +19,5 @@ pub(crate) mod skill_signatures;
 pub mod skills;
 pub mod slash;
 pub mod status;
+pub mod update;
 pub mod version;
