@@ -69,7 +69,7 @@ build_skill() {
   echo "Building $directory..."
   (
     cd "$SCRIPT_DIR/$directory"
-    "$CARGO_BIN" build --target wasm32-unknown-unknown -j "$CARGO_BUILD_JOBS_VALUE" "${CARGO_ARGS[@]}"
+    "$CARGO_BIN" build --target wasm32-unknown-unknown -j "$CARGO_BUILD_JOBS_VALUE" ${CARGO_ARGS[@]+"${CARGO_ARGS[@]}"}
   )
   cp "$source" "$output"
   echo "✓ $directory built -> $directory/$artifact"

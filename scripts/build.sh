@@ -108,7 +108,7 @@ build_engine() {
   step_header "$1" "Building engine (fawx)..."
   (
     cd "$REPO_ROOT"
-    "$CARGO_BIN" build -p fx-cli -j "$CARGO_BUILD_JOBS_VALUE" "${CARGO_ARGS[@]}"
+    "$CARGO_BIN" build -p fx-cli -j "$CARGO_BUILD_JOBS_VALUE" ${CARGO_ARGS[@]+"${CARGO_ARGS[@]}"}
   )
   echo "✓ fawx built (target/$PROFILE/fawx)"
 }
@@ -117,7 +117,7 @@ build_tui() {
   step_header "$1" "Building TUI (fawx-tui)..."
   (
     cd "$REPO_ROOT"
-    "$CARGO_BIN" build -p fawx-tui -j "$CARGO_BUILD_JOBS_VALUE" "${CARGO_ARGS[@]}"
+    "$CARGO_BIN" build -p fawx-tui -j "$CARGO_BUILD_JOBS_VALUE" ${CARGO_ARGS[@]+"${CARGO_ARGS[@]}"}
   )
   echo "✓ fawx-tui built (target/$PROFILE/fawx-tui)"
 }
@@ -138,7 +138,7 @@ build_skills() {
   step_header "$1" "Building WASM skills..."
   (
     cd "$REPO_ROOT/skills"
-    CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS_VALUE" ./build.sh "${CARGO_ARGS[@]}"
+    CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS_VALUE" ./build.sh ${CARGO_ARGS[@]+"${CARGO_ARGS[@]}"}
   )
   echo "✓ $count skills built"
 }
