@@ -99,11 +99,7 @@ pub fn validate_manifest(manifest: &SkillManifest) -> Result<(), SkillError> {
         ));
     }
 
-    if manifest.author.trim().is_empty() {
-        return Err(SkillError::InvalidManifest(
-            "author cannot be empty".to_string(),
-        ));
-    }
+    // Author is optional for newly scaffolded local skills.
 
     // Validate api_version
     if manifest.api_version != "host_api_v1" && manifest.api_version != "host_api_v2" {
@@ -268,7 +264,7 @@ capabilities = ["network", "storage", "notifications", "sensors", "phone_actions
             entry_point: "run".to_string(),
         };
 
-        assert!(validate_manifest(&manifest).is_err());
+        assert!(validate_manifest(&manifest).is_ok());
     }
 
     #[test]
