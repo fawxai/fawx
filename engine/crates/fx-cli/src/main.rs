@@ -96,6 +96,12 @@ enum Commands {
     /// Run Fawx-specific security checks
     SecurityAudit(commands::security_audit::SecurityAuditArgs),
 
+    /// Create a compressed backup of ~/.fawx
+    Backup(commands::backup::BackupArgs),
+
+    /// Import memory and context from another workspace
+    Import(commands::import::ImportArgs),
+
     /// Interactive first-run setup wizard
     Setup {
         /// Re-run setup even if already configured
@@ -789,6 +795,8 @@ async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
         Commands::Version => Ok(commands::version::run()),
         Commands::Logs(args) => commands::logs::run(&args),
         Commands::SecurityAudit(args) => commands::security_audit::run(&args).await,
+        Commands::Backup(args) => commands::backup::run(&args),
+        Commands::Import(args) => commands::import::run(&args),
         Commands::Setup { force } => Ok(commands::setup::run(force).await?),
         Commands::Auth { command } => Ok(commands::auth::run(command).await?),
         Commands::Config => {

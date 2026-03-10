@@ -2,10 +2,12 @@
 
 pub mod audit;
 pub mod auth;
+pub mod backup;
 pub mod config;
 pub(crate) mod diagnostics;
 pub mod doctor;
 pub mod eval_harness;
+pub mod import;
 pub(crate) mod log_files;
 pub mod logs;
 pub mod marketplace;

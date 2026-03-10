@@ -5,6 +5,26 @@
 //! `fawx-tui` embedded mode.
 
 mod auth_store;
+#[cfg(test)]
+mod backup_command {
+    mod implementation {
+        include!("commands/backup.rs");
+    }
+    use implementation::*;
+    mod tests {
+        include!("commands/backup_tests.rs");
+    }
+}
+#[cfg(test)]
+mod import_command {
+    mod implementation {
+        include!("commands/import.rs");
+    }
+    use implementation::*;
+    mod tests {
+        include!("commands/import_tests.rs");
+    }
+}
 #[path = "commands/slash.rs"]
 pub(crate) mod slash_commands;
 mod commands {
