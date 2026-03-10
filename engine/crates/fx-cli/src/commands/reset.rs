@@ -299,10 +299,6 @@ fn preserve_reset_values(
     source: &serde_json::Value,
     parent: Option<&str>,
 ) {
-    if should_clone_preserved_array(target, source, parent) {
-        *target = source.clone();
-        return;
-    }
     match (target, source) {
         (serde_json::Value::Object(target_map), serde_json::Value::Object(source_map)) => {
             preserve_object_values(target_map, source_map, parent)
@@ -312,17 +308,6 @@ fn preserve_reset_values(
         }
         _ => {}
     }
-}
-
-fn should_clone_preserved_array(
-    target: &serde_json::Value,
-    source: &serde_json::Value,
-    parent: Option<&str>,
-) -> bool {
-    matches!(
-        (target, source),
-        (serde_json::Value::Array(_), serde_json::Value::Array(_))
-    ) && subtree_contains_preserved_values(source, parent)
 }
 
 fn preserve_object_values(
@@ -339,20 +324,93 @@ fn preserve_object_values(
             preserve_reset_values(target_value, source_value, Some(key));
             continue;
         }
-        if subtree_contains_preserved_values(source_value, Some(key)) {
-            target_map.insert(key.clone(), source_value.clone());
-        }
+        insert_missing_preserved_value(target_map, key, source_value);
+    }
+}
+
+fn insert_missing_preserved_value(
+    target_map: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    source_value: &serde_json::Value,
+) {
+    if let Some(value) = build_preserved_reset_value(source_value, Some(key)) {
+        target_map.insert(key.to_string(), value);
     }
 }
 
 fn preserve_array_values(
-    target_items: &mut [serde_json::Value],
+    target_items: &mut Vec<serde_json::Value>,
     source_items: &[serde_json::Value],
     parent: Option<&str>,
 ) {
+    let existing_len = target_items.len();
     for (target_item, source_item) in target_items.iter_mut().zip(source_items) {
         preserve_reset_values(target_item, source_item, parent);
     }
+    let missing_items = source_items
+        .iter()
+        .skip(existing_len)
+        .filter_map(|source_item| build_preserved_reset_value(source_item, parent))
+        .collect::<Vec<_>>();
+    target_items.extend(missing_items);
+}
+
+fn build_preserved_reset_value(
+    source: &serde_json::Value,
+    parent: Option<&str>,
+) -> Option<serde_json::Value> {
+    if !subtree_contains_preserved_values(source, parent) {
+        return None;
+    }
+    let mut target = reset_template_value_for_parent(source, parent);
+    preserve_reset_values(&mut target, source, parent);
+    Some(target)
+}
+
+fn reset_template_value_for_parent(
+    value: &serde_json::Value,
+    parent: Option<&str>,
+) -> serde_json::Value {
+    if parent == Some("nodes") && value.is_object() {
+        return reset_fleet_node_template();
+    }
+    reset_template_value(value)
+}
+
+fn reset_template_value(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .map(|(key, child)| (key.clone(), reset_template_value(child)))
+                .collect(),
+        ),
+        serde_json::Value::Array(_) => serde_json::Value::Array(Vec::new()),
+        serde_json::Value::String(_) => serde_json::Value::String(String::new()),
+        serde_json::Value::Number(number) => reset_number_value(number),
+        serde_json::Value::Bool(_) => serde_json::Value::Bool(false),
+        serde_json::Value::Null => serde_json::Value::Null,
+    }
+}
+
+fn reset_number_value(number: &serde_json::Number) -> serde_json::Value {
+    if number.is_f64() {
+        serde_json::json!(0.0)
+    } else {
+        serde_json::json!(0)
+    }
+}
+
+fn reset_fleet_node_template() -> serde_json::Value {
+    serde_json::json!({
+        "id": "",
+        "name": "",
+        "endpoint": null,
+        "auth_token": null,
+        "capabilities": [],
+        "address": null,
+        "user": null,
+        "ssh_key": null,
+    })
 }
 
 fn subtree_contains_preserved_values(value: &serde_json::Value, parent: Option<&str>) -> bool {
@@ -536,7 +594,7 @@ mod tests {
     }
 
     #[test]
-    fn config_reset_preserves_array_backed_node_credentials() {
+    fn config_reset_preserves_only_array_backed_node_credentials() {
         let fixture = ResetFixture::new(
             "[fleet]\ncoordinator = true\nstale_timeout_seconds = 120\n\n[[fleet.nodes]]\nid = \"node-1\"\nname = \"Node One\"\nendpoint = \"https://node.example\"\nauth_token = \"keep-token\"\nssh_key = \"~/.ssh/node-1\"\ncapabilities = [\"agentic_loop\"]\n",
         );
@@ -564,8 +622,12 @@ mod tests {
             FawxConfig::default().fleet.stale_timeout_seconds
         );
         assert_eq!(reset.fleet.nodes.len(), 1);
-        assert_eq!(reset.fleet.nodes[0].id, "node-1");
-        assert_eq!(reset.fleet.nodes[0].name, "Node One");
+        assert_eq!(reset.fleet.nodes[0].id, "");
+        assert_eq!(reset.fleet.nodes[0].name, "");
+        assert_eq!(reset.fleet.nodes[0].endpoint, None);
+        assert!(reset.fleet.nodes[0].capabilities.is_empty());
+        assert_eq!(reset.fleet.nodes[0].address, None);
+        assert_eq!(reset.fleet.nodes[0].user, None);
         assert_eq!(
             reset.fleet.nodes[0].auth_token.as_deref(),
             Some("keep-token")
@@ -579,7 +641,7 @@ mod tests {
     #[test]
     fn all_reset_preserves_credentials_while_resetting_the_rest() {
         let fixture = ResetFixture::new(
-            "[http]\nbearer_token = \"keep-me\"\n\n[telegram]\nbot_token = \"keep-bot\"\n",
+            "[http]\nbearer_token = \"keep-me\"\n\n[telegram]\nbot_token = \"keep-bot\"\n\n[[fleet.nodes]]\nid = \"node-1\"\nname = \"Node One\"\nendpoint = \"https://node.example\"\nauth_token = \"keep-token\"\nssh_key = \"~/.ssh/node-1\"\ncapabilities = [\"agentic_loop\"]\naddress = \"100.64.0.1\"\nuser = \"deploy\"\n",
         );
         write_dir_file(&fixture.layout.data_dir.join("memory"), "memory.json");
         write_dir_file(&fixture.layout.embedding_model_dir, "index.bin");
@@ -611,6 +673,21 @@ mod tests {
         assert!(fixture.layout.auth_db_path.exists());
         assert_eq!(reset.http.bearer_token.as_deref(), Some("keep-me"));
         assert_eq!(reset.telegram.bot_token.as_deref(), Some("keep-bot"));
+        assert_eq!(reset.fleet.nodes.len(), 1);
+        assert_eq!(reset.fleet.nodes[0].id, "");
+        assert_eq!(reset.fleet.nodes[0].name, "");
+        assert_eq!(reset.fleet.nodes[0].endpoint, None);
+        assert!(reset.fleet.nodes[0].capabilities.is_empty());
+        assert_eq!(reset.fleet.nodes[0].address, None);
+        assert_eq!(reset.fleet.nodes[0].user, None);
+        assert_eq!(
+            reset.fleet.nodes[0].auth_token.as_deref(),
+            Some("keep-token")
+        );
+        assert_eq!(
+            reset.fleet.nodes[0].ssh_key.as_deref(),
+            Some("~/.ssh/node-1")
+        );
     }
 
     #[test]
