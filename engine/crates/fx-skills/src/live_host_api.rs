@@ -17,8 +17,15 @@ const MAX_RESPONSE_BYTES: u64 = 1_048_576;
 /// because this prefix is not valid JSON, HTML, or any known API response
 /// format.
 // COUPLING: This sentinel must match the one in skills/tts-skill/src/lib.rs
-// (and any skill that handles binary HTTP responses).
+// and skills/stt-skill/src/lib.rs (and any skill that handles binary HTTP
+// responses).
 const HOST_BINARY_BASE64_PREFIX: &str = "__fawx_binary_base64__:";
+/// Prefix for binary HTTP request bodies passed over the string-only WASM ABI.
+///
+/// Skills encode raw request bytes as base64 with this sentinel so the host can
+/// reconstruct multipart/form-data or other non-UTF-8 payloads before sending.
+// COUPLING: This sentinel must match the one in skills/stt-skill/src/lib.rs.
+const HOST_REQUEST_BINARY_BASE64_PREFIX: &str = "__fawx_request_binary_base64__:";
 
 /// HTTP request timeout in seconds.
 const REQUEST_TIMEOUT_SECS: u64 = 30;
@@ -91,6 +98,26 @@ fn parse_headers(headers_json: &str) -> Option<Vec<(String, String)>> {
     Some(result)
 }
 
+enum RequestBody<'a> {
+    Empty,
+    Text(&'a str),
+    Binary(Vec<u8>),
+}
+
+fn prepare_request_body(body: &str) -> RequestBody<'_> {
+    if body.is_empty() {
+        return RequestBody::Empty;
+    }
+
+    match body.strip_prefix(HOST_REQUEST_BINARY_BASE64_PREFIX) {
+        Some(encoded) => match base64_decode(encoded) {
+            Some(bytes) => RequestBody::Binary(bytes),
+            None => RequestBody::Text(body),
+        },
+        None => RequestBody::Text(body),
+    }
+}
+
 /// Execute an HTTP request via ureq.
 ///
 /// Enforces HTTPS-only, 30s timeout, and 1MB response limit.
@@ -141,10 +168,10 @@ pub fn execute_http_request(method: &str, url: &str, headers: &str, body: &str) 
     }
 
     // Send request
-    let response = if body.is_empty() {
-        request.call()
-    } else {
-        request.send_string(body)
+    let response = match prepare_request_body(body) {
+        RequestBody::Empty => request.call(),
+        RequestBody::Text(text) => request.send_string(text),
+        RequestBody::Binary(bytes) => request.send_bytes(&bytes),
     };
 
     match response {
@@ -220,6 +247,63 @@ fn base64_encode(bytes: &[u8]) -> String {
         });
     }
     output
+}
+
+// COUPLING: This decoder powers the binary request-body path and must stay
+// compatible with the request-body encoder in skills/stt-skill/src/lib.rs.
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    let bytes: Vec<u8> = input
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+
+    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+
+    let mut output = Vec::with_capacity(bytes.len() / 4 * 3);
+    for chunk in bytes.chunks(4) {
+        decode_base64_chunk(chunk, &mut output)?;
+    }
+    Some(output)
+}
+
+fn decode_base64_chunk(chunk: &[u8], output: &mut Vec<u8>) -> Option<()> {
+    let v0 = decode_base64_value(chunk[0])?;
+    let v1 = decode_base64_value(chunk[1])?;
+    let v2 = decode_optional_base64_value(chunk[2])?;
+    let v3 = decode_optional_base64_value(chunk[3])?;
+    let combined = ((v0 as u32) << 18)
+        | ((v1 as u32) << 12)
+        | ((v2.unwrap_or(0) as u32) << 6)
+        | v3.unwrap_or(0) as u32;
+
+    output.push(((combined >> 16) & 0xFF) as u8);
+    if v2.is_some() {
+        output.push(((combined >> 8) & 0xFF) as u8);
+    }
+    if v3.is_some() {
+        output.push((combined & 0xFF) as u8);
+    }
+    Some(())
+}
+
+fn decode_optional_base64_value(byte: u8) -> Option<Option<u8>> {
+    if byte == b'=' {
+        return Some(None);
+    }
+    decode_base64_value(byte).map(Some)
+}
+
+fn decode_base64_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
 }
 
 impl HostApi for LiveHostApi {
@@ -371,6 +455,44 @@ mod tests {
         // execute_http_request rejects unknown methods
         let result = execute_http_request("CONNECT", "https://example.com", "{}", "");
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn prepare_request_body_decodes_binary_prefix() {
+        let payload = prepare_request_body("__fawx_request_binary_base64__:AQID");
+
+        match payload {
+            RequestBody::Binary(bytes) => assert_eq!(bytes, vec![1, 2, 3]),
+            _ => panic!("expected binary payload"),
+        }
+    }
+
+    #[test]
+    fn prepare_request_body_preserves_invalid_prefixed_text() {
+        let payload = prepare_request_body("__fawx_request_binary_base64__:%%%");
+
+        match payload {
+            RequestBody::Text(body) => {
+                assert_eq!(body, "__fawx_request_binary_base64__:%%%");
+            }
+            _ => panic!("expected text payload"),
+        }
+    }
+
+    #[test]
+    fn prepare_request_body_empty_returns_empty() {
+        let payload = prepare_request_body("");
+        assert!(matches!(payload, RequestBody::Empty));
+    }
+
+    #[test]
+    fn prepare_request_body_plain_text_passes_through() {
+        let payload = prepare_request_body(r#"{"key":"value"}"#);
+
+        match payload {
+            RequestBody::Text(body) => assert_eq!(body, r#"{"key":"value"}"#),
+            _ => panic!("expected text payload"),
+        }
     }
 
     #[test]

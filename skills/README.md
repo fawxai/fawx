@@ -99,6 +99,44 @@ Converts text to speech with OpenAI TTS and returns base64-encoded MP3 audio.
 }
 ```
 
+### STT Skill
+Transcribes speech audio with OpenAI Whisper from either a remote audio URL or base64-encoded audio data.
+
+**Capabilities:** `network`, `storage`
+
+**Input format:**
+```json
+{
+  "audio": "https://example.com/audio.mp3",
+  "language": "en",
+  "prompt": "RustConf keynote terminology",
+  "format": "verbose"
+}
+```
+
+**Output format:**
+```json
+{
+  "status": "success",
+  "text": "Hello, this is a test.",
+  "language": "en",
+  "duration": 3.5,
+  "segments": [
+    {
+      "start": 0.0,
+      "end": 1.2,
+      "text": "Hello,"
+    },
+    {
+      "start": 1.2,
+      "end": 3.5,
+      "text": "this is a test."
+    }
+  ],
+  "message": "🎤 Transcribed audio (22 chars, 3.5s, language: en, 2 segments)"
+}
+```
+
 ### Browser Skill
 Fetches web pages, extracts readable content, searches the web with Brave Search, and can return screenshots via a configured screenshot service.
 
@@ -212,6 +250,7 @@ fawx skill install skills/weather-skill/weather.wasm
 fawx skill install skills/calculator-skill/calculator.wasm
 fawx skill install skills/vision-skill/vision.wasm
 fawx skill install skills/tts-skill/tts.wasm
+fawx skill install skills/stt-skill/stt.wasm
 fawx skill install skills/browser-skill/browser.wasm
 ```
 

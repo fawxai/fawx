@@ -48,6 +48,14 @@ cp target/wasm32-unknown-unknown/release/browser_skill.wasm browser.wasm
 echo "✓ browser-skill built -> browser.wasm"
 cd ..
 
+# Build STT skill
+echo "Building stt-skill..."
+cd stt-skill
+cargo build --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/stt_skill.wasm stt.wasm
+echo "✓ stt-skill built -> stt.wasm"
+cd ..
+
 echo "Building canvas-skill..."
 cd canvas-skill
 cargo build --target wasm32-unknown-unknown --release
@@ -64,4 +72,5 @@ echo "  fawx skill install skills/calculator-skill/calculator.wasm"
 echo "  fawx skill install skills/vision-skill/vision.wasm"
 echo "  fawx skill install skills/tts-skill/tts.wasm"
 echo "  fawx skill install skills/browser-skill/browser.wasm"
+echo "  fawx skill install skills/stt-skill/stt.wasm"
 echo "  fawx skill install skills/canvas-skill/canvas.wasm"
