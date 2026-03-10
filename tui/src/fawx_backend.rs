@@ -377,6 +377,7 @@ impl HttpBackend {
             .auth_request(
                 self.client
                     .post(format!("{}/message", self.base_url))
+                    .header(reqwest::header::ACCEPT, "text/event-stream")
                     .json(&MessageRequest { message }),
             )
             .send()
