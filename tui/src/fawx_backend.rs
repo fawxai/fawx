@@ -503,6 +503,86 @@ pub(crate) fn try_send(tx: &UnboundedSender<BackendEvent>, event: BackendEvent) 
     true
 }
 
+fn handle_text_delta(data: &str, tx: &UnboundedSender<BackendEvent>) -> anyhow::Result<()> {
+    let d: TextDeltaData = serde_json::from_str(data).context("decode text_delta")?;
+    try_send(tx, BackendEvent::TextDelta(d.text));
+    Ok(())
+}
+
+fn handle_tool_call_start(data: &str, tx: &UnboundedSender<BackendEvent>) -> anyhow::Result<()> {
+    let d: ToolCallStartData = serde_json::from_str(data).context("decode tool_call_start")?;
+    try_send(
+        tx,
+        BackendEvent::ToolUse {
+            name: d.name.unwrap_or_default(),
+            arguments: Value::Null,
+        },
+    );
+    Ok(())
+}
+
+fn handle_tool_call_complete(data: &str, tx: &UnboundedSender<BackendEvent>) -> anyhow::Result<()> {
+    let d: ToolCallCompleteData =
+        serde_json::from_str(data).context("decode tool_call_complete")?;
+    try_send(
+        tx,
+        BackendEvent::ToolUse {
+            name: d.name.unwrap_or_default(),
+            arguments: d.arguments,
+        },
+    );
+    Ok(())
+}
+
+fn handle_tool_result(data: &str, tx: &UnboundedSender<BackendEvent>) -> anyhow::Result<()> {
+    let d: ToolResultData = serde_json::from_str(data).context("decode tool_result")?;
+    try_send(
+        tx,
+        BackendEvent::ToolResult {
+            name: d.id,
+            success: !d.is_error,
+            content: d.output.unwrap_or_default(),
+        },
+    );
+    Ok(())
+}
+
+fn handle_done(
+    data: &str,
+    tx: &UnboundedSender<BackendEvent>,
+    saw_text_delta: bool,
+) -> anyhow::Result<()> {
+    let d: DoneData = serde_json::from_str(data).context("decode done")?;
+    // Slash commands send their response only in the done event
+    // (no text_delta events preceded it). For streamed LLM responses
+    // the text already arrived via text_delta, so emitting
+    // done.response again would duplicate the output.
+    if !saw_text_delta {
+        if let Some(response) = d.response.filter(|r| !r.is_empty()) {
+            try_send(tx, BackendEvent::TextDelta(response));
+        }
+    }
+    try_send(
+        tx,
+        BackendEvent::Done {
+            model: None,
+            iterations: None,
+            input_tokens: None,
+            output_tokens: None,
+        },
+    );
+    Ok(())
+}
+
+fn handle_error(data: &str, tx: &UnboundedSender<BackendEvent>) -> anyhow::Result<()> {
+    let d: ErrorData = serde_json::from_str(data).context("decode error")?;
+    try_send(
+        tx,
+        BackendEvent::StreamError(friendly_error_message(&d.error)),
+    );
+    Ok(())
+}
+
 fn dispatch_sse_frame(
     frame: &str,
     tx: &UnboundedSender<BackendEvent>,
@@ -515,77 +595,15 @@ fn dispatch_sse_frame(
     match sse.event_type.as_str() {
         "text_delta" => {
             *saw_text_delta = true;
-            let d: TextDeltaData = serde_json::from_str(&sse.data).context("decode text_delta")?;
-            try_send(tx, BackendEvent::TextDelta(d.text));
+            handle_text_delta(&sse.data, tx)?;
         }
-        "tool_call_start" => {
-            let d: ToolCallStartData =
-                serde_json::from_str(&sse.data).context("decode tool_call_start")?;
-            try_send(
-                tx,
-                BackendEvent::ToolUse {
-                    name: d.name.unwrap_or_default(),
-                    arguments: Value::Null,
-                },
-            );
-        }
-        "tool_call_complete" => {
-            let d: ToolCallCompleteData =
-                serde_json::from_str(&sse.data).context("decode tool_call_complete")?;
-            try_send(
-                tx,
-                BackendEvent::ToolUse {
-                    name: d.name.unwrap_or_default(),
-                    arguments: d.arguments,
-                },
-            );
-        }
-        "tool_result" => {
-            let d: ToolResultData =
-                serde_json::from_str(&sse.data).context("decode tool_result")?;
-            try_send(
-                tx,
-                BackendEvent::ToolResult {
-                    name: d.id,
-                    success: !d.is_error,
-                    content: d.output.unwrap_or_default(),
-                },
-            );
-        }
-        "done" => {
-            let d: DoneData = serde_json::from_str(&sse.data).context("decode done")?;
-            // Slash commands send their response only in the done event
-            // (no text_delta events preceded it). For streamed LLM
-            // responses the text already arrived via text_delta, so
-            // emitting done.response again would duplicate the output.
-            if !*saw_text_delta {
-                if let Some(response) = d.response.filter(|r| !r.is_empty()) {
-                    try_send(tx, BackendEvent::TextDelta(response));
-                }
-            }
-            try_send(
-                tx,
-                BackendEvent::Done {
-                    model: None,
-                    iterations: None,
-                    input_tokens: None,
-                    output_tokens: None,
-                },
-            );
-        }
-        "phase" => {
-            // Phase changes are informational; TUI doesn't need them yet.
-        }
-        "error" => {
-            let d: ErrorData = serde_json::from_str(&sse.data).context("decode error")?;
-            try_send(
-                tx,
-                BackendEvent::StreamError(friendly_error_message(&d.error)),
-            );
-        }
-        other => {
-            tracing::debug!("ignoring unknown SSE event type: {other}");
-        }
+        "tool_call_start" => handle_tool_call_start(&sse.data, tx)?,
+        "tool_call_complete" => handle_tool_call_complete(&sse.data, tx)?,
+        "tool_result" => handle_tool_result(&sse.data, tx)?,
+        "done" => handle_done(&sse.data, tx, *saw_text_delta)?,
+        "phase" => { /* Phase changes are informational; TUI doesn't need them yet. */ }
+        "error" => handle_error(&sse.data, tx)?,
+        other => tracing::debug!("ignoring unknown SSE event type: {other}"),
     }
 
     Ok(())
@@ -964,7 +982,6 @@ model = "gpt-4"
     #[test]
     fn try_send_returns_true_when_receiver_alive() {
         let (tx, _rx) = unbounded_channel();
-        let mut saw = false;
         assert!(try_send(&tx, BackendEvent::TextDelta("hello".to_string())));
     }
 }
