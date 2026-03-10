@@ -1,76 +1,94 @@
-#!/bin/bash
-# Build script for Fawx WASM skills
+#!/usr/bin/env bash
+set -euo pipefail
 
-set -e
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../scripts/lib.sh
+source "$SCRIPT_DIR/../scripts/lib.sh"
+MODE="debug"
+PROFILE="debug"
+CARGO_ARGS=()
+CARGO_BUILD_JOBS_VALUE=""
+CARGO_BIN=""
+RUSTUP_BIN=""
+SKILL_SPECS=(
+  "weather-skill:weather_skill:weather.wasm"
+  "calculator-skill:calculator_skill:calculator.wasm"
+  "vision-skill:vision_skill:vision.wasm"
+  "tts-skill:tts_skill:tts.wasm"
+  "browser-skill:browser_skill:browser.wasm"
+  "stt-skill:stt_skill:stt.wasm"
+  "canvas-skill:canvas_skill:canvas.wasm"
+  "github-skill:github_skill:github.wasm"
+)
 
-echo "Building Fawx skills..."
+usage() {
+  cat <<'EOF'
+Usage:
+  ./skills/build.sh           Build WASM skills (debug)
+  ./skills/build.sh --release Build WASM skills (release)
+EOF
+}
 
-# Ensure wasm32-unknown-unknown target is installed
-rustup target add wasm32-unknown-unknown
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --release)
+        MODE="release"
+        PROFILE="release"
+        CARGO_ARGS=(--release)
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        echo "Unknown option: $1" >&2
+        usage >&2
+        exit 1
+        ;;
+    esac
+    shift
+  done
+}
 
-# Build weather skill
-echo "Building weather-skill..."
-cd weather-skill
-cargo build --target wasm32-unknown-unknown --release
-cp target/wasm32-unknown-unknown/release/weather_skill.wasm weather.wasm
-echo "✓ weather-skill built -> weather.wasm"
-cd ..
+ensure_wasm_target() {
+  if rustup target list --installed | grep -qx 'wasm32-unknown-unknown'; then
+    return
+  fi
+  echo "Installing wasm32-unknown-unknown target..."
+  "$RUSTUP_BIN" target add wasm32-unknown-unknown
+}
 
-# Build calculator skill
-echo "Building calculator-skill..."
-cd calculator-skill
-cargo build --target wasm32-unknown-unknown --release
-cp target/wasm32-unknown-unknown/release/calculator_skill.wasm calculator.wasm
-echo "✓ calculator-skill built -> calculator.wasm"
-cd ..
+build_skill() {
+  local spec="$1"
+  local directory crate artifact source output
+  IFS=: read -r directory crate artifact <<<"$spec"
+  source="$SCRIPT_DIR/$directory/target/wasm32-unknown-unknown/$PROFILE/$crate.wasm"
+  output="$SCRIPT_DIR/$directory/$artifact"
 
-# Build vision skill
-echo "Building vision-skill..."
-cd vision-skill
-cargo build --target wasm32-unknown-unknown --release
-cp target/wasm32-unknown-unknown/release/vision_skill.wasm vision.wasm
-echo "✓ vision-skill built -> vision.wasm"
-cd ..
+  echo "Building $directory..."
+  (
+    cd "$SCRIPT_DIR/$directory"
+    "$CARGO_BIN" build --target wasm32-unknown-unknown -j "$CARGO_BUILD_JOBS_VALUE" "${CARGO_ARGS[@]}"
+  )
+  cp "$source" "$output"
+  echo "✓ $directory built -> $directory/$artifact"
+}
 
-# Build TTS skill
-echo "Building tts-skill..."
-cd tts-skill
-cargo build --target wasm32-unknown-unknown --release
-cp target/wasm32-unknown-unknown/release/tts_skill.wasm tts.wasm
-echo "✓ tts-skill built -> tts.wasm"
-cd ..
+main() {
+  CARGO_BUILD_JOBS_VALUE="${CARGO_BUILD_JOBS:-$(detect_cpu_count)}"
+  CARGO_BIN="$(resolve_tool cargo)"
+  RUSTUP_BIN="$(resolve_tool rustup)"
+  parse_args "$@"
+  ensure_wasm_target
 
-# Build browser skill
-echo "Building browser-skill..."
-cd browser-skill
-cargo build --target wasm32-unknown-unknown --release
-cp target/wasm32-unknown-unknown/release/browser_skill.wasm browser.wasm
-echo "✓ browser-skill built -> browser.wasm"
-cd ..
+  echo "Building Fawx skills ($MODE)..."
+  for spec in "${SKILL_SPECS[@]}"; do
+    build_skill "$spec"
+  done
 
-# Build STT skill
-echo "Building stt-skill..."
-cd stt-skill
-cargo build --target wasm32-unknown-unknown --release
-cp target/wasm32-unknown-unknown/release/stt_skill.wasm stt.wasm
-echo "✓ stt-skill built -> stt.wasm"
-cd ..
+  echo
+  echo "Built ${#SKILL_SPECS[@]} skills in $MODE mode"
+}
 
-echo "Building canvas-skill..."
-cd canvas-skill
-cargo build --target wasm32-unknown-unknown --release
-cp target/wasm32-unknown-unknown/release/canvas_skill.wasm canvas.wasm
-echo "✓ canvas-skill built -> canvas.wasm"
-cd ..
-
-echo ""
-echo "All skills built successfully!"
-echo ""
-echo "To install skills:"
-echo "  fawx skill install skills/weather-skill/weather.wasm"
-echo "  fawx skill install skills/calculator-skill/calculator.wasm"
-echo "  fawx skill install skills/vision-skill/vision.wasm"
-echo "  fawx skill install skills/tts-skill/tts.wasm"
-echo "  fawx skill install skills/browser-skill/browser.wasm"
-echo "  fawx skill install skills/stt-skill/stt.wasm"
-echo "  fawx skill install skills/canvas-skill/canvas.wasm"
+main "$@"

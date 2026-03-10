@@ -12,6 +12,7 @@ mod http_serve;
 mod markdown;
 mod prompts;
 mod proposal_review;
+mod restart;
 #[allow(dead_code)]
 // TODO(#1282): narrow this once embedded/lib and CLI startup paths stop leaving target-specific helpers unused.
 mod startup;
@@ -72,6 +73,9 @@ enum Commands {
         #[arg(long, default_value = "8400")]
         port: u16,
     },
+
+    /// Restart the running agent daemon
+    Restart(restart::RestartArgs),
 
     /// Run system diagnostics
     Doctor,
@@ -747,12 +751,14 @@ async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
             http,
             port,
         } => {
+            let _pid_guard = restart::create_serve_pid_file_guard()?;
             if http {
                 run_http_server(system_prompt, port).await
             } else {
                 run_headless(single, json, system_prompt).await
             }
         }
+        Commands::Restart(args) => restart::run(args),
         Commands::Doctor => Ok(commands::doctor::run().await?),
         Commands::Setup { force } => Ok(commands::setup::run(force).await?),
         Commands::Auth { command } => Ok(commands::auth::run(command).await?),
@@ -873,6 +879,7 @@ mod tests {
         resolve_ripcord_path_with, ripcord_binary_name, Cli, Commands, FAWX_TUI_NOT_FOUND_MESSAGE,
     };
     use crate::auth_store::AuthStore;
+    use crate::restart;
     use clap::Parser;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -971,6 +978,30 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Commands::Tui { args }) if args == vec!["--host", "http://127.0.0.1:8400"]
+        ));
+    }
+
+    #[test]
+    fn cli_parses_restart_rebuild_flag() {
+        let cli = Cli::parse_from(["fawx", "restart", "--rebuild"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Restart(restart::RestartArgs {
+                rebuild: true,
+                hard: false
+            }))
+        ));
+    }
+
+    #[test]
+    fn cli_parses_restart_hard_flag() {
+        let cli = Cli::parse_from(["fawx", "restart", "--hard"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Restart(restart::RestartArgs {
+                rebuild: false,
+                hard: true
+            }))
         ));
     }
 
