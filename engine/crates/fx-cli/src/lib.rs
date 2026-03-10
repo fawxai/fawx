@@ -61,7 +61,7 @@ struct HeadlessAppBuildConfig {
 pub fn build_headless_app(system_prompt: Option<PathBuf>) -> anyhow::Result<headless::HeadlessApp> {
     let auth_manager = startup::load_auth_manager()?;
     let router = Arc::new(startup::build_router(&auth_manager)?);
-    let config = startup::load_config()?;
+    let config = prepare_embedded_config(startup::load_config()?);
     let build_config = HeadlessAppBuildConfig {
         data_dir: configured_data_dir(&config),
         config_manager: Some(build_config_manager(&config)),
@@ -216,10 +216,49 @@ fn ripcord_binary_name() -> &'static str {
     }
 }
 
+/// Normalize embedded-mode config before constructing the headless app.
+///
+/// Embedded callers run inside another host process, so they should inherit
+/// the host process working directory unless config already overrides it.
+pub fn prepare_embedded_config(mut config: fx_config::FawxConfig) -> fx_config::FawxConfig {
+    if config.tools.working_dir.is_none() {
+        config.tools.working_dir = Some(startup::configured_working_dir(&config));
+    }
+    config
+}
+
 fn configured_data_dir(config: &fx_config::FawxConfig) -> PathBuf {
     config
         .general
         .data_dir
         .clone()
         .unwrap_or_else(startup::fawx_data_dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fx_config::test_support::CurrentDirGuard;
+    use std::path::PathBuf;
+
+    #[test]
+    fn normalize_embedded_working_dir_defaults_to_process_current_dir() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let _guard = CurrentDirGuard::set(tempdir.path()).expect("set current dir");
+
+        let config = prepare_embedded_config(fx_config::FawxConfig::default());
+
+        assert_eq!(config.tools.working_dir, Some(tempdir.path().to_path_buf()));
+    }
+
+    #[test]
+    fn normalize_embedded_working_dir_preserves_explicit_config_value() {
+        let explicit = PathBuf::from("/tmp/fawx-explicit-working-dir");
+        let mut config = fx_config::FawxConfig::default();
+        config.tools.working_dir = Some(explicit.clone());
+
+        let config = prepare_embedded_config(config);
+
+        assert_eq!(config.tools.working_dir, Some(explicit));
+    }
 }

@@ -1,4 +1,6 @@
 pub mod manager;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 
 use serde::{Deserialize, Serialize};
 use toml_edit::{value, DocumentMut, Item, Table};
