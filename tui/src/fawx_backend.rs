@@ -70,13 +70,11 @@ struct HealthResponse {
     status: String,
 }
 
-#[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
 /// SSE event parsed from `event:` + `data:` lines.
 ///
 /// Field names match the engine's `serialize_stream_event` output in
 /// `http_serve.rs`.  The `event_type` is set by `parse_sse_frame` from the
-/// `event:` line; serde then only needs to match the data payload.
+/// `event:` line; per-event data structs are deserialized separately.
 struct SseFrame {
     event_type: String,
     data: String,
@@ -763,6 +761,117 @@ model = "gpt-4"
         let (tx, mut rx) = unbounded_channel();
         dispatch_sse_frame(": keep-alive", &tx).expect("comment frame should be ignored");
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn dispatch_tool_call_start_produces_tool_use_event() {
+        let (tx, mut rx) = unbounded_channel();
+        dispatch_sse_frame(
+            "event: tool_call_start\ndata: {\"id\":\"c1\",\"name\":\"read_file\"}",
+            &tx,
+        )
+        .expect("should decode");
+        match rx.try_recv().expect("event") {
+            BackendEvent::ToolUse { name, .. } => assert_eq!(name, "read_file"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_tool_call_complete_produces_tool_use_with_arguments() {
+        let (tx, mut rx) = unbounded_channel();
+        dispatch_sse_frame(
+            "event: tool_call_complete\ndata: {\"id\":\"c1\",\"name\":\"read_file\",\"arguments\":{\"path\":\"foo.txt\"}}",
+            &tx,
+        )
+        .expect("should decode");
+        match rx.try_recv().expect("event") {
+            BackendEvent::ToolUse { name, arguments } => {
+                assert_eq!(name, "read_file");
+                assert_eq!(arguments["path"], "foo.txt");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_tool_result_maps_fields_correctly() {
+        let (tx, mut rx) = unbounded_channel();
+        dispatch_sse_frame(
+            "event: tool_result\ndata: {\"id\":\"c1\",\"output\":\"file contents\",\"is_error\":false}",
+            &tx,
+        )
+        .expect("should decode");
+        match rx.try_recv().expect("event") {
+            BackendEvent::ToolResult {
+                name,
+                success,
+                content,
+            } => {
+                assert_eq!(name.as_deref(), Some("c1"));
+                assert!(success);
+                assert_eq!(content, "file contents");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_tool_result_error_maps_is_error_to_success_false() {
+        let (tx, mut rx) = unbounded_channel();
+        dispatch_sse_frame(
+            "event: tool_result\ndata: {\"id\":\"c1\",\"output\":\"not found\",\"is_error\":true}",
+            &tx,
+        )
+        .expect("should decode");
+        match rx.try_recv().expect("event") {
+            BackendEvent::ToolResult { success, .. } => assert!(!success),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_done_produces_done_event() {
+        let (tx, mut rx) = unbounded_channel();
+        dispatch_sse_frame("event: done\ndata: {\"response\":\"hello world\"}", &tx)
+            .expect("should decode");
+        match rx.try_recv().expect("event") {
+            BackendEvent::Done { .. } => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_phase_is_silent() {
+        let (tx, mut rx) = unbounded_channel();
+        dispatch_sse_frame("event: phase\ndata: {\"phase\":\"reason\"}", &tx)
+            .expect("should decode");
+        assert!(
+            rx.try_recv().is_err(),
+            "phase events should not produce backend events"
+        );
+    }
+
+    #[test]
+    fn dispatch_error_produces_stream_error() {
+        let (tx, mut rx) = unbounded_channel();
+        dispatch_sse_frame("event: error\ndata: {\"error\":\"rate limited\"}", &tx)
+            .expect("should decode");
+        match rx.try_recv().expect("event") {
+            BackendEvent::StreamError(msg) => assert!(msg.contains("rate limited")),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_unknown_event_type_is_silent() {
+        let (tx, mut rx) = unbounded_channel();
+        dispatch_sse_frame("event: future_event\ndata: {\"foo\":\"bar\"}", &tx)
+            .expect("should not error on unknown events");
+        assert!(
+            rx.try_recv().is_err(),
+            "unknown events should be silently ignored"
+        );
     }
 
     #[test]
