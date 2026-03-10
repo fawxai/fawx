@@ -1,4 +1,5 @@
 use super::runtime_layout::RuntimeLayout;
+use crate::persisted_memory::persisted_memory_entry_count;
 use serde::Deserialize;
 use std::fs;
 use std::path::Path;
@@ -91,8 +92,8 @@ fn apply_filesystem_snapshot(snapshot: &mut StatusSnapshot, layout: &RuntimeLayo
         }
     }
     if snapshot.memory.is_none() {
-        snapshot.memory = count_memory_entries(&layout.memory_json_path)
-            .map(|count| format_memory(count, layout));
+        let count = persisted_memory_entry_count(&layout.memory_json_path);
+        snapshot.memory = Some(format_memory(count, layout));
     }
     if snapshot.skills.is_none() {
         snapshot.skills =
@@ -212,12 +213,6 @@ fn parse_linux_uptime_seconds(content: &str) -> Option<f64> {
     content.split_whitespace().next()?.parse().ok()
 }
 
-fn count_memory_entries(path: &Path) -> Option<usize> {
-    let content = fs::read_to_string(path).ok()?;
-    let json = serde_json::from_str::<serde_json::Value>(&content).ok()?;
-    json.as_array().map(std::vec::Vec::len)
-}
-
 fn count_skill_dirs(path: &Path) -> Option<usize> {
     read_directory_count(path, |entry| entry.path().is_dir()).ok()
 }
@@ -312,6 +307,53 @@ fn format_row(label: &str, value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fx_config::FawxConfig;
+    use std::path::{Path, PathBuf};
+
+    fn test_layout(root: &Path) -> RuntimeLayout {
+        let mut config = FawxConfig::default();
+        config.memory.embeddings_enabled = true;
+        RuntimeLayout {
+            data_dir: root.to_path_buf(),
+            config_path: root.join("config.toml"),
+            storage_dir: root.join("storage"),
+            audit_log_path: root.join("audit.log"),
+            auth_db_path: root.join("auth.db"),
+            logs_dir: root.join("logs"),
+            skills_dir: root.join("skills"),
+            trusted_keys_dir: root.join("trusted_keys"),
+            embedding_model_dir: root.join("models"),
+            pid_file: root.join("fawx.pid"),
+            memory_json_path: root.join("memory").join("memory.json"),
+            sessions_dir: root.join("signals"),
+            security_baseline_path: root.join("security-baseline.json"),
+            repo_root: PathBuf::from("/tmp/fawx"),
+            http_port: 8400,
+            config,
+        }
+    }
+
+    fn write_memory_store(path: &Path, count: usize) {
+        let Some(parent) = path.parent() else {
+            panic!("memory path missing parent");
+        };
+        fs::create_dir_all(parent).expect("create memory dir");
+        let mut store = serde_json::Map::new();
+        for index in 0..count {
+            store.insert(
+                format!("memory-{index}"),
+                serde_json::json!({
+                    "value": format!("entry-{index}"),
+                    "created_at_ms": 1,
+                    "last_accessed_at_ms": 2,
+                    "access_count": 3,
+                    "source": "User",
+                    "tags": []
+                }),
+            );
+        }
+        fs::write(path, serde_json::Value::Object(store).to_string()).expect("write memory json");
+    }
 
     #[test]
     fn parse_pid_file_content() {
@@ -324,6 +366,35 @@ mod tests {
     fn linux_pid_stat_parser_reads_start_ticks() {
         let stat = "12345 (fawx) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 123456 21 22";
         assert_eq!(parse_linux_start_ticks(stat), Some(123456));
+    }
+
+    #[test]
+    fn filesystem_snapshot_counts_object_shaped_memory_store() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let layout = test_layout(tempdir.path());
+        write_memory_store(&layout.memory_json_path, 2);
+        let mut snapshot = StatusSnapshot::default();
+
+        apply_filesystem_snapshot(&mut snapshot, &layout);
+
+        assert_eq!(
+            snapshot.memory.as_deref(),
+            Some("2 entries, embeddings enabled")
+        );
+    }
+
+    #[test]
+    fn filesystem_snapshot_defaults_missing_memory_store_to_zero() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let layout = test_layout(tempdir.path());
+        let mut snapshot = StatusSnapshot::default();
+
+        apply_filesystem_snapshot(&mut snapshot, &layout);
+
+        assert_eq!(
+            snapshot.memory.as_deref(),
+            Some("0 entries, embeddings enabled")
+        );
     }
 
     #[test]

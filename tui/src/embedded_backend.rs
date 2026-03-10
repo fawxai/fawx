@@ -1,7 +1,6 @@
 use async_trait::async_trait;
 use fx_kernel::{StreamCallback, StreamEvent};
 use serde_json::Value;
-use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -25,26 +24,15 @@ impl EmbeddedBackend {
 
     async fn engine_status(&self) -> EngineStatus {
         let app = self.app.lock().await;
-        let memory_entries =
-            embedded_memory_count(&app.data_dir().join("memory").join("memory.json"));
+        let memory_entries = fx_cli::persisted_memory_entry_count(
+            &app.data_dir().join("memory").join("memory.json"),
+        );
         EngineStatus {
             status: "running".to_string(),
             model: app.active_model().to_string(),
             memory_entries,
         }
     }
-}
-
-fn embedded_memory_count(path: &Path) -> usize {
-    let content = match std::fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(_) => return 0,
-    };
-    let json = match serde_json::from_str::<Value>(&content) {
-        Ok(json) => json,
-        Err(_) => return 0,
-    };
-    json.as_array().map(std::vec::Vec::len).unwrap_or(0)
 }
 
 #[async_trait]
@@ -182,7 +170,7 @@ mod tests {
         ModelRouter, ProviderCapabilities, ProviderError, StreamChunk, Usage,
     };
     use fx_subagent::{SubagentLimits, SubagentManager, SubagentManagerDeps};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::{atomic::AtomicBool, Arc};
     use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
@@ -393,12 +381,23 @@ mod tests {
     fn write_memory_entries(data_dir: &Path, count: usize) {
         let memory_dir = data_dir.join("memory");
         std::fs::create_dir_all(&memory_dir).expect("create memory dir");
-        let entries = (0..count)
-            .map(|index| serde_json::json!({"id": index}))
-            .collect::<Vec<_>>();
+        let mut store = serde_json::Map::new();
+        for index in 0..count {
+            store.insert(
+                format!("memory-{index}"),
+                serde_json::json!({
+                    "value": format!("entry-{index}"),
+                    "created_at_ms": 1,
+                    "last_accessed_at_ms": 2,
+                    "access_count": 3,
+                    "source": "User",
+                    "tags": []
+                }),
+            );
+        }
         std::fs::write(
             memory_dir.join("memory.json"),
-            serde_json::to_string(&entries).expect("serialize memory entries"),
+            serde_json::Value::Object(store).to_string(),
         )
         .expect("write memory entries");
     }

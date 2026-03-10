@@ -10,6 +10,7 @@ pub(crate) mod helpers;
 mod http_serve;
 #[cfg(test)]
 mod markdown;
+mod persisted_memory;
 mod prompts;
 mod proposal_review;
 mod repo_root;
