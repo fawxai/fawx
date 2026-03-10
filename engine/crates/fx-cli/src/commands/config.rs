@@ -59,8 +59,19 @@ fn get_config(config: &FawxConfig, key: &str) -> anyhow::Result<String> {
     if key == "all" {
         return show_config(config);
     }
-    let selected = select_config_value(config, key)?;
+    let selected = select_redacted_value(config, key)?;
     render_selected_value(key, &selected)
+}
+
+fn select_redacted_value(config: &FawxConfig, key: &str) -> anyhow::Result<TomlValue> {
+    let selected = select_config_value(config, key)?;
+    redact_selected_value(key, selected)
+}
+
+fn redact_selected_value(key: &str, value: TomlValue) -> anyhow::Result<TomlValue> {
+    let wrapped = wrap_selection(key, value);
+    let redacted = sanitize_toml(wrapped);
+    lookup_value(&redacted, key).ok_or_else(|| anyhow::anyhow!("failed to render config selection"))
 }
 
 fn set_config(manager: &mut ConfigManager, key: &str, value: &str) -> anyhow::Result<String> {
@@ -180,6 +191,35 @@ mod tests {
     }
 
     #[test]
+    fn get_redacts_secret_scalar_values() {
+        let mut test_manager = manager_from("[http]\nbearer_token = \"super-secret\"\n");
+        let output = execute(
+            Some(ConfigCommands::Get {
+                key: "http.bearer_token".to_string(),
+            }),
+            &mut test_manager.manager,
+        )
+        .expect("get secret value");
+        assert_eq!(output, "[REDACTED]");
+    }
+
+    #[test]
+    fn get_redacts_secret_values_inside_sections() {
+        let mut test_manager =
+            manager_from("[telegram]\nbot_token = \"bot-secret\"\nallowed_chat_ids = [1]\n");
+        let output = execute(
+            Some(ConfigCommands::Get {
+                key: "telegram".to_string(),
+            }),
+            &mut test_manager.manager,
+        )
+        .expect("get redacted section");
+        assert!(output.contains("[REDACTED]"));
+        assert!(output.contains("allowed_chat_ids = [1]"));
+        assert!(!output.contains("bot-secret"));
+    }
+
+    #[test]
     fn set_updates_persisted_config_through_manager() {
         let mut test_manager = manager_from("[model]\ndefault_model = \"old\"\n");
         let output = execute(
@@ -192,6 +232,28 @@ mod tests {
         .expect("set config");
         assert!(output.contains("Updated model.default_model"));
         assert!(output.ends_with("new"));
+    }
+
+    #[test]
+    fn set_redacts_secret_values_after_update() {
+        let mut test_manager = manager_from("[telegram]\nallowed_chat_ids = [1]\n");
+        let output = execute(
+            Some(ConfigCommands::Set {
+                key: "telegram.bot_token".to_string(),
+                value: "new-secret".to_string(),
+            }),
+            &mut test_manager.manager,
+        )
+        .expect("set secret config");
+        assert!(output.contains("Updated telegram.bot_token"));
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("new-secret"));
+        assert_eq!(
+            select_config_value(test_manager.manager.config(), "telegram.bot_token")
+                .expect("stored secret")
+                .as_str(),
+            Some("new-secret")
+        );
     }
 
     #[test]

@@ -130,7 +130,7 @@ fn selected_scopes(args: &ResetArgs) -> anyhow::Result<BTreeSet<ResetScope>> {
 fn build_actions(layout: &RuntimeLayout, scopes: &BTreeSet<ResetScope>) -> Vec<ResetAction> {
     let mut actions = Vec::new();
     if scopes.contains(&ResetScope::Memory) {
-        actions.push(remove_path_action("memory", layout.data_dir.join("memory")));
+        actions.extend(memory_actions(layout));
     }
     if scopes.contains(&ResetScope::Conversations) {
         actions.extend(conversation_actions(layout));
@@ -139,6 +139,13 @@ fn build_actions(layout: &RuntimeLayout, scopes: &BTreeSet<ResetScope>) -> Vec<R
         actions.push(ResetAction::ResetConfig);
     }
     actions
+}
+
+fn memory_actions(layout: &RuntimeLayout) -> Vec<ResetAction> {
+    vec![
+        remove_path_action("memory", layout.data_dir.join("memory")),
+        remove_path_action("memory embeddings", layout.embedding_model_dir.clone()),
+    ]
 }
 
 fn conversation_actions(layout: &RuntimeLayout) -> Vec<ResetAction> {
@@ -292,6 +299,10 @@ fn preserve_reset_values(
     source: &serde_json::Value,
     parent: Option<&str>,
 ) {
+    if should_clone_preserved_array(target, source, parent) {
+        *target = source.clone();
+        return;
+    }
     match (target, source) {
         (serde_json::Value::Object(target_map), serde_json::Value::Object(source_map)) => {
             preserve_object_values(target_map, source_map, parent)
@@ -301,6 +312,17 @@ fn preserve_reset_values(
         }
         _ => {}
     }
+}
+
+fn should_clone_preserved_array(
+    target: &serde_json::Value,
+    source: &serde_json::Value,
+    parent: Option<&str>,
+) -> bool {
+    matches!(
+        (target, source),
+        (serde_json::Value::Array(_), serde_json::Value::Array(_))
+    ) && subtree_contains_preserved_values(source, parent)
 }
 
 fn preserve_object_values(
@@ -315,6 +337,10 @@ fn preserve_object_values(
         }
         if let Some(target_value) = target_map.get_mut(key) {
             preserve_reset_values(target_value, source_value, Some(key));
+            continue;
+        }
+        if subtree_contains_preserved_values(source_value, Some(key)) {
+            target_map.insert(key.clone(), source_value.clone());
         }
     }
 }
@@ -326,6 +352,19 @@ fn preserve_array_values(
 ) {
     for (target_item, source_item) in target_items.iter_mut().zip(source_items) {
         preserve_reset_values(target_item, source_item, parent);
+    }
+}
+
+fn subtree_contains_preserved_values(value: &serde_json::Value, parent: Option<&str>) -> bool {
+    match value {
+        serde_json::Value::Object(map) => map.iter().any(|(key, child)| {
+            should_preserve_key(parent, key)
+                || subtree_contains_preserved_values(child, Some(key.as_str()))
+        }),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .any(|item| subtree_contains_preserved_values(item, parent)),
+        _ => false,
     }
 }
 
@@ -421,9 +460,10 @@ mod tests {
     }
 
     #[test]
-    fn memory_reset_deletes_only_memory_paths() {
+    fn memory_reset_deletes_memory_entries_and_embeddings_only() {
         let fixture = ResetFixture::new("");
         write_dir_file(&fixture.layout.data_dir.join("memory"), "memory.json");
+        write_dir_file(&fixture.layout.embedding_model_dir, "index.bin");
         write_file(&fixture.layout.auth_db_path);
         write_dir_file(
             &fixture.layout.data_dir.join(CONVERSATIONS_DIR),
@@ -439,6 +479,7 @@ mod tests {
 
         assert!(matches!(outcome, ResetOutcome::Applied(_)));
         assert!(!fixture.layout.data_dir.join("memory").exists());
+        assert!(!fixture.layout.embedding_model_dir.exists());
         assert!(fixture.layout.auth_db_path.exists());
         assert!(fixture.layout.data_dir.join(CONVERSATIONS_DIR).exists());
     }
@@ -495,11 +536,53 @@ mod tests {
     }
 
     #[test]
+    fn config_reset_preserves_array_backed_node_credentials() {
+        let fixture = ResetFixture::new(
+            "[fleet]\ncoordinator = true\nstale_timeout_seconds = 120\n\n[[fleet.nodes]]\nid = \"node-1\"\nname = \"Node One\"\nendpoint = \"https://node.example\"\nauth_token = \"keep-token\"\nssh_key = \"~/.ssh/node-1\"\ncapabilities = [\"agentic_loop\"]\n",
+        );
+        let args = ResetArgs {
+            config: true,
+            ..test_args()
+        };
+
+        execute_with_confirmation(&args, &fixture.layout, |_| Ok(true)).expect("reset outcome");
+
+        let reset = FawxConfig::load(
+            fixture
+                .layout
+                .config_path
+                .parent()
+                .expect("config parent directory"),
+        )
+        .expect("reload config");
+        assert_eq!(
+            reset.fleet.coordinator,
+            FawxConfig::default().fleet.coordinator
+        );
+        assert_eq!(
+            reset.fleet.stale_timeout_seconds,
+            FawxConfig::default().fleet.stale_timeout_seconds
+        );
+        assert_eq!(reset.fleet.nodes.len(), 1);
+        assert_eq!(reset.fleet.nodes[0].id, "node-1");
+        assert_eq!(reset.fleet.nodes[0].name, "Node One");
+        assert_eq!(
+            reset.fleet.nodes[0].auth_token.as_deref(),
+            Some("keep-token")
+        );
+        assert_eq!(
+            reset.fleet.nodes[0].ssh_key.as_deref(),
+            Some("~/.ssh/node-1")
+        );
+    }
+
+    #[test]
     fn all_reset_preserves_credentials_while_resetting_the_rest() {
         let fixture = ResetFixture::new(
             "[http]\nbearer_token = \"keep-me\"\n\n[telegram]\nbot_token = \"keep-bot\"\n",
         );
         write_dir_file(&fixture.layout.data_dir.join("memory"), "memory.json");
+        write_dir_file(&fixture.layout.embedding_model_dir, "index.bin");
         write_dir_file(
             &fixture.layout.data_dir.join(CONVERSATIONS_DIR),
             "conv.jsonl",
@@ -522,6 +605,7 @@ mod tests {
         )
         .expect("reload config");
         assert!(!fixture.layout.data_dir.join("memory").exists());
+        assert!(!fixture.layout.embedding_model_dir.exists());
         assert!(!fixture.layout.data_dir.join(CONVERSATIONS_DIR).exists());
         assert!(!fixture.layout.sessions_dir.exists());
         assert!(fixture.layout.auth_db_path.exists());
