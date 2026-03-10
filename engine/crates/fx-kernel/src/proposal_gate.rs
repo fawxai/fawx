@@ -319,11 +319,6 @@ fn classify_and_gate(
         ));
     }
 
-    // When self-modify gating is disabled, non-Tier-3 writes pass through.
-    if !config.enabled {
-        return GateDecision::PassThrough;
-    }
-
     // Active proposal covers this path → allow
     if covers_path(active, &path) {
         return GateDecision::PassThrough;
@@ -774,13 +769,27 @@ mod tests {
         let (executor, probe) = make_executor(enabled_config());
 
         let results = executor
-            .execute_tools(&[write_call("1", "server.key")], None)
+            .execute_tools(&[write_call("1", "credentials.json")], None)
             .await
             .unwrap();
 
         assert!(!results[0].success);
         assert!(results[0].output.contains("BLOCKED"));
         assert!(results[0].output.contains("deny tier"));
+        assert_eq!(probe.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn always_propose_key_creates_proposal_without_executing() {
+        let (executor, probe) = make_executor(enabled_config());
+
+        let results = executor
+            .execute_tools(&[write_call("1", "server.key")], None)
+            .await
+            .unwrap();
+
+        assert!(results[0].success);
+        assert!(results[0].output.contains("PROPOSAL CREATED"));
         assert_eq!(probe.call_count(), 0);
     }
 
@@ -850,17 +859,17 @@ mod tests {
         assert_eq!(probe.call_count(), 0);
     }
 
-    // Test 7: Disabled config allows non-Tier-3 writes (Tier 3 still blocked)
+    // Test 7: Disabled config still allows normal non-Tier-3 writes
     #[tokio::test]
-    async fn disabled_config_allows_non_tier3_writes() {
+    async fn disabled_config_allows_normal_non_tier3_writes() {
         let config = SelfModifyConfig::default(); // enabled=false
         let (executor, probe) = make_executor(config);
 
         let results = executor
             .execute_tools(
                 &[
-                    write_call("1", "server.key"),
-                    write_call("2", "docs/readme.md"),
+                    write_call("1", "docs/readme.md"),
+                    write_call("2", "notes/todo.txt"),
                 ],
                 None,
             )
@@ -870,6 +879,60 @@ mod tests {
         assert!(results[0].success);
         assert!(results[1].success);
         assert_eq!(probe.call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn disabled_config_proposes_sensitive_writes() {
+        let config = SelfModifyConfig::default(); // enabled=false
+        let (executor, probe) = make_executor(config);
+
+        let results = executor
+            .execute_tools(
+                &[
+                    write_call("1", "config.toml"),
+                    write_call("2", "credentials.db"),
+                    write_call("3", "auth.db"),
+                    write_call("4", "keys/server.key"),
+                    write_call("5", "certs/server.pem"),
+                ],
+                None,
+            )
+            .await
+            .unwrap();
+
+        for result in &results {
+            assert!(result.success);
+            assert!(result.output.contains("PROPOSAL CREATED"));
+        }
+        assert_eq!(probe.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn disabled_config_proposes_absolute_fawx_config_path() {
+        let config = SelfModifyConfig::default(); // enabled=false
+        let working_dir = std::env::temp_dir().join(format!(
+            "fx-proposal-gate-disabled-config-{}",
+            epoch_seconds()
+        ));
+        let proposals_dir = std::env::temp_dir().join(format!(
+            "fx-proposal-gate-disabled-config-proposals-{}",
+            epoch_seconds()
+        ));
+        fs::create_dir_all(&working_dir).unwrap();
+        let absolute_path = working_dir.join("config.toml");
+        let (executor, probe) = make_executor_in(config, working_dir.clone(), proposals_dir);
+
+        let results = executor
+            .execute_tools(
+                &[write_call("1", absolute_path.to_string_lossy().as_ref())],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(results[0].success);
+        assert!(results[0].output.contains("PROPOSAL CREATED"));
+        assert_eq!(probe.call_count(), 0);
     }
 
     // Test 7b: Tier 3 blocked even when config disabled (regression for bypass bug)
@@ -900,7 +963,7 @@ mod tests {
         let calls = vec![
             read_call("1", "docs/readme.md"),
             write_call("2", "docs/guide.md"),
-            write_call("3", "server.key"),
+            write_call("3", "credentials.json"),
         ];
 
         let results = executor.execute_tools(&calls, None).await.unwrap();
