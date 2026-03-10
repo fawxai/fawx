@@ -19,6 +19,7 @@ pub mod setup;
 pub(crate) mod skill_signatures;
 pub mod skills;
 pub mod slash;
+pub(crate) mod start_stop;
 pub mod status;
 pub mod update;
 pub mod version;

@@ -723,12 +723,6 @@ async fn run_http_server(
     Ok(1)
 }
 
-fn run_stub(action: &str) -> i32 {
-    println!("{action} Fawx agent daemon...");
-    println!("(Implementation pending - Epic 9)");
-    0
-}
-
 async fn dispatch_audit(command: AuditCommands) -> anyhow::Result<i32> {
     match command {
         AuditCommands::Show { limit } => {
@@ -771,8 +765,8 @@ async fn dispatch_skill(command: SkillCommands) -> anyhow::Result<i32> {
 async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
     match command {
         Commands::Tui { args } => launch_fawx_tui(&args),
-        Commands::Start => Ok(run_stub("Starting")),
-        Commands::Stop => Ok(run_stub("Stopping")),
+        Commands::Start => commands::start_stop::run_start(),
+        Commands::Stop => commands::start_stop::run_stop(),
         Commands::Chat => launch_embedded_tui(),
         Commands::Serve {
             single,

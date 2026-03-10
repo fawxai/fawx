@@ -2,7 +2,7 @@ use crate::startup;
 use anyhow::{anyhow, Context};
 use clap::Args;
 use std::{
-    fs,
+    fs::{self, OpenOptions},
     io::ErrorKind,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -63,6 +63,7 @@ enum RestartMode {
 pub(crate) enum RestartSignal {
     Hangup,
     Terminate,
+    Kill,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,7 +205,7 @@ pub(crate) fn resolve_target_pid(
     system.find_fawx_process(std::process::id())
 }
 
-fn read_pid_file(path: &Path) -> anyhow::Result<Option<u32>> {
+pub(crate) fn read_pid_file(path: &Path) -> anyhow::Result<Option<u32>> {
     match fs::read_to_string(path) {
         Ok(contents) => parse_pid_file(&contents).map(Some),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
@@ -231,7 +232,7 @@ fn write_pid_file(path: &Path, pid: u32) -> anyhow::Result<()> {
         .with_context(|| format!("failed to write pid file {}", path.display()))
 }
 
-fn remove_pid_file(path: &Path) -> anyhow::Result<()> {
+pub(crate) fn remove_pid_file(path: &Path) -> anyhow::Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
@@ -317,7 +318,7 @@ impl RestartSystem for LiveRestartSystem {
     }
 
     fn spawn_serve(&self, executable: &Path) -> anyhow::Result<u32> {
-        spawn_serve(executable)
+        spawn_serve(executable, None)
     }
 }
 
@@ -406,13 +407,14 @@ pub(crate) fn cargo_binary() -> anyhow::Result<PathBuf> {
     which::which("cargo").context("failed to locate cargo in PATH for rebuild/update")
 }
 
-pub(crate) fn spawn_serve(executable: &Path) -> anyhow::Result<u32> {
+pub(crate) fn spawn_serve(executable: &Path, log_file: Option<&Path>) -> anyhow::Result<u32> {
+    let (stdout, stderr) = spawn_stdio(log_file)?;
     let mut command = Command::new(executable);
     command
         .args(DEFAULT_START_ARGS)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(stdout)
+        .stderr(stderr);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -422,6 +424,32 @@ pub(crate) fn spawn_serve(executable: &Path) -> anyhow::Result<u32> {
         .spawn()
         .with_context(|| format!("failed to start {} serve --http", executable.display()))?;
     Ok(child.id())
+}
+
+fn spawn_stdio(log_file: Option<&Path>) -> anyhow::Result<(Stdio, Stdio)> {
+    match log_file {
+        Some(path) => log_stdio(path),
+        None => Ok((Stdio::null(), Stdio::null())),
+    }
+}
+
+fn log_stdio(log_file: &Path) -> anyhow::Result<(Stdio, Stdio)> {
+    let parent = log_file.parent().ok_or_else(|| {
+        anyhow!(
+            "log file path {} has no parent directory",
+            log_file.display()
+        )
+    })?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    let stdout = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_file)
+        .with_context(|| format!("failed to open log file {}", log_file.display()))?;
+    let stderr = stdout
+        .try_clone()
+        .with_context(|| format!("failed to clone log file handle {}", log_file.display()))?;
+    Ok((Stdio::from(stdout), Stdio::from(stderr)))
 }
 
 #[cfg(unix)]
@@ -452,6 +480,7 @@ fn send_signal(pid: u32, signal: RestartSignal) -> anyhow::Result<()> {
     let signal = match signal {
         RestartSignal::Hangup => signal::Signal::SIGHUP,
         RestartSignal::Terminate => signal::Signal::SIGTERM,
+        RestartSignal::Kill => signal::Signal::SIGKILL,
     };
     signal::kill(unix_pid(pid)?, signal)
         .map_err(|error| anyhow!(error))

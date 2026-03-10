@@ -297,7 +297,7 @@ fn resolve_file_logging(config: &LoggingConfig, mode: LoggingMode) -> bool {
         .unwrap_or(matches!(mode, LoggingMode::Serve))
 }
 
-fn resolve_log_dir(config: &LoggingConfig) -> PathBuf {
+pub(crate) fn resolve_log_dir(config: &LoggingConfig) -> PathBuf {
     config
         .log_dir
         .as_deref()

@@ -25,8 +25,16 @@ mod import_command {
         include!("commands/import_tests.rs");
     }
 }
+#[cfg(test)]
+mod repo_root;
+#[cfg(test)]
+mod restart;
 #[path = "commands/slash.rs"]
 pub(crate) mod slash_commands;
+#[cfg(test)]
+mod start_stop_command {
+    include!("commands/start_stop.rs");
+}
 mod commands {
     pub(crate) use super::slash_commands as slash;
 }
