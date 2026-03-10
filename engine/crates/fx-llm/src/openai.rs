@@ -7,7 +7,7 @@ use futures::{stream, Stream, StreamExt};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 
 use crate::provider::{CompletionStream, LlmProvider, ProviderCapabilities};
@@ -84,6 +84,25 @@ impl OpenAiProvider {
         } else {
             format!("{base_url}/v1/chat/completions")
         }
+    }
+
+    fn models_endpoint(&self) -> String {
+        let base_url = self.base_url.trim_end_matches('/');
+        if base_url.ends_with("/v1") {
+            format!("{base_url}/models")
+        } else {
+            format!("{base_url}/v1/models")
+        }
+    }
+
+    async fn fetch_models(&self) -> Result<Vec<String>, LlmError> {
+        let response = self
+            .client
+            .get(self.models_endpoint())
+            .bearer_auth(&self.api_key)
+            .send()
+            .await?;
+        parse_model_response(response, &self.supported_models).await
     }
 
     fn ensure_supported_model(&self, model: &str) -> Result<(), LlmError> {
@@ -430,12 +449,81 @@ impl LlmProvider for OpenAiProvider {
         self.supported_models.clone()
     }
 
+    async fn list_models(&self) -> Result<Vec<String>, LlmError> {
+        if self.api_key.trim().is_empty() {
+            return Ok(self.supported_models());
+        }
+
+        match self.fetch_models().await {
+            Ok(models) if !models.is_empty() => Ok(models),
+            Ok(_) => {
+                tracing::warn!(provider = %self.provider_name, "openai models response was empty; using static fallback");
+                Ok(self.supported_models())
+            }
+            Err(error) => {
+                tracing::warn!(provider = %self.provider_name, error = %error, "failed to fetch openai models; using static fallback");
+                Ok(self.supported_models())
+            }
+        }
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             supports_temperature: true,
             requires_streaming: false,
         }
     }
+}
+
+async fn parse_model_response(
+    response: reqwest::Response,
+    supported_models: &[String],
+) -> Result<Vec<String>, LlmError> {
+    let status = response.status();
+    if !status.is_success() {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|error| format!("unable to read error body: {error}"));
+        return Err(OpenAiProvider::map_http_error(status, body));
+    }
+
+    let parsed = response
+        .json::<OpenAiModelsResponse>()
+        .await
+        .map_err(|error| LlmError::InvalidResponse(error.to_string()))?;
+    Ok(filter_model_ids(parsed.data, supported_models))
+}
+
+fn filter_model_ids(models: Vec<OpenAiModel>, supported_models: &[String]) -> Vec<String> {
+    let mut ids = models
+        .into_iter()
+        .filter_map(|model| filter_model_id(&model.id, supported_models))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids
+}
+
+fn filter_model_id(model_id: &str, supported_models: &[String]) -> Option<String> {
+    if supported_models
+        .iter()
+        .any(|supported| supported == model_id)
+    {
+        return Some(model_id.to_string());
+    }
+    if is_chat_model(model_id) {
+        return Some(model_id.to_string());
+    }
+    None
+}
+
+fn is_chat_model(model_id: &str) -> bool {
+    let normalized = model_id.to_ascii_lowercase();
+    ["gpt", "o1", "o3", "o4"]
+        .iter()
+        .any(|needle| normalized.contains(needle))
 }
 
 fn maybe_push_usage_chunk(chunks: &mut Vec<StreamChunk>, usage: Option<OpenAiUsage>) {
@@ -677,6 +765,17 @@ struct OpenAiFunctionCall {
 }
 
 #[derive(Debug, Deserialize)]
+struct OpenAiModelsResponse {
+    #[serde(default)]
+    data: Vec<OpenAiModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiModel {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct OpenAiResponseBody {
     choices: Vec<OpenAiChoice>,
     #[serde(default)]
@@ -777,6 +876,89 @@ mod tests {
     use crate::test_helpers::{callback_events, read_events};
     use crate::types::ToolDefinition;
     use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn spawn_json_server(status_line: &str, body: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("local addr");
+        let status_line = status_line.to_string();
+        let body = body.to_string();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept connection");
+            let mut buffer = [0_u8; 2048];
+            let _ = socket.read(&mut buffer).await.expect("read request");
+            let response = format!(
+                "HTTP/1.1 {status_line}
+content-type: application/json
+content-length: {}
+connection: close
+
+{}",
+                body.len(),
+                body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn openai_list_models_parses_response() {
+        let base_url = spawn_json_server(
+            "200 OK",
+            r#"{"data":[{"id":"gpt-4o"},{"id":"gpt-4.1-mini"},{"id":"text-embedding-3-small"},{"id":"o3-mini"}]}"#,
+        )
+        .await;
+        let provider = OpenAiProvider::new(base_url, "test-key")
+            .expect("provider")
+            .with_supported_models(vec!["custom-openai-model".to_string()]);
+
+        let models = provider.list_models().await.expect("list models");
+
+        assert_eq!(
+            models,
+            vec![
+                "gpt-4.1-mini".to_string(),
+                "gpt-4o".to_string(),
+                "o3-mini".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_list_models_filters_non_chat() {
+        let base_url = spawn_json_server(
+            "200 OK",
+            r#"{"data":[{"id":"text-embedding-ada-002"},{"id":"dall-e-3"},{"id":"gpt-4o"}]}"#,
+        )
+        .await;
+        let provider = OpenAiProvider::new(base_url, "test-key").expect("provider");
+
+        let models = provider.list_models().await.expect("list models");
+
+        assert_eq!(models, vec!["gpt-4o".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn openai_list_models_falls_back_on_error() {
+        let base_url = spawn_json_server("500 Internal Server Error", r#"{"error":"nope"}"#).await;
+        let provider = OpenAiProvider::new(base_url, "test-key")
+            .expect("provider")
+            .with_supported_models(vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()]);
+
+        let models = provider.list_models().await.expect("list models");
+
+        assert_eq!(
+            models,
+            vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()]
+        );
+    }
 
     #[test]
     fn test_build_request_body_maps_messages_tools_and_system() {

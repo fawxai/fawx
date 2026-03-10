@@ -571,6 +571,22 @@ impl HeadlessApp {
         let parsed: JsonInput = serde_json::from_str(raw)?;
         Ok(parsed.message)
     }
+
+    async fn list_models_dynamic(&self) -> anyhow::Result<String> {
+        let models = self.dynamic_models_or_fallback().await;
+        Ok(render_model_menu_text(
+            Some(self.active_model.as_str()),
+            &models,
+        ))
+    }
+
+    async fn dynamic_models_or_fallback(&self) -> Vec<ModelInfo> {
+        let models = self.router.fetch_available_models().await;
+        if models.is_empty() {
+            return self.router.available_models();
+        }
+        models
+    }
 }
 
 impl CommandHost for HeadlessApp {
@@ -1375,6 +1391,7 @@ async fn execute_headless_async_command(
     parsed: &ParsedCommand,
 ) -> Result<Option<String>, anyhow::Error> {
     match parsed {
+        ParsedCommand::Model(None) => app.list_models_dynamic().await.map(Some),
         ParsedCommand::Analyze => app.analyze_signals_command().await.map(Some),
         ParsedCommand::Improve(flags) => app.improve_command(flags).await.map(Some),
         _ => Ok(None),
@@ -1711,6 +1728,7 @@ mod tests {
     struct StaticModelsProvider {
         name: &'static str,
         models: Vec<&'static str>,
+        dynamic_models: Option<Vec<String>>,
     }
 
     #[async_trait]
@@ -1745,6 +1763,13 @@ mod tests {
                 .collect()
         }
 
+        async fn list_models(&self) -> Result<Vec<String>, fx_llm::ProviderError> {
+            Ok(self
+                .dynamic_models
+                .clone()
+                .unwrap_or_else(|| self.supported_models()))
+        }
+
         fn capabilities(&self) -> fx_llm::ProviderCapabilities {
             fx_llm::ProviderCapabilities {
                 supports_temperature: false,
@@ -1758,6 +1783,7 @@ mod tests {
         router.register_provider(Box::new(StaticModelsProvider {
             name: "static-models",
             models: models.to_vec(),
+            dynamic_models: None,
         }));
         router
     }
@@ -1843,6 +1869,28 @@ mod tests {
     #[test]
     fn empty_input_not_treated_as_quit() {
         assert!(!is_quit_command(""));
+    }
+
+    #[tokio::test]
+    async fn headless_model_menu_uses_dynamic_when_available() {
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(StaticModelsProvider {
+            name: "dynamic-models",
+            models: vec!["static-model"],
+            dynamic_models: Some(
+                vec!["dynamic-model"]
+                    .into_iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            ),
+        }));
+        let mut app = headless_app_with_router(router, "dynamic-model");
+
+        let rendered = process_command_input(&mut app, "/model").await;
+        let rendered = rendered.expect("command result").response;
+
+        assert!(rendered.contains("dynamic-model"));
+        assert!(!rendered.contains("static-model (api_key)"));
     }
 
     #[test]

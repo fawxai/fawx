@@ -5,7 +5,7 @@ use futures::{stream, Stream, StreamExt};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 
 use crate::provider::{CompletionStream, LlmProvider, ProviderCapabilities};
@@ -102,6 +102,19 @@ impl AnthropicProvider {
 
     fn endpoint(&self) -> String {
         format!("{}/v1/messages", self.base_url.trim_end_matches('/'))
+    }
+
+    fn models_endpoint(&self) -> String {
+        format!("{}/v1/models", self.base_url.trim_end_matches('/'))
+    }
+
+    async fn fetch_models(&self) -> Result<Vec<String>, LlmError> {
+        let request_builder = self
+            .client
+            .get(self.models_endpoint())
+            .header("anthropic-version", &self.api_version);
+        let response = self.apply_auth(request_builder).send().await?;
+        parse_model_response(response).await
     }
 
     /// Apply auth headers to a request builder based on auth mode.
@@ -598,12 +611,55 @@ impl LlmProvider for AnthropicProvider {
         self.supported_models.clone()
     }
 
+    async fn list_models(&self) -> Result<Vec<String>, LlmError> {
+        match self.fetch_models().await {
+            Ok(models) if !models.is_empty() => Ok(models),
+            Ok(_) => {
+                tracing::warn!("anthropic models response was empty; using static fallback");
+                Ok(self.supported_models())
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to fetch anthropic models; using static fallback");
+                Ok(self.supported_models())
+            }
+        }
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             supports_temperature: true,
             requires_streaming: false,
         }
     }
+}
+
+async fn parse_model_response(response: reqwest::Response) -> Result<Vec<String>, LlmError> {
+    let status = response.status();
+    if !status.is_success() {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|error| format!("unable to read error body: {error}"));
+        return Err(AnthropicProvider::map_http_error(status, body));
+    }
+
+    let parsed = response
+        .json::<AnthropicModelsResponse>()
+        .await
+        .map_err(|error| LlmError::InvalidResponse(error.to_string()))?;
+    Ok(filter_model_ids(parsed.data))
+}
+
+fn filter_model_ids(models: Vec<AnthropicModel>) -> Vec<String> {
+    let mut ids = models
+        .into_iter()
+        .filter(|model| model.model_type == "model")
+        .map(|model| model.id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids
 }
 
 fn map_content_to_anthropic(block: &ContentBlock) -> Result<AnthropicContentBlock, LlmError> {
@@ -693,6 +749,19 @@ enum AnthropicContentBlock {
     RedactedThinking {
         data: String,
     },
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicModelsResponse {
+    #[serde(default)]
+    data: Vec<AnthropicModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicModel {
+    id: String,
+    #[serde(rename = "type")]
+    model_type: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -818,6 +887,70 @@ mod tests {
     use crate::test_helpers::{callback_events, read_events};
     use crate::types::ToolDefinition;
     use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn spawn_json_server(status_line: &str, body: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("local addr");
+        let status_line = status_line.to_string();
+        let body = body.to_string();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept connection");
+            let mut buffer = [0_u8; 2048];
+            let _ = socket.read(&mut buffer).await.expect("read request");
+            let response = format!(
+                "HTTP/1.1 {status_line}
+content-type: application/json
+content-length: {}
+connection: close
+
+{}",
+                body.len(),
+                body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn anthropic_list_models_parses_response() {
+        let base_url = spawn_json_server(
+            "200 OK",
+            r#"{"data":[{"id":"claude-3-5-haiku-20241022","type":"model"},{"id":"claude-3-7-sonnet-latest","type":"alias"},{"id":"claude-sonnet-4-20250514","type":"model"}]}"#,
+        )
+        .await;
+        let provider = AnthropicProvider::new(base_url, "test-key")
+            .expect("provider")
+            .with_supported_models(vec!["claude-static".to_string()]);
+
+        let models = provider.list_models().await.expect("list models");
+
+        assert_eq!(
+            models,
+            vec![
+                "claude-3-5-haiku-20241022".to_string(),
+                "claude-sonnet-4-20250514".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_list_models_falls_back_on_error() {
+        let provider = AnthropicProvider::new("http://127.0.0.1:1", "test-key")
+            .expect("provider")
+            .with_supported_models(vec!["claude-opus-4-1-20250805".to_string()]);
+
+        let models = provider.list_models().await.expect("list models");
+
+        assert_eq!(models, vec!["claude-opus-4-1-20250805".to_string()]);
+    }
 
     #[test]
     fn test_build_request_body_maps_system_tools_and_content() {
