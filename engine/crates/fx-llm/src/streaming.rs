@@ -60,10 +60,7 @@ where
     collector.finish(callback)
 }
 
-pub(crate) fn emit_default_stream_response(
-    response: &CompletionResponse,
-    callback: &StreamCallback,
-) {
+pub fn emit_default_stream_response(response: &CompletionResponse, callback: &StreamCallback) {
     let text = completion_text(response);
     if !text.is_empty() {
         emit_event(callback, StreamEvent::TextDelta { text: text.clone() });
@@ -71,7 +68,7 @@ pub(crate) fn emit_default_stream_response(
     emit_event(callback, StreamEvent::Done { response: text });
 }
 
-pub(crate) fn completion_text(response: &CompletionResponse) -> String {
+pub fn completion_text(response: &CompletionResponse) -> String {
     response
         .content
         .iter()

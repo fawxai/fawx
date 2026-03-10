@@ -4,7 +4,8 @@ use fx_config::ThinkingBudget;
 use fx_core::error::LlmError as CoreLlmError;
 use fx_kernel::loop_engine::{LlmProvider as LoopLlmProvider, LoopStatus};
 use fx_llm::{
-    CompletionRequest, Message, ModelInfo, ModelRouter, ProviderError, StreamChunk, ThinkingConfig,
+    CompletionRequest, Message, ModelInfo, ModelRouter, ProviderError, StreamCallback, StreamChunk,
+    ThinkingConfig,
 };
 use std::fmt;
 use std::io::{self, Write};
@@ -316,6 +317,14 @@ impl LoopLlmProvider for RouterLoopLlmProvider<'_> {
         request: CompletionRequest,
     ) -> Result<fx_llm::CompletionStream, ProviderError> {
         self.router.complete_stream(request).await
+    }
+
+    async fn stream(
+        &self,
+        request: CompletionRequest,
+        callback: StreamCallback,
+    ) -> Result<fx_llm::CompletionResponse, ProviderError> {
+        self.router.stream(request, callback).await
     }
 
     fn model_name(&self) -> &str {

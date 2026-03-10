@@ -17,6 +17,7 @@ use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::loop_engine::{LoopEngine, LoopResult};
 use fx_kernel::signals::Signal;
 use fx_kernel::types::PerceptionSnapshot;
+use fx_kernel::StreamCallback;
 use fx_llm::CompletionProvider;
 use fx_llm::{Message, ModelInfo, ModelRouter};
 use fx_memory::SignalStore;
@@ -270,12 +271,32 @@ impl HeadlessApp {
         self.process_message_for_source(input, &source).await
     }
 
+    pub async fn process_message_streaming(
+        &mut self,
+        input: &str,
+        callback: StreamCallback,
+    ) -> Result<CycleResult, anyhow::Error> {
+        let source = InputSource::Text;
+        self.process_message_for_source_streaming(input, &source, callback)
+            .await
+    }
+
     pub async fn process_message_for_source(
         &mut self,
         input: &str,
         source: &InputSource,
     ) -> Result<CycleResult, anyhow::Error> {
         self.run_cycle_result(input, source).await
+    }
+
+    pub async fn process_message_for_source_streaming(
+        &mut self,
+        input: &str,
+        source: &InputSource,
+        callback: StreamCallback,
+    ) -> Result<CycleResult, anyhow::Error> {
+        self.run_cycle_result_streaming(input, source, callback)
+            .await
     }
 
     /// Return the active model identifier.
@@ -392,6 +413,24 @@ impl HeadlessApp {
         let result = self
             .loop_engine
             .run_cycle(snapshot, &llm)
+            .await
+            .map_err(|e| anyhow::anyhow!("loop error: stage={} reason={}", e.stage, e.reason))?;
+        self.evaluate_canary(&result);
+        Ok(self.finalize_cycle(input, &result))
+    }
+
+    async fn run_cycle_result_streaming(
+        &mut self,
+        input: &str,
+        source: &InputSource,
+        callback: StreamCallback,
+    ) -> Result<CycleResult, anyhow::Error> {
+        self.update_memory_context(input);
+        let snapshot = self.build_perception_snapshot(input, source);
+        let llm = RouterLoopLlmProvider::new(&self.router, self.active_model.clone());
+        let result = self
+            .loop_engine
+            .run_cycle_streaming(snapshot, &llm, Some(callback))
             .await
             .map_err(|e| anyhow::anyhow!("loop error: stage={} reason={}", e.stage, e.reason))?;
         self.evaluate_canary(&result);
@@ -1211,6 +1250,28 @@ pub async fn process_input_with_commands(
     match source {
         Some(source) => app.process_message_for_source(input, source).await,
         None => app.process_message(input).await,
+    }
+}
+
+pub async fn process_input_with_commands_streaming(
+    app: &mut HeadlessApp,
+    input: &str,
+    source: Option<&InputSource>,
+    callback: StreamCallback,
+) -> Result<CycleResult, anyhow::Error> {
+    if is_command_input(input) {
+        let result = process_command_input(app, input).await?;
+        callback(fx_kernel::StreamEvent::Done {
+            response: result.response.clone(),
+        });
+        return Ok(result);
+    }
+    match source {
+        Some(source) => {
+            app.process_message_for_source_streaming(input, source, callback)
+                .await
+        }
+        None => app.process_message_streaming(input, callback).await,
     }
 }
 

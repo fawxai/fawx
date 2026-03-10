@@ -19,6 +19,7 @@ use crate::input::{LoopCommand, LoopInputChannel};
 use crate::learn::Learning;
 use crate::perceive::{ProcessedPerception, TrimmingPolicy};
 use crate::signals::{LoopStep, Signal, SignalCollector, SignalKind};
+use crate::streaming::{Phase, StreamCallback, StreamEvent};
 use crate::types::{
     Goal, IdentityContext, LoopError, PerceptionSnapshot, ReasoningContext, WorkingMemoryEntry,
 };
@@ -31,8 +32,9 @@ use fx_decompose::{
     AggregationStrategy, ComplexityHint, DecompositionPlan, SubGoal, SubGoalOutcome, SubGoalResult,
 };
 use fx_llm::{
-    CompletionRequest, CompletionResponse, CompletionStream, ContentBlock, Message, MessageRole,
-    ProviderError, StreamChunk, ToolCall, ToolDefinition, ToolUseDelta, Usage,
+    emit_default_stream_response, CompletionRequest, CompletionResponse, CompletionStream,
+    ContentBlock, Message, MessageRole, ProviderError, StreamCallback as ProviderStreamCallback,
+    StreamChunk, StreamEvent as ProviderStreamEvent, ToolCall, ToolDefinition, ToolUseDelta, Usage,
 };
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -106,6 +108,16 @@ pub trait LlmProvider: Send + Sync + std::fmt::Debug {
             futures_util::stream::once(async move { Ok::<StreamChunk, ProviderError>(chunk) });
         Ok(Box::pin(stream))
     }
+
+    async fn stream(
+        &self,
+        request: CompletionRequest,
+        callback: ProviderStreamCallback,
+    ) -> Result<CompletionResponse, ProviderError> {
+        let response = self.complete(request).await?;
+        emit_default_stream_response(&response, &callback);
+        Ok(response)
+    }
 }
 
 fn response_to_chunk(response: CompletionResponse) -> StreamChunk {
@@ -136,6 +148,86 @@ fn response_to_chunk(response: CompletionResponse) -> StreamChunk {
         usage: response.usage,
         stop_reason: response.stop_reason,
     }
+}
+
+#[derive(Clone, Copy)]
+struct CycleStream<'a> {
+    callback: Option<&'a StreamCallback>,
+}
+
+impl<'a> CycleStream<'a> {
+    fn disabled() -> Self {
+        Self { callback: None }
+    }
+
+    fn enabled(callback: &'a StreamCallback) -> Self {
+        Self {
+            callback: Some(callback),
+        }
+    }
+
+    fn emit(self, event: StreamEvent) {
+        if let Some(callback) = self.callback {
+            callback(event);
+        }
+    }
+
+    fn phase(self, phase: Phase) {
+        self.emit(StreamEvent::PhaseChange { phase });
+    }
+
+    fn tool_call_start(self, call: &ToolCall) {
+        self.emit(StreamEvent::ToolCallStart {
+            id: call.id.clone(),
+            name: call.name.clone(),
+        });
+    }
+
+    fn tool_call_complete(self, call: &ToolCall) {
+        self.emit(StreamEvent::ToolCallComplete {
+            id: call.id.clone(),
+            name: call.name.clone(),
+            arguments: call.arguments.to_string(),
+        });
+    }
+
+    fn tool_result(self, result: &ToolResult) {
+        self.emit(StreamEvent::ToolResult {
+            id: result.tool_call_id.clone(),
+            output: result.output.clone(),
+            is_error: !result.success,
+        });
+    }
+
+    fn done(self, response: &str) {
+        self.emit(StreamEvent::Done {
+            response: response.to_string(),
+        });
+    }
+
+    fn done_result(self, result: &LoopResult) {
+        if let Some(response) = result.stream_done_response() {
+            self.done(&response);
+        }
+    }
+}
+
+fn provider_stream_bridge(
+    callback: StreamCallback,
+    event_bus: Option<fx_core::EventBus>,
+    phase: StreamPhase,
+) -> ProviderStreamCallback {
+    Arc::new(move |event| {
+        if let ProviderStreamEvent::TextDelta { text } = event {
+            if let Some(bus) = &event_bus {
+                let _ = bus.publish(InternalMessage::StreamDelta {
+                    delta: text.clone(),
+                    phase,
+                });
+            }
+            callback(StreamEvent::TextDelta { text });
+        }
+    })
 }
 
 /// Runtime loop status for `/loop` diagnostics.
@@ -219,6 +311,28 @@ impl LoopResult {
             | Self::NeedsInput { signals, .. }
             | Self::UserStopped { signals, .. }
             | Self::Error { signals, .. } => signals,
+        }
+    }
+
+    fn stream_done_response(&self) -> Option<String> {
+        match self {
+            Self::Complete { response, .. } => Some(response.clone()),
+            Self::BudgetExhausted {
+                partial_response, ..
+            } => Some(
+                partial_response
+                    .clone()
+                    .unwrap_or_else(|| "budget exhausted".to_string()),
+            ),
+            Self::NeedsInput { prompt, .. } => Some(prompt.clone()),
+            Self::UserStopped {
+                partial_response, ..
+            } => Some(
+                partial_response
+                    .clone()
+                    .unwrap_or_else(|| "user stopped".to_string()),
+            ),
+            Self::Error { .. } => None,
         }
     }
 }
@@ -826,44 +940,77 @@ impl LoopEngine {
     /// Run one full loop cycle.
     pub async fn run_cycle(
         &mut self,
+        perception: PerceptionSnapshot,
+        llm: &dyn LlmProvider,
+    ) -> Result<LoopResult, LoopError> {
+        self.run_cycle_streaming(perception, llm, None).await
+    }
+
+    pub async fn run_cycle_streaming(
+        &mut self,
         mut perception: PerceptionSnapshot,
         llm: &dyn LlmProvider,
+        stream_callback: Option<StreamCallback>,
     ) -> Result<LoopResult, LoopError> {
         self.prepare_cycle();
         let mut state = CycleState::default();
+        let stream = stream_callback
+            .as_ref()
+            .map_or_else(CycleStream::disabled, CycleStream::enabled);
 
         while self.iteration_count < self.max_iterations {
             self.iteration_count = self.iteration_count.saturating_add(1);
             self.refresh_iteration_state();
-            match self.execute_iteration(&perception, llm, &mut state).await? {
-                IterationStep::Terminal(result) => return Ok(self.finalize_result(result)),
+            match self
+                .execute_iteration(&perception, llm, &mut state, stream)
+                .await?
+            {
+                IterationStep::Terminal(result) => {
+                    stream.done_result(&result);
+                    return Ok(self.finalize_result(result));
+                }
                 IterationStep::Progress(outcome) => {
-                    let IterationOutcome {
-                        response_text,
-                        continuation,
-                        learning,
-                    } = outcome;
-                    if let Some(result) = self.handle_continuation(
-                        continuation,
-                        response_text,
-                        learning,
-                        &mut perception,
-                        &mut state,
-                    ) {
+                    if let Some(result) =
+                        self.apply_iteration_outcome(outcome, &mut perception, &mut state, stream)
+                    {
                         return Ok(self.finalize_result(result));
                     }
                 }
             }
         }
 
-        Ok(self.finalize_result(LoopResult::Error {
+        let result = LoopResult::Error {
             message: format!(
                 "Loop reached safety limit of {} iterations without completion.",
                 self.max_iterations
             ),
             recoverable: true,
             signals: Vec::new(),
-        }))
+        };
+        stream.done_result(&result);
+        Ok(self.finalize_result(result))
+    }
+
+    fn apply_iteration_outcome(
+        &mut self,
+        outcome: IterationOutcome,
+        perception: &mut PerceptionSnapshot,
+        state: &mut CycleState,
+        stream: CycleStream<'_>,
+    ) -> Option<LoopResult> {
+        let IterationOutcome {
+            response_text,
+            continuation,
+            learning,
+        } = outcome;
+        self.handle_continuation(
+            continuation,
+            response_text,
+            learning,
+            perception,
+            state,
+            stream,
+        )
     }
 
     /// Drain the input channel and return the highest-priority flow command.
@@ -968,6 +1115,7 @@ impl LoopEngine {
         perception: &PerceptionSnapshot,
         llm: &dyn LlmProvider,
         state: &mut CycleState,
+        stream: CycleStream<'_>,
     ) -> Result<IterationStep, LoopError> {
         if let Some(step) =
             self.budget_terminal(ActionCost::default(), state.partial_response.clone())
@@ -979,13 +1127,15 @@ impl LoopEngine {
             return Ok(step);
         }
 
+        stream.phase(Phase::Perceive);
         let processed = self.perceive(perception).await?;
         let reason_cost = self.estimate_reasoning_cost(&processed);
         if let Some(step) = self.budget_terminal(reason_cost, state.partial_response.clone()) {
             return Ok(step);
         }
 
-        let response = self.reason(&processed, llm).await?;
+        stream.phase(Phase::Reason);
+        let response = self.reason(&processed, llm, stream).await?;
         self.record_reasoning_cost(reason_cost, state);
 
         let decision = self.decide(&response).await?;
@@ -996,7 +1146,8 @@ impl LoopEngine {
             return Ok(step);
         }
 
-        self.execute_action_and_finalize(&decision, llm, state, &processed.context_window)
+        stream.phase(Phase::Act);
+        self.execute_action_and_finalize(&decision, llm, state, &processed.context_window, stream)
             .await
     }
 
@@ -1006,8 +1157,9 @@ impl LoopEngine {
         llm: &dyn LlmProvider,
         state: &mut CycleState,
         context_messages: &[Message],
+        stream: CycleStream<'_>,
     ) -> Result<IterationStep, LoopError> {
-        let action = self.act(decision, llm, context_messages).await?;
+        let action = self.act(decision, llm, context_messages, stream).await?;
 
         // Tool actions record costs incrementally inside act_with_tools().
         // Non-tool actions need their costs recorded here.
@@ -1091,9 +1243,10 @@ impl LoopEngine {
         learning: Learning,
         perception: &mut PerceptionSnapshot,
         state: &mut CycleState,
+        stream: CycleStream<'_>,
     ) -> Option<LoopResult> {
         state.learnings.push(learning);
-        match continuation {
+        let result = match continuation {
             Continuation::Complete => Some(LoopResult::Complete {
                 response: response_text,
                 iterations: self.iteration_count,
@@ -1110,7 +1263,11 @@ impl LoopEngine {
                 *perception = next_perception_from_sub_goal(perception, &sub_goal);
                 None
             }
+        };
+        if let Some(result) = &result {
+            stream.done_result(result);
         }
+        result
     }
 
     /// Perceive step.
@@ -1173,6 +1330,7 @@ impl LoopEngine {
         &mut self,
         perception: &ProcessedPerception,
         llm: &dyn LlmProvider,
+        stream: CycleStream<'_>,
     ) -> Result<CompletionResponse, LoopError> {
         let request = build_reasoning_request(
             perception,
@@ -1184,23 +1342,76 @@ impl LoopEngine {
         );
         let reasoning_messages = request.messages.clone();
         let started = current_time_ms();
-        let mut stream = llm
-            .complete_stream(request)
-            .await
-            .map_err(|error| loop_error("reason", &format!("completion failed: {error}"), true))?;
-
-        self.publish_stream_started(StreamPhase::Reason);
         let response = self
-            .consume_stream_with_events(&mut stream, StreamPhase::Reason)
+            .request_completion(llm, request, StreamPhase::Reason, "reason", stream)
             .await?;
 
         let response = self
-            .continue_truncated_response(response, &reasoning_messages, llm, LoopStep::Reason)
+            .continue_truncated_response(
+                response,
+                &reasoning_messages,
+                llm,
+                LoopStep::Reason,
+                stream,
+            )
             .await?;
         let latency_ms = current_time_ms().saturating_sub(started);
         let usage = response.usage;
         self.emit_reason_trace_and_perf(latency_ms, usage.as_ref());
         Ok(response)
+    }
+
+    async fn request_completion(
+        &mut self,
+        llm: &dyn LlmProvider,
+        request: CompletionRequest,
+        phase: StreamPhase,
+        stage: &str,
+        stream: CycleStream<'_>,
+    ) -> Result<CompletionResponse, LoopError> {
+        match stream.callback {
+            Some(callback) => {
+                self.request_streaming_completion(llm, request, phase, stage, callback)
+                    .await
+            }
+            None => {
+                self.request_buffered_completion(llm, request, phase, stage)
+                    .await
+            }
+        }
+    }
+
+    async fn request_buffered_completion(
+        &mut self,
+        llm: &dyn LlmProvider,
+        request: CompletionRequest,
+        phase: StreamPhase,
+        stage: &str,
+    ) -> Result<CompletionResponse, LoopError> {
+        let mut stream = llm
+            .complete_stream(request)
+            .await
+            .map_err(|error| loop_error(stage, &format!("completion failed: {error}"), true))?;
+        self.publish_stream_started(phase);
+        self.consume_stream_with_events(&mut stream, phase).await
+    }
+
+    async fn request_streaming_completion(
+        &self,
+        llm: &dyn LlmProvider,
+        request: CompletionRequest,
+        phase: StreamPhase,
+        stage: &str,
+        callback: &StreamCallback,
+    ) -> Result<CompletionResponse, LoopError> {
+        self.publish_stream_started(phase);
+        let bridge = provider_stream_bridge(callback.clone(), self.event_bus.clone(), phase);
+        let result = llm
+            .stream(request, bridge)
+            .await
+            .map_err(|error| loop_error(stage, &format!("completion failed: {error}"), true));
+        self.publish_stream_finished(phase);
+        result
     }
 
     fn publish_stream_started(&self, phase: StreamPhase) {
@@ -1312,6 +1523,7 @@ impl LoopEngine {
         llm: &dyn LlmProvider,
         continuation_messages: &[Message],
         step: LoopStep,
+        stream: CycleStream<'_>,
     ) -> Result<CompletionResponse, LoopError> {
         self.ensure_continuation_budget(continuation_messages, step)?;
         let request = build_truncation_continuation_request(
@@ -1324,14 +1536,15 @@ impl LoopEngine {
             self.thinking_config.clone(),
         );
         let request_messages = request.messages.clone();
-        let stage = step_stage(step);
-        let response = llm.complete(request).await.map_err(|error| {
-            loop_error(
-                stage,
-                &format!("continuation completion failed: {error}"),
-                true,
+        let response = self
+            .request_completion(
+                llm,
+                request,
+                stream_phase_for_step(step),
+                step_stage(step),
+                stream,
             )
-        })?;
+            .await?;
         self.record_continuation_budget(&response, &request_messages);
         Ok(response)
     }
@@ -1342,6 +1555,7 @@ impl LoopEngine {
         base_messages: &[Message],
         llm: &dyn LlmProvider,
         step: LoopStep,
+        stream: CycleStream<'_>,
     ) -> Result<CompletionResponse, LoopError> {
         let mut attempts = 0;
         let mut full_text = extract_response_text(&initial_response);
@@ -1353,7 +1567,7 @@ impl LoopEngine {
             self.emit_continuation_trace(step, attempts);
             let continuation_messages = build_continuation_messages(base_messages, &full_text);
             let continued = self
-                .request_truncated_continuation(llm, &continuation_messages, step)
+                .request_truncated_continuation(llm, &continuation_messages, step, stream)
                 .await?;
             combined = merge_continuation_response(combined, continued, &mut full_text);
         }
@@ -1399,6 +1613,7 @@ impl LoopEngine {
         decision: &Decision,
         llm: &dyn LlmProvider,
         context_messages: &[Message],
+        stream: CycleStream<'_>,
     ) -> Result<ActionResult, LoopError> {
         match decision {
             // Note: Clarify and Defer are not produced by decide() in the current
@@ -1408,7 +1623,7 @@ impl LoopEngine {
             }
             Decision::UseTools(calls) => {
                 let action = self
-                    .act_with_tools(decision, calls, llm, context_messages)
+                    .act_with_tools(decision, calls, llm, context_messages, stream)
                     .await?;
                 self.emit_action_signals(&action.tool_results);
                 Ok(action)
@@ -1476,8 +1691,14 @@ impl LoopEngine {
             Decision::UseTools(c) => c,
             _ => unreachable!(),
         };
-        self.act_with_tools(&decision, calls_ref, llm, context_messages)
-            .await
+        self.act_with_tools(
+            &decision,
+            calls_ref,
+            llm,
+            context_messages,
+            CycleStream::disabled(),
+        )
+        .await
     }
 
     /// Gate 3: reject if estimated cost exceeds 150% of remaining budget.
@@ -2218,33 +2439,42 @@ impl LoopEngine {
         }
     }
 
-    fn publish_tool_calls(&self, calls: &[ToolCall]) {
-        let Some(bus) = &self.event_bus else {
-            return;
-        };
-
+    fn publish_tool_calls(&self, calls: &[ToolCall], stream: CycleStream<'_>) {
         for call in calls {
-            let _ = bus.publish(InternalMessage::ToolUse {
-                call_id: call.id.clone(),
-                name: call.name.clone(),
-                arguments: call.arguments.clone(),
-            });
+            stream.tool_call_start(call);
+            stream.tool_call_complete(call);
+            self.publish_tool_use(call);
         }
     }
 
-    fn publish_tool_results(&self, results: &[ToolResult]) {
+    fn publish_tool_use(&self, call: &ToolCall) {
         let Some(bus) = &self.event_bus else {
             return;
         };
+        let _ = bus.publish(InternalMessage::ToolUse {
+            call_id: call.id.clone(),
+            name: call.name.clone(),
+            arguments: call.arguments.clone(),
+        });
+    }
 
+    fn publish_tool_results(&self, results: &[ToolResult], stream: CycleStream<'_>) {
         for result in results {
-            let _ = bus.publish(InternalMessage::ToolResult {
-                call_id: result.tool_call_id.clone(),
-                name: result.tool_name.clone(),
-                success: result.success,
-                content: result.output.clone(),
-            });
+            stream.tool_result(result);
+            self.publish_tool_result(result);
         }
+    }
+
+    fn publish_tool_result(&self, result: &ToolResult) {
+        let Some(bus) = &self.event_bus else {
+            return;
+        };
+        let _ = bus.publish(InternalMessage::ToolResult {
+            call_id: result.tool_call_id.clone(),
+            name: result.tool_name.clone(),
+            success: result.success,
+            content: result.output.clone(),
+        });
     }
 
     fn emit_verification_signals(&mut self, verification: &Verification) {
@@ -2560,6 +2790,7 @@ impl LoopEngine {
         calls: &[ToolCall],
         llm: &dyn LlmProvider,
         context_messages: &[Message],
+        stream: CycleStream<'_>,
     ) -> Result<ActionResult, LoopError> {
         if self.budget.state() == BudgetState::Low {
             return Ok(self.budget_low_blocked_result(decision, "tool dispatch"));
@@ -2584,7 +2815,10 @@ impl LoopEngine {
                 break;
             }
 
-            match self.execute_tool_round(round + 1, llm, &mut state).await? {
+            match self
+                .execute_tool_round(round + 1, llm, &mut state, stream)
+                .await?
+            {
                 ToolRoundOutcome::Cancelled => {
                     return Ok(self.cancelled_tool_action_from_state(decision, state));
                 }
@@ -2607,6 +2841,7 @@ impl LoopEngine {
                             &state.continuation_messages,
                             llm,
                             LoopStep::Act,
+                            stream,
                         )
                         .await?;
 
@@ -2620,8 +2855,14 @@ impl LoopEngine {
             }
         }
 
-        self.synthesize_tool_fallback(decision, state.all_tool_results, state.tokens_used, llm)
-            .await
+        self.synthesize_tool_fallback(
+            decision,
+            state.all_tool_results,
+            state.tokens_used,
+            llm,
+            stream,
+        )
+        .await
     }
 
     fn apply_fan_out_cap(&mut self, calls: &[ToolCall]) -> (Vec<ToolCall>, Vec<ToolCall>) {
@@ -2738,11 +2979,12 @@ impl LoopEngine {
         round: u32,
         llm: &dyn LlmProvider,
         state: &mut ToolRoundState,
+        stream: CycleStream<'_>,
     ) -> Result<ToolRoundOutcome, LoopError> {
         let round_started = current_time_ms();
-        self.publish_tool_calls(&state.current_calls);
+        self.publish_tool_calls(&state.current_calls, stream);
         let results = self.execute_tool_calls(&state.current_calls).await?;
-        self.publish_tool_results(&results);
+        self.publish_tool_results(&results, stream);
         self.record_tool_execution_cost(results.len());
 
         let round_result_bytes: usize = results.iter().map(|r| r.output.len()).sum();
@@ -2767,8 +3009,14 @@ impl LoopEngine {
             return Ok(ToolRoundOutcome::BudgetLow);
         }
 
+        stream.phase(Phase::Synthesize);
         let response = self
-            .request_tool_continuation(llm, &state.continuation_messages, &mut state.tokens_used)
+            .request_tool_continuation(
+                llm,
+                &state.continuation_messages,
+                &mut state.tokens_used,
+                stream,
+            )
             .await?;
         self.record_continuation_cost(&response, &state.continuation_messages);
         self.emit_tool_round_trace_and_perf(
@@ -2841,6 +3089,7 @@ impl LoopEngine {
         llm: &dyn LlmProvider,
         context_messages: &[Message],
         tokens_used: &mut TokenUsage,
+        stream: CycleStream<'_>,
     ) -> Result<CompletionResponse, LoopError> {
         let request = build_continuation_request(
             context_messages,
@@ -2851,17 +3100,8 @@ impl LoopEngine {
             self.thinking_config.clone(),
         );
 
-        let mut stream = llm.complete_stream(request).await.map_err(|error| {
-            loop_error(
-                "act",
-                &format!("tool continuation completion failed: {error}"),
-                true,
-            )
-        })?;
-
-        self.publish_stream_started(StreamPhase::Synthesize);
         let response = self
-            .consume_stream_with_events(&mut stream, StreamPhase::Synthesize)
+            .request_completion(llm, request, StreamPhase::Synthesize, "act", stream)
             .await?;
 
         tokens_used.accumulate(response_usage_or_estimate(&response, context_messages));
@@ -2902,11 +3142,15 @@ impl LoopEngine {
         tool_results: Vec<ToolResult>,
         mut tokens_used: TokenUsage,
         llm: &dyn LlmProvider,
+        stream: CycleStream<'_>,
     ) -> Result<ActionResult, LoopError> {
         let max_tokens = self.budget.config().max_synthesis_tokens;
         let evicted = evict_oldest_results(tool_results, max_tokens);
         let synthesis_prompt = tool_synthesis_prompt(&evicted, &self.synthesis_instruction);
-        let llm_text = self.generate_tool_summary(&synthesis_prompt, llm).await?;
+        stream.phase(Phase::Synthesize);
+        let llm_text = self
+            .generate_tool_summary(&synthesis_prompt, llm, stream)
+            .await?;
         tokens_used.accumulate(synthesis_usage(&synthesis_prompt, &llm_text));
         Ok(ActionResult {
             decision: decision.clone(),
@@ -2925,12 +3169,17 @@ impl LoopEngine {
         &self,
         synthesis_prompt: &str,
         llm: &dyn LlmProvider,
+        stream: CycleStream<'_>,
     ) -> Result<String, LoopError> {
         let chunks = Arc::new(Mutex::new(Vec::new()));
         let callback_chunks = Arc::clone(&chunks);
+        let stream_callback = stream.callback.cloned();
         let callback = Box::new(move |chunk: String| {
             if let Ok(mut guard) = callback_chunks.lock() {
-                guard.push(chunk);
+                guard.push(chunk.clone());
+            }
+            if let Some(callback) = &stream_callback {
+                callback(StreamEvent::TextDelta { text: chunk });
             }
         });
 
@@ -3835,6 +4084,14 @@ fn phase_stage(phase: StreamPhase) -> &'static str {
     match phase {
         StreamPhase::Reason => "reason",
         StreamPhase::Synthesize => "act",
+    }
+}
+
+fn stream_phase_for_step(step: LoopStep) -> StreamPhase {
+    match step {
+        LoopStep::Reason => StreamPhase::Reason,
+        LoopStep::Act => StreamPhase::Synthesize,
+        _ => StreamPhase::Synthesize,
     }
 }
 
@@ -4743,7 +5000,10 @@ mod tests {
             .perceive(&base_snapshot("read"))
             .await
             .expect("perceive");
-        let response = engine.reason(&perception, &llm).await.expect("reason");
+        let response = engine
+            .reason(&perception, &llm, CycleStream::disabled())
+            .await
+            .expect("reason");
         assert_eq!(response.tool_calls.len(), 1);
     }
 
@@ -5898,7 +6158,13 @@ mod phase2_tests {
         )]);
 
         let stitched = engine
-            .continue_truncated_response(initial, &[Message::user("hello")], &llm, LoopStep::Reason)
+            .continue_truncated_response(
+                initial,
+                &[Message::user("hello")],
+                &llm,
+                LoopStep::Reason,
+                CycleStream::disabled(),
+            )
             .await
             .expect("continuation should succeed");
 
@@ -5925,6 +6191,7 @@ mod phase2_tests {
                 &[Message::user("continue")],
                 &llm,
                 LoopStep::Reason,
+                CycleStream::disabled(),
             )
             .await
             .expect("continuation should stop at max attempts");
@@ -5948,6 +6215,7 @@ mod phase2_tests {
                 &[Message::user("continue")],
                 &llm,
                 LoopStep::Reason,
+                CycleStream::disabled(),
             )
             .await
             .expect("continuation should stop when natural stop reason arrives");
@@ -6156,7 +6424,7 @@ mod phase2_tests {
         let llm = StreamingCaptureLlm::new("summary from stream");
 
         let summary = engine
-            .generate_tool_summary("summarize this", &llm)
+            .generate_tool_summary("summarize this", &llm, CycleStream::disabled())
             .await
             .expect("streaming synthesis should succeed");
 
@@ -6491,6 +6759,7 @@ mod phase4_tests {
                 calls_from_decision(&decision),
                 &llm,
                 &context_messages,
+                CycleStream::disabled(),
             )
             .await
             .expect("act_with_tools");
@@ -6517,6 +6786,7 @@ mod phase4_tests {
                 calls_from_decision(&decision),
                 &llm,
                 &context_messages,
+                CycleStream::disabled(),
             )
             .await
             .expect("act_with_tools");
@@ -6544,6 +6814,7 @@ mod phase4_tests {
                 calls_from_decision(&decision),
                 &llm,
                 &context_messages,
+                CycleStream::disabled(),
             )
             .await
             .expect("act_with_tools");
@@ -6581,6 +6852,7 @@ mod phase4_tests {
                 calls_from_decision(&decision),
                 &llm,
                 &context_messages,
+                CycleStream::disabled(),
             )
             .await
             .expect("act_with_tools");
@@ -6636,6 +6908,7 @@ mod phase4_tests {
                 calls_from_decision(&decision),
                 &llm,
                 &context_messages,
+                CycleStream::disabled(),
             )
             .await
             .expect("act_with_tools should succeed via synthesis fallback");
@@ -7179,6 +7452,9 @@ mod cancellation_tests {
     #[derive(Debug)]
     struct PartialErrorStreamLlm;
 
+    #[derive(Debug)]
+    struct FailingBufferedStreamLlm;
+
     #[async_trait]
     impl LlmProvider for PartialErrorStreamLlm {
         async fn generate(&self, _: &str, _: u32) -> Result<String, CoreLlmError> {
@@ -7215,6 +7491,36 @@ mod cancellation_tests {
                 )),
             ];
             Ok(Box::pin(futures_util::stream::iter(chunks)))
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for FailingBufferedStreamLlm {
+        async fn generate(&self, _: &str, _: u32) -> Result<String, CoreLlmError> {
+            Ok("summary".to_string())
+        }
+
+        async fn generate_streaming(
+            &self,
+            _: &str,
+            _: u32,
+            callback: Box<dyn Fn(String) + Send + 'static>,
+        ) -> Result<String, CoreLlmError> {
+            callback("summary".to_string());
+            Ok("summary".to_string())
+        }
+
+        fn model_name(&self) -> &str {
+            "failing-buffered-stream"
+        }
+
+        async fn complete_stream(
+            &self,
+            _: CompletionRequest,
+        ) -> Result<CompletionStream, ProviderError> {
+            Err(ProviderError::Provider(
+                "simulated stream setup failure".to_string(),
+            ))
         }
     }
 
@@ -7298,6 +7604,21 @@ mod cancellation_tests {
             usage: None,
             stop_reason: None,
         }
+    }
+
+    fn stream_recorder() -> (StreamCallback, Arc<Mutex<Vec<StreamEvent>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let callback: StreamCallback = Arc::new(move |event| {
+            captured.lock().expect("lock").push(event);
+        });
+        (callback, events)
+    }
+
+    fn assert_done_event(events: &[StreamEvent], expected: &str) {
+        assert!(
+            matches!(events.last(), Some(StreamEvent::Done { response }) if response == expected)
+        );
     }
 
     fn tool_delta(id: &str, name: Option<&str>, arguments_delta: &str, done: bool) -> ToolUseDelta {
@@ -7387,6 +7708,127 @@ mod cancellation_tests {
             .expect("run_cycle");
         send_task.await.expect("send task");
         (result, rounds.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn run_cycle_streaming_emits_text_and_done_events() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let llm = ScriptedLlm::new(vec![text_response("done")]);
+        let (callback, events) = stream_recorder();
+
+        let result = engine
+            .run_cycle_streaming(test_snapshot("hello"), &llm, Some(callback))
+            .await
+            .expect("run_cycle_streaming");
+
+        let response = match result {
+            LoopResult::Complete { response, .. } => response,
+            other => panic!("expected complete result, got {other:?}"),
+        };
+        let events = events.lock().expect("lock").clone();
+        assert_eq!(response, "done");
+        assert!(events.contains(&StreamEvent::PhaseChange {
+            phase: Phase::Perceive,
+        }));
+        assert!(events.contains(&StreamEvent::PhaseChange {
+            phase: Phase::Reason,
+        }));
+        assert!(events.contains(&StreamEvent::PhaseChange { phase: Phase::Act }));
+        assert!(events.contains(&StreamEvent::TextDelta {
+            text: "done".to_string(),
+        }));
+        assert!(
+            matches!(events.last(), Some(StreamEvent::Done { response }) if response == "done")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_cycle_streaming_emits_tool_events_and_synthesize_phase() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let llm = ScriptedLlm::new(vec![tool_use_response("call-1"), text_response("done")]);
+        let (callback, events) = stream_recorder();
+
+        let result = engine
+            .run_cycle_streaming(test_snapshot("read file"), &llm, Some(callback))
+            .await
+            .expect("run_cycle_streaming");
+
+        let response = match result {
+            LoopResult::Complete { response, .. } => response,
+            other => panic!("expected complete result, got {other:?}"),
+        };
+        let events = events.lock().expect("lock").clone();
+        assert_eq!(response, "done");
+        assert!(events.contains(&StreamEvent::PhaseChange {
+            phase: Phase::Synthesize,
+        }));
+        assert!(events.contains(&StreamEvent::ToolCallStart {
+            id: "call-1".to_string(),
+            name: "read_file".to_string(),
+        }));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolCallComplete { id, name, .. }
+                if id == "call-1" && name == "read_file"
+        )));
+        assert!(events.contains(&StreamEvent::ToolResult {
+            id: "call-1".to_string(),
+            output: "ok".to_string(),
+            is_error: false,
+        }));
+        assert_done_event(&events, "done");
+    }
+
+    #[tokio::test]
+    async fn run_cycle_streaming_emits_done_when_budget_exhausted() {
+        let zero_budget = crate::budget::BudgetConfig {
+            max_llm_calls: 0,
+            max_tool_invocations: 0,
+            max_tokens: 0,
+            max_cost_cents: 0,
+            max_wall_time_ms: 0,
+            max_recursion_depth: 0,
+            decompose_depth_mode: DepthMode::Adaptive,
+            ..BudgetConfig::default()
+        };
+        let mut engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(zero_budget, 0, 0))
+            .context(ContextCompactor::new(2048, 256))
+            .max_iterations(3)
+            .tool_executor(Arc::new(NoopToolExecutor))
+            .synthesis_instruction("Summarize tool output".to_string())
+            .build()
+            .expect("test engine build");
+        let llm = ScriptedLlm::new(vec![text_response("hello")]);
+        let (callback, events) = stream_recorder();
+
+        let result = engine
+            .run_cycle_streaming(test_snapshot("hello"), &llm, Some(callback))
+            .await
+            .expect("run_cycle_streaming");
+
+        assert!(matches!(result, LoopResult::BudgetExhausted { .. }));
+        let events = events.lock().expect("lock").clone();
+        assert_done_event(&events, "budget exhausted");
+    }
+
+    #[tokio::test]
+    async fn run_cycle_streaming_emits_done_when_user_stopped() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let (sender, channel) = loop_input_channel();
+        engine.set_input_channel(channel);
+        sender.send(LoopCommand::Stop).expect("send Stop");
+        let llm = ScriptedLlm::new(vec![text_response("hello")]);
+        let (callback, events) = stream_recorder();
+
+        let result = engine
+            .run_cycle_streaming(test_snapshot("hello"), &llm, Some(callback))
+            .await
+            .expect("run_cycle_streaming");
+
+        assert!(matches!(result, LoopResult::UserStopped { .. }));
+        let events = events.lock().expect("lock").clone();
+        assert_done_event(&events, "user stopped");
     }
 
     #[test]
@@ -7706,7 +8148,11 @@ mod cancellation_tests {
         engine.set_event_bus(bus);
 
         let error = engine
-            .reason(&reason_perception("hello"), &PartialErrorStreamLlm)
+            .reason(
+                &reason_perception("hello"),
+                &PartialErrorStreamLlm,
+                CycleStream::disabled(),
+            )
             .await
             .expect_err("stream should fail");
         assert!(error.reason.contains("stream consumption failed"));
@@ -7731,6 +8177,25 @@ mod cancellation_tests {
             receiver.try_recv().is_err(),
             "finished should be emitted once"
         );
+    }
+
+    #[tokio::test]
+    async fn reason_does_not_publish_stream_events_when_buffered_stream_setup_fails() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let bus = fx_core::EventBus::new(8);
+        let mut receiver = bus.subscribe();
+        engine.set_event_bus(bus);
+
+        let error = engine
+            .reason(
+                &reason_perception("hello"),
+                &FailingBufferedStreamLlm,
+                CycleStream::disabled(),
+            )
+            .await
+            .expect_err("stream setup should fail");
+        assert!(error.reason.contains("completion failed"));
+        assert!(receiver.try_recv().is_err(), "no stream events expected");
     }
 
     #[tokio::test]
@@ -10239,7 +10704,7 @@ mod context_compaction_tests {
         let mut state = ToolRoundState::new(&calls, &large_history(12, 70));
 
         let _ = engine
-            .execute_tool_round(1, &llm, &mut state)
+            .execute_tool_round(1, &llm, &mut state, CycleStream::disabled())
             .await
             .expect("tool round");
 
@@ -11414,7 +11879,7 @@ mod loop_resilience_tests {
         let llm = SequentialMockLlm::new(vec![]);
 
         let result = engine
-            .act(&decision, &llm, &context)
+            .act(&decision, &llm, &context, CycleStream::disabled())
             .await
             .expect("act should succeed");
 
@@ -11463,7 +11928,7 @@ mod loop_resilience_tests {
         let llm = SequentialMockLlm::new(vec![]);
 
         let result = engine
-            .act(&decision, &llm, &context)
+            .act(&decision, &llm, &context, CycleStream::disabled())
             .await
             .expect("act should succeed");
 
@@ -11617,7 +12082,10 @@ mod loop_resilience_tests {
             stop_reason: None,
         }]);
 
-        let result = engine.act(&decision, &llm, &context).await.expect("act");
+        let result = engine
+            .act(&decision, &llm, &context, CycleStream::disabled())
+            .await
+            .expect("act");
 
         assert_eq!(result.tool_results.len(), 3, "all 3 should execute");
     }
@@ -11644,7 +12112,10 @@ mod loop_resilience_tests {
             stop_reason: None,
         }]);
 
-        let result = engine.act(&decision, &llm, &context).await.expect("act");
+        let result = engine
+            .act(&decision, &llm, &context, CycleStream::disabled())
+            .await
+            .expect("act");
 
         let executed: Vec<_> = result.tool_results.iter().filter(|r| r.success).collect();
         assert_eq!(executed.len(), 4, "only first 4 should execute");
@@ -11735,7 +12206,10 @@ mod loop_resilience_tests {
             stop_reason: None,
         }]);
 
-        let result = engine.act(&decision, &llm, &context).await.expect("act");
+        let result = engine
+            .act(&decision, &llm, &context, CycleStream::disabled())
+            .await
+            .expect("act");
 
         let executed: Vec<_> = result.tool_results.iter().filter(|r| r.success).collect();
         assert_eq!(executed.len(), 1, "cap=1 should execute exactly 1 tool");
@@ -11780,7 +12254,10 @@ mod loop_resilience_tests {
 
         let decision = Decision::UseTools(calls);
         let context = vec![Message::user("do things")];
-        let result = engine.act(&decision, &llm, &context).await.expect("act");
+        let result = engine
+            .act(&decision, &llm, &context, CycleStream::disabled())
+            .await
+            .expect("act");
 
         // Should have 1 executed + 1 deferred-as-synthetic = 2 tool results
         assert_eq!(
@@ -11848,7 +12325,10 @@ mod loop_resilience_tests {
 
         let decision = Decision::UseTools(initial_calls);
         let context = vec![Message::user("read files")];
-        let result = engine.act(&decision, &llm, &context).await.expect("act");
+        let result = engine
+            .act(&decision, &llm, &context, CycleStream::disabled())
+            .await
+            .expect("act");
 
         // Initial 2 + capped 2 executed + 2 deferred (synthetic) = 6 total
         assert_eq!(
@@ -13516,7 +13996,13 @@ mod per_tool_retry_budget_tests {
         let context_messages = vec![Message::user("do something")];
 
         let action = engine
-            .act_with_tools(&decision, tool_calls, &llm, &context_messages)
+            .act_with_tools(
+                &decision,
+                tool_calls,
+                &llm,
+                &context_messages,
+                CycleStream::disabled(),
+            )
             .await
             .expect("act_with_tools should succeed with budget-low path");
 

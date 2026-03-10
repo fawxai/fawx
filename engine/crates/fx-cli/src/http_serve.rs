@@ -9,28 +9,34 @@
 //! via HMAC-based constant-time comparison (`ring::hmac`). The `/health`
 //! endpoint is public for monitoring.
 
+use axum::body::{Body, Bytes};
 use axum::extract::{Json, Path, State};
-use axum::http::StatusCode;
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use futures::stream;
 use fx_channel_telegram::{IncomingMessage, OutgoingMessage, TelegramChannel};
 use fx_channel_webhook::{WebhookChannel, WebhookMessage, WebhookResponse};
 use fx_config::HttpConfig;
 use fx_core::channel::{Channel, ResponseContext};
 use fx_core::types::InputSource;
-use fx_kernel::{ChannelRegistry, HttpChannel, ResponseRouter};
+use fx_kernel::{ChannelRegistry, HttpChannel, ResponseRouter, StreamCallback, StreamEvent};
 use ring::hmac;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 
-use crate::headless::{process_input_with_commands, CycleResult, HeadlessApp};
+use crate::headless::{
+    process_input_with_commands, process_input_with_commands_streaming, CycleResult, HeadlessApp,
+};
 
 // ── Request/Response types ──────────────────────────────────────────────────
 
@@ -69,6 +75,168 @@ struct StatusResponse {
 #[derive(Serialize)]
 struct ErrorBody {
     error: String,
+}
+
+// ── SSE helpers ─────────────────────────────────────────────────────────────
+
+const SSE_CHANNEL_CAPACITY: usize = 64;
+
+fn wants_sse(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|part| part.trim().starts_with("text/event-stream"))
+        })
+}
+
+fn sse_frame(event: &str, data: serde_json::Value) -> Option<String> {
+    serde_json::to_string(&data)
+        .ok()
+        .map(|data| format!("event: {event}\ndata: {data}\n\n"))
+}
+
+fn serialize_stream_event(event: StreamEvent) -> Option<String> {
+    match event {
+        StreamEvent::TextDelta { text } => {
+            sse_frame("text_delta", serde_json::json!({ "text": text }))
+        }
+        StreamEvent::ToolCallStart { id, name } => sse_frame(
+            "tool_call_start",
+            serde_json::json!({ "id": id, "name": name }),
+        ),
+        StreamEvent::ToolCallComplete {
+            id,
+            name,
+            arguments,
+        } => sse_frame(
+            "tool_call_complete",
+            serde_json::json!({
+                "id": id,
+                "name": name,
+                "arguments": arguments,
+            }),
+        ),
+        StreamEvent::ToolResult {
+            id,
+            output,
+            is_error,
+        } => sse_frame(
+            "tool_result",
+            serde_json::json!({
+                "id": id,
+                "output": output,
+                "is_error": is_error,
+            }),
+        ),
+        StreamEvent::PhaseChange { phase } => {
+            sse_frame("phase", serde_json::json!({ "phase": phase }))
+        }
+        StreamEvent::Done { response } => {
+            sse_frame("done", serde_json::json!({ "response": response }))
+        }
+    }
+}
+
+fn error_stream_frame(error: &str) -> String {
+    sse_frame("error", serde_json::json!({ "error": error }))
+        .unwrap_or_else(|| "event: error\ndata: {\"error\":\"internal_error\"}\n\n".to_string())
+}
+
+fn send_sse_frame(
+    sender: &mpsc::Sender<String>,
+    disconnected: &Arc<AtomicBool>,
+    frame: String,
+) -> bool {
+    if disconnected.load(Ordering::Relaxed) {
+        return false;
+    }
+
+    match sender.try_send(frame) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            disconnected.store(true, Ordering::Relaxed);
+            tracing::warn!("stopping SSE stream: client is too slow");
+            false
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            disconnected.store(true, Ordering::Relaxed);
+            tracing::debug!("stopping SSE stream: client disconnected");
+            false
+        }
+    }
+}
+
+fn sse_response(receiver: mpsc::Receiver<String>) -> Response {
+    let body_stream = stream::unfold(receiver, |mut receiver| async move {
+        receiver.recv().await.map(|chunk| {
+            let bytes = Ok::<Bytes, Infallible>(Bytes::from(chunk));
+            (bytes, receiver)
+        })
+    });
+    let mut response = Response::new(Body::from_stream(body_stream));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("text/event-stream"),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-cache"),
+    );
+    response.headers_mut().insert(
+        header::CONNECTION,
+        header::HeaderValue::from_static("keep-alive"),
+    );
+    response
+}
+
+async fn stream_message_response(state: HttpState, message: String) -> Response {
+    let (sender, receiver) = mpsc::channel(SSE_CHANNEL_CAPACITY);
+    let disconnected = Arc::new(AtomicBool::new(false));
+    tokio::spawn(run_streaming_message_task(
+        state,
+        message,
+        sender,
+        disconnected,
+    ));
+    sse_response(receiver)
+}
+
+async fn run_streaming_message_task(
+    state: HttpState,
+    message: String,
+    sender: mpsc::Sender<String>,
+    disconnected: Arc<AtomicBool>,
+) {
+    let callback = stream_callback(sender.clone(), Arc::clone(&disconnected));
+    let result = {
+        let mut app = state.app.lock().await;
+        process_input_with_commands_streaming(
+            &mut app,
+            &message,
+            Some(&InputSource::Http),
+            callback,
+        )
+        .await
+    };
+    if let Err(error) = result {
+        let _ = send_sse_frame(
+            &sender,
+            &disconnected,
+            error_stream_frame(&error.to_string()),
+        );
+    }
+}
+
+fn stream_callback(sender: mpsc::Sender<String>, disconnected: Arc<AtomicBool>) -> StreamCallback {
+    Arc::new(move |event| {
+        let Some(frame) = serialize_stream_event(event) else {
+            return;
+        };
+        let _ = send_sse_frame(&sender, &disconnected, frame);
+    })
 }
 
 // ── Shared state ────────────────────────────────────────────────────────────
@@ -486,8 +654,9 @@ fn build_router(state: HttpState) -> Router {
 
 async fn handle_message(
     State(state): State<HttpState>,
+    headers: HeaderMap,
     Json(request): Json<MessageRequest>,
-) -> Result<Json<MessageResponse>, (StatusCode, Json<ErrorBody>)> {
+) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
     if request.message.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -495,6 +664,10 @@ async fn handle_message(
                 error: "message must not be empty".to_string(),
             }),
         ));
+    }
+
+    if wants_sse(&headers) {
+        return Ok(stream_message_response(state, request.message).await);
     }
 
     let result = process_and_route_message(
@@ -516,7 +689,8 @@ async fn handle_message(
         response,
         model: result.model,
         iterations: result.iterations,
-    }))
+    })
+    .into_response())
 }
 
 fn internal_error(error: anyhow::Error) -> (StatusCode, Json<ErrorBody>) {
@@ -1754,6 +1928,59 @@ mod tests {
         assert!(verify_token("", ""));
     }
 
+    #[test]
+    fn serialize_stream_event_uses_distinct_tool_call_event_names() {
+        let start = serialize_stream_event(StreamEvent::ToolCallStart {
+            id: "call-1".to_string(),
+            name: "read_file".to_string(),
+        })
+        .expect("start frame");
+        let complete = serialize_stream_event(StreamEvent::ToolCallComplete {
+            id: "call-1".to_string(),
+            name: "read_file".to_string(),
+            arguments: r#"{"path":"README.md"}"#.to_string(),
+        })
+        .expect("complete frame");
+
+        assert!(start.contains("event: tool_call_start"));
+        assert!(complete.contains("event: tool_call_complete"));
+    }
+
+    #[test]
+    fn serialize_stream_event_serializes_typed_phase() {
+        let frame = serialize_stream_event(StreamEvent::PhaseChange {
+            phase: fx_kernel::Phase::Perceive,
+        })
+        .expect("phase frame");
+
+        assert_eq!(frame, "event: phase\ndata: {\"phase\":\"perceive\"}\n\n");
+    }
+
+    #[test]
+    fn send_sse_frame_stops_when_receiver_is_closed() {
+        let (sender, receiver) = mpsc::channel(1);
+        let disconnected = Arc::new(AtomicBool::new(false));
+        drop(receiver);
+
+        assert!(!send_sse_frame(&sender, &disconnected, "frame".to_string()));
+        assert!(disconnected.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn send_sse_frame_stops_when_channel_is_full() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let disconnected = Arc::new(AtomicBool::new(false));
+
+        assert!(send_sse_frame(&sender, &disconnected, "first".to_string()));
+        assert!(!send_sse_frame(
+            &sender,
+            &disconnected,
+            "second".to_string()
+        ));
+        assert!(disconnected.load(Ordering::Relaxed));
+        assert_eq!(receiver.try_recv().expect("queued frame"), "first");
+    }
+
     // ── Bearer token validation (config) ────────────────────────────────
 
     #[test]
@@ -2197,6 +2424,7 @@ allowed_chat_ids = [123]
                 .method("POST")
                 .uri("/message")
                 .header("authorization", format!("Bearer {TEST_TOKEN}"))
+                .header("accept", "application/json")
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"message":"hello there"}"#))
                 .expect("request");
@@ -2208,6 +2436,33 @@ allowed_chat_ids = [123]
             assert_eq!(json["model"], "mock-model");
             assert_eq!(json["iterations"], 1);
             assert_eq!(json["response"], "Mock response");
+        }
+
+        #[tokio::test]
+        async fn message_endpoint_streams_sse_when_requested() {
+            let app = build_router(test_state(None, Vec::new()));
+            let req = Request::builder()
+                .method("POST")
+                .uri("/message")
+                .header("authorization", format!("Bearer {TEST_TOKEN}"))
+                .header("accept", "text/event-stream")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"message":"hello there"}"#))
+                .expect("request");
+
+            let resp = app.oneshot(req).await.expect("response");
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers()
+                    .get(header::CONTENT_TYPE)
+                    .expect("content-type"),
+                "text/event-stream"
+            );
+            let body = resp.into_body().collect().await.expect("body").to_bytes();
+            let text = String::from_utf8(body.to_vec()).expect("utf8 body");
+            assert!(text.contains("event: phase\ndata: {\"phase\":\"perceive\"}"));
+            assert!(text.contains("event: text_delta\ndata: {\"text\":\"Mock response\"}"));
+            assert!(text.contains("event: done\ndata: {\"response\":\"Mock response\"}"));
         }
 
         #[tokio::test]

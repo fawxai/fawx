@@ -36,7 +36,7 @@ pub use openai_responses::OpenAiResponsesProvider;
 pub use provider::{CompletionStream, LlmProvider as CompletionProvider, ProviderCapabilities};
 pub use router::{LlmRouter, ModelInfo, ModelRouter, RouterError, RoutingStrategy};
 pub use routing::{resolve_strategy, RoutingCondition, RoutingConfig, RoutingContext, RoutingRule};
-pub use streaming::{StreamCallback, StreamEvent};
+pub use streaming::{completion_text, emit_default_stream_response, StreamCallback, StreamEvent};
 pub use types::{
     CompletionRequest, CompletionResponse, ContentBlock, LlmError as ProviderError, Message,
     MessageRole, StreamChunk, ThinkingConfig, ToolCall, ToolDefinition, ToolUseDelta, Usage,
