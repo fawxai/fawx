@@ -1433,10 +1433,11 @@ fn resolve_system_prompt(
 }
 
 fn resolve_active_model(router: &ModelRouter, config: &FawxConfig) -> String {
-    router
-        .active_model()
-        .map(ToString::to_string)
-        .or_else(|| config.model.default_model.clone())
+    config
+        .model
+        .default_model
+        .clone()
+        .or_else(|| router.active_model().map(ToString::to_string))
         .unwrap_or_default()
 }
 
@@ -2221,7 +2222,7 @@ mod tests {
     }
 
     #[test]
-    fn new_uses_router_model_over_config_default() {
+    fn new_uses_config_default_over_router_model() {
         use fx_llm::{
             CompletionProvider, CompletionRequest, CompletionResponse, CompletionStream,
             ProviderCapabilities, ProviderError,
@@ -2281,8 +2282,9 @@ mod tests {
         };
 
         let app = HeadlessApp::new(deps).expect("should build");
-        // Router's explicit model wins over config default.
-        assert_eq!(app.active_model, "router-model");
+        // Config default_model wins over router's first-available pick.
+        // The user chose this model during setup — honor their choice.
+        assert_eq!(app.active_model, "config-model");
     }
 
     #[test]
