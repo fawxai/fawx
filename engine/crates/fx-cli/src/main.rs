@@ -12,6 +12,7 @@ mod http_serve;
 mod markdown;
 mod prompts;
 mod proposal_review;
+mod repo_root;
 mod restart;
 #[allow(dead_code)]
 // TODO(#1282): narrow this once embedded/lib and CLI startup paths stop leaving target-specific helpers unused.
@@ -79,6 +80,18 @@ enum Commands {
 
     /// Run system diagnostics
     Doctor,
+
+    /// Show runtime status for a running Fawx instance
+    Status,
+
+    /// Show CLI build information
+    Version,
+
+    /// Inspect persistent log files
+    Logs(commands::logs::LogsArgs),
+
+    /// Run Fawx-specific security checks
+    SecurityAudit(commands::security_audit::SecurityAuditArgs),
 
     /// Interactive first-run setup wizard
     Setup {
@@ -760,6 +773,10 @@ async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
         }
         Commands::Restart(args) => restart::run(args),
         Commands::Doctor => Ok(commands::doctor::run().await?),
+        Commands::Status => Ok(commands::status::run().await?),
+        Commands::Version => Ok(commands::version::run()),
+        Commands::Logs(args) => commands::logs::run(&args),
+        Commands::SecurityAudit(args) => commands::security_audit::run(&args).await,
         Commands::Setup { force } => Ok(commands::setup::run(force).await?),
         Commands::Auth { command } => Ok(commands::auth::run(command).await?),
         Commands::Config => {
@@ -1002,6 +1019,31 @@ mod tests {
                 rebuild: false,
                 hard: true
             }))
+        ));
+    }
+
+    #[test]
+    fn cli_parses_logs_command() {
+        let cli = Cli::parse_from(["fawx", "logs", "--lines", "100"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Logs(crate::commands::logs::LogsArgs {
+                lines: 100,
+                list: false
+            }))
+        ));
+    }
+
+    #[test]
+    fn cli_parses_security_audit_flag() {
+        let cli = Cli::parse_from(["fawx", "security-audit", "--update-baseline"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::SecurityAudit(
+                crate::commands::security_audit::SecurityAuditArgs {
+                    update_baseline: true
+                }
+            ))
         ));
     }
 

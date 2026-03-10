@@ -76,6 +76,9 @@ which = "6.0"
 subtle = { version = "2.6", optional = true }
 urlencoding = "2.1"
 
+[build-dependencies]
+chrono = "0.4"
+
 [dev-dependencies]
 fx-embeddings = { workspace = true, features = ["test-support"] }
 fx-subagent = { workspace = true, features = ["test-support"] }

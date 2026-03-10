@@ -1124,7 +1124,8 @@ async fn validate_telegram_startup(telegram: Option<&Arc<TelegramChannel>>) {
 
     match tg.get_me().await {
         Ok(()) => {
-            eprintln!("Telegram channel: enabled (token valid, webhook at /telegram/webhook)")
+            eprintln!("Telegram channel: enabled (token valid, webhook at /telegram/webhook)");
+            tg.register_commands().await;
         }
         Err(e) => {
             eprintln!("Warning: Telegram get_me failed: {e}");

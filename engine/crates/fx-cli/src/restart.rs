@@ -80,7 +80,7 @@ fn restart_config() -> anyhow::Result<RestartConfig> {
     let current_dir = std::env::current_dir().context("failed to read current directory")?;
     Ok(RestartConfig {
         pid_file: pid_file_path(),
-        repo_root: discover_repo_root(&current_exe, &current_dir),
+        repo_root: crate::repo_root::resolve_repo_root(&current_dir, &current_exe).ok(),
         current_exe,
         stop_timeout: DEFAULT_STOP_TIMEOUT,
     })
@@ -92,28 +92,6 @@ fn pid_file_path() -> PathBuf {
         .map(|config| startup::configured_data_dir(&base_data_dir, &config))
         .unwrap_or(base_data_dir);
     data_dir.join(PID_FILE_NAME)
-}
-
-fn discover_repo_root(current_exe: &Path, current_dir: &Path) -> Option<PathBuf> {
-    find_repo_root(current_dir).or_else(|| find_repo_root_from_exe(current_exe))
-}
-
-fn find_repo_root(current_dir: &Path) -> Option<PathBuf> {
-    current_dir
-        .ancestors()
-        .find(|path| is_repo_root(path))
-        .map(Path::to_path_buf)
-}
-
-fn find_repo_root_from_exe(current_exe: &Path) -> Option<PathBuf> {
-    current_exe
-        .parent()
-        .and_then(|path| path.ancestors().find(|candidate| is_repo_root(candidate)))
-        .map(Path::to_path_buf)
-}
-
-fn is_repo_root(path: &Path) -> bool {
-    path.join("Cargo.toml").is_file() && path.join("engine/crates/fx-cli/Cargo.toml").is_file()
 }
 
 fn execute_restart(
@@ -667,10 +645,11 @@ mod tests {
     }
 
     #[test]
-    fn discover_repo_root_prefers_current_directory() {
+    fn resolve_repo_root_prefers_current_directory() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let repo_root = temp_dir.path().join("repo");
         fs::create_dir_all(repo_root.join("engine/crates/fx-cli")).expect("crate dir");
+        fs::write(repo_root.join(".git"), "gitdir: /tmp/worktree\n").expect("git marker");
         fs::write(repo_root.join("Cargo.toml"), "[workspace]\n").expect("workspace file");
         fs::write(
             repo_root.join("engine/crates/fx-cli/Cargo.toml"),
@@ -680,7 +659,8 @@ mod tests {
         let current_dir = repo_root.join("engine").join("crates");
         let current_exe = repo_root.join("target/release/fawx");
 
-        let discovered = discover_repo_root(&current_exe, &current_dir).expect("repo root");
+        let discovered =
+            crate::repo_root::resolve_repo_root(&current_dir, &current_exe).expect("repo root");
 
         assert_eq!(discovered, repo_root);
     }

@@ -22,6 +22,19 @@ use std::sync::Mutex;
 /// Telegram Bot API maximum message length in UTF-8 code units.
 const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
 
+/// Slash commands registered with Telegram on startup via `setMyCommands`.
+/// Keep in sync with `fx-cli/src/commands/slash.rs`.
+const TELEGRAM_COMMANDS: &[(&str, &str)] = &[
+    ("model", "Switch or list LLM models"),
+    ("status", "Engine status and health"),
+    ("budget", "Show token budget"),
+    ("new", "Start a new conversation"),
+    ("history", "Show conversation history"),
+    ("thinking", "Toggle thinking mode"),
+    ("config", "Show or reload configuration"),
+    ("help", "Show available commands"),
+];
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -342,7 +355,6 @@ pub struct TelegramChannel {
 
 /// Default Telegram Bot API base URL.
 const DEFAULT_BASE_URL: &str = "https://api.telegram.org";
-const DEFAULT_PARSE_MODE: &str = "Markdown";
 
 impl TelegramChannel {
     /// Create a new Telegram channel with the given configuration.
@@ -603,7 +615,34 @@ impl TelegramChannel {
         check_api_response(resp).await
     }
 
-    // Finding #6: get_updates as a method
+    /// Register slash commands with Telegram via `setMyCommands`.
+    ///
+    /// Called on startup to keep bot commands in sync with the codebase.
+    /// Fire-and-forget: logs a warning on failure but does not block startup.
+    pub async fn register_commands(&self) {
+        let commands = serde_json::json!({
+            "commands": TELEGRAM_COMMANDS.iter().map(|(cmd, desc)| {
+                serde_json::json!({ "command": cmd, "description": desc })
+            }).collect::<Vec<_>>()
+        });
+
+        let url = self.bot_url("setMyCommands");
+        let result = async {
+            let resp = self
+                .client
+                .post(&url)
+                .json(&commands)
+                .send()
+                .await
+                .map_err(|e| TelegramError::ApiError(e.to_string()))?;
+            check_api_response(resp).await
+        }
+        .await;
+
+        if let Err(e) = result {
+            tracing::warn!("failed to register Telegram commands: {e}");
+        }
+    }
 
     /// Fetch updates via long polling.
     pub async fn get_updates(
@@ -725,7 +764,10 @@ impl Channel for TelegramChannel {
     }
 
     fn send_response(&self, message: &str, context: &ResponseContext) -> Result<(), ChannelError> {
-        self.queue_response(message, context, Some(DEFAULT_PARSE_MODE.to_string()))
+        // Send as plain text by default. Telegram's Markdown parser is strict
+        // and breaks on common characters (* _ ` etc.) in tool output and
+        // slash command responses. Plain text is always safe.
+        self.queue_response(message, context, None)
     }
 }
 
@@ -1164,7 +1206,7 @@ mod tests {
     }
 
     #[test]
-    fn send_response_queues_markdown_message() {
+    fn send_response_queues_plain_text_by_default() {
         let ch = make_channel();
         let context = ResponseContext {
             routing_key: Some("12345".to_string()),
@@ -1178,7 +1220,7 @@ mod tests {
             vec![QueuedMessage {
                 chat_id: 12345,
                 text: "hello".to_string(),
-                parse_mode: Some(DEFAULT_PARSE_MODE.to_string()),
+                parse_mode: None,
                 reply_to_message_id: Some(99),
             }]
         );
@@ -1478,5 +1520,82 @@ mod tests {
         let resp: GetUpdatesResponse = serde_json::from_str(json).expect("should deserialize");
         assert!(resp.ok);
         assert!(resp.description.is_none());
+    }
+
+    #[tokio::test]
+    async fn register_commands_sends_set_my_commands() {
+        use axum::routing::post;
+        use std::sync::Arc;
+        use tokio::net::TcpListener;
+        use tokio::sync::Mutex;
+
+        let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
+        let captured_clone = captured.clone();
+
+        let app = axum::Router::new().route(
+            "/bot123456:ABC-DEF/setMyCommands",
+            post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let cap = captured_clone.clone();
+                async move {
+                    *cap.lock().await = Some(body);
+                    axum::Json(serde_json::json!({ "ok": true, "result": true }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        let ch = TelegramChannel::new_with_base_url(make_config(), format!("http://{addr}"));
+        ch.register_commands().await;
+
+        let body = captured.lock().await;
+        let body = body.as_ref().expect("should have received request");
+        let commands = body["commands"].as_array().expect("commands array");
+        assert_eq!(commands.len(), TELEGRAM_COMMANDS.len());
+        // Verify first and last command match
+        assert_eq!(commands[0]["command"], TELEGRAM_COMMANDS[0].0);
+        assert_eq!(commands[0]["description"], TELEGRAM_COMMANDS[0].1);
+        let last = TELEGRAM_COMMANDS.len() - 1;
+        assert_eq!(commands[last]["command"], TELEGRAM_COMMANDS[last].0);
+    }
+
+    #[tokio::test]
+    async fn register_commands_logs_warning_on_api_failure() {
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        let app = axum::Router::new().route(
+            "/bot123456:ABC-DEF/setMyCommands",
+            post(|| async {
+                axum::Json(serde_json::json!({
+                    "ok": false,
+                    "description": "Unauthorized"
+                }))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        let ch = TelegramChannel::new_with_base_url(make_config(), format!("http://{addr}"));
+        // Should not panic — fire-and-forget with warning
+        ch.register_commands().await;
+    }
+
+    #[test]
+    fn telegram_commands_all_have_nonempty_descriptions() {
+        for (cmd, desc) in TELEGRAM_COMMANDS {
+            assert!(!cmd.is_empty(), "command name is empty");
+            assert!(!desc.is_empty(), "description for /{cmd} is empty");
+            assert!(
+                !cmd.starts_with('/'),
+                "/{cmd} should not include the slash prefix"
+            );
+        }
     }
 }
