@@ -43,6 +43,7 @@ exclude = [
     "skills/weather-skill",
     "skills/vision-skill",
     "skills/tts-skill",
+    "skills/browser-skill",
 ]
 resolver = "2"
 

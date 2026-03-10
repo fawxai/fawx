@@ -99,6 +99,55 @@ Converts text to speech with OpenAI TTS and returns base64-encoded MP3 audio.
 }
 ```
 
+### Browser Skill
+Fetches web pages, extracts readable content, searches the web with Brave Search, and can return screenshots via a configured screenshot service.
+
+**Capabilities:** `network`, `storage`
+
+**Input format:**
+```json
+{
+  "tool": "web_fetch",
+  "url": "https://example.com",
+  "format": "markdown",
+  "max_length": "10000"
+}
+```
+
+```json
+{
+  "tool": "web_search",
+  "query": "rust async programming",
+  "count": "5"
+}
+```
+
+```json
+{
+  "tool": "web_screenshot",
+  "url": "https://example.com",
+  "width": "1280",
+  "height": "720"
+}
+```
+
+**Output format:**
+```json
+{
+  "status": "success",
+  "query": "rust async programming",
+  "count": 5,
+  "results": [
+    {
+      "title": "Rust Programming Language",
+      "url": "https://www.rust-lang.org",
+      "snippet": "A language empowering everyone to build reliable software."
+    }
+  ],
+  "message": "🔍 Found 5 results for: rust async programming"
+}
+```
+
 ## Building Skills
 
 ### Prerequisites
@@ -120,7 +169,7 @@ cd weather-skill
 cargo build --target wasm32-unknown-unknown --release
 ```
 
-The compiled WASM binary will be at `target/wasm32-unknown-unknown/release/weather_skill.wasm`.
+The compiled WASM binary will be at `target/wasm32-unknown-unknown/release/weather_skill.wasm` (or `browser_skill.wasm` for the browser skill).
 
 ## Installing Skills
 
@@ -131,6 +180,7 @@ fawx skill install skills/weather-skill/weather.wasm
 fawx skill install skills/calculator-skill/calculator.wasm
 fawx skill install skills/vision-skill/vision.wasm
 fawx skill install skills/tts-skill/tts.wasm
+fawx skill install skills/browser-skill/browser.wasm
 ```
 
 ## Manifest Format
