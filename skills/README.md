@@ -71,6 +71,34 @@ Analyzes images with vision-capable LLMs using Anthropic Claude or OpenAI GPT-4o
 A black cat sitting on a couch and looking at the camera.
 ```
 
+### TTS Skill
+Converts text to speech with OpenAI TTS and returns base64-encoded MP3 audio.
+
+**Capabilities:** `network`, `storage`
+
+**Input format:**
+```json
+{
+  "text": "Hello from Fawx",
+  "voice": "alloy",
+  "provider": "openai",
+  "speed": "1.0"
+}
+```
+
+**Output format:**
+```json
+{
+  "status": "success",
+  "provider": "openai",
+  "voice": "alloy",
+  "format": "mp3",
+  "audio_base64": "<base64 encoded mp3>",
+  "text_length": 15,
+  "message": "🔊 Generated speech (15 chars, voice: alloy, OpenAI TTS)"
+}
+```
+
 ## Building Skills
 
 ### Prerequisites
@@ -102,6 +130,7 @@ Use the Fawx CLI to install skills:
 fawx skill install skills/weather-skill/weather.wasm
 fawx skill install skills/calculator-skill/calculator.wasm
 fawx skill install skills/vision-skill/vision.wasm
+fawx skill install skills/tts-skill/tts.wasm
 ```
 
 ## Manifest Format

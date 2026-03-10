@@ -42,6 +42,7 @@ exclude = [
     "skills/github-skill",
     "skills/weather-skill",
     "skills/vision-skill",
+    "skills/tts-skill",
 ]
 resolver = "2"
 

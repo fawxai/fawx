@@ -32,6 +32,14 @@ cp target/wasm32-unknown-unknown/release/vision_skill.wasm vision.wasm
 echo "✓ vision-skill built -> vision.wasm"
 cd ..
 
+# Build TTS skill
+echo "Building tts-skill..."
+cd tts-skill
+cargo build --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/tts_skill.wasm tts.wasm
+echo "✓ tts-skill built -> tts.wasm"
+cd ..
+
 echo ""
 echo "All skills built successfully!"
 echo ""
@@ -39,3 +47,4 @@ echo "To install skills:"
 echo "  fawx skill install skills/weather-skill/weather.wasm"
 echo "  fawx skill install skills/calculator-skill/calculator.wasm"
 echo "  fawx skill install skills/vision-skill/vision.wasm"
+echo "  fawx skill install skills/tts-skill/tts.wasm"

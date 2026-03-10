@@ -10,6 +10,16 @@ use zeroize::Zeroizing;
 /// Maximum response body size: 1 MB.
 const MAX_RESPONSE_BYTES: u64 = 1_048_576;
 
+/// Prefix for binary HTTP responses passed through the string-only WASM ABI.
+///
+/// Skills detect this sentinel and decode the remaining base64 back into the
+/// original bytes. Collision with a real text response is extremely unlikely
+/// because this prefix is not valid JSON, HTML, or any known API response
+/// format.
+// COUPLING: This sentinel must match the one in skills/tts-skill/src/lib.rs
+// (and any skill that handles binary HTTP responses).
+const HOST_BINARY_BASE64_PREFIX: &str = "__fawx_binary_base64__:";
+
 /// HTTP request timeout in seconds.
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 
@@ -158,18 +168,58 @@ fn read_response_body(response: ureq::Response) -> Option<String> {
 
 /// Read a response body from a size-limited reader.
 ///
-/// Returns `None` if the body is not valid UTF-8 or on read errors.
-/// The caller is responsible for applying `.take(MAX_RESPONSE_BYTES)` to
-/// enforce the size limit before passing the reader here.
+/// Text responses are passed through unchanged. Binary responses are encoded as
+/// base64 with a sentinel prefix so skills can recover the original bytes over
+/// the string-only WASM host ABI.
 fn read_limited_body(mut reader: impl Read) -> Option<String> {
-    let mut body = String::new();
-    match reader.read_to_string(&mut body) {
-        Ok(_) => Some(body),
-        Err(e) => {
-            tracing::error!("http_request: failed to read response body: {}", e);
-            None
+    let mut body = Vec::new();
+    if let Err(error) = reader.read_to_end(&mut body) {
+        tracing::error!("http_request: failed to read response body: {}", error);
+        return None;
+    }
+
+    Some(encode_http_response_body(&body))
+}
+
+fn encode_http_response_body(body: &[u8]) -> String {
+    if body.contains(&0) {
+        return format!("{HOST_BINARY_BASE64_PREFIX}{}", base64_encode(body));
+    }
+
+    match String::from_utf8(body.to_vec()) {
+        Ok(text) => text,
+        Err(error) => {
+            let bytes = error.into_bytes();
+            format!("{HOST_BINARY_BASE64_PREFIX}{}", base64_encode(&bytes))
         }
     }
+}
+
+// COUPLING: This encoder must match the one in skills/tts-skill/src/lib.rs.
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        let combined = ((b0 as u32) << 16) | ((b1 as u32) << 8) | b2 as u32;
+
+        output.push(TABLE[((combined >> 18) & 0x3F) as usize] as char);
+        output.push(TABLE[((combined >> 12) & 0x3F) as usize] as char);
+        output.push(if chunk.len() > 1 {
+            TABLE[((combined >> 6) & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+        output.push(if chunk.len() > 2 {
+            TABLE[(combined & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+    }
+    output
 }
 
 impl HostApi for LiveHostApi {
@@ -332,6 +382,13 @@ mod tests {
     }
 
     #[test]
+    fn read_limited_body_empty_returns_empty_string() {
+        let reader = std::io::Cursor::new(Vec::<u8>::new());
+        let result = read_limited_body(reader);
+        assert_eq!(result, Some(String::new()));
+    }
+
+    #[test]
     fn read_limited_body_truncates_at_1mb() {
         // Create a reader with 2MB of data, limited to 1MB via take()
         let data = vec![b'a'; 2 * 1024 * 1024]; // 2 MB
@@ -356,11 +413,19 @@ mod tests {
     }
 
     #[test]
-    fn read_limited_body_invalid_utf8_returns_none() {
-        let data: Vec<u8> = vec![0xFF, 0xFE, 0x00, 0x01];
+    fn read_limited_body_invalid_utf8_returns_binary_base64() {
+        let data: Vec<u8> = vec![0xFF, 0xFE, 0x01];
         let reader = std::io::Cursor::new(data);
-        let result = read_limited_body(reader);
-        assert_eq!(result, None, "Invalid UTF-8 should return None");
+        let result = read_limited_body(reader).expect("binary response should encode");
+        assert_eq!(result, format!("{HOST_BINARY_BASE64_PREFIX}//4B"));
+    }
+
+    #[test]
+    fn read_limited_body_with_nul_byte_returns_binary_base64() {
+        let data: Vec<u8> = vec![b'O', 0, b'K'];
+        let reader = std::io::Cursor::new(data);
+        let result = read_limited_body(reader).expect("binary response should encode");
+        assert_eq!(result, format!("{HOST_BINARY_BASE64_PREFIX}TwBL"));
     }
 
     /// Mock credential provider for testing the KV bridge.
