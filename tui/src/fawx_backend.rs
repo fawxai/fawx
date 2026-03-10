@@ -116,11 +116,10 @@ struct ToolResultData {
 /// Data payload for `done` events.
 #[derive(Deserialize)]
 struct DoneData {
-    /// The final response text. Currently unused by the TUI (it
-    /// reconstructs the response from streamed deltas) but parsed
-    /// for forward compatibility.
+    /// The final response text. For streamed LLM responses this may
+    /// duplicate the accumulated deltas; for slash commands this is
+    /// the only source of the response text.
     #[serde(default)]
-    #[allow(dead_code)]
     response: Option<String>,
 }
 
@@ -548,7 +547,13 @@ fn dispatch_sse_frame(frame: &str, tx: &UnboundedSender<BackendEvent>) -> anyhow
             );
         }
         "done" => {
-            let _d: DoneData = serde_json::from_str(&sse.data).context("decode done")?;
+            let d: DoneData = serde_json::from_str(&sse.data).context("decode done")?;
+            // Slash commands send their response only in the done event
+            // (no text_delta events). Emit it as a TextDelta so the TUI
+            // displays it.
+            if let Some(response) = d.response.filter(|r| !r.is_empty()) {
+                try_send(tx, BackendEvent::TextDelta(response));
+            }
             try_send(
                 tx,
                 BackendEvent::Done {
@@ -831,14 +836,32 @@ model = "gpt-4"
     }
 
     #[test]
-    fn dispatch_done_produces_done_event() {
+    fn dispatch_done_emits_response_as_text_delta_then_done() {
         let (tx, mut rx) = unbounded_channel();
         dispatch_sse_frame("event: done\ndata: {\"response\":\"hello world\"}", &tx)
             .expect("should decode");
-        match rx.try_recv().expect("event") {
+        // Response text emitted as TextDelta first (for slash commands)
+        match rx.try_recv().expect("text delta event") {
+            BackendEvent::TextDelta(text) => assert_eq!(text, "hello world"),
+            other => panic!("unexpected: {other:?}"),
+        }
+        // Then Done signal
+        match rx.try_recv().expect("done event") {
             BackendEvent::Done { .. } => {}
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn dispatch_done_without_response_skips_text_delta() {
+        let (tx, mut rx) = unbounded_channel();
+        dispatch_sse_frame("event: done\ndata: {}", &tx).expect("should decode");
+        match rx.try_recv().expect("done event") {
+            BackendEvent::Done { .. } => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+        // No extra TextDelta
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

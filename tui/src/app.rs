@@ -38,8 +38,6 @@ const HERO: &str = r#"███████  █████  ██     ██ 
 ██      ██   ██ ██ ███ ██  ██ ██
 ██      ██   ██  ███ ███  ██   ██"#;
 
-const PHASE1_NOTE: &str =
-    "Phase 1 stubs are active for approvals, diffs, file search, multi-agent views, and voice.";
 const INPUT_PLACEHOLDER: &str = "Ask Fawx anything...";
 const SHORTCUT_HINT: &str =
     "Ctrl+C: cancel | /help: commands | /clear: clear transcript | /quit: exit";
@@ -875,10 +873,6 @@ fn initial_entries(logo_art: &str) -> Vec<Entry> {
         Entry {
             role: EntryRole::System,
             text: "Use /help to see available commands.".to_string(),
-        },
-        Entry {
-            role: EntryRole::System,
-            text: PHASE1_NOTE.to_string(),
         },
     ]
 }
