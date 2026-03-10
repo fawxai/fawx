@@ -891,9 +891,16 @@ async fn build_text_with_photos(
 // ── Telegram long-polling loop ──────────────────────────────────────────────
 
 fn telegram_context(incoming: &IncomingMessage) -> ResponseContext {
+    // Only reply-to in group chats where context is needed.
+    // In 1:1 chats, reply indicators are visual noise.
+    let reply_to = if incoming.chat_id < 0 {
+        Some(incoming.message_id.to_string())
+    } else {
+        None
+    };
     ResponseContext {
         routing_key: Some(incoming.chat_id.to_string()),
-        reply_to: Some(incoming.message_id.to_string()),
+        reply_to,
     }
 }
 
