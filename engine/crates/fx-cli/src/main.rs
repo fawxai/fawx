@@ -315,6 +315,14 @@ fn launch_fawx_tui(args: &[String]) -> anyhow::Result<i32> {
     Ok(status.code().unwrap_or(1))
 }
 
+fn launch_embedded_tui() -> anyhow::Result<i32> {
+    launch_fawx_tui(&embedded_tui_args())
+}
+
+fn embedded_tui_args() -> Vec<String> {
+    vec!["--embedded".to_string()]
+}
+
 fn find_fawx_tui_binary() -> anyhow::Result<PathBuf> {
     let current_exe =
         std::env::current_exe().context("failed to locate current fawx executable")?;
@@ -759,7 +767,7 @@ async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
         Commands::Tui { args } => launch_fawx_tui(&args),
         Commands::Start => Ok(run_stub("Starting")),
         Commands::Stop => Ok(run_stub("Stopping")),
-        Commands::Chat => Ok(commands::chat::run().await?),
+        Commands::Chat => launch_embedded_tui(),
         Commands::Serve {
             single,
             json,
@@ -904,7 +912,12 @@ mod tests {
     use clap::Parser;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use std::{fs, path::Path};
+    use std::{
+        ffi::OsString,
+        fs,
+        path::Path,
+        sync::{Mutex, OnceLock},
+    };
 
     fn test_auth_store() -> AuthStore {
         AuthStore::open_for_testing().expect("test auth store")
@@ -1154,6 +1167,66 @@ exit 0
             permissions.set_mode(0o755);
             fs::set_permissions(path, permissions).expect("set permissions");
         }
+    }
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct PathGuard {
+        previous: Option<OsString>,
+    }
+
+    impl PathGuard {
+        fn set(path: &Path) -> (std::sync::MutexGuard<'static, ()>, Self) {
+            let guard = env_lock().lock().expect("PATH env lock");
+            let previous = std::env::var_os("PATH");
+            std::env::set_var("PATH", path);
+            (guard, Self { previous })
+        }
+    }
+
+    impl Drop for PathGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(previous) => std::env::set_var("PATH", previous),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_argument_recording_executable(path: &Path, args_log: &Path) {
+        fs::create_dir_all(path.parent().expect("parent")).expect("create dirs");
+        let script = format!(
+            r#"#!/bin/sh
+printf '%s\n' "$@" > "{}"
+exit 0
+"#,
+            args_log.display()
+        );
+        fs::write(path, script).expect("write executable");
+        let mut permissions = fs::metadata(path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("set permissions");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn chat_command_launches_tui_in_embedded_mode() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let path_dir = tempdir.path().join("path");
+        let args_log = tempdir.path().join("chat-args.log");
+        let tui = path_dir.join(fawx_tui_binary_name());
+        write_argument_recording_executable(&tui, &args_log);
+        let (_guard, _path_guard) = PathGuard::set(&path_dir);
+
+        let exit_code = dispatch_command(Commands::Chat).await.expect("dispatch");
+        let args = fs::read_to_string(&args_log).expect("read args log");
+
+        assert_eq!(exit_code, 0);
+        assert_eq!(args.lines().collect::<Vec<_>>(), vec!["--embedded"]);
     }
 
     #[tokio::test]

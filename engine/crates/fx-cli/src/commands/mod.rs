@@ -2,7 +2,6 @@
 
 pub mod audit;
 pub mod auth;
-pub mod chat;
 pub mod config;
 pub(crate) mod diagnostics;
 pub mod doctor;

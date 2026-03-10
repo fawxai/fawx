@@ -443,11 +443,15 @@ fn credential_state(recreated: bool) -> &'static str {
     }
 }
 
-fn completion_lines() -> [&'static str; 3] {
+fn completion_lines() -> [&'static str; 7] {
     [
-        "Setup complete! Next steps:",
-        "  fawx serve --http    — start the engine",
-        "  fawx-tui             — connect the terminal UI (requires engine running)",
+        "Setup complete! Start chatting:",
+        "",
+        "  fawx chat              — all-in-one (recommended)",
+        "",
+        "Or run as a server:",
+        "  fawx serve --http      — start the engine",
+        "  fawx tui               — connect the TUI (separate terminal)",
     ]
 }
 
@@ -859,9 +863,13 @@ mod tests {
         assert_eq!(
             completion_lines(),
             [
-                "Setup complete! Next steps:",
-                "  fawx serve --http    — start the engine",
-                "  fawx-tui             — connect the terminal UI (requires engine running)",
+                "Setup complete! Start chatting:",
+                "",
+                "  fawx chat              — all-in-one (recommended)",
+                "",
+                "Or run as a server:",
+                "  fawx serve --http      — start the engine",
+                "  fawx tui               — connect the TUI (separate terminal)",
             ]
         );
     }
