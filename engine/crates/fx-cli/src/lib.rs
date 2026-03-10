@@ -47,6 +47,7 @@ pub(crate) mod helpers;
 pub mod http_serve;
 #[cfg(test)]
 mod markdown;
+mod persisted_memory;
 mod proposal_review;
 #[allow(dead_code)]
 // TODO(#1282): narrow this once embedded/lib and CLI startup paths stop leaving target-specific helpers unused.
@@ -57,6 +58,8 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+
+pub use persisted_memory::persisted_memory_entry_count;
 
 struct HeadlessAppBuildConfig {
     router: Arc<fx_llm::ModelRouter>,

@@ -24,10 +24,13 @@ impl EmbeddedBackend {
 
     async fn engine_status(&self) -> EngineStatus {
         let app = self.app.lock().await;
+        let memory_entries = fx_cli::persisted_memory_entry_count(
+            &app.data_dir().join("memory").join("memory.json"),
+        );
         EngineStatus {
             status: "running".to_string(),
             model: app.active_model().to_string(),
-            memory_entries: 0,
+            memory_entries,
         }
     }
 }
@@ -167,7 +170,7 @@ mod tests {
         ModelRouter, ProviderCapabilities, ProviderError, StreamChunk, Usage,
     };
     use fx_subagent::{SubagentLimits, SubagentManager, SubagentManagerDeps};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::{atomic::AtomicBool, Arc};
     use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
@@ -328,11 +331,17 @@ mod tests {
     }
 
     fn test_headless_app() -> HeadlessApp {
-        test_headless_app_with_provider(TestProvider)
+        test_headless_app_with_provider_and_config(TestProvider, FawxConfig::default())
     }
 
     fn test_headless_app_with_provider(provider: impl CompletionProvider + 'static) -> HeadlessApp {
-        let config = FawxConfig::default();
+        test_headless_app_with_provider_and_config(provider, FawxConfig::default())
+    }
+
+    fn test_headless_app_with_provider_and_config(
+        provider: impl CompletionProvider + 'static,
+        config: FawxConfig,
+    ) -> HeadlessApp {
         let router = test_router_with_provider(provider);
         let subagent_manager = test_subagent_manager(Arc::clone(&router), &config);
         HeadlessApp::new(HeadlessAppDeps {
@@ -361,6 +370,36 @@ mod tests {
         ));
         std::fs::create_dir_all(&path).expect("create temp dir");
         path
+    }
+
+    fn headless_app_with_data_dir(data_dir: PathBuf) -> HeadlessApp {
+        let mut config = FawxConfig::default();
+        config.general.data_dir = Some(data_dir);
+        test_headless_app_with_provider_and_config(TestProvider, config)
+    }
+
+    fn write_memory_entries(data_dir: &Path, count: usize) {
+        let memory_dir = data_dir.join("memory");
+        std::fs::create_dir_all(&memory_dir).expect("create memory dir");
+        let mut store = serde_json::Map::new();
+        for index in 0..count {
+            store.insert(
+                format!("memory-{index}"),
+                serde_json::json!({
+                    "value": format!("entry-{index}"),
+                    "created_at_ms": 1,
+                    "last_accessed_at_ms": 2,
+                    "access_count": 3,
+                    "source": "User",
+                    "tags": []
+                }),
+            );
+        }
+        std::fs::write(
+            memory_dir.join("memory.json"),
+            serde_json::Value::Object(store).to_string(),
+        )
+        .expect("write memory entries");
     }
 
     async fn recv_event(rx: &mut UnboundedReceiver<BackendEvent>) -> BackendEvent {
@@ -490,8 +529,36 @@ mod tests {
             BackendEvent::Connected(status) => {
                 assert_eq!(status.status, "running");
                 assert_eq!(status.model, "mock-model");
-                assert_eq!(status.memory_entries, 0);
             }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn check_health_reads_memory_entry_count_from_disk() {
+        let data_dir = unique_temp_dir();
+        write_memory_entries(&data_dir, 2);
+        let backend = EmbeddedBackend::new(headless_app_with_data_dir(data_dir));
+        let (tx, mut rx) = unbounded_channel();
+
+        backend.check_health(tx).await;
+
+        match recv_event(&mut rx).await {
+            BackendEvent::Connected(status) => assert_eq!(status.memory_entries, 2),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn check_health_reports_zero_when_memory_store_is_missing() {
+        let data_dir = unique_temp_dir();
+        let backend = EmbeddedBackend::new(headless_app_with_data_dir(data_dir));
+        let (tx, mut rx) = unbounded_channel();
+
+        backend.check_health(tx).await;
+
+        match recv_event(&mut rx).await {
+            BackendEvent::Connected(status) => assert_eq!(status.memory_entries, 0),
             other => panic!("unexpected event: {other:?}"),
         }
     }
