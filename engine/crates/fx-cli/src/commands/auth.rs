@@ -78,7 +78,7 @@ fn set_token(provider: &str, key: &str) -> anyhow::Result<()> {
     }
 }
 
-fn set_credential(name: &str, value: &str) -> anyhow::Result<()> {
+pub(crate) fn set_credential(name: &str, value: &str) -> anyhow::Result<()> {
     let store = open_skill_credential_store()?;
     store
         .set_generic(name, value)
@@ -120,7 +120,7 @@ fn print_credentials() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn open_skill_credential_store() -> anyhow::Result<EncryptedFileCredentialStore> {
+pub(crate) fn open_skill_credential_store() -> anyhow::Result<EncryptedFileCredentialStore> {
     EncryptedFileCredentialStore::open(&fawx_data_dir()).map_err(|error| anyhow!(error))
 }
 

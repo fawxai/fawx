@@ -1,3 +1,4 @@
+use super::auth;
 use crate::auth_store::{open_auth_store_with_recovery, AuthStore};
 use crate::prompts::{
     open_browser, parse_auth_selection, prompt_api_key_provider_with_surface,
@@ -7,10 +8,14 @@ use crate::prompts::{
 use crate::startup::{build_router, fawx_data_dir};
 use anyhow::{anyhow, Context};
 use fx_auth::auth::{AuthManager, AuthMethod};
+use fx_auth::credential_store::{
+    AuthProvider, CredentialStore as SkillCredentialStoreTrait, EncryptedFileCredentialStore,
+};
 use fx_auth::oauth::{extract_openai_account_id, PkceFlow, TokenExchangeRequest, TokenResponse};
 use fx_config::DEFAULT_CONFIG_TEMPLATE;
 use fx_llm::{CompletionRequest, Message, ModelCatalog};
 use serde::Deserialize;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
@@ -41,6 +46,8 @@ pub async fn run(force: bool) -> anyhow::Result<i32> {
 
     wizard.run_auth_phase().await?;
     wizard.run_model_phase().await?;
+    let skill_state = wizard.run_skills_phase()?;
+    wizard.run_skill_credentials_phase(&skill_state)?;
     wizard.run_http_phase()?;
     wizard.run_channels_phase().await?;
     wizard.run_validation_phase().await?;
@@ -54,12 +61,14 @@ struct SetupWizard {
     config_path: PathBuf,
     auth_store: AuthStore,
     auth_manager: AuthManager,
+    skill_credential_store: EncryptedFileCredentialStore,
     config_document: DocumentMut,
     existing_config: bool,
     force: bool,
     store_recreated: bool,
     selected_provider: Option<String>,
     default_model: Option<String>,
+    selected_skills: Vec<&'static SetupSkill>,
     http: HttpSetup,
     telegram: Option<TelegramSetup>,
     webhooks: Vec<GenericWebhookSetup>,
@@ -82,6 +91,99 @@ struct GenericWebhookSetup {
     callback_url: String,
 }
 
+#[derive(Clone, Copy)]
+struct SetupSkill {
+    name: &'static str,
+    label: &'static str,
+    default_selected: bool,
+    auth: SkillAuth,
+}
+
+#[derive(Clone, Copy)]
+enum SkillAuth {
+    Free,
+    OpenAiReuse,
+    Credential {
+        key: &'static str,
+        label: &'static str,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct SkillToggle {
+    skill: &'static SetupSkill,
+    selected: bool,
+}
+
+struct SkillWizardState {
+    openai_configured: bool,
+    installed_skills: BTreeSet<String>,
+    stored_credentials: BTreeSet<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CredentialPrompt {
+    key: &'static str,
+    label: &'static str,
+}
+
+static SETUP_SKILLS: [SetupSkill; 8] = [
+    SetupSkill {
+        name: "calculator",
+        label: "Calculator",
+        default_selected: true,
+        auth: SkillAuth::Free,
+    },
+    SetupSkill {
+        name: "weather",
+        label: "Weather",
+        default_selected: true,
+        auth: SkillAuth::Free,
+    },
+    SetupSkill {
+        name: "canvas",
+        label: "Canvas",
+        default_selected: true,
+        auth: SkillAuth::Free,
+    },
+    SetupSkill {
+        name: "tts",
+        label: "TTS",
+        default_selected: false,
+        auth: SkillAuth::OpenAiReuse,
+    },
+    SetupSkill {
+        name: "stt",
+        label: "STT",
+        default_selected: false,
+        auth: SkillAuth::OpenAiReuse,
+    },
+    SetupSkill {
+        name: "vision",
+        label: "Vision",
+        default_selected: false,
+        auth: SkillAuth::OpenAiReuse,
+    },
+    SetupSkill {
+        name: "browser",
+        label: "Browser",
+        default_selected: false,
+        auth: SkillAuth::Credential {
+            key: "brave_api_key",
+            label: "Brave API key",
+        },
+    },
+    SetupSkill {
+        name: "github",
+        label: "GitHub",
+        default_selected: false,
+        auth: SkillAuth::Credential {
+            key: "github_token",
+            label: "GitHub Personal Access Token",
+        },
+    },
+];
+
 impl SetupWizard {
     fn new(force: bool) -> anyhow::Result<Self> {
         let data_dir = fawx_data_dir();
@@ -95,18 +197,22 @@ impl SetupWizard {
         let auth_manager = auth_store
             .load_auth_manager()
             .map_err(|error| anyhow!(error))?;
+        let skill_credential_store =
+            EncryptedFileCredentialStore::open(&data_dir).map_err(|error| anyhow!(error))?;
         let config_document = load_config_document(&config_path)?;
         Ok(Self {
             data_dir,
             config_path,
             auth_store,
             auth_manager,
+            skill_credential_store,
             config_document,
             existing_config,
             force,
             store_recreated,
             selected_provider: None,
             default_model: None,
+            selected_skills: Vec::new(),
             http: HttpSetup {
                 port: DEFAULT_HTTP_PORT,
                 ..HttpSetup::default()
@@ -143,7 +249,7 @@ impl SetupWizard {
     }
 
     async fn run_auth_phase(&mut self) -> anyhow::Result<()> {
-        println!("Step 1/5: LLM Provider");
+        println!("Step 1: LLM Provider");
         println!("  How would you like to authenticate?");
         println!("    [1] Claude subscription (setup token)");
         println!("    [2] ChatGPT subscription (browser sign-in)");
@@ -222,7 +328,7 @@ impl SetupWizard {
     }
 
     async fn run_model_phase(&mut self) -> anyhow::Result<()> {
-        println!("Step 2/5: Model Selection");
+        println!("Step 2: Model Selection");
         println!("  Fetching available models...");
         let provider = self
             .selected_provider
@@ -246,8 +352,73 @@ impl SetupWizard {
         fallback_models(&self.auth_manager, provider)
     }
 
+    fn run_skills_phase(&mut self) -> anyhow::Result<SkillWizardState> {
+        println!("Step 3: Skills");
+        let state = self.skill_wizard_state()?;
+        self.selected_skills = prompt_skill_selection(&state)?
+            .into_iter()
+            .filter(|toggle| toggle.selected)
+            .map(|toggle| toggle.skill)
+            .collect();
+        print_selected_skill_status(&state, &self.selected_skills);
+        println!();
+        Ok(state)
+    }
+
+    fn run_skill_credentials_phase(&mut self, state: &SkillWizardState) -> anyhow::Result<()> {
+        println!("Step 4: Skill Credentials");
+        let reuse_messages = provider_reuse_messages(&self.selected_skills, state);
+        let requirement_messages = provider_requirement_messages(&self.selected_skills, state);
+        let prompts = credential_prompts(&self.selected_skills, state);
+        print_skill_messages(&reuse_messages);
+        print_skill_messages(&requirement_messages);
+        if prompts.is_empty() && reuse_messages.is_empty() && requirement_messages.is_empty() {
+            println!("  No additional skill credentials needed.");
+        }
+        for prompt in prompts {
+            self.prompt_for_skill_credential(prompt)?;
+        }
+        println!();
+        Ok(())
+    }
+
+    fn skill_wizard_state(&self) -> anyhow::Result<SkillWizardState> {
+        let installed_skills = installed_skill_names(&self.data_dir)?;
+        let mut stored_credentials = self
+            .skill_credential_store
+            .list_generic_names()
+            .map_err(|error| anyhow!(error))?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        if github_token_configured(&self.skill_credential_store)? {
+            stored_credentials.insert("github_token".to_string());
+        }
+        Ok(SkillWizardState {
+            openai_configured: self.auth_manager.get("openai").is_some(),
+            installed_skills,
+            stored_credentials,
+        })
+    }
+
+    fn prompt_for_skill_credential(&self, prompt: CredentialPrompt) -> anyhow::Result<()> {
+        let value = prompt_line(&format!(
+            "  {} (optional, press enter to skip): ",
+            prompt.label
+        ))?;
+        if value.is_empty() {
+            println!(
+                "  - {} not stored; the skill will prompt later.",
+                prompt.label
+            );
+            return Ok(());
+        }
+        auth::set_credential(prompt.key, &value)?;
+        println!("  ✓ Stored securely");
+        Ok(())
+    }
+
     fn run_http_phase(&mut self) -> anyhow::Result<()> {
-        println!("Step 3/5: HTTP API");
+        println!("Step 5: HTTP API");
         let enable = prompt_yes_no("  Enable HTTP API? [Y/n]: ", true)?;
         if !enable {
             println!("  ✓ HTTP API disabled");
@@ -266,7 +437,7 @@ impl SetupWizard {
     }
 
     async fn run_channels_phase(&mut self) -> anyhow::Result<()> {
-        println!("Step 4/5: Channels");
+        println!("Step 6: Channels");
         if !self.http.enabled {
             println!("  HTTP API is disabled; skipping channel setup.\n");
             return Ok(());
@@ -328,7 +499,7 @@ impl SetupWizard {
     }
 
     async fn run_validation_phase(&mut self) -> anyhow::Result<()> {
-        println!("Step 5/5: Validation");
+        println!("Step 7: Validation");
         self.validate_model_connection().await?;
         self.validate_saved_telegram();
         println!("  ✓ Credential store: healthy");
@@ -408,6 +579,205 @@ impl SetupWizard {
         self.auth_store
             .save_auth_manager(&self.auth_manager)
             .map_err(|error| anyhow!(error))
+    }
+}
+
+fn installed_skill_names(data_dir: &Path) -> anyhow::Result<BTreeSet<String>> {
+    let skills_dir = data_dir.join("skills");
+    if !skills_dir.exists() {
+        return Ok(BTreeSet::new());
+    }
+    let mut names = BTreeSet::new();
+    for entry in fs::read_dir(skills_dir)? {
+        let entry = entry?;
+        if entry.path().is_dir() {
+            names.insert(entry.file_name().to_string_lossy().to_string());
+        }
+    }
+    Ok(names)
+}
+
+fn github_token_configured(store: &EncryptedFileCredentialStore) -> anyhow::Result<bool> {
+    store
+        .get(
+            AuthProvider::GitHub,
+            fx_auth::credential_store::CredentialMethod::Pat,
+        )
+        .map(|value| value.is_some())
+        .map_err(|error| anyhow!(error))
+}
+
+fn prompt_skill_selection(state: &SkillWizardState) -> anyhow::Result<Vec<SkillToggle>> {
+    let mut toggles = SETUP_SKILLS
+        .iter()
+        .map(|skill| SkillToggle {
+            skill,
+            selected: skill.default_selected,
+        })
+        .collect::<Vec<_>>();
+    loop {
+        print_skill_selection_prompt(&toggles, state);
+        let input = prompt_line("  > ")?;
+        if input.is_empty() {
+            return Ok(toggles);
+        }
+        let indexes = parse_toggle_input(&input, toggles.len());
+        apply_skill_toggles(&mut toggles, &indexes);
+    }
+}
+
+fn print_skill_selection_prompt(toggles: &[SkillToggle], state: &SkillWizardState) {
+    println!("  Toggle skills with numbers, press enter to confirm:");
+    for line in skill_display_lines(toggles, state) {
+        println!("  {line}");
+    }
+}
+
+fn skill_display_lines(toggles: &[SkillToggle], state: &SkillWizardState) -> Vec<String> {
+    toggles
+        .iter()
+        .enumerate()
+        .map(|(index, toggle)| format_skill_line(index + 1, toggle, state))
+        .collect()
+}
+
+fn format_skill_line(index: usize, toggle: &SkillToggle, state: &SkillWizardState) -> String {
+    format!(
+        "{}. [{}] {:<16} {} [{}]",
+        index,
+        if toggle.selected { "x" } else { " " },
+        toggle.skill.label,
+        skill_requirement_text(toggle.skill, state),
+        skill_install_state(toggle.skill, state)
+    )
+}
+
+fn skill_requirement_text(skill: &SetupSkill, state: &SkillWizardState) -> String {
+    match skill.auth {
+        SkillAuth::Free => "free, no key needed".to_string(),
+        SkillAuth::OpenAiReuse if state.openai_configured => "uses your OpenAI key".to_string(),
+        SkillAuth::OpenAiReuse => "needs OpenAI auth".to_string(),
+        SkillAuth::Credential { label, .. } => format!("needs {label}"),
+    }
+}
+
+fn skill_install_state(skill: &SetupSkill, state: &SkillWizardState) -> &'static str {
+    if state.installed_skills.contains(skill.name) {
+        "installed"
+    } else {
+        "not installed"
+    }
+}
+
+fn parse_toggle_input(input: &str, len: usize) -> Vec<usize> {
+    let mut indexes = BTreeSet::new();
+    for token in input.split([',', ' ']) {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let Ok(index) = token.parse::<usize>() else {
+            continue;
+        };
+        if (1..=len).contains(&index) {
+            indexes.insert(index - 1);
+        }
+    }
+    indexes.into_iter().collect()
+}
+
+fn apply_skill_toggles(toggles: &mut [SkillToggle], indexes: &[usize]) {
+    for index in indexes {
+        toggles[*index].selected = !toggles[*index].selected;
+    }
+}
+
+fn print_selected_skill_status(state: &SkillWizardState, selected: &[&SetupSkill]) {
+    let installed = installed_skill_labels(selected, state);
+    let missing = missing_skill_labels(selected, state);
+    if selected.is_empty() {
+        println!("  ✓ No skills selected.");
+        return;
+    }
+    if !installed.is_empty() {
+        println!("  ✓ Installed: {}", installed.join(", "));
+    }
+    if !missing.is_empty() {
+        println!("  ! Not yet installed: {}", missing.join(", "));
+        println!("  Run `skills/build.sh --install` to build and install skills.");
+    }
+}
+
+fn installed_skill_labels(selected: &[&SetupSkill], state: &SkillWizardState) -> Vec<&'static str> {
+    selected
+        .iter()
+        .copied()
+        .filter(|skill| state.installed_skills.contains(skill.name))
+        .map(|skill| skill.label)
+        .collect()
+}
+
+fn missing_skill_labels(selected: &[&SetupSkill], state: &SkillWizardState) -> Vec<&'static str> {
+    selected
+        .iter()
+        .copied()
+        .filter(|skill| !state.installed_skills.contains(skill.name))
+        .map(|skill| skill.label)
+        .collect()
+}
+
+fn provider_reuse_messages(selected: &[&SetupSkill], state: &SkillWizardState) -> Vec<String> {
+    let labels = openai_skill_labels(selected);
+    if !state.openai_configured || labels.is_empty() {
+        return Vec::new();
+    }
+    vec![format!(
+        "  {} will use your OpenAI key automatically.",
+        labels.join("/")
+    )]
+}
+
+fn provider_requirement_messages(
+    selected: &[&SetupSkill],
+    state: &SkillWizardState,
+) -> Vec<String> {
+    let labels = openai_skill_labels(selected);
+    if state.openai_configured || labels.is_empty() {
+        return Vec::new();
+    }
+    vec![format!(
+        "  ! {} {} OpenAI auth. Configure OpenAI to use {}.",
+        labels.join("/"),
+        if labels.len() == 1 { "needs" } else { "need" },
+        labels.join("/")
+    )]
+}
+
+fn openai_skill_labels(selected: &[&SetupSkill]) -> Vec<&'static str> {
+    selected
+        .iter()
+        .copied()
+        .filter(|skill| matches!(skill.auth, SkillAuth::OpenAiReuse))
+        .map(|skill| skill.label)
+        .collect()
+}
+
+fn credential_prompts(selected: &[&SetupSkill], state: &SkillWizardState) -> Vec<CredentialPrompt> {
+    let mut seen = BTreeSet::new();
+    let mut prompts = Vec::new();
+    for skill in selected {
+        if let SkillAuth::Credential { key, label } = skill.auth {
+            if seen.insert(key) && !state.stored_credentials.contains(key) {
+                prompts.push(CredentialPrompt { key, label });
+            }
+        }
+    }
+    prompts
+}
+
+fn print_skill_messages(messages: &[String]) {
+    for message in messages {
+        println!("{message}");
     }
 }
 
@@ -859,6 +1229,32 @@ mod tests {
     }
 
     #[test]
+    fn parse_toggle_input_accepts_single_number() {
+        assert_eq!(parse_toggle_input("3", 8), vec![2]);
+    }
+
+    #[test]
+    fn parse_toggle_input_accepts_comma_and_space_separated_numbers() {
+        assert_eq!(parse_toggle_input("1,3,5", 8), vec![0, 2, 4]);
+        assert_eq!(parse_toggle_input("1 3 5", 8), vec![0, 2, 4]);
+        assert_eq!(parse_toggle_input("1, 3 5", 8), vec![0, 2, 4]);
+    }
+
+    #[test]
+    fn parse_toggle_input_ignores_invalid_and_duplicate_entries() {
+        assert_eq!(parse_toggle_input("0", 8), Vec::<usize>::new());
+        assert_eq!(parse_toggle_input("99", 8), Vec::<usize>::new());
+        assert_eq!(parse_toggle_input("abc", 8), Vec::<usize>::new());
+        assert_eq!(parse_toggle_input("3,3", 8), vec![2]);
+        assert_eq!(parse_toggle_input("", 8), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn parse_toggle_input_keeps_valid_entries_when_mixed_with_invalid_ones() {
+        assert_eq!(parse_toggle_input("1,abc", 8), vec![0]);
+    }
+
+    #[test]
     fn completion_lines_match_headless_engine_workflow() {
         assert_eq!(
             completion_lines(),
@@ -929,6 +1325,95 @@ mod tests {
             .expect("webhook secret present");
         assert_eq!(*bot_token, "bot-token");
         assert_eq!(*webhook_secret, "secret-token");
+    }
+
+    fn test_state() -> SkillWizardState {
+        SkillWizardState {
+            openai_configured: false,
+            installed_skills: BTreeSet::new(),
+            stored_credentials: BTreeSet::new(),
+        }
+    }
+
+    fn test_skill(name: &str) -> &'static SetupSkill {
+        SETUP_SKILLS
+            .iter()
+            .find(|skill| skill.name == name)
+            .expect("setup skill")
+    }
+
+    #[test]
+    fn skill_display_lines_show_mixed_install_state() {
+        let mut state = test_state();
+        state.installed_skills.insert("calculator".to_string());
+        let toggles = SETUP_SKILLS
+            .iter()
+            .map(|skill| SkillToggle {
+                skill,
+                selected: skill.default_selected,
+            })
+            .collect::<Vec<_>>();
+
+        let lines = skill_display_lines(&toggles, &state);
+
+        assert!(lines[0].contains("Calculator"));
+        assert!(lines[0].contains("[installed]"));
+        assert!(lines[1].contains("Weather"));
+        assert!(lines[1].contains("[not installed]"));
+    }
+
+    #[test]
+    fn credential_prompts_only_include_selected_missing_keys() {
+        let mut state = test_state();
+        state.stored_credentials.insert("github_token".to_string());
+
+        let prompts = credential_prompts(&[test_skill("browser"), test_skill("github")], &state);
+
+        assert_eq!(
+            prompts,
+            vec![CredentialPrompt {
+                key: "brave_api_key",
+                label: "Brave API key",
+            }]
+        );
+    }
+
+    #[test]
+    fn credential_prompts_skip_existing_keys() {
+        let mut state = test_state();
+        state.stored_credentials.insert("brave_api_key".to_string());
+
+        let prompts = credential_prompts(&[test_skill("browser")], &state);
+
+        assert!(prompts.is_empty());
+    }
+
+    #[test]
+    fn provider_reuse_message_groups_selected_openai_skills() {
+        let mut state = test_state();
+        state.openai_configured = true;
+
+        let messages = provider_reuse_messages(&[test_skill("tts"), test_skill("stt")], &state);
+
+        assert_eq!(
+            messages,
+            vec!["  TTS/STT will use your OpenAI key automatically.".to_string()]
+        );
+    }
+
+    #[test]
+    fn provider_requirement_messages_handle_singular_plural_and_empty_cases() {
+        let state = test_state();
+
+        assert_eq!(
+            provider_requirement_messages(&[test_skill("tts")], &state),
+            vec!["  ! TTS needs OpenAI auth. Configure OpenAI to use TTS.".to_string()]
+        );
+        assert_eq!(
+            provider_requirement_messages(&[test_skill("tts"), test_skill("stt")], &state),
+            vec!["  ! TTS/STT need OpenAI auth. Configure OpenAI to use TTS/STT.".to_string()]
+        );
+        assert!(provider_requirement_messages(&[test_skill("browser")], &state).is_empty());
     }
 
     #[test]
