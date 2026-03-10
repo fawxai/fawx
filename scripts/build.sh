@@ -122,7 +122,7 @@ build_tui() {
   step_header "$1" "Building TUI (fawx-tui)..."
   (
     cd "$REPO_ROOT"
-    "$CARGO_BIN" build -p fawx-tui -j "$CARGO_BUILD_JOBS_VALUE" ${CARGO_ARGS[@]+"${CARGO_ARGS[@]}"}
+    "$CARGO_BIN" build -p fawx-tui --features embedded -j "$CARGO_BUILD_JOBS_VALUE" ${CARGO_ARGS[@]+"${CARGO_ARGS[@]}"}
   )
   echo "✓ fawx-tui built (target/$PROFILE/fawx-tui)"
 }
