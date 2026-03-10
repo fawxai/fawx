@@ -184,7 +184,7 @@ impl Drop for HeadlessApp {
 impl HeadlessApp {
     /// Build from the standard startup bundle + router + config.
     pub fn new(mut deps: HeadlessAppDeps) -> Result<Self, anyhow::Error> {
-        let active_model = resolve_active_model(&deps.router, &deps.config);
+        let active_model = resolve_active_model(&deps.router, &deps.config)?;
         seed_router_default_model(&mut deps.router, &active_model);
 
         let max_history = deps.config.general.max_history;
@@ -962,10 +962,7 @@ fn sync_headless_model_from_config(
     app: &mut HeadlessApp,
     default_model: Option<String>,
 ) -> anyhow::Result<()> {
-    let Some(selector) = default_model else {
-        return Ok(());
-    };
-    let resolved = resolve_headless_model_selector(&app.router, &selector)?;
+    let resolved = resolve_requested_model(&app.router, default_model.as_deref())?;
     apply_headless_active_model(app, &resolved);
     Ok(())
 }
@@ -1432,17 +1429,69 @@ fn resolve_system_prompt(
         .or_else(|| load_system_prompt(explicit_path))
 }
 
-fn resolve_active_model(router: &ModelRouter, config: &FawxConfig) -> String {
-    config
-        .model
-        .default_model
-        .clone()
-        .or_else(|| router.active_model().map(ToString::to_string))
-        .unwrap_or_default()
+fn resolve_active_model(router: &ModelRouter, config: &FawxConfig) -> anyhow::Result<String> {
+    resolve_requested_model(router, config.model.default_model.as_deref())
+}
+
+fn resolve_requested_model(
+    router: &ModelRouter,
+    configured_default: Option<&str>,
+) -> anyhow::Result<String> {
+    if let Some(model) = configured_default.filter(|model| !model.is_empty()) {
+        return resolve_configured_model_or_fallback(router, model);
+    }
+    first_runtime_model(router)
+}
+
+fn resolve_configured_model_or_fallback(
+    router: &ModelRouter,
+    configured_model: &str,
+) -> anyhow::Result<String> {
+    match resolve_headless_model_selector(router, configured_model) {
+        Ok(model) => Ok(model),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "configured default_model '{}' not available, falling back",
+                configured_model
+            );
+            first_runtime_model(router)
+        }
+    }
+}
+
+fn first_runtime_model(router: &ModelRouter) -> anyhow::Result<String> {
+    router
+        .active_model()
+        .filter(|model| headless_model_available(router, model))
+        .map(ToString::to_string)
+        .or_else(|| first_available_model(router))
+        .ok_or_else(no_headless_models_available)
+}
+
+fn first_available_model(router: &ModelRouter) -> Option<String> {
+    router
+        .available_models()
+        .into_iter()
+        .next()
+        .map(|model| model.model_id)
+}
+
+fn headless_model_available(router: &ModelRouter, model: &str) -> bool {
+    router
+        .available_models()
+        .iter()
+        .any(|candidate| candidate.model_id == model)
+}
+
+fn no_headless_models_available() -> anyhow::Error {
+    anyhow::anyhow!(
+        "no models available in router; configure a provider and authenticate it before starting headless mode"
+    )
 }
 
 fn seed_router_default_model(router: &mut Arc<ModelRouter>, active_model: &str) {
-    if active_model.is_empty() || router.active_model().is_some() {
+    if active_model.is_empty() || router.active_model() == Some(active_model) {
         return;
     }
     let Some(router) = Arc::get_mut(router) else {
@@ -1452,7 +1501,7 @@ fn seed_router_default_model(router: &mut Arc<ModelRouter>, active_model: &str) 
         tracing::warn!(
             error = %error,
             model = %active_model,
-            "config default_model not available in router"
+            "failed to set router active model"
         );
     }
 }
@@ -1509,7 +1558,7 @@ mod tests {
     use fx_kernel::cancellation::CancellationToken;
     use fx_kernel::context_manager::ContextCompactor;
     use fx_kernel::loop_engine::LoopEngine;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     // ── Test helpers ────────────────────────────────────────────────────
 
@@ -1631,6 +1680,129 @@ mod tests {
         router.register_provider(Box::new(UsageReportingProvider));
         router.set_active("mock-model").expect("set active");
         Arc::new(router)
+    }
+
+    #[derive(Debug)]
+    struct StaticModelsProvider {
+        name: &'static str,
+        models: Vec<&'static str>,
+    }
+
+    #[async_trait]
+    impl fx_llm::CompletionProvider for StaticModelsProvider {
+        async fn complete(
+            &self,
+            _request: fx_llm::CompletionRequest,
+        ) -> Result<fx_llm::CompletionResponse, fx_llm::ProviderError> {
+            Ok(mock_completion_response())
+        }
+
+        async fn complete_stream(
+            &self,
+            _request: fx_llm::CompletionRequest,
+        ) -> Result<fx_llm::CompletionStream, fx_llm::ProviderError> {
+            let chunk = fx_llm::StreamChunk {
+                delta_content: Some(mock_completion_text()),
+                stop_reason: Some("end_turn".to_string()),
+                ..Default::default()
+            };
+            Ok(Box::pin(futures::stream::iter(vec![Ok(chunk)])))
+        }
+
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn supported_models(&self) -> Vec<String> {
+            self.models
+                .iter()
+                .map(|model| (*model).to_string())
+                .collect()
+        }
+
+        fn capabilities(&self) -> fx_llm::ProviderCapabilities {
+            fx_llm::ProviderCapabilities {
+                supports_temperature: false,
+                requires_streaming: false,
+            }
+        }
+    }
+
+    fn static_model_router(models: &[&'static str]) -> ModelRouter {
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(StaticModelsProvider {
+            name: "static-models",
+            models: models.to_vec(),
+        }));
+        router
+    }
+
+    fn headless_deps(router: ModelRouter, config: FawxConfig) -> HeadlessAppDeps {
+        HeadlessAppDeps {
+            loop_engine: test_engine(),
+            router: Arc::new(router),
+            config,
+            memory: None,
+            embedding_index_persistence: None,
+            system_prompt_path: None,
+            config_manager: None,
+            system_prompt_text: None,
+            subagent_manager: new_disabled_subagent_manager(),
+            canary_monitor: None,
+        }
+    }
+
+    fn headless_app_with_router(router: ModelRouter, active_model: &str) -> HeadlessApp {
+        let mut app = test_app();
+        app.router = Arc::new(router);
+        app.active_model = active_model.to_string();
+        app
+    }
+
+    #[derive(Clone, Default)]
+    struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl LogBuffer {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().expect("log buffer lock").clone())
+                .expect("log buffer utf8")
+        }
+    }
+
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log writer lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
+        type Writer = LogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            LogWriter(self.0.clone())
+        }
+    }
+
+    fn with_warn_logs<T>(action: impl FnOnce() -> T) -> (T, String) {
+        let logs = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(logs.clone())
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, action);
+        (result, logs.contents())
     }
 
     // ── Unit tests (10) ─────────────────────────────────────────────────
@@ -2198,69 +2370,8 @@ mod tests {
     }
 
     #[test]
-    fn new_falls_back_to_config_default_model() {
-        let mut config = FawxConfig::default();
-        config.model.default_model = Some("test-model-fallback".to_string());
-
-        let deps = HeadlessAppDeps {
-            loop_engine: test_engine(),
-            router: Arc::new(ModelRouter::new()),
-            config,
-            memory: None,
-            embedding_index_persistence: None,
-            system_prompt_path: None,
-            config_manager: None,
-            system_prompt_text: None,
-            subagent_manager: new_disabled_subagent_manager(),
-            canary_monitor: None,
-        };
-
-        let app = HeadlessApp::new(deps).expect("should build");
-        // Router has no providers so set_active will fail, but the
-        // active_model string should still be populated from config.
-        assert_eq!(app.active_model, "test-model-fallback");
-    }
-
-    #[test]
-    fn new_uses_config_default_over_router_model() {
-        use fx_llm::{
-            CompletionProvider, CompletionRequest, CompletionResponse, CompletionStream,
-            ProviderCapabilities, ProviderError,
-        };
-
-        #[derive(Debug)]
-        struct FakeProvider;
-
-        #[async_trait]
-        impl CompletionProvider for FakeProvider {
-            async fn complete(
-                &self,
-                _req: CompletionRequest,
-            ) -> Result<CompletionResponse, ProviderError> {
-                unimplemented!()
-            }
-            async fn complete_stream(
-                &self,
-                _req: CompletionRequest,
-            ) -> Result<CompletionStream, ProviderError> {
-                unimplemented!()
-            }
-            fn name(&self) -> &str {
-                "fake"
-            }
-            fn supported_models(&self) -> Vec<String> {
-                vec!["router-model".to_string()]
-            }
-            fn capabilities(&self) -> ProviderCapabilities {
-                ProviderCapabilities {
-                    supports_temperature: false,
-                    requires_streaming: false,
-                }
-            }
-        }
-
-        let mut router = ModelRouter::new();
-        router.register_provider(Box::new(FakeProvider));
+    fn new_uses_available_config_default_model() {
+        let mut router = static_model_router(&["router-model", "config-model"]);
         router
             .set_active("router-model")
             .expect("set active should work");
@@ -2268,23 +2379,96 @@ mod tests {
         let mut config = FawxConfig::default();
         config.model.default_model = Some("config-model".to_string());
 
-        let deps = HeadlessAppDeps {
-            loop_engine: test_engine(),
-            router: Arc::new(router),
-            config,
-            memory: None,
-            embedding_index_persistence: None,
-            system_prompt_path: None,
-            config_manager: None,
-            system_prompt_text: None,
-            subagent_manager: new_disabled_subagent_manager(),
-            canary_monitor: None,
-        };
+        let app = HeadlessApp::new(headless_deps(router, config)).expect("should build");
 
-        let app = HeadlessApp::new(deps).expect("should build");
-        // Config default_model wins over router's first-available pick.
-        // The user chose this model during setup — honor their choice.
         assert_eq!(app.active_model, "config-model");
+        assert_eq!(app.router.active_model(), Some("config-model"));
+    }
+
+    #[test]
+    fn new_falls_back_when_config_default_model_is_unavailable() {
+        let router = static_model_router(&["z-model", "a-model"]);
+        let mut config = FawxConfig::default();
+        config.model.default_model = Some("missing-model".to_string());
+
+        let (app, logs) = with_warn_logs(|| {
+            HeadlessApp::new(headless_deps(router, config)).expect("should build")
+        });
+
+        assert_eq!(app.active_model, "a-model");
+        assert_eq!(app.router.active_model(), Some("a-model"));
+        assert!(
+            logs.contains("configured default_model 'missing-model' not available, falling back")
+        );
+        assert!(logs.contains("error=model not found: missing-model"));
+    }
+
+    #[test]
+    fn new_treats_empty_config_default_model_like_none() {
+        let router = static_model_router(&["z-model", "a-model"]);
+        let mut config = FawxConfig::default();
+        config.model.default_model = Some(String::new());
+
+        let (app, logs) = with_warn_logs(|| {
+            HeadlessApp::new(headless_deps(router, config)).expect("should build")
+        });
+
+        assert_eq!(app.active_model, "a-model");
+        assert_eq!(app.router.active_model(), Some("a-model"));
+        assert!(logs.is_empty(), "unexpected warnings: {logs}");
+    }
+
+    #[test]
+    fn sync_headless_model_from_config_updates_active_model() {
+        let mut router = static_model_router(&["old-model", "new-model"]);
+        router.set_active("old-model").expect("set active");
+        let mut app = headless_app_with_router(router, "old-model");
+
+        sync_headless_model_from_config(&mut app, Some("new-model".to_string())).expect("sync");
+
+        assert_eq!(app.active_model, "new-model");
+        assert_eq!(app.router.active_model(), Some("new-model"));
+    }
+
+    #[test]
+    fn sync_headless_model_from_config_falls_back_gracefully() {
+        let mut router = static_model_router(&["old-model", "new-model"]);
+        router.set_active("old-model").expect("set active");
+        let mut app = headless_app_with_router(router, "old-model");
+
+        let (_, logs) = with_warn_logs(|| {
+            sync_headless_model_from_config(&mut app, Some("missing-model".to_string()))
+                .expect("sync");
+        });
+
+        assert_eq!(app.active_model, "old-model");
+        assert_eq!(app.router.active_model(), Some("old-model"));
+        assert!(
+            logs.contains("configured default_model 'missing-model' not available, falling back")
+        );
+    }
+
+    #[test]
+    fn new_uses_first_available_model_when_config_default_missing() {
+        let router = static_model_router(&["z-model", "a-model"]);
+        let config = FawxConfig::default();
+
+        let app = HeadlessApp::new(headless_deps(router, config)).expect("should build");
+
+        assert_eq!(app.active_model, "a-model");
+        assert_eq!(app.router.active_model(), Some("a-model"));
+    }
+
+    #[test]
+    fn new_returns_clear_error_when_no_models_are_available() {
+        let result = HeadlessApp::new(headless_deps(ModelRouter::new(), FawxConfig::default()));
+        assert!(result.is_err(), "should fail without any models");
+
+        let error = result.err().expect("missing error");
+        assert_eq!(
+            error.to_string(),
+            "no models available in router; configure a provider and authenticate it before starting headless mode"
+        );
     }
 
     #[test]
