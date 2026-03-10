@@ -27,21 +27,32 @@ use sparx::{render_file, RenderConfig};
 use std::cmp::min;
 use std::fmt;
 use std::io::{self, Stdout};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-
-const HERO: &str = r#"███████  █████  ██     ██ ██   ██
-██      ██   ██ ██     ██  ██ ██
-█████   ███████ ██  █  ██   ███
-██      ██   ██ ██ ███ ██  ██ ██
-██      ██   ██  ███ ███  ██   ██"#;
 
 const INPUT_PLACEHOLDER: &str = "Ask Fawx anything...";
 const SHORTCUT_HINT: &str =
     "Ctrl+C: cancel | /help: commands | /clear: clear transcript | /quit: exit";
 const THINKING_FRAMES: [&str; 3] = [".", "..", "..."];
+const WIDE_WELCOME_BREAKPOINT: usize = 100;
+const MEDIUM_WELCOME_BREAKPOINT: usize = 60;
+const WELCOME_COLUMN_GAP: usize = 3;
+const WELCOME_LEFT_WIDTH: usize = 22;
+const WELCOME_COMMAND_WIDTH: usize = 28;
+const MAX_VISIBLE_SKILLS: usize = 8;
+const VERSION_LABEL: &str = concat!("Fawx v", env!("CARGO_PKG_VERSION"));
+const EMPTY_SKILLS_MESSAGE: &str = "No skills installed. Run fawx install to browse.";
+const DEFAULT_SKILL_ICON: &str = "🧩";
+const WELCOME_COMMANDS: [(&str, &str); 6] = [
+    ("/help", "overview"),
+    ("/model", "switch LLM"),
+    ("/skills", "list skills"),
+    ("/clear", "clear chat"),
+    ("/status", "engine info"),
+    ("/quit", "exit"),
+];
 
 #[derive(Debug, Clone)]
 pub struct RunOptions {
@@ -92,7 +103,7 @@ fn build_embedded_backend() -> anyhow::Result<(Arc<dyn EngineBackend>, String)> 
 
 #[derive(Clone, Copy)]
 enum EntryRole {
-    Hero,
+    Welcome,
     User,
     Assistant,
     System,
@@ -107,10 +118,35 @@ struct Entry {
     text: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InstalledSkill {
+    icon: String,
+    name: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WelcomeLayout {
+    Wide,
+    Medium,
+    Narrow,
+}
+
+impl WelcomeLayout {
+    fn for_width(width: usize) -> Self {
+        if width > WIDE_WELCOME_BREAKPOINT {
+            Self::Wide
+        } else if width >= MEDIUM_WELCOME_BREAKPOINT {
+            Self::Medium
+        } else {
+            Self::Narrow
+        }
+    }
+}
+
 impl fmt::Display for EntryRole {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let label = match self {
-            Self::Hero => "hero",
+            Self::Welcome => "welcome",
             Self::User => "user",
             Self::Assistant => "assistant",
             Self::System => "system",
@@ -194,6 +230,7 @@ struct App {
     streaming_text: Option<String>,
     logo_art: String,
     logo_width: Option<u32>,
+    installed_skills: Vec<InstalledSkill>,
     pending_request: bool,
     awaiting_stream_start: bool,
     follow_output: bool,
@@ -219,12 +256,13 @@ impl App {
             connection_target,
             tx,
             rx,
-            entries: initial_entries(HERO),
+            entries: initial_entries(),
             input: String::new(),
             connection: ConnectionState::Connecting,
             streaming_text: None,
-            logo_art: HERO.to_string(),
+            logo_art: String::new(),
             logo_width: None,
+            installed_skills: discover_installed_skills(),
             pending_request: false,
             awaiting_stream_start: false,
             follow_output: true,
@@ -405,7 +443,8 @@ impl App {
     }
 
     fn clear_transcript(&mut self) {
-        self.entries = initial_entries(&self.logo_art);
+        self.entries = initial_entries();
+        self.installed_skills = discover_installed_skills();
         self.streaming_text = None;
         self.pending_request = false;
         self.awaiting_stream_start = false;
@@ -554,26 +593,19 @@ impl App {
         self.render_input(frame, layout[2]);
     }
 
-    /// Re-render the ASCII logo art when the terminal width changes.
+    /// Re-render the mascot art when the welcome layout needs it.
     ///
-    /// Cached by `logo_width`: only re-renders when the computed target width
-    /// differs from the last render. The `sparx::render_file` call is the
-    /// expensive part; on steady-state frames this is a no-op comparison.
+    /// Cached by `logo_width`: only re-renders when the welcome layout's
+    /// mascot column changes size. Narrow layouts skip art entirely.
     fn sync_logo_art(&mut self, area_width: u16) {
         let desired_width = logo_target_width(area_width);
-        if self.logo_width == Some(desired_width) {
+        if self.logo_width == desired_width {
             return;
         }
 
-        self.logo_width = Some(desired_width);
-        self.logo_art = render_logo_art(desired_width).unwrap_or_else(|_| HERO.to_string());
-
-        if let Some(entry) = self
-            .entries
-            .iter_mut()
-            .find(|entry| matches!(entry.role, EntryRole::Hero))
-        {
-            entry.text = self.logo_art.clone();
+        self.logo_width = desired_width;
+        if let Some(width) = desired_width {
+            self.logo_art = render_logo_art(width).unwrap_or_else(|_| "🦊".to_string());
         }
     }
 
@@ -747,9 +779,6 @@ impl App {
     fn rendered_transcript_lines(&self, width: usize) -> Vec<Line<'static>> {
         let mut out = Vec::new();
         for entry in &self.entries {
-            if matches!(entry.role, EntryRole::Hero) && !self.should_show_logo_art() {
-                continue;
-            }
             self.render_entry(entry, width, &mut out);
             out.push(Line::default());
         }
@@ -766,27 +795,14 @@ impl App {
         out
     }
 
-    fn should_show_logo_art(&self) -> bool {
-        self.input.trim().is_empty()
-    }
-
     fn render_entry(&self, entry: &Entry, width: usize, out: &mut Vec<Line<'static>>) {
         match entry.role {
-            EntryRole::Hero => {
-                out.extend(
-                    entry
-                        .text
-                        .lines()
-                        .map(|line| {
-                            Line::from(vec![Span::styled(
-                                line.to_string(),
-                                Style::default()
-                                    .fg(fawx_amber())
-                                    .add_modifier(Modifier::BOLD),
-                            )])
-                        })
-                        .collect::<Vec<_>>(),
-                );
+            EntryRole::Welcome => {
+                out.extend(render_welcome_screen(
+                    width,
+                    &self.logo_art,
+                    &self.installed_skills,
+                ));
             }
             EntryRole::Assistant => {
                 let rendered =
@@ -860,38 +876,356 @@ fn fawx_amber() -> Color {
     Color::Rgb(255, 140, 0)
 }
 
-fn initial_entries(logo_art: &str) -> Vec<Entry> {
-    vec![
-        Entry {
-            role: EntryRole::Hero,
-            text: logo_art.to_string(),
-        },
-        Entry {
-            role: EntryRole::System,
-            text: "connecting to Fawx...".to_string(),
-        },
-        Entry {
-            role: EntryRole::System,
-            text: "Use /help to see available commands.".to_string(),
-        },
-    ]
+fn initial_entries() -> Vec<Entry> {
+    vec![Entry {
+        role: EntryRole::Welcome,
+        text: String::new(),
+    }]
 }
 
 fn render_logo_art(width: u32) -> anyhow::Result<String> {
-    let image_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("assets")
-        .join("fawx.png");
     let config = RenderConfig {
         width: Some(width),
         color: false,
         ..Default::default()
     };
-    render_file(&image_path.to_string_lossy(), &config)
+    render_logo_variant("fawx-mascot.png", &config)
+        .or_else(|_| render_logo_variant("fawx.png", &config))
+}
+
+fn render_logo_variant(name: &str, config: &RenderConfig) -> anyhow::Result<String> {
+    let image_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join(name);
+    render_file(&image_path.to_string_lossy(), config)
         .with_context(|| format!("render splash art {}", image_path.display()))
 }
 
-fn logo_target_width(area_width: u16) -> u32 {
-    u32::from(area_width.saturating_sub(4).clamp(24, 110))
+fn logo_target_width(area_width: u16) -> Option<u32> {
+    let layout = WelcomeLayout::for_width(area_width.saturating_sub(4) as usize);
+    match layout {
+        WelcomeLayout::Wide => Some(18),
+        WelcomeLayout::Medium => Some(16),
+        WelcomeLayout::Narrow => None,
+    }
+}
+
+fn discover_installed_skills() -> Vec<InstalledSkill> {
+    home_skills_dir()
+        .map(|path| discover_installed_skills_from(&path))
+        .unwrap_or_default()
+}
+
+fn home_skills_dir() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(PathBuf::from(home).join(".fawx").join("skills"))
+}
+
+fn discover_installed_skills_from(path: &Path) -> Vec<InstalledSkill> {
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+    let mut skills = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| read_installed_skill(&entry.path()))
+        .collect::<Vec<_>>();
+    skills.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    skills
+}
+
+fn read_installed_skill(path: &Path) -> InstalledSkill {
+    let fallback_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let manifest_path = path.join("manifest.toml");
+    let content = std::fs::read_to_string(&manifest_path).ok();
+    let name = content
+        .as_deref()
+        .and_then(|value| parse_manifest_string(value, "name"))
+        .unwrap_or_else(|| fallback_name.clone());
+    let icon = content
+        .as_deref()
+        .and_then(|value| parse_manifest_string(value, "icon"))
+        .unwrap_or_else(|| default_skill_icon(&name).to_string());
+    InstalledSkill { icon, name }
+}
+
+fn parse_manifest_string(content: &str, field: &str) -> Option<String> {
+    let prefix = format!("{field} =");
+    for line in content.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        let Some(rest) = line.strip_prefix(&prefix) else {
+            continue;
+        };
+        let value = rest.trim();
+        let parsed = value
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .or_else(|| {
+                value
+                    .strip_prefix('\'')
+                    .and_then(|value| value.strip_suffix('\''))
+            });
+        if let Some(parsed) = parsed.filter(|parsed| !parsed.trim().is_empty()) {
+            return Some(parsed.trim().to_string());
+        }
+    }
+    None
+}
+
+fn default_skill_icon(name: &str) -> &'static str {
+    match name.to_ascii_lowercase().as_str() {
+        "weather" => "🌤",
+        "vision" => "👁",
+        "tts" => "🔊",
+        "browser" => "🌐",
+        "canvas" => "🖼",
+        "stt" => "🎤",
+        "github" => "🐙",
+        "calculator" => "🧮",
+        _ => DEFAULT_SKILL_ICON,
+    }
+}
+
+fn render_welcome_screen(
+    width: usize,
+    mascot_art: &str,
+    skills: &[InstalledSkill],
+) -> Vec<Line<'static>> {
+    match WelcomeLayout::for_width(width) {
+        WelcomeLayout::Wide => render_wide_welcome(width, mascot_art, skills),
+        WelcomeLayout::Medium => render_medium_welcome(width, mascot_art, skills),
+        WelcomeLayout::Narrow => render_narrow_welcome(width, skills),
+    }
+}
+
+fn render_wide_welcome(
+    width: usize,
+    mascot_art: &str,
+    skills: &[InstalledSkill],
+) -> Vec<Line<'static>> {
+    let right_width = width
+        .saturating_sub(WELCOME_LEFT_WIDTH + WELCOME_COMMAND_WIDTH + (WELCOME_COLUMN_GAP * 2))
+        .max(18);
+    let left = welcome_left_column(mascot_art);
+    let commands = welcome_command_section(WELCOME_COMMAND_WIDTH);
+    let skills = welcome_skill_section(right_width, skills);
+    let mut lines = merge_columns(vec![
+        (left, WELCOME_LEFT_WIDTH),
+        (commands, WELCOME_COMMAND_WIDTH),
+        (skills, right_width),
+    ]);
+    lines.push(blank_line());
+    lines.push(styled_line(
+        INPUT_PLACEHOLDER,
+        Style::default().fg(Color::DarkGray),
+    ));
+    lines
+}
+
+fn render_medium_welcome(
+    width: usize,
+    mascot_art: &str,
+    skills: &[InstalledSkill],
+) -> Vec<Line<'static>> {
+    let right_width = width
+        .saturating_sub(WELCOME_LEFT_WIDTH + WELCOME_COLUMN_GAP)
+        .max(24);
+    let left = welcome_left_column(mascot_art);
+    let right = welcome_right_column(right_width, skills);
+    let mut lines = merge_columns(vec![(left, WELCOME_LEFT_WIDTH), (right, right_width)]);
+    lines.push(blank_line());
+    lines.push(styled_line(
+        INPUT_PLACEHOLDER,
+        Style::default().fg(Color::DarkGray),
+    ));
+    lines
+}
+
+fn render_narrow_welcome(width: usize, skills: &[InstalledSkill]) -> Vec<Line<'static>> {
+    let mut lines = welcome_command_section(width);
+    lines.push(blank_line());
+    lines.extend(welcome_skill_section(width, skills));
+    lines.push(blank_line());
+    lines.push(styled_line(
+        VERSION_LABEL,
+        Style::default().fg(Color::DarkGray),
+    ));
+    lines.push(styled_line(
+        INPUT_PLACEHOLDER,
+        Style::default().fg(Color::DarkGray),
+    ));
+    lines
+}
+
+fn welcome_left_column(mascot_art: &str) -> Vec<Line<'static>> {
+    let mut lines = mascot_art
+        .lines()
+        .map(|line| {
+            Line::from(vec![Span::styled(
+                line.to_string(),
+                Style::default()
+                    .fg(fawx_amber())
+                    .add_modifier(Modifier::BOLD),
+            )])
+        })
+        .collect::<Vec<_>>();
+    lines.push(blank_line());
+    lines.push(styled_line(
+        VERSION_LABEL,
+        Style::default().fg(Color::DarkGray),
+    ));
+    lines
+}
+
+fn welcome_right_column(width: usize, skills: &[InstalledSkill]) -> Vec<Line<'static>> {
+    let mut lines = welcome_command_section(width);
+    lines.push(blank_line());
+    lines.extend(welcome_skill_section(width, skills));
+    lines
+}
+
+fn welcome_command_section(width: usize) -> Vec<Line<'static>> {
+    let mut lines = vec![section_header("Commands")];
+    for (command, description) in WELCOME_COMMANDS {
+        lines.push(command_line(command, description, width));
+    }
+    lines
+}
+
+fn welcome_skill_section(width: usize, skills: &[InstalledSkill]) -> Vec<Line<'static>> {
+    let mut lines = vec![section_header("Skills")];
+    lines.extend(render_skill_items(width, skills));
+    lines
+}
+
+fn render_skill_items(width: usize, skills: &[InstalledSkill]) -> Vec<Line<'static>> {
+    if skills.is_empty() {
+        return wrap_plain_text(EMPTY_SKILLS_MESSAGE, width.max(1))
+            .into_iter()
+            .map(|line| restyle_line(line, Style::default().fg(Color::Gray)))
+            .collect();
+    }
+
+    let mut lines = skills
+        .iter()
+        .take(MAX_VISIBLE_SKILLS)
+        .map(|skill| skill_line(skill, width))
+        .collect::<Vec<_>>();
+    let overflow = skills.len().saturating_sub(MAX_VISIBLE_SKILLS);
+    if overflow > 0 {
+        lines.push(styled_line(
+            format!("+{overflow} more"),
+            Style::default().fg(Color::Gray),
+        ));
+    }
+    lines
+}
+
+fn section_header(title: &str) -> Line<'static> {
+    styled_line(
+        title,
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+fn command_line(command: &str, description: &str, width: usize) -> Line<'static> {
+    let name_width = width.min(9);
+    let command_text = truncate_text(command, name_width);
+    let padding = " ".repeat(name_width.saturating_sub(command_text.len()) + 2);
+    let description_width = width.saturating_sub(name_width + 2);
+    let description_text = truncate_text(description, description_width);
+    Line::from(vec![
+        Span::styled(
+            command_text,
+            Style::default()
+                .fg(fawx_amber())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(padding),
+        Span::styled(description_text, Style::default().fg(Color::Gray)),
+    ])
+}
+
+fn skill_line(skill: &InstalledSkill, width: usize) -> Line<'static> {
+    let text = truncate_text(&format!("{}  {}", skill.icon, skill.name), width.max(1));
+    styled_line(text, Style::default().fg(Color::Gray))
+}
+
+fn truncate_text(text: &str, width: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= width {
+        return text.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return "…".to_string();
+    }
+    let mut truncated = text
+        .chars()
+        .take(width.saturating_sub(1))
+        .collect::<String>();
+    truncated.push('…');
+    truncated
+}
+
+fn merge_columns(columns: Vec<(Vec<Line<'static>>, usize)>) -> Vec<Line<'static>> {
+    let row_count = columns
+        .iter()
+        .map(|(lines, _)| lines.len())
+        .max()
+        .unwrap_or(0);
+    let mut merged = Vec::with_capacity(row_count);
+    for row in 0..row_count {
+        merged.push(merge_column_row(&columns, row));
+    }
+    merged
+}
+
+fn merge_column_row(columns: &[(Vec<Line<'static>>, usize)], row: usize) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (index, (lines, width)) in columns.iter().enumerate() {
+        let line = lines.get(row).cloned().unwrap_or_default();
+        push_padded_line(&mut spans, line, *width);
+        if index + 1 < columns.len() {
+            spans.push(Span::raw(" ".repeat(WELCOME_COLUMN_GAP)));
+        }
+    }
+    Line::from(spans)
+}
+
+fn push_padded_line(spans: &mut Vec<Span<'static>>, line: Line<'static>, width: usize) {
+    let line_width = line.width();
+    spans.extend(line.spans);
+    let padding = width.saturating_sub(line_width);
+    if padding > 0 {
+        spans.push(Span::raw(" ".repeat(padding)));
+    }
+}
+
+fn styled_line(text: impl Into<String>, style: Style) -> Line<'static> {
+    Line::from(vec![Span::styled(text.into(), style)])
+}
+
+fn restyle_line(line: Line<'static>, style: Style) -> Line<'static> {
+    let spans = line
+        .spans
+        .into_iter()
+        .map(|span| Span::styled(span.content.into_owned(), style))
+        .collect::<Vec<_>>();
+    Line::from(spans)
+}
+
+fn blank_line() -> Line<'static> {
+    Line::default()
 }
 
 fn format_token_usage(tokens: TokenUsageSummary) -> String {
@@ -1043,6 +1377,17 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    fn rendered_text(lines: &[Line<'_>]) -> Vec<String> {
+        lines.iter().map(line_text).collect()
+    }
+
+    fn skill(name: &str, icon: &str) -> InstalledSkill {
+        InstalledSkill {
+            icon: icon.to_string(),
+            name: name.to_string(),
+        }
     }
 
     fn entry_texts(app: &App) -> Vec<&str> {
@@ -1229,13 +1574,76 @@ mod tests {
     }
 
     #[test]
-    fn initial_entries_point_users_to_server_help() {
-        let entries = initial_entries("fox art");
-        assert!(matches!(entries[0].role, EntryRole::Hero));
-        assert_eq!(entries[0].text, "fox art");
-        assert!(entries
+    fn initial_entries_start_with_welcome_screen() {
+        let entries = initial_entries();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(entries[0].role, EntryRole::Welcome));
+    }
+
+    #[test]
+    fn wide_welcome_layout_renders_commands_and_skills_side_by_side() {
+        let lines = render_welcome_screen(
+            120,
+            "FOX\nART",
+            &[skill("weather", "🌤"), skill("browser", "🌐")],
+        );
+        let text = rendered_text(&lines);
+
+        assert!(text.iter().any(|line| line.contains("FOX")));
+        assert!(text
             .iter()
-            .any(|entry| entry.text == "Use /help to see available commands."));
+            .any(|line| line.contains("Commands") && line.contains("Skills")));
+        assert!(text
+            .iter()
+            .any(|line| line.contains("/help") && line.contains("🌤  weather")));
+        assert!(text.iter().any(|line| line.contains(VERSION_LABEL)));
+    }
+
+    #[test]
+    fn medium_welcome_layout_stacks_skills_below_commands() {
+        let lines = render_welcome_screen(80, "FOX", &[skill("weather", "🌤")]);
+        let text = rendered_text(&lines);
+        let commands_index = text
+            .iter()
+            .position(|line| line.contains("Commands"))
+            .expect("commands header");
+        let skills_index = text
+            .iter()
+            .position(|line| line.contains("Skills"))
+            .expect("skills header");
+
+        assert!(text.iter().any(|line| line.contains("FOX")));
+        assert!(skills_index > commands_index);
+    }
+
+    #[test]
+    fn narrow_welcome_layout_omits_mascot_art() {
+        let lines = render_welcome_screen(50, "FOX", &[skill("weather", "🌤")]);
+        let text = rendered_text(&lines);
+
+        assert!(!text.iter().any(|line| line.contains("FOX")));
+        assert!(text.iter().any(|line| line.contains("Commands")));
+        assert!(text.iter().any(|line| line.contains("Skills")));
+    }
+
+    #[test]
+    fn welcome_screen_shows_empty_skills_placeholder() {
+        let lines = render_welcome_screen(50, "FOX", &[]);
+        let text = rendered_text(&lines).join("\n");
+
+        assert!(text.contains("No skills installed."));
+        assert!(text.contains("fawx install"));
+    }
+
+    #[test]
+    fn welcome_screen_truncates_long_skill_lists() {
+        let skills = (1..=10)
+            .map(|index| skill(&format!("skill-{index}"), "🧩"))
+            .collect::<Vec<_>>();
+        let lines = render_welcome_screen(120, "FOX", &skills);
+        let text = rendered_text(&lines).join("\n");
+
+        assert!(text.contains("+2 more"));
     }
 
     #[test]

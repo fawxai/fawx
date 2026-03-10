@@ -318,6 +318,11 @@ impl HeadlessApp {
         &self.active_model
     }
 
+    /// Return the resolved data directory for the current config.
+    pub fn data_dir(&self) -> PathBuf {
+        configured_data_dir(&fawx_data_dir(), &self.config)
+    }
+
     /// Return the shared config manager (if configured).
     #[cfg(feature = "http")]
     pub fn config_manager(&self) -> Option<&Arc<Mutex<ConfigManager>>> {
