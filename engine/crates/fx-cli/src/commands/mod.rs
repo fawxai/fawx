@@ -14,6 +14,7 @@ pub mod logs;
 pub mod marketplace;
 #[cfg(feature = "oauth-bridge")]
 pub mod oauth_bridge;
+pub mod reset;
 pub(crate) mod runtime_layout;
 pub mod security_audit;
 pub mod setup;

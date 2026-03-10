@@ -558,61 +558,11 @@ async fn process_and_route_message(
 }
 
 fn sanitize_config(value: serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Object(map) => sanitize_config_object(map),
-        serde_json::Value::Array(items) => {
-            serde_json::Value::Array(items.into_iter().map(sanitize_config).collect())
-        }
-        other => other,
-    }
-}
-
-fn sanitize_config_object(map: serde_json::Map<String, serde_json::Value>) -> serde_json::Value {
-    let sanitized = map
-        .into_iter()
-        .map(|(key, value)| {
-            let next = if is_secret_key(&key) {
-                serde_json::Value::String("[REDACTED]".to_string())
-            } else {
-                sanitize_config(value)
-            };
-            (key, next)
-        })
-        .collect();
-    serde_json::Value::Object(sanitized)
+    crate::config_redaction::sanitize_json(value)
 }
 
 fn is_secret_key(key: &str) -> bool {
-    let key = key.to_ascii_lowercase();
-    let exact = [
-        "access_key",
-        "api_key",
-        "auth_token",
-        "bearer_token",
-        "bot_token",
-        "credential",
-        "password",
-        "private_key",
-        "secret",
-        "ssh_key",
-        "token",
-        "webhook_secret",
-    ];
-    if exact.iter().any(|candidate| key == *candidate) {
-        return true;
-    }
-    [
-        "_access_key",
-        "_api_key",
-        "_credential",
-        "_password",
-        "_private_key",
-        "_secret",
-        "_ssh_key",
-        "_token",
-    ]
-    .iter()
-    .any(|suffix| key.ends_with(suffix))
+    crate::config_redaction::is_secret_key(key)
 }
 
 fn sanitized_status_config(app: &HeadlessApp) -> Option<serde_json::Value> {

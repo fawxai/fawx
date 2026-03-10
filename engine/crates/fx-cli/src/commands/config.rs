@@ -1,252 +1,284 @@
-//! Configuration display command
+use super::runtime_layout::RuntimeLayout;
+use crate::config_redaction::sanitize_toml;
+use anyhow::Context;
+use clap::Subcommand;
+use fx_config::{manager::ConfigManager, FawxConfig};
+use toml::Value as TomlValue;
 
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Serialize, Deserialize, Default, Clone)]
-struct Config {
-    #[serde(default)]
-    agent: AgentConfig,
-
-    #[serde(default)]
-    security: SecurityConfig,
-
-    #[serde(default)]
-    llm: LlmConfig,
+#[derive(Debug, Clone, Subcommand)]
+pub enum ConfigCommands {
+    /// Show the full redacted configuration
+    Show,
+    /// Read a config key or section
+    Get {
+        /// Dot-path key or section name
+        key: String,
+    },
+    /// Update a config value
+    Set {
+        /// Dot-path key
+        key: String,
+        /// New value
+        value: String,
+    },
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct AgentConfig {
-    #[serde(default = "default_name")]
-    name: String,
-
-    #[serde(default = "default_workspace")]
-    workspace: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct SecurityConfig {
-    #[serde(default = "default_bool_true")]
-    require_confirmation: bool,
-
-    #[serde(default = "default_bool_true")]
-    audit_enabled: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct LlmConfig {
-    #[serde(default = "default_model")]
-    model: String,
-
-    #[serde(default)]
-    api_key: Option<String>,
-
-    #[serde(default)]
-    claude_setup_token: Option<String>,
-
-    #[serde(default)]
-    claude_sdk_url: Option<String>,
-
-    #[serde(default)]
-    openai_oauth_token: Option<String>,
-}
-
-fn default_name() -> String {
-    "Fawx".to_string()
-}
-
-fn default_workspace() -> String {
-    "~/.fawx".to_string()
-}
-
-fn default_bool_true() -> bool {
-    true
-}
-
-fn default_model() -> String {
-    "llama-3-8b".to_string()
-}
-
-impl Default for AgentConfig {
-    fn default() -> Self {
-        Self {
-            name: default_name(),
-            workspace: default_workspace(),
-        }
-    }
-}
-
-impl Default for SecurityConfig {
-    fn default() -> Self {
-        Self {
-            require_confirmation: true,
-            audit_enabled: true,
-        }
-    }
-}
-
-impl Default for LlmConfig {
-    fn default() -> Self {
-        Self {
-            model: default_model(),
-            api_key: None,
-            claude_setup_token: None,
-            claude_sdk_url: None,
-            openai_oauth_token: None,
-        }
-    }
-}
-
-/// Show current configuration
-pub async fn run() -> anyhow::Result<()> {
-    let config = load_config().await?;
-    let redacted_config = redact_sensitive(&config);
-
-    let toml_str = toml::to_string_pretty(&redacted_config)?;
-    println!("Current configuration:\n");
-    println!("{}", toml_str);
-
+pub async fn run(command: Option<ConfigCommands>) -> anyhow::Result<()> {
+    let mut manager = load_config_manager()?;
+    let output = execute(command, &mut manager)?;
+    println!("{output}");
     Ok(())
 }
 
-async fn load_config() -> anyhow::Result<Config> {
-    let config_path = get_config_path()?;
-
-    if config_path.exists() {
-        let content = tokio::fs::read_to_string(&config_path).await?;
-        let config: Config = toml::from_str(&content)?;
-        Ok(config)
-    } else {
-        // Return default config
-        Ok(Config::default())
+pub(crate) fn execute(
+    command: Option<ConfigCommands>,
+    manager: &mut ConfigManager,
+) -> anyhow::Result<String> {
+    match command.unwrap_or(ConfigCommands::Show) {
+        ConfigCommands::Show => show_config(manager.config()),
+        ConfigCommands::Get { key } => get_config(manager.config(), &key),
+        ConfigCommands::Set { key, value } => set_config(manager, &key, &value),
     }
 }
 
-fn get_config_path() -> anyhow::Result<std::path::PathBuf> {
-    let home =
-        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
-    Ok(home.join(".fawx").join("config.toml"))
+fn load_config_manager() -> anyhow::Result<ConfigManager> {
+    let layout = RuntimeLayout::detect()?;
+    Ok(ConfigManager::from_config(
+        layout.config,
+        layout.config_path,
+    ))
 }
 
-fn redact_sensitive(config: &Config) -> Config {
-    let mut redacted = config.clone();
-
-    redacted.llm.api_key = redact_secret(redacted.llm.api_key.as_deref());
-    redacted.llm.claude_setup_token = redact_secret(redacted.llm.claude_setup_token.as_deref());
-    redacted.llm.openai_oauth_token = redact_secret(redacted.llm.openai_oauth_token.as_deref());
-    redacted.llm.claude_sdk_url = redact_secret(redacted.llm.claude_sdk_url.as_deref());
-
-    redacted
+fn show_config(config: &FawxConfig) -> anyhow::Result<String> {
+    let value = config_toml_value(config)?;
+    let redacted = sanitize_toml(value);
+    toml::to_string_pretty(&redacted).context("failed to render config")
 }
 
-fn redact_secret(value: Option<&str>) -> Option<String> {
-    let value = value?;
-    if value.is_empty() {
-        return Some(String::new());
+fn get_config(config: &FawxConfig, key: &str) -> anyhow::Result<String> {
+    if key == "all" {
+        return show_config(config);
     }
+    let selected = select_redacted_value(config, key)?;
+    render_selected_value(key, &selected)
+}
 
-    // Redact tokens/keys while preserving a tiny prefix for debugging.
-    let prefix = if value.len() > 6 {
-        &value[..6]
-    } else {
-        &value[..value.len().min(2)]
-    };
-    Some(format!("{}...REDACTED", prefix))
+fn select_redacted_value(config: &FawxConfig, key: &str) -> anyhow::Result<TomlValue> {
+    let selected = select_config_value(config, key)?;
+    redact_selected_value(key, selected)
+}
+
+fn redact_selected_value(key: &str, value: TomlValue) -> anyhow::Result<TomlValue> {
+    let wrapped = wrap_selection(key, value);
+    let redacted = sanitize_toml(wrapped);
+    lookup_value(&redacted, key).ok_or_else(|| anyhow::anyhow!("failed to render config selection"))
+}
+
+fn set_config(manager: &mut ConfigManager, key: &str, value: &str) -> anyhow::Result<String> {
+    manager.set(key, value).map_err(anyhow::Error::msg)?;
+    let rendered = get_config(manager.config(), key)?;
+    Ok(format!("Updated {key}\n{rendered}"))
+}
+
+fn select_config_value(config: &FawxConfig, key: &str) -> anyhow::Result<TomlValue> {
+    let value = config_toml_value(config)?;
+    lookup_value(&value, key).ok_or_else(|| unknown_key_error(key))
+}
+
+fn config_toml_value(config: &FawxConfig) -> anyhow::Result<TomlValue> {
+    TomlValue::try_from(config.clone()).context("failed to serialize config")
+}
+
+fn lookup_value(value: &TomlValue, key: &str) -> Option<TomlValue> {
+    key.split('.')
+        .try_fold(value, |current, segment| match current {
+            TomlValue::Table(table) => table.get(segment),
+            _ => None,
+        })
+        .cloned()
+}
+
+fn unknown_key_error(key: &str) -> anyhow::Error {
+    anyhow::anyhow!("unknown config key or section: '{key}'")
+}
+
+fn render_selected_value(key: &str, value: &TomlValue) -> anyhow::Result<String> {
+    match value {
+        TomlValue::String(text) => Ok(text.clone()),
+        TomlValue::Integer(number) => Ok(number.to_string()),
+        TomlValue::Float(number) => Ok(number.to_string()),
+        TomlValue::Boolean(flag) => Ok(flag.to_string()),
+        TomlValue::Datetime(datetime) => Ok(datetime.to_string()),
+        other => render_wrapped_value(key, other),
+    }
+}
+
+fn render_wrapped_value(key: &str, value: &TomlValue) -> anyhow::Result<String> {
+    let wrapped = wrap_selection(key, value.clone());
+    toml::to_string_pretty(&wrapped)
+        .context("failed to render config selection")
+        .map(trim_trailing_newline)
+}
+
+fn wrap_selection(key: &str, value: TomlValue) -> TomlValue {
+    key.split('.').rev().fold(value, wrap_segment)
+}
+
+fn wrap_segment(value: TomlValue, segment: &str) -> TomlValue {
+    let mut table = toml::map::Map::new();
+    table.insert(segment.to_string(), value);
+    TomlValue::Table(table)
+}
+
+fn trim_trailing_newline(text: String) -> String {
+    text.trim_end_matches('\n').to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
-    #[test]
-    fn test_default_config_valid() {
-        let config = Config::default();
-        let toml_str = toml::to_string_pretty(&config).expect("Failed to serialize");
-        assert!(!toml_str.is_empty());
-        assert!(toml_str.contains("Fawx"));
+    struct TestManager {
+        _temp: TempDir,
+        manager: ConfigManager,
+    }
+
+    fn manager_from(content: &str) -> TestManager {
+        let temp = TempDir::new().expect("tempdir");
+        std::fs::write(temp.path().join("config.toml"), content).expect("write config");
+        let config = FawxConfig::load(temp.path()).expect("load config");
+        let manager = ConfigManager::from_config(config, temp.path().join("config.toml"));
+        TestManager {
+            _temp: temp,
+            manager,
+        }
     }
 
     #[test]
-    fn test_redact_hides_api_keys() {
-        let mut config = Config::default();
-        config.llm.api_key = Some("sk-1234567890abcdef".to_string());
-        config.llm.claude_setup_token = Some("claude-sub-token-abc123".to_string());
-        config.llm.openai_oauth_token = Some("openai-oauth-token-xyz999".to_string());
-
-        let redacted = redact_sensitive(&config);
-
-        assert!(redacted.llm.api_key.is_some());
-        let redacted_key = redacted.llm.api_key.unwrap();
-        assert!(redacted_key.contains("REDACTED"));
-        assert!(!redacted_key.contains("1234567890abcdef"));
-
-        let redacted_claude_token = redacted.llm.claude_setup_token.unwrap();
-        assert!(redacted_claude_token.contains("REDACTED"));
-        assert!(!redacted_claude_token.contains("abc123"));
-
-        let redacted_openai_token = redacted.llm.openai_oauth_token.unwrap();
-        assert!(redacted_openai_token.contains("REDACTED"));
-        assert!(!redacted_openai_token.contains("xyz999"));
+    fn bare_config_behaves_like_show() {
+        let mut test_manager = manager_from("[http]\nbearer_token = \"secret\"\n");
+        let bare = execute(None, &mut test_manager.manager).expect("bare config");
+        let show = execute(Some(ConfigCommands::Show), &mut test_manager.manager).expect("show");
+        assert_eq!(bare, show);
     }
 
     #[test]
-    fn test_redact_preserves_non_sensitive() {
-        let mut config = Config::default();
-        config.agent.name = "TestAgent".to_string();
-        config.llm.model = "test-model".to_string();
-        config.llm.api_key = Some("sk-secret".to_string());
-        config.llm.claude_setup_token = Some("claude-secret".to_string());
-        config.llm.openai_oauth_token = Some("openai-secret".to_string());
-
-        let redacted = redact_sensitive(&config);
-
-        assert_eq!(redacted.agent.name, "TestAgent");
-        assert_eq!(redacted.llm.model, "test-model");
-        assert!(redacted.llm.api_key.unwrap().contains("REDACTED"));
-        assert!(redacted
-            .llm
-            .claude_setup_token
-            .unwrap()
-            .contains("REDACTED"));
-        assert!(redacted
-            .llm
-            .openai_oauth_token
-            .unwrap()
-            .contains("REDACTED"));
+    fn get_returns_scalar_value_cleanly() {
+        let mut test_manager = manager_from("[model]\ndefault_model = \"opus\"\n");
+        let output = execute(
+            Some(ConfigCommands::Get {
+                key: "model.default_model".to_string(),
+            }),
+            &mut test_manager.manager,
+        )
+        .expect("get config");
+        assert_eq!(output, "opus");
     }
 
     #[test]
-    fn test_redact_empty_key() {
-        let mut config = Config::default();
-        config.llm.api_key = Some("".to_string());
-
-        let redacted = redact_sensitive(&config);
-        assert_eq!(redacted.llm.api_key, Some("".to_string()));
-        assert_eq!(redacted.llm.claude_setup_token, None);
-        assert_eq!(redacted.llm.openai_oauth_token, None);
+    fn get_returns_section_as_toml() {
+        let mut test_manager = manager_from("[model]\ndefault_model = \"opus\"\n");
+        let output = execute(
+            Some(ConfigCommands::Get {
+                key: "model".to_string(),
+            }),
+            &mut test_manager.manager,
+        )
+        .expect("get section");
+        assert!(output.contains("[model]"));
+        assert!(output.contains("default_model = \"opus\""));
     }
 
     #[test]
-    fn test_redact_none_key() {
-        let config = Config::default();
-        let redacted = redact_sensitive(&config);
-        assert!(redacted.llm.api_key.is_none());
-        assert!(redacted.llm.claude_setup_token.is_none());
-        assert!(redacted.llm.openai_oauth_token.is_none());
+    fn get_redacts_secret_scalar_values() {
+        let mut test_manager = manager_from("[http]\nbearer_token = \"super-secret\"\n");
+        let output = execute(
+            Some(ConfigCommands::Get {
+                key: "http.bearer_token".to_string(),
+            }),
+            &mut test_manager.manager,
+        )
+        .expect("get secret value");
+        assert_eq!(output, "[REDACTED]");
     }
 
     #[test]
-    fn test_redact_short_key() {
-        let mut config = Config::default();
-        config.llm.api_key = Some("abc".to_string());
-
-        let redacted = redact_sensitive(&config);
-        let redacted_key = redacted.llm.api_key.unwrap();
-        assert!(redacted_key.contains("REDACTED"));
+    fn get_redacts_secret_values_inside_sections() {
+        let mut test_manager =
+            manager_from("[telegram]\nbot_token = \"bot-secret\"\nallowed_chat_ids = [1]\n");
+        let output = execute(
+            Some(ConfigCommands::Get {
+                key: "telegram".to_string(),
+            }),
+            &mut test_manager.manager,
+        )
+        .expect("get redacted section");
+        assert!(output.contains("[REDACTED]"));
+        assert!(output.contains("allowed_chat_ids = [1]"));
+        assert!(!output.contains("bot-secret"));
     }
 
     #[test]
-    fn test_redact_secret_empty_and_none() {
-        assert_eq!(redact_secret(None), None);
-        assert_eq!(redact_secret(Some("")), Some("".to_string()));
+    fn set_updates_persisted_config_through_manager() {
+        let mut test_manager = manager_from("[model]\ndefault_model = \"old\"\n");
+        let output = execute(
+            Some(ConfigCommands::Set {
+                key: "model.default_model".to_string(),
+                value: "new".to_string(),
+            }),
+            &mut test_manager.manager,
+        )
+        .expect("set config");
+        assert!(output.contains("Updated model.default_model"));
+        assert!(output.ends_with("new"));
+    }
+
+    #[test]
+    fn set_redacts_secret_values_after_update() {
+        let mut test_manager = manager_from("[telegram]\nallowed_chat_ids = [1]\n");
+        let output = execute(
+            Some(ConfigCommands::Set {
+                key: "telegram.bot_token".to_string(),
+                value: "new-secret".to_string(),
+            }),
+            &mut test_manager.manager,
+        )
+        .expect("set secret config");
+        assert!(output.contains("Updated telegram.bot_token"));
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("new-secret"));
+        assert_eq!(
+            select_config_value(test_manager.manager.config(), "telegram.bot_token")
+                .expect("stored secret")
+                .as_str(),
+            Some("new-secret")
+        );
+    }
+
+    #[test]
+    fn invalid_set_value_surfaces_validation_error() {
+        let mut test_manager = manager_from("[general]\nmax_iterations = 10\n");
+        let error = execute(
+            Some(ConfigCommands::Set {
+                key: "general.max_iterations".to_string(),
+                value: "0".to_string(),
+            }),
+            &mut test_manager.manager,
+        )
+        .expect_err("invalid set should fail");
+        assert!(error.to_string().contains("must be >= 1"));
+    }
+
+    #[test]
+    fn show_keeps_full_config_redacted() {
+        let mut test_manager = manager_from(
+            "[http]\nbearer_token = \"super-secret\"\n\n[telegram]\nbot_token = \"bot-secret\"\n",
+        );
+        let output =
+            execute(Some(ConfigCommands::Show), &mut test_manager.manager).expect("show config");
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("super-secret"));
+        assert!(!output.contains("bot-secret"));
     }
 }
