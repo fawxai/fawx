@@ -72,7 +72,17 @@ const DEFAULT_ANTHROPIC_MODELS: &[&str] = &[
     "claude-opus-4-20250514",
     "claude-sonnet-4-20250514",
 ];
-const DEFAULT_OPENAI_MODELS: &[&str] = &["gpt-4.1", "gpt-4o", "gpt-4o-mini"];
+const DEFAULT_OPENAI_MODELS: &[&str] = &[
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "o3",
+    "o4-mini",
+    "gpt-4.1",
+    "gpt-4.1-mini",
+    "gpt-4.1-nano",
+    "gpt-4o",
+    "gpt-4o-mini",
+];
 const DEFAULT_OPENAI_SUBSCRIPTION_MODELS: &[&str] =
     &["gpt-5.3-codex", "gpt-5.2", "gpt-5.1", "o4-mini"];
 const DEFAULT_OPENROUTER_MODELS: &[&str] = &[
