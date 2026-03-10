@@ -3,6 +3,7 @@
 mod auth_store;
 mod commands;
 mod config_bridge;
+mod config_redaction;
 mod confirmation;
 mod context;
 mod headless;
@@ -116,8 +117,14 @@ enum Commands {
         command: commands::auth::AuthCommands,
     },
 
-    /// Show current configuration
-    Config,
+    /// Show or update configuration
+    Config {
+        #[command(subcommand)]
+        command: Option<commands::config::ConfigCommands>,
+    },
+
+    /// Reset managed Fawx runtime state while preserving credentials
+    Reset(commands::reset::ResetArgs),
 
     /// Generate shell completions
     Completions {
@@ -801,10 +808,11 @@ async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
         Commands::Import(args) => commands::import::run(&args),
         Commands::Setup { force } => Ok(commands::setup::run(force).await?),
         Commands::Auth { command } => Ok(commands::auth::run(command).await?),
-        Commands::Config => {
-            commands::config::run().await?;
+        Commands::Config { command } => {
+            commands::config::run(command).await?;
             Ok(0)
         }
+        Commands::Reset(args) => commands::reset::run(&args),
         Commands::Completions { shell } => commands::completions::run(shell),
         Commands::Audit { command } => dispatch_audit(command).await,
         Commands::Skill { command } => dispatch_skill(command).await,
@@ -1024,6 +1032,41 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Commands::Completions { shell: Shell::Bash })
+        ));
+    }
+
+    #[test]
+    fn cli_parses_bare_config_command() {
+        let cli = Cli::parse_from(["fawx", "config"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Config { command: None })
+        ));
+    }
+
+    #[test]
+    fn cli_parses_config_get_command() {
+        let cli = Cli::parse_from(["fawx", "config", "get", "model.default_model"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Config {
+                command: Some(crate::commands::config::ConfigCommands::Get { key })
+            }) if key == "model.default_model"
+        ));
+    }
+
+    #[test]
+    fn cli_parses_reset_command() {
+        let cli = Cli::parse_from(["fawx", "reset", "--memory", "--force"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Reset(crate::commands::reset::ResetArgs {
+                memory: true,
+                conversations: false,
+                config: false,
+                all: false,
+                force: true,
+            }))
         ));
     }
 

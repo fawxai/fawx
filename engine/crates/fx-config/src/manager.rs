@@ -57,9 +57,9 @@ impl ConfigManager {
         &self.current
     }
 
-    /// Read a config section as JSON. Use `"all"` for the entire config.
+    /// Read a config key or section as JSON. Use `"all"` for the entire config.
     pub fn get(&self, section: &str) -> Result<JsonValue, String> {
-        serialize_section(&self.current, section)
+        serialize_selection(&self.current, section)
     }
 
     /// Update a config value by dot-separated key path.
@@ -306,16 +306,25 @@ fn read_or_default(path: &Path) -> Result<String, String> {
     }
 }
 
-/// Serialize a section of the config to JSON.
-fn serialize_section(config: &FawxConfig, section: &str) -> Result<JsonValue, String> {
+/// Serialize a config selection to JSON.
+fn serialize_selection(config: &FawxConfig, selection: &str) -> Result<JsonValue, String> {
     let full =
         serde_json::to_value(config).map_err(|e| format!("failed to serialize config: {e}"))?;
-    if section == "all" {
+    if selection == "all" {
         return Ok(full);
     }
-    full.get(section)
+    lookup_selection(&full, selection)
         .cloned()
-        .ok_or_else(|| format!("unknown config section: '{section}'"))
+        .ok_or_else(|| format!("unknown config key or section: '{selection}'"))
+}
+
+fn lookup_selection<'a>(value: &'a JsonValue, selection: &str) -> Option<&'a JsonValue> {
+    selection
+        .split('.')
+        .try_fold(value, |current, segment| match current {
+            JsonValue::Object(map) => map.get(segment),
+            _ => None,
+        })
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -367,7 +376,16 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let mgr = ConfigManager::new(temp.path()).expect("manager");
         let err = mgr.get("nonexistent").unwrap_err();
-        assert!(err.contains("unknown config section"));
+        assert!(err.contains("unknown config key or section"));
+    }
+
+    #[test]
+    fn get_returns_nested_key() {
+        let temp = TempDir::new().expect("tempdir");
+        write_config(temp.path(), "[model]\ndefault_model = \"test-model\"\n");
+        let mgr = ConfigManager::new(temp.path()).expect("manager");
+        let val = mgr.get("model.default_model").expect("get key");
+        assert_eq!(val, JsonValue::String("test-model".to_string()));
     }
 
     #[test]

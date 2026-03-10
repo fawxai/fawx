@@ -4915,7 +4915,23 @@ three
         let err = exec
             .handle_config_get(&serde_json::json!({"section": "nonexistent"}))
             .expect_err("should fail");
-        assert!(err.contains("unknown config section"));
+        assert!(err.contains("unknown config key or section"));
+    }
+
+    #[test]
+    fn config_get_returns_nested_key() {
+        let temp = TempDir::new().expect("tempdir");
+        std::fs::write(
+            temp.path().join("config.toml"),
+            "[model]\ndefault_model = \"my-model\"\n",
+        )
+        .unwrap();
+        let exec = executor_with_config(temp.path());
+        let result = exec
+            .handle_config_get(&serde_json::json!({"section": "model.default_model"}))
+            .expect("config_get key");
+        let json: serde_json::Value = serde_json::from_str(&result).expect("parse json");
+        assert_eq!(json, "my-model");
     }
 
     // ── config_set tests ────────────────────────────────────────────────
