@@ -4,6 +4,7 @@ mod auth_store;
 mod commands;
 mod config_bridge;
 mod confirmation;
+mod context;
 mod headless;
 pub(crate) mod helpers;
 #[cfg(feature = "http")]

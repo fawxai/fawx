@@ -38,6 +38,7 @@ use crate::commands::slash::{
     render_signals_summary, CommandContext, CommandHost, ImproveFlags, ParsedCommand,
     DEFAULT_SYNTHESIS_INSTRUCTION, MAX_SYNTHESIS_INSTRUCTION_LENGTH,
 };
+use crate::context::load_context_files;
 use crate::helpers::{
     available_provider_names, format_memory_for_prompt, render_model_menu_text, render_status_text,
     resolve_model_alias, thinking_config_from_budget, trim_history, AnalysisCompletionProvider,
@@ -188,8 +189,12 @@ impl HeadlessApp {
         seed_router_default_model(&mut deps.router, &active_model);
 
         let max_history = deps.config.general.max_history;
-        let custom_system_prompt =
-            resolve_system_prompt(deps.system_prompt_text, deps.system_prompt_path.as_deref());
+        let data_dir = configured_data_dir(&fawx_data_dir(), &deps.config);
+        let custom_system_prompt = resolve_system_prompt(
+            deps.system_prompt_text,
+            deps.system_prompt_path.as_deref(),
+            &data_dir,
+        );
 
         Ok(Self {
             loop_engine: deps.loop_engine,
@@ -487,7 +492,7 @@ impl HeadlessApp {
         eprintln!("fawx serve — headless mode");
         eprintln!("model: {}", self.active_model);
         if self.custom_system_prompt.is_some() {
-            eprintln!("system prompt: ~/.fawx/system_prompt.md loaded");
+            eprintln!("system prompt: custom prompt/context loaded");
         }
         eprintln!("ready (type /quit to exit)");
     }
@@ -1423,10 +1428,25 @@ fn load_system_prompt(explicit_path: Option<&std::path::Path>) -> Option<String>
 fn resolve_system_prompt(
     inline_prompt: Option<String>,
     explicit_path: Option<&std::path::Path>,
+    data_dir: &Path,
 ) -> Option<String> {
-    inline_prompt
+    let base_prompt = inline_prompt
         .filter(|prompt| !prompt.trim().is_empty())
-        .or_else(|| load_system_prompt(explicit_path))
+        .or_else(|| load_system_prompt(explicit_path));
+    let context_dir = data_dir.join("context");
+    append_context_files(base_prompt, load_context_files(&context_dir))
+}
+
+fn append_context_files(
+    base_prompt: Option<String>,
+    context_files: Option<String>,
+) -> Option<String> {
+    match (base_prompt, context_files) {
+        (Some(prompt), Some(context)) => Some(format!("{prompt}{context}")),
+        (Some(prompt), None) => Some(prompt),
+        (None, Some(context)) => Some(context),
+        (None, None) => None,
+    }
 }
 
 fn resolve_active_model(router: &ModelRouter, config: &FawxConfig) -> anyhow::Result<String> {
@@ -2365,8 +2385,29 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("prompt.md");
         std::fs::write(&path, "from file").expect("write");
-        let prompt = resolve_system_prompt(Some("inline".to_string()), Some(&path));
+        let prompt = resolve_system_prompt(Some("inline".to_string()), Some(&path), dir.path());
         assert_eq!(prompt.as_deref(), Some("inline"));
+    }
+
+    #[test]
+    fn new_appends_context_files_to_system_prompt() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp_dir.path().join(".fawx");
+        std::fs::create_dir_all(data_dir.join("context")).expect("context dir");
+        std::fs::write(data_dir.join("context").join("SOUL.md"), "be helpful")
+            .expect("write context");
+
+        let mut config = FawxConfig::default();
+        config.general.data_dir = Some(data_dir);
+
+        let mut deps = headless_deps(static_model_router(&["test-model"]), config);
+        deps.system_prompt_text = Some("base prompt".to_string());
+
+        let app = HeadlessApp::new(deps).expect("should build");
+        let prompt = app.custom_system_prompt.clone().expect("system prompt");
+
+        assert!(prompt.starts_with("base prompt"));
+        assert!(prompt.contains("--- SOUL.md ---\nbe helpful\n"));
     }
 
     #[test]

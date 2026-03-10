@@ -39,6 +39,7 @@ mod commands {
     pub(crate) use super::slash_commands as slash;
 }
 mod config_bridge;
+mod context;
 pub mod headless;
 pub(crate) mod helpers;
 #[cfg(feature = "http")]
