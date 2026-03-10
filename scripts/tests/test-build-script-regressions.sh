@@ -28,6 +28,11 @@ EOF
   chmod +x "$path"
 }
 
+assert_exists() {
+  local path="$1"
+  [[ -f "$path" ]] || fail "missing file: $path"
+}
+
 assert_logged_invocation() {
   local log_file="$1"
   local expected="$2"
@@ -35,6 +40,24 @@ assert_logged_invocation() {
     cat "$log_file" >&2
     fail "missing log entry: $expected"
   }
+}
+
+assert_skill_install_artifacts() {
+  local install_dir="$1"
+  local directory artifact
+  while IFS=: read -r directory artifact; do
+    assert_exists "$install_dir/$artifact"
+    assert_exists "$install_dir/$directory.toml"
+  done <<'EOF'
+weather-skill:weather.wasm
+calculator-skill:calculator.wasm
+vision-skill:vision.wasm
+tts-skill:tts.wasm
+browser-skill:browser.wasm
+stt-skill:stt.wasm
+canvas-skill:canvas.wasm
+github-skill:github.wasm
+EOF
 }
 
 TMP_DIR="$(mktemp -d)"
@@ -46,15 +69,23 @@ mkdir -p "$FAKE_BIN" "$FAKE_HOME/.cargo/bin"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 require_contains "$BUILD_SCRIPT" 'source "$SCRIPT_DIR/lib.sh"'
+require_contains "$BUILD_SCRIPT" 'local skills_args=(${CARGO_ARGS[@]+"${CARGO_ARGS[@]}"})'
+require_contains "$BUILD_SCRIPT" './build.sh ${skills_args[@]+"${skills_args[@]}"}'
+require_contains "$BUILD_SCRIPT" 'clippy ${WORKSPACE_CHECK_ARGS[@]+"${WORKSPACE_CHECK_ARGS[@]}"} -- -D warnings'
+require_contains "$BUILD_SCRIPT" 'test ${WORKSPACE_CHECK_ARGS[@]+"${WORKSPACE_CHECK_ARGS[@]}"}'
 require_contains "$SKILLS_BUILD_SCRIPT" 'source "$SCRIPT_DIR/../scripts/lib.sh"'
+require_contains "$SKILLS_BUILD_SCRIPT" '"$CARGO_BIN" build --target wasm32-unknown-unknown -j "$CARGO_BUILD_JOBS_VALUE" ${CARGO_ARGS[@]+"${CARGO_ARGS[@]}"}'
 require_contains "$LIB_SCRIPT" 'detect_cpu_count()'
 require_contains "$LIB_SCRIPT" 'resolve_tool()'
 
+make_fake_command "$FAKE_BIN/bash" 'exec /bin/bash "$@"'
 make_fake_command "$FAKE_BIN/dirname" 'exec /usr/bin/dirname "$@"'
 make_fake_command "$FAKE_BIN/date" 'exec /usr/bin/date "$@"'
 make_fake_command "$FAKE_BIN/awk" 'exec /usr/bin/awk "$@"'
 make_fake_command "$FAKE_BIN/cat" 'exec /usr/bin/cat "$@"'
 make_fake_command "$FAKE_BIN/grep" 'exec /usr/bin/grep "$@"'
+make_fake_command "$FAKE_BIN/mkdir" 'exec /bin/mkdir "$@"'
+make_fake_command "$FAKE_BIN/cp" 'exec /bin/cp "$@"'
 make_fake_command "$FAKE_BIN/cargo" '
 {
   printf "argc=%s\n" "$#"
@@ -63,11 +94,45 @@ make_fake_command "$FAKE_BIN/cargo" '
   done
   printf -- "---\n"
 } >>"$CARGO_LOG"
+
+if [[ "${1:-}" != "build" ]]; then
+  exit 0
+fi
+
+profile=debug
+for arg in "$@"; do
+  if [[ "$arg" == "--release" ]]; then
+    profile=release
+    break
+  fi
+done
+
+crate="${PWD##*/}"
+crate="${crate//-/_}"
+target_dir="$PWD/target/wasm32-unknown-unknown/$profile"
+mkdir -p "$target_dir"
+printf "fake wasm for %s\n" "$crate" >"$target_dir/$crate.wasm"
 '
-make_fake_command "$FAKE_HOME/.cargo/bin/rustup" 'echo rustup-fallback >/dev/null'
+make_fake_command "$FAKE_HOME/.cargo/bin/rustup" '
+if [[ "${1:-}" == "target" && "${2:-}" == "list" && "${3:-}" == "--installed" ]]; then
+  printf "wasm32-unknown-unknown\n"
+  exit 0
+fi
+
+if [[ "${1:-}" == "target" && "${2:-}" == "add" && "${3:-}" == "wasm32-unknown-unknown" ]]; then
+  exit 0
+fi
+
+exit 0
+'
+
+SKILLS_OUTPUT="$TMP_DIR/skills.out"
+SKILLS_INSTALL_OUTPUT="$TMP_DIR/skills-install.out"
 
 PATH="$FAKE_BIN" HOME="$FAKE_HOME" /bin/bash "$BUILD_SCRIPT" --check >/dev/null
 PATH="$FAKE_BIN" HOME="$FAKE_HOME" /bin/bash "$SKILLS_BUILD_SCRIPT" --help >/dev/null
+PATH="$FAKE_BIN" HOME="$FAKE_HOME" /bin/bash "$BUILD_SCRIPT" --skills >"$SKILLS_OUTPUT"
+PATH="$FAKE_BIN" HOME="$FAKE_HOME" /bin/bash "$BUILD_SCRIPT" --skills --install >"$SKILLS_INSTALL_OUTPUT"
 
 assert_logged_invocation "$CARGO_LOG" 'arg=fmt'
 assert_logged_invocation "$CARGO_LOG" 'arg=clippy'
@@ -75,10 +140,14 @@ assert_logged_invocation "$CARGO_LOG" 'arg=test'
 assert_logged_invocation "$CARGO_LOG" 'arg=--workspace'
 assert_logged_invocation "$CARGO_LOG" 'arg=--exclude'
 assert_logged_invocation "$CARGO_LOG" 'arg=llama-cpp-sys'
+require_contains "$SKILLS_OUTPUT" '✓ 8 skills built'
+require_contains "$SKILLS_INSTALL_OUTPUT" 'Installed to ~/.fawx/skills/'
 
 if grep -Fq 'arg=--workspace --exclude llama-cpp-sys' "$CARGO_LOG"; then
   cat "$CARGO_LOG" >&2
   fail 'workspace check args were collapsed into one word-split string'
 fi
+
+assert_skill_install_artifacts "$FAKE_HOME/.fawx/skills"
 
 echo "build script regression checks passed"

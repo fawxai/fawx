@@ -17,6 +17,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/lib.sh"
 MODE="debug"
 PROFILE="debug"
+INSTALL=false
 CARGO_ARGS=()
 BUILD_SCOPE="all"
 TOTAL_STEPS=3
@@ -35,6 +36,7 @@ Usage:
   ./scripts/build.sh --skills
   ./scripts/build.sh --engine
   ./scripts/build.sh --check
+  ./scripts/build.sh --install
 EOF
 }
 
@@ -62,6 +64,9 @@ parse_args() {
         PROFILE="debug"
         CARGO_ARGS=()
         TOTAL_STEPS=1
+        ;;
+      --install)
+        INSTALL=true
         ;;
       -h|--help)
         usage
@@ -134,11 +139,17 @@ count_skills() {
 
 build_skills() {
   local count
+  local skills_args=(${CARGO_ARGS[@]+"${CARGO_ARGS[@]}"})
   count="$(count_skills)"
+
+  if [[ "$INSTALL" == true ]]; then
+    skills_args+=(--install)
+  fi
+
   step_header "$1" "Building WASM skills..."
   (
     cd "$REPO_ROOT/skills"
-    CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS_VALUE" ./build.sh ${CARGO_ARGS[@]+"${CARGO_ARGS[@]}"}
+    CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS_VALUE" ./build.sh ${skills_args[@]+"${skills_args[@]}"}
   )
   echo "✓ $count skills built"
 }
@@ -149,8 +160,8 @@ run_checks() {
   (
     cd "$REPO_ROOT"
     "$CARGO_BIN" fmt --all --check
-    "$CARGO_BIN" clippy "${WORKSPACE_CHECK_ARGS[@]}" -- -D warnings
-    "$CARGO_BIN" test "${WORKSPACE_CHECK_ARGS[@]}"
+    "$CARGO_BIN" clippy ${WORKSPACE_CHECK_ARGS[@]+"${WORKSPACE_CHECK_ARGS[@]}"} -- -D warnings
+    "$CARGO_BIN" test ${WORKSPACE_CHECK_ARGS[@]+"${WORKSPACE_CHECK_ARGS[@]}"}
   )
   if ! has_cxx_compiler; then
     echo "✓ checks passed (llama-cpp-sys skipped: no C++ compiler found)"

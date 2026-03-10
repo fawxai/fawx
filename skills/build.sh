@@ -6,10 +6,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/../scripts/lib.sh"
 MODE="debug"
 PROFILE="debug"
+INSTALL=false
+INSTALL_DIR="$HOME/.fawx/skills"
 CARGO_ARGS=()
 CARGO_BUILD_JOBS_VALUE=""
 CARGO_BIN=""
 RUSTUP_BIN=""
+INSTALLED_SKILLS=()
 SKILL_SPECS=(
   "weather-skill:weather_skill:weather.wasm"
   "calculator-skill:calculator_skill:calculator.wasm"
@@ -26,6 +29,7 @@ usage() {
 Usage:
   ./skills/build.sh           Build WASM skills (debug)
   ./skills/build.sh --release Build WASM skills (release)
+  ./skills/build.sh --install Build and install WASM skills to ~/.fawx/skills/
 EOF
 }
 
@@ -36,6 +40,9 @@ parse_args() {
         MODE="release"
         PROFILE="release"
         CARGO_ARGS=(--release)
+        ;;
+      --install)
+        INSTALL=true
         ;;
       -h|--help)
         usage
@@ -52,11 +59,23 @@ parse_args() {
 }
 
 ensure_wasm_target() {
-  if rustup target list --installed | grep -qx 'wasm32-unknown-unknown'; then
+  if "$RUSTUP_BIN" target list --installed | grep -qx 'wasm32-unknown-unknown'; then
     return
   fi
   echo "Installing wasm32-unknown-unknown target..."
   "$RUSTUP_BIN" target add wasm32-unknown-unknown
+}
+
+install_skill() {
+  local directory="$1"
+  local artifact="$2"
+  local output="$SCRIPT_DIR/$directory/$artifact"
+  local manifest="$SCRIPT_DIR/$directory/manifest.toml"
+
+  mkdir -p "$INSTALL_DIR"
+  cp "$output" "$INSTALL_DIR/$artifact"
+  cp "$manifest" "$INSTALL_DIR/$directory.toml"
+  INSTALLED_SKILLS+=("$directory")
 }
 
 build_skill() {
@@ -73,6 +92,23 @@ build_skill() {
   )
   cp "$source" "$output"
   echo "✓ $directory built -> $directory/$artifact"
+
+  if [[ "$INSTALL" == true ]]; then
+    install_skill "$directory" "$artifact"
+  fi
+}
+
+print_summary() {
+  echo
+  echo "✓ ${#SKILL_SPECS[@]} skills built"
+
+  if [[ "$INSTALL" != true ]]; then
+    return
+  fi
+
+  echo
+  echo "Installed to ~/.fawx/skills/"
+  echo "✓ ${#INSTALLED_SKILLS[@]} skills installed"
 }
 
 main() {
@@ -87,8 +123,7 @@ main() {
     build_skill "$spec"
   done
 
-  echo
-  echo "Built ${#SKILL_SPECS[@]} skills in $MODE mode"
+  print_summary
 }
 
 main "$@"
