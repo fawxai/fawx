@@ -10,6 +10,7 @@ use fx_kernel::act::{
 use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::{ListEntry, ProcessConfig, ProcessRegistry, SpawnResult, StatusResult};
 use fx_llm::{ToolCall, ToolDefinition};
+use fx_memory::embedding_index::EmbeddingIndex;
 use fx_propose::{build_proposal_content, current_file_hash, Proposal, ProposalWriter};
 use fx_subagent::{
     SpawnConfig, SpawnMode, SubagentControl, SubagentHandle, SubagentId, SubagentStatus,
@@ -43,6 +44,7 @@ const MAX_SEARCH_MATCHES: usize = 100;
 const DEFAULT_MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 const DEFAULT_MAX_READ_SIZE: u64 = 1024 * 1024;
 const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_MEMORY_SEARCH_RESULTS: usize = 5;
 
 fn default_process_registry(working_dir: &Path) -> Arc<ProcessRegistry> {
     Arc::new(ProcessRegistry::new(ProcessConfig {
@@ -57,6 +59,7 @@ pub struct FawxToolExecutor {
     config: ToolConfig,
     process_registry: Arc<ProcessRegistry>,
     memory: Option<Arc<Mutex<dyn MemoryStore>>>,
+    embedding_index: Option<Arc<Mutex<EmbeddingIndex>>>,
     runtime_info: Option<Arc<RwLock<RuntimeInfo>>>,
     self_modify: Option<SelfModifyConfig>,
     concurrency_policy: ConcurrencyPolicy,
@@ -102,6 +105,7 @@ impl FawxToolExecutor {
             config,
             process_registry,
             memory: None,
+            embedding_index: None,
             runtime_info: None,
             self_modify: None,
             concurrency_policy: ConcurrencyPolicy::default(),
@@ -124,6 +128,12 @@ impl FawxToolExecutor {
     /// Attach a persistent memory provider.
     pub fn with_memory(mut self, memory: Arc<Mutex<dyn MemoryStore>>) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    /// Attach a semantic embedding index for memory search.
+    pub fn with_embedding_index(mut self, index: Arc<Mutex<EmbeddingIndex>>) -> Self {
+        self.embedding_index = Some(index);
         self
     }
 
@@ -181,9 +191,8 @@ impl FawxToolExecutor {
 
     fn cacheability_for(tool_name: &str) -> ToolCacheability {
         match tool_name {
-            "read_file" | "list_directory" | "search_text" | "memory_read" | "memory_list" => {
-                ToolCacheability::Cacheable
-            }
+            "read_file" | "list_directory" | "search_text" | "memory_read" | "memory_list"
+            | "memory_search" => ToolCacheability::Cacheable,
             "write_file" | "edit_file" | "memory_write" | "memory_delete" | "run_command"
             | "exec_background" | "exec_kill" | "config_set" | "fawx_restart" | "spawn_agent"
             | "node_run" => ToolCacheability::SideEffect,
@@ -226,6 +235,7 @@ impl FawxToolExecutor {
             "memory_write" => self.handle_memory_write(&call.arguments),
             "memory_read" => self.handle_memory_read(&call.arguments),
             "memory_list" => self.handle_memory_list(),
+            "memory_search" => self.handle_memory_search(&call.arguments),
             "memory_delete" => self.handle_memory_delete(&call.arguments),
             "spawn_agent" => self.handle_spawn_agent(&call.arguments).await,
             "subagent_status" => self.handle_subagent_status(&call.arguments).await,
@@ -728,6 +738,8 @@ impl FawxToolExecutor {
         let memory = self.memory.as_ref().ok_or("memory not configured")?;
         let mut guard = memory.lock().map_err(|e| format!("{e}"))?;
         guard.write(&parsed.key, &parsed.value)?;
+        drop(guard);
+        self.upsert_embedding_memory(&parsed.key, &parsed.value)?;
         Ok(format!("stored key '{}'", parsed.key))
     }
 
@@ -756,15 +768,115 @@ impl FawxToolExecutor {
         Ok(lines)
     }
 
+    fn handle_memory_search(&self, args: &serde_json::Value) -> Result<String, String> {
+        let parsed: MemorySearchArgs = parse_args(args)?;
+        let max_results = parsed.max_results.unwrap_or(DEFAULT_MEMORY_SEARCH_RESULTS);
+        let results = self.memory_search_results(&parsed.query, max_results)?;
+        self.touch_memory_search_results(&results)?;
+        Ok(format_memory_search_results(&parsed.query, &results))
+    }
+
     fn handle_memory_delete(&self, args: &serde_json::Value) -> Result<String, String> {
         let parsed: MemoryDeleteArgs = parse_args(args)?;
         let memory = self.memory.as_ref().ok_or("memory not configured")?;
         let mut guard = memory.lock().map_err(|e| format!("{e}"))?;
-        if guard.delete(&parsed.key) {
+        let deleted = guard.delete(&parsed.key);
+        drop(guard);
+        if deleted {
+            self.remove_embedding_memory(&parsed.key)?;
             Ok(format!("deleted key '{}'", parsed.key))
         } else {
             Ok(format!("key '{}' not found", parsed.key))
         }
+    }
+
+    fn memory_search_results(
+        &self,
+        query: &str,
+        max_results: usize,
+    ) -> Result<Vec<MemorySearchResult>, String> {
+        if let Some(index) = &self.embedding_index {
+            match self.semantic_memory_search(index, query, max_results) {
+                Ok(results) => return Ok(results),
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "semantic search failed; falling back to keyword search"
+                    );
+                }
+            }
+        }
+        self.keyword_memory_search(query, max_results)
+    }
+
+    fn touch_memory_search_results(&self, results: &[MemorySearchResult]) -> Result<(), String> {
+        let memory = self.memory.as_ref().ok_or("memory not configured")?;
+        let mut guard = memory.lock().map_err(|error| format!("{error}"))?;
+        results
+            .iter()
+            .try_for_each(|result| guard.touch(&result.key))
+    }
+
+    fn semantic_memory_search(
+        &self,
+        index: &Arc<Mutex<EmbeddingIndex>>,
+        query: &str,
+        max_results: usize,
+    ) -> Result<Vec<MemorySearchResult>, String> {
+        let hits = index
+            .lock()
+            .map_err(|e| format!("{e}"))?
+            .search(query, max_results)
+            .map_err(|error| error.to_string())?;
+        let memory = self.memory.as_ref().ok_or("memory not configured")?;
+        let guard = memory.lock().map_err(|e| format!("{e}"))?;
+        Ok(hits
+            .into_iter()
+            .filter_map(|(key, score)| {
+                guard.read(&key).map(|value| MemorySearchResult {
+                    key,
+                    value,
+                    score: Some(score),
+                })
+            })
+            .collect())
+    }
+
+    fn keyword_memory_search(
+        &self,
+        query: &str,
+        max_results: usize,
+    ) -> Result<Vec<MemorySearchResult>, String> {
+        let memory = self.memory.as_ref().ok_or("memory not configured")?;
+        let guard = memory.lock().map_err(|e| format!("{e}"))?;
+        Ok(guard
+            .search_relevant(query, max_results)
+            .into_iter()
+            .map(|(key, value)| MemorySearchResult {
+                key,
+                value,
+                score: None,
+            })
+            .collect())
+    }
+
+    fn upsert_embedding_memory(&self, key: &str, value: &str) -> Result<(), String> {
+        let Some(index) = &self.embedding_index else {
+            return Ok(());
+        };
+        index
+            .lock()
+            .map_err(|e| format!("{e}"))?
+            .upsert(key, value)
+            .map_err(|error| error.to_string())
+    }
+
+    fn remove_embedding_memory(&self, key: &str) -> Result<(), String> {
+        let Some(index) = &self.embedding_index else {
+            return Ok(());
+        };
+        index.lock().map_err(|e| format!("{e}"))?.remove(key);
+        Ok(())
     }
 
     async fn handle_spawn_agent(&self, args: &serde_json::Value) -> Result<String, String> {
@@ -1146,6 +1258,7 @@ impl std::fmt::Debug for FawxToolExecutor {
             .field("config", &self.config)
             .field("process_registry", &true)
             .field("memory", &self.memory.is_some())
+            .field("embedding_index", &self.embedding_index.is_some())
             .field("runtime_info", &self.runtime_info.is_some())
             .field("self_modify", &self.self_modify)
             .field("concurrency_policy", &self.concurrency_policy)
@@ -1675,6 +1788,25 @@ pub fn memory_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["key"]
             }),
         },
+        ToolDefinition {
+            name: "memory_search".to_string(),
+            description: "Search agent memory by meaning. Finds semantically related memories even without exact keyword matches."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural language search query"
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum results to return (default: 5)"
+                    }
+                },
+                "required": ["query"]
+            }),
+        },
     ]
 }
 
@@ -1690,6 +1822,43 @@ fn format_memory_list(entries: &[(String, String)]) -> String {
             "
 ",
         )
+}
+
+struct MemorySearchResult {
+    key: String,
+    value: String,
+    score: Option<f32>,
+}
+
+fn format_memory_search_results(query: &str, results: &[MemorySearchResult]) -> String {
+    if results.is_empty() {
+        return format!("No relevant memories found for: {query}");
+    }
+
+    let items = results
+        .iter()
+        .enumerate()
+        .map(|(index, result)| format_memory_search_item(index + 1, result))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    format!("Found {} relevant memories:\n\n{items}", results.len())
+}
+
+fn format_memory_search_item(index: usize, result: &MemorySearchResult) -> String {
+    let header = match result.score {
+        Some(score) => format!("{index}. [{}] (score: {score:.2})", result.key),
+        None => format!("{index}. [{}]", result.key),
+    };
+    let value = indent_memory_value(&result.value);
+    format!("{header}\n{value}")
+}
+
+fn indent_memory_value(value: &str) -> String {
+    value
+        .lines()
+        .map(|line| format!("   {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn truncate_preview(value: &str, max_len: usize) -> String {
@@ -1995,6 +2164,12 @@ struct MemoryDeleteArgs {
 }
 
 #[derive(Deserialize)]
+struct MemorySearchArgs {
+    query: String,
+    max_results: Option<usize>,
+}
+
+#[derive(Deserialize)]
 struct ConfigGetArgs {
     section: Option<String>,
 }
@@ -2189,7 +2364,9 @@ pub fn config_tool_definitions() -> Vec<ToolDefinition> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fx_core::memory::MemoryProvider;
+    use fx_core::memory::{MemoryProvider, MemoryTouchProvider};
+    use fx_embeddings::{test_support::create_test_model_dir, EmbeddingModel};
+    use fx_memory::embedding_index::EmbeddingIndex;
     use fx_subagent::{test_support::StubSubagentControl, SubagentStatus};
     use tempfile::TempDir;
 
@@ -2217,6 +2394,35 @@ mod tests {
 
     fn test_executor(root: &Path) -> FawxToolExecutor {
         FawxToolExecutor::new(root.to_path_buf(), ToolConfig::default())
+    }
+
+    fn memory_executor(root: &Path) -> (FawxToolExecutor, Arc<Mutex<fx_memory::JsonFileMemory>>) {
+        let memory = Arc::new(Mutex::new(
+            fx_memory::JsonFileMemory::new(root).expect("memory"),
+        ));
+        let executor = test_executor(root).with_memory(memory.clone());
+        (executor, memory)
+    }
+
+    fn embedding_executor(
+        root: &Path,
+    ) -> (
+        FawxToolExecutor,
+        Arc<Mutex<fx_memory::JsonFileMemory>>,
+        Arc<Mutex<EmbeddingIndex>>,
+    ) {
+        let (executor, memory) = memory_executor(root);
+        let model = test_embedding_model(8);
+        let index = Arc::new(Mutex::new(
+            EmbeddingIndex::build_from(&[], &model).expect("index"),
+        ));
+        let executor = executor.with_embedding_index(index.clone());
+        (executor, memory, index)
+    }
+
+    fn test_embedding_model(dimensions: usize) -> Arc<EmbeddingModel> {
+        let model_dir = create_test_model_dir(dimensions);
+        Arc::new(EmbeddingModel::load(model_dir.path()).expect("load test model"))
     }
 
     fn sample_runtime_info(model: &str) -> Arc<RwLock<RuntimeInfo>> {
@@ -3426,6 +3632,10 @@ three
             ToolCacheability::Cacheable
         );
         assert_eq!(
+            executor.cacheability("memory_search"),
+            ToolCacheability::Cacheable
+        );
+        assert_eq!(
             executor.cacheability("write_file"),
             ToolCacheability::SideEffect
         );
@@ -3825,17 +4035,14 @@ three
     #[test]
     fn memory_tools_appear_in_definitions_when_memory_configured() {
         let temp = TempDir::new().expect("temp");
-        let memory = Arc::new(Mutex::new(
-            fx_memory::JsonFileMemory::new(temp.path()).expect("memory"),
-        ));
-        let executor = FawxToolExecutor::new(temp.path().to_path_buf(), ToolConfig::default())
-            .with_memory(memory);
+        let (executor, _memory) = memory_executor(temp.path());
         let defs = executor.tool_definitions();
         let names: Vec<_> = defs.iter().map(|d| d.name.as_str()).collect();
         assert!(names.contains(&"memory_write"));
         assert!(names.contains(&"memory_read"));
         assert!(names.contains(&"memory_list"));
         assert!(names.contains(&"memory_delete"));
+        assert!(names.contains(&"memory_search"));
     }
 
     #[test]
@@ -3952,11 +4159,7 @@ three
     #[test]
     fn memory_delete_tool_returns_not_found() {
         let temp = TempDir::new().expect("temp");
-        let memory = Arc::new(Mutex::new(
-            fx_memory::JsonFileMemory::new(temp.path()).expect("memory"),
-        ));
-        let executor = FawxToolExecutor::new(temp.path().to_path_buf(), ToolConfig::default())
-            .with_memory(memory);
+        let (executor, _memory) = memory_executor(temp.path());
         let result = executor
             .handle_memory_delete(&serde_json::json!({"key": "nonexistent"}))
             .expect("delete");
@@ -3964,6 +4167,249 @@ three
             result.contains("not found"),
             "should say not found, got: {result}"
         );
+    }
+
+    #[test]
+    fn memory_search_tool_returns_formatted_results_with_scores() {
+        let temp = TempDir::new().expect("temp");
+        let (executor, memory, index) = embedding_executor(temp.path());
+        {
+            let mut guard = memory.lock().expect("lock");
+            guard
+                .write(
+                    "auth_decision",
+                    "Switched to PKCE OAuth flow for ChatGPT credentials.",
+                )
+                .expect("write auth");
+            guard
+                .write(
+                    "security_review",
+                    "Bearer token stored in encrypted credential store.",
+                )
+                .expect("write security");
+        }
+        {
+            let mut guard = index.lock().expect("lock");
+            guard
+                .upsert(
+                    "auth_decision",
+                    "Switched to PKCE OAuth flow for ChatGPT credentials.",
+                )
+                .expect("index auth");
+            guard
+                .upsert(
+                    "security_review",
+                    "Bearer token stored in encrypted credential store.",
+                )
+                .expect("index security");
+        }
+
+        let result = executor
+            .handle_memory_search(&serde_json::json!({
+                "query": "Switched to PKCE OAuth flow for ChatGPT credentials.",
+                "max_results": 2
+            }))
+            .expect("memory search");
+
+        assert!(result.contains("Found 2 relevant memories:"), "{result}");
+        assert!(result.contains("[auth_decision]"), "{result}");
+        assert!(result.contains("score:"), "{result}");
+    }
+
+    #[test]
+    fn memory_search_tool_returns_helpful_message_when_empty() {
+        let temp = TempDir::new().expect("temp");
+        let (executor, _memory, _index) = embedding_executor(temp.path());
+
+        let result = executor
+            .handle_memory_search(&serde_json::json!({"query": "oauth"}))
+            .expect("memory search");
+
+        assert_eq!(result, "No relevant memories found for: oauth");
+    }
+
+    #[test]
+    fn memory_search_tool_falls_back_to_keyword_search_without_index() {
+        let temp = TempDir::new().expect("temp");
+        let (executor, memory) = memory_executor(temp.path());
+        {
+            let mut guard = memory.lock().expect("lock");
+            guard
+                .write("project_notes", "shipping auth flow soon")
+                .expect("write notes");
+        }
+
+        let result = executor
+            .handle_memory_search(&serde_json::json!({"query": "project auth"}))
+            .expect("keyword fallback");
+
+        assert!(result.contains("Found 1 relevant memories:"), "{result}");
+        assert!(result.contains("[project_notes]"), "{result}");
+        assert!(!result.contains("score:"), "{result}");
+    }
+
+    #[test]
+    fn memory_search_tool_falls_back_to_keyword_search_when_index_search_fails() {
+        let temp = TempDir::new().expect("temp");
+        let (executor, memory, index) = embedding_executor(temp.path());
+        {
+            let mut guard = memory.lock().expect("lock");
+            guard
+                .write("project_notes", "shipping auth flow soon")
+                .expect("write notes");
+        }
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = index.lock().expect("lock");
+            panic!("poison embedding index");
+        }));
+        assert!(panic_result.is_err(), "expected poisoned index");
+
+        let result = executor
+            .handle_memory_search(&serde_json::json!({"query": "project auth"}))
+            .expect("keyword fallback after semantic failure");
+
+        assert!(result.contains("Found 1 relevant memories:"), "{result}");
+        assert!(result.contains("[project_notes]"), "{result}");
+        assert!(!result.contains("score:"), "{result}");
+    }
+
+    #[test]
+    fn memory_search_touches_returned_keys() {
+        let temp = TempDir::new().expect("temp");
+        let (executor, memory) = memory_executor(temp.path());
+        {
+            let mut guard = memory.lock().expect("lock");
+            guard.write("alpha", "general notes").expect("write alpha");
+            guard.touch("alpha").expect("touch alpha");
+            guard
+                .write("project_notes", "shipping auth flow soon")
+                .expect("write notes");
+        }
+
+        let initial_snapshot = memory.lock().expect("lock").snapshot();
+        assert_eq!(initial_snapshot[0].0, "alpha");
+
+        executor
+            .handle_memory_search(&serde_json::json!({"query": "project auth"}))
+            .expect("memory search");
+
+        let touched_snapshot = memory.lock().expect("lock").snapshot();
+        assert_eq!(touched_snapshot[0].0, "project_notes");
+    }
+
+    #[test]
+    fn memory_search_respects_max_results_parameter() {
+        let temp = TempDir::new().expect("temp");
+        let (executor, memory, index) = embedding_executor(temp.path());
+        let entries = [
+            ("alpha", "hello world"),
+            ("beta", "hello world"),
+            ("gamma", "hello world"),
+        ];
+        {
+            let mut guard = memory.lock().expect("lock");
+            for (key, value) in entries {
+                guard.write(key, value).expect("write entry");
+            }
+        }
+        {
+            let mut guard = index.lock().expect("lock");
+            for (key, value) in entries {
+                guard.upsert(key, value).expect("index entry");
+            }
+        }
+
+        let result = executor
+            .handle_memory_search(&serde_json::json!({
+                "query": "hello world",
+                "max_results": 2
+            }))
+            .expect("memory search");
+
+        assert!(result.contains("Found 2 relevant memories:"), "{result}");
+        assert!(!result.contains("3. ["), "{result}");
+    }
+
+    #[test]
+    fn memory_search_uses_default_max_results_of_five() {
+        let temp = TempDir::new().expect("temp");
+        let (executor, memory, index) = embedding_executor(temp.path());
+        let entries = [
+            ("alpha", "hello world"),
+            ("beta", "hello world"),
+            ("gamma", "hello world"),
+            ("delta", "hello world"),
+            ("epsilon", "hello world"),
+            ("zeta", "hello world"),
+        ];
+        {
+            let mut guard = memory.lock().expect("lock");
+            for (key, value) in entries {
+                guard.write(key, value).expect("write entry");
+            }
+        }
+        {
+            let mut guard = index.lock().expect("lock");
+            for (key, value) in entries {
+                guard.upsert(key, value).expect("index entry");
+            }
+        }
+
+        let result = executor
+            .handle_memory_search(&serde_json::json!({"query": "hello world"}))
+            .expect("memory search");
+
+        assert!(result.contains("Found 5 relevant memories:"), "{result}");
+        assert!(!result.contains("6. ["), "{result}");
+    }
+
+    #[test]
+    fn memory_write_updates_embedding_index() {
+        let temp = TempDir::new().expect("temp");
+        let (executor, _memory, index) = embedding_executor(temp.path());
+
+        executor
+            .handle_memory_write(&serde_json::json!({
+                "key": "hello_memory",
+                "value": "hello world"
+            }))
+            .expect("memory write");
+
+        let results = index
+            .lock()
+            .expect("lock")
+            .search("hello world", 5)
+            .expect("search index");
+        assert!(results.iter().any(|(key, _)| key == "hello_memory"));
+    }
+
+    #[test]
+    fn memory_delete_removes_from_embedding_index() {
+        let temp = TempDir::new().expect("temp");
+        let (executor, memory, index) = embedding_executor(temp.path());
+        {
+            let mut memory_guard = memory.lock().expect("lock memory");
+            memory_guard
+                .write("hello_memory", "hello world")
+                .expect("write");
+        }
+        {
+            let mut index_guard = index.lock().expect("lock index");
+            index_guard
+                .upsert("hello_memory", "hello world")
+                .expect("index entry");
+        }
+
+        executor
+            .handle_memory_delete(&serde_json::json!({"key": "hello_memory"}))
+            .expect("memory delete");
+
+        let results = index
+            .lock()
+            .expect("lock")
+            .search("hello world", 5)
+            .expect("search index");
+        assert!(results.iter().all(|(key, _)| key != "hello_memory"));
     }
 
     #[test]

@@ -13,6 +13,9 @@ const CONFIG_FILE: &str = "config.json";
 const MODEL_FILE: &str = "model.safetensors";
 const TOKENIZER_FILE: &str = "tokenizer.json";
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
+
 /// A local embedding model for generating vector representations of text.
 pub struct EmbeddingModel {
     tokenizer: Tokenizer,
@@ -312,42 +315,11 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{
+        create_test_model_dir as create_model_dir,
+        create_test_model_dir_with_config as create_model_dir_with_config,
+    };
     use std::fs;
-
-    use tempfile::TempDir;
-
-    const TEST_TOKENIZER_JSON: &str = r#"{
-  "version": "1.0",
-  "truncation": null,
-  "padding": null,
-  "added_tokens": [
-    {
-      "id": 0,
-      "content": "[UNK]",
-      "single_word": false,
-      "lstrip": false,
-      "rstrip": false,
-      "normalized": false,
-      "special": true
-    }
-  ],
-  "normalizer": null,
-  "pre_tokenizer": { "type": "Whitespace" },
-  "post_processor": null,
-  "decoder": null,
-  "model": {
-    "type": "WordLevel",
-    "vocab": {
-      "[UNK]": 0,
-      "hello": 1,
-      "world": 2,
-      "memory": 3,
-      "search": 4,
-      "semantic": 5
-    },
-    "unk_token": "[UNK]"
-  }
-}"#;
 
     #[test]
     fn cosine_similarity_is_one_for_identical_vectors() {
@@ -519,29 +491,5 @@ mod tests {
             result,
             Err(EmbeddingError::LoadFailed(message)) if message.contains(file_name)
         ));
-    }
-
-    fn create_model_dir(dimensions: usize) -> TempDir {
-        create_model_dir_with_config(&format!("{{\"hidden_size\": {dimensions}}}"))
-    }
-
-    fn create_model_dir_with_config(config_contents: &str) -> TempDir {
-        let temp_dir = TempDir::new().unwrap();
-        fs::write(temp_dir.path().join(CONFIG_FILE), config_contents).unwrap();
-        fs::write(temp_dir.path().join(TOKENIZER_FILE), TEST_TOKENIZER_JSON).unwrap();
-        fs::write(temp_dir.path().join(MODEL_FILE), b"placeholder weights").unwrap();
-        write_manifest(temp_dir.path());
-        temp_dir
-    }
-
-    fn write_manifest(model_path: &Path) {
-        let mut lines = Vec::new();
-        for file_name in [CONFIG_FILE, TOKENIZER_FILE, MODEL_FILE] {
-            let bytes = fs::read(model_path.join(file_name)).unwrap();
-            let checksum = sha256_hex(&bytes);
-            lines.push(format!("{checksum}  {file_name}"));
-        }
-
-        fs::write(model_path.join(CHECKSUM_MANIFEST), lines.join("\n")).unwrap();
     }
 }

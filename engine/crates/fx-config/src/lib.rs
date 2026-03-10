@@ -47,6 +47,7 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Fawx Configuration
 # max_value_size = 10240
 # max_snapshot_chars = 2000
 # max_relevant_results = 5
+# embeddings_enabled = true
 
 # [security]
 # require_signatures = false
@@ -337,6 +338,7 @@ pub struct MemoryConfig {
     pub max_value_size: usize,
     pub max_snapshot_chars: usize,
     pub max_relevant_results: usize,
+    pub embeddings_enabled: bool,
 }
 
 impl Default for GeneralConfig {
@@ -367,6 +369,7 @@ impl Default for MemoryConfig {
             max_value_size: 10240,
             max_snapshot_chars: 2000,
             max_relevant_results: 5,
+            embeddings_enabled: true,
         }
     }
 }
@@ -813,6 +816,7 @@ max_entries = 200
 max_value_size = 555
 max_snapshot_chars = 777
 max_relevant_results = 9
+embeddings_enabled = false
 "#;
         write_config(&temp, content);
         let loaded = FawxConfig::load(temp.path()).expect("load config");
@@ -823,6 +827,7 @@ max_relevant_results = 9
         assert_eq!(loaded.tools.max_read_size, 4096);
         assert_eq!(loaded.memory.max_snapshot_chars, 777);
         assert_eq!(loaded.memory.max_relevant_results, 9);
+        assert!(!loaded.memory.embeddings_enabled);
     }
 
     #[test]
@@ -909,6 +914,7 @@ log_dir = "~/.fawx/custom-logs"
         assert_eq!(defaults.memory.max_value_size, 10240);
         assert_eq!(defaults.memory.max_snapshot_chars, 2000);
         assert_eq!(defaults.memory.max_relevant_results, 5);
+        assert!(defaults.memory.embeddings_enabled);
     }
 
     #[test]
@@ -941,6 +947,7 @@ log_dir = "~/.fawx/custom-logs"
                 max_value_size: 5,
                 max_snapshot_chars: 6,
                 max_relevant_results: 7,
+                embeddings_enabled: false,
             },
             self_modify: SelfModifyCliConfig {
                 enabled: true,

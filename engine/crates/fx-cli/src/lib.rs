@@ -81,6 +81,7 @@ fn build_app_with_dependencies(
         router: build_config.router,
         config: build_config.config,
         memory: bundle.memory,
+        embedding_index_persistence: bundle.embedding_index_persistence,
         system_prompt_path: build_config.system_prompt,
         config_manager: build_config.config_manager,
         system_prompt_text: None,

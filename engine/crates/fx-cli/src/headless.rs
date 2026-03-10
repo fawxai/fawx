@@ -102,6 +102,7 @@ pub struct HeadlessAppDeps {
     pub router: Arc<ModelRouter>,
     pub config: FawxConfig,
     pub memory: Option<SharedMemoryStore>,
+    pub embedding_index_persistence: Option<crate::startup::EmbeddingIndexPersistence>,
     pub system_prompt_path: Option<PathBuf>,
     pub config_manager: Option<Arc<Mutex<ConfigManager>>>,
     pub system_prompt_text: Option<String>,
@@ -115,6 +116,7 @@ pub struct HeadlessApp {
     router: Arc<ModelRouter>,
     config: FawxConfig,
     memory: Option<SharedMemoryStore>,
+    embedding_index_persistence: Option<crate::startup::EmbeddingIndexPersistence>,
     _subagent_manager: Arc<SubagentManager>,
     active_model: String,
     conversation_history: Vec<Message>,
@@ -168,6 +170,17 @@ pub fn init_serve_logging(
     crate::startup::init_logging(&config.logging, crate::startup::LoggingMode::Serve)
 }
 
+impl Drop for HeadlessApp {
+    fn drop(&mut self) {
+        let Some(persistence) = &self.embedding_index_persistence else {
+            return;
+        };
+        if let Err(error) = persistence.save_if_dirty() {
+            tracing::warn!(error = %error, "failed to save embedding index on shutdown");
+        }
+    }
+}
+
 impl HeadlessApp {
     /// Build from the standard startup bundle + router + config.
     pub fn new(mut deps: HeadlessAppDeps) -> Result<Self, anyhow::Error> {
@@ -183,6 +196,7 @@ impl HeadlessApp {
             router: deps.router,
             config: deps.config,
             memory: deps.memory,
+            embedding_index_persistence: deps.embedding_index_persistence,
             _subagent_manager: deps.subagent_manager,
             active_model,
             conversation_history: Vec::new(),
@@ -1208,7 +1222,8 @@ impl SubagentFactory for HeadlessSubagentFactory {
             loop_engine: bundle.engine,
             router: Arc::clone(&self.deps.router),
             config: self.deps.config.clone(),
-            memory: None,
+            memory: bundle.memory,
+            embedding_index_persistence: bundle.embedding_index_persistence,
             system_prompt_path: None,
             config_manager: None,
             system_prompt_text: config.system_prompt.clone(),
@@ -1479,6 +1494,7 @@ mod tests {
             router: Arc::new(ModelRouter::new()),
             config: FawxConfig::default(),
             memory: None,
+            embedding_index_persistence: None,
             _subagent_manager: new_disabled_subagent_manager(),
             active_model: "mock-model".to_string(),
             conversation_history: Vec::new(),
@@ -1681,6 +1697,7 @@ mod tests {
             router: Arc::new(router),
             config,
             memory: None,
+            embedding_index_persistence: None,
             _subagent_manager: new_disabled_subagent_manager(),
             active_model: "old-model".to_string(),
             conversation_history: Vec::new(),
@@ -1947,6 +1964,7 @@ mod tests {
             router: test_router(),
             config: FawxConfig::default(),
             memory: None,
+            embedding_index_persistence: None,
             _subagent_manager: new_disabled_subagent_manager(),
             active_model: "mock-model".to_string(),
             conversation_history: Vec::new(),
@@ -1971,6 +1989,7 @@ mod tests {
             router: test_router(),
             config: FawxConfig::default(),
             memory: None,
+            embedding_index_persistence: None,
             _subagent_manager: new_disabled_subagent_manager(),
             active_model: "mock-model".to_string(),
             conversation_history: Vec::new(),
@@ -2117,6 +2136,7 @@ mod tests {
             router: Arc::new(ModelRouter::new()),
             config,
             memory: None,
+            embedding_index_persistence: None,
             system_prompt_path: None,
             config_manager: None,
             system_prompt_text: None,
@@ -2182,6 +2202,7 @@ mod tests {
             router: Arc::new(router),
             config,
             memory: None,
+            embedding_index_persistence: None,
             system_prompt_path: None,
             config_manager: None,
             system_prompt_text: None,

@@ -12,6 +12,7 @@ use fx_config::{
 use fx_core::memory::{MemoryProvider, MemoryStore};
 use fx_core::runtime_info::{ConfigSummary, RuntimeInfo, SkillInfo};
 use fx_core::EventBus;
+use fx_embeddings::EmbeddingModel;
 use fx_fleet::{NodeRegistry, NodeTransport, SshTransport};
 use fx_journal::JournalSkill;
 use fx_kernel::act::ToolExecutor;
@@ -26,6 +27,7 @@ use fx_llm::{
     AnthropicProvider, CompletionRequest, ModelRouter, OpenAiProvider, OpenAiResponsesProvider,
 };
 use fx_loadable::{SignaturePolicy, SkillRegistry, TransactionSkill};
+use fx_memory::embedding_index::EmbeddingIndex;
 use fx_memory::{JsonFileMemory, JsonMemoryConfig, SignalStore};
 use fx_scratchpad::skill::ScratchpadSkill;
 use fx_scratchpad::Scratchpad;
@@ -86,6 +88,26 @@ const LOG_FILE_PREFIX: &str = "fawx";
 const LOG_FILE_SUFFIX: &str = "log";
 
 pub(crate) type SharedMemoryStore = Arc<Mutex<dyn MemoryStore>>;
+pub(crate) type SharedEmbeddingIndex = Arc<Mutex<EmbeddingIndex>>;
+
+#[derive(Clone)]
+pub struct EmbeddingIndexPersistence {
+    pub index: SharedEmbeddingIndex,
+    pub path: PathBuf,
+}
+
+impl EmbeddingIndexPersistence {
+    pub fn save_if_dirty(&self) -> Result<(), String> {
+        let guard = self
+            .index
+            .lock()
+            .map_err(|error| format!("embedding index lock poisoned: {error}"))?;
+        if !guard.is_dirty() {
+            return Ok(());
+        }
+        guard.save(&self.path).map_err(|error| error.to_string())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoggingMode {
@@ -306,6 +328,7 @@ fn build_loop_engine_bundle() -> LoopEngineBundle {
 pub struct LoopEngineBundle {
     pub engine: LoopEngine,
     pub memory: Option<SharedMemoryStore>,
+    pub embedding_index_persistence: Option<EmbeddingIndexPersistence>,
     pub runtime_info: Arc<RwLock<RuntimeInfo>>,
     pub event_bus: EventBus,
     pub scratchpad: Arc<Mutex<Scratchpad>>,
@@ -452,6 +475,7 @@ fn build_loop_engine_with_options(
     Ok(LoopEngineBundle {
         engine,
         memory: skills.memory,
+        embedding_index_persistence: skills.embedding_index_persistence,
         runtime_info: skills.runtime_info,
         event_bus,
         scratchpad: skills.scratchpad,
@@ -583,6 +607,7 @@ impl ToolExecutor for SharedSkillRegistry {
 struct SkillRegistryBundle {
     registry: Arc<SkillRegistry>,
     memory: Option<SharedMemoryStore>,
+    embedding_index_persistence: Option<EmbeddingIndexPersistence>,
     memory_snapshot: Option<String>,
     runtime_info: Arc<RwLock<RuntimeInfo>>,
     scratchpad: Arc<Mutex<Scratchpad>>,
@@ -612,7 +637,7 @@ fn build_skill_registry(
     ProcessRegistry::spawn_cleanup_task(&process_registry);
     let executor = FawxToolExecutor::new(options.working_dir.clone(), tool_config)
         .with_process_registry(process_registry);
-    let (mut executor, memory, snapshot_text, memory_enabled) =
+    let (mut executor, memory, embedding_index_persistence, snapshot_text, memory_enabled) =
         attach_memory_if_enabled(executor, data_dir, config, options.memory_enabled);
 
     let self_modify_config = crate::config_bridge::to_core_self_modify(&config.self_modify);
@@ -732,6 +757,7 @@ fn build_skill_registry(
     SkillRegistryBundle {
         registry,
         memory,
+        embedding_index_persistence,
         memory_snapshot: snapshot_text,
         runtime_info,
         scratchpad,
@@ -807,34 +833,186 @@ fn attach_memory_if_enabled(
 ) -> (
     FawxToolExecutor,
     Option<SharedMemoryStore>,
+    Option<EmbeddingIndexPersistence>,
     Option<String>,
     bool,
 ) {
     if !enabled {
-        return (executor, None, None, false);
+        return (executor, None, None, None, false);
     }
-    let memory_config = JsonMemoryConfig {
-        max_entries: config.memory.max_entries,
-        max_value_size: config.memory.max_value_size,
-        decay_config: fx_memory::DecayConfig::default(),
-    };
-    match JsonFileMemory::new_with_config(data_dir, memory_config) {
-        Ok(mut memory_store) => {
-            let pruned = memory_store.prune();
-            if pruned > 0 {
-                eprintln!("memory: pruned {pruned} stale entries at session start");
-            }
-            let snapshot = memory_store.snapshot();
-            let text = format_memory_for_prompt(&snapshot, config.memory.max_snapshot_chars);
+    match build_memory_state(data_dir, config) {
+        Ok((memory_store, snapshot_text, persistence)) => {
             let memory: SharedMemoryStore = Arc::new(Mutex::new(memory_store));
             executor = executor.with_memory(Arc::clone(&memory));
-            (executor, Some(memory), text, true)
+            if let Some(persistence) = &persistence {
+                executor = executor.with_embedding_index(Arc::clone(&persistence.index));
+            }
+            (executor, Some(memory), persistence, snapshot_text, true)
         }
         Err(error) => {
             eprintln!("warning: failed to initialize memory: {error}");
-            (executor, None, None, false)
+            (executor, None, None, None, false)
         }
     }
+}
+
+fn build_memory_state(
+    data_dir: &Path,
+    config: &FawxConfig,
+) -> Result<
+    (
+        JsonFileMemory,
+        Option<String>,
+        Option<EmbeddingIndexPersistence>,
+    ),
+    String,
+> {
+    let mut memory_store = JsonFileMemory::new_with_config(data_dir, memory_config(config))?;
+    log_pruned_memories(&mut memory_store);
+    let persistence = load_embedding_index_persistence(data_dir, config, &memory_store)?;
+    let snapshot = memory_store.snapshot();
+    let text = format_memory_for_prompt(&snapshot, config.memory.max_snapshot_chars);
+    Ok((memory_store, text, persistence))
+}
+
+fn memory_config(config: &FawxConfig) -> JsonMemoryConfig {
+    JsonMemoryConfig {
+        max_entries: config.memory.max_entries,
+        max_value_size: config.memory.max_value_size,
+        decay_config: fx_memory::DecayConfig::default(),
+    }
+}
+
+fn log_pruned_memories(memory_store: &mut JsonFileMemory) {
+    let pruned = memory_store.prune();
+    if pruned > 0 {
+        eprintln!("memory: pruned {pruned} stale entries at session start");
+    }
+}
+
+fn load_embedding_index_persistence(
+    data_dir: &Path,
+    config: &FawxConfig,
+    memory_store: &JsonFileMemory,
+) -> Result<Option<EmbeddingIndexPersistence>, String> {
+    if !config.memory.embeddings_enabled {
+        tracing::info!("memory embeddings disabled in config");
+        return Ok(None);
+    }
+    let paths = embedding_paths(data_dir);
+    let Some(model) = load_embedding_model_or_warn(&paths.model_dir) else {
+        return Ok(None);
+    };
+    let Some(index) = load_or_build_embedding_index_or_warn(memory_store, &paths.index_path, model)
+    else {
+        return Ok(None);
+    };
+    log_embedding_index_status(&index, &paths.index_path)?;
+    Ok(Some(EmbeddingIndexPersistence {
+        index,
+        path: paths.index_path,
+    }))
+}
+
+struct EmbeddingPaths {
+    model_dir: PathBuf,
+    index_path: PathBuf,
+}
+
+fn embedding_paths(data_dir: &Path) -> EmbeddingPaths {
+    EmbeddingPaths {
+        model_dir: data_dir.join("models").join("nomic-embed-text-v1.5"),
+        index_path: data_dir.join("memory").join("embeddings.bin"),
+    }
+}
+
+fn load_embedding_model_or_warn(model_dir: &Path) -> Option<Arc<EmbeddingModel>> {
+    match load_embedding_model(model_dir) {
+        Ok(model) => model,
+        Err(error) => {
+            tracing::warn!(path = %model_dir.display(), error = %error, "failed to initialize memory embeddings");
+            None
+        }
+    }
+}
+
+fn load_embedding_model(model_dir: &Path) -> Result<Option<Arc<EmbeddingModel>>, String> {
+    if !model_dir.exists() {
+        tracing::info!(path = %model_dir.display(), "memory embedding model not found; skipping semantic memory search");
+        return Ok(None);
+    }
+    EmbeddingModel::load(model_dir)
+        .map(Arc::new)
+        .map(Some)
+        .map_err(|error| format!("failed to load embedding model: {error}"))
+}
+
+fn load_or_build_embedding_index_or_warn(
+    memory_store: &JsonFileMemory,
+    index_path: &Path,
+    model: Arc<EmbeddingModel>,
+) -> Option<SharedEmbeddingIndex> {
+    match load_or_build_embedding_index(memory_store, index_path, model) {
+        Ok(index) => Some(index),
+        Err(error) => {
+            tracing::warn!(path = %index_path.display(), error = %error, "failed to initialize embedding index");
+            None
+        }
+    }
+}
+
+fn load_or_build_embedding_index(
+    memory_store: &JsonFileMemory,
+    index_path: &Path,
+    model: Arc<EmbeddingModel>,
+) -> Result<SharedEmbeddingIndex, String> {
+    let index = match try_load_embedding_index(index_path, Arc::clone(&model)) {
+        Some(Ok(index)) => index,
+        Some(Err(error)) => {
+            tracing::warn!(path = %index_path.display(), error = %error, "failed to load embedding index; rebuilding from memory");
+            build_embedding_index(memory_store, &model)?
+        }
+        None => build_embedding_index(memory_store, &model)?,
+    };
+    Ok(Arc::new(Mutex::new(index)))
+}
+
+fn try_load_embedding_index(
+    index_path: &Path,
+    model: Arc<EmbeddingModel>,
+) -> Option<Result<EmbeddingIndex, String>> {
+    if !index_path.exists() {
+        return None;
+    }
+    Some(load_embedding_index(index_path, model))
+}
+
+fn load_embedding_index(
+    index_path: &Path,
+    model: Arc<EmbeddingModel>,
+) -> Result<EmbeddingIndex, String> {
+    EmbeddingIndex::load(index_path, model).map_err(|error| error.to_string())
+}
+
+fn build_embedding_index(
+    memory_store: &JsonFileMemory,
+    model: &Arc<EmbeddingModel>,
+) -> Result<EmbeddingIndex, String> {
+    let entries = memory_store.list();
+    EmbeddingIndex::build_from(&entries, model).map_err(|error| error.to_string())
+}
+
+fn log_embedding_index_status(
+    index: &SharedEmbeddingIndex,
+    index_path: &Path,
+) -> Result<(), String> {
+    let entries = index.lock().map_err(|error| format!("{error}"))?.len();
+    tracing::info!(
+        entries,
+        path = %index_path.display(),
+        "memory embeddings enabled"
+    );
+    Ok(())
 }
 
 fn new_runtime_info(config: &FawxConfig, memory_enabled: bool) -> Arc<RwLock<RuntimeInfo>> {
@@ -1245,6 +1423,8 @@ fn duration_millis_u64(duration: std::time::Duration) -> u64 {
 mod tests {
     use super::*;
     use fx_config::manager::ConfigManager;
+    use fx_core::memory::MemoryProvider;
+    use fx_embeddings::test_support::create_test_model_dir;
     use fx_subagent::test_support::StubSubagentControl;
     use std::sync::{Arc, Mutex};
     use tracing_subscriber::filter::LevelFilter;
@@ -1268,6 +1448,21 @@ mod tests {
             address: Some("10.0.0.5".to_string()),
             user: Some("joseph".to_string()),
             ssh_key: Some("~/.ssh/id_ed25519".to_string()),
+        }
+    }
+
+    fn create_embedding_model_dir(base: &Path, dimensions: usize) {
+        let source = create_test_model_dir(dimensions);
+        let model_dir = base.join("models").join("nomic-embed-text-v1.5");
+        std::fs::create_dir_all(&model_dir).expect("model dir");
+        for file_name in [
+            "config.json",
+            "tokenizer.json",
+            "model.safetensors",
+            "checksums.sha256",
+        ] {
+            std::fs::copy(source.path().join(file_name), model_dir.join(file_name))
+                .expect("copy model file");
         }
     }
 
@@ -1561,6 +1756,59 @@ mod tests {
         let names = bundle_tool_names(&bundle);
 
         assert!(!names.contains(&"node_run".to_string()));
+    }
+
+    #[test]
+    fn headless_bundle_builds_embedding_index_from_existing_memory() {
+        let (config, _temp_dir) = test_config_with_temp_dir();
+        let data_dir = config.general.data_dir.clone().expect("data dir");
+        let mut memory = JsonFileMemory::new(&data_dir).expect("memory");
+        memory.write("auth", "hello world").expect("write memory");
+        create_embedding_model_dir(&data_dir, 8);
+
+        let bundle = build_headless_loop_engine_bundle(
+            &config,
+            None,
+            HeadlessLoopBuildOptions {
+                memory_enabled: true,
+                ..HeadlessLoopBuildOptions::default()
+            },
+        )
+        .expect("bundle should build");
+        let names = bundle_tool_names(&bundle);
+        let persistence = bundle
+            .embedding_index_persistence
+            .as_ref()
+            .expect("embedding index should be configured");
+        let results = persistence
+            .index
+            .lock()
+            .expect("lock index")
+            .search("hello world", 5)
+            .expect("search index");
+
+        assert!(results.iter().any(|(key, _)| key == "auth"));
+        assert!(names.contains(&"memory_search".to_string()));
+    }
+
+    #[test]
+    fn headless_bundle_skips_embedding_index_when_disabled_in_config() {
+        let (mut config, _temp_dir) = test_config_with_temp_dir();
+        let data_dir = config.general.data_dir.clone().expect("data dir");
+        create_embedding_model_dir(&data_dir, 8);
+        config.memory.embeddings_enabled = false;
+
+        let bundle = build_headless_loop_engine_bundle(
+            &config,
+            None,
+            HeadlessLoopBuildOptions {
+                memory_enabled: true,
+                ..HeadlessLoopBuildOptions::default()
+            },
+        )
+        .expect("bundle should build");
+
+        assert!(bundle.embedding_index_persistence.is_none());
     }
 
     #[test]

@@ -32,6 +32,7 @@ fx-conversation.workspace = true
 fx-llm = { path = "../fx-llm" }
 fx-loadable = { path = "../fx-loadable" }
 fx-memory.workspace = true
+fx-embeddings.workspace = true
 fx-analysis.workspace = true
 fx-improve.workspace = true
 fx-security.workspace = true
@@ -76,6 +77,7 @@ subtle = { version = "2.6", optional = true }
 urlencoding = "2.1"
 
 [dev-dependencies]
+fx-embeddings = { workspace = true, features = ["test-support"] }
 fx-subagent = { workspace = true, features = ["test-support"] }
 tempfile = "3.14"
 tower = { version = "0.5", features = ["util"] }

@@ -208,6 +208,7 @@ mod tests {
             router,
             config,
             memory: None,
+            embedding_index_persistence: None,
             system_prompt_path: None,
             config_manager: None,
             system_prompt_text: None,

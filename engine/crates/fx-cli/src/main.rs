@@ -409,6 +409,7 @@ fn build_headless_app(
         router,
         config,
         memory: bundle.memory,
+        embedding_index_persistence: bundle.embedding_index_persistence,
         system_prompt_path: system_prompt,
         config_manager,
         system_prompt_text: None,
