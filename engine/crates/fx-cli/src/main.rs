@@ -118,6 +118,13 @@ enum Commands {
     /// Show current configuration
     Config,
 
+    /// Generate shell completions
+    Completions {
+        /// Shell to generate for (bash, zsh, fish)
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
+
     /// Manage audit logs
     Audit {
         #[command(subcommand)]
@@ -797,6 +804,7 @@ async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
             commands::config::run().await?;
             Ok(0)
         }
+        Commands::Completions { shell } => commands::completions::run(shell),
         Commands::Audit { command } => dispatch_audit(command).await,
         Commands::Skill { command } => dispatch_skill(command).await,
         Commands::Search { query } => {
@@ -912,6 +920,7 @@ mod tests {
     use crate::auth_store::AuthStore;
     use crate::restart;
     use clap::Parser;
+    use clap_complete::Shell;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::{
@@ -1009,6 +1018,15 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_completions_command() {
+        let cli = Cli::parse_from(["fawx", "completions", "bash"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Completions { shell: Shell::Bash })
+        ));
+    }
+
+    #[test]
     fn cli_parses_tui_passthrough_args() {
         let cli = Cli::parse_from(["fawx", "tui", "--host", "http://127.0.0.1:8400"]);
         assert!(matches!(
@@ -1094,6 +1112,27 @@ mod tests {
                 }
             ))
         ));
+    }
+
+    fn assert_completion_output(shell: Shell) {
+        let output = crate::commands::completions::render(shell).expect("generate completions");
+        assert!(!output.trim().is_empty());
+        assert!(output.contains("fawx"));
+    }
+
+    #[test]
+    fn bash_completions_are_generated() {
+        assert_completion_output(Shell::Bash);
+    }
+
+    #[test]
+    fn zsh_completions_are_generated() {
+        assert_completion_output(Shell::Zsh);
+    }
+
+    #[test]
+    fn fish_completions_are_generated() {
+        assert_completion_output(Shell::Fish);
     }
 
     #[test]

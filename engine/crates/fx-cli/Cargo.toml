@@ -45,6 +45,7 @@ fx-session.workspace = true
 fx-storage.workspace = true
 ring.workspace = true
 clap.workspace = true
+clap_complete.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
