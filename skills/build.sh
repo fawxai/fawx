@@ -71,10 +71,11 @@ install_skill() {
   local artifact="$2"
   local output="$SCRIPT_DIR/$directory/$artifact"
   local manifest="$SCRIPT_DIR/$directory/manifest.toml"
+  local skill_dir="$INSTALL_DIR/$directory"
 
-  mkdir -p "$INSTALL_DIR"
-  cp "$output" "$INSTALL_DIR/$artifact"
-  cp "$manifest" "$INSTALL_DIR/$directory.toml"
+  mkdir -p "$skill_dir"
+  cp "$output" "$skill_dir/$artifact"
+  cp "$manifest" "$skill_dir/manifest.toml"
   INSTALLED_SKILLS+=("$directory")
 }
 
