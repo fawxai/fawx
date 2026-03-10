@@ -1131,19 +1131,21 @@ fn analysis_confidence_badge(confidence: Confidence) -> &'static str {
     }
 }
 
-fn render_improve_output(result: &fx_improve::ExecutionResult, dry_run: bool) -> String {
+fn render_improve_output(result: &fx_improve::ImprovementRunResult, dry_run: bool) -> String {
     let mut lines = vec![if dry_run {
         "⚡ Dry run complete.".to_string()
     } else {
         "⚡ Improvement cycle complete.".to_string()
     }];
-    if result.proposals_written.is_empty()
-        && result.branches_created.is_empty()
-        && result.skipped.is_empty()
-    {
+
+    if let Some(summary) = render_improve_summary(result) {
+        lines.push(summary);
+    }
+    if improve_result_is_empty(result) {
         lines.push("  No actionable improvements found.".to_string());
         return lines.join("\n");
     }
+
     lines.extend(
         result
             .proposals_written
@@ -1156,6 +1158,7 @@ fn render_improve_output(result: &fx_improve::ExecutionResult, dry_run: bool) ->
             .iter()
             .map(|branch| format!("  Branch: {branch}")),
     );
+    lines.extend(render_skipped_candidates(&result.skipped_candidates));
     lines.extend(
         result
             .skipped
@@ -1163,6 +1166,53 @@ fn render_improve_output(result: &fx_improve::ExecutionResult, dry_run: bool) ->
             .map(|(name, reason)| format!("  Skipped: {name} — {reason}")),
     );
     lines.join("\n")
+}
+
+fn render_skipped_candidates(skipped_candidates: &[fx_improve::SkippedCandidate]) -> Vec<String> {
+    skipped_candidates
+        .iter()
+        .map(|candidate| {
+            format!(
+                "  Skipped candidate: {} — {}",
+                candidate.name, candidate.reason
+            )
+        })
+        .collect()
+}
+
+fn render_improve_summary(result: &fx_improve::ImprovementRunResult) -> Option<String> {
+    if result.plans_generated == 0 && result.skipped_candidates.is_empty() {
+        return None;
+    }
+
+    let mut summary = format!(
+        "  {} {} generated",
+        result.plans_generated,
+        pluralize(result.plans_generated, "plan", "plans")
+    );
+    if !result.skipped_candidates.is_empty() {
+        summary.push_str(&format!(
+            ", {}",
+            fx_improve::skipped_candidate_summary(&result.skipped_candidates)
+        ));
+    }
+    Some(summary)
+}
+
+fn improve_result_is_empty(result: &fx_improve::ImprovementRunResult) -> bool {
+    result.plans_generated == 0
+        && result.proposals_written.is_empty()
+        && result.branches_created.is_empty()
+        && result.skipped.is_empty()
+        && result.skipped_candidates.is_empty()
+}
+
+fn pluralize<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
+    if count == 1 {
+        singular
+    } else {
+        plural
+    }
 }
 
 impl HeadlessSubagentFactory {
@@ -1802,6 +1852,26 @@ mod tests {
         assert_eq!(json["response"], "hello");
         assert_eq!(json["model"], "gpt-4");
         assert_eq!(json["iterations"], 2);
+    }
+
+    #[test]
+    fn render_improve_output_includes_skipped_candidate_summary() {
+        let result = fx_improve::ImprovementRunResult {
+            plans_generated: 2,
+            proposals_written: vec![PathBuf::from("/tmp/proposal.md")],
+            branches_created: Vec::new(),
+            skipped: Vec::new(),
+            skipped_candidates: vec![fx_improve::SkippedCandidate {
+                name: "timeout-loop".to_string(),
+                reason: "model did not produce a plan".to_string(),
+            }],
+        };
+
+        let rendered = render_improve_output(&result, false);
+
+        assert!(rendered
+            .contains("2 plans generated, 1 candidate skipped (model did not produce a plan)"));
+        assert!(rendered.contains("Skipped candidate: timeout-loop — model did not produce a plan"));
     }
 
     #[tokio::test]
