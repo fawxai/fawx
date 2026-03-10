@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Phase 0 — Pressure Test & Key Decisions</title>
+<style>
+  :root {
+    --bg: #0d1117; --surface: #161b22; --surface2: #1c2333; --border: #30363d;
+    --text: #e6edf3; --text-dim: #8b949e; --accent: #f0883e;
+    --green: #3fb950; --green-glow: rgba(63,185,80,0.12);
+    --red: #f85149; --red-glow: rgba(248,81,73,0.12);
+    --yellow: #d29922; --yellow-glow: rgba(210,153,34,0.12);
+    --blue: #58a6ff; --blue-glow: rgba(88,166,255,0.12);
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; line-height: 1.7; }
+  .container { max-width: 900px; margin: 0 auto; padding: 32px 24px; }
+  h1 { font-size: 1.8em; margin-bottom: 8px; }
+  h1 span { color: var(--accent); }
+  .subtitle { color: var(--text-dim); margin-bottom: 32px; }
+  .pr-card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; margin-bottom: 24px; overflow: hidden; }
+  .pr-header { padding: 18px 22px; display: flex; align-items: center; gap: 14px; border-bottom: 1px solid var(--border); }
+  .pr-num { font-size: 1.4em; font-weight: 700; color: var(--accent); min-width: 36px; }
+  .pr-title { font-weight: 600; font-size: 1.05em; }
+  .pr-size { font-size: 0.75em; color: var(--text-dim); background: var(--bg); padding: 3px 8px; border-radius: 4px; margin-left: auto; }
+  .pr-body { padding: 18px 22px; }
+  .verdict { display: inline-flex; align-items: center; gap: 6px; font-size: 0.8em; font-weight: 600; padding: 4px 12px; border-radius: 6px; margin-bottom: 12px; }
+  .v-pass { background: var(--green-glow); color: var(--green); border: 1px solid rgba(63,185,80,0.25); }
+  .v-fix { background: var(--yellow-glow); color: var(--yellow); border: 1px solid rgba(210,153,34,0.25); }
+  .v-rethink { background: var(--red-glow); color: var(--red); border: 1px solid rgba(248,81,73,0.25); }
+  .section { margin-bottom: 16px; }
+  .section-title { font-weight: 600; font-size: 0.85em; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-dim); margin-bottom: 6px; }
+  .finding { padding: 10px 14px; background: var(--bg); border-radius: 8px; border: 1px solid var(--border); margin-bottom: 6px; font-size: 0.9em; }
+  .finding.issue { border-left: 3px solid var(--yellow); }
+  .finding.risk { border-left: 3px solid var(--red); }
+  .finding.decision { border-left: 3px solid var(--blue); }
+  .finding.ok { border-left: 3px solid var(--green); }
+  .tag { font-size: 0.7em; padding: 2px 6px; border-radius: 3px; font-weight: 600; text-transform: uppercase; margin-right: 6px; }
+  .tag-issue { background: var(--yellow-glow); color: var(--yellow); }
+  .tag-risk { background: var(--red-glow); color: var(--red); }
+  .tag-decision { background: var(--blue-glow); color: var(--blue); }
+  .tag-ok { background: var(--green-glow); color: var(--green); }
+  code { background: var(--surface2); padding: 1px 5px; border-radius: 3px; font-size: 0.9em; }
+  .summary-box { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 22px; margin-top: 32px; }
+  .summary-box h2 { font-size: 1.2em; margin-bottom: 12px; color: var(--accent); }
+  .summary-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .summary-item { padding: 8px 12px; background: var(--bg); border-radius: 6px; font-size: 0.88em; }
+  .footer { text-align: center; color: var(--text-dim); font-size: 0.78em; margin-top: 40px; padding-top: 20px; border-top: 1px solid var(--border); }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>🔬 Phase 0 — <span>Pressure Test</span></h1>
+<p class="subtitle">6 PRs audited against actual source code. Issues found, decisions needed, risks flagged.</p>
+
+<!-- ═══ PR 1 ═══ -->
+<div class="pr-card">
+  <div class="pr-header">
+    <div class="pr-num">1</div>
+    <div class="pr-title">TUI Feature Parity — SubagentManager + ConfigManager</div>
+    <div class="pr-size">~80 lines</div>
+  </div>
+  <div class="pr-body">
+    <div class="verdict v-fix">⚠ Spec needs minor fix</div>
+    <div class="section">
+      <div class="section-title">Findings</div>
+      <div class="finding issue"><span class="tag tag-issue">Issue</span> <code>run_tui()</code> creates a non-Arc <code>ModelRouter</code>, but <code>HeadlessSubagentFactory</code> needs <code>Arc&lt;ModelRouter&gt;</code>. Spec doesn't mention this — implementer needs to wrap router in Arc before passing to factory.</div>
+      <div class="finding issue"><span class="tag tag-issue">Issue</span> TUI subagents would run headless (stdin/stdout). Need to verify <code>HeadlessSubagentFactory</code> doesn't write to the parent's terminal stdout — could interleave with ratatui's alternate screen rendering.</div>
+      <div class="finding ok"><span class="tag tag-ok">OK</span> ConfigManager pattern is identical to headless path. Straightforward copy.</div>
+    </div>
+    <div class="section">
+      <div class="section-title">Key Decision</div>
+      <div class="finding decision"><span class="tag tag-decision">Decision</span> <strong>Subagent I/O isolation:</strong> Subagents spawned from TUI must NOT share the parent's terminal. HeadlessSubagentFactory spawns a child <code>fawx serve</code> process — verify it uses its own stdin/stdout pipes, not the parent's TTY.</div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ PR 2 ═══ -->
+<div class="pr-card">
+  <div class="pr-header">
+    <div class="pr-num">2</div>
+    <div class="pr-title">Canary → Ripcord Wiring</div>
+    <div class="pr-size">~150 lines</div>
+  </div>
+  <div class="pr-body">
+    <div class="verdict v-rethink">🔴 Scope underestimated — needs rethink</div>
+    <div class="section">
+      <div class="section-title">Findings</div>
+      <div class="finding risk"><span class="tag tag-risk">Risk</span> <strong>Canary is ALSO unwired.</strong> fx-canary is pure computation — <code>Canary::evaluate()</code> takes a <code>&amp;[Signal]</code> and returns a <code>Verdict</code>. But nothing ever calls it. No background task, no periodic check. The canary doesn't run anywhere — it's library code like the fleet.</div>
+      <div class="finding risk"><span class="tag tag-risk">Risk</span> <strong>No signal collection mechanism.</strong> Canary needs signals to evaluate. Who collects them? The loop engine emits signals, but there's no signal aggregator that accumulates them for canary evaluation. We'd need to build: signal collector → periodic canary evaluation → ripcord trigger.</div>
+      <div class="finding risk"><span class="tag tag-risk">Risk</span> <strong>Ripcord snapshots are manual only.</strong> <code>fawx-ripcord --create</code> creates snapshots manually. There's no auto-snapshot on deploy/skill-install. For canary→ripcord to work, we need automatic pre-deployment snapshots.</div>
+      <div class="finding issue"><span class="tag tag-issue">Issue</span> Ripcord restores config.toml + skills. But what about the <code>fawx</code> binary itself? It hashes it but doesn't restore it. If a bad binary was deployed, ripcord can only restore config/skills.</div>
+    </div>
+    <div class="section">
+      <div class="section-title">Key Decisions</div>
+      <div class="finding decision"><span class="tag tag-decision">Decision</span> <strong>Revised scope:</strong> This PR is actually 3 pieces: (a) signal collector in the loop engine, (b) periodic canary evaluation as background task, (c) ripcord trigger on Degraded verdict. Estimate jumps from ~150 to ~350 lines.</div>
+      <div class="finding decision"><span class="tag tag-decision">Decision</span> <strong>Auto-snapshot timing:</strong> When should snapshots be created automatically? Options: (1) before every skill install/update, (2) on a daily schedule, (3) both. Recommend: before skill install + daily cron.</div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ PR 3 ═══ -->
+<div class="pr-card">
+  <div class="pr-header">
+    <div class="pr-num">3</div>
+    <div class="pr-title">node_run Tool Wiring</div>
+    <div class="pr-size">~150 lines</div>
+  </div>
+  <div class="pr-body">
+    <div class="verdict v-fix">⚠ Spec needs minor fix</div>
+    <div class="section">
+      <div class="section-title">Findings</div>
+      <div class="finding issue"><span class="tag tag-issue">Issue</span> <code>SshTransport::new()</code> — need to verify constructor signature. If it takes config params (key paths, known_hosts policy), spec needs to specify where those come from.</div>
+      <div class="finding issue"><span class="tag tag-issue">Issue</span> <code>NodeInfo</code> struct in fx-fleet may not exactly match <code>NodeConfig</code> from fx-config. Need a <code>From&lt;NodeConfig&gt;</code> impl or manual field mapping.</div>
+      <div class="finding ok"><span class="tag tag-ok">OK</span> Tool should NOT appear when fleet config is empty. The <code>if !config.fleet.nodes.is_empty()</code> guard handles this correctly.</div>
+      <div class="finding ok"><span class="tag tag-ok">OK</span> SSH auth auto-detection (key → agent → password) is already implemented in SshTransport.</div>
+    </div>
+    <div class="section">
+      <div class="section-title">Key Decision</div>
+      <div class="finding decision"><span class="tag tag-decision">Decision</span> <strong>SSH failure UX:</strong> When SSH fails (bad key, host unreachable, auth denied), the error message goes back to the model as a tool error. Should be human-readable, not raw SSH errors. Implementer should wrap <code>TransportError</code> into clear messages.</div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ PR 4 ═══ -->
+<div class="pr-card">
+  <div class="pr-header">
+    <div class="pr-num">4</div>
+    <div class="pr-title">Proposal Approval Flow</div>
+    <div class="pr-size">~300 lines</div>
+  </div>
+  <div class="pr-body">
+    <div class="verdict v-fix">⚠ Design correction needed</div>
+    <div class="section">
+      <div class="section-title">Findings</div>
+      <div class="finding risk"><span class="tag tag-risk">Risk</span> <strong>Spec over-engineers the approval path.</strong> <code>/approve</code> is a HUMAN action, not an agent action. It doesn't need to go through <code>ProposalGateState.set_active_proposal()</code> — that mechanism is for granting the agent temporary write permission. The human can just write the file directly. Simpler: read proposal → write file → move to applied/.</div>
+      <div class="finding risk"><span class="tag tag-risk">Risk</span> <strong>Stale proposal danger.</strong> If the target file changed between proposal creation and approval, applying the proposal overwrites the changes. Proposals store full file content, not diffs. Need a staleness check: compare file hash at proposal time vs current.</div>
+      <div class="finding issue"><span class="tag tag-issue">Issue</span> <strong>Proposal format parsing is fragile.</strong> <code>ProposalWriter::format_proposal()</code> creates markdown. Parsing it back requires exact format matching. If the writer format ever changes, the parser breaks. Consider: write a structured sidecar (JSON) alongside the markdown.</div>
+      <div class="finding ok"><span class="tag tag-ok">OK</span> Tier 3 check on approve is correct and necessary — even humans shouldn't casually modify kernel paths through this flow.</div>
+    </div>
+    <div class="section">
+      <div class="section-title">Key Decisions</div>
+      <div class="finding decision"><span class="tag tag-decision">Decision</span> <strong>Drop ProposalGateState involvement.</strong> <code>/approve</code> writes directly as the human. No need for <code>set_active_proposal()</code>. This removes the refactor of ProposalGateExecutor to accept <code>Arc&lt;Mutex&lt;ProposalGateState&gt;&gt;</code> — significant simplification.</div>
+      <div class="finding decision"><span class="tag tag-decision">Decision</span> <strong>Staleness guard:</strong> ProposalWriter should save target file hash in proposal metadata. <code>/approve</code> checks: if file hash changed since proposal → warn and require <code>/approve &lt;id&gt; --force</code>.</div>
+      <div class="finding decision"><span class="tag tag-decision">Decision</span> <strong>Structured sidecar:</strong> Write <code>proposal-{id}.json</code> alongside <code>proposal-{id}.md</code>. JSON has: target_path, proposed_content, file_hash_at_creation, risk, timestamp. Markdown is human-readable, JSON is machine-parseable.</div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ PR 5 ═══ -->
+<div class="pr-card">
+  <div class="pr-header">
+    <div class="pr-num">5</div>
+    <div class="pr-title">ChannelRegistry + ResponseRouter Wiring</div>
+    <div class="pr-size">~400 lines</div>
+  </div>
+  <div class="pr-body">
+    <div class="verdict v-pass">✓ Architecture verified — solid</div>
+    <div class="section">
+      <div class="section-title">Findings</div>
+      <div class="finding ok"><span class="tag tag-ok">OK</span> <strong>Channel trait is well-designed.</strong> <code>TelegramChannel</code> implements <code>Channel</code>. <code>ChannelRegistry</code> supports register/get/list/remove. <code>ResponseRouter</code> routes by <code>InputSource</code>. All tested. The abstraction is ready.</div>
+      <div class="finding ok"><span class="tag tag-ok">OK</span> <code>ChannelRegistry.register()</code> takes <code>Box&lt;dyn Channel&gt;</code> — but the spec says <code>Arc</code>. Needs to be <code>Box</code>. Minor spec fix.</div>
+      <div class="finding issue"><span class="tag tag-issue">Issue</span> <strong>Telegram long-polling is pull-based.</strong> Current <code>run_telegram_polling()</code> is a background task that calls <code>telegram.get_updates()</code> in a loop. This doesn't fit cleanly into ChannelRegistry's push model. The polling task needs to continue as-is, but route received messages through the registry.</div>
+      <div class="finding issue"><span class="tag tag-issue">Issue</span> <strong>Response routing is async challenge.</strong> Agent processing is async (send message → loop runs → response ready). <code>HttpChannel</code> uses a <code>Mutex&lt;Option&lt;String&gt;&gt;</code> slot. Telegram needs to send responses back via <code>send_message</code> API. The <code>Channel::send_response()</code> trait is sync (<code>&amp;self</code>, returns <code>Result</code>). Telegram's send is async. May need <code>send_response</code> to accept a tokio channel sender instead.</div>
+    </div>
+    <div class="section">
+      <div class="section-title">Key Decisions</div>
+      <div class="finding decision"><span class="tag tag-decision">Decision</span> <strong>Async response delivery:</strong> <code>TelegramChannel::send_response()</code> can't directly await the Telegram API. Two options: (1) buffer response internally and have polling task drain it, or (2) change trait to async. Recommend option 1 — same pattern as HttpChannel's pending_response slot. Keep the trait sync.</div>
+      <div class="finding decision"><span class="tag tag-decision">Decision</span> <strong>Telegram polling stays as background task</strong> — receives messages, tags with <code>InputSource::Channel("telegram")</code>, feeds into the loop engine. ResponseRouter sends responses back via the channel's buffered slot. Polling task checks the buffer on each iteration.</div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ PR 6 ═══ -->
+<div class="pr-card">
+  <div class="pr-header">
+    <div class="pr-num">6</div>
+    <div class="pr-title">fx-fleet Wiring</div>
+    <div class="pr-size">~500 lines</div>
+  </div>
+  <div class="pr-body">
+    <div class="verdict v-rethink">🔴 Premature — defer or radically rescope</div>
+    <div class="section">
+      <div class="section-title">Findings</div>
+      <div class="finding risk"><span class="tag tag-risk">Risk</span> <strong>Fleet assumes Fawx nodes, but we have SSH machines.</strong> The fleet model (heartbeat, capability tags, stale detection) assumes fleet nodes that actively report in. Our actual nodes are Mac Mini and MacBook that we SSH into. They don't run a Fawx fleet agent. The heartbeat model doesn't match reality.</div>
+      <div class="finding risk"><span class="tag tag-risk">Risk</span> <strong>Task dispatch overlaps with node_run.</strong> PR 3 wires <code>node_run</code> for direct SSH command execution. The fleet orchestrator also dispatches tasks to nodes. These are competing mechanisms for the same thing — risk of confusion about which path to use.</div>
+      <div class="finding risk"><span class="tag tag-risk">Risk</span> <strong>No fleet client exists.</strong> Even if we wire the server-side orchestrator, there's no fleet client running on remote nodes to receive tasks, execute them, and report results. The orchestrator can submit and track tasks but has nothing on the other end.</div>
+      <div class="finding issue"><span class="tag tag-issue">Issue</span> <strong>Highest risk PR in Phase 0.</strong> 500 lines touching HTTP message flow, background services, and distributed coordination — with no client-side implementation and a model that doesn't match our current infrastructure.</div>
+    </div>
+    <div class="section">
+      <div class="section-title">Key Decisions</div>
+      <div class="finding decision"><span class="tag tag-decision">Decision</span> <strong>Recommend: defer to Wave 9 or later.</strong> Fleet orchestration is future infrastructure for when Fawx runs on multiple nodes as a distributed system. Today, <code>node_run</code> via SSH (PR 3) covers our actual use case. Don't wire a distributed orchestrator to a system that only has SSH nodes.</div>
+      <div class="finding decision"><span class="tag tag-decision">Decision</span> <strong>If we keep it:</strong> Radically rescope to just NodeRegistry from config (read-only, no heartbeat) + fleet status endpoint (report config, not live state). Drop TaskRouter and Orchestrator wiring entirely. ~100 lines instead of 500.</div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ SUMMARY ═══ -->
+<div class="summary-box">
+  <h2>Pressure Test Summary</h2>
+  <div class="summary-grid">
+    <div class="summary-item">✅ <strong>PR 1</strong> — Pass with minor fixes (Arc wrapping, I/O isolation check)</div>
+    <div class="summary-item">🔴 <strong>PR 2</strong> — Underscoped. Canary is also unwired. ~350 lines, not 150.</div>
+    <div class="summary-item">⚠️ <strong>PR 3</strong> — Pass with minor fixes (struct mapping, error UX)</div>
+    <div class="summary-item">⚠️ <strong>PR 4</strong> — Design correction: drop ProposalGateState, add staleness guard + JSON sidecar</div>
+    <div class="summary-item">✅ <strong>PR 5</strong> — Architecture verified solid. Async response buffering is the key design choice.</div>
+    <div class="summary-item">🔴 <strong>PR 6</strong> — Premature. Defer or radically rescope to ~100 lines read-only.</div>
+  </div>
+</div>
+
+<div class="summary-box" style="margin-top: 16px;">
+  <h2>Revised Estimate</h2>
+  <div class="summary-grid">
+    <div class="summary-item"><strong>PR 1:</strong> ~80 lines → ~100 lines (Arc fix)</div>
+    <div class="summary-item"><strong>PR 2:</strong> ~150 lines → ~350 lines (signal collector + canary wiring)</div>
+    <div class="summary-item"><strong>PR 3:</strong> ~150 lines (unchanged)</div>
+    <div class="summary-item"><strong>PR 4:</strong> ~300 lines → ~250 lines (simpler without ProposalGateState refactor)</div>
+    <div class="summary-item"><strong>PR 5:</strong> ~400 lines (unchanged)</div>
+    <div class="summary-item"><strong>PR 6:</strong> ~500 lines → defer (or ~100 lines if read-only rescope)</div>
+  </div>
+  <p style="margin-top: 12px; font-size: 0.9em; color: var(--text-dim);">
+    <strong>Original total:</strong> ~1,580 lines across 6 PRs<br>
+    <strong>Revised total:</strong> ~1,150 lines across 5 PRs (deferring PR 6)<br>
+    <strong>If keeping PR 6 rescoped:</strong> ~1,250 lines across 6 PRs
+  </p>
+</div>
+
+<div class="footer">
+  Phase 0 Pressure Test — March 8, 2026<br>
+  All findings verified against source code in engine/crates/
+</div>
+
+</div>
+</body>
+</html>
