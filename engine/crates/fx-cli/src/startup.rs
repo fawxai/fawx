@@ -551,26 +551,88 @@ impl ScratchpadProvider for ScratchpadBridge {
     }
 }
 
-/// Bridges the encrypted credential store to the [`CredentialProvider`]
-/// trait so WASM skills can retrieve secrets via `kv_get`.
+/// Bridges stored auth and encrypted skill credentials into the
+/// [`CredentialProvider`] trait so WASM skills can retrieve secrets via
+/// `kv_get`.
 ///
-/// Maps well-known key names to credential store lookups:
-/// - `"github_token"` → GitHub PAT from the encrypted store
+/// Well-known mappings:
+/// - `"openai_api_key"` → OpenAI API key from the auth manager
+/// - `"anthropic_api_key"` → Anthropic API key from the auth manager
+/// - `"github_token"` → GitHub PAT from the credential store
+///
+/// Unknown keys fall back to generic encrypted skill credentials.
 struct CredentialStoreBridge {
+    data_dir: PathBuf,
     store: Arc<fx_auth::credential_store::EncryptedFileCredentialStore>,
+}
+
+impl CredentialStoreBridge {
+    fn well_known_credential(&self, key: &str) -> Option<zeroize::Zeroizing<String>> {
+        match key {
+            "openai_api_key" => self.auth_api_key("openai"),
+            "anthropic_api_key" => self.auth_api_key("anthropic"),
+            "github_token" => self.github_token(),
+            _ => None,
+        }
+    }
+
+    fn auth_api_key(&self, provider: &str) -> Option<zeroize::Zeroizing<String>> {
+        let manager = match self.load_auth_manager() {
+            Ok(manager) => manager,
+            Err(error) => {
+                tracing::warn!(
+                    provider,
+                    error = %error,
+                    "failed to load auth manager while resolving credential bridge API key"
+                );
+                return None;
+            }
+        };
+
+        match manager.get(provider) {
+            Some(AuthMethod::ApiKey { key, .. }) => Some(zeroize::Zeroizing::new(key.clone())),
+            _ => None,
+        }
+    }
+
+    fn github_token(&self) -> Option<zeroize::Zeroizing<String>> {
+        use fx_auth::credential_store::{AuthProvider, CredentialMethod};
+
+        match self.store.get(AuthProvider::GitHub, CredentialMethod::Pat) {
+            Ok(token) => token,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "failed to read GitHub token while resolving credential bridge credential"
+                );
+                None
+            }
+        }
+    }
+
+    fn generic_credential(&self, key: &str) -> Option<zeroize::Zeroizing<String>> {
+        match self.store.get_generic(key) {
+            Ok(credential) => credential,
+            Err(error) => {
+                tracing::warn!(
+                    credential = key,
+                    error = %error,
+                    "failed to read generic credential while resolving credential bridge credential"
+                );
+                None
+            }
+        }
+    }
+
+    fn load_auth_manager(&self) -> Result<AuthManager, String> {
+        AuthStore::open(&self.data_dir)?.load_auth_manager()
+    }
 }
 
 impl CredentialProvider for CredentialStoreBridge {
     fn get_credential(&self, key: &str) -> Option<zeroize::Zeroizing<String>> {
-        use fx_auth::credential_store::{AuthProvider, CredentialMethod};
-        match key {
-            "github_token" => self
-                .store
-                .get(AuthProvider::GitHub, CredentialMethod::Pat)
-                .ok()
-                .flatten(),
-            _ => None,
-        }
+        self.well_known_credential(key)
+            .or_else(|| self.generic_credential(key))
     }
 }
 
@@ -737,6 +799,7 @@ fn build_skill_registry(
     let credential_provider: Option<Arc<dyn CredentialProvider>> =
         credential_store.as_ref().map(|store| {
             Arc::new(CredentialStoreBridge {
+                data_dir: data_dir.to_path_buf(),
                 store: Arc::clone(store),
             }) as Arc<dyn CredentialProvider>
         });
@@ -1436,8 +1499,12 @@ mod tests {
     use fx_core::memory::MemoryProvider;
     use fx_embeddings::test_support::create_test_model_dir;
     use fx_subagent::test_support::StubSubagentControl;
+    use std::io;
+    use std::io::Write;
     use std::sync::{Arc, Mutex};
+    use tracing::Level;
     use tracing_subscriber::filter::LevelFilter;
+    use tracing_subscriber::fmt::writer::MakeWriter;
 
     fn test_config_with_temp_dir() -> (FawxConfig, tempfile::TempDir) {
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -1474,6 +1541,74 @@ mod tests {
             std::fs::copy(source.path().join(file_name), model_dir.join(file_name))
                 .expect("copy model file");
         }
+    }
+
+    fn bridge_for(data_dir: &Path) -> CredentialStoreBridge {
+        let store = fx_auth::credential_store::EncryptedFileCredentialStore::open(data_dir)
+            .expect("credential store");
+        CredentialStoreBridge {
+            data_dir: data_dir.to_path_buf(),
+            store: Arc::new(store),
+        }
+    }
+
+    fn store_auth_api_key(data_dir: &Path, provider: &str, key: &str) {
+        let store = AuthStore::open(data_dir).expect("auth store");
+        let mut manager = AuthManager::new();
+        manager.store(
+            provider,
+            AuthMethod::ApiKey {
+                provider: provider.to_string(),
+                key: key.to_string(),
+            },
+        );
+        store
+            .save_auth_manager(&manager)
+            .expect("save auth manager");
+    }
+
+    #[derive(Clone)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("capture logs").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct SharedMakeWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl<'a> MakeWriter<'a> for SharedMakeWriter {
+        type Writer = SharedWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            SharedWriter(Arc::clone(&self.0))
+        }
+    }
+
+    fn capture_warn_logs<T>(action: impl FnOnce() -> T) -> (T, String) {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(Level::WARN)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(SharedMakeWriter(Arc::clone(&buffer)))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let result = action();
+        let logs = String::from_utf8(buffer.lock().expect("capture logs").clone())
+            .expect("captured logs should be utf8");
+        (result, logs)
+    }
+
+    fn remove_credential_salt(data_dir: &Path) {
+        std::fs::remove_file(data_dir.join(".credentials-salt")).expect("remove salt");
     }
 
     fn bundle_tool_names(bundle: &LoopEngineBundle) -> Vec<String> {
@@ -1895,6 +2030,122 @@ mod tests {
         assert!(openai_models
             .iter()
             .any(|model| model.model_id == "gpt-5.3-codex"));
+    }
+
+    #[test]
+    fn credential_bridge_returns_openai_api_key_from_auth_manager() {
+        let (config, _temp_dir) = test_config_with_temp_dir();
+        let data_dir = config.general.data_dir.clone().expect("data dir");
+        store_auth_api_key(&data_dir, "openai", "sk-openai-123");
+
+        let bridge = bridge_for(&data_dir);
+        let value = bridge
+            .get_credential("openai_api_key")
+            .expect("openai api key should be available");
+
+        assert_eq!(*value, "sk-openai-123");
+    }
+
+    #[test]
+    fn credential_bridge_returns_anthropic_api_key_from_auth_manager() {
+        let (config, _temp_dir) = test_config_with_temp_dir();
+        let data_dir = config.general.data_dir.clone().expect("data dir");
+        store_auth_api_key(&data_dir, "anthropic", "sk-ant-123");
+
+        let bridge = bridge_for(&data_dir);
+        let value = bridge
+            .get_credential("anthropic_api_key")
+            .expect("anthropic api key should be available");
+
+        assert_eq!(*value, "sk-ant-123");
+    }
+
+    #[test]
+    fn credential_bridge_returns_none_for_missing_unknown_key() {
+        let (config, _temp_dir) = test_config_with_temp_dir();
+        let data_dir = config.general.data_dir.clone().expect("data dir");
+        let bridge = bridge_for(&data_dir);
+
+        assert!(bridge.get_credential("missing_skill_key").is_none());
+    }
+
+    #[test]
+    fn credential_bridge_falls_back_to_generic_skill_credentials() {
+        let (config, _temp_dir) = test_config_with_temp_dir();
+        let data_dir = config.general.data_dir.clone().expect("data dir");
+        let store = fx_auth::credential_store::EncryptedFileCredentialStore::open(&data_dir)
+            .expect("credential store");
+        store
+            .set_generic("brave_api_key", "brv-bridge-test")
+            .expect("set generic credential");
+        drop(store);
+
+        let bridge = bridge_for(&data_dir);
+        let value = bridge
+            .get_credential("brave_api_key")
+            .expect("generic skill credential should be available");
+
+        assert_eq!(*value, "brv-bridge-test");
+    }
+
+    #[test]
+    fn credential_bridge_warns_when_github_token_read_fails() {
+        use fx_auth::credential_store::{
+            AuthProvider, CredentialMetadata, CredentialMethod, CredentialStore,
+        };
+        use zeroize::Zeroizing;
+
+        let (config, _temp_dir) = test_config_with_temp_dir();
+        let data_dir = config.general.data_dir.clone().expect("data dir");
+        let store = fx_auth::credential_store::EncryptedFileCredentialStore::open(&data_dir)
+            .expect("credential store");
+        let metadata = CredentialMetadata {
+            provider: AuthProvider::GitHub,
+            method: CredentialMethod::Pat,
+            last_validated_ms: 0,
+            login: None,
+            scopes: Vec::new(),
+            token_kind: None,
+        };
+        store
+            .set(
+                AuthProvider::GitHub,
+                CredentialMethod::Pat,
+                &Zeroizing::new("ghp-bridge-test".to_string()),
+                &metadata,
+            )
+            .expect("set github token");
+        drop(store);
+        remove_credential_salt(&data_dir);
+
+        let bridge = bridge_for(&data_dir);
+        let (value, logs) = capture_warn_logs(|| bridge.github_token());
+
+        assert!(value.is_none());
+        assert!(logs
+            .contains("failed to read GitHub token while resolving credential bridge credential"));
+    }
+
+    #[test]
+    fn credential_bridge_warns_when_generic_credential_read_fails() {
+        let (config, _temp_dir) = test_config_with_temp_dir();
+        let data_dir = config.general.data_dir.clone().expect("data dir");
+        let store = fx_auth::credential_store::EncryptedFileCredentialStore::open(&data_dir)
+            .expect("credential store");
+        store
+            .set_generic("brave_api_key", "brv-bridge-test")
+            .expect("set generic credential");
+        drop(store);
+        remove_credential_salt(&data_dir);
+
+        let bridge = bridge_for(&data_dir);
+        let (value, logs) = capture_warn_logs(|| bridge.get_credential("brave_api_key"));
+
+        assert!(value.is_none());
+        assert!(logs.contains(
+            "failed to read generic credential while resolving credential bridge credential"
+        ));
+        assert!(logs.contains("brave_api_key"));
     }
 
     #[test]
