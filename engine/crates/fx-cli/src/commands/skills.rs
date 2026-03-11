@@ -3,8 +3,7 @@
 use anyhow::{Context, Result};
 use fx_author::{BuildConfig, BuildResult};
 use fx_skills::manifest::{
-    parse_manifest, validate_manifest, validate_skill_name as validate_manifest_skill_name,
-    Capability, ALL_CAPABILITIES,
+    validate_skill_name as validate_manifest_skill_name, Capability, ALL_CAPABILITIES,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -564,6 +563,7 @@ fn print_build_summary(result: &BuildResult) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fx_skills::manifest::{parse_manifest, validate_manifest};
     use tempfile::TempDir;
 
     fn parse_generated_lib_rs(name: &str) -> syn::File {

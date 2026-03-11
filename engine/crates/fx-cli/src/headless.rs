@@ -46,8 +46,9 @@ use crate::helpers::{
 };
 use crate::proposal_review::{approve_pending, reject_pending, render_pending, ReviewContext};
 use crate::startup::{
-    build_headless_loop_engine_bundle, configured_data_dir, configured_working_dir, fawx_data_dir,
-    HeadlessLoopBuildOptions, SharedMemoryStore,
+    build_headless_loop_engine_bundle, configured_data_dir as startup_configured_data_dir,
+    configured_working_dir, fawx_data_dir as startup_fawx_data_dir, HeadlessLoopBuildOptions,
+    SharedMemoryStore,
 };
 use fx_subagent::{
     CreatedSubagentSession, SpawnConfig, SubagentError, SubagentFactory, SubagentLimits,
@@ -64,6 +65,14 @@ use fx_subagent::{
 const DEFAULT_HTTP_MODEL: &str = "claude-opus-4-6";
 
 const HEADLESS_SIGNAL_SESSION_ID: &str = "headless";
+
+pub fn fawx_data_dir() -> PathBuf {
+    startup_fawx_data_dir()
+}
+
+pub fn configured_data_dir(base_data_dir: &Path, config: &FawxConfig) -> PathBuf {
+    startup_configured_data_dir(base_data_dir, config)
+}
 
 // ── JSON I/O types ──────────────────────────────────────────────────────────
 
@@ -321,6 +330,11 @@ impl HeadlessApp {
     /// Return the active model identifier.
     pub fn active_model(&self) -> &str {
         &self.active_model
+    }
+
+    /// Return the loaded configuration.
+    pub fn config(&self) -> &FawxConfig {
+        &self.config
     }
 
     /// Return the shared config manager (if configured).

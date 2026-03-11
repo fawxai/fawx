@@ -24,9 +24,10 @@ impl EmbeddedBackend {
 
     async fn engine_status(&self) -> EngineStatus {
         let app = self.app.lock().await;
-        let memory_entries = fx_cli::persisted_memory_entry_count(
-            &app.data_dir().join("memory").join("memory.json"),
-        );
+        let data_dir =
+            fx_cli::headless::configured_data_dir(&fx_cli::headless::fawx_data_dir(), app.config());
+        let memory_entries =
+            fx_cli::persisted_memory_entry_count(&data_dir.join("memory").join("memory.json"));
         EngineStatus {
             status: "running".to_string(),
             model: app.active_model().to_string(),
