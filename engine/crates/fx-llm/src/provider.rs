@@ -48,6 +48,14 @@ pub trait LlmProvider: Send + Sync {
     /// Models supported by this provider.
     fn supported_models(&self) -> Vec<String>;
 
+    /// Fetch available models dynamically from the provider API.
+    ///
+    /// Returns model IDs the current credential has access to. Providers
+    /// without a dynamic catalog override fall back to their static support list.
+    async fn list_models(&self) -> Result<Vec<String>, LlmError> {
+        Ok(self.supported_models())
+    }
+
     /// Provider feature support contract.
     fn capabilities(&self) -> ProviderCapabilities;
 }

@@ -17,6 +17,7 @@ use tokio_tungstenite::tungstenite::{
     Message as WsMessage,
 };
 
+use crate::openai_common::{filter_model_ids, OpenAiModelsResponse};
 use crate::provider::{CompletionStream, LlmProvider, ProviderCapabilities};
 use crate::sse::{SseFrame, SseFramer};
 use crate::types::{
@@ -95,6 +96,32 @@ impl OpenAiResponsesProvider {
         } else {
             format!("{base}/codex/responses")
         }
+    }
+
+    fn models_endpoint(&self) -> String {
+        let base = self.base_url.trim_end_matches('/');
+        if base.ends_with("/responses") {
+            return format!(
+                "{}/models",
+                base.trim_end_matches("/responses")
+                    .trim_end_matches("/codex")
+            );
+        }
+        if base.ends_with("/codex") || base.ends_with("/backend-api") {
+            return format!("{}/models", base.trim_end_matches("/codex"));
+        }
+        format!("{base}/v1/models")
+    }
+
+    async fn fetch_models(&self) -> Result<Vec<String>, LlmError> {
+        let response = self
+            .client
+            .get(self.models_endpoint())
+            .bearer_auth(&self.access_token)
+            .header("chatgpt-account-id", &self.account_id)
+            .send()
+            .await?;
+        parse_model_response(response, &self.supported_models).await
     }
 
     fn ensure_supported_model(&self, model: &str) -> Result<(), LlmError> {
@@ -805,12 +832,49 @@ impl LlmProvider for OpenAiResponsesProvider {
         self.supported_models.clone()
     }
 
+    async fn list_models(&self) -> Result<Vec<String>, LlmError> {
+        if self.access_token.trim().is_empty() {
+            return Ok(self.supported_models());
+        }
+
+        match self.fetch_models().await {
+            Ok(models) if !models.is_empty() => Ok(models),
+            Ok(_) => Ok(self.supported_models()),
+            Err(error) => {
+                tracing::warn!(provider = %self.provider_name, error = %error, "failed to fetch openai responses models; using static fallback");
+                Ok(self.supported_models())
+            }
+        }
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             supports_temperature: false,
             requires_streaming: true,
         }
     }
+}
+
+async fn parse_model_response(
+    response: reqwest::Response,
+    supported_models: &[String],
+) -> Result<Vec<String>, LlmError> {
+    let status = response.status();
+    if !status.is_success() {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|error| format!("unable to read error body: {error}"));
+        return Err(LlmError::Provider(format!(
+            "model list request failed ({status}): {body}"
+        )));
+    }
+
+    let parsed = response
+        .json::<OpenAiModelsResponse>()
+        .await
+        .map_err(|error| LlmError::InvalidResponse(error.to_string()))?;
+    Ok(filter_model_ids(parsed.data, supported_models))
 }
 
 // ============================================================================
@@ -1119,6 +1183,7 @@ fn finalize_tool_calls(pending: Vec<PendingToolCall>) -> Vec<ToolCall> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::spawn_json_server;
     use futures::{pin_mut, stream, StreamExt};
 
     #[test]
@@ -1139,6 +1204,48 @@ mod tests {
             already_full.endpoint(),
             "https://example.com/codex/responses"
         );
+    }
+
+    #[tokio::test]
+    async fn list_models_fetches_dynamic_openai_catalog() {
+        let base_url = spawn_json_server(
+            "200 OK",
+            r#"{"data":[{"id":"gpt-4.1"},{"id":"text-embedding-3-small"},{"id":"o3-mini"}]}"#,
+        )
+        .await;
+        let provider = OpenAiResponsesProvider::new("test-token", "test-account")
+            .expect("provider")
+            .with_base_url(base_url)
+            .with_supported_models(vec!["gpt-4o-mini".to_string()]);
+
+        let models = provider.list_models().await.expect("list models");
+
+        assert_eq!(models, vec!["gpt-4.1".to_string(), "o3-mini".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn list_models_falls_back_when_dynamic_fetch_fails() {
+        let base_url = spawn_json_server("500 Internal Server Error", r#"{"error":"nope"}"#).await;
+        let provider = OpenAiResponsesProvider::new("test-token", "test-account")
+            .expect("provider")
+            .with_base_url(base_url)
+            .with_supported_models(vec!["gpt-4o-mini".to_string()]);
+
+        let models = provider.list_models().await.expect("list models");
+
+        assert_eq!(models, vec!["gpt-4o-mini".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn list_models_returns_supported_models_when_token_is_empty() {
+        let mut provider = OpenAiResponsesProvider::new("test-token", "test-account")
+            .expect("provider")
+            .with_supported_models(vec!["gpt-4o-mini".to_string()]);
+        provider.access_token.clear();
+
+        let models = provider.list_models().await.expect("list models");
+
+        assert_eq!(models, vec!["gpt-4o-mini".to_string()]);
     }
 
     #[test]

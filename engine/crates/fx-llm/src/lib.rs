@@ -15,6 +15,7 @@ mod fallback;
 mod local;
 pub mod model_catalog;
 mod openai;
+mod openai_common;
 mod openai_responses;
 mod provider;
 mod router;
