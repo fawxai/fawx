@@ -417,9 +417,7 @@ impl SetupWizard {
     }
 
     fn store_skill_credential(&self, key: &str, value: &str) -> anyhow::Result<()> {
-        self.skill_credential_store
-            .set_generic(key, value)
-            .map_err(|error| anyhow!(error))
+        Ok(self.skill_credential_store.set_generic(key, value)?)
     }
 
     fn run_http_phase(&mut self) -> anyhow::Result<()> {
