@@ -523,6 +523,7 @@ mod tests {
                 ]),
                 decision: Decision::Accept,
                 timestamp: Utc::now(),
+                candidate_patches: BTreeMap::new(),
             },
             chain_entry_index: 4,
             candidates: vec![
@@ -869,6 +870,7 @@ mod tests {
             aggregate_scores: BTreeMap::from([(candidate_id, 8.73)]),
             decision: Decision::Accept,
             timestamp,
+            candidate_patches: BTreeMap::new(),
         };
         chain
             .append(experiment, result, Some("diff --git".to_owned()), None)
