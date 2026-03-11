@@ -7,8 +7,11 @@ use fx_consensus::{
     ProposalTier, Severity, Signal,
 };
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
-use tempfile::tempdir;
+use tokio::sync::Barrier;
+use tokio::time::sleep;
 use uuid::Uuid;
 
 #[tokio::test]
@@ -76,6 +79,29 @@ async fn stores_submitted_evaluation() {
 }
 
 #[tokio::test]
+async fn rejects_self_evaluation_in_engine() {
+    let engine = create_engine();
+    let experiment = engine
+        .create_experiment(sample_config(1))
+        .await
+        .expect("create works");
+    let candidate = sample_candidate(experiment.id, "node-a", "candidate-a");
+    let evaluation = sample_evaluation(candidate.id, "node-a", 9.0, true, false, true);
+
+    engine
+        .submit_candidate(candidate)
+        .await
+        .expect("submit works");
+
+    let error = engine
+        .submit_evaluation(evaluation)
+        .await
+        .expect_err("self evaluation must fail");
+
+    assert!(matches!(error, ConsensusError::SafetyViolation(_)));
+}
+
+#[tokio::test]
 async fn finalizes_with_accept_and_correct_winner() {
     let engine = create_engine();
     let experiment = engine
@@ -103,7 +129,41 @@ async fn finalizes_with_accept_and_correct_winner() {
 
     assert_eq!(result.decision, Decision::Accept);
     assert_eq!(result.winner, Some(candidate_a.id));
-    assert_eq!(engine.chain().len(), 1);
+    assert_eq!(engine.chain().expect("chain available").len(), 1);
+}
+
+#[tokio::test]
+async fn chain_returns_snapshot_clone() {
+    let engine = create_engine();
+    let initial_chain = engine.chain().expect("chain available");
+    let experiment = engine
+        .create_experiment(sample_config(1))
+        .await
+        .expect("create works");
+    let candidate = sample_candidate(experiment.id, "node-a", "candidate-a");
+
+    engine
+        .submit_candidate(candidate.clone())
+        .await
+        .expect("submit works");
+    engine
+        .submit_evaluation(sample_evaluation(
+            candidate.id,
+            "node-b",
+            9.0,
+            true,
+            false,
+            true,
+        ))
+        .await
+        .expect("evaluation works");
+    engine
+        .finalize(experiment.id)
+        .await
+        .expect("finalize works");
+
+    assert_eq!(initial_chain.len(), 0);
+    assert_eq!(engine.chain().expect("chain available").len(), 1);
 }
 
 #[tokio::test]
@@ -201,6 +261,19 @@ async fn double_finalize_returns_already_finalized_error() {
 }
 
 #[tokio::test]
+async fn experiment_config_round_trips_through_serde() {
+    let config = sample_config(2);
+    let json = serde_json::to_string(&config).expect("serialize config");
+    let decoded: ExperimentConfig = serde_json::from_str(&json).expect("deserialize config");
+
+    assert_eq!(decoded.hypothesis, config.hypothesis);
+    assert_eq!(decoded.min_candidates, config.min_candidates);
+    assert_eq!(decoded.timeout, config.timeout);
+    assert_eq!(decoded.scope, config.scope);
+    assert_eq!(decoded.fitness_criteria, config.fitness_criteria);
+}
+
+#[tokio::test]
 async fn orchestrator_runs_full_experiment_end_to_end() {
     let engine = create_engine();
     let expected_winner = Uuid::new_v4();
@@ -235,8 +308,100 @@ async fn orchestrator_runs_full_experiment_end_to_end() {
     assert_eq!(result.candidates.len(), 2);
 }
 
+#[tokio::test]
+async fn orchestrator_generates_candidates_concurrently() {
+    let engine = create_engine();
+    let orchestrator = ExperimentOrchestrator::new(engine);
+    let barrier = Arc::new(Barrier::new(2));
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    let generators: Vec<Box<dyn CandidateGenerator>> = vec![
+        Box::new(BlockedGenerator::new(
+            "node-a",
+            barrier.clone(),
+            active.clone(),
+            max_active.clone(),
+        )),
+        Box::new(BlockedGenerator::new(
+            "node-b",
+            barrier,
+            active,
+            max_active.clone(),
+        )),
+    ];
+    let evaluators: Vec<Box<dyn CandidateEvaluator>> = vec![Box::new(MockEvaluator::new("node-c"))];
+
+    orchestrator
+        .run_experiment(sample_config(2), generators, evaluators)
+        .await
+        .expect("orchestration works");
+
+    assert_eq!(max_active.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn orchestrator_evaluates_each_candidate_concurrently() {
+    let engine = create_engine();
+    let orchestrator = ExperimentOrchestrator::new(engine);
+    let barrier = Arc::new(Barrier::new(2));
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    let generators: Vec<Box<dyn CandidateGenerator>> = vec![
+        Box::new(MockGenerator::new("node-a", Uuid::new_v4(), "winner", 10.0)),
+        Box::new(MockGenerator::new(
+            "node-b",
+            Uuid::new_v4(),
+            "runner-up",
+            4.0,
+        )),
+    ];
+    let evaluators: Vec<Box<dyn CandidateEvaluator>> = vec![
+        Box::new(BlockedEvaluator::new(
+            "node-c",
+            barrier.clone(),
+            active.clone(),
+            max_active.clone(),
+        )),
+        Box::new(BlockedEvaluator::new(
+            "node-d",
+            barrier,
+            active,
+            max_active.clone(),
+        )),
+    ];
+
+    orchestrator
+        .run_experiment(sample_config(2), generators, evaluators)
+        .await
+        .expect("orchestration works");
+
+    assert_eq!(max_active.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn mock_evaluator_scores_independently_from_candidate_self_metrics() {
+    let evaluator = MockEvaluator::new("node-b");
+    let experiment = sample_experiment();
+    let candidate = Candidate {
+        id: Uuid::new_v4(),
+        experiment_id: experiment.id,
+        node_id: NodeId::from("node-a"),
+        patch: "diff --git a/x b/x".into(),
+        approach: "candidate-a".into(),
+        self_metrics: BTreeMap::from([("fitness".into(), 999.0)]),
+        created_at: Utc::now(),
+    };
+
+    let evaluation = evaluator
+        .evaluate(&experiment, &candidate)
+        .await
+        .expect("evaluation works");
+
+    assert_eq!(evaluation.fitness_scores.get("fitness"), Some(&7.0));
+}
+
 fn create_engine() -> LocalConsensusEngine {
-    let path = tempdir().expect("create tempdir").keep().join("chain.json");
+    let path = std::env::temp_dir().join(format!("fx-consensus-{}.json", Uuid::new_v4()));
     LocalConsensusEngine::new(Box::new(JsonFileChainStorage::new(path))).expect("engine creates")
 }
 
@@ -278,6 +443,31 @@ fn sample_config(min_candidates: u32) -> ExperimentConfig {
         },
         timeout: Duration::from_secs(30),
         min_candidates,
+    }
+}
+
+fn sample_experiment() -> Experiment {
+    Experiment {
+        id: Uuid::new_v4(),
+        trigger: Signal {
+            id: Uuid::new_v4(),
+            name: "token_waste".into(),
+            description: "Parallel work exists".into(),
+            severity: Severity::Medium,
+        },
+        hypothesis: "parallel candidates improve outcomes".into(),
+        fitness_criteria: vec![FitnessCriterion {
+            name: "fitness".into(),
+            metric_type: MetricType::Higher,
+            weight: 1.0,
+        }],
+        scope: ModificationScope {
+            allowed_files: vec![PathPattern::from("src/**/*.rs")],
+            proposal_tier: ProposalTier::Tier1,
+        },
+        timeout: Duration::from_secs(30),
+        min_candidates: 2,
+        created_at: Utc::now(),
     }
 }
 
@@ -350,6 +540,52 @@ impl CandidateGenerator for MockGenerator {
     }
 }
 
+struct BlockedGenerator {
+    node_id: NodeId,
+    barrier: Arc<Barrier>,
+    active: Arc<AtomicUsize>,
+    max_active: Arc<AtomicUsize>,
+}
+
+impl BlockedGenerator {
+    fn new(
+        node_id: &str,
+        barrier: Arc<Barrier>,
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+    ) -> Self {
+        Self {
+            node_id: NodeId::from(node_id),
+            barrier,
+            active,
+            max_active,
+        }
+    }
+}
+
+#[async_trait]
+impl CandidateGenerator for BlockedGenerator {
+    async fn generate(&self, experiment: &Experiment) -> Result<Candidate, ConsensusError> {
+        track_parallelism(&self.active, &self.max_active);
+        self.barrier.wait().await;
+        sleep(Duration::from_millis(10)).await;
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        Ok(Candidate {
+            id: Uuid::new_v4(),
+            experiment_id: experiment.id,
+            node_id: self.node_id.clone(),
+            patch: format!("diff --git a/{} b/{}", self.node_id.0, self.node_id.0),
+            approach: format!("approach-{}", self.node_id.0),
+            self_metrics: BTreeMap::from([("fitness".into(), 7.0)]),
+            created_at: Utc::now(),
+        })
+    }
+
+    fn node_id(&self) -> &NodeId {
+        &self.node_id
+    }
+}
+
 struct MockEvaluator {
     node_id: NodeId,
 }
@@ -360,6 +596,10 @@ impl MockEvaluator {
             node_id: NodeId::from(node_id),
         }
     }
+
+    fn independent_score(&self) -> f64 {
+        7.0
+    }
 }
 
 #[async_trait]
@@ -369,11 +609,7 @@ impl CandidateEvaluator for MockEvaluator {
         _experiment: &Experiment,
         candidate: &Candidate,
     ) -> Result<Evaluation, ConsensusError> {
-        let score = candidate
-            .self_metrics
-            .get("fitness")
-            .copied()
-            .expect("mock candidate has fitness score");
+        let score = self.independent_score();
         Ok(Evaluation {
             candidate_id: candidate.id,
             evaluator_id: self.node_id.clone(),
@@ -388,5 +624,71 @@ impl CandidateEvaluator for MockEvaluator {
 
     fn node_id(&self) -> &NodeId {
         &self.node_id
+    }
+}
+
+struct BlockedEvaluator {
+    node_id: NodeId,
+    barrier: Arc<Barrier>,
+    active: Arc<AtomicUsize>,
+    max_active: Arc<AtomicUsize>,
+}
+
+impl BlockedEvaluator {
+    fn new(
+        node_id: &str,
+        barrier: Arc<Barrier>,
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+    ) -> Self {
+        Self {
+            node_id: NodeId::from(node_id),
+            barrier,
+            active,
+            max_active,
+        }
+    }
+}
+
+#[async_trait]
+impl CandidateEvaluator for BlockedEvaluator {
+    async fn evaluate(
+        &self,
+        _experiment: &Experiment,
+        candidate: &Candidate,
+    ) -> Result<Evaluation, ConsensusError> {
+        track_parallelism(&self.active, &self.max_active);
+        self.barrier.wait().await;
+        sleep(Duration::from_millis(10)).await;
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        Ok(Evaluation {
+            candidate_id: candidate.id,
+            evaluator_id: self.node_id.clone(),
+            fitness_scores: BTreeMap::from([("fitness".into(), 7.0)]),
+            safety_pass: true,
+            signal_resolved: true,
+            regression_detected: false,
+            notes: "blocked eval".into(),
+            created_at: Utc::now(),
+        })
+    }
+
+    fn node_id(&self) -> &NodeId {
+        &self.node_id
+    }
+}
+
+fn track_parallelism(active: &AtomicUsize, max_active: &AtomicUsize) {
+    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+    update_max_active(max_active, current);
+}
+
+fn update_max_active(max_active: &AtomicUsize, current: usize) {
+    let mut observed = max_active.load(Ordering::SeqCst);
+    while current > observed {
+        match max_active.compare_exchange(observed, current, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => break,
+            Err(value) => observed = value,
+        }
     }
 }

@@ -3,22 +3,23 @@ use crate::error::{ConsensusError, Result};
 use crate::scoring::{compute_aggregate_scores, determine_winner};
 use crate::types::{
     Candidate, ConsensusResult, Evaluation, Experiment, FitnessCriterion, ModificationScope,
-    PathPattern, ProposalTier, Signal,
+    NodeId, PathPattern, ProposalTier, Signal,
 };
 use async_trait::async_trait;
 use chrono::Utc;
-use std::cell::UnsafeCell;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::Duration;
 use uuid::Uuid;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExperimentConfig {
     pub signal: Signal,
     pub hypothesis: String,
     pub fitness_criteria: Vec<FitnessCriterion>,
     pub scope: ModificationScope,
+    #[serde(with = "duration_serde")]
     pub timeout: Duration,
     pub min_candidates: u32,
 }
@@ -30,7 +31,7 @@ pub trait ConsensusProtocol: Send + Sync {
     async fn candidates(&self, experiment_id: Uuid) -> Result<Vec<Candidate>>;
     async fn submit_evaluation(&self, evaluation: Evaluation) -> Result<()>;
     async fn finalize(&self, experiment_id: Uuid) -> Result<ConsensusResult>;
-    fn chain(&self) -> &Chain;
+    fn chain(&self) -> Result<Chain>;
 }
 
 struct EngineState {
@@ -39,17 +40,12 @@ struct EngineState {
     evaluations: HashMap<Uuid, Vec<Evaluation>>,
     finalized: HashMap<Uuid, ConsensusResult>,
     storage: Box<dyn ChainStorage>,
+    chain: Chain,
 }
 
 pub struct LocalConsensusEngine {
     state: RwLock<EngineState>,
-    chain: UnsafeCell<Chain>,
 }
-
-// Safety: all mutable access to `chain` and the other state maps happens while holding
-// `state`'s write lock.
-unsafe impl Send for LocalConsensusEngine {}
-unsafe impl Sync for LocalConsensusEngine {}
 
 impl LocalConsensusEngine {
     pub fn new(storage: Box<dyn ChainStorage>) -> Result<Self> {
@@ -62,8 +58,8 @@ impl LocalConsensusEngine {
                 evaluations: HashMap::new(),
                 finalized: HashMap::new(),
                 storage,
+                chain,
             }),
-            chain: UnsafeCell::new(chain),
         })
     }
 
@@ -89,16 +85,6 @@ impl LocalConsensusEngine {
             ));
         }
         validate_scope(&config.scope)
-    }
-
-    fn chain_mut(&self) -> &mut Chain {
-        // Safety: all mutation is serialized through `state` write locks.
-        unsafe { &mut *self.chain.get() }
-    }
-
-    fn chain_ref(&self) -> &Chain {
-        // Safety: `chain` is only updated under the engine lock and then exposed as a shared ref.
-        unsafe { &*self.chain.get() }
     }
 }
 
@@ -144,8 +130,14 @@ impl ConsensusProtocol for LocalConsensusEngine {
 
     async fn submit_evaluation(&self, evaluation: Evaluation) -> Result<()> {
         let mut state = lock_write(&self.state)?;
-        let experiment_id = find_experiment_id_for_candidate(&state, evaluation.candidate_id)?;
+        let (experiment_id, candidate_node_id) =
+            find_candidate_context(&state, evaluation.candidate_id)?;
         ensure_open_experiment(&state, experiment_id)?;
+        if evaluation.evaluator_id == candidate_node_id {
+            return Err(ConsensusError::SafetyViolation(
+                "self-evaluation is not allowed".into(),
+            ));
+        }
         state
             .evaluations
             .entry(experiment_id)
@@ -181,15 +173,16 @@ impl ConsensusProtocol for LocalConsensusEngine {
             timestamp: Utc::now(),
         };
         let winning_patch = winner.and_then(|winner_id| find_patch(&candidates, winner_id));
-        self.chain_mut()
+        state
+            .chain
             .append(experiment, result.clone(), winning_patch, None)?;
-        state.storage.save(self.chain_ref())?;
+        state.storage.save(&state.chain)?;
         state.finalized.insert(experiment_id, result.clone());
         Ok(result)
     }
 
-    fn chain(&self) -> &Chain {
-        self.chain_ref()
+    fn chain(&self) -> Result<Chain> {
+        Ok(lock_read(&self.state)?.chain.clone())
     }
 }
 
@@ -251,15 +244,15 @@ fn get_open_experiment(state: &EngineState, experiment_id: Uuid) -> Result<&Expe
         .ok_or(ConsensusError::ExperimentNotFound(experiment_id))
 }
 
-fn find_experiment_id_for_candidate(state: &EngineState, candidate_id: Uuid) -> Result<Uuid> {
+fn find_candidate_context(state: &EngineState, candidate_id: Uuid) -> Result<(Uuid, NodeId)> {
     state
         .candidates
         .iter()
         .find_map(|(experiment_id, candidates)| {
             candidates
                 .iter()
-                .any(|candidate| candidate.id == candidate_id)
-                .then_some(*experiment_id)
+                .find(|candidate| candidate.id == candidate_id)
+                .map(|candidate| (*experiment_id, candidate.node_id.clone()))
         })
         .ok_or(ConsensusError::CandidateNotFound(candidate_id))
 }
@@ -280,4 +273,34 @@ fn find_patch(candidates: &[Candidate], winner_id: Uuid) -> Option<String> {
         .iter()
         .find(|candidate| candidate.id == winner_id)
         .map(|candidate| candidate.patch.clone())
+}
+
+mod duration_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::time::Duration;
+
+    #[derive(Serialize, Deserialize)]
+    struct DurationRepr {
+        secs: u64,
+        nanos: u32,
+    }
+
+    pub fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        DurationRepr {
+            secs: duration.as_secs(),
+            nanos: duration.subsec_nanos(),
+        }
+        .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let repr = DurationRepr::deserialize(deserializer)?;
+        Ok(Duration::new(repr.secs, repr.nanos))
+    }
 }

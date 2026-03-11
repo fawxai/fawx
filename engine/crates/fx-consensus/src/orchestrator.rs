@@ -2,6 +2,7 @@ use crate::error::Result;
 use crate::protocol::{ConsensusProtocol, ExperimentConfig};
 use crate::types::{Candidate, ConsensusResult, Evaluation, Experiment, NodeId};
 use async_trait::async_trait;
+use futures::future::try_join_all;
 
 pub struct ExperimentOrchestrator<E: ConsensusProtocol> {
     engine: E,
@@ -42,12 +43,13 @@ async fn generate_candidates<E: ConsensusProtocol>(
     experiment: &Experiment,
     generators: Vec<Box<dyn CandidateGenerator>>,
 ) -> Result<Vec<Candidate>> {
-    let mut candidates = Vec::with_capacity(generators.len());
-    for generator in generators {
-        let candidate = generator.generate(experiment).await?;
-        engine.submit_candidate(candidate.clone()).await?;
-        candidates.push(candidate);
-    }
+    let candidates = try_join_all(
+        generators
+            .into_iter()
+            .map(|generator| async move { generator.generate(experiment).await }),
+    )
+    .await?;
+    submit_candidates(engine, &candidates).await?;
     Ok(candidates)
 }
 
@@ -58,23 +60,42 @@ async fn evaluate_candidates<E: ConsensusProtocol>(
     evaluators: Vec<Box<dyn CandidateEvaluator>>,
 ) -> Result<()> {
     for candidate in candidates {
-        submit_candidate_evaluations(engine, experiment, candidate, &evaluators).await?;
+        let evaluations = generate_evaluations(experiment, candidate, &evaluators).await?;
+        submit_evaluations(engine, &evaluations).await?;
     }
     Ok(())
 }
 
-async fn submit_candidate_evaluations<E: ConsensusProtocol>(
-    engine: &E,
+async fn generate_evaluations(
     experiment: &Experiment,
     candidate: &Candidate,
     evaluators: &[Box<dyn CandidateEvaluator>],
+) -> Result<Vec<Evaluation>> {
+    try_join_all(
+        evaluators
+            .iter()
+            .filter(|evaluator| evaluator.node_id() != &candidate.node_id)
+            .map(|evaluator| async move { evaluator.evaluate(experiment, candidate).await }),
+    )
+    .await
+}
+
+async fn submit_candidates<E: ConsensusProtocol>(
+    engine: &E,
+    candidates: &[Candidate],
 ) -> Result<()> {
-    for evaluator in evaluators {
-        if evaluator.node_id() == &candidate.node_id {
-            continue;
-        }
-        let evaluation = evaluator.evaluate(experiment, candidate).await?;
-        engine.submit_evaluation(evaluation).await?;
+    for candidate in candidates {
+        engine.submit_candidate(candidate.clone()).await?;
+    }
+    Ok(())
+}
+
+async fn submit_evaluations<E: ConsensusProtocol>(
+    engine: &E,
+    evaluations: &[Evaluation],
+) -> Result<()> {
+    for evaluation in evaluations {
+        engine.submit_evaluation(evaluation.clone()).await?;
     }
     Ok(())
 }
