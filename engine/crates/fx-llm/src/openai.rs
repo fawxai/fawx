@@ -496,14 +496,12 @@ async fn parse_model_response(
 }
 
 fn filter_model_ids(models: Vec<OpenAiModel>, supported_models: &[String]) -> Vec<String> {
-    let mut ids = models
+    models
         .into_iter()
         .filter_map(|model| filter_model_id(&model.id, supported_models))
         .collect::<BTreeSet<_>>()
         .into_iter()
-        .collect::<Vec<_>>();
-    ids.sort();
-    ids
+        .collect()
 }
 
 fn filter_model_id(model_id: &str, supported_models: &[String]) -> Option<String> {
@@ -873,40 +871,9 @@ impl OpenAiSseState {
 mod tests {
     use super::*;
     use crate::streaming::{collect_stream_chunks, StreamEvent};
-    use crate::test_helpers::{callback_events, read_events};
+    use crate::test_helpers::{callback_events, read_events, spawn_json_server};
     use crate::types::ToolDefinition;
     use serde_json::json;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
-
-    async fn spawn_json_server(status_line: &str, body: &str) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind test server");
-        let address = listener.local_addr().expect("local addr");
-        let status_line = status_line.to_string();
-        let body = body.to_string();
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.expect("accept connection");
-            let mut buffer = [0_u8; 2048];
-            let _ = socket.read(&mut buffer).await.expect("read request");
-            let response = format!(
-                "HTTP/1.1 {status_line}
-content-type: application/json
-content-length: {}
-connection: close
-
-{}",
-                body.len(),
-                body
-            );
-            socket
-                .write_all(response.as_bytes())
-                .await
-                .expect("write response");
-        });
-        format!("http://{address}")
-    }
 
     #[tokio::test]
     async fn openai_list_models_parses_response() {

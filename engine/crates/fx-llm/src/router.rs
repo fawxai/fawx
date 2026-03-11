@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use futures::future::join_all;
 use fx_core::error::LlmError;
 use thiserror::Error;
 use tracing::{debug, warn};
@@ -95,16 +96,25 @@ impl ModelRouter {
 
     /// Fetch available models from all registered providers dynamically.
     pub async fn fetch_available_models(&self) -> Vec<ModelInfo> {
+        let fetches = self
+            .providers
+            .iter()
+            .map(|(provider_name, provider)| async move {
+                let auth_method = self
+                    .provider_auth_methods
+                    .get(provider_name)
+                    .cloned()
+                    .unwrap_or_else(|| infer_auth_method(provider_name));
+                (
+                    provider_name.clone(),
+                    auth_method,
+                    fetch_provider_models(provider.as_ref()).await,
+                )
+            });
         let mut model_entries = BTreeMap::new();
 
-        for (provider_name, provider) in &self.providers {
-            let model_ids = fetch_provider_models(provider.as_ref()).await;
-            let auth_method = self
-                .provider_auth_methods
-                .get(provider_name)
-                .cloned()
-                .unwrap_or_else(|| infer_auth_method(provider_name));
-            add_provider_models(&mut model_entries, provider_name, &auth_method, model_ids);
+        for (provider_name, auth_method, model_ids) in join_all(fetches).await {
+            add_provider_models(&mut model_entries, &provider_name, &auth_method, model_ids);
         }
 
         model_entries.into_values().collect()
@@ -595,6 +605,7 @@ mod model_router_tests {
         captured_models: Arc<Mutex<Vec<String>>>,
         captured_temperatures: Arc<Mutex<Vec<Option<f32>>>>,
         capabilities: ProviderCapabilities,
+        list_models_delay_ms: u64,
     }
 
     impl MockCompletionProvider {
@@ -615,11 +626,17 @@ mod model_router_tests {
                 captured_models,
                 captured_temperatures,
                 capabilities,
+                list_models_delay_ms: 0,
             }
         }
 
         fn with_dynamic_models(mut self, dynamic_models: Result<Vec<String>, String>) -> Self {
             self.dynamic_models = dynamic_models;
+            self
+        }
+
+        fn with_list_models_delay_ms(mut self, delay_ms: u64) -> Self {
+            self.list_models_delay_ms = delay_ms;
             self
         }
     }
@@ -668,6 +685,10 @@ mod model_router_tests {
         }
 
         async fn list_models(&self) -> Result<Vec<String>, LlmError> {
+            if self.list_models_delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(self.list_models_delay_ms))
+                    .await;
+            }
             self.dynamic_models.clone().map_err(LlmError::Provider)
         }
 
@@ -824,6 +845,42 @@ mod model_router_tests {
             .collect::<Vec<_>>();
 
         assert_eq!(ids, vec!["claude-opus-4-1-20250805", "gpt-4.1", "gpt-4o"]);
+    }
+
+    #[tokio::test]
+    async fn router_fetches_providers_in_parallel() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let temperatures = Arc::new(Mutex::new(Vec::new()));
+        let openai = MockCompletionProvider::new(
+            "openai",
+            vec!["gpt-4o"],
+            "from openai",
+            Arc::clone(&captured),
+            Arc::clone(&temperatures),
+            default_capabilities(),
+        )
+        .with_dynamic_models(Ok(vec!["gpt-4o".to_string()]))
+        .with_list_models_delay_ms(150);
+        let anthropic = MockCompletionProvider::new(
+            "anthropic",
+            vec!["claude-opus-4-1-20250805"],
+            "from anthropic",
+            Arc::clone(&captured),
+            Arc::clone(&temperatures),
+            default_capabilities(),
+        )
+        .with_dynamic_models(Ok(vec!["claude-opus-4-1-20250805".to_string()]))
+        .with_list_models_delay_ms(150);
+
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(openai));
+        router.register_provider(Box::new(anthropic));
+
+        let started = tokio::time::Instant::now();
+        let models = router.fetch_available_models().await;
+
+        assert!(started.elapsed() < std::time::Duration::from_millis(275));
+        assert_eq!(models.len(), 2);
     }
 
     #[tokio::test]
