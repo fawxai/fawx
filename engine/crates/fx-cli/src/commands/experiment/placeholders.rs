@@ -4,6 +4,7 @@ use fx_consensus::{
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::fmt;
 
 pub(super) fn build_nodes(count: u32) -> Vec<NodeConfig> {
     (0..count)
@@ -13,10 +14,7 @@ pub(super) fn build_nodes(count: u32) -> Vec<NodeConfig> {
             NodeConfig {
                 node_id: node_id.clone(),
                 strategy: strategy.clone(),
-                patch_source: Box::new(PlaceholderPatchSource {
-                    strategy: strategy.clone(),
-                    node_id,
-                }),
+                patch_source: Box::new(PlaceholderPatchSource { strategy, node_id }),
                 workspace: Box::new(PlaceholderWorkspace),
             }
         })
@@ -31,12 +29,21 @@ pub(super) fn strategy_for(index: u32) -> GenerationStrategy {
     }
 }
 
-pub(super) fn strategy_label(strategy: &GenerationStrategy) -> &'static str {
-    match strategy {
-        GenerationStrategy::Conservative => "Conservative",
-        GenerationStrategy::Aggressive => "Aggressive",
-        GenerationStrategy::Creative => "Creative",
+pub(super) struct StrategyDisplay<'a>(&'a GenerationStrategy);
+
+impl fmt::Display for StrategyDisplay<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self.0 {
+            GenerationStrategy::Conservative => "Conservative",
+            GenerationStrategy::Aggressive => "Aggressive",
+            GenerationStrategy::Creative => "Creative",
+        };
+        formatter.write_str(label)
     }
+}
+
+pub(super) fn display_strategy(strategy: &GenerationStrategy) -> StrategyDisplay<'_> {
+    StrategyDisplay(strategy)
 }
 
 pub(super) struct PlaceholderPatchSource {
@@ -62,7 +69,7 @@ impl PatchSource for PlaceholderPatchSource {
 fn placeholder_approach(strategy: &GenerationStrategy, experiment: &Experiment) -> String {
     format!(
         "{} strategy placeholder for hypothesis: {}",
-        strategy_label(strategy),
+        display_strategy(strategy),
         experiment.hypothesis
     )
 }

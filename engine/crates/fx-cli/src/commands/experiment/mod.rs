@@ -1,10 +1,13 @@
 use anyhow::{anyhow, bail, Context};
 use clap::Subcommand;
+use fx_auth::auth::AuthManager;
+use fx_config::FawxConfig;
 use fx_consensus::{
     Chain, ChainStorage, ExperimentConfig, ExperimentRunner, FitnessCriterion,
     JsonFileChainStorage, MetricType, ModificationScope, PathPattern, ProposalTier, Signal,
 };
 use fx_llm::ModelRouter;
+use fx_subagent::{SubagentLimits, SubagentManager, SubagentManagerDeps};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,11 +18,14 @@ mod cargo_workspace;
 mod format;
 mod llm_source;
 mod placeholders;
+mod response_parser;
+mod subagent_source;
 
 use cargo_workspace::CargoWorkspace;
 use format::{format_chain_entries, format_chain_entry, format_experiment_report};
 use llm_source::LlmPatchSource;
 use placeholders::build_nodes;
+use subagent_source::SubagentPatchSource;
 
 const CHAIN_PATH_ENV: &str = "FAWX_CONSENSUS_CHAIN_PATH";
 
@@ -47,11 +53,11 @@ pub enum ExperimentCommands {
         #[arg(long, default_value = "120")]
         timeout: u64,
 
-        /// Use a real LLM router and cargo workspace instead of placeholders
-        #[arg(long, default_value = "false")]
-        live: bool,
+        /// Experiment node mode: placeholder, direct, or subagent
+        #[arg(long, default_value = "placeholder")]
+        mode: ExperimentNodeMode,
 
-        /// Cargo workspace project directory for live evaluation
+        /// Cargo workspace project directory for direct/subagent evaluation
         #[arg(long)]
         project: Option<String>,
     },
@@ -81,7 +87,7 @@ pub async fn run(command: ExperimentCommands) -> anyhow::Result<String> {
             nodes,
             scope,
             timeout,
-            live,
+            mode,
             project,
         } => {
             run_experiment(RunExperimentArgs {
@@ -90,7 +96,7 @@ pub async fn run(command: ExperimentCommands) -> anyhow::Result<String> {
                 nodes,
                 scope,
                 timeout,
-                live,
+                mode,
                 project,
             })
             .await
@@ -101,13 +107,20 @@ pub async fn run(command: ExperimentCommands) -> anyhow::Result<String> {
     }
 }
 
+#[derive(Clone, Copy, Debug, clap::ValueEnum, PartialEq, Eq)]
+pub enum ExperimentNodeMode {
+    Placeholder,
+    Direct,
+    Subagent,
+}
+
 pub struct RunExperimentArgs {
     pub signal: String,
     pub hypothesis: String,
     pub nodes: u32,
     pub scope: String,
     pub timeout: u64,
-    pub live: bool,
+    pub mode: ExperimentNodeMode,
     pub project: Option<String>,
 }
 
@@ -120,28 +133,64 @@ async fn run_experiment_with_path(
     chain_path: PathBuf,
 ) -> anyhow::Result<String> {
     ensure_chain_parent_dir(&chain_path)?;
-    let nodes = if args.live {
-        build_live_nodes_from_args(&args)?
-    } else {
-        build_nodes(args.nodes)
-    };
+    let nodes = build_nodes_from_args(&args)?;
     let runner = ExperimentRunner::with_nodes(chain_path, nodes)?;
     let report = runner.run(build_config(&args)?).await?;
     Ok(format_experiment_report(&args, &report))
 }
 
-fn build_live_nodes_from_args(
+fn build_nodes_from_args(
+    args: &RunExperimentArgs,
+) -> anyhow::Result<Vec<fx_consensus::NodeConfig>> {
+    match args.mode {
+        ExperimentNodeMode::Placeholder => Ok(build_nodes(args.nodes)),
+        ExperimentNodeMode::Direct => build_direct_nodes_from_args(args),
+        ExperimentNodeMode::Subagent => build_subagent_nodes_from_args(args),
+    }
+}
+
+fn build_direct_nodes_from_args(
     args: &RunExperimentArgs,
 ) -> anyhow::Result<Vec<fx_consensus::NodeConfig>> {
     let auth_manager = crate::startup::load_auth_manager()?;
-    let mut router = crate::startup::build_router(&auth_manager)?;
     let config = crate::startup::load_config()?;
-    let model = crate::headless::resolve_active_model(&router, &config)?;
+    let (router, model) = build_active_router(&auth_manager, &config)?;
+    let project_dir = resolve_project_dir(args)?;
+    build_direct_nodes(args.nodes, router, model, project_dir)
+}
+
+fn build_subagent_nodes_from_args(
+    args: &RunExperimentArgs,
+) -> anyhow::Result<Vec<fx_consensus::NodeConfig>> {
+    let auth_manager = crate::startup::load_auth_manager()?;
+    let config = crate::startup::load_config()?;
+    let (router, _) = build_active_router(&auth_manager, &config)?;
+    let improvement_provider = crate::startup::build_improvement_provider(&auth_manager, &config);
+    let factory = crate::headless::HeadlessSubagentFactory::new(
+        crate::headless::HeadlessSubagentFactoryDeps {
+            router: Arc::clone(&router),
+            config: config.clone(),
+            improvement_provider,
+        },
+    );
+    let manager = Arc::new(SubagentManager::new(SubagentManagerDeps {
+        factory: Arc::new(factory),
+        limits: SubagentLimits::default(),
+    }));
+    let project_dir = resolve_project_dir(args)?;
+    build_subagent_nodes(args.nodes, manager, project_dir)
+}
+
+fn build_active_router(
+    auth_manager: &AuthManager,
+    config: &FawxConfig,
+) -> anyhow::Result<(Arc<ModelRouter>, String)> {
+    let mut router = crate::startup::build_router(auth_manager)?;
+    let model = crate::headless::resolve_active_model(&router, config)?;
     router
         .set_active(&model)
         .map_err(|error| anyhow!("failed to activate model '{model}': {error}"))?;
-    let project_dir = resolve_project_dir(args)?;
-    build_live_nodes(args.nodes, Arc::new(router), model, project_dir)
+    Ok((Arc::new(router), model))
 }
 
 fn resolve_project_dir(args: &RunExperimentArgs) -> anyhow::Result<PathBuf> {
@@ -205,7 +254,7 @@ fn run_git_check(project_dir: &Path, args: &[&str]) -> anyhow::Result<String> {
     }
 }
 
-fn build_live_nodes(
+fn build_direct_nodes(
     count: u32,
     router: Arc<ModelRouter>,
     model: String,
@@ -221,6 +270,31 @@ fn build_live_nodes(
                 node_id: node_id.clone(),
                 strategy: strategy.clone(),
                 patch_source: Box::new(LlmPatchSource::new(router.clone(), model.clone())),
+                workspace: Box::new(workspace),
+            })
+        })
+        .collect()
+}
+
+fn build_subagent_nodes(
+    count: u32,
+    manager: Arc<SubagentManager>,
+    project_dir: PathBuf,
+) -> anyhow::Result<Vec<fx_consensus::NodeConfig>> {
+    (0..count)
+        .map(|index| {
+            let strategy = placeholders::strategy_for(index);
+            let node_id = fx_consensus::NodeId(format!("node-{index}"));
+            let workspace = CargoWorkspace::clone_from(&project_dir, &node_id.0)
+                .map_err(anyhow::Error::from)?;
+            Ok(fx_consensus::NodeConfig {
+                node_id: node_id.clone(),
+                strategy: strategy.clone(),
+                patch_source: Box::new(SubagentPatchSource::new(
+                    manager.clone(),
+                    strategy,
+                    project_dir.clone(),
+                )),
                 workspace: Box::new(workspace),
             })
         })
@@ -379,7 +453,7 @@ mod tests {
                 nodes: 3,
                 scope: "src/**/*.rs".to_owned(),
                 timeout: 120,
-                live: false,
+                mode: ExperimentNodeMode::Placeholder,
                 project: None,
             },
             chain_path.clone(),
@@ -445,7 +519,7 @@ mod tests {
             nodes: 2,
             scope: "src/**/*.rs".to_owned(),
             timeout: 120,
-            live: false,
+            mode: ExperimentNodeMode::Placeholder,
             project: None,
         };
 
@@ -555,7 +629,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_parser_accepts_live_flag_and_project() {
+    fn cli_parser_accepts_direct_mode() {
         #[derive(Parser)]
         struct TestCli {
             #[command(subcommand)]
@@ -569,15 +643,72 @@ mod tests {
             "latency",
             "--hypothesis",
             "parallelism helps",
-            "--live",
+            "--mode",
+            "direct",
+        ])
+        .expect("parse experiment cli");
+
+        match cli.command {
+            ExperimentCommands::Run { mode, .. } => {
+                assert_eq!(mode, ExperimentNodeMode::Direct);
+            }
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn cli_parser_accepts_placeholder_mode() {
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(subcommand)]
+            command: ExperimentCommands,
+        }
+
+        let cli = TestCli::try_parse_from([
+            "experiment",
+            "run",
+            "--signal",
+            "latency",
+            "--hypothesis",
+            "parallelism helps",
+            "--mode",
+            "placeholder",
+        ])
+        .expect("parse experiment cli");
+
+        match cli.command {
+            ExperimentCommands::Run { mode, .. } => {
+                assert_eq!(mode, ExperimentNodeMode::Placeholder);
+            }
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn cli_parser_accepts_subagent_mode_and_project() {
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(subcommand)]
+            command: ExperimentCommands,
+        }
+
+        let cli = TestCli::try_parse_from([
+            "experiment",
+            "run",
+            "--signal",
+            "latency",
+            "--hypothesis",
+            "parallelism helps",
+            "--mode",
+            "subagent",
             "--project",
             "/tmp/demo",
         ])
         .expect("parse experiment cli");
 
         match cli.command {
-            ExperimentCommands::Run { live, project, .. } => {
-                assert!(live);
+            ExperimentCommands::Run { mode, project, .. } => {
+                assert_eq!(mode, ExperimentNodeMode::Subagent);
                 assert_eq!(project.as_deref(), Some("/tmp/demo"));
             }
             _ => panic!("expected run command"),

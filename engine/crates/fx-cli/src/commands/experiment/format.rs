@@ -1,5 +1,5 @@
 use super::RunExperimentArgs;
-use crate::commands::experiment::placeholders::strategy_label;
+use crate::commands::experiment::placeholders::display_strategy;
 use fx_consensus::{Chain, ChainEntry, Decision, ExperimentReport};
 use uuid::Uuid;
 
@@ -44,7 +44,7 @@ fn format_candidate_line(candidate: &fx_consensus::CandidateReport) -> String {
     format!(
         "{prefix} {} ({})  score: {:.2}{winner_suffix}",
         candidate.node_id.0,
-        strategy_label(&candidate.strategy),
+        display_strategy(&candidate.strategy),
         candidate.aggregate_score,
     )
 }
