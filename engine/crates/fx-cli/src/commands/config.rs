@@ -281,4 +281,48 @@ mod tests {
         assert!(!output.contains("super-secret"));
         assert!(!output.contains("bot-secret"));
     }
+
+    #[test]
+    fn show_uses_default_config_when_config_file_is_missing() {
+        let temp = TempDir::new().expect("tempdir");
+        let manager = ConfigManager::new(temp.path()).expect("manager");
+        let output = show_config(manager.config()).expect("show defaults");
+        assert!(output.contains("[general]"));
+        assert!(output.contains("max_iterations = 10"));
+    }
+
+    #[test]
+    fn set_then_get_round_trips_fawx_config_keys() {
+        let mut test_manager = manager_from("");
+        execute(
+            Some(ConfigCommands::Set {
+                key: "model.default_model".to_string(),
+                value: "openai/gpt-5".to_string(),
+            }),
+            &mut test_manager.manager,
+        )
+        .expect("set config");
+        let output = execute(
+            Some(ConfigCommands::Get {
+                key: "model.default_model".to_string(),
+            }),
+            &mut test_manager.manager,
+        )
+        .expect("get config");
+        assert_eq!(output, "openai/gpt-5");
+    }
+
+    #[test]
+    fn set_invalid_key_path_errors_cleanly() {
+        let mut test_manager = manager_from("");
+        let error = execute(
+            Some(ConfigCommands::Set {
+                key: "model.missing_field".to_string(),
+                value: "openai/gpt-5".to_string(),
+            }),
+            &mut test_manager.manager,
+        )
+        .expect_err("invalid key should fail");
+        assert!(error.to_string().contains("missing_field"));
+    }
 }

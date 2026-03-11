@@ -21,12 +21,9 @@ pub(crate) fn sanitize_toml(value: TomlValue) -> TomlValue {
 
 pub(crate) fn is_secret_key(key: &str) -> bool {
     let normalized = key.to_ascii_lowercase();
-    if exact_secret_keys().contains(&normalized.as_str()) {
-        return true;
-    }
-    secret_suffixes()
+    secret_markers()
         .iter()
-        .any(|suffix| normalized.ends_with(suffix))
+        .any(|marker| normalized.contains(marker))
 }
 
 fn sanitize_json_object(map: JsonMap<String, JsonValue>) -> JsonMap<String, JsonValue> {
@@ -58,34 +55,8 @@ fn sanitize_toml_entry(key: &str, value: TomlValue) -> TomlValue {
     }
 }
 
-fn exact_secret_keys() -> &'static [&'static str] {
-    &[
-        "access_key",
-        "api_key",
-        "auth_token",
-        "bearer_token",
-        "bot_token",
-        "credential",
-        "password",
-        "private_key",
-        "secret",
-        "ssh_key",
-        "token",
-        "webhook_secret",
-    ]
-}
-
-fn secret_suffixes() -> &'static [&'static str] {
-    &[
-        "_access_key",
-        "_api_key",
-        "_credential",
-        "_password",
-        "_private_key",
-        "_secret",
-        "_ssh_key",
-        "_token",
-    ]
+fn secret_markers() -> &'static [&'static str] {
+    &["key", "token", "secret", "password", "credential"]
 }
 
 #[cfg(test)]
@@ -93,10 +64,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn secret_key_detection_covers_exact_and_suffix_matches() {
+    fn secret_key_detection_uses_contains_heuristic() {
         assert!(is_secret_key("bot_token"));
         assert!(is_secret_key("service_private_key"));
         assert!(is_secret_key("aws_access_key"));
+        assert!(is_secret_key("customCredentialName"));
         assert!(!is_secret_key("default_model"));
     }
 
