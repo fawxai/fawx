@@ -222,7 +222,7 @@ mod tests {
     #[test]
     fn set_updates_persisted_config_through_manager() {
         let mut test_manager = manager_from("[model]\ndefault_model = \"old\"\n");
-        let output = execute(
+        execute(
             Some(ConfigCommands::Set {
                 key: "model.default_model".to_string(),
                 value: "new".to_string(),
@@ -230,8 +230,14 @@ mod tests {
             &mut test_manager.manager,
         )
         .expect("set config");
-        assert!(output.contains("Updated model.default_model"));
-        assert!(output.ends_with("new"));
+
+        let stored = select_config_value(test_manager.manager.config(), "model.default_model")
+            .expect("stored model");
+        assert_eq!(stored.as_str(), Some("new"));
+
+        let persisted =
+            std::fs::read_to_string(test_manager.manager.config_path()).expect("persisted config");
+        assert!(persisted.contains("default_model = \"new\""));
     }
 
     #[test]
@@ -280,5 +286,49 @@ mod tests {
         assert!(output.contains("[REDACTED]"));
         assert!(!output.contains("super-secret"));
         assert!(!output.contains("bot-secret"));
+    }
+
+    #[test]
+    fn show_uses_default_config_when_config_file_is_missing() {
+        let temp = TempDir::new().expect("tempdir");
+        let manager = ConfigManager::new(temp.path()).expect("manager");
+        let output = show_config(manager.config()).expect("show defaults");
+        assert!(output.contains("[general]"));
+        assert!(output.contains("max_iterations = 10"));
+    }
+
+    #[test]
+    fn set_then_get_round_trips_fawx_config_keys() {
+        let mut test_manager = manager_from("");
+        execute(
+            Some(ConfigCommands::Set {
+                key: "model.default_model".to_string(),
+                value: "openai/gpt-5".to_string(),
+            }),
+            &mut test_manager.manager,
+        )
+        .expect("set config");
+        let output = execute(
+            Some(ConfigCommands::Get {
+                key: "model.default_model".to_string(),
+            }),
+            &mut test_manager.manager,
+        )
+        .expect("get config");
+        assert_eq!(output, "openai/gpt-5");
+    }
+
+    #[test]
+    fn set_invalid_key_path_errors_cleanly() {
+        let mut test_manager = manager_from("");
+        let error = execute(
+            Some(ConfigCommands::Set {
+                key: "model.missing_field".to_string(),
+                value: "openai/gpt-5".to_string(),
+            }),
+            &mut test_manager.manager,
+        )
+        .expect_err("invalid key should fail");
+        assert!(error.to_string().contains("missing_field"));
     }
 }
