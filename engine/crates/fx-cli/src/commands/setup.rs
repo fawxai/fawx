@@ -1,4 +1,3 @@
-use super::auth;
 use crate::auth_store::{open_auth_store_with_recovery, AuthStore};
 use crate::prompts::{
     open_browser, parse_auth_selection, prompt_api_key_provider_with_surface,
@@ -412,9 +411,13 @@ impl SetupWizard {
             );
             return Ok(());
         }
-        auth::set_credential(prompt.key, &value)?;
+        self.store_skill_credential(prompt.key, &value)?;
         println!("  ✓ Stored securely");
         Ok(())
+    }
+
+    fn store_skill_credential(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        Ok(self.skill_credential_store.set_generic(key, value)?)
     }
 
     fn run_http_phase(&mut self) -> anyhow::Result<()> {
@@ -1203,6 +1206,37 @@ pub(crate) enum ChannelSelection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    static TEST_HOME_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    struct HomeGuard {
+        original_home: Option<String>,
+    }
+
+    impl HomeGuard {
+        fn set(temp_home: &TempDir) -> Self {
+            let original_home = std::env::var("HOME").ok();
+            unsafe {
+                std::env::set_var("HOME", temp_home.path());
+            }
+            Self { original_home }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            if let Some(home) = &self.original_home {
+                unsafe {
+                    std::env::set_var("HOME", home);
+                }
+            } else {
+                unsafe {
+                    std::env::remove_var("HOME");
+                }
+            }
+        }
+    }
 
     #[test]
     fn parse_chat_ids_accepts_blank_input() {
@@ -1325,6 +1359,25 @@ mod tests {
             .expect("webhook secret present");
         assert_eq!(*bot_token, "bot-token");
         assert_eq!(*webhook_secret, "secret-token");
+    }
+
+    #[test]
+    fn setup_wizard_stores_skill_credentials_without_reopening_database() {
+        let _home_lock = TEST_HOME_LOCK.lock().expect("home lock");
+        let temp_home = TempDir::new().expect("temp home");
+        let _home = HomeGuard::set(&temp_home);
+        let wizard = SetupWizard::new(false).expect("setup wizard");
+
+        wizard
+            .store_skill_credential("brave_api_key", "brv-test")
+            .expect("store skill credential");
+
+        let stored = wizard
+            .skill_credential_store
+            .get_generic("brave_api_key")
+            .expect("read skill credential")
+            .expect("skill credential present");
+        assert_eq!(*stored, "brv-test");
     }
 
     fn test_state() -> SkillWizardState {
