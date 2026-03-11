@@ -1,4 +1,4 @@
-use crate::llm_source::build_experiment_prompt;
+use crate::llm_source::build_subagent_experiment_prompt;
 use crate::response_parser::parse_patch_response;
 use crate::{ConsensusError, Experiment, GenerationStrategy, PatchResponse, PatchSource};
 use fx_subagent::{SpawnConfig, SpawnMode, SubagentControl, SubagentStatus};
@@ -34,7 +34,7 @@ impl SubagentPatchSource {
     }
 
     fn spawn_config(&self, system_prompt: &str, experiment: &Experiment) -> SpawnConfig {
-        let mut config = SpawnConfig::new(build_experiment_prompt(experiment));
+        let mut config = SpawnConfig::new(build_subagent_experiment_prompt(experiment));
         config.label = Some(format!("experiment-{}", strategy_slug(&self.strategy)));
         config.mode = SpawnMode::Run;
         config.cwd = Some(self.working_dir.clone());
@@ -258,9 +258,11 @@ mod tests {
         assert!(config
             .task
             .contains("Signal: latency — High latency detected"));
+        assert!(config.task.contains("IMPORTANT: You have full tool access"));
         assert!(config
             .task
-            .contains("Return exactly three tagged sections in this order"));
+            .contains("READ the target files using read_file"));
+        assert!(config.task.contains("RUN `cargo build` via run_command"));
     }
 
     #[tokio::test]

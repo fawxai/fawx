@@ -303,6 +303,76 @@ mod tests {
         assert!(loaded.verify().is_ok());
     }
 
+    #[test]
+    fn deserializes_legacy_chain_entry_without_candidate_patches() {
+        let experiment_id = uuid::Uuid::nil();
+        let candidate_id = uuid::Uuid::from_u128(1);
+        let signal_id = uuid::Uuid::from_u128(2);
+        let candidate_node = "node-a";
+        let evaluator_node = "node-b";
+        let timestamp = "2026-03-11T00:00:00Z";
+        let candidate_nodes = BTreeMap::from([(candidate_id.to_string(), candidate_node)]);
+        let aggregate_scores = BTreeMap::from([(candidate_id.to_string(), 0.7)]);
+        let legacy_entry = serde_json::json!({
+            "index": 0,
+            "previous_hash": "genesis",
+            "experiment": {
+                "id": experiment_id,
+                "trigger": {
+                    "id": signal_id,
+                    "name": "latency",
+                    "description": "High latency detected",
+                    "severity": "high"
+                },
+                "hypothesis": "parallelism helps",
+                "fitness_criteria": [{
+                    "name": "latency",
+                    "metric_type": "Lower",
+                    "weight": 1.0
+                }],
+                "scope": {
+                    "allowed_files": ["src/**/*.rs"],
+                    "proposal_tier": "Tier1"
+                },
+                "timeout": {"secs": 300, "nanos": 0},
+                "min_candidates": 2,
+                "created_at": timestamp
+            },
+            "result": {
+                "experiment_id": experiment_id,
+                "winner": candidate_id,
+                "candidates": [candidate_id],
+                "candidate_nodes": candidate_nodes,
+                "evaluations": [{
+                    "candidate_id": candidate_id,
+                    "evaluator_id": evaluator_node,
+                    "fitness_scores": {"latency": 0.7},
+                    "safety_pass": true,
+                    "signal_resolved": true,
+                    "regression_detected": false,
+                    "notes": "Looks good",
+                    "created_at": timestamp
+                }],
+                "aggregate_scores": aggregate_scores,
+                "decision": "Accept",
+                "timestamp": timestamp
+            },
+            "winning_patch": null,
+            "applied_at": null,
+            "hash": "legacy-hash"
+        });
+        let legacy_chain = serde_json::json!({
+            "entries": [legacy_entry],
+            "head_hash": "legacy-hash"
+        });
+
+        let chain: Chain =
+            serde_json::from_value(legacy_chain).expect("legacy chain should deserialize");
+
+        assert_eq!(chain.len(), 1);
+        assert!(chain.entries()[0].result.candidate_patches.is_empty());
+    }
+
     fn sample_result(experiment_id: uuid::Uuid) -> ConsensusResult {
         let candidate = sample_candidate(experiment_id, "node-a");
         ConsensusResult {
@@ -310,6 +380,7 @@ mod tests {
             winner: Some(candidate.id),
             candidates: vec![candidate.id],
             candidate_nodes: BTreeMap::from([(candidate.id, candidate.node_id.clone())]),
+            candidate_patches: BTreeMap::from([(candidate.id, candidate.patch.clone())]),
             evaluations: vec![sample_evaluation(candidate.id, "node-b", 0.7)],
             aggregate_scores: BTreeMap::from([(candidate.id, 0.7)]),
             decision: Decision::Accept,

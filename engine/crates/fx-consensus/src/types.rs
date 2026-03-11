@@ -110,6 +110,8 @@ pub struct ConsensusResult {
     pub winner: Option<Uuid>,
     pub candidates: Vec<Uuid>,
     pub candidate_nodes: BTreeMap<Uuid, NodeId>,
+    #[serde(default)]
+    pub candidate_patches: BTreeMap<Uuid, String>,
     pub evaluations: Vec<Evaluation>,
     pub aggregate_scores: BTreeMap<Uuid, f64>,
     pub decision: Decision,
@@ -168,6 +170,7 @@ pub(crate) mod tests {
             winner: Some(candidate.id),
             candidates: vec![candidate.id],
             candidate_nodes: BTreeMap::from([(candidate.id, candidate.node_id.clone())]),
+            candidate_patches: BTreeMap::from([(candidate.id, candidate.patch.clone())]),
             evaluations: vec![evaluation],
             aggregate_scores: BTreeMap::from([(candidate.id, 0.9)]),
             decision: Decision::Accept,

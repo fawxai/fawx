@@ -38,20 +38,28 @@ impl PatchSource for LlmPatchSource {
     }
 }
 
-pub fn build_experiment_prompt(experiment: &Experiment) -> String {
-    let scope = experiment
+fn experiment_scope(experiment: &Experiment) -> String {
+    experiment
         .scope
         .allowed_files
         .iter()
         .map(|path| path.0.as_str())
         .collect::<Vec<_>>()
-        .join(", ");
-    let criteria = experiment
+        .join(", ")
+}
+
+fn experiment_criteria(experiment: &Experiment) -> String {
+    experiment
         .fitness_criteria
         .iter()
         .map(|criterion| criterion.name.as_str())
         .collect::<Vec<_>>()
-        .join(", ");
+        .join(", ")
+}
+
+pub fn build_experiment_prompt(experiment: &Experiment) -> String {
+    let scope = experiment_scope(experiment);
+    let criteria = experiment_criteria(experiment);
     format!(
         concat!(
             "You are participating in a proof-of-fitness experiment.\n\n",
@@ -69,6 +77,49 @@ pub fn build_experiment_prompt(experiment: &Experiment) -> String {
             "<METRICS>\n",
             "{{\"build_success\": 0.0-1.0, \"test_pass_rate\": 0.0-1.0, \"signal_resolution\": 0.0-1.0}}\n",
             "</METRICS>"
+        ),
+        experiment.trigger.name,
+        experiment.trigger.description,
+        experiment.hypothesis,
+        scope,
+        criteria,
+    )
+}
+
+pub fn build_subagent_experiment_prompt(experiment: &Experiment) -> String {
+    let scope = experiment_scope(experiment);
+    let criteria = experiment
+        .fitness_criteria
+        .iter()
+        .map(|criterion| format!("{} (weight: {})", criterion.name, criterion.weight))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        concat!(
+            "You are a Fawx agent participating in a proof-of-fitness experiment.\n\n",
+            "Signal: {} — {}\n",
+            "Hypothesis: {}\n",
+            "Target files: {}\n",
+            "Fitness criteria: {}\n\n",
+            "IMPORTANT: You have full tool access. Follow these steps:\n\n",
+            "1. READ the target files using read_file to understand the current code\n",
+            "2. READ any related files (imports, types, existing tests) to understand patterns\n",
+            "3. PLAN your changes based on what you read\n",
+            "4. WRITE the improved code using write_file or edit_file\n",
+            "5. RUN `cargo build` via run_command to verify it compiles\n",
+            "6. RUN `cargo test` via run_command to verify tests pass\n",
+            "7. If build/test fails, FIX the issues and retry\n\n",
+            "After your changes compile and tests pass, output your results:\n\n",
+            "<PATCH>\n",
+            "[run `git diff` to get the actual unified diff of your changes]\n",
+            "</PATCH>\n",
+            "<APPROACH>\n",
+            "[1-2 sentence summary of what you did and why]\n",
+            "</APPROACH>\n",
+            "<METRICS>\n",
+            "{{\"build_success\": 1.0, \"test_pass_rate\": <actual_rate>, \"signal_resolution\": <0.0-1.0>}}\n",
+            "</METRICS>\n\n",
+            "DO NOT guess at file contents. READ them first. DO NOT output a patch without verifying it builds."
         ),
         experiment.trigger.name,
         experiment.trigger.description,
@@ -130,6 +181,26 @@ mod tests {
                 requires_streaming: false,
             }
         }
+    }
+
+    #[test]
+    fn build_subagent_experiment_prompt_includes_tool_instructions() {
+        let prompt = build_subagent_experiment_prompt(&sample_experiment());
+
+        assert!(prompt.contains("IMPORTANT: You have full tool access"));
+        assert!(prompt.contains("READ the target files using read_file"));
+        assert!(prompt.contains("RUN `cargo build` via run_command"));
+        assert!(prompt.contains("DO NOT guess at file contents. READ them first."));
+    }
+
+    #[test]
+    fn build_experiment_prompt_stays_direct_llm_focused() {
+        let prompt = build_experiment_prompt(&sample_experiment());
+
+        assert!(prompt.contains("Return exactly three tagged sections in this order"));
+        assert!(!prompt.contains("IMPORTANT: You have full tool access"));
+        assert!(!prompt.contains("read_file"));
+        assert!(!prompt.contains("run_command"));
     }
 
     #[tokio::test]

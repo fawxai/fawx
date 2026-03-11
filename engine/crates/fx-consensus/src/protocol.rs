@@ -8,7 +8,7 @@ use crate::types::{
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::RwLock;
 use std::time::Duration;
 use tracing::warn;
@@ -167,6 +167,10 @@ impl ConsensusProtocol for LocalConsensusEngine {
         let aggregate_scores =
             compute_aggregate_scores(&candidates, &evaluations, &experiment.fitness_criteria);
         let (decision, winner) = determine_winner(&aggregate_scores, &evaluations);
+        let candidate_patches: BTreeMap<Uuid, String> = candidates
+            .iter()
+            .map(|candidate| (candidate.id, candidate.patch.clone()))
+            .collect();
         let result = ConsensusResult {
             experiment_id,
             winner,
@@ -175,6 +179,7 @@ impl ConsensusProtocol for LocalConsensusEngine {
                 .iter()
                 .map(|candidate| (candidate.id, candidate.node_id.clone()))
                 .collect(),
+            candidate_patches,
             evaluations,
             aggregate_scores,
             decision,

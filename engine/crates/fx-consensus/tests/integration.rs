@@ -33,6 +33,10 @@ fn end_to_end_consensus_flow_records_chain_entry() {
             (candidate_a.id, NodeId::from("node-a")),
             (candidate_b.id, NodeId::from("node-b")),
         ]),
+        candidate_patches: BTreeMap::from([
+            (candidate_a.id, candidate_a.patch.clone()),
+            (candidate_b.id, candidate_b.patch.clone()),
+        ]),
         evaluations,
         aggregate_scores: scores,
         decision,
@@ -136,6 +140,10 @@ fn build_result(
         candidate_nodes: candidates
             .iter()
             .map(|c| (c.id, c.node_id.clone()))
+            .collect(),
+        candidate_patches: candidates
+            .iter()
+            .map(|candidate| (candidate.id, candidate.patch.clone()))
             .collect(),
         evaluations,
         aggregate_scores: scores,
