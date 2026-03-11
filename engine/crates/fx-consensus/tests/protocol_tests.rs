@@ -397,7 +397,14 @@ async fn mock_evaluator_scores_independently_from_candidate_self_metrics() {
         .await
         .expect("evaluation works");
 
-    assert_eq!(evaluation.fitness_scores.get("fitness"), Some(&7.0));
+    // Score should be independent of candidate's self_metrics (999.0).
+    // "candidate-a" approach doesn't contain "winner", so score is 5.0.
+    assert_eq!(evaluation.fitness_scores.get("fitness"), Some(&5.0));
+    assert_ne!(
+        evaluation.fitness_scores.get("fitness"),
+        candidate.self_metrics.get("fitness"),
+        "evaluator must not copy candidate self-metrics"
+    );
 }
 
 fn create_engine() -> LocalConsensusEngine {
@@ -596,10 +603,6 @@ impl MockEvaluator {
             node_id: NodeId::from(node_id),
         }
     }
-
-    fn independent_score(&self) -> f64 {
-        7.0
-    }
 }
 
 #[async_trait]
@@ -609,7 +612,14 @@ impl CandidateEvaluator for MockEvaluator {
         _experiment: &Experiment,
         candidate: &Candidate,
     ) -> Result<Evaluation, ConsensusError> {
-        let score = self.independent_score();
+        // Use candidate's approach text length as a differentiator:
+        // "winner" (6 chars) vs "runner-up" (9 chars) gives different scores.
+        // This ensures independent evaluation that still differentiates candidates.
+        let score = if candidate.approach.contains("winner") {
+            9.0
+        } else {
+            5.0
+        };
         Ok(Evaluation {
             candidate_id: candidate.id,
             evaluator_id: self.node_id.clone(),
