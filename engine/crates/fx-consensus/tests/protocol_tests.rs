@@ -277,7 +277,7 @@ async fn experiment_config_round_trips_through_serde() {
 async fn orchestrator_runs_full_experiment_end_to_end() {
     let engine = create_engine();
     let expected_winner = Uuid::new_v4();
-    let orchestrator = ExperimentOrchestrator::new(engine);
+    let orchestrator = ExperimentOrchestrator::new(&engine);
     let generators: Vec<Box<dyn CandidateGenerator>> = vec![
         Box::new(MockGenerator::new(
             "node-a",
@@ -299,7 +299,7 @@ async fn orchestrator_runs_full_experiment_end_to_end() {
     ];
 
     let result = orchestrator
-        .run_experiment(sample_config(2), generators, evaluators)
+        .run_experiment(sample_config(2), &generators, &evaluators)
         .await
         .expect("orchestration works");
 
@@ -311,7 +311,7 @@ async fn orchestrator_runs_full_experiment_end_to_end() {
 #[tokio::test]
 async fn orchestrator_generates_candidates_concurrently() {
     let engine = create_engine();
-    let orchestrator = ExperimentOrchestrator::new(engine);
+    let orchestrator = ExperimentOrchestrator::new(&engine);
     let barrier = Arc::new(Barrier::new(2));
     let active = Arc::new(AtomicUsize::new(0));
     let max_active = Arc::new(AtomicUsize::new(0));
@@ -332,7 +332,7 @@ async fn orchestrator_generates_candidates_concurrently() {
     let evaluators: Vec<Box<dyn CandidateEvaluator>> = vec![Box::new(MockEvaluator::new("node-c"))];
 
     orchestrator
-        .run_experiment(sample_config(2), generators, evaluators)
+        .run_experiment(sample_config(2), &generators, &evaluators)
         .await
         .expect("orchestration works");
 
@@ -342,7 +342,7 @@ async fn orchestrator_generates_candidates_concurrently() {
 #[tokio::test]
 async fn orchestrator_evaluates_each_candidate_concurrently() {
     let engine = create_engine();
-    let orchestrator = ExperimentOrchestrator::new(engine);
+    let orchestrator = ExperimentOrchestrator::new(&engine);
     let barrier = Arc::new(Barrier::new(2));
     let active = Arc::new(AtomicUsize::new(0));
     let max_active = Arc::new(AtomicUsize::new(0));
@@ -371,7 +371,7 @@ async fn orchestrator_evaluates_each_candidate_concurrently() {
     ];
 
     orchestrator
-        .run_experiment(sample_config(2), generators, evaluators)
+        .run_experiment(sample_config(2), &generators, &evaluators)
         .await
         .expect("orchestration works");
 

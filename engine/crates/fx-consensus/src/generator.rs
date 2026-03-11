@@ -126,7 +126,8 @@ fn strategy_prompt(instruction: &str, experiment: &Experiment) -> String {
     format!(
         concat!(
             "You are generating a unified diff patch for a Proof of Fitness experiment.\n",
-            "Strategy: {instruction}\n\n",
+            "Strategy: {instruction}\n",
+            "NEVER modify kernel/safety paths (Tier 3). These are enforced at runtime but must not be attempted.\n\n",
             "Trigger signal: {signal_name}\n",
             "Signal description: {signal_description}\n",
             "Hypothesis: {hypothesis}\n",
@@ -208,6 +209,9 @@ mod tests {
         assert!(stored[0].contains("Make the minimal change needed"));
         assert!(stored[1].contains("Fix the root cause"));
         assert!(stored[2].contains("Find an unconventional solution"));
+        assert!(stored
+            .iter()
+            .all(|prompt| prompt.contains("NEVER modify kernel/safety paths (Tier 3).")));
         assert_ne!(stored[0], stored[1]);
         assert_ne!(stored[1], stored[2]);
         assert_ne!(stored[0], stored[2]);

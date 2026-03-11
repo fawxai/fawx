@@ -2,9 +2,9 @@ use crate::chain::JsonFileChainStorage;
 use crate::error::ConsensusError;
 use crate::evaluator::{BuildTestEvaluator, EvaluationWorkspace};
 use crate::generator::{GenerationStrategy, LlmCandidateGenerator, PatchSource};
-use crate::orchestrator::{CandidateEvaluator, CandidateGenerator};
+use crate::orchestrator::{CandidateEvaluator, CandidateGenerator, ExperimentOrchestrator};
 use crate::protocol::{ConsensusProtocol, ExperimentConfig, LocalConsensusEngine};
-use crate::types::{Candidate, ConsensusResult, Evaluation, NodeId};
+use crate::types::{Candidate, ConsensusResult, NodeId};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -60,11 +60,10 @@ impl ExperimentRunner {
     }
 
     pub async fn run(&self, config: ExperimentConfig) -> Result<ExperimentReport, ConsensusError> {
-        let experiment = self.engine.create_experiment(config).await?;
-        let candidates = generate_candidates(&self.generators, &experiment).await?;
-        submit_candidates(&self.engine, &candidates).await?;
-        submit_all_evaluations(&self.engine, &self.evaluators, &experiment, &candidates).await?;
-        let result = self.engine.finalize(experiment.id).await?;
+        let orchestrator = ExperimentOrchestrator::new(&self.engine);
+        let result = orchestrator
+            .run_experiment(config, &self.generators, &self.evaluators)
+            .await?;
         build_report(&self.engine, &self.strategies, result).await
     }
 }
@@ -96,65 +95,6 @@ fn build_nodes(nodes: Vec<NodeConfig>) -> BuiltNodes {
         evaluators,
         strategies,
     }
-}
-
-async fn generate_candidates(
-    generators: &[Box<dyn CandidateGenerator>],
-    experiment: &crate::types::Experiment,
-) -> Result<Vec<Candidate>, ConsensusError> {
-    let mut candidates = Vec::new();
-    for generator in generators {
-        candidates.push(generator.generate(experiment).await?);
-    }
-    Ok(candidates)
-}
-
-async fn submit_candidates(
-    engine: &LocalConsensusEngine,
-    candidates: &[Candidate],
-) -> Result<(), ConsensusError> {
-    for candidate in candidates {
-        engine.submit_candidate(candidate.clone()).await?;
-    }
-    Ok(())
-}
-
-async fn submit_all_evaluations(
-    engine: &LocalConsensusEngine,
-    evaluators: &[Box<dyn CandidateEvaluator>],
-    experiment: &crate::types::Experiment,
-    candidates: &[Candidate],
-) -> Result<(), ConsensusError> {
-    for candidate in candidates {
-        let evaluations = evaluate_candidate(evaluators, experiment, candidate).await?;
-        submit_evaluations(engine, &evaluations).await?;
-    }
-    Ok(())
-}
-
-async fn evaluate_candidate(
-    evaluators: &[Box<dyn CandidateEvaluator>],
-    experiment: &crate::types::Experiment,
-    candidate: &Candidate,
-) -> Result<Vec<Evaluation>, ConsensusError> {
-    let mut evaluations = Vec::new();
-    for evaluator in evaluators {
-        if evaluator.node_id() == &candidate.node_id {
-            continue;
-        }
-        evaluations.push(evaluator.evaluate(experiment, candidate).await?);
-    }
-    Ok(evaluations)
-}
-
-async fn submit_evaluations(
-    engine: &LocalConsensusEngine,
-    evaluations: &[Evaluation],
-) -> Result<(), ConsensusError> {
-    for evaluation in evaluations {
-        engine.submit_evaluation(evaluation.clone()).await?;
-    }
-    Ok(())
 }
 
 async fn build_report(
@@ -197,7 +137,7 @@ fn candidate_reports(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::evaluator::{EvaluationWorkspace, TestResult};
+    use crate::evaluator::TestResult;
     use crate::generator::PatchResponse;
     use crate::types::{
         FitnessCriterion, MetricType, ModificationScope, PathPattern, ProposalTier, Severity,
@@ -222,15 +162,15 @@ mod tests {
 
     #[async_trait]
     impl EvaluationWorkspace for FailingWorkspace {
-        async fn apply_patch(&self, _patch: &str) -> Result<(), ConsensusError> {
+        async fn apply_patch(&self, _patch: &str) -> crate::error::Result<()> {
             Ok(())
         }
 
-        async fn build(&self) -> Result<(), ConsensusError> {
+        async fn build(&self) -> crate::error::Result<()> {
             Err(ConsensusError::BuildFailed("build failed".into()))
         }
 
-        async fn test(&self) -> Result<TestResult, ConsensusError> {
+        async fn test(&self) -> crate::error::Result<TestResult> {
             Err(ConsensusError::TestFailed {
                 passed: 0,
                 failed: 1,
@@ -238,11 +178,18 @@ mod tests {
             })
         }
 
-        async fn check_signal(&self, _signal: &Signal) -> Result<bool, ConsensusError> {
+        async fn check_signal(&self, _signal: &Signal) -> crate::error::Result<bool> {
             Ok(false)
         }
 
-        async fn reset(&self) -> Result<(), ConsensusError> {
+        async fn check_regression(
+            &self,
+            _experiment: &crate::types::Experiment,
+        ) -> crate::error::Result<bool> {
+            Ok(false)
+        }
+
+        async fn reset(&self) -> crate::error::Result<()> {
             Ok(())
         }
     }
@@ -253,7 +200,7 @@ mod tests {
             &self,
             _system_prompt: &str,
             _experiment: &crate::types::Experiment,
-        ) -> Result<PatchResponse, ConsensusError> {
+        ) -> crate::error::Result<PatchResponse> {
             Ok(PatchResponse {
                 patch: self.patch.clone(),
                 approach: self.approach.clone(),
@@ -264,16 +211,16 @@ mod tests {
 
     #[async_trait]
     impl EvaluationWorkspace for PatchAwareWorkspace {
-        async fn apply_patch(&self, patch: &str) -> Result<(), ConsensusError> {
+        async fn apply_patch(&self, patch: &str) -> crate::error::Result<()> {
             *self.current_patch.lock().expect("patch lock") = patch.to_owned();
             Ok(())
         }
 
-        async fn build(&self) -> Result<(), ConsensusError> {
+        async fn build(&self) -> crate::error::Result<()> {
             Ok(())
         }
 
-        async fn test(&self) -> Result<TestResult, ConsensusError> {
+        async fn test(&self) -> crate::error::Result<TestResult> {
             let patch = self.current_patch.lock().expect("patch lock").clone();
             match patch.as_str() {
                 value if value.contains("node-a") => Ok(TestResult {
@@ -299,12 +246,19 @@ mod tests {
             }
         }
 
-        async fn check_signal(&self, _signal: &Signal) -> Result<bool, ConsensusError> {
+        async fn check_signal(&self, _signal: &Signal) -> crate::error::Result<bool> {
             let patch = self.current_patch.lock().expect("patch lock").clone();
             Ok(patch.contains("node-c"))
         }
 
-        async fn reset(&self) -> Result<(), ConsensusError> {
+        async fn check_regression(
+            &self,
+            _experiment: &crate::types::Experiment,
+        ) -> crate::error::Result<bool> {
+            Ok(false)
+        }
+
+        async fn reset(&self) -> crate::error::Result<()> {
             *self.current_patch.lock().expect("patch lock") = String::new();
             Ok(())
         }

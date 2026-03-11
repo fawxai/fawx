@@ -23,38 +23,13 @@ pub trait EvaluationWorkspace: Send + Sync {
     async fn build(&self) -> Result<(), ConsensusError>;
     async fn test(&self) -> Result<TestResult, ConsensusError>;
     async fn check_signal(&self, signal: &Signal) -> Result<bool, ConsensusError>;
+    async fn check_regression(&self, experiment: &Experiment) -> Result<bool, ConsensusError>;
     async fn reset(&self) -> Result<(), ConsensusError>;
-}
-
-pub struct MockEvaluationWorkspace {
-    reset_result: Result<(), ConsensusError>,
-    patch_result: Result<(), ConsensusError>,
-    build_result: Result<(), ConsensusError>,
-    test_result: Result<TestResult, ConsensusError>,
-    signal_present: bool,
 }
 
 impl BuildTestEvaluator {
     pub fn new(node_id: NodeId, workspace: Box<dyn EvaluationWorkspace>) -> Self {
         Self { node_id, workspace }
-    }
-}
-
-impl MockEvaluationWorkspace {
-    pub fn new(
-        reset_result: Result<(), ConsensusError>,
-        patch_result: Result<(), ConsensusError>,
-        build_result: Result<(), ConsensusError>,
-        test_result: Result<TestResult, ConsensusError>,
-        signal_present: bool,
-    ) -> Self {
-        Self {
-            reset_result,
-            patch_result,
-            build_result,
-            test_result,
-            signal_present,
-        }
     }
 }
 
@@ -66,44 +41,30 @@ impl CandidateEvaluator for BuildTestEvaluator {
         candidate: &Candidate,
     ) -> Result<Evaluation, ConsensusError> {
         self.workspace.reset().await?;
-        self.workspace.apply_patch(&candidate.patch).await?;
-        let build_ok = self.workspace.build().await.is_ok();
+        if self.workspace.apply_patch(&candidate.patch).await.is_err() {
+            return Ok(failed_evaluation(candidate, self.node_id.clone()));
+        }
+
+        if self.workspace.build().await.is_err() {
+            return Ok(failed_evaluation(candidate, self.node_id.clone()));
+        }
+
         let test_result = collect_test_result(&*self.workspace).await?;
-        let signal_present = self.workspace.check_signal(&experiment.trigger).await?;
+        let signal_resolved = check_signal_resolved(&*self.workspace, experiment).await;
+        let regression_detected = check_regression_detected(&*self.workspace, experiment).await;
+
         Ok(build_evaluation(
             candidate,
             self.node_id.clone(),
-            build_ok,
+            true,
             test_result,
-            signal_present,
+            signal_resolved,
+            regression_detected,
         ))
     }
 
     fn node_id(&self) -> &NodeId {
         &self.node_id
-    }
-}
-
-#[async_trait]
-impl EvaluationWorkspace for MockEvaluationWorkspace {
-    async fn apply_patch(&self, _patch: &str) -> Result<(), ConsensusError> {
-        clone_result(&self.patch_result)
-    }
-
-    async fn build(&self) -> Result<(), ConsensusError> {
-        clone_result(&self.build_result)
-    }
-
-    async fn test(&self) -> Result<TestResult, ConsensusError> {
-        clone_result(&self.test_result)
-    }
-
-    async fn check_signal(&self, _signal: &Signal) -> Result<bool, ConsensusError> {
-        Ok(self.signal_present)
-    }
-
-    async fn reset(&self) -> Result<(), ConsensusError> {
-        clone_result(&self.reset_result)
     }
 }
 
@@ -125,25 +86,60 @@ async fn collect_test_result(
     }
 }
 
+async fn check_signal_resolved(
+    workspace: &dyn EvaluationWorkspace,
+    experiment: &Experiment,
+) -> bool {
+    match workspace.check_signal(&experiment.trigger).await {
+        Ok(signal_present) => !signal_present,
+        Err(_) => false,
+    }
+}
+
+async fn check_regression_detected(
+    workspace: &dyn EvaluationWorkspace,
+    experiment: &Experiment,
+) -> bool {
+    workspace
+        .check_regression(experiment)
+        .await
+        .unwrap_or(false)
+}
+
 fn build_evaluation(
     candidate: &Candidate,
     evaluator_id: NodeId,
     build_ok: bool,
     test_result: TestResult,
-    signal_present: bool,
+    signal_resolved: bool,
+    regression_detected: bool,
 ) -> Evaluation {
-    let signal_resolved = !signal_present;
-    let safety_pass = build_ok && test_result.failed == 0;
+    let safety_pass = build_ok && test_result.failed == 0 && !regression_detected;
     Evaluation {
         candidate_id: candidate.id,
         evaluator_id,
         fitness_scores: fitness_scores(build_ok, &test_result, signal_resolved),
         safety_pass,
         signal_resolved,
-        regression_detected: false,
-        notes: evaluation_notes(build_ok, &test_result, signal_resolved),
+        regression_detected,
+        notes: evaluation_notes(build_ok, &test_result, signal_resolved, regression_detected),
         created_at: Utc::now(),
     }
+}
+
+fn failed_evaluation(candidate: &Candidate, evaluator_id: NodeId) -> Evaluation {
+    build_evaluation(
+        candidate,
+        evaluator_id,
+        false,
+        TestResult {
+            passed: 0,
+            failed: 0,
+            total: 0,
+        },
+        false,
+        false,
+    )
 }
 
 fn fitness_scores(
@@ -158,9 +154,14 @@ fn fitness_scores(
     ])
 }
 
-fn evaluation_notes(build_ok: bool, test_result: &TestResult, signal_resolved: bool) -> String {
+fn evaluation_notes(
+    build_ok: bool,
+    test_result: &TestResult,
+    signal_resolved: bool,
+    regression_detected: bool,
+) -> String {
     format!(
-        "build_ok={build_ok}; tests={}/{}, failed={}; signal_resolved={signal_resolved}",
+        "build_ok={build_ok}; tests={}/{}, failed={}; signal_resolved={signal_resolved}; regression_detected={regression_detected}",
         test_result.passed, test_result.total, test_result.failed,
     )
 }
@@ -180,12 +181,69 @@ fn bool_score(value: bool) -> f64 {
     }
 }
 
-fn clone_result<T: Clone>(result: &Result<T, ConsensusError>) -> Result<T, ConsensusError> {
-    result.clone()
+#[cfg(test)]
+mod test_support {
+    use super::*;
+
+    pub struct MockEvaluationWorkspace {
+        reset_result: Result<(), ConsensusError>,
+        patch_result: Result<(), ConsensusError>,
+        build_result: Result<(), ConsensusError>,
+        test_result: Result<TestResult, ConsensusError>,
+        signal_result: Result<bool, ConsensusError>,
+        regression_result: Result<bool, ConsensusError>,
+    }
+
+    impl MockEvaluationWorkspace {
+        pub fn new(
+            reset_result: Result<(), ConsensusError>,
+            patch_result: Result<(), ConsensusError>,
+            build_result: Result<(), ConsensusError>,
+            test_result: Result<TestResult, ConsensusError>,
+            signal_result: Result<bool, ConsensusError>,
+        ) -> Self {
+            Self {
+                reset_result,
+                patch_result,
+                build_result,
+                test_result,
+                signal_result,
+                regression_result: Ok(false),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl EvaluationWorkspace for MockEvaluationWorkspace {
+        async fn apply_patch(&self, _patch: &str) -> Result<(), ConsensusError> {
+            self.patch_result.clone()
+        }
+
+        async fn build(&self) -> Result<(), ConsensusError> {
+            self.build_result.clone()
+        }
+
+        async fn test(&self) -> Result<TestResult, ConsensusError> {
+            self.test_result.clone()
+        }
+
+        async fn check_signal(&self, _signal: &Signal) -> Result<bool, ConsensusError> {
+            self.signal_result.clone()
+        }
+
+        async fn check_regression(&self, _experiment: &Experiment) -> Result<bool, ConsensusError> {
+            self.regression_result.clone()
+        }
+
+        async fn reset(&self) -> Result<(), ConsensusError> {
+            self.reset_result.clone()
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::MockEvaluationWorkspace;
     use super::*;
     use crate::types::tests::{sample_candidate, sample_experiment};
 
@@ -202,7 +260,7 @@ mod tests {
                 failed: 0,
                 total: 4,
             }),
-            false,
+            Ok(false),
         ));
 
         let evaluation = evaluator
@@ -212,6 +270,7 @@ mod tests {
 
         assert!(evaluation.safety_pass);
         assert!(evaluation.signal_resolved);
+        assert!(!evaluation.regression_detected);
         assert_eq!(evaluation.fitness_scores.get("build_success"), Some(&1.0));
         assert_eq!(evaluation.fitness_scores.get("test_pass_rate"), Some(&1.0));
         assert_eq!(
@@ -229,11 +288,11 @@ mod tests {
             Ok(()),
             Err(ConsensusError::BuildFailed("compile error".into())),
             Ok(TestResult {
-                passed: 0,
+                passed: 4,
                 failed: 0,
-                total: 0,
+                total: 4,
             }),
-            true,
+            Ok(false),
         ));
 
         let evaluation = evaluator
@@ -243,7 +302,13 @@ mod tests {
 
         assert!(!evaluation.safety_pass);
         assert!(!evaluation.signal_resolved);
+        assert!(!evaluation.regression_detected);
         assert_eq!(evaluation.fitness_scores.get("build_success"), Some(&0.0));
+        assert_eq!(evaluation.fitness_scores.get("test_pass_rate"), Some(&0.0));
+        assert_eq!(
+            evaluation.fitness_scores.get("signal_resolution"),
+            Some(&0.0)
+        );
     }
 
     #[tokio::test]
@@ -259,7 +324,7 @@ mod tests {
                 failed: 1,
                 total: 3,
             }),
-            false,
+            Ok(false),
         ));
 
         let evaluation = evaluator
@@ -287,7 +352,60 @@ mod tests {
                 failed: 0,
                 total: 3,
             }),
-            true,
+            Ok(true),
+        ));
+
+        let evaluation = evaluator
+            .evaluate(&experiment, &candidate)
+            .await
+            .expect("evaluate");
+
+        assert!(!evaluation.signal_resolved);
+        assert_eq!(
+            evaluation.fitness_scores.get("signal_resolution"),
+            Some(&0.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn evaluator_returns_unsafe_result_when_patch_application_fails() {
+        let experiment = sample_experiment();
+        let candidate = sample_candidate(experiment.id, "node-a");
+        let evaluator = build_evaluator(MockEvaluationWorkspace::new(
+            Ok(()),
+            Err(ConsensusError::Protocol("patch failed".into())),
+            Ok(()),
+            Ok(TestResult {
+                passed: 1,
+                failed: 0,
+                total: 1,
+            }),
+            Ok(false),
+        ));
+
+        let evaluation = evaluator
+            .evaluate(&experiment, &candidate)
+            .await
+            .expect("evaluate");
+
+        assert!(!evaluation.safety_pass);
+        assert_eq!(evaluation.fitness_scores.get("build_success"), Some(&0.0));
+    }
+
+    #[tokio::test]
+    async fn evaluator_handles_signal_check_failure_gracefully() {
+        let experiment = sample_experiment();
+        let candidate = sample_candidate(experiment.id, "node-a");
+        let evaluator = build_evaluator(MockEvaluationWorkspace::new(
+            Ok(()),
+            Ok(()),
+            Ok(()),
+            Ok(TestResult {
+                passed: 2,
+                failed: 0,
+                total: 2,
+            }),
+            Err(ConsensusError::Protocol("signal failed".into())),
         ));
 
         let evaluation = evaluator

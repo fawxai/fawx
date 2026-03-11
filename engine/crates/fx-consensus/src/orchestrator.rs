@@ -4,24 +4,24 @@ use crate::types::{Candidate, ConsensusResult, Evaluation, Experiment, NodeId};
 use async_trait::async_trait;
 use futures::future::try_join_all;
 
-pub struct ExperimentOrchestrator<E: ConsensusProtocol> {
-    engine: E,
+pub struct ExperimentOrchestrator<'a, E: ConsensusProtocol> {
+    engine: &'a E,
 }
 
-impl<E: ConsensusProtocol> ExperimentOrchestrator<E> {
-    pub fn new(engine: E) -> Self {
+impl<'a, E: ConsensusProtocol> ExperimentOrchestrator<'a, E> {
+    pub fn new(engine: &'a E) -> Self {
         Self { engine }
     }
 
     pub async fn run_experiment(
         &self,
         config: ExperimentConfig,
-        generators: Vec<Box<dyn CandidateGenerator>>,
-        evaluators: Vec<Box<dyn CandidateEvaluator>>,
+        generators: &[Box<dyn CandidateGenerator>],
+        evaluators: &[Box<dyn CandidateEvaluator>],
     ) -> Result<ConsensusResult> {
         let experiment = self.engine.create_experiment(config).await?;
-        let candidates = generate_candidates(&self.engine, &experiment, generators).await?;
-        evaluate_candidates(&self.engine, &experiment, &candidates, evaluators).await?;
+        let candidates = generate_candidates(self.engine, &experiment, generators).await?;
+        evaluate_candidates(self.engine, &experiment, &candidates, evaluators).await?;
         self.engine.finalize(experiment.id).await
     }
 }
@@ -41,11 +41,11 @@ pub trait CandidateEvaluator: Send + Sync {
 async fn generate_candidates<E: ConsensusProtocol>(
     engine: &E,
     experiment: &Experiment,
-    generators: Vec<Box<dyn CandidateGenerator>>,
+    generators: &[Box<dyn CandidateGenerator>],
 ) -> Result<Vec<Candidate>> {
     let candidates = try_join_all(
         generators
-            .into_iter()
+            .iter()
             .map(|generator| async move { generator.generate(experiment).await }),
     )
     .await?;
@@ -57,10 +57,10 @@ async fn evaluate_candidates<E: ConsensusProtocol>(
     engine: &E,
     experiment: &Experiment,
     candidates: &[Candidate],
-    evaluators: Vec<Box<dyn CandidateEvaluator>>,
+    evaluators: &[Box<dyn CandidateEvaluator>],
 ) -> Result<()> {
     for candidate in candidates {
-        let evaluations = generate_evaluations(experiment, candidate, &evaluators).await?;
+        let evaluations = generate_evaluations(experiment, candidate, evaluators).await?;
         submit_evaluations(engine, &evaluations).await?;
     }
     Ok(())
