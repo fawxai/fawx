@@ -323,11 +323,6 @@ impl HeadlessApp {
         &self.active_model
     }
 
-    /// Return the resolved data directory for the current config.
-    pub fn data_dir(&self) -> PathBuf {
-        configured_data_dir(&fawx_data_dir(), &self.config)
-    }
-
     /// Return the shared config manager (if configured).
     #[cfg(feature = "http")]
     pub fn config_manager(&self) -> Option<&Arc<Mutex<ConfigManager>>> {
@@ -1533,7 +1528,7 @@ fn no_headless_models_available() -> anyhow::Error {
 }
 
 fn seed_router_default_model(router: &mut Arc<ModelRouter>, active_model: &str) {
-    if active_model.is_empty() || router.active_model() == Some(active_model) {
+    if active_model.is_empty() {
         return;
     }
     let Some(router) = Arc::get_mut(router) else {
@@ -1543,7 +1538,7 @@ fn seed_router_default_model(router: &mut Arc<ModelRouter>, active_model: &str) 
         tracing::warn!(
             error = %error,
             model = %active_model,
-            "failed to set router active model"
+            "config default_model not available in router"
         );
     }
 }
@@ -2551,6 +2546,22 @@ mod tests {
 
         assert_eq!(app.active_model, "a-model");
         assert_eq!(app.router.active_model(), Some("a-model"));
+    }
+
+    #[test]
+    fn new_overrides_preselected_router_model_with_config_default_model() {
+        let mut router = static_model_router(&["router-model", "config-model"]);
+        router
+            .set_active("router-model")
+            .expect("set active should work");
+
+        let mut config = FawxConfig::default();
+        config.model.default_model = Some("config-model".to_string());
+
+        let app = HeadlessApp::new(headless_deps(router, config)).expect("should build");
+
+        assert_eq!(app.active_model, "config-model");
+        assert_eq!(app.router.active_model(), Some("config-model"));
     }
 
     #[test]

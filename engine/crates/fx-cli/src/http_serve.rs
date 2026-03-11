@@ -561,10 +561,6 @@ fn sanitize_config(value: serde_json::Value) -> serde_json::Value {
     crate::config_redaction::sanitize_json(value)
 }
 
-fn is_secret_key(key: &str) -> bool {
-    crate::config_redaction::is_secret_key(key)
-}
-
 fn sanitized_status_config(app: &HeadlessApp) -> Option<serde_json::Value> {
     let manager = app.config_manager()?;
     let guard = manager.lock().ok()?;
@@ -2265,7 +2261,10 @@ mod tests {
                 "credential",
                 "db_credential",
             ] {
-                assert!(is_secret_key(key), "expected `{key}` to be redacted");
+                assert!(
+                    crate::config_redaction::is_secret_key(key),
+                    "expected `{key}` to be redacted"
+                );
             }
         }
 

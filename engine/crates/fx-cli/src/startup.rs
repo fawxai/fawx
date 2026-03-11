@@ -1290,17 +1290,6 @@ pub fn build_router(auth_manager: &AuthManager) -> Result<ModelRouter, StartupEr
         }
     }
 
-    if let Some(first_model) = router
-        .available_models()
-        .into_iter()
-        .next()
-        .map(|model| model.model_id)
-    {
-        if let Err(error) = router.set_active(&first_model) {
-            eprintln!("failed to set initial model {first_model}: {error}");
-        }
-    }
-
     Ok(router)
 }
 
@@ -2030,6 +2019,25 @@ mod tests {
         assert!(openai_models
             .iter()
             .any(|model| model.model_id == "gpt-5.3-codex"));
+    }
+
+    #[test]
+    fn build_router_does_not_preselect_active_model() {
+        let mut auth_manager = AuthManager::new();
+        auth_manager.store(
+            "anthropic",
+            AuthMethod::SetupToken {
+                token: "setup-token-no-default".to_string(),
+            },
+        );
+
+        let router = build_router(&auth_manager).expect("router should build");
+
+        assert!(
+            !router.available_models().is_empty(),
+            "router should expose available models"
+        );
+        assert_eq!(router.active_model(), None);
     }
 
     #[test]
