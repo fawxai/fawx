@@ -8,6 +8,15 @@ use std::path::{Path, PathBuf};
 
 const GENESIS_HASH: &str = "genesis";
 
+struct HashInput<'a> {
+    index: u64,
+    previous_hash: &'a str,
+    experiment: &'a Experiment,
+    result: &'a ConsensusResult,
+    winning_patch: &'a Option<String>,
+    applied_at: &'a Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChainEntry {
     pub index: u64,
@@ -128,14 +137,14 @@ impl Chain {
         applied_at: Option<DateTime<Utc>>,
     ) -> Result<ChainEntry> {
         let index = self.entries.len() as u64;
-        let hash = compute_hash(
+        let hash = compute_hash(HashInput {
             index,
-            &self.head_hash,
-            &experiment,
-            &result,
-            &winning_patch,
-            &applied_at,
-        )?;
+            previous_hash: &self.head_hash,
+            experiment: &experiment,
+            result: &result,
+            winning_patch: &winning_patch,
+            applied_at: &applied_at,
+        })?;
         Ok(ChainEntry {
             index,
             previous_hash: self.head_hash.clone(),
@@ -159,14 +168,14 @@ fn verify_entry_link(entry: &ChainEntry, index: usize, previous_hash: &str) -> R
 }
 
 fn verify_entry_hash(entry: &ChainEntry, index: usize) -> Result<()> {
-    let expected = compute_hash(
-        entry.index,
-        &entry.previous_hash,
-        &entry.experiment,
-        &entry.result,
-        &entry.winning_patch,
-        &entry.applied_at,
-    )?;
+    let expected = compute_hash(HashInput {
+        index: entry.index,
+        previous_hash: &entry.previous_hash,
+        experiment: &entry.experiment,
+        result: &entry.result,
+        winning_patch: &entry.winning_patch,
+        applied_at: &entry.applied_at,
+    })?;
     if entry.hash != expected {
         return Err(ConsensusError::ChainIntegrity {
             index,
@@ -176,21 +185,14 @@ fn verify_entry_hash(entry: &ChainEntry, index: usize) -> Result<()> {
     Ok(())
 }
 
-fn compute_hash(
-    index: u64,
-    previous_hash: &str,
-    experiment: &Experiment,
-    result: &ConsensusResult,
-    winning_patch: &Option<String>,
-    applied_at: &Option<DateTime<Utc>>,
-) -> Result<String> {
+fn compute_hash(input: HashInput<'_>) -> Result<String> {
     let payload = serde_json::json!({
-        "index": index,
-        "previous_hash": previous_hash,
-        "experiment": experiment,
-        "result": result,
-        "winning_patch": winning_patch,
-        "applied_at": applied_at,
+        "index": input.index,
+        "previous_hash": input.previous_hash,
+        "experiment": input.experiment,
+        "result": input.result,
+        "winning_patch": input.winning_patch,
+        "applied_at": input.applied_at,
     });
     let encoded =
         serde_json::to_vec(&payload).map_err(|error| ConsensusError::Storage(error.to_string()))?;

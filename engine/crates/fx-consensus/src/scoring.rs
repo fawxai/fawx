@@ -5,6 +5,7 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CandidateStatus {
     Accepted,
+    NotEvaluated,
     RejectedSafety,
     RejectedSignal,
     RejectedRegression,
@@ -65,25 +66,16 @@ fn is_accepted(candidate_id: Uuid, candidate_statuses: &[(Uuid, CandidateStatus)
 }
 
 fn decision_without_winner(candidate_statuses: &[(Uuid, CandidateStatus)]) -> Decision {
-    if candidate_statuses.is_empty() {
+    if candidate_statuses.is_empty() || !any_candidate_was_evaluated(candidate_statuses) {
         return Decision::Inconclusive;
     }
-    if all_have_status(candidate_statuses, CandidateStatus::RejectedSafety) {
-        return Decision::Reject;
-    }
-    if all_have_status(candidate_statuses, CandidateStatus::RejectedSignal) {
-        return Decision::Reject;
-    }
-    Decision::Inconclusive
+    Decision::Reject
 }
 
-fn all_have_status(
-    candidate_statuses: &[(Uuid, CandidateStatus)],
-    expected: CandidateStatus,
-) -> bool {
+fn any_candidate_was_evaluated(candidate_statuses: &[(Uuid, CandidateStatus)]) -> bool {
     candidate_statuses
         .iter()
-        .all(|(_, status)| *status == expected)
+        .any(|(_, status)| *status != CandidateStatus::NotEvaluated)
 }
 
 fn candidate_status(candidate_id: Uuid, evaluations: &[Evaluation]) -> CandidateStatus {
@@ -95,7 +87,10 @@ fn candidate_status(candidate_id: Uuid, evaluations: &[Evaluation]) -> Candidate
 }
 
 fn evaluate_candidate(evaluations: &[&Evaluation]) -> CandidateStatus {
-    if evaluations.is_empty() || !all_safe(evaluations) {
+    if evaluations.is_empty() {
+        return CandidateStatus::NotEvaluated;
+    }
+    if !all_safe(evaluations) {
         return CandidateStatus::RejectedSafety;
     }
     if !has_signal_majority(evaluations) {
@@ -258,5 +253,31 @@ mod tests {
         let result = determine_winner(&scores, &[reg_a, reg_b, ok_a, ok_b]);
 
         assert_eq!(result, (Decision::Accept, Some(accepted_candidate)));
+    }
+
+    #[test]
+    fn rejects_when_candidates_fail_different_gates() {
+        let safety_rejected = Uuid::new_v4();
+        let signal_rejected = Uuid::new_v4();
+        let mut unsafe_eval = sample_evaluation(safety_rejected, "node-b", 1.0);
+        unsafe_eval.safety_pass = false;
+        let mut unresolved_a = sample_evaluation(signal_rejected, "node-c", 1.0);
+        let mut unresolved_b = sample_evaluation(signal_rejected, "node-d", 1.0);
+        unresolved_a.signal_resolved = false;
+        unresolved_b.signal_resolved = false;
+        let scores = BTreeMap::from([(safety_rejected, 10.0), (signal_rejected, 9.0)]);
+
+        let result = determine_winner(&scores, &[unsafe_eval, unresolved_a, unresolved_b]);
+
+        assert_eq!(result, (Decision::Reject, None));
+    }
+
+    #[test]
+    fn stays_inconclusive_when_candidates_have_no_evaluations() {
+        let scores = BTreeMap::from([(Uuid::new_v4(), 10.0)]);
+
+        let result = determine_winner(&scores, &[]);
+
+        assert_eq!(result, (Decision::Inconclusive, None));
     }
 }

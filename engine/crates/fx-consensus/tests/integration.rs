@@ -91,7 +91,7 @@ fn records_reject_when_signal_is_not_resolved_by_majority() {
 }
 
 #[test]
-fn records_inconclusive_when_candidates_fail_for_mixed_reasons() {
+fn records_reject_when_candidates_fail_for_mixed_reasons() {
     let experiment = sample_experiment();
     let candidate_a = sample_candidate(experiment.id, "node-a");
     let candidate_b = sample_candidate(experiment.id, "node-b");
@@ -114,7 +114,7 @@ fn records_inconclusive_when_candidates_fail_for_mixed_reasons() {
 
     assert_eq!(
         chain.head().map(|entry| entry.result.decision.clone()),
-        Some(Decision::Inconclusive)
+        Some(Decision::Reject)
     );
 }
 
