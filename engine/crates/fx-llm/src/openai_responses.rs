@@ -10,7 +10,6 @@ use http::{header::HeaderValue, Request};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
 use tokio_tungstenite::tungstenite::{
     self,
     client::IntoClientRequest,
@@ -18,6 +17,7 @@ use tokio_tungstenite::tungstenite::{
     Message as WsMessage,
 };
 
+use crate::openai_common::{filter_model_ids, OpenAiModelsResponse};
 use crate::provider::{CompletionStream, LlmProvider, ProviderCapabilities};
 use crate::sse::{SseFrame, SseFramer};
 use crate::types::{
@@ -833,6 +833,10 @@ impl LlmProvider for OpenAiResponsesProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<String>, LlmError> {
+        if self.access_token.trim().is_empty() {
+            return Ok(self.supported_models());
+        }
+
         match self.fetch_models().await {
             Ok(models) if !models.is_empty() => Ok(models),
             Ok(_) => Ok(self.supported_models()),
@@ -873,43 +877,9 @@ async fn parse_model_response(
     Ok(filter_model_ids(parsed.data, supported_models))
 }
 
-fn filter_model_ids(models: Vec<OpenAiModel>, supported_models: &[String]) -> Vec<String> {
-    models
-        .into_iter()
-        .filter_map(|model| filter_model_id(&model.id, supported_models))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
-}
-
-fn filter_model_id(model_id: &str, supported_models: &[String]) -> Option<String> {
-    if supported_models
-        .iter()
-        .any(|supported| supported == model_id)
-    {
-        return Some(model_id.to_string());
-    }
-    let normalized = model_id.to_ascii_lowercase();
-    ["gpt", "o1", "o3", "o4"]
-        .iter()
-        .any(|needle| normalized.contains(needle))
-        .then(|| model_id.to_string())
-}
-
 // ============================================================================
 // Request/Response types
 // ============================================================================
-
-#[derive(Debug, Deserialize)]
-struct OpenAiModelsResponse {
-    #[serde(default)]
-    data: Vec<OpenAiModel>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiModel {
-    id: String,
-}
 
 #[derive(Serialize)]
 struct ResponsesRequestBody {
@@ -1260,6 +1230,18 @@ mod tests {
             .expect("provider")
             .with_base_url(base_url)
             .with_supported_models(vec!["gpt-4o-mini".to_string()]);
+
+        let models = provider.list_models().await.expect("list models");
+
+        assert_eq!(models, vec!["gpt-4o-mini".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn list_models_returns_supported_models_when_token_is_empty() {
+        let mut provider = OpenAiResponsesProvider::new("test-token", "test-account")
+            .expect("provider")
+            .with_supported_models(vec!["gpt-4o-mini".to_string()]);
+        provider.access_token.clear();
 
         let models = provider.list_models().await.expect("list models");
 

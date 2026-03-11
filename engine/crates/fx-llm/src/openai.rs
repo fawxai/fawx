@@ -7,9 +7,10 @@ use futures::{stream, Stream, StreamExt};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::time::Duration;
 
+use crate::openai_common::{filter_model_ids, OpenAiModelsResponse};
 use crate::provider::{CompletionStream, LlmProvider, ProviderCapabilities};
 use crate::sse::{SseFrame, SseFramer};
 use crate::streaming::{collect_completion_stream, StreamCallback};
@@ -495,35 +496,6 @@ async fn parse_model_response(
     Ok(filter_model_ids(parsed.data, supported_models))
 }
 
-fn filter_model_ids(models: Vec<OpenAiModel>, supported_models: &[String]) -> Vec<String> {
-    models
-        .into_iter()
-        .filter_map(|model| filter_model_id(&model.id, supported_models))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
-}
-
-fn filter_model_id(model_id: &str, supported_models: &[String]) -> Option<String> {
-    if supported_models
-        .iter()
-        .any(|supported| supported == model_id)
-    {
-        return Some(model_id.to_string());
-    }
-    if is_chat_model(model_id) {
-        return Some(model_id.to_string());
-    }
-    None
-}
-
-fn is_chat_model(model_id: &str) -> bool {
-    let normalized = model_id.to_ascii_lowercase();
-    ["gpt", "o1", "o3", "o4"]
-        .iter()
-        .any(|needle| normalized.contains(needle))
-}
-
 fn maybe_push_usage_chunk(chunks: &mut Vec<StreamChunk>, usage: Option<OpenAiUsage>) {
     let Some(usage) = usage else {
         return;
@@ -760,17 +732,6 @@ struct OpenAiToolCall {
 struct OpenAiFunctionCall {
     name: String,
     arguments: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiModelsResponse {
-    #[serde(default)]
-    data: Vec<OpenAiModel>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiModel {
-    id: String,
 }
 
 #[derive(Debug, Deserialize)]
