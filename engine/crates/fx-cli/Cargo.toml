@@ -81,6 +81,7 @@ urlencoding = "2.1"
 chrono = "0.4"
 
 [dev-dependencies]
+syn = { version = "2", features = ["full"] }
 fx-config = { workspace = true, features = ["test-support"] }
 fx-embeddings = { workspace = true, features = ["test-support"] }
 fx-subagent = { workspace = true, features = ["test-support"] }

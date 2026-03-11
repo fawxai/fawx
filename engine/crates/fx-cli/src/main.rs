@@ -275,9 +275,18 @@ enum SkillCommands {
     },
 
     /// Scaffold a new skill project
-    New {
+    Create {
         /// Name for the new skill
         name: String,
+        /// Comma-separated capabilities to pre-fill in the manifest
+        #[arg(long)]
+        capabilities: Option<String>,
+        /// Primary tool name in the manifest
+        #[arg(long)]
+        tool_name: Option<String>,
+        /// Directory to create the project in
+        #[arg(long)]
+        path: Option<String>,
     },
 }
 
@@ -771,8 +780,18 @@ async fn dispatch_skill(command: SkillCommands) -> anyhow::Result<i32> {
             commands::skills::build(&path, no_sign, no_install)?;
             Ok(0)
         }
-        SkillCommands::New { name } => {
-            commands::skills::scaffold(&name)?;
+        SkillCommands::Create {
+            name,
+            capabilities,
+            tool_name,
+            path,
+        } => {
+            commands::skills::create(
+                &name,
+                capabilities.as_deref(),
+                tool_name.as_deref(),
+                path.as_deref(),
+            )?;
             Ok(0)
         }
     }
@@ -925,7 +944,8 @@ mod tests {
     use super::{build_telegram_channel, telegram_webhook_secret_from_credential_store};
     use super::{
         dispatch_command, fawx_tui_binary_name, find_fawx_tui_binary_from,
-        resolve_ripcord_path_with, ripcord_binary_name, Cli, Commands, FAWX_TUI_NOT_FOUND_MESSAGE,
+        resolve_ripcord_path_with, ripcord_binary_name, Cli, Commands, SkillCommands,
+        FAWX_TUI_NOT_FOUND_MESSAGE,
     };
     use crate::auth_store::AuthStore;
     use crate::restart;
@@ -1025,6 +1045,36 @@ mod tests {
     fn cli_parses_setup_command() {
         let cli = Cli::parse_from(["fawx", "setup", "--force"]);
         assert!(matches!(cli.command, Some(Commands::Setup { force: true })));
+    }
+
+    #[test]
+    fn cli_parses_skill_create_command() {
+        let cli = Cli::parse_from([
+            "fawx",
+            "skill",
+            "create",
+            "weather-skill",
+            "--capabilities",
+            "network,storage",
+            "--tool-name",
+            "weather_tool",
+            "--path",
+            "/tmp/skills",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Skill {
+                command: SkillCommands::Create {
+                    name,
+                    capabilities,
+                    tool_name,
+                    path,
+                }
+            }) if name == "weather-skill"
+                && capabilities.as_deref() == Some("network,storage")
+                && tool_name.as_deref() == Some("weather_tool")
+                && path.as_deref() == Some("/tmp/skills")
+        ));
     }
 
     #[test]
