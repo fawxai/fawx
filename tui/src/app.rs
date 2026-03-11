@@ -43,12 +43,18 @@ const WELCOME_LEFT_WIDTH: usize = 22;
 const WELCOME_COMMAND_WIDTH: usize = 28;
 const MAX_VISIBLE_SKILLS: usize = 8;
 const VERSION_LABEL: &str = concat!("Fawx v", env!("CARGO_PKG_VERSION"));
-const EMPTY_SKILLS_MESSAGE: &str = "No skills installed. Run fawx install to browse.";
+const EMPTY_SKILLS_MESSAGE: &str = "No skills installed. Run /skills or fawx skill install <name>.";
 const DEFAULT_SKILL_ICON: &str = "🧩";
+const ASCII_LOGO_ART: &str = r#"    ___                  
+   / __\__ ___      ___ __
+  / _\/ _` \ \ /\ / \ \/ /
+ / / | (_| |\ V  V / >  < 
+ \/   \__,_| \_/\_/ /_/\_\
+"#;
 const WELCOME_COMMANDS: [(&str, &str); 6] = [
     ("/help", "overview"),
     ("/model", "switch LLM"),
-    ("/skills", "list skills"),
+    ("/skills", "show skills"),
     ("/clear", "clear chat"),
     ("/status", "engine info"),
     ("/quit", "exit"),
@@ -434,6 +440,10 @@ impl App {
                 self.clear_transcript();
                 true
             }
+            Some("/skills") => {
+                self.show_skills_list();
+                true
+            }
             Some("/quit") | Some("/exit") => {
                 self.should_quit = true;
                 true
@@ -556,6 +566,14 @@ impl App {
                 ));
             }
         }
+    }
+
+    fn show_skills_list(&mut self) {
+        let installed = discover_installed_skills();
+        let available = discover_built_skills(&installed);
+        let message = format_skills_message(&installed, &available);
+        self.installed_skills = installed;
+        self.push_system(message);
     }
 
     fn push_system(&mut self, message: impl Into<String>) {
@@ -891,6 +909,8 @@ fn render_logo_art(width: u32) -> anyhow::Result<String> {
     };
     render_logo_variant("fawx-mascot.png", &config)
         .or_else(|_| render_logo_variant("fawx.png", &config))
+        .and_then(validate_logo_art)
+        .or_else(|_| Ok(ASCII_LOGO_ART.to_string()))
 }
 
 fn render_logo_variant(name: &str, config: &RenderConfig) -> anyhow::Result<String> {
@@ -899,6 +919,22 @@ fn render_logo_variant(name: &str, config: &RenderConfig) -> anyhow::Result<Stri
         .join(name);
     render_file(&image_path.to_string_lossy(), config)
         .with_context(|| format!("render splash art {}", image_path.display()))
+}
+
+fn validate_logo_art(art: String) -> anyhow::Result<String> {
+    if logo_art_looks_garbled(&art) {
+        anyhow::bail!("rendered logo art looked garbled")
+    }
+    Ok(art)
+}
+
+fn logo_art_looks_garbled(art: &str) -> bool {
+    let visible = art.chars().filter(|ch| !ch.is_whitespace()).count();
+    if visible == 0 {
+        return true;
+    }
+    let noise = art.chars().filter(|ch| "⣿⣷⣶⣤⣀⠿⡿".contains(*ch)).count();
+    noise * 2 >= visible
 }
 
 fn logo_target_width(area_width: u16) -> Option<u32> {
@@ -916,6 +952,27 @@ fn discover_installed_skills() -> Vec<InstalledSkill> {
         .unwrap_or_default()
 }
 
+fn discover_built_skills(installed: &[InstalledSkill]) -> Vec<InstalledSkill> {
+    let Some(root) = repo_root_from_manifest_dir() else {
+        return Vec::new();
+    };
+    let skills_dir = root.join("skills");
+    let entries = match std::fs::read_dir(skills_dir) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+    let installed = installed
+        .iter()
+        .map(|skill| skill.name.to_lowercase())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut skills = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| read_built_skill(&entry.path(), &installed))
+        .collect::<Vec<_>>();
+    skills.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    skills
+}
+
 fn home_skills_dir() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
     Some(PathBuf::from(home).join(".fawx").join("skills"))
@@ -929,13 +986,47 @@ fn discover_installed_skills_from(path: &Path) -> Vec<InstalledSkill> {
     let mut skills = entries
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.path().is_dir())
-        .map(|entry| read_installed_skill(&entry.path()))
+        .map(|entry| read_skill_manifest(&entry.path()))
         .collect::<Vec<_>>();
     skills.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
     skills
 }
 
-fn read_installed_skill(path: &Path) -> InstalledSkill {
+fn repo_root_from_manifest_dir() -> Option<PathBuf> {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(Path::to_path_buf)
+}
+
+fn read_built_skill(
+    path: &Path,
+    installed: &std::collections::BTreeSet<String>,
+) -> Option<InstalledSkill> {
+    if !built_skill_artifact_exists(path) {
+        return None;
+    }
+    let skill = read_skill_manifest(path);
+    (!installed.contains(&skill.name.to_lowercase())).then_some(skill)
+}
+
+fn built_skill_artifact_exists(path: &Path) -> bool {
+    let package_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    if package_name.is_empty() {
+        return false;
+    }
+    let target_wasm = path
+        .join("target")
+        .join("wasm32-wasi")
+        .join("release")
+        .join(format!("{package_name}.wasm"));
+    let packaged_wasm = path.join("pkg").join(format!("{package_name}.wasm"));
+    target_wasm.exists() || packaged_wasm.exists()
+}
+
+fn read_skill_manifest(path: &Path) -> InstalledSkill {
     let fallback_name = path
         .file_name()
         .and_then(|value| value.to_str())
@@ -989,6 +1080,31 @@ fn default_skill_icon(name: &str) -> &'static str {
         "calculator" => "🧮",
         _ => DEFAULT_SKILL_ICON,
     }
+}
+
+fn format_skills_message(installed: &[InstalledSkill], available: &[InstalledSkill]) -> String {
+    if installed.is_empty() && available.is_empty() {
+        return "No skills found. Build with ./scripts/build.sh --skills".to_string();
+    }
+
+    let mut sections = Vec::new();
+    if !installed.is_empty() {
+        sections.push(format_skill_section("Installed:", '✓', installed));
+    }
+    if !available.is_empty() {
+        sections.push(format_skill_section("Available (built):", '○', available));
+    }
+    sections.join("\n\n")
+}
+
+fn format_skill_section(title: &str, marker: char, skills: &[InstalledSkill]) -> String {
+    let mut lines = vec![title.to_string()];
+    lines.extend(
+        skills
+            .iter()
+            .map(|skill| format!("{marker} {} {}", skill.icon, skill.name)),
+    );
+    lines.join("\n")
 }
 
 fn render_welcome_screen(
@@ -1341,8 +1457,10 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use serde_json::json;
+    use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::OnceLock;
+    use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn test_app() -> App {
@@ -1411,6 +1529,16 @@ mod tests {
                 text: format!("line {index}: this is a deliberately long transcript entry to force wrapping in a narrow viewport"),
             });
         }
+    }
+
+    fn temp_test_dir(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("fawx-tui-{name}-{unique}"));
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
     }
 
     fn env_lock() -> &'static tokio::sync::Mutex<()> {
@@ -1632,7 +1760,17 @@ mod tests {
         let text = rendered_text(&lines).join("\n");
 
         assert!(text.contains("No skills installed."));
-        assert!(text.contains("fawx install"));
+        assert!(text.contains("/skills"));
+        assert!(text.contains("fawx skill"));
+        assert!(text.contains("install <name>"));
+    }
+
+    #[test]
+    fn garbled_logo_art_uses_ascii_fallback() {
+        let art = validate_logo_art("⣿⣿⣿⣿\n⣷⣷⣷⣷".to_string()).unwrap_err();
+
+        assert!(art.to_string().contains("garbled"));
+        assert!(render_logo_art(18).is_ok());
     }
 
     #[test]
@@ -1676,6 +1814,76 @@ mod tests {
             );
         }
         assert!(app.entries.is_empty());
+    }
+
+    #[test]
+    fn discover_built_skills_filters_against_provided_installed_skills() {
+        let built_dir = repo_root_from_manifest_dir()
+            .expect("repo root")
+            .join("skills")
+            .join("test-filtered-built-skill");
+        fs::create_dir_all(built_dir.join("pkg")).expect("built dir");
+        fs::write(
+            built_dir.join("manifest.toml"),
+            "name = \"weather\"\nicon = \"🌤\"\n",
+        )
+        .expect("built manifest");
+        fs::write(
+            built_dir.join("pkg").join("test-filtered-built-skill.wasm"),
+            b"wasm",
+        )
+        .expect("built wasm");
+
+        let built = discover_built_skills(&[skill("weather", "🌤")]);
+
+        fs::remove_dir_all(&built_dir).expect("cleanup built dir");
+
+        assert!(built.iter().all(|skill| skill.name != "weather"));
+    }
+
+    #[test]
+    fn skills_command_shows_installed_and_built_skills() {
+        let _guard = env_lock().blocking_lock();
+        let home = temp_test_dir("home");
+        let previous_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+
+        let installed_dir = home.join(".fawx").join("skills").join("weather-skill");
+        fs::create_dir_all(&installed_dir).expect("installed dir");
+        fs::write(
+            installed_dir.join("manifest.toml"),
+            "name = \"weather\"\nicon = \"🌤\"\n",
+        )
+        .expect("installed manifest");
+
+        let built_dir = repo_root_from_manifest_dir()
+            .expect("repo root")
+            .join("skills")
+            .join("test-built-skill");
+        fs::create_dir_all(built_dir.join("pkg")).expect("built dir");
+        fs::write(
+            built_dir.join("manifest.toml"),
+            "name = \"test-built\"\nicon = \"🧪\"\n",
+        )
+        .expect("built manifest");
+        fs::write(built_dir.join("pkg").join("test-built-skill.wasm"), b"wasm")
+            .expect("built wasm");
+
+        let mut app = test_app();
+        assert!(app.handle_local_command("/skills"));
+        let text = last_entry_text(&app).to_string();
+
+        fs::remove_dir_all(&built_dir).expect("cleanup built dir");
+        match previous_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        fs::remove_dir_all(&home).expect("cleanup home");
+
+        assert!(text.contains("Installed:"));
+        assert!(text.contains("✓ 🌤 weather"));
+        assert!(text.contains("Available (built):"));
+        assert!(text.contains("○ 🧪 test-built"));
     }
 
     #[tokio::test(flavor = "current_thread")]
