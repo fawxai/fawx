@@ -277,7 +277,7 @@ async fn experiment_config_round_trips_through_serde() {
 async fn orchestrator_runs_full_experiment_end_to_end() {
     let engine = create_engine();
     let expected_winner = Uuid::new_v4();
-    let orchestrator = ExperimentOrchestrator::new(engine);
+    let orchestrator = ExperimentOrchestrator::new(&engine);
     let generators: Vec<Box<dyn CandidateGenerator>> = vec![
         Box::new(MockGenerator::new(
             "node-a",
@@ -299,7 +299,7 @@ async fn orchestrator_runs_full_experiment_end_to_end() {
     ];
 
     let result = orchestrator
-        .run_experiment(sample_config(2), generators, evaluators)
+        .run_experiment(sample_config(2), &generators, &evaluators)
         .await
         .expect("orchestration works");
 
@@ -309,9 +309,32 @@ async fn orchestrator_runs_full_experiment_end_to_end() {
 }
 
 #[tokio::test]
+async fn orchestrator_returns_inconclusive_when_self_eval_exclusion_leaves_zero_evaluations() {
+    let engine = create_engine();
+    let orchestrator = ExperimentOrchestrator::new(&engine);
+    let generators: Vec<Box<dyn CandidateGenerator>> = vec![Box::new(MockGenerator::new(
+        "node-a",
+        Uuid::new_v4(),
+        "solo",
+        10.0,
+    ))];
+    let evaluators: Vec<Box<dyn CandidateEvaluator>> = vec![Box::new(MockEvaluator::new("node-a"))];
+
+    let result = orchestrator
+        .run_experiment(sample_config(1), &generators, &evaluators)
+        .await
+        .expect("orchestration works");
+
+    assert_eq!(result.decision, Decision::Inconclusive);
+    assert_eq!(result.winner, None);
+    assert!(result.evaluations.is_empty());
+    assert_eq!(result.candidates.len(), 1);
+}
+
+#[tokio::test]
 async fn orchestrator_generates_candidates_concurrently() {
     let engine = create_engine();
-    let orchestrator = ExperimentOrchestrator::new(engine);
+    let orchestrator = ExperimentOrchestrator::new(&engine);
     let barrier = Arc::new(Barrier::new(2));
     let active = Arc::new(AtomicUsize::new(0));
     let max_active = Arc::new(AtomicUsize::new(0));
@@ -332,7 +355,7 @@ async fn orchestrator_generates_candidates_concurrently() {
     let evaluators: Vec<Box<dyn CandidateEvaluator>> = vec![Box::new(MockEvaluator::new("node-c"))];
 
     orchestrator
-        .run_experiment(sample_config(2), generators, evaluators)
+        .run_experiment(sample_config(2), &generators, &evaluators)
         .await
         .expect("orchestration works");
 
@@ -342,7 +365,7 @@ async fn orchestrator_generates_candidates_concurrently() {
 #[tokio::test]
 async fn orchestrator_evaluates_each_candidate_concurrently() {
     let engine = create_engine();
-    let orchestrator = ExperimentOrchestrator::new(engine);
+    let orchestrator = ExperimentOrchestrator::new(&engine);
     let barrier = Arc::new(Barrier::new(2));
     let active = Arc::new(AtomicUsize::new(0));
     let max_active = Arc::new(AtomicUsize::new(0));
@@ -371,7 +394,7 @@ async fn orchestrator_evaluates_each_candidate_concurrently() {
     ];
 
     orchestrator
-        .run_experiment(sample_config(2), generators, evaluators)
+        .run_experiment(sample_config(2), &generators, &evaluators)
         .await
         .expect("orchestration works");
 
@@ -397,7 +420,14 @@ async fn mock_evaluator_scores_independently_from_candidate_self_metrics() {
         .await
         .expect("evaluation works");
 
-    assert_eq!(evaluation.fitness_scores.get("fitness"), Some(&7.0));
+    // Score should be independent of candidate's self_metrics (999.0).
+    // "candidate-a" approach doesn't contain "winner", so score is 5.0.
+    assert_eq!(evaluation.fitness_scores.get("fitness"), Some(&5.0));
+    assert_ne!(
+        evaluation.fitness_scores.get("fitness"),
+        candidate.self_metrics.get("fitness"),
+        "evaluator must not copy candidate self-metrics"
+    );
 }
 
 fn create_engine() -> LocalConsensusEngine {
@@ -596,10 +626,6 @@ impl MockEvaluator {
             node_id: NodeId::from(node_id),
         }
     }
-
-    fn independent_score(&self) -> f64 {
-        7.0
-    }
 }
 
 #[async_trait]
@@ -609,7 +635,14 @@ impl CandidateEvaluator for MockEvaluator {
         _experiment: &Experiment,
         candidate: &Candidate,
     ) -> Result<Evaluation, ConsensusError> {
-        let score = self.independent_score();
+        // Use candidate's approach text length as a differentiator:
+        // "winner" (6 chars) vs "runner-up" (9 chars) gives different scores.
+        // This ensures independent evaluation that still differentiates candidates.
+        let score = if candidate.approach.contains("winner") {
+            9.0
+        } else {
+            5.0
+        };
         Ok(Evaluation {
             candidate_id: candidate.id,
             evaluator_id: self.node_id.clone(),

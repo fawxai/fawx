@@ -3,7 +3,7 @@ use uuid::Uuid;
 
 pub type Result<T> = std::result::Result<T, ConsensusError>;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Clone)]
 pub enum ConsensusError {
     #[error("chain integrity failure at index {index}: {message}")]
     ChainIntegrity { index: usize, message: String },
@@ -25,4 +25,16 @@ pub enum ConsensusError {
     InsufficientCandidates { required: u32, received: u32 },
     #[error("protocol error: {0}")]
     Protocol(String),
+    #[error("build failed: {0}")]
+    BuildFailed(String),
+    #[error("tests failed: passed {passed}, failed {failed}, total {total}")]
+    TestFailed {
+        passed: u32,
+        failed: u32,
+        total: u32,
+    },
+    #[error("patch failed: {0}")]
+    PatchFailed(String),
+    #[error("workspace error: {0}")]
+    WorkspaceError(String),
 }
