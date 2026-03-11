@@ -55,13 +55,6 @@ pub trait SubagentControl: Send + Sync + Debug {
     async fn spawn(&self, config: SpawnConfig) -> Result<SubagentHandle, SubagentError>;
     async fn status(&self, id: &SubagentId) -> Result<Option<SubagentStatus>, SubagentError>;
     async fn list(&self) -> Result<Vec<SubagentHandle>, SubagentError>;
-    async fn get(&self, id: &SubagentId) -> Result<Option<SubagentHandle>, SubagentError> {
-        Ok(self
-            .list()
-            .await?
-            .into_iter()
-            .find(|handle| handle.id == *id))
-    }
     async fn cancel(&self, id: &SubagentId) -> Result<(), SubagentError>;
     async fn send(&self, id: &SubagentId, message: &str) -> Result<String, SubagentError>;
     async fn gc(&self, max_age: Duration) -> Result<(), SubagentError>;
