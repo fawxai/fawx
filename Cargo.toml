@@ -36,6 +36,7 @@ members = [
     "engine/crates/fx-orchestrator",
     "engine/crates/fx-journal",
     "engine/crates/fx-session",
+    "engine/crates/fx-consensus",
 ]
 exclude = [
     "skills/calculator-skill",
