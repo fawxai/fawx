@@ -309,6 +309,29 @@ async fn orchestrator_runs_full_experiment_end_to_end() {
 }
 
 #[tokio::test]
+async fn orchestrator_returns_inconclusive_when_self_eval_exclusion_leaves_zero_evaluations() {
+    let engine = create_engine();
+    let orchestrator = ExperimentOrchestrator::new(&engine);
+    let generators: Vec<Box<dyn CandidateGenerator>> = vec![Box::new(MockGenerator::new(
+        "node-a",
+        Uuid::new_v4(),
+        "solo",
+        10.0,
+    ))];
+    let evaluators: Vec<Box<dyn CandidateEvaluator>> = vec![Box::new(MockEvaluator::new("node-a"))];
+
+    let result = orchestrator
+        .run_experiment(sample_config(1), &generators, &evaluators)
+        .await
+        .expect("orchestration works");
+
+    assert_eq!(result.decision, Decision::Inconclusive);
+    assert_eq!(result.winner, None);
+    assert!(result.evaluations.is_empty());
+    assert_eq!(result.candidates.len(), 1);
+}
+
+#[tokio::test]
 async fn orchestrator_generates_candidates_concurrently() {
     let engine = create_engine();
     let orchestrator = ExperimentOrchestrator::new(&engine);

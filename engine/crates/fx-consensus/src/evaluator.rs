@@ -100,10 +100,7 @@ async fn check_regression_detected(
     workspace: &dyn EvaluationWorkspace,
     experiment: &Experiment,
 ) -> bool {
-    workspace
-        .check_regression(experiment)
-        .await
-        .unwrap_or(false)
+    workspace.check_regression(experiment).await.unwrap_or(true)
 }
 
 fn build_evaluation(
@@ -201,6 +198,7 @@ mod test_support {
             build_result: Result<(), ConsensusError>,
             test_result: Result<TestResult, ConsensusError>,
             signal_result: Result<bool, ConsensusError>,
+            regression_result: Result<bool, ConsensusError>,
         ) -> Self {
             Self {
                 reset_result,
@@ -208,7 +206,7 @@ mod test_support {
                 build_result,
                 test_result,
                 signal_result,
-                regression_result: Ok(false),
+                regression_result,
             }
         }
     }
@@ -261,6 +259,7 @@ mod tests {
                 total: 4,
             }),
             Ok(false),
+            Ok(false),
         ));
 
         let evaluation = evaluator
@@ -292,6 +291,7 @@ mod tests {
                 failed: 0,
                 total: 4,
             }),
+            Ok(false),
             Ok(false),
         ));
 
@@ -325,6 +325,7 @@ mod tests {
                 total: 3,
             }),
             Ok(false),
+            Ok(false),
         ));
 
         let evaluation = evaluator
@@ -353,6 +354,7 @@ mod tests {
                 total: 3,
             }),
             Ok(true),
+            Ok(false),
         ));
 
         let evaluation = evaluator
@@ -381,6 +383,7 @@ mod tests {
                 total: 1,
             }),
             Ok(false),
+            Ok(false),
         ));
 
         let evaluation = evaluator
@@ -406,6 +409,7 @@ mod tests {
                 total: 2,
             }),
             Err(ConsensusError::Protocol("signal failed".into())),
+            Ok(false),
         ));
 
         let evaluation = evaluator
@@ -418,6 +422,32 @@ mod tests {
             evaluation.fitness_scores.get("signal_resolution"),
             Some(&0.0)
         );
+    }
+
+    #[tokio::test]
+    async fn evaluator_fails_closed_when_regression_check_errors() {
+        let experiment = sample_experiment();
+        let candidate = sample_candidate(experiment.id, "node-a");
+        let evaluator = build_evaluator(MockEvaluationWorkspace::new(
+            Ok(()),
+            Ok(()),
+            Ok(()),
+            Ok(TestResult {
+                passed: 2,
+                failed: 0,
+                total: 2,
+            }),
+            Ok(false),
+            Err(ConsensusError::Protocol("regression failed".into())),
+        ));
+
+        let evaluation = evaluator
+            .evaluate(&experiment, &candidate)
+            .await
+            .expect("evaluate");
+
+        assert!(evaluation.regression_detected);
+        assert!(!evaluation.safety_pass);
     }
 
     fn build_evaluator(workspace: MockEvaluationWorkspace) -> BuildTestEvaluator {
