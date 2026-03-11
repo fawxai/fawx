@@ -5,6 +5,7 @@ use fx_subagent::{SpawnConfig, SpawnMode, SubagentControl, SubagentStatus};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::warn;
 
 pub struct SubagentPatchSource {
     manager: Arc<dyn SubagentControl>,
@@ -111,7 +112,60 @@ impl PatchSource for SubagentPatchSource {
             .await
             .map_err(subagent_protocol_error)?;
         let text = self.await_response(&handle.id, experiment.timeout).await?;
-        parse_patch_response(&text)
+        match parse_patch_response(&text) {
+            Ok(response) => Ok(response),
+            Err(parse_error) => {
+                warn!(
+                    error = %parse_error,
+                    "subagent response missing patch tags, falling back to git diff"
+                );
+                fallback_git_diff(&self.working_dir, &text, parse_error).await
+            }
+        }
+    }
+}
+
+async fn fallback_git_diff(
+    working_dir: &std::path::Path,
+    text: &str,
+    parse_error: ConsensusError,
+) -> Result<PatchResponse, ConsensusError> {
+    let output = tokio::process::Command::new("git")
+        .args(["diff", "HEAD"])
+        .current_dir(working_dir)
+        .output()
+        .await
+        .map_err(|err| ConsensusError::Protocol(format!("git diff failed: {err}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        warn!(%stderr, "git diff exited with non-zero status, returning original parse error");
+        return Err(parse_error);
+    }
+    let diff = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if diff.is_empty() {
+        return Err(ConsensusError::Protocol(
+            "subagent made no file changes and provided no patch".to_owned(),
+        ));
+    }
+    let approach = extract_approach_from_text(text);
+    Ok(PatchResponse {
+        patch: diff,
+        approach,
+        self_metrics: std::collections::BTreeMap::new(),
+    })
+}
+
+fn extract_approach_from_text(text: &str) -> String {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(3)
+        .collect();
+    if lines.is_empty() {
+        "Subagent made changes but did not provide an approach summary".to_owned()
+    } else {
+        lines.join(" ")
     }
 }
 
@@ -433,9 +487,31 @@ mod tests {
             .err()
             .expect("missing patch should fail");
 
-        assert!(error
-            .to_string()
-            .contains("generated response did not include a diff patch"));
+        // Fallback runs git diff HEAD on /tmp/project which doesn't exist as a repo,
+        // so it falls back to returning the original parse error
+        let error_text = error.to_string();
+        assert!(
+            error_text.contains("git diff failed")
+                || error_text.contains("no file changes")
+                || error_text.contains("did not include a diff patch"),
+            "unexpected error: {error_text}"
+        );
+    }
+
+    #[test]
+    fn extract_approach_from_text_uses_first_three_lines() {
+        let text = "I added tests for scoring.\nAll tests pass.\nBuild successful.\nExtra line.";
+        let approach = extract_approach_from_text(text);
+        assert_eq!(
+            approach,
+            "I added tests for scoring. All tests pass. Build successful."
+        );
+    }
+
+    #[test]
+    fn extract_approach_from_empty_text_returns_default() {
+        let approach = extract_approach_from_text("");
+        assert!(approach.contains("did not provide an approach"));
     }
 
     fn sample_experiment(timeout: Duration) -> Experiment {
