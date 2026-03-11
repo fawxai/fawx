@@ -88,6 +88,10 @@ impl SubagentControl for SubagentManager {
             .collect())
     }
 
+    async fn get(&self, id: &SubagentId) -> Result<Option<SubagentHandle>, SubagentError> {
+        self.snapshot(id).await
+    }
+
     async fn cancel(&self, id: &SubagentId) -> Result<(), SubagentError> {
         let instance = self.instance(id).await?;
         instance.cancel().await;

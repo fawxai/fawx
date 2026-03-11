@@ -111,12 +111,12 @@ pub fn build_subagent_experiment_prompt(experiment: &Experiment) -> String {
             "- Use edit_file to modify the target files\n",
             "- If you need test helper functions, define them in the same file — do NOT reference helpers from other files unless you verified they are pub and importable\n\n",
             "## Step 3: Verify (MANDATORY — do not skip)\n",
-            "- Run: `cargo build 2>&1` via run_command (from the project root)\n",
-            "- If build fails, read the errors, fix them with edit_file, and rebuild\n",
+            "- Run: `cargo check 2>&1` via run_command (from the project root)\n",
+            "- If check fails, read the errors, fix them with edit_file, and rerun it\n",
             "- Run: `cargo test 2>&1` via run_command\n",
             "- If tests fail, read the errors, fix them with edit_file, and retest\n",
-            "- REPEAT until both build and test pass with zero errors\n",
-            "- You MUST see a successful build and test output before proceeding\n\n",
+            "- REPEAT until both check and test pass with zero errors\n",
+            "- You MUST see a successful cargo check and test output before proceeding\n\n",
             "## Step 4: Output results (ONLY after Step 3 passes)\n",
             "- Run: `git diff` via run_command to capture your changes\n",
             "- Output the diff inside <PATCH> tags\n\n",
@@ -130,7 +130,7 @@ pub fn build_subagent_experiment_prompt(experiment: &Experiment) -> String {
             "{{\"build_success\": 1.0, \"test_pass_rate\": <actual_rate>, \"signal_resolution\": <0.0-1.0>}}\n",
             "</METRICS>\n\n",
             "CRITICAL RULES:\n",
-            "- NEVER output <PATCH> until cargo build AND cargo test pass\n",
+            "- NEVER output <PATCH> until cargo check AND cargo test pass\n",
             "- NEVER assume helper functions exist — define them or verify with read_file\n",
             "- NEVER generate a diff from memory — always use `git diff` output\n",
             "- If you cannot make the code compile after 3 attempts, output an empty <PATCH></PATCH> with build_success: 0.0"
@@ -203,8 +203,8 @@ mod tests {
 
         assert!(prompt.contains("You MUST use tools"));
         assert!(prompt.contains("Use read_file to read EVERY target file"));
-        assert!(prompt.contains("cargo build 2>&1"));
-        assert!(prompt.contains("NEVER output <PATCH> until cargo build AND cargo test pass"));
+        assert!(prompt.contains("cargo check 2>&1"));
+        assert!(prompt.contains("NEVER output <PATCH> until cargo check AND cargo test pass"));
         assert!(prompt.contains("NEVER assume helper functions exist"));
     }
 
