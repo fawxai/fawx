@@ -570,7 +570,7 @@ impl App {
 
     fn show_skills_list(&mut self) {
         let installed = discover_installed_skills();
-        let available = discover_built_skills();
+        let available = discover_built_skills(&installed);
         let message = format_skills_message(&installed, &available);
         self.installed_skills = installed;
         self.push_system(message);
@@ -952,7 +952,7 @@ fn discover_installed_skills() -> Vec<InstalledSkill> {
         .unwrap_or_default()
 }
 
-fn discover_built_skills() -> Vec<InstalledSkill> {
+fn discover_built_skills(installed: &[InstalledSkill]) -> Vec<InstalledSkill> {
     let Some(root) = repo_root_from_manifest_dir() else {
         return Vec::new();
     };
@@ -961,8 +961,8 @@ fn discover_built_skills() -> Vec<InstalledSkill> {
         Ok(entries) => entries,
         Err(_) => return Vec::new(),
     };
-    let installed = discover_installed_skills()
-        .into_iter()
+    let installed = installed
+        .iter()
         .map(|skill| skill.name.to_lowercase())
         .collect::<std::collections::BTreeSet<_>>();
     let mut skills = entries
@@ -986,7 +986,7 @@ fn discover_installed_skills_from(path: &Path) -> Vec<InstalledSkill> {
     let mut skills = entries
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.path().is_dir())
-        .map(|entry| read_installed_skill(&entry.path()))
+        .map(|entry| read_skill_manifest(&entry.path()))
         .collect::<Vec<_>>();
     skills.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
     skills
@@ -1043,10 +1043,6 @@ fn read_skill_manifest(path: &Path) -> InstalledSkill {
         .and_then(|value| parse_manifest_string(value, "icon"))
         .unwrap_or_else(|| default_skill_icon(&name).to_string());
     InstalledSkill { icon, name }
-}
-
-fn read_installed_skill(path: &Path) -> InstalledSkill {
-    read_skill_manifest(path)
 }
 
 fn parse_manifest_string(content: &str, field: &str) -> Option<String> {
@@ -1818,6 +1814,31 @@ mod tests {
             );
         }
         assert!(app.entries.is_empty());
+    }
+
+    #[test]
+    fn discover_built_skills_filters_against_provided_installed_skills() {
+        let built_dir = repo_root_from_manifest_dir()
+            .expect("repo root")
+            .join("skills")
+            .join("test-filtered-built-skill");
+        fs::create_dir_all(built_dir.join("pkg")).expect("built dir");
+        fs::write(
+            built_dir.join("manifest.toml"),
+            "name = \"weather\"\nicon = \"🌤\"\n",
+        )
+        .expect("built manifest");
+        fs::write(
+            built_dir.join("pkg").join("test-filtered-built-skill.wasm"),
+            b"wasm",
+        )
+        .expect("built wasm");
+
+        let built = discover_built_skills(&[skill("weather", "🌤")]);
+
+        fs::remove_dir_all(&built_dir).expect("cleanup built dir");
+
+        assert!(built.iter().all(|skill| skill.name != "weather"));
     }
 
     #[test]
