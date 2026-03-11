@@ -18,7 +18,9 @@ use uuid::Uuid;
 mod format;
 mod placeholders;
 
-use format::{format_chain_entries, format_chain_entry, format_experiment_report};
+use format::{
+    format_chain_entries, format_chain_entry, format_chain_entry_detail, format_experiment_report,
+};
 use placeholders::build_nodes;
 
 const CHAIN_PATH_ENV: &str = "FAWX_CONSENSUS_CHAIN_PATH";
@@ -67,6 +69,12 @@ pub enum ExperimentCommands {
     Show {
         /// Chain entry index
         index: u64,
+        /// Show detailed evaluation breakdown
+        #[arg(long)]
+        detail: bool,
+        /// Show raw JSON
+        #[arg(long)]
+        raw: bool,
     },
 
     /// Verify chain integrity
@@ -96,7 +104,7 @@ pub async fn run(command: ExperimentCommands) -> anyhow::Result<String> {
             .await
         }
         ExperimentCommands::Chain { limit } => show_chain(limit),
-        ExperimentCommands::Show { index } => show_entry(index),
+        ExperimentCommands::Show { index, detail, raw } => show_entry(index, detail, raw),
         ExperimentCommands::Verify => verify_chain(),
     }
 }
@@ -380,17 +388,23 @@ fn show_chain_at(path: PathBuf, limit: usize) -> anyhow::Result<String> {
     Ok(format_chain_entries(&chain, limit))
 }
 
-fn show_entry(index: u64) -> anyhow::Result<String> {
-    show_entry_at(consensus_chain_path(), index)
+fn show_entry(index: u64, detail: bool, raw: bool) -> anyhow::Result<String> {
+    show_entry_at(consensus_chain_path(), index, detail, raw)
 }
 
-fn show_entry_at(path: PathBuf, index: u64) -> anyhow::Result<String> {
+fn show_entry_at(path: PathBuf, index: u64, detail: bool, raw: bool) -> anyhow::Result<String> {
     let chain = load_chain(path)?;
     let entry = chain
         .entries()
         .iter()
         .find(|entry| entry.index == index)
         .ok_or_else(|| anyhow!("Chain entry #{index} not found"))?;
+    if raw {
+        return Ok(serde_json::to_string_pretty(&entry)?);
+    }
+    if detail {
+        return Ok(format_chain_entry_detail(entry));
+    }
     Ok(format_chain_entry(entry))
 }
 
@@ -552,7 +566,7 @@ mod tests {
         let chain_path = temp.path().join("chain.json");
         write_sample_chain(&chain_path);
 
-        let output = show_entry_at(chain_path, 0).expect("show entry");
+        let output = show_entry_at(chain_path, 0, false, false).expect("show entry");
 
         assert!(output.contains("Chain entry #0"));
         assert!(output.contains("Decision: ✅ ACCEPT"));
@@ -565,12 +579,78 @@ mod tests {
     }
 
     #[test]
+    fn show_entry_default_is_summary() {
+        let temp = TempDir::new().expect("temp dir");
+        let chain_path = temp.path().join("chain.json");
+        write_sample_chain(&chain_path);
+
+        let output = show_entry_at(chain_path, 0, false, false).expect("show entry");
+
+        assert!(output.contains("Chain entry #0"));
+        assert!(output.contains("Decision: ✅ ACCEPT"));
+        assert!(output.contains("Winner: node-0"));
+        assert!(output.contains("Scores:"));
+        assert!(!output.contains("Fitness scores:"));
+        assert!(!output.contains("Scope:"));
+    }
+
+    #[test]
+    fn show_entry_detail_formats_evaluations() {
+        let temp = TempDir::new().expect("temp dir");
+        let chain_path = temp.path().join("chain.json");
+        write_sample_chain(&chain_path);
+
+        let output = show_entry_at(chain_path, 0, true, false).expect("show entry detail");
+
+        assert!(output.contains("Chain entry #0"));
+        assert!(output.contains("Scope: src/**/*.rs"));
+        assert!(output.contains("Timeout: 120s"));
+        assert!(output.contains("Candidates:"));
+        assert!(output.contains("node-0 (Conservative)"));
+        assert!(output.contains("Approach: (not stored in chain entry)"));
+        assert!(output.contains("Patch:"));
+        assert!(output.contains("diff --git"));
+        assert!(output.contains("Evaluations:"));
+        assert!(output.contains("[1] Evaluator: node-1"));
+        assert!(output.contains("Build: ✅ PASSED"));
+        assert!(output.contains("Tests: 0 passed / 0 failed / 0 total"));
+        assert!(output.contains("Signal resolved: yes"));
+        assert!(output.contains("Regression detected: no"));
+        assert!(output.contains("Safety pass: yes"));
+        assert!(output.contains("Fitness scores:"));
+        assert!(output.contains("build_success: 1.00 (weight: 0.20)"));
+        assert!(output.contains("test_pass_rate: 0.00 (weight: 0.50)"));
+        assert!(output.contains("signal_resolution: 0.00 (weight: 0.30)"));
+        assert!(
+            output.contains("Notes: build_ok=true; tests=0/0, failed=0; placeholder evaluation")
+        );
+        assert!(output.contains("Decision: ✅ ACCEPT"));
+        assert!(output.contains("Winner: node-0"));
+        assert!(output.contains("Chain hash:"));
+    }
+
+    #[test]
+    fn show_entry_raw_outputs_json() {
+        let temp = TempDir::new().expect("temp dir");
+        let chain_path = temp.path().join("chain.json");
+        write_sample_chain(&chain_path);
+
+        let output = show_entry_at(chain_path.clone(), 0, false, true).expect("show raw entry");
+        let from_raw: fx_consensus::ChainEntry =
+            serde_json::from_str(&output).expect("deserialize chain entry");
+        let chain = load_chain(chain_path).expect("load chain");
+
+        assert_eq!(from_raw, chain.entries()[0]);
+    }
+
+    #[test]
     fn show_entry_with_invalid_index_returns_error() {
         let temp = TempDir::new().expect("temp dir");
         let chain_path = temp.path().join("chain.json");
         write_sample_chain(&chain_path);
 
-        let error = show_entry_at(chain_path, 99).expect_err("missing entry should fail");
+        let error =
+            show_entry_at(chain_path, 99, false, false).expect_err("missing entry should fail");
 
         assert_eq!(error.to_string(), "Chain entry #99 not found");
     }
@@ -783,7 +863,7 @@ mod tests {
                 safety_pass: true,
                 signal_resolved: true,
                 regression_detected: false,
-                notes: "Looks good".to_owned(),
+                notes: "build_ok=true; tests=0/0, failed=0; placeholder evaluation".to_owned(),
                 created_at: timestamp,
             }],
             aggregate_scores: BTreeMap::from([(candidate_id, 8.73)]),
