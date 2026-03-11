@@ -609,13 +609,13 @@ impl App {
         self.render_input(frame, layout[2]);
     }
 
-    /// Render the mascot art, sized to fit the welcome banner left column.
+    /// Render the mascot art once for the fixed welcome banner layout.
     fn sync_logo_art(&mut self) {
         if !self.logo_art.is_empty() {
             return;
         }
-        let width = WELCOME_LEFT_WIDTH as u32;
-        self.logo_art = render_logo_art(width).unwrap_or_else(|_| "🦊".to_string());
+
+        self.logo_art = render_logo_art().unwrap_or_else(|_| "🦊".to_string());
     }
 
     fn render_header(&self) -> Paragraph<'static> {
@@ -892,17 +892,17 @@ fn initial_entries() -> Vec<Entry> {
     }]
 }
 
+const LOGO_RENDER_WIDTH: u32 = 40;
 const LOGO_RENDER_THRESHOLD: u8 = 35;
 
-fn render_logo_art(width: u32) -> anyhow::Result<String> {
+fn render_logo_art() -> anyhow::Result<String> {
     let config = RenderConfig {
-        width: Some(width),
+        width: Some(LOGO_RENDER_WIDTH),
         threshold: LOGO_RENDER_THRESHOLD,
-        gamma: Some(1.8),
+        color: false,
         ..Default::default()
     };
-    render_logo_variant("fawx-new-logo.jpg", &config)
-        .or_else(|_| render_logo_variant("fawx-mascot.png", &config))
+    render_logo_variant("fawx-mascot.png", &config)
         .or_else(|_| render_logo_variant("fawx.png", &config))
         .and_then(validate_logo_art)
         .or_else(|_| Ok(ASCII_LOGO_ART.to_string()))
@@ -1756,7 +1756,7 @@ mod tests {
         let art = validate_logo_art("⣿⣿⣿⣿\n⣷⣷⣷⣷".to_string()).unwrap_err();
 
         assert!(art.to_string().contains("garbled"));
-        assert!(render_logo_art(22).is_ok());
+        assert!(render_logo_art().is_ok());
     }
 
     #[test]
