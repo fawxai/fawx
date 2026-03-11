@@ -2,7 +2,10 @@
 
 use anyhow::{Context, Result};
 use fx_author::{BuildConfig, BuildResult};
-use fx_skills::manifest::{parse_manifest, validate_manifest, Capability};
+use fx_skills::manifest::{
+    parse_manifest, validate_manifest, validate_skill_name as validate_manifest_skill_name,
+    Capability, ALL_CAPABILITIES,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -10,14 +13,6 @@ const MAX_NAME_LEN: usize = 64;
 const MAX_DESCRIPTION_LEN: usize = 1024;
 const MAX_WASM_SIZE: usize = 10 * 1024 * 1024;
 const MAX_CAPABILITIES: usize = 10;
-const VALID_CAPABILITIES: [&str; 5] = [
-    "network",
-    "storage",
-    "notifications",
-    "sensors",
-    "phone_actions",
-];
-
 /// Get the skills directory path.
 fn get_skills_dir() -> Result<PathBuf> {
     let home = dirs::home_dir().context("Failed to get home directory")?;
@@ -118,13 +113,9 @@ fn load_manifest(manifest_path: &Path) -> Result<fx_skills::manifest::SkillManif
 }
 
 fn validate_manifest_fields(manifest: &fx_skills::manifest::SkillManifest) -> Result<()> {
-    if manifest.name.len() > MAX_NAME_LEN {
-        anyhow::bail!("Skill name too long (max {} chars)", MAX_NAME_LEN);
-    }
-
-    if has_invalid_skill_name(&manifest.name) {
-        anyhow::bail!("Invalid skill name: must not contain path separators or '..'");
-    }
+    validate_manifest_name_length(&manifest.name)?;
+    validate_manifest_skill_name(&manifest.name)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
 
     if manifest.description.len() > MAX_DESCRIPTION_LEN {
         anyhow::bail!(
@@ -329,6 +320,7 @@ pub fn create(
     Ok(())
 }
 
+#[derive(Debug)]
 struct CreateOptions {
     name: String,
     tool_name: String,
@@ -367,51 +359,46 @@ fn resolve_parent_dir(path: Option<&str>) -> Result<PathBuf> {
 }
 
 fn validate_skill_name(name: &str) -> Result<()> {
-    if name.trim().is_empty() {
-        anyhow::bail!("name cannot be empty");
+    validate_manifest_name_length(name)?;
+    validate_manifest_skill_name(name).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    if !name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+    {
+        anyhow::bail!("name must contain only alphanumeric characters and hyphens");
     }
+    Ok(())
+}
+
+fn validate_manifest_name_length(name: &str) -> Result<()> {
     if name.len() > MAX_NAME_LEN {
         anyhow::bail!("name must be {} characters or fewer", MAX_NAME_LEN);
-    }
-    if has_invalid_skill_name(name) {
-        anyhow::bail!("name must not contain path separators or '..'");
-    }
-    if !name.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-') {
-        anyhow::bail!("name must contain only alphanumeric characters and hyphens");
     }
     Ok(())
 }
 
 fn parse_capabilities(input: Option<&str>) -> Result<Vec<Capability>> {
     input
-        .map(split_capabilities)
-        .unwrap_or_default()
-        .into_iter()
-        .map(parse_capability)
-        .collect()
-}
-
-fn split_capabilities(input: &str) -> Vec<&str> {
-    input
-        .split(',')
-        .map(str::trim)
-        .filter(|capability| !capability.is_empty())
-        .collect()
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|capability| !capability.is_empty())
+                .map(parse_capability)
+                .collect()
+        })
+        .unwrap_or_else(|| Ok(Vec::new()))
 }
 
 fn parse_capability(capability: &str) -> Result<Capability> {
-    match capability {
-        "network" => Ok(Capability::Network),
-        "storage" => Ok(Capability::Storage),
-        "notifications" => Ok(Capability::Notifications),
-        "sensors" => Ok(Capability::Sensors),
-        "phone_actions" => Ok(Capability::PhoneActions),
-        unknown => anyhow::bail!(
-            "unknown capability '{}', valid: {}",
-            unknown,
-            VALID_CAPABILITIES.join(", ")
-        ),
-    }
+    Capability::parse(capability).ok_or_else(|| {
+        let valid = ALL_CAPABILITIES
+            .iter()
+            .map(|capability| capability.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::anyhow!("unknown capability '{}', valid: {}", capability, valid)
+    })
 }
 
 fn scaffold_skill_project(options: &CreateOptions) -> Result<PathBuf> {
@@ -431,19 +418,19 @@ fn ensure_project_dir_absent(project_dir: &Path) -> Result<()> {
 }
 
 fn write_scaffold_files(project_dir: &Path, options: &CreateOptions) -> Result<()> {
-    write_file(project_dir.join("Cargo.toml"), &cargo_toml(&options.name))?;
+    write_file(&project_dir.join("Cargo.toml"), &cargo_toml(&options.name))?;
     write_file(
-        project_dir.join("manifest.toml"),
+        &project_dir.join("manifest.toml"),
         &manifest_toml(&options.name, &options.tool_name, &options.capabilities),
     )?;
-    write_file(project_dir.join("src/lib.rs"), &lib_rs(&options.name))?;
-    write_file(project_dir.join(".gitignore"), "/target\n")?;
-    write_file(project_dir.join("README.md"), &readme_md(&options.name))?;
+    write_file(&project_dir.join("src/lib.rs"), &lib_rs(&options.name))?;
+    write_file(&project_dir.join(".gitignore"), "/target\n")?;
+    write_file(&project_dir.join("README.md"), &readme_md(&options.name))?;
     Ok(())
 }
 
-fn write_file(path: PathBuf, content: &str) -> Result<()> {
-    fs::write(&path, content).with_context(|| format!("Failed to write file: {}", path.display()))
+fn write_file(path: &Path, content: &str) -> Result<()> {
+    fs::write(path, content).with_context(|| format!("Failed to write file: {}", path.display()))
 }
 
 fn cargo_toml(name: &str) -> String {
@@ -457,7 +444,8 @@ fn cargo_toml(name: &str) -> String {
             "crate-type = [\"cdylib\"]\n\n",
             "[dependencies]\n",
             "# No deps by default — host API is provided via imports\n"
-        )
+        ),
+        name = name
     )
 }
 
@@ -468,7 +456,7 @@ fn manifest_toml(name: &str, tool_name: &str, capabilities: &[Capability]) -> St
             "name = \"{name}\"\n",
             "version = \"0.1.0\"\n",
             "description = \"A Fawx skill\"\n",
-            "author = \"\"\n",
+            "author = \"TODO: set author\"\n",
             "api_version = \"host_api_v2\"\n",
             "entry_point = \"run\"\n",
             "capabilities = [{capabilities}]\n\n",
@@ -480,7 +468,10 @@ fn manifest_toml(name: &str, tool_name: &str, capabilities: &[Capability]) -> St
             "type = \"string\"\n",
             "description = \"TODO: describe the input parameter\"\n",
             "required = true\n"
-        )
+        ),
+        name = name,
+        capabilities = capabilities,
+        tool_name = tool_name
     )
 }
 
@@ -501,20 +492,21 @@ fn lib_rs(name: &str) -> String {
             "/// The host provides input as a JSON string via the `input` parameter.\n",
             "/// Return a JSON string as the tool result.\n",
             "#[no_mangle]\n",
-            "pub extern \"C\" fn run(input_ptr: *const u8, input_len: usize) -> u64 {\n",
-            "    let input = unsafe {\n",
+            "pub extern \"C\" fn run(input_ptr: *const u8, input_len: usize) -> u64 {{\n",
+            "    let input = unsafe {{\n",
             "        let slice = std::slice::from_raw_parts(input_ptr, input_len);\n",
             "        std::str::from_utf8_unchecked(slice)\n",
-            "    };\n\n",
+            "    }};\n\n",
             "    // TODO: implement your skill logic here\n",
-            "    let result = format!(\"{{\\\"result\\\": \\\"Hello from {name}! Input was: {{}}\\\"}}\", input);\n\n",
+            "    let result = format!(\"{{{{\\\"result\\\": \\\"Hello from {name}! Input was: {{}}\\\"}}}}\", input);\n\n",
             "    let bytes = result.into_bytes();\n",
             "    let ptr = bytes.as_ptr() as u64;\n",
             "    let len = bytes.len() as u64;\n",
             "    std::mem::forget(bytes);\n\n",
             "    (ptr << 32) | len\n",
-            "}\n"
-        )
+            "}}\n"
+        ),
+        name = name
     )
 }
 
@@ -531,7 +523,8 @@ fn readme_md(name: &str) -> String {
             "```bash\n",
             "fawx skill install target/wasm32-unknown-unknown/release/{name}.wasm\n",
             "```\n"
-        )
+        ),
+        name = name
     )
 }
 
@@ -573,23 +566,37 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn parse_generated_lib_rs(name: &str) -> syn::File {
+        syn::parse_file(&lib_rs(name)).expect("generated lib.rs should parse as Rust")
+    }
+
     #[test]
     fn create_scaffolds_all_files() {
         let temp_dir = TempDir::new().expect("temp dir");
-        let options = CreateOptions::new("weather-skill", None, None, Some(path_str(temp_dir.path())))
-            .expect("options");
+        let options =
+            CreateOptions::new("weather-skill", None, None, Some(path_str(temp_dir.path())))
+                .expect("options");
 
         let project_dir = scaffold_skill_project(&options).expect("scaffold project");
 
         assert_eq!(project_dir, temp_dir.path().join("weather-skill"));
-        assert_eq!(read(project_dir.join("Cargo.toml")), cargo_toml("weather-skill"));
+        assert_eq!(
+            read(project_dir.join("Cargo.toml")),
+            cargo_toml("weather-skill")
+        );
         assert_eq!(
             read(project_dir.join("manifest.toml")),
             manifest_toml("weather-skill", "weather-skill", &[])
         );
-        assert_eq!(read(project_dir.join("src/lib.rs")), lib_rs("weather-skill"));
+        assert_eq!(
+            read(project_dir.join("src/lib.rs")),
+            lib_rs("weather-skill")
+        );
         assert_eq!(read(project_dir.join(".gitignore")), "/target\n");
-        assert_eq!(read(project_dir.join("README.md")), readme_md("weather-skill"));
+        assert_eq!(
+            read(project_dir.join("README.md")),
+            readme_md("weather-skill")
+        );
     }
 
     #[test]
@@ -630,13 +637,8 @@ mod tests {
     fn create_with_custom_path() {
         let temp_dir = TempDir::new().expect("temp dir");
         let custom_root = temp_dir.path().join("test-skills");
-        let options = CreateOptions::new(
-            "weather-skill",
-            None,
-            None,
-            Some(path_str(&custom_root)),
-        )
-        .expect("options");
+        let options = CreateOptions::new("weather-skill", None, None, Some(path_str(&custom_root)))
+            .expect("options");
 
         let project_dir = scaffold_skill_project(&options).expect("scaffold project");
 
@@ -657,8 +659,9 @@ mod tests {
         let temp_dir = TempDir::new().expect("temp dir");
         let project_dir = temp_dir.path().join("weather-skill");
         fs::create_dir_all(&project_dir).expect("create dir");
-        let options = CreateOptions::new("weather-skill", None, None, Some(path_str(temp_dir.path())))
-            .expect("options");
+        let options =
+            CreateOptions::new("weather-skill", None, None, Some(path_str(temp_dir.path())))
+                .expect("options");
 
         let error = scaffold_skill_project(&options).expect_err("existing directory should fail");
 
@@ -680,6 +683,22 @@ mod tests {
     }
 
     #[test]
+    fn generated_lib_rs_parses_as_rust() {
+        let parsed = parse_generated_lib_rs("weather-skill");
+
+        assert_eq!(parsed.items.len(), 1);
+    }
+
+    #[test]
+    fn generated_lib_rs_keeps_inner_format_braces_escaped() {
+        let generated = lib_rs("weather-skill");
+
+        assert!(generated.contains("format!(\"{{\\\"result\\\":"));
+        assert!(generated.contains("Input was: {}"));
+        assert!(generated.contains("\\\"}}\", input);"));
+    }
+
+    #[test]
     fn create_manifest_parses_cleanly() {
         let temp_dir = TempDir::new().expect("temp dir");
         let options = CreateOptions::new(
@@ -695,9 +714,13 @@ mod tests {
         let parsed = parse_manifest(&manifest).expect("manifest should parse");
 
         validate_manifest(&parsed).expect("manifest should validate");
+        assert_eq!(parsed.author, "TODO: set author");
         assert_eq!(parsed.name, "weather-skill");
         assert_eq!(parsed.api_version, "host_api_v2");
-        assert_eq!(parsed.capabilities, vec![Capability::Network, Capability::Storage]);
+        assert_eq!(
+            parsed.capabilities,
+            vec![Capability::Network, Capability::Storage]
+        );
     }
 
     fn assert_invalid_name(name: &str) {

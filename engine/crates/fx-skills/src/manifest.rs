@@ -5,7 +5,7 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 
 /// Capability a skill can request.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
     /// HTTP requests
@@ -20,15 +20,35 @@ pub enum Capability {
     PhoneActions,
 }
 
+pub const ALL_CAPABILITIES: [Capability; 5] = [
+    Capability::Network,
+    Capability::Storage,
+    Capability::Notifications,
+    Capability::Sensors,
+    Capability::PhoneActions,
+];
+
+impl Capability {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Capability::Network => "network",
+            Capability::Storage => "storage",
+            Capability::Notifications => "notifications",
+            Capability::Sensors => "sensors",
+            Capability::PhoneActions => "phone_actions",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        ALL_CAPABILITIES
+            .into_iter()
+            .find(|capability| capability.as_str() == value)
+    }
+}
+
 impl std::fmt::Display for Capability {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Capability::Network => write!(f, "network"),
-            Capability::Storage => write!(f, "storage"),
-            Capability::Notifications => write!(f, "notifications"),
-            Capability::Sensors => write!(f, "sensors"),
-            Capability::PhoneActions => write!(f, "phone_actions"),
-        }
+        write!(f, "{}", self.as_str())
     }
 }
 
@@ -63,21 +83,25 @@ pub fn parse_manifest(toml_str: &str) -> Result<SkillManifest, SkillError> {
         .map_err(|e| SkillError::InvalidManifest(format!("Failed to parse TOML: {}", e)))
 }
 
-/// Validate a skill manifest.
-pub fn validate_manifest(manifest: &SkillManifest) -> Result<(), SkillError> {
-    // Check required fields are non-empty
-    if manifest.name.trim().is_empty() {
+pub fn validate_skill_name(name: &str) -> Result<(), SkillError> {
+    if name.trim().is_empty() {
         return Err(SkillError::InvalidManifest(
             "name cannot be empty".to_string(),
         ));
     }
 
-    // Prevent path traversal via skill names
-    if manifest.name.contains("..") || manifest.name.contains('/') || manifest.name.contains('\\') {
+    if name.contains("..") || name.contains('/') || name.contains('\\') {
         return Err(SkillError::InvalidManifest(
             "name must not contain path separators or '..'".to_string(),
         ));
     }
+
+    Ok(())
+}
+
+/// Validate a skill manifest.
+pub fn validate_manifest(manifest: &SkillManifest) -> Result<(), SkillError> {
+    validate_skill_name(&manifest.name)?;
 
     if manifest.version.trim().is_empty() {
         return Err(SkillError::InvalidManifest(
@@ -99,7 +123,11 @@ pub fn validate_manifest(manifest: &SkillManifest) -> Result<(), SkillError> {
         ));
     }
 
-    // Author is optional for newly scaffolded local skills.
+    if manifest.author.trim().is_empty() {
+        return Err(SkillError::InvalidManifest(
+            "author cannot be empty".to_string(),
+        ));
+    }
 
     // Validate api_version
     if manifest.api_version != "host_api_v1" && manifest.api_version != "host_api_v2" {
@@ -264,7 +292,21 @@ capabilities = ["network", "storage", "notifications", "sensors", "phone_actions
             entry_point: "run".to_string(),
         };
 
-        assert!(validate_manifest(&manifest).is_ok());
+        assert!(validate_manifest(&manifest).is_err());
+    }
+
+    #[test]
+    fn test_validate_name_rejects_path_traversal() {
+        let result = validate_skill_name("../evil");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_capability_parse_uses_shared_capability_list() {
+        for capability in ALL_CAPABILITIES {
+            assert_eq!(Capability::parse(capability.as_str()), Some(capability));
+        }
     }
 
     #[test]
