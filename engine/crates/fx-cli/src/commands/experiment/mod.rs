@@ -3,8 +3,9 @@ use clap::Subcommand;
 use fx_auth::auth::AuthManager;
 use fx_config::FawxConfig;
 use fx_consensus::{
-    Chain, ChainStorage, ExperimentConfig, ExperimentRunner, FitnessCriterion,
-    JsonFileChainStorage, MetricType, ModificationScope, PathPattern, ProposalTier, Signal,
+    CargoWorkspace, Chain, ChainStorage, ExperimentConfig, ExperimentRunner, FitnessCriterion,
+    JsonFileChainStorage, LlmPatchSource, MetricType, ModificationScope, PathPattern, ProposalTier,
+    Signal, SubagentPatchSource,
 };
 use fx_llm::ModelRouter;
 use fx_subagent::{SubagentLimits, SubagentManager, SubagentManagerDeps};
@@ -14,18 +15,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
-mod cargo_workspace;
 mod format;
-mod llm_source;
 mod placeholders;
-mod response_parser;
-mod subagent_source;
 
-use cargo_workspace::CargoWorkspace;
 use format::{format_chain_entries, format_chain_entry, format_experiment_report};
-use llm_source::LlmPatchSource;
 use placeholders::build_nodes;
-use subagent_source::SubagentPatchSource;
 
 const CHAIN_PATH_ENV: &str = "FAWX_CONSENSUS_CHAIN_PATH";
 
@@ -134,7 +128,8 @@ async fn run_experiment_with_path(
 ) -> anyhow::Result<String> {
     ensure_chain_parent_dir(&chain_path)?;
     let nodes = build_nodes_from_args(&args)?;
-    let runner = ExperimentRunner::with_nodes(chain_path, nodes)?;
+    let neutral_evaluator = build_neutral_evaluator_from_args(&args)?;
+    let runner = ExperimentRunner::with_nodes(chain_path, nodes, neutral_evaluator)?;
     let report = runner.run(build_config(&args)?).await?;
     Ok(format_experiment_report(&args, &report))
 }
@@ -146,6 +141,26 @@ fn build_nodes_from_args(
         ExperimentNodeMode::Placeholder => Ok(build_nodes(args.nodes)),
         ExperimentNodeMode::Direct => build_direct_nodes_from_args(args),
         ExperimentNodeMode::Subagent => build_subagent_nodes_from_args(args),
+    }
+}
+
+fn build_neutral_evaluator_from_args(
+    args: &RunExperimentArgs,
+) -> anyhow::Result<Option<fx_consensus::NeutralEvaluatorConfig>> {
+    if args.nodes != 1 {
+        return Ok(None);
+    }
+    match args.mode {
+        ExperimentNodeMode::Placeholder => Ok(Some(placeholders::build_neutral_evaluator())),
+        ExperimentNodeMode::Direct | ExperimentNodeMode::Subagent => {
+            let project_dir = resolve_project_dir(args)?;
+            let workspace = CargoWorkspace::clone_from(&project_dir, "neutral-evaluator")
+                .map_err(anyhow::Error::from)?;
+            Ok(Some(fx_consensus::NeutralEvaluatorConfig {
+                node_id: fx_consensus::NodeId("neutral-evaluator".to_owned()),
+                workspace: Box::new(workspace),
+            }))
+        }
     }
 }
 

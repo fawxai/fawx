@@ -1,6 +1,6 @@
 use fx_consensus::{
-    EvaluationWorkspace, Experiment, GenerationStrategy, NodeConfig, PatchResponse, PatchSource,
-    Signal, TestResult,
+    EvaluationWorkspace, Experiment, GenerationStrategy, NeutralEvaluatorConfig, NodeConfig,
+    PatchResponse, PatchSource, Signal, TestResult,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -19,6 +19,13 @@ pub(super) fn build_nodes(count: u32) -> Vec<NodeConfig> {
             }
         })
         .collect()
+}
+
+pub(super) fn build_neutral_evaluator() -> NeutralEvaluatorConfig {
+    NeutralEvaluatorConfig {
+        node_id: fx_consensus::NodeId("neutral-evaluator".to_owned()),
+        workspace: Box::new(PlaceholderWorkspace),
+    }
 }
 
 pub(super) fn strategy_for(index: u32) -> GenerationStrategy {

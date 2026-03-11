@@ -34,8 +34,8 @@ use fx_scratchpad::Scratchpad;
 use fx_skills::live_host_api::CredentialProvider;
 use fx_subagent::SubagentControl;
 use fx_tools::{
-    BuiltinToolsSkill, FawxToolExecutor, GitSkill, ImprovementToolsState, NodeRunState,
-    SessionToolsSkill, ToolConfig,
+    BuiltinToolsSkill, ExperimentToolState, FawxToolExecutor, GitSkill, ImprovementToolsState,
+    NodeRunState, SessionToolsSkill, ToolConfig,
 };
 use std::fmt;
 use std::fs;
@@ -725,6 +725,20 @@ fn build_skill_registry(
     }
     if let Some(control) = options.subagent_control {
         executor = executor.with_subagent_control(control);
+    }
+    if let Ok(auth_manager) = load_auth_manager() {
+        match build_router(&auth_manager) {
+            Ok(router) => {
+                executor = executor.with_experiment(ExperimentToolState {
+                    chain_path: data_dir.join("consensus").join("chain.json"),
+                    router: Arc::new(router),
+                    config: config.clone(),
+                });
+            }
+            Err(error) => {
+                eprintln!("warning: experiment tool unavailable: {error}");
+            }
+        }
     }
     executor = attach_node_run_if_configured(executor, config);
 

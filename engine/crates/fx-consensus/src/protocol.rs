@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::Duration;
+use tracing::warn;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,9 +135,12 @@ impl ConsensusProtocol for LocalConsensusEngine {
             find_candidate_context(&state, evaluation.candidate_id)?;
         ensure_open_experiment(&state, experiment_id)?;
         if evaluation.evaluator_id == candidate_node_id {
-            return Err(ConsensusError::SafetyViolation(
-                "self-evaluation is not allowed".into(),
-            ));
+            warn!(
+                candidate_id = %evaluation.candidate_id,
+                evaluator_id = %evaluation.evaluator_id.0,
+                "skipping self-evaluation submission"
+            );
+            return Ok(());
         }
         state
             .evaluations
@@ -306,5 +310,52 @@ mod duration_serde {
     {
         let repr = DurationRepr::deserialize(deserializer)?;
         Ok(Duration::new(repr.secs, repr.nanos))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chain::JsonFileChainStorage;
+    use crate::types::tests::{sample_candidate, sample_evaluation, sample_experiment};
+
+    #[tokio::test]
+    async fn submit_evaluation_skips_self_evaluation() {
+        let engine = LocalConsensusEngine::new(Box::new(JsonFileChainStorage::new(temp_path())))
+            .expect("engine");
+        let experiment = engine
+            .create_experiment(sample_config(1))
+            .await
+            .expect("experiment");
+        let candidate = sample_candidate(experiment.id, "node-a");
+        engine
+            .submit_candidate(candidate.clone())
+            .await
+            .expect("candidate");
+
+        engine
+            .submit_evaluation(sample_evaluation(candidate.id, "node-a", 0.8))
+            .await
+            .expect("self evaluation should be ignored");
+
+        let result = engine.finalize(experiment.id).await.expect("finalize");
+        assert!(result.evaluations.is_empty());
+        assert_eq!(result.decision, crate::types::Decision::Inconclusive);
+    }
+
+    fn sample_config(min_candidates: u32) -> ExperimentConfig {
+        let experiment = sample_experiment();
+        ExperimentConfig {
+            signal: experiment.trigger,
+            hypothesis: experiment.hypothesis,
+            fitness_criteria: experiment.fitness_criteria,
+            scope: experiment.scope,
+            timeout: experiment.timeout,
+            min_candidates,
+        }
+    }
+
+    fn temp_path() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("fx-consensus-protocol-{}.json", Uuid::new_v4()))
     }
 }

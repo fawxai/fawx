@@ -1,3 +1,4 @@
+mod experiment_tool;
 mod git_skill;
 #[cfg(feature = "improvement")]
 mod improvement_tools;
@@ -6,6 +7,7 @@ mod session_tools;
 mod skill_bridge;
 mod tools;
 
+pub use experiment_tool::ExperimentToolState;
 pub use git_skill::GitSkill;
 #[cfg(feature = "improvement")]
 pub use improvement_tools::ImprovementToolsState;

@@ -1,4 +1,4 @@
-use fx_consensus::{ConsensusError, EvaluationWorkspace, Experiment, Signal, TestResult};
+use crate::{ConsensusError, EvaluationWorkspace, Experiment, Signal, TestResult};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::{NamedTempFile, TempDir};
@@ -11,7 +11,7 @@ pub struct CargoWorkspace {
 }
 
 impl CargoWorkspace {
-    pub fn new(project_dir: PathBuf) -> fx_consensus::Result<Self> {
+    pub fn new(project_dir: PathBuf) -> crate::Result<Self> {
         validate_workspace_dir(&project_dir)?;
         let baseline_tests = collect_baseline_tests(&project_dir)?;
         Ok(Self {
@@ -21,7 +21,7 @@ impl CargoWorkspace {
         })
     }
 
-    pub fn clone_from(source_dir: &Path, label: &str) -> fx_consensus::Result<Self> {
+    pub fn clone_from(source_dir: &Path, label: &str) -> crate::Result<Self> {
         let workspace_root = tempfile::Builder::new()
             .prefix(&format!("fx-experiment-{label}-"))
             .tempdir()
@@ -33,7 +33,7 @@ impl CargoWorkspace {
         Ok(workspace)
     }
 
-    async fn run_cargo(&self, subcommand: &str) -> fx_consensus::Result<String> {
+    async fn run_cargo(&self, subcommand: &str) -> crate::Result<String> {
         let output = Command::new("cargo")
             .arg(subcommand)
             .current_dir(&self.project_dir)
@@ -60,7 +60,7 @@ impl CargoWorkspace {
 
 #[async_trait::async_trait]
 impl EvaluationWorkspace for CargoWorkspace {
-    async fn apply_patch(&self, patch: &str) -> fx_consensus::Result<()> {
+    async fn apply_patch(&self, patch: &str) -> crate::Result<()> {
         let mut patch_file = NamedTempFile::new_in(&self.project_dir)
             .map_err(|error| ConsensusError::PatchFailed(error.to_string()))?;
         use std::io::Write as _;
@@ -80,11 +80,11 @@ impl EvaluationWorkspace for CargoWorkspace {
         apply_patch_directly(&self.project_dir, patch)
     }
 
-    async fn build(&self) -> fx_consensus::Result<()> {
+    async fn build(&self) -> crate::Result<()> {
         self.run_cargo("build").await.map(|_| ())
     }
 
-    async fn test(&self) -> fx_consensus::Result<TestResult> {
+    async fn test(&self) -> crate::Result<TestResult> {
         match self.run_cargo("test").await {
             Ok(output) => Ok(parse_test_result(&output)),
             Err(ConsensusError::TestFailed {
@@ -100,11 +100,11 @@ impl EvaluationWorkspace for CargoWorkspace {
         }
     }
 
-    async fn check_signal(&self, _signal: &Signal) -> fx_consensus::Result<bool> {
+    async fn check_signal(&self, _signal: &Signal) -> crate::Result<bool> {
         Ok(false)
     }
 
-    async fn check_regression(&self, _experiment: &Experiment) -> fx_consensus::Result<bool> {
+    async fn check_regression(&self, _experiment: &Experiment) -> crate::Result<bool> {
         let candidate = self.test().await;
         self.reset().await?;
         match candidate {
@@ -116,13 +116,13 @@ impl EvaluationWorkspace for CargoWorkspace {
         }
     }
 
-    async fn reset(&self) -> fx_consensus::Result<()> {
+    async fn reset(&self) -> crate::Result<()> {
         run_git_command(&self.project_dir, &["checkout", "--", "."]).await?;
         run_git_command(&self.project_dir, &["clean", "-fd"]).await
     }
 }
 
-fn validate_workspace_dir(project_dir: &Path) -> fx_consensus::Result<()> {
+fn validate_workspace_dir(project_dir: &Path) -> crate::Result<()> {
     let manifest = project_dir.join("Cargo.toml");
     if !manifest.exists() {
         return Err(ConsensusError::WorkspaceError(format!(
@@ -133,7 +133,7 @@ fn validate_workspace_dir(project_dir: &Path) -> fx_consensus::Result<()> {
     verify_git_repo(project_dir)
 }
 
-fn collect_baseline_tests(project_dir: &Path) -> fx_consensus::Result<TestResult> {
+fn collect_baseline_tests(project_dir: &Path) -> crate::Result<TestResult> {
     let output = std::process::Command::new("cargo")
         .arg("test")
         .current_dir(project_dir)
@@ -152,7 +152,7 @@ fn collect_baseline_tests(project_dir: &Path) -> fx_consensus::Result<TestResult
     }
 }
 
-fn verify_git_repo(project_dir: &Path) -> fx_consensus::Result<()> {
+fn verify_git_repo(project_dir: &Path) -> crate::Result<()> {
     let output = std::process::Command::new("git")
         .args(["rev-parse", "--git-dir"])
         .current_dir(project_dir)
@@ -168,7 +168,7 @@ fn verify_git_repo(project_dir: &Path) -> fx_consensus::Result<()> {
     }
 }
 
-fn clone_project_dir(source_dir: &Path, target_dir: &Path) -> fx_consensus::Result<()> {
+fn clone_project_dir(source_dir: &Path, target_dir: &Path) -> crate::Result<()> {
     let output = std::process::Command::new("git")
         .args(["clone", "--local"])
         .arg(source_dir)
@@ -187,7 +187,7 @@ fn clone_project_dir(source_dir: &Path, target_dir: &Path) -> fx_consensus::Resu
     }
 }
 
-async fn run_git_command(project_dir: &Path, args: &[&str]) -> fx_consensus::Result<()> {
+async fn run_git_command(project_dir: &Path, args: &[&str]) -> crate::Result<()> {
     let output = Command::new("git")
         .args(args)
         .current_dir(project_dir)
@@ -203,7 +203,7 @@ async fn run_git_command(project_dir: &Path, args: &[&str]) -> fx_consensus::Res
     }
 }
 
-fn apply_patch_directly(project_dir: &Path, patch: &str) -> fx_consensus::Result<()> {
+fn apply_patch_directly(project_dir: &Path, patch: &str) -> crate::Result<()> {
     let file_patch = parse_single_file_patch(patch)?;
     let path = project_dir.join(file_patch.path);
     let original = fs::read_to_string(&path)
@@ -227,7 +227,7 @@ enum HunkLine {
     Add(String),
 }
 
-fn parse_single_file_patch(patch: &str) -> fx_consensus::Result<FilePatch> {
+fn parse_single_file_patch(patch: &str) -> crate::Result<FilePatch> {
     let file_count = patch
         .lines()
         .filter(|line| line.starts_with("diff --git "))
@@ -276,7 +276,7 @@ fn parse_single_file_patch(patch: &str) -> fx_consensus::Result<FilePatch> {
     Ok(FilePatch { path, hunks })
 }
 
-fn apply_hunks(original: &str, hunks: &[Hunk]) -> fx_consensus::Result<String> {
+fn apply_hunks(original: &str, hunks: &[Hunk]) -> crate::Result<String> {
     let mut current = original.to_owned();
     for hunk in hunks {
         let before = hunk
@@ -472,13 +472,13 @@ mod tests {
                 id: uuid::Uuid::nil(),
                 name: "signal".to_owned(),
                 description: "signal".to_owned(),
-                severity: fx_consensus::Severity::Low,
+                severity: crate::Severity::Low,
             },
             hypothesis: "hypothesis".to_owned(),
             fitness_criteria: Vec::new(),
-            scope: fx_consensus::ModificationScope {
+            scope: crate::ModificationScope {
                 allowed_files: Vec::new(),
-                proposal_tier: fx_consensus::ProposalTier::Tier1,
+                proposal_tier: crate::ProposalTier::Tier1,
             },
             timeout: std::time::Duration::from_secs(1),
             min_candidates: 1,

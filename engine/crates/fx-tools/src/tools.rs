@@ -1,3 +1,6 @@
+use crate::experiment_tool::{
+    handle_run_experiment, run_experiment_tool_definition, ExperimentToolState,
+};
 use async_trait::async_trait;
 use fx_config::manager::ConfigManager;
 use fx_core::memory::MemoryStore;
@@ -66,6 +69,7 @@ pub struct FawxToolExecutor {
     config_manager: Option<Arc<Mutex<ConfigManager>>>,
     start_time: std::time::Instant,
     subagent_control: Option<Arc<dyn SubagentControl>>,
+    experiment: Option<ExperimentToolState>,
     node_run: Option<crate::node_run::NodeRunState>,
     #[cfg(feature = "improvement")]
     improvement: Option<crate::improvement_tools::ImprovementToolsState>,
@@ -112,6 +116,7 @@ impl FawxToolExecutor {
             config_manager: None,
             start_time: std::time::Instant::now(),
             subagent_control: None,
+            experiment: None,
             node_run: None,
             #[cfg(feature = "improvement")]
             improvement: None,
@@ -161,6 +166,16 @@ impl FawxToolExecutor {
         self
     }
 
+    /// Attach experiment execution state for run_experiment.
+    pub fn with_experiment(mut self, state: ExperimentToolState) -> Self {
+        self.experiment = Some(state);
+        self
+    }
+
+    pub fn set_experiment(&mut self, state: ExperimentToolState) {
+        self.experiment = Some(state);
+    }
+
     /// Attach node_run tool state for remote command execution.
     pub fn with_node_run(mut self, state: crate::node_run::NodeRunState) -> Self {
         self.node_run = Some(state);
@@ -195,7 +210,7 @@ impl FawxToolExecutor {
             | "memory_search" => ToolCacheability::Cacheable,
             "write_file" | "edit_file" | "memory_write" | "memory_delete" | "run_command"
             | "exec_background" | "exec_kill" | "config_set" | "fawx_restart" | "spawn_agent"
-            | "node_run" => ToolCacheability::SideEffect,
+            | "node_run" | "run_experiment" => ToolCacheability::SideEffect,
             "current_time"
             | "self_info"
             | "config_get"
@@ -239,6 +254,7 @@ impl FawxToolExecutor {
             "memory_delete" => self.handle_memory_delete(&call.arguments),
             "spawn_agent" => self.handle_spawn_agent(&call.arguments).await,
             "subagent_status" => self.handle_subagent_status(&call.arguments).await,
+            "run_experiment" => self.handle_run_experiment(&call.arguments).await,
             "node_run" => {
                 return self.dispatch_node_run(call).await;
             }
@@ -890,6 +906,20 @@ impl FawxToolExecutor {
         serialize_output(spawned_handle_value(&handle))
     }
 
+    async fn handle_run_experiment(&self, args: &serde_json::Value) -> Result<String, String> {
+        let state = self
+            .experiment
+            .as_ref()
+            .ok_or_else(|| "experiment tool not configured".to_string())?;
+        handle_run_experiment(
+            state,
+            self.subagent_control.as_ref(),
+            &self.working_dir,
+            args,
+        )
+        .await
+    }
+
     async fn handle_subagent_status(&self, args: &serde_json::Value) -> Result<String, String> {
         let control = self.subagent_control()?;
         let parsed: SubagentStatusArgs = parse_args(args)?;
@@ -1228,7 +1258,8 @@ impl ToolExecutor for FawxToolExecutor {
     }
 
     fn tool_definitions(&self) -> Vec<ToolDefinition> {
-        let mut defs = fawx_tool_definitions(self.subagent_control.is_some());
+        let mut defs =
+            fawx_tool_definitions(self.subagent_control.is_some(), self.experiment.is_some());
         if self.memory.is_some() {
             defs.extend(memory_tool_definitions());
         }
@@ -1263,7 +1294,8 @@ impl std::fmt::Debug for FawxToolExecutor {
             .field("self_modify", &self.self_modify)
             .field("concurrency_policy", &self.concurrency_policy)
             .field("config_manager", &self.config_manager.is_some())
-            .field("subagent_control", &self.subagent_control.is_some());
+            .field("subagent_control", &self.subagent_control.is_some())
+            .field("experiment", &self.experiment.is_some());
         #[cfg(feature = "improvement")]
         debug.field("improvement", &self.improvement.is_some());
         debug.finish()
@@ -1348,7 +1380,10 @@ async fn collect_ordered_results(
     Ok(indexed.into_iter().map(|(_, result)| result).collect())
 }
 
-pub fn fawx_tool_definitions(include_subagent_tools: bool) -> Vec<ToolDefinition> {
+pub fn fawx_tool_definitions(
+    include_subagent_tools: bool,
+    include_experiment_tool: bool,
+) -> Vec<ToolDefinition> {
     let mut definitions = vec![
         ToolDefinition {
             name: "read_file".to_string(),
@@ -1499,6 +1534,9 @@ pub fn fawx_tool_definitions(include_subagent_tools: bool) -> Vec<ToolDefinition
             parameters: serde_json::json!({"type": "object", "properties": {}, "required": []}),
         },
     ];
+    if include_experiment_tool {
+        definitions.insert(0, run_experiment_tool_definition());
+    }
     if include_subagent_tools {
         definitions.extend(subagent_tool_definitions());
     }
@@ -3586,20 +3624,33 @@ three
     }
 
     #[test]
+    fn run_experiment_definition_only_appears_when_enabled() {
+        let without_experiment = fawx_tool_definitions(false, false);
+        assert!(!without_experiment
+            .iter()
+            .any(|tool| tool.name == "run_experiment"));
+
+        let with_experiment = fawx_tool_definitions(false, true);
+        assert!(with_experiment
+            .iter()
+            .any(|tool| tool.name == "run_experiment"));
+    }
+
+    #[test]
     fn current_time_appears_in_definitions() {
-        let definitions = fawx_tool_definitions(false);
+        let definitions = fawx_tool_definitions(false, false);
         assert!(definitions.iter().any(|tool| tool.name == "current_time"));
     }
 
     #[test]
     fn edit_file_appears_in_definitions() {
-        let definitions = fawx_tool_definitions(false);
+        let definitions = fawx_tool_definitions(false, false);
         assert!(definitions.iter().any(|tool| tool.name == "edit_file"));
     }
 
     #[test]
     fn background_process_tools_appear_in_definitions() {
-        let definitions = fawx_tool_definitions(false);
+        let definitions = fawx_tool_definitions(false, false);
         assert!(definitions
             .iter()
             .any(|tool| tool.name == "exec_background"));
@@ -3609,7 +3660,7 @@ three
 
     #[test]
     fn read_file_definition_exposes_offset_and_limit() {
-        let definitions = fawx_tool_definitions(false);
+        let definitions = fawx_tool_definitions(false, false);
         let read_file = definitions
             .iter()
             .find(|tool| tool.name == "read_file")
@@ -3945,7 +3996,7 @@ three
 
     #[test]
     fn self_info_appears_in_tool_definitions() {
-        let definitions = fawx_tool_definitions(false);
+        let definitions = fawx_tool_definitions(false, false);
         assert!(definitions.iter().any(|tool| tool.name == "self_info"));
     }
 
@@ -4447,13 +4498,13 @@ three
         let temp = TempDir::new().expect("temp");
         let config = SelfModifyConfig {
             enabled: true,
-            deny_paths: vec!["*.key".to_string()],
+            deny_paths: vec!["*.txt".to_string()],
             ..SelfModifyConfig::default()
         };
         let executor = FawxToolExecutor::new(temp.path().to_path_buf(), ToolConfig::default())
             .with_self_modify(config);
         let result = executor
-            .handle_write_file(&serde_json::json!({"path": "secret.key", "content": "data"}));
+            .handle_write_file(&serde_json::json!({"path": "secret.txt", "content": "data"}));
         assert!(result.is_err());
         assert!(result
             .unwrap_err()

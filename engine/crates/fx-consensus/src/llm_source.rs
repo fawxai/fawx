@@ -1,5 +1,5 @@
-use super::response_parser::parse_patch_response;
-use fx_consensus::{Experiment, PatchSource};
+use crate::response_parser::parse_patch_response;
+use crate::{Experiment, PatchSource};
 use fx_llm::{completion_text, CompletionRequest, Message, ModelRouter};
 use std::sync::Arc;
 
@@ -20,7 +20,7 @@ impl PatchSource for LlmPatchSource {
         &self,
         system_prompt: &str,
         experiment: &Experiment,
-    ) -> fx_consensus::Result<fx_consensus::PatchResponse> {
+    ) -> crate::Result<crate::PatchResponse> {
         let request = CompletionRequest {
             model: self.model.clone(),
             messages: vec![Message::user(build_experiment_prompt(experiment))],
@@ -31,14 +31,14 @@ impl PatchSource for LlmPatchSource {
             thinking: None,
         };
         let response = self.router.complete(request).await.map_err(|error| {
-            fx_consensus::ConsensusError::Protocol(format!("LLM completion failed: {error}"))
+            crate::ConsensusError::Protocol(format!("LLM completion failed: {error}"))
         })?;
         let text = completion_text(&response);
         parse_patch_response(&text)
     }
 }
 
-pub(super) fn build_experiment_prompt(experiment: &Experiment) -> String {
+pub fn build_experiment_prompt(experiment: &Experiment) -> String {
     let scope = experiment
         .scope
         .allowed_files
@@ -174,24 +174,24 @@ mod tests {
         assert_eq!(response.self_metrics.get("signal_resolution"), Some(&0.8));
     }
 
-    fn sample_experiment() -> fx_consensus::Experiment {
-        fx_consensus::Experiment {
+    fn sample_experiment() -> crate::Experiment {
+        crate::Experiment {
             id: Uuid::new_v4(),
-            trigger: fx_consensus::Signal {
+            trigger: crate::Signal {
                 id: Uuid::new_v4(),
                 name: "latency".to_owned(),
                 description: "High latency detected".to_owned(),
-                severity: fx_consensus::Severity::High,
+                severity: crate::Severity::High,
             },
             hypothesis: "parallelism helps".to_owned(),
-            fitness_criteria: vec![fx_consensus::FitnessCriterion {
+            fitness_criteria: vec![crate::FitnessCriterion {
                 name: "build_success".to_owned(),
-                metric_type: fx_consensus::MetricType::Higher,
+                metric_type: crate::MetricType::Higher,
                 weight: 1.0,
             }],
-            scope: fx_consensus::ModificationScope {
-                allowed_files: vec![fx_consensus::PathPattern::from("src/**/*.rs")],
-                proposal_tier: fx_consensus::ProposalTier::Tier1,
+            scope: crate::ModificationScope {
+                allowed_files: vec![crate::PathPattern::from("src/**/*.rs")],
+                proposal_tier: crate::ProposalTier::Tier1,
             },
             timeout: Duration::from_secs(60),
             min_candidates: 1,

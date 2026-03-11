@@ -1,15 +1,15 @@
-use fx_consensus::{ConsensusError, PatchResponse};
+use crate::{ConsensusError, PatchResponse};
 use std::collections::BTreeMap;
 
-pub(super) const PATCH_START: &str = "<PATCH>";
-pub(super) const PATCH_END: &str = "</PATCH>";
-pub(super) const APPROACH_START: &str = "<APPROACH>";
-pub(super) const APPROACH_END: &str = "</APPROACH>";
-pub(super) const METRICS_START: &str = "<METRICS>";
-pub(super) const METRICS_END: &str = "</METRICS>";
-pub(super) const METRIC_KEYS: [&str; 3] = ["build_success", "test_pass_rate", "signal_resolution"];
+pub(crate) const PATCH_START: &str = "<PATCH>";
+pub(crate) const PATCH_END: &str = "</PATCH>";
+pub(crate) const APPROACH_START: &str = "<APPROACH>";
+pub(crate) const APPROACH_END: &str = "</APPROACH>";
+pub(crate) const METRICS_START: &str = "<METRICS>";
+pub(crate) const METRICS_END: &str = "</METRICS>";
+pub(crate) const METRIC_KEYS: [&str; 3] = ["build_success", "test_pass_rate", "signal_resolution"];
 
-pub(super) fn parse_patch_response(text: &str) -> Result<PatchResponse, ConsensusError> {
+pub(crate) fn parse_patch_response(text: &str) -> Result<PatchResponse, ConsensusError> {
     let patch = extract_patch(text).ok_or_else(|| {
         ConsensusError::Protocol("generated response did not include a diff patch".to_owned())
     })?;
@@ -22,13 +22,13 @@ pub(super) fn parse_patch_response(text: &str) -> Result<PatchResponse, Consensu
     })
 }
 
-pub(super) fn extract_patch(text: &str) -> Option<String> {
+pub(crate) fn extract_patch(text: &str) -> Option<String> {
     extract_tagged_block(text, PATCH_START, PATCH_END)
         .or_else(|| extract_fenced_block(text, "diff"))
         .or_else(|| extract_fenced_block(text, "patch"))
 }
 
-pub(super) fn extract_fenced_block(text: &str, language: &str) -> Option<String> {
+pub(crate) fn extract_fenced_block(text: &str, language: &str) -> Option<String> {
     let fence = format!("```{language}");
     let start = text.find(&fence)?;
     let after_start = &text[start + fence.len()..];
@@ -36,13 +36,13 @@ pub(super) fn extract_fenced_block(text: &str, language: &str) -> Option<String>
     Some(after_start[..end].trim().to_owned())
 }
 
-pub(super) fn extract_tagged_block(text: &str, start_tag: &str, end_tag: &str) -> Option<String> {
+pub(crate) fn extract_tagged_block(text: &str, start_tag: &str, end_tag: &str) -> Option<String> {
     let start = text.find(start_tag)? + start_tag.len();
     let end = text[start..].find(end_tag)? + start;
     Some(text[start..end].trim().to_owned())
 }
 
-pub(super) fn extract_approach(text: &str, patch: &str) -> String {
+pub(crate) fn extract_approach(text: &str, patch: &str) -> String {
     if let Some(approach) = extract_tagged_block(text, APPROACH_START, APPROACH_END) {
         return fallback_approach(&approach);
     }
@@ -64,7 +64,7 @@ pub(super) fn extract_approach(text: &str, patch: &str) -> String {
     fallback_approach(&remainder)
 }
 
-pub(super) fn fallback_approach(text: &str) -> String {
+pub(crate) fn fallback_approach(text: &str) -> String {
     let approach = text
         .lines()
         .map(str::trim)
@@ -78,7 +78,7 @@ pub(super) fn fallback_approach(text: &str) -> String {
     }
 }
 
-pub(super) fn extract_metrics(text: &str) -> BTreeMap<String, f64> {
+pub(crate) fn extract_metrics(text: &str) -> BTreeMap<String, f64> {
     let Some(metrics_block) = extract_json_block(text) else {
         return BTreeMap::new();
     };
@@ -94,7 +94,7 @@ pub(super) fn extract_metrics(text: &str) -> BTreeMap<String, f64> {
         .collect()
 }
 
-pub(super) fn extract_json_block(text: &str) -> Option<String> {
+pub(crate) fn extract_json_block(text: &str) -> Option<String> {
     if let Some(tagged) = extract_tagged_block(text, METRICS_START, METRICS_END) {
         return Some(tagged);
     }
@@ -115,7 +115,7 @@ pub(super) fn extract_json_block(text: &str) -> Option<String> {
     None
 }
 
-pub(super) fn patch_search_start(text: &str) -> usize {
+pub(crate) fn patch_search_start(text: &str) -> usize {
     if let Some(end) = tagged_block_end(text, PATCH_START, PATCH_END) {
         return end;
     }
@@ -127,20 +127,20 @@ pub(super) fn patch_search_start(text: &str) -> usize {
     0
 }
 
-pub(super) fn tagged_block_end(text: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
+pub(crate) fn tagged_block_end(text: &str, start_tag: &str, end_tag: &str) -> Option<usize> {
     let start = text.find(start_tag)? + start_tag.len();
     let end = text[start..].find(end_tag)? + start;
     Some(end + end_tag.len())
 }
 
-pub(super) fn fenced_block_end(text: &str, language: &str) -> Option<usize> {
+pub(crate) fn fenced_block_end(text: &str, language: &str) -> Option<usize> {
     let fence = format!("```{language}");
     let start = text.find(&fence)? + fence.len();
     let end = text[start..].find("```")? + start;
     Some(end + 3)
 }
 
-pub(super) fn extract_balanced_json(text: &str, start: usize) -> Option<String> {
+pub(crate) fn extract_balanced_json(text: &str, start: usize) -> Option<String> {
     let mut depth = 0_u32;
     let mut end = None;
     for (offset, character) in text[start..].char_indices() {
@@ -159,7 +159,7 @@ pub(super) fn extract_balanced_json(text: &str, start: usize) -> Option<String> 
     end.map(|index| text[start..index].to_owned())
 }
 
-pub(super) fn has_expected_metrics(block: &str) -> bool {
+pub(crate) fn has_expected_metrics(block: &str) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(block) else {
         return false;
     };

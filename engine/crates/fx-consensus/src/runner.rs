@@ -22,6 +22,11 @@ pub struct NodeConfig {
     pub workspace: Box<dyn EvaluationWorkspace>,
 }
 
+pub struct NeutralEvaluatorConfig {
+    pub node_id: NodeId,
+    pub workspace: Box<dyn EvaluationWorkspace>,
+}
+
 pub struct ExperimentReport {
     pub result: ConsensusResult,
     pub chain_entry_index: u64,
@@ -38,19 +43,20 @@ pub struct CandidateReport {
 
 impl ExperimentRunner {
     pub fn new(storage_path: PathBuf) -> Result<Self, ConsensusError> {
-        Self::with_nodes(storage_path, Vec::new())
+        Self::with_nodes(storage_path, Vec::new(), None)
     }
 
     pub fn with_nodes(
         storage_path: PathBuf,
         nodes: Vec<NodeConfig>,
+        neutral_evaluator: Option<NeutralEvaluatorConfig>,
     ) -> Result<Self, ConsensusError> {
         let engine = LocalConsensusEngine::new(Box::new(JsonFileChainStorage::new(storage_path)))?;
         let BuiltNodes {
             generators,
             evaluators,
             strategies,
-        } = build_nodes(nodes);
+        } = build_nodes(nodes, neutral_evaluator);
         Ok(Self {
             engine,
             generators,
@@ -74,7 +80,10 @@ struct BuiltNodes {
     strategies: BTreeMap<NodeId, GenerationStrategy>,
 }
 
-fn build_nodes(nodes: Vec<NodeConfig>) -> BuiltNodes {
+fn build_nodes(
+    nodes: Vec<NodeConfig>,
+    neutral_evaluator: Option<NeutralEvaluatorConfig>,
+) -> BuiltNodes {
     let mut generators: Vec<Box<dyn CandidateGenerator>> = Vec::new();
     let mut evaluators: Vec<Box<dyn CandidateEvaluator>> = Vec::new();
     let mut strategies = BTreeMap::new();
@@ -89,6 +98,14 @@ fn build_nodes(nodes: Vec<NodeConfig>) -> BuiltNodes {
             node.node_id,
             node.workspace,
         )));
+    }
+    if generators.len() == 1 {
+        if let Some(neutral_evaluator) = neutral_evaluator {
+            evaluators.push(Box::new(BuildTestEvaluator::new(
+                neutral_evaluator.node_id,
+                neutral_evaluator.workspace,
+            )));
+        }
     }
     BuiltNodes {
         generators,
@@ -274,6 +291,7 @@ mod tests {
                 node("node-b", GenerationStrategy::Aggressive),
                 node("node-c", GenerationStrategy::Creative),
             ],
+            None,
         )
         .expect("runner");
 
@@ -304,6 +322,7 @@ mod tests {
                 failing_node("node-b", GenerationStrategy::Aggressive),
                 failing_node("node-c", GenerationStrategy::Creative),
             ],
+            None,
         )
         .expect("runner");
 
@@ -311,6 +330,54 @@ mod tests {
 
         assert_eq!(report.result.decision, crate::types::Decision::Reject);
         assert!(report.result.winner.is_none());
+    }
+
+    #[tokio::test]
+    async fn single_node_runner_uses_neutral_evaluator() {
+        let path = temp_path();
+        let runner = ExperimentRunner::with_nodes(
+            path,
+            vec![node("node-c", GenerationStrategy::Creative)],
+            Some(neutral_evaluator("neutral-evaluator")),
+        )
+        .expect("runner");
+
+        let mut config = sample_config();
+        config.min_candidates = 1;
+        let report = runner.run(config).await.expect("run");
+
+        assert_eq!(report.result.evaluations.len(), 1);
+        assert!(report
+            .result
+            .aggregate_scores
+            .values()
+            .any(|score| *score > 0.0));
+    }
+
+    #[tokio::test]
+    async fn multi_node_runner_cross_evaluates() {
+        let path = temp_path();
+        let runner = ExperimentRunner::with_nodes(
+            path,
+            vec![
+                node("node-a", GenerationStrategy::Conservative),
+                node("node-c", GenerationStrategy::Creative),
+            ],
+            Some(neutral_evaluator("neutral-evaluator")),
+        )
+        .expect("runner");
+
+        let mut config = sample_config();
+        config.min_candidates = 2;
+        let report = runner.run(config).await.expect("run");
+
+        assert_eq!(report.result.candidates.len(), 2);
+        assert_eq!(report.result.evaluations.len(), 2);
+        assert!(report
+            .result
+            .evaluations
+            .iter()
+            .all(|evaluation| evaluation.evaluator_id != NodeId::from("neutral-evaluator")));
     }
 
     fn node(node_id: &str, strategy: GenerationStrategy) -> NodeConfig {
@@ -326,6 +393,15 @@ mod tests {
                     ("signal_resolution".into(), 1.0),
                 ]),
             }),
+            workspace: Box::new(PatchAwareWorkspace {
+                current_patch: Mutex::new(String::new()),
+            }),
+        }
+    }
+
+    fn neutral_evaluator(node_id: &str) -> NeutralEvaluatorConfig {
+        NeutralEvaluatorConfig {
+            node_id: NodeId::from(node_id),
             workspace: Box::new(PatchAwareWorkspace {
                 current_patch: Mutex::new(String::new()),
             }),

@@ -1,6 +1,6 @@
-use super::llm_source::build_experiment_prompt;
-use super::response_parser::parse_patch_response;
-use fx_consensus::{ConsensusError, Experiment, GenerationStrategy, PatchResponse, PatchSource};
+use crate::llm_source::build_experiment_prompt;
+use crate::response_parser::parse_patch_response;
+use crate::{ConsensusError, Experiment, GenerationStrategy, PatchResponse, PatchSource};
 use fx_subagent::{SpawnConfig, SpawnMode, SubagentControl, SubagentStatus};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -130,11 +130,11 @@ fn strategy_slug(strategy: &GenerationStrategy) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
-    use fx_consensus::{
+    use crate::{
         FitnessCriterion, MetricType, ModificationScope, PathPattern, ProposalTier, Severity,
         Signal,
     };
+    use chrono::Utc;
     use fx_subagent::{SubagentError, SubagentHandle, SubagentId};
     use std::sync::Mutex;
     use std::time::Instant;

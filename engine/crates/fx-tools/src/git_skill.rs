@@ -1139,10 +1139,10 @@ mod tests {
         let repo = init_test_repo();
         let config = SelfModifyConfig {
             enabled: true,
-            deny_paths: vec!["*.key".to_string()],
+            deny_paths: vec!["*.txt".to_string()],
             ..SelfModifyConfig::default()
         };
-        fs::write(repo.path().join("secret.key"), "private").expect("write key file");
+        fs::write(repo.path().join("secret.txt"), "private").expect("write text file");
         let skill = GitSkill::new(repo.path().to_path_buf(), Some(config));
         let error = run_tool(
             &skill,

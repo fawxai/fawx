@@ -79,7 +79,7 @@ async fn stores_submitted_evaluation() {
 }
 
 #[tokio::test]
-async fn rejects_self_evaluation_in_engine() {
+async fn skips_self_evaluation_in_engine() {
     let engine = create_engine();
     let experiment = engine
         .create_experiment(sample_config(1))
@@ -92,13 +92,18 @@ async fn rejects_self_evaluation_in_engine() {
         .submit_candidate(candidate)
         .await
         .expect("submit works");
-
-    let error = engine
+    engine
         .submit_evaluation(evaluation)
         .await
-        .expect_err("self evaluation must fail");
+        .expect("self evaluation should be ignored");
 
-    assert!(matches!(error, ConsensusError::SafetyViolation(_)));
+    let result = engine
+        .finalize(experiment.id)
+        .await
+        .expect("finalize works");
+
+    assert!(result.evaluations.is_empty());
+    assert_eq!(result.decision, Decision::Inconclusive);
 }
 
 #[tokio::test]

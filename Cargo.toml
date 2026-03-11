@@ -133,3 +133,4 @@ fx-marketplace = { path = "engine/crates/fx-marketplace" }
 fx-fleet = { path = "engine/crates/fx-fleet" }
 fx-orchestrator = { path = "engine/crates/fx-orchestrator" }
 fx-session = { path = "engine/crates/fx-session" }
+fx-consensus = { path = "engine/crates/fx-consensus" }
