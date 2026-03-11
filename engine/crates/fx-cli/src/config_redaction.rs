@@ -1,5 +1,4 @@
 use serde_json::{Map as JsonMap, Value as JsonValue};
-use toml::{map::Map as TomlMap, Value as TomlValue};
 
 pub(crate) const REDACTED_SECRET: &str = "[REDACTED]";
 
@@ -7,14 +6,6 @@ pub(crate) fn sanitize_json(value: JsonValue) -> JsonValue {
     match value {
         JsonValue::Object(map) => JsonValue::Object(sanitize_json_object(map)),
         JsonValue::Array(items) => JsonValue::Array(items.into_iter().map(sanitize_json).collect()),
-        other => other,
-    }
-}
-
-pub(crate) fn sanitize_toml(value: TomlValue) -> TomlValue {
-    match value {
-        TomlValue::Table(table) => TomlValue::Table(sanitize_toml_table(table)),
-        TomlValue::Array(items) => TomlValue::Array(items.into_iter().map(sanitize_toml).collect()),
         other => other,
     }
 }
@@ -44,21 +35,6 @@ fn sanitize_json_entry(key: &str, value: JsonValue) -> JsonValue {
         JsonValue::String(REDACTED_SECRET.to_string())
     } else {
         sanitize_json(value)
-    }
-}
-
-fn sanitize_toml_table(table: TomlMap<String, TomlValue>) -> TomlMap<String, TomlValue> {
-    table
-        .into_iter()
-        .map(|(key, value)| (key.clone(), sanitize_toml_entry(&key, value)))
-        .collect()
-}
-
-fn sanitize_toml_entry(key: &str, value: TomlValue) -> TomlValue {
-    if is_secret_key(key) {
-        TomlValue::String(REDACTED_SECRET.to_string())
-    } else {
-        sanitize_toml(value)
     }
 }
 
@@ -97,25 +73,5 @@ mod tests {
         assert_eq!(sanitized["model"]["default_model"], "test-model");
         assert_eq!(sanitized["telegram"]["bot_token"], REDACTED_SECRET);
         assert_eq!(sanitized["nested"]["api_key"], REDACTED_SECRET);
-    }
-
-    #[test]
-    fn sanitize_toml_redacts_secret_values_without_touching_safe_fields() {
-        let sanitized = sanitize_toml(
-            toml::Value::try_from(serde_json::json!({
-                "http": { "bearer_token": "secret-bearer" },
-                "model": { "default_model": "test-model" }
-            }))
-            .expect("toml value"),
-        );
-
-        assert_eq!(
-            sanitized["http"]["bearer_token"].as_str(),
-            Some(REDACTED_SECRET)
-        );
-        assert_eq!(
-            sanitized["model"]["default_model"].as_str(),
-            Some("test-model")
-        );
     }
 }
