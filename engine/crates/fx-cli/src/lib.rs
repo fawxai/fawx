@@ -73,8 +73,10 @@ struct HeadlessAppBuildConfig {
 /// Build a headless app suitable for embedded use.
 pub fn build_headless_app(system_prompt: Option<PathBuf>) -> anyhow::Result<headless::HeadlessApp> {
     let auth_manager = startup::load_auth_manager()?;
-    let router = Arc::new(startup::build_router(&auth_manager)?);
     let config = prepare_embedded_config(startup::load_config()?);
+    let mut router = startup::build_router(&auth_manager)?;
+    headless::seed_headless_router_active_model(&mut router, &config);
+    let router = Arc::new(router);
     let build_config = HeadlessAppBuildConfig {
         data_dir: configured_data_dir(&config),
         config_manager: Some(build_config_manager(&config)),

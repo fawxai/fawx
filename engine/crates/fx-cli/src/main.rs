@@ -422,7 +422,9 @@ fn build_headless_startup(
     let config = startup::load_config()?;
     let logging_guard = headless::init_serve_logging(&config)?;
     let auth_manager = startup::load_auth_manager()?;
-    let router = Arc::new(startup::build_router(&auth_manager)?);
+    let mut router = startup::build_router(&auth_manager)?;
+    headless::seed_headless_router_active_model(&mut router, &config);
+    let router = Arc::new(router);
     #[cfg(feature = "http")]
     let http_config = config.http.clone();
     #[cfg(feature = "http")]

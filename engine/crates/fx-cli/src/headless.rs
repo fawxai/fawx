@@ -193,9 +193,9 @@ impl Drop for HeadlessApp {
 
 impl HeadlessApp {
     /// Build from the standard startup bundle + router + config.
-    pub fn new(mut deps: HeadlessAppDeps) -> Result<Self, anyhow::Error> {
+    pub fn new(deps: HeadlessAppDeps) -> Result<Self, anyhow::Error> {
+        // Callers must seed the router's active model before construction.
         let active_model = resolve_active_model(&deps.router, &deps.config)?;
-        seed_router_default_model(&mut deps.router, &active_model);
 
         let max_history = deps.config.general.max_history;
         let data_dir = configured_data_dir(&fawx_data_dir(), &deps.config);
@@ -1481,8 +1481,21 @@ fn append_context_files(
     }
 }
 
-fn resolve_active_model(router: &ModelRouter, config: &FawxConfig) -> anyhow::Result<String> {
+pub fn resolve_active_model(router: &ModelRouter, config: &FawxConfig) -> anyhow::Result<String> {
     resolve_requested_model(router, config.model.default_model.as_deref())
+}
+
+pub fn seed_headless_router_active_model(router: &mut ModelRouter, config: &FawxConfig) {
+    let Ok(active_model) = resolve_active_model(router, config) else {
+        return;
+    };
+    if let Err(error) = router.set_active(&active_model) {
+        tracing::warn!(
+            error = %error,
+            model = %active_model,
+            "failed to set default model"
+        );
+    }
 }
 
 fn resolve_requested_model(
@@ -1540,22 +1553,6 @@ fn no_headless_models_available() -> anyhow::Error {
     anyhow::anyhow!(
         "no models available in router; configure a provider and authenticate it before starting headless mode"
     )
-}
-
-fn seed_router_default_model(router: &mut Arc<ModelRouter>, active_model: &str) {
-    if active_model.is_empty() {
-        return;
-    }
-    let Some(router) = Arc::get_mut(router) else {
-        return;
-    };
-    if let Err(error) = router.set_active(active_model) {
-        tracing::warn!(
-            error = %error,
-            model = %active_model,
-            "config default_model not available in router"
-        );
-    }
 }
 
 /// Reset SIGPIPE to default behavior on Unix so piped output
@@ -1798,7 +1795,8 @@ mod tests {
         router
     }
 
-    fn headless_deps(router: ModelRouter, config: FawxConfig) -> HeadlessAppDeps {
+    fn headless_deps(mut router: ModelRouter, config: FawxConfig) -> HeadlessAppDeps {
+        seed_headless_router_active_model(&mut router, &config);
         HeadlessAppDeps {
             loop_engine: test_engine(),
             router: Arc::new(router),
@@ -2487,6 +2485,24 @@ mod tests {
 
         assert_eq!(app.active_model, "config-model");
         assert_eq!(app.router.active_model(), Some("config-model"));
+    }
+
+    #[test]
+    fn active_model_remains_set_after_router_arc_is_cloned() {
+        let mut router = static_model_router(&["router-model", "config-model"]);
+        let mut config = FawxConfig::default();
+        config.model.default_model = Some("config-model".to_string());
+
+        let active_model = resolve_active_model(&router, &config).expect("resolve active model");
+        router
+            .set_active(&active_model)
+            .expect("set active before Arc sharing");
+
+        let router = Arc::new(router);
+        let cloned_router = Arc::clone(&router);
+
+        assert_eq!(router.active_model(), Some("config-model"));
+        assert_eq!(cloned_router.active_model(), Some("config-model"));
     }
 
     #[test]
