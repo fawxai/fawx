@@ -39,7 +39,7 @@ const THINKING_FRAMES: [&str; 3] = [".", "..", "..."];
 const WIDE_WELCOME_BREAKPOINT: usize = 100;
 const MEDIUM_WELCOME_BREAKPOINT: usize = 60;
 const WELCOME_COLUMN_GAP: usize = 3;
-const WELCOME_LEFT_WIDTH: usize = 22;
+const WELCOME_LEFT_WIDTH: usize = 30;
 const WELCOME_COMMAND_WIDTH: usize = 28;
 const MAX_VISIBLE_SKILLS: usize = 8;
 const VERSION_LABEL: &str = concat!("Fawx v", env!("CARGO_PKG_VERSION"));
@@ -615,7 +615,7 @@ impl App {
             return;
         }
 
-        self.logo_art = render_logo_art().unwrap_or_else(|_| "🦊".to_string());
+        self.logo_art = render_logo_art(LOGO_RENDER_WIDTH).unwrap_or_else(|_| "🦊".to_string());
     }
 
     fn render_header(&self) -> Paragraph<'static> {
@@ -895,15 +895,14 @@ fn initial_entries() -> Vec<Entry> {
 const LOGO_RENDER_WIDTH: u32 = 40;
 const LOGO_RENDER_THRESHOLD: u8 = 35;
 
-fn render_logo_art() -> anyhow::Result<String> {
+fn render_logo_art(width: u32) -> anyhow::Result<String> {
     let config = RenderConfig {
-        width: Some(LOGO_RENDER_WIDTH),
+        width: Some(width),
         threshold: LOGO_RENDER_THRESHOLD,
         color: false,
         ..Default::default()
     };
-    render_logo_variant("fawx-mascot.png", &config)
-        .or_else(|_| render_logo_variant("fawx.png", &config))
+    render_logo_variant("fawx-new.png", &config)
         .and_then(validate_logo_art)
         .or_else(|_| Ok(ASCII_LOGO_ART.to_string()))
 }
@@ -1110,16 +1109,16 @@ fn render_wide_welcome(
     mascot_art: &str,
     skills: &[InstalledSkill],
 ) -> Vec<Line<'static>> {
-    let right_width = width
+    let mascot_width = width
         .saturating_sub(WELCOME_LEFT_WIDTH + WELCOME_COMMAND_WIDTH + (WELCOME_COLUMN_GAP * 2))
-        .max(18);
-    let left = welcome_left_column(mascot_art);
-    let commands = welcome_command_section(WELCOME_COMMAND_WIDTH);
-    let skills = welcome_skill_section(right_width, skills);
+        .max(20);
+    let left = welcome_text_column();
+    let middle = welcome_commands_and_skills(WELCOME_COMMAND_WIDTH, skills);
+    let right = welcome_mascot_column(mascot_art);
     let mut lines = merge_columns(vec![
         (left, WELCOME_LEFT_WIDTH),
-        (commands, WELCOME_COMMAND_WIDTH),
-        (skills, right_width),
+        (middle, WELCOME_COMMAND_WIDTH),
+        (right, mascot_width),
     ]);
     lines.push(blank_line());
     lines.push(styled_line(
@@ -1134,12 +1133,17 @@ fn render_medium_welcome(
     mascot_art: &str,
     skills: &[InstalledSkill],
 ) -> Vec<Line<'static>> {
-    let right_width = width
-        .saturating_sub(WELCOME_LEFT_WIDTH + WELCOME_COLUMN_GAP)
-        .max(24);
-    let left = welcome_left_column(mascot_art);
-    let right = welcome_right_column(right_width, skills);
-    let mut lines = merge_columns(vec![(left, WELCOME_LEFT_WIDTH), (right, right_width)]);
+    let mascot_width = width
+        .saturating_sub(WELCOME_LEFT_WIDTH + WELCOME_COMMAND_WIDTH + (WELCOME_COLUMN_GAP * 2))
+        .max(20);
+    let left = welcome_text_column();
+    let middle = welcome_commands_and_skills(WELCOME_COMMAND_WIDTH, skills);
+    let right = welcome_mascot_column(mascot_art);
+    let mut lines = merge_columns(vec![
+        (left, WELCOME_LEFT_WIDTH),
+        (middle, WELCOME_COMMAND_WIDTH),
+        (right, mascot_width),
+    ]);
     lines.push(blank_line());
     lines.push(styled_line(
         INPUT_PLACEHOLDER,
@@ -1164,18 +1168,18 @@ fn render_narrow_welcome(width: usize, skills: &[InstalledSkill]) -> Vec<Line<'s
     lines
 }
 
-fn welcome_left_column(mascot_art: &str) -> Vec<Line<'static>> {
-    let mut lines = mascot_art
+fn welcome_text_column() -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = ASCII_LOGO_ART
         .lines()
         .map(|line| {
-            Line::from(vec![Span::styled(
+            Line::from(Span::styled(
                 line.to_string(),
                 Style::default()
                     .fg(fawx_amber())
                     .add_modifier(Modifier::BOLD),
-            )])
+            ))
         })
-        .collect::<Vec<_>>();
+        .collect();
     lines.push(blank_line());
     lines.push(styled_line(
         VERSION_LABEL,
@@ -1184,7 +1188,19 @@ fn welcome_left_column(mascot_art: &str) -> Vec<Line<'static>> {
     lines
 }
 
-fn welcome_right_column(width: usize, skills: &[InstalledSkill]) -> Vec<Line<'static>> {
+fn welcome_mascot_column(mascot_art: &str) -> Vec<Line<'static>> {
+    mascot_art
+        .lines()
+        .map(|line| {
+            Line::from(Span::styled(
+                line.to_string(),
+                Style::default().fg(fawx_amber()),
+            ))
+        })
+        .collect()
+}
+
+fn welcome_commands_and_skills(width: usize, skills: &[InstalledSkill]) -> Vec<Line<'static>> {
     let mut lines = welcome_command_section(width);
     lines.push(blank_line());
     lines.extend(welcome_skill_section(width, skills));
@@ -1695,21 +1711,29 @@ mod tests {
     }
 
     #[test]
-    fn wide_welcome_layout_renders_commands_and_skills_side_by_side() {
+    fn wide_welcome_layout_renders_text_left_and_combined_middle_column() {
         let lines = render_welcome_screen(
             120,
             "FOX\nART",
             &[skill("weather", "🌤"), skill("browser", "🌐")],
         );
         let text = rendered_text(&lines);
+        let commands_index = text
+            .iter()
+            .position(|line| line.contains("Commands"))
+            .expect("commands header");
+        let skills_index = text
+            .iter()
+            .position(|line| line.contains("Skills"))
+            .expect("skills header");
 
+        assert!(text.iter().any(|line| line.contains("___")));
         assert!(text.iter().any(|line| line.contains("FOX")));
+        assert!(skills_index > commands_index);
         assert!(text
             .iter()
-            .any(|line| line.contains("Commands") && line.contains("Skills")));
-        assert!(text
-            .iter()
-            .any(|line| line.contains("/help") && line.contains("🌤  weather")));
+            .any(|line| line.contains("/help") && line.contains("overview")));
+        assert!(text.iter().any(|line| line.contains("🌤  weather")));
         assert!(text.iter().any(|line| line.contains(VERSION_LABEL)));
     }
 
@@ -1756,7 +1780,7 @@ mod tests {
         let art = validate_logo_art("⣿⣿⣿⣿\n⣷⣷⣷⣷".to_string()).unwrap_err();
 
         assert!(art.to_string().contains("garbled"));
-        assert!(render_logo_art().is_ok());
+        assert!(render_logo_art(LOGO_RENDER_WIDTH).is_ok());
     }
 
     #[test]
