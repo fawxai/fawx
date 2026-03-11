@@ -29,6 +29,10 @@ fn end_to_end_consensus_flow_records_chain_entry() {
         experiment_id: experiment.id,
         winner,
         candidates: vec![candidate_a.id, candidate_b.id],
+        candidate_nodes: BTreeMap::from([
+            (candidate_a.id, NodeId::from("node-a")),
+            (candidate_b.id, NodeId::from("node-b")),
+        ]),
         evaluations,
         aggregate_scores: scores,
         decision,
@@ -129,6 +133,10 @@ fn build_result(
         experiment_id: experiment.id,
         winner,
         candidates: candidates.iter().map(|candidate| candidate.id).collect(),
+        candidate_nodes: candidates
+            .iter()
+            .map(|c| (c.id, c.node_id.clone()))
+            .collect(),
         evaluations,
         aggregate_scores: scores,
         decision,
