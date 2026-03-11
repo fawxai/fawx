@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Experiment {
     pub id: Uuid,
     pub trigger: Signal,
@@ -17,55 +17,85 @@ pub struct Experiment {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FitnessCriterion {
     pub name: String,
     pub metric_type: MetricType,
     pub weight: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MetricType {
     Lower,
     Higher,
     Boolean,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModificationScope {
-    pub allowed_files: Vec<String>,
+    pub allowed_files: Vec<PathPattern>,
     pub proposal_tier: ProposalTier,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProposalTier {
     Tier1,
     Tier2,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Signal {
     pub id: Uuid,
     pub name: String,
     pub description: String,
-    pub severity: String,
+    pub severity: Severity,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Severity {
+    Critical,
+    High,
+    Medium,
+    Low,
+    Info,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct NodeId(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PathPattern(pub String);
+
+impl From<&str> for NodeId {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
+impl From<&str> for PathPattern {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Candidate {
     pub id: Uuid,
     pub experiment_id: Uuid,
-    pub node_id: String,
+    pub node_id: NodeId,
     pub patch: String,
     pub approach: String,
     pub self_metrics: BTreeMap<String, f64>,
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Evaluation {
     pub candidate_id: Uuid,
-    pub evaluator_id: String,
+    pub evaluator_id: NodeId,
     pub fitness_scores: BTreeMap<String, f64>,
     pub safety_pass: bool,
     pub signal_resolved: bool,
@@ -74,7 +104,7 @@ pub struct Evaluation {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConsensusResult {
     pub experiment_id: Uuid,
     pub winner: Option<Uuid>,
@@ -85,7 +115,7 @@ pub struct ConsensusResult {
     pub timestamp: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Decision {
     Accept,
     Reject,
@@ -147,6 +177,20 @@ pub(crate) mod tests {
         round_trip(&result);
     }
 
+    #[test]
+    fn supports_equality_checks_for_phase_two_types() {
+        assert_eq!(MetricType::Higher, MetricType::Higher);
+        assert_eq!(ProposalTier::Tier1, ProposalTier::Tier1);
+        assert_eq!(Decision::Reject, Decision::Reject);
+        assert_eq!(Severity::High, Severity::High);
+        assert_eq!(NodeId::from("node-a"), NodeId::from("node-a"));
+        assert_eq!(
+            PathPattern::from("src/**/*.rs"),
+            PathPattern::from("src/**/*.rs")
+        );
+        assert_eq!(sample_experiment().trigger.severity, Severity::High);
+    }
+
     fn round_trip<T>(value: &T)
     where
         T: Serialize + for<'de> Deserialize<'de>,
@@ -162,7 +206,7 @@ pub(crate) mod tests {
                 id: Uuid::new_v4(),
                 name: "latency".into(),
                 description: "High latency detected".into(),
-                severity: "high".into(),
+                severity: Severity::High,
             },
             hypothesis: "parallelism helps".into(),
             fitness_criteria: vec![FitnessCriterion {
@@ -171,7 +215,7 @@ pub(crate) mod tests {
                 weight: 1.0,
             }],
             scope: ModificationScope {
-                allowed_files: vec!["src/**/*.rs".into()],
+                allowed_files: vec![PathPattern::from("src/**/*.rs")],
                 proposal_tier: ProposalTier::Tier1,
             },
             timeout: Duration::from_secs(300),
@@ -184,7 +228,7 @@ pub(crate) mod tests {
         Candidate {
             id: Uuid::new_v4(),
             experiment_id,
-            node_id: node_id.into(),
+            node_id: NodeId::from(node_id),
             patch: "diff --git a/src/lib.rs b/src/lib.rs".into(),
             approach: "Optimize scoring".into(),
             self_metrics: BTreeMap::from([("latency".into(), 123.0)]),
@@ -199,7 +243,7 @@ pub(crate) mod tests {
     ) -> Evaluation {
         Evaluation {
             candidate_id,
-            evaluator_id: evaluator_id.into(),
+            evaluator_id: NodeId::from(evaluator_id),
             fitness_scores: BTreeMap::from([("latency".into(), score)]),
             safety_pass: true,
             signal_resolved: true,

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 const GENESIS_HASH: &str = "genesis";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChainEntry {
     pub index: u64,
     pub previous_hash: String,
@@ -19,13 +19,13 @@ pub struct ChainEntry {
     pub hash: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Chain {
     entries: Vec<ChainEntry>,
     head_hash: String,
 }
 
-pub trait ChainStorage {
+pub trait ChainStorage: Send + Sync {
     fn load(&self) -> Result<Chain>;
     fn save(&self, chain: &Chain) -> Result<()>;
 }
@@ -79,13 +79,15 @@ impl Chain {
         experiment: Experiment,
         result: ConsensusResult,
         winning_patch: Option<String>,
+        applied_at: Option<DateTime<Utc>>,
     ) -> Result<()> {
-        let entry = self.build_entry(experiment, result, winning_patch)?;
+        let entry = self.build_entry(experiment, result, winning_patch, applied_at)?;
         self.head_hash = entry.hash.clone();
         self.entries.push(entry);
         Ok(())
     }
 
+    #[must_use = "chain verification must be checked to detect tampering"]
     pub fn verify(&self) -> Result<()> {
         let mut previous_hash = GENESIS_HASH.to_string();
         for (index, entry) in self.entries.iter().enumerate() {
@@ -102,6 +104,14 @@ impl Chain {
         Ok(())
     }
 
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     pub fn entries(&self) -> &[ChainEntry] {
         &self.entries
     }
@@ -115,9 +125,9 @@ impl Chain {
         experiment: Experiment,
         result: ConsensusResult,
         winning_patch: Option<String>,
+        applied_at: Option<DateTime<Utc>>,
     ) -> Result<ChainEntry> {
         let index = self.entries.len() as u64;
-        let applied_at = winning_patch.as_ref().map(|_| Utc::now());
         let hash = compute_hash(
             index,
             &self.head_hash,
@@ -199,7 +209,8 @@ mod tests {
     #[test]
     fn creates_empty_chain_with_genesis_hash() {
         let chain = Chain::new();
-        assert!(chain.entries().is_empty());
+        assert!(chain.is_empty());
+        assert_eq!(chain.len(), 0);
         assert!(chain.verify().is_ok());
     }
 
@@ -208,14 +219,38 @@ mod tests {
         let mut chain = Chain::new();
         let experiment = sample_experiment();
         let result = sample_result(experiment.id);
+        let applied_at = Some(Utc::now());
 
         chain
-            .append(experiment, result, Some("diff --git".into()))
+            .append(experiment, result, Some("diff --git".into()), applied_at)
             .expect("append succeeds");
 
-        assert_eq!(chain.entries().len(), 1);
+        assert_eq!(chain.len(), 1);
         assert!(chain.head().is_some());
+        assert_eq!(chain.head().and_then(|entry| entry.applied_at), applied_at);
         assert!(chain.verify().is_ok());
+    }
+
+    #[test]
+    fn verifies_multi_entry_chain_and_detects_middle_entry_tampering() {
+        let mut chain = Chain::new();
+        for _ in 0..3 {
+            let experiment = sample_experiment();
+            let result = sample_result(experiment.id);
+            chain
+                .append(experiment, result, None, None)
+                .expect("append succeeds");
+        }
+
+        assert!(chain.verify().is_ok());
+        chain.entries[1].winning_patch = Some("tampered".into());
+
+        let error = chain.verify().expect_err("verification should fail");
+
+        assert!(matches!(
+            error,
+            ConsensusError::ChainIntegrity { index: 1, .. }
+        ));
     }
 
     #[test]
@@ -224,7 +259,7 @@ mod tests {
         let experiment = sample_experiment();
         let result = sample_result(experiment.id);
         chain
-            .append(experiment, result, None)
+            .append(experiment, result, None, None)
             .expect("append succeeds");
         chain.entries[0].winning_patch = Some("tampered".into());
 
@@ -237,6 +272,18 @@ mod tests {
     }
 
     #[test]
+    fn loading_nonexistent_storage_path_returns_empty_chain() {
+        let dir = tempdir().expect("create tempdir");
+        let storage = JsonFileChainStorage::new(dir.path().join("missing-chain.json"));
+
+        let chain = storage.load().expect("load succeeds");
+
+        assert!(chain.is_empty());
+        assert_eq!(chain.len(), 0);
+        assert!(chain.verify().is_ok());
+    }
+
+    #[test]
     fn saves_and_loads_chain_round_trip() {
         let dir = tempdir().expect("create tempdir");
         let storage = JsonFileChainStorage::new(dir.path().join("chain.json"));
@@ -244,13 +291,13 @@ mod tests {
         let experiment = sample_experiment();
         let result = sample_result(experiment.id);
         chain
-            .append(experiment, result, None)
+            .append(experiment, result, None, None)
             .expect("append succeeds");
 
         storage.save(&chain).expect("save succeeds");
         let loaded = storage.load().expect("load succeeds");
 
-        assert_eq!(loaded.entries().len(), 1);
+        assert_eq!(loaded.len(), 1);
         assert!(loaded.verify().is_ok());
     }
 

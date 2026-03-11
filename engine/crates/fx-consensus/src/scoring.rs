@@ -2,6 +2,14 @@ use crate::types::{Candidate, Decision, Evaluation, FitnessCriterion, MetricType
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateStatus {
+    Accepted,
+    RejectedSafety,
+    RejectedSignal,
+    RejectedRegression,
+}
+
 pub fn compute_aggregate_scores(
     candidates: &[Candidate],
     evaluations: &[Evaluation],
@@ -22,25 +30,81 @@ pub fn determine_winner(
     aggregate_scores: &BTreeMap<Uuid, f64>,
     evaluations: &[Evaluation],
 ) -> (Decision, Option<Uuid>) {
-    let Some((winner, _)) = aggregate_scores
-        .iter()
-        .max_by(|left, right| left.1.total_cmp(right.1))
-    else {
-        return (Decision::Inconclusive, None);
-    };
-
-    let winner = *winner;
-    let candidate_evaluations: Vec<&Evaluation> = evaluations
-        .iter()
-        .filter(|evaluation| evaluation.candidate_id == winner)
-        .collect();
-    if candidate_evaluations.is_empty() || !all_safe(&candidate_evaluations) {
-        return (Decision::Reject, None);
-    }
-    if has_signal_majority(&candidate_evaluations) {
+    let candidate_statuses = collect_candidate_statuses(aggregate_scores, evaluations);
+    if let Some(winner) = select_accepted_candidate(aggregate_scores, &candidate_statuses) {
         return (Decision::Accept, Some(winner));
     }
-    (Decision::Reject, None)
+    (decision_without_winner(&candidate_statuses), None)
+}
+
+fn collect_candidate_statuses(
+    aggregate_scores: &BTreeMap<Uuid, f64>,
+    evaluations: &[Evaluation],
+) -> Vec<(Uuid, CandidateStatus)> {
+    aggregate_scores
+        .keys()
+        .map(|candidate_id| (*candidate_id, candidate_status(*candidate_id, evaluations)))
+        .collect()
+}
+
+fn select_accepted_candidate(
+    aggregate_scores: &BTreeMap<Uuid, f64>,
+    candidate_statuses: &[(Uuid, CandidateStatus)],
+) -> Option<Uuid> {
+    aggregate_scores
+        .iter()
+        .filter(|(candidate_id, _)| is_accepted(**candidate_id, candidate_statuses))
+        .max_by(|left, right| left.1.total_cmp(right.1))
+        .map(|(candidate_id, _)| *candidate_id)
+}
+
+fn is_accepted(candidate_id: Uuid, candidate_statuses: &[(Uuid, CandidateStatus)]) -> bool {
+    candidate_statuses
+        .iter()
+        .any(|(id, status)| *id == candidate_id && *status == CandidateStatus::Accepted)
+}
+
+fn decision_without_winner(candidate_statuses: &[(Uuid, CandidateStatus)]) -> Decision {
+    if candidate_statuses.is_empty() {
+        return Decision::Inconclusive;
+    }
+    if all_have_status(candidate_statuses, CandidateStatus::RejectedSafety) {
+        return Decision::Reject;
+    }
+    if all_have_status(candidate_statuses, CandidateStatus::RejectedSignal) {
+        return Decision::Reject;
+    }
+    Decision::Inconclusive
+}
+
+fn all_have_status(
+    candidate_statuses: &[(Uuid, CandidateStatus)],
+    expected: CandidateStatus,
+) -> bool {
+    candidate_statuses
+        .iter()
+        .all(|(_, status)| *status == expected)
+}
+
+fn candidate_status(candidate_id: Uuid, evaluations: &[Evaluation]) -> CandidateStatus {
+    let candidate_evaluations: Vec<&Evaluation> = evaluations
+        .iter()
+        .filter(|evaluation| evaluation.candidate_id == candidate_id)
+        .collect();
+    evaluate_candidate(&candidate_evaluations)
+}
+
+fn evaluate_candidate(evaluations: &[&Evaluation]) -> CandidateStatus {
+    if evaluations.is_empty() || !all_safe(evaluations) {
+        return CandidateStatus::RejectedSafety;
+    }
+    if !has_signal_majority(evaluations) {
+        return CandidateStatus::RejectedSignal;
+    }
+    if has_regression_majority(evaluations) {
+        return CandidateStatus::RejectedRegression;
+    }
+    CandidateStatus::Accepted
 }
 
 fn score_candidate(
@@ -87,11 +151,27 @@ fn all_safe(evaluations: &[&Evaluation]) -> bool {
 }
 
 fn has_signal_majority(evaluations: &[&Evaluation]) -> bool {
-    let resolved = evaluations
-        .iter()
-        .filter(|evaluation| evaluation.signal_resolved && !evaluation.regression_detected)
-        .count();
-    resolved * 2 > evaluations.len()
+    majority_count(
+        evaluations
+            .iter()
+            .filter(|evaluation| evaluation.signal_resolved)
+            .count(),
+        evaluations.len(),
+    )
+}
+
+fn has_regression_majority(evaluations: &[&Evaluation]) -> bool {
+    majority_count(
+        evaluations
+            .iter()
+            .filter(|evaluation| evaluation.regression_detected)
+            .count(),
+        evaluations.len(),
+    )
+}
+
+fn majority_count(matches: usize, total: usize) -> bool {
+    matches * 2 > total
 }
 
 #[cfg(test)]
@@ -145,20 +225,38 @@ mod tests {
 
         let result = determine_winner(&scores, &[failing, passing]);
 
-        assert!(matches!(result, (Decision::Reject, None)));
+        assert_eq!(result, (Decision::Reject, None));
     }
 
     #[test]
-    fn accepts_candidate_when_signal_resolution_has_majority() {
+    fn accepts_candidate_when_signal_resolution_has_majority_even_with_minor_regression() {
         let candidate_id = Uuid::new_v4();
         let yes_a = sample_evaluation(candidate_id, "node-b", 1.0);
-        let yes_b = sample_evaluation(candidate_id, "node-c", 1.0);
+        let mut yes_b = sample_evaluation(candidate_id, "node-c", 1.0);
+        yes_b.regression_detected = true;
         let mut no = sample_evaluation(candidate_id, "node-d", 1.0);
         no.signal_resolved = false;
         let scores = BTreeMap::from([(candidate_id, 10.0)]);
 
         let result = determine_winner(&scores, &[yes_a, yes_b, no]);
 
-        assert!(matches!(result, (Decision::Accept, Some(id)) if id == candidate_id));
+        assert_eq!(result, (Decision::Accept, Some(candidate_id)));
+    }
+
+    #[test]
+    fn falls_back_to_next_highest_candidate_that_meets_consensus_rules() {
+        let rejected_candidate = Uuid::new_v4();
+        let accepted_candidate = Uuid::new_v4();
+        let mut reg_a = sample_evaluation(rejected_candidate, "node-b", 1.0);
+        let mut reg_b = sample_evaluation(rejected_candidate, "node-c", 1.0);
+        reg_a.regression_detected = true;
+        reg_b.regression_detected = true;
+        let ok_a = sample_evaluation(accepted_candidate, "node-d", 1.0);
+        let ok_b = sample_evaluation(accepted_candidate, "node-e", 1.0);
+        let scores = BTreeMap::from([(rejected_candidate, 10.0), (accepted_candidate, 9.0)]);
+
+        let result = determine_winner(&scores, &[reg_a, reg_b, ok_a, ok_b]);
+
+        assert_eq!(result, (Decision::Accept, Some(accepted_candidate)));
     }
 }
