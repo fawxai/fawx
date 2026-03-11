@@ -215,17 +215,21 @@ fn build_subagent_nodes(
         .map(|index| {
             let node_id = NodeId(format!("node-{index}"));
             let strategy = strategy_for(index);
-            let workspace = CargoWorkspace::clone_from(&project_dir, &node_id.0)
-                .map_err(|error| error.to_string())?;
+            let generator_workspace =
+                CargoWorkspace::clone_from(&project_dir, &format!("{}-gen", node_id.0))
+                    .map_err(|error| error.to_string())?;
+            let evaluator_workspace =
+                CargoWorkspace::clone_from(&project_dir, &format!("{}-eval", node_id.0))
+                    .map_err(|error| error.to_string())?;
             Ok(NodeConfig {
                 node_id,
                 strategy: strategy.clone(),
-                patch_source: Box::new(SubagentPatchSource::new(
+                patch_source: Box::new(SubagentPatchSource::with_workspace(
                     Arc::clone(&control),
                     strategy,
-                    project_dir.clone(),
+                    generator_workspace,
                 )),
-                workspace: Box::new(workspace),
+                workspace: Box::new(evaluator_workspace),
             })
         })
         .collect()

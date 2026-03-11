@@ -308,17 +308,21 @@ fn build_subagent_nodes(
         .map(|index| {
             let strategy = placeholders::strategy_for(index);
             let node_id = fx_consensus::NodeId(format!("node-{index}"));
-            let workspace = CargoWorkspace::clone_from(&project_dir, &node_id.0)
-                .map_err(anyhow::Error::from)?;
+            let generator_workspace =
+                CargoWorkspace::clone_from(&project_dir, &format!("{}-gen", node_id.0))
+                    .map_err(anyhow::Error::from)?;
+            let evaluator_workspace =
+                CargoWorkspace::clone_from(&project_dir, &format!("{}-eval", node_id.0))
+                    .map_err(anyhow::Error::from)?;
             Ok(fx_consensus::NodeConfig {
                 node_id: node_id.clone(),
                 strategy: strategy.clone(),
-                patch_source: Box::new(SubagentPatchSource::new(
+                patch_source: Box::new(SubagentPatchSource::with_workspace(
                     manager.clone(),
                     strategy,
-                    project_dir.clone(),
+                    generator_workspace,
                 )),
-                workspace: Box::new(workspace),
+                workspace: Box::new(evaluator_workspace),
             })
         })
         .collect()

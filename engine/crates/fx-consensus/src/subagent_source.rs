@@ -1,3 +1,4 @@
+use crate::cargo_workspace::CargoWorkspace;
 use crate::llm_source::build_subagent_experiment_prompt;
 use crate::response_parser::parse_patch_response;
 use crate::{ConsensusError, Experiment, GenerationStrategy, PatchResponse, PatchSource};
@@ -11,6 +12,8 @@ pub struct SubagentPatchSource {
     manager: Arc<dyn SubagentControl>,
     strategy: GenerationStrategy,
     working_dir: PathBuf,
+    /// Keeps the cloned workspace alive so the temp directory is not deleted.
+    _workspace: Option<CargoWorkspace>,
     poll_interval: Duration,
 }
 
@@ -24,6 +27,22 @@ impl SubagentPatchSource {
             manager,
             strategy,
             working_dir,
+            _workspace: None,
+            poll_interval: Duration::from_millis(100),
+        }
+    }
+
+    pub fn with_workspace(
+        manager: Arc<dyn SubagentControl>,
+        strategy: GenerationStrategy,
+        workspace: CargoWorkspace,
+    ) -> Self {
+        let working_dir = workspace.project_dir().to_path_buf();
+        Self {
+            manager,
+            strategy,
+            working_dir,
+            _workspace: Some(workspace),
             poll_interval: Duration::from_millis(100),
         }
     }
@@ -512,6 +531,78 @@ mod tests {
     fn extract_approach_from_empty_text_returns_default() {
         let approach = extract_approach_from_text("");
         assert!(approach.contains("did not provide an approach"));
+    }
+
+    #[test]
+    fn with_workspace_keeps_temp_dir_alive() {
+        use crate::cargo_workspace::CargoWorkspace;
+        use tempfile::TempDir;
+
+        // Create a minimal git project in a temp dir
+        let temp = TempDir::new().expect("temp dir");
+        let path = temp.path();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(path)
+            .status()
+            .expect("git init");
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(path)
+            .status()
+            .expect("git config");
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(path)
+            .status()
+            .expect("git config");
+        std::fs::create_dir_all(path.join("src")).expect("src dir");
+        std::fs::write(
+            path.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("Cargo.toml");
+        std::fs::write(path.join("src/lib.rs"), "pub fn value() -> i32 { 1 }\n").expect("lib.rs");
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(path)
+            .status()
+            .expect("git add");
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(path)
+            .status()
+            .expect("git commit");
+
+        let workspace = CargoWorkspace::clone_from(path, "regression-test").expect("clone");
+        let cloned_dir = workspace.project_dir().to_path_buf();
+
+        // Verify the cloned dir exists
+        assert!(
+            cloned_dir.exists(),
+            "cloned dir should exist before ownership transfer"
+        );
+
+        let manager: Arc<dyn SubagentControl> = Arc::new(MockSubagentControl::new(vec![]));
+        let source = SubagentPatchSource::with_workspace(
+            manager,
+            GenerationStrategy::Conservative,
+            workspace,
+        );
+
+        // The cloned dir should still exist because SubagentPatchSource owns the workspace
+        assert!(
+            cloned_dir.exists(),
+            "cloned dir must survive — SubagentPatchSource owns the workspace"
+        );
+        assert_eq!(source.working_dir, cloned_dir);
+
+        // Drop the source — now the temp dir should be cleaned up
+        drop(source);
+        assert!(
+            !cloned_dir.exists(),
+            "cloned dir should be cleaned up after SubagentPatchSource is dropped"
+        );
     }
 
     fn sample_experiment(timeout: Duration) -> Experiment {

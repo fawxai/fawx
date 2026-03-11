@@ -11,6 +11,10 @@ pub struct CargoWorkspace {
 }
 
 impl CargoWorkspace {
+    pub fn project_dir(&self) -> &Path {
+        &self.project_dir
+    }
+
     pub fn new(project_dir: PathBuf) -> crate::Result<Self> {
         validate_workspace_dir(&project_dir)?;
         let baseline_tests = collect_baseline_tests(&project_dir)?;
@@ -348,6 +352,19 @@ fn parse_count(line: &str, label: &str) -> u32 {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn project_dir_returns_configured_path() {
+        let temp = TempDir::new().expect("temp dir");
+        init_git_project(temp.path());
+        write_project_files(
+            temp.path(),
+            "pub fn value() -> i32 { 1 }\n",
+            "assert_eq!(demo::value(), 1);",
+        );
+        let workspace = CargoWorkspace::new(temp.path().to_path_buf()).expect("workspace");
+        assert_eq!(workspace.project_dir(), temp.path());
+    }
 
     #[tokio::test]
     async fn apply_patch_build_and_test_work_for_temp_project() {
