@@ -101,25 +101,39 @@ pub fn build_subagent_experiment_prompt(experiment: &Experiment) -> String {
             "Hypothesis: {}\n",
             "Target files: {}\n",
             "Fitness criteria: {}\n\n",
-            "IMPORTANT: You have full tool access. Follow these steps:\n\n",
-            "1. READ the target files using read_file to understand the current code\n",
-            "2. READ any related files (imports, types, existing tests) to understand patterns\n",
-            "3. PLAN your changes based on what you read\n",
-            "4. WRITE the improved code using write_file or edit_file\n",
-            "5. RUN `cargo build` via run_command to verify it compiles\n",
-            "6. RUN `cargo test` via run_command to verify tests pass\n",
-            "7. If build/test fails, FIX the issues and retry\n\n",
-            "After your changes compile and tests pass, output your results:\n\n",
+            "IMPORTANT: You have full tool access. You MUST use tools — do NOT generate code from memory.\n\n",
+            "## Step 1: Understand the code\n",
+            "- Use read_file to read EVERY target file completely\n",
+            "- Use read_file to read files they import (check `use` statements)\n",
+            "- If there are existing tests, read them to understand test patterns and helper functions\n",
+            "- Do NOT assume any functions, types, or helpers exist — verify by reading\n\n",
+            "## Step 2: Make changes\n",
+            "- Use edit_file to modify the target files\n",
+            "- If you need test helper functions, define them in the same file — do NOT reference helpers from other files unless you verified they are pub and importable\n\n",
+            "## Step 3: Verify (MANDATORY — do not skip)\n",
+            "- Run: `cargo build 2>&1` via run_command (from the project root)\n",
+            "- If build fails, read the errors, fix them with edit_file, and rebuild\n",
+            "- Run: `cargo test 2>&1` via run_command\n",
+            "- If tests fail, read the errors, fix them with edit_file, and retest\n",
+            "- REPEAT until both build and test pass with zero errors\n",
+            "- You MUST see a successful build and test output before proceeding\n\n",
+            "## Step 4: Output results (ONLY after Step 3 passes)\n",
+            "- Run: `git diff` via run_command to capture your changes\n",
+            "- Output the diff inside <PATCH> tags\n\n",
             "<PATCH>\n",
-            "[run `git diff` to get the actual unified diff of your changes]\n",
+            "[paste the exact output of `git diff` here]\n",
             "</PATCH>\n",
             "<APPROACH>\n",
-            "[1-2 sentence summary of what you did and why]\n",
+            "[1-2 sentence summary of what you changed and why]\n",
             "</APPROACH>\n",
             "<METRICS>\n",
             "{{\"build_success\": 1.0, \"test_pass_rate\": <actual_rate>, \"signal_resolution\": <0.0-1.0>}}\n",
             "</METRICS>\n\n",
-            "DO NOT guess at file contents. READ them first. DO NOT output a patch without verifying it builds."
+            "CRITICAL RULES:\n",
+            "- NEVER output <PATCH> until cargo build AND cargo test pass\n",
+            "- NEVER assume helper functions exist — define them or verify with read_file\n",
+            "- NEVER generate a diff from memory — always use `git diff` output\n",
+            "- If you cannot make the code compile after 3 attempts, output an empty <PATCH></PATCH> with build_success: 0.0"
         ),
         experiment.trigger.name,
         experiment.trigger.description,
@@ -187,10 +201,11 @@ mod tests {
     fn build_subagent_experiment_prompt_includes_tool_instructions() {
         let prompt = build_subagent_experiment_prompt(&sample_experiment());
 
-        assert!(prompt.contains("IMPORTANT: You have full tool access"));
-        assert!(prompt.contains("READ the target files using read_file"));
-        assert!(prompt.contains("RUN `cargo build` via run_command"));
-        assert!(prompt.contains("DO NOT guess at file contents. READ them first."));
+        assert!(prompt.contains("You MUST use tools"));
+        assert!(prompt.contains("Use read_file to read EVERY target file"));
+        assert!(prompt.contains("cargo build 2>&1"));
+        assert!(prompt.contains("NEVER output <PATCH> until cargo build AND cargo test pass"));
+        assert!(prompt.contains("NEVER assume helper functions exist"));
     }
 
     #[test]

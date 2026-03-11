@@ -258,11 +258,11 @@ mod tests {
         assert!(config
             .task
             .contains("Signal: latency — High latency detected"));
-        assert!(config.task.contains("IMPORTANT: You have full tool access"));
+        assert!(config.task.contains("You MUST use tools"));
         assert!(config
             .task
-            .contains("READ the target files using read_file"));
-        assert!(config.task.contains("RUN `cargo build` via run_command"));
+            .contains("Use read_file to read EVERY target file"));
+        assert!(config.task.contains("cargo build 2>&1"));
     }
 
     #[tokio::test]
