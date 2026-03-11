@@ -320,7 +320,11 @@ mod tests {
             patch_source: Box::new(StaticPatchSource {
                 patch: format!("diff --git a/{node_id} b/{node_id}"),
                 approach: format!("{strategy:?} approach"),
-                metrics: BTreeMap::from([("fitness".into(), 1.0)]),
+                metrics: BTreeMap::from([
+                    ("build_success".into(), 1.0),
+                    ("test_pass_rate".into(), 1.0),
+                    ("signal_resolution".into(), 1.0),
+                ]),
             }),
             workspace: Box::new(PatchAwareWorkspace {
                 current_patch: Mutex::new(String::new()),
@@ -335,7 +339,11 @@ mod tests {
             patch_source: Box::new(StaticPatchSource {
                 patch: format!("diff --git a/{node_id} b/{node_id}"),
                 approach: format!("{strategy:?} approach"),
-                metrics: BTreeMap::from([("fitness".into(), 1.0)]),
+                metrics: BTreeMap::from([
+                    ("build_success".into(), 1.0),
+                    ("test_pass_rate".into(), 1.0),
+                    ("signal_resolution".into(), 1.0),
+                ]),
             }),
             workspace: Box::new(FailingWorkspace),
         }

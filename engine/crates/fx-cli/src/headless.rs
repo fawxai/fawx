@@ -333,6 +333,7 @@ impl HeadlessApp {
     }
 
     /// Return the loaded configuration.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn config(&self) -> &FawxConfig {
         &self.config
     }

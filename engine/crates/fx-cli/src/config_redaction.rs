@@ -11,6 +11,7 @@ pub(crate) fn sanitize_json(value: JsonValue) -> JsonValue {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn sanitize_toml(value: TomlValue) -> TomlValue {
     match value {
         TomlValue::Table(table) => TomlValue::Table(sanitize_toml_table(table)),
@@ -47,6 +48,7 @@ fn sanitize_json_entry(key: &str, value: JsonValue) -> JsonValue {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn sanitize_toml_table(table: TomlMap<String, TomlValue>) -> TomlMap<String, TomlValue> {
     table
         .into_iter()
@@ -54,6 +56,7 @@ fn sanitize_toml_table(table: TomlMap<String, TomlValue>) -> TomlMap<String, Tom
         .collect()
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn sanitize_toml_entry(key: &str, value: TomlValue) -> TomlValue {
     if is_secret_key(key) {
         TomlValue::String(REDACTED_SECRET.to_string())

@@ -167,6 +167,10 @@ impl ConsensusProtocol for LocalConsensusEngine {
             experiment_id,
             winner,
             candidates: candidates.iter().map(|candidate| candidate.id).collect(),
+            candidate_nodes: candidates
+                .iter()
+                .map(|candidate| (candidate.id, candidate.node_id.clone()))
+                .collect(),
             evaluations,
             aggregate_scores,
             decision,

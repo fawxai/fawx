@@ -215,6 +215,12 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         fail_on_regression: bool,
     },
+
+    /// Run proof-of-fitness experiments
+    Experiment {
+        #[command(subcommand)]
+        command: commands::experiment::ExperimentCommands,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -873,6 +879,11 @@ async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
             update_baseline,
             fail_on_regression,
         } => dispatch_eval(mode, output, baseline, update_baseline, fail_on_regression),
+        Commands::Experiment { command } => {
+            let result = commands::experiment::run(command).await?;
+            println!("{result}");
+            Ok(0)
+        }
     }
 }
 

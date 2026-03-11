@@ -12,7 +12,7 @@ default = ["http"]
 http = ["dep:axum", "dep:fx-channel-telegram", "dep:fx-channel-webhook"]
 # Enable the OAuth bridge HTTP server subcommand (`fawx oauth-bridge`).
 # Pulls in axum and crypto dependencies. Disabled by default to reduce build times.
-oauth-bridge = ["dep:axum", "dep:base64", "dep:rand", "dep:subtle"]
+oauth-bridge = ["dep:axum", "dep:base64", "dep:subtle", "dep:rand"]
 
 [[bin]]
 name = "fawx"
@@ -26,6 +26,7 @@ fx-fleet.workspace = true
 fx-kernel.workspace = true
 fx-propose.workspace = true
 fx-canary = { path = "../fx-canary" }
+fx-consensus = { path = "../fx-consensus" }
 fx-subagent.workspace = true
 fx-auth.workspace = true
 fx-conversation.workspace = true

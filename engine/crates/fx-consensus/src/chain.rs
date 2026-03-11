@@ -309,6 +309,7 @@ mod tests {
             experiment_id,
             winner: Some(candidate.id),
             candidates: vec![candidate.id],
+            candidate_nodes: BTreeMap::from([(candidate.id, candidate.node_id.clone())]),
             evaluations: vec![sample_evaluation(candidate.id, "node-b", 0.7)],
             aggregate_scores: BTreeMap::from([(candidate.id, 0.7)]),
             decision: Decision::Accept,
