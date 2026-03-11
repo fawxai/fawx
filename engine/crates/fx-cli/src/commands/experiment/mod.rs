@@ -1,18 +1,24 @@
-use anyhow::{anyhow, Context};
+use anyhow::{anyhow, bail, Context};
 use clap::Subcommand;
 use fx_consensus::{
     Chain, ChainStorage, ExperimentConfig, ExperimentRunner, FitnessCriterion,
     JsonFileChainStorage, MetricType, ModificationScope, PathPattern, ProposalTier, Signal,
 };
+use fx_llm::ModelRouter;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
+mod cargo_workspace;
 mod format;
+mod llm_source;
 mod placeholders;
 
+use cargo_workspace::CargoWorkspace;
 use format::{format_chain_entries, format_chain_entry, format_experiment_report};
+use llm_source::LlmPatchSource;
 use placeholders::build_nodes;
 
 const CHAIN_PATH_ENV: &str = "FAWX_CONSENSUS_CHAIN_PATH";
@@ -40,6 +46,14 @@ pub enum ExperimentCommands {
         /// Timeout per node in seconds (default: 120)
         #[arg(long, default_value = "120")]
         timeout: u64,
+
+        /// Use a real LLM router and cargo workspace instead of placeholders
+        #[arg(long, default_value = "false")]
+        live: bool,
+
+        /// Cargo workspace project directory for live evaluation
+        #[arg(long)]
+        project: Option<String>,
     },
 
     /// View the consensus chain
@@ -67,6 +81,8 @@ pub async fn run(command: ExperimentCommands) -> anyhow::Result<String> {
             nodes,
             scope,
             timeout,
+            live,
+            project,
         } => {
             run_experiment(RunExperimentArgs {
                 signal,
@@ -74,6 +90,8 @@ pub async fn run(command: ExperimentCommands) -> anyhow::Result<String> {
                 nodes,
                 scope,
                 timeout,
+                live,
+                project,
             })
             .await
         }
@@ -89,6 +107,8 @@ pub struct RunExperimentArgs {
     pub nodes: u32,
     pub scope: String,
     pub timeout: u64,
+    pub live: bool,
+    pub project: Option<String>,
 }
 
 pub async fn run_experiment(args: RunExperimentArgs) -> anyhow::Result<String> {
@@ -100,9 +120,111 @@ async fn run_experiment_with_path(
     chain_path: PathBuf,
 ) -> anyhow::Result<String> {
     ensure_chain_parent_dir(&chain_path)?;
-    let runner = ExperimentRunner::with_nodes(chain_path, build_nodes(args.nodes))?;
+    let nodes = if args.live {
+        build_live_nodes_from_args(&args)?
+    } else {
+        build_nodes(args.nodes)
+    };
+    let runner = ExperimentRunner::with_nodes(chain_path, nodes)?;
     let report = runner.run(build_config(&args)?).await?;
     Ok(format_experiment_report(&args, &report))
+}
+
+fn build_live_nodes_from_args(
+    args: &RunExperimentArgs,
+) -> anyhow::Result<Vec<fx_consensus::NodeConfig>> {
+    let auth_manager = crate::startup::load_auth_manager()?;
+    let mut router = crate::startup::build_router(&auth_manager)?;
+    let config = crate::startup::load_config()?;
+    let model = crate::headless::resolve_active_model(&router, &config)?;
+    router
+        .set_active(&model)
+        .map_err(|error| anyhow!("failed to activate model '{model}': {error}"))?;
+    let project_dir = resolve_project_dir(args)?;
+    build_live_nodes(args.nodes, Arc::new(router), model, project_dir)
+}
+
+fn resolve_project_dir(args: &RunExperimentArgs) -> anyhow::Result<PathBuf> {
+    let project_dir = args
+        .project
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    validate_project_dir(&project_dir)
+}
+
+fn validate_project_dir(project_dir: &Path) -> anyhow::Result<PathBuf> {
+    let canonical = fs::canonicalize(project_dir)
+        .with_context(|| format!("failed to access project path {}", project_dir.display()))?;
+    if !canonical.exists() {
+        bail!("project path does not exist: {}", canonical.display());
+    }
+    if !canonical.is_dir() {
+        bail!("project path is not a directory: {}", canonical.display());
+    }
+    let manifest = canonical.join("Cargo.toml");
+    if !manifest.is_file() {
+        bail!("project is missing Cargo.toml: {}", canonical.display());
+    }
+    verify_git_repo(&canonical)?;
+    ensure_clean_git_status(&canonical)?;
+    Ok(canonical)
+}
+
+fn verify_git_repo(project_dir: &Path) -> anyhow::Result<()> {
+    run_git_check(project_dir, &["rev-parse", "--git-dir"]).map(|_| ())
+}
+
+fn ensure_clean_git_status(project_dir: &Path) -> anyhow::Result<()> {
+    let status = run_git_check(project_dir, &["status", "--porcelain"])?;
+    if status.trim().is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "refusing to run experiment on a dirty git repository: {}",
+            project_dir.display()
+        )
+    }
+}
+
+fn run_git_check(project_dir: &Path, args: &[&str]) -> anyhow::Result<String> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(project_dir)
+        .output()
+        .with_context(|| format!("failed to run git in {}", project_dir.display()))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        bail!(
+            "git {} failed for {}: {}",
+            args.join(" "),
+            project_dir.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    }
+}
+
+fn build_live_nodes(
+    count: u32,
+    router: Arc<ModelRouter>,
+    model: String,
+    project_dir: PathBuf,
+) -> anyhow::Result<Vec<fx_consensus::NodeConfig>> {
+    (0..count)
+        .map(|index| {
+            let strategy = placeholders::strategy_for(index);
+            let node_id = fx_consensus::NodeId(format!("node-{index}"));
+            let workspace = CargoWorkspace::clone_from(&project_dir, &node_id.0)
+                .map_err(anyhow::Error::from)?;
+            Ok(fx_consensus::NodeConfig {
+                node_id: node_id.clone(),
+                strategy: strategy.clone(),
+                patch_source: Box::new(LlmPatchSource::new(router.clone(), model.clone())),
+                workspace: Box::new(workspace),
+            })
+        })
+        .collect()
 }
 
 fn build_config(args: &RunExperimentArgs) -> anyhow::Result<ExperimentConfig> {
@@ -223,7 +345,8 @@ fn ensure_chain_parent_dir(path: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use fx_consensus::{ChainEntry, Decision, ExperimentReport, GenerationStrategy};
+    use clap::Parser;
+    use fx_consensus::{Decision, ExperimentReport, GenerationStrategy};
     use std::collections::BTreeMap;
     use tempfile::TempDir;
 
@@ -256,6 +379,8 @@ mod tests {
                 nodes: 3,
                 scope: "src/**/*.rs".to_owned(),
                 timeout: 120,
+                live: false,
+                project: None,
             },
             chain_path.clone(),
         )
@@ -320,6 +445,8 @@ mod tests {
             nodes: 2,
             scope: "src/**/*.rs".to_owned(),
             timeout: 120,
+            live: false,
+            project: None,
         };
 
         let output = format_experiment_report(&args, &report);
@@ -383,6 +510,96 @@ mod tests {
                 PathPattern::from("docs/*.md"),
             ]
         );
+    }
+
+    #[test]
+    fn validate_project_dir_requires_git_repo() {
+        let temp = TempDir::new().expect("temp dir");
+        fs::write(
+            temp.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("manifest");
+
+        let error = validate_project_dir(temp.path()).expect_err("missing git repo");
+
+        assert!(error.to_string().contains("git rev-parse --git-dir failed"));
+    }
+
+    #[test]
+    fn validate_project_dir_rejects_dirty_repo() {
+        let temp = TempDir::new().expect("temp dir");
+        init_git_project(temp.path());
+        fs::write(
+            temp.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("manifest");
+        std::process::Command::new("git")
+            .args(["add", "Cargo.toml"])
+            .current_dir(temp.path())
+            .status()
+            .expect("git add");
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(temp.path())
+            .status()
+            .expect("git commit");
+        fs::write(temp.path().join("scratch.txt"), "dirty\n").expect("scratch file");
+
+        let error = validate_project_dir(temp.path()).expect_err("dirty repo");
+
+        assert!(error
+            .to_string()
+            .contains("refusing to run experiment on a dirty git repository"));
+    }
+
+    #[test]
+    fn cli_parser_accepts_live_flag_and_project() {
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(subcommand)]
+            command: ExperimentCommands,
+        }
+
+        let cli = TestCli::try_parse_from([
+            "experiment",
+            "run",
+            "--signal",
+            "latency",
+            "--hypothesis",
+            "parallelism helps",
+            "--live",
+            "--project",
+            "/tmp/demo",
+        ])
+        .expect("parse experiment cli");
+
+        match cli.command {
+            ExperimentCommands::Run { live, project, .. } => {
+                assert!(live);
+                assert_eq!(project.as_deref(), Some("/tmp/demo"));
+            }
+            _ => panic!("expected run command"),
+        }
+    }
+
+    fn init_git_project(path: &Path) {
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(path)
+            .status()
+            .expect("git init");
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(path)
+            .status()
+            .expect("git email");
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(path)
+            .status()
+            .expect("git name");
     }
 
     fn write_sample_chain(path: &Path) {

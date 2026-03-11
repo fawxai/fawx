@@ -23,7 +23,7 @@ pub(super) fn build_nodes(count: u32) -> Vec<NodeConfig> {
         .collect()
 }
 
-fn strategy_for(index: u32) -> GenerationStrategy {
+pub(super) fn strategy_for(index: u32) -> GenerationStrategy {
     match index % 3 {
         0 => GenerationStrategy::Conservative,
         1 => GenerationStrategy::Aggressive,
