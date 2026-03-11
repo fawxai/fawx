@@ -222,7 +222,7 @@ mod tests {
     #[test]
     fn set_updates_persisted_config_through_manager() {
         let mut test_manager = manager_from("[model]\ndefault_model = \"old\"\n");
-        let output = execute(
+        execute(
             Some(ConfigCommands::Set {
                 key: "model.default_model".to_string(),
                 value: "new".to_string(),
@@ -230,8 +230,14 @@ mod tests {
             &mut test_manager.manager,
         )
         .expect("set config");
-        assert!(output.contains("Updated model.default_model"));
-        assert!(output.ends_with("new"));
+
+        let stored = select_config_value(test_manager.manager.config(), "model.default_model")
+            .expect("stored model");
+        assert_eq!(stored.as_str(), Some("new"));
+
+        let persisted =
+            std::fs::read_to_string(test_manager.manager.config_path()).expect("persisted config");
+        assert!(persisted.contains("default_model = \"new\""));
     }
 
     #[test]

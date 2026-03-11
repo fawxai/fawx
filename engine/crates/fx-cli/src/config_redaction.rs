@@ -23,7 +23,14 @@ pub(crate) fn is_secret_key(key: &str) -> bool {
     let normalized = key.to_ascii_lowercase();
     secret_markers()
         .iter()
-        .any(|marker| normalized.contains(marker))
+        .any(|marker| has_secret_suffix(&normalized, marker))
+}
+
+fn has_secret_suffix(key: &str, marker: &str) -> bool {
+    key == marker
+        || key
+            .strip_suffix(marker)
+            .is_some_and(|prefix| prefix.ends_with('_'))
 }
 
 fn sanitize_json_object(map: JsonMap<String, JsonValue>) -> JsonMap<String, JsonValue> {
@@ -64,12 +71,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn secret_key_detection_uses_contains_heuristic() {
+    fn secret_key_detection_matches_secret_suffixes() {
         assert!(is_secret_key("bot_token"));
         assert!(is_secret_key("service_private_key"));
         assert!(is_secret_key("aws_access_key"));
-        assert!(is_secret_key("customCredentialName"));
+        assert!(is_secret_key("credential"));
         assert!(!is_secret_key("default_model"));
+    }
+
+    #[test]
+    fn secret_key_detection_avoids_non_secret_marker_substrings() {
+        assert!(!is_secret_key("max_tokens"));
+        assert!(!is_secret_key("api_key_id"));
+        assert!(!is_secret_key("tokenizer_model"));
     }
 
     #[test]
