@@ -1,4 +1,5 @@
 use thiserror::Error;
+use uuid::Uuid;
 
 pub type Result<T> = std::result::Result<T, ConsensusError>;
 
@@ -14,4 +15,14 @@ pub enum ConsensusError {
     NoConsensus(String),
     #[error("safety violation: {0}")]
     SafetyViolation(String),
+    #[error("experiment not found: {0}")]
+    ExperimentNotFound(Uuid),
+    #[error("experiment already finalized: {0}")]
+    ExperimentAlreadyFinalized(Uuid),
+    #[error("candidate not found: {0}")]
+    CandidateNotFound(Uuid),
+    #[error("insufficient candidates: required {required}, received {received}")]
+    InsufficientCandidates { required: u32, received: u32 },
+    #[error("protocol error: {0}")]
+    Protocol(String),
 }
