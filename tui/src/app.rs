@@ -235,7 +235,6 @@ struct App {
     connection: ConnectionState,
     streaming_text: Option<String>,
     logo_art: String,
-    logo_width: Option<u32>,
     installed_skills: Vec<InstalledSkill>,
     pending_request: bool,
     awaiting_stream_start: bool,
@@ -267,7 +266,6 @@ impl App {
             connection: ConnectionState::Connecting,
             streaming_text: None,
             logo_art: String::new(),
-            logo_width: None,
             installed_skills: discover_installed_skills(),
             pending_request: false,
             awaiting_stream_start: false,
@@ -604,27 +602,20 @@ impl App {
             .split(size);
         self.transcript_area = layout[1];
         self.input_area = layout[2];
-        self.sync_logo_art(layout[1].width);
+        self.sync_logo_art();
 
         frame.render_widget(self.render_header(), layout[0]);
         frame.render_widget(self.render_transcript(layout[1]), layout[1]);
         self.render_input(frame, layout[2]);
     }
 
-    /// Re-render the mascot art when the welcome layout needs it.
-    ///
-    /// Cached by `logo_width`: only re-renders when the welcome layout's
-    /// mascot column changes size. Narrow layouts skip art entirely.
-    fn sync_logo_art(&mut self, area_width: u16) {
-        let desired_width = logo_target_width(area_width);
-        if self.logo_width == desired_width {
+    /// Render the mascot art once for the fixed welcome banner layout.
+    fn sync_logo_art(&mut self) {
+        if !self.logo_art.is_empty() {
             return;
         }
 
-        self.logo_width = desired_width;
-        if let Some(width) = desired_width {
-            self.logo_art = render_logo_art(width).unwrap_or_else(|_| "🦊".to_string());
-        }
+        self.logo_art = render_logo_art().unwrap_or_else(|_| "🦊".to_string());
     }
 
     fn render_header(&self) -> Paragraph<'static> {
@@ -901,9 +892,13 @@ fn initial_entries() -> Vec<Entry> {
     }]
 }
 
-fn render_logo_art(width: u32) -> anyhow::Result<String> {
+const LOGO_RENDER_WIDTH: u32 = 40;
+const LOGO_RENDER_THRESHOLD: u8 = 35;
+
+fn render_logo_art() -> anyhow::Result<String> {
     let config = RenderConfig {
-        width: Some(width),
+        width: Some(LOGO_RENDER_WIDTH),
+        threshold: LOGO_RENDER_THRESHOLD,
         color: false,
         ..Default::default()
     };
@@ -935,15 +930,6 @@ fn logo_art_looks_garbled(art: &str) -> bool {
     }
     let noise = art.chars().filter(|ch| "⣿⣷⣶⣤⣀⠿⡿".contains(*ch)).count();
     noise * 2 >= visible
-}
-
-fn logo_target_width(area_width: u16) -> Option<u32> {
-    let layout = WelcomeLayout::for_width(area_width.saturating_sub(4) as usize);
-    match layout {
-        WelcomeLayout::Wide => Some(18),
-        WelcomeLayout::Medium => Some(16),
-        WelcomeLayout::Narrow => None,
-    }
 }
 
 fn discover_installed_skills() -> Vec<InstalledSkill> {
@@ -1770,7 +1756,7 @@ mod tests {
         let art = validate_logo_art("⣿⣿⣿⣿\n⣷⣷⣷⣷".to_string()).unwrap_err();
 
         assert!(art.to_string().contains("garbled"));
-        assert!(render_logo_art(18).is_ok());
+        assert!(render_logo_art().is_ok());
     }
 
     #[test]
