@@ -900,6 +900,7 @@ fn render_logo_art() -> anyhow::Result<String> {
         width: Some(LOGO_RENDER_WIDTH),
         threshold: LOGO_RENDER_THRESHOLD,
         color: false,
+        gamma: Some(1.8),
         ..Default::default()
     };
     render_logo_variant("fawx-mascot.png", &config)
