@@ -1,20 +1,16 @@
+use crate::{current_time_ms, fs_utils::write_private};
 use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-#[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::fs;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 
 const FLEET_KEY_LEN: usize = 32;
 const TOKEN_SECRET_LEN: usize = 32;
 const TOKEN_ID_LEN: usize = 16;
-const PRIVATE_FILE_MODE: u32 = 0o600;
 
 /// Errors from fleet token and key operations.
 #[derive(Debug, Error)]
@@ -34,6 +30,10 @@ pub enum FleetError {
     /// The fleet token has been revoked.
     #[error("fleet token revoked")]
     TokenRevoked,
+
+    /// Fleet state could not be serialized or deserialized.
+    #[error("fleet state serialization error: {0}")]
+    JsonError(#[from] serde_json::Error),
 
     /// Attempted to register a duplicate node.
     #[error("duplicate node")]
@@ -82,11 +82,7 @@ impl FleetKey {
     /// Save to a file path (mode 0600).
     pub fn save(&self, path: &Path) -> Result<(), FleetError> {
         validate_key_bytes(&self.key_bytes)?;
-        ensure_parent_dir(path)?;
-        let mut file = create_private_file(path)?;
-        file.write_all(&self.key_bytes)?;
-        file.sync_all()?;
-        set_private_permissions(path)
+        write_private(path, &self.key_bytes)
     }
 
     /// Sign a message (HMAC-SHA256).
@@ -165,27 +161,6 @@ fn validate_key_bytes(key_bytes: &[u8]) -> Result<(), FleetError> {
     }
 }
 
-fn ensure_parent_dir(path: &Path) -> Result<(), FleetError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    Ok(())
-}
-
-fn create_private_file(path: &Path) -> Result<std::fs::File, FleetError> {
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    options.mode(PRIVATE_FILE_MODE);
-    Ok(options.open(path)?)
-}
-
-fn set_private_permissions(path: &Path) -> Result<(), FleetError> {
-    #[cfg(unix)]
-    fs::set_permissions(path, fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
-    Ok(())
-}
-
 fn random_bytes(len: usize) -> Result<Vec<u8>, FleetError> {
     let mut bytes = vec![0_u8; len];
     SystemRandom::new().fill(&mut bytes).map_err(|_| {
@@ -209,21 +184,10 @@ fn encode_hex(bytes: &[u8]) -> String {
     encoded
 }
 
-/// Returns the current Unix timestamp in milliseconds.
-///
-/// If the system clock is ever observed before the Unix epoch, this returns 0.
-fn current_time_ms() -> u64 {
-    let duration = match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(duration) => duration,
-        Err(_) => return 0,
-    };
-
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fs_utils::assert_private_permissions;
     use tempfile::TempDir;
 
     #[test]
@@ -347,14 +311,5 @@ mod tests {
         let signature = key.sign(message);
 
         assert!(!key.verify(b"tampered-message", &signature));
-    }
-
-    fn assert_private_permissions(path: &Path) {
-        #[cfg(unix)]
-        {
-            let metadata = fs::metadata(path).expect("metadata should load");
-            let mode = metadata.permissions().mode() & 0o777;
-            assert_eq!(mode, PRIVATE_FILE_MODE);
-        }
     }
 }

@@ -1,7 +1,10 @@
+pub(crate) mod fs_utils;
+pub mod manager;
 pub mod ssh;
 pub mod token;
 pub mod transport;
 
+pub use manager::FleetManager;
 pub use ssh::SshTransport;
 pub use token::{FleetError, FleetKey, FleetToken};
 pub use transport::{CommandResult, NodeTransport, TransportError};
@@ -105,7 +108,7 @@ impl From<&NodeConfig> for NodeInfo {
     }
 }
 
-fn current_time_ms() -> u64 {
+pub(crate) fn current_time_ms() -> u64 {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
