@@ -114,7 +114,10 @@ mod tests {
         use std::time::{Duration, SystemTime};
         let time = SystemTime::UNIX_EPOCH + Duration::from_secs(unix_secs as u64);
         let times = fs::FileTimes::new().set_modified(time);
-        let file = fs::File::options().write(true).open(path).expect("open for mtime");
+        let file = fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open for mtime");
         file.set_times(times).expect("set mtime");
     }
 

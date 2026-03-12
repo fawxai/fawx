@@ -296,7 +296,11 @@ mod tests {
 
         // On macOS /var → /private/var symlink, so canonicalize both sides.
         let expected = tempdir.path().canonicalize().ok();
-        let actual = config.tools.working_dir.as_ref().and_then(|p| p.canonicalize().ok());
+        let actual = config
+            .tools
+            .working_dir
+            .as_ref()
+            .and_then(|p| p.canonicalize().ok());
         assert_eq!(actual, expected);
     }
 

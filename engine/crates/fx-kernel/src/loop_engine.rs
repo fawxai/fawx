@@ -11106,7 +11106,9 @@ mod context_compaction_tests {
             .with(CaptureLayer {
                 events: Arc::clone(&events),
             });
-        let _guard = tracing::subscriber::set_default(subscriber);
+        // Use dispatcher::with_default to override even a global subscriber set by other tests.
+        let dispatch = tracing::dispatcher::Dispatch::new(subscriber);
+        let _guard = tracing::dispatcher::set_default(&dispatch);
 
         let history = large_history(12, 70);
         let compacted = engine
@@ -11118,7 +11120,7 @@ mod context_compaction_tests {
         let captured = events.lock().expect("events lock").clone();
         assert!(
             !captured.is_empty(),
-            "expected tracing events to be captured"
+            "expected tracing events to be captured; another test may have set a global subscriber"
         );
 
         let info_event = captured.iter().find(|event| {

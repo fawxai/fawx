@@ -465,7 +465,10 @@ mod tests {
             .await;
         let err = result.unwrap().unwrap_err();
         assert!(
-            err.contains("Deny") || err.contains("deny") || err.contains("blocked") || err.contains("policy violation"),
+            err.contains("Deny")
+                || err.contains("deny")
+                || err.contains("blocked")
+                || err.contains("policy violation"),
             "unexpected error: {err}"
         );
     }
