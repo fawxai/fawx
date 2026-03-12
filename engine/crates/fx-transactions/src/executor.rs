@@ -644,7 +644,8 @@ mod tests {
     #[tokio::test]
     async fn commit_deny_tier_path_aborts_before_writes() {
         let dir = TempDir::new().expect("tempdir");
-        let denied_path = temp_path(&dir, "secret.key");
+        // Use *.dat (not *.key) to avoid ALWAYS_PROPOSE_PATTERNS override.
+        let denied_path = temp_path(&dir, "secret.dat");
 
         let mut store = TransactionStore::new();
         let id = store.begin("deny".into(), None, 0).expect("begin ok");
@@ -652,7 +653,7 @@ mod tests {
             .stage(id, denied_path.clone(), "blocked".into(), 0)
             .expect("stage ok");
 
-        let self_modify = strict_self_modify(&["**"], &["*.key"]);
+        let self_modify = strict_self_modify(&["**"], &["*.dat"]);
         let err = commit(&mut store, id, None, &self_modify, dir.path())
             .await
             .expect_err("deny-tier path must fail commit");
@@ -699,7 +700,8 @@ mod tests {
     async fn commit_mixed_paths_with_deny_tier_aborts_atomically() {
         let dir = TempDir::new().expect("tempdir");
         let allow_path = temp_path(&dir, "src/main.rs");
-        let denied_path = temp_path(&dir, "secret.key");
+        // Use *.dat (not *.key) to avoid ALWAYS_PROPOSE_PATTERNS override.
+        let denied_path = temp_path(&dir, "secret.dat");
         tokio::fs::create_dir_all(allow_path.parent().expect("parent"))
             .await
             .expect("mkdir");
@@ -716,7 +718,7 @@ mod tests {
             .stage(id, denied_path.clone(), "blocked".into(), 0)
             .expect("stage deny");
 
-        let self_modify = strict_self_modify(&["**"], &["*.key"]);
+        let self_modify = strict_self_modify(&["**"], &["*.dat"]);
         let err = commit(&mut store, id, None, &self_modify, dir.path())
             .await
             .expect_err("mixed commit must fail when one path is deny-tier");
