@@ -1,7 +1,9 @@
 pub mod ssh;
+pub mod token;
 pub mod transport;
 
 pub use ssh::SshTransport;
+pub use token::{FleetError, FleetKey, FleetToken};
 pub use transport::{CommandResult, NodeTransport, TransportError};
 
 use fx_config::NodeConfig;
