@@ -6,6 +6,8 @@
 //! responses, and calling the Bot API. No agentic loop logic — that stays
 //! in HeadlessApp.
 
+pub mod progress;
+
 use fx_core::channel::{Channel, ChannelError, ResponseContext};
 use fx_core::types::InputSource;
 use regex::Regex;
@@ -21,7 +23,7 @@ use std::sync::{Mutex, OnceLock};
 // ---------------------------------------------------------------------------
 
 /// Telegram Bot API maximum message length in UTF-8 code units.
-const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
+pub(crate) const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
 
 /// Slash commands registered with Telegram on startup via `setMyCommands`.
 /// Keep in sync with `fx-cli/src/commands/slash.rs`.
@@ -257,7 +259,7 @@ struct TgFile {
 }
 
 /// Check a Telegram Bot API response for errors.
-async fn check_api_response(resp: reqwest::Response) -> Result<(), TelegramError> {
+pub(crate) async fn check_api_response(resp: reqwest::Response) -> Result<(), TelegramError> {
     let api_resp: ApiResponse = resp
         .json()
         .await
@@ -524,7 +526,7 @@ pub struct TelegramChannel {
 }
 
 /// Default Telegram Bot API base URL.
-const DEFAULT_BASE_URL: &str = "https://api.telegram.org";
+pub(crate) const DEFAULT_BASE_URL: &str = "https://api.telegram.org";
 
 impl TelegramChannel {
     /// Create a new Telegram channel with the given configuration.
