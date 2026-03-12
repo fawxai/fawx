@@ -11,7 +11,7 @@ use fx_auth::credential_store::{
     AuthProvider, CredentialStore as SkillCredentialStoreTrait, EncryptedFileCredentialStore,
 };
 use fx_auth::oauth::{extract_openai_account_id, PkceFlow, TokenExchangeRequest, TokenResponse};
-use fx_config::DEFAULT_CONFIG_TEMPLATE;
+use fx_config::{PermissionAction, PermissionPreset, PermissionsConfig, DEFAULT_CONFIG_TEMPLATE};
 use fx_llm::{CompletionRequest, Message, ModelCatalog};
 use serde::Deserialize;
 use std::collections::BTreeSet;
@@ -45,6 +45,7 @@ pub async fn run(force: bool) -> anyhow::Result<i32> {
 
     wizard.run_auth_phase().await?;
     wizard.run_model_phase().await?;
+    wizard.run_permissions_phase()?;
     let skill_state = wizard.run_skills_phase()?;
     wizard.run_skill_credentials_phase(&skill_state)?;
     wizard.run_http_phase()?;
@@ -67,6 +68,7 @@ struct SetupWizard {
     store_recreated: bool,
     selected_provider: Option<String>,
     default_model: Option<String>,
+    permissions_preset: Option<PermissionPreset>,
     selected_skills: Vec<&'static SetupSkill>,
     http: HttpSetup,
     telegram: Option<TelegramSetup>,
@@ -126,7 +128,7 @@ struct CredentialPrompt {
     label: &'static str,
 }
 
-static SETUP_SKILLS: [SetupSkill; 8] = [
+static SETUP_SKILLS: [SetupSkill; 7] = [
     SetupSkill {
         name: "calculator",
         label: "Calculator",
@@ -154,12 +156,6 @@ static SETUP_SKILLS: [SetupSkill; 8] = [
     SetupSkill {
         name: "stt",
         label: "STT",
-        default_selected: false,
-        auth: SkillAuth::OpenAiReuse,
-    },
-    SetupSkill {
-        name: "vision",
-        label: "Vision",
         default_selected: false,
         auth: SkillAuth::OpenAiReuse,
     },
@@ -211,6 +207,7 @@ impl SetupWizard {
             store_recreated,
             selected_provider: None,
             default_model: None,
+            permissions_preset: None,
             selected_skills: Vec::new(),
             http: HttpSetup {
                 port: DEFAULT_HTTP_PORT,
@@ -343,6 +340,31 @@ impl SetupWizard {
         Ok(())
     }
 
+    fn run_permissions_phase(&mut self) -> anyhow::Result<()> {
+        println!("Step 3: Permissions");
+        println!("  Choose how much autonomy Fawx has:");
+        println!(
+            "    [1] 🔥 Power — full workspace autonomy, proposals for external actions (recommended)"
+        );
+        println!("    [2] 🔒 Cautious — proposals required for all writes and code execution");
+        println!("    [3] 🧪 Experimental — maximum autonomy including kernel self-modification");
+        let preset = prompt_choice_with_surface(
+            PromptSurface::PlainTerminal,
+            "  > ",
+            "Please choose 1, 2, or 3.\n",
+            "permission preset",
+            parse_permissions_selection,
+        )?;
+        self.permissions_preset = Some(preset);
+        println!(
+            "  ✓ Permissions: {} ({})",
+            permission_preset_label(preset),
+            permission_preset_summary(preset)
+        );
+        println!();
+        Ok(())
+    }
+
     async fn available_models(&self, provider: &str) -> anyhow::Result<Vec<String>> {
         let dynamic = fetch_catalog_models(provider, self.auth_manager.get(provider)).await?;
         if !dynamic.is_empty() {
@@ -352,7 +374,7 @@ impl SetupWizard {
     }
 
     fn run_skills_phase(&mut self) -> anyhow::Result<SkillWizardState> {
-        println!("Step 3: Skills");
+        println!("Step 4: Skills");
         let state = self.skill_wizard_state()?;
         self.selected_skills = prompt_skill_selection(&state)?
             .into_iter()
@@ -365,7 +387,7 @@ impl SetupWizard {
     }
 
     fn run_skill_credentials_phase(&mut self, state: &SkillWizardState) -> anyhow::Result<()> {
-        println!("Step 4: Skill Credentials");
+        println!("Step 5: Skill Credentials");
         let reuse_messages = provider_reuse_messages(&self.selected_skills, state);
         let requirement_messages = provider_requirement_messages(&self.selected_skills, state);
         let prompts = credential_prompts(&self.selected_skills, state);
@@ -421,7 +443,7 @@ impl SetupWizard {
     }
 
     fn run_http_phase(&mut self) -> anyhow::Result<()> {
-        println!("Step 5: HTTP API");
+        println!("Step 6: HTTP API");
         let enable = prompt_yes_no("  Enable HTTP API? [Y/n]: ", true)?;
         if !enable {
             println!("  ✓ HTTP API disabled");
@@ -440,7 +462,7 @@ impl SetupWizard {
     }
 
     async fn run_channels_phase(&mut self) -> anyhow::Result<()> {
-        println!("Step 6: Channels");
+        println!("Step 7: Channels");
         if !self.http.enabled {
             println!("  HTTP API is disabled; skipping channel setup.\n");
             return Ok(());
@@ -502,7 +524,7 @@ impl SetupWizard {
     }
 
     async fn run_validation_phase(&mut self) -> anyhow::Result<()> {
-        println!("Step 7: Validation");
+        println!("Step 8: Validation");
         self.validate_model_connection().await?;
         self.validate_saved_telegram();
         println!("  ✓ Credential store: healthy");
@@ -551,6 +573,9 @@ impl SetupWizard {
                 "default_model",
                 &model,
             )?;
+        }
+        if let Some(preset) = self.permissions_preset {
+            write_permissions_preset(&mut self.config_document, preset)?;
         }
         if self.http.enabled {
             set_integer(
@@ -874,6 +899,33 @@ fn parse_list_selection(value: &str, len: usize) -> Option<usize> {
     (1..=len).contains(&parsed).then_some(parsed)
 }
 
+fn parse_permissions_selection(value: &str) -> Option<PermissionPreset> {
+    match value.trim() {
+        "1" => Some(PermissionPreset::Power),
+        "2" => Some(PermissionPreset::Cautious),
+        "3" => Some(PermissionPreset::Experimental),
+        _ => None,
+    }
+}
+
+fn permission_preset_label(preset: PermissionPreset) -> &'static str {
+    match preset {
+        PermissionPreset::Power => "Power",
+        PermissionPreset::Cautious => "Cautious",
+        PermissionPreset::Experimental => "Experimental",
+        PermissionPreset::Custom => "Custom",
+    }
+}
+
+fn permission_preset_summary(preset: PermissionPreset) -> &'static str {
+    match preset {
+        PermissionPreset::Power => "full workspace autonomy",
+        PermissionPreset::Cautious => "proposals required for all writes and code execution",
+        PermissionPreset::Experimental => "maximum autonomy including kernel self-modification",
+        PermissionPreset::Custom => "custom permission policy",
+    }
+}
+
 fn prompt_channel_selection() -> anyhow::Result<ChannelSelection> {
     println!("    [1] Telegram");
     println!("    [2] Webhook (generic HTTP)");
@@ -1095,6 +1147,52 @@ fn write_webhook_config(
     Ok(())
 }
 
+fn write_permissions_preset(
+    document: &mut DocumentMut,
+    preset: PermissionPreset,
+) -> anyhow::Result<()> {
+    let permissions = match preset {
+        PermissionPreset::Power => PermissionsConfig::power(),
+        PermissionPreset::Cautious => PermissionsConfig::cautious(),
+        PermissionPreset::Experimental => PermissionsConfig::experimental(),
+        PermissionPreset::Custom => PermissionsConfig {
+            preset,
+            ..PermissionsConfig::default()
+        },
+    };
+    write_permissions_config(document, &permissions)
+}
+
+fn write_permissions_config(
+    document: &mut DocumentMut,
+    permissions: &PermissionsConfig,
+) -> anyhow::Result<()> {
+    let unrestricted = permission_action_names(&permissions.unrestricted);
+    let proposal_required = permission_action_names(&permissions.proposal_required);
+    set_string(
+        document,
+        &["permissions"],
+        "preset",
+        permissions.preset.as_str(),
+    )?;
+    set_string_array(document, &["permissions"], "unrestricted", &unrestricted)?;
+    set_string_array(
+        document,
+        &["permissions"],
+        "proposal_required",
+        &proposal_required,
+    )?;
+    Ok(())
+}
+
+fn permission_action_names(actions: &[PermissionAction]) -> Vec<&'static str> {
+    actions
+        .iter()
+        .copied()
+        .map(PermissionAction::as_str)
+        .collect()
+}
+
 fn set_string(
     document: &mut DocumentMut,
     sections: &[&str],
@@ -1133,6 +1231,21 @@ fn set_integer_array(
     sections: &[&str],
     key: &str,
     field_values: &[i64],
+) -> anyhow::Result<()> {
+    let table = table_mut(document, sections)?;
+    let mut array = Array::new();
+    for value in field_values {
+        array.push(*value);
+    }
+    table[key] = Item::Value(array.into());
+    Ok(())
+}
+
+fn set_string_array(
+    document: &mut DocumentMut,
+    sections: &[&str],
+    key: &str,
+    field_values: &[&str],
 ) -> anyhow::Result<()> {
     let table = table_mut(document, sections)?;
     let mut array = Array::new();
@@ -1263,29 +1376,69 @@ mod tests {
     }
 
     #[test]
+    fn parse_permissions_selection() {
+        assert_eq!(
+            super::parse_permissions_selection("1"),
+            Some(PermissionPreset::Power)
+        );
+        assert_eq!(
+            super::parse_permissions_selection("2"),
+            Some(PermissionPreset::Cautious)
+        );
+        assert_eq!(
+            super::parse_permissions_selection("3"),
+            Some(PermissionPreset::Experimental)
+        );
+        assert_eq!(super::parse_permissions_selection("0"), None);
+        assert_eq!(super::parse_permissions_selection("4"), None);
+        assert_eq!(super::parse_permissions_selection("abc"), None);
+    }
+
+    #[test]
     fn parse_toggle_input_accepts_single_number() {
-        assert_eq!(parse_toggle_input("3", 8), vec![2]);
+        assert_eq!(parse_toggle_input("3", SETUP_SKILLS.len()), vec![2]);
     }
 
     #[test]
     fn parse_toggle_input_accepts_comma_and_space_separated_numbers() {
-        assert_eq!(parse_toggle_input("1,3,5", 8), vec![0, 2, 4]);
-        assert_eq!(parse_toggle_input("1 3 5", 8), vec![0, 2, 4]);
-        assert_eq!(parse_toggle_input("1, 3 5", 8), vec![0, 2, 4]);
+        assert_eq!(
+            parse_toggle_input("1,3,5", SETUP_SKILLS.len()),
+            vec![0, 2, 4]
+        );
+        assert_eq!(
+            parse_toggle_input("1 3 5", SETUP_SKILLS.len()),
+            vec![0, 2, 4]
+        );
+        assert_eq!(
+            parse_toggle_input("1, 3 5", SETUP_SKILLS.len()),
+            vec![0, 2, 4]
+        );
     }
 
     #[test]
     fn parse_toggle_input_ignores_invalid_and_duplicate_entries() {
-        assert_eq!(parse_toggle_input("0", 8), Vec::<usize>::new());
-        assert_eq!(parse_toggle_input("99", 8), Vec::<usize>::new());
-        assert_eq!(parse_toggle_input("abc", 8), Vec::<usize>::new());
-        assert_eq!(parse_toggle_input("3,3", 8), vec![2]);
-        assert_eq!(parse_toggle_input("", 8), Vec::<usize>::new());
+        assert_eq!(
+            parse_toggle_input("0", SETUP_SKILLS.len()),
+            Vec::<usize>::new()
+        );
+        assert_eq!(
+            parse_toggle_input("99", SETUP_SKILLS.len()),
+            Vec::<usize>::new()
+        );
+        assert_eq!(
+            parse_toggle_input("abc", SETUP_SKILLS.len()),
+            Vec::<usize>::new()
+        );
+        assert_eq!(parse_toggle_input("3,3", SETUP_SKILLS.len()), vec![2]);
+        assert_eq!(
+            parse_toggle_input("", SETUP_SKILLS.len()),
+            Vec::<usize>::new()
+        );
     }
 
     #[test]
     fn parse_toggle_input_keeps_valid_entries_when_mixed_with_invalid_ones() {
-        assert_eq!(parse_toggle_input("1,abc", 8), vec![0]);
+        assert_eq!(parse_toggle_input("1,abc", SETUP_SKILLS.len()), vec![0]);
     }
 
     #[test]
@@ -1344,6 +1497,41 @@ mod tests {
     }
 
     #[test]
+    fn permissions_config_writes_preset_to_document() {
+        let mut document = load_config_document(Path::new("config.toml")).expect("document");
+        let permissions = PermissionsConfig::power();
+
+        write_permissions_config(&mut document, &permissions).expect("permissions config");
+
+        let rendered = document.to_string();
+        assert!(rendered.contains("[permissions]"));
+        assert!(rendered.contains("preset = \"power\""));
+        assert!(rendered.contains(
+            "unrestricted = [\"read_any\", \"web_search\", \"web_fetch\", \"code_execute\", \"file_write\", \"git\", \"shell\", \"tool_call\", \"self_modify\"]"
+        ));
+        assert!(rendered.contains(
+            "proposal_required = [\"credential_change\", \"system_install\", \"network_listen\", \"outbound_message\", \"file_delete\", \"outside_workspace\", \"kernel_modify\"]"
+        ));
+    }
+
+    #[test]
+    fn write_permissions_preset_writes_each_selectable_preset() {
+        let cases = [
+            PermissionPreset::Power,
+            PermissionPreset::Cautious,
+            PermissionPreset::Experimental,
+        ];
+
+        for preset in cases {
+            let mut document = load_config_document(Path::new("config.toml")).expect("document");
+            write_permissions_preset(&mut document, preset).expect("write preset");
+            assert!(document
+                .to_string()
+                .contains(&format!("preset = \"{}\"", preset.as_str())));
+        }
+    }
+
+    #[test]
     fn store_telegram_credentials_persists_bot_token_and_webhook_secret() {
         let store = AuthStore::open_for_testing().expect("test auth store");
 
@@ -1393,6 +1581,12 @@ mod tests {
             .iter()
             .find(|skill| skill.name == name)
             .expect("setup skill")
+    }
+
+    #[test]
+    fn setup_skills_exclude_vision() {
+        assert_eq!(SETUP_SKILLS.len(), 7);
+        assert!(SETUP_SKILLS.iter().all(|skill| skill.name != "vision"));
     }
 
     #[test]

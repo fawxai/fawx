@@ -144,6 +144,17 @@ pub enum PermissionPreset {
     Custom,
 }
 
+impl PermissionPreset {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Power => "power",
+            Self::Cautious => "cautious",
+            Self::Experimental => "experimental",
+            Self::Custom => "custom",
+        }
+    }
+}
+
 impl FromStr for PermissionPreset {
     type Err = String;
 
@@ -180,6 +191,29 @@ pub enum PermissionAction {
     FileDelete,
     OutsideWorkspace,
     KernelModify,
+}
+
+impl PermissionAction {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadAny => "read_any",
+            Self::WebSearch => "web_search",
+            Self::WebFetch => "web_fetch",
+            Self::CodeExecute => "code_execute",
+            Self::FileWrite => "file_write",
+            Self::Git => "git",
+            Self::Shell => "shell",
+            Self::ToolCall => "tool_call",
+            Self::SelfModify => "self_modify",
+            Self::CredentialChange => "credential_change",
+            Self::SystemInstall => "system_install",
+            Self::NetworkListen => "network_listen",
+            Self::OutboundMessage => "outbound_message",
+            Self::FileDelete => "file_delete",
+            Self::OutsideWorkspace => "outside_workspace",
+            Self::KernelModify => "kernel_modify",
+        }
+    }
 }
 
 /// Permissions configuration for preset-based and custom autonomy policies.
@@ -1874,6 +1908,48 @@ working_dir = "/tmp/work"
         let encoded = toml::to_string(&config).expect("serialize");
         let decoded: PermissionsConfig = toml::from_str(&encoded).expect("deserialize");
         assert_eq!(decoded, config);
+    }
+
+    #[test]
+    fn permission_preset_as_str_matches_serde_name() {
+        let presets = [
+            PermissionPreset::Power,
+            PermissionPreset::Cautious,
+            PermissionPreset::Experimental,
+            PermissionPreset::Custom,
+        ];
+
+        for preset in presets {
+            let encoded = serde_json::to_string(&preset).expect("serialize preset");
+            assert_eq!(encoded, format!("\"{}\"", preset.as_str()));
+        }
+    }
+
+    #[test]
+    fn permission_action_as_str_matches_serde_name() {
+        let actions = [
+            PermissionAction::ReadAny,
+            PermissionAction::WebSearch,
+            PermissionAction::WebFetch,
+            PermissionAction::CodeExecute,
+            PermissionAction::FileWrite,
+            PermissionAction::Git,
+            PermissionAction::Shell,
+            PermissionAction::ToolCall,
+            PermissionAction::SelfModify,
+            PermissionAction::CredentialChange,
+            PermissionAction::SystemInstall,
+            PermissionAction::NetworkListen,
+            PermissionAction::OutboundMessage,
+            PermissionAction::FileDelete,
+            PermissionAction::OutsideWorkspace,
+            PermissionAction::KernelModify,
+        ];
+
+        for action in actions {
+            let encoded = serde_json::to_string(&action).expect("serialize action");
+            assert_eq!(encoded, format!("\"{}\"", action.as_str()));
+        }
     }
 
     #[test]
