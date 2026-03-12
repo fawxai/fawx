@@ -221,6 +221,12 @@ enum Commands {
         #[command(subcommand)]
         command: commands::experiment::ExperimentCommands,
     },
+
+    /// Manage the distributed fleet
+    Fleet {
+        #[command(subcommand)]
+        command: commands::fleet::FleetCommands,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -884,6 +890,10 @@ async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
         Commands::Experiment { command } => {
             let result = commands::experiment::run(command).await?;
             println!("{result}");
+            Ok(0)
+        }
+        Commands::Fleet { command } => {
+            commands::fleet::handle_fleet_command(&command)?;
             Ok(0)
         }
     }

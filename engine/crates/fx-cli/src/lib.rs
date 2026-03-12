@@ -26,6 +26,12 @@ mod import_command {
     }
 }
 #[cfg(test)]
+mod fleet_command {
+    mod implementation {
+        include!("commands/fleet.rs");
+    }
+}
+#[cfg(test)]
 mod repo_root;
 #[cfg(test)]
 mod restart;

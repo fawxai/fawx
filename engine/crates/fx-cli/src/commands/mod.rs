@@ -9,6 +9,7 @@ pub(crate) mod diagnostics;
 pub mod doctor;
 pub mod eval_harness;
 pub mod experiment;
+pub mod fleet;
 pub mod import;
 pub(crate) mod log_files;
 pub mod logs;
