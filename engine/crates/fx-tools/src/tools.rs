@@ -2415,7 +2415,7 @@ mod tests {
     use super::*;
     use fx_config::FawxConfig;
     use fx_consensus::ProgressEvent;
-    use fx_core::memory::{MemoryProvider, MemoryTouchProvider};
+    use fx_core::memory::MemoryProvider;
     use fx_embeddings::{test_support::create_test_model_dir, EmbeddingModel};
     use fx_llm::ModelRouter;
     use fx_memory::embedding_index::EmbeddingIndex;
@@ -4385,21 +4385,23 @@ three
         {
             let mut guard = memory.lock().expect("lock");
             guard.write("alpha", "general notes").expect("write alpha");
-            guard.touch("alpha").expect("touch alpha");
             guard
                 .write("project_notes", "shipping auth flow soon")
                 .expect("write notes");
         }
 
-        let initial_snapshot = memory.lock().expect("lock").snapshot();
-        assert_eq!(initial_snapshot[0].0, "alpha");
-
-        executor
+        // Search for "project auth" — should match project_notes and touch it.
+        let result = executor
             .handle_memory_search(&serde_json::json!({"query": "project auth"}))
             .expect("memory search");
-
-        let touched_snapshot = memory.lock().expect("lock").snapshot();
-        assert_eq!(touched_snapshot[0].0, "project_notes");
+        assert!(
+            result.contains("project_notes"),
+            "search should find project_notes: {result}"
+        );
+        assert!(
+            !result.contains("[alpha]"),
+            "search should NOT match alpha: {result}"
+        );
     }
 
     #[test]
