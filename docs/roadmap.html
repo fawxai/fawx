@@ -155,17 +155,38 @@
 
     <div class="phase">
       <div class="phase-header">
-        <span class="phase-badge badge-building">Building</span>
-        <h2 class="phase-title">Experiment UX + Fleet</h2>
+        <span class="phase-badge badge-shipped">Shipped</span>
+        <h2 class="phase-title">Experiment UX</h2>
       </div>
-      <p class="phase-desc">Live progress streaming, distributed experiments across machines, channel-appropriate rendering.</p>
+      <p class="phase-desc">Live progress streaming to every surface. Channel-appropriate rendering: side panel in TUI, edit_message on Telegram.</p>
       <ul class="feature-list">
-        <li><span class="wip">◐</span> Verbose mode with progress callbacks (--verbose)</li>
-        <li><span class="planned">○</span> TUI side panel with live experiment progress</li>
-        <li><span class="planned">○</span> Telegram edit_message progress updates</li>
-        <li><span class="planned">○</span> Remote evaluation via SSH (cross-machine experiments)</li>
-        <li><span class="planned">○</span> Fleet config file (~/.fawx/fleet.toml)</li>
-        <li><span class="planned">○</span> Fleet-aware node placement</li>
+        <li><span class="check">✓</span> Verbose mode with progress callbacks (--verbose)</li>
+        <li><span class="check">✓</span> TUI side panel with live experiment progress (70/30 split)</li>
+        <li><span class="check">✓</span> Telegram edit_message progress updates (mpsc bridge)</li>
+        <li><span class="check">✓</span> Remote evaluation via SSH (--eval-node, cross-machine)</li>
+        <li><span class="check">✓</span> Progress callback wired through FawxToolExecutor</li>
+        <li><span class="check">✓</span> TUI experiment panel widget with auto-hide</li>
+      </ul>
+    </div>
+    <hr class="divider">
+
+    <div class="phase">
+      <div class="phase-header">
+        <span class="phase-badge badge-building">Building</span>
+        <h2 class="phase-title">Distributed Fleet</h2>
+      </div>
+      <p class="phase-desc">Tailnet-only distributed experiments. Token-based auth, fleet management CLI, task dispatch across machines.</p>
+      <ul class="feature-list">
+        <li><span class="check">✓</span> Fleet signing key (HMAC-SHA256) + bearer tokens</li>
+        <li><span class="check">✓</span> FleetManager with file persistence (nodes.json, tokens.json)</li>
+        <li><span class="check">✓</span> Fleet CLI: fawx fleet init / add / remove / list</li>
+        <li><span class="check">✓</span> Secure file permissions (0600) + atomic persist</li>
+        <li><span class="check">✓</span> Node registry with capability-based routing</li>
+        <li><span class="wip">◐</span> HTTP task dispatch over Tailscale</li>
+        <li><span class="planned">○</span> Worker join flow (fawx fleet join)</li>
+        <li><span class="planned">○</span> Heartbeat monitoring + health checks</li>
+        <li><span class="planned">○</span> PAT borrowing (read-only GitHub access for workers)</li>
+        <li><span class="planned">○</span> Fleet-aware experiment scheduling (--fleet flag)</li>
       </ul>
     </div>
     <hr class="divider">
