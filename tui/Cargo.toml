@@ -16,7 +16,7 @@ path = "src/lib.rs"
 
 [features]
 default = []
-embedded = ["dep:fx-cli"]
+embedded = ["dep:fx-cli", "dep:fx-consensus"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -25,6 +25,7 @@ clap = { workspace = true, features = ["derive"] }
 crossterm = { workspace = true, features = ["bracketed-paste", "event-stream"] }
 fx-auth = { workspace = true }
 fx-cli = { workspace = true, optional = true, features = ["http"] }
+fx-consensus = { workspace = true, optional = true }
 fx-kernel = { workspace = true }
 fx-storage = { workspace = true }
 futures = { workspace = true }

@@ -1,5 +1,6 @@
 #[cfg(feature = "embedded")]
-use crate::embedded_backend::EmbeddedBackend;
+use crate::embedded_backend::{EmbeddedBackend, SharedExperimentPanel};
+use crate::experiment_panel::ExperimentPanel;
 use crate::fawx_backend::{
     friendly_error_message, BackendEvent, EngineBackend, EngineStatus, HttpBackend,
 };
@@ -21,14 +22,14 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use sparx::{render_file, RenderConfig};
 use std::cmp::min;
 use std::fmt;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
@@ -59,6 +60,10 @@ const WELCOME_COMMANDS: [(&str, &str); 6] = [
     ("/status", "engine info"),
     ("/quit", "exit"),
 ];
+const EXPERIMENT_PANEL_TITLE: &str = "Experiment";
+const TRANSCRIPT_WIDTH_PERCENT: u16 = 70;
+const EXPERIMENT_PANEL_WIDTH_PERCENT: u16 = 30;
+const PANEL_BORDER_LINES: usize = 2;
 
 #[derive(Debug, Clone)]
 pub struct RunOptions {
@@ -67,9 +72,9 @@ pub struct RunOptions {
 }
 
 pub async fn run_tui(options: RunOptions) -> anyhow::Result<()> {
-    let (backend, connection_target) = build_backend(&options)?;
+    let (backend, connection_target, experiment_panel) = build_backend(&options)?;
     let (tx, rx) = unbounded_channel();
-    let mut app = App::new(backend, connection_target, tx.clone(), rx);
+    let mut app = App::new(backend, connection_target, experiment_panel, tx.clone(), rx);
     app.spawn_bootstrap();
 
     let mut terminal = init_terminal()?;
@@ -78,30 +83,40 @@ pub async fn run_tui(options: RunOptions) -> anyhow::Result<()> {
     result
 }
 
-fn build_backend(options: &RunOptions) -> anyhow::Result<(Arc<dyn EngineBackend>, String)> {
+fn build_backend(
+    options: &RunOptions,
+) -> anyhow::Result<(Arc<dyn EngineBackend>, String, Arc<Mutex<ExperimentPanel>>)> {
     if options.embedded {
         return build_embedded_backend();
     }
     Ok(build_http_backend(&options.host))
 }
 
-fn build_http_backend(host: &str) -> (Arc<dyn EngineBackend>, String) {
+fn build_http_backend(host: &str) -> (Arc<dyn EngineBackend>, String, Arc<Mutex<ExperimentPanel>>) {
     let backend = HttpBackend::new(host);
     let target = backend.base_url().to_string();
-    (Arc::new(backend), target)
+    (
+        Arc::new(backend),
+        target,
+        // HTTP mode: panel stays empty (no embedded progress callback), but kept for uniform API
+        Arc::new(Mutex::new(ExperimentPanel::new())),
+    )
 }
 
 #[cfg(feature = "embedded")]
-fn build_embedded_backend() -> anyhow::Result<(Arc<dyn EngineBackend>, String)> {
-    let app = fx_cli::build_headless_app(None)?;
+fn build_embedded_backend(
+) -> anyhow::Result<(Arc<dyn EngineBackend>, String, SharedExperimentPanel)> {
+    let (backend, experiment_panel) = EmbeddedBackend::build()?;
     Ok((
-        Arc::new(EmbeddedBackend::new(app)),
+        Arc::new(backend),
         "embedded engine".to_string(),
+        experiment_panel,
     ))
 }
 
 #[cfg(not(feature = "embedded"))]
-fn build_embedded_backend() -> anyhow::Result<(Arc<dyn EngineBackend>, String)> {
+fn build_embedded_backend(
+) -> anyhow::Result<(Arc<dyn EngineBackend>, String, Arc<Mutex<ExperimentPanel>>)> {
     Err(anyhow::anyhow!(
         "Embedded mode requires the 'embedded' feature. Build with: cargo build -p fawx-tui --features embedded"
     ))
@@ -228,6 +243,7 @@ impl Command for DisableAlternateScroll {
 struct App {
     backend: Arc<dyn EngineBackend>,
     connection_target: String,
+    experiment_panel: Arc<Mutex<ExperimentPanel>>,
     tx: UnboundedSender<BackendEvent>,
     rx: UnboundedReceiver<BackendEvent>,
     entries: Vec<Entry>,
@@ -253,12 +269,14 @@ impl App {
     fn new(
         backend: Arc<dyn EngineBackend>,
         connection_target: String,
+        experiment_panel: Arc<Mutex<ExperimentPanel>>,
         tx: UnboundedSender<BackendEvent>,
         rx: UnboundedReceiver<BackendEvent>,
     ) -> Self {
         Self {
             backend,
             connection_target,
+            experiment_panel,
             tx,
             rx,
             entries: initial_entries(),
@@ -319,9 +337,21 @@ impl App {
     }
 
     fn handle_tick(&mut self) {
+        self.advance_spinner();
+        self.update_experiment_panel();
+    }
+
+    fn advance_spinner(&mut self) {
         if self.pending_request && self.awaiting_stream_start {
             self.spinner_frame = (self.spinner_frame + 1) % (THINKING_FRAMES.len() * 4);
         }
+    }
+
+    fn update_experiment_panel(&self) {
+        let Ok(mut panel) = self.experiment_panel.lock() else {
+            return;
+        };
+        let _ = panel.check_auto_hide();
     }
 
     fn handle_terminal_event(&mut self, event: CEvent) {
@@ -459,7 +489,15 @@ impl App {
         self.last_meta = None;
         self.last_tokens = None;
         self.input_scroll = 0;
+        self.clear_experiment_panel();
         self.push_system("Transcript cleared.");
+    }
+
+    fn clear_experiment_panel(&self) {
+        let Ok(mut panel) = self.experiment_panel.lock() else {
+            return;
+        };
+        panel.clear();
     }
 
     fn handle_backend_event(&mut self, event: BackendEvent) {
@@ -600,13 +638,48 @@ impl App {
                 Constraint::Length(4),
             ])
             .split(size);
-        self.transcript_area = layout[1];
+        let (transcript_area, experiment_area) = transcript_layout(layout[1], self.panel_visible());
+        self.transcript_area = transcript_area;
         self.input_area = layout[2];
         self.sync_logo_art();
 
         frame.render_widget(self.render_header(), layout[0]);
-        frame.render_widget(self.render_transcript(layout[1]), layout[1]);
+        frame.render_widget(self.render_transcript(transcript_area), transcript_area);
+        if let Some(experiment_area) = experiment_area {
+            frame.render_widget(
+                self.render_experiment_panel(experiment_area),
+                experiment_area,
+            );
+        }
         self.render_input(frame, layout[2]);
+    }
+
+    fn panel_visible(&self) -> bool {
+        let Ok(panel) = self.experiment_panel.lock() else {
+            return false;
+        };
+        panel.is_visible()
+    }
+
+    fn render_experiment_panel(&self, area: Rect) -> Paragraph<'static> {
+        let inner_width = area.width.saturating_sub(2) as usize;
+        let lines = self.experiment_panel_lines(inner_width.max(1));
+        let scroll = panel_scroll(lines.len(), area.height);
+        Paragraph::new(lines)
+            .scroll((scroll, 0))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(EXPERIMENT_PANEL_TITLE),
+            )
+    }
+
+    fn experiment_panel_lines(&self, width: usize) -> Vec<Line<'static>> {
+        let Ok(panel) = self.experiment_panel.lock() else {
+            return vec![Line::default()];
+        };
+        render_panel_lines(panel.lines(), width)
     }
 
     /// Render the mascot art once for the fixed welcome banner layout.
@@ -879,6 +952,38 @@ impl App {
             }
         }
     }
+}
+
+fn transcript_layout(area: Rect, show_panel: bool) -> (Rect, Option<Rect>) {
+    if !show_panel {
+        return (area, None);
+    }
+    let layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(TRANSCRIPT_WIDTH_PERCENT),
+            Constraint::Percentage(EXPERIMENT_PANEL_WIDTH_PERCENT),
+        ])
+        .split(area);
+    (layout[0], Some(layout[1]))
+}
+
+fn render_panel_lines(lines: &[String], width: usize) -> Vec<Line<'static>> {
+    let mut rendered = Vec::new();
+    for line in lines {
+        rendered.extend(wrap_plain_text(line, width));
+    }
+    if rendered.is_empty() {
+        rendered.push(Line::default());
+    }
+    rendered
+}
+
+fn panel_scroll(total_lines: usize, area_height: u16) -> u16 {
+    total_lines
+        .saturating_add(PANEL_BORDER_LINES)
+        .saturating_sub(area_height as usize)
+        .min(u16::MAX as usize) as u16
 }
 
 fn fawx_amber() -> Color {
@@ -1468,7 +1573,13 @@ mod tests {
     fn test_app() -> App {
         let backend: Arc<dyn EngineBackend> = Arc::new(HttpBackend::from_env());
         let (tx, rx) = unbounded_channel();
-        let mut app = App::new(backend, crate::DEFAULT_ENGINE_URL.to_string(), tx, rx);
+        let mut app = App::new(
+            backend,
+            crate::DEFAULT_ENGINE_URL.to_string(),
+            Arc::new(Mutex::new(ExperimentPanel::new())),
+            tx,
+            rx,
+        );
         app.entries.clear();
         app
     }
@@ -1575,7 +1686,13 @@ mod tests {
         let backend = Arc::new(TestBackend::default());
         let app_backend: Arc<dyn EngineBackend> = backend.clone();
         let (tx, rx) = unbounded_channel();
-        let mut app = App::new(app_backend, "embedded engine".to_string(), tx, rx);
+        let mut app = App::new(
+            app_backend,
+            "embedded engine".to_string(),
+            Arc::new(Mutex::new(ExperimentPanel::new())),
+            tx,
+            rx,
+        );
         app.entries.clear();
 
         app.spawn_bootstrap();

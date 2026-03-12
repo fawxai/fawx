@@ -9,6 +9,7 @@ use fx_config::manager::ConfigManager;
 use fx_config::{
     parse_log_level as parse_config_log_level, FawxConfig, ImprovementToolsConfig, LoggingConfig,
 };
+use fx_consensus::ProgressCallback;
 use fx_core::memory::{MemoryProvider, MemoryStore};
 use fx_core::runtime_info::{ConfigSummary, RuntimeInfo, SkillInfo};
 use fx_core::EventBus;
@@ -358,6 +359,7 @@ pub struct HeadlessLoopBuildOptions {
     pub subagent_control: Option<Arc<dyn SubagentControl>>,
     pub config_manager: Option<Arc<Mutex<ConfigManager>>>,
     pub cancel_token: Option<CancellationToken>,
+    pub experiment_progress: Option<ProgressCallback>,
 }
 
 impl HeadlessLoopBuildOptions {
@@ -368,6 +370,7 @@ impl HeadlessLoopBuildOptions {
             subagent_control: Some(subagent_control),
             config_manager: None,
             cancel_token: None,
+            experiment_progress: None,
         }
     }
 
@@ -378,6 +381,7 @@ impl HeadlessLoopBuildOptions {
             subagent_control: None,
             config_manager: None,
             cancel_token: Some(cancel_token),
+            experiment_progress: None,
         }
     }
 }
@@ -388,6 +392,7 @@ struct SkillRegistryBuildOptions {
     memory_enabled: bool,
     subagent_control: Option<Arc<dyn SubagentControl>>,
     config_manager: Option<Arc<Mutex<ConfigManager>>>,
+    experiment_progress: Option<ProgressCallback>,
 }
 
 /// Build a loop engine from an already-loaded config.
@@ -510,6 +515,7 @@ fn build_skill_registry_options(
         memory_enabled: options.memory_enabled,
         subagent_control: options.subagent_control.clone(),
         config_manager: options.config_manager.clone(),
+        experiment_progress: options.experiment_progress.clone(),
     }
 }
 
@@ -707,8 +713,7 @@ fn build_skill_registry(
         ..ProcessConfig::default()
     }));
     ProcessRegistry::spawn_cleanup_task(&process_registry);
-    let executor = FawxToolExecutor::new(options.working_dir.clone(), tool_config)
-        .with_process_registry(process_registry);
+    let executor = build_tool_executor(&options, tool_config, process_registry);
     let (mut executor, memory, embedding_index_persistence, snapshot_text, memory_enabled) =
         attach_memory_if_enabled(executor, data_dir, config, options.memory_enabled);
 
@@ -852,6 +857,19 @@ fn build_skill_registry(
         credential_provider,
         credential_store,
         signature_policy,
+    }
+}
+
+fn build_tool_executor(
+    options: &SkillRegistryBuildOptions,
+    tool_config: ToolConfig,
+    process_registry: Arc<ProcessRegistry>,
+) -> FawxToolExecutor {
+    let executor = FawxToolExecutor::new(options.working_dir.clone(), tool_config)
+        .with_process_registry(process_registry);
+    match options.experiment_progress.clone() {
+        Some(progress) => executor.with_experiment_progress(progress),
+        None => executor,
     }
 }
 

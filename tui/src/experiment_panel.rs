@@ -38,10 +38,6 @@ impl ExperimentPanel {
         self.auto_hide_at = Some(Instant::now() + AUTO_HIDE_DELAY);
     }
 
-    pub fn toggle(&mut self) {
-        self.visible = !self.visible;
-    }
-
     pub fn check_auto_hide(&mut self) -> bool {
         if let Some(at) = self.auto_hide_at {
             if Instant::now() >= at {
@@ -85,16 +81,6 @@ mod tests {
         panel.push_line("▸ Starting...".into());
         assert!(panel.is_visible());
         assert_eq!(panel.lines().len(), 1);
-    }
-
-    #[test]
-    fn toggle_flips_visibility() {
-        let mut panel = ExperimentPanel::new();
-        assert!(!panel.is_visible());
-        panel.toggle();
-        assert!(panel.is_visible());
-        panel.toggle();
-        assert!(!panel.is_visible());
     }
 
     #[test]

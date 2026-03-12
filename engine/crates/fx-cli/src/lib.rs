@@ -54,6 +54,7 @@ mod proposal_review;
 pub(crate) mod startup;
 
 use fx_canary::{CanaryConfig, CanaryMonitor, RipcordTrigger, RollbackTrigger};
+use fx_consensus::ProgressCallback;
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -68,10 +69,19 @@ struct HeadlessAppBuildConfig {
     system_prompt: Option<PathBuf>,
     config_manager: Option<Arc<std::sync::Mutex<fx_config::manager::ConfigManager>>>,
     data_dir: PathBuf,
+    experiment_progress: Option<ProgressCallback>,
 }
 
 /// Build a headless app suitable for embedded use.
 pub fn build_headless_app(system_prompt: Option<PathBuf>) -> anyhow::Result<headless::HeadlessApp> {
+    build_headless_app_with_progress(system_prompt, None)
+}
+
+/// Build a headless app suitable for embedded use with optional experiment progress reporting.
+pub fn build_headless_app_with_progress(
+    system_prompt: Option<PathBuf>,
+    experiment_progress: Option<ProgressCallback>,
+) -> anyhow::Result<headless::HeadlessApp> {
     let auth_manager = startup::load_auth_manager()?;
     let config = prepare_embedded_config(startup::load_config()?);
     let mut router = startup::build_router(&auth_manager)?;
@@ -84,6 +94,7 @@ pub fn build_headless_app(system_prompt: Option<PathBuf>) -> anyhow::Result<head
         system_prompt,
         router,
         config,
+        experiment_progress,
     };
 
     build_initialized_headless_app(build_config)
@@ -108,7 +119,11 @@ fn build_app_with_dependencies(
     let bundle = startup::build_headless_loop_engine_bundle(
         &build_config.config,
         build_config.improvement_provider,
-        parent_loop_build_options(&subagent_manager, build_config.config_manager.clone()),
+        parent_loop_build_options(
+            &subagent_manager,
+            build_config.config_manager.clone(),
+            build_config.experiment_progress,
+        ),
     )?;
 
     headless::HeadlessApp::new(headless::HeadlessAppDeps {
@@ -160,6 +175,7 @@ fn build_subagent_manager(
 fn parent_loop_build_options(
     subagent_manager: &Arc<fx_subagent::SubagentManager>,
     config_manager: Option<Arc<std::sync::Mutex<fx_config::manager::ConfigManager>>>,
+    experiment_progress: Option<ProgressCallback>,
 ) -> startup::HeadlessLoopBuildOptions {
     startup::HeadlessLoopBuildOptions {
         memory_enabled: true,
@@ -167,6 +183,7 @@ fn parent_loop_build_options(
             Arc::clone(subagent_manager) as Arc<dyn fx_subagent::SubagentControl>
         ),
         config_manager,
+        experiment_progress,
         ..startup::HeadlessLoopBuildOptions::default()
     }
 }

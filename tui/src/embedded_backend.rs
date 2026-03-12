@@ -1,24 +1,53 @@
-use async_trait::async_trait;
-use fx_kernel::{StreamCallback, StreamEvent};
-use serde_json::Value;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
-use tokio::sync::{mpsc::UnboundedSender, Mutex};
-
+use crate::experiment_panel::ExperimentPanel;
 use crate::fawx_backend::{
     friendly_error_message, try_send, BackendEvent, EngineBackend, EngineStatus,
 };
+use async_trait::async_trait;
+use fx_consensus::{format_progress_event, ProgressCallback};
+use fx_kernel::{StreamCallback, StreamEvent};
+use serde_json::Value;
+use std::collections::HashSet;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex as StdMutex,
+};
+use tokio::sync::{mpsc::UnboundedSender, Mutex};
+
+pub(crate) type SharedExperimentPanel = Arc<StdMutex<ExperimentPanel>>;
+type ActiveExperimentTools = StdMutex<HashSet<String>>;
 
 pub struct EmbeddedBackend {
     app: Arc<Mutex<fx_cli::headless::HeadlessApp>>,
+    experiment_panel: SharedExperimentPanel,
 }
 
 impl EmbeddedBackend {
+    #[cfg(test)]
     pub fn new(app: fx_cli::headless::HeadlessApp) -> Self {
+        Self::with_panel(app, Arc::new(StdMutex::new(ExperimentPanel::new())))
+    }
+
+    pub fn build() -> anyhow::Result<(Self, SharedExperimentPanel)> {
+        let experiment_panel = Arc::new(StdMutex::new(ExperimentPanel::new()));
+        let app = fx_cli::build_headless_app_with_progress(
+            None,
+            Some(build_experiment_progress_callback(Arc::clone(
+                &experiment_panel,
+            ))),
+        )?;
+        Ok((
+            Self::with_panel(app, Arc::clone(&experiment_panel)),
+            experiment_panel,
+        ))
+    }
+
+    pub fn with_panel(
+        app: fx_cli::headless::HeadlessApp,
+        experiment_panel: SharedExperimentPanel,
+    ) -> Self {
         Self {
             app: Arc::new(Mutex::new(app)),
+            experiment_panel,
         }
     }
 
@@ -41,7 +70,11 @@ impl EngineBackend for EmbeddedBackend {
     async fn stream_message(&self, message: String, tx: UnboundedSender<BackendEvent>) {
         let mut app = self.app.lock().await;
         let saw_text_delta = Arc::new(AtomicBool::new(false));
-        let callback = build_stream_callback(tx.clone(), Arc::clone(&saw_text_delta));
+        let callback = build_stream_callback(
+            tx.clone(),
+            Arc::clone(&saw_text_delta),
+            Arc::clone(&self.experiment_panel),
+        );
         let result = fx_cli::headless::process_input_with_commands_streaming(
             &mut app, &message, None, callback,
         )
@@ -66,29 +99,113 @@ impl EngineBackend for EmbeddedBackend {
     }
 }
 
+pub(crate) fn build_experiment_progress_callback(
+    experiment_panel: SharedExperimentPanel,
+) -> ProgressCallback {
+    Arc::new(move |event| push_progress_line(&experiment_panel, format_progress_event(event)))
+}
+
 fn build_stream_callback(
     tx: UnboundedSender<BackendEvent>,
     saw_text_delta: Arc<AtomicBool>,
+    experiment_panel: SharedExperimentPanel,
 ) -> StreamCallback {
-    Arc::new(move |event| handle_stream_event(&tx, saw_text_delta.as_ref(), event))
+    // Per-message scope: each stream_message gets its own active set.
+    // Experiment tool calls don't span multiple messages.
+    let active_experiments = StdMutex::new(HashSet::new());
+    Arc::new(move |event| {
+        handle_stream_event(
+            &tx,
+            saw_text_delta.as_ref(),
+            &experiment_panel,
+            &active_experiments,
+            event,
+        )
+    })
 }
 
 fn handle_stream_event(
     tx: &UnboundedSender<BackendEvent>,
     saw_text_delta: &AtomicBool,
+    experiment_panel: &SharedExperimentPanel,
+    active_experiments: &ActiveExperimentTools,
     event: StreamEvent,
 ) {
     match event {
         StreamEvent::TextDelta { text } => send_text_delta(tx, saw_text_delta, text),
-        StreamEvent::ToolCallStart { name, .. } => send_tool_call_start(tx, name),
+        StreamEvent::ToolCallStart { id, name } => {
+            track_experiment_tool(active_experiments, experiment_panel, &id, &name);
+            send_tool_call_start(tx, name);
+        }
         StreamEvent::ToolCallComplete {
-            name, arguments, ..
-        } => send_tool_call_complete(tx, name, &arguments),
+            id,
+            name,
+            arguments,
+        } => {
+            track_experiment_tool(active_experiments, experiment_panel, &id, &name);
+            send_tool_call_complete(tx, name, &arguments);
+        }
         StreamEvent::ToolResult {
-            output, is_error, ..
-        } => send_tool_result(tx, output, is_error),
+            id,
+            output,
+            is_error,
+        } => {
+            complete_experiment_tool(active_experiments, experiment_panel, &id);
+            send_tool_result(tx, output, is_error);
+        }
         StreamEvent::Done { .. } | StreamEvent::PhaseChange { .. } => {}
     }
+}
+
+fn track_experiment_tool(
+    active_experiments: &ActiveExperimentTools,
+    experiment_panel: &SharedExperimentPanel,
+    tool_id: &str,
+    tool_name: &str,
+) {
+    if tool_name != "run_experiment" {
+        return;
+    }
+    let Ok(mut active) = active_experiments.lock() else {
+        return;
+    };
+    if active.insert(tool_id.to_string()) {
+        clear_experiment_panel(experiment_panel);
+    }
+}
+
+fn complete_experiment_tool(
+    active_experiments: &ActiveExperimentTools,
+    experiment_panel: &SharedExperimentPanel,
+    tool_id: &str,
+) {
+    let Ok(mut active) = active_experiments.lock() else {
+        return;
+    };
+    if active.remove(tool_id) {
+        mark_experiment_complete(experiment_panel);
+    }
+}
+
+fn push_progress_line(experiment_panel: &SharedExperimentPanel, line: String) {
+    let Ok(mut panel) = experiment_panel.lock() else {
+        return;
+    };
+    panel.push_line(line);
+}
+
+fn clear_experiment_panel(experiment_panel: &SharedExperimentPanel) {
+    let Ok(mut panel) = experiment_panel.lock() else {
+        return;
+    };
+    panel.clear();
+}
+
+fn mark_experiment_complete(experiment_panel: &SharedExperimentPanel) {
+    let Ok(mut panel) = experiment_panel.lock() else {
+        return;
+    };
+    panel.mark_complete();
 }
 
 fn send_text_delta(tx: &UnboundedSender<BackendEvent>, saw_text_delta: &AtomicBool, text: String) {
@@ -419,6 +536,14 @@ mod tests {
         }
     }
 
+    fn test_experiment_panel() -> SharedExperimentPanel {
+        Arc::new(StdMutex::new(ExperimentPanel::new()))
+    }
+
+    fn test_active_experiments() -> ActiveExperimentTools {
+        StdMutex::new(HashSet::new())
+    }
+
     #[test]
     fn prepare_embedded_config_defaults_working_dir_to_process_current_dir() {
         let temp_dir = unique_temp_dir();
@@ -433,10 +558,14 @@ mod tests {
     async fn handle_stream_event_maps_tool_call_start_to_tool_use() {
         let (tx, mut rx) = unbounded_channel();
         let saw_text_delta = AtomicBool::new(false);
+        let experiment_panel = test_experiment_panel();
+        let active_experiments = test_active_experiments();
 
         handle_stream_event(
             &tx,
             &saw_text_delta,
+            &experiment_panel,
+            &active_experiments,
             StreamEvent::ToolCallStart {
                 id: "call-1".to_string(),
                 name: "read".to_string(),
@@ -456,10 +585,14 @@ mod tests {
     async fn handle_stream_event_maps_tool_call_complete_to_tool_use() {
         let (tx, mut rx) = unbounded_channel();
         let saw_text_delta = AtomicBool::new(false);
+        let experiment_panel = test_experiment_panel();
+        let active_experiments = test_active_experiments();
 
         handle_stream_event(
             &tx,
             &saw_text_delta,
+            &experiment_panel,
+            &active_experiments,
             StreamEvent::ToolCallComplete {
                 id: "call-1".to_string(),
                 name: "read".to_string(),
@@ -480,10 +613,14 @@ mod tests {
     async fn handle_stream_event_maps_tool_result_to_backend_tool_result() {
         let (tx, mut rx) = unbounded_channel();
         let saw_text_delta = AtomicBool::new(false);
+        let experiment_panel = test_experiment_panel();
+        let active_experiments = test_active_experiments();
 
         handle_stream_event(
             &tx,
             &saw_text_delta,
+            &experiment_panel,
+            &active_experiments,
             StreamEvent::ToolResult {
                 id: "call-1".to_string(),
                 output: "denied".to_string(),
@@ -503,6 +640,63 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn progress_callback_formats_events_into_panel_lines() {
+        let experiment_panel = test_experiment_panel();
+        let callback = build_experiment_progress_callback(Arc::clone(&experiment_panel));
+        let event = fx_consensus::ProgressEvent::RoundStarted {
+            round: 1,
+            max_rounds: 3,
+            signal: "signal".to_string(),
+        };
+
+        callback(&event);
+
+        let panel = experiment_panel.lock().expect("experiment panel");
+        assert_eq!(panel.lines(), &[format_progress_event(&event)]);
+        assert!(panel.is_visible());
+    }
+
+    #[test]
+    fn run_experiment_tool_start_clears_panel_and_tracks_active_tool() {
+        let experiment_panel = test_experiment_panel();
+        let active_experiments = test_active_experiments();
+        let mut panel = experiment_panel.lock().expect("experiment panel");
+        panel.push_line("stale".to_string());
+        drop(panel);
+
+        track_experiment_tool(
+            &active_experiments,
+            &experiment_panel,
+            "call-1",
+            "run_experiment",
+        );
+
+        let panel = experiment_panel.lock().expect("experiment panel");
+        assert!(panel.lines().is_empty());
+        drop(panel);
+        let active = active_experiments.lock().expect("active experiments");
+        assert!(active.contains("call-1"));
+    }
+
+    #[test]
+    fn run_experiment_tool_result_removes_active_tool() {
+        let experiment_panel = test_experiment_panel();
+        let active_experiments = test_active_experiments();
+        track_experiment_tool(
+            &active_experiments,
+            &experiment_panel,
+            "call-1",
+            "run_experiment",
+        );
+        push_progress_line(&experiment_panel, "progress".to_string());
+
+        complete_experiment_tool(&active_experiments, &experiment_panel, "call-1");
+
+        let active = active_experiments.lock().expect("active experiments");
+        assert!(!active.contains("call-1"));
     }
 
     #[tokio::test]
