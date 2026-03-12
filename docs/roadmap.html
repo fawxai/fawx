@@ -71,8 +71,9 @@
         <li><span class="check">✓</span> Persistent memory with semantic search</li>
         <li><span class="check">✓</span> Multi-provider (Claude, GPT, local models)</li>
         <li><span class="check">✓</span> Encrypted credential store (AES-256-GCM)</li>
-        <li><span class="check">✓</span> Config management with hot-reload</li>
+        <li><span class="check">✓</span> Config management with hot-reload (SIGHUP restart)</li>
         <li><span class="check">✓</span> Token-by-token streaming over SSE</li>
+        <li><span class="check">✓</span> Reflective memory (fx-journal crate)</li>
       </ul>
     </div>
     <hr class="divider">
@@ -85,10 +86,12 @@
       <p class="phase-desc">Terminal UI (ratatui), Telegram bot, HTTP API. Same engine, same memory, different surfaces.</p>
       <ul class="feature-list">
         <li><span class="check">✓</span> Full terminal UI with streaming and markdown</li>
-        <li><span class="check">✓</span> Telegram bot channel</li>
-        <li><span class="check">✓</span> HTTP API (headless mode)</li>
-        <li><span class="check">✓</span> Interactive setup wizard</li>
+        <li><span class="check">✓</span> Telegram bot channel with image support</li>
+        <li><span class="check">✓</span> Webhook channel for external integrations</li>
+        <li><span class="check">✓</span> HTTP API (headless mode, dual-bind)</li>
+        <li><span class="check">✓</span> Interactive setup wizard with credential store</li>
         <li><span class="check">✓</span> Model switching mid-conversation</li>
+        <li><span class="check">✓</span> Multi-session management</li>
       </ul>
     </div>
     <hr class="divider">
@@ -119,8 +122,33 @@
         <li><span class="check">✓</span> WASI runtime with sandboxing</li>
         <li><span class="check">✓</span> Ed25519 signature verification</li>
         <li><span class="check">✓</span> Hot-reload without restart</li>
-        <li><span class="check">✓</span> Skill creation CLI</li>
-        <li><span class="check">✓</span> Marketplace skills: weather, vision, TTS, browser</li>
+        <li><span class="check">✓</span> Skill creation CLI (`fawx skill create`)</li>
+        <li><span class="check">✓</span> Marketplace skills: weather, vision, TTS</li>
+      </ul>
+    </div>
+    <hr class="divider">
+
+    <div class="phase">
+      <div class="phase-header">
+        <span class="phase-badge badge-shipped">Shipped</span>
+        <h2 class="phase-title">Proof of Fitness Protocol</h2>
+      </div>
+      <p class="phase-desc">Competing agents, objective scoring, tamper-evident chain. Goal-agnostic experimentation that works end-to-end.</p>
+      <ul class="feature-list">
+        <li><span class="check">✓</span> Core protocol engine (fx-consensus crate, 74+ tests)</li>
+        <li><span class="check">✓</span> Orchestrator with cross-evaluation and safety gates</li>
+        <li><span class="check">✓</span> CLI: experiment run/chain/show/verify</li>
+        <li><span class="check">✓</span> Real LLM + cargo workspace evaluation</li>
+        <li><span class="check">✓</span> Subagent-driven nodes (full Fawx agents as experiment nodes)</li>
+        <li><span class="check">✓</span> Experiment tool callable from chat and channels</li>
+        <li><span class="check">✓</span> Post-hoc build verification with retry</li>
+        <li><span class="check">✓</span> Recursive learning (chain history feeds into prompts)</li>
+        <li><span class="check">✓</span> Auto-chain iterative refinement (--max-rounds)</li>
+        <li><span class="check">✓</span> Canonical chain hashing with legacy fallback</li>
+        <li><span class="check">✓</span> Cargo-scoped evaluation (-p target crate only)</li>
+        <li><span class="check">✓</span> Candidate patch persistence in chain</li>
+        <li><span class="check">✓</span> Sequential node execution (--sequential)</li>
+        <li><span class="check">✓</span> Diagnostics (--detail, --raw)</li>
       </ul>
     </div>
     <hr class="divider">
@@ -128,38 +156,16 @@
     <div class="phase">
       <div class="phase-header">
         <span class="phase-badge badge-building">Building</span>
-        <h2 class="phase-title">Proof of Fitness Protocol</h2>
+        <h2 class="phase-title">Experiment UX + Fleet</h2>
       </div>
-      <p class="phase-desc">Competing agents, objective scoring, tamper-evident chain. Goal-agnostic experimentation.</p>
+      <p class="phase-desc">Live progress streaming, distributed experiments across machines, channel-appropriate rendering.</p>
       <ul class="feature-list">
-        <li><span class="check">✓</span> Core protocol (fx-consensus crate, 62+ tests)</li>
-        <li><span class="check">✓</span> Protocol engine + orchestrator + cross-evaluation</li>
-        <li><span class="check">✓</span> CLI: experiment run/chain/show/verify</li>
-        <li><span class="check">✓</span> Real LLM + cargo workspace evaluation</li>
-        <li><span class="check">✓</span> Subagent-driven nodes (full Fawx agents)</li>
-        <li><span class="check">✓</span> Experiment tool in agentic loop</li>
-        <li><span class="wip">◐</span> Diagnostics (--detail, --raw)</li>
-        <li><span class="wip">◐</span> Agent-aware prompts (read before patch)</li>
-        <li><span class="planned">○</span> Candidate patch persistence in chain</li>
-        <li><span class="planned">○</span> TUI side panel with live progress</li>
-        <li><span class="planned">○</span> Canonical chain serialization</li>
-      </ul>
-    </div>
-    <hr class="divider">
-
-    <div class="phase">
-      <div class="phase-header">
-        <span class="phase-badge badge-planned">Planned</span>
-        <h2 class="phase-title">Distributed Fleet</h2>
-      </div>
-      <p class="phase-desc">Experiments across multiple machines. Node registry, task distribution, remote evaluation.</p>
-      <ul class="feature-list">
-        <li><span class="check">✓</span> Fleet primitives: Channel, NodeRegistry, TaskRouter</li>
-        <li><span class="check">✓</span> SSH transport for remote commands</li>
-        <li><span class="check">✓</span> Subagent spawning and lifecycle</li>
-        <li><span class="planned">○</span> Fleet-aware experiment node placement</li>
-        <li><span class="planned">○</span> Cross-machine evaluation</li>
-        <li><span class="planned">○</span> Binary rollback via ripcord</li>
+        <li><span class="wip">◐</span> Verbose mode with progress callbacks (--verbose)</li>
+        <li><span class="planned">○</span> TUI side panel with live experiment progress</li>
+        <li><span class="planned">○</span> Telegram edit_message progress updates</li>
+        <li><span class="planned">○</span> Remote evaluation via SSH (cross-machine experiments)</li>
+        <li><span class="planned">○</span> Fleet config file (~/.fawx/fleet.toml)</li>
+        <li><span class="planned">○</span> Fleet-aware node placement</li>
       </ul>
     </div>
     <hr class="divider">
@@ -173,7 +179,7 @@
       <ul class="feature-list">
         <li><span class="planned">○</span> BitNet provider (1-bit LLM on CPU)</li>
         <li><span class="planned">○</span> Model download + setup wizard</li>
-        <li><span class="planned">○</span> Hardware-aware kernel selection</li>
+        <li><span class="planned">○</span> Hardware-aware model selection</li>
         <li><span class="planned">○</span> Continuous local experimentation</li>
       </ul>
     </div>
@@ -186,7 +192,7 @@
       </div>
       <p class="phase-desc">Recursive improvement: experiments generate training data, fine-tune the local model, better model runs better experiments.</p>
       <ul class="feature-list">
-        <li><span class="planned">○</span> Training data curation from winners</li>
+        <li><span class="planned">○</span> Training data curation from chain winners</li>
         <li><span class="planned">○</span> LoRA fine-tuning orchestration</li>
         <li><span class="planned">○</span> Model evaluation as fitness criterion</li>
         <li><span class="planned">○</span> Signed adapter deployment via chain</li>
