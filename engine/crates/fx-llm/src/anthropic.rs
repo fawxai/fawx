@@ -297,6 +297,12 @@ impl AnthropicProvider {
                         content: result,
                     });
                 }
+                AnthropicContentBlock::Image { source } => {
+                    content.push(ContentBlock::Image {
+                        media_type: source.media_type,
+                        data: source.data,
+                    });
+                }
                 AnthropicContentBlock::Thinking { .. } => {
                     // Extended thinking block — skip (not surfaced to user)
                 }
@@ -716,6 +722,13 @@ fn map_content_to_anthropic(block: &ContentBlock) -> Result<AnthropicContentBloc
             tool_use_id: tool_use_id.clone(),
             content: content.clone(),
         }),
+        ContentBlock::Image { media_type, data } => Ok(AnthropicContentBlock::Image {
+            source: AnthropicImageSource {
+                source_type: "base64".to_string(),
+                media_type: media_type.clone(),
+                data: data.clone(),
+            },
+        }),
     }
 }
 
@@ -724,6 +737,7 @@ fn extract_text(blocks: &[ContentBlock]) -> String {
         .iter()
         .filter_map(|block| match block {
             ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::Image { .. } => None,
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -782,12 +796,23 @@ enum AnthropicContentBlock {
         tool_use_id: String,
         content: Value,
     },
+    Image {
+        source: AnthropicImageSource,
+    },
     Thinking {
         thinking: String,
     },
     RedactedThinking {
         data: String,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AnthropicImageSource {
+    #[serde(rename = "type")]
+    source_type: String,
+    media_type: String,
+    data: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1285,6 +1310,44 @@ mod tests {
         assert!(
             matches!(server_error, LlmError::Provider(message) if message.contains("server error 500"))
         );
+    }
+
+    #[test]
+    fn image_content_block_serializes_for_anthropic() {
+        let source = AnthropicImageSource {
+            source_type: "base64".to_string(),
+            media_type: "image/png".to_string(),
+            data: "abc123".to_string(),
+        };
+        let block = AnthropicContentBlock::Image {
+            source: source.clone(),
+        };
+
+        let serialized = serde_json::to_value(&block).unwrap();
+
+        assert_eq!(serialized["type"], "image");
+        assert_eq!(serialized["source"]["type"], "base64");
+        assert_eq!(serialized["source"]["media_type"], "image/png");
+        assert_eq!(serialized["source"]["data"], "abc123");
+    }
+
+    #[test]
+    fn map_content_image_round_trips() {
+        let block = ContentBlock::Image {
+            media_type: "image/jpeg".to_string(),
+            data: "xyz789".to_string(),
+        };
+
+        let mapped = map_content_to_anthropic(&block).unwrap();
+
+        match mapped {
+            AnthropicContentBlock::Image { source } => {
+                assert_eq!(source.source_type, "base64");
+                assert_eq!(source.media_type, "image/jpeg");
+                assert_eq!(source.data, "xyz789");
+            }
+            other => panic!("expected image, got {other:?}"),
+        }
     }
 
     #[test]

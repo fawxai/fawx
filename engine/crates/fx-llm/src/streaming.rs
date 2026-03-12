@@ -74,6 +74,7 @@ pub fn completion_text(response: &CompletionResponse) -> String {
         .iter()
         .filter_map(|block| match block {
             ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::Image { .. } => None,
             _ => None,
         })
         .collect::<String>()

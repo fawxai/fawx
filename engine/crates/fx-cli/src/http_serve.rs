@@ -16,6 +16,7 @@ use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use base64::Engine as _;
 use futures::stream;
 use fx_channel_telegram::{IncomingMessage, OutgoingMessage, TelegramChannel};
 use fx_channel_webhook::{WebhookChannel, WebhookMessage, WebhookResponse};
@@ -24,6 +25,7 @@ use fx_core::channel::{Channel, ResponseContext};
 use fx_core::types::InputSource;
 use fx_fleet::FleetManager;
 use fx_kernel::{ChannelRegistry, HttpChannel, ResponseRouter, StreamCallback, StreamEvent};
+use fx_llm::ImageAttachment;
 use ring::hmac;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -544,19 +546,49 @@ fn build_channel_runtime(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EncodedImage {
+    media_type: String,
+    base64_data: String,
+}
+
 async fn process_and_route_message(
     app: &Arc<Mutex<HeadlessApp>>,
     router: &ResponseRouter,
     text: &str,
+    images: Vec<EncodedImage>,
     source: InputSource,
     context: ResponseContext,
 ) -> Result<CycleResult, anyhow::Error> {
     let mut guard = app.lock().await;
-    let result = process_input_with_commands(&mut guard, text, Some(&source)).await?;
+    let result = run_message_cycle(&mut guard, text, &images, &source).await?;
     router
         .route(&source, &result.response, &context)
         .map_err(|error| anyhow::anyhow!("response routing failed: {error}"))?;
     Ok(result)
+}
+
+async fn run_message_cycle(
+    app: &mut HeadlessApp,
+    text: &str,
+    images: &[EncodedImage],
+    source: &InputSource,
+) -> Result<CycleResult, anyhow::Error> {
+    if images.is_empty() {
+        return process_input_with_commands(app, text, Some(source)).await;
+    }
+    app.process_message_with_images(text, &encoded_images_to_attachments(images), source)
+        .await
+}
+
+fn encoded_images_to_attachments(images: &[EncodedImage]) -> Vec<ImageAttachment> {
+    images
+        .iter()
+        .map(|image| ImageAttachment {
+            media_type: image.media_type.clone(),
+            data: image.base64_data.clone(),
+        })
+        .collect()
 }
 
 fn sanitize_config(value: serde_json::Value) -> serde_json::Value {
@@ -574,6 +606,7 @@ fn sanitized_status_config(app: &HeadlessApp) -> Option<serde_json::Value> {
 
 /// Maximum request body size (1 MiB).
 const MAX_REQUEST_BYTES: usize = 1_048_576;
+const MAX_IMAGE_BYTES: usize = 15 * 1024 * 1024;
 
 fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManager>>>) -> Router {
     let authenticated = Router::new()
@@ -639,6 +672,7 @@ async fn handle_message(
         &state.app,
         state.channels.router.as_ref(),
         &request.message,
+        Vec::new(),
         InputSource::Http,
         ResponseContext::default(),
     )
@@ -695,6 +729,7 @@ async fn handle_webhook(
         &state.app,
         state.channels.router.as_ref(),
         &request.text,
+        Vec::new(),
         source,
         ResponseContext::default(),
     )
@@ -811,45 +846,103 @@ fn media_inbound_dir() -> std::path::PathBuf {
         .join("inbound")
 }
 
-/// Download photos and build the final message text.
-///
-/// If the incoming message has photos, downloads each one and prepends
-/// `[Image: /path/to/file.jpg]\n` to the text. Creates the media directory
-/// on first use.
-async fn build_text_with_photos(
+/// Download photos and encode them for native image content blocks.
+async fn encode_photos(
     telegram: &TelegramChannel,
     incoming: &mut IncomingMessage,
-) -> String {
+) -> Vec<EncodedImage> {
     if incoming.photos.is_empty() {
-        return incoming.text.clone();
+        return Vec::new();
     }
 
     let media_dir = media_inbound_dir();
-    if let Err(e) = std::fs::create_dir_all(&media_dir) {
-        tracing::error!("Failed to create media dir: {e}");
-        return incoming.text.clone();
+    if let Err(error) = std::fs::create_dir_all(&media_dir) {
+        tracing::error!("Failed to create media dir: {error}");
+        return Vec::new();
     }
 
-    let mut prefix = String::new();
+    let mut images = Vec::new();
     for photo in &mut incoming.photos {
-        match telegram
-            .download_file(&photo.file_id, incoming.message_id, &media_dir)
-            .await
-        {
-            Ok(path) => {
-                prefix.push_str(&format!("[Image: {}]\n", path.display()));
-                photo.file_path = Some(path);
-            }
-            Err(e) => {
-                tracing::error!("Failed to download photo {}: {e}", photo.file_id);
-            }
+        let encoded =
+            download_and_encode_photo(telegram, incoming.message_id, &media_dir, photo).await;
+        if let Some(image) = encoded {
+            images.push(image);
         }
     }
+    images
+}
 
-    if prefix.is_empty() {
-        incoming.text.clone()
-    } else {
-        format!("{prefix}{}", incoming.text)
+async fn download_and_encode_photo(
+    telegram: &TelegramChannel,
+    message_id: i64,
+    media_dir: &std::path::Path,
+    photo: &mut fx_channel_telegram::PhotoAttachment,
+) -> Option<EncodedImage> {
+    let path = download_photo_file(telegram, message_id, media_dir, photo).await?;
+    encode_downloaded_photo(photo, &path)
+}
+
+async fn download_photo_file(
+    telegram: &TelegramChannel,
+    message_id: i64,
+    media_dir: &std::path::Path,
+    photo: &mut fx_channel_telegram::PhotoAttachment,
+) -> Option<std::path::PathBuf> {
+    match telegram
+        .download_file(&photo.file_id, message_id, media_dir)
+        .await
+    {
+        Ok(path) => {
+            photo.file_path = Some(path.clone());
+            Some(path)
+        }
+        Err(error) => {
+            tracing::error!("Failed to download photo {}: {error}", photo.file_id);
+            None
+        }
+    }
+}
+
+fn encode_downloaded_photo(
+    photo: &fx_channel_telegram::PhotoAttachment,
+    path: &std::path::Path,
+) -> Option<EncodedImage> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if metadata.len() > MAX_IMAGE_BYTES as u64 {
+        tracing::warn!(
+            path = %path.display(),
+            bytes = metadata.len(),
+            max_bytes = MAX_IMAGE_BYTES,
+            "Skipping oversized Telegram photo"
+        );
+        return None;
+    }
+
+    let media_type = validated_image_mime_type(&photo.mime_type);
+    match std::fs::read(path) {
+        Ok(bytes) => Some(EncodedImage {
+            media_type,
+            base64_data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        }),
+        Err(error) => {
+            tracing::error!("Failed to read photo file {}: {error}", path.display());
+            None
+        }
+    }
+}
+
+fn validated_image_mime_type(media_type: &str) -> String {
+    let trimmed = media_type.trim();
+    match trimmed {
+        "image/jpeg" | "image/png" | "image/gif" | "image/webp" => trimmed.to_string(),
+        "" => "image/jpeg".to_string(),
+        unexpected => {
+            tracing::warn!(
+                media_type = unexpected,
+                "Unexpected Telegram photo MIME type; defaulting to image/jpeg"
+            );
+            "image/jpeg".to_string()
+        }
     }
 }
 
@@ -918,10 +1011,11 @@ async fn handle_telegram_update(
     );
     let _ = telegram.send_typing(incoming.chat_id).await;
 
-    let message_text = build_text_with_photos(telegram, &mut incoming).await;
+    let images = encode_photos(telegram, &mut incoming).await;
     let source = InputSource::Channel("telegram".to_string());
     let context = telegram_context(&incoming);
-    if let Err(error) = process_and_route_message(app, router, &message_text, source, context).await
+    if let Err(error) =
+        process_and_route_message(app, router, &incoming.text, images, source, context).await
     {
         tracing::error!("Telegram poll loop error: {error}");
         queue_telegram_error(telegram, &incoming, &error);
@@ -997,13 +1091,14 @@ async fn handle_telegram_webhook(
     );
     let _ = telegram.send_typing(incoming.chat_id).await;
 
-    let message_text = build_text_with_photos(&telegram, &mut incoming).await;
+    let images = encode_photos(&telegram, &mut incoming).await;
     let source = InputSource::Channel("telegram".to_string());
     let context = telegram_context(&incoming);
     if let Err(error) = process_and_route_message(
         &state.app,
         state.channels.router.as_ref(),
-        &message_text,
+        &incoming.text,
+        images,
         source,
         context,
     )
@@ -1301,12 +1396,33 @@ fn join_server_result(
 mod tests {
     use super::*;
     use axum::body::Body;
+    use fx_llm::{CompletionResponse, CompletionStream, ContentBlock, StreamChunk};
     use http_body_util::BodyExt;
     use hyper::Request;
     use std::net::Ipv4Addr;
     use tower::ServiceExt;
 
     const TEST_TOKEN: &str = "test-secret-token-abc123";
+
+    fn mock_completion_response() -> CompletionResponse {
+        CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "Mock response".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: Some("end_turn".to_string()),
+        }
+    }
+
+    fn mock_completion_stream() -> CompletionStream {
+        let chunk = StreamChunk {
+            delta_content: Some("Mock response".to_string()),
+            stop_reason: Some("end_turn".to_string()),
+            ..Default::default()
+        };
+        Box::pin(futures::stream::once(async move { Ok(chunk) }))
+    }
 
     // ── Auth-only state for test middleware ──────────────────────────────
 
@@ -2106,8 +2222,7 @@ mod tests {
         use fx_kernel::loop_engine::LoopEngine;
         use fx_llm::{
             CompletionProvider, CompletionRequest, CompletionResponse, CompletionStream,
-            ContentBlock, ModelRouter, ProviderCapabilities, ProviderError as LlmError,
-            StreamChunk,
+            ModelRouter, ProviderCapabilities, ProviderError as LlmError,
         };
         use fx_subagent::{
             test_support::DisabledSubagentFactory, SubagentLimits, SubagentManager,
@@ -2139,27 +2254,14 @@ mod tests {
                 &self,
                 _request: CompletionRequest,
             ) -> Result<CompletionResponse, LlmError> {
-                Ok(CompletionResponse {
-                    content: vec![ContentBlock::Text {
-                        text: "Mock response".to_string(),
-                    }],
-                    tool_calls: Vec::new(),
-                    usage: None,
-                    stop_reason: Some("end_turn".to_string()),
-                })
+                Ok(mock_completion_response())
             }
 
             async fn complete_stream(
                 &self,
                 _request: CompletionRequest,
             ) -> Result<CompletionStream, LlmError> {
-                let chunk = StreamChunk {
-                    delta_content: Some("Mock response".to_string()),
-                    stop_reason: Some("end_turn".to_string()),
-                    ..Default::default()
-                };
-                let stream = futures::stream::once(async move { Ok(chunk) });
-                Ok(Box::pin(stream))
+                Ok(mock_completion_stream())
             }
 
             fn name(&self) -> &str {
@@ -2897,6 +2999,51 @@ allowed_chat_ids = [123]
 
         // ── Failing completion provider (always errors) ─────────────────
 
+        #[derive(Clone)]
+        struct CapturingProvider {
+            captured: Arc<std::sync::Mutex<Vec<CompletionRequest>>>,
+        }
+
+        #[async_trait]
+        impl CompletionProvider for CapturingProvider {
+            async fn complete(
+                &self,
+                request: CompletionRequest,
+            ) -> Result<CompletionResponse, LlmError> {
+                self.capture_request(request);
+                Ok(mock_completion_response())
+            }
+
+            async fn complete_stream(
+                &self,
+                request: CompletionRequest,
+            ) -> Result<CompletionStream, LlmError> {
+                self.capture_request(request);
+                Ok(mock_completion_stream())
+            }
+
+            fn name(&self) -> &str {
+                "capturing"
+            }
+
+            fn supported_models(&self) -> Vec<String> {
+                vec!["capturing-model".to_string()]
+            }
+
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities {
+                    supports_temperature: false,
+                    requires_streaming: false,
+                }
+            }
+        }
+
+        impl CapturingProvider {
+            fn capture_request(&self, request: CompletionRequest) {
+                self.captured.lock().expect("capture lock").push(request);
+            }
+        }
+
         struct FailingProvider;
 
         #[async_trait]
@@ -3169,6 +3316,140 @@ allowed_chat_ids = [123]
                 .expect("sendMessage request")
                 .clone();
             assert!(send_message.body.get("parse_mode").is_none());
+        }
+
+        #[tokio::test]
+        async fn encode_photos_returns_empty_for_no_photos() {
+            let telegram = TelegramChannel::new(test_telegram_config());
+            let mut incoming = IncomingMessage {
+                chat_id: 12345,
+                text: "hello".to_string(),
+                message_id: 42,
+                from_name: Some("TestUser".to_string()),
+                photos: Vec::new(),
+            };
+
+            let images = encode_photos(&telegram, &mut incoming).await;
+
+            assert!(images.is_empty());
+        }
+
+        #[test]
+        fn encode_skips_oversized_photo() {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let path = temp.path().join("large.jpg");
+            std::fs::write(&path, vec![0u8; MAX_IMAGE_BYTES + 1]).expect("write image");
+            let photo = fx_channel_telegram::PhotoAttachment {
+                file_id: "file-1".to_string(),
+                width: 1,
+                height: 1,
+                file_path: None,
+                mime_type: "image/jpeg".to_string(),
+            };
+
+            let encoded = encode_downloaded_photo(&photo, &path);
+
+            assert!(encoded.is_none());
+        }
+
+        #[test]
+        fn encode_trims_valid_mime_type() {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let path = temp.path().join("photo.bin");
+            std::fs::write(&path, [1u8, 2, 3, 4]).expect("write image");
+            let photo = fx_channel_telegram::PhotoAttachment {
+                file_id: "file-2".to_string(),
+                width: 1,
+                height: 1,
+                file_path: None,
+                mime_type: "  image/png  ".to_string(),
+            };
+
+            let encoded = encode_downloaded_photo(&photo, &path).expect("encoded image");
+
+            assert_eq!(encoded.media_type, "image/png");
+            assert_eq!(encoded.base64_data, "AQIDBA==");
+        }
+
+        #[test]
+        fn encode_defaults_unknown_mime_type() {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let path = temp.path().join("photo.bin");
+            std::fs::write(&path, [1u8, 2, 3, 4]).expect("write image");
+            let photo = fx_channel_telegram::PhotoAttachment {
+                file_id: "file-2".to_string(),
+                width: 1,
+                height: 1,
+                file_path: None,
+                mime_type: "application/octet-stream".to_string(),
+            };
+
+            let encoded = encode_downloaded_photo(&photo, &path).expect("encoded image");
+
+            assert_eq!(encoded.media_type, "image/jpeg");
+            assert_eq!(encoded.base64_data, "AQIDBA==");
+        }
+
+        fn capturing_router(
+            captured: Arc<std::sync::Mutex<Vec<CompletionRequest>>>,
+        ) -> ModelRouter {
+            let mut router = ModelRouter::new();
+            router.register_provider(Box::new(CapturingProvider { captured }));
+            router
+                .set_active("capturing-model")
+                .expect("set active capturing model");
+            router
+        }
+
+        #[tokio::test]
+        async fn process_and_route_message_with_images_passes_through() {
+            let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let app = Arc::new(Mutex::new(make_test_app(capturing_router(Arc::clone(
+                &captured,
+            )))));
+            let (base_url, _server) = mock_telegram_server().await;
+            let telegram = Arc::new(TelegramChannel::new_with_base_url(
+                test_telegram_config(),
+                base_url,
+            ));
+            let mut registry = ChannelRegistry::new();
+            let telegram_channel: Arc<dyn Channel> = telegram;
+            registry.register(telegram_channel);
+            let router = ResponseRouter::new(Arc::new(registry));
+            let images = vec![EncodedImage {
+                media_type: "image/jpeg".to_string(),
+                base64_data: "abc123".to_string(),
+            }];
+
+            let result = process_and_route_message(
+                &app,
+                &router,
+                "what's in this image?",
+                images,
+                InputSource::Channel("telegram".to_string()),
+                ResponseContext {
+                    routing_key: Some("12345".to_string()),
+                    reply_to: None,
+                },
+            )
+            .await
+            .expect("process with images");
+
+            assert_eq!(result.response, "Mock response");
+            let requests = captured.lock().expect("capture lock");
+            let last_request = requests.last().expect("captured request");
+            let last_message = last_request.messages.last().expect("user message");
+            assert_eq!(last_message.role, fx_llm::MessageRole::User);
+            assert!(last_message.content.iter().any(|block| {
+                block
+                    == &ContentBlock::Image {
+                        media_type: "image/jpeg".to_string(),
+                        data: "abc123".to_string(),
+                    }
+            }));
+            assert!(last_message.content.iter().any(|block| {
+                matches!(block, ContentBlock::Text { text } if text.contains("what's in this image?"))
+            }));
         }
     }
 }

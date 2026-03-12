@@ -128,7 +128,7 @@ impl OpenAiProvider {
                 0,
                 OpenAiMessage {
                     role: "system".to_string(),
-                    content: Some(system_prompt.clone()),
+                    content: Some(OpenAiMessageContent::Text(system_prompt.clone())),
                     tool_calls: None,
                     tool_call_id: None,
                 },
@@ -168,7 +168,7 @@ impl OpenAiProvider {
         let mut content = Vec::new();
         let mut tool_calls = Vec::new();
 
-        if let Some(text) = choice.message.content {
+        if let Some(OpenAiMessageContent::Text(text)) = choice.message.content {
             if !text.is_empty() {
                 content.push(ContentBlock::Text { text });
             }
@@ -568,7 +568,7 @@ fn map_messages_to_openai(messages: &[Message]) -> Result<Vec<OpenAiMessage>, Ll
                         MessageRole::User => "user".to_string(),
                         _ => unreachable!(),
                     },
-                    content: Some(extract_text(&message.content)),
+                    content: map_openai_message_content(&message.content),
                     tool_calls: None,
                     tool_call_id: None,
                 });
@@ -579,7 +579,11 @@ fn map_messages_to_openai(messages: &[Message]) -> Result<Vec<OpenAiMessage>, Ll
 
                 mapped.push(OpenAiMessage {
                     role: "assistant".to_string(),
-                    content: if text.is_empty() { None } else { Some(text) },
+                    content: if text.is_empty() {
+                        None
+                    } else {
+                        Some(OpenAiMessageContent::Text(text))
+                    },
                     tool_calls: if tool_calls.is_empty() {
                         None
                     } else {
@@ -604,7 +608,7 @@ fn map_messages_to_openai(messages: &[Message]) -> Result<Vec<OpenAiMessage>, Ll
                 if tool_results.is_empty() {
                     mapped.push(OpenAiMessage {
                         role: "tool".to_string(),
-                        content: Some(extract_text(&message.content)),
+                        content: map_openai_message_content(&message.content),
                         tool_calls: None,
                         tool_call_id: None,
                     });
@@ -612,7 +616,9 @@ fn map_messages_to_openai(messages: &[Message]) -> Result<Vec<OpenAiMessage>, Ll
                     for (tool_call_id, content) in tool_results {
                         mapped.push(OpenAiMessage {
                             role: "tool".to_string(),
-                            content: Some(value_to_openai_content(content)),
+                            content: Some(OpenAiMessageContent::Text(value_to_openai_content(
+                                content,
+                            ))),
                             tool_calls: None,
                             tool_call_id: Some(tool_call_id),
                         });
@@ -651,10 +657,36 @@ fn extract_text(blocks: &[ContentBlock]) -> String {
         .iter()
         .filter_map(|block| match block {
             ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::Image { .. } => None,
             _ => None,
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn map_openai_message_content(blocks: &[ContentBlock]) -> Option<OpenAiMessageContent> {
+    let content = blocks
+        .iter()
+        .filter_map(map_openai_input_block)
+        .collect::<Vec<_>>();
+
+    match content.as_slice() {
+        [] => None,
+        [OpenAiInputBlock::Text { text }] => Some(OpenAiMessageContent::Text(text.clone())),
+        _ => Some(OpenAiMessageContent::Blocks(content)),
+    }
+}
+
+fn map_openai_input_block(block: &ContentBlock) -> Option<OpenAiInputBlock> {
+    match block {
+        ContentBlock::Text { text } => Some(OpenAiInputBlock::Text { text: text.clone() }),
+        ContentBlock::Image { media_type, data } => Some(OpenAiInputBlock::ImageUrl {
+            image_url: OpenAiImageUrl {
+                url: format!("data:{media_type};base64,{data}"),
+            },
+        }),
+        ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => None,
+    }
 }
 
 fn parse_json_or_string(value: &str) -> Value {
@@ -699,11 +731,30 @@ struct OpenAiRequestBody {
 struct OpenAiMessage {
     role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
+    content: Option<OpenAiMessageContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<OpenAiToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum OpenAiMessageContent {
+    Text(String),
+    Blocks(Vec<OpenAiInputBlock>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum OpenAiInputBlock {
+    Text { text: String },
+    ImageUrl { image_url: OpenAiImageUrl },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OpenAiImageUrl {
+    url: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -917,8 +968,45 @@ mod tests {
         assert_eq!(serialized["messages"][0]["role"], "system");
         assert_eq!(serialized["messages"][0]["content"], "Be concise");
         assert_eq!(serialized["messages"][1]["role"], "user");
+        assert_eq!(serialized["messages"][1]["content"], "hello");
         assert_eq!(serialized["tools"].as_array().unwrap().len(), 1);
         assert_eq!(serialized["tools"][0]["function"]["name"], "lookup");
+    }
+
+    #[test]
+    fn image_content_block_serializes_for_openai() {
+        let provider = OpenAiProvider::new("http://localhost:8080", "test-key")
+            .unwrap()
+            .with_supported_models(vec!["gpt-4o-mini".to_string()]);
+        let request = CompletionRequest {
+            model: "gpt-4o-mini".to_string(),
+            messages: vec![Message::user_with_images(
+                "describe this image",
+                vec![crate::types::ImageAttachment {
+                    media_type: "image/jpeg".to_string(),
+                    data: "abc123".to_string(),
+                }],
+            )],
+            tools: vec![],
+            temperature: None,
+            max_tokens: Some(128),
+            system_prompt: None,
+            thinking: None,
+        };
+
+        let body = provider.build_request_body(&request, false).unwrap();
+        let serialized = serde_json::to_value(body).unwrap();
+
+        assert_eq!(serialized["messages"][0]["content"][0]["type"], "image_url");
+        assert_eq!(
+            serialized["messages"][0]["content"][0]["image_url"]["url"],
+            "data:image/jpeg;base64,abc123"
+        );
+        assert_eq!(serialized["messages"][0]["content"][1]["type"], "text");
+        assert_eq!(
+            serialized["messages"][0]["content"][1]["text"],
+            "describe this image"
+        );
     }
 
     #[test]
@@ -927,7 +1015,7 @@ mod tests {
             choices: vec![OpenAiChoice {
                 message: OpenAiMessage {
                     role: "assistant".to_string(),
-                    content: Some("I can call a tool".to_string()),
+                    content: Some(OpenAiMessageContent::Text("I can call a tool".to_string())),
                     tool_calls: Some(vec![OpenAiToolCall {
                         id: "call_1".to_string(),
                         call_type: "function".to_string(),
@@ -965,7 +1053,7 @@ mod tests {
             choices: vec![OpenAiChoice {
                 message: OpenAiMessage {
                     role: "assistant".to_string(),
-                    content: Some("Partial response".to_string()),
+                    content: Some(OpenAiMessageContent::Text("Partial response".to_string())),
                     tool_calls: None,
                     tool_call_id: None,
                 },
@@ -1062,7 +1150,7 @@ mod tests {
             choices: vec![OpenAiChoice {
                 message: OpenAiMessage {
                     role: "assistant".to_string(),
-                    content: Some("I can call a tool".to_string()),
+                    content: Some(OpenAiMessageContent::Text("I can call a tool".to_string())),
                     tool_calls: Some(vec![OpenAiToolCall {
                         id: "call_1".to_string(),
                         call_type: "function".to_string(),
@@ -1179,7 +1267,10 @@ mod tests {
         assert_eq!(mapped.len(), 1);
         assert_eq!(mapped[0].role, "tool");
         assert_eq!(mapped[0].tool_call_id.as_deref(), Some("call_1"));
-        assert_eq!(mapped[0].content.as_deref(), Some("tool output"));
+        assert!(matches!(
+            mapped[0].content.as_ref(),
+            Some(OpenAiMessageContent::Text(text)) if text == "tool output"
+        ));
     }
 
     #[test]
@@ -1196,10 +1287,10 @@ mod tests {
         assert_eq!(mapped.len(), 1);
         assert_eq!(mapped[0].role, "tool");
         assert_eq!(mapped[0].tool_call_id.as_deref(), Some("call_1"));
-        assert_eq!(
-            mapped[0].content.as_deref(),
-            Some("[ERROR] permission denied")
-        );
+        assert!(matches!(
+            mapped[0].content.as_ref(),
+            Some(OpenAiMessageContent::Text(text)) if text == "[ERROR] permission denied"
+        ));
     }
 
     fn continuation_assistant_message() -> Message {
@@ -1250,7 +1341,10 @@ mod tests {
                 (
                     message.role.as_str(),
                     message.tool_call_id.as_deref(),
-                    message.content.as_deref(),
+                    match message.content.as_ref() {
+                        Some(OpenAiMessageContent::Text(text)) => Some(text.as_str()),
+                        _ => None,
+                    },
                 )
             })
             .collect::<Vec<_>>();

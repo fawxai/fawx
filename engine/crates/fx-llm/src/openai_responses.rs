@@ -713,9 +713,26 @@ fn map_message_to_responses_input(
 }
 
 fn push_text_input(input: &mut Vec<Value>, role: &str, blocks: &[ContentBlock]) {
-    let text = extract_text(blocks);
-    if !text.is_empty() {
-        input.push(json!({"role": role, "content": text}));
+    let content = response_input_content(blocks);
+    if content.is_empty() {
+        return;
+    }
+
+    input.push(json!({"role": role, "content": content}));
+}
+
+fn response_input_content(blocks: &[ContentBlock]) -> Vec<Value> {
+    blocks.iter().filter_map(response_input_block).collect()
+}
+
+fn response_input_block(block: &ContentBlock) -> Option<Value> {
+    match block {
+        ContentBlock::Text { text } => Some(json!({"type": "input_text", "text": text})),
+        ContentBlock::Image { media_type, data } => Some(json!({
+            "type": "input_image",
+            "image_url": format!("data:{media_type};base64,{data}")
+        })),
+        ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => None,
     }
 }
 
@@ -1015,6 +1032,7 @@ fn extract_text(content: &[ContentBlock]) -> String {
         .iter()
         .filter_map(|block| match block {
             ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::Image { .. } => None,
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -1358,8 +1376,51 @@ mod tests {
         assert_eq!(body.instructions, Some("You are helpful.".to_string()));
         assert_eq!(input.len(), 1);
         assert_eq!(input[0]["role"], "user");
-        assert_eq!(input[0]["content"], "Hello");
+        assert_eq!(
+            input[0]["content"][0],
+            serde_json::json!({"type": "input_text", "text": "Hello"})
+        );
         assert!(!body.stream);
+    }
+
+    #[test]
+    fn build_request_body_maps_user_images_for_responses_api() {
+        let provider = OpenAiResponsesProvider::new("token", "account").unwrap();
+        let request = CompletionRequest {
+            model: "gpt-4.1".to_string(),
+            messages: vec![crate::types::Message::user_with_images(
+                "describe this",
+                vec![crate::types::ImageAttachment {
+                    media_type: "image/png".to_string(),
+                    data: "abc123".to_string(),
+                }],
+            )],
+            system_prompt: None,
+            tools: vec![],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+        };
+
+        let body = provider.build_request_body(&request, false).unwrap();
+        let serialized = serde_json::to_value(&body).unwrap();
+        let input = serialized["input"].as_array().unwrap();
+        let content = input[0]["content"].as_array().unwrap();
+
+        assert_eq!(
+            content[0],
+            serde_json::json!({
+                "type": "input_image",
+                "image_url": "data:image/png;base64,abc123"
+            })
+        );
+        assert_eq!(
+            content[1],
+            serde_json::json!({
+                "type": "input_text",
+                "text": "describe this"
+            })
+        );
     }
 
     #[test]
@@ -1374,7 +1435,10 @@ mod tests {
         assert_eq!(input.len(), 5);
         assert_eq!(
             input[0],
-            serde_json::json!({"role": "user", "content": "Find weather"})
+            serde_json::json!({
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Find weather"}]
+            })
         );
         assert_eq!(input[1]["type"], "function_call");
         assert_eq!(input[1]["id"], "call_1");

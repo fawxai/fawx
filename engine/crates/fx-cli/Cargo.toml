@@ -9,7 +9,7 @@ license.workspace = true
 default = ["http"]
 # Enable the HTTP API server for headless mode (`fawx serve --http`).
 # Tailscale-only binding. Pulls in axum.
-http = ["dep:axum", "dep:fx-channel-telegram", "dep:fx-channel-webhook"]
+http = ["dep:axum", "dep:base64", "dep:fx-channel-telegram", "dep:fx-channel-webhook"]
 # Enable the OAuth bridge HTTP server subcommand (`fawx oauth-bridge`).
 # Pulls in axum and crypto dependencies. Disabled by default to reduce build times.
 oauth-bridge = ["dep:axum", "dep:base64", "dep:subtle", "dep:rand"]

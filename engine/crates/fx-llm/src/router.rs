@@ -716,6 +716,7 @@ mod model_router_tests {
     fn first_text(response: &CompletionResponse) -> Option<String> {
         response.content.iter().find_map(|block| match block {
             ContentBlock::Text { text } => Some(text.clone()),
+            ContentBlock::Image { .. } => None,
             _ => None,
         })
     }

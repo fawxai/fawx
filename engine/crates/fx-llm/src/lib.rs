@@ -39,9 +39,10 @@ pub use router::{LlmRouter, ModelInfo, ModelRouter, RouterError, RoutingStrategy
 pub use routing::{resolve_strategy, RoutingCondition, RoutingConfig, RoutingContext, RoutingRule};
 pub use streaming::{completion_text, emit_default_stream_response, StreamCallback, StreamEvent};
 pub use types::{
-    CompletionRequest, CompletionResponse, ContentBlock, LlmError as ProviderError, Message,
-    MessageRole, StreamChunk, ThinkingConfig, ToolCall, ToolDefinition, ToolUseDelta, Usage,
-    THINKING_BUDGET_ADAPTIVE, THINKING_BUDGET_HIGH, THINKING_BUDGET_LOW,
+    CompletionRequest, CompletionResponse, ContentBlock, ImageAttachment,
+    LlmError as ProviderError, Message, MessageRole, StreamChunk, ThinkingConfig, ToolCall,
+    ToolDefinition, ToolUseDelta, Usage, THINKING_BUDGET_ADAPTIVE, THINKING_BUDGET_HIGH,
+    THINKING_BUDGET_LOW,
 };
 
 /// Legacy prompt-generation provider trait.

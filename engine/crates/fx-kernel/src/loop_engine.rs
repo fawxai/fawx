@@ -126,6 +126,7 @@ fn response_to_chunk(response: CompletionResponse) -> StreamChunk {
         .iter()
         .filter_map(|block| match block {
             ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::Image { .. } => None,
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -210,6 +211,22 @@ impl<'a> CycleStream<'a> {
             self.done(&response);
         }
     }
+}
+
+fn build_user_message(snapshot: &PerceptionSnapshot, user_message: &str) -> Message {
+    match snapshot.user_input.as_ref() {
+        Some(user_input) if !user_input.images.is_empty() => {
+            Message::user_with_images(user_message, user_input.images.clone())
+        }
+        _ => Message::user(user_message),
+    }
+}
+
+fn build_processed_perception_message(perception: &ProcessedPerception, text: &str) -> Message {
+    if perception.images.is_empty() {
+        return Message::user(text);
+    }
+    Message::user_with_images(text, perception.images.clone())
 }
 
 fn provider_stream_bridge(
@@ -1287,7 +1304,7 @@ impl LoopEngine {
         );
 
         let mut context_window = snapshot_with_steer.conversation_history.clone();
-        context_window.push(Message::user(user_message.clone()));
+        context_window.push(build_user_message(&snapshot_with_steer, &user_message));
 
         let compacted_context = self
             .compact_if_needed(
@@ -1318,6 +1335,11 @@ impl LoopEngine {
 
         Ok(ProcessedPerception {
             user_message: user_message.clone(),
+            images: snapshot_with_steer
+                .user_input
+                .as_ref()
+                .map(|user_input| user_input.images.clone())
+                .unwrap_or_default(),
             context_window,
             active_goals: vec![format!("Help the user with: {user_message}")],
             budget_remaining: self.budget.remaining(snapshot_with_steer.timestamp_ms),
@@ -3329,6 +3351,7 @@ fn build_sub_goal_snapshot(
             source: InputSource::Text,
             timestamp: timestamp_ms,
             context_id: None,
+            images: Vec::new(),
         }),
         sensor_data: None,
         conversation_history: context_messages.to_vec(),
@@ -4358,6 +4381,7 @@ fn response_usage_or_estimate(
             ContentBlock::Text { text } => estimate_tokens(text),
             ContentBlock::ToolUse { input, .. } => estimate_tokens(&input.to_string()),
             ContentBlock::ToolResult { content, .. } => estimate_tokens(&content.to_string()),
+            ContentBlock::Image { data, .. } => estimate_tokens(data),
         })
         .sum();
     let text = extract_response_text(response);
@@ -4402,6 +4426,7 @@ fn next_perception_from_sub_goal(
         source: InputSource::Text,
         timestamp: timestamp_ms,
         context_id: Some("loop-continuation".to_string()),
+        images: Vec::new(),
     });
     next
 }
@@ -4421,6 +4446,7 @@ fn message_to_text(message: &Message) -> String {
             fx_llm::ContentBlock::ToolResult { tool_use_id, .. } => {
                 format!("[tool_result:{tool_use_id}]")
             }
+            fx_llm::ContentBlock::Image { media_type, .. } => format!("[image:{media_type}]"),
         })
         .collect::<Vec<_>>()
         .join(" ");
@@ -4469,7 +4495,11 @@ fn build_reasoning_request(
 
     CompletionRequest {
         model: model.to_string(),
-        messages: [context, vec![Message::user(user_prompt)]].concat(),
+        messages: [
+            context,
+            vec![build_processed_perception_message(perception, &user_prompt)],
+        ]
+        .concat(),
         tools,
         temperature: Some(REASONING_TEMPERATURE),
         max_tokens: Some(REASONING_MAX_OUTPUT_TOKENS),
@@ -4563,6 +4593,7 @@ fn extract_response_text(response: &CompletionResponse) -> String {
         .iter()
         .filter_map(|block| match block {
             fx_llm::ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::Image { .. } => None,
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -4735,6 +4766,7 @@ mod tests {
                 source: InputSource::Text,
                 timestamp: 1,
                 context_id: None,
+                images: Vec::new(),
             }),
             sensor_data: None,
             conversation_history: vec![Message::user(text)],
@@ -5288,6 +5320,7 @@ mod phase2_tests {
                 source: InputSource::Text,
                 timestamp: 1,
                 context_id: None,
+                images: Vec::new(),
             }),
             sensor_data: None,
             conversation_history: vec![Message::user(text)],
@@ -6391,6 +6424,7 @@ mod phase2_tests {
 
         let perception = ProcessedPerception {
             user_message: "hello".to_string(),
+            images: Vec::new(),
             context_window: vec![Message::user("hello")],
             active_goals: vec!["reply".to_string()],
             budget_remaining: BudgetRemaining {
@@ -6688,6 +6722,7 @@ mod phase4_tests {
                 source: InputSource::Text,
                 timestamp: 1,
                 context_id: None,
+                images: Vec::new(),
             }),
             sensor_data: None,
             conversation_history: vec![Message::user(text)],
@@ -7554,6 +7589,7 @@ mod cancellation_tests {
                 source: InputSource::Text,
                 timestamp: 1,
                 context_id: None,
+                images: Vec::new(),
             }),
             sensor_data: None,
             conversation_history: vec![Message::user(text)],
@@ -7651,6 +7687,7 @@ mod cancellation_tests {
     fn reason_perception(message: &str) -> ProcessedPerception {
         ProcessedPerception {
             user_message: message.to_string(),
+            images: Vec::new(),
             context_window: vec![Message::user(message)],
             active_goals: vec!["reply".to_string()],
             budget_remaining: BudgetRemaining {
@@ -7946,6 +7983,7 @@ mod cancellation_tests {
     fn reasoning_user_prompt_includes_steer_context() {
         let perception = ProcessedPerception {
             user_message: "hello".to_string(),
+            images: Vec::new(),
             context_window: vec![Message::user("hello")],
             active_goals: vec!["reply".to_string()],
             budget_remaining: BudgetRemaining {
@@ -8491,6 +8529,7 @@ mod fallback_retry_tests {
                 source: InputSource::Text,
                 timestamp: 1,
                 context_id: None,
+                images: Vec::new(),
             }),
             sensor_data: None,
             conversation_history: vec![Message::user(text)],
@@ -8895,6 +8934,7 @@ mod decomposition_tests {
                 source: InputSource::Text,
                 timestamp: 1,
                 context_id: None,
+                images: Vec::new(),
             }),
             sensor_data: None,
             conversation_history: vec![Message::user(text)],
@@ -9038,6 +9078,7 @@ mod decomposition_tests {
     fn sample_perception() -> ProcessedPerception {
         ProcessedPerception {
             user_message: "Break this task into phases".to_string(),
+            images: Vec::new(),
             context_window: vec![Message::user("context")],
             active_goals: vec!["Help the user".to_string()],
             budget_remaining: sample_budget_remaining(),
@@ -10345,6 +10386,7 @@ mod context_compaction_tests {
                 source: InputSource::Text,
                 timestamp: 10,
                 context_id: None,
+                images: Vec::new(),
             }),
             sensor_data: None,
             conversation_history: history,
@@ -11881,6 +11923,7 @@ mod loop_resilience_tests {
                 source: InputSource::Text,
                 timestamp: 1,
                 context_id: None,
+                images: Vec::new(),
             }),
             sensor_data: None,
             conversation_history: vec![Message::user(text)],
@@ -12892,6 +12935,7 @@ mod test_fixtures {
                 source: InputSource::Text,
                 timestamp: 1,
                 context_id: None,
+                images: Vec::new(),
             }),
             sensor_data: None,
             conversation_history: vec![Message::user(text)],

@@ -10,6 +10,7 @@ fn create_user_input(text: &str) -> UserInput {
         source: InputSource::Text,
         timestamp: 1234567890,
         context_id: None,
+        images: Vec::new(),
     }
 }
 

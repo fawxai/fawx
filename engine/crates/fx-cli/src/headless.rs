@@ -19,7 +19,7 @@ use fx_kernel::signals::Signal;
 use fx_kernel::types::PerceptionSnapshot;
 use fx_kernel::StreamCallback;
 use fx_llm::CompletionProvider;
-use fx_llm::{Message, ModelInfo, ModelRouter};
+use fx_llm::{ImageAttachment, Message, ModelInfo, ModelRouter};
 use fx_memory::SignalStore;
 use sha2::{Digest, Sha256};
 
@@ -317,6 +317,24 @@ impl HeadlessApp {
         self.run_cycle_result(input, source).await
     }
 
+    pub async fn process_message_with_images(
+        &mut self,
+        input: &str,
+        images: &[ImageAttachment],
+        source: &InputSource,
+    ) -> Result<CycleResult, anyhow::Error> {
+        self.update_memory_context(input);
+        let snapshot = self.build_perception_snapshot_with_images(input, source, images);
+        let llm = RouterLoopLlmProvider::new(&self.router, self.active_model.clone());
+        let result = self
+            .loop_engine
+            .run_cycle(snapshot, &llm)
+            .await
+            .map_err(|e| anyhow::anyhow!("loop error: stage={} reason={}", e.stage, e.reason))?;
+        self.evaluate_canary(&result);
+        Ok(self.finalize_cycle(input, &result))
+    }
+
     pub async fn process_message_for_source_streaming(
         &mut self,
         input: &str,
@@ -547,7 +565,17 @@ impl HeadlessApp {
     }
 
     fn build_perception_snapshot(&self, input: &str, source: &InputSource) -> PerceptionSnapshot {
+        self.build_perception_snapshot_with_images(input, source, &[])
+    }
+
+    fn build_perception_snapshot_with_images(
+        &self,
+        input: &str,
+        source: &InputSource,
+        images: &[ImageAttachment],
+    ) -> PerceptionSnapshot {
         let timestamp_ms = current_time_ms();
+        let image_pairs = images.to_vec();
         PerceptionSnapshot {
             screen: ScreenState {
                 current_app: "fawx.headless".to_string(),
@@ -563,6 +591,7 @@ impl HeadlessApp {
                 source: source.clone(),
                 timestamp: timestamp_ms,
                 context_id: None,
+                images: image_pairs,
             }),
             conversation_history: self.conversation_history.clone(),
             steer_context: None,

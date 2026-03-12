@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 const COMPACTION_MARKER_PREFIX: &str = "[context compacted:";
 const SUMMARY_MARKER_PREFIX: &str = "[context summary]";
+const IMAGE_TOKEN_ESTIMATE: usize = 1600;
 
 /// Shared token estimation heuristic used by loop and perception accounting.
 ///
@@ -35,6 +36,7 @@ fn estimate_content_tokens(content: &ContentBlock) -> usize {
             tool_use_id,
             content,
         } => estimate_text_tokens(tool_use_id) + estimate_text_tokens(&content.to_string()),
+        ContentBlock::Image { .. } => IMAGE_TOKEN_ESTIMATE,
     }
 }
 
@@ -87,7 +89,7 @@ fn tool_ids_in_message(message: &Message) -> Vec<&str> {
         .filter_map(|block| match block {
             ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
             ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
-            ContentBlock::Text { .. } => None,
+            ContentBlock::Text { .. } | ContentBlock::Image { .. } => None,
         })
         .collect()
 }
@@ -105,7 +107,7 @@ fn unresolved_tool_use_ids(messages: &[Message]) -> HashSet<&str> {
                 ContentBlock::ToolResult { tool_use_id, .. } => {
                     tool_result_ids.insert(tool_use_id.as_str());
                 }
-                ContentBlock::Text { .. } => {}
+                ContentBlock::Text { .. } | ContentBlock::Image { .. } => {}
             }
         }
     }
@@ -524,6 +526,7 @@ fn message_to_summary_line(message: &Message) -> String {
             } => {
                 format!("[tool_result:{tool_use_id}] {}", content)
             }
+            ContentBlock::Image { media_type, .. } => format!("[image:{media_type}]"),
         })
         .collect::<Vec<_>>()
         .join(" ");
@@ -882,6 +885,16 @@ mod tests {
     #[test]
     fn estimate_text_tokens_unicode_uses_char_count_heuristic() {
         assert_eq!(estimate_text_tokens("🦝"), 1);
+    }
+
+    #[test]
+    fn estimate_content_tokens_uses_fixed_cost_for_images() {
+        let image = ContentBlock::Image {
+            media_type: "image/jpeg".to_string(),
+            data: "tiny".to_string(),
+        };
+
+        assert_eq!(estimate_content_tokens(&image), IMAGE_TOKEN_ESTIMATE);
     }
 
     // 5.2 SlidingWindowCompactor tests
