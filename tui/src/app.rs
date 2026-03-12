@@ -24,6 +24,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
+use serde_json::Value;
 use sparx::{render_file, RenderConfig};
 use std::cmp::min;
 use std::fmt;
@@ -64,6 +65,14 @@ const EXPERIMENT_PANEL_TITLE: &str = "Experiment";
 const TRANSCRIPT_WIDTH_PERCENT: u16 = 70;
 const EXPERIMENT_PANEL_WIDTH_PERCENT: u16 = 30;
 const PANEL_BORDER_LINES: usize = 2;
+const TOOL_USE_PREFIX: &str = "tool › ";
+const TOOL_RESULT_PREFIX: &str = "tool · ";
+const TOOL_ERROR_PREFIX: &str = "tool ! ";
+const TOOL_PREFIX_WIDTH: usize = TOOL_USE_PREFIX.len();
+const TOOL_USE_FIELD_LIMIT: usize = 3;
+const TOOL_USE_MAX_LINES: usize = 5;
+const TOOL_RESULT_MAX_LINES: usize = 20;
+const TOOL_VALUE_PREVIEW_CHARS: usize = 80;
 
 #[derive(Debug, Clone)]
 pub struct RunOptions {
@@ -137,6 +146,8 @@ enum EntryRole {
 struct Entry {
     role: EntryRole,
     text: String,
+    tool_name: Option<String>,
+    tool_arguments: Option<Value>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -183,6 +194,35 @@ impl fmt::Display for EntryRole {
 impl fmt::Display for Entry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}: {}", self.role, self.text)
+    }
+}
+
+impl Entry {
+    fn plain(role: EntryRole, text: impl Into<String>) -> Self {
+        Self {
+            role,
+            text: text.into(),
+            tool_name: None,
+            tool_arguments: None,
+        }
+    }
+
+    fn tool_use(name: String, arguments: Value) -> Self {
+        Self {
+            role: EntryRole::ToolUse,
+            text: name.clone(),
+            tool_name: Some(name),
+            tool_arguments: normalize_tool_arguments(arguments),
+        }
+    }
+
+    fn tool_result(role: EntryRole, name: Option<String>, content: String) -> Self {
+        Self {
+            role,
+            text: content,
+            tool_name: name,
+            tool_arguments: None,
+        }
     }
 }
 
@@ -260,6 +300,7 @@ struct App {
     spinner_frame: usize,
     last_meta: Option<String>,
     last_tokens: Option<TokenUsageSummary>,
+    active_tool_name: Option<String>,
     should_quit: bool,
     transcript_area: Rect,
     input_area: Rect,
@@ -293,6 +334,7 @@ impl App {
             spinner_frame: 0,
             last_meta: None,
             last_tokens: None,
+            active_tool_name: None,
             should_quit: false,
             transcript_area: Rect::default(),
             input_area: Rect::default(),
@@ -442,16 +484,15 @@ impl App {
             return;
         }
 
-        self.entries.push(Entry {
-            role: EntryRole::User,
-            text: input.clone(),
-        });
+        self.entries
+            .push(Entry::plain(EntryRole::User, input.clone()));
         self.streaming_text = Some(String::new());
         self.pending_request = true;
         self.awaiting_stream_start = true;
         self.follow_output = true;
         self.spinner_frame = 0;
         self.last_meta = None;
+        self.active_tool_name = None;
         self.input.clear();
         self.input_scroll = 0;
 
@@ -488,6 +529,7 @@ impl App {
         self.awaiting_stream_start = false;
         self.last_meta = None;
         self.last_tokens = None;
+        self.active_tool_name = None;
         self.input_scroll = 0;
         self.clear_experiment_panel();
         self.push_system("Transcript cleared.");
@@ -521,40 +563,12 @@ impl App {
                     .push_str(&delta);
                 self.follow_output = true;
             }
-            BackendEvent::ToolUse { name, arguments } => {
-                self.awaiting_stream_start = false;
-                let text = match serde_json::to_string_pretty(&arguments) {
-                    Ok(arguments) if arguments != "null" && arguments != "{}" => {
-                        format!("{name}\n{arguments}")
-                    }
-                    _ => name,
-                };
-                self.entries.push(Entry {
-                    role: EntryRole::ToolUse,
-                    text,
-                });
-                self.follow_output = true;
-            }
+            BackendEvent::ToolUse { name, arguments } => self.push_tool_use(name, arguments),
             BackendEvent::ToolResult {
                 name,
                 success,
                 content,
-            } => {
-                self.awaiting_stream_start = false;
-                let text = match name {
-                    Some(name) if !name.is_empty() => format!("{name}\n{content}"),
-                    _ => content,
-                };
-                self.entries.push(Entry {
-                    role: if success {
-                        EntryRole::ToolResult
-                    } else {
-                        EntryRole::ToolError
-                    },
-                    text,
-                });
-                self.follow_output = true;
-            }
+            } => self.push_tool_result(name, success, content),
             BackendEvent::Done {
                 model,
                 iterations,
@@ -562,10 +576,7 @@ impl App {
                 output_tokens,
             } => {
                 if let Some(text) = self.streaming_text.take() {
-                    self.entries.push(Entry {
-                        role: EntryRole::Assistant,
-                        text,
-                    });
+                    self.entries.push(Entry::plain(EntryRole::Assistant, text));
                 }
                 self.pending_request = false;
                 self.awaiting_stream_start = false;
@@ -588,10 +599,7 @@ impl App {
             BackendEvent::StreamError(error) => {
                 if let Some(text) = self.streaming_text.take() {
                     if !text.is_empty() {
-                        self.entries.push(Entry {
-                            role: EntryRole::Assistant,
-                            text,
-                        });
+                        self.entries.push(Entry::plain(EntryRole::Assistant, text));
                     }
                 }
                 self.pending_request = false;
@@ -604,6 +612,36 @@ impl App {
         }
     }
 
+    fn push_tool_use(&mut self, name: String, arguments: Value) {
+        self.awaiting_stream_start = false;
+        self.active_tool_name = Some(name.clone());
+        if let Some(entry) = self.entries.last_mut() {
+            if should_update_tool_use(entry, &name) {
+                *entry = Entry::tool_use(name, arguments);
+                self.follow_output = true;
+                return;
+            }
+        }
+        self.entries.push(Entry::tool_use(name, arguments));
+        self.follow_output = true;
+    }
+
+    fn push_tool_result(&mut self, name: Option<String>, success: bool, content: String) {
+        self.awaiting_stream_start = false;
+        let role = if success {
+            EntryRole::ToolResult
+        } else {
+            EntryRole::ToolError
+        };
+        let resolved_name = self
+            .active_tool_name
+            .take()
+            .or(name.filter(|value| !value.is_empty()));
+        self.entries
+            .push(Entry::tool_result(role, resolved_name, content));
+        self.follow_output = true;
+    }
+
     fn show_skills_list(&mut self) {
         let installed = discover_installed_skills();
         let available = discover_built_skills(&installed);
@@ -613,18 +651,12 @@ impl App {
     }
 
     fn push_system(&mut self, message: impl Into<String>) {
-        self.entries.push(Entry {
-            role: EntryRole::System,
-            text: message.into(),
-        });
+        self.entries.push(Entry::plain(EntryRole::System, message));
         self.follow_output = true;
     }
 
     fn push_error(&mut self, message: impl Into<String>) {
-        self.entries.push(Entry {
-            role: EntryRole::Error,
-            text: message.into(),
-        });
+        self.entries.push(Entry::plain(EntryRole::Error, message));
         self.follow_output = true;
     }
 
@@ -746,7 +778,9 @@ impl App {
     fn transcript_widget(&self, area: Rect) -> Paragraph<'static> {
         let inner_width = area.width.saturating_sub(4) as usize;
         let lines = self.rendered_transcript_lines(inner_width.max(20));
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Conversation"))
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title("Conversation"))
     }
 
     fn transcript_max_scroll(&self, area: Rect) -> u16 {
@@ -866,10 +900,7 @@ impl App {
         }
         if let Some(text) = &self.streaming_text {
             self.render_entry(
-                &Entry {
-                    role: EntryRole::Assistant,
-                    text: text.clone(),
-                },
+                &Entry::plain(EntryRole::Assistant, text.clone()),
                 width,
                 &mut out,
             );
@@ -924,31 +955,13 @@ impl App {
                 ));
             }
             EntryRole::ToolUse => {
-                out.extend(prefix_wrapped_lines(
-                    &entry.text,
-                    width,
-                    "tool › ",
-                    "       ",
-                    Style::default().fg(Color::Magenta),
-                ));
+                out.extend(render_tool_use_entry(entry, width));
             }
             EntryRole::ToolResult => {
-                out.extend(prefix_wrapped_lines(
-                    &entry.text,
-                    width,
-                    "tool · ",
-                    "       ",
-                    Style::default().fg(Color::Green),
-                ));
+                out.extend(render_tool_result_entry(entry, width, self.panel_visible()));
             }
             EntryRole::ToolError => {
-                out.extend(prefix_wrapped_lines(
-                    &entry.text,
-                    width,
-                    "tool ! ",
-                    "       ",
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                ));
+                out.extend(render_tool_result_entry(entry, width, self.panel_visible()));
             }
         }
     }
@@ -991,10 +1004,7 @@ fn fawx_amber() -> Color {
 }
 
 fn initial_entries() -> Vec<Entry> {
-    vec![Entry {
-        role: EntryRole::Welcome,
-        text: String::new(),
-    }]
+    vec![Entry::plain(EntryRole::Welcome, String::new())]
 }
 
 const LOGO_RENDER_WIDTH: u32 = 40;
@@ -1471,6 +1481,348 @@ fn format_token_count(value: u64) -> String {
     }
 }
 
+fn normalize_tool_arguments(arguments: Value) -> Option<Value> {
+    match arguments {
+        Value::Null => None,
+        Value::Object(map) if map.is_empty() => None,
+        other => Some(other),
+    }
+}
+
+fn should_update_tool_use(entry: &Entry, name: &str) -> bool {
+    matches!(entry.role, EntryRole::ToolUse)
+        && entry.tool_name.as_deref() == Some(name)
+        && entry.tool_arguments.is_none()
+}
+
+fn render_tool_use_entry(entry: &Entry, width: usize) -> Vec<Line<'static>> {
+    let content_width = tool_content_width(width);
+    let lines = wrap_tool_text_lines(&tool_use_summary_lines(entry, content_width), content_width);
+    prefix_tool_lines(lines, EntryRole::ToolUse)
+}
+
+fn render_tool_result_entry(
+    entry: &Entry,
+    width: usize,
+    panel_visible: bool,
+) -> Vec<Line<'static>> {
+    let content_width = tool_content_width(width);
+    let plan = tool_result_render_plan(entry, content_width);
+    let mut lines = wrap_tool_text_lines(
+        &tool_result_summary_lines(entry, plan.summarize),
+        content_width,
+    );
+    let budget = TOOL_RESULT_MAX_LINES.saturating_sub(lines.len());
+    lines.extend(tool_result_preview_lines(
+        entry,
+        content_width,
+        budget,
+        panel_visible,
+        plan,
+    ));
+    prefix_tool_lines(lines, entry.role)
+}
+
+fn tool_content_width(width: usize) -> usize {
+    width.saturating_sub(TOOL_PREFIX_WIDTH).max(1)
+}
+
+fn prefix_tool_lines(lines: Vec<Line<'static>>, role: EntryRole) -> Vec<Line<'static>> {
+    let (initial, style) = tool_prefix(role);
+    prefix_lines(
+        lines,
+        Span::styled(initial, style),
+        Span::raw(tool_continuation_prefix()),
+    )
+}
+
+fn tool_continuation_prefix() -> String {
+    " ".repeat(TOOL_PREFIX_WIDTH)
+}
+
+fn tool_prefix(role: EntryRole) -> (&'static str, Style) {
+    match role {
+        EntryRole::ToolUse => (TOOL_USE_PREFIX, Style::default().fg(Color::Magenta)),
+        EntryRole::ToolResult => (TOOL_RESULT_PREFIX, Style::default().fg(Color::Green)),
+        EntryRole::ToolError => (
+            TOOL_ERROR_PREFIX,
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        _ => (TOOL_RESULT_PREFIX, Style::default()),
+    }
+}
+
+fn wrap_tool_text_lines(lines: &[String], width: usize) -> Vec<Line<'static>> {
+    let mut rendered = Vec::new();
+    for line in lines {
+        rendered.extend(wrap_tool_output_text(line, width));
+    }
+    if rendered.is_empty() {
+        rendered.push(Line::default());
+    }
+    rendered
+}
+
+fn tool_use_summary_lines(entry: &Entry, width: usize) -> Vec<String> {
+    let mut lines = vec![format!(
+        "▶ {}",
+        entry.tool_name.as_deref().unwrap_or("tool")
+    )];
+    if let Some(arguments) = &entry.tool_arguments {
+        lines.extend(tool_argument_summary_lines(
+            entry.tool_name.as_deref(),
+            arguments,
+            width,
+        ));
+    }
+    truncate_tool_use_summary(lines)
+}
+
+fn truncate_tool_use_summary(lines: Vec<String>) -> Vec<String> {
+    if lines.len() <= TOOL_USE_MAX_LINES {
+        return lines;
+    }
+    let mut limited = lines[..TOOL_USE_MAX_LINES - 1].to_vec();
+    limited.push(format!(
+        "  … {} more fields",
+        lines.len() - TOOL_USE_MAX_LINES + 1
+    ));
+    limited
+}
+
+fn tool_argument_summary_lines(
+    tool_name: Option<&str>,
+    arguments: &Value,
+    width: usize,
+) -> Vec<String> {
+    match arguments {
+        Value::Object(map) => tool_object_summary_lines(tool_name, map, width),
+        other => vec![format!(
+            "  args: {}",
+            summarize_tool_value(other, width.saturating_sub(10))
+        )],
+    }
+}
+
+fn tool_object_summary_lines(
+    tool_name: Option<&str>,
+    map: &serde_json::Map<String, Value>,
+    width: usize,
+) -> Vec<String> {
+    let fields = prioritized_tool_fields(tool_name, map);
+    let mut lines = fields
+        .into_iter()
+        .take(TOOL_USE_FIELD_LIMIT)
+        .map(|(key, value)| {
+            let available = width.saturating_sub(key.len() + 7);
+            format!("  {key}: {}", summarize_tool_value(value, available))
+        })
+        .collect::<Vec<_>>();
+    let remaining = map.len().saturating_sub(TOOL_USE_FIELD_LIMIT);
+    if remaining > 0 {
+        lines.push(format!("  … {remaining} more fields"));
+    }
+    lines
+}
+
+fn prioritized_tool_fields<'a>(
+    tool_name: Option<&str>,
+    map: &'a serde_json::Map<String, Value>,
+) -> Vec<(&'a String, &'a Value)> {
+    let mut fields = map.iter().collect::<Vec<_>>();
+    if tool_name == Some("run_experiment") {
+        fields.sort_by_key(|(key, _)| (experiment_tool_argument_priority(key), key.as_str()));
+    }
+    fields
+}
+
+fn experiment_tool_argument_priority(key: &str) -> usize {
+    match key {
+        "signal" => 0,
+        "hypothesis" => 1,
+        "scope" => 2,
+        "nodes" => 3,
+        "mode" => 4,
+        "timeout" => 5,
+        _ => 6,
+    }
+}
+
+fn summarize_tool_value(value: &Value, limit: usize) -> String {
+    match value {
+        Value::String(text) => format!("\"{}\"", preview_text(text, limit)),
+        Value::Array(items) => format!("[{} items]", items.len()),
+        Value::Object(map) => format!("{{{} keys}}", map.len()),
+        other => other.to_string(),
+    }
+}
+
+fn preview_text(text: &str, limit: usize) -> String {
+    let preview_limit = limit.clamp(4, TOOL_VALUE_PREVIEW_CHARS);
+    truncate_text(
+        &text.split_whitespace().collect::<Vec<_>>().join(" "),
+        preview_limit,
+    )
+}
+
+fn tool_result_summary_lines(entry: &Entry, summarize_experiment: bool) -> Vec<String> {
+    let status = if matches!(entry.role, EntryRole::ToolError) {
+        "failure"
+    } else {
+        "success"
+    };
+    let label = entry.tool_name.as_deref().unwrap_or("tool");
+    let mut lines = vec![format!(
+        "{} {label} ({status})",
+        tool_status_icon(entry.role)
+    )];
+    if summarize_experiment {
+        lines.extend(experiment_result_summary_lines(&entry.text));
+    }
+    lines
+}
+
+fn tool_status_icon(role: EntryRole) -> &'static str {
+    if matches!(role, EntryRole::ToolError) {
+        "✗"
+    } else {
+        "✓"
+    }
+}
+
+fn experiment_result_summary_lines(text: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(decision) = find_prefixed_line(text, "Decision:") {
+        lines.push(collapse_whitespace(decision));
+    }
+    if let Some(score_line) = find_experiment_score_line(text) {
+        lines.push(collapse_whitespace(score_line));
+    }
+    if let Some(chain_entry) = find_line_containing(text, "Chain entry #") {
+        lines.push(collapse_whitespace(chain_entry));
+    }
+    lines
+}
+
+fn find_prefixed_line<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    text.lines()
+        .find(|line| line.trim_start().starts_with(prefix))
+}
+
+fn find_experiment_score_line(text: &str) -> Option<&str> {
+    text.lines()
+        .find(|line| line.contains("score:") && line.contains("WINNER"))
+        .or_else(|| text.lines().find(|line| line.contains("score:")))
+}
+
+fn find_line_containing<'a>(text: &'a str, needle: &str) -> Option<&'a str> {
+    text.lines().find(|line| line.contains(needle))
+}
+
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+struct ToolResultRenderPlan {
+    wrapped_output: Vec<Line<'static>>,
+    summarize: bool,
+}
+
+fn tool_result_preview_lines(
+    entry: &Entry,
+    width: usize,
+    limit: usize,
+    panel_visible: bool,
+    plan: ToolResultRenderPlan,
+) -> Vec<Line<'static>> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let total_lines = plan.wrapped_output.len();
+    if plan.summarize {
+        return experiment_notice_lines(entry, width, panel_visible, limit, total_lines);
+    }
+    truncate_wrapped_lines(
+        plan.wrapped_output,
+        width,
+        limit,
+        tool_result_notice(entry, panel_visible, total_lines),
+    )
+}
+
+fn has_experiment_summary(entry: &Entry) -> bool {
+    !experiment_result_summary_lines(&entry.text).is_empty()
+}
+
+fn tool_result_render_plan(entry: &Entry, width: usize) -> ToolResultRenderPlan {
+    let wrapped_output = wrap_tool_output_text(&entry.text, width);
+    let summarize = has_experiment_summary(entry) && wrapped_output.len() > TOOL_RESULT_MAX_LINES;
+    ToolResultRenderPlan {
+        wrapped_output,
+        summarize,
+    }
+}
+
+fn experiment_notice_lines(
+    entry: &Entry,
+    width: usize,
+    panel_visible: bool,
+    limit: usize,
+    total_lines: usize,
+) -> Vec<Line<'static>> {
+    let notice = wrap_plain_text(
+        &tool_result_notice(entry, panel_visible, total_lines),
+        width,
+    );
+    notice.into_iter().take(limit).collect()
+}
+
+fn truncate_wrapped_lines(
+    wrapped: Vec<Line<'static>>,
+    width: usize,
+    limit: usize,
+    notice: String,
+) -> Vec<Line<'static>> {
+    if wrapped.len() <= limit {
+        return wrapped;
+    }
+    let notice_lines = wrap_tool_output_text(&notice, width);
+    let keep = limit.saturating_sub(notice_lines.len());
+    let mut out = wrapped.into_iter().take(keep).collect::<Vec<_>>();
+    out.extend(
+        notice_lines
+            .into_iter()
+            .take(limit.saturating_sub(out.len())),
+    );
+    out
+}
+
+fn tool_result_notice(entry: &Entry, panel_visible: bool, total_lines: usize) -> String {
+    if panel_visible && entry.tool_name.as_deref() == Some("run_experiment") {
+        return format!("[full output: {total_lines} lines — see Experiment panel →]");
+    }
+    format!("[full output: {total_lines} lines — truncated in transcript]")
+}
+
+fn wrap_tool_output_text(text: &str, width: usize) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    let options = textwrap::Options::new(width).break_words(true);
+    for raw_line in text.lines() {
+        out.extend(
+            textwrap::wrap(raw_line, &options)
+                .into_iter()
+                .map(|line| Line::from(line.into_owned())),
+        );
+    }
+    if text.ends_with('\n') {
+        out.push(Line::default());
+    }
+    if out.is_empty() {
+        out.push(Line::default());
+    }
+    out
+}
+
 fn prefix_wrapped_lines(
     text: &str,
     width: usize,
@@ -1614,6 +1966,16 @@ mod tests {
         lines.iter().map(line_text).collect()
     }
 
+    fn assert_lines_fit(lines: &[Line<'_>], width: usize) {
+        for line in lines {
+            assert!(
+                line.width() <= width,
+                "line exceeded width {width}: {}",
+                line_text(line)
+            );
+        }
+    }
+
     fn skill(name: &str, icon: &str) -> InstalledSkill {
         InstalledSkill {
             icon: icon.to_string(),
@@ -1637,10 +1999,12 @@ mod tests {
 
     fn fill_transcript(app: &mut App, count: usize) {
         for index in 0..count {
-            app.entries.push(Entry {
-                role: EntryRole::Assistant,
-                text: format!("line {index}: this is a deliberately long transcript entry to force wrapping in a narrow viewport"),
-            });
+            app.entries.push(Entry::plain(
+                EntryRole::Assistant,
+                format!(
+                    "line {index}: this is a deliberately long transcript entry to force wrapping in a narrow viewport"
+                ),
+            ));
         }
     }
 
@@ -1752,11 +2116,12 @@ mod tests {
         assert_eq!(app.scroll, initial_bottom);
         assert!(app.follow_output);
 
-        app.entries.push(Entry {
-            role: EntryRole::ToolResult,
-            text: "tool output\nwith enough detail to extend the transcript and move the viewport down"
+        app.entries.push(Entry::tool_result(
+            EntryRole::ToolResult,
+            Some("run_experiment".to_string()),
+            "tool output\nwith enough detail to extend the transcript and move the viewport down"
                 .to_string(),
-        });
+        ));
 
         let grown_bottom = app.transcript_max_scroll(area);
         let grown_scroll = app.sync_transcript_scroll(area);
@@ -1764,6 +2129,147 @@ mod tests {
         assert_eq!(grown_scroll, grown_bottom);
         assert_eq!(app.scroll, grown_bottom);
         assert!(app.follow_output);
+    }
+
+    #[test]
+    fn tool_use_rendering_summarizes_arguments_without_raw_json() {
+        let entry = Entry::tool_use(
+            "run_experiment".to_string(),
+            json!({
+                "signal": "Low success-to-decision ratio in the experiment runner transcript view",
+                "hypothesis": "Subagent tool output should be summarized instead of rendered as a raw JSON blob",
+                "nodes": 2,
+                "mode": "subagent",
+                "scope": "tui/src/app.rs"
+            }),
+        );
+
+        for width in [42, 80, 120, 200] {
+            let lines = render_tool_use_entry(&entry, width);
+            let text = rendered_text(&lines).join("\n");
+
+            assert!(text.contains("▶ run_experiment"));
+            assert!(text.contains("signal:"));
+            assert!(text.contains("hypothesis:"));
+            assert!(text.contains("… 2 more fields"));
+            assert!(!text.contains('{'));
+            assert!(lines.len() <= TOOL_USE_MAX_LINES);
+            assert_lines_fit(&lines, width);
+        }
+    }
+
+    #[test]
+    fn tool_results_reuse_previous_tool_name_and_render_summary() {
+        let mut app = test_app();
+        app.handle_backend_event(BackendEvent::ToolUse {
+            name: "run_experiment".to_string(),
+            arguments: Value::Null,
+        });
+        app.handle_backend_event(BackendEvent::ToolUse {
+            name: "run_experiment".to_string(),
+            arguments: json!({
+                "signal": "rendering overflow",
+                "hypothesis": "tool call summaries should fit narrow transcript widths"
+            }),
+        });
+        app.handle_backend_event(BackendEvent::ToolResult {
+            name: None,
+            success: true,
+            content: "═══ Experiment Complete ═══\nDecision:      ✅ ACCEPT\nnode-0 Conservative score: 8.73 ← WINNER\nChain entry #7 recorded".to_string(),
+        });
+
+        assert_eq!(app.entries.len(), 2);
+        assert_eq!(app.entries[0].tool_name.as_deref(), Some("run_experiment"));
+        assert!(app.entries[0].tool_arguments.is_some());
+        assert_eq!(app.entries[1].tool_name.as_deref(), Some("run_experiment"));
+    }
+
+    #[test]
+    fn short_experiment_results_render_full_output_without_notice() {
+        let entry = Entry::tool_result(
+            EntryRole::ToolResult,
+            Some("run_experiment".to_string()),
+            "═══ Experiment Complete ═══\nDecision:      ✅ ACCEPT\nnode-0 Conservative score: 8.73 ← WINNER\nChain entry #7 recorded".to_string(),
+        );
+
+        let lines = render_tool_result_entry(&entry, 52, true);
+        let text = rendered_text(&lines).join("\n");
+
+        assert!(text.contains("Decision:"));
+        assert!(text.contains("Chain entry #7 recorded"));
+        assert!(!text.contains("[full output:"));
+        assert_lines_fit(&lines, 52);
+    }
+
+    #[test]
+    fn tool_result_rendering_truncates_verbose_output_to_transcript_budget() {
+        let content = (0..30)
+            .map(|index| format!("line {index}: {}", "verbose output ".repeat(4)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let entry = Entry::tool_result(
+            EntryRole::ToolResult,
+            Some("run_experiment".to_string()),
+            content,
+        );
+
+        for width in [40, 80, 120, 200] {
+            let lines = render_tool_result_entry(&entry, width, true);
+            let text = rendered_text(&lines).join("\n");
+
+            assert!(text.contains("✓ run_experiment (success)"));
+            assert!(text.contains("[full output:"));
+            assert!(lines.len() <= TOOL_RESULT_MAX_LINES);
+            assert_lines_fit(&lines, width);
+        }
+    }
+
+    #[test]
+    fn non_experiment_tool_result_truncation_has_regression_coverage() {
+        let content = (0..30)
+            .map(|index| format!("stdout line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let entry = Entry::tool_result(EntryRole::ToolResult, Some("exec".to_string()), content);
+
+        let lines = render_tool_result_entry(&entry, 40, false);
+        let text = rendered_text(&lines).join("\n");
+
+        assert!(text.contains("✓ exec (success)"));
+        assert!(text.contains("stdout line 0"));
+        assert!(text.contains("truncated in transcript"));
+        assert!(!text.contains("Experiment panel"));
+        assert!(lines.len() <= TOOL_RESULT_MAX_LINES);
+        assert_lines_fit(&lines, 40);
+    }
+
+    #[test]
+    fn tool_error_rendering_shows_failure_header_and_stays_in_bounds() {
+        let content = (0..12)
+            .map(|index| format!("stderr line {index}: permission denied while opening file"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let entry = Entry::tool_result(EntryRole::ToolError, Some("read".to_string()), content);
+
+        let lines = render_tool_result_entry(&entry, 36, false);
+        let text = rendered_text(&lines).join("\n");
+
+        assert!(text.contains("✗ read (failure)"));
+        assert!(!text.contains("(success)"));
+        assert_lines_fit(&lines, 36);
+    }
+
+    #[test]
+    fn tool_result_rendering_wraps_long_url_like_output_to_width() {
+        let entry = Entry::tool_result(
+            EntryRole::ToolResult,
+            Some("read".to_string()),
+            "https://example.com/a/really/long/tool/output/path/that/used/to/overflow/the/transcript/view".to_string(),
+        );
+
+        let lines = render_tool_result_entry(&entry, 36, false);
+
+        assert_lines_fit(&lines, 36);
     }
 
     #[test]
@@ -2042,10 +2548,8 @@ mod tests {
     #[test]
     fn clear_command_resets_transcript_state_and_keeps_clear_notice() {
         let mut app = test_app();
-        app.entries.push(Entry {
-            role: EntryRole::Assistant,
-            text: "stale".to_string(),
-        });
+        app.entries
+            .push(Entry::plain(EntryRole::Assistant, "stale".to_string()));
         app.streaming_text = Some("partial".to_string());
         app.pending_request = true;
         app.awaiting_stream_start = true;
