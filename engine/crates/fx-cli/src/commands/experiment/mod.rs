@@ -4,9 +4,10 @@ use fx_auth::auth::AuthManager;
 use fx_config::FawxConfig;
 use fx_consensus::{
     format_auto_chain_result, load_chain_history_for_signal, CargoWorkspace, Chain, ChainStorage,
-    ConsensusError, ExperimentConfig, ExperimentRunner, FitnessCriterion, JsonFileChainStorage,
-    LlmPatchSource, MetricType, ModificationScope, NeutralEvaluatorConfig, PathPattern,
-    ProgressCallback, ProposalTier, RoundNodes, RoundNodesBuilder, Signal, SubagentPatchSource,
+    ConsensusError, EvaluationWorkspace, ExperimentConfig, ExperimentRunner, FitnessCriterion,
+    JsonFileChainStorage, LlmPatchSource, MetricType, ModificationScope, NeutralEvaluatorConfig,
+    PathPattern, ProgressCallback, ProposalTier, RemoteEvalTarget, RemoteEvaluationWorkspace,
+    RoundNodes, RoundNodesBuilder, Signal, SubagentPatchSource,
 };
 use fx_llm::ModelRouter;
 use fx_subagent::{SubagentControl, SubagentLimits, SubagentManager, SubagentManagerDeps};
@@ -59,6 +60,10 @@ pub enum ExperimentCommands {
         #[arg(long)]
         project: Option<String>,
 
+        /// Remote SSH evaluation target in user@host:/path format
+        #[arg(long)]
+        eval_node: Option<String>,
+
         /// Run node generation and evaluation one at a time
         #[arg(long)]
         sequential: bool,
@@ -109,6 +114,7 @@ pub async fn run(command: ExperimentCommands) -> anyhow::Result<String> {
             timeout,
             mode,
             project,
+            eval_node,
             sequential,
             max_rounds,
             verbose,
@@ -122,6 +128,7 @@ pub async fn run(command: ExperimentCommands) -> anyhow::Result<String> {
                     timeout,
                     mode,
                     project,
+                    eval_node,
                     sequential,
                     verbose,
                 },
@@ -150,6 +157,7 @@ pub struct RunExperimentArgs {
     pub timeout: u64,
     pub mode: ExperimentNodeMode,
     pub project: Option<String>,
+    pub eval_node: Option<String>,
     pub sequential: bool,
     pub verbose: bool,
 }
@@ -209,6 +217,7 @@ fn build_direct_runner(
         router,
         model,
         project_dir,
+        eval_target: parse_eval_target(args)?,
     };
     ExperimentRunner::with_round_nodes_builder(chain_path, builder).map_err(anyhow::Error::from)
 }
@@ -236,6 +245,7 @@ fn build_subagent_runner(
             limits: SubagentLimits::default(),
         })),
         project_dir: resolve_project_dir(args)?,
+        eval_target: parse_eval_target(args)?,
     };
     ExperimentRunner::with_round_nodes_builder(chain_path, builder).map_err(anyhow::Error::from)
 }
@@ -250,8 +260,14 @@ fn build_neutral_evaluator_from_args(
         ExperimentNodeMode::Placeholder => Ok(Some(placeholders::build_neutral_evaluator())),
         ExperimentNodeMode::Direct | ExperimentNodeMode::Subagent => {
             let project_dir = resolve_project_dir(args)?;
-            build_round_neutral_evaluator(args.nodes, &project_dir, &args.scope)
-                .map_err(anyhow::Error::from)
+            let eval_target = parse_eval_target(args)?;
+            build_round_neutral_evaluator(
+                args.nodes,
+                &project_dir,
+                &args.scope,
+                eval_target.as_ref(),
+            )
+            .map_err(anyhow::Error::from)
         }
     }
 }
@@ -262,6 +278,7 @@ struct DirectRoundNodesBuilder {
     router: Arc<ModelRouter>,
     model: String,
     project_dir: PathBuf,
+    eval_target: Option<RemoteEvalTarget>,
 }
 
 impl RoundNodesBuilder for DirectRoundNodesBuilder {
@@ -277,6 +294,7 @@ impl RoundNodesBuilder for DirectRoundNodesBuilder {
             router: Arc::clone(&self.router),
             model: self.model.clone(),
             project_dir: self.project_dir.clone(),
+            eval_target: self.eval_target.clone(),
             chain_history,
         })
         .map_err(protocol_error)?;
@@ -286,6 +304,7 @@ impl RoundNodesBuilder for DirectRoundNodesBuilder {
                 self.count,
                 &self.project_dir,
                 &self.scope,
+                self.eval_target.as_ref(),
             )?,
         })
     }
@@ -296,6 +315,7 @@ struct SubagentRoundNodesBuilder {
     scope: String,
     manager: Arc<SubagentManager>,
     project_dir: PathBuf,
+    eval_target: Option<RemoteEvalTarget>,
 }
 
 impl RoundNodesBuilder for SubagentRoundNodesBuilder {
@@ -310,6 +330,7 @@ impl RoundNodesBuilder for SubagentRoundNodesBuilder {
             scope: self.scope.clone(),
             manager: Arc::clone(&self.manager),
             project_dir: self.project_dir.clone(),
+            eval_target: self.eval_target.clone(),
             chain_history,
         })
         .map_err(protocol_error)?;
@@ -319,6 +340,7 @@ impl RoundNodesBuilder for SubagentRoundNodesBuilder {
                 self.count,
                 &self.project_dir,
                 &self.scope,
+                self.eval_target.as_ref(),
             )?,
         })
     }
@@ -332,17 +354,56 @@ fn build_round_neutral_evaluator(
     count: u32,
     project_dir: &Path,
     scope: &str,
+    eval_target: Option<&RemoteEvalTarget>,
 ) -> Result<Option<NeutralEvaluatorConfig>, ConsensusError> {
     if count != 1 {
         return Ok(None);
     }
-    let package = CargoWorkspace::package_from_scope(scope);
-    let workspace =
-        CargoWorkspace::clone_from_with_package(project_dir, "neutral-evaluator", package)?;
     Ok(Some(NeutralEvaluatorConfig {
         node_id: fx_consensus::NodeId("neutral-evaluator".to_owned()),
-        workspace: Box::new(workspace),
+        workspace: build_evaluation_workspace(
+            project_dir,
+            "neutral-evaluator",
+            scope,
+            eval_target,
+        )?,
     }))
+}
+
+fn parse_eval_target(args: &RunExperimentArgs) -> anyhow::Result<Option<RemoteEvalTarget>> {
+    args.eval_node
+        .as_deref()
+        .map(|target| target.parse().map_err(anyhow::Error::from))
+        .transpose()
+}
+
+fn build_evaluation_workspace(
+    project_dir: &Path,
+    label: &str,
+    scope: &str,
+    eval_target: Option<&RemoteEvalTarget>,
+) -> Result<Box<dyn EvaluationWorkspace>, ConsensusError> {
+    let package = CargoWorkspace::package_from_scope(scope);
+    match eval_target {
+        Some(target) => Ok(Box::new(RemoteEvaluationWorkspace::new(
+            target.clone(),
+            package,
+        )?)),
+        None => Ok(Box::new(CargoWorkspace::clone_from_with_package(
+            project_dir,
+            label,
+            package,
+        )?)),
+    }
+}
+
+fn build_generator_workspace(
+    project_dir: &Path,
+    label: &str,
+    scope: &str,
+) -> Result<CargoWorkspace, ConsensusError> {
+    let package = CargoWorkspace::package_from_scope(scope);
+    CargoWorkspace::clone_from_with_package(project_dir, label, package)
 }
 
 fn protocol_error(error: anyhow::Error) -> ConsensusError {
@@ -428,31 +489,31 @@ struct DirectNodesBuildConfig {
     router: Arc<ModelRouter>,
     model: String,
     project_dir: PathBuf,
+    eval_target: Option<RemoteEvalTarget>,
     chain_history: String,
 }
 
 fn build_direct_nodes(
     config: DirectNodesBuildConfig,
 ) -> anyhow::Result<Vec<fx_consensus::NodeConfig>> {
-    let package = CargoWorkspace::package_from_scope(&config.scope);
     (0..config.count)
         .map(|index| {
             let strategy = placeholders::strategy_for(index);
             let node_id = fx_consensus::NodeId(format!("node-{index}"));
-            let workspace = CargoWorkspace::clone_from_with_package(
-                &config.project_dir,
-                &node_id.0,
-                package.clone(),
-            )
-            .map_err(anyhow::Error::from)?;
             Ok(fx_consensus::NodeConfig {
-                node_id,
+                node_id: node_id.clone(),
                 strategy,
                 patch_source: Box::new(
                     LlmPatchSource::new(Arc::clone(&config.router), config.model.clone())
                         .with_chain_history(config.chain_history.clone()),
                 ),
-                workspace: Box::new(workspace),
+                workspace: build_evaluation_workspace(
+                    &config.project_dir,
+                    &node_id.0,
+                    &config.scope,
+                    config.eval_target.as_ref(),
+                )
+                .map_err(anyhow::Error::from)?,
             })
         })
         .collect()
@@ -463,23 +524,22 @@ struct SubagentNodesBuildConfig {
     scope: String,
     manager: Arc<SubagentManager>,
     project_dir: PathBuf,
+    eval_target: Option<RemoteEvalTarget>,
     chain_history: String,
 }
 
 fn build_subagent_nodes(
     config: SubagentNodesBuildConfig,
 ) -> anyhow::Result<Vec<fx_consensus::NodeConfig>> {
-    let package = CargoWorkspace::package_from_scope(&config.scope);
     (0..config.count)
         .map(|index| {
             let strategy = placeholders::strategy_for(index);
             let node_id = fx_consensus::NodeId(format!("node-{index}"));
-            let (generator_workspace, evaluator_workspace) = CargoWorkspace::clone_node_workspaces(
-                &config.project_dir,
-                &node_id.0,
-                package.clone(),
-            )
-            .map_err(anyhow::Error::from)?;
+            let generator_label = format!("{}-gen", node_id.0);
+            let evaluator_label = format!("{}-eval", node_id.0);
+            let generator_workspace =
+                build_generator_workspace(&config.project_dir, &generator_label, &config.scope)
+                    .map_err(anyhow::Error::from)?;
             Ok(fx_consensus::NodeConfig {
                 node_id: node_id.clone(),
                 strategy: strategy.clone(),
@@ -491,7 +551,13 @@ fn build_subagent_nodes(
                     )
                     .with_chain_history(config.chain_history.clone()),
                 ),
-                workspace: Box::new(evaluator_workspace),
+                workspace: build_evaluation_workspace(
+                    &config.project_dir,
+                    &evaluator_label,
+                    &config.scope,
+                    config.eval_target.as_ref(),
+                )
+                .map_err(anyhow::Error::from)?,
             })
         })
         .collect()

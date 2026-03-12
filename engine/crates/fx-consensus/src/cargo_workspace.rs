@@ -271,7 +271,7 @@ async fn run_git_command(project_dir: &Path, args: &[&str]) -> crate::Result<()>
     }
 }
 
-fn parse_test_result(output: &str) -> TestResult {
+pub(crate) fn parse_test_result(output: &str) -> TestResult {
     let mut passed = 0;
     let mut failed = 0;
     let mut total = 0;

@@ -19,17 +19,50 @@ pub struct TestResult {
 
 #[async_trait]
 pub trait EvaluationWorkspace: Send + Sync {
+    async fn begin_evaluation(&self) -> Result<(), ConsensusError> {
+        Ok(())
+    }
+
     async fn apply_patch(&self, patch: &str) -> Result<(), ConsensusError>;
     async fn build(&self) -> Result<(), ConsensusError>;
     async fn test(&self) -> Result<TestResult, ConsensusError>;
     async fn check_signal(&self, signal: &Signal) -> Result<bool, ConsensusError>;
     async fn check_regression(&self, experiment: &Experiment) -> Result<bool, ConsensusError>;
     async fn reset(&self) -> Result<(), ConsensusError>;
+
+    async fn finish_evaluation(&self) -> Result<(), ConsensusError> {
+        Ok(())
+    }
 }
 
 impl BuildTestEvaluator {
     pub fn new(node_id: NodeId, workspace: Box<dyn EvaluationWorkspace>) -> Self {
         Self { node_id, workspace }
+    }
+
+    async fn evaluate_candidate(
+        &self,
+        experiment: &Experiment,
+        candidate: &Candidate,
+    ) -> Result<Evaluation, ConsensusError> {
+        self.workspace.reset().await?;
+        if self.workspace.apply_patch(&candidate.patch).await.is_err() {
+            return Ok(failed_evaluation(candidate, self.node_id.clone()));
+        }
+        if self.workspace.build().await.is_err() {
+            return Ok(failed_evaluation(candidate, self.node_id.clone()));
+        }
+        let test_result = collect_test_result(&*self.workspace).await?;
+        let signal_resolved = check_signal_resolved(&*self.workspace, experiment).await;
+        let regression_detected = check_regression_detected(&*self.workspace, experiment).await;
+        Ok(build_evaluation(
+            candidate,
+            self.node_id.clone(),
+            true,
+            test_result,
+            signal_resolved,
+            regression_detected,
+        ))
     }
 }
 
@@ -40,31 +73,26 @@ impl CandidateEvaluator for BuildTestEvaluator {
         experiment: &Experiment,
         candidate: &Candidate,
     ) -> Result<Evaluation, ConsensusError> {
-        self.workspace.reset().await?;
-        if self.workspace.apply_patch(&candidate.patch).await.is_err() {
-            return Ok(failed_evaluation(candidate, self.node_id.clone()));
-        }
-
-        if self.workspace.build().await.is_err() {
-            return Ok(failed_evaluation(candidate, self.node_id.clone()));
-        }
-
-        let test_result = collect_test_result(&*self.workspace).await?;
-        let signal_resolved = check_signal_resolved(&*self.workspace, experiment).await;
-        let regression_detected = check_regression_detected(&*self.workspace, experiment).await;
-
-        Ok(build_evaluation(
-            candidate,
-            self.node_id.clone(),
-            true,
-            test_result,
-            signal_resolved,
-            regression_detected,
-        ))
+        self.workspace.begin_evaluation().await?;
+        let result = self.evaluate_candidate(experiment, candidate).await;
+        complete_evaluation(&*self.workspace, result).await
     }
 
     fn node_id(&self) -> &NodeId {
         &self.node_id
+    }
+}
+
+async fn complete_evaluation(
+    workspace: &dyn EvaluationWorkspace,
+    result: Result<Evaluation, ConsensusError>,
+) -> Result<Evaluation, ConsensusError> {
+    let finish_result = workspace.finish_evaluation().await;
+    match (result, finish_result) {
+        (Ok(evaluation), Ok(())) => Ok(evaluation),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(_)) => Err(error),
     }
 }
 
@@ -244,6 +272,48 @@ mod tests {
     use super::test_support::MockEvaluationWorkspace;
     use super::*;
     use crate::types::tests::{sample_candidate, sample_experiment};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct FinishingWorkspace {
+        finish_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl EvaluationWorkspace for FinishingWorkspace {
+        async fn apply_patch(&self, _patch: &str) -> Result<(), ConsensusError> {
+            Err(ConsensusError::PatchFailed("patch failed".into()))
+        }
+
+        async fn build(&self) -> Result<(), ConsensusError> {
+            Ok(())
+        }
+
+        async fn test(&self) -> Result<TestResult, ConsensusError> {
+            Ok(TestResult {
+                passed: 1,
+                failed: 0,
+                total: 1,
+            })
+        }
+
+        async fn check_signal(&self, _signal: &Signal) -> Result<bool, ConsensusError> {
+            Ok(false)
+        }
+
+        async fn check_regression(&self, _experiment: &Experiment) -> Result<bool, ConsensusError> {
+            Ok(false)
+        }
+
+        async fn reset(&self) -> Result<(), ConsensusError> {
+            Ok(())
+        }
+
+        async fn finish_evaluation(&self) -> Result<(), ConsensusError> {
+            self.finish_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
 
     #[tokio::test]
     async fn evaluator_reports_high_fitness_when_build_tests_and_signal_all_pass() {
@@ -393,6 +463,27 @@ mod tests {
 
         assert!(!evaluation.safety_pass);
         assert_eq!(evaluation.fitness_scores.get("build_success"), Some(&0.0));
+    }
+
+    #[tokio::test]
+    async fn evaluator_finishes_workspace_after_patch_failure() {
+        let experiment = sample_experiment();
+        let candidate = sample_candidate(experiment.id, "node-a");
+        let finish_calls = Arc::new(AtomicUsize::new(0));
+        let evaluator = BuildTestEvaluator::new(
+            NodeId::from("node-b"),
+            Box::new(FinishingWorkspace {
+                finish_calls: Arc::clone(&finish_calls),
+            }),
+        );
+
+        let evaluation = evaluator
+            .evaluate(&experiment, &candidate)
+            .await
+            .expect("evaluate");
+
+        assert!(!evaluation.safety_pass);
+        assert_eq!(finish_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
