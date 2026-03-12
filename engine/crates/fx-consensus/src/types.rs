@@ -125,6 +125,32 @@ pub enum Decision {
     Inconclusive,
 }
 
+impl Decision {
+    pub fn lowercase_label(&self) -> &'static str {
+        match self {
+            Self::Accept => "accept",
+            Self::Reject => "reject",
+            Self::Inconclusive => "inconclusive",
+        }
+    }
+
+    pub fn uppercase_label(&self) -> &'static str {
+        match self {
+            Self::Accept => "ACCEPT",
+            Self::Reject => "REJECT",
+            Self::Inconclusive => "INCONCLUSIVE",
+        }
+    }
+
+    pub fn emoji_label(&self) -> &'static str {
+        match self {
+            Self::Accept => "✅ ACCEPT",
+            Self::Reject => "❌ REJECT",
+            Self::Inconclusive => "⚠️ INCONCLUSIVE",
+        }
+    }
+}
+
 mod duration_serde {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::time::Duration;

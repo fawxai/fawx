@@ -36,6 +36,7 @@ fx-improve = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3.14"
+fx-consensus = { workspace = true, features = ["test-support"] }
 fx-embeddings = { workspace = true, features = ["test-support"] }
 fx-subagent = { path = "../fx-subagent", features = ["test-support"] }
 fx-storage.workspace = true

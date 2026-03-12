@@ -10,6 +10,8 @@ pub(crate) mod response_parser;
 pub mod runner;
 pub mod scoring;
 pub mod subagent_source;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_fixtures;
 pub mod types;
 
 pub use cargo_workspace::CargoWorkspace;
@@ -23,7 +25,9 @@ pub use generator::{
 pub use orchestrator::{CandidateEvaluator, CandidateGenerator, ExperimentOrchestrator};
 pub use protocol::{ConsensusProtocol, ExperimentConfig, LocalConsensusEngine};
 pub use runner::{
-    CandidateReport, ExperimentReport, ExperimentRunner, NeutralEvaluatorConfig, NodeConfig,
+    format_auto_chain_result, validate_auto_chain_rounds, AutoChainResult, CandidateReport,
+    ExperimentReport, ExperimentRunner, NeutralEvaluatorConfig, NodeConfig, RoundNodes,
+    RoundNodesBuilder,
 };
 pub use scoring::{compute_aggregate_scores, determine_winner};
 pub use types::{
@@ -31,5 +35,8 @@ pub use types::{
     ModificationScope, NodeId, PathPattern, ProposalTier, Severity, Signal,
 };
 
-pub use llm_source::{build_experiment_prompt, LlmPatchSource};
+pub use llm_source::{
+    build_experiment_prompt, build_subagent_experiment_prompt, format_chain_history,
+    load_chain_history_for_signal, LlmPatchSource, CHAIN_HISTORY_LIMIT,
+};
 pub use subagent_source::SubagentPatchSource;

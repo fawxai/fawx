@@ -1,5 +1,4 @@
 use crate::{ConsensusError, EvaluationWorkspace, Experiment, Signal, TestResult};
-use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::{NamedTempFile, TempDir};
 use tokio::process::Command;
@@ -7,6 +6,7 @@ use tokio::process::Command;
 pub struct CargoWorkspace {
     project_dir: PathBuf,
     baseline_tests: TestResult,
+    package: Option<String>,
     _workspace_root: Option<TempDir>,
 }
 
@@ -15,31 +15,80 @@ impl CargoWorkspace {
         &self.project_dir
     }
 
+    /// Derive a crate package name from a scope path like
+    /// `engine/crates/fx-consensus/src/scoring.rs`.
+    /// Looks for a `crates/<name>/` pattern in the path.
+    pub fn package_from_scope(scope: &str) -> Option<String> {
+        let parts: Vec<&str> = scope.split('/').collect();
+        for window in parts.windows(2) {
+            if window[0] == "crates" {
+                return Some(window[1].to_owned());
+            }
+        }
+        None
+    }
+
     pub fn new(project_dir: PathBuf) -> crate::Result<Self> {
+        Self::with_package(project_dir, None)
+    }
+
+    pub fn with_package(project_dir: PathBuf, package: Option<String>) -> crate::Result<Self> {
         validate_workspace_dir(&project_dir)?;
-        let baseline_tests = collect_baseline_tests(&project_dir)?;
+        let baseline_tests = collect_baseline_tests(&project_dir, package.as_deref())?;
         Ok(Self {
             project_dir,
             baseline_tests,
+            package,
             _workspace_root: None,
         })
     }
 
     pub fn clone_from(source_dir: &Path, label: &str) -> crate::Result<Self> {
+        Self::clone_from_with_package(source_dir, label, None)
+    }
+
+    pub fn clone_from_with_package(
+        source_dir: &Path,
+        label: &str,
+        package: Option<String>,
+    ) -> crate::Result<Self> {
         let workspace_root = tempfile::Builder::new()
             .prefix(&format!("fx-experiment-{label}-"))
             .tempdir()
             .map_err(|error| ConsensusError::WorkspaceError(error.to_string()))?;
         let project_dir = workspace_root.path().join("project");
         clone_project_dir(source_dir, &project_dir)?;
-        let mut workspace = Self::new(project_dir)?;
+        let mut workspace = Self::with_package(project_dir, package)?;
         workspace._workspace_root = Some(workspace_root);
         Ok(workspace)
     }
 
+    pub fn clone_node_workspaces(
+        source_dir: &Path,
+        node_label: &str,
+        package: Option<String>,
+    ) -> crate::Result<(Self, Self)> {
+        let generator = Self::clone_node_workspace(source_dir, node_label, "gen", package.clone())?;
+        let evaluator = Self::clone_node_workspace(source_dir, node_label, "eval", package)?;
+        Ok((generator, evaluator))
+    }
+
+    fn clone_node_workspace(
+        source_dir: &Path,
+        node_label: &str,
+        role: &str,
+        package: Option<String>,
+    ) -> crate::Result<Self> {
+        Self::clone_from_with_package(source_dir, &format!("{node_label}-{role}"), package)
+    }
+
     async fn run_cargo(&self, subcommand: &str) -> crate::Result<String> {
-        let output = Command::new("cargo")
-            .arg(subcommand)
+        let mut cmd = Command::new("cargo");
+        cmd.arg(subcommand);
+        if let Some(pkg) = &self.package {
+            cmd.args(["-p", pkg]);
+        }
+        let output = cmd
             .current_dir(&self.project_dir)
             .output()
             .await
@@ -65,23 +114,34 @@ impl CargoWorkspace {
 #[async_trait::async_trait]
 impl EvaluationWorkspace for CargoWorkspace {
     async fn apply_patch(&self, patch: &str) -> crate::Result<()> {
+        // git apply requires a trailing newline; ensure it's present
+        // (various extraction paths trim() the patch text)
+        let patch = if patch.ends_with('\n') {
+            patch.to_owned()
+        } else {
+            format!("{patch}\n")
+        };
         let mut patch_file = NamedTempFile::new_in(&self.project_dir)
             .map_err(|error| ConsensusError::PatchFailed(error.to_string()))?;
         use std::io::Write as _;
         patch_file
             .write_all(patch.as_bytes())
             .map_err(|error| ConsensusError::PatchFailed(error.to_string()))?;
-        let git_apply = Command::new("git")
+        let output = Command::new("git")
             .arg("apply")
             .arg(patch_file.path())
             .current_dir(&self.project_dir)
             .output()
             .await
             .map_err(|error| ConsensusError::PatchFailed(error.to_string()))?;
-        if git_apply.status.success() {
-            return Ok(());
+        if output.status.success() {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(ConsensusError::PatchFailed(format!(
+                "git apply failed: {stderr}"
+            )))
         }
-        apply_patch_directly(&self.project_dir, patch)
     }
 
     async fn build(&self) -> crate::Result<()> {
@@ -137,9 +197,13 @@ fn validate_workspace_dir(project_dir: &Path) -> crate::Result<()> {
     verify_git_repo(project_dir)
 }
 
-fn collect_baseline_tests(project_dir: &Path) -> crate::Result<TestResult> {
-    let output = std::process::Command::new("cargo")
-        .arg("test")
+fn collect_baseline_tests(project_dir: &Path, package: Option<&str>) -> crate::Result<TestResult> {
+    let mut cmd = std::process::Command::new("cargo");
+    cmd.arg("test");
+    if let Some(pkg) = package {
+        cmd.args(["-p", pkg]);
+    }
+    let output = cmd
         .current_dir(project_dir)
         .output()
         .map_err(|error| ConsensusError::WorkspaceError(error.to_string()))?;
@@ -207,110 +271,6 @@ async fn run_git_command(project_dir: &Path, args: &[&str]) -> crate::Result<()>
     }
 }
 
-fn apply_patch_directly(project_dir: &Path, patch: &str) -> crate::Result<()> {
-    let file_patch = parse_single_file_patch(patch)?;
-    let path = project_dir.join(file_patch.path);
-    let original = fs::read_to_string(&path)
-        .map_err(|error| ConsensusError::PatchFailed(error.to_string()))?;
-    let updated = apply_hunks(&original, &file_patch.hunks)?;
-    fs::write(path, updated).map_err(|error| ConsensusError::PatchFailed(error.to_string()))
-}
-
-struct FilePatch {
-    path: PathBuf,
-    hunks: Vec<Hunk>,
-}
-
-struct Hunk {
-    lines: Vec<HunkLine>,
-}
-
-enum HunkLine {
-    Context(String),
-    Remove(String),
-    Add(String),
-}
-
-fn parse_single_file_patch(patch: &str) -> crate::Result<FilePatch> {
-    let file_count = patch
-        .lines()
-        .filter(|line| line.starts_with("diff --git "))
-        .count();
-    if file_count > 1 {
-        return Err(ConsensusError::PatchFailed(
-            "direct patch fallback only supports single-file patches".to_owned(),
-        ));
-    }
-
-    let mut path = None;
-    let mut hunks = Vec::new();
-    let mut current = Vec::new();
-    for line in patch.lines() {
-        if let Some(stripped) = line.strip_prefix("+++ b/") {
-            path = Some(PathBuf::from(stripped));
-            continue;
-        }
-        if line.starts_with("@@") {
-            if !current.is_empty() {
-                hunks.push(Hunk { lines: current });
-                current = Vec::new();
-            }
-            continue;
-        }
-        if let Some(content) = line.strip_prefix(' ') {
-            current.push(HunkLine::Context(content.to_owned()));
-            continue;
-        }
-        if let Some(content) = line.strip_prefix('-') {
-            current.push(HunkLine::Remove(content.to_owned()));
-            continue;
-        }
-        if let Some(content) = line.strip_prefix('+') {
-            current.push(HunkLine::Add(content.to_owned()));
-        }
-    }
-    if !current.is_empty() {
-        hunks.push(Hunk { lines: current });
-    }
-    let Some(path) = path else {
-        return Err(ConsensusError::PatchFailed(
-            "patch missing target file".to_owned(),
-        ));
-    };
-    Ok(FilePatch { path, hunks })
-}
-
-fn apply_hunks(original: &str, hunks: &[Hunk]) -> crate::Result<String> {
-    let mut current = original.to_owned();
-    for hunk in hunks {
-        let before = hunk
-            .lines
-            .iter()
-            .filter_map(|line| match line {
-                HunkLine::Context(text) | HunkLine::Remove(text) => Some(text.as_str()),
-                HunkLine::Add(_) => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let after = hunk
-            .lines
-            .iter()
-            .filter_map(|line| match line {
-                HunkLine::Context(text) | HunkLine::Add(text) => Some(text.as_str()),
-                HunkLine::Remove(_) => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        if !current.contains(&before) {
-            return Err(ConsensusError::PatchFailed(
-                "failed to map patch hunk onto file contents".to_owned(),
-            ));
-        }
-        current = current.replacen(&before, &after, 1);
-    }
-    Ok(current)
-}
-
 fn parse_test_result(output: &str) -> TestResult {
     let mut passed = 0;
     let mut failed = 0;
@@ -351,6 +311,7 @@ fn parse_count(line: &str, label: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use tempfile::TempDir;
 
     #[test]
@@ -440,29 +401,81 @@ mod tests {
         assert_eq!(result.failed, 0);
     }
 
-    #[test]
-    fn direct_patch_fallback_rejects_multi_file_patch() {
-        let result = parse_single_file_patch(concat!(
+    #[tokio::test]
+    async fn apply_patch_handles_indented_code() {
+        let temp = TempDir::new().expect("temp dir");
+        init_git_project(temp.path());
+        write_project_files(
+            temp.path(),
+            concat!(
+                "pub fn value() -> i32 { 1 }\n",
+                "\n",
+                "#[cfg(test)]\n",
+                "mod tests {\n",
+                "    use super::*;\n",
+                "\n",
+                "    #[test]\n",
+                "    fn it_works() {\n",
+                "        assert_eq!(value(), 1);\n",
+                "    }\n",
+                "}\n",
+            ),
+            "assert_eq!(demo::value(), 1);",
+        );
+        let workspace = CargoWorkspace::new(temp.path().to_path_buf()).expect("workspace");
+
+        // Patch adds an indented test inside the existing mod tests block
+        let patch = concat!(
             "diff --git a/src/lib.rs b/src/lib.rs\n",
             "--- a/src/lib.rs\n",
             "+++ b/src/lib.rs\n",
-            "@@ -1 +1 @@\n",
-            "-old\n",
-            "+new\n",
-            "diff --git a/tests/basic.rs b/tests/basic.rs\n",
-            "--- a/tests/basic.rs\n",
-            "+++ b/tests/basic.rs\n",
-            "@@ -1 +1 @@\n",
-            "-old\n",
-            "+new\n"
-        ));
+            "@@ -9,4 +9,9 @@ mod tests {\n",
+            "     fn it_works() {\n",
+            "         assert_eq!(value(), 1);\n",
+            "     }\n",
+            "+\n",
+            "+    #[test]\n",
+            "+    fn it_also_works() {\n",
+            "+        assert_eq!(value() + 1, 2);\n",
+            "+    }\n",
+            " }\n",
+        );
 
-        match result {
-            Err(error) => assert!(error
-                .to_string()
-                .contains("direct patch fallback only supports single-file patches")),
-            Ok(_) => panic!("multi-file patch should fail"),
-        }
+        workspace
+            .apply_patch(patch)
+            .await
+            .expect("patch should apply to indented code");
+
+        let content = fs::read_to_string(temp.path().join("src/lib.rs")).expect("read");
+        assert!(content.contains("fn it_also_works()"));
+        assert!(content.contains("        assert_eq!(value() + 1, 2);"));
+    }
+
+    #[test]
+    fn clone_node_workspaces_creates_isolated_generator_and_evaluator_clones() {
+        let temp = TempDir::new().expect("temp dir");
+        init_git_project(temp.path());
+        write_project_files(
+            temp.path(),
+            "pub fn value() -> i32 { 1 }\n",
+            "assert_eq!(demo::value(), 1);",
+        );
+
+        let (generator, evaluator) =
+            CargoWorkspace::clone_node_workspaces(temp.path(), "node-0", None)
+                .expect("clone workspaces");
+
+        assert_ne!(generator.project_dir(), evaluator.project_dir());
+        fs::write(
+            generator.project_dir().join("src/lib.rs"),
+            "pub fn value() -> i32 { 2 }\n",
+        )
+        .expect("write generator clone");
+
+        let evaluator_lib = fs::read_to_string(evaluator.project_dir().join("src/lib.rs"))
+            .expect("read evaluator clone");
+
+        assert_eq!(evaluator_lib, "pub fn value() -> i32 { 1 }\n");
     }
 
     #[test]

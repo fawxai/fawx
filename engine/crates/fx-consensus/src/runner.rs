@@ -4,15 +4,14 @@ use crate::evaluator::{BuildTestEvaluator, EvaluationWorkspace};
 use crate::generator::{GenerationStrategy, LlmCandidateGenerator, PatchSource};
 use crate::orchestrator::{CandidateEvaluator, CandidateGenerator, ExperimentOrchestrator};
 use crate::protocol::{ConsensusProtocol, ExperimentConfig, LocalConsensusEngine};
-use crate::types::{Candidate, ConsensusResult, NodeId};
+use crate::types::{Candidate, ConsensusResult, Decision, NodeId};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub struct ExperimentRunner {
     engine: LocalConsensusEngine,
-    generators: Vec<Box<dyn CandidateGenerator>>,
-    evaluators: Vec<Box<dyn CandidateEvaluator>>,
-    strategies: BTreeMap<NodeId, GenerationStrategy>,
+    storage_path: PathBuf,
+    node_provider: NodeProvider,
 }
 
 pub struct NodeConfig {
@@ -27,18 +26,122 @@ pub struct NeutralEvaluatorConfig {
     pub workspace: Box<dyn EvaluationWorkspace>,
 }
 
+pub struct RoundNodes {
+    pub nodes: Vec<NodeConfig>,
+    pub neutral_evaluator: Option<NeutralEvaluatorConfig>,
+}
+
+pub trait RoundNodesBuilder: Send + Sync {
+    fn build_round_nodes(
+        &self,
+        chain_path: &Path,
+        signal: &str,
+    ) -> Result<RoundNodes, ConsensusError>;
+}
+
+#[derive(Debug)]
 pub struct ExperimentReport {
     pub result: ConsensusResult,
     pub chain_entry_index: u64,
     pub candidates: Vec<CandidateReport>,
 }
 
+impl ExperimentReport {
+    pub fn best_aggregate_score(&self) -> f64 {
+        self.result
+            .aggregate_scores
+            .values()
+            .copied()
+            .fold(0.0_f64, f64::max)
+    }
+
+    fn should_stop_auto_chain(&self) -> bool {
+        match self.result.decision {
+            Decision::Accept | Decision::Inconclusive => true,
+            Decision::Reject => self.best_aggregate_score() == 0.0,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct CandidateReport {
     pub node_id: NodeId,
     pub strategy: GenerationStrategy,
     pub approach: String,
     pub aggregate_score: f64,
     pub is_winner: bool,
+}
+
+#[derive(Debug)]
+pub struct AutoChainResult {
+    pub rounds_completed: u32,
+    pub max_rounds: u32,
+    pub reports: Vec<ExperimentReport>,
+}
+
+impl AutoChainResult {
+    pub fn final_report(&self) -> Option<&ExperimentReport> {
+        self.reports.last()
+    }
+}
+
+pub fn validate_auto_chain_rounds(max_rounds: u32) -> Result<(), ConsensusError> {
+    if max_rounds == 0 {
+        return Err(ConsensusError::Protocol(
+            "max_rounds must be at least 1".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn format_auto_chain_result<F>(result: &AutoChainResult, mut format_report: F) -> String
+where
+    F: FnMut(&ExperimentReport) -> String,
+{
+    if result.max_rounds == 1 {
+        return result
+            .final_report()
+            .map(&mut format_report)
+            .unwrap_or_default();
+    }
+    let mut lines = Vec::new();
+    for (index, report) in result.reports.iter().enumerate() {
+        let round = index as u32 + 1;
+        lines.push(format!(
+            "═══ Experiment Round {}/{} ═══",
+            round, result.max_rounds
+        ));
+        lines.push(format_report(report));
+        if round < result.rounds_completed {
+            lines.push(format!(
+                "Continuing — promising result ({}), retrying with chain history...\n",
+                report.result.decision.uppercase_label()
+            ));
+        }
+    }
+    lines.push(auto_chain_summary(result));
+    lines.join("\n")
+}
+
+fn auto_chain_summary(result: &AutoChainResult) -> String {
+    let final_decision = result
+        .final_report()
+        .map(|report| report.result.decision.uppercase_label())
+        .unwrap_or("UNKNOWN");
+    format!(
+        "═══ Auto-chain complete: {} after {} round{} ═══",
+        final_decision,
+        result.rounds_completed,
+        plural_suffix(result.rounds_completed),
+    )
+}
+
+fn plural_suffix(rounds_completed: u32) -> &'static str {
+    if rounds_completed == 1 {
+        ""
+    } else {
+        "s"
+    }
 }
 
 impl ExperimentRunner {
@@ -51,26 +154,106 @@ impl ExperimentRunner {
         nodes: Vec<NodeConfig>,
         neutral_evaluator: Option<NeutralEvaluatorConfig>,
     ) -> Result<Self, ConsensusError> {
-        let engine = LocalConsensusEngine::new(Box::new(JsonFileChainStorage::new(storage_path)))?;
-        let BuiltNodes {
-            generators,
-            evaluators,
-            strategies,
-        } = build_nodes(nodes, neutral_evaluator);
+        let engine =
+            LocalConsensusEngine::new(Box::new(JsonFileChainStorage::new(storage_path.clone())))?;
         Ok(Self {
             engine,
-            generators,
-            evaluators,
-            strategies,
+            storage_path,
+            node_provider: NodeProvider::Fixed(build_nodes(nodes, neutral_evaluator)),
+        })
+    }
+
+    pub fn with_round_nodes_builder<B>(
+        storage_path: PathBuf,
+        builder: B,
+    ) -> Result<Self, ConsensusError>
+    where
+        B: RoundNodesBuilder + 'static,
+    {
+        let engine =
+            LocalConsensusEngine::new(Box::new(JsonFileChainStorage::new(storage_path.clone())))?;
+        Ok(Self {
+            engine,
+            storage_path,
+            node_provider: NodeProvider::Builder(Box::new(builder)),
         })
     }
 
     pub async fn run(&self, config: ExperimentConfig) -> Result<ExperimentReport, ConsensusError> {
+        let nodes = self.active_nodes(&config.signal.name)?;
         let orchestrator = ExperimentOrchestrator::new(&self.engine);
         let result = orchestrator
-            .run_experiment(config, &self.generators, &self.evaluators)
+            .run_experiment(config, nodes.generators(), nodes.evaluators())
             .await?;
-        build_report(&self.engine, &self.strategies, result).await
+        build_report(&self.engine, nodes.strategies(), result).await
+    }
+
+    pub async fn run_loop(
+        &self,
+        config: ExperimentConfig,
+        max_rounds: u32,
+    ) -> Result<AutoChainResult, ConsensusError> {
+        validate_auto_chain_rounds(max_rounds)?;
+        let mut reports = Vec::new();
+        for _ in 1..=max_rounds {
+            let report = self.run(config.clone()).await?;
+            let should_stop = report.should_stop_auto_chain();
+            reports.push(report);
+            if should_stop {
+                break;
+            }
+        }
+        Ok(AutoChainResult {
+            rounds_completed: reports.len() as u32,
+            max_rounds,
+            reports,
+        })
+    }
+
+    fn active_nodes(&self, signal: &str) -> Result<ActiveNodes<'_>, ConsensusError> {
+        match &self.node_provider {
+            NodeProvider::Fixed(nodes) => Ok(ActiveNodes::Fixed(nodes)),
+            NodeProvider::Builder(builder) => {
+                let round_nodes = builder.build_round_nodes(&self.storage_path, signal)?;
+                Ok(ActiveNodes::Built(build_nodes(
+                    round_nodes.nodes,
+                    round_nodes.neutral_evaluator,
+                )))
+            }
+        }
+    }
+}
+
+enum NodeProvider {
+    Fixed(BuiltNodes),
+    Builder(Box<dyn RoundNodesBuilder>),
+}
+
+enum ActiveNodes<'a> {
+    Fixed(&'a BuiltNodes),
+    Built(BuiltNodes),
+}
+
+impl ActiveNodes<'_> {
+    fn generators(&self) -> &[Box<dyn CandidateGenerator>] {
+        match self {
+            ActiveNodes::Fixed(nodes) => &nodes.generators,
+            ActiveNodes::Built(nodes) => &nodes.generators,
+        }
+    }
+
+    fn evaluators(&self) -> &[Box<dyn CandidateEvaluator>] {
+        match self {
+            ActiveNodes::Fixed(nodes) => &nodes.evaluators,
+            ActiveNodes::Built(nodes) => &nodes.evaluators,
+        }
+    }
+
+    fn strategies(&self) -> &BTreeMap<NodeId, GenerationStrategy> {
+        match self {
+            ActiveNodes::Fixed(nodes) => &nodes.strategies,
+            ActiveNodes::Built(nodes) => &nodes.strategies,
+        }
     }
 }
 
@@ -154,11 +337,12 @@ fn candidate_reports(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chain::ChainStorage;
     use crate::evaluator::TestResult;
     use crate::generator::PatchResponse;
     use crate::types::{
-        FitnessCriterion, MetricType, ModificationScope, PathPattern, ProposalTier, Severity,
-        Signal,
+        Decision, FitnessCriterion, MetricType, ModificationScope, PathPattern, ProposalTier,
+        Severity, Signal,
     };
     use async_trait::async_trait;
     use std::sync::Mutex;
@@ -462,5 +646,426 @@ mod tests {
 
     fn temp_path() -> PathBuf {
         std::env::temp_dir().join(format!("fx-consensus-runner-{}.json", Uuid::new_v4()))
+    }
+
+    // --- Auto-chain (run_loop) tests ---
+
+    /// Workspace that produces an ACCEPT decision (all tests pass, signal resolved).
+    /// check_signal returns false meaning "signal is no longer present" = resolved.
+    struct AcceptingWorkspace;
+
+    #[async_trait]
+    impl EvaluationWorkspace for AcceptingWorkspace {
+        async fn apply_patch(&self, _patch: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn build(&self) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn test(&self) -> crate::error::Result<TestResult> {
+            Ok(TestResult {
+                passed: 5,
+                failed: 0,
+                total: 5,
+            })
+        }
+        async fn check_signal(&self, _signal: &Signal) -> crate::error::Result<bool> {
+            Ok(false) // signal gone = resolved
+        }
+        async fn check_regression(
+            &self,
+            _experiment: &crate::types::Experiment,
+        ) -> crate::error::Result<bool> {
+            Ok(false)
+        }
+        async fn reset(&self) -> crate::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Workspace where build fails (score 0.0 → REJECT).
+    struct ZeroScoreWorkspace;
+
+    #[async_trait]
+    impl EvaluationWorkspace for ZeroScoreWorkspace {
+        async fn apply_patch(&self, _patch: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn build(&self) -> crate::error::Result<()> {
+            Err(ConsensusError::BuildFailed("build failed".into()))
+        }
+        async fn test(&self) -> crate::error::Result<TestResult> {
+            Err(ConsensusError::TestFailed {
+                passed: 0,
+                failed: 1,
+                total: 1,
+            })
+        }
+        async fn check_signal(&self, _signal: &Signal) -> crate::error::Result<bool> {
+            Ok(false)
+        }
+        async fn check_regression(
+            &self,
+            _experiment: &crate::types::Experiment,
+        ) -> crate::error::Result<bool> {
+            Ok(false)
+        }
+        async fn reset(&self) -> crate::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Workspace that produces a partial score (tests pass, but signal not resolved → REJECT > 0).
+    struct PartialScoreWorkspace;
+
+    #[async_trait]
+    impl EvaluationWorkspace for PartialScoreWorkspace {
+        async fn apply_patch(&self, _patch: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn build(&self) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn test(&self) -> crate::error::Result<TestResult> {
+            Ok(TestResult {
+                passed: 4,
+                failed: 1,
+                total: 5,
+            })
+        }
+        async fn check_signal(&self, _signal: &Signal) -> crate::error::Result<bool> {
+            Ok(false)
+        }
+        async fn check_regression(
+            &self,
+            _experiment: &crate::types::Experiment,
+        ) -> crate::error::Result<bool> {
+            Ok(false)
+        }
+        async fn reset(&self) -> crate::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn accepting_node(node_id: &str) -> NodeConfig {
+        NodeConfig {
+            node_id: NodeId::from(node_id),
+            strategy: GenerationStrategy::Conservative,
+            patch_source: Box::new(StaticPatchSource {
+                patch: format!("diff --git a/{node_id} b/{node_id}"),
+                approach: "accepting approach".into(),
+                metrics: BTreeMap::from([
+                    ("build_success".into(), 1.0),
+                    ("test_pass_rate".into(), 1.0),
+                    ("signal_resolution".into(), 1.0),
+                ]),
+            }),
+            workspace: Box::new(AcceptingWorkspace),
+        }
+    }
+
+    fn zero_score_node(node_id: &str) -> NodeConfig {
+        NodeConfig {
+            node_id: NodeId::from(node_id),
+            strategy: GenerationStrategy::Conservative,
+            patch_source: Box::new(StaticPatchSource {
+                patch: format!("diff --git a/{node_id} b/{node_id}"),
+                approach: "zero score approach".into(),
+                metrics: BTreeMap::from([
+                    ("build_success".into(), 0.0),
+                    ("test_pass_rate".into(), 0.0),
+                    ("signal_resolution".into(), 0.0),
+                ]),
+            }),
+            workspace: Box::new(ZeroScoreWorkspace),
+        }
+    }
+
+    fn partial_score_node(node_id: &str) -> NodeConfig {
+        NodeConfig {
+            node_id: NodeId::from(node_id),
+            strategy: GenerationStrategy::Conservative,
+            patch_source: Box::new(StaticPatchSource {
+                patch: format!("diff --git a/{node_id} b/{node_id}"),
+                approach: "partial approach".into(),
+                metrics: BTreeMap::from([
+                    ("build_success".into(), 1.0),
+                    ("test_pass_rate".into(), 0.8),
+                    ("signal_resolution".into(), 0.0),
+                ]),
+            }),
+            workspace: Box::new(PartialScoreWorkspace),
+        }
+    }
+
+    fn single_node_config() -> ExperimentConfig {
+        ExperimentConfig {
+            signal: Signal {
+                id: Uuid::new_v4(),
+                name: "signal".into(),
+                description: "something is wrong".into(),
+                severity: Severity::Medium,
+            },
+            hypothesis: "best candidate wins".into(),
+            fitness_criteria: vec![
+                FitnessCriterion {
+                    name: "build_success".into(),
+                    metric_type: MetricType::Higher,
+                    weight: 0.2,
+                },
+                FitnessCriterion {
+                    name: "test_pass_rate".into(),
+                    metric_type: MetricType::Higher,
+                    weight: 0.5,
+                },
+                FitnessCriterion {
+                    name: "signal_resolution".into(),
+                    metric_type: MetricType::Higher,
+                    weight: 0.3,
+                },
+            ],
+            scope: ModificationScope {
+                allowed_files: vec![PathPattern::from("src/**/*.rs")],
+                proposal_tier: ProposalTier::Tier1,
+            },
+            timeout: Duration::from_secs(30),
+            min_candidates: 1,
+        }
+    }
+
+    fn accepting_neutral_evaluator() -> NeutralEvaluatorConfig {
+        NeutralEvaluatorConfig {
+            node_id: NodeId::from("neutral"),
+            workspace: Box::new(AcceptingWorkspace),
+        }
+    }
+
+    fn zero_score_neutral_evaluator() -> NeutralEvaluatorConfig {
+        NeutralEvaluatorConfig {
+            node_id: NodeId::from("neutral"),
+            workspace: Box::new(ZeroScoreWorkspace),
+        }
+    }
+
+    fn partial_score_neutral_evaluator() -> NeutralEvaluatorConfig {
+        NeutralEvaluatorConfig {
+            node_id: NodeId::from("neutral"),
+            workspace: Box::new(PartialScoreWorkspace),
+        }
+    }
+
+    struct ChainHistoryRoundBuilder;
+
+    impl RoundNodesBuilder for ChainHistoryRoundBuilder {
+        fn build_round_nodes(
+            &self,
+            chain_path: &Path,
+            signal: &str,
+        ) -> Result<RoundNodes, ConsensusError> {
+            let chain_history = crate::load_chain_history_for_signal(chain_path, signal)?;
+            Ok(RoundNodes {
+                nodes: vec![NodeConfig {
+                    node_id: NodeId::from("node-a"),
+                    strategy: GenerationStrategy::Conservative,
+                    patch_source: Box::new(StaticPatchSource {
+                        patch: "diff --git a/node-a b/node-a".to_owned(),
+                        approach: chain_history,
+                        metrics: BTreeMap::from([
+                            ("build_success".into(), 1.0),
+                            ("test_pass_rate".into(), 0.8),
+                            ("signal_resolution".into(), 0.0),
+                        ]),
+                    }),
+                    workspace: Box::new(PartialScoreWorkspace),
+                }],
+                neutral_evaluator: Some(partial_score_neutral_evaluator()),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn run_loop_reloads_chain_history_between_rounds() {
+        let path = temp_path();
+        let runner = ExperimentRunner::with_round_nodes_builder(path, ChainHistoryRoundBuilder)
+            .expect("runner");
+
+        let result = runner
+            .run_loop(single_node_config(), 2)
+            .await
+            .expect("run_loop");
+
+        assert_eq!(result.rounds_completed, 2);
+        assert!(result.reports[0].candidates[0]
+            .approach
+            .contains("No previous experiments recorded"));
+        assert!(result.reports[1].candidates[0]
+            .approach
+            .contains("Entry #0"));
+    }
+
+    #[tokio::test]
+    async fn run_loop_preserves_signal_id_across_rounds() {
+        let path = temp_path();
+        let runner = ExperimentRunner::with_nodes(
+            path.clone(),
+            vec![partial_score_node("node-a")],
+            Some(partial_score_neutral_evaluator()),
+        )
+        .expect("runner");
+        let config = single_node_config();
+        let signal_id = config.signal.id;
+
+        runner.run_loop(config, 2).await.expect("run_loop");
+        let chain = JsonFileChainStorage::new(&path).load().expect("load chain");
+
+        assert_eq!(chain.entries().len(), 2);
+        assert!(chain
+            .entries()
+            .iter()
+            .all(|entry| entry.experiment.trigger.id == signal_id));
+    }
+
+    #[tokio::test]
+    async fn run_loop_rejects_zero_rounds() {
+        let path = temp_path();
+        let runner = ExperimentRunner::with_nodes(
+            path,
+            vec![accepting_node("node-a")],
+            Some(accepting_neutral_evaluator()),
+        )
+        .expect("runner");
+
+        let error = runner
+            .run_loop(single_node_config(), 0)
+            .await
+            .expect_err("zero rounds should fail");
+
+        assert_eq!(
+            error.to_string(),
+            "protocol error: max_rounds must be at least 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_loop_stops_on_inconclusive_after_round_1() {
+        let path = temp_path();
+        let runner = ExperimentRunner::with_nodes(path, vec![accepting_node("node-a")], None)
+            .expect("runner");
+
+        let result = runner
+            .run_loop(single_node_config(), 5)
+            .await
+            .expect("run_loop");
+
+        assert_eq!(result.rounds_completed, 1);
+        assert_eq!(result.reports[0].result.decision, Decision::Inconclusive);
+    }
+
+    #[tokio::test]
+    async fn run_loop_stops_on_accept_after_round_1() {
+        let path = temp_path();
+        let runner = ExperimentRunner::with_nodes(
+            path,
+            vec![accepting_node("node-a")],
+            Some(accepting_neutral_evaluator()),
+        )
+        .expect("runner");
+
+        let result = runner
+            .run_loop(single_node_config(), 5)
+            .await
+            .expect("run_loop");
+
+        assert_eq!(result.rounds_completed, 1);
+        assert_eq!(result.max_rounds, 5);
+        assert_eq!(result.reports.len(), 1);
+        assert_eq!(
+            result.reports[0].result.decision,
+            crate::types::Decision::Accept
+        );
+    }
+
+    #[tokio::test]
+    async fn run_loop_stops_on_zero_score() {
+        let path = temp_path();
+        let runner = ExperimentRunner::with_nodes(
+            path,
+            vec![zero_score_node("node-a")],
+            Some(zero_score_neutral_evaluator()),
+        )
+        .expect("runner");
+
+        let result = runner
+            .run_loop(single_node_config(), 5)
+            .await
+            .expect("run_loop");
+
+        assert_eq!(result.rounds_completed, 1);
+        assert_eq!(
+            result.reports[0].result.decision,
+            crate::types::Decision::Reject
+        );
+    }
+
+    #[tokio::test]
+    async fn run_loop_continues_on_reject_with_positive_score() {
+        let path = temp_path();
+        let runner = ExperimentRunner::with_nodes(
+            path,
+            vec![partial_score_node("node-a")],
+            Some(partial_score_neutral_evaluator()),
+        )
+        .expect("runner");
+
+        let result = runner
+            .run_loop(single_node_config(), 3)
+            .await
+            .expect("run_loop");
+
+        assert_eq!(result.rounds_completed, 3);
+        assert_eq!(result.max_rounds, 3);
+        assert_eq!(result.reports.len(), 3);
+        for report in &result.reports {
+            assert_eq!(report.result.decision, crate::types::Decision::Reject);
+        }
+    }
+
+    #[tokio::test]
+    async fn run_loop_stops_at_max_rounds() {
+        let path = temp_path();
+        let runner = ExperimentRunner::with_nodes(
+            path,
+            vec![partial_score_node("node-a")],
+            Some(partial_score_neutral_evaluator()),
+        )
+        .expect("runner");
+
+        let result = runner
+            .run_loop(single_node_config(), 2)
+            .await
+            .expect("run_loop");
+
+        assert_eq!(result.rounds_completed, 2);
+        assert_eq!(result.reports.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn run_loop_default_max_rounds_preserves_single_shot() {
+        let path = temp_path();
+        let runner = ExperimentRunner::with_nodes(
+            path,
+            vec![accepting_node("node-a")],
+            Some(accepting_neutral_evaluator()),
+        )
+        .expect("runner");
+
+        let result = runner
+            .run_loop(single_node_config(), 1)
+            .await
+            .expect("run_loop");
+
+        assert_eq!(result.rounds_completed, 1);
+        assert_eq!(result.max_rounds, 1);
+        assert_eq!(result.reports.len(), 1);
     }
 }

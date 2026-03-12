@@ -3,6 +3,9 @@ name = "fx-consensus"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+test-support = []
+
 [dependencies]
 async-trait = "0.1"
 fx-llm = { path = "../fx-llm" }

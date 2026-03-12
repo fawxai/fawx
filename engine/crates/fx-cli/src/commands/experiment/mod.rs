@@ -3,12 +3,13 @@ use clap::Subcommand;
 use fx_auth::auth::AuthManager;
 use fx_config::FawxConfig;
 use fx_consensus::{
-    CargoWorkspace, Chain, ChainStorage, ExperimentConfig, ExperimentRunner, FitnessCriterion,
-    JsonFileChainStorage, LlmPatchSource, MetricType, ModificationScope, PathPattern, ProposalTier,
-    Signal, SubagentPatchSource,
+    format_auto_chain_result, load_chain_history_for_signal, CargoWorkspace, Chain, ChainStorage,
+    ConsensusError, ExperimentConfig, ExperimentRunner, FitnessCriterion, JsonFileChainStorage,
+    LlmPatchSource, MetricType, ModificationScope, NeutralEvaluatorConfig, PathPattern,
+    ProposalTier, RoundNodes, RoundNodesBuilder, Signal, SubagentPatchSource,
 };
 use fx_llm::ModelRouter;
-use fx_subagent::{SubagentLimits, SubagentManager, SubagentManagerDeps};
+use fx_subagent::{SubagentControl, SubagentLimits, SubagentManager, SubagentManagerDeps};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,7 +26,7 @@ use placeholders::build_nodes;
 
 const CHAIN_PATH_ENV: &str = "FAWX_CONSENSUS_CHAIN_PATH";
 
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 pub enum ExperimentCommands {
     /// Create and run a new experiment
     Run {
@@ -56,6 +57,14 @@ pub enum ExperimentCommands {
         /// Cargo workspace project directory for direct/subagent evaluation
         #[arg(long)]
         project: Option<String>,
+
+        /// Maximum rounds for auto-chain loop (default: 1, preserves single-shot behavior)
+        #[arg(
+            long,
+            default_value_t = 1,
+            value_parser = clap::value_parser!(u32).range(1..)
+        )]
+        max_rounds: u32,
     },
 
     /// View the consensus chain
@@ -91,16 +100,20 @@ pub async fn run(command: ExperimentCommands) -> anyhow::Result<String> {
             timeout,
             mode,
             project,
+            max_rounds,
         } => {
-            run_experiment(RunExperimentArgs {
-                signal,
-                hypothesis,
-                nodes,
-                scope,
-                timeout,
-                mode,
-                project,
-            })
+            run_experiment(
+                RunExperimentArgs {
+                    signal,
+                    hypothesis,
+                    nodes,
+                    scope,
+                    timeout,
+                    mode,
+                    project,
+                },
+                max_rounds,
+            )
             .await
         }
         ExperimentCommands::Chain { limit } => show_chain(limit),
@@ -126,65 +139,62 @@ pub struct RunExperimentArgs {
     pub project: Option<String>,
 }
 
-pub async fn run_experiment(args: RunExperimentArgs) -> anyhow::Result<String> {
-    run_experiment_with_path(args, consensus_chain_path()).await
+pub async fn run_experiment(args: RunExperimentArgs, max_rounds: u32) -> anyhow::Result<String> {
+    run_experiment_with_path(args, consensus_chain_path(), max_rounds).await
 }
 
 async fn run_experiment_with_path(
     args: RunExperimentArgs,
     chain_path: PathBuf,
+    max_rounds: u32,
 ) -> anyhow::Result<String> {
     ensure_chain_parent_dir(&chain_path)?;
-    let nodes = build_nodes_from_args(&args)?;
-    let neutral_evaluator = build_neutral_evaluator_from_args(&args)?;
-    let runner = ExperimentRunner::with_nodes(chain_path, nodes, neutral_evaluator)?;
-    let report = runner.run(build_config(&args)?).await?;
-    Ok(format_experiment_report(&args, &report))
+    let runner = build_runner(&args, chain_path)?;
+    let chain_result = runner.run_loop(build_config(&args)?, max_rounds).await?;
+    Ok(format_auto_chain_result(&chain_result, |report| {
+        format_experiment_report(&args, report)
+    }))
 }
 
-fn build_nodes_from_args(
-    args: &RunExperimentArgs,
-) -> anyhow::Result<Vec<fx_consensus::NodeConfig>> {
+fn build_runner(args: &RunExperimentArgs, chain_path: PathBuf) -> anyhow::Result<ExperimentRunner> {
     match args.mode {
-        ExperimentNodeMode::Placeholder => Ok(build_nodes(args.nodes)),
-        ExperimentNodeMode::Direct => build_direct_nodes_from_args(args),
-        ExperimentNodeMode::Subagent => build_subagent_nodes_from_args(args),
+        ExperimentNodeMode::Placeholder => build_placeholder_runner(args, chain_path),
+        ExperimentNodeMode::Direct => build_direct_runner(args, chain_path),
+        ExperimentNodeMode::Subagent => build_subagent_runner(args, chain_path),
     }
 }
 
-fn build_neutral_evaluator_from_args(
+fn build_placeholder_runner(
     args: &RunExperimentArgs,
-) -> anyhow::Result<Option<fx_consensus::NeutralEvaluatorConfig>> {
-    if args.nodes != 1 {
-        return Ok(None);
-    }
-    match args.mode {
-        ExperimentNodeMode::Placeholder => Ok(Some(placeholders::build_neutral_evaluator())),
-        ExperimentNodeMode::Direct | ExperimentNodeMode::Subagent => {
-            let project_dir = resolve_project_dir(args)?;
-            let workspace = CargoWorkspace::clone_from(&project_dir, "neutral-evaluator")
-                .map_err(anyhow::Error::from)?;
-            Ok(Some(fx_consensus::NeutralEvaluatorConfig {
-                node_id: fx_consensus::NodeId("neutral-evaluator".to_owned()),
-                workspace: Box::new(workspace),
-            }))
-        }
-    }
+    chain_path: PathBuf,
+) -> anyhow::Result<ExperimentRunner> {
+    let neutral_evaluator = build_neutral_evaluator_from_args(args)?;
+    ExperimentRunner::with_nodes(chain_path, build_nodes(args.nodes), neutral_evaluator)
+        .map_err(anyhow::Error::from)
 }
 
-fn build_direct_nodes_from_args(
+fn build_direct_runner(
     args: &RunExperimentArgs,
-) -> anyhow::Result<Vec<fx_consensus::NodeConfig>> {
+    chain_path: PathBuf,
+) -> anyhow::Result<ExperimentRunner> {
     let auth_manager = crate::startup::load_auth_manager()?;
     let config = crate::startup::load_config()?;
     let (router, model) = build_active_router(&auth_manager, &config)?;
     let project_dir = resolve_project_dir(args)?;
-    build_direct_nodes(args.nodes, router, model, project_dir)
+    let builder = DirectRoundNodesBuilder {
+        count: args.nodes,
+        scope: args.scope.clone(),
+        router,
+        model,
+        project_dir,
+    };
+    ExperimentRunner::with_round_nodes_builder(chain_path, builder).map_err(anyhow::Error::from)
 }
 
-fn build_subagent_nodes_from_args(
+fn build_subagent_runner(
     args: &RunExperimentArgs,
-) -> anyhow::Result<Vec<fx_consensus::NodeConfig>> {
+    chain_path: PathBuf,
+) -> anyhow::Result<ExperimentRunner> {
     let auth_manager = crate::startup::load_auth_manager()?;
     let config = crate::startup::load_config()?;
     let (router, _) = build_active_router(&auth_manager, &config)?;
@@ -196,12 +206,125 @@ fn build_subagent_nodes_from_args(
             improvement_provider,
         },
     );
-    let manager = Arc::new(SubagentManager::new(SubagentManagerDeps {
-        factory: Arc::new(factory),
-        limits: SubagentLimits::default(),
-    }));
-    let project_dir = resolve_project_dir(args)?;
-    build_subagent_nodes(args.nodes, manager, project_dir)
+    let builder = SubagentRoundNodesBuilder {
+        count: args.nodes,
+        scope: args.scope.clone(),
+        manager: Arc::new(SubagentManager::new(SubagentManagerDeps {
+            factory: Arc::new(factory),
+            limits: SubagentLimits::default(),
+        })),
+        project_dir: resolve_project_dir(args)?,
+    };
+    ExperimentRunner::with_round_nodes_builder(chain_path, builder).map_err(anyhow::Error::from)
+}
+
+fn build_neutral_evaluator_from_args(
+    args: &RunExperimentArgs,
+) -> anyhow::Result<Option<NeutralEvaluatorConfig>> {
+    if args.nodes != 1 {
+        return Ok(None);
+    }
+    match args.mode {
+        ExperimentNodeMode::Placeholder => Ok(Some(placeholders::build_neutral_evaluator())),
+        ExperimentNodeMode::Direct | ExperimentNodeMode::Subagent => {
+            let project_dir = resolve_project_dir(args)?;
+            build_round_neutral_evaluator(args.nodes, &project_dir, &args.scope)
+                .map_err(anyhow::Error::from)
+        }
+    }
+}
+
+struct DirectRoundNodesBuilder {
+    count: u32,
+    scope: String,
+    router: Arc<ModelRouter>,
+    model: String,
+    project_dir: PathBuf,
+}
+
+impl RoundNodesBuilder for DirectRoundNodesBuilder {
+    fn build_round_nodes(
+        &self,
+        chain_path: &Path,
+        signal: &str,
+    ) -> Result<RoundNodes, ConsensusError> {
+        let chain_history = load_round_chain_history(chain_path, signal)?;
+        let nodes = build_direct_nodes(DirectNodesBuildConfig {
+            count: self.count,
+            scope: self.scope.clone(),
+            router: Arc::clone(&self.router),
+            model: self.model.clone(),
+            project_dir: self.project_dir.clone(),
+            chain_history,
+        })
+        .map_err(protocol_error)?;
+        Ok(RoundNodes {
+            nodes,
+            neutral_evaluator: build_round_neutral_evaluator(
+                self.count,
+                &self.project_dir,
+                &self.scope,
+            )?,
+        })
+    }
+}
+
+struct SubagentRoundNodesBuilder {
+    count: u32,
+    scope: String,
+    manager: Arc<SubagentManager>,
+    project_dir: PathBuf,
+}
+
+impl RoundNodesBuilder for SubagentRoundNodesBuilder {
+    fn build_round_nodes(
+        &self,
+        chain_path: &Path,
+        signal: &str,
+    ) -> Result<RoundNodes, ConsensusError> {
+        let chain_history = load_round_chain_history(chain_path, signal)?;
+        let nodes = build_subagent_nodes(SubagentNodesBuildConfig {
+            count: self.count,
+            scope: self.scope.clone(),
+            manager: Arc::clone(&self.manager),
+            project_dir: self.project_dir.clone(),
+            chain_history,
+        })
+        .map_err(protocol_error)?;
+        Ok(RoundNodes {
+            nodes,
+            neutral_evaluator: build_round_neutral_evaluator(
+                self.count,
+                &self.project_dir,
+                &self.scope,
+            )?,
+        })
+    }
+}
+
+fn load_round_chain_history(chain_path: &Path, signal: &str) -> Result<String, ConsensusError> {
+    load_chain_history_for_signal(chain_path, signal)
+}
+
+fn build_round_neutral_evaluator(
+    count: u32,
+    project_dir: &Path,
+    scope: &str,
+) -> Result<Option<NeutralEvaluatorConfig>, ConsensusError> {
+    if count != 1 {
+        return Ok(None);
+    }
+    let package = CargoWorkspace::package_from_scope(scope);
+    let workspace =
+        CargoWorkspace::clone_from_with_package(project_dir, "neutral-evaluator", package)?;
+    Ok(Some(NeutralEvaluatorConfig {
+        node_id: fx_consensus::NodeId("neutral-evaluator".to_owned()),
+        workspace: Box::new(workspace),
+    }))
+}
+
+fn protocol_error(error: anyhow::Error) -> ConsensusError {
+    ConsensusError::Protocol(error.to_string())
 }
 
 fn build_active_router(
@@ -277,51 +400,75 @@ fn run_git_check(project_dir: &Path, args: &[&str]) -> anyhow::Result<String> {
     }
 }
 
-fn build_direct_nodes(
+struct DirectNodesBuildConfig {
     count: u32,
+    scope: String,
     router: Arc<ModelRouter>,
     model: String,
     project_dir: PathBuf,
+    chain_history: String,
+}
+
+fn build_direct_nodes(
+    config: DirectNodesBuildConfig,
 ) -> anyhow::Result<Vec<fx_consensus::NodeConfig>> {
-    (0..count)
+    let package = CargoWorkspace::package_from_scope(&config.scope);
+    (0..config.count)
         .map(|index| {
             let strategy = placeholders::strategy_for(index);
             let node_id = fx_consensus::NodeId(format!("node-{index}"));
-            let workspace = CargoWorkspace::clone_from(&project_dir, &node_id.0)
-                .map_err(anyhow::Error::from)?;
+            let workspace = CargoWorkspace::clone_from_with_package(
+                &config.project_dir,
+                &node_id.0,
+                package.clone(),
+            )
+            .map_err(anyhow::Error::from)?;
             Ok(fx_consensus::NodeConfig {
-                node_id: node_id.clone(),
-                strategy: strategy.clone(),
-                patch_source: Box::new(LlmPatchSource::new(router.clone(), model.clone())),
+                node_id,
+                strategy,
+                patch_source: Box::new(
+                    LlmPatchSource::new(Arc::clone(&config.router), config.model.clone())
+                        .with_chain_history(config.chain_history.clone()),
+                ),
                 workspace: Box::new(workspace),
             })
         })
         .collect()
 }
 
-fn build_subagent_nodes(
+struct SubagentNodesBuildConfig {
     count: u32,
+    scope: String,
     manager: Arc<SubagentManager>,
     project_dir: PathBuf,
+    chain_history: String,
+}
+
+fn build_subagent_nodes(
+    config: SubagentNodesBuildConfig,
 ) -> anyhow::Result<Vec<fx_consensus::NodeConfig>> {
-    (0..count)
+    let package = CargoWorkspace::package_from_scope(&config.scope);
+    (0..config.count)
         .map(|index| {
             let strategy = placeholders::strategy_for(index);
             let node_id = fx_consensus::NodeId(format!("node-{index}"));
-            let generator_workspace =
-                CargoWorkspace::clone_from(&project_dir, &format!("{}-gen", node_id.0))
-                    .map_err(anyhow::Error::from)?;
-            let evaluator_workspace =
-                CargoWorkspace::clone_from(&project_dir, &format!("{}-eval", node_id.0))
-                    .map_err(anyhow::Error::from)?;
+            let (generator_workspace, evaluator_workspace) = CargoWorkspace::clone_node_workspaces(
+                &config.project_dir,
+                &node_id.0,
+                package.clone(),
+            )
+            .map_err(anyhow::Error::from)?;
             Ok(fx_consensus::NodeConfig {
                 node_id: node_id.clone(),
                 strategy: strategy.clone(),
-                patch_source: Box::new(SubagentPatchSource::with_workspace(
-                    manager.clone(),
-                    strategy,
-                    generator_workspace,
-                )),
+                patch_source: Box::new(
+                    SubagentPatchSource::with_workspace(
+                        Arc::clone(&config.manager) as Arc<dyn SubagentControl>,
+                        strategy,
+                        generator_workspace,
+                    )
+                    .with_chain_history(config.chain_history.clone()),
+                ),
                 workspace: Box::new(evaluator_workspace),
             })
         })
@@ -453,6 +600,7 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use clap::Parser;
+    use fx_consensus::test_fixtures::write_chain_with_signals;
     use fx_consensus::{Decision, ExperimentReport, GenerationStrategy};
     use std::collections::BTreeMap;
     use tempfile::TempDir;
@@ -490,6 +638,7 @@ mod tests {
                 project: None,
             },
             chain_path.clone(),
+            1,
         )
         .await
         .expect("run experiment");
@@ -674,6 +823,31 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn placeholder_mode_skips_corrupt_chain_loading() {
+        let temp = TempDir::new().expect("temp dir");
+        let chain_path = temp.path().join("chain.json");
+        fs::write(&chain_path, "{not-json").expect("invalid chain");
+
+        let output = run_experiment_with_path(
+            RunExperimentArgs {
+                signal: "latency".to_owned(),
+                hypothesis: "placeholder should ignore chain history".to_owned(),
+                nodes: 1,
+                scope: "src/**/*.rs".to_owned(),
+                timeout: 120,
+                mode: ExperimentNodeMode::Placeholder,
+                project: None,
+            },
+            chain_path,
+            1,
+        )
+        .await
+        .expect("placeholder run");
+
+        assert!(output.contains("═══ Experiment Complete ═══"));
+    }
+
     #[test]
     fn parse_scope_splits_comma_separated_patterns() {
         assert_eq!(
@@ -730,7 +904,7 @@ mod tests {
 
     #[test]
     fn cli_parser_accepts_direct_mode() {
-        #[derive(Parser)]
+        #[derive(Debug, Parser)]
         struct TestCli {
             #[command(subcommand)]
             command: ExperimentCommands,
@@ -758,7 +932,7 @@ mod tests {
 
     #[test]
     fn cli_parser_accepts_placeholder_mode() {
-        #[derive(Parser)]
+        #[derive(Debug, Parser)]
         struct TestCli {
             #[command(subcommand)]
             command: ExperimentCommands,
@@ -786,7 +960,7 @@ mod tests {
 
     #[test]
     fn cli_parser_accepts_subagent_mode_and_project() {
-        #[derive(Parser)]
+        #[derive(Debug, Parser)]
         struct TestCli {
             #[command(subcommand)]
             command: ExperimentCommands,
@@ -815,6 +989,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cli_parser_rejects_zero_max_rounds() {
+        #[derive(Debug, Parser)]
+        struct TestCli {
+            #[command(subcommand)]
+            command: ExperimentCommands,
+        }
+
+        let error = TestCli::try_parse_from([
+            "experiment",
+            "run",
+            "--signal",
+            "latency",
+            "--hypothesis",
+            "parallelism helps",
+            "--max-rounds",
+            "0",
+        ])
+        .expect_err("zero max rounds should fail");
+
+        assert!(error.to_string().contains("1.."));
+    }
+
     fn init_git_project(path: &Path) {
         std::process::Command::new("git")
             .args(["init"])
@@ -834,54 +1031,13 @@ mod tests {
     }
 
     fn write_sample_chain(path: &Path) {
-        let mut chain = Chain::new();
-        let candidate_id = Uuid::from_u128(1);
-        let experiment_id = Uuid::from_u128(2);
-        let timestamp = Utc::now();
-        let experiment = fx_consensus::Experiment {
-            id: experiment_id,
-            trigger: Signal {
-                id: Uuid::from_u128(3),
-                name: "sequential-tool-calls".to_owned(),
-                description: "signal".to_owned(),
-                severity: fx_consensus::Severity::Medium,
-            },
-            hypothesis: "Parallelizing tool calls reduces token waste".to_owned(),
-            fitness_criteria: default_fitness_criteria(),
-            scope: build_scope("src/**/*.rs"),
-            timeout: Duration::from_secs(120),
-            min_candidates: 1,
-            created_at: timestamp,
-        };
-        let result = fx_consensus::ConsensusResult {
-            experiment_id,
-            winner: Some(candidate_id),
-            candidates: vec![candidate_id],
-            candidate_nodes: BTreeMap::from([(
-                candidate_id,
-                fx_consensus::NodeId("node-0".to_owned()),
-            )]),
-            evaluations: vec![fx_consensus::Evaluation {
-                candidate_id,
-                evaluator_id: fx_consensus::NodeId("node-1".to_owned()),
-                fitness_scores: BTreeMap::from([("build_success".to_owned(), 1.0)]),
-                safety_pass: true,
-                signal_resolved: true,
-                regression_detected: false,
-                notes: "build_ok=true; tests=0/0, failed=0; placeholder evaluation".to_owned(),
-                created_at: timestamp,
-            }],
-            aggregate_scores: BTreeMap::from([(candidate_id, 8.73)]),
-            decision: Decision::Accept,
-            timestamp,
-            candidate_patches: BTreeMap::new(),
-        };
-        chain
-            .append(experiment, result, Some("diff --git".to_owned()), None)
-            .expect("append chain entry");
-        ensure_chain_parent_dir(path).expect("chain dir");
-        JsonFileChainStorage::new(path)
-            .save(&chain)
-            .expect("save chain");
+        write_chain_with_signals(
+            path,
+            [(
+                "sequential-tool-calls",
+                "Parallelizing tool calls reduces token waste",
+                "build_ok=true; tests=0/0, failed=0; placeholder evaluation",
+            )],
+        );
     }
 }

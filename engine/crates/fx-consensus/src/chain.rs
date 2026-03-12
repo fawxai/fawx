@@ -129,6 +129,19 @@ impl Chain {
         self.entries.last()
     }
 
+    pub fn recent_entries_for_signal(&self, signal_name: &str, limit: usize) -> Vec<ChainEntry> {
+        self.entries
+            .iter()
+            .rev()
+            .filter(|entry| signal_matches(&entry.experiment.trigger.name, signal_name))
+            .take(limit)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
+    }
+
     fn build_entry(
         &self,
         experiment: Experiment,
@@ -137,7 +150,7 @@ impl Chain {
         applied_at: Option<DateTime<Utc>>,
     ) -> Result<ChainEntry> {
         let index = self.entries.len() as u64;
-        let hash = compute_hash(HashInput {
+        let hash = compute_hash(&HashInput {
             index,
             previous_hash: &self.head_hash,
             experiment: &experiment,
@@ -157,6 +170,12 @@ impl Chain {
     }
 }
 
+fn signal_matches(entry_signal: &str, requested_signal: &str) -> bool {
+    entry_signal
+        .trim()
+        .eq_ignore_ascii_case(requested_signal.trim())
+}
+
 fn verify_entry_link(entry: &ChainEntry, index: usize, previous_hash: &str) -> Result<()> {
     if entry.index != index as u64 || entry.previous_hash != previous_hash {
         return Err(ConsensusError::ChainIntegrity {
@@ -168,42 +187,79 @@ fn verify_entry_link(entry: &ChainEntry, index: usize, previous_hash: &str) -> R
 }
 
 fn verify_entry_hash(entry: &ChainEntry, index: usize) -> Result<()> {
-    let expected = compute_hash(HashInput {
+    let input = HashInput {
         index: entry.index,
         previous_hash: &entry.previous_hash,
         experiment: &entry.experiment,
         result: &entry.result,
         winning_patch: &entry.winning_patch,
         applied_at: &entry.applied_at,
-    })?;
-    if entry.hash != expected {
-        return Err(ConsensusError::ChainIntegrity {
-            index,
-            message: "entry hash mismatch".into(),
-        });
+    };
+    let expected = compute_hash(&input)?;
+    if entry.hash == expected {
+        return Ok(());
     }
-    Ok(())
+    // Accept entries hashed with the pre-canonical serializer
+    let legacy = compute_hash_legacy(&input)?;
+    if entry.hash == legacy {
+        return Ok(());
+    }
+    Err(ConsensusError::ChainIntegrity {
+        index,
+        message: "entry hash mismatch".into(),
+    })
 }
 
-fn compute_hash(input: HashInput<'_>) -> Result<String> {
-    let payload = serde_json::json!({
+fn compute_hash(input: &HashInput<'_>) -> Result<String> {
+    let payload = hash_payload(input);
+    let canonical = canonicalize_value(&payload);
+    let encoded = serde_json::to_vec(&canonical)
+        .map_err(|error| ConsensusError::Storage(error.to_string()))?;
+    Ok(format!("{:x}", Sha256::digest(encoded)))
+}
+
+/// Accepts entries written before canonical serialization was introduced.
+fn compute_hash_legacy(input: &HashInput<'_>) -> Result<String> {
+    let payload = hash_payload(input);
+    let encoded =
+        serde_json::to_vec(&payload).map_err(|error| ConsensusError::Storage(error.to_string()))?;
+    Ok(format!("{:x}", Sha256::digest(encoded)))
+}
+
+fn hash_payload(input: &HashInput<'_>) -> serde_json::Value {
+    serde_json::json!({
         "index": input.index,
         "previous_hash": input.previous_hash,
         "experiment": input.experiment,
         "result": input.result,
         "winning_patch": input.winning_patch,
         "applied_at": input.applied_at,
-    });
-    let encoded =
-        serde_json::to_vec(&payload).map_err(|error| ConsensusError::Storage(error.to_string()))?;
-    Ok(format!("{:x}", Sha256::digest(encoded)))
+    })
+}
+
+/// Recursively sort all object keys so serialization is deterministic
+/// regardless of struct field declaration order or serde version.
+fn canonicalize_value(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let sorted: serde_json::Map<String, serde_json::Value> = map
+                .iter()
+                .map(|(k, v)| (k.clone(), canonicalize_value(v)))
+                .collect();
+            serde_json::Value::Object(sorted)
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(canonicalize_value).collect())
+        }
+        other => other.clone(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::tests::{sample_candidate, sample_evaluation, sample_experiment};
-    use crate::types::{ConsensusResult, Decision};
+    use crate::types::{ConsensusResult, Decision, Experiment};
     use chrono::Utc;
     use std::collections::BTreeMap;
     use tempfile::tempdir;
@@ -304,6 +360,66 @@ mod tests {
     }
 
     #[test]
+    fn recent_entries_for_signal_filters_matches_and_preserves_order() {
+        let mut chain = Chain::new();
+        chain
+            .append(
+                experiment_with_signal("latency"),
+                sample_result(uuid::Uuid::new_v4()),
+                None,
+                None,
+            )
+            .expect("append succeeds");
+        chain
+            .append(
+                experiment_with_signal("throughput"),
+                sample_result(uuid::Uuid::new_v4()),
+                None,
+                None,
+            )
+            .expect("append succeeds");
+        chain
+            .append(
+                experiment_with_signal("Latency"),
+                sample_result(uuid::Uuid::new_v4()),
+                None,
+                None,
+            )
+            .expect("append succeeds");
+
+        let entries = chain.recent_entries_for_signal(" latency ", 2);
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].index, 0);
+        assert_eq!(entries[1].index, 2);
+        assert!(entries.iter().all(|entry| entry
+            .experiment
+            .trigger
+            .name
+            .eq_ignore_ascii_case("latency")));
+    }
+
+    #[test]
+    fn recent_entries_for_signal_respects_limit() {
+        let mut chain = Chain::new();
+        for _ in 0..3 {
+            chain
+                .append(
+                    experiment_with_signal("latency"),
+                    sample_result(uuid::Uuid::new_v4()),
+                    None,
+                    None,
+                )
+                .expect("append succeeds");
+        }
+
+        let entries = chain.recent_entries_for_signal("latency", 1);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].index, 2);
+    }
+
+    #[test]
     fn deserializes_legacy_chain_entry_without_candidate_patches() {
         let experiment_id = uuid::Uuid::nil();
         let candidate_id = uuid::Uuid::from_u128(1);
@@ -371,6 +487,12 @@ mod tests {
 
         assert_eq!(chain.len(), 1);
         assert!(chain.entries()[0].result.candidate_patches.is_empty());
+    }
+
+    fn experiment_with_signal(signal: &str) -> Experiment {
+        let mut experiment = sample_experiment();
+        experiment.trigger.name = signal.to_owned();
+        experiment
     }
 
     fn sample_result(experiment_id: uuid::Uuid) -> ConsensusResult {

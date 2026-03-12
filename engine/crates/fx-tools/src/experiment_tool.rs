@@ -1,9 +1,10 @@
 use async_trait::async_trait;
 use fx_config::FawxConfig;
 use fx_consensus::{
-    CargoWorkspace, ExperimentConfig, ExperimentRunner, FitnessCriterion, GenerationStrategy,
-    LlmPatchSource, MetricType, ModificationScope, NeutralEvaluatorConfig, NodeConfig, NodeId,
-    PathPattern, ProposalTier, Severity, Signal, SubagentPatchSource,
+    format_auto_chain_result, load_chain_history_for_signal, CargoWorkspace, ConsensusError,
+    ExperimentConfig, ExperimentRunner, FitnessCriterion, GenerationStrategy, LlmPatchSource,
+    MetricType, ModificationScope, NeutralEvaluatorConfig, NodeConfig, NodeId, PathPattern,
+    ProposalTier, RoundNodes, RoundNodesBuilder, Severity, Signal, SubagentPatchSource,
 };
 use fx_llm::{ModelInfo, ModelRouter, ToolDefinition};
 use fx_subagent::SubagentControl;
@@ -20,7 +21,7 @@ pub struct ExperimentToolState {
     pub config: FawxConfig,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct RunExperimentArgs {
     pub signal: String,
     pub hypothesis: String,
@@ -33,6 +34,8 @@ pub struct RunExperimentArgs {
     #[serde(default = "default_timeout")]
     pub timeout: u64,
     pub project: Option<PathBuf>,
+    #[serde(default = "default_max_rounds")]
+    pub max_rounds: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -78,6 +81,11 @@ pub fn run_experiment_tool_definition() -> ToolDefinition {
                 "project": {
                     "type": "string",
                     "description": "Cargo project directory. Defaults to the current working directory"
+                },
+                "max_rounds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Maximum rounds for auto-chain loop. Default: 1 (single-shot)"
                 }
             },
             "required": ["signal", "hypothesis"]
@@ -100,6 +108,9 @@ pub fn parse_run_experiment_args(
     if parsed.nodes == 0 {
         return Err("nodes must be at least 1".to_string());
     }
+    if parsed.max_rounds == 0 {
+        return Err("max_rounds must be at least 1".to_string());
+    }
     parsed.project = Some(
         parsed
             .project
@@ -116,15 +127,118 @@ pub async fn handle_run_experiment(
     args: &serde_json::Value,
 ) -> Result<String, String> {
     let parsed = parse_run_experiment_args(args, working_dir)?;
-    let nodes = build_nodes(&parsed, state, subagent_control)?;
-    let neutral_evaluator = build_neutral_evaluator(&parsed)?;
-    let runner = ExperimentRunner::with_nodes(state.chain_path.clone(), nodes, neutral_evaluator)
-        .map_err(|error| error.to_string())?;
-    let report = runner
-        .run(build_config(&parsed))
+    let runner = build_runner(&parsed, state, subagent_control)?;
+    let chain_result = runner
+        .run_loop(build_config(&parsed), parsed.max_rounds)
         .await
         .map_err(|error| error.to_string())?;
-    Ok(format_experiment_report(&parsed, &report))
+    Ok(format_auto_chain_result(&chain_result, |report| {
+        format_experiment_report(&parsed, report)
+    }))
+}
+
+fn build_runner(
+    args: &RunExperimentArgs,
+    state: &ExperimentToolState,
+    subagent_control: Option<&Arc<dyn SubagentControl>>,
+) -> Result<ExperimentRunner, String> {
+    match args.mode {
+        ExperimentNodeMode::Placeholder => build_placeholder_runner(args, state, subagent_control),
+        ExperimentNodeMode::Direct => build_direct_runner(args, state),
+        ExperimentNodeMode::Subagent => build_subagent_runner(args, state, subagent_control),
+    }
+}
+
+fn build_placeholder_runner(
+    args: &RunExperimentArgs,
+    state: &ExperimentToolState,
+    subagent_control: Option<&Arc<dyn SubagentControl>>,
+) -> Result<ExperimentRunner, String> {
+    let nodes = build_nodes(args, state, subagent_control, "")?;
+    let neutral_evaluator = build_neutral_evaluator(args)?;
+    ExperimentRunner::with_nodes(state.chain_path.clone(), nodes, neutral_evaluator)
+        .map_err(|error| error.to_string())
+}
+
+fn build_direct_runner(
+    args: &RunExperimentArgs,
+    state: &ExperimentToolState,
+) -> Result<ExperimentRunner, String> {
+    let builder = DirectRoundNodesBuilder {
+        args: args.clone(),
+        state: state.clone(),
+    };
+    ExperimentRunner::with_round_nodes_builder(state.chain_path.clone(), builder)
+        .map_err(|error| error.to_string())
+}
+
+fn build_subagent_runner(
+    args: &RunExperimentArgs,
+    state: &ExperimentToolState,
+    subagent_control: Option<&Arc<dyn SubagentControl>>,
+) -> Result<ExperimentRunner, String> {
+    let control = subagent_control
+        .cloned()
+        .ok_or_else(|| "subagent control not configured".to_string())?;
+    let builder = SubagentRoundNodesBuilder {
+        args: args.clone(),
+        state: state.clone(),
+        control,
+    };
+    ExperimentRunner::with_round_nodes_builder(state.chain_path.clone(), builder)
+        .map_err(|error| error.to_string())
+}
+
+#[derive(Clone)]
+struct DirectRoundNodesBuilder {
+    args: RunExperimentArgs,
+    state: ExperimentToolState,
+}
+
+impl RoundNodesBuilder for DirectRoundNodesBuilder {
+    fn build_round_nodes(
+        &self,
+        chain_path: &Path,
+        signal: &str,
+    ) -> Result<RoundNodes, ConsensusError> {
+        let chain_history = load_chain_history_for_signal(chain_path, signal)?;
+        Ok(RoundNodes {
+            nodes: build_direct_nodes(&self.args, &self.state, &chain_history)
+                .map_err(protocol_error)?,
+            neutral_evaluator: build_neutral_evaluator(&self.args).map_err(protocol_error)?,
+        })
+    }
+}
+
+#[derive(Clone)]
+struct SubagentRoundNodesBuilder {
+    args: RunExperimentArgs,
+    state: ExperimentToolState,
+    control: Arc<dyn SubagentControl>,
+}
+
+impl RoundNodesBuilder for SubagentRoundNodesBuilder {
+    fn build_round_nodes(
+        &self,
+        chain_path: &Path,
+        signal: &str,
+    ) -> Result<RoundNodes, ConsensusError> {
+        let chain_history = load_chain_history_for_signal(chain_path, signal)?;
+        Ok(RoundNodes {
+            nodes: build_subagent_nodes(
+                &self.args,
+                &self.state,
+                Some(&self.control),
+                &chain_history,
+            )
+            .map_err(protocol_error)?,
+            neutral_evaluator: build_neutral_evaluator(&self.args).map_err(protocol_error)?,
+        })
+    }
+}
+
+fn protocol_error(error: String) -> ConsensusError {
+    ConsensusError::Protocol(error)
 }
 
 fn build_neutral_evaluator(
@@ -137,8 +251,10 @@ fn build_neutral_evaluator(
         ExperimentNodeMode::Placeholder => Ok(Some(build_placeholder_neutral_evaluator())),
         ExperimentNodeMode::Direct | ExperimentNodeMode::Subagent => {
             let project_dir = validate_project_dir(required_project(args)?)?;
-            let workspace = CargoWorkspace::clone_from(&project_dir, "neutral-evaluator")
-                .map_err(|error| error.to_string())?;
+            let package = CargoWorkspace::package_from_scope(&args.scope);
+            let workspace =
+                CargoWorkspace::clone_from_with_package(&project_dir, "neutral-evaluator", package)
+                    .map_err(|error| error.to_string())?;
             Ok(Some(NeutralEvaluatorConfig {
                 node_id: NodeId("neutral-evaluator".to_owned()),
                 workspace: Box::new(workspace),
@@ -151,11 +267,14 @@ fn build_nodes(
     args: &RunExperimentArgs,
     state: &ExperimentToolState,
     subagent_control: Option<&Arc<dyn SubagentControl>>,
+    chain_history: &str,
 ) -> Result<Vec<NodeConfig>, String> {
     match args.mode {
         ExperimentNodeMode::Placeholder => Ok(build_placeholder_nodes(args.nodes)),
-        ExperimentNodeMode::Direct => build_direct_nodes(args, state),
-        ExperimentNodeMode::Subagent => build_subagent_nodes(args, state, subagent_control),
+        ExperimentNodeMode::Direct => build_direct_nodes(args, state, chain_history),
+        ExperimentNodeMode::Subagent => {
+            build_subagent_nodes(args, state, subagent_control, chain_history)
+        }
     }
 }
 
@@ -180,22 +299,25 @@ fn build_placeholder_neutral_evaluator() -> NeutralEvaluatorConfig {
 fn build_direct_nodes(
     args: &RunExperimentArgs,
     state: &ExperimentToolState,
+    chain_history: &str,
 ) -> Result<Vec<NodeConfig>, String> {
     let model = resolve_model(&state.router, &state.config)?;
     let project_dir = validate_project_dir(required_project(args)?)?;
+    let package = CargoWorkspace::package_from_scope(&args.scope);
     (0..args.nodes)
         .map(|index| {
             let node_id = NodeId(format!("node-{index}"));
             let strategy = strategy_for(index);
-            let workspace = CargoWorkspace::clone_from(&project_dir, &node_id.0)
-                .map_err(|error| error.to_string())?;
+            let workspace =
+                CargoWorkspace::clone_from_with_package(&project_dir, &node_id.0, package.clone())
+                    .map_err(|error| error.to_string())?;
             Ok(NodeConfig {
                 node_id,
                 strategy,
-                patch_source: Box::new(LlmPatchSource::new(
-                    Arc::clone(&state.router),
-                    model.clone(),
-                )),
+                patch_source: Box::new(
+                    LlmPatchSource::new(Arc::clone(&state.router), model.clone())
+                        .with_chain_history(chain_history.to_owned()),
+                ),
                 workspace: Box::new(workspace),
             })
         })
@@ -206,29 +328,31 @@ fn build_subagent_nodes(
     args: &RunExperimentArgs,
     _state: &ExperimentToolState,
     subagent_control: Option<&Arc<dyn SubagentControl>>,
+    chain_history: &str,
 ) -> Result<Vec<NodeConfig>, String> {
     let control = subagent_control
         .cloned()
         .ok_or_else(|| "subagent control not configured".to_string())?;
     let project_dir = validate_project_dir(required_project(args)?)?;
+    let package = CargoWorkspace::package_from_scope(&args.scope);
     (0..args.nodes)
         .map(|index| {
             let node_id = NodeId(format!("node-{index}"));
             let strategy = strategy_for(index);
-            let generator_workspace =
-                CargoWorkspace::clone_from(&project_dir, &format!("{}-gen", node_id.0))
-                    .map_err(|error| error.to_string())?;
-            let evaluator_workspace =
-                CargoWorkspace::clone_from(&project_dir, &format!("{}-eval", node_id.0))
+            let (generator_workspace, evaluator_workspace) =
+                CargoWorkspace::clone_node_workspaces(&project_dir, &node_id.0, package.clone())
                     .map_err(|error| error.to_string())?;
             Ok(NodeConfig {
                 node_id,
                 strategy: strategy.clone(),
-                patch_source: Box::new(SubagentPatchSource::with_workspace(
-                    Arc::clone(&control),
-                    strategy,
-                    generator_workspace,
-                )),
+                patch_source: Box::new(
+                    SubagentPatchSource::with_workspace(
+                        Arc::clone(&control),
+                        strategy,
+                        generator_workspace,
+                    )
+                    .with_chain_history(chain_history.to_owned()),
+                ),
                 workspace: Box::new(evaluator_workspace),
             })
         })
@@ -349,14 +473,7 @@ fn format_experiment_report(
         format!("Mode:          {:?}", args.mode),
         format!("Nodes:         {}", args.nodes),
         format!("Experiment ID: {}", report.result.experiment_id),
-        format!(
-            "Decision:      {}",
-            match report.result.decision {
-                fx_consensus::Decision::Accept => "✅ ACCEPT",
-                fx_consensus::Decision::Reject => "❌ REJECT",
-                fx_consensus::Decision::Inconclusive => "➖ INCONCLUSIVE",
-            }
-        ),
+        format!("Decision:      {}", report.result.decision.emoji_label()),
     ];
     for candidate in &report.candidates {
         lines.push(format!(
@@ -459,6 +576,10 @@ fn default_mode() -> ExperimentNodeMode {
     ExperimentNodeMode::Subagent
 }
 
+fn default_max_rounds() -> u32 {
+    1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,6 +609,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_args_placeholder_mode_survives_corrupt_chain() {
+        // Regression test: Placeholder mode must not attempt to load chain.
+        // With a corrupt chain file, Subagent mode would fail but Placeholder
+        // should succeed because the guard skips the load entirely.
+        let temp = TempDir::new().expect("tempdir");
+        let parsed = parse_run_experiment_args(
+            &serde_json::json!({
+                "signal": "test-signal",
+                "hypothesis": "test",
+                "mode": "placeholder"
+            }),
+            temp.path(),
+        )
+        .expect("parse");
+        assert_eq!(parsed.mode, ExperimentNodeMode::Placeholder);
+    }
+
+    #[test]
     fn parse_args_rejects_missing_required_fields() {
         let temp = TempDir::new().expect("tempdir");
         let error = parse_run_experiment_args(
@@ -496,5 +635,20 @@ mod tests {
         )
         .expect_err("empty signal should fail");
         assert!(error.contains("signal is required"));
+    }
+
+    #[test]
+    fn parse_args_rejects_zero_max_rounds() {
+        let temp = TempDir::new().expect("tempdir");
+        let error = parse_run_experiment_args(
+            &serde_json::json!({
+                "signal": "latency",
+                "hypothesis": "parallelism helps",
+                "max_rounds": 0
+            }),
+            temp.path(),
+        )
+        .expect_err("zero max_rounds should fail");
+        assert!(error.contains("max_rounds must be at least 1"));
     }
 }

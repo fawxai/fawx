@@ -1,6 +1,6 @@
 use super::RunExperimentArgs;
 use crate::commands::experiment::placeholders::{display_strategy, strategy_for};
-use fx_consensus::{Chain, ChainEntry, Decision, ExperimentReport, GenerationStrategy};
+use fx_consensus::{Chain, ChainEntry, ExperimentReport, GenerationStrategy};
 use uuid::Uuid;
 
 const PATCH_PREVIEW_LINES: usize = 20;
@@ -15,10 +15,7 @@ pub(super) fn format_experiment_report(
         format!("  Experiment ID: {}", report.result.experiment_id),
         format!("  Signal:        {}", args.signal),
         format!("  Hypothesis:    {}", args.hypothesis),
-        format!(
-            "  Decision:      {}",
-            decision_label(&report.result.decision)
-        ),
+        format!("  Decision:      {}", report.result.decision.emoji_label()),
         format!("  Candidates:    {}", report.candidates.len()),
         String::new(),
         "  Candidates:".to_owned(),
@@ -51,14 +48,6 @@ fn format_candidate_line(candidate: &fx_consensus::CandidateReport) -> String {
     )
 }
 
-fn decision_label(decision: &Decision) -> &'static str {
-    match decision {
-        Decision::Accept => "✅ ACCEPT",
-        Decision::Reject => "❌ REJECT",
-        Decision::Inconclusive => "⚠️ INCONCLUSIVE",
-    }
-}
-
 pub(super) fn format_chain_entries(chain: &Chain, limit: usize) -> String {
     let mut lines = vec!["Recent experiments:".to_owned()];
     lines.extend(
@@ -77,7 +66,7 @@ fn format_chain_summary_line(entry: &ChainEntry) -> String {
         "#{} | {} | {} | winner: {} | {}",
         entry.index,
         entry.experiment.hypothesis,
-        decision_label(&entry.result.decision),
+        entry.result.decision.emoji_label(),
         winner_node_label(entry),
         entry.result.timestamp.to_rfc3339(),
     )
@@ -99,7 +88,7 @@ pub(super) fn format_chain_entry(entry: &ChainEntry) -> String {
         format!("Experiment ID: {}", entry.experiment.id),
         format!("Signal: {}", entry.experiment.trigger.name),
         format!("Hypothesis: {}", entry.experiment.hypothesis),
-        format!("Decision: {}", decision_label(&entry.result.decision)),
+        format!("Decision: {}", entry.result.decision.emoji_label()),
         format!("Winner: {}", winner),
         format!(
             "Winning patch: {}",
@@ -131,7 +120,7 @@ pub(super) fn format_chain_entry_detail(entry: &ChainEntry) -> String {
     lines.extend(format_detail_evaluations(entry));
     lines.extend([
         String::new(),
-        format!("Decision: {}", decision_label(&entry.result.decision)),
+        format!("Decision: {}", entry.result.decision.emoji_label()),
         format!("Winner: {}", winner_node_label(entry)),
         format!("Chain hash: {}", entry.hash),
     ]);
