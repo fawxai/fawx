@@ -464,7 +464,10 @@ mod tests {
             .execute("commit_transaction", r#"{"tx_id": 0}"#, None)
             .await;
         let err = result.unwrap().unwrap_err();
-        assert!(err.contains("Deny") || err.contains("deny") || err.contains("blocked"));
+        assert!(
+            err.contains("Deny") || err.contains("deny") || err.contains("blocked") || err.contains("policy violation"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]

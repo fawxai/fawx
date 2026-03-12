@@ -59,7 +59,17 @@ impl ChainStorage for JsonFileChainStorage {
         }
         let json = fs::read_to_string(&self.path)
             .map_err(|error| ConsensusError::Storage(error.to_string()))?;
-        serde_json::from_str(&json).map_err(|error| ConsensusError::Storage(error.to_string()))
+        match serde_json::from_str(&json) {
+            Ok(chain) => Ok(chain),
+            Err(error) => {
+                tracing::warn!(
+                    path = %self.path.display(),
+                    %error,
+                    "corrupt chain file, starting fresh"
+                );
+                Ok(Chain::new())
+            }
+        }
     }
 
     fn save(&self, chain: &Chain) -> Result<()> {

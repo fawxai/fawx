@@ -111,13 +111,11 @@ mod tests {
     }
 
     fn set_mtime(path: &Path, unix_secs: i64) {
-        let status = std::process::Command::new("touch")
-            .arg("-d")
-            .arg(format!("@{unix_secs}"))
-            .arg(path)
-            .status()
-            .expect("touch mtime");
-        assert!(status.success());
+        use std::time::{Duration, SystemTime};
+        let time = SystemTime::UNIX_EPOCH + Duration::from_secs(unix_secs as u64);
+        let times = fs::FileTimes::new().set_modified(time);
+        let file = fs::File::options().write(true).open(path).expect("open for mtime");
+        file.set_times(times).expect("set mtime");
     }
 
     #[test]
