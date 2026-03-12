@@ -22,12 +22,14 @@ use fx_channel_webhook::{WebhookChannel, WebhookMessage, WebhookResponse};
 use fx_config::HttpConfig;
 use fx_core::channel::{Channel, ResponseContext};
 use fx_core::types::InputSource;
+use fx_fleet::FleetManager;
 use fx_kernel::{ChannelRegistry, HttpChannel, ResponseRouter, StreamCallback, StreamEvent};
 use ring::hmac;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
+use std::path::Path as FilesystemPath;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -573,7 +575,7 @@ fn sanitized_status_config(app: &HeadlessApp) -> Option<serde_json::Value> {
 /// Maximum request body size (1 MiB).
 const MAX_REQUEST_BYTES: usize = 1_048_576;
 
-fn build_router(state: HttpState) -> Router {
+fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManager>>>) -> Router {
     let authenticated = Router::new()
         .route("/message", post(handle_message))
         .route("/status", get(handle_status))
@@ -589,11 +591,28 @@ fn build_router(state: HttpState) -> Router {
     let public = Router::new()
         .route("/health", get(handle_health))
         .route("/telegram/webhook", post(handle_telegram_webhook));
+    let router = authenticated.merge(public).with_state(state);
 
-    authenticated
-        .merge(public)
+    merge_fleet_router(router, fleet_manager)
         .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BYTES))
-        .with_state(state)
+}
+
+fn merge_fleet_router(router: Router, fleet_manager: Option<Arc<Mutex<FleetManager>>>) -> Router {
+    match fleet_manager {
+        Some(manager) => router.merge(crate::fleet_endpoints::fleet_router(manager)),
+        None => router,
+    }
+}
+
+fn load_fleet_manager_if_initialized(
+    data_dir: &FilesystemPath,
+) -> anyhow::Result<Option<Arc<Mutex<FleetManager>>>> {
+    let fleet_dir = data_dir.join("fleet");
+    if !fleet_dir.join("fleet.key").is_file() {
+        return Ok(None);
+    }
+    let manager = FleetManager::load(&fleet_dir)?;
+    Ok(Some(Arc::new(Mutex::new(manager))))
 }
 
 // ── Handlers ────────────────────────────────────────────────────────────────
@@ -1033,7 +1052,8 @@ pub async fn run(
         bearer_token,
         channels: channels.clone(),
     };
-    let router = build_router(state);
+    let fleet_manager = load_fleet_manager_if_initialized(&data_dir)?;
+    let router = build_router(state, fleet_manager);
 
     print_startup_targets(&listeners);
     eprintln!("Bearer token authentication: enabled");
@@ -2288,7 +2308,7 @@ allowed_chat_ids = [123]
             let manager = Arc::new(StdMutex::new(
                 ConfigManager::new(temp.path()).expect("config manager"),
             ));
-            let app = build_router(test_state(Some(manager), Vec::new()));
+            let app = build_router(test_state(Some(manager), Vec::new()), None);
             let req = Request::builder()
                 .method("GET")
                 .uri("/status")
@@ -2307,8 +2327,41 @@ allowed_chat_ids = [123]
         }
 
         #[tokio::test]
+        async fn build_router_mounts_fleet_routes_when_manager_present() {
+            let temp = TempDir::new().expect("tempdir");
+            let mut manager = FleetManager::init(temp.path()).expect("fleet init");
+            let token = manager
+                .add_node("macmini", "100.75.191.19", 8400)
+                .expect("node should add");
+            let app = build_router(
+                test_state(None, Vec::new()),
+                Some(Arc::new(Mutex::new(manager))),
+            );
+            let request = Request::builder()
+                .method("POST")
+                .uri("/fleet/register")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&fx_fleet::FleetRegistrationRequest {
+                        node_name: "macmini".to_string(),
+                        bearer_token: token.secret,
+                        capabilities: vec!["agentic_loop".to_string()],
+                        rust_version: None,
+                        os: Some("macos".to_string()),
+                        cpus: Some(8),
+                        ram_gb: None,
+                    })
+                    .expect("request should serialize"),
+                ))
+                .expect("request should build");
+
+            let response = app.oneshot(request).await.expect("route should respond");
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
         async fn message_endpoint_intercepts_server_side_status_command() {
-            let app = build_router(test_state(None, Vec::new()));
+            let app = build_router(test_state(None, Vec::new()), None);
             let req = Request::builder()
                 .method("POST")
                 .uri("/message")
@@ -2331,7 +2384,7 @@ allowed_chat_ids = [123]
 
         #[tokio::test]
         async fn message_endpoint_returns_client_only_message_for_quit() {
-            let app = build_router(test_state(None, Vec::new()));
+            let app = build_router(test_state(None, Vec::new()), None);
             let req = Request::builder()
                 .method("POST")
                 .uri("/message")
@@ -2354,7 +2407,7 @@ allowed_chat_ids = [123]
 
         #[tokio::test]
         async fn message_endpoint_routes_auth_server_side() {
-            let app = build_router(test_state(None, Vec::new()));
+            let app = build_router(test_state(None, Vec::new()), None);
             let req = Request::builder()
                 .method("POST")
                 .uri("/message")
@@ -2377,7 +2430,7 @@ allowed_chat_ids = [123]
 
         #[tokio::test]
         async fn message_endpoint_routes_plain_text_to_agentic_loop() {
-            let app = build_router(test_state(None, Vec::new()));
+            let app = build_router(test_state(None, Vec::new()), None);
             let req = Request::builder()
                 .method("POST")
                 .uri("/message")
@@ -2398,7 +2451,7 @@ allowed_chat_ids = [123]
 
         #[tokio::test]
         async fn message_endpoint_streams_sse_when_requested() {
-            let app = build_router(test_state(None, Vec::new()));
+            let app = build_router(test_state(None, Vec::new()), None);
             let req = Request::builder()
                 .method("POST")
                 .uri("/message")
@@ -2435,11 +2488,10 @@ allowed_chat_ids = [123]
                 ConfigManager::new(temp.path()).expect("config manager"),
             ));
             let config = fx_config::FawxConfig::load(temp.path()).expect("load config");
-            let app = build_router(test_state_with_config(
-                config,
-                Some(Arc::clone(&manager)),
-                Vec::new(),
-            ));
+            let app = build_router(
+                test_state_with_config(config, Some(Arc::clone(&manager)), Vec::new()),
+                None,
+            );
 
             std::fs::write(
                 temp.path().join("config.toml"),
@@ -2499,7 +2551,7 @@ allowed_chat_ids = [123]
             let temp = TempDir::new().expect("tempdir");
             let mut config = fx_config::FawxConfig::default();
             config.general.data_dir = Some(temp.path().to_path_buf());
-            let app = build_router(test_state_with_config(config, None, Vec::new()));
+            let app = build_router(test_state_with_config(config, None, Vec::new()), None);
             let req = Request::builder()
                 .method("POST")
                 .uri("/message")
@@ -2521,7 +2573,7 @@ allowed_chat_ids = [123]
             let temp = TempDir::new().expect("tempdir");
             let mut config = fx_config::FawxConfig::default();
             config.general.data_dir = Some(temp.path().to_path_buf());
-            let app = build_router(test_state_with_config(config, None, Vec::new()));
+            let app = build_router(test_state_with_config(config, None, Vec::new()), None);
             let req = Request::builder()
                 .method("POST")
                 .uri("/message")
@@ -2546,7 +2598,7 @@ allowed_chat_ids = [123]
                 "Alpha".to_string(),
                 None,
             ));
-            let app = build_router(test_state(None, vec![webhook]));
+            let app = build_router(test_state(None, vec![webhook]), None);
             let req = Request::builder()
                 .method("POST")
                 .uri("/webhook/alpha")
@@ -2587,7 +2639,7 @@ allowed_chat_ids = [123]
                     webhooks: Arc::new(webhooks),
                 },
             };
-            let app = build_router(state);
+            let app = build_router(state, None);
             let req = Request::builder()
                 .method("POST")
                 .uri("/webhook/alpha")

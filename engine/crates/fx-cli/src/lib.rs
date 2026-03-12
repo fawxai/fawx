@@ -47,6 +47,8 @@ mod commands {
 mod config_bridge;
 mod config_redaction;
 mod context;
+#[cfg(feature = "http")]
+mod fleet_endpoints;
 pub mod headless;
 pub(crate) mod helpers;
 #[cfg(feature = "http")]

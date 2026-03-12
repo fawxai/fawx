@@ -1,4 +1,5 @@
 use crate::token::FleetError;
+use serde::Serialize;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 #[cfg(unix)]
@@ -19,6 +20,15 @@ pub(crate) fn write_private(path: &Path, data: &[u8]) -> Result<(), FleetError> 
     file.write_all(data)?;
     file.sync_all()?;
     set_private_permissions(path)
+}
+
+pub(crate) fn write_json_private<T>(path: &Path, value: &T) -> Result<(), FleetError>
+where
+    T: Serialize + ?Sized,
+{
+    let mut json = serde_json::to_vec_pretty(value)?;
+    json.push(b'\n');
+    write_private(path, &json)
 }
 
 fn ensure_parent_dir(path: &Path) -> Result<(), FleetError> {

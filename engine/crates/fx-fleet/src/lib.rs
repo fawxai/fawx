@@ -1,5 +1,6 @@
 pub(crate) mod fs_utils;
 pub mod http;
+pub mod identity;
 pub mod manager;
 pub mod ssh;
 pub mod token;
@@ -10,6 +11,7 @@ pub use http::{
     FleetTaskRequest, FleetTaskResult, FleetTaskStatus, FleetTaskType, FleetWorkerStatus,
     WorkerState,
 };
+pub use identity::FleetIdentity;
 pub use manager::FleetManager;
 pub use ssh::SshTransport;
 pub use token::{FleetError, FleetKey, FleetToken};
@@ -114,7 +116,8 @@ impl From<&NodeConfig> for NodeInfo {
     }
 }
 
-pub(crate) fn current_time_ms() -> u64 {
+/// Returns the current Unix timestamp in milliseconds.
+pub fn current_time_ms() -> u64 {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
@@ -179,6 +182,10 @@ impl NodeRegistry {
     /// Get a node by id.
     pub fn get(&self, node_id: &str) -> Option<&NodeInfo> {
         self.nodes.get(node_id)
+    }
+
+    pub(crate) fn get_mut(&mut self, node_id: &str) -> Option<&mut NodeInfo> {
+        self.nodes.get_mut(node_id)
     }
 
     /// List all nodes.

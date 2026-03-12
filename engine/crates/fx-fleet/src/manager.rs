@@ -1,9 +1,8 @@
 use crate::{
-    current_time_ms, fs_utils::write_private, FleetError, FleetKey, FleetToken, NodeInfo,
-    NodeRegistry, NodeStatus,
+    current_time_ms, fs_utils::write_json_private, FleetError, FleetKey, FleetToken,
+    NodeCapability, NodeInfo, NodeRegistry, NodeStatus,
 };
 use serde::de::DeserializeOwned;
-use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -75,6 +74,43 @@ impl FleetManager {
             .map(|token| token.node_id.clone())
     }
 
+    /// Mark a worker as online, store its reported capabilities, and record a heartbeat.
+    pub fn register_worker(
+        &mut self,
+        node_id: &str,
+        capabilities: Vec<NodeCapability>,
+        now_ms: u64,
+    ) -> Result<NodeInfo, FleetError> {
+        self.update_registered_node(node_id, move |registry| {
+            if let Some(node) = registry.get_mut(node_id) {
+                node.capabilities = capabilities;
+                node.status = NodeStatus::Online;
+            }
+            let _ = registry.heartbeat(node_id, now_ms);
+        })
+    }
+
+    /// Update worker liveness and current availability state from a heartbeat.
+    pub fn record_worker_heartbeat(
+        &mut self,
+        node_id: &str,
+        status: NodeStatus,
+        now_ms: u64,
+    ) -> Result<(), FleetError> {
+        self.update_registered_node(node_id, move |registry| {
+            if let Some(node) = registry.get_mut(node_id) {
+                node.status = status;
+            }
+            let _ = registry.heartbeat(node_id, now_ms);
+        })?;
+        Ok(())
+    }
+
+    /// Mark that a worker completed a callback to the primary.
+    pub fn mark_result_received(&mut self, node_id: &str, now_ms: u64) -> Result<(), FleetError> {
+        self.record_worker_heartbeat(node_id, NodeStatus::Online, now_ms)
+    }
+
     /// Persist the current registry and issued token state.
     pub fn persist(&self) -> Result<(), FleetError> {
         fs::create_dir_all(&self.fleet_dir)?;
@@ -86,6 +122,30 @@ impl FleetManager {
             &tokens_path(&self.fleet_dir),
             &tokens,
         )
+    }
+
+    fn update_registered_node<F>(
+        &mut self,
+        node_id: &str,
+        update: F,
+    ) -> Result<NodeInfo, FleetError>
+    where
+        F: FnOnce(&mut NodeRegistry),
+    {
+        let original = self
+            .registry
+            .get(node_id)
+            .cloned()
+            .ok_or(FleetError::NodeNotFound)?;
+        update(&mut self.registry);
+        if let Err(error) = self.persist() {
+            self.registry.register(original);
+            return Err(error);
+        }
+        self.registry
+            .get(node_id)
+            .cloned()
+            .ok_or(FleetError::NodeNotFound)
     }
 
     fn empty(fleet_dir: &Path, key: FleetKey) -> Self {
@@ -207,8 +267,8 @@ fn persist_state_inner(
     tokens: &[FleetToken],
     tokens_tmp: &Path,
 ) -> Result<(), FleetError> {
-    write_json_secure(nodes_tmp, nodes)?;
-    write_json_secure(tokens_tmp, tokens)?;
+    write_json_private(nodes_tmp, nodes)?;
+    write_json_private(tokens_tmp, tokens)?;
     ensure_file_target(tokens_path)?;
     ensure_file_target(nodes_path)?;
     fs::rename(tokens_tmp, tokens_path)?;
@@ -220,15 +280,6 @@ fn temp_path(path: &Path) -> PathBuf {
     let mut temp = path.as_os_str().to_os_string();
     temp.push(".tmp");
     PathBuf::from(temp)
-}
-
-fn write_json_secure<T>(path: &Path, value: &T) -> Result<(), FleetError>
-where
-    T: Serialize + ?Sized,
-{
-    let mut json = serde_json::to_vec_pretty(value)?;
-    json.push(b'\n');
-    write_private(path, &json)
 }
 
 fn ensure_file_target(path: &Path) -> Result<(), FleetError> {
@@ -489,6 +540,75 @@ mod tests {
         let manager = FleetManager::init(temp_dir.path()).expect("fleet should initialize");
 
         assert_eq!(manager.verify_bearer("unknown-token"), None);
+    }
+
+    #[test]
+    fn register_worker_updates_status_capabilities_and_heartbeat() {
+        let temp_dir = TempDir::new().expect("tempdir should create");
+        let mut manager = FleetManager::init(temp_dir.path()).expect("fleet should initialize");
+        let token = manager
+            .add_node("macmini", "100.75.191.19", 8400)
+            .expect("node should add");
+
+        let node = manager
+            .register_worker(
+                &token.node_id,
+                vec![
+                    NodeCapability::AgenticLoop,
+                    NodeCapability::Custom("macos-aarch64".into()),
+                ],
+                12_345,
+            )
+            .expect("worker should register");
+
+        assert_eq!(node.status, NodeStatus::Online);
+        assert_eq!(node.last_heartbeat_ms, 12_345);
+        assert!(node.capabilities.contains(&NodeCapability::AgenticLoop));
+    }
+
+    #[test]
+    fn record_worker_heartbeat_updates_node_status() {
+        let temp_dir = TempDir::new().expect("tempdir should create");
+        let mut manager = FleetManager::init(temp_dir.path()).expect("fleet should initialize");
+        let token = manager
+            .add_node("macmini", "100.75.191.19", 8400)
+            .expect("node should add");
+
+        manager
+            .record_worker_heartbeat(&token.node_id, NodeStatus::Busy, 54_321)
+            .expect("heartbeat should persist");
+        let node = manager
+            .list_nodes()
+            .into_iter()
+            .find(|node| node.node_id == token.node_id)
+            .expect("node should remain registered");
+
+        assert_eq!(node.status, NodeStatus::Busy);
+        assert_eq!(node.last_heartbeat_ms, 54_321);
+    }
+
+    #[test]
+    fn mark_result_received_marks_worker_online() {
+        let temp_dir = TempDir::new().expect("tempdir should create");
+        let mut manager = FleetManager::init(temp_dir.path()).expect("fleet should initialize");
+        let token = manager
+            .add_node("macmini", "100.75.191.19", 8400)
+            .expect("node should add");
+        manager
+            .record_worker_heartbeat(&token.node_id, NodeStatus::Busy, 100)
+            .expect("heartbeat should persist");
+
+        manager
+            .mark_result_received(&token.node_id, 200)
+            .expect("result callback should persist");
+        let node = manager
+            .list_nodes()
+            .into_iter()
+            .find(|node| node.node_id == token.node_id)
+            .expect("node should remain registered");
+
+        assert_eq!(node.status, NodeStatus::Online);
+        assert_eq!(node.last_heartbeat_ms, 200);
     }
 
     #[test]

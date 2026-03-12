@@ -6,6 +6,8 @@ mod config_bridge;
 mod config_redaction;
 mod confirmation;
 mod context;
+#[cfg(feature = "http")]
+mod fleet_endpoints;
 mod headless;
 pub(crate) mod helpers;
 #[cfg(feature = "http")]
@@ -893,7 +895,7 @@ async fn dispatch_command(command: Commands) -> anyhow::Result<i32> {
             Ok(0)
         }
         Commands::Fleet { command } => {
-            commands::fleet::handle_fleet_command(&command)?;
+            commands::fleet::handle_fleet_command(&command).await?;
             Ok(0)
         }
     }

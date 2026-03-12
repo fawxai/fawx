@@ -1,12 +1,16 @@
 use crate::commands::slash::display_path_for_user;
 use crate::startup::fawx_data_dir;
 use clap::Subcommand;
-use fx_fleet::{FleetError, FleetManager, NodeInfo, NodeStatus};
+use fx_fleet::{
+    current_time_ms, FleetError, FleetHttpClient, FleetIdentity, FleetManager,
+    FleetRegistrationRequest, FleetRegistrationResponse, NodeInfo, NodeStatus,
+};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 const FLEET_DIR_NAME: &str = "fleet";
+const IDENTITY_FILE: &str = "identity.json";
 #[cfg(test)]
 const FLEET_KEY_FILE: &str = "fleet.key";
 #[cfg(test)]
@@ -29,6 +33,14 @@ pub enum FleetCommands {
         #[arg(long, default_value = "8400")]
         port: u16,
     },
+    /// Join a fleet as a worker node
+    Join {
+        /// Primary node endpoint (e.g., 100.93.251.101:8400)
+        primary: String,
+        /// Bearer token from `fawx fleet add`
+        #[arg(long)]
+        token: String,
+    },
     /// Remove a worker node from the fleet
     Remove {
         /// Node name to remove
@@ -38,17 +50,19 @@ pub enum FleetCommands {
     List,
 }
 
-pub fn handle_fleet_command(command: &FleetCommands) -> anyhow::Result<()> {
+pub async fn handle_fleet_command(command: &FleetCommands) -> anyhow::Result<()> {
     let fleet_dir = default_fleet_dir();
     let mut stdout = std::io::stdout();
-    execute_fleet_command(command, &fleet_dir, &mut stdout).map_err(anyhow::Error::from)
+    execute_fleet_command(command, &fleet_dir, &mut stdout)
+        .await
+        .map_err(anyhow::Error::from)
 }
 
 fn default_fleet_dir() -> PathBuf {
     fawx_data_dir().join(FLEET_DIR_NAME)
 }
 
-fn execute_fleet_command(
+async fn execute_fleet_command(
     command: &FleetCommands,
     fleet_dir: &Path,
     writer: &mut impl Write,
@@ -57,6 +71,9 @@ fn execute_fleet_command(
         FleetCommands::Init => run_init_command(fleet_dir, writer),
         FleetCommands::Add { name, ip, port } => {
             run_add_command(fleet_dir, name, ip, *port, writer)
+        }
+        FleetCommands::Join { primary, token } => {
+            run_join_command(fleet_dir, primary, token, writer).await
         }
         FleetCommands::Remove { name } => run_remove_command(fleet_dir, name, writer),
         FleetCommands::List => run_list_command(fleet_dir, writer),
@@ -82,6 +99,45 @@ fn run_add_command(
     Ok(())
 }
 
+async fn run_join_command(
+    fleet_dir: &Path,
+    primary: &str,
+    token: &str,
+    writer: &mut impl Write,
+) -> Result<(), FleetError> {
+    let join_request = build_join_request(token)?;
+    let primary_endpoint = primary_endpoint(primary);
+    let client = FleetHttpClient::new(Duration::from_secs(10));
+    let response = client
+        .register(&primary_endpoint, &join_request.request)
+        .await?;
+    ensure_registration_accepted(&response)?;
+
+    let identity = FleetIdentity {
+        node_id: response.node_id.clone(),
+        primary_endpoint: primary_endpoint.clone(),
+        bearer_token: token.to_string(),
+        registered_at_ms: current_time_ms(),
+    };
+    let identity_path = identity_path(fleet_dir);
+    identity.save(&identity_path)?;
+
+    writer.write_all(
+        render_join_output(&join_request.summary, primary, &response, &identity_path).as_bytes(),
+    )?;
+    Ok(())
+}
+
+fn ensure_registration_accepted(response: &FleetRegistrationResponse) -> Result<(), FleetError> {
+    if response.accepted {
+        Ok(())
+    } else {
+        Err(FleetError::HttpError(
+            "worker registration was rejected by the primary".to_string(),
+        ))
+    }
+}
+
 fn run_remove_command(
     fleet_dir: &Path,
     name: &str,
@@ -101,6 +157,68 @@ fn run_list_command(fleet_dir: &Path, writer: &mut impl Write) -> Result<(), Fle
     Ok(())
 }
 
+fn build_join_request(token: &str) -> Result<JoinRequest, FleetError> {
+    let summary = detect_capability_summary()?;
+    Ok(JoinRequest {
+        request: FleetRegistrationRequest {
+            node_name: summary.node_name.clone(),
+            bearer_token: token.to_string(),
+            capabilities: vec!["agentic_loop".to_string(), summary.platform.clone()],
+            rust_version: None,
+            os: Some(std::env::consts::OS.to_string()),
+            cpus: Some(summary.cpus),
+            ram_gb: None,
+        },
+        summary,
+    })
+}
+
+fn detect_capability_summary() -> Result<CapabilitySummary, FleetError> {
+    Ok(CapabilitySummary {
+        node_name: detected_node_name(),
+        cpus: detected_cpus()?,
+        platform: detected_platform(),
+    })
+}
+
+fn detected_node_name() -> String {
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|output| parsed_hostname(&output.stdout))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn parsed_hostname(output: &[u8]) -> Option<String> {
+    std::str::from_utf8(output)
+        .ok()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+}
+
+fn detected_cpus() -> Result<u32, FleetError> {
+    std::thread::available_parallelism()
+        .map(|parallelism| u32::try_from(parallelism.get()).unwrap_or(u32::MAX))
+        .map_err(FleetError::from)
+}
+
+fn detected_platform() -> String {
+    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn primary_endpoint(primary: &str) -> String {
+    if primary.starts_with("http://") || primary.starts_with("https://") {
+        primary.to_string()
+    } else {
+        format!("http://{primary}")
+    }
+}
+
+fn identity_path(fleet_dir: &Path) -> PathBuf {
+    fleet_dir.join(IDENTITY_FILE)
+}
+
 fn render_init_output(fleet_dir: &Path) -> String {
     let fleet_dir = display_fleet_dir(fleet_dir);
     format!(
@@ -111,6 +229,21 @@ fn render_init_output(fleet_dir: &Path) -> String {
 fn render_add_output(name: &str, ip: &str, port: u16, secret: &str) -> String {
     format!(
         "✓ Node \"{name}\" registered\n✓ Token generated\n\n  Join command (run on the worker):\n  fawx fleet join {ip}:{port} --token {secret}\n"
+    )
+}
+
+fn render_join_output(
+    summary: &CapabilitySummary,
+    primary: &str,
+    response: &FleetRegistrationResponse,
+    identity_path: &Path,
+) -> String {
+    format!(
+        "✓ Connected to primary at {primary}\n✓ Registered as node \"{}\"\n✓ Capabilities: {} CPUs, {}\n✓ Identity saved to {}\n\n  Start the fleet worker with:\n  fawx serve --fleet\n",
+        response.node_id,
+        summary.cpus,
+        summary.platform,
+        display_path_for_user(identity_path),
     )
 }
 
@@ -207,11 +340,17 @@ fn table_widths(nodes: &[&NodeInfo]) -> TableWidths {
     widths
 }
 
-fn current_time_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
+#[derive(Debug, Clone)]
+struct JoinRequest {
+    request: FleetRegistrationRequest,
+    summary: CapabilitySummary,
+}
+
+#[derive(Debug, Clone)]
+struct CapabilitySummary {
+    node_name: String,
+    cpus: u32,
+    platform: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -234,18 +373,150 @@ impl Default for TableWidths {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        body::{Body, Bytes},
+        extract::State,
+        http::{header, HeaderMap, Method, StatusCode, Uri},
+        response::{IntoResponse, Response},
+        routing::post,
+        Json, Router,
+    };
     use fx_fleet::FleetToken;
     use serde_json::from_slice;
     use std::fs;
+    use std::sync::Arc;
     use tempfile::TempDir;
+    use tokio::{
+        sync::{oneshot, Mutex},
+        task::JoinHandle,
+        time::timeout,
+    };
+
+    #[derive(Debug, Clone)]
+    struct TestRegisterResponse {
+        status: StatusCode,
+        body: FleetRegistrationResponse,
+    }
+
+    #[derive(Debug)]
+    struct CapturedRegistration {
+        authorization: Option<String>,
+        json: FleetRegistrationRequest,
+        method: Method,
+        path: String,
+    }
+
+    #[derive(Clone)]
+    struct TestServerState {
+        sender: Arc<Mutex<Option<oneshot::Sender<CapturedRegistration>>>>,
+        response: TestRegisterResponse,
+    }
+
+    struct TestRegisterServer {
+        base_url: String,
+        receiver: Option<oneshot::Receiver<CapturedRegistration>>,
+        handle: JoinHandle<()>,
+    }
+
+    impl TestRegisterServer {
+        async fn spawn(response: TestRegisterResponse) -> Self {
+            let (sender, receiver) = oneshot::channel();
+            let app = Router::new()
+                .route("/fleet/register", post(capture_registration))
+                .with_state(TestServerState {
+                    sender: Arc::new(Mutex::new(Some(sender))),
+                    response,
+                });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("test server should bind");
+            let address = listener.local_addr().expect("local address should exist");
+            let handle = tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .await
+                    .expect("test server should run");
+            });
+
+            Self {
+                base_url: format!("http://{address}"),
+                receiver: Some(receiver),
+                handle,
+            }
+        }
+
+        async fn captured(&mut self) -> CapturedRegistration {
+            let receiver = self.receiver.take().expect("receiver should be available");
+            timeout(Duration::from_secs(2), receiver)
+                .await
+                .expect("request should arrive")
+                .expect("request should be captured")
+        }
+    }
+
+    impl Drop for TestRegisterServer {
+        fn drop(&mut self) {
+            self.handle.abort();
+        }
+    }
+
+    async fn capture_registration(
+        State(state): State<TestServerState>,
+        method: Method,
+        uri: Uri,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Response {
+        let captured = CapturedRegistration {
+            authorization: headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned),
+            json: serde_json::from_slice(&body).expect("request should decode"),
+            method,
+            path: uri.path().to_string(),
+        };
+        if let Some(sender) = state.sender.lock().await.take() {
+            let _ = sender.send(captured);
+        }
+        Json(state.response.body)
+            .into_response()
+            .with_status(state.response.status)
+    }
+
+    trait ResponseStatusExt {
+        fn with_status(self, status: StatusCode) -> Response;
+    }
+
+    impl ResponseStatusExt for Response {
+        fn with_status(mut self, status: StatusCode) -> Response {
+            *self.status_mut() = status;
+            self
+        }
+    }
 
     #[test]
-    fn fleet_init_creates_directory() {
+    fn parsed_hostname_trims_trailing_newline() {
+        assert_eq!(parsed_hostname(b"macmini\n"), Some("macmini".to_string()));
+    }
+
+    #[test]
+    fn parsed_hostname_rejects_blank_output() {
+        assert_eq!(parsed_hostname(b"  \n\t"), None);
+    }
+
+    #[test]
+    fn parsed_hostname_rejects_invalid_utf8() {
+        assert_eq!(parsed_hostname(&[0xff, 0xfe]), None);
+    }
+
+    #[tokio::test]
+    async fn fleet_init_creates_directory() {
         let temp_dir = TempDir::new().expect("tempdir should create");
         let fleet_dir = temp_dir.path().join("fleet");
         let mut output = Vec::new();
 
         execute_fleet_command(&FleetCommands::Init, &fleet_dir, &mut output)
+            .await
             .expect("fleet init should succeed");
 
         assert!(fleet_dir.is_dir());
@@ -257,12 +528,13 @@ mod tests {
             .contains("Fleet initialized at"));
     }
 
-    #[test]
-    fn fleet_add_prints_join_command() {
+    #[tokio::test]
+    async fn fleet_add_prints_join_command() {
         let temp_dir = TempDir::new().expect("tempdir should create");
         let fleet_dir = temp_dir.path().join("fleet");
         let mut init_output = Vec::new();
         execute_fleet_command(&FleetCommands::Init, &fleet_dir, &mut init_output)
+            .await
             .expect("fleet init should succeed");
 
         let mut output = Vec::new();
@@ -275,6 +547,7 @@ mod tests {
             &fleet_dir,
             &mut output,
         )
+        .await
         .expect("fleet add should succeed");
 
         let output = String::from_utf8(output).expect("utf8");
@@ -290,12 +563,13 @@ mod tests {
         )));
     }
 
-    #[test]
-    fn fleet_add_duplicate_returns_error() {
+    #[tokio::test]
+    async fn fleet_add_duplicate_returns_error() {
         let temp_dir = TempDir::new().expect("tempdir should create");
         let fleet_dir = temp_dir.path().join("fleet");
         let mut init_output = Vec::new();
         execute_fleet_command(&FleetCommands::Init, &fleet_dir, &mut init_output)
+            .await
             .expect("fleet init should succeed");
         let mut first_output = Vec::new();
         execute_fleet_command(
@@ -307,6 +581,7 @@ mod tests {
             &fleet_dir,
             &mut first_output,
         )
+        .await
         .expect("first add should succeed");
 
         let result = execute_fleet_command(
@@ -317,13 +592,66 @@ mod tests {
             },
             &fleet_dir,
             &mut Vec::new(),
-        );
+        )
+        .await;
 
         assert!(matches!(result, Err(FleetError::DuplicateNode)));
     }
 
-    #[test]
-    fn fleet_remove_success() {
+    #[tokio::test]
+    async fn fleet_join_saves_identity() {
+        let mut server = TestRegisterServer::spawn(TestRegisterResponse {
+            status: StatusCode::OK,
+            body: FleetRegistrationResponse {
+                node_id: "macmini-a1b2c3".to_string(),
+                accepted: true,
+                message: "registered".to_string(),
+            },
+        })
+        .await;
+        let temp_dir = TempDir::new().expect("tempdir should create");
+        let fleet_dir = temp_dir.path().join("fleet");
+        let primary = server.base_url.trim_start_matches("http://").to_string();
+        let token = "tok_abc123";
+        let mut output = Vec::new();
+
+        execute_fleet_command(
+            &FleetCommands::Join {
+                primary: primary.clone(),
+                token: token.to_string(),
+            },
+            &fleet_dir,
+            &mut output,
+        )
+        .await
+        .expect("fleet join should succeed");
+
+        let identity =
+            FleetIdentity::load(&fleet_dir.join(IDENTITY_FILE)).expect("identity should load");
+        let captured = server.captured().await;
+        let output = String::from_utf8(output).expect("utf8");
+
+        assert_eq!(captured.method, Method::POST);
+        assert_eq!(captured.path, "/fleet/register");
+        assert!(captured.authorization.is_none());
+        assert_eq!(captured.json.bearer_token, token);
+        assert!(!captured.json.node_name.trim().is_empty());
+        assert_eq!(captured.json.os.as_deref(), Some(std::env::consts::OS));
+        assert!(captured
+            .json
+            .capabilities
+            .contains(&"agentic_loop".to_string()));
+        assert_eq!(identity.node_id, "macmini-a1b2c3");
+        assert_eq!(identity.primary_endpoint, server.base_url);
+        assert_eq!(identity.bearer_token, token);
+        assert!(identity.registered_at_ms > 0);
+        assert!(output.contains("✓ Connected to primary at"));
+        assert!(output.contains("✓ Registered as node \"macmini-a1b2c3\""));
+        assert!(output.contains("✓ Identity saved to"));
+    }
+
+    #[tokio::test]
+    async fn fleet_remove_success() {
         let temp_dir = TempDir::new().expect("tempdir should create");
         let fleet_dir = temp_dir.path().join("fleet");
         let mut manager = FleetManager::init(&fleet_dir).expect("fleet should initialize");
@@ -339,6 +667,7 @@ mod tests {
             &fleet_dir,
             &mut output,
         )
+        .await
         .expect("fleet remove should succeed");
 
         let reloaded_manager = FleetManager::load(&fleet_dir).expect("fleet should load");
@@ -349,12 +678,13 @@ mod tests {
         assert!(reloaded_manager.list_nodes().is_empty());
     }
 
-    #[test]
-    fn fleet_remove_nonexistent_returns_error() {
+    #[tokio::test]
+    async fn fleet_remove_nonexistent_returns_error() {
         let temp_dir = TempDir::new().expect("tempdir should create");
         let fleet_dir = temp_dir.path().join("fleet");
         let mut init_output = Vec::new();
         execute_fleet_command(&FleetCommands::Init, &fleet_dir, &mut init_output)
+            .await
             .expect("fleet init should succeed");
 
         let result = execute_fleet_command(
@@ -363,21 +693,24 @@ mod tests {
             },
             &fleet_dir,
             &mut Vec::new(),
-        );
+        )
+        .await;
 
         assert!(matches!(result, Err(FleetError::NodeNotFound)));
     }
 
-    #[test]
-    fn fleet_list_empty_shows_no_nodes() {
+    #[tokio::test]
+    async fn fleet_list_empty_shows_no_nodes() {
         let temp_dir = TempDir::new().expect("tempdir should create");
         let fleet_dir = temp_dir.path().join("fleet");
         let mut init_output = Vec::new();
         execute_fleet_command(&FleetCommands::Init, &fleet_dir, &mut init_output)
+            .await
             .expect("fleet init should succeed");
 
         let mut output = Vec::new();
         execute_fleet_command(&FleetCommands::List, &fleet_dir, &mut output)
+            .await
             .expect("fleet list should succeed");
 
         let output = String::from_utf8(output).expect("utf8");
@@ -385,12 +718,13 @@ mod tests {
         assert!(output.contains("(no nodes registered)"));
     }
 
-    #[test]
-    fn fleet_list_with_nodes_shows_table() {
+    #[tokio::test]
+    async fn fleet_list_with_nodes_shows_table() {
         let temp_dir = TempDir::new().expect("tempdir should create");
         let fleet_dir = temp_dir.path().join("fleet");
         let mut init_output = Vec::new();
         execute_fleet_command(&FleetCommands::Init, &fleet_dir, &mut init_output)
+            .await
             .expect("fleet init should succeed");
 
         let mut manager = FleetManager::load(&fleet_dir).expect("fleet should load");
@@ -413,6 +747,7 @@ mod tests {
 
         let mut output = Vec::new();
         execute_fleet_command(&FleetCommands::List, &fleet_dir, &mut output)
+            .await
             .expect("fleet list should succeed");
 
         let output = String::from_utf8(output).expect("utf8");
@@ -427,8 +762,8 @@ mod tests {
         assert!(output.contains("(never seen)"));
     }
 
-    #[test]
-    fn fleet_list_does_not_leak_token_secret() {
+    #[tokio::test]
+    async fn fleet_list_does_not_leak_token_secret() {
         let temp_dir = TempDir::new().expect("tempdir should create");
         let fleet_dir = temp_dir.path().join("fleet");
         let mut manager = FleetManager::init(&fleet_dir).expect("fleet should initialize");
