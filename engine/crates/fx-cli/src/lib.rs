@@ -38,6 +38,7 @@ mod restart;
 #[path = "commands/slash.rs"]
 pub(crate) mod slash_commands;
 #[cfg(test)]
+#[allow(dead_code)]
 mod start_stop_command {
     include!("commands/start_stop.rs");
 }

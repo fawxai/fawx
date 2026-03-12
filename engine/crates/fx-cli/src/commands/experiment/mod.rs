@@ -726,6 +726,8 @@ mod tests {
                 mode: ExperimentNodeMode::Placeholder,
                 project: None,
                 sequential: false,
+                eval_node: None,
+                verbose: false,
             },
             chain_path.clone(),
             1,
@@ -795,6 +797,8 @@ mod tests {
             mode: ExperimentNodeMode::Placeholder,
             project: None,
             sequential: false,
+            eval_node: None,
+            verbose: false,
         };
 
         let output = format_experiment_report(&args, &report);
@@ -930,6 +934,8 @@ mod tests {
                 mode: ExperimentNodeMode::Placeholder,
                 project: None,
                 sequential: false,
+                eval_node: None,
+                verbose: false,
             },
             chain_path,
             1,
