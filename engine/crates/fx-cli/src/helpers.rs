@@ -292,8 +292,7 @@ impl LoopLlmProvider for RouterLoopLlmProvider<'_> {
             .complete_stream(request)
             .await
             .map_err(|error| CoreLlmError::Inference(error.to_string()))?;
-        let mut stdout = io::stdout();
-        let collected = consume_stream_with_writer(&mut stream, &mut stdout).await?;
+        let collected = consume_stream_with_callback(&mut stream, callback).await?;
 
         if collected.trim().is_empty() {
             return Err(CoreLlmError::InvalidResponse(
@@ -301,7 +300,6 @@ impl LoopLlmProvider for RouterLoopLlmProvider<'_> {
             ));
         }
 
-        callback(collected.clone());
         Ok(collected)
     }
 
@@ -338,6 +336,25 @@ async fn consume_stream_silent(
 ) -> Result<String, CoreLlmError> {
     let mut sink = io::sink();
     consume_stream_with_writer(stream, &mut sink).await
+}
+
+async fn consume_stream_with_callback(
+    stream: &mut (impl futures::Stream<Item = Result<StreamChunk, ProviderError>> + Unpin),
+    callback: Box<dyn Fn(String) + Send + 'static>,
+) -> Result<String, CoreLlmError> {
+    let mut collected = String::new();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(chunk) => {
+                if let Some(delta) = chunk.delta_content {
+                    collected.push_str(&delta);
+                    callback(delta);
+                }
+            }
+            Err(error) => return Err(CoreLlmError::Inference(error.to_string())),
+        }
+    }
+    Ok(collected)
 }
 
 async fn consume_stream_with_writer(
@@ -381,8 +398,10 @@ pub(crate) fn trim_history(history: &mut Vec<Message>, max_history: usize) {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use futures::stream;
     use fx_config::ThinkingBudget;
     use fx_llm::{CompletionProvider, CompletionResponse, CompletionStream, ProviderCapabilities};
+    use std::sync::{Arc, Mutex};
 
     #[derive(Debug)]
     struct ModelEchoProvider {
@@ -418,6 +437,57 @@ mod tests {
             ProviderCapabilities {
                 supports_temperature: false,
                 requires_streaming: false,
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct StreamingProvider {
+        provider_name: String,
+        model: String,
+        chunks: Vec<&'static str>,
+    }
+
+    #[async_trait]
+    impl CompletionProvider for StreamingProvider {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            unimplemented!()
+        }
+
+        async fn complete_stream(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionStream, ProviderError> {
+            let chunks = self
+                .chunks
+                .iter()
+                .map(|chunk| {
+                    Ok(StreamChunk {
+                        delta_content: Some((*chunk).to_string()),
+                        tool_use_deltas: Vec::new(),
+                        usage: None,
+                        stop_reason: None,
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok(Box::pin(stream::iter(chunks)))
+        }
+
+        fn name(&self) -> &str {
+            &self.provider_name
+        }
+
+        fn supported_models(&self) -> Vec<String> {
+            vec![self.model.clone()]
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                supports_temperature: false,
+                requires_streaming: true,
             }
         }
     }
@@ -520,5 +590,37 @@ mod tests {
         trim_history(&mut history, 2);
 
         assert_eq!(history, vec![Message::user("q2"), Message::assistant("a2")]);
+    }
+
+    #[tokio::test]
+    async fn router_loop_llm_provider_streams_deltas_through_callback() {
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(StreamingProvider {
+            provider_name: "Anthropic".to_string(),
+            model: "claude-opus-4-6".to_string(),
+            chunks: vec!["hello", " world"],
+        }));
+        router.set_active("claude-opus-4-6").expect("active model");
+
+        let provider = RouterLoopLlmProvider::new(&router, "claude-opus-4-6".to_string());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let callback_seen = Arc::clone(&seen);
+
+        let result = provider
+            .generate_streaming(
+                "test prompt",
+                32,
+                Box::new(move |chunk| {
+                    callback_seen.lock().expect("callback chunks").push(chunk);
+                }),
+            )
+            .await
+            .expect("streamed response");
+
+        assert_eq!(result, "hello world");
+        assert_eq!(
+            seen.lock().expect("callback chunks").clone(),
+            vec!["hello".to_string(), " world".to_string()]
+        );
     }
 }

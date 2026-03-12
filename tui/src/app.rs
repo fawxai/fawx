@@ -22,15 +22,16 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
+use regex_lite::Regex;
 use serde_json::Value;
 use sparx::{render_file, RenderConfig};
 use std::cmp::min;
 use std::fmt;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
@@ -74,11 +75,25 @@ const PANEL_BORDER_LINES: usize = 2;
 const TOOL_USE_PREFIX: &str = "tool › ";
 const TOOL_RESULT_PREFIX: &str = "tool · ";
 const TOOL_ERROR_PREFIX: &str = "tool ! ";
-const TOOL_PREFIX_WIDTH: usize = TOOL_USE_PREFIX.len();
+const TOOL_PREFIX_DISPLAY_WIDTH: usize = 7;
 const TOOL_USE_FIELD_LIMIT: usize = 3;
 const TOOL_USE_MAX_LINES: usize = 5;
 const TOOL_RESULT_MAX_LINES: usize = 20;
 const TOOL_VALUE_PREVIEW_CHARS: usize = 80;
+static ANSI_CSI_RE: LazyLock<Regex> =
+    LazyLock::new(|| match Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]") {
+        Ok(regex) => regex,
+        Err(error) => panic!("invalid ANSI CSI regex: {error}"),
+    });
+static ANSI_OSC_RE: LazyLock<Regex> =
+    LazyLock::new(|| match Regex::new(r"\x1b\][^\x07\x1b]*(\x07|\x1b\\)") {
+        Ok(regex) => regex,
+        Err(error) => panic!("invalid ANSI OSC regex: {error}"),
+    });
+static ANSI_ESC_RE: LazyLock<Regex> = LazyLock::new(|| match Regex::new(r"\x1b[@-_]") {
+    Ok(regex) => regex,
+    Err(error) => panic!("invalid ANSI escape regex: {error}"),
+});
 
 #[derive(Debug, Clone)]
 pub struct RunOptions {
@@ -144,6 +159,12 @@ enum EntryRole {
     ToolUse,
     ToolResult,
     ToolError,
+}
+
+#[derive(Clone, Copy)]
+enum ToolOutcome {
+    Success,
+    Error,
 }
 
 struct Entry {
@@ -219,12 +240,21 @@ impl Entry {
         }
     }
 
-    fn tool_result(role: EntryRole, name: Option<String>, content: String) -> Self {
+    fn tool_result(outcome: ToolOutcome, name: Option<String>, content: String) -> Self {
         Self {
-            role,
+            role: outcome.role(),
             text: content,
             tool_name: name,
             tool_arguments: None,
+        }
+    }
+}
+
+impl ToolOutcome {
+    fn role(self) -> EntryRole {
+        match self {
+            Self::Success => EntryRole::ToolResult,
+            Self::Error => EntryRole::ToolError,
         }
     }
 }
@@ -475,6 +505,7 @@ impl App {
             return;
         }
 
+        self.dismiss_welcome_entry(&input);
         if self.handle_local_command(&input) {
             self.input.clear();
             self.follow_output = true;
@@ -504,6 +535,12 @@ impl App {
         tokio::spawn(async move {
             backend.stream_message(input, tx).await;
         });
+    }
+
+    fn dismiss_welcome_entry(&mut self, input: &str) {
+        if should_dismiss_welcome(&self.entries, input) {
+            self.entries.remove(0);
+        }
     }
 
     fn handle_local_command(&mut self, input: &str) -> bool {
@@ -631,17 +668,17 @@ impl App {
 
     fn push_tool_result(&mut self, name: Option<String>, success: bool, content: String) {
         self.awaiting_stream_start = false;
-        let role = if success {
-            EntryRole::ToolResult
+        let outcome = if success {
+            ToolOutcome::Success
         } else {
-            EntryRole::ToolError
+            ToolOutcome::Error
         };
         let resolved_name = self
             .active_tool_name
             .take()
             .or(name.filter(|value| !value.is_empty()));
         self.entries
-            .push(Entry::tool_result(role, resolved_name, content));
+            .push(Entry::tool_result(outcome, resolved_name, content));
         self.follow_output = true;
     }
 
@@ -679,8 +716,10 @@ impl App {
         self.sync_logo_art();
 
         frame.render_widget(self.render_header(), layout[0]);
+        frame.render_widget(Clear, transcript_area);
         frame.render_widget(self.render_transcript(transcript_area), transcript_area);
         if let Some(experiment_area) = experiment_area {
+            frame.render_widget(Clear, experiment_area);
             frame.render_widget(
                 self.render_experiment_panel(experiment_area),
                 experiment_area,
@@ -774,28 +813,21 @@ impl App {
     }
 
     fn render_transcript(&mut self, area: Rect) -> Paragraph<'static> {
-        let scroll = self.sync_transcript_scroll(area);
-        self.transcript_widget(area).scroll((scroll, 0))
-    }
-
-    fn transcript_widget(&self, area: Rect) -> Paragraph<'static> {
-        let inner_width = area.width.saturating_sub(4) as usize;
-        let lines = self.rendered_transcript_lines(inner_width.max(20));
+        let lines = self.transcript_lines_for_area(area);
+        let scroll = self.sync_transcript_scroll(area, transcript_content_line_count(&lines));
         Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL).title("Conversation"))
+            .scroll((scroll, 0))
+            .block(transcript_block())
     }
 
+    #[cfg(test)]
     fn transcript_max_scroll(&self, area: Rect) -> u16 {
-        let inner_width = area.width.saturating_sub(4) as usize;
-        let lines = self.rendered_transcript_lines(inner_width.max(20));
-        let total_lines = lines.len().saturating_add(2);
-        let bottom = total_lines.saturating_sub(area.height as usize);
-        bottom.min(u16::MAX as usize) as u16
+        let lines = self.transcript_lines_for_area(area);
+        transcript_scroll_limit(transcript_content_line_count(&lines), area)
     }
 
-    fn sync_transcript_scroll(&mut self, area: Rect) -> u16 {
-        let bottom = self.transcript_max_scroll(area);
+    fn sync_transcript_scroll(&mut self, area: Rect, total_lines: usize) -> u16 {
+        let bottom = transcript_scroll_limit(total_lines, area);
         let scroll = if self.follow_output {
             bottom
         } else {
@@ -808,6 +840,7 @@ impl App {
 
     fn render_input(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let (widget, cursor) = self.input_widget(area);
+        frame.render_widget(Clear, area);
         frame.render_widget(widget, area);
         if let Some((x, y)) = cursor {
             frame.set_cursor_position((x, y));
@@ -898,10 +931,15 @@ impl App {
     fn rendered_transcript_lines(&self, width: usize) -> Vec<Line<'static>> {
         let mut out = Vec::new();
         for entry in &self.entries {
+            if !out.is_empty() {
+                out.push(Line::default());
+            }
             self.render_entry(entry, width, &mut out);
-            out.push(Line::default());
         }
         if let Some(text) = &self.streaming_text {
+            if !out.is_empty() {
+                out.push(Line::default());
+            }
             self.render_entry(
                 &Entry::plain(EntryRole::Assistant, text.clone()),
                 width,
@@ -921,8 +959,9 @@ impl App {
                 ));
             }
             EntryRole::Assistant => {
+                let text = sanitize_terminal_text(&entry.text);
                 let rendered =
-                    render_markdown_text_with_width(&entry.text, Some(width.saturating_sub(7)));
+                    render_markdown_text_with_width(&text, Some(width.saturating_sub(7)));
                 let prefixed = prefix_lines(
                     rendered.lines,
                     Span::styled("fawx › ", Style::default().fg(fawx_amber())),
@@ -931,8 +970,9 @@ impl App {
                 out.extend(prefixed);
             }
             EntryRole::User => {
+                let text = sanitize_terminal_text(&entry.text);
                 out.extend(prefix_wrapped_lines(
-                    &entry.text,
+                    &text,
                     width,
                     "you  › ",
                     "       ",
@@ -940,8 +980,9 @@ impl App {
                 ));
             }
             EntryRole::System => {
+                let text = sanitize_terminal_text(&entry.text);
                 out.extend(prefix_wrapped_lines(
-                    &entry.text,
+                    &text,
                     width,
                     "info › ",
                     "       ",
@@ -949,8 +990,9 @@ impl App {
                 ));
             }
             EntryRole::Error => {
+                let text = sanitize_terminal_text(&entry.text);
                 out.extend(prefix_wrapped_lines(
-                    &entry.text,
+                    &text,
                     width,
                     "error! ",
                     "       ",
@@ -968,6 +1010,10 @@ impl App {
             }
         }
     }
+
+    fn transcript_lines_for_area(&self, area: Rect) -> Vec<Line<'static>> {
+        self.rendered_transcript_lines(transcript_inner_width(area))
+    }
 }
 
 fn transcript_layout(area: Rect, show_panel: bool) -> (Rect, Option<Rect>) {
@@ -984,10 +1030,65 @@ fn transcript_layout(area: Rect, show_panel: bool) -> (Rect, Option<Rect>) {
     (layout[0], Some(layout[1]))
 }
 
+fn transcript_block() -> Block<'static> {
+    Block::default().borders(Borders::ALL).title("Conversation")
+}
+
+fn transcript_inner_area(area: Rect) -> Rect {
+    transcript_block().inner(area)
+}
+
+fn transcript_inner_width(area: Rect) -> usize {
+    transcript_inner_area(area).width.max(1) as usize
+}
+
+fn transcript_scroll_limit(total_lines: usize, area: Rect) -> u16 {
+    total_lines
+        .saturating_sub(transcript_inner_area(area).height as usize)
+        .min(u16::MAX as usize) as u16
+}
+
+fn transcript_content_line_count(lines: &[Line<'_>]) -> usize {
+    lines
+        .iter()
+        .rposition(|line| transcript_line_has_content(line))
+        .map_or(0, |index| index + 1)
+}
+
+fn transcript_line_has_content(line: &Line<'_>) -> bool {
+    line.spans
+        .iter()
+        .any(|span| !span.content.trim().is_empty())
+}
+
+fn should_dismiss_welcome(entries: &[Entry], input: &str) -> bool {
+    matches!(
+        entries.first().map(|entry| entry.role),
+        Some(EntryRole::Welcome)
+    ) && !matches!(
+        input.split_whitespace().next(),
+        Some("/clear") | Some("/quit") | Some("/exit")
+    )
+}
+
+fn sanitize_terminal_text(text: &str) -> String {
+    let normalized = text
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('\t', "    ");
+    let without_osc = ANSI_OSC_RE.replace_all(&normalized, "");
+    let without_csi = ANSI_CSI_RE.replace_all(&without_osc, "");
+    let without_esc = ANSI_ESC_RE.replace_all(&without_csi, "");
+    without_esc
+        .chars()
+        .filter(|ch| *ch == '\n' || !ch.is_control())
+        .collect()
+}
+
 fn render_panel_lines(lines: &[String], width: usize) -> Vec<Line<'static>> {
     let mut rendered = Vec::new();
     for line in lines {
-        rendered.extend(wrap_plain_text(line, width));
+        rendered.extend(wrap_plain_text(&sanitize_terminal_text(line), width));
     }
     if rendered.is_empty() {
         rendered.push(Line::default());
@@ -1510,9 +1611,10 @@ fn render_tool_result_entry(
     panel_visible: bool,
 ) -> Vec<Line<'static>> {
     let content_width = tool_content_width(width);
-    let plan = tool_result_render_plan(entry, content_width);
+    let text = sanitize_terminal_text(&entry.text);
+    let plan = tool_result_render_plan(&text, content_width);
     let mut lines = wrap_tool_text_lines(
-        &tool_result_summary_lines(entry, plan.summarize),
+        &tool_result_summary_lines(entry, &text, plan.summarize),
         content_width,
     );
     let budget = TOOL_RESULT_MAX_LINES.saturating_sub(lines.len());
@@ -1527,7 +1629,7 @@ fn render_tool_result_entry(
 }
 
 fn tool_content_width(width: usize) -> usize {
-    width.saturating_sub(TOOL_PREFIX_WIDTH).max(1)
+    width.saturating_sub(TOOL_PREFIX_DISPLAY_WIDTH).max(1)
 }
 
 fn prefix_tool_lines(lines: Vec<Line<'static>>, role: EntryRole) -> Vec<Line<'static>> {
@@ -1540,7 +1642,7 @@ fn prefix_tool_lines(lines: Vec<Line<'static>>, role: EntryRole) -> Vec<Line<'st
 }
 
 fn tool_continuation_prefix() -> String {
-    " ".repeat(TOOL_PREFIX_WIDTH)
+    " ".repeat(TOOL_PREFIX_DISPLAY_WIDTH)
 }
 
 fn tool_prefix(role: EntryRole) -> (&'static str, Style) {
@@ -1567,10 +1669,7 @@ fn wrap_tool_text_lines(lines: &[String], width: usize) -> Vec<Line<'static>> {
 }
 
 fn tool_use_summary_lines(entry: &Entry, width: usize) -> Vec<String> {
-    let mut lines = vec![format!(
-        "▶ {}",
-        entry.tool_name.as_deref().unwrap_or("tool")
-    )];
+    let mut lines = vec![format!("▶ {}", tool_label(entry.tool_name.as_deref()))];
     if let Some(arguments) = &entry.tool_arguments {
         lines.extend(tool_argument_summary_lines(
             entry.tool_name.as_deref(),
@@ -1653,7 +1752,9 @@ fn experiment_tool_argument_priority(key: &str) -> usize {
 
 fn summarize_tool_value(value: &Value, limit: usize) -> String {
     match value {
-        Value::String(text) => format!("\"{}\"", preview_text(text, limit)),
+        Value::String(text) => {
+            format!("\"{}\"", preview_text(&sanitize_terminal_text(text), limit))
+        }
         Value::Array(items) => format!("[{} items]", items.len()),
         Value::Object(map) => format!("{{{} keys}}", map.len()),
         other => other.to_string(),
@@ -1668,21 +1769,30 @@ fn preview_text(text: &str, limit: usize) -> String {
     )
 }
 
-fn tool_result_summary_lines(entry: &Entry, summarize_experiment: bool) -> Vec<String> {
+fn tool_result_summary_lines(entry: &Entry, text: &str, summarize_experiment: bool) -> Vec<String> {
     let status = if matches!(entry.role, EntryRole::ToolError) {
         "failure"
     } else {
         "success"
     };
-    let label = entry.tool_name.as_deref().unwrap_or("tool");
+    let label = tool_label(entry.tool_name.as_deref());
     let mut lines = vec![format!(
         "{} {label} ({status})",
         tool_status_icon(entry.role)
     )];
     if summarize_experiment {
-        lines.extend(experiment_result_summary_lines(&entry.text));
+        lines.extend(experiment_result_summary_lines(text));
     }
     lines
+}
+
+fn tool_label(name: Option<&str>) -> String {
+    let sanitized = sanitize_terminal_text(name.unwrap_or("tool"));
+    if sanitized.trim().is_empty() {
+        "tool".to_string()
+    } else {
+        sanitized
+    }
 }
 
 fn tool_status_icon(role: EntryRole) -> &'static str {
@@ -1753,13 +1863,13 @@ fn tool_result_preview_lines(
     )
 }
 
-fn has_experiment_summary(entry: &Entry) -> bool {
-    !experiment_result_summary_lines(&entry.text).is_empty()
+fn has_experiment_summary(text: &str) -> bool {
+    !experiment_result_summary_lines(text).is_empty()
 }
 
-fn tool_result_render_plan(entry: &Entry, width: usize) -> ToolResultRenderPlan {
-    let wrapped_output = wrap_tool_output_text(&entry.text, width);
-    let summarize = has_experiment_summary(entry) && wrapped_output.len() > TOOL_RESULT_MAX_LINES;
+fn tool_result_render_plan(text: &str, width: usize) -> ToolResultRenderPlan {
+    let wrapped_output = wrap_tool_output_text(text, width);
+    let summarize = has_experiment_summary(text) && wrapped_output.len() > TOOL_RESULT_MAX_LINES;
     ToolResultRenderPlan {
         wrapped_output,
         summarize,
@@ -1918,12 +2028,51 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> anyhow
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use ratatui::backend::TestBackend as RatatuiTestBackend;
+    use ratatui::buffer::Buffer;
     use serde_json::json;
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::OnceLock;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const TEST_HELP_TEXT: &str = concat!(
+        "Commands\n",
+        "  /model         List models and switch active model\n",
+        "  /model <name>  Switch to a specific model\n",
+        "  /auth          Show credential status + auth help\n",
+        "  /auth <provider> set-token <TOKEN>\n",
+        "                 Save API key or PAT for a provider\n",
+        "  /keys          Manage WASM signing keys\n",
+        "  /keys generate [--force]\n",
+        "  /keys list     List trusted public keys\n",
+        "  /keys trust <path>\n",
+        "  /keys revoke <fingerprint>\n",
+        "  /sign <skill>  Sign one WASM skill\n",
+        "  /sign --all    Sign all installed WASM skills\n",
+        "  /status        Show model, tokens, budget summary\n",
+        "  /budget        Show detailed budget usage\n",
+        "  /loop          Show loop iteration details\n",
+        "  /signals       Show condensed signal summary for last turn\n",
+        "  /debug         Show full signal dump for last turn\n",
+        "  /analyze       Analyze persisted signals across sessions\n",
+        "  /improve       Run self-improvement cycle\n",
+        "  /proposals     List pending self-modification proposals\n",
+        "  /proposals <id> Show a proposal diff preview\n",
+        "  /approve       Apply a pending proposal (/approve <id> [--force])\n",
+        "  /reject        Archive a pending proposal (/reject <id>)\n",
+        "  /synthesis     Set or reset synthesis instruction\n",
+        "  /thinking      Show or set thinking budget (high|low|adaptive|off)\n",
+        "  /clear         Clear the screen and active conversation\n",
+        "  /new           Start a new conversation\n",
+        "  /history       List saved conversations\n",
+        "  /config        Show loaded config values\n",
+        "  /config init   Create ~/.fawx/config.toml template\n",
+        "  /config reload Reload config.toml without restarting\n",
+        "  /help          Show this help\n",
+        "  /quit          Exit"
+    );
 
     fn test_app() -> App {
         let backend: AppBackend = Arc::new(HttpBackend::from_env());
@@ -1938,6 +2087,18 @@ mod tests {
         );
         app.entries.clear();
         app
+    }
+
+    fn live_like_test_app() -> App {
+        let backend: Arc<dyn EngineBackend> = Arc::new(TestBackend::default());
+        let (tx, rx) = unbounded_channel();
+        App::new(
+            backend,
+            crate::DEFAULT_ENGINE_URL.to_string(),
+            Arc::new(Mutex::new(ExperimentPanel::new())),
+            tx,
+            rx,
+        )
     }
 
     #[derive(Default)]
@@ -1970,6 +2131,44 @@ mod tests {
         lines.iter().map(line_text).collect()
     }
 
+    fn visible_transcript_text(app: &mut App, area: Rect) -> Vec<String> {
+        let lines = app.transcript_lines_for_area(area);
+        let scroll = app.sync_transcript_scroll(area, transcript_content_line_count(&lines));
+        lines
+            .iter()
+            .skip(scroll as usize)
+            .take(transcript_inner_area(area).height as usize)
+            .map(line_text)
+            .collect()
+    }
+
+    fn draw_app(app: &mut App, terminal: &mut Terminal<RatatuiTestBackend>) {
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("draw app to test backend");
+    }
+
+    fn buffer_area_text(buffer: &Buffer, area: Rect) -> String {
+        let mut out = String::new();
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn buffer_area_lines(buffer: &Buffer, area: Rect) -> Vec<String> {
+        (area.top()..area.bottom())
+            .map(|y| {
+                (area.left()..area.right())
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
     fn assert_lines_fit(lines: &[Line<'_>], width: usize) {
         for line in lines {
             assert!(
@@ -1978,6 +2177,28 @@ mod tests {
                 line_text(line)
             );
         }
+    }
+
+    fn assert_tool_prefix_alignment(lines: &[Line<'_>]) {
+        let expected = lines
+            .first()
+            .and_then(|line| line.spans.first())
+            .map(|span| span.width())
+            .expect("tool line prefix");
+        for line in lines.iter().skip(1) {
+            let actual = line
+                .spans
+                .first()
+                .map(|span| span.width())
+                .expect("tool continuation prefix");
+            assert_eq!(
+                actual,
+                expected,
+                "misaligned tool prefix: {}",
+                line_text(line)
+            );
+        }
+        assert_eq!(expected, TOOL_PREFIX_DISPLAY_WIDTH);
     }
 
     fn skill(name: &str, icon: &str) -> InstalledSkill {
@@ -2114,26 +2335,253 @@ mod tests {
         let area = Rect::new(0, 0, 40, 8);
         let mut app = test_app();
         fill_transcript(&mut app, 8);
+        let initial_lines = app.transcript_lines_for_area(area);
 
         let initial_bottom = app.transcript_max_scroll(area);
-        let initial_scroll = app.sync_transcript_scroll(area);
+        let initial_scroll =
+            app.sync_transcript_scroll(area, transcript_content_line_count(&initial_lines));
         assert_eq!(initial_scroll, initial_bottom);
         assert_eq!(app.scroll, initial_bottom);
         assert!(app.follow_output);
 
         app.entries.push(Entry::tool_result(
-            EntryRole::ToolResult,
+            ToolOutcome::Success,
             Some("run_experiment".to_string()),
             "tool output\nwith enough detail to extend the transcript and move the viewport down"
                 .to_string(),
         ));
 
         let grown_bottom = app.transcript_max_scroll(area);
-        let grown_scroll = app.sync_transcript_scroll(area);
+        let grown_lines = app.transcript_lines_for_area(area);
+        let grown_scroll =
+            app.sync_transcript_scroll(area, transcript_content_line_count(&grown_lines));
         assert!(grown_bottom > initial_bottom);
         assert_eq!(grown_scroll, grown_bottom);
         assert_eq!(app.scroll, grown_bottom);
         assert!(app.follow_output);
+    }
+
+    #[test]
+    fn follow_output_keeps_latest_transcript_line_visible_with_experiment_panel() {
+        let mut app = test_app();
+        fill_transcript(&mut app, 6);
+        app.entries.push(Entry::tool_result(
+            ToolOutcome::Success,
+            Some("run_experiment".to_string()),
+            "summary\nLATEST MARKER".to_string(),
+        ));
+        app.experiment_panel
+            .lock()
+            .expect("experiment panel")
+            .push_line("running".to_string());
+
+        let (transcript_area, experiment_area) = transcript_layout(Rect::new(0, 0, 80, 12), true);
+        assert!(experiment_area.is_some());
+
+        let visible = visible_transcript_text(&mut app, transcript_area);
+        let last_visible = visible
+            .iter()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .expect("visible transcript content");
+
+        assert!(last_visible.contains("LATEST MARKER"));
+    }
+
+    #[test]
+    fn follow_output_does_not_leave_trailing_blank_row_after_latest_entry() {
+        let area = Rect::new(0, 0, 40, 8);
+        let mut app = test_app();
+        fill_transcript(&mut app, 4);
+        app.entries.push(Entry::tool_result(
+            ToolOutcome::Success,
+            Some("exec".to_string()),
+            "LATEST MARKER".to_string(),
+        ));
+
+        let visible = visible_transcript_text(&mut app, area);
+        let last_row = visible.last().expect("visible transcript row");
+
+        assert!(last_row.contains("LATEST MARKER"));
+    }
+
+    #[test]
+    fn rendered_buffer_keeps_latest_help_lines_visible() {
+        let mut app = live_like_test_app();
+        let help = TEST_HELP_TEXT.to_string();
+        app.push_system("Connected to Fawx on http://127.0.0.1:8400 using model claude-opus-4-6.");
+        app.entries
+            .push(Entry::plain(EntryRole::Assistant, help.clone()));
+        app.entries
+            .push(Entry::plain(EntryRole::User, "/help".to_string()));
+        app.entries
+            .push(Entry::plain(EntryRole::Assistant, help.clone()));
+        let area = Rect::new(0, 0, 136, 58);
+        let body = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(10),
+                Constraint::Length(4),
+            ])
+            .split(area)[1];
+        let mut terminal =
+            Terminal::new(RatatuiTestBackend::new(area.width, area.height)).expect("terminal");
+
+        draw_app(&mut app, &mut terminal);
+
+        let inner = transcript_inner_area(body);
+        let actual = buffer_area_lines(terminal.backend().buffer(), inner)
+            .into_iter()
+            .map(|line| line.trim_end().to_string())
+            .collect::<Vec<_>>();
+        let expected = visible_transcript_text(&mut app, body);
+
+        assert_eq!(actual, expected);
+        assert!(
+            actual
+                .iter()
+                .any(|line| line.contains("/quit") && line.contains("Exit")),
+            "visible rows:\n{}",
+            actual.join("\n")
+        );
+    }
+
+    #[test]
+    fn sanitize_terminal_text_strips_ansi_and_control_sequences() {
+        let input = "\x1b[31mred\x1b[0m\rprogress\r\nnext\x07\tok";
+        let sanitized = sanitize_terminal_text(input);
+
+        assert_eq!(sanitized, "red\nprogress\nnext    ok");
+    }
+
+    #[test]
+    fn transcript_rendering_strips_terminal_control_sequences() {
+        let mut app = live_like_test_app();
+        app.entries.clear();
+        app.entries.push(Entry::tool_result(
+            ToolOutcome::Error,
+            Some("run_experiment".to_string()),
+            "\x1b[31mtool failed\x1b[0m\rcollecting baseline\r\nnext line".to_string(),
+        ));
+        app.entries.push(Entry::plain(
+            EntryRole::Assistant,
+            "Summary of `\x1b[36mrun_command\x1b[0m`:\rpath escapes working directory".to_string(),
+        ));
+        let area = Rect::new(0, 0, 100, 20);
+        let body = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(10),
+                Constraint::Length(4),
+            ])
+            .split(area)[1];
+        let inner = transcript_inner_area(body);
+        let mut terminal =
+            Terminal::new(RatatuiTestBackend::new(area.width, area.height)).expect("terminal");
+
+        draw_app(&mut app, &mut terminal);
+
+        let actual = buffer_area_lines(terminal.backend().buffer(), inner).join("\n");
+        assert!(!actual.contains('\u{1b}'));
+        assert!(!actual.contains('\r'));
+        assert!(actual.contains("tool failed"));
+        assert!(actual.contains("collecting baseline"));
+        assert!(actual.contains("Summary of run_command:"));
+        assert!(actual.contains("path escapes working directory"));
+    }
+
+    #[test]
+    fn experiment_panel_rendering_strips_terminal_control_sequences() {
+        let lines = render_panel_lines(
+            &[String::from(
+                "\x1b[32mrun_experiment\x1b[0m\rcollecting\tbaseline\r\nnext step",
+            )],
+            32,
+        );
+        let text = rendered_text(&lines).join("\n");
+
+        assert!(!text.contains('\u{1b}'));
+        assert!(!text.contains('\r'));
+        assert!(text.contains("run_experiment"));
+        assert!(text.contains("collecting    baseline"));
+        assert!(text.contains("next step"));
+    }
+
+    #[test]
+    fn trailing_blank_rows_do_not_push_latest_help_line_out_of_view() {
+        let mut app = live_like_test_app();
+        let help = format!("{TEST_HELP_TEXT}\n\n\n");
+        app.push_system("Connected to Fawx on http://127.0.0.1:8400 using model claude-opus-4-6.");
+        app.entries
+            .push(Entry::plain(EntryRole::Assistant, help.clone()));
+        app.entries
+            .push(Entry::plain(EntryRole::User, "/help".to_string()));
+        app.entries.push(Entry::plain(EntryRole::Assistant, help));
+        let area = Rect::new(0, 0, 136, 58);
+        let body = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(10),
+                Constraint::Length(4),
+            ])
+            .split(area)[1];
+        let inner = transcript_inner_area(body);
+        let mut terminal =
+            Terminal::new(RatatuiTestBackend::new(area.width, area.height)).expect("terminal");
+
+        draw_app(&mut app, &mut terminal);
+
+        let actual = buffer_area_lines(terminal.backend().buffer(), inner);
+        let last_visible = actual
+            .iter()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .expect("last visible transcript line");
+
+        assert!(last_visible.contains("/quit"));
+        assert!(last_visible.contains("Exit"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn first_help_turn_dismisses_welcome_screen() {
+        let mut app = live_like_test_app();
+        app.push_system("Connected to Fawx on embedded engine using model claude-opus-4-6.");
+        app.input = "/help".to_string();
+
+        app.submit_input();
+        app.handle_backend_event(BackendEvent::TextDelta(TEST_HELP_TEXT.to_string()));
+        app.handle_backend_event(BackendEvent::Done {
+            model: Some("claude-opus-4-6".to_string()),
+            iterations: Some(0),
+            input_tokens: None,
+            output_tokens: None,
+        });
+
+        let area = Rect::new(0, 0, 136, 58);
+        let body = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(10),
+                Constraint::Length(4),
+            ])
+            .split(area)[1];
+        let visible = visible_transcript_text(&mut app, body);
+
+        assert!(!app
+            .entries
+            .iter()
+            .any(|entry| matches!(entry.role, EntryRole::Welcome)));
+        assert!(visible.iter().any(|line| line.contains("you  › /help")));
+        assert!(visible
+            .iter()
+            .any(|line| line.contains("/quit") && line.contains("Exit")));
+        assert!(!visible
+            .iter()
+            .any(|line| line.contains("Ask Fawx anything")));
     }
 
     #[test]
@@ -2160,7 +2608,26 @@ mod tests {
             assert!(!text.contains('{'));
             assert!(lines.len() <= TOOL_USE_MAX_LINES);
             assert_lines_fit(&lines, width);
+            assert_tool_prefix_alignment(&lines);
         }
+    }
+
+    #[test]
+    fn tool_use_rendering_sanitizes_names_and_keeps_prefixes_aligned() {
+        let entry = Entry::tool_use(
+            "\x1b[31mrun_experiment\x1b[0m".to_string(),
+            json!({
+                "signal": "alignment regression coverage for wrapped tool summaries",
+            }),
+        );
+
+        let lines = render_tool_use_entry(&entry, 28);
+        let text = rendered_text(&lines).join("\n");
+
+        assert!(text.contains("▶ run_experiment"));
+        assert!(!text.contains('\u{1b}'));
+        assert_lines_fit(&lines, 28);
+        assert_tool_prefix_alignment(&lines);
     }
 
     #[test]
@@ -2192,7 +2659,7 @@ mod tests {
     #[test]
     fn short_experiment_results_render_full_output_without_notice() {
         let entry = Entry::tool_result(
-            EntryRole::ToolResult,
+            ToolOutcome::Success,
             Some("run_experiment".to_string()),
             "═══ Experiment Complete ═══\nDecision:      ✅ ACCEPT\nnode-0 Conservative score: 8.73 ← WINNER\nChain entry #7 recorded".to_string(),
         );
@@ -2213,7 +2680,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let entry = Entry::tool_result(
-            EntryRole::ToolResult,
+            ToolOutcome::Success,
             Some("run_experiment".to_string()),
             content,
         );
@@ -2235,7 +2702,7 @@ mod tests {
             .map(|index| format!("stdout line {index}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let entry = Entry::tool_result(EntryRole::ToolResult, Some("exec".to_string()), content);
+        let entry = Entry::tool_result(ToolOutcome::Success, Some("exec".to_string()), content);
 
         let lines = render_tool_result_entry(&entry, 40, false);
         let text = rendered_text(&lines).join("\n");
@@ -2254,7 +2721,7 @@ mod tests {
             .map(|index| format!("stderr line {index}: permission denied while opening file"))
             .collect::<Vec<_>>()
             .join("\n");
-        let entry = Entry::tool_result(EntryRole::ToolError, Some("read".to_string()), content);
+        let entry = Entry::tool_result(ToolOutcome::Error, Some("read".to_string()), content);
 
         let lines = render_tool_result_entry(&entry, 36, false);
         let text = rendered_text(&lines).join("\n");
@@ -2267,7 +2734,7 @@ mod tests {
     #[test]
     fn tool_result_rendering_wraps_long_url_like_output_to_width() {
         let entry = Entry::tool_result(
-            EntryRole::ToolResult,
+            ToolOutcome::Success,
             Some("read".to_string()),
             "https://example.com/a/really/long/tool/output/path/that/used/to/overflow/the/transcript/view".to_string(),
         );
@@ -2278,19 +2745,60 @@ mod tests {
     }
 
     #[test]
+    fn panel_render_clears_stale_tool_output_when_layout_narrows() {
+        let mut app = test_app();
+        app.entries.push(Entry::tool_result(
+            ToolOutcome::Success,
+            Some("exec".to_string()),
+            "Q".repeat(160),
+        ));
+        let area = Rect::new(0, 0, 80, 18);
+        let body = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(10),
+                Constraint::Length(4),
+            ])
+            .split(area)[1];
+        let (_, panel_area) = transcript_layout(body, true);
+        let panel_area = panel_area.expect("experiment panel area");
+        let mut terminal =
+            Terminal::new(RatatuiTestBackend::new(area.width, area.height)).expect("terminal");
+
+        draw_app(&mut app, &mut terminal);
+        let initial = buffer_area_text(terminal.backend().buffer(), panel_area);
+        assert!(initial.contains('Q'));
+
+        app.experiment_panel
+            .lock()
+            .expect("experiment panel")
+            .push_line("running".to_string());
+        draw_app(&mut app, &mut terminal);
+
+        let rerendered = buffer_area_text(terminal.backend().buffer(), panel_area);
+        assert!(!rerendered.contains('Q'));
+    }
+
+    #[test]
     fn scrolling_up_from_follow_mode_starts_from_current_bottom() {
         let area = Rect::new(0, 0, 40, 8);
         let mut app = test_app();
         fill_transcript(&mut app, 8);
+        let lines = app.transcript_lines_for_area(area);
 
-        let bottom = app.sync_transcript_scroll(area);
+        let bottom = app.sync_transcript_scroll(area, transcript_content_line_count(&lines));
         assert!(bottom > 0);
 
         app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
 
         assert!(!app.follow_output);
         assert_eq!(app.scroll, bottom.saturating_sub(1));
-        assert_eq!(app.sync_transcript_scroll(area), bottom.saturating_sub(1));
+        let lines = app.transcript_lines_for_area(area);
+        assert_eq!(
+            app.sync_transcript_scroll(area, transcript_content_line_count(&lines)),
+            bottom.saturating_sub(1)
+        );
     }
 
     #[test]
@@ -2311,6 +2819,34 @@ mod tests {
 
         assert_eq!(line_text(&lines[0]), INPUT_PLACEHOLDER);
         assert_eq!(line_text(&lines[1]), SHORTCUT_HINT);
+    }
+
+    #[test]
+    fn input_pane_clears_stale_text_after_submit() {
+        let mut app = test_app();
+        app.input = "persistent memory assistant experiments or approaches might be worth exploring after reading the current memory architecture".to_string();
+        let area = Rect::new(0, 0, 90, 18);
+        let input_area = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(10),
+                Constraint::Length(4),
+            ])
+            .split(area)[2];
+        let inner = Block::default().borders(Borders::ALL).inner(input_area);
+        let mut terminal =
+            Terminal::new(RatatuiTestBackend::new(area.width, area.height)).expect("terminal");
+
+        draw_app(&mut app, &mut terminal);
+
+        app.input.clear();
+        draw_app(&mut app, &mut terminal);
+
+        let actual = buffer_area_lines(terminal.backend().buffer(), inner).join("\n");
+        assert!(actual.contains(INPUT_PLACEHOLDER));
+        assert!(actual.contains(SHORTCUT_HINT));
+        assert!(!actual.contains("persistent memory assistant"));
     }
 
     #[test]
