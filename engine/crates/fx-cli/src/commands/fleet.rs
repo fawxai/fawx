@@ -374,7 +374,7 @@ impl Default for TableWidths {
 mod tests {
     use super::*;
     use axum::{
-        body::{Body, Bytes},
+        body::Bytes,
         extract::State,
         http::{header, HeaderMap, Method, StatusCode, Uri},
         response::{IntoResponse, Response},

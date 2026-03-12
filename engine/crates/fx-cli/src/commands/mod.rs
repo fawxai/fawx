@@ -2,6 +2,7 @@
 
 pub mod audit;
 pub mod auth;
+#[allow(dead_code)] // Called from binary target, not lib
 pub mod backup;
 pub mod completions;
 pub mod config;
