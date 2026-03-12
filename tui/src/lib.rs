@@ -6,6 +6,7 @@ mod app;
 pub(crate) mod credential_reader;
 #[cfg(feature = "embedded")]
 mod embedded_backend;
+pub mod experiment_panel;
 mod fawx_backend;
 mod markdown_render;
 mod render {
