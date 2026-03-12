@@ -1377,6 +1377,7 @@ exit 0
 
     #[cfg(unix)]
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // PathGuard must live across async dispatch in test
     async fn chat_command_launches_tui_in_embedded_mode() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let path_dir = tempdir.path().join("path");

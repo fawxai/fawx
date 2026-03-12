@@ -6,6 +6,7 @@
 
 mod auth_store;
 #[cfg(test)]
+#[allow(dead_code)]
 mod backup_command {
     mod implementation {
         include!("commands/backup.rs");
@@ -16,6 +17,7 @@ mod backup_command {
     }
 }
 #[cfg(test)]
+#[allow(dead_code)]
 mod import_command {
     mod implementation {
         include!("commands/import.rs");
@@ -26,14 +28,17 @@ mod import_command {
     }
 }
 #[cfg(test)]
+#[allow(dead_code)]
 mod fleet_command {
     mod implementation {
         include!("commands/fleet.rs");
     }
 }
 #[cfg(test)]
+#[allow(dead_code)]
 mod repo_root;
 #[cfg(test)]
+#[allow(dead_code)]
 mod restart;
 #[path = "commands/slash.rs"]
 pub(crate) mod slash_commands;

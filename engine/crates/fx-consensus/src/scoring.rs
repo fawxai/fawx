@@ -190,7 +190,8 @@ mod tests {
             weight: 0.5,
         }];
 
-        let scores = compute_aggregate_scores(&[candidate.clone()], &evaluations, &criteria);
+        let scores =
+            compute_aggregate_scores(std::slice::from_ref(&candidate), &evaluations, &criteria);
 
         assert_eq!(scores.get(&candidate.id), Some(&1.5));
     }
@@ -204,8 +205,11 @@ mod tests {
         let peer_eval = sample_evaluation(candidate.id, "node-b", 4.0);
         let criteria = experiment.fitness_criteria.clone();
 
-        let scores =
-            compute_aggregate_scores(&[candidate.clone()], &[self_eval, peer_eval], &criteria);
+        let scores = compute_aggregate_scores(
+            std::slice::from_ref(&candidate),
+            &[self_eval, peer_eval],
+            &criteria,
+        );
 
         assert_eq!(scores.get(&candidate.id), Some(&-4.0));
     }

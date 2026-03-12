@@ -284,7 +284,7 @@ mod tests {
 
     fn sigkill_fallback_responses() -> Vec<bool> {
         let mut responses = vec![true];
-        responses.extend(std::iter::repeat(true).take(poll_attempts(STOP_TIMEOUT) + 1));
+        responses.extend(std::iter::repeat_n(true, poll_attempts(STOP_TIMEOUT) + 1));
         responses.push(false);
         responses
     }

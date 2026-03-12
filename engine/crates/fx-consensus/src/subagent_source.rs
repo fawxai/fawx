@@ -923,8 +923,7 @@ mod tests {
                 Duration::from_millis(10),
             )
             .await
-            .err()
-            .expect("retry send should time out");
+            .expect_err("retry send should time out");
 
         assert!(error
             .to_string()
@@ -963,8 +962,7 @@ mod tests {
 
         let error = verify_build(temp.path(), Duration::from_millis(50))
             .await
-            .err()
-            .expect("cargo check should time out");
+            .expect_err("cargo check should time out");
 
         assert!(error.to_string().contains("cargo check timed out"));
     }
