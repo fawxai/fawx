@@ -1,10 +1,9 @@
 use fx_consensus::{
-    EvaluationWorkspace, Experiment, GenerationStrategy, NeutralEvaluatorConfig, NodeConfig,
-    PatchResponse, PatchSource, Signal, TestResult,
+    display_strategy, EvaluationWorkspace, Experiment, GenerationStrategy, NeutralEvaluatorConfig,
+    NodeConfig, PatchResponse, PatchSource, Signal, StrategyDisplay, TestResult,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::fmt;
 
 pub(super) fn build_nodes(count: u32) -> Vec<NodeConfig> {
     (0..count)
@@ -36,23 +35,6 @@ pub(super) fn strategy_for(index: u32) -> GenerationStrategy {
     }
 }
 
-pub(super) struct StrategyDisplay<'a>(&'a GenerationStrategy);
-
-impl fmt::Display for StrategyDisplay<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let label = match self.0 {
-            GenerationStrategy::Conservative => "Conservative",
-            GenerationStrategy::Aggressive => "Aggressive",
-            GenerationStrategy::Creative => "Creative",
-        };
-        formatter.write_str(label)
-    }
-}
-
-pub(super) fn display_strategy(strategy: &GenerationStrategy) -> StrategyDisplay<'_> {
-    StrategyDisplay(strategy)
-}
-
 pub(super) struct PlaceholderPatchSource {
     strategy: GenerationStrategy,
     node_id: fx_consensus::NodeId,
@@ -74,9 +56,9 @@ impl PatchSource for PlaceholderPatchSource {
 }
 
 fn placeholder_approach(strategy: &GenerationStrategy, experiment: &Experiment) -> String {
+    let strategy_label: StrategyDisplay<'_> = display_strategy(strategy);
     format!(
-        "{} strategy placeholder for hypothesis: {}",
-        display_strategy(strategy),
+        "{strategy_label} strategy placeholder for hypothesis: {}",
         experiment.hypothesis
     )
 }

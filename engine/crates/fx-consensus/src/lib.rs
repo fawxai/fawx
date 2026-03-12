@@ -5,6 +5,7 @@ pub mod evaluator;
 pub mod generator;
 pub mod llm_source;
 pub mod orchestrator;
+pub mod progress_format;
 pub mod protocol;
 pub mod remote_workspace;
 pub(crate) mod response_parser;
@@ -24,6 +25,7 @@ pub use generator::{
     LlmCandidateGenerator, PatchResponse, PatchSource,
 };
 pub use orchestrator::{CandidateEvaluator, CandidateGenerator};
+pub use progress_format::{display_strategy, format_progress_event, StrategyDisplay};
 pub use protocol::{ConsensusProtocol, ExperimentConfig, LocalConsensusEngine};
 pub use runner::{
     build_summary, evaluation_build_success, format_auto_chain_result, note_value, plural_suffix,
