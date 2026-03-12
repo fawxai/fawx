@@ -1,9 +1,15 @@
 pub(crate) mod fs_utils;
+pub mod http;
 pub mod manager;
 pub mod ssh;
 pub mod token;
 pub mod transport;
 
+pub use http::{
+    FleetHeartbeat, FleetHttpClient, FleetRegistrationRequest, FleetRegistrationResponse,
+    FleetTaskRequest, FleetTaskResult, FleetTaskStatus, FleetTaskType, FleetWorkerStatus,
+    WorkerState,
+};
 pub use manager::FleetManager;
 pub use ssh::SshTransport;
 pub use token::{FleetError, FleetKey, FleetToken};

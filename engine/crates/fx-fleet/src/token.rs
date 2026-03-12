@@ -35,6 +35,10 @@ pub enum FleetError {
     #[error("fleet state serialization error: {0}")]
     JsonError(#[from] serde_json::Error),
 
+    /// An HTTP request failed during fleet communication.
+    #[error("fleet HTTP error: {0}")]
+    HttpError(String),
+
     /// Attempted to register a duplicate node.
     #[error("duplicate node")]
     DuplicateNode,
