@@ -1,5 +1,5 @@
 #[cfg(feature = "embedded")]
-use crate::embedded_backend::{EmbeddedBackend, SharedExperimentPanel};
+use crate::embedded_backend::EmbeddedBackend;
 use crate::experiment_panel::ExperimentPanel;
 use crate::fawx_backend::{
     friendly_error_message, BackendEvent, EngineBackend, EngineStatus, HttpBackend,
@@ -38,6 +38,12 @@ const INPUT_PLACEHOLDER: &str = "Ask Fawx anything...";
 const SHORTCUT_HINT: &str =
     "Ctrl+C: cancel | /help: commands | /clear: clear transcript | /quit: exit";
 const THINKING_FRAMES: [&str; 3] = [".", "..", "..."];
+
+type AppBackend = Arc<dyn EngineBackend>;
+type SharedPanel = Arc<Mutex<ExperimentPanel>>;
+type BuiltBackend = (AppBackend, String, SharedPanel);
+type BackendBuildResult = anyhow::Result<BuiltBackend>;
+
 const WIDE_WELCOME_BREAKPOINT: usize = 100;
 const MEDIUM_WELCOME_BREAKPOINT: usize = 60;
 const WELCOME_COLUMN_GAP: usize = 3;
@@ -92,29 +98,27 @@ pub async fn run_tui(options: RunOptions) -> anyhow::Result<()> {
     result
 }
 
-fn build_backend(
-    options: &RunOptions,
-) -> anyhow::Result<(Arc<dyn EngineBackend>, String, Arc<Mutex<ExperimentPanel>>)> {
+fn build_backend(options: &RunOptions) -> BackendBuildResult {
     if options.embedded {
-        return build_embedded_backend();
+        build_embedded_backend()
+    } else {
+        build_http_backend(&options.host)
     }
-    Ok(build_http_backend(&options.host))
 }
 
-fn build_http_backend(host: &str) -> (Arc<dyn EngineBackend>, String, Arc<Mutex<ExperimentPanel>>) {
+fn build_http_backend(host: &str) -> BackendBuildResult {
     let backend = HttpBackend::new(host);
     let target = backend.base_url().to_string();
-    (
+    Ok((
         Arc::new(backend),
         target,
         // HTTP mode: panel stays empty (no embedded progress callback), but kept for uniform API
         Arc::new(Mutex::new(ExperimentPanel::new())),
-    )
+    ))
 }
 
 #[cfg(feature = "embedded")]
-fn build_embedded_backend(
-) -> anyhow::Result<(Arc<dyn EngineBackend>, String, SharedExperimentPanel)> {
+fn build_embedded_backend() -> BackendBuildResult {
     let (backend, experiment_panel) = EmbeddedBackend::build()?;
     Ok((
         Arc::new(backend),
@@ -124,8 +128,7 @@ fn build_embedded_backend(
 }
 
 #[cfg(not(feature = "embedded"))]
-fn build_embedded_backend(
-) -> anyhow::Result<(Arc<dyn EngineBackend>, String, Arc<Mutex<ExperimentPanel>>)> {
+fn build_embedded_backend() -> BackendBuildResult {
     Err(anyhow::anyhow!(
         "Embedded mode requires the 'embedded' feature. Build with: cargo build -p fawx-tui --features embedded"
     ))
@@ -281,9 +284,9 @@ impl Command for DisableAlternateScroll {
 }
 
 struct App {
-    backend: Arc<dyn EngineBackend>,
+    backend: AppBackend,
     connection_target: String,
-    experiment_panel: Arc<Mutex<ExperimentPanel>>,
+    experiment_panel: SharedPanel,
     tx: UnboundedSender<BackendEvent>,
     rx: UnboundedReceiver<BackendEvent>,
     entries: Vec<Entry>,
@@ -308,9 +311,9 @@ struct App {
 
 impl App {
     fn new(
-        backend: Arc<dyn EngineBackend>,
+        backend: AppBackend,
         connection_target: String,
-        experiment_panel: Arc<Mutex<ExperimentPanel>>,
+        experiment_panel: SharedPanel,
         tx: UnboundedSender<BackendEvent>,
         rx: UnboundedReceiver<BackendEvent>,
     ) -> Self {
@@ -1923,12 +1926,13 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn test_app() -> App {
-        let backend: Arc<dyn EngineBackend> = Arc::new(HttpBackend::from_env());
+        let backend: AppBackend = Arc::new(HttpBackend::from_env());
+        let experiment_panel: SharedPanel = Arc::new(Mutex::new(ExperimentPanel::new()));
         let (tx, rx) = unbounded_channel();
         let mut app = App::new(
             backend,
             crate::DEFAULT_ENGINE_URL.to_string(),
-            Arc::new(Mutex::new(ExperimentPanel::new())),
+            experiment_panel,
             tx,
             rx,
         );
@@ -2048,12 +2052,13 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn spawn_bootstrap_uses_backend_trait_health_check() {
         let backend = Arc::new(TestBackend::default());
-        let app_backend: Arc<dyn EngineBackend> = backend.clone();
+        let app_backend: AppBackend = backend.clone();
+        let experiment_panel: SharedPanel = Arc::new(Mutex::new(ExperimentPanel::new()));
         let (tx, rx) = unbounded_channel();
         let mut app = App::new(
             app_backend,
             "embedded engine".to_string(),
-            Arc::new(Mutex::new(ExperimentPanel::new())),
+            experiment_panel,
             tx,
             rx,
         );

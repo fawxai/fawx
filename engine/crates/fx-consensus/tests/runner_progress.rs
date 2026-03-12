@@ -190,6 +190,7 @@ fn sample_config() -> ExperimentConfig {
         },
         timeout: Duration::from_secs(30),
         min_candidates: 1,
+        sequential: false,
     }
 }
 
