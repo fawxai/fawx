@@ -112,6 +112,7 @@ pub(crate) fn prompt_non_empty_secret_with_surface(
     })
 }
 
+#[allow(clippy::needless_return)]
 pub(crate) fn open_browser(url: &str) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     {
