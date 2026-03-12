@@ -17,7 +17,9 @@ mod markdown;
 mod persisted_memory;
 mod prompts;
 mod proposal_review;
+#[allow(dead_code)]
 mod repo_root;
+#[allow(dead_code)]
 mod restart;
 #[allow(dead_code)]
 // TODO(#1282): narrow this once embedded/lib and CLI startup paths stop leaving target-specific helpers unused.
