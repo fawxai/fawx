@@ -6,12 +6,13 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+fx-consensus.workspace = true
 fx-core = { path = "../fx-core" }
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 reqwest.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["rt", "sync"] } # rt: progress callback spawns background task
 tracing.workspace = true
 
 [dev-dependencies]

@@ -1,6 +1,9 @@
 use crate::{check_api_response, TelegramError, DEFAULT_BASE_URL, TELEGRAM_MAX_MESSAGE_LENGTH};
+use fx_consensus::{ProgressCallback, ProgressEvent};
 use serde::Deserialize;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 const MIN_EDIT_INTERVAL: Duration = Duration::from_secs(1);
 const PROGRESS_BUFFER_LIMIT: usize = 4000;
@@ -20,6 +23,10 @@ pub struct TelegramProgressSender {
 
 impl TelegramProgressSender {
     pub fn new(bot_token: String, chat_id: i64) -> Self {
+        Self::new_with_base_url(bot_token, chat_id, DEFAULT_BASE_URL.to_string())
+    }
+
+    fn new_with_base_url(bot_token: String, chat_id: i64, base_url: String) -> Self {
         Self {
             bot_token,
             chat_id,
@@ -27,7 +34,7 @@ impl TelegramProgressSender {
             buffer: String::new(),
             last_edit: None,
             client: reqwest::Client::new(),
-            base_url: DEFAULT_BASE_URL.to_string(),
+            base_url,
         }
     }
 
@@ -113,6 +120,59 @@ impl TelegramProgressSender {
         self.last_edit
             .map(|last_edit| last_edit.elapsed() < MIN_EDIT_INTERVAL)
             .unwrap_or(false)
+    }
+}
+
+/// Build a progress callback that streams formatted experiment events into a
+/// TelegramProgressSender. The caller should drop the callback after the
+/// experiment finishes, then await the join handle to flush the final edit.
+pub fn build_telegram_progress_callback(
+    bot_token: String,
+    chat_id: i64,
+) -> (ProgressCallback, tokio::task::JoinHandle<()>) {
+    build_telegram_progress_callback_with_base_url(bot_token, chat_id, DEFAULT_BASE_URL.to_string())
+}
+
+pub(crate) fn build_telegram_progress_callback_with_base_url(
+    bot_token: String,
+    chat_id: i64,
+    base_url: String,
+) -> (ProgressCallback, tokio::task::JoinHandle<()>) {
+    let sender = TelegramProgressSender::new_with_base_url(bot_token, chat_id, base_url);
+    build_progress_callback_from_sender(sender)
+}
+
+fn build_progress_callback_from_sender(
+    sender: TelegramProgressSender,
+) -> (ProgressCallback, tokio::task::JoinHandle<()>) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let callback = build_callback_sender(tx);
+    let handle = tokio::spawn(async move {
+        forward_progress_lines(sender, rx).await;
+    });
+    (callback, handle)
+}
+
+fn build_callback_sender(tx: UnboundedSender<String>) -> ProgressCallback {
+    Arc::new(move |event: &ProgressEvent| {
+        let line = fx_consensus::format_progress_event(event);
+        let _ = tx.send(line);
+    })
+}
+
+async fn forward_progress_lines(
+    mut sender: TelegramProgressSender,
+    mut rx: UnboundedReceiver<String>,
+) {
+    while let Some(line) = rx.recv().await {
+        if let Err(error) = sender.push_line(&line).await {
+            tracing::warn!(%error, "telegram progress send failed");
+            return;
+        }
+    }
+
+    if let Err(error) = sender.flush().await {
+        tracing::warn!(%error, "telegram progress flush failed");
     }
 }
 
@@ -274,6 +334,40 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].0, "editMessageText");
         assert_eq!(requests[0].1["text"], "done");
+    }
+
+    #[tokio::test]
+    async fn progress_callback_bridge_flushes_buffered_lines() {
+        let (base_url, requests) = spawn_mock_server().await;
+        let mut sender = make_sender(&base_url);
+        sender.message_id = Some(456);
+        sender.last_edit = Some(Instant::now());
+
+        let (callback, handle) = build_progress_callback_from_sender(sender);
+        let first = ProgressEvent::RoundStarted {
+            round: 1,
+            max_rounds: 1,
+            signal: "signal".to_string(),
+        };
+        let second = ProgressEvent::BaselineCollected {
+            round: 1,
+            max_rounds: 1,
+            node_count: 2,
+        };
+        callback(&first);
+        callback(&second);
+        drop(callback);
+        handle.await.expect("join progress forwarder");
+
+        let expected = format!(
+            "{}\n{}",
+            fx_consensus::format_progress_event(&first),
+            fx_consensus::format_progress_event(&second)
+        );
+        let requests = requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, "editMessageText");
+        assert_eq!(requests[0].1["text"], expected);
     }
 
     fn make_rate_limited_sender() -> TelegramProgressSender {

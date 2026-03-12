@@ -4,7 +4,8 @@ use fx_consensus::{
     format_auto_chain_result, load_chain_history_for_signal, CargoWorkspace, ConsensusError,
     ExperimentConfig, ExperimentRunner, FitnessCriterion, GenerationStrategy, LlmPatchSource,
     MetricType, ModificationScope, NeutralEvaluatorConfig, NodeConfig, NodeId, PathPattern,
-    ProposalTier, RoundNodes, RoundNodesBuilder, Severity, Signal, SubagentPatchSource,
+    ProgressCallback, ProposalTier, RoundNodes, RoundNodesBuilder, Severity, Signal,
+    SubagentPatchSource,
 };
 use fx_llm::{ModelInfo, ModelRouter, ToolDefinition};
 use fx_subagent::SubagentControl;
@@ -131,9 +132,10 @@ pub async fn handle_run_experiment(
     subagent_control: Option<&Arc<dyn SubagentControl>>,
     working_dir: &Path,
     args: &serde_json::Value,
+    progress: Option<ProgressCallback>,
 ) -> Result<String, String> {
     let parsed = parse_run_experiment_args(args, working_dir)?;
-    let runner = build_runner(&parsed, state, subagent_control)?.with_progress(None);
+    let runner = build_runner(&parsed, state, subagent_control)?.with_progress(progress);
     let chain_result = runner
         .run_loop(build_config(&parsed), parsed.max_rounds)
         .await

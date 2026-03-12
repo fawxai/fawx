@@ -8,6 +8,8 @@
 
 pub mod progress;
 
+pub use progress::build_telegram_progress_callback;
+
 use fx_core::channel::{Channel, ChannelError, ResponseContext};
 use fx_core::types::InputSource;
 use regex::Regex;
@@ -545,6 +547,24 @@ impl TelegramChannel {
             outbound: Mutex::new(VecDeque::new()),
             base_url,
         }
+    }
+
+    /// Build a Telegram-backed experiment progress callback for one
+    /// `run_experiment` invocation in `chat_id`.
+    ///
+    /// Headless callers should install the returned callback on a short-lived
+    /// `FawxToolExecutor` or per-call tool context, drop that callback when the
+    /// tool returns, then await the join handle so the last buffered edit is
+    /// flushed to Telegram.
+    pub fn build_experiment_progress(
+        &self,
+        chat_id: i64,
+    ) -> (fx_consensus::ProgressCallback, tokio::task::JoinHandle<()>) {
+        progress::build_telegram_progress_callback_with_base_url(
+            self.config.bot_token.clone(),
+            chat_id,
+            self.base_url.clone(),
+        )
     }
 
     /// Build the Bot API URL for a given method.

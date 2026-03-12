@@ -3,6 +3,7 @@ use crate::experiment_tool::{
 };
 use async_trait::async_trait;
 use fx_config::manager::ConfigManager;
+use fx_consensus::ProgressCallback;
 use fx_core::memory::MemoryStore;
 use fx_core::runtime_info::RuntimeInfo;
 use fx_core::self_modify::{classify_path, format_tier_violation, PathTier, SelfModifyConfig};
@@ -70,6 +71,7 @@ pub struct FawxToolExecutor {
     start_time: std::time::Instant,
     subagent_control: Option<Arc<dyn SubagentControl>>,
     experiment: Option<ExperimentToolState>,
+    experiment_progress: Option<ProgressCallback>,
     node_run: Option<crate::node_run::NodeRunState>,
     #[cfg(feature = "improvement")]
     improvement: Option<crate::improvement_tools::ImprovementToolsState>,
@@ -117,6 +119,7 @@ impl FawxToolExecutor {
             start_time: std::time::Instant::now(),
             subagent_control: None,
             experiment: None,
+            experiment_progress: None,
             node_run: None,
             #[cfg(feature = "improvement")]
             improvement: None,
@@ -169,6 +172,12 @@ impl FawxToolExecutor {
     /// Attach experiment execution state for run_experiment.
     pub fn with_experiment(mut self, state: ExperimentToolState) -> Self {
         self.experiment = Some(state);
+        self
+    }
+
+    /// Attach an experiment progress callback for run_experiment.
+    pub fn with_experiment_progress(mut self, progress: ProgressCallback) -> Self {
+        self.experiment_progress = Some(progress);
         self
     }
 
@@ -916,6 +925,7 @@ impl FawxToolExecutor {
             self.subagent_control.as_ref(),
             &self.working_dir,
             args,
+            self.experiment_progress.clone(),
         )
         .await
     }
@@ -1295,7 +1305,8 @@ impl std::fmt::Debug for FawxToolExecutor {
             .field("concurrency_policy", &self.concurrency_policy)
             .field("config_manager", &self.config_manager.is_some())
             .field("subagent_control", &self.subagent_control.is_some())
-            .field("experiment", &self.experiment.is_some());
+            .field("experiment", &self.experiment.is_some())
+            .field("experiment_progress", &self.experiment_progress.is_some());
         #[cfg(feature = "improvement")]
         debug.field("improvement", &self.improvement.is_some());
         debug.finish()
@@ -2402,8 +2413,11 @@ pub fn config_tool_definitions() -> Vec<ToolDefinition> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fx_config::FawxConfig;
+    use fx_consensus::ProgressEvent;
     use fx_core::memory::{MemoryProvider, MemoryTouchProvider};
     use fx_embeddings::{test_support::create_test_model_dir, EmbeddingModel};
+    use fx_llm::ModelRouter;
     use fx_memory::embedding_index::EmbeddingIndex;
     use fx_subagent::{test_support::StubSubagentControl, SubagentStatus};
     use tempfile::TempDir;
@@ -2493,6 +2507,14 @@ mod tests {
         control: Arc<dyn SubagentControl>,
     ) -> FawxToolExecutor {
         test_executor(root).with_subagent_control(control)
+    }
+
+    fn experiment_state(root: &Path) -> ExperimentToolState {
+        ExperimentToolState {
+            chain_path: root.join("chain.json"),
+            router: Arc::new(ModelRouter::new()),
+            config: FawxConfig::default(),
+        }
     }
 
     #[test]
@@ -3634,6 +3656,38 @@ three
         assert!(with_experiment
             .iter()
             .any(|tool| tool.name == "run_experiment"));
+    }
+
+    #[tokio::test]
+    async fn run_experiment_uses_executor_progress_callback() {
+        let temp = TempDir::new().expect("tempdir");
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let events = Arc::clone(&recorded);
+        let executor = test_executor(temp.path())
+            .with_experiment(experiment_state(temp.path()))
+            .with_experiment_progress(Arc::new(move |event: &ProgressEvent| {
+                events.lock().expect("progress lock").push(event.clone());
+            }));
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "run_experiment".to_string(),
+            arguments: serde_json::json!({
+                "signal": "signal",
+                "hypothesis": "test hypothesis",
+                "mode": "placeholder",
+                "nodes": 1,
+                "project": temp.path().display().to_string(),
+            }),
+        };
+
+        let result = executor.execute_call(&call, None).await;
+        let events = recorded.lock().expect("progress lock").clone();
+
+        assert!(result.success, "{}", result.output);
+        assert!(matches!(
+            events.first(),
+            Some(ProgressEvent::RoundStarted { .. })
+        ));
     }
 
     #[test]
