@@ -478,6 +478,7 @@ fn sample_config(min_candidates: u32) -> ExperimentConfig {
         },
         timeout: Duration::from_secs(30),
         min_candidates,
+        sequential: false,
     }
 }
 

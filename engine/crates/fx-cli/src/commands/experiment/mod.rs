@@ -58,6 +58,10 @@ pub enum ExperimentCommands {
         #[arg(long)]
         project: Option<String>,
 
+        /// Run node generation and evaluation one at a time
+        #[arg(long)]
+        sequential: bool,
+
         /// Maximum rounds for auto-chain loop (default: 1, preserves single-shot behavior)
         #[arg(
             long,
@@ -100,6 +104,7 @@ pub async fn run(command: ExperimentCommands) -> anyhow::Result<String> {
             timeout,
             mode,
             project,
+            sequential,
             max_rounds,
         } => {
             run_experiment(
@@ -111,6 +116,7 @@ pub async fn run(command: ExperimentCommands) -> anyhow::Result<String> {
                     timeout,
                     mode,
                     project,
+                    sequential,
                 },
                 max_rounds,
             )
@@ -137,6 +143,7 @@ pub struct RunExperimentArgs {
     pub timeout: u64,
     pub mode: ExperimentNodeMode,
     pub project: Option<String>,
+    pub sequential: bool,
 }
 
 pub async fn run_experiment(args: RunExperimentArgs, max_rounds: u32) -> anyhow::Result<String> {
@@ -483,6 +490,7 @@ fn build_config(args: &RunExperimentArgs) -> anyhow::Result<ExperimentConfig> {
         scope: build_scope(&args.scope),
         timeout: Duration::from_secs(args.timeout),
         min_candidates: args.nodes,
+        sequential: args.sequential,
     })
 }
 
@@ -636,6 +644,7 @@ mod tests {
                 timeout: 120,
                 mode: ExperimentNodeMode::Placeholder,
                 project: None,
+                sequential: false,
             },
             chain_path.clone(),
             1,
@@ -704,6 +713,7 @@ mod tests {
             timeout: 120,
             mode: ExperimentNodeMode::Placeholder,
             project: None,
+            sequential: false,
         };
 
         let output = format_experiment_report(&args, &report);
@@ -838,6 +848,7 @@ mod tests {
                 timeout: 120,
                 mode: ExperimentNodeMode::Placeholder,
                 project: None,
+                sequential: false,
             },
             chain_path,
             1,
@@ -984,6 +995,33 @@ mod tests {
             ExperimentCommands::Run { mode, project, .. } => {
                 assert_eq!(mode, ExperimentNodeMode::Subagent);
                 assert_eq!(project.as_deref(), Some("/tmp/demo"));
+            }
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn cli_parser_accepts_sequential_flag() {
+        #[derive(Debug, Parser)]
+        struct TestCli {
+            #[command(subcommand)]
+            command: ExperimentCommands,
+        }
+
+        let cli = TestCli::try_parse_from([
+            "experiment",
+            "run",
+            "--signal",
+            "latency",
+            "--hypothesis",
+            "parallelism helps",
+            "--sequential",
+        ])
+        .expect("parse experiment cli");
+
+        match cli.command {
+            ExperimentCommands::Run { sequential, .. } => {
+                assert!(sequential);
             }
             _ => panic!("expected run command"),
         }

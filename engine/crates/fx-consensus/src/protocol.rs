@@ -23,6 +23,8 @@ pub struct ExperimentConfig {
     #[serde(with = "duration_serde")]
     pub timeout: Duration,
     pub min_candidates: u32,
+    #[serde(default)]
+    pub sequential: bool,
 }
 
 #[async_trait]
@@ -348,6 +350,22 @@ mod tests {
         assert_eq!(result.decision, crate::types::Decision::Inconclusive);
     }
 
+    #[test]
+    fn experiment_config_defaults_sequential_to_false() {
+        let experiment = sample_experiment();
+        let config: ExperimentConfig = serde_json::from_value(serde_json::json!({
+            "signal": experiment.trigger,
+            "hypothesis": experiment.hypothesis,
+            "fitness_criteria": experiment.fitness_criteria,
+            "scope": experiment.scope,
+            "timeout": {"secs": experiment.timeout.as_secs(), "nanos": 0},
+            "min_candidates": 1
+        }))
+        .expect("deserialize config");
+
+        assert!(!config.sequential);
+    }
+
     fn sample_config(min_candidates: u32) -> ExperimentConfig {
         let experiment = sample_experiment();
         ExperimentConfig {
@@ -357,6 +375,7 @@ mod tests {
             scope: experiment.scope,
             timeout: experiment.timeout,
             min_candidates,
+            sequential: false,
         }
     }
 

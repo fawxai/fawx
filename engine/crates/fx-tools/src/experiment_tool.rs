@@ -34,6 +34,8 @@ pub struct RunExperimentArgs {
     #[serde(default = "default_timeout")]
     pub timeout: u64,
     pub project: Option<PathBuf>,
+    #[serde(default)]
+    pub sequential: bool,
     #[serde(default = "default_max_rounds")]
     pub max_rounds: u32,
 }
@@ -81,6 +83,10 @@ pub fn run_experiment_tool_definition() -> ToolDefinition {
                 "project": {
                     "type": "string",
                     "description": "Cargo project directory. Defaults to the current working directory"
+                },
+                "sequential": {
+                    "type": "boolean",
+                    "description": "Run node generation and evaluation one at a time. Default: false"
                 },
                 "max_rounds": {
                     "type": "integer",
@@ -422,6 +428,7 @@ fn build_config(args: &RunExperimentArgs) -> ExperimentConfig {
         },
         timeout: Duration::from_secs(args.timeout),
         min_candidates: args.nodes,
+        sequential: args.sequential,
     }
 }
 
@@ -606,6 +613,7 @@ mod tests {
         assert_eq!(parsed.mode, ExperimentNodeMode::Subagent);
         assert_eq!(parsed.project.as_deref(), Some(temp.path()));
         assert_eq!(parsed.nodes, 3);
+        assert!(!parsed.sequential);
     }
 
     #[test]
@@ -624,6 +632,22 @@ mod tests {
         )
         .expect("parse");
         assert_eq!(parsed.mode, ExperimentNodeMode::Placeholder);
+    }
+
+    #[test]
+    fn parse_args_accepts_sequential_mode() {
+        let temp = TempDir::new().expect("tempdir");
+        let parsed = parse_run_experiment_args(
+            &serde_json::json!({
+                "signal": "latency",
+                "hypothesis": "parallelism helps",
+                "sequential": true
+            }),
+            temp.path(),
+        )
+        .expect("parse args");
+
+        assert!(parsed.sequential);
     }
 
     #[test]

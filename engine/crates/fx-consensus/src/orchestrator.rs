@@ -19,9 +19,18 @@ impl<'a, E: ConsensusProtocol> ExperimentOrchestrator<'a, E> {
         generators: &[Box<dyn CandidateGenerator>],
         evaluators: &[Box<dyn CandidateEvaluator>],
     ) -> Result<ConsensusResult> {
+        let sequential = config.sequential;
         let experiment = self.engine.create_experiment(config).await?;
-        let candidates = generate_candidates(self.engine, &experiment, generators).await?;
-        evaluate_candidates(self.engine, &experiment, &candidates, evaluators).await?;
+        let candidates =
+            generate_candidates(self.engine, &experiment, generators, sequential).await?;
+        evaluate_candidates(
+            self.engine,
+            &experiment,
+            &candidates,
+            evaluators,
+            sequential,
+        )
+        .await?;
         self.engine.finalize(experiment.id).await
     }
 }
@@ -42,14 +51,37 @@ async fn generate_candidates<E: ConsensusProtocol>(
     engine: &E,
     experiment: &Experiment,
     generators: &[Box<dyn CandidateGenerator>],
+    sequential: bool,
 ) -> Result<Vec<Candidate>> {
-    let candidates = try_join_all(
+    let candidates = if sequential {
+        generate_candidates_sequential(experiment, generators).await?
+    } else {
+        generate_candidates_parallel(experiment, generators).await?
+    };
+    submit_candidates(engine, &candidates).await?;
+    Ok(candidates)
+}
+
+async fn generate_candidates_parallel(
+    experiment: &Experiment,
+    generators: &[Box<dyn CandidateGenerator>],
+) -> Result<Vec<Candidate>> {
+    try_join_all(
         generators
             .iter()
             .map(|generator| async move { generator.generate(experiment).await }),
     )
-    .await?;
-    submit_candidates(engine, &candidates).await?;
+    .await
+}
+
+async fn generate_candidates_sequential(
+    experiment: &Experiment,
+    generators: &[Box<dyn CandidateGenerator>],
+) -> Result<Vec<Candidate>> {
+    let mut candidates = Vec::with_capacity(generators.len());
+    for generator in generators {
+        candidates.push(generator.generate(experiment).await?);
+    }
     Ok(candidates)
 }
 
@@ -58,15 +90,30 @@ async fn evaluate_candidates<E: ConsensusProtocol>(
     experiment: &Experiment,
     candidates: &[Candidate],
     evaluators: &[Box<dyn CandidateEvaluator>],
+    sequential: bool,
 ) -> Result<()> {
     for candidate in candidates {
-        let evaluations = generate_evaluations(experiment, candidate, evaluators).await?;
+        let evaluations =
+            generate_evaluations(experiment, candidate, evaluators, sequential).await?;
         submit_evaluations(engine, &evaluations).await?;
     }
     Ok(())
 }
 
 async fn generate_evaluations(
+    experiment: &Experiment,
+    candidate: &Candidate,
+    evaluators: &[Box<dyn CandidateEvaluator>],
+    sequential: bool,
+) -> Result<Vec<Evaluation>> {
+    if sequential {
+        generate_evaluations_sequential(experiment, candidate, evaluators).await
+    } else {
+        generate_evaluations_parallel(experiment, candidate, evaluators).await
+    }
+}
+
+async fn generate_evaluations_parallel(
     experiment: &Experiment,
     candidate: &Candidate,
     evaluators: &[Box<dyn CandidateEvaluator>],
@@ -78,6 +125,21 @@ async fn generate_evaluations(
             .map(|evaluator| async move { evaluator.evaluate(experiment, candidate).await }),
     )
     .await
+}
+
+async fn generate_evaluations_sequential(
+    experiment: &Experiment,
+    candidate: &Candidate,
+    evaluators: &[Box<dyn CandidateEvaluator>],
+) -> Result<Vec<Evaluation>> {
+    let mut evaluations = Vec::with_capacity(evaluators.len());
+    for evaluator in evaluators {
+        if evaluator.node_id() == &candidate.node_id {
+            continue;
+        }
+        evaluations.push(evaluator.evaluate(experiment, candidate).await?);
+    }
+    Ok(evaluations)
 }
 
 async fn submit_candidates<E: ConsensusProtocol>(
@@ -174,7 +236,7 @@ mod tests {
             }),
         ];
 
-        let evaluations = generate_evaluations(&experiment, &candidate, &evaluators)
+        let evaluations = generate_evaluations(&experiment, &candidate, &evaluators, false)
             .await
             .expect("evaluations");
 
@@ -232,6 +294,7 @@ mod tests {
             scope: experiment.scope,
             timeout: experiment.timeout,
             min_candidates,
+            sequential: false,
         }
     }
 

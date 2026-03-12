@@ -564,6 +564,65 @@ mod tests {
             .all(|evaluation| evaluation.evaluator_id != NodeId::from("neutral-evaluator")));
     }
 
+    #[tokio::test]
+    async fn sequential_mode_matches_parallel_placeholder_results() {
+        let parallel_report = multi_node_runner(temp_path())
+            .run(sample_config())
+            .await
+            .expect("parallel run");
+        let mut sequential_config = sample_config();
+        sequential_config.sequential = true;
+        let sequential_report = multi_node_runner(temp_path())
+            .run(sequential_config)
+            .await
+            .expect("sequential run");
+
+        assert_eq!(
+            parallel_report.result.decision,
+            sequential_report.result.decision
+        );
+        assert_eq!(parallel_report.result.evaluations.len(), 6);
+        assert_eq!(
+            parallel_report.result.evaluations.len(),
+            sequential_report.result.evaluations.len()
+        );
+        assert_eq!(
+            candidate_outcomes(&parallel_report),
+            candidate_outcomes(&sequential_report)
+        );
+    }
+
+    fn candidate_outcomes(
+        report: &ExperimentReport,
+    ) -> Vec<(NodeId, GenerationStrategy, String, f64, bool)> {
+        report
+            .candidates
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.node_id.clone(),
+                    candidate.strategy.clone(),
+                    candidate.approach.clone(),
+                    candidate.aggregate_score,
+                    candidate.is_winner,
+                )
+            })
+            .collect()
+    }
+
+    fn multi_node_runner(path: PathBuf) -> ExperimentRunner {
+        ExperimentRunner::with_nodes(
+            path,
+            vec![
+                node("node-a", GenerationStrategy::Conservative),
+                node("node-b", GenerationStrategy::Aggressive),
+                node("node-c", GenerationStrategy::Creative),
+            ],
+            None,
+        )
+        .expect("runner")
+    }
+
     fn node(node_id: &str, strategy: GenerationStrategy) -> NodeConfig {
         NodeConfig {
             node_id: NodeId::from(node_id),
@@ -641,6 +700,7 @@ mod tests {
             },
             timeout: Duration::from_secs(30),
             min_candidates: 3,
+            sequential: false,
         }
     }
 
@@ -830,6 +890,7 @@ mod tests {
             },
             timeout: Duration::from_secs(30),
             min_candidates: 1,
+            sequential: false,
         }
     }
 
