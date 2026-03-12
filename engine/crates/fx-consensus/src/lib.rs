@@ -22,12 +22,13 @@ pub use generator::{
     aggressive_prompt, conservative_prompt, creative_prompt, GenerationStrategy,
     LlmCandidateGenerator, PatchResponse, PatchSource,
 };
-pub use orchestrator::{CandidateEvaluator, CandidateGenerator, ExperimentOrchestrator};
+pub use orchestrator::{CandidateEvaluator, CandidateGenerator};
 pub use protocol::{ConsensusProtocol, ExperimentConfig, LocalConsensusEngine};
 pub use runner::{
-    format_auto_chain_result, validate_auto_chain_rounds, AutoChainResult, CandidateReport,
-    ExperimentReport, ExperimentRunner, NeutralEvaluatorConfig, NodeConfig, RoundNodes,
-    RoundNodesBuilder,
+    build_summary, evaluation_build_success, format_auto_chain_result, note_value, plural_suffix,
+    validate_auto_chain_rounds, AutoChainResult, BuildOutcome, BuildSummary, CandidateReport,
+    ExperimentReport, ExperimentRunner, NeutralEvaluatorConfig, NodeConfig, ProgressCallback,
+    ProgressEvent, RoundNodes, RoundNodesBuilder,
 };
 pub use scoring::{compute_aggregate_scores, determine_winner};
 pub use types::{

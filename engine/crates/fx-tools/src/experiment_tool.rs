@@ -133,7 +133,7 @@ pub async fn handle_run_experiment(
     args: &serde_json::Value,
 ) -> Result<String, String> {
     let parsed = parse_run_experiment_args(args, working_dir)?;
-    let runner = build_runner(&parsed, state, subagent_control)?;
+    let runner = build_runner(&parsed, state, subagent_control)?.with_progress(None);
     let chain_result = runner
         .run_loop(build_config(&parsed), parsed.max_rounds)
         .await

@@ -6,7 +6,7 @@ use fx_consensus::{
     format_auto_chain_result, load_chain_history_for_signal, CargoWorkspace, Chain, ChainStorage,
     ConsensusError, ExperimentConfig, ExperimentRunner, FitnessCriterion, JsonFileChainStorage,
     LlmPatchSource, MetricType, ModificationScope, NeutralEvaluatorConfig, PathPattern,
-    ProposalTier, RoundNodes, RoundNodesBuilder, Signal, SubagentPatchSource,
+    ProgressCallback, ProposalTier, RoundNodes, RoundNodesBuilder, Signal, SubagentPatchSource,
 };
 use fx_llm::ModelRouter;
 use fx_subagent::{SubagentControl, SubagentLimits, SubagentManager, SubagentManagerDeps};
@@ -21,6 +21,7 @@ mod placeholders;
 
 use format::{
     format_chain_entries, format_chain_entry, format_chain_entry_detail, format_experiment_report,
+    render_progress_event,
 };
 use placeholders::build_nodes;
 
@@ -69,6 +70,10 @@ pub enum ExperimentCommands {
             value_parser = clap::value_parser!(u32).range(1..)
         )]
         max_rounds: u32,
+
+        /// Stream experiment progress to stderr
+        #[arg(long)]
+        verbose: bool,
     },
 
     /// View the consensus chain
@@ -106,6 +111,7 @@ pub async fn run(command: ExperimentCommands) -> anyhow::Result<String> {
             project,
             sequential,
             max_rounds,
+            verbose,
         } => {
             run_experiment(
                 RunExperimentArgs {
@@ -117,6 +123,7 @@ pub async fn run(command: ExperimentCommands) -> anyhow::Result<String> {
                     mode,
                     project,
                     sequential,
+                    verbose,
                 },
                 max_rounds,
             )
@@ -144,6 +151,7 @@ pub struct RunExperimentArgs {
     pub mode: ExperimentNodeMode,
     pub project: Option<String>,
     pub sequential: bool,
+    pub verbose: bool,
 }
 
 pub async fn run_experiment(args: RunExperimentArgs, max_rounds: u32) -> anyhow::Result<String> {
@@ -156,11 +164,18 @@ async fn run_experiment_with_path(
     max_rounds: u32,
 ) -> anyhow::Result<String> {
     ensure_chain_parent_dir(&chain_path)?;
-    let runner = build_runner(&args, chain_path)?;
+    let runner = build_runner(&args, chain_path)?.with_progress(build_progress_callback(&args));
     let chain_result = runner.run_loop(build_config(&args)?, max_rounds).await?;
     Ok(format_auto_chain_result(&chain_result, |report| {
         format_experiment_report(&args, report)
     }))
+}
+
+fn build_progress_callback(args: &RunExperimentArgs) -> Option<ProgressCallback> {
+    if !args.verbose {
+        return None;
+    }
+    Some(Arc::new(render_progress_event))
 }
 
 fn build_runner(args: &RunExperimentArgs, chain_path: PathBuf) -> anyhow::Result<ExperimentRunner> {

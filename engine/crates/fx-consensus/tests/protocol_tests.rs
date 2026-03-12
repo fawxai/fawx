@@ -1,10 +1,11 @@
 use async_trait::async_trait;
 use chrono::Utc;
+use fx_consensus::orchestrator::ExperimentOrchestrator;
 use fx_consensus::{
     Candidate, CandidateEvaluator, CandidateGenerator, ConsensusError, ConsensusProtocol, Decision,
-    Evaluation, Experiment, ExperimentConfig, ExperimentOrchestrator, FitnessCriterion,
-    JsonFileChainStorage, LocalConsensusEngine, MetricType, ModificationScope, NodeId, PathPattern,
-    ProposalTier, Severity, Signal,
+    Evaluation, Experiment, ExperimentConfig, FitnessCriterion, JsonFileChainStorage,
+    LocalConsensusEngine, MetricType, ModificationScope, NodeId, PathPattern, ProposalTier,
+    Severity, Signal,
 };
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};

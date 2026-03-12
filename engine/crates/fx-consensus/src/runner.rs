@@ -2,16 +2,207 @@ use crate::chain::JsonFileChainStorage;
 use crate::error::ConsensusError;
 use crate::evaluator::{BuildTestEvaluator, EvaluationWorkspace};
 use crate::generator::{GenerationStrategy, LlmCandidateGenerator, PatchSource};
-use crate::orchestrator::{CandidateEvaluator, CandidateGenerator, ExperimentOrchestrator};
+use crate::orchestrator::{
+    evaluate_candidates, generate_candidates, node_strategy, CandidateEvaluator,
+    CandidateGenerator, OrchestrationProgress,
+};
 use crate::protocol::{ConsensusProtocol, ExperimentConfig, LocalConsensusEngine};
-use crate::types::{Candidate, ConsensusResult, Decision, NodeId};
+use crate::types::{Candidate, ConsensusResult, Decision, Evaluation, NodeId};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+pub type ProgressCallback = Arc<dyn Fn(&ProgressEvent) + Send + Sync>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProgressEvent {
+    RoundStarted {
+        round: u32,
+        max_rounds: u32,
+        signal: String,
+    },
+    BaselineCollected {
+        round: u32,
+        max_rounds: u32,
+        node_count: usize,
+    },
+    NodeStarted {
+        round: u32,
+        max_rounds: u32,
+        node_id: NodeId,
+        strategy: GenerationStrategy,
+    },
+    PatchGenerated {
+        round: u32,
+        max_rounds: u32,
+        node_id: NodeId,
+    },
+    BuildVerifying {
+        round: u32,
+        max_rounds: u32,
+        node_id: NodeId,
+    },
+    BuildResult {
+        round: u32,
+        max_rounds: u32,
+        node_id: NodeId,
+        passed: usize,
+        total: usize,
+    },
+    EvaluationStarted {
+        round: u32,
+        max_rounds: u32,
+        node_id: NodeId,
+    },
+    EvaluationComplete {
+        round: u32,
+        max_rounds: u32,
+        node_id: NodeId,
+        evaluated: usize,
+    },
+    ScoringComplete {
+        round: u32,
+        max_rounds: u32,
+        decision: Decision,
+        winner: Option<NodeId>,
+    },
+    RoundComplete {
+        round: u32,
+        max_rounds: u32,
+        decision: Decision,
+        continuing: bool,
+    },
+    ChainRecorded {
+        round: u32,
+        max_rounds: u32,
+        entry_index: u64,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RoundProgress {
+    round: u32,
+    max_rounds: u32,
+}
+
+impl RoundProgress {
+    pub(crate) fn new(round: u32, max_rounds: u32) -> Self {
+        Self { round, max_rounds }
+    }
+
+    pub(crate) fn single() -> Self {
+        Self::new(1, 1)
+    }
+
+    pub(crate) fn round_started(self, signal: &str) -> ProgressEvent {
+        ProgressEvent::RoundStarted {
+            round: self.round,
+            max_rounds: self.max_rounds,
+            signal: signal.to_owned(),
+        }
+    }
+
+    pub(crate) fn baseline_collected(self, node_count: usize) -> ProgressEvent {
+        ProgressEvent::BaselineCollected {
+            round: self.round,
+            max_rounds: self.max_rounds,
+            node_count,
+        }
+    }
+
+    pub(crate) fn node_started(
+        self,
+        node_id: NodeId,
+        strategy: GenerationStrategy,
+    ) -> ProgressEvent {
+        ProgressEvent::NodeStarted {
+            round: self.round,
+            max_rounds: self.max_rounds,
+            node_id,
+            strategy,
+        }
+    }
+
+    pub(crate) fn patch_generated(self, node_id: NodeId) -> ProgressEvent {
+        ProgressEvent::PatchGenerated {
+            round: self.round,
+            max_rounds: self.max_rounds,
+            node_id,
+        }
+    }
+
+    pub(crate) fn build_verifying(self, node_id: NodeId) -> ProgressEvent {
+        ProgressEvent::BuildVerifying {
+            round: self.round,
+            max_rounds: self.max_rounds,
+            node_id,
+        }
+    }
+
+    pub(crate) fn build_result(
+        self,
+        node_id: NodeId,
+        passed: usize,
+        total: usize,
+    ) -> ProgressEvent {
+        ProgressEvent::BuildResult {
+            round: self.round,
+            max_rounds: self.max_rounds,
+            node_id,
+            passed,
+            total,
+        }
+    }
+
+    pub(crate) fn evaluation_started(self, node_id: NodeId) -> ProgressEvent {
+        ProgressEvent::EvaluationStarted {
+            round: self.round,
+            max_rounds: self.max_rounds,
+            node_id,
+        }
+    }
+
+    pub(crate) fn evaluation_complete(self, node_id: NodeId, evaluated: usize) -> ProgressEvent {
+        ProgressEvent::EvaluationComplete {
+            round: self.round,
+            max_rounds: self.max_rounds,
+            node_id,
+            evaluated,
+        }
+    }
+
+    pub(crate) fn scoring_complete(self, result: &ConsensusResult) -> ProgressEvent {
+        ProgressEvent::ScoringComplete {
+            round: self.round,
+            max_rounds: self.max_rounds,
+            decision: result.decision.clone(),
+            winner: winner_node(result),
+        }
+    }
+
+    pub(crate) fn round_complete(self, decision: Decision, continuing: bool) -> ProgressEvent {
+        ProgressEvent::RoundComplete {
+            round: self.round,
+            max_rounds: self.max_rounds,
+            decision,
+            continuing,
+        }
+    }
+
+    pub(crate) fn chain_recorded(self, entry_index: u64) -> ProgressEvent {
+        ProgressEvent::ChainRecorded {
+            round: self.round,
+            max_rounds: self.max_rounds,
+            entry_index,
+        }
+    }
+}
 
 pub struct ExperimentRunner {
     engine: LocalConsensusEngine,
     storage_path: PathBuf,
     node_provider: NodeProvider,
+    progress: Option<ProgressCallback>,
 }
 
 pub struct NodeConfig {
@@ -132,16 +323,87 @@ fn auto_chain_summary(result: &AutoChainResult) -> String {
         "═══ Auto-chain complete: {} after {} round{} ═══",
         final_decision,
         result.rounds_completed,
-        plural_suffix(result.rounds_completed),
+        plural_suffix(u64::from(result.rounds_completed)),
     )
 }
 
-fn plural_suffix(rounds_completed: u32) -> &'static str {
-    if rounds_completed == 1 {
+pub fn plural_suffix(count: u64) -> &'static str {
+    if count == 1 {
         ""
     } else {
         "s"
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuildSummary {
+    pub passed: usize,
+    pub total: usize,
+}
+
+impl BuildSummary {
+    pub fn from_counts(passed: usize, total: usize) -> Self {
+        Self { passed, total }
+    }
+
+    pub fn outcome(self) -> BuildOutcome {
+        if self.total == 0 {
+            return BuildOutcome::Skipped;
+        }
+        if self.passed == self.total {
+            return BuildOutcome::Passed;
+        }
+        BuildOutcome::Failed {
+            failed: self.total.saturating_sub(self.passed),
+            total: self.total,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildOutcome {
+    Skipped,
+    Passed,
+    Failed { failed: usize, total: usize },
+}
+
+pub fn build_summary(evaluations: &[Evaluation]) -> BuildSummary {
+    let passed = evaluations
+        .iter()
+        .filter(|evaluation| evaluation_build_success(evaluation))
+        .count();
+    BuildSummary::from_counts(passed, evaluations.len())
+}
+
+pub fn evaluation_build_success(evaluation: &Evaluation) -> bool {
+    build_ok_note(&evaluation.notes).unwrap_or_else(|| {
+        evaluation
+            .fitness_scores
+            .get("build_success")
+            .copied()
+            .unwrap_or(0.0)
+            > 0.0
+    })
+}
+
+fn build_ok_note(notes: &str) -> Option<bool> {
+    note_value(notes, "build_ok").and_then(|value| match value {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    })
+}
+
+/// Extract a value from semicolon-separated `key=value` notes.
+pub fn note_value<'a>(notes: &'a str, key: &str) -> Option<&'a str> {
+    notes.split(';').map(str::trim).find_map(|segment| {
+        let (name, value) = segment.split_once('=')?;
+        if name.trim() == key {
+            Some(value.trim())
+        } else {
+            None
+        }
+    })
 }
 
 impl ExperimentRunner {
@@ -160,6 +422,7 @@ impl ExperimentRunner {
             engine,
             storage_path,
             node_provider: NodeProvider::Fixed(build_nodes(nodes, neutral_evaluator)),
+            progress: None,
         })
     }
 
@@ -176,16 +439,21 @@ impl ExperimentRunner {
             engine,
             storage_path,
             node_provider: NodeProvider::Builder(Box::new(builder)),
+            progress: None,
         })
     }
 
+    pub fn with_progress(mut self, progress: Option<ProgressCallback>) -> Self {
+        self.progress = progress;
+        self
+    }
+
     pub async fn run(&self, config: ExperimentConfig) -> Result<ExperimentReport, ConsensusError> {
-        let nodes = self.active_nodes(&config.signal.name)?;
-        let orchestrator = ExperimentOrchestrator::new(&self.engine);
-        let result = orchestrator
-            .run_experiment(config, nodes.generators(), nodes.evaluators())
-            .await?;
-        build_report(&self.engine, nodes.strategies(), result).await
+        let round = RoundProgress::single();
+        self.emit(round.round_started(&config.signal.name));
+        let report = self.run_round(config, round).await?;
+        self.emit(round.round_complete(report.result.decision.clone(), false));
+        Ok(report)
     }
 
     pub async fn run_loop(
@@ -195,9 +463,13 @@ impl ExperimentRunner {
     ) -> Result<AutoChainResult, ConsensusError> {
         validate_auto_chain_rounds(max_rounds)?;
         let mut reports = Vec::new();
-        for _ in 1..=max_rounds {
-            let report = self.run(config.clone()).await?;
+        for round_index in 1..=max_rounds {
+            let round = RoundProgress::new(round_index, max_rounds);
+            self.emit(round.round_started(&config.signal.name));
+            let report = self.run_round(config.clone(), round).await?;
             let should_stop = report.should_stop_auto_chain();
+            let continuing = !should_stop && round_index < max_rounds;
+            self.emit(round.round_complete(report.result.decision.clone(), continuing));
             reports.push(report);
             if should_stop {
                 break;
@@ -221,6 +493,47 @@ impl ExperimentRunner {
                 )))
             }
         }
+    }
+
+    async fn run_round(
+        &self,
+        config: ExperimentConfig,
+        round: RoundProgress,
+    ) -> Result<ExperimentReport, ConsensusError> {
+        let nodes = self.active_nodes(&config.signal.name)?;
+        let progress = self
+            .progress
+            .as_ref()
+            .map(|callback| OrchestrationProgress::new(round, nodes.strategies(), callback));
+        self.emit(round.baseline_collected(nodes.generator_count()));
+        let sequential = config.sequential;
+        let experiment = self.engine.create_experiment(config).await?;
+        let candidates = generate_candidates(
+            &self.engine,
+            &experiment,
+            nodes.generators(),
+            sequential,
+            progress,
+        )
+        .await?;
+        evaluate_candidates(
+            &self.engine,
+            &experiment,
+            &candidates,
+            nodes.evaluators(),
+            sequential,
+            progress,
+        )
+        .await?;
+        let result = self.engine.finalize(experiment.id).await?;
+        self.emit(round.scoring_complete(&result));
+        let chain_entry_index = latest_chain_entry_index(&self.engine)?;
+        self.emit(round.chain_recorded(chain_entry_index));
+        build_report(&self.engine, nodes.strategies(), result, chain_entry_index).await
+    }
+
+    fn emit(&self, event: ProgressEvent) {
+        emit_progress(self.progress.as_ref(), event);
     }
 }
 
@@ -254,6 +567,10 @@ impl ActiveNodes<'_> {
             ActiveNodes::Fixed(nodes) => &nodes.strategies,
             ActiveNodes::Built(nodes) => &nodes.strategies,
         }
+    }
+
+    fn generator_count(&self) -> usize {
+        self.generators().len()
     }
 }
 
@@ -297,18 +614,35 @@ fn build_nodes(
     }
 }
 
+fn emit_progress(progress: Option<&ProgressCallback>, event: ProgressEvent) {
+    if let Some(callback) = progress {
+        callback(&event);
+    }
+}
+
+fn latest_chain_entry_index(engine: &LocalConsensusEngine) -> Result<u64, ConsensusError> {
+    engine
+        .chain()?
+        .head()
+        .map(|entry| entry.index)
+        .ok_or_else(|| ConsensusError::Protocol("missing chain entry after experiment".into()))
+}
+
+fn winner_node(result: &ConsensusResult) -> Option<NodeId> {
+    result
+        .winner
+        .and_then(|winner| result.candidate_nodes.get(&winner).cloned())
+}
+
 async fn build_report(
     engine: &LocalConsensusEngine,
     strategies: &BTreeMap<NodeId, GenerationStrategy>,
     result: ConsensusResult,
+    chain_entry_index: u64,
 ) -> Result<ExperimentReport, ConsensusError> {
     let candidates = engine.candidates(result.experiment_id).await?;
-    let chain = engine.chain()?;
-    let entry = chain
-        .head()
-        .ok_or_else(|| ConsensusError::Protocol("missing chain entry after experiment".into()))?;
     Ok(ExperimentReport {
-        chain_entry_index: entry.index,
+        chain_entry_index,
         candidates: candidate_reports(&candidates, strategies, &result),
         result,
     })
@@ -323,10 +657,7 @@ fn candidate_reports(
         .iter()
         .map(|candidate| CandidateReport {
             node_id: candidate.node_id.clone(),
-            strategy: strategies
-                .get(&candidate.node_id)
-                .cloned()
-                .unwrap_or(GenerationStrategy::Conservative),
+            strategy: node_strategy(strategies, &candidate.node_id),
             approach: candidate.approach.clone(),
             aggregate_score: *result.aggregate_scores.get(&candidate.id).unwrap_or(&0.0),
             is_winner: result.winner == Some(candidate.id),
@@ -345,9 +676,203 @@ mod tests {
         Severity, Signal,
     };
     use async_trait::async_trait;
+    use chrono::Utc;
     use std::sync::Mutex;
     use std::time::Duration;
     use uuid::Uuid;
+
+    fn sample_progress_result(decision: Decision, winner: Option<&str>) -> ConsensusResult {
+        let candidate_id = Uuid::new_v4();
+        ConsensusResult {
+            experiment_id: Uuid::new_v4(),
+            winner: winner.map(|_| candidate_id),
+            candidates: vec![candidate_id],
+            candidate_nodes: BTreeMap::from([(candidate_id, NodeId::from("node-a"))]),
+            candidate_patches: BTreeMap::new(),
+            evaluations: Vec::new(),
+            aggregate_scores: BTreeMap::from([(candidate_id, 1.0)]),
+            decision,
+            timestamp: Utc::now(),
+        }
+    }
+
+    fn sample_build_evaluation(notes: &str, build_success: Option<f64>) -> Evaluation {
+        let mut fitness_scores = BTreeMap::new();
+        if let Some(score) = build_success {
+            fitness_scores.insert("build_success".into(), score);
+        }
+        Evaluation {
+            candidate_id: Uuid::new_v4(),
+            evaluator_id: NodeId::from("node-b"),
+            fitness_scores,
+            safety_pass: true,
+            signal_resolved: false,
+            regression_detected: false,
+            notes: notes.to_owned(),
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn round_progress_builders_cover_round_setup_events() {
+        let round = RoundProgress::new(2, 4);
+
+        assert_eq!(
+            round.round_started("signal"),
+            ProgressEvent::RoundStarted {
+                round: 2,
+                max_rounds: 4,
+                signal: "signal".into(),
+            }
+        );
+        assert_eq!(
+            round.baseline_collected(3),
+            ProgressEvent::BaselineCollected {
+                round: 2,
+                max_rounds: 4,
+                node_count: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn round_progress_builders_cover_node_workflow_events() {
+        let round = RoundProgress::new(2, 4);
+        let node_id = NodeId::from("node-a");
+
+        assert_eq!(
+            round.node_started(node_id.clone(), GenerationStrategy::Creative),
+            ProgressEvent::NodeStarted {
+                round: 2,
+                max_rounds: 4,
+                node_id: node_id.clone(),
+                strategy: GenerationStrategy::Creative,
+            }
+        );
+        assert_eq!(
+            round.patch_generated(node_id.clone()),
+            ProgressEvent::PatchGenerated {
+                round: 2,
+                max_rounds: 4,
+                node_id: node_id.clone(),
+            }
+        );
+        assert_eq!(
+            round.build_verifying(node_id.clone()),
+            ProgressEvent::BuildVerifying {
+                round: 2,
+                max_rounds: 4,
+                node_id: node_id.clone(),
+            }
+        );
+        assert_eq!(
+            round.build_result(node_id, 1, 2),
+            ProgressEvent::BuildResult {
+                round: 2,
+                max_rounds: 4,
+                node_id: NodeId::from("node-a"),
+                passed: 1,
+                total: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn round_progress_builders_cover_completion_events() {
+        let round = RoundProgress::new(2, 4);
+        let node_id = NodeId::from("node-a");
+        let result = sample_progress_result(Decision::Accept, Some("node-a"));
+
+        assert_eq!(
+            round.evaluation_started(node_id.clone()),
+            ProgressEvent::EvaluationStarted {
+                round: 2,
+                max_rounds: 4,
+                node_id: node_id.clone(),
+            }
+        );
+        assert_eq!(
+            round.evaluation_complete(node_id.clone(), 1),
+            ProgressEvent::EvaluationComplete {
+                round: 2,
+                max_rounds: 4,
+                node_id,
+                evaluated: 1,
+            }
+        );
+        assert_eq!(
+            round.scoring_complete(&result),
+            ProgressEvent::ScoringComplete {
+                round: 2,
+                max_rounds: 4,
+                decision: Decision::Accept,
+                winner: Some(NodeId::from("node-a")),
+            }
+        );
+        assert_eq!(
+            round.round_complete(Decision::Reject, true),
+            ProgressEvent::RoundComplete {
+                round: 2,
+                max_rounds: 4,
+                decision: Decision::Reject,
+                continuing: true,
+            }
+        );
+        assert_eq!(
+            round.chain_recorded(9),
+            ProgressEvent::ChainRecorded {
+                round: 2,
+                max_rounds: 4,
+                entry_index: 9,
+            }
+        );
+    }
+
+    #[test]
+    fn build_summary_returns_zero_counts_when_evaluations_are_empty() {
+        assert_eq!(
+            build_summary(&[]),
+            BuildSummary {
+                passed: 0,
+                total: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn evaluation_build_success_prefers_build_ok_note_over_metric() {
+        let evaluation = sample_build_evaluation("build_ok=false", Some(1.0));
+
+        assert!(!evaluation_build_success(&evaluation));
+    }
+
+    #[test]
+    fn evaluation_build_success_falls_back_to_metric_for_missing_or_invalid_notes() {
+        let from_metric = sample_build_evaluation("tests=3/3", Some(1.0));
+        let malformed_note = sample_build_evaluation("build_ok=maybe", Some(0.0));
+        let missing_metric = sample_build_evaluation("tests=0/0", None);
+
+        assert!(evaluation_build_success(&from_metric));
+        assert!(!evaluation_build_success(&malformed_note));
+        assert!(!evaluation_build_success(&missing_metric));
+    }
+
+    #[test]
+    fn build_summary_counts_build_success_from_notes_and_metrics() {
+        let evaluations = vec![
+            sample_build_evaluation("build_ok=true", None),
+            sample_build_evaluation("tests=1/1", Some(1.0)),
+            sample_build_evaluation("build_ok=false", Some(1.0)),
+        ];
+
+        assert_eq!(
+            build_summary(&evaluations),
+            BuildSummary {
+                passed: 2,
+                total: 3,
+            }
+        );
+    }
 
     struct StaticPatchSource {
         patch: String,

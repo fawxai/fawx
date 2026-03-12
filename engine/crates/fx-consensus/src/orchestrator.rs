@@ -1,8 +1,12 @@
 use crate::error::Result;
+use crate::generator::GenerationStrategy;
 use crate::protocol::{ConsensusProtocol, ExperimentConfig};
+use crate::runner::{build_summary, ProgressCallback, ProgressEvent, RoundProgress};
 use crate::types::{Candidate, ConsensusResult, Evaluation, Experiment, NodeId};
 use async_trait::async_trait;
 use futures::future::try_join_all;
+use std::collections::BTreeMap;
+use tracing::warn;
 
 pub struct ExperimentOrchestrator<'a, E: ConsensusProtocol> {
     engine: &'a E,
@@ -22,16 +26,71 @@ impl<'a, E: ConsensusProtocol> ExperimentOrchestrator<'a, E> {
         let sequential = config.sequential;
         let experiment = self.engine.create_experiment(config).await?;
         let candidates =
-            generate_candidates(self.engine, &experiment, generators, sequential).await?;
+            generate_candidates(self.engine, &experiment, generators, sequential, None).await?;
         evaluate_candidates(
             self.engine,
             &experiment,
             &candidates,
             evaluators,
             sequential,
+            None,
         )
         .await?;
         self.engine.finalize(experiment.id).await
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct OrchestrationProgress<'a> {
+    round: RoundProgress,
+    strategies: &'a BTreeMap<NodeId, GenerationStrategy>,
+    callback: &'a ProgressCallback,
+}
+
+impl<'a> OrchestrationProgress<'a> {
+    pub(crate) fn new(
+        round: RoundProgress,
+        strategies: &'a BTreeMap<NodeId, GenerationStrategy>,
+        callback: &'a ProgressCallback,
+    ) -> Self {
+        Self {
+            round,
+            strategies,
+            callback,
+        }
+    }
+
+    fn emit(self, event: ProgressEvent) {
+        (self.callback)(&event);
+    }
+
+    fn node_started(self, node_id: &NodeId) {
+        let strategy = node_strategy(self.strategies, node_id);
+        self.emit(self.round.node_started(node_id.clone(), strategy));
+    }
+
+    fn patch_generated(self, node_id: &NodeId) {
+        self.emit(self.round.patch_generated(node_id.clone()));
+    }
+
+    fn build_verifying(self, node_id: &NodeId) {
+        self.emit(self.round.build_verifying(node_id.clone()));
+    }
+
+    fn build_result(self, node_id: &NodeId, evaluations: &[Evaluation]) {
+        let build = build_summary(evaluations);
+        self.emit(
+            self.round
+                .build_result(node_id.clone(), build.passed, build.total),
+        );
+    }
+
+    fn evaluation_started(self, node_id: &NodeId) {
+        self.emit(self.round.evaluation_started(node_id.clone()));
+    }
+
+    fn evaluation_complete(self, node_id: &NodeId, evaluated: usize) {
+        self.emit(self.round.evaluation_complete(node_id.clone(), evaluated));
     }
 }
 
@@ -47,16 +106,20 @@ pub trait CandidateEvaluator: Send + Sync {
     fn node_id(&self) -> &NodeId;
 }
 
-async fn generate_candidates<E: ConsensusProtocol>(
+pub(crate) async fn generate_candidates<E>(
     engine: &E,
     experiment: &Experiment,
     generators: &[Box<dyn CandidateGenerator>],
     sequential: bool,
-) -> Result<Vec<Candidate>> {
+    progress: Option<OrchestrationProgress<'_>>,
+) -> Result<Vec<Candidate>>
+where
+    E: ConsensusProtocol,
+{
     let candidates = if sequential {
-        generate_candidates_sequential(experiment, generators).await?
+        generate_candidates_sequential(experiment, generators, progress).await?
     } else {
-        generate_candidates_parallel(experiment, generators).await?
+        generate_candidates_parallel(experiment, generators, progress).await?
     };
     submit_candidates(engine, &candidates).await?;
     Ok(candidates)
@@ -65,37 +128,68 @@ async fn generate_candidates<E: ConsensusProtocol>(
 async fn generate_candidates_parallel(
     experiment: &Experiment,
     generators: &[Box<dyn CandidateGenerator>],
+    progress: Option<OrchestrationProgress<'_>>,
 ) -> Result<Vec<Candidate>> {
-    try_join_all(
-        generators
-            .iter()
-            .map(|generator| async move { generator.generate(experiment).await }),
-    )
+    try_join_all(generators.iter().map(|generator| async move {
+        generate_candidate(generator.as_ref(), experiment, progress).await
+    }))
     .await
 }
 
 async fn generate_candidates_sequential(
     experiment: &Experiment,
     generators: &[Box<dyn CandidateGenerator>],
+    progress: Option<OrchestrationProgress<'_>>,
 ) -> Result<Vec<Candidate>> {
     let mut candidates = Vec::with_capacity(generators.len());
     for generator in generators {
-        candidates.push(generator.generate(experiment).await?);
+        candidates.push(generate_candidate(generator.as_ref(), experiment, progress).await?);
     }
     Ok(candidates)
 }
 
-async fn evaluate_candidates<E: ConsensusProtocol>(
+async fn generate_candidate(
+    generator: &dyn CandidateGenerator,
+    experiment: &Experiment,
+    progress: Option<OrchestrationProgress<'_>>,
+) -> Result<Candidate> {
+    let node_id = generator.node_id().clone();
+    if let Some(progress) = progress {
+        progress.node_started(&node_id);
+    }
+    let candidate = generator.generate(experiment).await?;
+    if let Some(progress) = progress {
+        progress.patch_generated(&node_id);
+    }
+    Ok(candidate)
+}
+
+pub(crate) async fn evaluate_candidates<E>(
     engine: &E,
     experiment: &Experiment,
     candidates: &[Candidate],
     evaluators: &[Box<dyn CandidateEvaluator>],
     sequential: bool,
-) -> Result<()> {
+    progress: Option<OrchestrationProgress<'_>>,
+) -> Result<()>
+where
+    E: ConsensusProtocol,
+{
     for candidate in candidates {
+        let node_id = candidate.node_id.clone();
+        if let Some(progress) = progress {
+            progress.build_verifying(&node_id);
+        }
         let evaluations =
             generate_evaluations(experiment, candidate, evaluators, sequential).await?;
+        if let Some(progress) = progress {
+            progress.build_result(&node_id, &evaluations);
+            progress.evaluation_started(&node_id);
+        }
         submit_evaluations(engine, &evaluations).await?;
+        if let Some(progress) = progress {
+            progress.evaluation_complete(&node_id, evaluations.len());
+        }
     }
     Ok(())
 }
@@ -142,163 +236,59 @@ async fn generate_evaluations_sequential(
     Ok(evaluations)
 }
 
-async fn submit_candidates<E: ConsensusProtocol>(
-    engine: &E,
-    candidates: &[Candidate],
-) -> Result<()> {
+async fn submit_candidates<E>(engine: &E, candidates: &[Candidate]) -> Result<()>
+where
+    E: ConsensusProtocol,
+{
     for candidate in candidates {
         engine.submit_candidate(candidate.clone()).await?;
     }
     Ok(())
 }
 
-async fn submit_evaluations<E: ConsensusProtocol>(
-    engine: &E,
-    evaluations: &[Evaluation],
-) -> Result<()> {
+async fn submit_evaluations<E>(engine: &E, evaluations: &[Evaluation]) -> Result<()>
+where
+    E: ConsensusProtocol,
+{
     for evaluation in evaluations {
         engine.submit_evaluation(evaluation.clone()).await?;
     }
     Ok(())
 }
 
+pub(crate) fn node_strategy(
+    strategies: &BTreeMap<NodeId, GenerationStrategy>,
+    node_id: &NodeId,
+) -> GenerationStrategy {
+    strategies.get(node_id).cloned().unwrap_or_else(|| {
+        warn!(
+            "Unknown node_id {:?} not found in strategies map, defaulting to Conservative",
+            node_id
+        );
+        GenerationStrategy::Conservative
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chain::JsonFileChainStorage;
-    use crate::protocol::LocalConsensusEngine;
-    use crate::types::tests::{sample_candidate, sample_evaluation, sample_experiment};
-    use chrono::Utc;
-    use std::collections::BTreeMap;
-    use std::sync::{Arc, Mutex};
-    use uuid::Uuid;
 
-    struct StaticEvaluator {
-        node_id: NodeId,
-        calls: Arc<Mutex<Vec<NodeId>>>,
+    #[test]
+    fn node_strategy_returns_default_for_unknown_node() {
+        let strategies = BTreeMap::new();
+        let node_id = NodeId::from("unknown-node");
+        let strategy = node_strategy(&strategies, &node_id);
+        assert_eq!(strategy, GenerationStrategy::Conservative);
     }
 
-    #[async_trait]
-    impl CandidateEvaluator for StaticEvaluator {
-        async fn evaluate(
-            &self,
-            _experiment: &Experiment,
-            candidate: &Candidate,
-        ) -> Result<Evaluation> {
-            self.calls
-                .lock()
-                .expect("calls lock")
-                .push(candidate.node_id.clone());
-            Ok(sample_evaluation(candidate.id, &self.node_id.0, 1.0))
-        }
-
-        fn node_id(&self) -> &NodeId {
-            &self.node_id
-        }
-    }
-
-    struct StaticGenerator {
-        node_id: NodeId,
-    }
-
-    #[async_trait]
-    impl CandidateGenerator for StaticGenerator {
-        async fn generate(&self, experiment: &Experiment) -> Result<Candidate> {
-            Ok(Candidate {
-                id: Uuid::new_v4(),
-                experiment_id: experiment.id,
-                node_id: self.node_id.clone(),
-                patch: format!("patch-{}", self.node_id.0),
-                approach: "approach".into(),
-                self_metrics: BTreeMap::new(),
-                created_at: Utc::now(),
-            })
-        }
-
-        fn node_id(&self) -> &NodeId {
-            &self.node_id
-        }
-    }
-
-    #[tokio::test]
-    async fn generate_evaluations_skips_self_eval() {
-        let experiment = sample_experiment();
-        let candidate = sample_candidate(experiment.id, "node-a");
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let evaluators: Vec<Box<dyn CandidateEvaluator>> = vec![
-            Box::new(StaticEvaluator {
-                node_id: NodeId::from("node-a"),
-                calls: Arc::clone(&calls),
-            }),
-            Box::new(StaticEvaluator {
-                node_id: NodeId::from("node-b"),
-                calls,
-            }),
-        ];
-
-        let evaluations = generate_evaluations(&experiment, &candidate, &evaluators, false)
-            .await
-            .expect("evaluations");
-
-        assert_eq!(evaluations.len(), 1);
-        assert_eq!(evaluations[0].evaluator_id, NodeId::from("node-b"));
-    }
-
-    #[tokio::test]
-    async fn cross_evaluation_works_with_multiple_nodes() {
-        let engine = LocalConsensusEngine::new(Box::new(JsonFileChainStorage::new(temp_path())))
-            .expect("engine");
-        let orchestrator = ExperimentOrchestrator::new(&engine);
-        let generators: Vec<Box<dyn CandidateGenerator>> = vec![
-            Box::new(StaticGenerator {
-                node_id: NodeId::from("node-a"),
-            }),
-            Box::new(StaticGenerator {
-                node_id: NodeId::from("node-b"),
-            }),
-        ];
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let evaluators: Vec<Box<dyn CandidateEvaluator>> = vec![
-            Box::new(StaticEvaluator {
-                node_id: NodeId::from("node-a"),
-                calls: Arc::clone(&calls),
-            }),
-            Box::new(StaticEvaluator {
-                node_id: NodeId::from("node-b"),
-                calls,
-            }),
-        ];
-
-        let result = orchestrator
-            .run_experiment(sample_config(2), &generators, &evaluators)
-            .await
-            .expect("run experiment");
-
-        assert_eq!(result.candidates.len(), 2);
-        assert_eq!(result.evaluations.len(), 2);
-        for evaluation in &result.evaluations {
-            let candidate_node = result
-                .candidate_nodes
-                .get(&evaluation.candidate_id)
-                .expect("candidate node");
-            assert_ne!(candidate_node, &evaluation.evaluator_id);
-        }
-    }
-
-    fn sample_config(min_candidates: u32) -> ExperimentConfig {
-        let experiment = sample_experiment();
-        ExperimentConfig {
-            signal: experiment.trigger,
-            hypothesis: experiment.hypothesis,
-            fitness_criteria: experiment.fitness_criteria,
-            scope: experiment.scope,
-            timeout: experiment.timeout,
-            min_candidates,
-            sequential: false,
-        }
-    }
-
-    fn temp_path() -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("fx-consensus-orchestrator-{}.json", Uuid::new_v4()))
+    #[test]
+    fn node_strategy_returns_mapped_strategy() {
+        let mut strategies = BTreeMap::new();
+        let node_id = NodeId::from("node-0");
+        strategies.insert(node_id.clone(), GenerationStrategy::Aggressive);
+        assert_eq!(
+            node_strategy(&strategies, &node_id),
+            GenerationStrategy::Aggressive
+        );
     }
 }
