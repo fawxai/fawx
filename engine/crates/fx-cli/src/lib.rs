@@ -294,7 +294,10 @@ mod tests {
 
         let config = prepare_embedded_config(fx_config::FawxConfig::default());
 
-        assert_eq!(config.tools.working_dir, Some(tempdir.path().to_path_buf()));
+        // On macOS /var → /private/var symlink, so canonicalize both sides.
+        let expected = tempdir.path().canonicalize().ok();
+        let actual = config.tools.working_dir.as_ref().and_then(|p| p.canonicalize().ok());
+        assert_eq!(actual, expected);
     }
 
     #[test]
