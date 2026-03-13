@@ -19,7 +19,7 @@ use crate::input::{LoopCommand, LoopInputChannel};
 use crate::learn::Learning;
 use crate::perceive::{ProcessedPerception, TrimmingPolicy};
 use crate::signals::{LoopStep, Signal, SignalCollector, SignalKind};
-use crate::streaming::{Phase, StreamCallback, StreamEvent};
+use crate::streaming::{ErrorCategory, Phase, StreamCallback, StreamEvent};
 use crate::types::{
     Goal, IdentityContext, LoopError, PerceptionSnapshot, ReasoningContext, WorkingMemoryEntry,
 };
@@ -171,6 +171,14 @@ impl<'a> CycleStream<'a> {
         if let Some(callback) = self.callback {
             callback(event);
         }
+    }
+
+    fn emit_error(self, category: ErrorCategory, message: impl Into<String>, recoverable: bool) {
+        self.emit(StreamEvent::Error {
+            category,
+            message: message.into(),
+            recoverable,
+        });
     }
 
     fn phase(self, phase: Phase) {
@@ -385,7 +393,6 @@ impl std::fmt::Display for CompactionScope {
 /// `compaction_last_iteration: Mutex<HashMap<CompactionScope, u32>>`.
 /// `LoopInputChannel` also contains an `mpsc::Receiver`, which remains
 /// non-`Clone`. No existing code clones `LoopEngine`, so this is a safe change.
-#[derive(Debug)]
 pub struct LoopEngine {
     budget: BudgetTracker,
     context: ContextCompactor,
@@ -416,13 +423,63 @@ pub struct LoopEngine {
     iteration_counter: Option<Arc<AtomicU32>>,
     /// Dynamic scratchpad provider for iteration-boundary context refresh.
     scratchpad_provider: Option<Arc<dyn ScratchpadProvider>>,
+    error_callback: Option<StreamCallback>,
     /// Extended thinking configuration forwarded to completion requests.
     thinking_config: Option<fx_llm::ThinkingConfig>,
     /// Registry of active input/output channels.
     channel_registry: ChannelRegistry,
 }
 
-#[derive(Debug, Default)]
+impl std::fmt::Debug for LoopEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoopEngine")
+            .field("max_iterations", &self.max_iterations)
+            .field("iteration_count", &self.iteration_count)
+            .field("memory_context", &self.memory_context)
+            .field("scratchpad_context", &self.scratchpad_context)
+            .field("compaction_config", &self.compaction_config)
+            .field("budget_low_signaled", &self.budget_low_signaled)
+            .field("tool_attempts", &self.tool_attempts)
+            .finish_non_exhaustive()
+    }
+}
+
+struct ErrorCallbackGuard<'a> {
+    engine: &'a mut LoopEngine,
+    original: Option<StreamCallback>,
+}
+
+impl<'a> ErrorCallbackGuard<'a> {
+    fn install(engine: &'a mut LoopEngine, replacement: Option<StreamCallback>) -> Self {
+        let original = engine.error_callback.clone();
+        if let Some(callback) = replacement {
+            engine.error_callback = Some(callback);
+        }
+        Self { engine, original }
+    }
+}
+
+impl std::ops::Deref for ErrorCallbackGuard<'_> {
+    type Target = LoopEngine;
+
+    fn deref(&self) -> &Self::Target {
+        self.engine
+    }
+}
+
+impl std::ops::DerefMut for ErrorCallbackGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.engine
+    }
+}
+
+impl Drop for ErrorCallbackGuard<'_> {
+    fn drop(&mut self) {
+        self.engine.error_callback = self.original.take();
+    }
+}
+
+#[derive(Default)]
 #[must_use = "builder does nothing unless .build() is called"]
 pub struct LoopEngineBuilder {
     budget: Option<BudgetTracker>,
@@ -440,7 +497,46 @@ pub struct LoopEngineBuilder {
     scratchpad_context: Option<String>,
     iteration_counter: Option<Arc<AtomicU32>>,
     scratchpad_provider: Option<Arc<dyn ScratchpadProvider>>,
+    error_callback: Option<StreamCallback>,
     thinking_config: Option<fx_llm::ThinkingConfig>,
+}
+
+impl std::fmt::Debug for LoopEngineBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoopEngineBuilder")
+            .field("budget", &self.budget)
+            .field("context", &self.context)
+            .field(
+                "tool_executor",
+                &self.tool_executor.as_ref().map(|_| "ToolExecutor"),
+            )
+            .field("max_iterations", &self.max_iterations)
+            .field("synthesis_instruction", &self.synthesis_instruction)
+            .field("compaction_config", &self.compaction_config)
+            .field(
+                "compaction_llm",
+                &self.compaction_llm.as_ref().map(|_| "LlmProvider"),
+            )
+            .field(
+                "memory_flush",
+                &self.memory_flush.as_ref().map(|_| "CompactionMemoryFlush"),
+            )
+            .field("event_bus", &self.event_bus)
+            .field("cancel_token", &self.cancel_token)
+            .field("input_channel", &self.input_channel)
+            .field("memory_context", &self.memory_context)
+            .field("scratchpad_context", &self.scratchpad_context)
+            .field("iteration_counter", &self.iteration_counter)
+            .field(
+                "scratchpad_provider",
+                &self
+                    .scratchpad_provider
+                    .as_ref()
+                    .map(|_| "ScratchpadProvider"),
+            )
+            .field("thinking_config", &self.thinking_config)
+            .finish_non_exhaustive()
+    }
 }
 
 impl LoopEngineBuilder {
@@ -524,6 +620,11 @@ impl LoopEngineBuilder {
         self
     }
 
+    pub fn error_callback(mut self, cb: StreamCallback) -> Self {
+        self.error_callback = Some(cb);
+        self
+    }
+
     pub fn thinking_config(mut self, config: fx_llm::ThinkingConfig) -> Self {
         self.thinking_config = Some(config);
         self
@@ -563,6 +664,7 @@ impl LoopEngineBuilder {
             tool_attempts: HashMap::new(),
             iteration_counter: self.iteration_counter,
             scratchpad_provider: self.scratchpad_provider,
+            error_callback: self.error_callback,
             thinking_config: self.thinking_config,
             channel_registry: ChannelRegistry::new(),
         })
@@ -936,6 +1038,23 @@ impl LoopEngine {
         attach_signals(result, signals)
     }
 
+    // Emit a user-visible error through the out-of-band error callback.
+    // Used for errors outside the streaming cycle (compaction, background ops).
+    fn emit_background_error(
+        &self,
+        category: ErrorCategory,
+        message: impl Into<String>,
+        recoverable: bool,
+    ) {
+        if let Some(cb) = &self.error_callback {
+            cb(StreamEvent::Error {
+                category,
+                message: message.into(),
+                recoverable,
+            });
+        }
+    }
+
     fn emit_cache_stats_signal(&mut self) {
         let Some(stats) = self.tool_executor.cache_stats() else {
             return;
@@ -973,15 +1092,25 @@ impl LoopEngine {
 
     pub async fn run_cycle_streaming(
         &mut self,
-        mut perception: PerceptionSnapshot,
+        perception: PerceptionSnapshot,
         llm: &dyn LlmProvider,
         stream_callback: Option<StreamCallback>,
     ) -> Result<LoopResult, LoopError> {
+        let mut engine = ErrorCallbackGuard::install(self, stream_callback.clone());
+        engine
+            .run_cycle_streaming_inner(perception, llm, stream_callback.as_ref())
+            .await
+    }
+
+    async fn run_cycle_streaming_inner(
+        &mut self,
+        mut perception: PerceptionSnapshot,
+        llm: &dyn LlmProvider,
+        stream_callback: Option<&StreamCallback>,
+    ) -> Result<LoopResult, LoopError> {
         self.prepare_cycle();
         let mut state = CycleState::default();
-        let stream = stream_callback
-            .as_ref()
-            .map_or_else(CycleStream::disabled, CycleStream::enabled);
+        let stream = stream_callback.map_or_else(CycleStream::disabled, CycleStream::enabled);
 
         while self.iteration_count < self.max_iterations {
             self.iteration_count = self.iteration_count.saturating_add(1);
@@ -991,8 +1120,7 @@ impl LoopEngine {
                 .await?
             {
                 IterationStep::Terminal(result) => {
-                    stream.done_result(&result);
-                    return Ok(self.finalize_result(result));
+                    return Ok(self.finish_streaming_result(result, stream))
                 }
                 IterationStep::Progress(outcome) => {
                     if let Some(result) =
@@ -1004,16 +1132,27 @@ impl LoopEngine {
             }
         }
 
-        let result = LoopResult::Error {
+        Ok(self.finish_streaming_result(self.safety_limit_result(), stream))
+    }
+
+    fn finish_streaming_result(
+        &mut self,
+        result: LoopResult,
+        stream: CycleStream<'_>,
+    ) -> LoopResult {
+        stream.done_result(&result);
+        self.finalize_result(result)
+    }
+
+    fn safety_limit_result(&self) -> LoopResult {
+        LoopResult::Error {
             message: format!(
                 "Loop reached safety limit of {} iterations without completion.",
                 self.max_iterations
             ),
             recoverable: true,
             signals: Vec::new(),
-        };
-        stream.done_result(&result);
-        Ok(self.finalize_result(result))
+        }
     }
 
     fn apply_iteration_outcome(
@@ -1418,10 +1557,14 @@ impl LoopEngine {
         phase: StreamPhase,
         stage: &str,
     ) -> Result<CompletionResponse, LoopError> {
-        let mut stream = llm
-            .complete_stream(request)
-            .await
-            .map_err(|error| loop_error(stage, &format!("completion failed: {error}"), true))?;
+        let mut stream = llm.complete_stream(request).await.map_err(|error| {
+            self.emit_background_error(
+                ErrorCategory::Provider,
+                format!("LLM request failed: {error}"),
+                false,
+            );
+            loop_error(stage, &format!("completion failed: {error}"), true)
+        })?;
         self.publish_stream_started(phase);
         self.consume_stream_with_events(&mut stream, phase).await
     }
@@ -1436,10 +1579,14 @@ impl LoopEngine {
     ) -> Result<CompletionResponse, LoopError> {
         self.publish_stream_started(phase);
         let bridge = provider_stream_bridge(callback.clone(), self.event_bus.clone(), phase);
-        let result = llm
-            .stream(request, bridge)
-            .await
-            .map_err(|error| loop_error(stage, &format!("completion failed: {error}"), true));
+        let result = llm.stream(request, bridge).await.map_err(|error| {
+            callback(StreamEvent::Error {
+                category: ErrorCategory::Provider,
+                message: format!("LLM streaming failed: {error}"),
+                recoverable: false,
+            });
+            loop_error(stage, &format!("completion failed: {error}"), true)
+        });
         self.publish_stream_finished(phase);
         result
     }
@@ -1496,6 +1643,11 @@ impl LoopEngine {
                 Ok(chunk) => chunk,
                 Err(error) => {
                     self.publish_stream_finished(phase);
+                    self.emit_background_error(
+                        ErrorCategory::Provider,
+                        format!("LLM stream error: {error}"),
+                        false,
+                    );
                     return Err(loop_error(
                         phase_stage(phase),
                         &format!("stream consumption failed: {error}"),
@@ -2677,6 +2829,11 @@ impl LoopEngine {
                             evicted_count = evicted.len(),
                             "pre-compaction memory flush failed; proceeding without flush"
                         );
+                        self.emit_background_error(
+                            ErrorCategory::Memory,
+                            format!("Memory flush failed during compaction: {err}"),
+                            true,
+                        );
                     }
                 }
             }
@@ -3033,7 +3190,9 @@ impl LoopEngine {
     ) -> Result<ToolRoundOutcome, LoopError> {
         let round_started = current_time_ms();
         self.publish_tool_calls(&state.current_calls, stream);
-        let results = self.execute_tool_calls(&state.current_calls).await?;
+        let results = self
+            .execute_tool_calls_with_stream(&state.current_calls, stream)
+            .await?;
         self.publish_tool_results(&results, stream);
         self.record_tool_execution_cost(results.len());
 
@@ -3083,17 +3242,38 @@ impl LoopEngine {
         Ok(ToolRoundOutcome::Response(response))
     }
 
+    #[cfg(test)]
     async fn execute_tool_calls(
         &mut self,
         calls: &[ToolCall],
     ) -> Result<Vec<ToolResult>, LoopError> {
+        self.execute_tool_calls_with_stream(calls, CycleStream::disabled())
+            .await
+    }
+
+    async fn execute_tool_calls_with_stream(
+        &mut self,
+        calls: &[ToolCall],
+        stream: CycleStream<'_>,
+    ) -> Result<Vec<ToolResult>, LoopError> {
         let max_retries = self.budget.config().max_tool_retries;
         let max_attempts = u16::from(max_retries).saturating_add(1);
-
         let (allowed, blocked) =
             partition_by_retry_budget(calls, &mut self.tool_attempts, max_attempts);
 
-        for call in &blocked {
+        self.emit_blocked_tool_errors(&blocked, max_retries, stream);
+        let mut results = self.execute_allowed_tool_calls(&allowed, stream).await?;
+        results.extend(build_blocked_tool_results(&blocked, max_retries));
+        Ok(reorder_results_by_calls(calls, results))
+    }
+
+    fn emit_blocked_tool_errors(
+        &mut self,
+        blocked: &[ToolCall],
+        max_retries: u8,
+        stream: CycleStream<'_>,
+    ) {
+        for call in blocked {
             let attempts = self.tool_attempts.get(&call.name).copied().unwrap_or(0);
             self.emit_signal(
                 LoopStep::Act,
@@ -3108,30 +3288,41 @@ impl LoopEngine {
                     "max_retries": max_retries,
                 }),
             );
+            stream.emit_error(
+                ErrorCategory::ToolExecution,
+                blocked_tool_message(&call.name, max_retries),
+                true,
+            );
+        }
+    }
+
+    async fn execute_allowed_tool_calls(
+        &mut self,
+        allowed: &[ToolCall],
+        stream: CycleStream<'_>,
+    ) -> Result<Vec<ToolResult>, LoopError> {
+        if allowed.is_empty() {
+            return Ok(Vec::new());
         }
 
         let max_bytes = self.budget.config().max_tool_result_bytes;
-        let mut results = if allowed.is_empty() {
-            Vec::new()
-        } else {
-            let executed = self
-                .tool_executor
-                .execute_tools(&allowed, self.cancel_token.as_ref())
-                .await
-                .map_err(|error| {
-                    loop_error(
-                        "act",
-                        &format!("tool execution failed: {}", error.message),
-                        error.recoverable,
-                    )
-                })?;
-            truncate_tool_results(executed, max_bytes)
-        };
-
-        let blocked_results = build_blocked_tool_results(&blocked, max_retries);
-        results.extend(blocked_results);
-
-        Ok(reorder_results_by_calls(calls, results))
+        let executed = self
+            .tool_executor
+            .execute_tools(allowed, self.cancel_token.as_ref())
+            .await
+            .map_err(|error| {
+                stream.emit_error(
+                    ErrorCategory::ToolExecution,
+                    tool_execution_failure_message(allowed, &error.message),
+                    error.recoverable,
+                );
+                loop_error(
+                    "act",
+                    &format!("tool execution failed: {}", error.message),
+                    error.recoverable,
+                )
+            })?;
+        Ok(truncate_tool_results(executed, max_bytes))
     }
 
     async fn request_tool_continuation(
@@ -3775,6 +3966,27 @@ fn partition_by_retry_budget(
     (allowed, blocked)
 }
 
+fn blocked_tool_message(tool_name: &str, max_retries: u8) -> String {
+    format!(
+        "Tool '{}' blocked: exceeded {} retries this cycle. Try a different approach.",
+        tool_name, max_retries
+    )
+}
+
+fn tool_execution_failure_message(calls: &[ToolCall], error_message: &str) -> String {
+    match calls {
+        [call] => format!("Tool '{}' failed: {error_message}", call.name),
+        _ => {
+            let names = calls
+                .iter()
+                .map(|call| call.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("Tool batch failed for [{names}]: {error_message}")
+        }
+    }
+}
+
 /// Build synthetic failure results for blocked tool calls.
 fn build_blocked_tool_results(blocked: &[ToolCall], max_retries: u8) -> Vec<ToolResult> {
     blocked
@@ -3783,10 +3995,7 @@ fn build_blocked_tool_results(blocked: &[ToolCall], max_retries: u8) -> Vec<Tool
             tool_call_id: call.id.clone(),
             tool_name: call.name.clone(),
             success: false,
-            output: format!(
-                "Tool '{}' blocked: exceeded {} retries this cycle. Try a different approach.",
-                call.name, max_retries
-            ),
+            output: blocked_tool_message(&call.name, max_retries),
         })
         .collect()
 }
@@ -7587,6 +7796,40 @@ mod cancellation_tests {
         }
     }
 
+    #[derive(Debug)]
+    struct FailingStreamingLlm;
+
+    #[async_trait]
+    impl LlmProvider for FailingStreamingLlm {
+        async fn generate(&self, _: &str, _: u32) -> Result<String, CoreLlmError> {
+            Ok("summary".to_string())
+        }
+
+        async fn generate_streaming(
+            &self,
+            _: &str,
+            _: u32,
+            callback: Box<dyn Fn(String) + Send + 'static>,
+        ) -> Result<String, CoreLlmError> {
+            callback("summary".to_string());
+            Ok("summary".to_string())
+        }
+
+        fn model_name(&self) -> &str {
+            "failing-streaming"
+        }
+
+        async fn stream(
+            &self,
+            _: CompletionRequest,
+            _: ProviderStreamCallback,
+        ) -> Result<CompletionResponse, ProviderError> {
+            Err(ProviderError::Provider(
+                "simulated streaming failure".to_string(),
+            ))
+        }
+    }
+
     fn engine_with_executor(executor: Arc<dyn ToolExecutor>, max_iterations: u32) -> LoopEngine {
         LoopEngine::builder()
             .budget(BudgetTracker::new(
@@ -7677,6 +7920,55 @@ mod cancellation_tests {
             captured.lock().expect("lock").push(event);
         });
         (callback, events)
+    }
+
+    #[test]
+    fn error_callback_guard_restores_original_value_after_panic() {
+        let (original, original_events) = stream_recorder();
+        let (replacement, replacement_events) = stream_recorder();
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        engine.error_callback = Some(original.clone());
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let guard = ErrorCallbackGuard::install(&mut engine, Some(replacement.clone()));
+            guard
+                .error_callback
+                .as_ref()
+                .expect("replacement should be installed")(StreamEvent::Done {
+                response: "replacement".to_string(),
+            });
+            panic!("boom");
+        }));
+
+        assert!(result.is_err());
+        engine
+            .error_callback
+            .as_ref()
+            .expect("original should be restored")(StreamEvent::Done {
+            response: "original".to_string(),
+        });
+
+        let original_events = original_events.lock().expect("lock").clone();
+        let replacement_events = replacement_events.lock().expect("lock").clone();
+        assert_eq!(original_events.len(), 1);
+        assert_eq!(replacement_events.len(), 1);
+        assert!(matches!(
+            original_events.as_slice(),
+            [StreamEvent::Done { response }] if response == "original"
+        ));
+        assert!(matches!(
+            replacement_events.as_slice(),
+            [StreamEvent::Done { response }] if response == "replacement"
+        ));
+    }
+
+    #[test]
+    fn loop_engine_builder_debug_skips_error_callback() {
+        let (callback, _) = stream_recorder();
+        let builder = LoopEngine::builder().error_callback(callback);
+        let debug = format!("{builder:?}");
+        assert!(debug.contains("LoopEngineBuilder"));
+        assert!(!debug.contains("error_callback"));
     }
 
     fn assert_done_event(events: &[StreamEvent], expected: &str) {
@@ -8262,6 +8554,134 @@ mod cancellation_tests {
             .expect_err("stream setup should fail");
         assert!(error.reason.contains("completion failed"));
         assert!(receiver.try_recv().is_err(), "no stream events expected");
+    }
+
+    #[tokio::test]
+    async fn reason_emits_background_error_on_buffered_stream_setup_failure() {
+        let (callback, events) = stream_recorder();
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        engine.error_callback = Some(callback);
+
+        let error = engine
+            .reason(
+                &reason_perception("hello"),
+                &FailingBufferedStreamLlm,
+                CycleStream::disabled(),
+            )
+            .await
+            .expect_err("stream setup should fail");
+        assert!(error.reason.contains("completion failed"));
+
+        let events = events.lock().expect("lock").clone();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::Error {
+                category: ErrorCategory::Provider,
+                message,
+                recoverable: false,
+            } if message == "LLM request failed: provider error: simulated stream setup failure"
+        )));
+    }
+
+    #[tokio::test]
+    async fn reason_emits_stream_error_on_streaming_provider_failure() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let (callback, events) = stream_recorder();
+
+        let error = engine
+            .reason(
+                &reason_perception("hello"),
+                &FailingStreamingLlm,
+                CycleStream::enabled(&callback),
+            )
+            .await
+            .expect_err("streaming request should fail");
+        assert!(error.reason.contains("completion failed"));
+
+        let events = events.lock().expect("lock").clone();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::Error {
+                category: ErrorCategory::Provider,
+                message,
+                recoverable: false,
+            } if message == "LLM streaming failed: provider error: simulated streaming failure"
+        )));
+    }
+
+    #[tokio::test]
+    async fn execute_tool_calls_emits_stream_error_on_executor_failure() {
+        #[derive(Debug)]
+        struct LocalFailingExecutor;
+
+        #[async_trait]
+        impl ToolExecutor for LocalFailingExecutor {
+            async fn execute_tools(
+                &self,
+                _calls: &[ToolCall],
+                _cancel: Option<&CancellationToken>,
+            ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+                Err(crate::act::ToolExecutorError {
+                    message: "tool crashed".to_string(),
+                    recoverable: true,
+                })
+            }
+
+            fn tool_definitions(&self) -> Vec<ToolDefinition> {
+                vec![read_file_definition()]
+            }
+        }
+
+        let mut engine = engine_with_executor(Arc::new(LocalFailingExecutor), 3);
+        let (callback, events) = stream_recorder();
+        let calls = vec![read_file_call("call-1")];
+
+        let error = engine
+            .execute_tool_calls_with_stream(&calls, CycleStream::enabled(&callback))
+            .await
+            .expect_err("tool execution should fail");
+        assert!(error.reason.contains("tool execution failed: tool crashed"));
+
+        let events = events.lock().expect("lock").clone();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::Error {
+                category: ErrorCategory::ToolExecution,
+                message,
+                recoverable: true,
+            } if message == "Tool 'read_file' failed: tool crashed"
+        )));
+    }
+
+    #[tokio::test]
+    async fn execute_tool_calls_emits_stream_error_when_retry_budget_blocks_tool() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        engine.budget = BudgetTracker::new(
+            crate::budget::BudgetConfig {
+                max_tool_retries: 0,
+                ..crate::budget::BudgetConfig::default()
+            },
+            0,
+            0,
+        );
+        engine.tool_attempts.insert("read_file".to_string(), 1);
+        let (callback, events) = stream_recorder();
+        let calls = vec![read_file_call("call-1")];
+
+        let _ = engine
+            .execute_tool_calls_with_stream(&calls, CycleStream::enabled(&callback))
+            .await
+            .expect("blocked tool call should return synthetic result");
+        let events = events.lock().expect("lock").clone();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::Error {
+                category: ErrorCategory::ToolExecution,
+                message,
+                recoverable: true,
+            } if message
+                == "Tool 'read_file' blocked: exceeded 0 retries this cycle. Try a different approach."
+        )));
     }
 
     #[tokio::test]
@@ -10972,6 +11392,48 @@ mod context_compaction_tests {
 
         assert!(has_compaction_marker(compacted.as_ref()));
         assert!(compacted.len() < messages.len());
+    }
+
+    #[tokio::test]
+    async fn compact_if_needed_emits_memory_error_when_flush_fails() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let events = Arc::new(Mutex::new(Vec::<StreamEvent>::new()));
+        let captured = Arc::clone(&events);
+        let callback: StreamCallback = Arc::new(move |event| {
+            captured.lock().expect("lock").push(event);
+        });
+        let engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                current_time_ms(),
+                0,
+            ))
+            .context(ContextCompactor::new(2_048, 256))
+            .max_iterations(4)
+            .tool_executor(executor)
+            .synthesis_instruction("synthesize".to_string())
+            .compaction_config(compaction_config())
+            .memory_flush(Arc::new(FailingFlush) as Arc<dyn CompactionMemoryFlush>)
+            .error_callback(callback)
+            .build()
+            .expect("test engine build");
+        let messages = large_history(10, 60);
+
+        let compacted = engine
+            .compact_if_needed(&messages, CompactionScope::Perceive, 10)
+            .await
+            .expect("compaction should proceed when flush fails");
+
+        assert!(has_compaction_marker(compacted.as_ref()));
+        let events = events.lock().expect("lock").clone();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::Error {
+                category: ErrorCategory::Memory,
+                message,
+                recoverable: true,
+            } if message == "Memory flush failed during compaction: memory flush failed: test failure"
+        )));
     }
 
     #[tokio::test]

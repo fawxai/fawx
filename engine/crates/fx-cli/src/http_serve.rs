@@ -141,6 +141,18 @@ fn serialize_stream_event(event: StreamEvent) -> Option<String> {
         StreamEvent::Done { response } => {
             sse_frame("done", serde_json::json!({ "response": response }))
         }
+        StreamEvent::Error {
+            category,
+            message,
+            recoverable,
+        } => sse_frame(
+            "engine_error",
+            serde_json::json!({
+                "category": category,
+                "message": message,
+                "recoverable": recoverable,
+            }),
+        ),
     }
 }
 
@@ -2044,6 +2056,21 @@ mod tests {
         .expect("phase frame");
 
         assert_eq!(frame, "event: phase\ndata: {\"phase\":\"perceive\"}\n\n");
+    }
+
+    #[test]
+    fn serialize_stream_event_serializes_error_event_payload() {
+        let frame = serialize_stream_event(StreamEvent::Error {
+            category: fx_kernel::ErrorCategory::Memory,
+            message: "memory flush failed".to_string(),
+            recoverable: true,
+        })
+        .expect("error frame");
+
+        assert!(frame.contains("event: engine_error"));
+        assert!(frame.contains("\"category\":\"memory\""));
+        assert!(frame.contains("\"message\":\"memory flush failed\""));
+        assert!(frame.contains("\"recoverable\":true"));
     }
 
     #[test]

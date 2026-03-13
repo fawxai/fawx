@@ -77,6 +77,6 @@ pub use process_registry::{
 };
 pub use proposal_gate::{is_tier3_path, ProposalGateExecutor, ProposalGateState};
 pub use signals::{LoopStep, Signal, SignalCollector, SignalKind};
-pub use streaming::{Phase, StreamCallback, StreamEvent};
+pub use streaming::{ErrorCategory, Phase, StreamCallback, StreamEvent};
 pub use types::{ContinuationDecision, EscalationContext, LoopError, LoopEvidence};
 pub use verify::Verification;

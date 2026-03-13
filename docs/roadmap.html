@@ -238,18 +238,39 @@
     <div class="phase">
       <div class="phase-header">
         <span class="phase-badge badge-building">Building</span>
-        <h2 class="phase-title">Native GUI (Mobile + Desktop)</h2>
+        <h2 class="phase-title">Native GUI (macOS + iOS)</h2>
       </div>
-      <p class="phase-desc">Web client connecting to the HTTP API over Tailscale. Replace Telegram as the daily-driver interface. Phone-first, works anywhere.</p>
+      <p class="phase-desc">Swift native app connecting to the HTTP API over Tailscale. Full CLI parity — every terminal command available from the app. Replace Telegram as the daily-driver interface.</p>
+
+      <h3 style="margin: 16px 0 8px; font-size: 14px; color: #888;">Prerequisites: HTTP API Parity (30 endpoints)</h3>
       <ul class="feature-list">
-        <li><span class="planned">○</span> PWA / web client served from fawx serve --http</li>
+        <li><span class="planned">○</span> Sprint 1: Session CRUD + conversation history + image support (~200 lines)</li>
+        <li><span class="planned">○</span> Sprint 2: Model switching + thinking toggle + auth management (~150 lines)</li>
+        <li><span class="planned">○</span> Sprint 3: Skills CRUD + search, fleet init/add/remove/list (~200 lines)</li>
+        <li><span class="planned">○</span> Sprint 4: Experiment launch/status/history, signals/budget/proposals (~300 lines)</li>
+        <li><span class="planned">○</span> Sprint 5: Diagnostics, logs, audit, backup, update, restart (~150 lines)</li>
+      </ul>
+
+      <h3 style="margin: 16px 0 8px; font-size: 14px; color: #888;">Phase 1: Daily Driver</h3>
+      <ul class="feature-list">
+        <li><span class="planned">○</span> SwiftUI shared codebase (macOS + iOS)</li>
         <li><span class="planned">○</span> SSE streaming for real-time responses</li>
-        <li><span class="planned">○</span> Conversation history and session management</li>
+        <li><span class="planned">○</span> Conversation list + session management</li>
         <li><span class="planned">○</span> Tool call visualization</li>
         <li><span class="planned">○</span> Image send/receive</li>
-        <li><span class="planned">○</span> Experiment progress panel</li>
+        <li><span class="planned">○</span> Model switching + thinking toggle</li>
+        <li><span class="planned">○</span> Config management</li>
+        <li><span class="planned">○</span> Error display (StreamEvent::Error)</li>
+      </ul>
+
+      <h3 style="margin: 16px 0 8px; font-size: 14px; color: #888;">Phase 2: Power User</h3>
+      <ul class="feature-list">
+        <li><span class="planned">○</span> Experiment progress panel + launcher</li>
         <li><span class="planned">○</span> Fleet status dashboard</li>
-        <li><span class="planned">○</span> Mobile-responsive design (phone daily driver)</li>
+        <li><span class="planned">○</span> Skill browser + install/remove</li>
+        <li><span class="planned">○</span> Proposal review (approve/reject)</li>
+        <li><span class="planned">○</span> Signal + budget monitoring</li>
+        <li><span class="planned">○</span> Diagnostics + logs + audit viewer</li>
       </ul>
     </div>
     <hr class="divider">
