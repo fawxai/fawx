@@ -19,7 +19,7 @@ use crate::input::{LoopCommand, LoopInputChannel};
 use crate::learn::Learning;
 use crate::perceive::{ProcessedPerception, TrimmingPolicy};
 use crate::signals::{LoopStep, Signal, SignalCollector, SignalKind};
-use crate::streaming::{Phase, StreamCallback, StreamEvent};
+use crate::streaming::{ErrorCategory, Phase, StreamCallback, StreamEvent};
 use crate::types::{
     Goal, IdentityContext, LoopError, PerceptionSnapshot, ReasoningContext, WorkingMemoryEntry,
 };
@@ -385,7 +385,6 @@ impl std::fmt::Display for CompactionScope {
 /// `compaction_last_iteration: Mutex<HashMap<CompactionScope, u32>>`.
 /// `LoopInputChannel` also contains an `mpsc::Receiver`, which remains
 /// non-`Clone`. No existing code clones `LoopEngine`, so this is a safe change.
-#[derive(Debug)]
 pub struct LoopEngine {
     budget: BudgetTracker,
     context: ContextCompactor,
@@ -416,13 +415,28 @@ pub struct LoopEngine {
     iteration_counter: Option<Arc<AtomicU32>>,
     /// Dynamic scratchpad provider for iteration-boundary context refresh.
     scratchpad_provider: Option<Arc<dyn ScratchpadProvider>>,
+    error_callback: Option<StreamCallback>,
     /// Extended thinking configuration forwarded to completion requests.
     thinking_config: Option<fx_llm::ThinkingConfig>,
     /// Registry of active input/output channels.
     channel_registry: ChannelRegistry,
 }
 
-#[derive(Debug, Default)]
+impl std::fmt::Debug for LoopEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoopEngine")
+            .field("max_iterations", &self.max_iterations)
+            .field("iteration_count", &self.iteration_count)
+            .field("memory_context", &self.memory_context)
+            .field("scratchpad_context", &self.scratchpad_context)
+            .field("compaction_config", &self.compaction_config)
+            .field("budget_low_signaled", &self.budget_low_signaled)
+            .field("tool_attempts", &self.tool_attempts)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Default)]
 #[must_use = "builder does nothing unless .build() is called"]
 pub struct LoopEngineBuilder {
     budget: Option<BudgetTracker>,
@@ -440,6 +454,7 @@ pub struct LoopEngineBuilder {
     scratchpad_context: Option<String>,
     iteration_counter: Option<Arc<AtomicU32>>,
     scratchpad_provider: Option<Arc<dyn ScratchpadProvider>>,
+    error_callback: Option<StreamCallback>,
     thinking_config: Option<fx_llm::ThinkingConfig>,
 }
 
@@ -524,6 +539,11 @@ impl LoopEngineBuilder {
         self
     }
 
+    pub fn error_callback(mut self, cb: StreamCallback) -> Self {
+        self.error_callback = Some(cb);
+        self
+    }
+
     pub fn thinking_config(mut self, config: fx_llm::ThinkingConfig) -> Self {
         self.thinking_config = Some(config);
         self
@@ -563,6 +583,7 @@ impl LoopEngineBuilder {
             tool_attempts: HashMap::new(),
             iteration_counter: self.iteration_counter,
             scratchpad_provider: self.scratchpad_provider,
+            error_callback: self.error_callback,
             thinking_config: self.thinking_config,
             channel_registry: ChannelRegistry::new(),
         })
@@ -936,6 +957,39 @@ impl LoopEngine {
         attach_signals(result, signals)
     }
 
+    // Emit a user-visible error through the cycle stream callback.
+    fn emit_stream_error(
+        stream: &CycleStream<'_>,
+        category: ErrorCategory,
+        message: impl Into<String>,
+        recoverable: bool,
+    ) {
+        if let Some(callback) = &stream.callback {
+            callback(StreamEvent::Error {
+                category,
+                message: message.into(),
+                recoverable,
+            });
+        }
+    }
+
+    // Emit a user-visible error through the out-of-band error callback.
+    // Used for errors outside the streaming cycle (compaction, background ops).
+    fn emit_background_error(
+        &self,
+        category: ErrorCategory,
+        message: impl Into<String>,
+        recoverable: bool,
+    ) {
+        if let Some(cb) = &self.error_callback {
+            cb(StreamEvent::Error {
+                category,
+                message: message.into(),
+                recoverable,
+            });
+        }
+    }
+
     fn emit_cache_stats_signal(&mut self) {
         let Some(stats) = self.tool_executor.cache_stats() else {
             return;
@@ -977,43 +1031,57 @@ impl LoopEngine {
         llm: &dyn LlmProvider,
         stream_callback: Option<StreamCallback>,
     ) -> Result<LoopResult, LoopError> {
-        self.prepare_cycle();
-        let mut state = CycleState::default();
-        let stream = stream_callback
-            .as_ref()
-            .map_or_else(CycleStream::disabled, CycleStream::enabled);
+        let previous_error_callback = self.error_callback.clone();
+        if let Some(callback) = stream_callback.clone() {
+            self.error_callback = Some(callback);
+        }
 
-        while self.iteration_count < self.max_iterations {
-            self.iteration_count = self.iteration_count.saturating_add(1);
-            self.refresh_iteration_state();
-            match self
-                .execute_iteration(&perception, llm, &mut state, stream)
-                .await?
-            {
-                IterationStep::Terminal(result) => {
-                    stream.done_result(&result);
-                    return Ok(self.finalize_result(result));
-                }
-                IterationStep::Progress(outcome) => {
-                    if let Some(result) =
-                        self.apply_iteration_outcome(outcome, &mut perception, &mut state, stream)
-                    {
+        let run_result = async {
+            self.prepare_cycle();
+            let mut state = CycleState::default();
+            let stream = stream_callback
+                .as_ref()
+                .map_or_else(CycleStream::disabled, CycleStream::enabled);
+
+            while self.iteration_count < self.max_iterations {
+                self.iteration_count = self.iteration_count.saturating_add(1);
+                self.refresh_iteration_state();
+                match self
+                    .execute_iteration(&perception, llm, &mut state, stream)
+                    .await?
+                {
+                    IterationStep::Terminal(result) => {
+                        stream.done_result(&result);
                         return Ok(self.finalize_result(result));
+                    }
+                    IterationStep::Progress(outcome) => {
+                        if let Some(result) = self.apply_iteration_outcome(
+                            outcome,
+                            &mut perception,
+                            &mut state,
+                            stream,
+                        ) {
+                            return Ok(self.finalize_result(result));
+                        }
                     }
                 }
             }
-        }
 
-        let result = LoopResult::Error {
-            message: format!(
-                "Loop reached safety limit of {} iterations without completion.",
-                self.max_iterations
-            ),
-            recoverable: true,
-            signals: Vec::new(),
-        };
-        stream.done_result(&result);
-        Ok(self.finalize_result(result))
+            let result = LoopResult::Error {
+                message: format!(
+                    "Loop reached safety limit of {} iterations without completion.",
+                    self.max_iterations
+                ),
+                recoverable: true,
+                signals: Vec::new(),
+            };
+            stream.done_result(&result);
+            Ok(self.finalize_result(result))
+        }
+        .await;
+
+        self.error_callback = previous_error_callback;
+        run_result
     }
 
     fn apply_iteration_outcome(
@@ -1418,10 +1486,14 @@ impl LoopEngine {
         phase: StreamPhase,
         stage: &str,
     ) -> Result<CompletionResponse, LoopError> {
-        let mut stream = llm
-            .complete_stream(request)
-            .await
-            .map_err(|error| loop_error(stage, &format!("completion failed: {error}"), true))?;
+        let mut stream = llm.complete_stream(request).await.map_err(|error| {
+            self.emit_background_error(
+                ErrorCategory::Provider,
+                format!("LLM request failed: {error}"),
+                false,
+            );
+            loop_error(stage, &format!("completion failed: {error}"), true)
+        })?;
         self.publish_stream_started(phase);
         self.consume_stream_with_events(&mut stream, phase).await
     }
@@ -1436,10 +1508,15 @@ impl LoopEngine {
     ) -> Result<CompletionResponse, LoopError> {
         self.publish_stream_started(phase);
         let bridge = provider_stream_bridge(callback.clone(), self.event_bus.clone(), phase);
-        let result = llm
-            .stream(request, bridge)
-            .await
-            .map_err(|error| loop_error(stage, &format!("completion failed: {error}"), true));
+        let result = llm.stream(request, bridge).await.map_err(|error| {
+            Self::emit_stream_error(
+                &CycleStream::enabled(callback),
+                ErrorCategory::Provider,
+                format!("LLM streaming failed: {error}"),
+                false,
+            );
+            loop_error(stage, &format!("completion failed: {error}"), true)
+        });
         self.publish_stream_finished(phase);
         result
     }
@@ -1496,6 +1573,11 @@ impl LoopEngine {
                 Ok(chunk) => chunk,
                 Err(error) => {
                     self.publish_stream_finished(phase);
+                    self.emit_background_error(
+                        ErrorCategory::Provider,
+                        format!("LLM stream error: {error}"),
+                        false,
+                    );
                     return Err(loop_error(
                         phase_stage(phase),
                         &format!("stream consumption failed: {error}"),
@@ -2676,6 +2758,11 @@ impl LoopEngine {
                             error = %err,
                             evicted_count = evicted.len(),
                             "pre-compaction memory flush failed; proceeding without flush"
+                        );
+                        self.emit_background_error(
+                            ErrorCategory::Memory,
+                            format!("Memory flush failed during compaction: {err}"),
+                            true,
                         );
                     }
                 }
@@ -7587,6 +7674,40 @@ mod cancellation_tests {
         }
     }
 
+    #[derive(Debug)]
+    struct FailingStreamingLlm;
+
+    #[async_trait]
+    impl LlmProvider for FailingStreamingLlm {
+        async fn generate(&self, _: &str, _: u32) -> Result<String, CoreLlmError> {
+            Ok("summary".to_string())
+        }
+
+        async fn generate_streaming(
+            &self,
+            _: &str,
+            _: u32,
+            callback: Box<dyn Fn(String) + Send + 'static>,
+        ) -> Result<String, CoreLlmError> {
+            callback("summary".to_string());
+            Ok("summary".to_string())
+        }
+
+        fn model_name(&self) -> &str {
+            "failing-streaming"
+        }
+
+        async fn stream(
+            &self,
+            _: CompletionRequest,
+            _: ProviderStreamCallback,
+        ) -> Result<CompletionResponse, ProviderError> {
+            Err(ProviderError::Provider(
+                "simulated streaming failure".to_string(),
+            ))
+        }
+    }
+
     fn engine_with_executor(executor: Arc<dyn ToolExecutor>, max_iterations: u32) -> LoopEngine {
         LoopEngine::builder()
             .budget(BudgetTracker::new(
@@ -8262,6 +8383,59 @@ mod cancellation_tests {
             .expect_err("stream setup should fail");
         assert!(error.reason.contains("completion failed"));
         assert!(receiver.try_recv().is_err(), "no stream events expected");
+    }
+
+    #[tokio::test]
+    async fn reason_emits_background_error_on_buffered_stream_setup_failure() {
+        let (callback, events) = stream_recorder();
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        engine.error_callback = Some(callback);
+
+        let error = engine
+            .reason(
+                &reason_perception("hello"),
+                &FailingBufferedStreamLlm,
+                CycleStream::disabled(),
+            )
+            .await
+            .expect_err("stream setup should fail");
+        assert!(error.reason.contains("completion failed"));
+
+        let events = events.lock().expect("lock").clone();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::Error {
+                category: ErrorCategory::Provider,
+                message,
+                recoverable: false,
+            } if message == "LLM request failed: provider error: simulated stream setup failure"
+        )));
+    }
+
+    #[tokio::test]
+    async fn reason_emits_stream_error_on_streaming_provider_failure() {
+        let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+        let (callback, events) = stream_recorder();
+
+        let error = engine
+            .reason(
+                &reason_perception("hello"),
+                &FailingStreamingLlm,
+                CycleStream::enabled(&callback),
+            )
+            .await
+            .expect_err("streaming request should fail");
+        assert!(error.reason.contains("completion failed"));
+
+        let events = events.lock().expect("lock").clone();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::Error {
+                category: ErrorCategory::Provider,
+                message,
+                recoverable: false,
+            } if message == "LLM streaming failed: provider error: simulated streaming failure"
+        )));
     }
 
     #[tokio::test]
@@ -10972,6 +11146,48 @@ mod context_compaction_tests {
 
         assert!(has_compaction_marker(compacted.as_ref()));
         assert!(compacted.len() < messages.len());
+    }
+
+    #[tokio::test]
+    async fn compact_if_needed_emits_memory_error_when_flush_fails() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+        let events = Arc::new(Mutex::new(Vec::<StreamEvent>::new()));
+        let captured = Arc::clone(&events);
+        let callback: StreamCallback = Arc::new(move |event| {
+            captured.lock().expect("lock").push(event);
+        });
+        let engine = LoopEngine::builder()
+            .budget(BudgetTracker::new(
+                crate::budget::BudgetConfig::default(),
+                current_time_ms(),
+                0,
+            ))
+            .context(ContextCompactor::new(2_048, 256))
+            .max_iterations(4)
+            .tool_executor(executor)
+            .synthesis_instruction("synthesize".to_string())
+            .compaction_config(compaction_config())
+            .memory_flush(Arc::new(FailingFlush) as Arc<dyn CompactionMemoryFlush>)
+            .error_callback(callback)
+            .build()
+            .expect("test engine build");
+        let messages = large_history(10, 60);
+
+        let compacted = engine
+            .compact_if_needed(&messages, CompactionScope::Perceive, 10)
+            .await
+            .expect("compaction should proceed when flush fails");
+
+        assert!(has_compaction_marker(compacted.as_ref()));
+        let events = events.lock().expect("lock").clone();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::Error {
+                category: ErrorCategory::Memory,
+                message,
+                recoverable: true,
+            } if message == "Memory flush failed during compaction: memory flush failed: test failure"
+        )));
     }
 
     #[tokio::test]

@@ -17,7 +17,7 @@ use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::loop_engine::{LoopEngine, LoopResult};
 use fx_kernel::signals::Signal;
 use fx_kernel::types::PerceptionSnapshot;
-use fx_kernel::StreamCallback;
+use fx_kernel::{StreamCallback, StreamEvent};
 use fx_llm::CompletionProvider;
 use fx_llm::{ImageAttachment, Message, ModelInfo, ModelRouter};
 use fx_memory::SignalStore;
@@ -189,6 +189,13 @@ impl Drop for HeadlessApp {
             tracing::warn!(error = %error, "failed to save embedding index on shutdown");
         }
     }
+}
+
+fn headless_stream_callback(callback: StreamCallback) -> StreamCallback {
+    Arc::new(move |event| {
+        HeadlessApp::report_stream_error(&event);
+        callback(event);
+    })
 }
 
 impl HeadlessApp {
@@ -480,6 +487,7 @@ impl HeadlessApp {
         self.update_memory_context(input);
         let snapshot = self.build_perception_snapshot(input, source);
         let llm = RouterLoopLlmProvider::new(&self.router, self.active_model.clone());
+        let callback = headless_stream_callback(callback);
         let result = self
             .loop_engine
             .run_cycle_streaming(snapshot, &llm, Some(callback))
@@ -487,6 +495,18 @@ impl HeadlessApp {
             .map_err(|e| anyhow::anyhow!("loop error: stage={} reason={}", e.stage, e.reason))?;
         self.evaluate_canary(&result);
         Ok(self.finalize_cycle(input, &result))
+    }
+
+    fn report_stream_error(event: &StreamEvent) {
+        if let StreamEvent::Error {
+            category,
+            message,
+            recoverable,
+        } = event
+        {
+            let level = if *recoverable { "warning" } else { "error" };
+            eprintln!("[{level}] [{category:?}] {message}");
+        }
     }
 
     fn finalize_cycle(&mut self, input: &str, result: &LoopResult) -> CycleResult {
